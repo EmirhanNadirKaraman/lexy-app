@@ -401,15 +401,20 @@ def extract_german_logic(doc, overrides=None):
 
 
 # ---------------------------------------------------------------------------
-# Spanish phrase extractor — first slice (#36, 2026-05-23)
+# Spanish phrase extractor — slice 1 (#36, 2026-05-23) + slice 2 (2026-05-24)
 # ---------------------------------------------------------------------------
 #
-# Words-only Spanish v1 gets its first real phrase extractor. Deliberately a
-# NARROW first slice — two pattern families only:
-#   1. Reflexive verbs                 "me lavo"      -> "lavarse"
-#   2. Verb + preposition (allowlist)  "dependo de …" -> "depender de"
-# Clitic-attached infinitives ("quiero lavarme"), imperatives ("lávate"),
-# subjunctive, idioms and multiword expressions are intentionally deferred.
+# Conservative, pattern-based Spanish phrase extraction. Three families:
+#   1. Finite reflexive verbs          "me lavo"        -> "lavarse"
+#   2. Verb + preposition (allowlist)  "dependo de …"   -> "depender de"
+#   3. Clitic-attached infinitives     "quiero lavarme" -> "lavarse"  (slice 2)
+# Slice 2 also broadened the verb+prep allowlist and the prep-attachment search
+# (now matches `mark` deps, e.g. "consiste en practicar").
+#
+# Still deferred (model-bound or needs a new pattern): imperatives ("lávate" —
+# es_core_news_sm doesn't tag it as a verb), reflexive+preposition combos
+# ("acordarse de" — needs a separate set + canonical builder; see _ES_VERB_PREP
+# note), subjunctive, idioms, MWEs.
 #
 # Output shape is IDENTICAL to extract_german_logic so pipeline.insert_phrases
 # consumes it unchanged: each dict carries dictionary_entry / sentence_phrase /
@@ -430,12 +435,21 @@ _ES_REFLEXIVE_CLITICS = {
     "os":  ("2", {"Plur"}),
 }
 
-# Allowlisted verb+preposition collocations (verb lemma, preposition). Kept
-# conservative on purpose — only emit for a known pair, never guess.
+# Allowlisted NON-reflexive verb+preposition collocations (verb lemma,
+# preposition). Kept conservative on purpose — only emit for a known pair, never
+# guess. Reflexive+preposition collocations ("acordarse de", "enamorarse de",
+# "convertirse en", "quejarse de") are a DIFFERENT pattern that must yield a
+# reflexive canonical ("acordarse de", not "acordar de"); do NOT add those here
+# (a finite "me acuerdo de ti" would emit the wrong "acordar de"). They get
+# their own set + canonical builder in a later slice (see TODO #36).
 _ES_VERB_PREP = {
+    # slice 1
     ("depender", "de"), ("pensar", "en"), ("hablar", "de"), ("soñar", "con"),
     ("esperar", "a"), ("tratar", "de"), ("ayudar", "a"), ("aprender", "a"),
     ("empezar", "a"), ("acabar", "de"),
+    # slice 2 (each has a test in tests/test_spanish_phrase_extractor.py)
+    ("confiar", "en"), ("consistir", "en"), ("creer", "en"),
+    ("jugar", "a"), ("salir", "de"), ("llegar", "a"),
 }
 
 
@@ -458,23 +472,27 @@ def _es_clitic_agrees(verb, person, numbers):
 
 def _es_prep_candidates(verb):
     """Prepositions syntactically attached to `verb`: direct ADP children, plus
-    ADP 'case' markers heading the verb's oblique/object phrases (e.g. in
-    'dependo de mis padres', 'de' is a case-child of the obl noun 'padres')."""
+    ADP markers heading the verb's oblique/object/clausal complements. The
+    grandchild dep is `case` for noun objects ('dependo de mis padres' — 'de'
+    cases the obl noun 'padres') and `mark` for infinitive complements
+    ('consiste en practicar' — 'en' marks the xcomp verb 'practicar'). Emission
+    is still gated by the allowlist, so widening the dep set only finds more
+    candidate preps, never invents matches."""
     out = []
     for child in verb.children:
         if child.pos_ == "ADP":
             out.append((child.lemma_.lower(), child.i))
         else:
             for grand in child.children:
-                if grand.pos_ == "ADP" and grand.dep_ == "case":
+                if grand.pos_ == "ADP" and grand.dep_ in ("case", "mark"):
                     out.append((grand.lemma_.lower(), grand.i))
     return out
 
 
 def extract_spanish_logic(doc, overrides=None):
-    """First-slice Spanish phrase extractor (reflexives + allowlisted
-    verb+preposition). Returns extract_german_logic's dict shape. `doc` must be
-    a Spanish spaCy Doc; the caller owns model selection.
+    """Spanish phrase extractor (finite reflexives + allowlisted verb+preposition
+    + clitic-attached reflexive infinitives). Returns extract_german_logic's dict
+    shape. `doc` must be a Spanish spaCy Doc; the caller owns model selection.
 
     `overrides` (#39) is an optional {observed_lemma: corrected_lemma} map that
     patches spaCy lemmatizer errors (e.g. `duchaber`→`duchar`) before the
@@ -528,6 +546,26 @@ def extract_spanish_logic(doc, overrides=None):
             if (verb_lemma, prep_lemma) in _ES_VERB_PREP:
                 _emit(f"{verb_lemma} {prep_lemma}", [token.i, prep_i],
                       "es_verb_prep", f"{verb_lemma} -> {prep_lemma}")
+
+        # 3. Clitic-attached reflexive infinitive ("quiero lavarme" -> "lavarse").
+        #    spaCy keeps the enclitic fused into one VERB token (VerbForm=Inf)
+        #    whose surface ends in the clitic. Recover the base by stripping that
+        #    suffix — the spaCy lemma here is the quirky "lavar yo", so we use the
+        #    surface, not the lemma. (The override is applied to the recovered
+        #    base; block 1's finite path applies it to the spaCy lemma instead —
+        #    two override application points, one per recovery method.)
+        if "Inf" in token.morph.get("VerbForm"):
+            surface = token.text.lower()
+            # Longest clitic first: 'nos' before 'os', else 'lavarnos' strips to
+            # 'lavarn', fails the ends-in-'r' check, and the match is lost.
+            for clitic in ("nos", "me", "te", "se", "os"):
+                if surface.endswith(clitic):
+                    base = surface[: -len(clitic)]
+                    if base.endswith("r"):  # a real Spanish infinitive base
+                        base = overrides.get(base, base)
+                        _emit(f"{base}se", [token.i], "es_reflexive_infinitive",
+                              f"{base} + -{clitic} (clitic infinitive)")
+                    break
 
     return result
 

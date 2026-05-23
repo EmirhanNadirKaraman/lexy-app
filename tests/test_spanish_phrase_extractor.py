@@ -324,3 +324,84 @@ def test_insert_phrases_applies_overrides_to_canonical(es_nlp):
     joined = " ".join(cur.executed)
     assert "ducharse" in joined, "corrected canonical should reach the INSERT"
     assert "duchaberse" not in joined, "the broken canonical must not be written"
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 — clitic-attached reflexive infinitives ("quiero lavarme" -> lavarse)
+# ---------------------------------------------------------------------------
+
+def test_clitic_infinitive_lavarme(es_nlp):
+    assert "lavarse" in _canonicals(es_nlp, "Quiero lavarme.")
+
+
+def test_clitic_infinitive_levantarme(es_nlp):
+    assert "levantarse" in _canonicals(es_nlp, "Voy a levantarme temprano.")
+
+
+def test_clitic_infinitive_ducharme(es_nlp):
+    # The base infinitive lemmatizes correctly here ('duchar'), unlike the finite
+    # 'ducha'->'duchaber' — so this path needs no override.
+    assert "ducharse" in _canonicals(es_nlp, "Necesito ducharme.")
+
+
+def test_clitic_infinitive_acostarme(es_nlp):
+    assert "acostarse" in _canonicals(es_nlp, "Puedo acostarme tarde.")
+
+
+def test_non_reflexive_infinitive_not_marked_reflexive(es_nlp):
+    """A plain infinitive with no enclitic ('comer') must NOT become reflexive.
+    Guards the false-positive surface of the clitic-stripping rule."""
+    out = _canonicals(es_nlp, "Quiero comer.")
+    assert "comerse" not in out
+    assert all(not c.endswith("se") for c in out)
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 — broadened verb+preposition allowlist
+# ---------------------------------------------------------------------------
+
+def test_verbprep_confiar_en(es_nlp):
+    assert "confiar en" in _canonicals(es_nlp, "Confío en ti.")
+
+
+def test_verbprep_consistir_en(es_nlp):
+    # 'en' attaches as a `mark` on the infinitive complement — exercises the
+    # widened prep-attachment search added in slice 2.
+    assert "consistir en" in _canonicals(es_nlp, "Consiste en practicar.")
+
+
+def test_verbprep_creer_en(es_nlp):
+    assert "creer en" in _canonicals(es_nlp, "Creo en ti.")
+
+
+def test_verbprep_jugar_a(es_nlp):
+    assert "jugar a" in _canonicals(es_nlp, "Juego a fútbol.")
+
+
+def test_verbprep_salir_de(es_nlp):
+    assert "salir de" in _canonicals(es_nlp, "Salimos de la casa.")
+
+
+def test_verbprep_llegar_a(es_nlp):
+    assert "llegar a" in _canonicals(es_nlp, "Llega a Madrid mañana.")
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 — deferred patterns (regression guards)
+# ---------------------------------------------------------------------------
+
+def test_imperative_reflexive_currently_unsupported(es_nlp):
+    """es_core_news_sm tags 'Lávate.' as a non-verb, so reflexive imperatives
+    extract nothing today. Deferred; this pins the documented state so a future
+    change that starts extracting them flags the slice for review."""
+    assert _canonicals(es_nlp, "Lávate.") == []
+
+
+def test_reflexive_prep_combo_emits_reflexive_only(es_nlp):
+    """'Me acuerdo de ti.' yields the reflexive 'acordarse' (finite path). The
+    combined reflexive+prep 'acordarse de' is deferred, and crucially we must
+    NOT emit a bare 'acordar de' — 'acordar' is intentionally absent from the
+    verb+prep allowlist (it would be the wrong canonical)."""
+    out = _canonicals(es_nlp, "Me acuerdo de ti.")
+    assert "acordarse" in out
+    assert "acordar de" not in out

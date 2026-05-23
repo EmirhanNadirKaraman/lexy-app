@@ -196,7 +196,7 @@ Pytest tests for pipeline modules. Mostly hermetic (no DB).
 |---|---|
 | `pipeline.py` | yt-dlp scraper orchestrator. `load_channels` (DB), `populate`, `insert_phrases`, `load_lemma_overrides` (#39 — reads `lemma_override` → patches spaCy lemma errors at phrase-generation time), `_notify_user`, `_mark_request`. Run modes: full, `--requests-only`. |
 | `transcript_fetcher.py` | yt-dlp wrapper. JSON3 + WebVTT parsing. Cache under `transcript_cache/`. |
-| `phrase_finder.py` | Phrase extraction dispatched by language via `extract_phrases(doc, lang)` / `_LANGUAGE_EXTRACTORS`. German (`extract_german_logic`) loads `data/final_result.txt` (path resolved from `__file__`, no chdir) + spaCy at import. Spanish (`extract_spanish_logic`, #36 first slice) covers reflexives + an allowlisted verb+prep set with the same output dict shape. `matcher_service.match_sentence` wraps the str in `nlp(...)` before calling the German extractor. |
+| `phrase_finder.py` | Phrase extraction dispatched by language via `extract_phrases(doc, lang)` / `_LANGUAGE_EXTRACTORS`. German (`extract_german_logic`) loads `data/final_result.txt` (path resolved from `__file__`, no chdir) + spaCy at import. Spanish (`extract_spanish_logic`, #36 slices 1+2) covers finite reflexives, an allowlisted verb+prep set, and clitic-attached reflexive infinitives, with the same output dict shape. `matcher_service.match_sentence` wraps the str in `nlp(...)` before calling the German extractor. |
 | `seed_channels.py` | Bootstrap upsert of `seed_data/channels.json` → `channel` table. Idempotent. |
 | `backfill_video_channels.py`, `backfill_channel_names.py`, `backfill_categories.py` | One-off backfills. |
 | `channel_finder.py` | YouTube subscription / CSV channel discovery. Prints IDs to stdout. |

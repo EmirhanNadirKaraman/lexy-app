@@ -380,17 +380,21 @@ Coverage of the batch: 8 cleaner + 4 merger + 4 guard + 2 noise + 1 knowledge + 
   - 🟡 **Part 3 (per-format audio-track inspection) — deferred, optional.** Current impl uses the single `info["language"]` hint, not per-stream dub detection. Sufficient for now; revisit only if mis-tagging recurs on bilingual-audio videos.
   - The `--requests-only` video path benefits automatically from parts 1 & 2 (it calls `get_transcript` with no language).
 
-### 36. 🟡 Spanish phrase extractor — first slice shipped 2026-05-24; deeper patterns deferred
+### 36. 🟡 Spanish phrase extractor — slices 1+2 shipped 2026-05-24; deeper patterns deferred
 **File:** `subtitle-scraper/phrase_finder.py` (`extract_spanish_logic`, registered under `'es'` in `_LANGUAGE_EXTRACTORS`)
 **Problem:** Spanish v1 was words-only — `extract_phrases(doc, 'es')` returned `[]`.
 **Status (first slice, #36):** ✅ `extract_spanish_logic(doc)` ships two pattern families:
   - **Reflexive verbs** — finite verb + an agreeing reflexive clitic (me/te/se/nos/os); person/number agreement rejects non-reflexive object clitics ("me ve" ≠ `verse`). Canonical = verb lemma + "se" (e.g. "Nos acostamos…" → `acostarse`).
   - **Verb + preposition** — conservative allowlist (`depender de`, `pensar en`, `hablar de`, `soñar con`, `esperar a`, `tratar de`, `ayudar a`, `aprender a`, `empezar a`, `acabar de`). Canonical = "&lt;lemma&gt; &lt;prep&gt;".
   Output shape is identical to the German extractor (`dictionary_entry`/`sentence_phrase`/`logic`/`match_type`/`indices`), so `pipeline.insert_phrases` consumes it unchanged. Tests: `tests/test_spanish_phrase_extractor.py`.
+**Status (slice 2, 2026-05-24):** ✅ a third pattern family + a broader allowlist.
+  - **Clitic-attached infinitives** — `es_core_news_sm` fuses the enclitic into one `VERB` token (`VerbForm=Inf`, surface ends in the clitic). The base infinitive is recovered by stripping the clitic suffix (longest-first so `lavarnos`→`lavar`, not `lavarn`; validated by an ends-in-`r` check), then `+"se"`: "quiero lavarme" → `lavarse`, "voy a levantarme" → `levantarse`, "necesito ducharme" → `ducharse`, "puedo acostarme" → `acostarse`. Overrides apply to the recovered base.
+  - **Broadened verb+prep allowlist** (+`confiar en`, `consistir en`, `creer en`, `jugar a`, `salir de`, `llegar a`) and the prep-attachment search now also matches `mark` deps (so `consiste en practicar` resolves, not just `case`-marked noun objects).
 **Deferred (later slices):**
-  - Clitic-attached infinitives ("quiero lavarme") + imperatives ("lávate") — enclitics that `es_core_news_sm` fuses into one token.
-  - Broader verb+prep coverage (promote the allowlist to data/config), idioms, MWEs, subjunctive patterns.
-  - **Lemma quality:** spaCy mis-lemmatizes some verbs (`ducha`→`duchaber`, `ducho`→`duchir`), so canonicals are sometimes imperfect. **Verified 2026-05-24: this is a lemmatizer-data bug shared by `es_core_news_sm`, `_md` AND `_lg`** — bumping the model size does NOT fix it (`_lg` does fix peripheral cases like bare "Me lavo"→`lavar`, but not the `duchar` family). The real fix is a lemma-override layer — see #39. Detection itself is reliable; only the canonical is affected.
+  - **Imperatives** ("lávate", "levántate") — `es_core_news_sm` tags them as non-verbs, so they extract nothing (regression-guarded). Needs a model that tags imperatives or a normalization pass.
+  - **Reflexive+preposition combos** ("acordarse de", "enamorarse de", "convertirse en") — must yield a *reflexive* canonical, so they need their own set + builder (NOT in `_ES_VERB_PREP`, which would wrongly emit "acordar de"). A finite "me acuerdo de ti" today emits only the reflexive `acordarse`.
+  - Promote the allowlist to data/config; idioms, MWEs, subjunctive.
+  - **Lemma quality** is handled by the override layer — see #39 (the `ducha`→`duchaber` family; note the clitic-infinitive path lemmatizes `duchar` correctly without an override).
 **Blocks:** nothing — purely additive. German behaviour untouched (regression-guarded by `tests/test_phrase_dispatcher.py` + backend `test_matcher.py`).
 
 ### 39. 🟡 Lemma-override layer — slices 1+2 shipped 2026-05-24; community-signal slice 3 deferred
