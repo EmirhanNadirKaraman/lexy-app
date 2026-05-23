@@ -24,6 +24,8 @@ Test runner: pytest + pytest-asyncio. Fixtures in `conftest.py` provide `db_pool
 | `test_grammar_rules_srs.py` | grammar rule via `/words/{type}/{id}/status`; status_marked_learning currently creates passive only (grammar_rule guard added in this session) |
 | `test_llm_cache.py` | cache key generation, hit/miss, TTL |
 | `test_matcher.py` | phrase matching via `/sentences/match` — ❌ all 5 tests fail (pre-existing: phrase_finder called with str, expects spaCy Doc — `phrase_finder.py:151`) |
+| `test_matcher_limits.py` | 🆕 S16 DoS hardening for public `/sentences/match`: per-IP throttle (429), 1000-char input cap (422 before matcher), unknown-language → empty (no crash) |
+| `test_client_errors.py` | W7 crash-sink coverage; 🆕 extended with S6 per-IP throttle tests (429 after limit, authed below-limit still 204) |
 | `test_playlist.py` | playlist generation from target words |
 | `test_prioritization.py` | get_prioritized_items signal weights |
 | `test_progression.py` | rule table + apply_progression behaviours |

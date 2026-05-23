@@ -125,7 +125,10 @@ class ChatMessageRead(BaseModel):
 
 
 class MatchRequest(BaseModel):
-    sentence: str
+    # max_length caps unauthenticated spaCy work on the public /sentences/match
+    # route (S16): an over-length body is rejected with 422 before the handler
+    # runs, so the parser never sees it. 1000 chars covers any real sentence.
+    sentence: str = Field(..., max_length=1000)
 
 
 class MatchPhraseResult(BaseModel):

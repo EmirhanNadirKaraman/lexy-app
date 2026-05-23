@@ -122,3 +122,31 @@ async def rate_limit_register(request: Request) -> None:
         window_seconds=rate_limiter.REGISTER_WINDOW_SECONDS,
         detail=rate_limiter.AUTH_RATE_LIMIT_MESSAGE,
     )
+
+
+# ── Public-endpoint throttling (S6, S16) ────────────────────────────────────
+#
+# Same pattern as the auth helpers, for the two unauthenticated routes that do
+# real work. Keyed by client IP; called at the top of the handler so throttled
+# requests skip the DB write / spaCy parse entirely.
+
+async def rate_limit_client_errors(request: Request) -> None:
+    """Throttle anonymous crash reports per client IP (S6). Raises 429."""
+    ip = _client_ip(request)
+    await rate_limiter.check_window(
+        f"client_errors:{ip}",
+        limit=rate_limiter.CLIENT_ERROR_MAX_REPORTS,
+        window_seconds=rate_limiter.CLIENT_ERROR_WINDOW_SECONDS,
+        detail=rate_limiter.PUBLIC_RATE_LIMIT_MESSAGE,
+    )
+
+
+async def rate_limit_sentence_match(request: Request) -> None:
+    """Throttle sentence-match (spaCy) calls per client IP (S16). Raises 429."""
+    ip = _client_ip(request)
+    await rate_limiter.check_window(
+        f"sentence_match:{ip}",
+        limit=rate_limiter.SENTENCE_MATCH_MAX_REQUESTS,
+        window_seconds=rate_limiter.SENTENCE_MATCH_WINDOW_SECONDS,
+        detail=rate_limiter.PUBLIC_RATE_LIMIT_MESSAGE,
+    )

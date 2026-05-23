@@ -11,6 +11,7 @@ from httpx import AsyncClient
 
 from ._email_helper import make_test_email
 from backend.routers import errors as errors_router
+from backend.services import rate_limiter
 
 REGISTER = "/api/v1/auth/register"
 LOGIN    = "/api/v1/auth/login"
@@ -149,3 +150,27 @@ async def test_user_agent_falls_back_to_header(client: AsyncClient, db_pool):
         "SELECT user_agent FROM client_error_log ORDER BY error_id DESC LIMIT 1"
     )
     assert row["user_agent"] == "TestRunner/9.9"
+
+
+# ---------------------------------------------------------------------------
+# S6 — per-IP throttle (the endpoint stays public; floods are capped)
+# ---------------------------------------------------------------------------
+
+async def test_reports_throttled_per_ip_after_limit(client: AsyncClient, monkeypatch):
+    monkeypatch.setattr(rate_limiter, "CLIENT_ERROR_MAX_REPORTS", 3)
+
+    for _ in range(3):
+        ok = await client.post(URL, json=_minimal_payload())
+        assert ok.status_code == 204
+
+    blocked = await client.post(URL, json=_minimal_payload())
+    assert blocked.status_code == 429
+    assert blocked.json()["detail"] == rate_limiter.PUBLIC_RATE_LIMIT_MESSAGE
+
+
+async def test_authenticated_report_below_limit_still_succeeds(client: AsyncClient, db_pool, monkeypatch):
+    monkeypatch.setattr(rate_limiter, "CLIENT_ERROR_MAX_REPORTS", 5)
+    headers, _ = await _register(client, db_pool, make_test_email())
+
+    resp = await client.post(URL, json=_minimal_payload("auth ok"), headers=headers)
+    assert resp.status_code == 204

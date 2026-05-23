@@ -21,14 +21,13 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 
 ## Open findings — summary
 
-> **S1 and S5 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
+> **S1, S5, S6, S16 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
 
 | ID | Severity | Title | Primary location |
 |----|----------|-------|------------------|
 | S2 | MEDIUM | Open registration multiplies the per-user LLM budget | `routers/auth.py` + `services/rate_limiter.py` |
 | S3 | MEDIUM | Account deletion + long-lived non-revocable token + localStorage (chain) | `routers/account.py`, `core/security.py`, `frontend/src/auth.ts` |
 | S4 | MEDIUM | DB connection pool created without TLS | `database.py` |
-| S6 | MED-LOW | Unauthenticated, unthrottled crash-report insert | `routers/errors.py` |
 | S7 | MED-LOW | Unvalidated `content_id` fed to yt-dlp | `routers/content_requests.py` → `subtitle-scraper/pipeline.py` |
 | S8 | LOW-MED | Upload: extension-only check, unsanitized filename, pre-handler disk spool | `routers/books.py` |
 | S9 | LOW | User enumeration on registration | `services/auth_service.py` |
@@ -38,14 +37,13 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S13 | INFO | f-string SQL in a migration (pattern caution) | `migrations/versions/013_*.py` |
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
 | S15 | INFO | No dependency vulnerability scanning | `requirements.txt`, `package.json` |
-| S16 | MED-LOW | `POST /sentences/match` is unauthenticated + no input length cap | `routers/matcher.py`, `models/schemas.py` |
 | S17 | LOW/INFO | `POST /phrases/seed` triggerable by any authenticated user (not admin-gated) | `routers/phrases.py` |
 
 ---
 
 ## Open findings — detail
 
-> S1 (auth throttling) and S5 (security headers) were resolved on 2026-05-24 — see *Resolved findings*.
+> S1 (auth throttling), S5 (security headers), S6 (crash-report throttle), and S16 (sentence-match throttle + cap) were resolved on 2026-05-24 — see *Resolved findings*.
 
 ### S2 — Open registration multiplies the per-user LLM budget — MEDIUM
 **Where:** `routers/auth.py` register (no throttle, no email verification, no captcha) combined with `services/rate_limiter.py`, whose budget is keyed *per user*.
@@ -64,12 +62,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 **Impact:** If `DB_HOST` is a remote/managed Postgres, credentials and all query traffic may cross the network in plaintext. Non-issue when `DB_HOST` is localhost.
 **Verification check:** `rg -n 'create_pool|ssl' lexy-app/backend/database.py` → no `ssl=`; then check the deployed `DB_HOST` is local. If remote and no `ssl`, open.
 **Fix:** Pass `ssl="require"` (or, better, verify-full with the provider CA) whenever `DB_HOST` is not localhost. Same applies to `migrations/env.py` and `subtitle-scraper` DB connections.
-
-### S6 — Unauthenticated, unthrottled crash-report insert — MED-LOW
-**Where:** `routers/errors.py:92` — `POST /api/v1/errors/client`. Auth is intentionally optional (crashes happen pre-login). There is no rate limit.
-**Impact:** Anyone can POST unlimited rows (up to ~36 KB across the capped fields) into `client_error_log` → storage/DB flooding DoS and log-spam that hides real crashes. The auth-optional design is fine; the missing throttle is the gap.
-**Verification check:** Confirm the route has no auth requirement and no rate-limit dependency, and `client_error_log` has no retention/row cap.
-**Fix:** Per-IP rate limit, a periodic retention/pruning job (or row cap), and tighter field caps.
 
 ### S7 — Unvalidated `content_id` fed to yt-dlp — MED-LOW
 **Where:** `routers/content_requests.py:31–33` (`ContentRequestCreate.content_id: str` — free-form, no format validation). The scraper reads it (`subtitle-scraper/pipeline.py:785`) and interpolates it into YouTube URLs handed to `yt_dlp` (`pipeline.py:141`, `:211`, `:232`, `:529`).
@@ -125,12 +117,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 **Verification check:** No `pip-audit` / `npm audit` step in CI config.
 **Fix:** Add `pip-audit` (backend) and `npm audit --omit=dev` (frontend) to CI; review on a cadence.
 
-### S16 — `POST /sentences/match` is unauthenticated + no input length cap — MED-LOW
-**Where:** `routers/matcher.py:9` — `match_sentence` has **no** `get_current_user` (and the router has no router-level auth dependency). Its body model `MatchRequest.sentence` (`models/schemas.py:127`) is a bare `str` with no `max_length`. Each call runs `matcher_service.match_sentence` → spaCy NLP (CPU-bound).
-**Impact:** Anyone (no token) can drive spaCy phrase extraction on arbitrarily large input → unauthenticated CPU-exhaustion DoS. No data leak — it only extracts phrases from text the caller supplied. This endpoint is part of the genuinely public surface and was missed in the first sweep's "unauthenticated surface" note (now corrected below).
-**Verification check:** `rg -n 'get_current_user' lexy-app/backend/routers/matcher.py` → empty; `rg -n -A3 'class MatchRequest' lexy-app/backend/models/schemas.py` → no `max_length`.
-**Fix:** Require `get_current_user` (the sibling `/phrases/match` already does), and cap `MatchRequest.sentence` length (e.g. `Field(max_length=2000)`).
-
 ### S17 — `POST /phrases/seed` triggerable by any authenticated user — LOW/INFO
 **Where:** `routers/phrases.py:32` — `/phrases/seed` is gated by `get_current_user` (good, not public) but **not** by an admin check (`is_admin`).
 **Impact:** Any logged-in user can trigger a global phrase-table re-seed (shared catalog write + file/DB work). Impact is low: the seed is idempotent (`ON CONFLICT DO NOTHING`) and it's the same work startup already does. Listed for completeness — administrative/shared-resource operations should generally be admin-gated.
@@ -160,7 +146,7 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 
 > **Doc-drift note:** `CLAUDE.md` §7 calls `/api/search`, `/api/suggest`, `/api/video-sentences`, `/api/word-forms`, `/api/languages`, `/api/categories` "public legacy endpoints." They are actually auth-gated at the router level (`routers/search.py:20`, `APIRouter(dependencies=[Depends(get_current_user)])`). No data leak — but the §7 label is stale and should not be trusted when reasoning about the public attack surface.
 >
-> **The genuinely unauthenticated surface is:** the static file mount (`main.py:142`), `POST /api/v1/sentences/match` (S16), `POST /api/v1/errors/client` (S6), and the FastAPI docs `/docs` + `/openapi.json` (S11). Everything else requires a valid bearer token.
+> **The genuinely unauthenticated surface is:** the static file mount (`main.py:142`), `POST /api/v1/sentences/match` (now per-IP throttled + input-capped — S16 resolved), `POST /api/v1/errors/client` (now per-IP throttled — S6 resolved), and the FastAPI docs `/docs` + `/openapi.json` (S11, still open). Everything else requires a valid bearer token.
 
 ---
 
@@ -193,9 +179,26 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 **Re-check:** `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_security_headers.py backend/tests/test_notifications.py -q` passes; `rg -n 'SecurityHeadersMiddleware' lexy-app/backend/main.py` shows it wired.
 **Follow-up (not blocking):** CSP `script-src 'self'` has no `nonce`/hash; if a future build inlines a script, either externalize it or add a nonce — don't add `'unsafe-inline'` to `script-src`.
 
+### S6 — Unauthenticated, unthrottled crash-report insert — MED-LOW — RESOLVED 2026-05-24
+**Was:** `POST /api/v1/errors/client` was public (by design — crashes happen pre-login) but had no rate limit → anyone could flood `client_error_log` (storage DoS + log-spam hiding real crashes).
+**Fix shipped:** `core/deps.rate_limit_client_errors(request)` (per-IP, **30 / 10 min** via `rate_limiter.check_window`) called at the **top** of `report_client_error` — before the user-id lookup and the insert. The endpoint stays public and the frontend contract is unchanged: the ErrorBoundary reporter is fire-and-forget and ignores the 429. Payload caps were already enforced (`MAX_*` + `_truncate`, `message` `min_length=1`) — left as-is.
+**Not done (deferred):** a retention/pruning job (or row cap) for `client_error_log`; the throttle bounds inflow but not lifetime accumulation.
+**Tests:** `tests/test_client_errors.py` +2 (per-IP 429 after limit; authed report below limit still 204). Existing 9 tests still green.
+**Re-check:** `rg -n 'rate_limit_client_errors' lexy-app/backend/routers/errors.py` shows it wired; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_client_errors.py -q` passes.
+
+### S16 — `POST /sentences/match` unauthenticated + uncapped input — MED-LOW — RESOLVED 2026-05-24
+**Was:** Public route with a bare `str` body running spaCy → unauthenticated CPU-exhaustion DoS (large input and/or high volume).
+**Fix shipped (public + throttle + cap):**
+- **Input cap:** `MatchRequest.sentence` is now `Field(..., max_length=1000)` (`models/schemas.py`) → an over-length body is rejected with **422 before the handler runs**, so the parser never sees it.
+- **Throttle:** `core/deps.rate_limit_sentence_match(request)` (per-IP, **30 / 5 min**) called before any parsing → **429** when exceeded.
+**Why public, not auth-gated (for now):** the route is a dev/helper (the frontend never calls it — `rg sentences/match lexy-app/frontend/src` is empty), so auth-gating would be the cleanest end state. At implementation time, `test_matcher.py` (which POSTs unauthenticated) carried *uncommitted* #39 changes, so auth-gating then would have entangled the two changesets. #39 has since landed (commit `68a39e6`), so that obstacle is gone — but public + throttle + cap was already implemented, tested, and fully closes the CPU-DoS, so it ships as the S16 fix. **Follow-up (now unblocked):** auth-gate the route — add `Depends(get_current_user)` and update `test_matcher.py`'s calls to authenticate — as a clean standalone change.
+**Tests:** new `tests/test_matcher_limits.py` (normal match 200; over-length 422; per-IP 429; unknown language → empty, no crash). `test_matcher.py` (the #39 file) still green under the new throttle/cap.
+**Re-check:** `rg -n 'rate_limit_sentence_match' lexy-app/backend/routers/matcher.py` and `rg -n 'max_length=1000' lexy-app/backend/models/schemas.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_matcher_limits.py backend/tests/test_matcher.py -q` passes.
+
 ---
 
 ## Changelog
 
 - **2026-05-24** — Initial audit. 17 open findings (S1–S17), verified-strengths baseline recorded. Swept all 21 routers for auth; only `POST /sentences/match` (S16) is unauthenticated.
 - **2026-05-24** — **S1 (auth throttling)** and **S5 (HTTP security headers)** resolved. 17 new tests (`test_auth_throttle.py`, `test_security_headers.py`); added env vars `ENABLE_HSTS`, `TRUST_PROXY_HEADERS`. 15 findings remain open (S2–S4, S6–S17).
+- **2026-05-24** — **S6 (crash-report throttle)** and **S16 (sentence-match throttle + input cap)** resolved via the same per-IP `check_window`. 6 new tests (`test_client_errors.py` +2, `test_matcher_limits.py` +4). 13 findings remain open (S2–S4, S7–S15, S17). S16 ships public (throttled+capped); auth-gating is a now-unblocked follow-up (#39 has landed).

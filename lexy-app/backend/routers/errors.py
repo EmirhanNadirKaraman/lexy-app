@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, Header, Request, status
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
 
+from ..core.deps import rate_limit_client_errors
 from ..core.security import decode_token
 from ..database import get_pool
 
@@ -96,7 +97,13 @@ async def report_client_error(
     authorization: str | None = Header(default=None),
     pool=Depends(get_pool),
 ) -> Response:
-    """Record a frontend crash. Auth optional. Returns 204 on success."""
+    """Record a frontend crash. Auth optional. Returns 204 on success.
+
+    Throttled per client IP (S6) before any work — anonymous floods can't
+    fill client_error_log. A 429 here is harmless to the frontend, whose
+    ErrorBoundary reporter is fire-and-forget and ignores the response.
+    """
+    await rate_limit_client_errors(request)
     user_id = await _try_resolve_user_id(authorization, pool)
 
     # Server fills user_agent if the client didn't (the header is more reliable
