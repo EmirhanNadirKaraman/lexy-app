@@ -304,8 +304,10 @@ MOCK_LLM=false            # set true to short-circuit LLM in tests
 ## 12. Conventions / rules of the road
 
 - **Never read the real `.env` file.** It holds production secrets (DB password, JWT signing key, Anthropic API key). Use `.env.example` for the schema. If you need to confirm a variable name, grep the source — don't open `.env`.
+- **Commit messages never mention AI.** No `Co-Authored-By: Claude` (or any AI tool) trailer, no "🤖 Generated with…" line, no "written by Claude / with AI assistance" phrasing anywhere in the subject or body. Write every commit as the author. (This overrides any default tooling that auto-appends such a trailer.)
 - **Use `docs/SUMMARY.md` as the file-level index.** "Where do I look to change X?" is answered there. Update it whenever a file is added, removed, or changes responsibility.
 - **Update `docs/TESTS.md` whenever you add, remove, or rename a test.** It tracks coverage, known pre-existing failures, and the xfail audit-hole pins (flip strict=True when the fix lands so the test enforces the new behaviour).
+- **Consult and update `docs/SECURITY.md` for any security-relevant change.** It's the living tracker of open/resolved findings and the controls we rely on. See §14 for the read/update triggers and the four fields every finding must carry.
 - **All state changes go through `progression_service`.** Don't write directly to `user_word_knowledge` or `srs_cards` from a router.
 - **All LLM calls go through `llm_service` and cache via `llm_cache_service`.** Don't instantiate `AsyncAnthropic` ad-hoc.
 - **Polymorphic key everywhere:** if you add a new tracked content type, it gets an `item_type`, lives in its own content table (with `display_text` available), and plugs into `user_word_knowledge` / `srs_cards`.
@@ -325,3 +327,43 @@ MOCK_LLM=false            # set true to short-circuit LLM in tests
 6. Read `docs/WORKFLOW_AUDIT.md` — full word-learning trace from discovery → mastery with every known hole numbered.
 7. Glance at `docs/TESTS.md` for what is and isn't covered.
 8. Then read `docs/TODO.md` and pick something blocking the smallest number of other things.
+
+---
+
+## 14. Security review (ongoing)
+
+`docs/SECURITY.md` is the **living security tracker** — open findings, resolved findings, and the "verified strengths" we depend on. It is not a one-off audit; it's meant to be read and updated as part of normal work.
+
+**Read `docs/SECURITY.md` before you start a PR that touches any of:**
+- auth / login / registration / JWT / password handling
+- file upload or anything that writes a user-supplied path or filename
+- raw SQL (anything that isn't a plain parameterized `$1` query)
+- `subprocess` / spawning the scraper / shelling out
+- LLM prompts built from user content
+- routers with a path param (`/{id}`) — check the ownership filter
+- `users.settings` JSONB, CORS, middleware, or HTTP headers
+
+**When you change security-relevant code, update `docs/SECURITY.md` in the same PR:**
+- Fixed an open finding → move it to *Resolved* with the date + commit. **Don't delete it** (regression history).
+- Found something new → append to *Open findings* with the four required fields below, and add a summary-table row.
+- Weakened a *Verified strength* (e.g. dropped an ownership check, widened the settings whitelist) → that's a regression; either don't, or document why and add the new exposure as a finding.
+
+**Every finding must carry four things** (a finding without these rots into an untested claim):
+1. `file:line`
+2. severity — HIGH / MEDIUM / LOW / INFO
+3. a one-line **verification check** — the exact grep/curl/read that confirms it's still true or still fixed
+4. a suggested fix
+
+**Fast self-check greps** (run from repo root; each should come back clean or expected):
+```bash
+# Non-parameterized SQL outside migrations. Expected hits: search_service.py:62,103,216
+# (these interpolate only a loop index + a constant threshold — already verified safe).
+# Any OTHER hit, or any hit that interpolates a request value, is a real bug:
+rg -n 'f"(SELECT|INSERT|UPDATE|DELETE)' lexy-app/backend --glob '!**/migrations/**'
+# Shell / eval / exec sinks (review every hit):
+rg -n 'shell=True|os\.system|os\.popen|\beval\(|\bexec\(' lexy-app subtitle-scraper -g '*.py'
+# Frontend XSS sinks (should be empty):
+rg -n 'dangerouslySetInnerHTML|innerHTML|document\.write|eval\(' lexy-app/frontend/src
+# Settings privilege-escalation guard still whitelists (must still gate on DEFAULTS):
+rg -n 'k in DEFAULTS' lexy-app/backend/services/settings_service.py
+```
