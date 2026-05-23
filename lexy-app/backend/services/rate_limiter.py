@@ -41,6 +41,24 @@ from fastapi import HTTPException, status
 PER_MINUTE_DEFAULT = 30
 PER_HOUR_DEFAULT   = 400
 
+# Auth throttling (S1). These guard the *unauthenticated* /auth routes, which
+# have no user_id to key on, so `check_window` (below) keys by client IP — and,
+# for login, IP+email. Two-tier login (per IP+email AND per IP) is deliberate:
+# the IP+email bucket stops targeted brute-force of one account; the IP bucket
+# stops password-spraying many accounts from one host. Read at call time so
+# tests can monkeypatch them down.
+LOGIN_MAX_ATTEMPTS       = 10    # per (IP, email)
+LOGIN_WINDOW_SECONDS     = 300   # 5 minutes
+LOGIN_IP_MAX_ATTEMPTS    = 30    # per IP (spray guard), same window
+LOGIN_IP_WINDOW_SECONDS  = 300
+REGISTER_MAX_ATTEMPTS    = 5     # per IP
+REGISTER_WINDOW_SECONDS  = 3600  # 1 hour
+
+# Generic 429 message for auth throttling. Intentionally identical for login
+# and register, and independent of whether the account exists — never leak
+# account existence through the throttle.
+AUTH_RATE_LIMIT_MESSAGE = "Too many attempts. Try again later."
+
 _windows: dict[str, deque[float]] = defaultdict(deque)
 _lock = asyncio.Lock()
 
@@ -95,6 +113,43 @@ async def check_and_record(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="rate_limit_minute",
                 headers={"Retry-After": "60"},
+            )
+
+        q.append(now)
+
+
+async def check_window(
+    key: str,
+    *,
+    limit: int,
+    window_seconds: int,
+    detail: str,
+    retry_after: int | None = None,
+) -> None:
+    """Single-window sliding-window limiter, keyed by an arbitrary string.
+
+    Raises HTTPException(429, detail=detail) when *key* has already recorded
+    `limit` hits within the trailing `window_seconds`; otherwise records the
+    current timestamp. Shares the module lock + `_windows` store (and so
+    `reset_for_tests`) with the per-user LLM limiter — keys are namespaced by
+    caller (e.g. 'login:<ip>:<email>', 'register:<ip>') so they never collide
+    with the UUID keys used by `check_and_record`.
+
+    Used by the auth-route throttling helpers in `core/deps`. `retry_after`
+    defaults to `window_seconds`.
+    """
+    now = monotonic()
+    async with _lock:
+        q = _windows[key]
+        cutoff = now - window_seconds
+        while q and q[0] < cutoff:
+            q.popleft()
+
+        if len(q) >= limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=detail,
+                headers={"Retry-After": str(retry_after if retry_after is not None else window_seconds)},
             )
 
         q.append(now)

@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from ..core.deps import rate_limit_login, rate_limit_register
 from ..database import get_pool
 from ..models.schemas import LoginRequest, RegisterRequest, TokenResponse, UserRead
 from ..services import auth_service
@@ -8,7 +9,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterRequest, pool=Depends(get_pool)):
+async def register(body: RegisterRequest, request: Request, pool=Depends(get_pool)):
+    # Throttle per client IP before any DB lookup / password hashing (S1).
+    await rate_limit_register(request)
     try:
         user = await auth_service.register_user(pool, body.email, body.password)
     except ValueError as exc:
@@ -17,7 +20,9 @@ async def register(body: RegisterRequest, pool=Depends(get_pool)):
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, pool=Depends(get_pool)):
+async def login(body: LoginRequest, request: Request, pool=Depends(get_pool)):
+    # Throttle per (IP, email) then per IP before any DB lookup / bcrypt (S1).
+    await rate_limit_login(request, body.email)
     try:
         token = await auth_service.login_user(pool, body.email, body.password)
     except ValueError as exc:

@@ -116,6 +116,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Security headers (S5). Added after CORS so it is the OUTERMOST middleware and
+# stamps headers on every response, including CORS-handled preflights and error
+# responses. HSTS within is gated on ENABLE_HSTS.
+from .core.security_headers import SecurityHeadersMiddleware  # noqa: E402
+app.add_middleware(SecurityHeadersMiddleware)
+
 app.include_router(search_router,          prefix="/api")       # /api/search, /api/suggest, etc.
 app.include_router(auth_router,            prefix="/api/v1")    # /api/v1/auth/register, /api/v1/auth/login
 app.include_router(words_router,           prefix="/api/v1")    # /api/v1/words/knowledge, /api/v1/words/{type}/{id}/status

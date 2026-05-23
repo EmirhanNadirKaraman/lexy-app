@@ -17,6 +17,8 @@ Test runner: pytest + pytest-asyncio. Fixtures in `conftest.py` provide `db_pool
 | File | What it covers |
 |---|---|
 | `test_auth.py` | register, login, JWT token validation |
+| `test_auth_throttle.py` | 🆕 S1 auth throttling: login per-(IP,email) + per-IP spray guard, register per-IP, generic 429 (no user enumeration), reset, validation-not-throttled |
+| `test_security_headers.py` | 🆕 S5 security headers: baseline headers on 200/403/404/422, HSTS off-by-default + on-when-`ENABLE_HSTS`, CSP policy-builder unit |
 | `test_chat.py` | session lifecycle (create, get, messages), free + guided |
 | `test_free_chat_progression.py` | free-chat crediting: target word always scanned; de→both tracks, mixed/en-with-target→passive only, en-without-target→no progression |
 | `test_grammar_rules_srs.py` | grammar rule via `/words/{type}/{id}/status`; status_marked_learning currently creates passive only (grammar_rule guard added in this session) |
@@ -42,6 +44,7 @@ These were failing before #0b and are tracked here so they don't get blamed on f
 |---|---|---|
 | ~~`test_matcher.py` × 5~~ | ~~AttributeError~~ | **RESOLVED 2026-05-19** as a side effect of #5b's Path A fix. `matcher_service.match_sentence` now wraps the string with `_pf.nlp()` before calling `extract_german_logic`. All 6 matcher tests pass. |
 | ~~`test_settings.py` × 3~~ | ~~stale ALL_PREFERENCE_KEYS~~ | **RESOLVED 2026-05-19**. `ALL_PREFERENCE_KEYS` now derives from `settings_service.DEFAULTS` plus the four derived keys (`liked_categories`, `disliked_categories`, `liked_genres`, `disliked_genres`) that `get_preferences` always appends — stays in sync automatically when DEFAULTS grows. `test_get_preferences_new_user_returns_defaults` updated to expect the four empty derived lists alongside DEFAULTS. |
+| `test_account_deletion.py::test_client_error_log_user_id_set_null_on_delete` and `test_srs_backfill.py::test_audit_ignores_rows_that_already_have_active_srs_card` | Intermittent under `pytest -n auto` only | **Parallel-execution races, not logic bugs** (observed 2026-05-24, S1/S5 work). Both **pass serially** and in isolation; the `srs_backfill` one throws `UniqueViolationError` on `srs_cards (user_id,item_id,item_type,direction)` from cross-worker collisions on shared global tables. Unrelated to any specific feature diff. Re-confirm with `MOCK_LLM=true python -m pytest backend/tests/test_account_deletion.py backend/tests/test_srs_backfill.py -q` (serial → green). Fix would be worker-scoped isolation of the shared rows; deferred. |
 
 ---
 

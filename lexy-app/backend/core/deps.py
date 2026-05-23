@@ -1,7 +1,8 @@
 import json
+import os
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ..core.security import decode_token
@@ -59,3 +60,65 @@ async def rate_limit_llm(current_user: dict = Depends(get_current_user)) -> None
     rate-limit check — anonymous callers never reach the limiter.
     """
     await rate_limiter.check_and_record(str(current_user["user_id"]))
+
+
+# ── Auth-route throttling (S1) ──────────────────────────────────────────────
+#
+# /auth/login and /auth/register are unauthenticated, so there's no user_id to
+# key on — we key on client IP (and IP+email for login). These are plain async
+# helpers (not FastAPI dependencies) called at the top of the route handler,
+# because login needs the parsed request body (email) which a dependency can't
+# see. Call them BEFORE any password hashing / DB lookup so throttled requests
+# pay no expensive work.
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP for rate-limit keying.
+
+    By default we use the socket peer (`request.client.host`). X-Forwarded-For
+    is honoured ONLY when `TRUST_PROXY_HEADERS` is set, because a client can
+    spoof that header to dodge the throttle — trust it only when a known proxy
+    in front of the app rewrites it. Returns 'unknown' if the peer is absent
+    (e.g. some ASGI test transports), which simply collapses all such callers
+    into one bucket.
+    """
+    if os.getenv("TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes"):
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            first = forwarded.split(",")[0].strip()
+            if first:
+                return first
+    client = request.client
+    return client.host if client else "unknown"
+
+
+async def rate_limit_login(request: Request, email: str) -> None:
+    """Throttle login attempts. Two tiers (see rate_limiter constants):
+    per (IP, email) to stop targeted brute-force, then per IP to stop spraying.
+    Raises HTTPException(429) with a generic message that never reveals whether
+    the account exists.
+    """
+    ip = _client_ip(request)
+    normalized = (email or "").lower().strip()
+    await rate_limiter.check_window(
+        f"login:{ip}:{normalized}",
+        limit=rate_limiter.LOGIN_MAX_ATTEMPTS,
+        window_seconds=rate_limiter.LOGIN_WINDOW_SECONDS,
+        detail=rate_limiter.AUTH_RATE_LIMIT_MESSAGE,
+    )
+    await rate_limiter.check_window(
+        f"login_ip:{ip}",
+        limit=rate_limiter.LOGIN_IP_MAX_ATTEMPTS,
+        window_seconds=rate_limiter.LOGIN_IP_WINDOW_SECONDS,
+        detail=rate_limiter.AUTH_RATE_LIMIT_MESSAGE,
+    )
+
+
+async def rate_limit_register(request: Request) -> None:
+    """Throttle account creation per client IP. Raises HTTPException(429)."""
+    ip = _client_ip(request)
+    await rate_limiter.check_window(
+        f"register:{ip}",
+        limit=rate_limiter.REGISTER_MAX_ATTEMPTS,
+        window_seconds=rate_limiter.REGISTER_WINDOW_SECONDS,
+        detail=rate_limiter.AUTH_RATE_LIMIT_MESSAGE,
+    )
