@@ -60,7 +60,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `recommendation_service.py` | Pure scoring functions (score_sentence, score_video, channel_category_multiplier) + DB orchestration. Mixed item types go through `enrich_by_type` (dispatches to per-type enrichers for word/phrase/grammar_rule). `enrich_items` remains the word-only backend. |
 | `prioritization_service.py` | `get_prioritized_items` — combines is_due (×4), mistake_recency (×3 decay), freq_rank (×2 linear), is_learning (×1). |
 | `usage_events_service.py` | `record_event` (analytics fire-and-forget) + `record_transcript_click_event` (atomic dedup-aware insert) + 4 aggregations. Insight filters include `'transcript'` context. |
-| `matcher_service.py` | Async wrapper around `subtitle-scraper/phrase_finder.py`. Imports the scraper via `sys.path.insert` (post-#3, no more `os.chdir`). `match_sentence` runs sync spaCy in a thread pool. |
+| `matcher_service.py` | Async wrapper around `subtitle-scraper/phrase_finder.py`. Imports the scraper via `sys.path.insert` (post-#3, no more `os.chdir`). `match_sentence` runs sync spaCy in a thread pool. Parses per-language (#39 slice 2): German via phrase_finder's resident model, others via `nlp_service`'s cache (`_model_for`, lock-guarded); `match_sentence_with_ids` loads `lemma_override` and threads it into the extractor so chat canonicals are corrected. |
 | `phrase_service.py` | `seed_from_blueprint_map`, `enrich_phrases`, phrase_type inference from blueprint. |
 | `grammar_service.py` | `seed_rules` (curated DE list), `get_rules_for_phrase_type`, `get_rules_for_lemma`. |
 | `playlist_service.py` | Video playlist generation from target words. |

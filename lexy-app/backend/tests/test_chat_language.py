@@ -452,3 +452,30 @@ async def test_spanish_es_label_advances_both_tracks(client: AsyncClient, db_poo
     after = await _es_levels(db_pool, uid, word_id)
     assert after["passive_level"] > before["passive_level"], "passive should grow for es+es"
     assert after["active_level"] > before["active_level"], "active should grow for es+es"
+
+
+# ---------------------------------------------------------------------------
+# #39 slice 2 — backend matcher parses Spanish with the Spanish model AND
+# applies seeded lemma overrides (was: every language parsed with German model)
+# ---------------------------------------------------------------------------
+
+import importlib.util as _ilu  # noqa: E402
+
+_ES_INSTALLED = _ilu.find_spec("es_core_news_sm") is not None
+
+
+@pytest.mark.skipif(not _ES_INSTALLED, reason="es_core_news_sm not installed")
+async def test_matcher_with_ids_applies_seeded_lemma_override(db_pool):
+    """End-to-end #39: match_sentence_with_ids parses Spanish with the Spanish
+    model and loads the migration-033-seeded override (duchaber->duchar), so
+    'Se ducha…' yields the corrected canonical 'ducharse', never 'duchaberse'.
+    Pre-fix this parsed Spanish with the German model and produced nothing
+    usable."""
+    from backend.services import matcher_service
+
+    out = await matcher_service.match_sentence_with_ids(
+        db_pool, "Se ducha por la mañana.", "es",
+    )
+    canon = {p["dictionary_entry"] for p in out}
+    assert "ducharse" in canon, f"expected corrected canonical; got {canon}"
+    assert "duchaberse" not in canon, "the broken canonical must not survive the override"

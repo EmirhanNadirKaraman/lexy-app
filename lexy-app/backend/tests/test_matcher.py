@@ -111,8 +111,11 @@ async def test_language_query_de_keeps_german_extraction(matcher_client: AsyncCl
 
 
 async def test_language_query_es_returns_no_phrases(matcher_client: AsyncClient):
-    """Spanish has no v1 extractor — even when the sentence is German.
-    The dispatcher returns [] before any German logic runs."""
+    """A GERMAN sentence under ?language=es yields no phrases. Since #36 Spanish
+    HAS an extractor and (since #39 slice 2) es text is parsed by the Spanish
+    model — but German text contains no Spanish reflexive/verb-prep patterns, so
+    the result is still []. Real Spanish extraction is covered by the unit tests
+    below + tests/test_spanish_phrase_extractor.py."""
     resp = await matcher_client.post(
         f"{MATCH}?language=es", json={"sentence": "Ich lerne Deutsch."}
     )
@@ -129,9 +132,10 @@ async def test_language_query_unknown_returns_no_phrases(matcher_client: AsyncCl
 
 
 async def test_matcher_service_match_sentence_with_language_param():
-    """Unit-level: match_sentence(sentence, language='es') returns []
-    without invoking extract_german_logic. Asserts the language arg
-    actually threads through to the dispatcher rather than being ignored."""
+    """Unit-level: match_sentence(german_text, language='es') returns [] and
+    never invokes extract_german_logic — the language arg routes to the Spanish
+    path, and German text has no Spanish patterns. (Asserts language threads
+    through rather than being ignored.)"""
     from unittest.mock import patch
     from backend.services import matcher_service
 
@@ -149,3 +153,62 @@ async def test_matcher_service_match_sentence_default_language_is_de():
     result = await matcher_service.match_sentence("Ich lerne Deutsch.")
     assert isinstance(result, list)
     assert len(result) > 0
+
+
+# ---------------------------------------------------------------------------
+# #39 slice 2 — per-language model selection (the matcher used to parse every
+# language with the German model)
+# ---------------------------------------------------------------------------
+
+import importlib.util as _ilu  # noqa: E402
+
+_ES_INSTALLED = _ilu.find_spec("es_core_news_sm") is not None
+requires_es = pytest.mark.skipif(not _ES_INSTALLED, reason="es_core_news_sm not installed")
+
+
+@requires_es
+async def test_spanish_match_loads_spanish_model_not_german():
+    """The core fix: a Spanish match parses with the Spanish model (via
+    nlp_service), not phrase_finder's German model. Spy proves the selection
+    unambiguously — a behavioural test alone could pass on German-parsed junk."""
+    from backend.services import matcher_service, nlp_service
+
+    with patch.object(
+        nlp_service.NLPService, "get_model",
+        wraps=nlp_service.NLPService.get_model,
+    ) as gm:
+        await matcher_service.match_sentence("Me llamo Ana.", "es")
+    gm.assert_any_call("es")
+
+
+@requires_es
+async def test_spanish_reflexive_matched_via_spanish_model():
+    """Behavioural: a Spanish reflexive yields its canonical — only possible
+    when the sentence is parsed by the Spanish model."""
+    from backend.services import matcher_service
+
+    out = await matcher_service.match_sentence("Me llamo Ana.", "es")
+    assert any(p["dictionary_entry"] == "llamarse" for p in out)
+
+
+@requires_es
+async def test_spanish_verbprep_matched_via_spanish_model():
+    from backend.services import matcher_service
+
+    out = await matcher_service.match_sentence("Dependo de mis padres.", "es")
+    assert any(p["dictionary_entry"] == "depender de" for p in out)
+
+
+async def test_german_match_unchanged_unit():
+    """German still parses with the resident German model and extracts."""
+    from backend.services import matcher_service
+
+    out = await matcher_service.match_sentence("Ich lade meine Freunde ein.")
+    assert len(out) > 0
+
+
+async def test_unknown_language_returns_no_phrases_unit():
+    """No registered extractor → no parsing, no phrases (no model load)."""
+    from backend.services import matcher_service
+
+    assert await matcher_service.match_sentence("cualquier cosa", "xx") == []
