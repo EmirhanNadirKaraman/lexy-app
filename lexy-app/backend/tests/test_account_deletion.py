@@ -60,7 +60,7 @@ async def test_authenticated_user_can_delete_account(client, db_pool):
     headers, uid = await _register(client, db_pool, make_test_email())
     await _seed_private_rows(db_pool, uid)
 
-    r = await client.delete(URL, headers=headers)
+    r = await client.request("DELETE", URL, headers=headers, json={"password": "password123"})
 
     assert r.status_code == 204
     assert r.content == b""
@@ -80,7 +80,7 @@ async def test_cascade_clears_private_user_data(client, db_pool):
     pre_evt  = await db_pool.fetchval("SELECT COUNT(*) FROM word_usage_events    WHERE user_id = $1::uuid", uid)
     assert pre_uwk == 1 and pre_srs == 1 and pre_evt == 1
 
-    await client.delete(URL, headers=headers)
+    await client.request("DELETE", URL, headers=headers, json={"password": "password123"})
 
     # Post: all gone via ON DELETE CASCADE
     post_uwk = await db_pool.fetchval("SELECT COUNT(*) FROM user_word_knowledge WHERE user_id = $1::uuid", uid)
@@ -98,7 +98,7 @@ async def test_shared_catalog_data_preserved(client, db_pool):
     pre_channels = await db_pool.fetchval("SELECT COUNT(*) FROM channel")
     pre_videos   = await db_pool.fetchval("SELECT COUNT(*) FROM video")
 
-    r = await client.delete(URL, headers=headers)
+    r = await client.request("DELETE", URL, headers=headers, json={"password": "password123"})
     assert r.status_code == 204
 
     assert await db_pool.fetchval("SELECT COUNT(*) FROM word_table")         == pre_words
@@ -126,7 +126,7 @@ async def test_delete_does_not_affect_other_user(client, db_pool):
     headers_b, uid_b = await _register(client, db_pool, make_test_email())
     await _seed_private_rows(db_pool, uid_b)
 
-    r = await client.delete(URL, headers=headers_a)
+    r = await client.request("DELETE", URL, headers=headers_a, json={"password": "password123"})
     assert r.status_code == 204
 
     # B is untouched
@@ -141,12 +141,47 @@ async def test_delete_does_not_affect_other_user(client, db_pool):
 async def test_second_delete_with_same_token_returns_401(client, db_pool):
     headers, _uid = await _register(client, db_pool, make_test_email())
 
-    r1 = await client.delete(URL, headers=headers)
+    r1 = await client.request("DELETE", URL, headers=headers, json={"password": "password123"})
     assert r1.status_code == 204
 
-    r2 = await client.delete(URL, headers=headers)
+    r2 = await client.request("DELETE", URL, headers=headers, json={"password": "password123"})
     # get_current_user raises 401 "User not found" once the row is gone.
     assert r2.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Password re-authentication (S3)
+# ---------------------------------------------------------------------------
+
+async def test_delete_with_no_body_is_rejected_and_keeps_account(client, db_pool):
+    """The stolen-token case: a bare DELETE (valid token, no body/password) must
+    NOT delete the account — it now requires password re-auth."""
+    headers, uid = await _register(client, db_pool, make_test_email())
+
+    r = await client.delete(URL, headers=headers)  # no JSON body at all
+    assert r.status_code == 403
+    assert await db_pool.fetchval("SELECT user_id FROM users WHERE user_id = $1::uuid", uid) is not None
+
+
+async def test_delete_with_empty_password_is_rejected_and_keeps_account(client, db_pool):
+    headers, uid = await _register(client, db_pool, make_test_email())
+
+    r = await client.request("DELETE", URL, headers=headers, json={})
+    assert r.status_code == 403
+    assert await db_pool.fetchval("SELECT user_id FROM users WHERE user_id = $1::uuid", uid) is not None
+
+
+async def test_delete_with_wrong_password_is_rejected_and_keeps_account(client, db_pool):
+    headers, uid = await _register(client, db_pool, make_test_email())
+    await _seed_private_rows(db_pool, uid)
+
+    r = await client.request("DELETE", URL, headers=headers, json={"password": "not-the-password"})
+    assert r.status_code == 403
+    # Account and its cascade data are untouched.
+    assert await db_pool.fetchval("SELECT user_id FROM users WHERE user_id = $1::uuid", uid) is not None
+    assert await db_pool.fetchval(
+        "SELECT COUNT(*) FROM srs_cards WHERE user_id = $1::uuid", uid
+    ) == 1
 
 
 async def test_content_request_user_id_set_null_on_delete(client, db_pool):
@@ -162,7 +197,7 @@ async def test_content_request_user_id_set_null_on_delete(client, db_pool):
         uid,
     )
 
-    r = await client.delete(URL, headers=headers)
+    r = await client.request("DELETE", URL, headers=headers, json={"password": "password123"})
     assert r.status_code == 204
 
     # Row survives, user_id anonymised
@@ -189,7 +224,7 @@ async def test_client_error_log_user_id_set_null_on_delete(client, db_pool):
         uid,
     )
 
-    r = await client.delete(URL, headers=headers)
+    r = await client.request("DELETE", URL, headers=headers, json={"password": "password123"})
     assert r.status_code == 204
 
     row = await db_pool.fetchrow(

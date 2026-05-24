@@ -188,12 +188,15 @@ export function SettingsPanel({ prefs, onSave, onClose, token }: Props) {
     const [deleteConfirm, setDeleteConfirm] = useState(false);
     const [deleting, setDeleting]           = useState(false);
     const [deleteError, setDeleteError]     = useState<string | null>(null);
+    // S3: password re-auth — the destructive delete now requires the current
+    // password so a stolen bearer token can't delete the account on its own.
+    const [deletePassword, setDeletePassword] = useState('');
 
     async function handleDeleteAccount(): Promise<void> {
         setDeleting(true);
         setDeleteError(null);
         try {
-            await deleteAccount(token);
+            await deleteAccount(token, deletePassword);
             // deleteAccount() already cleared local auth + dispatched
             // 'auth:expired'. Layout listens for that event and resets
             // token state + navigates back to '/'. No further action here.
@@ -500,7 +503,7 @@ export function SettingsPanel({ prefs, onSave, onClose, token }: Props) {
                 {!deleteConfirm ? (
                     <button
                         data-testid="account-delete-start"
-                        onClick={() => { setDeleteError(null); setDeleteConfirm(true); }}
+                        onClick={() => { setDeleteError(null); setDeletePassword(''); setDeleteConfirm(true); }}
                         style={{
                             padding: '10px 16px',
                             minHeight: '44px',
@@ -517,46 +520,73 @@ export function SettingsPanel({ prefs, onSave, onClose, token }: Props) {
                         Delete account
                     </button>
                 ) : (
-                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                        <button
-                            data-testid="account-delete-confirm"
-                            onClick={handleDeleteAccount}
-                            disabled={deleting}
+                    <div>
+                        <label
+                            htmlFor="account-delete-password"
                             style={{
-                                padding: '10px 16px',
-                                minHeight: '44px',
-                                border: 'none',
-                                background: 'var(--color-danger)',
-                                color: '#fff',
-                                borderRadius: '5px',
-                                fontSize: '14px',
-                                fontWeight: 700,
-                                cursor: deleting ? 'wait' : 'pointer',
-                                touchAction: 'manipulation',
-                                opacity: deleting ? 0.7 : 1,
+                                display: 'block', fontSize: '13px', fontWeight: 600,
+                                color: 'var(--color-text)', marginBottom: '6px',
                             }}
                         >
-                            {deleting ? 'Deleting…' : 'Yes, permanently delete'}
-                        </button>
-                        <button
-                            data-testid="account-delete-cancel"
-                            onClick={() => setDeleteConfirm(false)}
+                            Enter your password to confirm
+                        </label>
+                        <input
+                            id="account-delete-password"
+                            data-testid="account-delete-password"
+                            type="password"
+                            autoComplete="current-password"
+                            value={deletePassword}
+                            onChange={e => setDeletePassword(e.target.value)}
                             disabled={deleting}
                             style={{
-                                padding: '10px 16px',
-                                minHeight: '44px',
-                                border: '1px solid var(--color-border)',
-                                background: 'var(--color-surface)',
-                                color: 'var(--color-text)',
-                                borderRadius: '5px',
-                                fontSize: '14px',
-                                fontWeight: 600,
-                                cursor: 'pointer',
-                                touchAction: 'manipulation',
+                                display: 'block', width: '100%', maxWidth: '280px',
+                                minHeight: '44px', padding: '8px 10px', marginBottom: '10px',
+                                border: '1px solid var(--color-border)', borderRadius: '5px',
+                                background: 'var(--color-surface)', color: 'var(--color-text)',
+                                fontSize: '14px', boxSizing: 'border-box',
                             }}
-                        >
-                            Cancel
-                        </button>
+                        />
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                            <button
+                                data-testid="account-delete-confirm"
+                                onClick={handleDeleteAccount}
+                                disabled={deleting || !deletePassword}
+                                style={{
+                                    padding: '10px 16px',
+                                    minHeight: '44px',
+                                    border: 'none',
+                                    background: 'var(--color-danger)',
+                                    color: '#fff',
+                                    borderRadius: '5px',
+                                    fontSize: '14px',
+                                    fontWeight: 700,
+                                    cursor: (deleting || !deletePassword) ? 'not-allowed' : 'pointer',
+                                    touchAction: 'manipulation',
+                                    opacity: (deleting || !deletePassword) ? 0.6 : 1,
+                                }}
+                            >
+                                {deleting ? 'Deleting…' : 'Yes, permanently delete'}
+                            </button>
+                            <button
+                                data-testid="account-delete-cancel"
+                                onClick={() => { setDeleteConfirm(false); setDeletePassword(''); }}
+                                disabled={deleting}
+                                style={{
+                                    padding: '10px 16px',
+                                    minHeight: '44px',
+                                    border: '1px solid var(--color-border)',
+                                    background: 'var(--color-surface)',
+                                    color: 'var(--color-text)',
+                                    borderRadius: '5px',
+                                    fontSize: '14px',
+                                    fontWeight: 600,
+                                    cursor: 'pointer',
+                                    touchAction: 'manipulation',
+                                }}
+                            >
+                                Cancel
+                            </button>
+                        </div>
                     </div>
                 )}
                 {deleteError && (

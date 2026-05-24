@@ -61,13 +61,28 @@ describe('SettingsPanel — account deletion', () => {
         expect(spy).not.toHaveBeenCalled();
     });
 
-    it('confirm calls deleteAccount with the provided token', async () => {
+    it('confirm sends the token and typed password to deleteAccount', async () => {
         const spy = vi.spyOn(accountApi, 'deleteAccount').mockResolvedValue();
         renderSettings({ token: 'tok-XYZ' });
         fireEvent.click(screen.getByTestId('account-delete-start'));
+        fireEvent.change(screen.getByTestId('account-delete-password'), { target: { value: 'hunter2' } });
         fireEvent.click(screen.getByTestId('account-delete-confirm'));
         await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
-        expect(spy).toHaveBeenCalledWith('tok-XYZ');
+        expect(spy).toHaveBeenCalledWith('tok-XYZ', 'hunter2');
+    });
+
+    it('confirm step shows a labelled password field and disables confirm until filled', () => {
+        renderSettings();
+        fireEvent.click(screen.getByTestId('account-delete-start'));
+
+        const pw = screen.getByLabelText(/enter your password/i) as HTMLInputElement;
+        expect(pw).toBeInTheDocument();
+        expect(pw.type).toBe('password');
+
+        const confirm = screen.getByTestId('account-delete-confirm') as HTMLButtonElement;
+        expect(confirm.disabled).toBe(true);          // no password yet
+        fireEvent.change(pw, { target: { value: 'pw' } });
+        expect(confirm.disabled).toBe(false);         // enabled once filled
     });
 
     it('start button is at least 44px high and confirm button reads "Yes, permanently delete"', () => {
@@ -81,14 +96,17 @@ describe('SettingsPanel — account deletion', () => {
         expect(parseInt(confirm.style.minHeight, 10)).toBeGreaterThanOrEqual(44);
     });
 
-    it('surfaces an error message when deleteAccount fails', async () => {
-        vi.spyOn(accountApi, 'deleteAccount').mockRejectedValue(new Error('Network down'));
+    it('surfaces an error and keeps the confirm UI when deleteAccount fails', async () => {
+        vi.spyOn(accountApi, 'deleteAccount').mockRejectedValue(
+            new Error('Incorrect password. Please try again.'),
+        );
         renderSettings();
         fireEvent.click(screen.getByTestId('account-delete-start'));
+        fireEvent.change(screen.getByTestId('account-delete-password'), { target: { value: 'wrong' } });
         fireEvent.click(screen.getByTestId('account-delete-confirm'));
-        const errorNode = await screen.findByText(/Network down/i);
+        const errorNode = await screen.findByText(/Incorrect password/i);
         expect(errorNode).toBeInTheDocument();
-        // Confirm UI still present so the user can retry or cancel.
+        // Confirm UI still present so the user can retry or cancel (auth NOT cleared).
         expect(screen.getByTestId('account-delete-confirm')).toBeInTheDocument();
     });
 });

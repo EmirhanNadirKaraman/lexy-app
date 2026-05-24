@@ -129,7 +129,13 @@ gaps closed.
 
 ## Tests added in this session
 
-🆕 **2026-05-24 (latest) — Test isolation: own the test word (global-table race)**
+🆕 **2026-05-24 (latest) — S3 account-deletion password re-auth**
+
+`DELETE /api/v1/account` now requires the current password in addition to the bearer token.
+- Backend `test_account_deletion.py` **+3**: bare DELETE (token only, no body) / empty password / wrong password → **403** with account + cascade data intact; the existing delete tests now send the password via `client.request("DELETE", …, json={"password": …})` (httpx's `client.delete` takes no body).
+- Frontend `AccountDeletion.test.tsx`: confirm step shows a labelled password field, confirm is disabled until filled, sends `(token, password)`; a failure keeps the confirm UI open. New `api/account.test.ts` **+3**: password in the DELETE body, clears auth on 204, **preserves** auth on a 403 (wrong password — user stays logged in).
+
+🆕 **2026-05-24 — Test isolation: own the test word (global-table race)**
 
 Root cause of the growing flake cluster (`test_srs_review.py` 1→2→4→6 failures across full-suite runs, plus intermittent `test_suggest` / `test_srs_backfill` / `test_account_deletion`): tests grabbed a **shared** `word_table` row via an unfiltered `SELECT ... LIMIT N` (no `ORDER BY`). Under `pytest -n auto`, another worker's `_reap_word_ids` (conftest teardown) could delete that exact row mid-test; `review_service.get_due_cards`' filter `WHERE wt.word_id IS NOT NULL` then silently dropped the card and the assert failed. Order-independent (no `pytest-randomly` installed), concurrency-triggered (passed serially / in isolation).
 
