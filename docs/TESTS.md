@@ -160,6 +160,19 @@ Fix (tests only — **no production change**). Two shared, race-safe patterns no
 
 **Validation:** newly-migrated subset serial → 188 passed; SRS + churners `-n auto` 3× → 125 each; **full suite `-n auto` run 2× → 623 passed, 2 skipped, 0 failed each** (previously 1–6 intermittent failures per run).
 
+🆕 **2026-05-24 — Test isolation round 2: shared-catalog reads/counts**
+
+Round 1 owned the `word_table` rows tests *pick*; round 2 fixes tests that depend on the *shared global state* of catalog tables a different way. Two flakes were reproduced under `-n auto` (both green serially / in isolation):
+
+| Flake | Root cause | Fix |
+|---|---|---|
+| `test_suggest.py::test_suggest_respects_limit` (+ 8 siblings via the same fixtures) | `seeded_words` / `seeded_de` inserted a **shared** `zzqx%` namespace into `word_table` and tore down with `DELETE … WHERE word LIKE 'zzqx%'`. A concurrent worker's teardown deleted this test's lowercase rows mid-run while leaving the capital casing variant → observed `['zzqxbajo','Zzqxalto']`. | Fixtures now build rows via `make_word` under a per-test-unique `zzqx<uuid>` prefix (reaped by id, no shared namespace, no prefix `DELETE`) and **yield the surfaces**; assertions reference them instead of hardcoded literals. |
+| `test_account_deletion.py::test_shared_catalog_data_preserved` and `test_srs_cleanup.py::test_apply_does_not_touch_word_or_phrase_tables` | Asserted `SELECT COUNT(*) FROM word_table/phrase_table/grammar_rule_table/channel/video` was unchanged across an operation — but other workers insert/reap owned catalog rows concurrently, so the global counts drift. | Insert **owned rows** (unique business keys) per catalog table, run the operation, assert each *specific* row still exists by key (and clean up by exact key). Stronger than the count check: account-deletion now also links the user → the owned word first. |
+
+**Acceptable shared-row reads left as-is (verified, not churned):** `phrase_table` `LIMIT 1` picks (`_get_phrase` in `test_srs_gloss`/`test_srs_backfill`/`test_reading_progression`/`test_audit_holes`/`test_recommendations`) read a row that `phrase_service` seeds at startup and **no test reaps**; `video`/`sentence` `LIMIT 1` reads (`test_recommendations`, `test_transcript_click`) hit scraper-populated rows that tests only ever read. None are mutated by the suite, so the pick is stable — unlike `word_table`, which has active per-test reaping. (If a future commit adds a phrase/video-reaping fixture, revisit these.)
+
+**Validation:** 3 fixed files serial → 30 passed; fixed + churners (`test_words`/`test_recommendations`/`test_e2e_learning_loop`) `-n auto` → 113 passed / 1 skipped; **full suite `-n auto` run 2× → 687 passed, 2 skipped, 0 failed each.** No production code changed.
+
 🆕 **2026-05-24 — Spanish phrase extractor slice 2 (#36)**
 
 Added a third pattern family (clitic-attached reflexive infinitives) and broadened the verb+prep allowlist. Scraper-only (`phrase_finder.py`); German untouched.

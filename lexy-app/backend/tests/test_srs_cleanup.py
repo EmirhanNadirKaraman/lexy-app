@@ -10,6 +10,8 @@ An orphan `srs_cards` row has no matching `user_word_knowledge` row for
 """
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from backend.services.srs_cleanup_service import (
@@ -172,15 +174,29 @@ async def test_idempotent_second_apply_deletes_zero(db_pool):
 
 async def test_apply_does_not_touch_word_or_phrase_tables(db_pool):
     uid = await _create_user(db_pool)
-    wid = await _get_word_id(db_pool)
+    wid = await _get_word_id(db_pool)  # owned word (insert_owned_word)
     await _insert_srs(db_pool, uid, wid, "word", "passive")  # orphan
 
-    pre_words   = await db_pool.fetchval("SELECT COUNT(*) FROM word_table")
-    pre_phrases = await db_pool.fetchval("SELECT COUNT(*) FROM phrase_table")
-    pre_grammar = await db_pool.fetchval("SELECT COUNT(*) FROM grammar_rule_table")
+    # Assert OWNED catalog rows survive the cleanup, not global COUNT(*) — the
+    # latter drifts under `pytest -n auto` as other workers mutate the shared
+    # catalog concurrently.
+    uniq = uuid.uuid4().hex[:12]
+    phrase_canon = f"_testphrase_{uniq}"
+    grammar_slug = f"_testrule_{uniq}"
+    await db_pool.execute(
+        "INSERT INTO phrase_table (canonical, surface_form) VALUES ($1, $1)", phrase_canon,
+    )
+    await db_pool.execute(
+        "INSERT INTO grammar_rule_table (slug, title, rule_type, short_explanation) "
+        "VALUES ($1, $1, 'test', 'x')", grammar_slug,
+    )
 
-    await cleanup_orphan_srs_cards(db_pool, apply=True)
+    try:
+        await cleanup_orphan_srs_cards(db_pool, apply=True)
 
-    assert await db_pool.fetchval("SELECT COUNT(*) FROM word_table")         == pre_words
-    assert await db_pool.fetchval("SELECT COUNT(*) FROM phrase_table")       == pre_phrases
-    assert await db_pool.fetchval("SELECT COUNT(*) FROM grammar_rule_table") == pre_grammar
+        assert await db_pool.fetchval("SELECT 1 FROM word_table         WHERE word_id = $1",   wid)          == 1
+        assert await db_pool.fetchval("SELECT 1 FROM phrase_table       WHERE canonical = $1", phrase_canon) == 1
+        assert await db_pool.fetchval("SELECT 1 FROM grammar_rule_table WHERE slug = $1",      grammar_slug) == 1
+    finally:
+        await db_pool.execute("DELETE FROM phrase_table       WHERE canonical = $1", phrase_canon)
+        await db_pool.execute("DELETE FROM grammar_rule_table WHERE slug = $1",      grammar_slug)

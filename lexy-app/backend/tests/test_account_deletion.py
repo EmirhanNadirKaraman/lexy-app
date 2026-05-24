@@ -11,6 +11,8 @@ service-layer mirror needed). Verifies:
   - auth is required
   - a second delete with the same token returns 401 (user no longer exists)
 """
+import uuid
+
 import pytest
 from httpx import AsyncClient
 
@@ -89,23 +91,59 @@ async def test_cascade_clears_private_user_data(client, db_pool):
     assert post_uwk == 0 and post_srs == 0 and post_evt == 0
 
 
-async def test_shared_catalog_data_preserved(client, db_pool):
-    headers, _uid = await _register(client, db_pool, make_test_email())
+async def test_shared_catalog_data_preserved(client, db_pool, make_word):
+    """Account deletion must not cascade into the shared catalog tables.
 
-    pre_words    = await db_pool.fetchval("SELECT COUNT(*) FROM word_table")
-    pre_phrases  = await db_pool.fetchval("SELECT COUNT(*) FROM phrase_table")
-    pre_grammar  = await db_pool.fetchval("SELECT COUNT(*) FROM grammar_rule_table")
-    pre_channels = await db_pool.fetchval("SELECT COUNT(*) FROM channel")
-    pre_videos   = await db_pool.fetchval("SELECT COUNT(*) FROM video")
+    Asserts that OWNED rows (unique business keys) in every catalog table
+    survive the delete — not global COUNT(*), which drifts under `pytest -n
+    auto` because other workers insert/reap owned catalog rows concurrently
+    (the original flake).
+    """
+    headers, uid = await _register(client, db_pool, make_test_email())
 
-    r = await client.request("DELETE", URL, headers=headers, json={"password": "password123"})
-    assert r.status_code == 204
+    uniq = uuid.uuid4().hex[:12]
+    word_id, _surface = await make_word("de")  # reaped by tracked_words
+    phrase_canon = f"_testphrase_{uniq}"
+    grammar_slug = f"_testrule_{uniq}"
+    channel_yt   = f"UCtest{uniq}"
+    video_title  = f"_testvideo_{uniq}"
 
-    assert await db_pool.fetchval("SELECT COUNT(*) FROM word_table")         == pre_words
-    assert await db_pool.fetchval("SELECT COUNT(*) FROM phrase_table")       == pre_phrases
-    assert await db_pool.fetchval("SELECT COUNT(*) FROM grammar_rule_table") == pre_grammar
-    assert await db_pool.fetchval("SELECT COUNT(*) FROM channel")            == pre_channels
-    assert await db_pool.fetchval("SELECT COUNT(*) FROM video")              == pre_videos
+    await db_pool.execute(
+        "INSERT INTO phrase_table (canonical, surface_form) VALUES ($1, $1)", phrase_canon,
+    )
+    await db_pool.execute(
+        "INSERT INTO grammar_rule_table (slug, title, rule_type, short_explanation) "
+        "VALUES ($1, $1, 'test', 'x')", grammar_slug,
+    )
+    await db_pool.execute("INSERT INTO channel (youtube_channel_id) VALUES ($1)", channel_yt)
+    await db_pool.execute(
+        "INSERT INTO video (title, thumbnail_url, duration, language, dialect) "
+        "VALUES ($1, 'x', 1.0, 'de', 'standard')", video_title,
+    )
+    # Give the delete a real user→catalog edge to traverse.
+    await db_pool.execute(
+        "INSERT INTO user_word_knowledge (user_id, item_id, item_type, status, "
+        "passive_level, active_level, times_seen, times_used_correctly) "
+        "VALUES ($1::uuid, $2, 'word', 'learning', 0, 0, 0, 0)",
+        uid, word_id,
+    )
+
+    try:
+        r = await client.request("DELETE", URL, headers=headers, json={"password": "password123"})
+        assert r.status_code == 204
+
+        # Each specific owned catalog row still exists — no cascade to catalog.
+        assert await db_pool.fetchval("SELECT 1 FROM word_table         WHERE word_id = $1",            word_id)      == 1
+        assert await db_pool.fetchval("SELECT 1 FROM phrase_table       WHERE canonical = $1",          phrase_canon) == 1
+        assert await db_pool.fetchval("SELECT 1 FROM grammar_rule_table WHERE slug = $1",               grammar_slug) == 1
+        assert await db_pool.fetchval("SELECT 1 FROM channel            WHERE youtube_channel_id = $1", channel_yt)   == 1
+        assert await db_pool.fetchval("SELECT 1 FROM video             WHERE title = $1",               video_title)  == 1
+    finally:
+        # Exact-key cleanup (word_id reaped via make_word/tracked_words).
+        await db_pool.execute("DELETE FROM phrase_table       WHERE canonical = $1",          phrase_canon)
+        await db_pool.execute("DELETE FROM grammar_rule_table WHERE slug = $1",               grammar_slug)
+        await db_pool.execute("DELETE FROM channel            WHERE youtube_channel_id = $1", channel_yt)
+        await db_pool.execute("DELETE FROM video             WHERE title = $1",               video_title)
 
 
 async def test_unauthenticated_request_rejected(client):
