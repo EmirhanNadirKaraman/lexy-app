@@ -12,6 +12,7 @@ from ..core.deps import get_current_user, require_admin
 from ..database import get_pool
 from ..models.schemas import (
     LemmaCorrectionAccept,
+    LemmaCorrectionAdjudication,
     LemmaCorrectionCreate,
     LemmaCorrectionRead,
     LemmaCorrectionReject,
@@ -128,3 +129,41 @@ async def reject_lemma_correction(
     except (lemma_correction_service.CandidateNotFound,
             lemma_correction_service.CandidateNotPending) as exc:
         raise _review_http_error(exc)
+
+
+async def get_lemma_adjudicator():
+    """Provide the LLM adjudicator callable, or None when none is configured.
+
+    Slice 3C ships NO real provider — this returns None, so the adjudicate
+    endpoint 503s in production (dry-run only, no live LLM calls). Tests override
+    this dependency with a fake adjudicator. A future slice wires a real
+    (llm_service-backed) adjudicator here.
+    """
+    return None
+
+
+@router.post("/admin/lemma-corrections/{candidate_id}/adjudicate",
+             response_model=LemmaCorrectionAdjudication)
+async def adjudicate_lemma_correction(
+    candidate_id: int,
+    pool=Depends(get_pool),
+    admin: dict = Depends(require_admin),
+    adjudicator=Depends(get_lemma_adjudicator),
+):
+    """Dry-run LLM adjudication proposal for a pending candidate. ADVISORY ONLY —
+    never writes `lemma_override` or changes the candidate; an admin still
+    decides via accept/reject. 503 when no adjudicator is configured (3C ships
+    none); 404 unknown; 409 already-reviewed; 502 if the adjudicator returns
+    malformed output."""
+    if adjudicator is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "adjudicator_unavailable")
+    try:
+        return await lemma_correction_service.adjudicate_candidate_dry_run(
+            pool, candidate_id=candidate_id, adjudicator=adjudicator,
+        )
+    except lemma_correction_service.CandidateNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "candidate_not_found")
+    except lemma_correction_service.CandidateNotPending as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"candidate_not_pending:{exc.status}")
+    except lemma_correction_service.AdjudicatorError:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "adjudicator_invalid_response")

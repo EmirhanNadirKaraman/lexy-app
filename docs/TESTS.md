@@ -219,6 +219,18 @@ The human-gated signal→authority path. Backend only; see `docs/LEMMA_OVERRIDE_
 
 **Validation:** `test_lemma_corrections.py` 29 passed (17 + 12); **full backend `-n auto` × 2 → 733 passed, 2 skipped, 0 failed each.**
 
+🆕 **2026-05-24 — #39 slice 3C: dry-run LLM adjudication (advisory)**
+
+Proposal-only adjudication; no live LLM calls, no persistence, no mutation. Backend only.
+
+| File | Change |
+|---|---|
+| `services/lemma_correction_service.py` | `adjudicate_candidate_dry_run` (read-only: load pending candidate → `await adjudicator(input)` → validate via schema → return; raises `CandidateNotFound`/`CandidateNotPending`/`AdjudicatorError`); `build_adjudication_input`, `ADJUDICATION_INSTRUCTION`, `format_adjudication_prompt`. |
+| `routers/lemma_corrections.py`, `models/schemas.py` | `POST /admin/lemma-corrections/{id}/adjudicate` (`require_admin` + injected `get_lemma_adjudicator` dep → `None`/503 in 3C); `LemmaCorrectionAdjudication` schema; errors → 404/409/502/503. |
+| `tests/test_lemma_corrections.py` | +12: service-level with a fake adjudicator (proposal returned, **no override mutation**, **no candidate change**, non-pending, not-found, invalid-output → `AdjudicatorError`), prompt builder (fields + the don't-trust-blindly warning), endpoint auth (non-admin 403 / unauth) + 503-no-adjudicator + a happy-path via `dependency_overrides[get_lemma_adjudicator]`. |
+
+**Validation:** `test_lemma_corrections.py` 41 passed (29 + 12); **full backend `-n auto` → 745 passed, 2 skipped, 0 failed.**
+
 🆕 **2026-05-24 — Spanish phrase extractor slice 2 (#36)**
 
 Added a third pattern family (clitic-attached reflexive infinitives) and broadened the verb+prep allowlist. Scraper-only (`phrase_finder.py`); German untouched.

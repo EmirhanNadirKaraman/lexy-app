@@ -40,7 +40,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `videos.py` | `/videos/{id}/reading-stats` | `reading_stats_service` |
 | `content_requests.py` | `/content-requests` POST/GET. Spawns `subtitle-scraper/pipeline.py --requests-only` subprocess. | direct SQL + subprocess |
 | `notifications.py` | `/notifications/stream` (SSE). Per-row mark-after-yield ordering (disconnect leaves un-yielded rows unseen for re-delivery). LISTEN/NOTIFY refactor deferred (TODO #4b). | direct SQL |
-| `lemma_corrections.py` | `POST /lemma-corrections` (auth + throttle, flag → candidate) + `GET /admin/lemma-corrections` (`require_admin`, queue) + `POST /admin/lemma-corrections/{id}/{accept,reject}` (`require_admin`; accept transactionally upserts `lemma_override`, the human-gated signal→authority step — #39 3A/3B). | `lemma_correction_service` |
+| `lemma_corrections.py` | `POST /lemma-corrections` (auth + throttle, flag → candidate) + `GET /admin/lemma-corrections` (`require_admin`, queue) + `POST /admin/lemma-corrections/{id}/{accept,reject}` (`require_admin`; accept transactionally upserts `lemma_override`) + `…/{id}/adjudicate` (`require_admin`, read-only dry-run LLM proposal via injected `get_lemma_adjudicator` → 503 if none) — #39 3A/3B/3C. | `lemma_correction_service` |
 
 ### Services (business logic) — `lexy-app/backend/services/`
 | Path | Owns |
@@ -63,7 +63,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `usage_events_service.py` | `record_event` (analytics fire-and-forget) + `record_transcript_click_event` (atomic dedup-aware insert) + 4 aggregations. Insight filters include `'transcript'` context. |
 | `matcher_service.py` | Async wrapper around `subtitle-scraper/phrase_finder.py`. Imports the scraper via `sys.path.insert` (post-#3, no more `os.chdir`). `match_sentence` runs sync spaCy in a thread pool. Parses per-language (#39 slice 2): German via phrase_finder's resident model, others via `nlp_service`'s cache (`_model_for`, lock-guarded); `match_sentence_with_ids` loads `lemma_override` and threads it into the extractor so chat canonicals are corrected. |
 | `phrase_service.py` | `seed_from_blueprint_map`, `enrich_phrases`, phrase_type inference from blueprint. |
-| `lemma_correction_service.py` | `create_candidate` (INSERT…ON CONFLICT…report_count+1) + `list_candidates`; `accept_candidate` (transactional: upsert `lemma_override`, flip `accepted`) + `reject_candidate` + domain exceptions (#39 3A/3B). Accept is the only path from a user signal to `lemma_override`. |
+| `lemma_correction_service.py` | `create_candidate` (INSERT…ON CONFLICT…report_count+1) + `list_candidates`; `accept_candidate` (transactional: upsert `lemma_override`, flip `accepted`) + `reject_candidate`; `adjudicate_candidate_dry_run` (read-only, injected adjudicator → advisory proposal) + `build_adjudication_input`/`format_adjudication_prompt` + domain exceptions (#39 3A/3B/3C). Accept is the only path from a user signal to `lemma_override`. |
 | `grammar_service.py` | `seed_rules` (curated DE list), `get_rules_for_phrase_type`, `get_rules_for_lemma`. |
 | `playlist_service.py` | Video playlist generation from target words. |
 | `nlp_service.py` | spaCy wrapper utilities. |

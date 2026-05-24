@@ -16,7 +16,7 @@ import pytest
 from httpx import AsyncClient
 
 from ._email_helper import make_test_email, worker_id
-from backend.services import rate_limiter
+from backend.services import lemma_correction_service, rate_limiter
 
 REGISTER = "/api/v1/auth/register"
 LOGIN    = "/api/v1/auth/login"
@@ -42,6 +42,10 @@ def _accept_url(cid: int) -> str:
 
 def _reject_url(cid: int) -> str:
     return f"/api/v1/admin/lemma-corrections/{cid}/reject"
+
+
+def _adjudicate_url(cid: int) -> str:
+    return f"/api/v1/admin/lemma-corrections/{cid}/adjudicate"
 
 
 async def _register(client: AsyncClient, db_pool, email: str) -> tuple[dict, str]:
@@ -406,3 +410,158 @@ async def test_accept_unknown_candidate_returns_404(client: AsyncClient, db_pool
     headers, _ = await _admin_headers(client, db_pool)
     r = await client.post(_accept_url(999_999_999), json={"corrected_lemma": "x"}, headers=headers)
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Dry-run LLM adjudication (#39 slice 3C) — advisory only; never mutates
+# ---------------------------------------------------------------------------
+
+async def _fake_accept(adj_input):
+    return {"decision": "accept", "proposed_corrected_lemma": "fixed",
+            "confidence": 0.9, "reason": "observed lemma is wrong"}
+
+
+async def _fake_bad(adj_input):
+    return {"decision": "approve"}  # not a Literal value + missing required fields
+
+
+# --- service level (inject a fake adjudicator) ---
+
+async def test_adjudicate_returns_proposal(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, headers, obs=_obs(), suggested="x")
+    proposal = await lemma_correction_service.adjudicate_candidate_dry_run(
+        db_pool, candidate_id=cid, adjudicator=_fake_accept,
+    )
+    assert proposal["candidate_id"] == cid
+    assert proposal["decision"] == "accept"
+    assert proposal["proposed_corrected_lemma"] == "fixed"
+    assert proposal["confidence"] == 0.9
+
+
+async def test_adjudicate_does_not_mutate_override(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    obs = _obs()
+    cid = await _post_candidate(client, headers, obs=obs, suggested="x")
+    await lemma_correction_service.adjudicate_candidate_dry_run(
+        db_pool, candidate_id=cid, adjudicator=_fake_accept,
+    )
+    assert await _override_for(db_pool, obs) is None
+
+
+async def test_adjudicate_does_not_change_candidate(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, headers, obs=_obs(), suggested="x")
+    await lemma_correction_service.adjudicate_candidate_dry_run(
+        db_pool, candidate_id=cid, adjudicator=_fake_accept,
+    )
+    row = await db_pool.fetchrow(
+        "SELECT status, report_count, reviewed_by FROM lemma_correction_candidate "
+        "WHERE candidate_id = $1",
+        cid,
+    )
+    assert row["status"] == "pending"
+    assert row["report_count"] == 1
+    assert row["reviewed_by"] is None
+
+
+async def test_adjudicate_non_pending_raises(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, headers, obs=_obs(), suggested="x")
+    await db_pool.execute(
+        "UPDATE lemma_correction_candidate SET status = 'accepted' WHERE candidate_id = $1", cid
+    )
+    with pytest.raises(lemma_correction_service.CandidateNotPending):
+        await lemma_correction_service.adjudicate_candidate_dry_run(
+            db_pool, candidate_id=cid, adjudicator=_fake_accept)
+
+
+async def test_adjudicate_not_found_raises(db_pool):
+    with pytest.raises(lemma_correction_service.CandidateNotFound):
+        await lemma_correction_service.adjudicate_candidate_dry_run(
+            db_pool, candidate_id=999_999_999, adjudicator=_fake_accept)
+
+
+async def test_adjudicate_invalid_output_raises(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, headers, obs=_obs(), suggested="x")
+    with pytest.raises(lemma_correction_service.AdjudicatorError):
+        await lemma_correction_service.adjudicate_candidate_dry_run(
+            db_pool, candidate_id=cid, adjudicator=_fake_bad)
+
+
+# --- prompt / input builders (deterministic, no model call) ---
+
+def test_build_adjudication_input_has_fields():
+    cand = {
+        "language": "es", "surface_form": "se ducha", "observed_lemma": "duchaber",
+        "suggested_lemma": "duchar", "context_text": "él se ducha", "report_count": 3,
+        "candidate_id": 1, "status": "pending",  # extra fields ignored
+    }
+    out = lemma_correction_service.build_adjudication_input(cand)
+    assert set(out) == {
+        "language", "surface_form", "observed_lemma",
+        "suggested_lemma", "context_text", "report_count",
+    }
+    assert out["observed_lemma"] == "duchaber" and out["report_count"] == 3
+
+
+def test_format_adjudication_prompt_includes_warning_and_fields():
+    adj = {
+        "language": "es", "surface_form": "se ducha", "observed_lemma": "duchaber",
+        "suggested_lemma": "duchar", "context_text": "él se ducha", "report_count": 3,
+    }
+    prompt = lemma_correction_service.format_adjudication_prompt(adj).lower()
+    # the load-bearing don't-trust-blindly warning
+    assert "do not" in prompt and "blindly" in prompt and "verify" in prompt
+    # the candidate fields
+    assert "duchaber" in prompt and "duchar" in prompt and "se ducha" in prompt
+
+
+# --- endpoint: auth + 503 (no adjudicator configured) ---
+
+async def test_adjudicate_normal_user_forbidden(client: AsyncClient, db_pool):
+    admin_h, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, admin_h, obs=_obs(), suggested="x")
+    user_h, _ = await _register(client, db_pool, make_test_email())
+    r = await client.post(_adjudicate_url(cid), headers=user_h)
+    assert r.status_code == 403
+    assert r.json()["detail"] == "admin_required"
+
+
+async def test_adjudicate_unauthenticated_rejected(client: AsyncClient, db_pool):
+    admin_h, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, admin_h, obs=_obs(), suggested="x")
+    r = await client.post(_adjudicate_url(cid))
+    assert r.status_code in (401, 403)
+
+
+async def test_adjudicate_503_when_no_adjudicator(client: AsyncClient, db_pool):
+    """3C ships no real adjudicator → the production endpoint 503s."""
+    headers, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, headers, obs=_obs(), suggested="x")
+    r = await client.post(_adjudicate_url(cid), headers=headers)
+    assert r.status_code == 503
+    assert r.json()["detail"] == "adjudicator_unavailable"
+
+
+# --- endpoint happy-path via dependency override (proves the wiring) ---
+
+async def test_adjudicate_endpoint_with_injected_adjudicator(client: AsyncClient, db_pool):
+    from backend.main import app
+    from backend.routers.lemma_corrections import get_lemma_adjudicator
+
+    headers, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, headers, obs=_obs(), suggested="x")
+    app.dependency_overrides[get_lemma_adjudicator] = lambda: _fake_accept
+    try:
+        r = await client.post(_adjudicate_url(cid), headers=headers)
+        assert r.status_code == 200
+        assert r.json()["decision"] == "accept"
+        # dry-run: the candidate is untouched.
+        st = await db_pool.fetchval(
+            "SELECT status FROM lemma_correction_candidate WHERE candidate_id = $1", cid
+        )
+        assert st == "pending"
+    finally:
+        app.dependency_overrides.pop(get_lemma_adjudicator, None)

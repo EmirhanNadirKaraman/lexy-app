@@ -902,3 +902,14 @@ class LemmaOverrideRead(BaseModel):
 class LemmaCorrectionReviewResult(BaseModel):
     candidate: LemmaCorrectionRead
     override: LemmaOverrideRead | None = None  # None for reject
+
+
+class LemmaCorrectionAdjudication(BaseModel):
+    # Dry-run LLM adjudication proposal (#39 slice 3C). ADVISORY ONLY — returned
+    # as an API response, never persisted, never mutates lemma_override. An admin
+    # still decides via accept/reject (3B).
+    candidate_id: int
+    decision: Literal["accept", "reject", "needs_review"]
+    proposed_corrected_lemma: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str

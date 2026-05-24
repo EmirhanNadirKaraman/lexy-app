@@ -131,14 +131,31 @@ suggestion is part of the suspicion's identity.
   writes `lemma_override`.
 - No reopen: an already-reviewed (`accepted`/`rejected`) candidate returns 409.
 
+**3C — dry-run LLM adjudication (advisory):**
+- `POST /api/v1/admin/lemma-corrections/{id}/adjudicate` — `require_admin`,
+  **read-only**. Returns a proposal `{decision: accept|reject|needs_review,
+  proposed_corrected_lemma, confidence, reason}` for a pending candidate. It
+  **never** writes `lemma_override`, never changes the candidate — an admin still
+  decides via accept/reject (3B). The LLM output is **advisory**, and the prompt
+  explicitly instructs the model NOT to trust the user's `suggested_lemma`
+  blindly.
+- The adjudicator is an **injected** async callable (`get_lemma_adjudicator`
+  dependency). 3C ships **no real provider** — the dependency returns `None`, so
+  the endpoint returns **503 `adjudicator_unavailable`** in production. No live
+  LLM call exists in the codebase yet; tests inject a fake adjudicator (at the
+  service level, or via `dependency_overrides`). Malformed adjudicator output is
+  validated against the schema and rejected (502).
+- `format_adjudication_prompt` is the deterministic, unit-tested prompt-shape
+  deliverable a future real adjudicator will use.
+
 ## What's deferred
 
-- **3C — LLM adjudication (optional):** a batch job feeds pending candidates to
-  Haiku ("is `observed_lemma` wrong for `surface_form` in `context_text`? what's
-  the correct lemma?") and proposes overrides for admin confirmation. No live
-  LLM calls in 3A/3B.
+- **3C live wiring:** an actual `llm_service`-backed adjudicator behind
+  `get_lemma_adjudicator` (Haiku, cached), and/or a batch job over pending
+  candidates. Proposals are response-only today — persisting an LLM-proposal
+  history is a further optional step.
 - **Frontend:** a "this looks wrong" flag button in the reading/SRS UI, and an
-  admin review screen over the accept/reject endpoints. None yet.
+  admin review screen over the accept/reject/adjudicate endpoints. None yet.
 
 ## Why not let the crowd vote directly (the rejected design)
 

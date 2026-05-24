@@ -7,6 +7,9 @@ writes `lemma_override`; promotion candidate → override is admin/LLM review
 from __future__ import annotations
 
 import asyncpg
+from pydantic import ValidationError
+
+from ..models.schemas import LemmaCorrectionAdjudication
 
 # Source tag for an override promoted from a reviewed user flag. Single source of
 # truth (must match the CHECK on lemma_override.source — migration 033).
@@ -27,6 +30,10 @@ class CandidateNotPending(Exception):
 
 class NothingToPromote(Exception):
     """Accept with no corrected_lemma and a blank suggested_lemma (router → 400)."""
+
+
+class AdjudicatorError(Exception):
+    """The injected adjudicator returned malformed output (router → 502)."""
 
 
 async def create_candidate(
@@ -177,3 +184,66 @@ async def reject_candidate(
                 candidate_id, admin_id, review_note,
             )
     return {"candidate": dict(updated), "override": None}
+
+
+# --- dry-run LLM adjudication (#39 slice 3C) -------------------------------
+# Advisory only: build a structured input + (via an INJECTED adjudicator) return
+# a proposal. NEVER writes lemma_override / candidate status / report_count. No
+# live LLM call lives here — the adjudicator is injected (None in production →
+# the endpoint 503s; tests pass a fake), so this stays fully testable.
+
+_ADJUDICATION_FIELDS = (
+    "language", "surface_form", "observed_lemma",
+    "suggested_lemma", "context_text", "report_count",
+)
+
+ADJUDICATION_INSTRUCTION = (
+    "You are a linguistics reviewer judging a flagged lemma. Decide whether "
+    "`observed_lemma` is the WRONG lemma for `surface_form` (in `context_text`) "
+    "and, if so, what the correct lemma is. Do NOT accept the user's "
+    "`suggested_lemma` blindly — verify it independently; a user flag is a "
+    "signal, not the answer. Respond as JSON: "
+    '{"decision": "accept"|"reject"|"needs_review", '
+    '"proposed_corrected_lemma": string|null, "confidence": 0.0-1.0, '
+    '"reason": string}.'
+)
+
+
+def build_adjudication_input(candidate: dict) -> dict:
+    """The structured candidate fields handed to an adjudicator (and the prompt)."""
+    return {k: candidate[k] for k in _ADJUDICATION_FIELDS}
+
+
+def format_adjudication_prompt(adj_input: dict) -> str:
+    """Deterministic prompt for a (future) real LLM adjudicator — the
+    instruction/warning + the candidate fields. No model is called here; this is
+    the prompt-shape deliverable, unit-tested for the don't-trust-blindly warning."""
+    body = "\n".join(f"{k}: {adj_input.get(k)}" for k in _ADJUDICATION_FIELDS)
+    return f"{ADJUDICATION_INSTRUCTION}\n\n{body}"
+
+
+async def adjudicate_candidate_dry_run(pool, *, candidate_id: int, adjudicator) -> dict:
+    """Return an adjudication PROPOSAL for a pending candidate — dry-run.
+
+    `adjudicator` is an async callable `(adj_input: dict) -> dict`. Read-only:
+    never writes `lemma_override`, never changes the candidate's status /
+    report_count. Raises `CandidateNotFound` / `CandidateNotPending` /
+    `AdjudicatorError` (malformed adjudicator output).
+    """
+    cand = await pool.fetchrow(
+        "SELECT * FROM lemma_correction_candidate WHERE candidate_id = $1", candidate_id,
+    )
+    if cand is None:
+        raise CandidateNotFound()
+    if cand["status"] != "pending":
+        raise CandidateNotPending(cand["status"])
+
+    adj_input = build_adjudication_input(dict(cand))
+    raw = await adjudicator(adj_input)
+    # The adjudicator is external/untrusted output — validate against the schema.
+    merged = {**(raw if isinstance(raw, dict) else {}), "candidate_id": candidate_id}
+    try:
+        proposal = LemmaCorrectionAdjudication(**merged)
+    except ValidationError as exc:
+        raise AdjudicatorError(str(exc)) from exc
+    return proposal.model_dump()
