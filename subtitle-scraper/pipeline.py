@@ -29,6 +29,7 @@ if _SCRAPER_DIR not in sys.path:
     sys.path.insert(0, _SCRAPER_DIR)
 from phrase_finder import extract_phrases
 from transcript_fetcher import fetch_with_retries
+from db_ssl import connect_kwargs
 
 
 # VIDEOS_PER_CHANNEL = 5
@@ -69,6 +70,7 @@ def connect():
         dbname=os.getenv("DB_NAME"),
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
+        **connect_kwargs(),  # S4: sslmode when DB_SSL_MODE enforces TLS
     )
 
 

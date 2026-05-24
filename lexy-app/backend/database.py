@@ -38,6 +38,32 @@ def _resolve_ssl(mode: str | None) -> bool | str:
     return False if raw == "disable" else raw
 
 
+def resolve_sslmode(mode: str | None) -> str | None:
+    """Translate DB_SSL_MODE into a libpq `sslmode` string for psycopg2 /
+    SQLAlchemy callers (S4 residual: Alembic `migrations/env.py` and the
+    standalone `subtitle-scraper` scripts).
+
+    Same accepted values and same rejection of `prefer`/`allow` as the asyncpg
+    `_resolve_ssl` above. The principle is identical — *preserve the driver's
+    default when unset* — but the concrete result differs because the drivers'
+    defaults differ: asyncpg's no-arg default is already no-TLS, so `_resolve_ssl`
+    returns ``ssl=False``; libpq's default is opportunistic `prefer`, so here we
+    return ``None`` for `unset`/`disable` and the caller OMITS `sslmode`, leaving
+    libpq's default untouched (zero behaviour change). `require`/`verify-ca`/
+    `verify-full` are returned verbatim; `prefer`/`allow`/anything else raises so
+    a typo can't silently weaken TLS.
+    """
+    raw = (mode or "").strip().lower()
+    if raw in ("", "disable"):
+        return None
+    if raw not in _VALID_SSL_MODES:
+        raise ValueError(
+            f"Invalid DB_SSL_MODE={mode!r}. "
+            f"Expected one of: {', '.join(sorted(_VALID_SSL_MODES))}."
+        )
+    return raw
+
+
 async def create_pool():
     global _pool
     _pool = await asyncpg.create_pool(

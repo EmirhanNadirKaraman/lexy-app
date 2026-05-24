@@ -19,7 +19,7 @@ Test runner: pytest + pytest-asyncio. Fixtures in `conftest.py` provide `db_pool
 | `test_auth.py` | register, login, JWT token validation |
 | `test_auth_throttle.py` | 🆕 S1 auth throttling: login per-(IP,email) + per-IP spray guard, register per-IP, generic 429 (no user enumeration), reset, validation-not-throttled |
 | `test_security_headers.py` | 🆕 S5 security headers: baseline headers on 200/403/404/422, HSTS off-by-default + on-when-`ENABLE_HSTS`, CSP policy-builder unit |
-| `test_database_ssl.py` | 🆕 S4 DB TLS: `_resolve_ssl` mapping (`DB_SSL_MODE` unset/`disable`→`False`, `require`/`verify-ca`/`verify-full`→passthrough, case-insensitive, `prefer`/`allow`/garbage→`ValueError`); mocked `create_pool` forwards `ssl=` + raises before opening a pool on a bad mode |
+| `test_database_ssl.py` | 🆕 S4 DB TLS. asyncpg `_resolve_ssl` (`DB_SSL_MODE` unset/`disable`→`False`, `require`/`verify-ca`/`verify-full`→passthrough, case-insensitive, `prefer`/`allow`/garbage→`ValueError`); mocked `create_pool` forwards `ssl=` + raises before opening a pool on a bad mode. libpq `resolve_sslmode` (for alembic/scraper): unset/`disable`→`None` (omit param), `require`/`verify-*`→string, `prefer`/`allow`/invalid→`ValueError` |
 | `test_password_limits.py` | 🆕 S10 bcrypt 72-byte cap: register rejects >72-byte passwords byte-accurately (`"a"*73`→422, multibyte `"€"*37`/111B→422, `"€"*24`/72B→201), `min_length=8` preserved, 72-byte register→login round-trip; login/delete body-capped at 1024 (over-72-byte login→401 not 422, >1024→422) |
 | `test_docs_gating.py` | 🆕 S11 docs gating: `_docs_enabled` parse matrix (`ENABLE_DOCS` unset/falsy/garbage→off, `1`/`true`/`yes`→on); live app `docs_url`/`redoc_url`/`openapi_url` agree with the flag; `/docs`,`/redoc`,`/openapi.json`→404 when off |
 | `test_phrases_seed_admin.py` | 🆕 S17 admin gate: `POST /phrases/seed` → 403 `admin_required` for a normal user, 201 for an admin (`is_admin` planted via direct SQL, not the settings API), 401/403 unauthenticated |
@@ -86,6 +86,7 @@ full picture):
 Hermetic pytest tests. Two sub-trees:
 - `tests/{subtitles,learning,exposure,pipeline}/` — 537 tests against the `src/app/` refactor (TODO #17 inventory).
 - `tests/runtime/` — 20 tests salvaged onto the runtime root modules (W4 batch 1, 2026-05-20: subtitle cleaner / merger / ingestion / multi-speaker guard / word_knowledge / onboarding).
+- Scraper-facing: `tests/test_scraper_channels.py`, `tests/test_scraper_es_path.py`, and 🆕 `tests/test_scraper_db_ssl.py` (S4 residual — `subtitle-scraper/db_ssl.py` resolver matrix + `seed_channels.connect()` forwards `sslmode`; scraper modules imported via add-if-absent / `sys.modules.pop` fixtures so the file never pollutes `sys.path` for `test_scraper_channels`).
 
 Root suite baseline (W4): **562 passed.** Run: `pytest tests/` from repo root.
 

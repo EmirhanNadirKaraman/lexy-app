@@ -12,11 +12,11 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | Path | Purpose |
 |---|---|
 | `main.py` | FastAPI app. Lifespan: pool init, phrase + grammar seeds, resume pending content requests. Mounts all routers. CORS env-driven via `CORS_ORIGINS` (`_parse_cors_origins`). |
-| `database.py` | asyncpg pool create/close/get. Single global pool. TLS configurable via `DB_SSL_MODE` (S4: `disable`/`require`/`verify-ca`/`verify-full`). |
+| `database.py` | asyncpg pool create/close/get. Single global pool. TLS via `DB_SSL_MODE` (S4: `disable`/`require`/`verify-ca`/`verify-full`): `_resolve_ssl` for the asyncpg pool, `resolve_sslmode` (libpq string, omit-on-unset) reused by Alembic + the scraper. |
 | `core/deps.py` | `get_current_user` JWT verification dependency. |
 | `core/security.py` | password hashing (bcrypt), `encode_token` / `decode_token`. |
 | `models/schemas.py` | All Pydantic request/response models. ~600 lines, one file. |
-| `alembic.ini`, `migrations/env.py` | Alembic config. |
+| `alembic.ini`, `migrations/env.py` | Alembic config. `env.py` builds the URL from `DB_*` env + appends `?sslmode=` via `database.resolve_sslmode` (S4). |
 | `migrations/versions/0XX_*.py` | 25 migrations, append-only. Schema lives here. |
 
 ### Routers (HTTP surface) — `lexy-app/backend/routers/`
@@ -200,6 +200,7 @@ Pytest tests for pipeline modules. Mostly hermetic (no DB).
 | `seed_channels.py` | Bootstrap upsert of `seed_data/channels.json` → `channel` table. Idempotent. |
 | `backfill_video_channels.py`, `backfill_channel_names.py`, `backfill_categories.py` | One-off backfills. |
 | `channel_finder.py` | YouTube subscription / CSV channel discovery. Prints IDs to stdout. |
+| `db_ssl.py` | S4 — `sslmode_from_env()` / `connect_kwargs()` resolve `DB_SSL_MODE` to a libpq `sslmode` (reject `prefer`/`allow`; omit on unset/disable). All five `psycopg2.connect()` sites pass `**connect_kwargs()`. Standalone duplicate of `database.resolve_sslmode` (scraper can't import the backend). |
 | `seed_data/channels.json` | Bundled bootstrap seed for the `channel` table. Read by `seed_channels.py`. |
 | `debug_transcript.py` | Single-video transcript debug. |
 | `profile_pipeline.py`, `profile_full_pipeline.py` | Profiling. |

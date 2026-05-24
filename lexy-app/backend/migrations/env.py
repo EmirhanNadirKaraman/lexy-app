@@ -1,4 +1,5 @@
 import os
+import sys
 from logging.config import fileConfig
 from pathlib import Path
 
@@ -10,6 +11,11 @@ from sqlalchemy import engine_from_config, pool
 # env.py → migrations/ → backend/ → lexy-app/ → sentence-to-phrase-matcher/
 load_dotenv(Path(__file__).parent.parent.parent.parent / ".env")
 
+# Make `database` importable regardless of how alembic is invoked (cwd may or
+# may not be backend/). env.py → migrations/ → backend/.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from database import resolve_sslmode  # noqa: E402  (after the sys.path insert)
+
 config = context.config
 
 if config.config_file_name is not None:
@@ -20,12 +26,18 @@ target_metadata = None
 
 
 def get_url() -> str:
-    return (
+    url = (
         f"postgresql+psycopg2://"
         f"{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}"
         f"@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT', '5432')}"
         f"/{os.getenv('DB_NAME')}"
     )
+    # S4: enforce TLS when DB_SSL_MODE opts in. unset/disable → no param (libpq
+    # default preserved); prefer/allow/invalid → resolve_sslmode raises.
+    sslmode = resolve_sslmode(os.getenv("DB_SSL_MODE"))
+    if sslmode:
+        url += f"?sslmode={sslmode}"
+    return url
 
 
 def run_migrations_offline() -> None:

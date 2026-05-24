@@ -24,6 +24,8 @@ import psycopg2
 import yt_dlp
 from dotenv import load_dotenv
 
+from db_ssl import connect_kwargs
+
 logger = logging.getLogger(__name__)
 
 load_dotenv(Path(__file__).parent.parent / ".env")
@@ -36,6 +38,7 @@ def connect():
         dbname=os.getenv("DB_NAME"),
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
+        **connect_kwargs(),  # S4: sslmode when DB_SSL_MODE enforces TLS
     )
 
 

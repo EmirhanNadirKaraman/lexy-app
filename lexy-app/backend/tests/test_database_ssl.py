@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import backend.database as db
-from backend.database import _resolve_ssl, create_pool
+from backend.database import _resolve_ssl, create_pool, resolve_sslmode
 
 
 # ---------------------------------------------------------------------------
@@ -92,3 +92,44 @@ async def test_create_pool_raises_on_invalid_mode(monkeypatch):
             await create_pool()
     # Validation happens before the pool is opened.
     fake.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# resolve_sslmode — libpq sslmode string for psycopg2 / SQLAlchemy (S4 residual:
+# alembic env.py + scraper). unset/disable → None (omit, preserve driver
+# default); require/verify-* → string; prefer/allow/invalid → ValueError.
+# ---------------------------------------------------------------------------
+
+def test_sslmode_unset_returns_none():
+    assert resolve_sslmode(None) is None
+
+
+def test_sslmode_empty_or_whitespace_returns_none():
+    assert resolve_sslmode("") is None
+    assert resolve_sslmode("   ") is None
+
+
+def test_sslmode_disable_returns_none():
+    # disable → omit the param (libpq default preserved), not a forced "disable".
+    assert resolve_sslmode("disable") is None
+
+
+def test_sslmode_require_passes_string_through():
+    assert resolve_sslmode("require") == "require"
+
+
+def test_sslmode_verify_ca_and_full_pass_through():
+    assert resolve_sslmode("verify-ca") == "verify-ca"
+    assert resolve_sslmode("verify-full") == "verify-full"
+
+
+def test_sslmode_case_insensitive_and_trimmed():
+    assert resolve_sslmode("REQUIRE") == "require"
+    assert resolve_sslmode("  Verify-Full ") == "verify-full"
+
+
+@pytest.mark.parametrize("bad", ["prefer", "allow", "true", "1", "ssl", "verifyfull"])
+def test_sslmode_invalid_or_fallback_modes_raise(bad):
+    # prefer/allow are rejected: both can silently fall back to plaintext.
+    with pytest.raises(ValueError, match="DB_SSL_MODE"):
+        resolve_sslmode(bad)
