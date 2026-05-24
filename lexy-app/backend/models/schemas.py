@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from ..core.security import BCRYPT_MAX_PASSWORD_BYTES
 
@@ -821,3 +821,56 @@ class ExplainRequest(BaseModel):
 
 class ExplainResponse(BaseModel):
     explanation: str
+
+
+# ---------------------------------------------------------------------------
+# Lemma correction candidates (#39 slice 3A) — user flags for bad lemmas.
+# Signal only; never mutates lemma_override. See docs/LEMMA_OVERRIDE_WORKFLOW.md.
+# ---------------------------------------------------------------------------
+
+
+class LemmaCorrectionCreate(BaseModel):
+    language: str = Field(min_length=1, max_length=16)
+    surface_form: str = Field(min_length=1, max_length=200)
+    observed_lemma: str = Field(min_length=1, max_length=200)
+    # `null`/missing/blank all mean "no suggested correction"; normalized to ''
+    # below so the table's NOT-NULL-DEFAULT-'' convention (migration 034) stays
+    # invisible to callers. Same for context_text.
+    suggested_lemma: str | None = Field(default=None, max_length=200)
+    context_text: str | None = Field(default=None, max_length=1000)
+    item_type: Literal["word", "phrase"] | None = None
+    item_id: int | None = None
+    sentence_id: int | None = None
+
+    @field_validator("language", "surface_form", "observed_lemma")
+    @classmethod
+    def _strip_required(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _normalize_optionals(self) -> "LemmaCorrectionCreate":
+        # None / missing(default) / blank → '' (the "absent" sentinel matching
+        # the NOT NULL DEFAULT '' columns). A model_validator runs even when the
+        # field used its default — a field_validator would SKIP the default case,
+        # letting a missing field reach SQL as NULL.
+        self.suggested_lemma = (self.suggested_lemma or "").strip()
+        self.context_text = (self.context_text or "").strip()
+        return self
+
+
+class LemmaCorrectionRead(BaseModel):
+    candidate_id: int
+    language: str
+    surface_form: str
+    observed_lemma: str
+    suggested_lemma: str
+    context_text: str
+    item_type: str | None = None
+    source: str
+    status: str
+    report_count: int
+    created_at: datetime
+    updated_at: datetime

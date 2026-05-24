@@ -40,6 +40,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `videos.py` | `/videos/{id}/reading-stats` | `reading_stats_service` |
 | `content_requests.py` | `/content-requests` POST/GET. Spawns `subtitle-scraper/pipeline.py --requests-only` subprocess. | direct SQL + subprocess |
 | `notifications.py` | `/notifications/stream` (SSE). Per-row mark-after-yield ordering (disconnect leaves un-yielded rows unseen for re-delivery). LISTEN/NOTIFY refactor deferred (TODO #4b). | direct SQL |
+| `lemma_corrections.py` | `POST /lemma-corrections` (auth + throttle, flag a bad lemma → candidate) + `GET /admin/lemma-corrections` (`require_admin`, review queue). Signal only — never writes `lemma_override` (#39 slice 3A). | `lemma_correction_service` |
 
 ### Services (business logic) — `lexy-app/backend/services/`
 | Path | Owns |
@@ -62,6 +63,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `usage_events_service.py` | `record_event` (analytics fire-and-forget) + `record_transcript_click_event` (atomic dedup-aware insert) + 4 aggregations. Insight filters include `'transcript'` context. |
 | `matcher_service.py` | Async wrapper around `subtitle-scraper/phrase_finder.py`. Imports the scraper via `sys.path.insert` (post-#3, no more `os.chdir`). `match_sentence` runs sync spaCy in a thread pool. Parses per-language (#39 slice 2): German via phrase_finder's resident model, others via `nlp_service`'s cache (`_model_for`, lock-guarded); `match_sentence_with_ids` loads `lemma_override` and threads it into the extractor so chat canonicals are corrected. |
 | `phrase_service.py` | `seed_from_blueprint_map`, `enrich_phrases`, phrase_type inference from blueprint. |
+| `lemma_correction_service.py` | `create_candidate` (INSERT…ON CONFLICT…report_count+1) + `list_candidates` for `lemma_correction_candidate`. Signal only; never writes `lemma_override` (#39 slice 3A). |
 | `grammar_service.py` | `seed_rules` (curated DE list), `get_rules_for_phrase_type`, `get_rules_for_lemma`. |
 | `playlist_service.py` | Video playlist generation from target words. |
 | `nlp_service.py` | spaCy wrapper utilities. |

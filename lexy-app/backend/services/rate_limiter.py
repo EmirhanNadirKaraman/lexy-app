@@ -67,6 +67,10 @@ CLIENT_ERROR_MAX_REPORTS      = 30    # per IP
 CLIENT_ERROR_WINDOW_SECONDS   = 600   # 10 minutes
 PUBLIC_RATE_LIMIT_MESSAGE = "Too many requests. Try again later."
 
+# Lemma correction flags (#39 slice 3A) — per authenticated user.
+LEMMA_CORRECTION_MAX_REPORTS    = 30    # per user
+LEMMA_CORRECTION_WINDOW_SECONDS = 3600  # 1 hour
+
 _windows: dict[str, deque[float]] = defaultdict(deque)
 _lock = asyncio.Lock()
 

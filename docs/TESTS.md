@@ -188,6 +188,25 @@ The last documented flake family. Two distinct root causes (the "UniqueViolation
 
 **Validation:** churn group (`test_client_errors` + `test_srs_backfill` + `test_grammar_rules_srs` + `test_srs_cleanup` + `test_audit_holes`) `-n auto` × 3 → 46 passed each (was 3–6 failing); **full suite `-n auto` × 2 → 704 passed, 2 skipped, 0 failed each.**
 
+🆕 **2026-05-24 — Test isolation round 4: grammar_rule_table unscoped pick**
+
+A residual flake round 3 left behind: `test_grammar_rules_srs.py::test_grammar_rule_appears_in_srs_due_with_title_as_display_text` still failed intermittently under `-n auto`. Root cause: `_get_german_rule` did `SELECT … WHERE language='de' LIMIT 1` with **no ORDER BY** (the round-1 shared-row-pick pattern, on `grammar_rule_table`). It was surfaced by the round-2/3 catalog-survival inserts — `grammar_rule_table.language` DEFAULTs to `'de'`, so those transient `_testrule_` rows land in the `language='de'` pool; an unscoped pick could grab one that the inserting test then deletes, and `/srs/due`'s JOIN drops the card. Fix: `ORDER BY rule_id LIMIT 1` (lowest id = a seeded rule, never a transient high-id one). One-line, in `test_grammar_rules_srs.py`. Validation: grammar + catalog-inserting tests `-n auto` × 3 → 42 passed each. (This corrects the round-3 "no round 4 known" note.)
+
+**Audit hint for a future round 5:** the failure mode is the *pattern*, not the table — `… FROM <shared catalog> LIMIT 1` with no `ORDER BY`. Remaining such reads (`_get_phrase` / `_get_grammar_rule_id` on `phrase_table`/`grammar_rule_table`; `video`/`sentence` `LIMIT 1` in `test_recommendations`/`test_transcript_click`) are stable **today** because no test inserts+deletes a row matching their WHERE — but flip any of them to a deterministic pick the moment a test starts mutating those tables.
+
+🆕 **2026-05-24 — #39 slice 3A: lemma correction candidates**
+
+Backend signal inbox for bad lemmas (no frontend / LLM / promotion). See `docs/LEMMA_OVERRIDE_WORKFLOW.md`.
+
+| File | Change |
+|---|---|
+| migration `034_lemma_correction_candidate.py` | Signal table; `''`-absent optionals; partial-unique pending dedup on `(language, surface_form, observed_lemma, suggested_lemma, context_text)` (cross-user); `user_id` `ON DELETE SET NULL`. |
+| `services/lemma_correction_service.py`, `routers/lemma_corrections.py` | `POST /lemma-corrections` (auth + 30/hr per-user throttle, create-or-bump) + `GET /admin/lemma-corrections` (`require_admin`, read-only). Never writes `lemma_override`. |
+| `models/schemas.py` | `LemmaCorrectionCreate` (caps, trims, item_type allowlist; `model_validator` normalizes missing/blank optionals → '' — a field_validator skips defaults). `LemmaCorrectionRead`. |
+| `tests/test_lemma_corrections.py` | +17: auth gate, create + defaults, validation matrix, cross-user dedup (`report_count`), separate-on-different-suggestion, **never-mutates-`lemma_override`** guard, admin-only list, per-user throttle. Per-worker-unique `surface_form` (dedup key is global). |
+
+**Validation:** `test_lemma_corrections.py` 17 passed; full backend suite `-n auto` → 721 passed, 2 skipped (after the round-4 grammar fix).
+
 🆕 **2026-05-24 — Spanish phrase extractor slice 2 (#36)**
 
 Added a third pattern family (clitic-attached reflexive infinitives) and broadened the verb+prep allowlist. Scraper-only (`phrase_finder.py`); German untouched.

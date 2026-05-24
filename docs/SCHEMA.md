@@ -142,7 +142,7 @@ Implemented by `DELETE /api/v1/account` (router: `routers/account.py`).
     `chat_sessions` (+ `chat_messages`), `word_lists` (+ `word_list_entries`),
     `word_usage_events`, `book_documents` (+ `book_pages` + `book_blocks`),
     `reading_selections`, `notification`, `user_channel_preference`.
-  - **SET NULL** (kept, anonymised): `content_request`, `client_error_log`.
+  - **SET NULL** (kept, anonymised): `content_request`, `client_error_log`, `lemma_correction_candidate` (`user_id` + `reviewed_by` — the community correction signal survives the reporter's deletion).
 - **Shared catalog tables are untouched** — `word_table`, `phrase_table`,
   `grammar_rule_table`, `language_table`, `channel`, `video`, `sentence`,
   `llm_cache`, the `*_to_*` bridge tables.
