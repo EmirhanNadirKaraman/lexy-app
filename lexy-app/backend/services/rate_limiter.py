@@ -59,14 +59,12 @@ REGISTER_WINDOW_SECONDS  = 3600  # 1 hour
 # account existence through the throttle.
 AUTH_RATE_LIMIT_MESSAGE = "Too many attempts. Try again later."
 
-# Public-endpoint throttling (S6, S16). These guard the two unauthenticated
-# routes that do real work: /errors/client (DB write → storage DoS) and
-# /sentences/match (spaCy parse → CPU DoS). Keyed by client IP via
-# `check_window`. Read at call time so tests can monkeypatch them down.
+# Public-endpoint throttling (S6). Guards the unauthenticated /errors/client
+# route (DB write → storage DoS). Keyed by client IP via `check_window`. Read at
+# call time so tests can monkeypatch them down. (/sentences/match also used this
+# until it was auth-gated — S16; its SENTENCE_MATCH_* constants were removed.)
 CLIENT_ERROR_MAX_REPORTS      = 30    # per IP
 CLIENT_ERROR_WINDOW_SECONDS   = 600   # 10 minutes
-SENTENCE_MATCH_MAX_REQUESTS   = 30    # per IP
-SENTENCE_MATCH_WINDOW_SECONDS = 300   # 5 minutes
 PUBLIC_RATE_LIMIT_MESSAGE = "Too many requests. Try again later."
 
 _windows: dict[str, deque[float]] = defaultdict(deque)
