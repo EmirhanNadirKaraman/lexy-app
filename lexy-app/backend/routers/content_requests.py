@@ -1,11 +1,13 @@
 import asyncio
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from ..core.deps import get_current_user
 from ..database import get_pool
@@ -28,9 +30,85 @@ async def _spawn_pipeline() -> None:
     )
 
 
+# ── content_id validation (S7) ──────────────────────────────────────────────
+# content_id is later interpolated into a youtube.com URL and handed to yt-dlp
+# by the scraper. Validate + normalize it to a canonical YouTube id at the API
+# boundary so no arbitrary URL / shell-like / non-YouTube string can reach the
+# subprocess. The API is the only writer of content_request, so the scraper
+# inherits already-validated ids.
+_VIDEO_ID_RE   = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+_YT_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "youtube-nocookie.com", "www.youtube-nocookie.com",
+}
+_MAX_CONTENT_ID_LEN = 256
+
+
+def _normalize_video_id(raw: str) -> str | None:
+    """Return the 11-char video id from a bare id or a YouTube watch / youtu.be
+    / shorts URL; None if it isn't a recognisable YouTube video reference."""
+    if _VIDEO_ID_RE.match(raw):            # bare id — happy path, no URL parse
+        return raw
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if host == "youtu.be":
+        vid = parsed.path.lstrip("/")
+        return vid if _VIDEO_ID_RE.match(vid) else None
+    if host in _YT_HOSTS:
+        if parsed.path == "/watch":
+            vid = parse_qs(parsed.query).get("v", [""])[0]
+            return vid if _VIDEO_ID_RE.match(vid) else None
+        m = re.match(r"^/shorts/([A-Za-z0-9_-]{11})$", parsed.path)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _normalize_channel_id(raw: str) -> str | None:
+    """Return the 'UC…' channel id from a bare id or a youtube.com/channel/UC…
+    URL; None otherwise. Handle / @ / c / user URLs don't yield a UC id and are
+    rejected — the scraper needs the canonical channel id to build its URL."""
+    if _CHANNEL_ID_RE.match(raw):
+        return raw
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if host in _YT_HOSTS:
+        m = re.match(r"^/channel/(UC[A-Za-z0-9_-]{22})/?$", parsed.path)
+        if m:
+            return m.group(1)
+    return None
+
+
 class ContentRequestCreate(BaseModel):
     request_type: Literal["channel", "video"]
     content_id: str
+
+    @model_validator(mode="after")
+    def _validate_content_id(self) -> "ContentRequestCreate":
+        # Reject empty / oversized before any parsing, then normalize to a
+        # canonical YouTube id per request_type. A ValueError here surfaces as
+        # a 422 *before* the handler runs, so an invalid id never reaches the DB
+        # or the scraper subprocess.
+        raw = (self.content_id or "").strip()
+        if not raw or len(raw) > _MAX_CONTENT_ID_LEN:
+            raise ValueError("content_id must be a non-empty YouTube id/URL (≤256 chars)")
+        if self.request_type == "video":
+            normalized = _normalize_video_id(raw)
+            if normalized is None:
+                raise ValueError(
+                    "content_id must be an 11-character YouTube video id or a "
+                    "youtube.com / youtu.be video URL"
+                )
+        else:  # channel
+            normalized = _normalize_channel_id(raw)
+            if normalized is None:
+                raise ValueError(
+                    "content_id must be a 'UC…' YouTube channel id or a "
+                    "youtube.com/channel/UC… URL"
+                )
+        self.content_id = normalized
+        return self
 
 
 class ContentRequestRead(BaseModel):

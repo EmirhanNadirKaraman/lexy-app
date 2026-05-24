@@ -13,6 +13,7 @@ calls asyncio.ensure_future on _spawn_pipeline but that schedules a coroutine
 that opens a subprocess we don't want running in CI. We patch _spawn_pipeline
 to be a no-op for these tests.
 """
+import os
 import uuid
 from unittest.mock import AsyncMock
 
@@ -29,9 +30,22 @@ def _email() -> str:
     return make_test_email()
 
 
+# xdist worker tag (sanitised to the id charset) so test content_ids are
+# per-worker. The autouse cleanup then deletes only THIS worker's rows and can't
+# race-delete another worker's in-flight rows under -n auto (the global content_id
+# DELETE was a pre-existing cross-worker flake). Tags stay inside the S7-valid
+# id formats (UC+22 / 11 chars).
+_WORKER = "".join(c for c in os.environ.get("PYTEST_XDIST_WORKER", "main") if c.isalnum()) or "main"
+
+
 def _channel_id() -> str:
-    # Looks YouTube-ish but is unique per test
-    return "UC" + uuid.uuid4().hex[:22]
+    # Valid 'UC'+22 channel id, worker-tagged + unique per test.
+    return ("UC" + _WORKER + uuid.uuid4().hex)[:24]
+
+
+def _video_id() -> str:
+    # Valid 11-char video id, worker-tagged + unique per test.
+    return ("v" + _WORKER + uuid.uuid4().hex)[:11]
 
 
 async def _register_and_get_user(client: AsyncClient, db_pool, email: str) -> tuple[dict, str]:
@@ -52,8 +66,11 @@ def _patch_spawn(monkeypatch):
 @pytest.fixture(autouse=True)
 async def _cleanup_requests(db_pool):
     yield
+    # Per-worker scoped: delete only ids this worker created (UC<worker>… /
+    # v<worker>…), so a concurrent worker's in-flight rows are never touched.
     await db_pool.execute(
-        "DELETE FROM content_request WHERE content_id LIKE 'UC%' OR content_id LIKE 'v_test_%'"
+        "DELETE FROM content_request WHERE content_id LIKE $1 OR content_id LIKE $2",
+        f"UC{_WORKER}%", f"v{_WORKER}%",
     )
 
 
@@ -82,7 +99,7 @@ async def test_post_channel_request_creates_pending_row(client: AsyncClient, db_
 
 async def test_post_video_request_creates_pending_row(client: AsyncClient, db_pool):
     headers, _ = await _register_and_get_user(client, db_pool, _email())
-    content_id = "v_test_" + uuid.uuid4().hex[:8]
+    content_id = _video_id()
 
     resp = await client.post(
         URL,
@@ -92,6 +109,7 @@ async def test_post_video_request_creates_pending_row(client: AsyncClient, db_po
 
     assert resp.status_code == 201
     assert resp.json()["request_type"] == "video"
+    assert resp.json()["content_id"] == content_id
 
 
 async def test_duplicate_pending_request_returns_existing(client: AsyncClient, db_pool):
@@ -319,6 +337,100 @@ async def test_notification_routes_to_submitting_user(client: AsyncClient, db_po
         "DELETE FROM notification WHERE type = 'channel_done' AND payload->>'channel_id' = $1",
         cid,
     )
+
+
+# ---------------------------------------------------------------------------
+# content_id validation + normalization (S7)
+# ---------------------------------------------------------------------------
+
+async def test_video_url_is_normalized_to_id(client: AsyncClient, db_pool):
+    headers, _ = await _register_and_get_user(client, db_pool, _email())
+    vid = _video_id()
+    resp = await client.post(
+        URL,
+        json={"request_type": "video", "content_id": f"https://www.youtube.com/watch?v={vid}"},
+        headers=headers,
+    )
+    assert resp.status_code == 201
+    assert resp.json()["content_id"] == vid  # stored as the bare id, not the URL
+
+
+async def test_youtu_be_short_url_normalized(client: AsyncClient, db_pool):
+    headers, _ = await _register_and_get_user(client, db_pool, _email())
+    vid = _video_id()
+    resp = await client.post(
+        URL,
+        json={"request_type": "video", "content_id": f"https://youtu.be/{vid}"},
+        headers=headers,
+    )
+    assert resp.status_code == 201
+    assert resp.json()["content_id"] == vid
+
+
+async def test_channel_url_is_normalized_to_id(client: AsyncClient, db_pool):
+    headers, _ = await _register_and_get_user(client, db_pool, _email())
+    cid = _channel_id()
+    resp = await client.post(
+        URL,
+        json={"request_type": "channel", "content_id": f"https://www.youtube.com/channel/{cid}"},
+        headers=headers,
+    )
+    assert resp.status_code == 201
+    assert resp.json()["content_id"] == cid
+
+
+@pytest.mark.parametrize("bad", [
+    "https://evil.com/watch?v=dQw4w9WgXcQ",   # non-YouTube host
+    "https://youtube.com.evil.com/watch?v=dQw4w9WgXcQ",  # look-alike host
+    "; rm -rf / #",                            # shell metacharacters
+    "$(whoami)",                               # command substitution
+    "../../etc/passwd",                        # path-traversal-ish
+    "x" * 300,                                 # overlong
+    "",                                        # empty
+    "   ",                                     # whitespace only
+    "dQw4w9WgX",                               # too short (9 chars)
+    "dQw4w9WgXcQextra",                        # too long (16 chars)
+])
+async def test_invalid_video_content_id_rejected(client: AsyncClient, db_pool, bad):
+    headers, _ = await _register_and_get_user(client, db_pool, _email())
+    resp = await client.post(
+        URL, json={"request_type": "video", "content_id": bad}, headers=headers,
+    )
+    assert resp.status_code == 422
+
+
+async def test_channel_id_rejected_as_video(client: AsyncClient, db_pool):
+    """A UC… channel id is the wrong length for a video request."""
+    headers, _ = await _register_and_get_user(client, db_pool, _email())
+    resp = await client.post(
+        URL, json={"request_type": "video", "content_id": _channel_id()}, headers=headers,
+    )
+    assert resp.status_code == 422
+
+
+async def test_video_id_rejected_as_channel(client: AsyncClient, db_pool):
+    headers, _ = await _register_and_get_user(client, db_pool, _email())
+    resp = await client.post(
+        URL, json={"request_type": "channel", "content_id": _video_id()}, headers=headers,
+    )
+    assert resp.status_code == 422
+
+
+async def test_invalid_request_not_inserted_and_not_spawned(client: AsyncClient, db_pool):
+    """A rejected content_id must neither create a row nor spawn the scraper."""
+    from backend.routers import content_requests
+    headers, _ = await _register_and_get_user(client, db_pool, _email())
+
+    resp = await client.post(
+        URL, json={"request_type": "video", "content_id": "not a valid id"}, headers=headers,
+    )
+    assert resp.status_code == 422
+
+    count = await db_pool.fetchval(
+        "SELECT COUNT(*) FROM content_request WHERE content_id = 'not a valid id'"
+    )
+    assert count == 0
+    content_requests._spawn_pipeline.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

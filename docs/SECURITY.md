@@ -21,14 +21,13 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 
 ## Open findings — summary
 
-> **S1, S5, S6, S16 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
+> **S1, S5, S6, S7, S16 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
 
 | ID | Severity | Title | Primary location |
 |----|----------|-------|------------------|
 | S2 | MEDIUM | Open registration multiplies the per-user LLM budget | `routers/auth.py` + `services/rate_limiter.py` |
 | S3 | MEDIUM | Account deletion + long-lived non-revocable token + localStorage (chain) | `routers/account.py`, `core/security.py`, `frontend/src/auth.ts` |
 | S4 | MEDIUM | DB connection pool created without TLS | `database.py` |
-| S7 | MED-LOW | Unvalidated `content_id` fed to yt-dlp | `routers/content_requests.py` → `subtitle-scraper/pipeline.py` |
 | S8 | LOW | Upload validation hardened — magic-byte + size (2026-05-24). Residuals (filename sanitization, proxy-level body spool) **deferred as accepted low risk** — no current exploit path | `routers/books.py` |
 | S9 | LOW | User enumeration on registration | `services/auth_service.py` |
 | S10 | LOW | bcrypt 72-byte truncation; no password max length | `core/security.py`, `models/schemas.py` |
@@ -62,12 +61,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 **Impact:** If `DB_HOST` is a remote/managed Postgres, credentials and all query traffic may cross the network in plaintext. Non-issue when `DB_HOST` is localhost.
 **Verification check:** `rg -n 'create_pool|ssl' lexy-app/backend/database.py` → no `ssl=`; then check the deployed `DB_HOST` is local. If remote and no `ssl`, open.
 **Fix:** Pass `ssl="require"` (or, better, verify-full with the provider CA) whenever `DB_HOST` is not localhost. Same applies to `migrations/env.py` and `subtitle-scraper` DB connections.
-
-### S7 — Unvalidated `content_id` fed to yt-dlp — MED-LOW
-**Where:** `routers/content_requests.py:31–33` (`ContentRequestCreate.content_id: str` — free-form, no format validation). The scraper reads it (`subtitle-scraper/pipeline.py:785`) and interpolates it into YouTube URLs handed to `yt_dlp` (`pipeline.py:141`, `:211`, `:232`, `:529`).
-**Impact:** The URL host is pinned to `youtube.com`, so this is not arbitrary SSRF, but (a) any string reaches the large yt-dlp attack/extractor surface, and (b) a request for a huge channel is unbounded work — resource exhaustion. The subprocess itself uses `create_subprocess_exec` with fixed args, so there is **no shell/command injection** (good).
-**Verification check:** Confirm `ContentRequestCreate.content_id` has no regex/length validator and the pipeline still interpolates it into the URL string.
-**Fix:** Validate at the API boundary — video `^[A-Za-z0-9_-]{11}$`, channel `^UC[A-Za-z0-9_-]{22}$`. Cap per-channel video count and wall-clock for the subprocess.
 
 ### S8 — Upload hardening — LOW — PARTIALLY RESOLVED 2026-05-24
 **Was:** `routers/books.py` validated only the `.pdf` extension (no content-type/magic check); large/lying uploads could do work before rejection; the raw `filename` is persisted.
@@ -198,6 +191,17 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 **Tests:** `tests/test_matcher.py` — `test_unauthenticated_request_rejected` (403), `test_authenticated_request_succeeds` (200), `test_oversize_sentence_returns_422`; existing HTTP tests now run through an authenticated client fixture. The old public-throttle file `tests/test_matcher_limits.py` was deleted (its tests assumed public access).
 **Re-check:** unauthenticated `POST /api/v1/sentences/match` → **403**; authenticated → **200**. `rg -n 'get_current_user' lexy-app/backend/routers/matcher.py` shows the gate; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_matcher.py -q` passes.
 
+### S7 — Unvalidated `content_id` fed to yt-dlp — MED-LOW — RESOLVED 2026-05-24
+**Was:** `ContentRequestCreate.content_id` was a free-form `str`. The scraper interpolates it into `youtube.com` URLs handed to `yt_dlp` (`pipeline.py:141/211/232/551`). Host was pinned to youtube.com (not arbitrary SSRF), but any string reached yt-dlp's large extractor surface, and a huge channel is unbounded work. No shell injection (subprocess uses `create_subprocess_exec` with fixed args).
+**Fix shipped (API-boundary allowlist):** a Pydantic `model_validator` on `ContentRequestCreate` (`routers/content_requests.py`) now normalizes + validates `content_id` per `request_type` *before* the handler runs (a `ValueError` → **422**, so nothing reaches the DB or the subprocess):
+- **video** → `^[A-Za-z0-9_-]{11}$`; also accepts and normalizes `youtube.com/watch?v=`, `youtu.be/<id>`, `youtube.com/shorts/<id>` to the bare 11-char id.
+- **channel** → `^UC[A-Za-z0-9_-]{22}$`; also accepts `youtube.com/channel/UC…` (handle/@/c/user URLs rejected — they don't yield a canonical UC id).
+- Non-YouTube hosts, shell-metachar strings, path-traversal-ish input, empty/whitespace, and anything > 256 chars are rejected. The stored value is always the canonical bare id.
+**Accepted formats:** bare video id (11 chars) · bare channel id (`UC`+22) · `https://www.youtube.com/watch?v=<id>` · `https://youtu.be/<id>` · `https://www.youtube.com/shorts/<id>` · `https://www.youtube.com/channel/<UC…>` (host ∈ youtube.com/www/m/youtu.be/youtube-nocookie).
+**Auth note:** the route still requires a bearer token (`get_current_user`); this validation is a *second* gate after auth. **Scraper untouched** (the API is the only writer of `content_request`, so it inherits validated ids). **Residual (deferred):** legacy rows created before this commit aren't re-validated — defense-in-depth re-checking at the scraper before `yt_dlp` would catch them, deferred per scope.
+**Tests:** `tests/test_content_requests.py` +12 (URL normalization for watch/youtu.be/channel; rejects non-YouTube host, look-alike host, shell strings, path-traversal, overlong, empty, wrong-length, wrong-type; invalid request neither inserts a row nor spawns the scraper).
+**Re-check:** `rg -n 'model_validator|_normalize_video_id|_normalize_channel_id' lexy-app/backend/routers/content_requests.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_content_requests.py -q` passes (a bare 11-char id / `UC…` id → 201; `https://evil.com/...` or `"; rm -rf /"` → 422).
+
 ---
 
 ## Changelog
@@ -207,3 +211,4 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 - **2026-05-24** — **S6 (crash-report throttle)** and **S16 (sentence-match throttle + input cap)** resolved via the same per-IP `check_window`. 6 new tests (`test_client_errors.py` +2, `test_matcher_limits.py` +4). 13 findings remain open (S2–S4, S7–S15, S17). S16 ships public (throttled+capped); auth-gating is a now-unblocked follow-up (#39 has landed).
 - **2026-05-24** — **S16 final fix:** `POST /sentences/match` auth-gated (`Depends(get_current_user)`); public per-IP throttle on it dropped (input cap kept as defence-in-depth). `test_matcher.py` gains auth tests (403 unauth / 200 auth / 422 over-length); obsolete `test_matcher_limits.py` deleted. The now-unused `rate_limit_sentence_match` helper + `SENTENCE_MATCH_*` constants were removed in a follow-up cleanup commit. Every API handler now requires a bearer token.
 - **2026-05-24** — **S8 partially resolved:** PDF upload now validates the `%PDF-` magic header (400 on a renamed non-PDF) before any processing; size guards re-verified (413 via `file.size` + bounded read); `Content-Type` deliberately not gated. `test_books_upload.py` +2 (wrong-magic rejected, mismatched-Content-Type accepted). Residuals deferred: filename sanitization (latent stored-XSS) + full-body disk spool (reverse-proxy fix). Open: S2–S4, S7, S9–S15, S17 (+ S8 residuals).
+- **2026-05-24** — **S7 resolved:** `content_id` validated + normalized to a canonical YouTube id at the API boundary (`model_validator` on `ContentRequestCreate`) before any DB write or scraper spawn — bare ids or youtube.com/youtu.be URLs accepted, everything else 422'd. `test_content_requests.py` +12. Scraper untouched (inherits validated ids); legacy rows not re-validated (deferred). Open: S2–S4, S9–S15, S17 (+ S8 residuals).
