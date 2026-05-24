@@ -10,7 +10,7 @@ The older endpoint is left unchanged so existing callers are not broken.
 """
 from fastapi import APIRouter, Depends, Query
 
-from ..core.deps import get_current_user
+from ..core.deps import get_current_user, require_admin
 from ..database import get_pool
 from ..models.schemas import MatchRequest, MatchResponse, PhraseLookupResult
 from ..services import matcher_service, phrase_service
@@ -33,15 +33,16 @@ async def list_phrases(
 async def seed_phrases(
     language: str = Query(default="de"),
     pool=Depends(get_pool),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     """
     Populate phrase_table from the verb blueprint dict loaded at startup.
 
     Idempotent: safe to call repeatedly.  Returns counts of newly inserted
-    and total phrases for the language.  Requires an authenticated user so
-    it isn't accidentally hit by crawlers, but there is no special admin
-    role check — any authenticated user can trigger a reseed.
+    and total phrases for the language.  **Admin-only (S17)** — this mutates the
+    global shared catalog, so it's gated on `require_admin` (403 for non-admins).
+    Startup already seeds the table in the lifespan; this endpoint is the manual
+    recovery path.
     """
     blueprint_map = matcher_service.get_blueprint_map()
     inserted = await phrase_service.seed_from_blueprint_map(pool, blueprint_map, language)

@@ -21,7 +21,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 
 ## Open findings — summary
 
-> **S1, S5, S6, S7, S11, S16 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
+> **S1, S5, S6, S7, S11, S16, S17 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
 
 | ID | Severity | Title | Primary location |
 |----|----------|-------|------------------|
@@ -35,7 +35,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S13 | INFO | f-string SQL in a migration (pattern caution) | `migrations/versions/013_*.py` |
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
 | S15 | INFO | No dependency vulnerability scanning | `requirements.txt`, `package.json` |
-| S17 | LOW/INFO | `POST /phrases/seed` triggerable by any authenticated user (not admin-gated) | `routers/phrases.py` |
 
 ---
 
@@ -116,12 +115,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 **Verification check:** No `pip-audit` / `npm audit` step in CI config.
 **Fix:** Add `pip-audit` (backend) and `npm audit --omit=dev` (frontend) to CI; review on a cadence.
 
-### S17 — `POST /phrases/seed` triggerable by any authenticated user — LOW/INFO
-**Where:** `routers/phrases.py:32` — `/phrases/seed` is gated by `get_current_user` (good, not public) but **not** by an admin check (`is_admin`).
-**Impact:** Any logged-in user can trigger a global phrase-table re-seed (shared catalog write + file/DB work). Impact is low: the seed is idempotent (`ON CONFLICT DO NOTHING`) and it's the same work startup already does. Listed for completeness — administrative/shared-resource operations should generally be admin-gated.
-**Verification check:** `rg -n 'is_admin' lexy-app/backend/routers/phrases.py` → empty.
-**Fix:** Gate `/phrases/seed` behind an `is_admin` check (the flag already exists on `current_user`), or remove the endpoint and rely on startup seeding.
-
 ---
 
 ## Verified strengths (do not regress)
@@ -141,7 +134,7 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 - **No frontend XSS sinks.** No `dangerouslySetInnerHTML`, `innerHTML`, `document.write`, or `eval` in `frontend/src`; React auto-escaping covers user-rendered fields (filenames, notes). Keep it that way (ties to S8).
 - **Notifications SSE** requires `get_current_user` and scopes rows to the user (`routers/notifications.py:65`).
 - **Content-request subprocess** uses `create_subprocess_exec` with fixed args (`routers/content_requests.py:26`) — no shell, no command injection.
-- **All 21 routers were swept for auth (2026-05-24).** Every handler is covered by `get_current_user` (router-level or per-handler) **except** the documented public ones — see the unauthenticated-surface list below. `search.py` is auth-gated at the router level; `playlists/generate` is auth-gated and is DB-only (no LLM, so it correctly does not need `rate_limit_llm`); `phrases/seed` is auth-gated (see S17 for the admin-gate gap). `POST /sentences/match` is now auth-gated too (S16 final fix), so **every** API handler requires a bearer token.
+- **All 21 routers were swept for auth (2026-05-24).** Every handler is covered by `get_current_user` (router-level or per-handler) **except** the documented public ones — see the unauthenticated-surface list below. `search.py` is auth-gated at the router level; `playlists/generate` is auth-gated and is DB-only (no LLM, so it correctly does not need `rate_limit_llm`); `phrases/seed` is auth-gated **and** admin-gated via `require_admin` (S17 resolved). `POST /sentences/match` is now auth-gated too (S16 final fix), so **every** API handler requires a bearer token.
 
 > **Doc-drift note:** `CLAUDE.md` §7 calls `/api/search`, `/api/suggest`, `/api/video-sentences`, `/api/word-forms`, `/api/languages`, `/api/categories` "public legacy endpoints." They are actually auth-gated at the router level (`routers/search.py:20`, `APIRouter(dependencies=[Depends(get_current_user)])`). No data leak — but the §7 label is stale and should not be trusted when reasoning about the public attack surface.
 >
@@ -208,6 +201,13 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 **Fix shipped (env-gated, secure default):** `main.py:_docs_enabled()` reads `ENABLE_DOCS` (truthy ∈ `{1,true,yes}`, matching the `ENABLE_HSTS` idiom) and the app passes `docs_url`/`redoc_url`/`openapi_url = None` unless it's set. **Default OFF** — a production deploy that doesn't opt in never publishes the schema; local dev sets `ENABLE_DOCS=true`. `.env.example` ships `ENABLE_DOCS=false` (off everywhere by default, so a prod that copied the template isn't exposed). No residual: the only way to expose docs now is an explicit opt-in.
 **Verification check:** `rg -n 'docs_url|_docs_enabled' lexy-app/backend/main.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_docs_gating.py -q` passes (env-unset → `app.openapi_url is None` + `/docs`,`/redoc`,`/openapi.json` → 404; truthy values enable). With `ENABLE_DOCS` unset, `GET /openapi.json` → 404.
 **Tests:** `tests/test_docs_gating.py` +15 (parse matrix for `_docs_enabled`; live app docs URLs agree with the flag; endpoints 404 when off).
+
+### S17 — `POST /phrases/seed` triggerable by any authenticated user — LOW/INFO — RESOLVED 2026-05-24
+**Was:** `/phrases/seed` was gated by `get_current_user` only — any logged-in user could trigger a global `phrase_table` re-seed (shared-catalog write + dict/DB work). Idempotent, so impact was low, but a shared-resource/admin operation shouldn't be user-triggerable.
+**Fix shipped (admin gate):** new `core/deps.require_admin` dependency (depends on `get_current_user`; **403 `admin_required`** when `current_user["is_admin"]` is false, returns the user otherwise). `routers/phrases.py:seed_phrases` now `Depends(require_admin)`. `is_admin` is planted out-of-band in `users.settings` and **cannot be self-granted** — `settings_service` filters writes to `DEFAULTS` keys (`settings_service.py:223`, `k in DEFAULTS`) and `is_admin` isn't one, so a `PUT /settings` can't set it. `/phrases/match` and `GET /phrases` are unchanged (not admin operations).
+**Behaviour change (intentional):** a non-admin authenticated user who could previously trigger a reseed now gets 403 — that's the finding, not a regression. Startup still seeds in the lifespan; this endpoint remains the manual recovery path for admins.
+**Verification check:** `rg -n 'require_admin' lexy-app/backend/routers/phrases.py lexy-app/backend/core/deps.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_phrases_seed_admin.py -q` passes (non-admin → 403 `admin_required`; admin via out-of-band SQL → 201; no token → 401/403).
+**Tests:** `tests/test_phrases_seed_admin.py` +3.
 **Re-check:** `rg -n 'model_validator|_normalize_video_id|_normalize_channel_id' lexy-app/backend/routers/content_requests.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_content_requests.py -q` passes (a bare 11-char id / `UC…` id → 201; `https://evil.com/...` or `"; rm -rf /"` → 422).
 
 ---
@@ -225,3 +225,4 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 - **2026-05-24** — **S4 partially resolved:** the asyncpg pool now passes `ssl=_resolve_ssl(os.getenv("DB_SSL_MODE"))` instead of omitting `ssl=`. `DB_SSL_MODE` ∈ {`disable` (default → plaintext), `require`, `verify-ca`, `verify-full`}; `prefer`/`allow` rejected (silent-plaintext-fallback footgun), unknown values raise at startup. `tests/conftest.py` pool threads the same helper; `.env.example` documents the knob. New `test_database_ssl.py` +13 (mapping + mocked `create_pool` forwarding + startup-raise). **Residual deferred:** prod must SET `DB_SSL_MODE=require` for a remote DB (default stays plaintext for local dev), and alembic `env.py` + `subtitle-scraper` connections still lack TLS. Open: S2, S9–S15, S17 (+ S3 token-revocation, S4 operational/other-sites & S8 residuals).
 - **2026-05-24** — **S10 partially resolved:** `RegisterRequest.password` gained a byte-accurate upper bound (`BCRYPT_MAX_PASSWORD_BYTES = 72` in `core/security.py`; `field_validator` → 422 when the UTF-8 byte length exceeds 72, so multibyte passwords under 72 *chars* but over 72 *bytes* are caught); `min_length=8` preserved. `LoginRequest` + `AccountDeleteRequest` got a generous `max_length=1024` body guard (NOT the 72-byte rule — avoids locking out pre-cap accounts). No pre-hashing (scheme unchanged, nothing truncated). New `test_password_limits.py` +8. **Residual accepted:** pre-cap accounts may hold already-truncated hashes (not retroactively detectable); full-length support needs the base64(sha256(pw))-before-bcrypt migration (deferred). Open: S2, S9, S11–S15, S17 (+ S3 token-revocation, S4 operational/other-sites, S8 & S10 long-password residuals).
 - **2026-05-24** — **S11 resolved:** interactive docs + OpenAPI schema are now env-gated. `main.py:_docs_enabled()` (reads `ENABLE_DOCS`, `ENABLE_HSTS` idiom) makes `docs_url`/`redoc_url`/`openapi_url` `None` by default; only an explicit `ENABLE_DOCS=true` exposes `/docs`,`/redoc`,`/openapi.json`. `.env.example` ships it `false` (off everywhere by default). New `test_docs_gating.py` +15. Moved to *Resolved findings* (no residual — secure by default, opt-in for dev). Open: S2, S9, S12–S15, S17 (+ S3 token-revocation, S4 operational/other-sites, S8 & S10 long-password residuals).
+- **2026-05-24** — **S17 resolved:** `POST /phrases/seed` is now admin-gated. New `core/deps.require_admin` (403 `admin_required` for non-admins); `routers/phrases.py:seed_phrases` depends on it. `is_admin` lives in `users.settings`, planted out-of-band and not self-grantable (settings writes are filtered to `DEFAULTS`). Non-admins who could previously reseed now get 403 (intentional — the finding). New `test_phrases_seed_admin.py` +3. Moved to *Resolved findings* (no residual). Open: S2, S9, S12–S15 (+ S3 token-revocation, S4 operational/other-sites, S8 & S10 long-password residuals).

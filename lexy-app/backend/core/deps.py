@@ -51,6 +51,21 @@ async def get_current_user(
     return row
 
 
+async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    """FastAPI dependency gating admin-only routes (S17). Raises 403 for
+    non-admins; returns the user dict for admins.
+
+    `is_admin` is planted out-of-band in `users.settings` (via SQL / migration).
+    The settings API can't set it — it isn't in `settings_service.DEFAULTS`, and
+    writes are filtered to DEFAULTS keys — so a user can't self-grant. Depends on
+    `get_current_user`, so a missing/expired/invalid token 401s before this
+    check ever runs.
+    """
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
+    return current_user
+
+
 async def rate_limit_llm(current_user: dict = Depends(get_current_user)) -> None:
     """FastAPI dependency that gates LLM-backed routes (#12).
 
