@@ -48,9 +48,18 @@ async def _register_and_login(client: AsyncClient, db_pool, email: str) -> tuple
 
 
 async def _get_german_rule(db_pool) -> tuple[int, str, str]:
-    """Return (rule_id, slug, title) for a seeded German grammar rule."""
+    """Return (rule_id, slug, title) for a seeded German grammar rule.
+
+    ORDER BY rule_id: pick the lowest-id (seeded-at-startup) rule, never a
+    transient high-id `_testrule_` row that another worker's catalog-survival
+    test inserts then deletes. An unscoped `LIMIT 1` here flaked under
+    `pytest -n auto` — the round-1 shared-row-pick pattern on grammar_rule_table,
+    surfaced by the round-2/3 inserts (grammar_rule_table.language DEFAULTs to
+    'de', so those `_testrule_` rows land in this WHERE clause).
+    """
     row = await db_pool.fetchrow(
-        "SELECT rule_id, slug, title FROM grammar_rule_table WHERE language = 'de' LIMIT 1"
+        "SELECT rule_id, slug, title FROM grammar_rule_table WHERE language = 'de' "
+        "ORDER BY rule_id LIMIT 1"
     )
     if row is None:
         pytest.skip("No grammar rules seeded for language='de'")
