@@ -45,6 +45,11 @@ logger = logging.getLogger(__name__)
 
 _MAX_UPLOAD_MB = 200
 _MAX_UPLOAD_BYTES = _MAX_UPLOAD_MB * 1024 * 1024
+# Every PDF begins with the "%PDF-" header (ISO 32000). We validate these magic
+# bytes rather than trusting the filename extension or the client-supplied
+# Content-Type — both are spoofable/unreliable — before handing the file to the
+# expensive extraction pipeline. (S8)
+_PDF_MAGIC = b"%PDF-"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -139,6 +144,16 @@ async def upload_book(
         )
     if len(file_bytes) < 4:
         raise HTTPException(status_code=400, detail="File is empty or too small")
+
+    # Content validation (S8): the .pdf extension and Content-Type are not
+    # trustworthy, so confirm the actual bytes start with the PDF magic header
+    # before any processing. This rejects a renamed non-PDF (e.g. an .exe or a
+    # zip with a .pdf name) up front.
+    if not file_bytes.startswith(_PDF_MAGIC):
+        raise HTTPException(
+            status_code=400,
+            detail="File is not a valid PDF (missing %PDF- header)",
+        )
 
     doc_id = await book_service.create_document(
         pool,

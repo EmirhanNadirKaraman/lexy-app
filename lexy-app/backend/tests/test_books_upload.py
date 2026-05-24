@@ -10,6 +10,9 @@ Covers:
     Content-Length-per-part) is caught by the bounded read fallback.
   - Tiny uploads (<4 bytes) still return 400.
   - Non-PDF extension still returns 400.
+  - A renamed non-PDF (.pdf extension but wrong magic bytes) returns 400 (S8).
+  - A valid PDF with a mismatched/odd Content-Type is still accepted — content
+    validation is by %PDF- magic bytes, not the spoofable Content-Type (S8).
   - Rejected uploads never invoke book_service.create_document /
     process_document.
 
@@ -196,3 +199,44 @@ async def test_non_pdf_extension_returns_400(
     assert resp.status_code == 400
     assert "PDF" in resp.json()["detail"]
     _mock_book_service["create"].assert_not_awaited()
+
+
+async def test_wrong_magic_bytes_rejected(
+    client: AsyncClient, _mock_book_service, _shrink_max_upload,
+):
+    """A renamed non-PDF: .pdf extension + valid size, but the bytes don't start
+    with %PDF-. Must be rejected (400) before any processing (S8)."""
+    headers = await _auth_headers(client)
+    payload = b"This is plain text pretending to be a PDF."  # no %PDF- header
+
+    resp = await client.post(
+        URL,
+        headers=headers,
+        files={"file": ("fake.pdf", payload, "application/pdf")},
+        data={"title": "Fake", "language": "de"},
+    )
+
+    assert resp.status_code == 400
+    assert "valid PDF" in resp.json()["detail"]
+    _mock_book_service["create"].assert_not_awaited()
+    _mock_book_service["process"].assert_not_awaited()
+
+
+async def test_valid_magic_with_mismatched_content_type_accepted(
+    client: AsyncClient, _mock_book_service, _shrink_max_upload,
+):
+    """Content-Type is not the gate (it's spoofable / varies by client). A file
+    with the real %PDF- magic is accepted even when the Content-Type is wrong —
+    proving validation relies on the magic bytes, not Content-Type (S8)."""
+    headers = await _auth_headers(client)
+    payload = b"%PDF-1.4\n%%\n"  # valid magic
+
+    resp = await client.post(
+        URL,
+        headers=headers,
+        files={"file": ("real.pdf", payload, "application/octet-stream")},
+        data={"title": "Real", "language": "de"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    _mock_book_service["create"].assert_awaited_once()

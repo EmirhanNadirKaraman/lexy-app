@@ -29,7 +29,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S3 | MEDIUM | Account deletion + long-lived non-revocable token + localStorage (chain) | `routers/account.py`, `core/security.py`, `frontend/src/auth.ts` |
 | S4 | MEDIUM | DB connection pool created without TLS | `database.py` |
 | S7 | MED-LOW | Unvalidated `content_id` fed to yt-dlp | `routers/content_requests.py` → `subtitle-scraper/pipeline.py` |
-| S8 | LOW-MED | Upload: extension-only check, unsanitized filename, pre-handler disk spool | `routers/books.py` |
+| S8 | LOW | Upload validation hardened — magic-byte + size (2026-05-24). Residuals (filename sanitization, proxy-level body spool) **deferred as accepted low risk** — no current exploit path | `routers/books.py` |
 | S9 | LOW | User enumeration on registration | `services/auth_service.py` |
 | S10 | LOW | bcrypt 72-byte truncation; no password max length | `core/security.py`, `models/schemas.py` |
 | S11 | LOW/INFO | FastAPI `/docs` + `/openapi.json` exposed | `main.py` |
@@ -69,11 +69,15 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 **Verification check:** Confirm `ContentRequestCreate.content_id` has no regex/length validator and the pipeline still interpolates it into the URL string.
 **Fix:** Validate at the API boundary — video `^[A-Za-z0-9_-]{11}$`, channel `^UC[A-Za-z0-9_-]{22}$`. Cap per-channel video count and wall-clock for the subprocess.
 
-### S8 — Upload: extension-only check, unsanitized filename, pre-handler disk spool — LOW-MED
-**Where:** `routers/books.py:115` validates only `file.filename.lower().endswith(".pdf")` (no content-type / magic-byte check). `books.py:147` stores the raw `file.filename` in the DB. The handler's own comment (`books.py:118–127`) notes Starlette has already spooled the full request body to disk before the size guard runs.
-**Impact:** (1) A non-PDF can be uploaded with a `.pdf` name (file-type confusion; docling will likely fail, low impact). (2) The on-disk file is named `{doc_id}.pdf` with a server UUID, so there is **no path traversal** — good — but the user's `filename` is persisted and shown in the UI. React escapes it today (no stored XSS), but it becomes a stored-XSS payload the moment anyone renders it via `dangerouslySetInnerHTML`. (3) Large/lying uploads spool to disk before rejection → disk-exhaustion DoS.
-**Verification check:** Confirm the only type check is the extension; confirm `filename` is still persisted; confirm there's no magic-byte check.
-**Fix:** Verify the `%PDF-` magic bytes; sanitize + length-cap `filename` before storage; enforce the size limit at the reverse proxy / ASGI middleware so the body is never fully spooled.
+### S8 — Upload hardening — LOW — PARTIALLY RESOLVED 2026-05-24
+**Was:** `routers/books.py` validated only the `.pdf` extension (no content-type/magic check); large/lying uploads could do work before rejection; the raw `filename` is persisted.
+**Resolved (2026-05-24):**
+- **Content validation by magic bytes.** `upload_book` now rejects any body that doesn't start with `_PDF_MAGIC = b"%PDF-"` with **400** before `book_service.create_document` / `process_document` run. A renamed non-PDF (e.g. `.exe`→`.pdf`) is caught up front. The extension check is kept as a cheap first filter; `Content-Type` is intentionally **not** a gate (spoofable/varies by client) — a valid-magic file with an odd Content-Type is accepted.
+- **Size guards (already in place, re-verified).** Pre-read `file.size` check → **413** before reading any body; bounded `await file.read(_MAX_UPLOAD_BYTES + 1)` → **413** even when `Content-Length` is missing/lying. No unbounded read before rejection.
+**Residuals — deferred as accepted low risk (not queued work; no current exploit path):**
+1. **`filename` is stored unsanitized** — latent stored-XSS only, and *not currently exploitable*: React escapes it everywhere it's rendered (a verified strength). On-disk path is `{doc_id}.pdf` (server UUID) so there's **no path traversal**. Becomes real only if someone later renders the filename via `dangerouslySetInnerHTML`; revisit then (length-cap + strip control/path chars at the upload boundary). Re-flag if the no-XSS-sinks strength is ever broken.
+2. **Full request body is spooled to disk by Starlette before the handler runs** — the route-level bounded read caps *in-memory* bytes, not the disk spool. This is an infra concern, not app code: the real fix is `client_max_body_size` at the reverse proxy. Deferred to deployment config.
+**Verification check (resolved parts):** unauthenticated upload still requires auth; a `.pdf` whose bytes are `b"not a pdf"` → **400** "not a valid PDF"; a `%PDF-` file with `Content-Type: application/octet-stream` → **200**; oversize → **413** with no downstream call. `rg -n '_PDF_MAGIC' lexy-app/backend/routers/books.py` shows the gate; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_books_upload.py -q` passes.
 
 ### S9 — User enumeration on registration — LOW
 **Where:** `services/auth_service.py:14–15` raises "Email already registered" → `routers/auth.py:15` returns it as a 400.
@@ -202,3 +206,4 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 - **2026-05-24** — **S1 (auth throttling)** and **S5 (HTTP security headers)** resolved. 17 new tests (`test_auth_throttle.py`, `test_security_headers.py`); added env vars `ENABLE_HSTS`, `TRUST_PROXY_HEADERS`. 15 findings remain open (S2–S4, S6–S17).
 - **2026-05-24** — **S6 (crash-report throttle)** and **S16 (sentence-match throttle + input cap)** resolved via the same per-IP `check_window`. 6 new tests (`test_client_errors.py` +2, `test_matcher_limits.py` +4). 13 findings remain open (S2–S4, S7–S15, S17). S16 ships public (throttled+capped); auth-gating is a now-unblocked follow-up (#39 has landed).
 - **2026-05-24** — **S16 final fix:** `POST /sentences/match` auth-gated (`Depends(get_current_user)`); public per-IP throttle on it dropped (input cap kept as defence-in-depth). `test_matcher.py` gains auth tests (403 unauth / 200 auth / 422 over-length); obsolete `test_matcher_limits.py` deleted. The now-unused `rate_limit_sentence_match` helper + `SENTENCE_MATCH_*` constants were removed in a follow-up cleanup commit. Every API handler now requires a bearer token.
+- **2026-05-24** — **S8 partially resolved:** PDF upload now validates the `%PDF-` magic header (400 on a renamed non-PDF) before any processing; size guards re-verified (413 via `file.size` + bounded read); `Content-Type` deliberately not gated. `test_books_upload.py` +2 (wrong-magic rejected, mismatched-Content-Type accepted). Residuals deferred: filename sanitization (latent stored-XSS) + full-body disk spool (reverse-proxy fix). Open: S2–S4, S7, S9–S15, S17 (+ S8 residuals).
