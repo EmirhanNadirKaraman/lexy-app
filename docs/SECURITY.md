@@ -43,7 +43,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 
 ## Open findings — detail
 
-> S1 (auth throttling), S5 (security headers), S6 (crash-report throttle), and S16 (sentence-match throttle + cap) were resolved on 2026-05-24 — see *Resolved findings*.
+> S1 (auth throttling), S5 (security headers), S6 (crash-report throttle), and S16 (sentence-match auth-gate) were resolved on 2026-05-24 — see *Resolved findings*.
 
 ### S2 — Open registration multiplies the per-user LLM budget — MEDIUM
 **Where:** `routers/auth.py` register (no throttle, no email verification, no captcha) combined with `services/rate_limiter.py`, whose budget is keyed *per user*.
@@ -142,11 +142,11 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 - **No frontend XSS sinks.** No `dangerouslySetInnerHTML`, `innerHTML`, `document.write`, or `eval` in `frontend/src`; React auto-escaping covers user-rendered fields (filenames, notes). Keep it that way (ties to S8).
 - **Notifications SSE** requires `get_current_user` and scopes rows to the user (`routers/notifications.py:65`).
 - **Content-request subprocess** uses `create_subprocess_exec` with fixed args (`routers/content_requests.py:26`) — no shell, no command injection.
-- **All 21 routers were swept for auth (2026-05-24).** Every handler is covered by `get_current_user` (router-level or per-handler) **except** the documented public ones — see the unauthenticated-surface list below. `search.py` is auth-gated at the router level; `playlists/generate` is auth-gated and is DB-only (no LLM, so it correctly does not need `rate_limit_llm`); `phrases/seed` is auth-gated (see S17 for the admin-gate gap). The one handler with *no* auth is `POST /sentences/match` (S16).
+- **All 21 routers were swept for auth (2026-05-24).** Every handler is covered by `get_current_user` (router-level or per-handler) **except** the documented public ones — see the unauthenticated-surface list below. `search.py` is auth-gated at the router level; `playlists/generate` is auth-gated and is DB-only (no LLM, so it correctly does not need `rate_limit_llm`); `phrases/seed` is auth-gated (see S17 for the admin-gate gap). `POST /sentences/match` is now auth-gated too (S16 final fix), so **every** API handler requires a bearer token.
 
 > **Doc-drift note:** `CLAUDE.md` §7 calls `/api/search`, `/api/suggest`, `/api/video-sentences`, `/api/word-forms`, `/api/languages`, `/api/categories` "public legacy endpoints." They are actually auth-gated at the router level (`routers/search.py:20`, `APIRouter(dependencies=[Depends(get_current_user)])`). No data leak — but the §7 label is stale and should not be trusted when reasoning about the public attack surface.
 >
-> **The genuinely unauthenticated surface is:** the static file mount (`main.py:142`), `POST /api/v1/sentences/match` (now per-IP throttled + input-capped — S16 resolved), `POST /api/v1/errors/client` (now per-IP throttled — S6 resolved), and the FastAPI docs `/docs` + `/openapi.json` (S11, still open). Everything else requires a valid bearer token.
+> **The genuinely unauthenticated surface is:** the static file mount (`main.py:142`), `POST /api/v1/errors/client` (per-IP throttled — S6 resolved), and the FastAPI docs `/docs` + `/openapi.json` (S11, still open). `POST /sentences/match` is no longer public (auth-gated — S16 final fix). Everything else requires a valid bearer token.
 
 ---
 
@@ -186,14 +186,13 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 **Tests:** `tests/test_client_errors.py` +2 (per-IP 429 after limit; authed report below limit still 204). Existing 9 tests still green.
 **Re-check:** `rg -n 'rate_limit_client_errors' lexy-app/backend/routers/errors.py` shows it wired; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_client_errors.py -q` passes.
 
-### S16 — `POST /sentences/match` unauthenticated + uncapped input — MED-LOW — RESOLVED 2026-05-24
+### S16 — `POST /sentences/match` unauthenticated + uncapped input — MED-LOW — RESOLVED 2026-05-24 (auth-gated)
 **Was:** Public route with a bare `str` body running spaCy → unauthenticated CPU-exhaustion DoS (large input and/or high volume).
-**Fix shipped (public + throttle + cap):**
-- **Input cap:** `MatchRequest.sentence` is now `Field(..., max_length=1000)` (`models/schemas.py`) → an over-length body is rejected with **422 before the handler runs**, so the parser never sees it.
-- **Throttle:** `core/deps.rate_limit_sentence_match(request)` (per-IP, **30 / 5 min**) called before any parsing → **429** when exceeded.
-**Why public, not auth-gated (for now):** the route is a dev/helper (the frontend never calls it — `rg sentences/match lexy-app/frontend/src` is empty), so auth-gating would be the cleanest end state. At implementation time, `test_matcher.py` (which POSTs unauthenticated) carried *uncommitted* #39 changes, so auth-gating then would have entangled the two changesets. #39 has since landed (commit `68a39e6`), so that obstacle is gone — but public + throttle + cap was already implemented, tested, and fully closes the CPU-DoS, so it ships as the S16 fix. **Follow-up (now unblocked):** auth-gate the route — add `Depends(get_current_user)` and update `test_matcher.py`'s calls to authenticate — as a clean standalone change.
-**Tests:** new `tests/test_matcher_limits.py` (normal match 200; over-length 422; per-IP 429; unknown language → empty, no crash). `test_matcher.py` (the #39 file) still green under the new throttle/cap.
-**Re-check:** `rg -n 'rate_limit_sentence_match' lexy-app/backend/routers/matcher.py` and `rg -n 'max_length=1000' lexy-app/backend/models/schemas.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_matcher_limits.py backend/tests/test_matcher.py -q` passes.
+**First fix (superseded):** shipped public + per-IP throttle + input cap (commit `a94b751`). Closed the DoS but kept the route public.
+**Final fix (auth-gated):** `POST /api/v1/sentences/match` now requires `Depends(get_current_user)` (`routers/matcher.py`). The frontend never calls it (`rg sentences/match lexy-app/frontend/src` is empty) — it's a logged-in utility/debug route — so authentication is the right gate and **removes the unauthenticated CPU-DoS surface entirely**. With the route no longer public, the per-IP throttle on it was dropped (an authenticated abuser is identifiable and out of scope for S16; an authenticated rate limit can be re-added later if wanted). The **input cap is kept** (`MatchRequest.sentence = Field(..., max_length=1000)`) as defence-in-depth — an over-length body is still 422'd before the parser runs.
+**Leftover (intentional, not dead-on-purpose):** `core/deps.rate_limit_sentence_match` + the `SENTENCE_MATCH_*` constants in `services/rate_limiter.py` are left in place but now unused — kept as ready-to-wire infra if authenticated throttling is later desired. Remove them if you'd rather not carry unused helpers.
+**Tests:** `tests/test_matcher.py` — `test_unauthenticated_request_rejected` (403), `test_authenticated_request_succeeds` (200), `test_oversize_sentence_returns_422`; existing HTTP tests now run through an authenticated client fixture. The old public-throttle file `tests/test_matcher_limits.py` was deleted (its tests assumed public access).
+**Re-check:** unauthenticated `POST /api/v1/sentences/match` → **403**; authenticated → **200**. `rg -n 'get_current_user' lexy-app/backend/routers/matcher.py` shows the gate; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_matcher.py -q` passes.
 
 ---
 
@@ -202,3 +201,4 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 - **2026-05-24** — Initial audit. 17 open findings (S1–S17), verified-strengths baseline recorded. Swept all 21 routers for auth; only `POST /sentences/match` (S16) is unauthenticated.
 - **2026-05-24** — **S1 (auth throttling)** and **S5 (HTTP security headers)** resolved. 17 new tests (`test_auth_throttle.py`, `test_security_headers.py`); added env vars `ENABLE_HSTS`, `TRUST_PROXY_HEADERS`. 15 findings remain open (S2–S4, S6–S17).
 - **2026-05-24** — **S6 (crash-report throttle)** and **S16 (sentence-match throttle + input cap)** resolved via the same per-IP `check_window`. 6 new tests (`test_client_errors.py` +2, `test_matcher_limits.py` +4). 13 findings remain open (S2–S4, S7–S15, S17). S16 ships public (throttled+capped); auth-gating is a now-unblocked follow-up (#39 has landed).
+- **2026-05-24** — **S16 final fix:** `POST /sentences/match` auth-gated (`Depends(get_current_user)`); public per-IP throttle on it dropped (input cap kept as defence-in-depth). `test_matcher.py` gains auth tests (403 unauth / 200 auth / 422 over-length); obsolete `test_matcher_limits.py` deleted. The now-unused `rate_limit_sentence_match` helper + `SENTENCE_MATCH_*` constants are retained as ready-to-wire infra. Every API handler now requires a bearer token.

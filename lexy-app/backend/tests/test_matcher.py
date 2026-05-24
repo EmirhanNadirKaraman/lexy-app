@@ -11,10 +11,43 @@ from httpx import ASGITransport, AsyncClient
 
 MATCH = "/api/v1/sentences/match"
 
+_FAKE_USER = {
+    "user_id": "00000000-0000-0000-0000-000000000000",
+    "email": "matcher-test@example.com",
+    "is_admin": False,
+}
+
 
 @pytest.fixture
 async def matcher_client():
-    """App client with DB pool creation stubbed out."""
+    """Authenticated app client with the DB pool stubbed out.
+
+    /sentences/match is auth-gated (S16). We override `get_current_user` with a
+    fake user so these tests stay DB-free (no token issue / user lookup) while
+    still exercising the route body. The tokenless-rejection path is covered
+    separately by `anon_matcher_client`.
+    """
+    from backend.main import app
+    from backend.core.deps import get_current_user
+
+    app.dependency_overrides[get_current_user] = lambda: _FAKE_USER
+    try:
+        with (
+            patch("backend.database.create_pool", new_callable=AsyncMock),
+            patch("backend.database.close_pool", new_callable=AsyncMock),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                yield ac
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.fixture
+async def anon_matcher_client():
+    """Unauthenticated client (no `get_current_user` override) — used to assert
+    the auth gate rejects tokenless requests before any matcher work runs."""
     from backend.main import app
 
     with (
@@ -25,6 +58,32 @@ async def matcher_client():
             transport=ASGITransport(app=app), base_url="http://test"
         ) as ac:
             yield ac
+
+
+# ---------------------------------------------------------------------------
+# S16 — authentication gate (route is logged-in-only, not public)
+# ---------------------------------------------------------------------------
+
+
+async def test_unauthenticated_request_rejected(anon_matcher_client: AsyncClient):
+    """No bearer token → 403 (HTTPBearer), before any spaCy work. This closes
+    S16: the endpoint is no longer a public CPU-exhaustion surface."""
+    resp = await anon_matcher_client.post(MATCH, json={"sentence": "Ich lerne Deutsch."})
+    assert resp.status_code == 403
+
+
+async def test_authenticated_request_succeeds(matcher_client: AsyncClient):
+    """A logged-in user still gets normal phrase extraction."""
+    resp = await matcher_client.post(MATCH, json={"sentence": "Ich lerne Deutsch."})
+    assert resp.status_code == 200
+    assert len(resp.json()["phrases"]) > 0
+
+
+async def test_oversize_sentence_returns_422(matcher_client: AsyncClient):
+    """Input cap retained as defence-in-depth even for authenticated callers:
+    a >1000-char body is rejected by schema validation before the matcher runs."""
+    resp = await matcher_client.post(MATCH, json={"sentence": "x" * 1001})
+    assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------
