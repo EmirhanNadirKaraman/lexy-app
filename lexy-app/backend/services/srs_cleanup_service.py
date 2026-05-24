@@ -36,18 +36,31 @@ NOT EXISTS (
 """
 
 
-async def find_orphan_srs_cards(pool: asyncpg.Pool) -> list[dict]:
+async def find_orphan_srs_cards(
+    pool: asyncpg.Pool, user_id: str | None = None
+) -> list[dict]:
     """
     Return every orphan `srs_cards` row identifier. Ordered by
     `(user_id, item_id, direction)` for deterministic reporting.
+
+    `user_id` (optional) scopes the audit to one user. **Additive** — `None` is
+    the global scan the cleanup script runs, unchanged. Tests pass their own
+    user_id so the global scan/delete can't race another xdist worker's rows.
+    The value is bound via `$1`; only a constant clause is concatenated.
     """
+    where = _ORPHAN_PREDICATE
+    args: list = []
+    if user_id is not None:
+        where = where + "   AND sc.user_id = $1::uuid\n"
+        args.append(user_id)
     rows = await pool.fetch(
         f"""
         SELECT sc.card_id, sc.user_id, sc.item_id, sc.item_type, sc.direction
           FROM srs_cards sc
-         WHERE {_ORPHAN_PREDICATE}
+         WHERE {where}
          ORDER BY sc.user_id, sc.item_id, sc.direction
         """,
+        *args,
     )
     return [
         {
@@ -61,7 +74,9 @@ async def find_orphan_srs_cards(pool: asyncpg.Pool) -> list[dict]:
     ]
 
 
-async def cleanup_orphan_srs_cards(pool: asyncpg.Pool, apply: bool = False) -> dict:
+async def cleanup_orphan_srs_cards(
+    pool: asyncpg.Pool, apply: bool = False, user_id: str | None = None
+) -> dict:
     """
     Audit (and optionally delete) orphan `srs_cards` rows.
 
@@ -75,20 +90,31 @@ async def cleanup_orphan_srs_cards(pool: asyncpg.Pool, apply: bool = False) -> d
     With `apply=False` (default) no rows are written. With `apply=True`, runs
     a single DELETE over the same predicate inside a transaction. A second
     `apply=True` pass returns `deleted == 0`.
+
+    `user_id` (optional) scopes the audit + delete to one user. **Additive** —
+    `None` is the global pass the script runs, unchanged. Tests pass their own
+    user_id so the global DELETE can't remove another xdist worker's orphan rows
+    mid-test (which skewed the count assertions).
     """
-    orphans = await find_orphan_srs_cards(pool)
+    orphans = await find_orphan_srs_cards(pool, user_id)
     found = len(orphans)
 
     if not apply or found == 0:
         return {"found": found, "deleted": 0, "dry_run": not apply}
 
+    where = _ORPHAN_PREDICATE
+    args: list = []
+    if user_id is not None:
+        where = where + "   AND sc.user_id = $1::uuid\n"
+        args.append(user_id)
     async with pool.acquire() as conn:
         async with conn.transaction():
             result = await conn.execute(
                 f"""
                 DELETE FROM srs_cards sc
-                 WHERE {_ORPHAN_PREDICATE}
+                 WHERE {where}
                 """,
+                *args,
             )
     # asyncpg returns "DELETE N"
     deleted = int(result.rsplit(" ", 1)[-1]) if result.startswith("DELETE") else 0

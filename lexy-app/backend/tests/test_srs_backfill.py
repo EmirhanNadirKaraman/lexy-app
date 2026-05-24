@@ -85,7 +85,7 @@ async def test_audit_finds_learning_word_missing_active_srs(db_pool):
     wid = await _get_word_id(db_pool)
     await _plant_pre_0b_learning(db_pool, uid, wid, "word")
 
-    rows = await find_missing_active_cards(db_pool)
+    rows = await find_missing_active_cards(db_pool, uid)
     assert _matches(rows, uid, wid, "word")
 
 
@@ -96,7 +96,7 @@ async def test_audit_finds_learning_phrase_missing_active_srs(db_pool):
     uid = await _create_user(db_pool)
     await _plant_pre_0b_learning(db_pool, uid, pid, "phrase")
 
-    rows = await find_missing_active_cards(db_pool)
+    rows = await find_missing_active_cards(db_pool, uid)
     assert _matches(rows, uid, pid, "phrase")
 
 
@@ -108,7 +108,7 @@ async def test_audit_ignores_grammar_rule_rows(db_pool):
     uid = await _create_user(db_pool)
     await _plant_pre_0b_learning(db_pool, uid, rid, "grammar_rule")
 
-    rows = await find_missing_active_cards(db_pool)
+    rows = await find_missing_active_cards(db_pool, uid)
     assert not _matches(rows, uid, rid, "grammar_rule")
 
 
@@ -126,7 +126,7 @@ async def test_audit_ignores_known_and_unknown_status_rows(db_pool):
         """,
         uid, wid,
     )
-    rows = await find_missing_active_cards(db_pool)
+    rows = await find_missing_active_cards(db_pool, uid)
     assert not _matches(rows, uid, wid, "word")
 
 
@@ -145,7 +145,7 @@ async def test_audit_ignores_rows_that_already_have_active_srs_card(db_pool):
         """,
         uid, wid,
     )
-    rows = await find_missing_active_cards(db_pool)
+    rows = await find_missing_active_cards(db_pool, uid)
     assert not _matches(rows, uid, wid, "word")
 
 
@@ -158,7 +158,7 @@ async def test_backfill_inserts_active_card_with_expected_defaults(db_pool):
     wid = await _get_word_id(db_pool)
     await _plant_pre_0b_learning(db_pool, uid, wid, "word")
 
-    result = await backfill_missing_active_cards(db_pool, apply=True)
+    result = await backfill_missing_active_cards(db_pool, apply=True, user_id=uid)
     assert result["inserted"] >= 1
 
     card = await db_pool.fetchrow(
@@ -191,7 +191,7 @@ async def test_backfill_does_not_mutate_user_word_knowledge(db_pool):
         """,
         uid, wid,
     )
-    await backfill_missing_active_cards(db_pool, apply=True)
+    await backfill_missing_active_cards(db_pool, apply=True, user_id=uid)
     after = await db_pool.fetchrow(
         """
         SELECT status, passive_level, active_level, times_seen, times_used_correctly
@@ -208,8 +208,8 @@ async def test_backfill_is_idempotent(db_pool):
     wid = await _get_word_id(db_pool)
     await _plant_pre_0b_learning(db_pool, uid, wid, "word")
 
-    first = await backfill_missing_active_cards(db_pool, apply=True)
-    second = await backfill_missing_active_cards(db_pool, apply=True)
+    first = await backfill_missing_active_cards(db_pool, apply=True, user_id=uid)
+    second = await backfill_missing_active_cards(db_pool, apply=True, user_id=uid)
 
     assert first["inserted"] >= 1
     assert second["inserted"] == 0, "second apply must be a no-op"
@@ -231,7 +231,7 @@ async def test_backfill_dry_run_does_not_insert(db_pool):
     wid = await _get_word_id(db_pool)
     await _plant_pre_0b_learning(db_pool, uid, wid, "word")
 
-    result = await backfill_missing_active_cards(db_pool, apply=False)
+    result = await backfill_missing_active_cards(db_pool, apply=False, user_id=uid)
     assert result["dry_run"] is True
     assert result["inserted"] == 0
     assert result["found"] >= 1
@@ -263,7 +263,7 @@ async def test_backfill_does_not_touch_passive_srs_card(db_pool):
         """,
         uid, wid,
     )
-    await backfill_missing_active_cards(db_pool, apply=True)
+    await backfill_missing_active_cards(db_pool, apply=True, user_id=uid)
     after = await db_pool.fetchrow(
         """
         SELECT due_date, interval_days, ease_factor, repetitions
@@ -274,6 +274,25 @@ async def test_backfill_does_not_touch_passive_srs_card(db_pool):
         uid, wid,
     )
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# Global path (no user_id) — the scripts' real call shape. Kept as coverage so
+# the additive user_id param can't silently break the unscoped behaviour. Uses
+# apply=False (dry-run): a global apply=True INSERT…SELECT would FK-race other
+# xdist workers' user deletions, which is exactly why the other tests scope to
+# their own user_id.
+# ---------------------------------------------------------------------------
+
+async def test_backfill_global_dry_run_smoke(db_pool):
+    uid = await _create_user(db_pool)
+    wid = await _get_word_id(db_pool)
+    await _plant_pre_0b_learning(db_pool, uid, wid, "word")
+
+    result = await backfill_missing_active_cards(db_pool, apply=False)  # global, no user_id
+    assert result["dry_run"] is True
+    assert result["inserted"] == 0
+    assert result["found"] >= 1  # at least this test's own planted row
 
 
 # Silence: ensure these tests' planted rows don't pollute neighbours.

@@ -50,13 +50,26 @@ SELECT uwk.user_id, uwk.item_id, uwk.item_type
 """
 
 
-async def find_missing_active_cards(pool: asyncpg.Pool) -> list[dict]:
+async def find_missing_active_cards(
+    pool: asyncpg.Pool, user_id: str | None = None
+) -> list[dict]:
     """
     Return every (user_id, item_id, item_type) triple whose `learning` row
     has no matching active SRS card. Ordered by user_id then item_id for
     deterministic reporting.
+
+    `user_id` (optional) scopes the audit to a single user. **Additive**: the
+    default `None` is the global scan the maintenance scripts rely on — that
+    behaviour is unchanged. Tests pass their own user_id so a global scan can't
+    race other xdist workers' transient `learning` rows.
     """
-    rows = await pool.fetch(_AUDIT_SQL + "\n ORDER BY uwk.user_id, uwk.item_id")
+    sql = _AUDIT_SQL
+    args: list = []
+    if user_id is not None:
+        sql += "   AND uwk.user_id = $1::uuid\n"
+        args.append(user_id)
+    sql += " ORDER BY uwk.user_id, uwk.item_id"
+    rows = await pool.fetch(sql, *args)
     return [
         {
             "user_id":   str(r["user_id"]),
@@ -67,7 +80,9 @@ async def find_missing_active_cards(pool: asyncpg.Pool) -> list[dict]:
     ]
 
 
-async def backfill_missing_active_cards(pool: asyncpg.Pool, apply: bool = False) -> dict:
+async def backfill_missing_active_cards(
+    pool: asyncpg.Pool, apply: bool = False, user_id: str | None = None
+) -> dict:
     """
     Audit (and optionally apply) the missing-active-card backfill.
 
@@ -83,6 +98,11 @@ async def backfill_missing_active_cards(pool: asyncpg.Pool, apply: bool = False)
     is idempotent — re-running is safe and yields `inserted == 0` on the
     second pass.
 
+    `user_id` (optional) scopes both the audit and the insert to one user.
+    **Additive** — `None` is the global pass the scripts run, unchanged. Tests
+    pass their own user_id so the global `INSERT ... SELECT` can't FK-violate on
+    another xdist worker's user being deleted mid-statement.
+
     Crucially does NOT change:
       - user_word_knowledge.passive_level
       - user_word_knowledge.active_level
@@ -90,19 +110,18 @@ async def backfill_missing_active_cards(pool: asyncpg.Pool, apply: bool = False)
       - user_word_knowledge.times_used_correctly
       - any existing srs_cards row (passive or active)
     """
-    missing = await find_missing_active_cards(pool)
+    missing = await find_missing_active_cards(pool, user_id)
     found = len(missing)
 
     if not apply or found == 0:
         return {"found": found, "inserted": 0, "dry_run": not apply}
 
-    # Mirror _update_srs("create") defaults: due NOW, interval 1d, ease 2.5,
-    # reps 0. Wrap in a transaction so a partial failure doesn't leave half
-    # the backfill committed.
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            result = await conn.execute(
-                """
+    # Same WHERE as the audit above; the optional user filter is spliced in
+    # identically (a constant clause + the value bound via $1 — not string
+    # interpolation of the value) so the count and the insert never diverge.
+    user_filter = "\n           AND uwk.user_id = $1::uuid" if user_id is not None else ""
+    args = [user_id] if user_id is not None else []
+    insert_head = """
                 INSERT INTO srs_cards
                     (user_id, item_id, item_type, direction,
                      due_date, interval_days, ease_factor, repetitions)
@@ -117,10 +136,14 @@ async def backfill_missing_active_cards(pool: asyncpg.Pool, apply: bool = False)
                           AND sc.item_id   = uwk.item_id
                           AND sc.item_type = uwk.item_type
                           AND sc.direction = 'active'
-                   )
-                ON CONFLICT (user_id, item_id, item_type, direction) DO NOTHING
-                """,
-            )
+                   )"""
+    insert_tail = "\n                ON CONFLICT (user_id, item_id, item_type, direction) DO NOTHING"
+    # Mirror _update_srs("create") defaults: due NOW, interval 1d, ease 2.5,
+    # reps 0. Wrap in a transaction so a partial failure doesn't leave half
+    # the backfill committed.
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            result = await conn.execute(insert_head + user_filter + insert_tail, *args)
     # asyncpg returns "INSERT 0 N" — strip the trailing count.
     inserted = int(result.rsplit(" ", 1)[-1]) if result.startswith("INSERT") else 0
     return {"found": found, "inserted": inserted, "dry_run": False}

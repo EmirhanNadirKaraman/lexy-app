@@ -50,7 +50,7 @@ These were failing before #0b and are tracked here so they don't get blamed on f
 |---|---|---|
 | ~~`test_matcher.py` × 5~~ | ~~AttributeError~~ | **RESOLVED 2026-05-19** as a side effect of #5b's Path A fix. `matcher_service.match_sentence` now wraps the string with `_pf.nlp()` before calling `extract_german_logic`. All 6 matcher tests pass. |
 | ~~`test_settings.py` × 3~~ | ~~stale ALL_PREFERENCE_KEYS~~ | **RESOLVED 2026-05-19**. `ALL_PREFERENCE_KEYS` now derives from `settings_service.DEFAULTS` plus the four derived keys (`liked_categories`, `disliked_categories`, `liked_genres`, `disliked_genres`) that `get_preferences` always appends — stays in sync automatically when DEFAULTS grows. `test_get_preferences_new_user_returns_defaults` updated to expect the four empty derived lists alongside DEFAULTS. |
-| `test_account_deletion.py::test_client_error_log_user_id_set_null_on_delete` and `test_srs_backfill.py::test_audit_ignores_rows_that_already_have_active_srs_card` | Intermittent under `pytest -n auto` only | **Parallel-execution races, not logic bugs** (observed 2026-05-24, S1/S5 work). Both **pass serially** and in isolation; the `srs_backfill` one throws `UniqueViolationError` on `srs_cards (user_id,item_id,item_type,direction)` from cross-worker collisions on shared global tables. Unrelated to any specific feature diff. Re-confirm with `MOCK_LLM=true python -m pytest backend/tests/test_account_deletion.py backend/tests/test_srs_backfill.py -q` (serial → green). Fix would be worker-scoped isolation of the shared rows; deferred. |
+| ~~`test_account_deletion.py::test_client_error_log_user_id_set_null_on_delete` and `test_srs_backfill.py::test_audit_ignores…`~~ (the `srs_cards` family) | ~~Intermittent under `pytest -n auto`~~ | **RESOLVED 2026-05-24 (test isolation round 3)** — see the round-3 section below. The actual errors were a `client_error_log` global-`DELETE`/unscoped-pick race **and** a `srs_cards` **ForeignKeyViolation** (not Unique) from the global backfill `INSERT…SELECT` racing a concurrent worker's user deletion. Fixed by per-worker message tagging (client errors) + an additive `user_id` scope on the four `srs_*` maintenance functions. Full suite `-n auto` now green twice. |
 
 ---
 
@@ -174,6 +174,19 @@ Round 1 owned the `word_table` rows tests *pick*; round 2 fixes tests that depen
 **Acceptable shared-row reads left as-is (verified, not churned):** `phrase_table` `LIMIT 1` picks (`_get_phrase` in `test_srs_gloss`/`test_srs_backfill`/`test_reading_progression`/`test_audit_holes`/`test_recommendations`) read a row that `phrase_service` seeds at startup and **no test reaps**; `video`/`sentence` `LIMIT 1` reads (`test_recommendations`, `test_transcript_click`) hit scraper-populated rows that tests only ever read. None are mutated by the suite, so the pick is stable — unlike `word_table`, which has active per-test reaping. (If a future commit adds a phrase/video-reaping fixture, revisit these.)
 
 **Validation:** 3 fixed files serial → 30 passed; fixed + churners (`test_words`/`test_recommendations`/`test_e2e_learning_loop`) `-n auto` → 113 passed / 1 skipped; **full suite `-n auto` run 2× → 687 passed, 2 skipped, 0 failed each.** No production code changed.
+
+🆕 **2026-05-24 — Test isolation round 3: `client_error_log` race + `srs_cards` FK race**
+
+The last documented flake family. Two distinct root causes (the "UniqueViolation" label in the prior tracker was imprecise — the srs one is a **ForeignKeyViolation**):
+
+| Cause | Detail | Fix |
+|---|---|---|
+| `client_error_log` shared-table race (`test_client_errors`, and `test_account_deletion::test_client_error_log_user_id_set_null_on_delete` as collateral) | Every `test_client_errors` test picked `ORDER BY error_id DESC LIMIT 1` (another worker's row) and the autouse cleanup did a **global** `DELETE FROM client_error_log` (deleting other workers' in-flight rows → `row=None` → `TypeError`). | `test_client_errors.py` rewritten: per-worker `_tag()` prefix on every message (rides at the front so it survives `MAX_MESSAGE` truncation), query the row back by tag, cleanup `DELETE … WHERE message LIKE 'cetest-<worker>-%'`. The collateral account-deletion test needed no change once the global DELETE was gone. |
+| `srs_cards` FK race (`test_srs_backfill`, `test_srs_cleanup`, and the varying victims `test_grammar_rules_srs`/`test_audit_holes`) | The maintenance ops `backfill_missing_active_cards` / `cleanup_orphan_srs_cards` scan **all** users. The backfill `INSERT…SELECT` FK-violated when a concurrent worker's user was deleted mid-statement (the FK check reads committed state, not the snapshot — a `JOIN users` would NOT close it); the cleanup's global `DELETE` + count assertions also collided. | **Additive `user_id: str \| None = None`** on all four `srs_backfill_service`/`srs_cleanup_service` functions (default `None` = the global behaviour the maintenance scripts use, byte-identical). Tests pass their own `user_id` so a global scan can't touch other workers' rows. One global dry-run smoke test per service keeps the unscoped path covered. |
+
+**Why a service signature change is in-scope:** the `user_id` param is strictly **additive** — every existing caller (`scripts/backfill_missing_active_srs.py`, `scripts/cleanup_orphan_srs_cards.py`) is unchanged, and "scope a backfill/cleanup to one user" is a genuinely useful maintenance capability. No behaviour change for the global path.
+
+**Validation:** churn group (`test_client_errors` + `test_srs_backfill` + `test_grammar_rules_srs` + `test_srs_cleanup` + `test_audit_holes`) `-n auto` × 3 → 46 passed each (was 3–6 failing); **full suite `-n auto` × 2 → 704 passed, 2 skipped, 0 failed each.**
 
 🆕 **2026-05-24 — Spanish phrase extractor slice 2 (#36)**
 

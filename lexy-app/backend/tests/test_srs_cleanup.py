@@ -75,7 +75,7 @@ async def test_audit_detects_orphan_card(db_pool):
     wid = await _get_word_id(db_pool)
     orphan_id = await _insert_srs(db_pool, uid, wid, "word", "passive")
 
-    rows = await find_orphan_srs_cards(db_pool)
+    rows = await find_orphan_srs_cards(db_pool, uid)
     assert _has(rows, orphan_id)
 
 
@@ -85,7 +85,7 @@ async def test_audit_ignores_card_with_matching_uwk_row(db_pool):
     await _insert_uwk(db_pool, uid, wid, "word")
     valid_id = await _insert_srs(db_pool, uid, wid, "word", "passive")
 
-    rows = await find_orphan_srs_cards(db_pool)
+    rows = await find_orphan_srs_cards(db_pool, uid)
     assert not _has(rows, valid_id)
 
 
@@ -98,7 +98,7 @@ async def test_dry_run_does_not_delete(db_pool):
     wid = await _get_word_id(db_pool)
     orphan_id = await _insert_srs(db_pool, uid, wid, "word", "passive")
 
-    result = await cleanup_orphan_srs_cards(db_pool, apply=False)
+    result = await cleanup_orphan_srs_cards(db_pool, apply=False, user_id=uid)
     assert result["dry_run"] is True
     assert result["deleted"] == 0
     assert result["found"] >= 1
@@ -129,7 +129,7 @@ async def test_apply_deletes_only_orphans(db_pool):
     # Clean it up so the assertions stay focused.
     await db_pool.execute("DELETE FROM srs_cards WHERE card_id = $1", orphan_id)
 
-    result = await cleanup_orphan_srs_cards(db_pool, apply=True)
+    result = await cleanup_orphan_srs_cards(db_pool, apply=True, user_id=uid)
     assert result["dry_run"] is False
     assert result["deleted"] >= 1
 
@@ -149,7 +149,7 @@ async def test_apply_does_not_touch_user_word_knowledge(db_pool):
     pre = await db_pool.fetchval(
         "SELECT COUNT(*) FROM user_word_knowledge WHERE user_id = $1::uuid", uid,
     )
-    await cleanup_orphan_srs_cards(db_pool, apply=True)
+    await cleanup_orphan_srs_cards(db_pool, apply=True, user_id=uid)
     post = await db_pool.fetchval(
         "SELECT COUNT(*) FROM user_word_knowledge WHERE user_id = $1::uuid", uid,
     )
@@ -161,8 +161,8 @@ async def test_idempotent_second_apply_deletes_zero(db_pool):
     wid = await _get_word_id(db_pool)
     await _insert_srs(db_pool, uid, wid, "word", "passive")  # orphan
 
-    first  = await cleanup_orphan_srs_cards(db_pool, apply=True)
-    second = await cleanup_orphan_srs_cards(db_pool, apply=True)
+    first  = await cleanup_orphan_srs_cards(db_pool, apply=True, user_id=uid)
+    second = await cleanup_orphan_srs_cards(db_pool, apply=True, user_id=uid)
 
     assert first["deleted"] >= 1
     assert second["deleted"] == 0
@@ -192,7 +192,7 @@ async def test_apply_does_not_touch_word_or_phrase_tables(db_pool):
     )
 
     try:
-        await cleanup_orphan_srs_cards(db_pool, apply=True)
+        await cleanup_orphan_srs_cards(db_pool, apply=True, user_id=uid)
 
         assert await db_pool.fetchval("SELECT 1 FROM word_table         WHERE word_id = $1",   wid)          == 1
         assert await db_pool.fetchval("SELECT 1 FROM phrase_table       WHERE canonical = $1", phrase_canon) == 1
@@ -200,3 +200,21 @@ async def test_apply_does_not_touch_word_or_phrase_tables(db_pool):
     finally:
         await db_pool.execute("DELETE FROM phrase_table       WHERE canonical = $1", phrase_canon)
         await db_pool.execute("DELETE FROM grammar_rule_table WHERE slug = $1",      grammar_slug)
+
+
+# ---------------------------------------------------------------------------
+# Global path (no user_id) — the cleanup script's real call shape. Coverage so
+# the additive user_id param can't silently break the unscoped behaviour. Uses
+# apply=False (dry-run): a global apply=True DELETE would remove other xdist
+# workers' orphan rows mid-test, which is why the other tests scope to user_id.
+# ---------------------------------------------------------------------------
+
+async def test_cleanup_global_dry_run_smoke(db_pool):
+    uid = await _create_user(db_pool)
+    wid = await _get_word_id(db_pool)
+    await _insert_srs(db_pool, uid, wid, "word", "passive")  # orphan (no uwk)
+
+    result = await cleanup_orphan_srs_cards(db_pool, apply=False)  # global, no user_id
+    assert result["dry_run"] is True
+    assert result["deleted"] == 0
+    assert result["found"] >= 1  # at least this test's own orphan
