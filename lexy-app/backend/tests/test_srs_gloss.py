@@ -41,10 +41,11 @@ async def _register(client: AsyncClient, db_pool, email: str) -> tuple[dict, str
 
 
 async def _get_word(db_pool) -> tuple[int, str, str]:
-    row = await db_pool.fetchrow("SELECT word_id, word, language FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table empty")
-    return row["word_id"], row["word"], row["language"]
+    # Owned, uniquely-named word (xdist-safe — see conftest / docs/TESTS.md).
+    # Gloss is mocked/stubbed in these tests, so the synthetic surface is fine.
+    from ._word_helper import insert_owned_word
+    wid, surface = await insert_owned_word(db_pool, language="de")
+    return wid, surface, "de"
 
 
 async def _get_phrase(db_pool) -> tuple[int, str, str] | None:

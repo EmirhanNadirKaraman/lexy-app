@@ -28,10 +28,10 @@ async def _create_user(pool) -> str:
 
 
 async def _get_word_id(pool) -> int:
-    row = await pool.fetchrow("SELECT word_id FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table empty — run the subtitle pipeline first")
-    return row["word_id"]
+    # Owned, uniquely-named word (xdist-safe — see conftest / docs/TESTS.md).
+    from ._word_helper import insert_owned_word
+    wid, _ = await insert_owned_word(pool)
+    return wid
 
 
 async def _insert_srs(pool, user_id: str, item_id: int, item_type: str, direction: str) -> int:
@@ -120,11 +120,7 @@ async def test_apply_deletes_only_orphans(db_pool):
     # The orphan above shares (user, item, item_type) with the valid row's
     # uwk, so it ISN'T actually an orphan once we plant the uwk. Fix by
     # planting the orphan on a *different* item_id that has no uwk anywhere.
-    other_wid = await db_pool.fetchval(
-        "SELECT word_id FROM word_table WHERE word_id <> $1 LIMIT 1", wid,
-    )
-    if other_wid is None:
-        pytest.skip("need at least two distinct word_ids in word_table")
+    other_wid = await _get_word_id(db_pool)  # a second distinct owned word
     real_orphan_id = await _insert_srs(db_pool, uid, other_wid, "word", "passive")
 
     # `orphan_id` is no longer orphan after we planted the uwk row above.
@@ -145,11 +141,7 @@ async def test_apply_does_not_touch_user_word_knowledge(db_pool):
     uid = await _create_user(db_pool)
     wid = await _get_word_id(db_pool)
     await _insert_uwk(db_pool, uid, wid, "word")
-    other_wid = await db_pool.fetchval(
-        "SELECT word_id FROM word_table WHERE word_id <> $1 LIMIT 1", wid,
-    )
-    if other_wid is None:
-        pytest.skip("need at least two distinct word_ids in word_table")
+    other_wid = await _get_word_id(db_pool)  # a second distinct owned word
     await _insert_srs(db_pool, uid, other_wid, "word", "passive")  # orphan
 
     pre = await db_pool.fetchval(

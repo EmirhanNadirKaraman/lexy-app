@@ -129,21 +129,21 @@ gaps closed.
 
 ## Tests added in this session
 
-🆕 **2026-05-24 (latest) — SRS test-isolation fix (flake cluster)**
+🆕 **2026-05-24 (latest) — Test isolation: own the test word (global-table race)**
 
-Root cause of the growing `test_srs_review.py` flake cluster (1→2→4→6 failures across full-suite runs): every test grabbed a **shared** catalog row via `SELECT word_id, word, language FROM word_table LIMIT 1` (no `ORDER BY`). Under `pytest -n auto`, another worker's `_reap_word_ids` (conftest teardown) could delete that exact row mid-test; `review_service.get_due_cards`' filter `WHERE wt.word_id IS NOT NULL` then silently dropped the card, so `_mark_learning_and_get_card_id`'s `assert cards` failed non-deterministically. Order-independent (no `pytest-randomly` installed) and concurrency-triggered (passed serially / in isolation).
+Root cause of the growing flake cluster (`test_srs_review.py` 1→2→4→6 failures across full-suite runs, plus intermittent `test_suggest` / `test_srs_backfill` / `test_account_deletion`): tests grabbed a **shared** `word_table` row via an unfiltered `SELECT ... LIMIT N` (no `ORDER BY`). Under `pytest -n auto`, another worker's `_reap_word_ids` (conftest teardown) could delete that exact row mid-test; `review_service.get_due_cards`' filter `WHERE wt.word_id IS NOT NULL` then silently dropped the card and the assert failed. Order-independent (no `pytest-randomly` installed), concurrency-triggered (passed serially / in isolation).
 
-Fix (tests only — **no production change**): `test_srs_review.py` now owns its data via two fixtures —
-| Fixture | Role |
-|---|---|
-| `make_word(language='de')` | factory; inserts a uniquely-named (`_srstest_<uuid>`) `word_table` row per call, reaps all at teardown, and asserts the reap actually deleted them (regression guard). Surface is unique so no unfiltered pick can ever return it and no other worker can reap it. |
-| `srs_word` | convenience wrapper → `(word_id, surface, 'de')` for the common single-word case. |
+Fix (tests only — **no production change**). Two shared, race-safe patterns now exist; both prevent selecting a row another worker can reap:
+| Pattern | Where it lives | When to use |
+|---|---|---|
+| `make_word` / `srs_word` fixtures + `_word_helper.insert_owned_word` + autouse `_reap_owned_words` | `conftest.py`, `_word_helper.py` | **Default.** Inserts a uniquely-named (`_testword_<uuid>` / `_srstest_<uuid>`) row per call; reaped at teardown. Unique surface ⇒ no unfiltered pick returns it and no worker can reap it. For tests needing an id (or a self-matching surface, e.g. the `/produce` answer). |
+| `word !~ '[0-9_]' ORDER BY word_id LIMIT 1` (real-word filter) | `test_words.py`, `test_free_chat_progression.py` (pre-existing); `test_reading_progression.py` (this pass) | Deterministically picks a REAL corpus word, excluding synthetic surfaces (digits/underscores). Use where the surface must round-trip the matcher/lemmatizer (`find_catalog_item`) — a synthetic token wouldn't resolve. Also race-safe (real words are never reaped). |
 
-`_get_word` (the `LIMIT 1` helper) deleted; all ~15 call sites use the fixtures; `test_due_limit_param_is_respected` uses two `make_word()` words.
+**Migrated to owned words:** `test_srs_review`, `test_reminders`, `test_audit_holes`, `test_rate_limit`, `test_guided_chat_targets`, `test_recommendations`, `test_usage_events`, `test_e2e_learning_loop`, `test_progression`, `test_transcript_click`, `test_insights`, `test_srs_produce`, `test_srs_backfill`, `test_srs_gloss`, `test_srs_cleanup`, `test_prioritization`. **Real-word filter:** `test_reading_progression`. **Already safe, left as-is:** `test_words`, `test_free_chat_progression`. **Out of scope** (different tables, not part of this race): `phrase_table` / `sentence` LIMIT picks (`_get_phrase`, `_get_two_sentences`).
 
-**Validation:** serial 23/23; `test_srs_review.py` + the heavy word-churners (`test_words`, `test_srs_backfill`, `test_suggest`, `test_recommendations`) under `-n auto` run **3×** → 125 passed each, 0 failures.
+**Regression guards:** `test_word_fixtures.py` — `make_word` + `insert_owned_word` produce unique, present rows; custom surface + language honoured.
 
-**Known residual (deferred follow-up):** 7 other files still use the same unfiltered `word_table LIMIT N` pattern and carry the identical latent race — `test_audit_holes.py`, `test_reminders.py`, `test_rate_limit.py`, `test_guided_chat_targets.py`, `test_recommendations.py`, `test_usage_events.py`, `test_e2e_learning_loop.py`. They flake far less (fewer due-card assertions) but should migrate to `make_word`-style ownership. Not done here to keep this change scoped to the SRS cluster.
+**Validation:** newly-migrated subset serial → 188 passed; SRS + churners `-n auto` 3× → 125 each; **full suite `-n auto` run 2× → 623 passed, 2 skipped, 0 failed each** (previously 1–6 intermittent failures per run).
 
 🆕 **2026-05-24 — Spanish phrase extractor slice 2 (#36)**
 

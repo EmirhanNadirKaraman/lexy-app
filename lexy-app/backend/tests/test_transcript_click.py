@@ -46,10 +46,10 @@ async def _register_and_login(client: AsyncClient, db_pool, email: str) -> tuple
 
 
 async def _get_word(db_pool) -> int:
-    row = await db_pool.fetchrow("SELECT word_id FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table is empty — run the subtitle pipeline first")
-    return row["word_id"]
+    # Owned, uniquely-named word (xdist-safe — see conftest / docs/TESTS.md).
+    from ._word_helper import insert_owned_word
+    wid, _ = await insert_owned_word(db_pool)
+    return wid
 
 
 async def _get_knowledge(db_pool, uid: str, word_id: int) -> dict | None:
@@ -193,10 +193,11 @@ async def _get_two_sentences(db_pool) -> tuple[int, int]:
 
 
 async def _get_two_words(db_pool) -> tuple[int, int]:
-    rows = await db_pool.fetch("SELECT word_id FROM word_table ORDER BY word_id LIMIT 2")
-    if len(rows) < 2:
-        pytest.skip("word_table has fewer than 2 rows — run the subtitle pipeline first")
-    return rows[0]["word_id"], rows[1]["word_id"]
+    # Two distinct owned words (xdist-safe — see conftest / docs/TESTS.md).
+    from ._word_helper import insert_owned_word
+    w1, _ = await insert_owned_word(db_pool)
+    w2, _ = await insert_owned_word(db_pool)
+    return w1, w2
 
 
 async def test_first_transcript_click_with_sentence_applies_progression(client, db_pool):

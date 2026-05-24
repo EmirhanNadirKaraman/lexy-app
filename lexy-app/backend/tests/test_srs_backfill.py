@@ -31,10 +31,10 @@ async def _create_user(pool) -> str:
 
 
 async def _get_word_id(pool) -> int:
-    row = await pool.fetchrow("SELECT word_id FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table empty — run the subtitle pipeline first")
-    return row["word_id"]
+    # Owned, uniquely-named word (xdist-safe — see conftest / docs/TESTS.md).
+    from ._word_helper import insert_owned_word
+    wid, _ = await insert_owned_word(pool)
+    return wid
 
 
 async def _get_phrase_id(pool) -> int | None:

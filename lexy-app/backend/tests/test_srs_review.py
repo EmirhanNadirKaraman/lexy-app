@@ -14,8 +14,6 @@ Covers:
 
 Implementation matches feature spec — no fixes required.
 """
-import uuid
-
 import pytest
 from httpx import AsyncClient
 
@@ -45,51 +43,9 @@ async def _register_and_get_user(client: AsyncClient, db_pool, email: str) -> tu
     return headers, uid
 
 
-@pytest.fixture
-async def make_word(db_pool):
-    """Factory for isolated, uniquely-named `word_table` rows; all reaped at teardown.
-
-    Test-isolation fix (SRS flake cluster): these tests used to grab a *shared*
-    row via `SELECT ... FROM word_table LIMIT 1` (no ORDER BY). Under
-    `pytest -n auto`, another worker's `_reap_word_ids` (conftest) could delete
-    that exact row mid-test, and `review_service.get_due_cards`' filter
-    `WHERE wt.word_id IS NOT NULL` then silently dropped the card — so
-    `_mark_learning_and_get_card_id`'s `assert cards` failed non-deterministically
-    (the 6-test SRS flake cluster). Each call here inserts a word with a
-    globally-unique surface that ONLY this test's teardown removes, so no other
-    worker can latch onto it (it's never returned by an unfiltered pick) or reap
-    it. Returns an async callable `_make(language='de') -> (word_id, surface)`.
-    """
-    created: list[int] = []
-
-    async def _make(language: str = "de") -> tuple[int, str]:
-        surface = f"_srstest_{uuid.uuid4().hex[:12]}"
-        wid = await db_pool.fetchval(
-            "INSERT INTO word_table (word, language, pos, tag, lemma) "
-            "VALUES ($1, $2, 'X', 'X', $1) RETURNING word_id",
-            surface, language,
-        )
-        created.append(wid)
-        return wid, surface
-
-    yield _make
-
-    if created:
-        await db_pool.execute(
-            "DELETE FROM word_table WHERE word_id = ANY($1::int[])", created
-        )
-        # Regression guard: the reap must actually remove every row it created.
-        remaining = await db_pool.fetchval(
-            "SELECT count(*) FROM word_table WHERE word_id = ANY($1::int[])", created
-        )
-        assert remaining == 0, "teardown left synthetic SRS word rows behind"
-
-
-@pytest.fixture
-async def srs_word(make_word) -> tuple[int, str, str]:
-    """Common single-word case: returns (word_id, surface, language='de')."""
-    wid, surface = await make_word("de")
-    return wid, surface, "de"
+# `make_word` / `srs_word` are shared fixtures in conftest.py (promoted from here
+# so every test file can own its words instead of picking a shared word_table
+# row). See the conftest docstrings + docs/TESTS.md for the isolation rationale.
 
 
 async def _get_srs_card(pool, user_id: str, item_id: int, item_type: str, direction: str) -> dict | None:

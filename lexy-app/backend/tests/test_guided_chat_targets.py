@@ -33,13 +33,6 @@ async def _get_phrase(db_pool, language: str = "de") -> tuple[int, str, str] | N
     return (row["phrase_id"], row["surface_form"], row["canonical"]) if row else None
 
 
-async def _get_word(db_pool) -> tuple[int, str, str]:
-    row = await db_pool.fetchrow("SELECT word_id, word, language FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table is empty")
-    return row["word_id"], row["word"], row["language"]
-
-
 # ---------------------------------------------------------------------------
 # Priority 1: due active SRS card
 # ---------------------------------------------------------------------------
@@ -77,11 +70,9 @@ async def test_picks_phrase_with_due_active_card(db_pool):
     assert target["lemma"]     == canonical
 
 
-async def test_due_word_card_still_chosen_when_no_phrase_due(db_pool):
+async def test_due_word_card_still_chosen_when_no_phrase_due(db_pool, make_word):
     """Existing word path must not regress — a due word card is picked when no phrase is due."""
-    word_id, word, language = await _get_word(db_pool)
-    if language != "de":
-        pytest.skip("test assumes de")
+    word_id, _ = await make_word()  # owned German word (see conftest make_word)
 
     uid = await _make_user(db_pool)
     await db_pool.execute(
@@ -104,16 +95,14 @@ async def test_due_word_card_still_chosen_when_no_phrase_due(db_pool):
     assert target["item_type"] == "word"
 
 
-async def test_phrase_card_chosen_over_word_when_phrase_due_first(db_pool):
+async def test_phrase_card_chosen_over_word_when_phrase_due_first(db_pool, make_word):
     """Priority 1 ordering: whichever card has the earliest due_date wins,
     regardless of item_type."""
     info = await _get_phrase(db_pool)
     if info is None:
         pytest.skip("phrase_table empty")
     phrase_id, _, _ = info
-    word_id, _, language = await _get_word(db_pool)
-    if language != "de":
-        pytest.skip("test assumes de")
+    word_id, _ = await make_word()  # owned German word (see conftest make_word)
 
     uid = await _make_user(db_pool)
 

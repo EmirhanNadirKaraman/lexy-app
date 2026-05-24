@@ -37,6 +37,7 @@ from backend.services.prioritization_service import (
     get_prioritized_items,
 )
 from ._email_helper import make_test_email
+from ._word_helper import insert_owned_word  # owned, xdist-safe words (docs/TESTS.md)
 
 
 # ---------------------------------------------------------------------------
@@ -150,10 +151,7 @@ async def test_new_user_returns_empty_list(db_pool):
 async def test_user_with_learning_word_appears_in_results(db_pool):
     user_id = await _create_user(db_pool)
 
-    word_row = await db_pool.fetchrow("SELECT word_id FROM word_table LIMIT 1")
-    if word_row is None:
-        pytest.skip("No words in word_table")
-    word_id = word_row["word_id"]
+    word_id, _ = await insert_owned_word(db_pool)
 
     await db_pool.execute(
         """
@@ -178,10 +176,7 @@ async def test_user_with_learning_word_appears_in_results(db_pool):
 async def test_user_with_due_srs_card_has_is_due_signal(db_pool):
     user_id = await _create_user(db_pool)
 
-    word_row = await db_pool.fetchrow("SELECT word_id FROM word_table LIMIT 1")
-    if word_row is None:
-        pytest.skip("No words in word_table")
-    word_id = word_row["word_id"]
+    word_id, _ = await insert_owned_word(db_pool)
 
     # Insert knowledge row (status != 'known') and an overdue passive SRS card
     await db_pool.execute(
@@ -212,9 +207,7 @@ async def test_user_with_due_srs_card_has_is_due_signal(db_pool):
 async def test_results_sorted_by_score_descending(db_pool):
     user_id = await _create_user(db_pool)
 
-    word_rows = await db_pool.fetch("SELECT word_id FROM word_table LIMIT 3")
-    if len(word_rows) < 2:
-        pytest.skip("Need at least 2 words")
+    word_rows = [{"word_id": (await insert_owned_word(db_pool))[0]} for _ in range(3)]
 
     for row in word_rows:
         await db_pool.execute(
@@ -234,7 +227,7 @@ async def test_results_sorted_by_score_descending(db_pool):
 async def test_limit_respected(db_pool):
     user_id = await _create_user(db_pool)
 
-    word_rows = await db_pool.fetch("SELECT word_id FROM word_table LIMIT 10")
+    word_rows = [{"word_id": (await insert_owned_word(db_pool))[0]} for _ in range(5)]
     for row in word_rows:
         await db_pool.execute(
             """
@@ -253,10 +246,7 @@ async def test_item_in_multiple_signals_appears_once(db_pool):
     """An item that is both 'learning' and 'due' should appear exactly once with combined score."""
     user_id = await _create_user(db_pool)
 
-    word_row = await db_pool.fetchrow("SELECT word_id FROM word_table LIMIT 1")
-    if word_row is None:
-        pytest.skip("No words in word_table")
-    word_id = word_row["word_id"]
+    word_id, _ = await insert_owned_word(db_pool)
 
     await db_pool.execute(
         """

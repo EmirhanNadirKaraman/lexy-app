@@ -74,16 +74,6 @@ async def _register(client: AsyncClient, db_pool, email: str) -> tuple[dict, str
     return headers, uid
 
 
-async def _get_de_word(db_pool) -> tuple[int, str]:
-    """Fetch a German word + its surface from word_table. Skips if empty."""
-    row = await db_pool.fetchrow(
-        "SELECT word_id, word FROM word_table WHERE language = 'de' LIMIT 1"
-    )
-    if row is None:
-        pytest.skip("word_table has no German entries — run the subtitle pipeline first")
-    return row["word_id"], row["word"]
-
-
 async def _get_uwk(db_pool, uid: str, word_id: int) -> dict | None:
     row = await db_pool.fetchrow(
         """
@@ -114,10 +104,10 @@ async def _get_card(db_pool, uid: str, word_id: int, direction: str) -> dict | N
 # The golden-path test
 # ---------------------------------------------------------------------------
 
-async def test_e2e_learning_loop_golden_path(client: AsyncClient, db_pool):
+async def test_e2e_learning_loop_golden_path(client: AsyncClient, db_pool, make_word):
     """Full learning-loop traversal through real HTTP + real DB."""
     headers, uid = await _register(client, db_pool, _email())
-    word_id, word_surface = await _get_de_word(db_pool)
+    word_id, word_surface = await make_word()  # owned German word (conftest make_word)
 
     # ----- 1. Mark Learning -----
     r = await client.put(
@@ -284,7 +274,7 @@ async def test_e2e_learning_loop_golden_path(client: AsyncClient, db_pool):
 
 
 async def test_e2e_demote_unknown_does_not_fabricate_missing_active_card(
-    client: AsyncClient, db_pool,
+    client: AsyncClient, db_pool, make_word,
 ):
     """Companion to the golden path: a user who reached 'known' via the manual
     confidence click (no production events, so no active card was ever created)
@@ -292,7 +282,7 @@ async def test_e2e_demote_unknown_does_not_fabricate_missing_active_card(
     the 'incorrect' action is documented as a no-op when the card is missing.
     """
     headers, uid = await _register(client, db_pool, _email())
-    word_id, _ = await _get_de_word(db_pool)
+    word_id, _ = await make_word()  # owned German word (conftest make_word)
 
     # Reach 'known' via manual click only. No active card is created by
     # status_marked_known (active_srs=None on that rule).

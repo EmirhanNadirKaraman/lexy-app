@@ -33,10 +33,10 @@ async def _register_and_get_user(client: AsyncClient, db_pool, email: str) -> tu
 
 
 async def _get_word(db_pool) -> tuple[int, str]:
-    row = await db_pool.fetchrow("SELECT word_id, language FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table is empty")
-    return row["word_id"], row["language"]
+    # Owned, uniquely-named word (xdist-safe — see conftest / docs/TESTS.md).
+    from ._word_helper import insert_owned_word
+    wid, _ = await insert_owned_word(db_pool, language="de")
+    return wid, "de"
 
 
 async def _seed_event(db_pool, uid: str, word_id: int, context: str, outcome: str):

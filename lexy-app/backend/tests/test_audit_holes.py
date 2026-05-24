@@ -31,13 +31,6 @@ async def _register(client: AsyncClient, db_pool, email: str) -> tuple[dict, str
     return headers, uid
 
 
-async def _get_word(db_pool) -> tuple[int, str]:
-    row = await db_pool.fetchrow("SELECT word_id, language FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table is empty")
-    return row["word_id"], row["language"]
-
-
 # ---------------------------------------------------------------------------
 # Hole 7 — status_marked_unknown is a no-op
 # ---------------------------------------------------------------------------
@@ -89,11 +82,11 @@ def test_passive_review_correct_bumps_passive_level():
 # Hole 5 — RESOLVED 2026-05-18. most_frequent_unknown_items now includes
 # 'transcript' in its context IN clause. Subtitle clicks surface in the
 # "Keeps coming up" insight card. Kept as a regression guard.
-async def test_transcript_context_in_frequent_unknowns_aggregation(db_pool):
+async def test_transcript_context_in_frequent_unknowns_aggregation(db_pool, make_word):
     """Direct test of the aggregation, not via HTTP."""
     from backend.services.usage_events_service import most_frequent_unknown_items
 
-    word_id, _ = await _get_word(db_pool)
+    word_id, _ = await make_word()
     uid = uuid.uuid4()
 
     try:
@@ -129,8 +122,8 @@ async def test_transcript_context_in_frequent_unknowns_aggregation(db_pool):
 # Hole 0a — PARTIALLY RESOLVED 2026-05-19. Backend payload now carries
 # prompt_text + answer_text (#0a-1). The frontend UI rewrite is #0a-2 — still
 # pending. This regression guard locks in the backend half of the contract.
-async def test_active_srs_card_has_english_prompt(client: AsyncClient, db_pool):
-    word_id, language = await _get_word(db_pool)
+async def test_active_srs_card_has_english_prompt(client: AsyncClient, db_pool, srs_word):
+    word_id, _, language = srs_word
     headers, _ = await _register(client, db_pool, _email())
 
     await client.put(

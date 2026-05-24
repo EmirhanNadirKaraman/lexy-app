@@ -27,13 +27,6 @@ async def _register(client: AsyncClient, db_pool, email: str) -> tuple[dict, str
     return headers, uid
 
 
-async def _get_word(db_pool) -> tuple[int, str]:
-    row = await db_pool.fetchrow("SELECT word_id, language FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table is empty")
-    return row["word_id"], row["language"]
-
-
 async def test_summary_returns_expected_keys(client: AsyncClient, db_pool):
     headers, _ = await _register(client, db_pool, _email())
 
@@ -57,8 +50,8 @@ async def test_summary_is_zero_for_new_user(client: AsyncClient, db_pool):
     assert body["has_anything_due"]   is False
 
 
-async def test_summary_counts_learning_word(client: AsyncClient, db_pool):
-    word_id, _ = await _get_word(db_pool)
+async def test_summary_counts_learning_word(client: AsyncClient, db_pool, srs_word):
+    word_id, _, _ = srs_word
     headers, _ = await _register(client, db_pool, _email())
 
     await client.put(
@@ -75,8 +68,8 @@ async def test_summary_counts_learning_word(client: AsyncClient, db_pool):
     assert body["has_anything_due"] is True
 
 
-async def test_summary_does_not_count_known(client: AsyncClient, db_pool):
-    word_id, _ = await _get_word(db_pool)
+async def test_summary_does_not_count_known(client: AsyncClient, db_pool, srs_word):
+    word_id, _, _ = srs_word
     headers, _ = await _register(client, db_pool, _email())
 
     await client.put(

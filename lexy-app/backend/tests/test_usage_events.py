@@ -29,17 +29,41 @@ from ._email_helper import make_test_email
 # Helpers
 # ---------------------------------------------------------------------------
 
-_word_ids: list[int] = []  # cached to avoid repeated DB calls
+_created_word_ids: list[int] = []  # reaped after each test by the autouse fixture below
+
+
+@pytest.fixture(autouse=True)
+async def _reap_created_words(db_pool):
+    """Reap words created by `_make_word` after each test — xdist-safe isolation.
+
+    Was: `_make_word` returned a SHARED catalog row (cached `SELECT ... LIMIT 20`).
+    Under `pytest -n auto` another worker could reap a cached row mid-test, so
+    aggregations that join word_table (`most_frequent_unknown_items` et al.)
+    dropped it and the test flaked. `_make_word` now inserts an owned word per
+    call; this fixture deletes exactly those rows afterwards.
+    """
+    yield
+    if _created_word_ids:
+        await db_pool.execute(
+            "DELETE FROM word_table WHERE word_id = ANY($1::int[])", _created_word_ids
+        )
+        _created_word_ids.clear()
 
 
 async def _make_word(pool, offset: int = 0) -> int:
-    """Return an existing word_id from word_table. Skips test if table is empty."""
-    if not _word_ids:
-        rows = await pool.fetch("SELECT word_id FROM word_table LIMIT 20")
-        if not rows:
-            pytest.skip("word_table is empty — run the subtitle pipeline first")
-        _word_ids.extend(r["word_id"] for r in rows)
-    return _word_ids[offset % len(_word_ids)]
+    """Create and return a fresh, uniquely-named word_id (owned + reaped).
+
+    `offset` is retained for call-site compatibility but no longer changes the
+    result — every call yields a distinct word, which is all the callers need.
+    """
+    surface = f"_testword_{uuid.uuid4().hex[:12]}"
+    wid = await pool.fetchval(
+        "INSERT INTO word_table (word, language, pos, tag, lemma) "
+        "VALUES ($1, 'de', 'NOUN', 'NN', $1) RETURNING word_id",
+        surface,
+    )
+    _created_word_ids.append(wid)
+    return wid
 
 
 async def _make_user(pool, email: str) -> str:

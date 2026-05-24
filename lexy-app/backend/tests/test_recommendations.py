@@ -752,25 +752,23 @@ async def _make_user(db_pool) -> str:
     return str(user["user_id"])
 
 
-async def test_enrich_by_type_buckets_words_and_phrases(db_pool):
+async def test_enrich_by_type_buckets_words_and_phrases(db_pool, make_word):
     """Mixed enrichment fans out to the per-type enrichers and returns a
     composite-keyed dict."""
     from backend.services.recommendation_service import enrich_by_type
 
-    word_row = await db_pool.fetchrow(
-        "SELECT word_id, word, language FROM word_table LIMIT 1"
-    )
+    # Phrase still comes from the shared catalog (phrase_table is out of scope for
+    # the word_table isolation pass); the word is owned + reaped (conftest
+    # make_word) and created in the phrase's language so the two match.
     phrase_row = await db_pool.fetchrow(
         "SELECT phrase_id, surface_form, language FROM phrase_table LIMIT 1"
     )
-    if word_row is None or phrase_row is None:
-        pytest.skip("word_table or phrase_table empty")
+    if phrase_row is None:
+        pytest.skip("phrase_table empty")
 
-    word_id  = word_row["word_id"]
+    language = phrase_row["language"]
     phrase_id = phrase_row["phrase_id"]
-    language = word_row["language"]
-    if phrase_row["language"] != language:
-        pytest.skip("word and phrase languages differ")
+    word_id, word_surface = await make_word(language)
 
     uid = await _make_user(db_pool)
 
@@ -781,7 +779,7 @@ async def test_enrich_by_type_buckets_words_and_phrases(db_pool):
     )
     assert ("word", word_id) in enrichment
     assert ("phrase", phrase_id) in enrichment
-    assert enrichment[("word", word_id)]["display_text"]   == word_row["word"]
+    assert enrichment[("word", word_id)]["display_text"]   == word_surface
     assert enrichment[("phrase", phrase_id)]["display_text"] == phrase_row["surface_form"]
 
 

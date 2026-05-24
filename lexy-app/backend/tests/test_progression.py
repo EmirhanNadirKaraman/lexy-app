@@ -36,16 +36,13 @@ from ._email_helper import make_test_email
 # Helpers
 # ---------------------------------------------------------------------------
 
-_word_ids: list[int] = []
-
-
 async def _get_word_id(pool, offset: int = 0) -> int:
-    if not _word_ids:
-        rows = await pool.fetch("SELECT word_id FROM word_table LIMIT 5")
-        if not rows:
-            pytest.skip("word_table is empty — run the subtitle pipeline first")
-        _word_ids.extend(r["word_id"] for r in rows)
-    return _word_ids[offset % len(_word_ids)]
+    # Owned, uniquely-named word (xdist-safe — see conftest / docs/TESTS.md).
+    # `offset` retained for call-site compatibility; each call now yields a
+    # distinct word, reaped after the test by conftest's _reap_owned_words.
+    from ._word_helper import insert_owned_word
+    wid, _ = await insert_owned_word(pool)
+    return wid
 
 
 async def _make_user(pool) -> str:

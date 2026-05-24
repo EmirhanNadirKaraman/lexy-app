@@ -13,6 +13,7 @@ matching THIS worker's pattern, so parallel workers can't trample each other's
 in-flight users.
 """
 import os
+import uuid
 from pathlib import Path
 
 import asyncpg
@@ -20,6 +21,7 @@ import pytest
 from dotenv import load_dotenv
 from httpx import ASGITransport, AsyncClient
 
+from . import _word_helper
 from ._email_helper import cleanup_pattern
 
 # .env is four levels up from this file:
@@ -105,3 +107,77 @@ async def tracked_words(db_pool):
     created: list[int] = []
     yield created
     await _reap_word_ids(db_pool, created)
+
+
+@pytest.fixture
+async def make_word(db_pool, tracked_words):
+    """Factory for test-OWNED, xdist-safe `word_table` rows.
+
+    Use this instead of `SELECT ... FROM word_table LIMIT N`. An unfiltered pick
+    returns a SHARED catalog row that another xdist worker can reap mid-test
+    (its `_reap_word_ids` teardown), after which `review_service.get_due_cards`'
+    `WHERE wt.word_id IS NOT NULL` drops the card and the test fails randomly —
+    the root cause of the SRS flake cluster (see docs/TESTS.md). Each call here
+    inserts a row with a globally-unique surface (`_testword_<uuid>`) and
+    registers it with `tracked_words`, so the existing reap deletes exactly what
+    this test created. The unique surface means no unfiltered pick anywhere can
+    return it and no other worker can delete it.
+
+        word_id, surface = await make_word()                  # German NOUN
+        word_id, surface = await make_word("es", pos="VERB")  # custom
+
+    Returns an async callable `(language='de', *, word, lemma, pos, tag,
+    frequency) -> (word_id, surface)`.
+    """
+    async def _make(
+        language: str = "de",
+        *,
+        word: str | None = None,
+        lemma: str | None = None,
+        pos: str = "NOUN",
+        tag: str = "NN",
+        frequency: int | None = None,
+    ) -> tuple[int, str]:
+        surface = word or f"_testword_{uuid.uuid4().hex[:12]}"
+        if frequency is None:
+            wid = await db_pool.fetchval(
+                "INSERT INTO word_table (word, language, pos, tag, lemma) "
+                "VALUES ($1, $2, $3, $4, $5) RETURNING word_id",
+                surface, language, pos, tag, lemma or surface,
+            )
+        else:
+            wid = await db_pool.fetchval(
+                "INSERT INTO word_table (word, language, pos, tag, lemma, frequency) "
+                "VALUES ($1, $2, $3, $4, $5, $6) RETURNING word_id",
+                surface, language, pos, tag, lemma or surface, frequency,
+            )
+        tracked_words.append(wid)
+        return wid, surface
+
+    return _make
+
+
+@pytest.fixture
+async def srs_word(make_word) -> tuple[int, str, str]:
+    """Convenience: one owned German word as (word_id, surface, 'de')."""
+    wid, surface = await make_word("de")
+    return wid, surface, "de"
+
+
+@pytest.fixture(autouse=True)
+async def _reap_owned_words(db_pool):
+    """Reap words created via `_word_helper.insert_owned_word` after each test.
+
+    Files with an existing local word-helper + many call sites rewrite that
+    helper to call `insert_owned_word` (which registers the id); this autouse
+    fixture deletes exactly those rows afterwards, so the shared `word_table`
+    stays clean and no row a test created can leak into another worker's pick.
+    Cheap no-op for tests that create no owned words. (The fixture-style
+    `make_word` path reaps via `tracked_words` instead.)
+    """
+    yield
+    ids = _word_helper._drain()
+    if ids:
+        await db_pool.execute(
+            "DELETE FROM word_table WHERE word_id = ANY($1::int[])", ids
+        )

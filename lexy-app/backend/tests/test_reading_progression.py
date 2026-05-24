@@ -49,9 +49,18 @@ async def _register_and_login(client: AsyncClient, db_pool, email: str) -> tuple
 
 
 async def _get_word(db_pool) -> tuple[int, str, str]:
-    row = await db_pool.fetchrow("SELECT word_id, word, language FROM word_table LIMIT 1")
+    # find_catalog_item() must resolve this surface back through the matcher /
+    # lemmatizer, so the word has to be a REAL corpus word — a synthetic
+    # `_testword_<uuid>` wouldn't round-trip. We use the same race-safe pattern
+    # as test_words.py: exclude synthetic surfaces (digits/underscores, which
+    # real words never carry) and pick deterministically by word_id, so no
+    # reapable row can ever be selected. (See docs/TESTS.md.)
+    row = await db_pool.fetchrow(
+        "SELECT word_id, word, language FROM word_table "
+        "WHERE word !~ '[0-9_]' ORDER BY word_id LIMIT 1"
+    )
     if row is None:
-        pytest.skip("word_table is empty — run the subtitle pipeline first")
+        pytest.skip("word_table has no plain word — run the subtitle pipeline first")
     return row["word_id"], row["word"], row["language"]
 
 

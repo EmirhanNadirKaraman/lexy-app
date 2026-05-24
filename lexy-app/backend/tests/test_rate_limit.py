@@ -36,13 +36,6 @@ async def _register(client: AsyncClient, db_pool, email: str) -> tuple[dict, str
     return headers, uid
 
 
-async def _get_word(db_pool) -> tuple[int, str, str]:
-    row = await db_pool.fetchrow("SELECT word_id, word, language FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table empty")
-    return row["word_id"], row["word"], row["language"]
-
-
 async def _active_card(client: AsyncClient, db_pool, headers, uid: str, word_id: int) -> int:
     await client.put(
         f"/api/v1/words/word/{word_id}/status",
@@ -151,7 +144,7 @@ def _mock_llm(monkeypatch):
     monkeypatch.setattr(llm_service, "_MOCK", True)
 
 
-async def test_protected_endpoint_returns_429_after_burst(client: AsyncClient, db_pool, monkeypatch):
+async def test_protected_endpoint_returns_429_after_burst(client: AsyncClient, db_pool, monkeypatch, srs_word):
     """POST /srs/review/{card_id}/produce is rate-limited. We tighten the
     per_minute default to 3 via monkeypatch so the burst test is fast.
 
@@ -159,7 +152,7 @@ async def test_protected_endpoint_returns_429_after_burst(client: AsyncClient, d
     patching the dependency, so the route's existing Depends still runs."""
     monkeypatch.setattr(rate_limiter, "PER_MINUTE_DEFAULT", 3)
 
-    word_id, word_text, _ = await _get_word(db_pool)
+    word_id, word_text, _ = srs_word
     headers, uid = await _register(client, db_pool, _email())
     card_id = await _active_card(client, db_pool, headers, uid, word_id)
 
@@ -178,11 +171,11 @@ async def test_protected_endpoint_returns_429_after_burst(client: AsyncClient, d
     assert resp.headers["retry-after"] == "60"
 
 
-async def test_protected_endpoint_429_isolated_per_user(client: AsyncClient, db_pool, monkeypatch):
+async def test_protected_endpoint_429_isolated_per_user(client: AsyncClient, db_pool, monkeypatch, srs_word):
     """User A's saturation must not affect user B."""
     monkeypatch.setattr(rate_limiter, "PER_MINUTE_DEFAULT", 2)
 
-    word_id, word_text, _ = await _get_word(db_pool)
+    word_id, word_text, _ = srs_word
     headers_a, uid_a = await _register(client, db_pool, _email())
     headers_b, uid_b = await _register(client, db_pool, _email())
     card_a = await _active_card(client, db_pool, headers_a, uid_a, word_id)
@@ -203,13 +196,13 @@ async def test_protected_endpoint_429_isolated_per_user(client: AsyncClient, db_
     assert b_ok.status_code == 200
 
 
-async def test_protected_endpoint_429_fires_after_auth(client: AsyncClient, db_pool, monkeypatch):
+async def test_protected_endpoint_429_fires_after_auth(client: AsyncClient, db_pool, monkeypatch, srs_word):
     """No Authorization header → 401/403, NOT 429. Rate limiter only runs
     after get_current_user succeeds, so anonymous callers never enter the
     bucket (and a 429 would actually be misleading)."""
     monkeypatch.setattr(rate_limiter, "PER_MINUTE_DEFAULT", 0)   # nothing should be allowed past auth
 
-    word_id, _, _ = await _get_word(db_pool)
+    word_id, _, _ = srs_word
     resp = await client.post(
         f"{SRS_REVIEW}/{word_id}/produce",
         json={"answer": "x"},
@@ -218,12 +211,12 @@ async def test_protected_endpoint_429_fires_after_auth(client: AsyncClient, db_p
     assert resp.status_code in (401, 403)
 
 
-async def test_srs_due_is_NOT_rate_limited(client: AsyncClient, db_pool, monkeypatch):
+async def test_srs_due_is_NOT_rate_limited(client: AsyncClient, db_pool, monkeypatch, srs_word):
     """GET /srs/due may call translate_item_gloss but is cached. Intentionally
     exempt from the limiter so loading a review session never 429s."""
     monkeypatch.setattr(rate_limiter, "PER_MINUTE_DEFAULT", 1)
 
-    word_id, _, language = await _get_word(db_pool)
+    word_id, _, language = srs_word
     headers, uid = await _register(client, db_pool, _email())
     await _active_card(client, db_pool, headers, uid, word_id)
 
