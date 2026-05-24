@@ -184,7 +184,18 @@ Added a third pattern family (clitic-attached reflexive infinitives) and broaden
 | `subtitle-scraper/phrase_finder.py` | New block 3 in `extract_spanish_logic`: clitic infinitives (`quiero lavarme`→`lavarse`) via VerbForm=Inf + longest-first clitic strip + ends-in-`r` check + override on the recovered base. `_es_prep_candidates` widened to `mark` deps. `_ES_VERB_PREP` +6 pairs (`confiar en`, `consistir en`, `creer en`, `jugar a`, `salir de`, `llegar a`). |
 | `tests/test_spanish_phrase_extractor.py` | +13: 4 clitic infinitives (lavarse/levantarse/ducharse/acostarse), non-reflexive-infinitive negative, 6 verb+prep, 2 deferred-pattern guards (imperative→[], reflexive+prep emits only `acordarse` not `acordar de`). |
 
-**Spanish spaCy (`es_core_news_sm`) limits hit (deferred, documented):** imperatives (`Lávate.`) and some 1sg forms (`llamarme`, `Salgo`, `Llego`) are mis-tagged as non-verbs, so those specific cases don't extract — verb+prep pairs use sentences the model tags correctly. Reflexive+prep combos (`acordarse de`) deferred to a separate set.
+**Spanish spaCy (`es_core_news_sm`) limits hit (deferred, documented):** imperatives (`Lávate.`) and some 1sg forms (`llamarme`, `Salgo`, `Llego`) are mis-tagged as non-verbs, so those specific cases don't extract — verb+prep pairs use sentences the model tags correctly. Reflexive+prep combos (`acordarse de`) deferred to a separate set (shipped in slice 3 below).
+
+🆕 **2026-05-24 — Spanish phrase extractor slice 3 (#36)**
+
+Reflexive+preposition combos for finite forms. Scraper-only (`phrase_finder.py`); German untouched.
+
+| File | Change |
+|---|---|
+| `subtitle-scraper/phrase_finder.py` | New `_ES_REFLEXIVE_PREP` set (separate from `_ES_VERB_PREP`); block 1 restructured so a finite verb with an agreeing reflexive clitic + a matching prep candidate emits `f"{lemma}se {prep}"` (`es_reflexive_prep`) and suppresses the bare reflexive for that token. |
+| `tests/test_spanish_phrase_extractor.py` | +7 net: 5-verb combo matrix (`acordarse/enamorarse/quejarse de`, `preocuparse por`, `olvidarse de`), per-token-suppression guard (`Se queja constantemente.`→`quejarse`, not `quejarse de`), `es_reflexive_prep` match_type lock; the pre-existing `test_reflexive_prep_combo_emits_reflexive_only` renamed/rewritten to `..._emits_combo` (now asserts `acordarse de` present, bare `acordarse` suppressed, `acordar de` never emitted). |
+
+All 5 verb lemmas verified correct against `es_core_news_sm` (no #39 override needed). Per-token suppression only — the bare reflexive still surfaces from prep-less occurrences elsewhere.
 
 **Validation:** root Spanish/dispatcher/es-path → 50 passed · backend `test_matcher.py` → 16 passed · full root suite **630 passed** · full backend suite green (regression).
 

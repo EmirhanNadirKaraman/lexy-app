@@ -397,11 +397,44 @@ def test_imperative_reflexive_currently_unsupported(es_nlp):
     assert _canonicals(es_nlp, "Lávate.") == []
 
 
-def test_reflexive_prep_combo_emits_reflexive_only(es_nlp):
-    """'Me acuerdo de ti.' yields the reflexive 'acordarse' (finite path). The
-    combined reflexive+prep 'acordarse de' is deferred, and crucially we must
-    NOT emit a bare 'acordar de' — 'acordar' is intentionally absent from the
-    verb+prep allowlist (it would be the wrong canonical)."""
+def test_reflexive_prep_combo_emits_combo(es_nlp):
+    """'Me acuerdo de ti.' now yields the reflexive+preposition collocation
+    'acordarse de' (the precise learning unit). The bare reflexive 'acordarse'
+    is suppressed for this token, and 'acordar de' must NEVER be emitted —
+    'acordar' is intentionally absent from the verb+prep allowlist."""
     out = _canonicals(es_nlp, "Me acuerdo de ti.")
-    assert "acordarse" in out
-    assert "acordar de" not in out
+    assert "acordarse de" in out
+    assert "acordarse" not in out      # bare suppressed in the combo sentence
+    assert "acordar de" not in out     # wrong (non-reflexive) canonical, never emitted
+
+
+@pytest.mark.parametrize("sentence, combo, bare", [
+    ("Me acuerdo de mi abuela.",  "acordarse de",   "acordarse"),
+    ("Se enamora de ella.",       "enamorarse de",  "enamorarse"),
+    ("Se queja de todo.",         "quejarse de",    "quejarse"),
+    ("Se preocupa por su madre.", "preocuparse por", "preocuparse"),
+    ("Me olvido de las llaves.",  "olvidarse de",   "olvidarse"),
+])
+def test_reflexive_prep_combos_emit_reflexive_canonical(es_nlp, sentence, combo, bare):
+    """Each finite reflexive+prep verb yields its reflexive collocation, not the
+    bare reflexive (suppressed here) nor the non-reflexive verb+prep form."""
+    out = _canonicals(es_nlp, sentence)
+    assert combo in out
+    assert bare not in out                              # bare suppressed in the combo sentence
+    assert combo.replace("se ", " ", 1) not in out     # e.g. "acordar de" never emitted
+
+
+def test_reflexive_without_prep_still_emits_bare(es_nlp):
+    """Suppression is per-token: a reflexive+prep verb used WITHOUT its
+    preposition still yields the bare reflexive (the combo only wins when the
+    prep is actually present)."""
+    out = _canonicals(es_nlp, "Se queja constantemente.")
+    assert "quejarse" in out
+    assert "quejarse de" not in out
+
+
+def test_reflexive_prep_combo_match_type(es_nlp):
+    """The combo carries the new 'es_reflexive_prep' match_type."""
+    phrases = pf.extract_phrases(es_nlp("Me acuerdo de mi abuela."), "es")
+    combo = [p for p in phrases if p["dictionary_entry"] == "acordarse de"]
+    assert combo and combo[0]["match_type"] == "es_reflexive_prep"

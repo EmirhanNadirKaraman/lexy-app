@@ -411,10 +411,11 @@ def extract_german_logic(doc, overrides=None):
 # Slice 2 also broadened the verb+prep allowlist and the prep-attachment search
 # (now matches `mark` deps, e.g. "consiste en practicar").
 #
-# Still deferred (model-bound or needs a new pattern): imperatives ("lávate" —
-# es_core_news_sm doesn't tag it as a verb), reflexive+preposition combos
-# ("acordarse de" — needs a separate set + canonical builder; see _ES_VERB_PREP
-# note), subjunctive, idioms, MWEs.
+# Reflexive+preposition combos ("acordarse de") are handled for FINITE forms via
+# `_ES_REFLEXIVE_PREP` (block 1a). Still deferred (model-bound or needs a new
+# pattern): imperatives ("lávate" — es_core_news_sm doesn't tag it as a verb),
+# reflexive+prep on a clitic-attached infinitive ("quiero acordarme de…" — block
+# 3 emits the bare reflexive only), subjunctive, idioms, MWEs.
 #
 # Output shape is IDENTICAL to extract_german_logic so pipeline.insert_phrases
 # consumes it unchanged: each dict carries dictionary_entry / sentence_phrase /
@@ -450,6 +451,23 @@ _ES_VERB_PREP = {
     # slice 2 (each has a test in tests/test_spanish_phrase_extractor.py)
     ("confiar", "en"), ("consistir", "en"), ("creer", "en"),
     ("jugar", "a"), ("salir", "de"), ("llegar", "a"),
+}
+
+# Allowlisted REFLEXIVE verb+preposition collocations (bare verb lemma, prep).
+# These are deliberately SEPARATE from `_ES_VERB_PREP` above and must NOT be
+# merged into it: the canonical is the *reflexive* form ("acordarse de"), built
+# as `f"{lemma}se {prep}"`, not "acordar de". They fire only when the finite
+# verb also carries an agreeing reflexive clitic (see extract_spanish_logic
+# block 1); a matching combo SUPPRESSES the bare reflexive ("acordarse") for
+# that token, since the collocation is the real learning unit. (The bare
+# reflexive still surfaces from prep-less occurrences elsewhere — phrase_table
+# dedups across the corpus.)
+_ES_REFLEXIVE_PREP = {
+    ("acordar", "de"),    # acordarse de
+    ("enamorar", "de"),   # enamorarse de
+    ("quejar", "de"),     # quejarse de
+    ("preocupar", "por"), # preocuparse por
+    ("olvidar", "de"),    # olvidarse de
 }
 
 
@@ -490,9 +508,10 @@ def _es_prep_candidates(verb):
 
 
 def extract_spanish_logic(doc, overrides=None):
-    """Spanish phrase extractor (finite reflexives + allowlisted verb+preposition
-    + clitic-attached reflexive infinitives). Returns extract_german_logic's dict
-    shape. `doc` must be a Spanish spaCy Doc; the caller owns model selection.
+    """Spanish phrase extractor (finite reflexives + reflexive+preposition combos
+    + allowlisted verb+preposition + clitic-attached reflexive infinitives).
+    Returns extract_german_logic's dict shape. `doc` must be a Spanish spaCy Doc;
+    the caller owns model selection.
 
     `overrides` (#39) is an optional {observed_lemma: corrected_lemma} map that
     patches spaCy lemmatizer errors (e.g. `duchaber`→`duchar`) before the
@@ -527,6 +546,7 @@ def extract_spanish_logic(doc, overrides=None):
         verb_lemma = overrides.get(verb_lemma, verb_lemma)
 
         # 1. Reflexive verbs: finite verb + an agreeing reflexive clitic child.
+        reflexive_child = None
         for child in token.children:
             if child.pos_ != "PRON":
                 continue
@@ -535,11 +555,28 @@ def extract_spanish_logic(doc, overrides=None):
                 continue
             person, numbers = spec
             if _es_clitic_agrees(token, person, numbers):
-                # lemma is the bare infinitive ("lavar"); guard the rare case
-                # where the model already returns the reflexive lemma.
-                canonical = verb_lemma if verb_lemma.endswith("se") else f"{verb_lemma}se"
-                _emit(canonical, [token.i, child.i], "es_reflexive",
-                      f"{verb_lemma} + {child.text.lower()} (reflexive)")
+                reflexive_child = child
+                break  # at most one reflexive clitic per finite verb
+        if reflexive_child is not None:
+            # lemma is the bare infinitive ("lavar"); guard the rare case where
+            # the model already returns the reflexive lemma.
+            base = verb_lemma if verb_lemma.endswith("se") else f"{verb_lemma}se"
+            # 1a. Reflexive + preposition combo ("acordarse de") — the precise
+            #     collocation. When it matches, it SUPPRESSES the bare reflexive
+            #     for THIS token (bare still surfaces from prep-less occurrences
+            #     elsewhere; phrase_table dedups across the corpus).
+            combo = False
+            for prep_lemma, prep_i in _es_prep_candidates(token):
+                if (verb_lemma, prep_lemma) in _ES_REFLEXIVE_PREP:
+                    combo = True
+                    _emit(f"{base} {prep_lemma}",
+                          [token.i, reflexive_child.i, prep_i],
+                          "es_reflexive_prep",
+                          f"{verb_lemma} + {reflexive_child.text.lower()} + {prep_lemma} (reflexive+prep)")
+                    break
+            if not combo:
+                _emit(base, [token.i, reflexive_child.i], "es_reflexive",
+                      f"{verb_lemma} + {reflexive_child.text.lower()} (reflexive)")
 
         # 2. Verb + preposition from the allowlist.
         for prep_lemma, prep_i in _es_prep_candidates(token):
