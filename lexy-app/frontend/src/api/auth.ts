@@ -29,11 +29,20 @@ export async function login(email: string, password: string): Promise<string> {
     return data.access_token;
 }
 
-export async function register(email: string, password: string): Promise<void> {
+export async function register(
+    email: string,
+    password: string,
+    registrationCode?: string,
+): Promise<void> {
+    // registration_code is only sent when the user supplied one; the backend
+    // enforces it only if REGISTRATION_CODE is configured (S2).
+    const body: Record<string, unknown> = { email, password };
+    if (registrationCode) body.registration_code = registrationCode;
+
     const res = await fetch(apiUrl('/api/v1/auth/register'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify(body),
     });
     if (!res.ok) {
         const err = await res.json().catch(() => ({})) as { detail?: unknown };

@@ -129,7 +129,13 @@ gaps closed.
 
 ## Tests added in this session
 
-🆕 **2026-05-24 (latest) — S3 account-deletion password re-auth**
+🆕 **2026-05-24 (latest) — S9 + S2 registration hardening (no email infra)**
+
+Registration now returns a single generic failure for duplicate-email and bad/missing invite-code alike (S9 enumeration-leak removed), and an optional `REGISTRATION_CODE` env gates signup invite-only (S2), on top of the S1 per-IP throttle.
+- Backend `test_auth.py` **+5**: duplicate uses `GENERIC_REGISTER_ERROR`; code ignored when env unset; code required (missing/wrong → generic 400, correct → 201) when set; wrong-code and duplicate-email responses are byte-identical.
+- Frontend `LoginForm.register.test.tsx` **+4** (new): optional invite-code field shows only in register mode (accessible label); `register()` gets the code when entered / `undefined` when blank; backend generic failure surfaces in the form.
+
+🆕 **2026-05-24 — S3 account-deletion password re-auth**
 
 `DELETE /api/v1/account` now requires the current password in addition to the bearer token.
 - Backend `test_account_deletion.py` **+3**: bare DELETE (token only, no body) / empty password / wrong password → **403** with account + cascade data intact; the existing delete tests now send the password via `client.request("DELETE", …, json={"password": …})` (httpx's `client.delete` takes no body).

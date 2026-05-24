@@ -44,7 +44,10 @@ async def test_register_duplicate_email_returns_400(client: AsyncClient):
 
     second = await client.post(REGISTER, json=payload)
     assert second.status_code == 400
-    assert "already registered" in second.json()["detail"]
+    # S9: the failure is generic and must NOT reveal the email already exists.
+    detail = second.json()["detail"]
+    assert "already registered" not in detail.lower()
+    assert "could not be completed" in detail.lower()
 
 
 async def test_register_normalises_email_to_lowercase(client: AsyncClient):
@@ -59,6 +62,72 @@ async def test_register_normalises_email_to_lowercase(client: AsyncClient):
 async def test_register_short_password_returns_422(client: AsyncClient):
     resp = await client.post(REGISTER, json={"email": make_email(), "password": "short"})
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Registration hardening — non-enumeration (S9) + invite code (S2)
+# ---------------------------------------------------------------------------
+
+async def test_register_duplicate_uses_generic_message(client: AsyncClient):
+    from backend.services.auth_service import GENERIC_REGISTER_ERROR
+    email = make_email()
+    await client.post(REGISTER, json={"email": email, "password": "password123"})
+    r = await client.post(REGISTER, json={"email": email, "password": "password123"})
+    assert r.status_code == 400
+    assert r.json()["detail"] == GENERIC_REGISTER_ERROR
+
+
+async def test_register_code_ignored_when_unset(client: AsyncClient, monkeypatch):
+    """Open registration: a supplied code is harmless, and none is required."""
+    monkeypatch.delenv("REGISTRATION_CODE", raising=False)
+    r1 = await client.post(
+        REGISTER, json={"email": make_email(), "password": "password123", "registration_code": "whatever"}
+    )
+    assert r1.status_code == 201
+    r2 = await client.post(REGISTER, json={"email": make_email(), "password": "password123"})
+    assert r2.status_code == 201
+
+
+async def test_register_requires_code_when_configured(client: AsyncClient, monkeypatch):
+    from backend.services.auth_service import GENERIC_REGISTER_ERROR
+    monkeypatch.setenv("REGISTRATION_CODE", "let-me-in")
+
+    missing = await client.post(REGISTER, json={"email": make_email(), "password": "password123"})
+    assert missing.status_code == 400
+    assert missing.json()["detail"] == GENERIC_REGISTER_ERROR
+
+    wrong = await client.post(
+        REGISTER, json={"email": make_email(), "password": "password123", "registration_code": "nope"}
+    )
+    assert wrong.status_code == 400
+    assert wrong.json()["detail"] == GENERIC_REGISTER_ERROR
+
+    ok = await client.post(
+        REGISTER, json={"email": make_email(), "password": "password123", "registration_code": "let-me-in"}
+    )
+    assert ok.status_code == 201
+
+
+async def test_register_wrong_code_and_duplicate_email_are_indistinguishable(client: AsyncClient, monkeypatch):
+    """With a code configured, a duplicate email (correct code) and a wrong code
+    return the identical response — the cause can't be inferred."""
+    from backend.services.auth_service import GENERIC_REGISTER_ERROR
+    monkeypatch.setenv("REGISTRATION_CODE", "let-me-in")
+
+    email = make_email()
+    created = await client.post(
+        REGISTER, json={"email": email, "password": "password123", "registration_code": "let-me-in"}
+    )
+    assert created.status_code == 201
+
+    dup = await client.post(
+        REGISTER, json={"email": email, "password": "password123", "registration_code": "let-me-in"}
+    )
+    wrong_code = await client.post(
+        REGISTER, json={"email": make_email(), "password": "password123", "registration_code": "bad"}
+    )
+    assert dup.status_code == wrong_code.status_code == 400
+    assert dup.json()["detail"] == wrong_code.json()["detail"] == GENERIC_REGISTER_ERROR
 
 
 # ---------------------------------------------------------------------------

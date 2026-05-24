@@ -25,11 +25,11 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 
 | ID | Severity | Title | Primary location |
 |----|----------|-------|------------------|
-| S2 | MEDIUM | Open registration multiplies the per-user LLM budget | `routers/auth.py` + `services/rate_limiter.py` |
+| S2 | MEDIUM | Open-signup LLM-budget abuse — per-IP throttle (S1) + optional `REGISTRATION_CODE` invite gate DONE (2026-05-24); residual: open signup when no code set (needs email/CAPTCHA) | `routers/auth.py`, `services/auth_service.py` |
 | S3 | MEDIUM | Account-deletion **re-auth DONE** (2026-05-24, password required); residual: no token revocation (leaked token → non-destructive access until 7-day expiry) | `routers/account.py`, `core/security.py`, `frontend/src/auth.ts` |
 | S4 | MEDIUM | DB connection pool created without TLS | `database.py` |
 | S8 | LOW | Upload validation hardened — magic-byte + size (2026-05-24). Residuals (filename sanitization, proxy-level body spool) **deferred as accepted low risk** — no current exploit path | `routers/books.py` |
-| S9 | LOW | User enumeration on registration | `services/auth_service.py` |
+| S9 | LOW | Registration enumeration — generic failure message DONE (2026-05-24); residual: 201-vs-400 status still inferable without email verification | `services/auth_service.py` |
 | S10 | LOW | bcrypt 72-byte truncation; no password max length | `core/security.py`, `models/schemas.py` |
 | S11 | LOW/INFO | FastAPI `/docs` + `/openapi.json` exposed | `main.py` |
 | S12 | LOW | In-memory rate limiter bypassable across workers (known) | `services/rate_limiter.py` |
@@ -44,11 +44,14 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 
 > S1 (auth throttling), S5 (security headers), S6 (crash-report throttle), and S16 (sentence-match auth-gate) were resolved on 2026-05-24 — see *Resolved findings*.
 
-### S2 — Open registration multiplies the per-user LLM budget — MEDIUM
-**Where:** `routers/auth.py` register (no throttle, no email verification, no captcha) combined with `services/rate_limiter.py`, whose budget is keyed *per user*.
-**Impact:** The LLM rate limit is per-user, so an attacker who can mint accounts in a loop multiplies the total LLM spend an attacker can drive — turning the per-user cap into no cap. This is a consequence of S1 but worth tracking on its own because the fix is different (registration friction, not login throttle).
-**Verification check:** Confirm `/auth/register` has no captcha, no email-verification gate, and no per-IP cap (`rg -n 'captcha|verify_email|email_verified' lexy-app/backend` → nothing).
-**Fix:** Require email verification before an account can call paid routes, add a captcha or per-IP registration cap.
+### S2 — Open registration multiplies the per-user LLM budget — MEDIUM — PARTIALLY RESOLVED 2026-05-24
+**Was:** open, unthrottled signup let an attacker mint accounts in a loop and multiply the per-user LLM budget into effectively no cap.
+**Fix shipped (defence-in-depth, no email infra):**
+- **Per-IP register throttle** (S1, already shipped): 5 registrations / hour / IP.
+- **Optional invite code** (`REGISTRATION_CODE` env): when set, `/auth/register` requires a matching `registration_code` (constant-time compare via `hmac.compare_digest`; wrong/missing → the same generic 400 as a duplicate, so the cause isn't revealed). When unset, registration stays open (throttle only). Frontend `LoginForm` shows an optional invite-code field in register mode; `.env.example` documents the var.
+**Residual (deferred):** when `REGISTRATION_CODE` is *unset* (the default), signup is still open — the per-IP throttle slows but doesn't stop a distributed account-minting campaign. Full closure of open-signup abuse wants email verification, CAPTCHA, payment, or invite-only mode (set `REGISTRATION_CODE`). Accepted until one is adopted.
+**Re-check:** with `REGISTRATION_CODE=secret`, `POST /auth/register` without / with wrong code → 400; correct code → 201; unset → open. `rg -n 'REGISTRATION_CODE' lexy-app/backend/services/auth_service.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_auth.py -q` passes.
+**Tests:** `test_auth.py` +4 (code required when set, ignored when unset, wrong-code == duplicate-email response).
 
 ### S3 — Account deletion + long-lived non-revocable token + localStorage (chain) — MEDIUM — PARTIALLY RESOLVED 2026-05-24
 **Was:** `DELETE /api/v1/account` required only a valid bearer token. Combined with 7-day non-revocable JWTs (`core/security.py`) stored in `localStorage`, a leaked token alone could irreversibly delete the account — the worst link in the chain.
@@ -74,11 +77,12 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 2. **Full request body is spooled to disk by Starlette before the handler runs** — the route-level bounded read caps *in-memory* bytes, not the disk spool. This is an infra concern, not app code: the real fix is `client_max_body_size` at the reverse proxy. Deferred to deployment config.
 **Verification check (resolved parts):** unauthenticated upload still requires auth; a `.pdf` whose bytes are `b"not a pdf"` → **400** "not a valid PDF"; a `%PDF-` file with `Content-Type: application/octet-stream` → **200**; oversize → **413** with no downstream call. `rg -n '_PDF_MAGIC' lexy-app/backend/routers/books.py` shows the gate; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_books_upload.py -q` passes.
 
-### S9 — User enumeration on registration — LOW
-**Where:** `services/auth_service.py:14–15` raises "Email already registered" → `routers/auth.py:15` returns it as a 400.
-**Impact:** An attacker can probe which emails have accounts. (Login is *not* enumerable — it returns a generic "Invalid email or password" — see strengths.)
-**Verification check:** Register with a known-existing email → distinct 400 message.
-**Fix:** Return a generic success/"check your email" response and move existence handling into a verification email, or accept the tradeoff explicitly.
+### S9 — User enumeration on registration — LOW — PARTIALLY RESOLVED 2026-05-24
+**Was:** `/auth/register` raised "Email already registered" → a 400 that let an attacker probe which emails have accounts.
+**Fix shipped:** the obvious leak is gone. `auth_service.register_user` raises a single `GENERIC_REGISTER_ERROR` ("Registration could not be completed. Please check your details, or sign in if you already have an account.") for *every* failure — duplicate email, and (when configured) wrong/missing invite code — so the response body no longer distinguishes causes. The frontend shows this message as-is.
+**Residual (deferred — needs email verification):** this only *reduces* enumeration. A successful register still returns a user object (the SPA then logs in), so a **201-vs-400 status** difference remains: with `REGISTRATION_CODE` unset, an attacker can still infer "email exists" from the 400 status alone (just not from the message). True non-enumeration needs an email-verification flow (always 202 "check your email", reveal nothing) — out of scope (no SMTP/email infra). With `REGISTRATION_CODE` set, even that status difference is gated behind knowing the code.
+**Re-check:** register a known email → 400 whose detail == `GENERIC_REGISTER_ERROR` (no "already registered"). `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_auth.py -q` passes.
+**Tests:** `test_auth.py` — duplicate now asserts the generic message; +4 invite-code / indistinguishability tests.
 
 ### S10 — bcrypt 72-byte truncation; no password max length — LOW
 **Where:** `core/security.py:19–24` (`bcrypt.hashpw`/`checkpw`) and `models/schemas.py` (`RegisterRequest.password: str = Field(min_length=8)` — no `max_length`).
@@ -214,4 +218,5 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 - **2026-05-24** — **S16 final fix:** `POST /sentences/match` auth-gated (`Depends(get_current_user)`); public per-IP throttle on it dropped (input cap kept as defence-in-depth). `test_matcher.py` gains auth tests (403 unauth / 200 auth / 422 over-length); obsolete `test_matcher_limits.py` deleted. The now-unused `rate_limit_sentence_match` helper + `SENTENCE_MATCH_*` constants were removed in a follow-up cleanup commit. Every API handler now requires a bearer token.
 - **2026-05-24** — **S8 partially resolved:** PDF upload now validates the `%PDF-` magic header (400 on a renamed non-PDF) before any processing; size guards re-verified (413 via `file.size` + bounded read); `Content-Type` deliberately not gated. `test_books_upload.py` +2 (wrong-magic rejected, mismatched-Content-Type accepted). Residuals deferred: filename sanitization (latent stored-XSS) + full-body disk spool (reverse-proxy fix). Open: S2–S4, S7, S9–S15, S17 (+ S8 residuals).
 - **2026-05-24** — **S7 resolved:** `content_id` validated + normalized to a canonical YouTube id at the API boundary (`model_validator` on `ContentRequestCreate`) before any DB write or scraper spawn — bare ids or youtube.com/youtu.be URLs accepted, everything else 422'd. `test_content_requests.py` +12. Scraper untouched (inherits validated ids); legacy rows not re-validated (deferred). Open: S2–S4, S9–S15, S17 (+ S8 residuals).
+- **2026-05-24** — **S9 + S2 partially resolved (no email infra):** registration failures now return one generic message (`GENERIC_REGISTER_ERROR`) for duplicate-email and bad-invite-code alike (S9 enumeration leak removed); optional `REGISTRATION_CODE` env gates signup invite-only when set, on top of the S1 per-IP throttle (S2). Frontend `LoginForm` gained an optional invite-code field. `test_auth.py` +5; `LoginForm.register.test.tsx` +4. Residuals: true non-enumeration + open-signup closure need email verification / CAPTCHA (deferred). Open: S4, S10–S15, S17 (+ S2/S3/S8/S9 residuals).
 - **2026-05-24** — **S3 partially resolved:** `DELETE /account` now requires password re-auth (verified via `verify_password`; missing/wrong → 403), closing the stolen-token → instant-delete hole. Frontend gained a labelled password field (confirm disabled until filled). Backend `test_account_deletion.py` +3; frontend `AccountDeletion.test.tsx` updated + `api/account.test.ts` +3. **Residual deferred:** token revocation (a leaked token still has non-destructive access until 7-day expiry) — needs the JWT/session model. Open: S2, S4, S9–S15, S17 (+ S3 token-revocation & S8 residuals).

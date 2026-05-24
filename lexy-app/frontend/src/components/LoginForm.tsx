@@ -14,6 +14,7 @@ export function LoginForm({ token, onLogin, onLogout }: Props) {
     const [mode, setMode] = useState<Mode>('closed');
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
+    const [registrationCode, setRegistrationCode] = useState('');
     const [error, setError] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
 
@@ -46,7 +47,7 @@ export function LoginForm({ token, onLogin, onLogout }: Props) {
         setLoading(true);
         try {
             if (mode === 'register') {
-                await register(email, password);
+                await register(email, password, registrationCode || undefined);
             }
             const newToken = await login(email, password);
             setToken(newToken);
@@ -55,6 +56,7 @@ export function LoginForm({ token, onLogin, onLogout }: Props) {
             setMode('closed');
             setEmail('');
             setPassword('');
+            setRegistrationCode('');
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Failed');
         } finally {
@@ -84,6 +86,13 @@ export function LoginForm({ token, onLogin, onLogout }: Props) {
                 aria-label="Password"
                 autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
                 data-testid="login-password" />
+            {mode === 'register' && (
+                <input type="text" placeholder="Invite code (optional)" value={registrationCode}
+                    onChange={e => setRegistrationCode(e.target.value)} style={inputStyle}
+                    aria-label="Registration code (optional)"
+                    autoComplete="off"
+                    data-testid="login-registration-code" />
+            )}
 
             <button type="submit" disabled={loading} style={primaryBtn} data-testid="login-submit">
                 {loading ? '…' : mode === 'register' ? 'Create' : 'Sign in'}

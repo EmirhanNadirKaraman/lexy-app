@@ -13,7 +13,9 @@ async def register(body: RegisterRequest, request: Request, pool=Depends(get_poo
     # Throttle per client IP before any DB lookup / password hashing (S1).
     await rate_limit_register(request)
     try:
-        user = await auth_service.register_user(pool, body.email, body.password)
+        user = await auth_service.register_user(
+            pool, body.email, body.password, body.registration_code
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return UserRead(user_id=user["user_id"], email=user["email"])
