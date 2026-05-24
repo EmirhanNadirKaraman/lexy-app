@@ -129,7 +129,23 @@ gaps closed.
 
 ## Tests added in this session
 
-🆕 **2026-05-24 (latest) — Spanish phrase extractor slice 2 (#36)**
+🆕 **2026-05-24 (latest) — SRS test-isolation fix (flake cluster)**
+
+Root cause of the growing `test_srs_review.py` flake cluster (1→2→4→6 failures across full-suite runs): every test grabbed a **shared** catalog row via `SELECT word_id, word, language FROM word_table LIMIT 1` (no `ORDER BY`). Under `pytest -n auto`, another worker's `_reap_word_ids` (conftest teardown) could delete that exact row mid-test; `review_service.get_due_cards`' filter `WHERE wt.word_id IS NOT NULL` then silently dropped the card, so `_mark_learning_and_get_card_id`'s `assert cards` failed non-deterministically. Order-independent (no `pytest-randomly` installed) and concurrency-triggered (passed serially / in isolation).
+
+Fix (tests only — **no production change**): `test_srs_review.py` now owns its data via two fixtures —
+| Fixture | Role |
+|---|---|
+| `make_word(language='de')` | factory; inserts a uniquely-named (`_srstest_<uuid>`) `word_table` row per call, reaps all at teardown, and asserts the reap actually deleted them (regression guard). Surface is unique so no unfiltered pick can ever return it and no other worker can reap it. |
+| `srs_word` | convenience wrapper → `(word_id, surface, 'de')` for the common single-word case. |
+
+`_get_word` (the `LIMIT 1` helper) deleted; all ~15 call sites use the fixtures; `test_due_limit_param_is_respected` uses two `make_word()` words.
+
+**Validation:** serial 23/23; `test_srs_review.py` + the heavy word-churners (`test_words`, `test_srs_backfill`, `test_suggest`, `test_recommendations`) under `-n auto` run **3×** → 125 passed each, 0 failures.
+
+**Known residual (deferred follow-up):** 7 other files still use the same unfiltered `word_table LIMIT N` pattern and carry the identical latent race — `test_audit_holes.py`, `test_reminders.py`, `test_rate_limit.py`, `test_guided_chat_targets.py`, `test_recommendations.py`, `test_usage_events.py`, `test_e2e_learning_loop.py`. They flake far less (fewer due-card assertions) but should migrate to `make_word`-style ownership. Not done here to keep this change scoped to the SRS cluster.
+
+🆕 **2026-05-24 — Spanish phrase extractor slice 2 (#36)**
 
 Added a third pattern family (clitic-attached reflexive infinitives) and broadened the verb+prep allowlist. Scraper-only (`phrase_finder.py`); German untouched.
 

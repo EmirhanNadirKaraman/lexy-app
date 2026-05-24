@@ -45,12 +45,51 @@ async def _register_and_get_user(client: AsyncClient, db_pool, email: str) -> tu
     return headers, uid
 
 
-async def _get_word(db_pool) -> tuple[int, str, str]:
-    """Return (word_id, word, language) or skip if word_table is empty."""
-    row = await db_pool.fetchrow("SELECT word_id, word, language FROM word_table LIMIT 1")
-    if row is None:
-        pytest.skip("word_table is empty — run the subtitle pipeline first")
-    return row["word_id"], row["word"], row["language"]
+@pytest.fixture
+async def make_word(db_pool):
+    """Factory for isolated, uniquely-named `word_table` rows; all reaped at teardown.
+
+    Test-isolation fix (SRS flake cluster): these tests used to grab a *shared*
+    row via `SELECT ... FROM word_table LIMIT 1` (no ORDER BY). Under
+    `pytest -n auto`, another worker's `_reap_word_ids` (conftest) could delete
+    that exact row mid-test, and `review_service.get_due_cards`' filter
+    `WHERE wt.word_id IS NOT NULL` then silently dropped the card — so
+    `_mark_learning_and_get_card_id`'s `assert cards` failed non-deterministically
+    (the 6-test SRS flake cluster). Each call here inserts a word with a
+    globally-unique surface that ONLY this test's teardown removes, so no other
+    worker can latch onto it (it's never returned by an unfiltered pick) or reap
+    it. Returns an async callable `_make(language='de') -> (word_id, surface)`.
+    """
+    created: list[int] = []
+
+    async def _make(language: str = "de") -> tuple[int, str]:
+        surface = f"_srstest_{uuid.uuid4().hex[:12]}"
+        wid = await db_pool.fetchval(
+            "INSERT INTO word_table (word, language, pos, tag, lemma) "
+            "VALUES ($1, $2, 'X', 'X', $1) RETURNING word_id",
+            surface, language,
+        )
+        created.append(wid)
+        return wid, surface
+
+    yield _make
+
+    if created:
+        await db_pool.execute(
+            "DELETE FROM word_table WHERE word_id = ANY($1::int[])", created
+        )
+        # Regression guard: the reap must actually remove every row it created.
+        remaining = await db_pool.fetchval(
+            "SELECT count(*) FROM word_table WHERE word_id = ANY($1::int[])", created
+        )
+        assert remaining == 0, "teardown left synthetic SRS word rows behind"
+
+
+@pytest.fixture
+async def srs_word(make_word) -> tuple[int, str, str]:
+    """Common single-word case: returns (word_id, surface, language='de')."""
+    wid, surface = await make_word("de")
+    return wid, surface, "de"
 
 
 async def _get_srs_card(pool, user_id: str, item_id: int, item_type: str, direction: str) -> dict | None:
@@ -127,8 +166,8 @@ def test_active_review_incorrect_delta():
 # GET /srs/due
 # ---------------------------------------------------------------------------
 
-async def test_due_returns_empty_list_for_new_user(client: AsyncClient, db_pool):
-    word_id, _, language = await _get_word(db_pool)
+async def test_due_returns_empty_list_for_new_user(client: AsyncClient, db_pool, srs_word):
+    word_id, _, language = srs_word
     headers, _ = await _register_and_get_user(client, db_pool, _email())
 
     resp = await client.get(SRS_DUE, params={"language": language}, headers=headers)
@@ -137,9 +176,9 @@ async def test_due_returns_empty_list_for_new_user(client: AsyncClient, db_pool)
     assert resp.json() == []
 
 
-async def test_due_returns_card_after_marking_word_learning(client: AsyncClient, db_pool):
+async def test_due_returns_card_after_marking_word_learning(client: AsyncClient, db_pool, srs_word):
     """status_marked_learning creates both passive and active SRS cards due NOW → both appear in /srs/due."""
-    word_id, _, language = await _get_word(db_pool)
+    word_id, _, language = srs_word
     headers, _ = await _register_and_get_user(client, db_pool, _email())
 
     await client.put(
@@ -162,9 +201,9 @@ async def test_due_returns_card_after_marking_word_learning(client: AsyncClient,
         assert "display_text" in card
 
 
-async def test_due_card_display_text_is_word_surface_form(client: AsyncClient, db_pool):
+async def test_due_card_display_text_is_word_surface_form(client: AsyncClient, db_pool, srs_word):
     """display_text must come from word_table.word, not stored on srs_cards."""
-    word_id, word_text, language = await _get_word(db_pool)
+    word_id, word_text, language = srs_word
     headers, _ = await _register_and_get_user(client, db_pool, _email())
 
     await client.put(
@@ -177,9 +216,9 @@ async def test_due_card_display_text_is_word_surface_form(client: AsyncClient, d
     assert cards[0]["display_text"] == word_text
 
 
-async def test_due_excludes_known_items(client: AsyncClient, db_pool):
+async def test_due_excludes_known_items(client: AsyncClient, db_pool, srs_word):
     """Items with status='known' must not appear in due cards even if due_date <= NOW."""
-    word_id, _, language = await _get_word(db_pool)
+    word_id, _, language = srs_word
     headers, _ = await _register_and_get_user(client, db_pool, _email())
 
     # Create the SRS card, then promote to known
@@ -198,21 +237,16 @@ async def test_due_requires_language_query_param(client: AsyncClient, db_pool):
     assert resp.status_code == 422
 
 
-async def test_due_limit_param_is_respected(client: AsyncClient, db_pool):
-    rows = await db_pool.fetch("SELECT word_id, language FROM word_table LIMIT 5")
-    if len(rows) < 2:
-        pytest.skip("Need at least 2 words in word_table")
-
-    language = rows[0]["language"]
-    same_lang = [r for r in rows if r["language"] == language]
-    if len(same_lang) < 2:
-        pytest.skip("Need at least 2 words with the same language")
+async def test_due_limit_param_is_respected(client: AsyncClient, db_pool, make_word):
+    # Two isolated, same-language words this test owns and reaps — no shared
+    # `word_table` pick, so a concurrent worker can't perturb the due set.
+    (w1, _), (w2, _) = await make_word("de"), await make_word("de")
 
     headers, _ = await _register_and_get_user(client, db_pool, _email())
-    for r in same_lang[:2]:
-        await client.put(f"/api/v1/words/word/{r['word_id']}/status", json={"status": "learning"}, headers=headers)
+    for wid in (w1, w2):
+        await client.put(f"/api/v1/words/word/{wid}/status", json={"status": "learning"}, headers=headers)
 
-    resp = await client.get(SRS_DUE, params={"language": language, "limit": 1}, headers=headers)
+    resp = await client.get(SRS_DUE, params={"language": "de", "limit": 1}, headers=headers)
 
     assert resp.status_code == 200
     assert len(resp.json()) == 1
@@ -222,8 +256,8 @@ async def test_due_limit_param_is_respected(client: AsyncClient, db_pool):
 # POST /srs/review/{card_id}
 # ---------------------------------------------------------------------------
 
-async def test_submit_correct_answer_returns_success_response(client: AsyncClient, db_pool):
-    word_id, _, language = await _get_word(db_pool)
+async def test_submit_correct_answer_returns_success_response(client: AsyncClient, db_pool, srs_word):
+    word_id, _, language = srs_word
     headers, _ = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
 
@@ -233,12 +267,12 @@ async def test_submit_correct_answer_returns_success_response(client: AsyncClien
     assert resp.json() == {"card_id": card_id, "success": True}
 
 
-async def test_correct_answer_advances_sm2_interval_and_repetitions(client: AsyncClient, db_pool):
+async def test_correct_answer_advances_sm2_interval_and_repetitions(client: AsyncClient, db_pool, srs_word):
     """
     Correct answer on a 'create'-initialized card (interval=1.0, rep=0) should:
       new_interval = 1.0 * 2.5 = 2.5, repetitions = 1.
     """
-    word_id, _, language = await _get_word(db_pool)
+    word_id, _, language = srs_word
     headers, uid = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
 
@@ -250,12 +284,12 @@ async def test_correct_answer_advances_sm2_interval_and_repetitions(client: Asyn
     assert card["interval_days"] > 1.0
 
 
-async def test_incorrect_answer_resets_sm2_to_one_day(client: AsyncClient, db_pool):
+async def test_incorrect_answer_resets_sm2_to_one_day(client: AsyncClient, db_pool, srs_word):
     """
     After one correct then one incorrect answer:
       interval = 1.0, repetitions = 0.
     """
-    word_id, _, language = await _get_word(db_pool)
+    word_id, _, language = srs_word
     headers, uid = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
 
@@ -269,9 +303,9 @@ async def test_incorrect_answer_resets_sm2_to_one_day(client: AsyncClient, db_po
     assert card["repetitions"] == 0
 
 
-async def test_submit_answer_for_another_users_card_returns_404(client: AsyncClient, db_pool):
+async def test_submit_answer_for_another_users_card_returns_404(client: AsyncClient, db_pool, srs_word):
     """Users must not be able to submit answers for cards they don't own."""
-    word_id, _, language = await _get_word(db_pool)
+    word_id, _, language = srs_word
     headers_a, _ = await _register_and_get_user(client, db_pool, _email())
     headers_b, _ = await _register_and_get_user(client, db_pool, _email())
 
@@ -289,8 +323,8 @@ async def test_submit_answer_for_another_users_card_returns_404(client: AsyncCli
 SKIP_URL = "/api/v1/srs/review/{card_id}/skip"
 
 
-async def test_skip_moves_due_date_into_the_future(client: AsyncClient, db_pool):
-    word_id, _, language = await _get_word(db_pool)
+async def test_skip_moves_due_date_into_the_future(client: AsyncClient, db_pool, srs_word):
+    word_id, _, language = srs_word
     headers, uid = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
 
@@ -306,8 +340,8 @@ async def test_skip_moves_due_date_into_the_future(client: AsyncClient, db_pool)
     assert timedelta(hours=23) <= delta <= timedelta(hours=25)
 
 
-async def test_skip_does_not_change_repetitions(client: AsyncClient, db_pool):
-    word_id, _, language = await _get_word(db_pool)
+async def test_skip_does_not_change_repetitions(client: AsyncClient, db_pool, srs_word):
+    word_id, _, language = srs_word
     headers, uid = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
     before = await _get_srs_card(db_pool, uid, word_id, "word", "passive")
@@ -318,8 +352,8 @@ async def test_skip_does_not_change_repetitions(client: AsyncClient, db_pool):
     assert after["repetitions"] == before["repetitions"]
 
 
-async def test_skip_does_not_change_interval_days(client: AsyncClient, db_pool):
-    word_id, _, language = await _get_word(db_pool)
+async def test_skip_does_not_change_interval_days(client: AsyncClient, db_pool, srs_word):
+    word_id, _, language = srs_word
     headers, uid = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
     before = await _get_srs_card(db_pool, uid, word_id, "word", "passive")
@@ -330,8 +364,8 @@ async def test_skip_does_not_change_interval_days(client: AsyncClient, db_pool):
     assert after["interval_days"] == before["interval_days"]
 
 
-async def test_skip_does_not_change_ease_factor(client: AsyncClient, db_pool):
-    word_id, _, language = await _get_word(db_pool)
+async def test_skip_does_not_change_ease_factor(client: AsyncClient, db_pool, srs_word):
+    word_id, _, language = srs_word
     headers, uid = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
     before = await _get_srs_card(db_pool, uid, word_id, "word", "passive")
@@ -342,9 +376,9 @@ async def test_skip_does_not_change_ease_factor(client: AsyncClient, db_pool):
     assert after["ease_factor"] == before["ease_factor"]
 
 
-async def test_skip_does_not_change_levels_or_times_used_correctly(client: AsyncClient, db_pool):
+async def test_skip_does_not_change_levels_or_times_used_correctly(client: AsyncClient, db_pool, srs_word):
     """Skip is scheduling, not evidence — never touches user_word_knowledge fields."""
-    word_id, _, language = await _get_word(db_pool)
+    word_id, _, language = srs_word
     headers, uid = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
 
@@ -371,8 +405,8 @@ async def test_skip_does_not_change_levels_or_times_used_correctly(client: Async
     assert after["status"] == before["status"]
 
 
-async def test_skipped_card_no_longer_appears_in_due_immediately(client: AsyncClient, db_pool):
-    word_id, _, language = await _get_word(db_pool)
+async def test_skipped_card_no_longer_appears_in_due_immediately(client: AsyncClient, db_pool, srs_word):
+    word_id, _, language = srs_word
     headers, _ = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
 
@@ -394,8 +428,8 @@ async def test_skipped_card_no_longer_appears_in_due_immediately(client: AsyncCl
     )
 
 
-async def test_skip_other_users_card_returns_404(client: AsyncClient, db_pool):
-    word_id, _, language = await _get_word(db_pool)
+async def test_skip_other_users_card_returns_404(client: AsyncClient, db_pool, srs_word):
+    word_id, _, language = srs_word
     headers_a, _ = await _register_and_get_user(client, db_pool, _email())
     headers_b, _ = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers_a, language, word_id)
@@ -410,9 +444,9 @@ async def test_skip_missing_card_returns_404(client: AsyncClient, db_pool):
     assert resp.status_code == 404
 
 
-async def test_skip_does_not_emit_usage_event(client: AsyncClient, db_pool):
+async def test_skip_does_not_emit_usage_event(client: AsyncClient, db_pool, srs_word):
     """Regression: skip must not write to word_usage_events (it's not evidence)."""
-    word_id, _, language = await _get_word(db_pool)
+    word_id, _, language = srs_word
     headers, uid = await _register_and_get_user(client, db_pool, _email())
     card_id = await _mark_learning_and_get_card_id(client, headers, language, word_id)
 
