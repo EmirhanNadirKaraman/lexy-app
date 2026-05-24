@@ -42,6 +42,7 @@ if _SCRAPER_DIR not in sys.path:
     sys.path.insert(0, _SCRAPER_DIR)
 from pipeline import (
     LANG_MODEL_MAP,
+    NO_MORPH_LANGS,
     connect,
     get_transcript,
     populate,
@@ -133,7 +134,7 @@ def profiled_populate(*, transcript, language, nlp, dry_run: bool, timer: Timer)
             all_tokens.append(tokens)
 
     POS_LIST = {"VERB", "ADJ", "NOUN", "ADV", "PRON"}
-    NO_MORPH_LANGS = {"ja", "ko"}
+    # NO_MORPH_LANGS now imported from pipeline (← language_config, #18).
 
     with timer.lap("grammar rule extraction (morph)"):
         if language not in NO_MORPH_LANGS:

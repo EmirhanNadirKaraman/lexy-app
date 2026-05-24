@@ -31,36 +31,20 @@ from phrase_finder import extract_phrases
 from transcript_fetcher import fetch_with_retries
 from db_ssl import connect_kwargs
 
+# Language config (#18) — single source in language_config.py. Re-exported here
+# under the historical names so every call site (and the profile scripts) stays
+# unchanged; adding a language means editing language_config.py only.
+from language_config import (  # noqa: E402  (sibling import, after the sys.path insert above)
+    MODEL_MAP as LANG_MODEL_MAP,
+    TRANSCRIPT_CODES as LANG_TRANSCRIPT_CODES,
+    NO_MORPH_LANGS,
+)
+
 
 # VIDEOS_PER_CHANNEL = 5
 # MAX_CHANNELS = 5
 
-LANG_MODEL_MAP = {
-    "en": "en_core_web_sm",
-    "de": "de_core_news_md",
-    "fr": "fr_core_news_sm",
-    "es": "es_core_news_sm",
-    "it": "it_core_news_sm",
-    "pt": "pt_core_news_sm",
-    "ru": "ru_core_news_sm",
-    "ja": "ja_core_news_sm",
-    "ko": "ko_core_news_sm",
-}
-
-LANG_TRANSCRIPT_CODES = {
-    "en": ["en-GB", "en", "en-US"],
-    "de": ["de", "de-DE", "de-AT"],
-    "fr": ["fr", "fr-FR", "fr-CA"],
-    "es": ["es", "es-ES", "es-MX", "es-419"],
-    "it": ["it", "it-IT"],
-    "pt": ["pt", "pt-PT", "pt-BR"],
-    "ru": ["ru", "ru-RU", "ru-UA"],
-    "ja": ["ja", "ja-JP"],
-    "ko": ["ko", "ko-KR"],
-}
-
-NO_MORPH_LANGS = {"ja", "ko"}
-POS_LIST = {"VERB", "ADJ", "NOUN", "ADV", "PRON"}
+POS_LIST = {"VERB", "ADJ", "NOUN", "ADV", "PRON"}  # not language-specific — stays here
 
 
 def connect():

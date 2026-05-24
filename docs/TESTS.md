@@ -86,7 +86,7 @@ full picture):
 Hermetic pytest tests. Two sub-trees:
 - `tests/{subtitles,learning,exposure,pipeline}/` — 537 tests against the `src/app/` refactor (TODO #17 inventory).
 - `tests/runtime/` — 20 tests salvaged onto the runtime root modules (W4 batch 1, 2026-05-20: subtitle cleaner / merger / ingestion / multi-speaker guard / word_knowledge / onboarding).
-- Scraper-facing: `tests/test_scraper_channels.py`, `tests/test_scraper_es_path.py`, and 🆕 `tests/test_scraper_db_ssl.py` (S4 residual — `subtitle-scraper/db_ssl.py` resolver matrix + `seed_channels.connect()` forwards `sslmode`; scraper modules imported via add-if-absent / `sys.modules.pop` fixtures so the file never pollutes `sys.path` for `test_scraper_channels`).
+- Scraper-facing: `tests/test_scraper_channels.py`, `tests/test_scraper_es_path.py`, 🆕 `tests/test_scraper_db_ssl.py` (S4 residual — `subtitle-scraper/db_ssl.py` resolver matrix + `seed_channels.connect()` forwards `sslmode`; scraper modules imported via add-if-absent / `sys.modules.pop` fixtures so the file never pollutes `sys.path` for `test_scraper_channels`), and 🆕 `tests/test_language_config.py` (#18 — `language_config.py` values/order/helpers/unknown-lang/malformed-config + pipeline-no-longer-hardcodes; loaded by `spec_from_file_location` with **no `sys.path` mutation**, the round-3 lesson — a module-level insert here broke `test_scraper_channels` under churn).
 
 Root suite baseline (W4): **562 passed.** Run: `pytest tests/` from repo root.
 
@@ -230,6 +230,19 @@ Proposal-only adjudication; no live LLM calls, no persistence, no mutation. Back
 | `tests/test_lemma_corrections.py` | +12: service-level with a fake adjudicator (proposal returned, **no override mutation**, **no candidate change**, non-pending, not-found, invalid-output → `AdjudicatorError`), prompt builder (fields + the don't-trust-blindly warning), endpoint auth (non-admin 403 / unauth) + 503-no-adjudicator + a happy-path via `dependency_overrides[get_lemma_adjudicator]`. |
 
 **Validation:** `test_lemma_corrections.py` 41 passed (29 + 12); **full backend `-n auto` → 745 passed, 2 skipped, 0 failed.**
+
+🆕 **2026-05-25 — #18: scraper language config centralised**
+
+`subtitle-scraper/language_config.py` is the single source for the per-language maps that were hardcoded in `pipeline.py`. Scraper-only; no behaviour change.
+
+| File | Change |
+|---|---|
+| `subtitle-scraper/language_config.py` (new) | `LANGUAGES` dict + helpers + validation + derived `MODEL_MAP`/`TRANSCRIPT_CODES`/`NO_MORPH_LANGS`. Plain Python (no YAML dep). |
+| `subtitle-scraper/pipeline.py` | 3 dict literals replaced by `from language_config import … as LANG_*` (re-export; 11 call sites unchanged). `POS_LIST` stays. |
+| `subtitle-scraper/profile_pipeline.py` | local `NO_MORPH_LANGS` duplicate now imported from `pipeline` (← config). |
+| `tests/test_language_config.py` (new) | +9: values + `de_core_news_md` asymmetry + **order invariant** + helper semantics + unknown-lang-matches-old + malformed-config `ValueError` + pipeline-no-longer-hardcodes (source check). |
+
+**Validation:** `test_language_config.py` 9 passed; scraper suites (`test_scraper_channels`/`test_scraper_es_path`/`test_phrase_dispatcher`) 28 passed; full root suite **671 passed**; backend unaffected (imports none of the changed files).
 
 🆕 **2026-05-24 — Spanish phrase extractor slice 2 (#36)**
 

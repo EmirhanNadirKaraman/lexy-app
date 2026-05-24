@@ -349,10 +349,11 @@ Coverage of the batch: 8 cleaner + 4 merger + 4 guard + 2 noise + 1 knowledge + 
 
 **Status:** Batch 1 shipped 2026-05-20 (W4) — 20 behavioural tests ported into `tests/runtime/` (subtitle cleaner / merger / ingestion / multi-speaker guard / word_knowledge / onboarding). Runtime APIs matched the refactor exactly; no production code changed. Batches 2+ not yet started; `src/app/` and the rest of `tests/{subtitles,learning,exposure,pipeline}/` still in place pending further salvage.
 
-### 18. 🟡 Hardcoded language config in scraper
-**File:** `subtitle-scraper/pipeline.py:36–60` (`LANG_MODEL_MAP`, `LANG_TRANSCRIPT_CODES`, `NO_MORPH_LANGS`)
-**Problem:** Adding a new language requires editing three dicts + installing a spaCy model + restarting the scraper.
-**Fix:** Move to a `language_config` table (or a YAML file checked into the repo): `(code, spacy_model, transcript_codes[], has_morphology, active)`. Load on scraper start.
+### 18. ✅ Hardcoded language config in scraper — RESOLVED 2026-05-25
+**Was:** `subtitle-scraper/pipeline.py` hardcoded `LANG_MODEL_MAP` / `LANG_TRANSCRIPT_CODES` / `NO_MORPH_LANGS` as three separate dicts; adding a language meant editing all three (+ a duplicated `NO_MORPH_LANGS` in `profile_pipeline.py`).
+**Resolution:** new single-source `subtitle-scraper/language_config.py` — a `LANGUAGES` dict `{code: {spacy_model, transcript_codes[], has_morphology, phrase_extractor}}` + helper fns (`get_spacy_model_name`/`get_transcript_codes`/`has_morphology`/`get_supported_languages`) + validation-on-load + derived `MODEL_MAP`/`TRANSCRIPT_CODES`/`NO_MORPH_LANGS`. `pipeline.py` re-exports those under the historical `LANG_*` names (`from language_config import … as LANG_*`), so all 11 call sites + the profile scripts are unchanged; `profile_pipeline.py`'s duplicate now imports from the config. **Adding a language = edit `language_config.py` only** (+ install the spaCy model). See `docs/MAINTENANCE.md` "How to add a scraper language".
+**Format choice:** plain-Python module, NOT YAML/table — PyYAML is only transitively available (not declared), and the goal was centralisation, not a config-file format; a module is zero-dependency + trivially testable. Can migrate to a table later if needed.
+**Preserved exactly:** `de` → `de_core_news_md` (medium model; the rest `_sm`); the `LANGUAGES` insertion order (load-bearing — `get_transcript` iterates `TRANSCRIPT_CODES.items()` for subtitle auto-detect); unknown-language behaviour. `POS_LIST` stayed in `pipeline.py` (not language-specific). Tests: `tests/test_language_config.py` (9 — values/order/helpers/unknown-lang/malformed-config/pipeline-no-longer-hardcodes); scraper suites green (`test_scraper_channels`/`test_scraper_es_path`/`test_phrase_dispatcher`).
 
 ### 19. ✅ Phrase extraction is German-only — RESOLVED 2026-05-21
 **File:** `subtitle-scraper/phrase_finder.py`, called from `subtitle-scraper/pipeline.py:376`

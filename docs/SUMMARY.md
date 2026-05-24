@@ -203,6 +203,7 @@ Pytest tests for pipeline modules. Mostly hermetic (no DB).
 | `backfill_video_channels.py`, `backfill_channel_names.py`, `backfill_categories.py` | One-off backfills. |
 | `channel_finder.py` | YouTube subscription / CSV channel discovery. Prints IDs to stdout. |
 | `db_ssl.py` | S4 — `sslmode_from_env()` / `connect_kwargs()` resolve `DB_SSL_MODE` to a libpq `sslmode` (reject `prefer`/`allow`; omit on unset/disable). All five `psycopg2.connect()` sites pass `**connect_kwargs()`. Standalone duplicate of `database.resolve_sslmode` (scraper can't import the backend). |
+| `language_config.py` | #18 — single source for per-language config (`LANGUAGES` dict: spacy_model, transcript_codes, has_morphology, phrase_extractor) + helpers + derived `MODEL_MAP`/`TRANSCRIPT_CODES`/`NO_MORPH_LANGS`. `pipeline.py` re-exports these as `LANG_*`. Add a language by editing here only. Plain Python (no YAML dep); order is load-bearing for transcript auto-detect. |
 | `seed_data/channels.json` | Bundled bootstrap seed for the `channel` table. Read by `seed_channels.py`. |
 | `debug_transcript.py` | Single-video transcript debug. |
 | `profile_pipeline.py`, `profile_full_pipeline.py` | Profiling. |

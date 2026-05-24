@@ -170,6 +170,41 @@ is the schema-side prerequisite.
 
 ---
 
+## How to add a scraper language (#18)
+
+Language config is centralised in `subtitle-scraper/language_config.py` — adding
+a language no longer means editing `pipeline.py` in several places.
+
+1. **Add a `LANGUAGES` entry** in `subtitle-scraper/language_config.py`:
+   ```python
+   "it": {
+       "spacy_model": "it_core_news_sm",
+       "transcript_codes": ["it", "it-IT"],   # tried in order
+       "has_morphology": True,                 # False for ja/ko-style langs
+       "phrase_extractor": None,               # "it" once a phrase extractor exists
+   },
+   ```
+   Order matters only relative to other languages for transcript auto-detection
+   (`get_transcript` iterates `TRANSCRIPT_CODES.items()`); append unless you have
+   a reason to prioritise. Validation runs at import — a malformed entry raises a
+   clear `ValueError`.
+2. **Install the spaCy model** on every scraper host: `python -m spacy download
+   it_core_news_sm` (see "spaCy language models" above).
+3. **Seed the `language_table` row** if the content-request flow needs it
+   (migration like 030's `'es'` INSERT), so requests for that language validate.
+4. **Decide phrase extraction.** Words + sentences work for any configured
+   language out of the box. Phrases require an extractor registered in
+   `phrase_finder._LANGUAGE_EXTRACTORS` (German + Spanish today); until then set
+   `phrase_extractor: None` — the scraper writes words/sentences, no phrase rows.
+5. **Add tests** — extend `tests/test_language_config.py` (the new language's
+   model name / transcript codes) and, if you add an extractor, a
+   `tests/test_*_phrase_extractor.py` like the Spanish one.
+
+`pipeline.py` re-exports the config as `LANG_MODEL_MAP` / `LANG_TRANSCRIPT_CODES`
+/ `NO_MORPH_LANGS`, so existing call sites pick up the new language automatically.
+
+---
+
 ## Second-language plan — content-request language policy (Stage 5)
 
 **Decision (2026-05-21):** Spanish v1 does NOT add an
