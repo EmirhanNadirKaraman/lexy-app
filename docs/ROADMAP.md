@@ -474,8 +474,9 @@ the input signal before changing the readout.
 
 ### T2.3 — Deploy gate sweep (no single TODO #)
 - **Effort:** S. Confirm `CORS_ORIGINS` set in prod, JWT secret rotated,
-  `MOCK_LLM=false`, `ANTHROPIC_API_KEY` set, `alembic upgrade head` clean on
-  the prod DB. Sanity check `Procfile` + that the frontend `vite build`
+  `MOCK_LLM=false`, `ANTHROPIC_API_KEY` set, `DB_SSL_MODE=require` (or
+  `verify-full`) when the prod DB is remote (S4), `alembic upgrade head` clean
+  on the prod DB. Sanity check `Procfile` + that the frontend `vite build`
   references the right backend URL via env (or proxy).
 - **Impact:** Required before Capacitor since iOS hits prod.
 - **Risk:** Low.

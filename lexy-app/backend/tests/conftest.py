@@ -21,6 +21,7 @@ import pytest
 from dotenv import load_dotenv
 from httpx import ASGITransport, AsyncClient
 
+from backend.database import _resolve_ssl
 from . import _word_helper
 from ._email_helper import cleanup_pattern
 
@@ -37,6 +38,7 @@ async def db_pool():
         database=os.getenv("DB_NAME"),
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
+        ssl=_resolve_ssl(os.getenv("DB_SSL_MODE")),  # S4: honour DB_SSL_MODE (default plaintext)
     )
     yield pool
     await pool.close()

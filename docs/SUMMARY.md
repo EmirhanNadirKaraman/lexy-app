@@ -12,7 +12,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | Path | Purpose |
 |---|---|
 | `main.py` | FastAPI app. Lifespan: pool init, phrase + grammar seeds, resume pending content requests. Mounts all routers. CORS env-driven via `CORS_ORIGINS` (`_parse_cors_origins`). |
-| `database.py` | asyncpg pool create/close/get. Single global pool. |
+| `database.py` | asyncpg pool create/close/get. Single global pool. TLS configurable via `DB_SSL_MODE` (S4: `disable`/`require`/`verify-ca`/`verify-full`). |
 | `core/deps.py` | `get_current_user` JWT verification dependency. |
 | `core/security.py` | password hashing (bcrypt), `encode_token` / `decode_token`. |
 | `models/schemas.py` | All Pydantic request/response models. ~600 lines, one file. |
