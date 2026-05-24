@@ -874,3 +874,31 @@ class LemmaCorrectionRead(BaseModel):
     report_count: int
     created_at: datetime
     updated_at: datetime
+
+
+# Admin review (#39 slice 3B) — accept promotes to lemma_override, reject does not.
+
+
+class LemmaCorrectionAccept(BaseModel):
+    # When omitted/blank, the candidate's own suggested_lemma is promoted; if
+    # that's also blank the accept is rejected (400 nothing_to_promote).
+    corrected_lemma: str | None = Field(default=None, max_length=200)
+    review_note: str | None = Field(default=None, max_length=1000)
+
+
+class LemmaCorrectionReject(BaseModel):
+    review_note: str | None = Field(default=None, max_length=1000)
+
+
+class LemmaOverrideRead(BaseModel):
+    id: int
+    language: str
+    observed_lemma: str
+    corrected_lemma: str
+    source: str
+    status: str
+
+
+class LemmaCorrectionReviewResult(BaseModel):
+    candidate: LemmaCorrectionRead
+    override: LemmaOverrideRead | None = None  # None for reject

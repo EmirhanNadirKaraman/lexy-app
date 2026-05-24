@@ -8,6 +8,26 @@ from __future__ import annotations
 
 import asyncpg
 
+# Source tag for an override promoted from a reviewed user flag. Single source of
+# truth (must match the CHECK on lemma_override.source — migration 033).
+REVIEWED_OVERRIDE_SOURCE = "user_flag_reviewed"
+
+
+class CandidateNotFound(Exception):
+    """No candidate with that id (router → 404)."""
+
+
+class CandidateNotPending(Exception):
+    """Candidate already reviewed — accepted/rejected/merged (router → 409)."""
+
+    def __init__(self, status: str):
+        super().__init__(status)
+        self.status = status
+
+
+class NothingToPromote(Exception):
+    """Accept with no corrected_lemma and a blank suggested_lemma (router → 400)."""
+
 
 async def create_candidate(
     pool: asyncpg.Pool,
@@ -64,3 +84,96 @@ async def list_candidates(
         status, limit,
     )
     return [dict(r) for r in rows]
+
+
+async def accept_candidate(
+    pool: asyncpg.Pool,
+    *,
+    candidate_id: int,
+    admin_id: str,
+    corrected_lemma: str | None,
+    review_note: str | None,
+) -> dict:
+    """Promote a pending candidate to a `lemma_override` and mark it accepted —
+    the human-gated signal→authority step (slice 3B). Atomic: the override write
+    and the candidate flip are one transaction, so an override failure leaves the
+    candidate pending. Raises `CandidateNotFound` / `CandidateNotPending` /
+    `NothingToPromote`. Returns `{"candidate": ..., "override": ...}`.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            cand = await conn.fetchrow(
+                "SELECT * FROM lemma_correction_candidate WHERE candidate_id = $1 FOR UPDATE",
+                candidate_id,
+            )
+            if cand is None:
+                raise CandidateNotFound()
+            if cand["status"] != "pending":
+                raise CandidateNotPending(cand["status"])
+            chosen = (corrected_lemma or "").strip() or (cand["suggested_lemma"] or "").strip()
+            if not chosen:
+                raise NothingToPromote()
+
+            # Context-free override (surface_form/pos left NULL → matches the
+            # partial unique index uq_lemma_override_lang_observed). Upsert:
+            # update an existing context-free override for the same
+            # (language, observed_lemma), else insert a new one.
+            override = await conn.fetchrow(
+                """
+                INSERT INTO lemma_override
+                    (language, observed_lemma, corrected_lemma, source, status)
+                VALUES ($1, $2, $3, $4, 'active')
+                ON CONFLICT (language, observed_lemma)
+                    WHERE surface_form IS NULL AND pos IS NULL
+                    DO UPDATE SET corrected_lemma = EXCLUDED.corrected_lemma,
+                                  source          = EXCLUDED.source,
+                                  status          = 'active',
+                                  updated_at      = NOW()
+                RETURNING *
+                """,
+                cand["language"], cand["observed_lemma"], chosen, REVIEWED_OVERRIDE_SOURCE,
+            )
+            updated = await conn.fetchrow(
+                """
+                UPDATE lemma_correction_candidate
+                   SET status = 'accepted', reviewed_by = $2::uuid,
+                       reviewed_at = NOW(), review_note = $3, updated_at = NOW()
+                 WHERE candidate_id = $1
+                RETURNING *
+                """,
+                candidate_id, admin_id, review_note,
+            )
+    return {"candidate": dict(updated), "override": dict(override)}
+
+
+async def reject_candidate(
+    pool: asyncpg.Pool,
+    *,
+    candidate_id: int,
+    admin_id: str,
+    review_note: str | None,
+) -> dict:
+    """Mark a pending candidate rejected. NEVER writes `lemma_override`. Raises
+    `CandidateNotFound` / `CandidateNotPending`. Returns `{"candidate": ...,
+    "override": None}`."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            cand = await conn.fetchrow(
+                "SELECT status FROM lemma_correction_candidate WHERE candidate_id = $1 FOR UPDATE",
+                candidate_id,
+            )
+            if cand is None:
+                raise CandidateNotFound()
+            if cand["status"] != "pending":
+                raise CandidateNotPending(cand["status"])
+            updated = await conn.fetchrow(
+                """
+                UPDATE lemma_correction_candidate
+                   SET status = 'rejected', reviewed_by = $2::uuid,
+                       reviewed_at = NOW(), review_note = $3, updated_at = NOW()
+                 WHERE candidate_id = $1
+                RETURNING *
+                """,
+                candidate_id, admin_id, review_note,
+            )
+    return {"candidate": dict(updated), "override": None}

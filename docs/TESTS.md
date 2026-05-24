@@ -207,6 +207,18 @@ Backend signal inbox for bad lemmas (no frontend / LLM / promotion). See `docs/L
 
 **Validation:** `test_lemma_corrections.py` 17 passed; full backend suite `-n auto` → 721 passed, 2 skipped (after the round-4 grammar fix).
 
+🆕 **2026-05-24 — #39 slice 3B: admin accept/reject (promote to `lemma_override`)**
+
+The human-gated signal→authority path. Backend only; see `docs/LEMMA_OVERRIDE_WORKFLOW.md`.
+
+| File | Change |
+|---|---|
+| `services/lemma_correction_service.py` | `accept_candidate` (transactional: `FOR UPDATE` → pending check → choose corrected lemma → upsert `lemma_override` via `ON CONFLICT … DO UPDATE` → flip `accepted`) + `reject_candidate`; domain exceptions `CandidateNotFound`/`CandidateNotPending`/`NothingToPromote`; `REVIEWED_OVERRIDE_SOURCE` constant. |
+| `routers/lemma_corrections.py`, `models/schemas.py` | `POST /admin/lemma-corrections/{id}/{accept,reject}` (`require_admin`), exceptions mapped → 404/409/400. `LemmaCorrectionAccept`/`Reject`/`LemmaOverrideRead`/`ReviewResult`. |
+| `tests/test_lemma_corrections.py` | +12: accept-creates-override, corrected-overrides-suggestion, **existing-override-updates-not-duplicates** (the upsert proof), review metadata, atomicity (both applied), reject-no-override, no-reopen (409 ×2), non-admin/unauth 403, nothing-to-promote 400, not-found 404. **Updated** 3A's `test_post_never_mutates_lemma_override` → scoped to a unique `observed_lemma` (3B writes `lemma_override` concurrently under -n auto). Per-worker-unique `observed_lemma` + override-row cleanup. |
+
+**Validation:** `test_lemma_corrections.py` 29 passed (17 + 12); **full backend `-n auto` × 2 → 733 passed, 2 skipped, 0 failed each.**
+
 🆕 **2026-05-24 — Spanish phrase extractor slice 2 (#36)**
 
 Added a third pattern family (clitic-attached reflexive infinitives) and broadened the verb+prep allowlist. Scraper-only (`phrase_finder.py`); German untouched.

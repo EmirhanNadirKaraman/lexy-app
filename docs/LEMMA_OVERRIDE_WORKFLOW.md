@@ -105,8 +105,9 @@ of how the field arrived (provided, null, or defaulted). Consequence: a flag *wi
 lemma and a flag *without* one are **different** candidates (different key) — the
 suggestion is part of the suspicion's identity.
 
-## What slice 3A ships (this slice)
+## What slices 3A + 3B ship
 
+**3A — the inbox (signal):**
 - `lemma_correction_candidate` table (034).
 - `POST /api/v1/lemma-corrections` — authenticated; validates + caps input;
   creates a pending candidate or bumps `report_count` on a pending duplicate;
@@ -114,17 +115,30 @@ suggestion is part of the suspicion's identity.
 - `GET /api/v1/admin/lemma-corrections?status=pending` — `require_admin`; lists
   newest pending candidates (capped). Read-only.
 
+**3B — the human-gated promotion (signal → authority):**
+- `POST /api/v1/admin/lemma-corrections/{id}/accept` — `require_admin`,
+  **transactional**: locks the candidate (`FOR UPDATE`), requires it `pending`
+  (else 409), picks the corrected lemma (request `corrected_lemma` → else the
+  candidate's `suggested_lemma` → else **400** `nothing_to_promote`), **upserts**
+  a context-free `lemma_override` (`source='user_flag_reviewed'`; `ON CONFLICT`
+  on the partial unique index updates an existing row rather than duplicating),
+  and flips the candidate to `accepted` (+`reviewed_by`/`reviewed_at`/note). An
+  override-write failure rolls back the whole thing — the candidate stays
+  pending. **This is the ONLY path that mutates `lemma_override` from a user
+  signal, and it goes through an admin.**
+- `POST /api/v1/admin/lemma-corrections/{id}/reject` — `require_admin`,
+  transactional: marks the candidate `rejected` (+review metadata). **Never**
+  writes `lemma_override`.
+- No reopen: an already-reviewed (`accepted`/`rejected`) candidate returns 409.
+
 ## What's deferred
 
-- **3B — promotion:** admin accept/reject endpoints; an accepted candidate
-  writes a `lemma_override` row (`source='user_flag_reviewed'`) and flips the
-  candidate's status. This is the only path that ever mutates the override table
-  from a user signal, and it goes through a human.
 - **3C — LLM adjudication (optional):** a batch job feeds pending candidates to
   Haiku ("is `observed_lemma` wrong for `surface_form` in `context_text`? what's
   the correct lemma?") and proposes overrides for admin confirmation. No live
   LLM calls in 3A/3B.
-- **Frontend:** a "this looks wrong" flag button in the reading/SRS UI. None yet.
+- **Frontend:** a "this looks wrong" flag button in the reading/SRS UI, and an
+  admin review screen over the accept/reject endpoints. None yet.
 
 ## Why not let the crowd vote directly (the rejected design)
 

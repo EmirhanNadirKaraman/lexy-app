@@ -29,6 +29,21 @@ def _surf() -> str:
     return f"lc-{worker_id()}-{uuid.uuid4().hex[:10]}"
 
 
+def _obs() -> str:
+    """Per-test-unique observed_lemma. Accept (3B) writes a lemma_override keyed
+    on (language, observed_lemma) — a fixed value would collide across workers,
+    so each review test uses a unique one (reaped by the autouse cleanup)."""
+    return f"obs-{worker_id()}-{uuid.uuid4().hex[:10]}"
+
+
+def _accept_url(cid: int) -> str:
+    return f"/api/v1/admin/lemma-corrections/{cid}/accept"
+
+
+def _reject_url(cid: int) -> str:
+    return f"/api/v1/admin/lemma-corrections/{cid}/reject"
+
+
 async def _register(client: AsyncClient, db_pool, email: str) -> tuple[dict, str]:
     await client.post(REGISTER, json={"email": email, "password": "password123"})
     r = await client.post(LOGIN, json={"email": email, "password": "password123"})
@@ -46,12 +61,34 @@ async def _make_admin(db_pool, user_id) -> None:
     )
 
 
+async def _admin_headers(client: AsyncClient, db_pool) -> tuple[dict, str]:
+    headers, uid = await _register(client, db_pool, make_test_email())
+    await _make_admin(db_pool, uid)
+    return headers, uid
+
+
+async def _post_candidate(client: AsyncClient, headers: dict, *, obs: str,
+                          suggested: str | None = None, surf: str | None = None) -> int:
+    """Create a pending candidate via the public endpoint; return its id."""
+    payload = {"language": "es", "surface_form": surf or _surf(), "observed_lemma": obs}
+    if suggested is not None:
+        payload["suggested_lemma"] = suggested
+    r = await client.post(URL, json=payload, headers=headers)
+    assert r.status_code == 201
+    return r.json()["candidate_id"]
+
+
 @pytest.fixture(autouse=True)
 async def _cleanup_candidates(db_pool):
     yield
     await db_pool.execute(
         "DELETE FROM lemma_correction_candidate WHERE surface_form LIKE $1",
         f"lc-{worker_id()}-%",
+    )
+    # slice 3B: accept writes lemma_override rows — reap this worker's test ones.
+    await db_pool.execute(
+        "DELETE FROM lemma_override WHERE observed_lemma LIKE $1",
+        f"obs-{worker_id()}-%",
     )
 
 
@@ -160,16 +197,23 @@ async def test_different_suggested_lemma_separate_candidate(client: AsyncClient,
 # --- the load-bearing safety guarantee --------------------------------------
 
 async def test_post_never_mutates_lemma_override(client: AsyncClient, db_pool):
-    """A flag is a signal, not authority — it must never touch lemma_override."""
+    """A flag is a signal, not authority — it must never touch lemma_override.
+    Scoped to a unique observed_lemma so a concurrent 3B accept (which DOES write
+    lemma_override) can't skew a global COUNT under -n auto."""
     headers, _ = await _register(client, db_pool, make_test_email())
-    pre = await db_pool.fetchval("SELECT COUNT(*) FROM lemma_override")
+    obs = _obs()
+    pre = await db_pool.fetchval(
+        "SELECT COUNT(*) FROM lemma_override WHERE observed_lemma = $1", obs
+    )
     r = await client.post(URL, json={
         "language": "es", "surface_form": _surf(),
-        "observed_lemma": "duchaber", "suggested_lemma": "duchar",
+        "observed_lemma": obs, "suggested_lemma": "duchar",
     }, headers=headers)
     assert r.status_code == 201
-    post = await db_pool.fetchval("SELECT COUNT(*) FROM lemma_override")
-    assert pre == post
+    post = await db_pool.fetchval(
+        "SELECT COUNT(*) FROM lemma_override WHERE observed_lemma = $1", obs
+    )
+    assert pre == post == 0
 
 
 # --- admin list -------------------------------------------------------------
@@ -208,3 +252,157 @@ async def test_per_user_throttle(client: AsyncClient, db_pool, monkeypatch):
         "language": "es", "surface_form": _surf(), "observed_lemma": "x",
     }, headers=headers)
     assert blocked.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Admin review (#39 slice 3B) — accept promotes to lemma_override; reject doesn't
+# ---------------------------------------------------------------------------
+
+async def _override_for(db_pool, obs: str):
+    return await db_pool.fetchrow(
+        "SELECT * FROM lemma_override WHERE language = 'es' AND observed_lemma = $1 "
+        "AND surface_form IS NULL AND pos IS NULL",
+        obs,
+    )
+
+
+# --- accept ---
+
+async def test_accept_with_suggested_creates_override(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    obs = _obs()
+    cid = await _post_candidate(client, headers, obs=obs, suggested="goodlemma")
+    r = await client.post(_accept_url(cid), json={}, headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["candidate"]["status"] == "accepted"
+    assert body["override"]["corrected_lemma"] == "goodlemma"
+    assert body["override"]["source"] == "user_flag_reviewed"
+    ov = await _override_for(db_pool, obs)
+    assert ov is not None and ov["corrected_lemma"] == "goodlemma"
+
+
+async def test_accept_with_corrected_lemma_overrides_suggestion(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    obs = _obs()
+    cid = await _post_candidate(client, headers, obs=obs, suggested="suggested_fix")
+    r = await client.post(_accept_url(cid), json={"corrected_lemma": "admin_fix"}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["override"]["corrected_lemma"] == "admin_fix"
+    assert (await _override_for(db_pool, obs))["corrected_lemma"] == "admin_fix"
+
+
+async def test_accept_updates_existing_override_no_duplicate(client: AsyncClient, db_pool):
+    """The load-bearing upsert test: an existing context-free override is UPDATED
+    in place (not duplicated) — proves the ON CONFLICT path fires."""
+    headers, _ = await _admin_headers(client, db_pool)
+    obs = _obs()
+    await db_pool.execute(
+        "INSERT INTO lemma_override (language, observed_lemma, corrected_lemma, source) "
+        "VALUES ('es', $1, 'oldvalue', 'manual')",
+        obs,
+    )
+    cid = await _post_candidate(client, headers, obs=obs, suggested="newvalue")
+    r = await client.post(_accept_url(cid), json={}, headers=headers)
+    assert r.status_code == 200
+    rows = await db_pool.fetch(
+        "SELECT corrected_lemma, source FROM lemma_override "
+        "WHERE language='es' AND observed_lemma=$1",
+        obs,
+    )
+    assert len(rows) == 1                                   # updated, not duplicated
+    assert rows[0]["corrected_lemma"] == "newvalue"
+    assert rows[0]["source"] == "user_flag_reviewed"
+
+
+async def test_accept_sets_review_metadata(client: AsyncClient, db_pool):
+    headers, uid = await _admin_headers(client, db_pool)
+    obs = _obs()
+    cid = await _post_candidate(client, headers, obs=obs, suggested="x")
+    await client.post(_accept_url(cid), json={"review_note": "looks right"}, headers=headers)
+    row = await db_pool.fetchrow(
+        "SELECT status, reviewed_by, reviewed_at, review_note "
+        "FROM lemma_correction_candidate WHERE candidate_id = $1",
+        cid,
+    )
+    assert row["status"] == "accepted"
+    assert str(row["reviewed_by"]) == uid
+    assert row["reviewed_at"] is not None
+    assert row["review_note"] == "looks right"
+
+
+async def test_accept_is_atomic_both_applied(client: AsyncClient, db_pool):
+    """Happy-path atomicity: after accept, BOTH the candidate is accepted AND the
+    override exists."""
+    headers, _ = await _admin_headers(client, db_pool)
+    obs = _obs()
+    cid = await _post_candidate(client, headers, obs=obs, suggested="x")
+    await client.post(_accept_url(cid), json={}, headers=headers)
+    cand = await db_pool.fetchrow(
+        "SELECT status FROM lemma_correction_candidate WHERE candidate_id = $1", cid
+    )
+    assert cand["status"] == "accepted"
+    assert await _override_for(db_pool, obs) is not None
+
+
+# --- reject ---
+
+async def test_reject_marks_rejected_no_override(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    obs = _obs()
+    cid = await _post_candidate(client, headers, obs=obs, suggested="x")
+    r = await client.post(_reject_url(cid), json={"review_note": "not a real error"}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["candidate"]["status"] == "rejected"
+    assert r.json()["override"] is None
+    assert await _override_for(db_pool, obs) is None
+
+
+async def test_rejected_cannot_be_accepted(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, headers, obs=_obs(), suggested="x")
+    await client.post(_reject_url(cid), json={}, headers=headers)
+    r = await client.post(_accept_url(cid), json={}, headers=headers)
+    assert r.status_code == 409
+
+
+async def test_accepted_cannot_be_rejected(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, headers, obs=_obs(), suggested="x")
+    await client.post(_accept_url(cid), json={}, headers=headers)
+    r = await client.post(_reject_url(cid), json={}, headers=headers)
+    assert r.status_code == 409
+
+
+# --- auth ---
+
+async def test_normal_user_cannot_accept_or_reject(client: AsyncClient, db_pool):
+    admin_h, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, admin_h, obs=_obs(), suggested="x")
+    user_h, _ = await _register(client, db_pool, make_test_email())
+    assert (await client.post(_accept_url(cid), json={}, headers=user_h)).status_code == 403
+    assert (await client.post(_reject_url(cid), json={}, headers=user_h)).status_code == 403
+
+
+async def test_unauthenticated_cannot_accept_or_reject(client: AsyncClient, db_pool):
+    admin_h, _ = await _admin_headers(client, db_pool)
+    cid = await _post_candidate(client, admin_h, obs=_obs(), suggested="x")
+    assert (await client.post(_accept_url(cid), json={})).status_code in (401, 403)
+    assert (await client.post(_reject_url(cid), json={})).status_code in (401, 403)
+
+
+# --- validation / not-found ---
+
+async def test_accept_nothing_to_promote_returns_400(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    obs = _obs()
+    cid = await _post_candidate(client, headers, obs=obs)        # no suggested_lemma → ''
+    r = await client.post(_accept_url(cid), json={}, headers=headers)  # and no corrected_lemma
+    assert r.status_code == 400
+    assert await _override_for(db_pool, obs) is None             # nothing written
+
+
+async def test_accept_unknown_candidate_returns_404(client: AsyncClient, db_pool):
+    headers, _ = await _admin_headers(client, db_pool)
+    r = await client.post(_accept_url(999_999_999), json={"corrected_lemma": "x"}, headers=headers)
+    assert r.status_code == 404
