@@ -380,7 +380,7 @@ Coverage of the batch: 8 cleaner + 4 merger + 4 guard + 2 noise + 1 knowledge + 
   - 🟡 **Part 3 (per-format audio-track inspection) — deferred, optional.** Current impl uses the single `info["language"]` hint, not per-stream dub detection. Sufficient for now; revisit only if mis-tagging recurs on bilingual-audio videos.
   - The `--requests-only` video path benefits automatically from parts 1 & 2 (it calls `get_transcript` with no language).
 
-### 36. 🟡 Spanish phrase extractor — slices 1–3 shipped 2026-05-24; deeper patterns deferred
+### 36. 🟡 Spanish phrase extractor — slices 1–4 shipped 2026-05-24; deeper patterns deferred
 **File:** `subtitle-scraper/phrase_finder.py` (`extract_spanish_logic`, registered under `'es'` in `_LANGUAGE_EXTRACTORS`)
 **Problem:** Spanish v1 was words-only — `extract_phrases(doc, 'es')` returned `[]`.
 **Status (first slice, #36):** ✅ `extract_spanish_logic(doc)` ships two pattern families:
@@ -392,9 +392,10 @@ Coverage of the batch: 8 cleaner + 4 merger + 4 guard + 2 noise + 1 knowledge + 
   - **Broadened verb+prep allowlist** (+`confiar en`, `consistir en`, `creer en`, `jugar a`, `salir de`, `llegar a`) and the prep-attachment search now also matches `mark` deps (so `consiste en practicar` resolves, not just `case`-marked noun objects).
 **Status (slice 3, 2026-05-24):** ✅ reflexive+preposition combos (finite forms).
   - New `_ES_REFLEXIVE_PREP` set (`acordar de`, `enamorar de`, `quejar de`, `preocupar por`, `olvidar de`) — deliberately SEPARATE from `_ES_VERB_PREP`. A finite verb with an agreeing reflexive clitic AND a matching prep candidate emits the *reflexive* canonical `f"{lemma}se {prep}"` → "acordarse de" (match_type `es_reflexive_prep`), never "acordar de". The combo **suppresses the bare reflexive for that token** ("acordarse"), since the collocation is the real learning unit; the bare form still surfaces from prep-less occurrences elsewhere (phrase_table dedups across the corpus). All 5 verb lemmas verified correct against `es_core_news_sm` (no #39 override needed). Tests: 7 in `tests/test_spanish_phrase_extractor.py` (5-verb matrix + per-token-suppression guard + match_type lock; the pre-existing deferred-state test updated to the new behaviour).
+**Status (slice 4, 2026-05-24):** ✅ reflexive+preposition combos on a clitic-attached infinitive.
+  - Block 3 (clitic-infinitive) now also checks `_es_prep_candidates(token)` against `_ES_REFLEXIVE_PREP`: "quiero acordarme de…" → `acordarse de` (was: bare `acordarse` only). Same suppress-the-bare rule as the finite path (block 1a); `match_type=es_reflexive_prep`. The infinitival "a" ("voy a enamorarme…") is filtered for free — only `(base, prep)` pairs in the set emit. Probe-confirmed against `es_core_news_sm`: the prep attaches to the fused infinitive token as a grand-ADP (`case`), so `_es_prep_candidates` finds it; no model switch / override needed. Tests: +9 in `tests/test_spanish_phrase_extractor.py` (5-verb matrix, bare-fallback when no prep, non-allowlisted-prep negative, no-duplicate-bare guard).
 **Deferred (later slices):**
   - **Imperatives** ("lávate", "levántate") — `es_core_news_sm` tags them as non-verbs, so they extract nothing (regression-guarded). Needs a model that tags imperatives or a normalization pass.
-  - **Reflexive+prep on a clitic-attached infinitive** ("quiero acordarme de…") — block 3 (clitic-infinitive) emits the bare reflexive only; the combo there is the remaining reflexive+prep edge.
   - Promote the allowlist to data/config; idioms, MWEs, subjunctive.
   - **Lemma quality** is handled by the override layer — see #39 (the `ducha`→`duchaber` family; note the clitic-infinitive path lemmatizes `duchar` correctly without an override).
 **Blocks:** nothing — purely additive. German behaviour untouched (regression-guarded by `tests/test_phrase_dispatcher.py` + backend `test_matcher.py`).

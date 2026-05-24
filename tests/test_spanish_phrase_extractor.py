@@ -438,3 +438,53 @@ def test_reflexive_prep_combo_match_type(es_nlp):
     phrases = pf.extract_phrases(es_nlp("Me acuerdo de mi abuela."), "es")
     combo = [p for p in phrases if p["dictionary_entry"] == "acordarse de"]
     assert combo and combo[0]["match_type"] == "es_reflexive_prep"
+
+
+# ---------------------------------------------------------------------------
+# Reflexive+preposition on a clitic-attached infinitive (slice 4)
+# "quiero acordarme de…" — the reflexive is fused into the infinitive token.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sentence, combo, bare", [
+    ("Quiero acordarme de ti.",               "acordarse de",    "acordarse"),
+    ("Voy a enamorarme de ella.",             "enamorarse de",   "enamorarse"),
+    ("Necesito quejarme de esto.",            "quejarse de",     "quejarse"),
+    ("Empiezo a preocuparme por el examen.",  "preocuparse por", "preocuparse"),
+    ("Intento olvidarme de eso.",             "olvidarse de",    "olvidarse"),
+])
+def test_clitic_infinitive_prep_combo(es_nlp, sentence, combo, bare):
+    """An infinitive-attached reflexive + its preposition yields the reflexive
+    collocation, suppressing the bare reflexive and never the non-reflexive form.
+    (The infinitival 'a' in 'voy a …' / 'empiezo a …' is filtered out.)"""
+    out = _canonicals(es_nlp, sentence)
+    assert combo in out
+    assert bare not in out                              # bare suppressed for this token
+    assert combo.replace("se ", " ", 1) not in out      # e.g. "acordar de" never emitted
+
+
+@pytest.mark.parametrize("sentence, bare", [
+    ("Quiero acordarme.",  "acordarse"),
+    ("Necesito quejarme.", "quejarse"),
+])
+def test_clitic_infinitive_without_prep_emits_bare(es_nlp, sentence, bare):
+    """No preposition → the bare reflexive infinitive (slice-2 behaviour), not a combo."""
+    out = _canonicals(es_nlp, sentence)
+    assert bare in out
+    assert f"{bare} de" not in out
+    assert f"{bare} por" not in out
+
+
+def test_clitic_infinitive_non_allowlisted_prep_no_combo(es_nlp):
+    """A preposition not in the reflexive+prep set ('con') yields no combo — the
+    token falls back to the bare reflexive."""
+    out = _canonicals(es_nlp, "Quiero acordarme con ella.")
+    assert "acordarse de" not in out
+    assert "acordarse con" not in out
+    assert "acordarse" in out
+
+
+def test_clitic_infinitive_combo_no_duplicate_bare(es_nlp):
+    """When the combo matches, the same token must not ALSO emit the bare form."""
+    out = _canonicals(es_nlp, "Quiero acordarme de ti.")
+    assert out.count("acordarse de") == 1
+    assert "acordarse" not in out

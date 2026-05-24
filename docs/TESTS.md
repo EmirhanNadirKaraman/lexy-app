@@ -212,6 +212,19 @@ All 5 verb lemmas verified correct against `es_core_news_sm` (no #39 override ne
 
 **Validation:** root Spanish/dispatcher/es-path → 50 passed · backend `test_matcher.py` → 16 passed · full root suite **630 passed** · full backend suite green (regression).
 
+🆕 **2026-05-24 — Spanish phrase extractor slice 4 (#36)**
+
+Reflexive+preposition combos on a clitic-attached infinitive ("quiero acordarme de…"). Scraper-only (`phrase_finder.py`); German untouched.
+
+| File | Change |
+|---|---|
+| `subtitle-scraper/phrase_finder.py` | Block 3 (clitic-infinitive) now also checks `_es_prep_candidates(token)` against `_ES_REFLEXIVE_PREP`: emits `f"{base}se {prep}"` (`es_reflexive_prep`) and suppresses the bare reflexive when a combo matches (same rule as the finite block 1a). The infinitival "a" (`voy a enamorarme…`) is filtered for free — only `(base, prep)` pairs in the set emit. |
+| `tests/test_spanish_phrase_extractor.py` | +9: 5-verb infinitive-combo matrix (`Quiero acordarme de ti.`→`acordarse de`, etc.), bare-fallback when no prep (`Quiero acordarme.`→`acordarse`), non-allowlisted-prep negative (`…acordarme con ella.`→ no combo, bare only), no-duplicate-bare guard. |
+
+Probe-confirmed against `es_core_news_sm`: the preposition attaches to the fused infinitive token as a grand-ADP (`case`), so `_es_prep_candidates` finds it — no model switch or override needed.
+
+**Validation:** root Spanish + dispatcher → 61 passed; backend `test_matcher.py` → 19 passed (German regression); full root suite **662 passed**.
+
 🆕 **2026-05-24 — matcher per-language model + override wiring, #39 slice 2**
 
 Fixed a correctness bug: `matcher_service._extract` parsed **every** language with the German model (`_pf.nlp`), so backend chat matched Spanish through `de_core_news_sm`. Now `_model_for(language)` selects per-language (German resident model; others via `nlp_service`'s cache, lock-guarded; no extractor → skip), and `match_sentence_with_ids` loads `lemma_override` (it has the pool) and threads it into the extractor so chat canonicals come out corrected (`ducharse`).

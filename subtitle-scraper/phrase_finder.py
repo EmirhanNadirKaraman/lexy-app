@@ -411,11 +411,11 @@ def extract_german_logic(doc, overrides=None):
 # Slice 2 also broadened the verb+prep allowlist and the prep-attachment search
 # (now matches `mark` deps, e.g. "consiste en practicar").
 #
-# Reflexive+preposition combos ("acordarse de") are handled for FINITE forms via
-# `_ES_REFLEXIVE_PREP` (block 1a). Still deferred (model-bound or needs a new
-# pattern): imperatives ("lávate" — es_core_news_sm doesn't tag it as a verb),
-# reflexive+prep on a clitic-attached infinitive ("quiero acordarme de…" — block
-# 3 emits the bare reflexive only), subjunctive, idioms, MWEs.
+# Reflexive+preposition combos ("acordarse de") are handled via `_ES_REFLEXIVE_PREP`
+# for BOTH finite forms (block 1a) and clitic-attached infinitives (block 3a,
+# "quiero acordarme de…"). Still deferred (model-bound or needs a new pattern):
+# imperatives ("lávate" — es_core_news_sm doesn't tag it as a verb), subjunctive,
+# idioms, MWEs.
 #
 # Output shape is IDENTICAL to extract_german_logic so pipeline.insert_phrases
 # consumes it unchanged: each dict carries dictionary_entry / sentence_phrase /
@@ -584,7 +584,9 @@ def extract_spanish_logic(doc, overrides=None):
                 _emit(f"{verb_lemma} {prep_lemma}", [token.i, prep_i],
                       "es_verb_prep", f"{verb_lemma} -> {prep_lemma}")
 
-        # 3. Clitic-attached reflexive infinitive ("quiero lavarme" -> "lavarse").
+        # 3. Clitic-attached reflexive infinitive ("quiero lavarme" -> "lavarse"),
+        #    plus reflexive+preposition on that infinitive ("quiero acordarme de"
+        #    -> "acordarse de", slice 4).
         #    spaCy keeps the enclitic fused into one VERB token (VerbForm=Inf)
         #    whose surface ends in the clitic. Recover the base by stripping that
         #    suffix — the spaCy lemma here is the quirky "lavar yo", so we use the
@@ -600,8 +602,24 @@ def extract_spanish_logic(doc, overrides=None):
                     base = surface[: -len(clitic)]
                     if base.endswith("r"):  # a real Spanish infinitive base
                         base = overrides.get(base, base)
-                        _emit(f"{base}se", [token.i], "es_reflexive_infinitive",
-                              f"{base} + -{clitic} (clitic infinitive)")
+                        # 3a. Reflexive + preposition on the infinitive (slice 4)
+                        #     — same priority/suppression rule as the finite path
+                        #     (block 1a): the combo wins, the bare reflexive is
+                        #     skipped for this token. The infinitival "a"
+                        #     ("voy a acordarme…") is filtered for free — only
+                        #     (base, prep) pairs in _ES_REFLEXIVE_PREP emit.
+                        combo = False
+                        for prep_lemma, prep_i in _es_prep_candidates(token):
+                            if (base, prep_lemma) in _ES_REFLEXIVE_PREP:
+                                combo = True
+                                _emit(f"{base}se {prep_lemma}",
+                                      [token.i, prep_i],
+                                      "es_reflexive_prep",
+                                      f"{base} + -{clitic} + {prep_lemma} (clitic infinitive + prep)")
+                                break
+                        if not combo:
+                            _emit(f"{base}se", [token.i], "es_reflexive_infinitive",
+                                  f"{base} + -{clitic} (clitic infinitive)")
                     break
 
     return result
