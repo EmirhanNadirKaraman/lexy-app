@@ -22,6 +22,8 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 ## Open findings — summary
 
 > **S1, S4, S5, S6, S7, S11, S15, S16, S17 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
+>
+> **S2, S3, S9, S12 are architecture/infra decisions** — implementation paused 2026-05-24. The scoped options, the `token_version`/Redis/email tradeoffs, the **pre-launch config checklist**, and the recommended order live in [`docs/SECURITY_ARCHITECTURE_DECISIONS.md`](./SECURITY_ARCHITECTURE_DECISIONS.md). Read that before starting any of them.
 
 | ID | Severity | Title | Primary location |
 |----|----------|-------|------------------|
