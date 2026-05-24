@@ -256,6 +256,7 @@ Pytest tests for pipeline modules. Mostly hermetic (no DB).
 | Path | Purpose |
 |---|---|
 | `Procfile` | `web: uvicorn backend.main:app` |
+| `.github/workflows/dependency-audit.yml` | The repo's CI (S15). `pip-audit` (backend) + `npm audit` (frontend) on push/PR to main + weekly cron. |
 | `.env.example` | Env schema. Real `.env` is secrets — never read it. |
 | `.gitignore` | |
 | `requirements.txt` | Delegates to backend's requirements. |

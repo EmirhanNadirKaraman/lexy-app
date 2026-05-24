@@ -1,0 +1,52 @@
+name: Dependency audit
+
+# Dependency vulnerability scanning (SECURITY.md S15). pip-audit (backend) +
+# npm audit (frontend) on every push/PR to main, plus a weekly schedule so a
+# newly disclosed CVE against an already-pinned dependency surfaces even when no
+# code changed. Both jobs are blocking; the baseline was clean when this landed
+# (2026-05-24), so the gate is green from day one.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: pip-audit (backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Run pip-audit
+        # Installed inline (not a project dependency). Audits the pinned backend
+        # requirements; exits non-zero (fails the job) on any known CVE.
+        run: |
+          pip install pip-audit
+          pip-audit -r lexy-app/backend/requirements.txt
+
+  frontend:
+    name: npm audit (frontend)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lexy-app/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: lexy-app/frontend/package-lock.json
+      - run: npm ci
+      - name: Run npm audit
+        # Production deps only; fail on high/critical to skip dev-chain noise.
+        run: npm audit --omit=dev --audit-level=high

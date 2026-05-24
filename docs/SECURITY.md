@@ -21,7 +21,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 
 ## Open findings — summary
 
-> **S1, S4, S5, S6, S7, S11, S16, S17 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
+> **S1, S4, S5, S6, S7, S11, S15, S16, S17 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
 
 | ID | Severity | Title | Primary location |
 |----|----------|-------|------------------|
@@ -33,7 +33,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S12 | LOW | In-memory rate limiter bypassable across workers (known) | `services/rate_limiter.py` |
 | S13 | INFO | f-string SQL in a migration (pattern caution) | `migrations/versions/013_*.py` |
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
-| S15 | INFO | No dependency vulnerability scanning | `requirements.txt`, `package.json` |
 
 ---
 
@@ -100,12 +99,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 **Impact:** A user can try to steer model output (e.g. via text embedded in an uploaded PDF). Impact is bounded because LLM output is not wired into shell/SQL/eval and responses are constrained by `tool_use` structured output. Treat as model-output manipulation, not RCE.
 **Verification check:** Confirm no code path passes LLM output into a shell, SQL string, `eval`, or filesystem path.
 **Fix:** Keep treating LLM output as untrusted; keep structured tool_use; don't interpolate model output into privileged sinks.
-
-### S15 — No dependency vulnerability scanning — INFO
-**Where:** `lexy-app/backend/requirements.txt`, `lexy-app/frontend/package.json` — no automated audit in CI.
-**Impact:** Known-vuln versions of yt-dlp, anthropic SDK, FastAPI, React toolchain, etc. can land unnoticed.
-**Verification check:** No `pip-audit` / `npm audit` step in CI config.
-**Fix:** Add `pip-audit` (backend) and `npm audit --omit=dev` (frontend) to CI; review on a cadence.
 
 ---
 
@@ -211,6 +204,12 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 **Deployment note (runbook, not a code residual):** a remote/managed prod DB must set `DB_SSL_MODE=require` (or `verify-full`); local dev stays `disable`. Same shape as S11's `ENABLE_DOCS`.
 **Verification check:** `rg -n 'resolve_sslmode|connect_kwargs|sslmode' lexy-app/backend/database.py lexy-app/backend/migrations/env.py subtitle-scraper/db_ssl.py`; `cd lexy-app && python -m pytest backend/tests/test_database_ssl.py -q` (asyncpg `_resolve_ssl` + libpq `resolve_sslmode`) and `python -m pytest tests/test_scraper_db_ssl.py -q` (scraper resolver + `seed_channels.connect()` forwards `sslmode`) pass; `alembic upgrade head` loads `env.py` cleanly.
 **Tests:** `tests/test_database_ssl.py` (+8 `resolve_sslmode`), `tests/test_scraper_db_ssl.py` (+16, new).
+
+### S15 — No dependency vulnerability scanning — INFO — RESOLVED 2026-05-24
+**Was:** no automated audit of `lexy-app/backend/requirements.txt` or `lexy-app/frontend/package.json`; a known-vuln dependency could land unnoticed. The repo had no CI at all.
+**Fix shipped:** new GitHub Actions workflow `.github/workflows/dependency-audit.yml` (the project's first CI). Two blocking jobs — `pip-audit -r lexy-app/backend/requirements.txt` (backend; tooling installed inline, not a project dep) and `npm audit --omit=dev --audit-level=high` (frontend, prod deps only) — on every push/PR to `main` plus a weekly cron (06:00 UTC Mondays) so newly disclosed CVEs against already-pinned deps surface without a code change. Baseline was clean when this landed (`pip-audit` + `npm audit` both reported 0 locally), so the gate is green from day one.
+**Verification check:** `cat .github/workflows/dependency-audit.yml`; locally `python -m pip_audit -r lexy-app/backend/requirements.txt` → "No known vulnerabilities found" and `cd lexy-app/frontend && npm audit --omit=dev --audit-level=high` → "found 0 vulnerabilities".
+**Known limitations of the gate (not finding residuals — S15 is fully closed):** scoped to high+ for npm (moderate/low dev-chain advisories don't block); `pip-audit` resolves transitive deps live, so a flaky PyPI/OSV connection can fail a run (the weekly cron re-checks).
 **Re-check:** `rg -n 'model_validator|_normalize_video_id|_normalize_channel_id' lexy-app/backend/routers/content_requests.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_content_requests.py -q` passes (a bare 11-char id / `UC…` id → 201; `https://evil.com/...` or `"; rm -rf /"` → 422).
 
 ---
@@ -230,3 +229,4 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 - **2026-05-24** — **S11 resolved:** interactive docs + OpenAPI schema are now env-gated. `main.py:_docs_enabled()` (reads `ENABLE_DOCS`, `ENABLE_HSTS` idiom) makes `docs_url`/`redoc_url`/`openapi_url` `None` by default; only an explicit `ENABLE_DOCS=true` exposes `/docs`,`/redoc`,`/openapi.json`. `.env.example` ships it `false` (off everywhere by default). New `test_docs_gating.py` +15. Moved to *Resolved findings* (no residual — secure by default, opt-in for dev). Open: S2, S9, S12–S15, S17 (+ S3 token-revocation, S4 operational/other-sites, S8 & S10 long-password residuals).
 - **2026-05-24** — **S17 resolved:** `POST /phrases/seed` is now admin-gated. New `core/deps.require_admin` (403 `admin_required` for non-admins); `routers/phrases.py:seed_phrases` depends on it. `is_admin` lives in `users.settings`, planted out-of-band and not self-grantable (settings writes are filtered to `DEFAULTS`). Non-admins who could previously reseed now get 403 (intentional — the finding). New `test_phrases_seed_admin.py` +3. Moved to *Resolved findings* (no residual). Open: S2, S9, S12–S15 (+ S3 token-revocation, S4 operational/other-sites, S8 & S10 long-password residuals).
 - **2026-05-24** — **S4 fully resolved:** `DB_SSL_MODE` now covers the two remaining connection families. Alembic `migrations/env.py` appends `?sslmode=<mode>` via new `database.resolve_sslmode()`; the scraper gets `subtitle-scraper/db_ssl.py` and all five `psycopg2.connect()` sites pass `**connect_kwargs()`. Uniform policy (reject `prefer`/`allow`); libpq sites omit the param on unset/disable (preserve driver default → zero behaviour change). `test_database_ssl.py` +8, new `test_scraper_db_ssl.py` +16. The "prod must set `DB_SSL_MODE=require` for a remote DB" item is now a deployment runbook note, not a code residual. Moved to *Resolved findings*. Open: S2, S9, S12–S15 (+ S3 token-revocation, S8 & S10 long-password residuals).
+- **2026-05-24** — **S15 resolved:** added the repo's first CI — `.github/workflows/dependency-audit.yml` runs `pip-audit` (backend) + `npm audit --omit=dev --audit-level=high` (frontend) on push/PR to main + a weekly cron. Both blocking; baseline clean (0 vulns each) so green from day one. Audit tooling installed inline (not added to `requirements.txt`/`package.json`). Moved to *Resolved findings*. Open: S2, S9, S12–S14 (+ S3 token-revocation, S8 & S10 long-password residuals). Remaining open items are architecture/infra: S2/S9 (email verification/CAPTCHA), S3 (JWT/session revocation), S12 (Redis-backed limiter); S13/S14 are INFO (f-string-SQL-in-migration caution, LLM prompt-injection).
