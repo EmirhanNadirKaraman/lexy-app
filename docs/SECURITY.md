@@ -21,7 +21,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 
 ## Open findings — summary
 
-> **S1, S5, S6, S7, S16 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
+> **S1, S5, S6, S7, S11, S16 are RESOLVED (2026-05-24)** — see the *Resolved findings* section. They are kept out of the open table below.
 
 | ID | Severity | Title | Primary location |
 |----|----------|-------|------------------|
@@ -31,7 +31,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S8 | LOW | Upload validation hardened — magic-byte + size (2026-05-24). Residuals (filename sanitization, proxy-level body spool) **deferred as accepted low risk** — no current exploit path | `routers/books.py` |
 | S9 | LOW | Registration enumeration — generic failure message DONE (2026-05-24); residual: 201-vs-400 status still inferable without email verification | `services/auth_service.py` |
 | S10 | LOW | bcrypt 72-byte truncation — register now rejects > 72-byte passwords (byte-accurate) + login/delete body-capped (DONE 2026-05-24); residual: pre-cap accounts may hold truncated hashes (not retroactively detectable) | `core/security.py`, `models/schemas.py`, `routers/account.py` |
-| S11 | LOW/INFO | FastAPI `/docs` + `/openapi.json` exposed | `main.py` |
 | S12 | LOW | In-memory rate limiter bypassable across workers (known) | `services/rate_limiter.py` |
 | S13 | INFO | f-string SQL in a migration (pattern caution) | `migrations/versions/013_*.py` |
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
@@ -93,12 +92,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 **Verification check:** `rg -n 'BCRYPT_MAX_PASSWORD_BYTES|field_validator' lexy-app/backend/models/schemas.py lexy-app/backend/core/security.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_password_limits.py -q` passes (`"a"*73` → 422, `"€"*37` → 422, `"€"*24` (72 bytes) → 201, login `"a"*200` → 401 not 422, login `"a"*2000` → 422).
 **Residual (accepted):** pre-cap accounts may have been registered with a password whose effective entropy was already bcrypt-truncated; this is **not retroactively detectable** without the plaintext, and forcing a reset would be hostile for a LOW finding. Full-length-password support would need the base64(sha256(pw))-before-bcrypt migration (use base64, **not** raw digest bytes — a null byte in the raw digest reintroduces the truncation bug); deferred as out of scope for S10.
 
-### S11 — FastAPI interactive docs + OpenAPI schema exposed — LOW/INFO
-**Where:** `main.py:92` — `FastAPI(...)` with no `docs_url=None` / `redoc_url=None` / `openapi_url=None`.
-**Impact:** `/docs`, `/redoc`, `/openapi.json` are publicly reachable, disclosing the full API surface. Usually acceptable; some prefer it off in production.
-**Verification check:** `GET /docs` and `GET /openapi.json` return 200 in the deployed environment.
-**Fix:** If undesired, gate behind an env flag and disable in production.
-
 ### S12 — In-memory rate limiter bypassable across workers — LOW (known)
 **Where:** `services/rate_limiter.py` — sliding window stored in process memory. Already documented in `CLAUDE.md` §10.
 **Impact:** With multiple uvicorn/gunicorn workers, each worker has its own counters → effective limit is N×. Also resets on restart.
@@ -152,7 +145,7 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 
 > **Doc-drift note:** `CLAUDE.md` §7 calls `/api/search`, `/api/suggest`, `/api/video-sentences`, `/api/word-forms`, `/api/languages`, `/api/categories` "public legacy endpoints." They are actually auth-gated at the router level (`routers/search.py:20`, `APIRouter(dependencies=[Depends(get_current_user)])`). No data leak — but the §7 label is stale and should not be trusted when reasoning about the public attack surface.
 >
-> **The genuinely unauthenticated surface is:** the static file mount (`main.py:142`), `POST /api/v1/errors/client` (per-IP throttled — S6 resolved), and the FastAPI docs `/docs` + `/openapi.json` (S11, still open). `POST /sentences/match` is no longer public (auth-gated — S16 final fix). Everything else requires a valid bearer token.
+> **The genuinely unauthenticated surface is:** the static file mount (`main.py:142`) and `POST /api/v1/errors/client` (per-IP throttled — S6 resolved). The FastAPI docs `/docs` + `/openapi.json` are off by default (require an explicit `ENABLE_DOCS=true` — S11 resolved). `POST /sentences/match` is no longer public (auth-gated — S16 final fix). Everything else requires a valid bearer token.
 
 ---
 
@@ -209,6 +202,12 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 **Accepted formats:** bare video id (11 chars) · bare channel id (`UC`+22) · `https://www.youtube.com/watch?v=<id>` · `https://youtu.be/<id>` · `https://www.youtube.com/shorts/<id>` · `https://www.youtube.com/channel/<UC…>` (host ∈ youtube.com/www/m/youtu.be/youtube-nocookie).
 **Auth note:** the route still requires a bearer token (`get_current_user`); this validation is a *second* gate after auth. **Scraper untouched** (the API is the only writer of `content_request`, so it inherits validated ids). **Residual (deferred):** legacy rows created before this commit aren't re-validated — defense-in-depth re-checking at the scraper before `yt_dlp` would catch them, deferred per scope.
 **Tests:** `tests/test_content_requests.py` +12 (URL normalization for watch/youtu.be/channel; rejects non-YouTube host, look-alike host, shell strings, path-traversal, overlong, empty, wrong-length, wrong-type; invalid request neither inserts a row nor spawns the scraper).
+
+### S11 — FastAPI interactive docs + OpenAPI schema exposed — LOW/INFO — RESOLVED 2026-05-24
+**Was:** `main.py` built `FastAPI(...)` with the default `docs_url`/`redoc_url`/`openapi_url`, so `/docs`, `/redoc`, and `/openapi.json` (the full route + model schema) were publicly reachable in every environment.
+**Fix shipped (env-gated, secure default):** `main.py:_docs_enabled()` reads `ENABLE_DOCS` (truthy ∈ `{1,true,yes}`, matching the `ENABLE_HSTS` idiom) and the app passes `docs_url`/`redoc_url`/`openapi_url = None` unless it's set. **Default OFF** — a production deploy that doesn't opt in never publishes the schema; local dev sets `ENABLE_DOCS=true`. `.env.example` ships `ENABLE_DOCS=false` (off everywhere by default, so a prod that copied the template isn't exposed). No residual: the only way to expose docs now is an explicit opt-in.
+**Verification check:** `rg -n 'docs_url|_docs_enabled' lexy-app/backend/main.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_docs_gating.py -q` passes (env-unset → `app.openapi_url is None` + `/docs`,`/redoc`,`/openapi.json` → 404; truthy values enable). With `ENABLE_DOCS` unset, `GET /openapi.json` → 404.
+**Tests:** `tests/test_docs_gating.py` +15 (parse matrix for `_docs_enabled`; live app docs URLs agree with the flag; endpoints 404 when off).
 **Re-check:** `rg -n 'model_validator|_normalize_video_id|_normalize_channel_id' lexy-app/backend/routers/content_requests.py`; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_content_requests.py -q` passes (a bare 11-char id / `UC…` id → 201; `https://evil.com/...` or `"; rm -rf /"` → 422).
 
 ---
@@ -225,3 +224,4 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 - **2026-05-24** — **S3 partially resolved:** `DELETE /account` now requires password re-auth (verified via `verify_password`; missing/wrong → 403), closing the stolen-token → instant-delete hole. Frontend gained a labelled password field (confirm disabled until filled). Backend `test_account_deletion.py` +3; frontend `AccountDeletion.test.tsx` updated + `api/account.test.ts` +3. **Residual deferred:** token revocation (a leaked token still has non-destructive access until 7-day expiry) — needs the JWT/session model. Open: S2, S4, S9–S15, S17 (+ S3 token-revocation & S8 residuals).
 - **2026-05-24** — **S4 partially resolved:** the asyncpg pool now passes `ssl=_resolve_ssl(os.getenv("DB_SSL_MODE"))` instead of omitting `ssl=`. `DB_SSL_MODE` ∈ {`disable` (default → plaintext), `require`, `verify-ca`, `verify-full`}; `prefer`/`allow` rejected (silent-plaintext-fallback footgun), unknown values raise at startup. `tests/conftest.py` pool threads the same helper; `.env.example` documents the knob. New `test_database_ssl.py` +13 (mapping + mocked `create_pool` forwarding + startup-raise). **Residual deferred:** prod must SET `DB_SSL_MODE=require` for a remote DB (default stays plaintext for local dev), and alembic `env.py` + `subtitle-scraper` connections still lack TLS. Open: S2, S9–S15, S17 (+ S3 token-revocation, S4 operational/other-sites & S8 residuals).
 - **2026-05-24** — **S10 partially resolved:** `RegisterRequest.password` gained a byte-accurate upper bound (`BCRYPT_MAX_PASSWORD_BYTES = 72` in `core/security.py`; `field_validator` → 422 when the UTF-8 byte length exceeds 72, so multibyte passwords under 72 *chars* but over 72 *bytes* are caught); `min_length=8` preserved. `LoginRequest` + `AccountDeleteRequest` got a generous `max_length=1024` body guard (NOT the 72-byte rule — avoids locking out pre-cap accounts). No pre-hashing (scheme unchanged, nothing truncated). New `test_password_limits.py` +8. **Residual accepted:** pre-cap accounts may hold already-truncated hashes (not retroactively detectable); full-length support needs the base64(sha256(pw))-before-bcrypt migration (deferred). Open: S2, S9, S11–S15, S17 (+ S3 token-revocation, S4 operational/other-sites, S8 & S10 long-password residuals).
+- **2026-05-24** — **S11 resolved:** interactive docs + OpenAPI schema are now env-gated. `main.py:_docs_enabled()` (reads `ENABLE_DOCS`, `ENABLE_HSTS` idiom) makes `docs_url`/`redoc_url`/`openapi_url` `None` by default; only an explicit `ENABLE_DOCS=true` exposes `/docs`,`/redoc`,`/openapi.json`. `.env.example` ships it `false` (off everywhere by default). New `test_docs_gating.py` +15. Moved to *Resolved findings* (no residual — secure by default, opt-in for dev). Open: S2, S9, S12–S15, S17 (+ S3 token-revocation, S4 operational/other-sites, S8 & S10 long-password residuals).

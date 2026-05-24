@@ -89,7 +89,26 @@ async def lifespan(app: FastAPI):
     await close_pool()
 
 
-app = FastAPI(title="Lexy Clone", lifespan=lifespan)
+def _docs_enabled() -> bool:
+    """Whether to expose the interactive API docs + schema (S11).
+
+    Off by default so a production deploy doesn't publish `/docs`, `/redoc`, or
+    `/openapi.json` (which enumerates every route and model). Opt in for local
+    development with `ENABLE_DOCS=true`. Matches the `ENABLE_HSTS` env idiom.
+    """
+    return os.getenv("ENABLE_DOCS", "").lower() in ("1", "true", "yes")
+
+
+_DOCS_ENABLED = _docs_enabled()
+
+app = FastAPI(
+    title="Lexy Clone",
+    lifespan=lifespan,
+    # S11: no interactive docs / schema unless explicitly enabled (e.g. local dev).
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
 
 
 def _parse_cors_origins(raw: str | None) -> list[str]:
