@@ -15,6 +15,12 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY is not set in .env")
 
+# bcrypt silently ignores any bytes past the 72nd (S10). We cap new passwords at
+# this length at the validation boundary (see models.schemas.RegisterRequest) so
+# a user's password is never silently truncated — rather than pre-hashing, which
+# would be a broader password-hashing migration.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")

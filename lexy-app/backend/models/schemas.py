@@ -3,6 +3,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from ..core.security import BCRYPT_MAX_PASSWORD_BYTES
+
 # ---------------------------------------------------------------------------
 # Existing search schemas (unchanged)
 # ---------------------------------------------------------------------------
@@ -51,10 +53,27 @@ class RegisterRequest(BaseModel):
     # REGISTRATION_CODE; ignored otherwise. Length-capped to bound the body.
     registration_code: str | None = Field(default=None, max_length=128)
 
+    @field_validator("password")
+    @classmethod
+    def _password_within_bcrypt_limit(cls, v: str) -> str:
+        # bcrypt truncates anything past 72 bytes (S10); reject instead of
+        # silently dropping entropy. Measured in BYTES, not len(): accented
+        # characters / emoji are multi-byte, so a password well under 72
+        # characters can still exceed 72 bytes.
+        if len(v.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
+            raise ValueError(
+                f"Password must not exceed {BCRYPT_MAX_PASSWORD_BYTES} bytes "
+                "(accented characters and emoji each use multiple bytes)."
+            )
+        return v
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    # max_length is a body-size guard only (S10) — NOT the 72-byte truncation
+    # rule. Capping login at 72 bytes would lock out any account whose password
+    # predates the register cap; verify_password truncates identically anyway.
+    password: str = Field(max_length=1024)
 
 
 class TokenResponse(BaseModel):

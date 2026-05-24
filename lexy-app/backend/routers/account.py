@@ -16,7 +16,7 @@ endpoint; that would need a separate route + admin gate.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..core.deps import get_current_user
 from ..core.security import verify_password
@@ -29,7 +29,9 @@ class AccountDeleteRequest(BaseModel):
     # Re-authentication for the destructive delete (S3). Optional at the schema
     # level so a *missing* body is handled uniformly in the route (→ 403) rather
     # than a 422 that would distinguish "missing" from "wrong".
-    password: str | None = None
+    # max_length is a body-size guard only (S10); a wrong/over-long password
+    # still verifies to a 403 via verify_password (which truncates at 72 bytes).
+    password: str | None = Field(default=None, max_length=1024)
 
 
 @router.delete("", status_code=status.HTTP_204_NO_CONTENT)
