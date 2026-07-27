@@ -50,8 +50,8 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 
 ### Data pipelines
 - **`subtitle-scraper/`** — yt-dlp + spaCy + Postgres. Pulls transcripts for ~916 YouTube channels.
-- **`pdf_text_extraction/`** — Docling + TATR + custom masking. Used for book ingestion.
-- **`masking/`** — alternative/older PDF pipeline (`latest_ingest.py`, table reconstruction).
+- **`pdf_text_extraction/`** — Docling + TATR + custom masking. **NOT used for book ingestion, and currently non-importable**: it imports `pipeline.stages.pdf_text_extraction.*`, a layout that doesn't exist in this repo (`ModuleNotFoundError: No module named 'pipeline.stages'`). The shipping book path is `book_service` (PyMuPDF embedded text → sparse-text heuristic → pytesseract OCR fallback), which imports none of this. Verified 2026-07-27.
+- **`masking/`** — alternative/older PDF pipeline (`latest_ingest.py`, table reconstruction). Partially functional: run from inside the folder, `mask_tables.py` and `visualize_docling_full.py` import fine, but `latest_ingest.py` / `simple_pdf_processor.py` need a `parsers` package that exists nowhere in this repo — so the **text-stitching** half (`ContextAwareStitcher`) is the missing piece. `book_service` does no cross-block stitching, so that is the one real gap here.
 - **`postprocessing/`** — bulk extraction of phrases from already-scraped text into `word_occurrences`.
 - **`ilp/`** — PuLP-based book-selection optimiser (find minimum book set covering a target vocab list). Standalone CLI, still unwired. Its *technique* now also lives in `playlist_service.ilp_cover` as the opt-in `algorithm="ilp"` playlist mode — re-implemented for the request path, not imported, since the CLI reads word-list files and its own DB config.
 
