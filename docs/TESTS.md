@@ -115,7 +115,40 @@ full picture):
 - Theme tokens: `src/test/theme.test.tsx` (across #20a/b).
 - Lemma corrections (#39 frontend, 2026-07-27) — see the dated row below.
 - Vocabulary lists: `WordListsPage` + `tests/test_word_lists.py` (2026-07-27).
-- LLM provider seam: `tests/test_llm_provider.py` (2026-07-27).
+- LLM provider seam + OpenAI-compatible backend: `tests/test_llm_provider.py` (2026-07-27, 61 tests).
+
+🆕 **2026-07-27 — OpenAI-compatible provider (+30 tests, same file)**
+
+Second backend behind the seam: `OpenAICompatibleProvider` POSTs
+`{LLM_BASE_URL}/chat/completions`, so the backend can target a self-hosted model
+server. **Anthropic stays the default** — with no new env vars the new class is
+never constructed. No Gemma/Ollama/llama.cpp-specific code, no new dependency
+(`httpx` was already in `requirements.txt`; the installed-but-undeclared
+`openai` package was deliberately not used).
+
+| Area | Tests | Covers |
+|---|---|---|
+| Provider selection | 8 | unset env → Anthropic (the back-compat promise); `LLM_PROVIDER=anthropic` incl. case/whitespace variants; `openai_compatible` → the new class; missing `LLM_BASE_URL` → clear error; missing `LLM_MODEL` → clear error; unknown value names both valid options; non-numeric `LLM_TIMEOUT_SECONDS` → clear error |
+| Request shape | 8 | URL is `{base}/chat/completions`; **four remote base-URL forms incl. a Tailscale name, a 100.x address and a trailing slash** — the no-localhost-assumption is parametrized, not asserted once; model + `max_tokens`; system message first, then caller messages in order; `response_format.json_schema` with `title`/`description` lifted out of `schema`; Bearer header; placeholder key when unset; timeout reaches the client |
+| Response handling | 8 | success → parsed dict; malformed JSON retries once then raises; **retry falls back to `json_object` and restates the schema in the prompt**; missing required field; non-object JSON; empty `choices`; HTTP 5xx raises *without* retrying; connection failure → `LLMProviderError` |
+| Credential hygiene | 3 | API key absent from errors on both malformed-JSON and HTTP-error paths while model + host remain present; `user:pass@` userinfo redacted from the base URL; credential-free URLs untouched |
+
+**Two deliberate design choices the tests pin:**
+
+1. **`LLM_MODEL` is required for `openai_compatible`.** No default is meaningful
+   across runtimes, and an empty/wrong model name surfaces as an opaque 404
+   from the server rather than a config error.
+2. **A 5xx is not retried.** The retry exists for *format* failures — a server
+   that doesn't implement `json_schema` may still honour `json_object`. Re-asking
+   a broken host with a different `response_format` just doubles the latency.
+
+Misconfiguration fails at **import**, since `get_provider()` runs at module
+import in all three services. That is intended: a backend that cannot reach its
+model server should fail at boot, not on the first learner's message.
+
+**Validation:** backend `-n auto` → **847 passed, 2 skipped** (817 + 30);
+`ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed.
 
 🆕 **2026-07-27 — LLM provider seam, step 1 (+31 tests / +1 file)**
 

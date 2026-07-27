@@ -12,6 +12,7 @@ assertion is what rules it out.
 
 These are pure unit tests: no DB, no network, no API key needed.
 """
+import json
 import subprocess
 
 import pytest
@@ -361,3 +362,399 @@ def test_rebuilt_language_factory_tools_are_byte_identical(language):
         name, description, body = llm_provider.split_schema(new_fn(language))
         rebuilt = {"name": name, "description": description, "input_schema": body}
         assert rebuilt == old_fn(language)
+
+
+# ---------------------------------------------------------------------------
+# Provider selection (LLM_PROVIDER)
+# ---------------------------------------------------------------------------
+
+
+def test_default_provider_is_anthropic_with_no_env_set(monkeypatch):
+    """The whole back-compat promise: an existing deployment that sets none of
+    the new vars keeps the exact provider it had."""
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    provider = llm_provider.get_provider()
+
+    assert isinstance(provider, llm_provider.AnthropicProvider)
+    assert provider.model_id == llm_provider.DEFAULT_ANTHROPIC_MODEL
+
+
+@pytest.mark.parametrize("value", ["anthropic", "Anthropic", "  ANTHROPIC  "])
+def test_llm_provider_anthropic_selects_anthropic(monkeypatch, value):
+    monkeypatch.setenv("LLM_PROVIDER", value)
+    assert isinstance(llm_provider.get_provider(), llm_provider.AnthropicProvider)
+
+
+def test_llm_provider_openai_compatible_selects_openai_provider(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("LLM_BASE_URL", "http://desktop-name:11434/v1")
+    monkeypatch.setenv("LLM_MODEL", "gemma3:12b")
+
+    provider = llm_provider.get_provider()
+
+    assert isinstance(provider, llm_provider.OpenAICompatibleProvider)
+    assert provider.model_id == "gemma3:12b"
+
+
+def test_openai_compatible_without_base_url_fails_clearly(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compatible")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "gemma3:12b")
+
+    with pytest.raises(llm_provider.LLMProviderError, match="LLM_BASE_URL"):
+        llm_provider.get_provider()
+
+
+def test_openai_compatible_without_model_fails_clearly(monkeypatch):
+    """No default model name is meaningful across runtimes, and an empty one
+    surfaces as an opaque 404 from the server."""
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("LLM_BASE_URL", "http://desktop-name:11434/v1")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    with pytest.raises(llm_provider.LLMProviderError, match="LLM_MODEL"):
+        llm_provider.get_provider()
+
+
+def test_unknown_llm_provider_value_fails_clearly(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+
+    with pytest.raises(llm_provider.LLMProviderError) as exc:
+        llm_provider.get_provider()
+
+    assert "ollama" in str(exc.value)
+    assert "anthropic" in str(exc.value)
+    assert "openai_compatible" in str(exc.value)
+
+
+def test_bad_timeout_value_fails_clearly(monkeypatch):
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "soon")
+
+    with pytest.raises(llm_provider.LLMProviderError, match="LLM_TIMEOUT_SECONDS"):
+        llm_provider.OpenAICompatibleProvider(
+            base_url="http://host:11434/v1", model="m",
+        )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible provider — request shape
+# ---------------------------------------------------------------------------
+
+
+def _oai(**overrides):
+    kwargs = {
+        "base_url": "http://desktop-tailscale-name:11434/v1",
+        "model": "gemma3:12b",
+        "api_key": "test-secret-key",
+        "timeout": 5.0,
+    }
+    kwargs.update(overrides)
+    return llm_provider.OpenAICompatibleProvider(**kwargs)
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload=None, status_code=200, text=None, raw=None):
+        self.status_code = status_code
+        self._payload = payload
+        self._raw = raw
+        self.text = text if text is not None else "<body>"
+
+    def json(self):
+        if self._raw is not None:
+            raise ValueError("not json")
+        return self._payload
+
+
+class _CapturingClient:
+    """Stands in for `httpx.AsyncClient` as an async context manager."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def __call__(self, **kwargs):
+        self.init_kwargs = kwargs
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        return self._responses.pop(0)
+
+
+def _ok(payload_obj):
+    return _FakeHTTPResponse({
+        "choices": [{"message": {"content": json.dumps(payload_obj)}}]
+    })
+
+
+async def test_openai_request_targets_chat_completions_under_base_url(monkeypatch):
+    client = _CapturingClient([_ok({"answer": "ok"})])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    await _oai().structured(
+        system="be helpful",
+        messages=[{"role": "user", "content": "hi"}],
+        schema=SAMPLE_SCHEMA,
+        max_tokens=99,
+    )
+
+    sent = client.calls[0]
+    assert sent["url"] == (
+        "http://desktop-tailscale-name:11434/v1/chat/completions"
+    )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://desktop-tailscale-name:11434/v1",
+        "http://100.101.102.103:11434/v1",
+        "http://desktop-name:8080/v1",
+        "http://desktop-name:11434/v1/",  # trailing slash tolerated
+    ],
+)
+async def test_remote_base_urls_are_supported_not_just_localhost(monkeypatch, base_url):
+    client = _CapturingClient([_ok({"answer": "ok"})])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    await _oai(base_url=base_url).structured(
+        system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+    )
+
+    assert client.calls[0]["url"] == base_url.rstrip("/") + "/chat/completions"
+
+
+async def test_openai_request_body_shape(monkeypatch):
+    client = _CapturingClient([_ok({"answer": "ok"})])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    await _oai().structured(
+        system="be helpful",
+        messages=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ],
+        schema=SAMPLE_SCHEMA,
+        max_tokens=99,
+    )
+
+    body = client.calls[0]["json"]
+    assert body["model"] == "gemma3:12b"
+    assert body["max_tokens"] == 99
+    # System first, then the caller's messages in order.
+    assert body["messages"] == [
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "second"},
+    ]
+    # JSON Schema response format, with title/description lifted out of the body.
+    assert body["response_format"]["type"] == "json_schema"
+    js = body["response_format"]["json_schema"]
+    assert js["name"] == "sample_tool"
+    assert js["description"] == "A sample."
+    assert js["schema"] == {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+    }
+    assert "title" not in js["schema"]
+
+
+async def test_openai_sends_bearer_auth_header(monkeypatch):
+    client = _CapturingClient([_ok({"answer": "ok"})])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    await _oai().structured(
+        system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+    )
+
+    assert client.calls[0]["headers"]["Authorization"] == "Bearer test-secret-key"
+
+
+async def test_missing_api_key_falls_back_to_placeholder(monkeypatch):
+    """Local servers ignore auth; the header still has to be well-formed."""
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    client = _CapturingClient([_ok({"answer": "ok"})])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    result = await _oai(api_key=None).structured(
+        system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+    )
+
+    assert result == {"answer": "ok"}
+    assert client.calls[0]["headers"]["Authorization"] == "Bearer not-needed"
+
+
+async def test_timeout_is_passed_to_the_http_client(monkeypatch):
+    client = _CapturingClient([_ok({"answer": "ok"})])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    await _oai(timeout=12.5).structured(
+        system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+    )
+
+    assert client.init_kwargs["timeout"] == 12.5
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible provider — response handling
+# ---------------------------------------------------------------------------
+
+
+async def test_successful_response_returns_the_parsed_dict(monkeypatch):
+    client = _CapturingClient([_ok({"answer": "hello", "extra": 1})])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    result = await _oai().structured(
+        system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+    )
+
+    assert result == {"answer": "hello", "extra": 1}
+
+
+async def test_malformed_json_retries_once_then_raises(monkeypatch):
+    bad = _FakeHTTPResponse({"choices": [{"message": {"content": "{not json"}}]})
+    client = _CapturingClient([bad, bad])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    with pytest.raises(llm_provider.LLMProviderError, match="not valid JSON"):
+        await _oai().structured(
+            system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+        )
+
+    assert len(client.calls) == 2, "one retry expected"
+
+
+async def test_retry_falls_back_to_plain_json_mode(monkeypatch):
+    """A server without json_schema support may still honour json_object."""
+    bad = _FakeHTTPResponse({"choices": [{"message": {"content": "{not json"}}]})
+    client = _CapturingClient([bad, _ok({"answer": "second try"})])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    result = await _oai().structured(
+        system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+    )
+
+    assert result == {"answer": "second try"}
+    assert client.calls[0]["json"]["response_format"]["type"] == "json_schema"
+    assert client.calls[1]["json"]["response_format"] == {"type": "json_object"}
+    # The retry restates the schema so the model has something to conform to.
+    assert "answer" in client.calls[1]["json"]["messages"][0]["content"]
+
+
+async def test_response_missing_required_field_raises(monkeypatch):
+    resp = _ok({"something_else": "x"})
+    client = _CapturingClient([resp, _ok({"something_else": "x"})])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    with pytest.raises(llm_provider.LLMProviderError, match="missing required field"):
+        await _oai().structured(
+            system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+        )
+
+
+async def test_non_object_json_raises(monkeypatch):
+    resp = _FakeHTTPResponse({"choices": [{"message": {"content": '["a"]'}}]})
+    client = _CapturingClient([resp, resp])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    with pytest.raises(llm_provider.LLMProviderError, match="expected a JSON object"):
+        await _oai().structured(
+            system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+        )
+
+
+async def test_missing_choices_raises(monkeypatch):
+    resp = _FakeHTTPResponse({"choices": []})
+    client = _CapturingClient([resp, resp])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    with pytest.raises(llm_provider.LLMProviderError, match="choices"):
+        await _oai().structured(
+            system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+        )
+
+
+async def test_http_error_status_raises_without_retry(monkeypatch):
+    client = _CapturingClient([
+        _FakeHTTPResponse(status_code=500, text="upstream exploded"),
+    ])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    with pytest.raises(llm_provider.LLMProviderError, match="HTTP 500"):
+        await _oai().structured(
+            system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+        )
+
+    assert len(client.calls) == 1, "a 500 should not be retried with another format"
+
+
+async def test_connection_failure_raises_provider_error(monkeypatch):
+    class _ExplodingClient(_CapturingClient):
+        async def post(self, url, json=None, headers=None):
+            raise llm_provider.httpx.ConnectError("no route to host")
+
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", _ExplodingClient([]))
+
+    with pytest.raises(llm_provider.LLMProviderError, match="request failed"):
+        await _oai().structured(
+            system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Error messages must not leak credentials
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "make_response",
+    [
+        lambda: _FakeHTTPResponse({"choices": [{"message": {"content": "{bad"}}]}),
+        lambda: _FakeHTTPResponse(status_code=401, text="unauthorized"),
+    ],
+    ids=["malformed-json", "http-error"],
+)
+async def test_errors_never_contain_the_api_key(monkeypatch, make_response):
+    client = _CapturingClient([make_response(), make_response()])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    with pytest.raises(llm_provider.LLMProviderError) as exc:
+        await _oai(api_key="sk-super-secret-value").structured(
+            system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+        )
+
+    message = str(exc.value)
+    assert "sk-super-secret-value" not in message
+    # ...but it does carry enough context to debug.
+    assert "gemma3:12b" in message
+    assert "desktop-tailscale-name" in message
+
+
+async def test_errors_redact_credentials_embedded_in_the_base_url(monkeypatch):
+    client = _CapturingClient([
+        _FakeHTTPResponse(status_code=500, text="boom"),
+    ])
+    monkeypatch.setattr(llm_provider.httpx, "AsyncClient", client)
+
+    with pytest.raises(llm_provider.LLMProviderError) as exc:
+        await _oai(base_url="http://user:tok3n@desktop:11434/v1").structured(
+            system="s", messages=[], schema=SAMPLE_SCHEMA, max_tokens=10,
+        )
+
+    assert "tok3n" not in str(exc.value)
+    assert "***@desktop:11434" in str(exc.value)
+
+
+def test_redact_leaves_credential_free_urls_alone():
+    url = "http://desktop-name:11434/v1"
+    assert llm_provider._redact(url) == url

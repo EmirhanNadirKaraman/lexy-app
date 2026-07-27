@@ -37,7 +37,7 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 - **FastAPI** + **asyncpg** (async Postgres driver, pool-based)
 - **Alembic** migrations (25+ files in `alembic/versions/`)
 - **JWT auth** (HS256, secret in `SECRET_KEY` env)
-- **Anthropic SDK** → `claude-haiku-4-5-20251001` (override with `LLM_MODEL`). All LLM calls go through `services/llm_provider.py`, which maps a JSON Schema onto a forced single-tool call. One call shape everywhere: non-streaming, structured JSON out.
+- **LLM** → `services/llm_provider.py` is the only place a client is constructed. Two backends, selected by `LLM_PROVIDER`: `anthropic` (default, `claude-haiku-4-5-20251001`) and `openai_compatible` (any `/chat/completions` server — Ollama `/v1`, llama.cpp, vLLM, LM Studio). One call shape everywhere: non-streaming, JSON Schema in, structured dict out. **No host is assumed** — `LLM_BASE_URL` is built for a GPU box over Tailscale, not localhost. See §11 for the env vars.
 - **LLM cache**: SHA256(prompt_key + model + params) → `llm_cache` table, with TTL.
 - **spaCy** (`de_core_news_md` etc.) for tokenisation/lemmatisation.
 
@@ -338,7 +338,27 @@ DB_NAME, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT
 SECRET_KEY                # JWT signing
 ANTHROPIC_API_KEY
 MOCK_LLM=false            # set true to short-circuit LLM in tests
+
+# LLM provider — all optional; unset = Anthropic, exactly as before.
+LLM_PROVIDER=anthropic    # anthropic | openai_compatible
+LLM_MODEL=                # overrides the model; REQUIRED for openai_compatible
+LLM_BASE_URL=             # REQUIRED for openai_compatible, e.g.
+                          #   http://desktop-tailscale-name:11434/v1
+LLM_API_KEY=              # usually ignored by local servers
+LLM_TIMEOUT_SECONDS=60
 ```
+
+**Pointing at a local model server.** Set `LLM_PROVIDER=openai_compatible`,
+`LLM_BASE_URL` and `LLM_MODEL`. A misconfigured pair fails at **import**, not on
+the first learner's message — a backend that can't reach its model server should
+not boot. Two things to know before switching:
+
+- **Keep the server off the public internet.** Ollama/llama.cpp have no
+  meaningful auth. Reach them over Tailscale or another authenticated tunnel.
+- **Measure quality before moving the grading paths.** `guided_evaluate` and
+  `evaluate_production` write real SRS state through `progression_service`; a
+  weaker model there corrupts scheduling rather than just reading badly.
+  Translations and glosses are the safe places to start.
 
 ---
 
@@ -351,7 +371,7 @@ MOCK_LLM=false            # set true to short-circuit LLM in tests
 - **Read `docs/COMMON_ERRORS.md` when something breaks, and add to it when something new breaks.** Symptom-first log of errors actually hit here — grep it by the error text before debugging from scratch. Several entries are traps where the obvious fix is wrong (ruff E402 on sibling imports, F401 on availability probes), so it is worth a look *before* "fixing" a lint or test failure, not only after being stuck.
 - **Consult and update `docs/SECURITY.md` for any security-relevant change.** It's the living tracker of open/resolved findings and the controls we rely on. See §14 for the read/update triggers and the four fields every finding must carry.
 - **All state changes go through `progression_service`.** Don't write directly to `user_word_knowledge` or `srs_cards` from a router.
-- **All LLM calls go through `llm_provider` and cache via `llm_cache_service`.** Don't instantiate `AsyncAnthropic` ad-hoc — `services/llm_provider.py` holds the only construction (true since 2026-07-27; `llm_service`, `book_llm_service` and `reading_llm_service` each built their own before that). New LLM call sites take a JSON Schema and call `_provider.structured(...)`.
+- **All LLM calls go through `llm_provider` and cache via `llm_cache_service`.** Don't instantiate `AsyncAnthropic` ad-hoc — `services/llm_provider.py` holds the only construction (true since 2026-07-27; `llm_service`, `book_llm_service` and `reading_llm_service` each built their own before that). New LLM call sites take a JSON Schema and call `_provider.structured(...)` — never a provider class directly, so both backends stay swappable.
 - **Polymorphic key everywhere:** if you add a new tracked content type, it gets an `item_type`, lives in its own content table (with `display_text` available), and plugs into `user_word_knowledge` / `srs_cards`.
 - **Migrations are append-only** — never edit an existing migration once it's been run anywhere.
 - **Tests live next to the layer they test** (backend tests under `lexy-app/backend/tests/`, pipeline tests under `tests/`).

@@ -35,6 +35,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S12 | LOW | In-memory rate limiter bypassable across workers (known) | `services/rate_limiter.py` |
 | S13 | INFO | f-string SQL in a migration (pattern caution) | `migrations/versions/013_*.py` |
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
+| S18 | LOW | Self-hosted model server has no auth; `LLM_BASE_URL` egress is operator-controlled (opt-in, unset by default) | `services/llm_provider.py` |
 
 ---
 
@@ -103,6 +104,47 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 **Fix:** Keep treating LLM output as untrusted; keep structured tool_use; don't interpolate model output into privileged sinks.
 
 ---
+
+### S18 — Self-hosted model server: no auth, operator-controlled egress — LOW — OPEN (opt-in)
+
+**file:line** — `services/llm_provider.py` (`OpenAICompatibleProvider.__init__`, `.structured`)
+
+**severity** — LOW. Inert by default: the provider is only constructed when an
+operator sets `LLM_PROVIDER=openai_compatible`. No user input selects it and no
+route exposes it.
+
+**What it is.** When enabled, the backend POSTs prompt content — which includes
+learner-authored chat messages and book text — to whatever host `LLM_BASE_URL`
+names. Two properties worth stating plainly rather than discovering later:
+
+1. **The target server typically has no authentication.** Ollama and
+   llama.cpp's `llama-server` bind without auth by default. Anyone who can
+   reach the port can use the model and read whatever is sent to it.
+2. **`LLM_BASE_URL` is an operator-set egress destination.** It is read from
+   env at import, never from a request, so it is not user-controllable — but it
+   does mean a typo'd or hostile value silently redirects prompt content.
+   Treat it like a database URL.
+
+**Controls already in place.** `LLM_API_KEY` is never included in an error
+message; `_redact()` additionally strips `user:pass@` userinfo from the base URL
+before it reaches an `LLMProviderError`, because those strings land in logs and
+client-error reports. Both are regression-tested
+(`test_errors_never_contain_the_api_key`,
+`test_errors_redact_credentials_embedded_in_the_base_url`).
+
+**verification check**
+```bash
+# Provider is opt-in and defaults to Anthropic:
+rg -n 'LLM_PROVIDER' lexy-app/backend/services/llm_provider.py
+# API key never interpolated into an error:
+rg -n '_api_key' lexy-app/backend/services/llm_provider.py   # expect: header build only
+```
+
+**suggested fix** — Deployment guidance rather than code: keep the model server
+on Tailscale or another authenticated tunnel, never on a public interface, and
+prefer `https://` when the tunnel supports it. If a shared/multi-tenant model
+server is ever used, revisit — prompt content would then leave the trust
+boundary.
 
 ## Verified strengths (do not regress)
 
@@ -220,6 +262,8 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-07-27** — **OpenAI-compatible provider added (opt-in; new finding S18).** `OpenAICompatibleProvider` lets the backend target a self-hosted `/chat/completions` server. Default behaviour is unchanged — with no new env vars the provider is Anthropic, and the new class is never constructed. New finding **S18** (LOW) records what enabling it means: the target server usually has no auth, and `LLM_BASE_URL` is an operator-set egress destination for prompt content (read from env at import, never from a request, so not user-controllable). Credential hygiene is test-pinned: `LLM_API_KEY` never appears in an error, and `_redact()` strips `user:pass@` userinfo from the base URL in error strings. No new dependency — `httpx` was already in requirements.txt.
 
 - **2026-07-27** — **LLM provider seam (no new findings, no regression).** `services/llm_provider.py` becomes the only `AsyncAnthropic` construction; `llm_service`, `book_llm_service` and `reading_llm_service` now depend on it. No new route, no path param, no change to how user content reaches a prompt (same system/messages, byte-identical tool definitions — test-pinned). `ANTHROPIC_API_KEY` is still read from env at import time and never logged; the new optional `LLM_MODEL` holds a model name, not a secret. S14 (LLM prompt injection from user content) is unchanged in scope — the seam moves where the client is built, not what goes into the prompt.
 
