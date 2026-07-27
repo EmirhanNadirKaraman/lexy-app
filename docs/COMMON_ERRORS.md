@@ -128,6 +128,51 @@ while the build had actually failed with two TypeScript errors.
 npm run build > /tmp/build.log 2>&1; echo "EXIT: $?"; tail -12 /tmp/build.log
 ```
 
+### `${PIPESTATUS[0]}` prints empty — the shell here is zsh, not bash
+**Symptom:** the documented fix for the piped-exit-code trap above,
+`cmd | tail -3; echo "EXIT: ${PIPESTATUS[0]}"`, prints `EXIT:` with no number.
+**Cause:** zsh's array is lowercase **and 1-indexed** — `${pipestatus[1]}` is
+the first command. `PIPESTATUS[0]` is a bash-ism and expands to nothing.
+**Fix:** don't pipe when you need the status. Redirect and check directly —
+this works in both shells and is what the entry above already recommends:
+```bash
+ruff check . > /tmp/r.log 2>&1; echo "EXIT: $?"; cat /tmp/r.log
+```
+
+### Scripted multi-step refactor: later regex runs on text an earlier one rewrote
+**Symptom:** a Python script doing a sequence of `re.sub` / `str.replace` over a
+source file produces code that looks right in the diff but is subtly broken.
+Two real instances in one session, both in the same script:
+- `.replace("tool_block.input", "response")` ran *before*
+  `re.sub(r'result = tool_block\.input\n', "")`, so the second pattern never
+  matched and a dangling `result = response` survived (caught later by ruff
+  F841 — but only because the variable happened to go unused).
+- A `.get(` rewrite dropped a closing quote, turning
+  `response.get("corrections", [])` into `response.get("corrections, [])` —
+  a syntax error 500 lines from anything that looked related.
+
+**Why it's dangerous:** each step is individually plausible, the file still
+*looks* like valid Python in a diff, and the failure surfaces far from the edit.
+Recovering incrementally is worse than starting over — you end up patching
+damage rather than doing the conversion.
+
+**Fix:** `git checkout --` the file and redo the whole conversion in **one**
+script that (a) uses brace/paren matching instead of regex for nested
+structures, and (b) **asserts its own postconditions before writing**:
+```python
+assert n_converted == n_expected, f"converted {n_converted}/{n_expected}"
+assert "_client" not in s, "old symbol survived"
+for block in each_converted_call(s):
+    for req in ("system=", "messages=", "schema=", "max_tokens="):
+        assert req in block
+compile(s, path, "exec")      # syntax gate
+p.write_text(s)               # write LAST
+```
+A verifier that runs before the write turns a silent corruption into a loud
+failure. Note the verifier itself needs the same care: a non-greedy
+`re.finditer(r'call\((.*?)\n\s*\)')` stopped inside a multi-line argument and
+reported a false failure on correctly-converted code.
+
 ### Edit tool: "Found N matches of the string to replace"
 **Symptom:** An edit fails because the target line appears more than once (e.g.
 `result = onboarding.seed_from_level("u1", LevelTier.A1, store)` appears 4× in
