@@ -544,30 +544,30 @@ Two defects:
 **Tests:** +61 in `test_llm_provider.py`. **Security:** new finding **S18** (LOW, opt-in) in `docs/SECURITY.md`.
 **Deliberately deferred — MockProvider.** `MOCK_LLM` fakes are computed from call arguments the provider never receives (`target_word in user_content`, `target_text` vs `user_answer`, the requested `language`). The provider sees those only as prose inside the prompt, so a MockProvider would have to regex them back out — coupling the mock to prompt wording and making it strictly worse. The 13 `if _MOCK:` branches stay at domain level.
 
-### 43. 🟡 Built-in / system vocabulary lists (Starter German, frequency lists) — INVESTIGATED 2026-07-27, partly blocked on provenance
-**Question asked:** can we ship built-in German A1/A2/B1 lists and a "4000 most frequent words" list from data we already have?
+### 43. 🟡 Built-in / system vocabulary lists — INVESTIGATED 2026-07-27, ready to wire
+**Question asked:** can we ship built-in German vocabulary lists from data we already have? **Yes.** The blocker recorded in the first pass — "unsafe pending a licensing review" — was wrong: the project owner holds distribution licences. What the repo actually lacked was *provenance documentation*, now written up in [`data/PROVENANCE.md`](../data/PROVENANCE.md). Read that file before touching any of this; it carries the per-file measurements.
 
-**What exists, precisely.** Three candidate source files **do exist and are tracked in git** — the issue is that they are *not productized*, not that they are absent:
+**The files exist, are git-tracked, and are usable — including for distribution.** What they are *not* yet is wired: none is read by `lexy-app/backend/`, and there is no system-list concept to expose them through.
 
-| File | Size | Status |
+| File | Entries | Role |
 |---|---|---|
-| `data/b1_parsed.txt` | 2,032 entries, German nouns with articles, alphabetical | **exists, git-tracked**; read only by `scripts/b1_word_finder.py`, `scripts/percentage_finder.py`, `ilp/optimal_set_finder.py` |
-| `data/b1_unparsed.txt` | bare noun forms | **exists, git-tracked**; read only by `scripts/b1_word_finder.py` |
-| `data/words_4000.txt` | 4,095 lines, frequency-ordered surface forms | **exists, git-tracked**; read only by `scripts/verb_finder.py`, `scripts/script.py` |
+| `data/words_4000_old.txt` | 4,095 | **Preferred source. Not an old version** — it is the full-fidelity 11-column TSV (translations 100%, examples 100%, POS 99%, conjugations 71%), ordered frequency-descending. Source of truth for the German 4000 list. |
+| `data/words_4000.txt` | 4,096 | **Redundant** — strictly column 0 of `_old`. Do not prefer it while `_old` is present. |
+| `data/b1_unparsed.txt` | 2,840 | B1 **entry set** — bare headwords, 815 of them absent from parsed. |
+| `data/b1_parsed.txt` | 2,032 | B1 **enrichment** — strict subset, adds gender + valency. Keep both; neither dominates. |
 
-None of the three is read by `lexy-app/backend/`. They are **not built-in/system word lists** in the product, and there is no code path that turns them into one.
+**Recommended order.** The first step is not a list at all — it is filling the catalog, because only ~40% of these headwords resolve against `word_table` today (the German catalog is 6,962 rows of scraped-subtitle vocabulary and lacks ordinary words like `Abbildung`, `Adresse`). A list built before this reads ~60% "unresolved".
 
-**Blocker: provenance is undocumented.** `b1_parsed.txt` / `b1_unparsed.txt` match the shape, size and content profile of the **Goethe-Institut Zertifikat B1 Wortliste** (alphabetical, articles, *Abbildung / Abitur / Abgas / Wettbewerb / Wirklichkeit*), which is copyrighted and not licensed for redistribution. `words_4000.txt` has no recorded source either. Nothing was downloaded to confirm. Being vendored as private dev data is one exposure; **shipping them as user-facing "B1" or "top 4000" lists is a materially larger one.** Verify provenance and licence before any product use.
+1. **Import `words_4000_old.txt` into `word_table`** — headword, POS, lemma. ~2,432 entries are missing today, a ~44% catalog expansion, and with real POS rather than the sparse `pos='X'` rows `learn_word_anyway` creates.
+2. **Pre-seed the permanent gloss cache** from column 2. `llm_service.translate_item_gloss` is one permanently-cached LLM call per item on the SRS due-card path; 4,095 human-quality glosses already exist in the file.
+3. **System-list schema + built-in lists.** `word_lists.user_id` is `NOT NULL` with `ON DELETE CASCADE`, so every list is user-owned — there is no system/default/shared concept. Needs a migration (nullable `user_id` + `is_system`, or a separate table) and widening the ownership filters in `word_list_service` from `user_id = $2::uuid`. Then the German 4000 list (chunkable by the file's own 169 groups) and the B1 list.
+4. **Optionally, later:** preload example generation from column 4, if the cache path supports it.
 
-**Two labelling hazards, independent of licensing:**
-1. **`onboarding.py` tiers are not CEFR.** `LevelTier.A1/A2/B1` hold 150 / 310 / 471 cumulative lemmas, but the module's own docstring says it "labels A1–B1 **informally**", the boundaries are "approximate", the lists are "hand-curated starting points", and production should "replace or supplement them with frequency data derived from a verified German subtitle corpus (e.g. SUBTLEX-DE, OpenSubtitles-DE)". The module is also **unwired** — the backend imports it nowhere. Do not surface these as CEFR levels.
-2. **`word_table.frequency` is app-corpus frequency, not general German frequency.** Migration 032 defines it as "number of sentences the word appears in" — i.e. scraped YouTube subtitles. Measured 2026-07-27: German has only 5,558 alphabetic words, 63% appearing in ≤1 sentence; by that ranking rank 500 is `Hongkong`(6), rank 1000 `Olafs`(3), rank 2000 `trust`(2, English), rank 3000+ are hapax legomena. Punctuation is in `word_table` and ranks top-2 (`.`=2442, `,`=1474). **A German "top 4000" generated from this column would be proper nouns, English loanwords and one-offs.** Spanish is ~4× deeper (22,548 alphabetic words, rank 4000 = `Laura`(6)) and could support a real top-1000–2000.
+**Two labelling cautions, which survive the licence question because they are accuracy not law:**
+1. **`onboarding.py` tiers are not a CEFR source.** `LevelTier.A1/A2/B1` (150 / 310 / 471 cumulative lemmas) are self-described as labelling CEFR "informally" with "approximate" boundaries, from "hand-curated starting points"; the module is also unwired. They remain a reasonable *Starter German* seed, but the next implementation is **wiring the documented data files, not guessing CEFR from these tiers**.
+2. **`word_table.frequency` is app-corpus frequency, not general German frequency.** Migration 032 defines it as "number of sentences the word appears in". Measured: 5,558 alphabetic German words, 63% appearing in ≤1 sentence; rank 500 is `Hongkong`, rank 1000 `Olafs`, rank 2000 the English word `trust`, and punctuation ranks top-2. **Use `words_4000_old.txt`'s own ordering as the frequency rank.**
 
-**Schema gap:** `word_lists.user_id` is `NOT NULL` with `ON DELETE CASCADE`, so every list is user-owned. There is no system/default/shared list concept — that is the one real blocker on the feature side, and needs a migration (nullable `user_id` + `is_system`, or a separate table) plus widening the ownership filters in `word_list_service` from `user_id = $2::uuid`.
-
-**Recommendation — ship the safe half first.** Build built-in **"Starter German"** lists from the `onboarding.py` tiers (150 / 310 / 471): project-authored, so no licensing question, already curated, already validated by `validate_tier_lemmas.py`. Name them for what they are (*Core 150 / Everyday 310 / Extended 471*) and **do not label them A1/A2/B1**. Revisit `b1_*.txt` and `words_4000.txt` **after** a provenance/licence review. If a frequency list is wanted before then, the honest version is "most common in Lexy's German videos — top ~300", punctuation- and proper-noun-filtered; below that depth German app-frequency stops being meaningful.
-
-**Not started.** No code written; this entry is the investigation record.
+**Not started.** No code written; this entry plus `data/PROVENANCE.md` are the record.
 
 ### 20. ✅ Dark mode theme system — RESOLVED 2026-05-19
 **What landed**

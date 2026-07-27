@@ -112,6 +112,36 @@ P-numbers.
 - **N4b — real privacy contact email — admin/account.** `PrivacyPage.tsx` and `docs/PRIVACY.md` still ship the literal `<YOUR_REAL_PRIVACY_EMAIL_BEFORE_LAUNCH>` placeholder. Needs an address that will still exist in a year, not a decision.
 - These unblock **independently** — doing one does not advance the other. Everything else on the checklist in `docs/CAPACITOR_READINESS.md` is done: packages installed, `ios/` scaffolded, `VITE_API_BASE_URL` helper in place, responsive + theme + PWA shipped.
 
+### N5a — Wire the German vocabulary data into built-in lists — **code**
+*The first substantial repo task in the queue.* Ranked below N1–N3 because
+those are the non-repo infrastructure/admin steps, but this is the largest
+piece of shippable product work currently unblocked.
+
+- **Not blocked, and not CEFR guesswork.** The earlier "unsafe pending
+  licensing" classification was wrong — the owner holds distribution licences.
+  What was missing was provenance documentation, now in
+  [`data/PROVENANCE.md`](../data/PROVENANCE.md). **The task is wiring
+  documented data files**, not inferring levels from `onboarding.py`'s tiers.
+- **`data/words_4000_old.txt` is the source of truth** — despite the name, it
+  is the full-fidelity file (4,095 entries; translations and examples at 100%,
+  POS 99%, conjugations 71%; frequency-descending order). `words_4000.txt` is
+  strictly its column 0 and is redundant.
+- **Order matters — catalog first, lists last.** Only ~40% of these headwords
+  resolve against `word_table` today, so a list built first would read ~60%
+  "unresolved":
+  1. Import into `word_table` (headword / POS / lemma) — ~2,432 missing
+     entries, a ~44% catalog expansion.
+  2. Pre-seed the permanent gloss cache from the translation column — 4,095
+     glosses replacing a permanently-cached LLM call per item on the SRS
+     due-card path.
+  3. System-list schema (`word_lists.user_id` is `NOT NULL`, so no shared-list
+     concept exists yet) + the built-in German 4000 and B1 lists.
+  4. Optionally later: preload example generation from the example column.
+- **Use the file's own ordering as the frequency rank**, not
+  `word_table.frequency` — that column is app-corpus (scraped-subtitle)
+  frequency, where rank 2000 is the English word `trust`.
+- Full per-file measurements: `docs/TODO.md` #43 and `data/PROVENANCE.md`.
+
 ### N5 — Hole 19: per-message language detection — **measurement-first, deferred**
 *Investigated 2026-07-27 (no code written). Real, but far narrower than it
 had been described — and the direction of the risk argues against fixing it
@@ -197,21 +227,11 @@ active credit) is the one that protects the asymmetry above.
   2. **The local corpus cannot validate the feature.** It is mostly UNED lecture register, where the target imperatives are essentially absent — so even a correct extractor would have nothing to extract, and no way to show it works.
   Reopening needs one of: an upstream spaCy fix, a normalisation pass that does not depend on the tagger, or a corpus in a register that actually uses imperatives. See `docs/TODO.md` #36.
 
-- **Built-in "B1" and "top 4000" vocabulary lists** — blocked on a provenance
-  review, not on engineering. **The source files exist and are git-tracked**
-  (`data/b1_parsed.txt`, `data/b1_unparsed.txt`, `data/words_4000.txt`); what
-  they are *not* is wired into the backend or exposed as built-in/system word
-  lists. They are read only by one-off scripts and the unwired `ilp/` CLI.
-  The `b1_*` pair matches the shape of the Goethe-Institut B1 Wortliste, and
-  `words_4000.txt` has no recorded source, so **they are not safe to expose
-  under CEFR or "top 4000" labels until provenance and licence are verified.**
-  Two separate labelling hazards apply even if the licence clears:
-  `onboarding.py`'s A1/A2/B1 tiers are self-described as *informal*, not CEFR;
-  and `word_table.frequency` is app-corpus (scraped-subtitle) frequency, not
-  general German frequency — a German "top 4000" built from it is mostly
-  proper nouns and one-offs. **Safer first step:** built-in *Starter German*
-  lists from the project-authored `onboarding.py` tiers (150/310/471), named
-  for what they are. Full record and measurements in `docs/TODO.md` #43.
+- ~~**Built-in "B1" and "top 4000" vocabulary lists** — blocked on a provenance
+  review.~~ **Corrected 2026-07-27:** not blocked. The owner holds distribution
+  licences; what was missing was provenance *documentation*, now written up in
+  `data/PROVENANCE.md`. Promoted to a real code task — see **N5a** in
+  §Remaining work.
 
 ---
 

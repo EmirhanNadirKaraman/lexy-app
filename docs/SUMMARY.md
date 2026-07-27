@@ -249,7 +249,10 @@ tests targeting one — see TODO #17.
 | Path | Purpose |
 |---|---|
 | `data/final_result.txt` | German verb dictionary used by `phrase_finder`. |
-| `data/words_4000.txt`, `b1_parsed.txt`, `known_words.txt`, `verbs.txt` | Reference word lists. |
+| `data/PROVENANCE.md` | **Read before using anything in `data/`.** Per-file provenance, licence basis, measured content, and which file is preferred vs redundant. Exists because the directory previously had no attribution and an audit had to infer each file from its byte structure. |
+| `data/words_4000_old.txt` | **Preferred vocabulary source, despite the name** — 11-column TSV, 4,095 entries with translations (100%), examples (100%), POS (99%), conjugations (71%), ordered frequency-descending. `words_4000.txt` is strictly its column 0 and is redundant. |
+| `data/b1_unparsed.txt`, `b1_parsed.txt` | B1 word list — unparsed is the entry set (2,840, 815 more than parsed); parsed is a strict subset adding gender + valency. Keep both. |
+| `data/known_words.txt`, `verbs.txt` | Reference lists; `known_words.txt` is personal study history and is read by `tests/test_free_chat_progression.py`. |
 | `files/book_pdfs/` | 29 German B1 books (PDFs). |
 | `files/json/`, `files/masked/`, `files/text/` | PDF pipeline intermediates. |
 | `ilp/optimal_set_finder.py` | PuLP ILP — pick minimum books covering target vocab. Standalone CLI, reads word-list files + its own DB config; outputs in same dir. **Still standalone and unchanged** — the playlist feature below re-implements the technique rather than importing this module. |
