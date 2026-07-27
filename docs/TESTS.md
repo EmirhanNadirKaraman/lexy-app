@@ -89,7 +89,9 @@ These were failing before #0b and are tracked here so they don't get blamed on f
 
 Test runner: Vitest + @testing-library/react + jsdom. Setup: `src/test/setup.ts`.
 
-**Current count (W13 baseline, 2026-05-20):** ~179+ tests across ~31 files.
+**Current count (2026-07-27): 238 tests across 40 files.** Was 219 across 37
+files before the #39 lemma-correction UI landed (+19 tests, +3 files).
+Historical baseline: ~179 across ~31 files at W13 (2026-05-20).
 The full per-file inventory is below in the dated "Tests added in this session"
 rows — each W# / T# row lists which test files it added or extended. Rather
 than maintain a parallel index here, treat those rows as the live list and
@@ -109,6 +111,36 @@ full picture):
   `SessionSummaryCard`, `SelectionPanel`, `FreeChatPage`, `ReminderBanner`,
   `PrivacyPage`.
 - Theme tokens: `src/test/theme.test.tsx` (across #20a/b).
+- Lemma corrections (#39 frontend, 2026-07-27) — see the dated row below.
+
+🆕 **2026-07-27 — #39 lemma-correction UI (frontend only, +19 tests / +3 files)**
+
+Frontend for the already-shipped slice 3A/3B backend. **No backend behaviour
+changed** — no backend Python was touched; `test_lemma_corrections.py` (41 tests)
+still passes unmodified.
+
+| File | Tests | Covers |
+|---|---|---|
+| `components/LemmaFlagButton.test.tsx` | 6 | POST body shape; **blank optional fields omitted, not sent as `''`**; quiet success collapses the form; a failed submit keeps the form open AND preserves typed input; the 429 throttle message surfaces from `_http.ts`; 44px target + 16px input guards |
+| `components/AdminLemmaQueuePage.test.tsx` | 8 | renders `surface_form` / `observed_lemma` / `suggested_lemma` / `context_text` / `report_count`; accept and reject each hit the right endpoint and update the row **in place** (asserted by counting list fetches — no refetch); `corrected_lemma` omitted when blank so the backend falls back to `suggested_lemma`, sent when typed; a `nothing_to_promote` 400 surfaces inline and leaves the row actionable; a 403 renders the error state, not a misleading empty queue |
+| `hooks/useIsLemmaAdmin.test.tsx` | 5 | 200 → true, 403 → false, starts false (no link flash), no probe without a token, network failure resolves false |
+
+**Two things these tests deliberately pin down:**
+
+1. **Admin gating is discoverability, not security.** `is_admin` lives in
+   `users.settings` JSONB and is exposed in *no* response model — not the token,
+   not `/settings/preferences` — so the client has no flag to read and instead
+   probes the admin endpoint. `require_admin` on the backend routes is the real
+   gate. The 403-error-state test in `AdminLemmaQueuePage.test.tsx` exists
+   precisely so nobody later mistakes the hidden nav link for enforcement.
+2. **`/adjudicate` is intentionally unused.** It returns 503 in production
+   (slice 3C ships no adjudicator), so no UI is built against it and no test
+   references it.
+
+**Gotcha found while adding these:** `npx tsc --noEmit` passed while
+`npm run build` failed. `build` runs `tsc -b`, a different project scope, which
+caught two uses of `global` (absent from the browser lib). **`tsc --noEmit`
+alone does not prove the build is clean** — run `npm run build` too.
 
 ---
 

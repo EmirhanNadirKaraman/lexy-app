@@ -46,7 +46,8 @@ through slice 3C (dry-run adjudication). Capacitor packages installed,
 user's call.
 
 Verified on 2026-07-27: backend **745 passed / 2 skipped**, root pipeline
-**671 passed**, frontend **219 passed**. Working tree clean.
+**671 passed**, frontend **238 passed across 40 files** (was 219/37 before
+the #39 UI landed), `ruff check .` clean.
 
 ---
 
@@ -55,20 +56,54 @@ Verified on 2026-07-27: backend **745 passed / 2 skipped**, root pipeline
 Ranked. Everything above the line in §Web-polish path is history; this is
 the live list.
 
-### P1 — #39 frontend: flag button + admin review queue
-- **Effort:** M. **Category:** product / completes shipped backend.
-- **Why now:** slices 3A + 3B shipped the entire signal→authority chain
-  (`POST /api/v1/lemma-corrections`, admin accept/reject with a
-  transactional upsert into `lemma_override`). **None of it is reachable
-  from the UI.** Users cannot flag a wrong lemma; admins have no screen.
-  This is the highest value-per-effort item open — the expensive half is
-  already built and tested (41 tests in `test_lemma_corrections.py`).
-- **Scope:** a flag affordance where a canonical phrase is displayed, and
-  an admin list view over `GET /api/v1/admin/lemma-corrections` with
-  accept/reject buttons. No new backend work required.
-- **Related, separate:** the live-LLM adjudicator behind
-  `get_lemma_adjudicator` (currently returns `None` → 503). That one is a
-  product decision about cost, not a blocked frontend.
+### P1 — #39 frontend: flag button + admin review queue — ✅ SHIPPED 2026-07-27
+- **Frontend only. No backend behaviour changed** — zero backend Python
+  files were touched, and `test_lemma_corrections.py` (41 tests) still
+  passes unmodified against slices 3A/3B as they already were.
+- **Learner flag:** `components/LemmaFlagButton.tsx`, mounted in the SRS
+  review reveal (`SRSReviewPage`) directly under the revealed canonical —
+  the moment a learner is actually looking at a lemma and can judge it.
+  Rendered only for `item_type` `word` / `phrase`: grammar rules carry no
+  lemma and the backend's `item_type` is `Literal["word","phrase"]`, so
+  offering it there would guarantee invalid submissions. Blank optional
+  fields are omitted from the body rather than sent as `''`.
+- **Admin queue:** `components/AdminLemmaQueuePage.tsx` at
+  `/admin/lemma-corrections`, over `GET /api/v1/admin/lemma-corrections`
+  with per-row accept/reject. Accept may carry an overriding
+  `corrected_lemma`; blank falls back to the candidate's
+  `suggested_lemma` (400 `nothing_to_promote` if both are empty, surfaced
+  inline). Rows update **in place** rather than refetching.
+- **Admin gating is discoverability, NOT security.** `is_admin` lives in
+  `users.settings` JSONB and is exposed in no response model — not the
+  token, not `/settings/preferences` — so there is no flag for the client
+  to read. `hooks/useIsLemmaAdmin.ts` probes the admin endpoint and hides
+  the nav link on a non-2xx. `require_admin` on the routes is the real
+  gate; a non-admin who types the URL still gets a server 403, rendered
+  as the queue's error state. Do not "harden" this by adding a
+  client-side forbidden screen — that would imply the client enforces
+  access.
+- **`/adjudicate` deliberately not wired.** It returns 503 in production
+  (slice 3C ships no adjudicator), so no UI is built against it.
+- **Tests:** +19 Vitest (238 across 40 files, was 219/37). See the
+  2026-07-27 row in `docs/TESTS.md`.
+
+### P1-followups — #39 remains OPEN overall
+Shipping the frontend closes the *reachability* gap, not #39. Two pieces
+are still open and both are **product decisions, not blocked engineering**
+(see also the "Blocked on a product decision" list below):
+- **Live LLM adjudicator** behind `get_lemma_adjudicator` — currently
+  returns `None`, so `/adjudicate` 503s by design. Wiring a real
+  Haiku-backed adjudicator is a **cost** decision, plus a call on whether
+  proposals get persisted as history. Until then the accept/reject path
+  is human-only, which is the intended slice-3C posture.
+- **Community voting on corrections** — a **stretch idea, not a plan**.
+  `docs/TODO.md` #39 records the case against it as the primary
+  mechanism: learners are the least-qualified group to adjudicate
+  lemmatisation, lemma correctness is objective rather than a matter of
+  opinion, and it would need sybil/abuse handling for worse accuracy than
+  the curated table. The shipped flag → admin-accept chain is the
+  "community surfaces, an authority decides" shape that idea concluded
+  was better.
 
 ### P2 — Deploy shape — ✅ DECIDED 2026-07-27: single-worker MVP
 - **Decision:** the backend is **officially single-worker** for MVP. Both
@@ -699,11 +734,18 @@ machine and a real privacy contact email. Until those two exist, T3.1
 cannot proceed regardless of code readiness.
 
 **2. Next single best task.**
-**P1 — the #39 frontend (flag button + admin review queue).** The entire
-backend chain from user signal to `lemma_override` shipped through slice
-3B and is covered by 41 tests, but no UI reaches it. Finishing the cheap
-half turns a fully-built, fully-tested subsystem from dead code into a
-working feature. Nothing else open has that ratio.
+~~P1 — the #39 frontend.~~ **Shipped 2026-07-27** (see §Current
+priorities). The signal→authority chain is now reachable end to end:
+learners can flag, admins can accept/reject, accepting writes the
+override.
+
+Next up is **P3 — the remaining Spanish extractor patterns (#36)**.
+Spanish is a shipped language whose phrase coverage is materially thinner
+than German's — imperatives extract nothing, and the verb+preposition
+allowlist is hardcoded rather than data. P2 is decided, P4 is a precision
+improvement on an already-mitigated path, and P5 is small residuals, so
+P3 is the largest remaining gap between what a German learner gets and
+what a Spanish learner gets.
 
 **3. Avoid right now.**
 - #5 reconciliation (Hole 23) — no user signal yet.
@@ -734,78 +776,60 @@ is still accurate whenever it's picked up.
 
 ## Recommended next prompt (paste back to continue)
 
-> Replaced 2026-07-27. The previous contents of this section asked for
-> **T1.1 (transcript-click dedup)**, which had already shipped on
-> 2026-05-20 — the section was never updated after the item it pointed at
-> landed. See T1.1 above for what was actually delivered.
+> Replaced 2026-07-27. The previous contents asked for the **#39 frontend
+> (flag button + admin queue)**, which shipped that day — see P1 in
+> §Current priorities. Before that it asked for **T1.1**, which had also
+> already shipped. If you are reading this section, check the item is
+> still open before pasting it.
 
 ```
-Implement P1: the #39 lemma-correction frontend (flag button + admin review queue).
+Implement P3: the remaining Spanish phrase-extractor patterns (#36).
 
-Goal:
-Make the already-shipped lemma-correction backend reachable from the UI.
-Slices 3A + 3B built the full chain -- user signal -> admin decision ->
-lemma_override -- with 41 tests. None of it has a frontend, so users cannot
-report a wrong lemma and admins cannot review one.
+Context:
+Spanish is a shipped language (stages 0-4, 2026-05-21), but its phrase
+coverage is materially thinner than German's. Slices 1-4 shipped reflexives,
+verb+preposition, clitic-attached infinitives, and reflexive+prep combos on
+both finite and infinitive forms. Read docs/TODO.md #36 for exactly what each
+slice covers before adding anything.
 
-Do NOT change backend behaviour. This is a UI task against endpoints that
-already exist and are already tested.
+Open, in rough value order:
+1. Imperatives ("lavate", "levantate") extract nothing -- es_core_news_sm tags
+   them as non-verbs. This is regression-guarded today, so the guard tests
+   encode the CURRENT (empty) behaviour and will need updating. Needs either a
+   model that tags imperatives or a normalization pass; establish which by
+   probing the model before writing extractor code.
+2. The verb+preposition allowlist is hardcoded in phrase_finder.py. Promote it
+   to data/config so adding a collocation is not a code change.
+3. Idioms, MWEs, subjunctive -- larger, scope separately.
 
-Existing backend surface (read before starting):
-- POST  /api/v1/lemma-corrections            auth, per-user 30/hr throttle
-                                             body: language, surface_form,
-                                             observed_lemma, optional
-                                             suggested_lemma + context_text
-                                             (missing/blank optionals normalize
-                                             to '' server-side)
-- GET   /api/v1/admin/lemma-corrections      require_admin, read-only queue
-- POST  /api/v1/admin/lemma-corrections/{id}/accept   require_admin
-                                             optional corrected_lemma in body;
-                                             falls back to the candidate's
-                                             suggested_lemma; 400 if neither
-- POST  /api/v1/admin/lemma-corrections/{id}/reject   require_admin
-- POST  /api/v1/admin/lemma-corrections/{id}/adjudicate  require_admin,
-                                             returns 503 today (no adjudicator
-                                             wired) -- do not build UI that
-                                             depends on it
+Constraints:
+- German behaviour must not change. It is regression-guarded by
+  tests/test_phrase_dispatcher.py and backend tests/test_matcher.py; both must
+  stay green.
+- Output shape must stay identical to the German extractor
+  (dictionary_entry / sentence_phrase / logic / match_type / indices) so
+  pipeline.insert_phrases consumes it unchanged.
+- Lemma quality is NOT this task -- that is the #39 override layer. If spaCy
+  returns a wrong lemma, add a lemma_override row, do not special-case it in
+  the extractor.
+- Probe es_core_news_sm directly before assuming any tagging behaviour. Slices
+  3 and 4 both turned on what the model actually produces, not what the docs
+  suggest.
 
-Service + schema detail: lexy-app/backend/services/lemma_correction_service.py,
-routers/lemma_corrections.py, docs/LEMMA_OVERRIDE_WORKFLOW.md.
-
-Frontend tasks:
-1. A flag affordance wherever a canonical phrase is displayed to a learner.
-   Opens a small form: what looks wrong, optional suggested lemma. Posts to
-   /api/v1/lemma-corrections. Success is quiet (a confirmation chip, not a
-   modal); a 429 surfaces the throttle message from _http.ts.
-2. An admin review screen listing pending candidates from
-   GET /api/v1/admin/lemma-corrections, showing surface_form, observed_lemma,
-   suggested_lemma, context_text, and report_count. Accept / Reject buttons
-   per row; accept optionally lets the admin type a corrected_lemma that
-   overrides the suggestion. Row updates in place on success.
-3. Route the admin screen behind the existing admin check. A non-admin user
-   must not see an entry point to it.
-4. Follow the house style: inline React.CSSProperties, var(--color-*) theme
-   tokens (no new hardcoded hex), 44px touch targets, 16px font on any input
-   (iOS focus-zoom guard), errors surfaced inline rather than swallowed.
-
-Tests (Vitest):
-1. Flag form posts the expected body; blank optional fields are omitted.
-2. A failed submit surfaces an error and keeps the form open.
-3. Admin list renders pending candidates including report_count.
-4. Accept and Reject each call the right endpoint and update the row.
-5. The admin entry point does not render for a non-admin user.
+Tests:
+Add to tests/test_spanish_phrase_extractor.py. Cover a verb matrix per new
+pattern, a negative case per pattern, and a guard that the bare form is
+suppressed where a combo form is emitted.
 
 Run:
-cd lexy-app/frontend && npx tsc --noEmit && npx vitest run && npm run build
-cd lexy-app/backend && python -m pytest tests/test_lemma_corrections.py -q
+ruff check .
+pytest tests/test_spanish_phrase_extractor.py tests/test_phrase_dispatcher.py -q
+cd lexy-app/backend && python -m pytest tests/test_matcher.py -q
 
-Report:
-- components added/changed and where the flag button was placed
-- how admin gating is enforced client-side
-- exact test results for both suites
+Report which model behaviours you probed and what they returned, since that is
+what determines whether a pattern is implementable at all.
 ```
 
-After P1 lands, the next decision is **P2 — single-worker or multi-worker
-deploy** (see §Current priorities). That one is a decision to make, not a
-task to hand off: answering it either closes S12 + #24 + T2.2 as
-non-issues or turns them into one Redis-shaped piece of work.
+After P3, the open list is P4 (Hole 19 per-message language detection) and P5
+(security residuals). #39 stays open overall until the live-LLM adjudicator is
+either wired or formally dropped — that is a cost decision, not engineering.
