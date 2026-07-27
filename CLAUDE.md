@@ -18,9 +18,16 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 |---|---|---|
 | **App backend** (production) | `lexy-app/backend/` | FastAPI + asyncpg + Postgres. This is what serves the frontend. |
 | **Pipeline modules (root)** | `pipeline.py`, `eligibility.py`, `exposure_counter.py`, `user_knowledge.py`, `learning_units.py`, `onboarding.py`, `subtitle_*.py`, `utterance_*.py`, `word_knowledge.py`, `validate_tier_lemmas.py` | Standalone in-memory utilities. NOT mounted on FastAPI. Used by `subtitle-scraper/` and ad-hoc data prep. |
-| **`src/app/`** | `src/app/{exposure,extraction,learning,pipeline,subtitles}/` | Refactored copies of root pipeline modules, reorganized as a package. **NOT wired into anything** — orphan refactor in progress. |
+**Implication:** the root pipeline modules are the **only** pipeline tree. Change them directly; there is no second copy to keep in sync.
 
-**Implication:** when you change pipeline logic, you may need to touch *two* copies (root + `src/app/`). Pick one as authoritative before doing real work; right now root is what runs.
+> **Historical (resolved 2026-07-27):** a third layer, `src/app/`, used to hold a
+> half-finished repackaging of the root pipeline modules. It had zero runtime
+> callers while 537 of the root suite's 671 tests exercised it, so the project
+> shipped untested runtime code and maintained tests for code nothing ran. The
+> valuable behaviour was ported onto the runtime modules (runtime coverage
+> 20 → 93 tests) and `src/` was deleted. If you find a doc or comment that still
+> says "two copies of the pipeline", it is stale — say so rather than recreating
+> the split.
 
 ---
 
@@ -72,7 +79,6 @@ language-app/
 │           ├── types/index.ts     ← all shared interfaces (~416 lines)
 │           └── config/wordColors.ts
 ├── pipeline.py + (subtitle/learning/exposure root .py)   ← standalone pipeline
-├── src/app/                        ← orphan refactor of the above
 ├── subtitle-scraper/               ← yt-dlp scraper
 ├── pdf_text_extraction/            ← Docling-based PDF pipeline
 ├── masking/, postprocessing/, ilp/ ← supporting data jobs
@@ -244,7 +250,7 @@ Read this before assuming anything about how an event flows through `progression
 - **Notifications** — write side: scraper emits `channel_done`, `video_done`, and `request_failed` (since 2026-05-19) via `_notify_user`. Read side: `routers/notifications.py` SSE handler now yields each row first and marks `seen=true` only after the yield resumes (per-row, mark-after-yield via the extracted `_yield_unseen(pool, user_id)` helper). Disconnect mid-stream leaves un-yielded rows unseen for re-delivery. Polling is still 3s (LISTEN/NOTIFY refactor is TODO #4b — not user-visible).
 - **Migration 010 ≠ separate `reading_review` table.** It adds `review_count` + `next_review_at` columns to `reading_selections`. Reading SRS now has a frontend (`ReadingReviewPage`, since #5 / 2026-05-20) and a wired `mastered → known` propagation; it still runs a parallel schedule to `srs_cards` for the same item (both advance on review — Hole 23 documented and accepted).
 - **`@/scripts/`** is mostly one-off legacy data fixers; check before editing.
-- **Two copies of pipeline code** (root vs `src/app/`). Until consolidated, edits go in root.
+- ~~**Two copies of pipeline code** (root vs `src/app/`).~~ Resolved 2026-07-27 — `src/` deleted. Root is the only pipeline tree; edit it directly.
 
 ---
 
@@ -349,7 +355,7 @@ MOCK_LLM=false            # set true to short-circuit LLM in tests
 - **Polymorphic key everywhere:** if you add a new tracked content type, it gets an `item_type`, lives in its own content table (with `display_text` available), and plugs into `user_word_knowledge` / `srs_cards`.
 - **Migrations are append-only** — never edit an existing migration once it's been run anywhere.
 - **Tests live next to the layer they test** (backend tests under `lexy-app/backend/tests/`, pipeline tests under `tests/`).
-- **No new top-level Python files** without a reason — root is already crowded with the pipeline modules and the `src/app/` refactor is in flight.
+- **No new top-level Python files** without a reason — root is already crowded with the pipeline modules. (The `src/app/` refactor that used to sit alongside them was deleted 2026-07-27; don't start a replacement without a plan to finish it.)
 
 ---
 

@@ -147,11 +147,18 @@ alone does not prove the build is clean** — run `npm run build` too.
 ## Pipeline tests — `tests/`
 
 Hermetic pytest tests. Two sub-trees:
-- `tests/{subtitles,learning,exposure,pipeline}/` — 537 tests against the `src/app/` refactor (TODO #17 inventory).
-- `tests/runtime/` — 20 tests salvaged onto the runtime root modules (W4 batch 1, 2026-05-20: subtitle cleaner / merger / ingestion / multi-speaker guard / word_knowledge / onboarding).
+- `tests/runtime/` — **93 tests** against the runtime root pipeline modules, in
+  nine files: subtitle cleaning / ingestion / merging / segmentation, quality
+  filter, exposure service, eligibility + unit extraction, onboarding tiers,
+  learning invariants.
+- ~~`tests/{subtitles,learning,exposure,pipeline}/` — 537 tests against the
+  `src/app/` refactor.~~ **Deleted 2026-07-27** with the refactor itself; the
+  valuable behaviour was ported into `tests/runtime/` first (TODO #17).
 - Scraper-facing: `tests/test_scraper_channels.py`, `tests/test_scraper_es_path.py`, 🆕 `tests/test_scraper_db_ssl.py` (S4 residual — `subtitle-scraper/db_ssl.py` resolver matrix + `seed_channels.connect()` forwards `sslmode`; scraper modules imported via add-if-absent / `sys.modules.pop` fixtures so the file never pollutes `sys.path` for `test_scraper_channels`), and 🆕 `tests/test_language_config.py` (#18 — `language_config.py` values/order/helpers/unknown-lang/malformed-config + pipeline-no-longer-hardcodes; loaded by `spec_from_file_location` with **no `sys.path` mutation**, the round-3 lesson — a module-level insert here broke `test_scraper_channels` under churn).
 
-Root suite baseline (W4): **562 passed.** Run: `pytest tests/` from repo root.
+Root suite baseline: **207 passed** (93 runtime + 114 scraper). Run
+`pytest tests/` from repo root. Historical: 562 at W4, peaking at 744 before
+the `src/app/` deletion.
 
 Backend suite baseline (W13, 2026-05-20): **521 passed / 2 skipped** (xdist parallel run ~48s). Run: `pytest -n auto` from `lexy-app/backend/`.
 
@@ -929,18 +936,54 @@ Run all three. The lint step is not optional.
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
 | Backend | `cd lexy-app/backend && pytest -n auto` | 745 passed, 2 skipped |
-| Root pipeline | `pytest tests/` *(repo root)* | 671 passed |
+| Root pipeline | `pytest tests/` *(repo root)* | 207 passed |
+
+The root suite is **207 = 93 + 114**: `tests/runtime/` (93) covers the root
+pipeline modules, `tests/*.py` (114) covers `subtitle-scraper/`. It was 744
+until 2026-07-27, when the `src/app/` refactor and the 537 tests that only
+targeted it were deleted — see the retirement note below.
 
 **When one of these fails, check [`docs/COMMON_ERRORS.md`](./COMMON_ERRORS.md)
 before debugging.** It carries the failures that have actually happened here —
 including two that mislead rather than simply fail: `pytest-randomly` erroring
 every test at setup so no assertion runs, and a `cd` persisting between shell
 calls so `pytest tests/` silently runs the *backend* suite from
-`lexy-app/backend` and reports 745 instead of 671.
+`lexy-app/backend` and reports 745 instead of 207.
 
 Frontend changes additionally want
 `cd lexy-app/frontend && npx tsc --noEmit && npx vitest run && npm run build`
-(219 tests across 37 files).
+(238 tests across 40 files).
+
+🆕 **2026-07-27 — `src/app/` retired; root suite 744 → 207**
+
+Phase 1 ported the valuable behaviour off the orphan refactor onto the runtime
+modules (`tests/runtime/`: **20 → 93 tests**, nine files), then Phase 2 deleted
+`src/` (3,462 lines), the four test directories that only targeted it
+(`tests/{subtitles,learning,exposure,pipeline}/`, 537 tests) and the root
+`conftest.py` sys.path injection.
+
+Coverage went *up* where it matters: before this, the shipping pipeline modules
+had 20 tests while 537 tests exercised code with zero runtime callers.
+`eligibility.py` — the i+1 rule the whole learning model rests on — had never
+been tested in its shipping form until batch 4.
+
+**Two accepted coverage losses, recorded rather than glossed:**
+  - `pipeline_diagnostics.py` (290 lines) lost its only 39 tests and has **no
+    runtime equivalent**. It emits profiling/timing tables with no product
+    behaviour, so this was judged acceptable — but it is now the one runtime
+    pipeline module with zero coverage.
+  - The 11 end-to-end `GermanSubtitlePipeline` smoke tests are gone. They bound
+    tightly to the refactor's class shape. Runtime is covered **stage by stage**
+    (ingestion → cleaning → merging → segmentation → extraction → eligibility →
+    quality → exposure) rather than by one end-to-end run, so a regression that
+    only appears in stage *composition* would not be caught today.
+
+`conftest.py` was deleted outright, not rewritten. Runtime tests import root
+modules directly (`from subtitle_cleaner import …`) and the repo root reaches
+`sys.path` via the `tests/__init__.py` + `tests/runtime/__init__.py` package
+chain, which makes pytest's basedir the repo root. That was an inference about
+pytest's import mode, so it was verified by removing the file and re-running
+(207 either way) rather than by reasoning.
 
 **Ruff baseline (2026-07-27): zero findings**, down from 153.
 

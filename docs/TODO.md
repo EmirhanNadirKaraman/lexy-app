@@ -270,7 +270,21 @@ Triaged 288 `print()` calls across 17 files. **62 prints converted** to `logger`
 
 ## P3 — Architectural debt. Doesn't break things, but every new feature pays the tax.
 
-### 17. 🟡 #17-runtime-test-alignment — root pipeline vs `src/app/` duplication
+### 17. ✅ #17-runtime-test-alignment — root pipeline vs `src/app/` duplication — RESOLVED 2026-07-27
+
+> **Closing note (appended; the inventory and options below are preserved as
+> written).** Option (B), selective salvage, was executed in full and then
+> completed with the deletion. Five batches ported the valuable behaviour onto
+> the runtime modules — `tests/runtime/` went **20 → 93 tests** across nine
+> files, including the first ever coverage of `eligibility.py` (the i+1 core)
+> and `subtitle_segmenter.py`. `src/` (3,462 lines), the 537 tests that only
+> targeted it, and the root `conftest.py` sys.path hack were then deleted. Root
+> suite **744 → 207** (93 runtime + 114 scraper), all against shipping code.
+> Accepted losses: `pipeline_diagnostics.py` (39 profiling tests, no runtime
+> equivalent) and the 11 end-to-end smoke tests (runtime is covered
+> stage-by-stage instead). The inventory table and per-test picks below are kept
+> as the record of how the salvage was chosen.
+
 
 **Original framing was wrong.** `src/app/` was tagged "orphan refactor with zero callers." A 2026-05-20 inspection found the real picture:
 
@@ -348,6 +362,8 @@ Coverage of the batch: 8 cleaner + 4 merger + 4 guard + 2 noise + 1 knowledge + 
 - Don't change `subtitle-scraper/` imports.
 
 **Status:** Batch 1 shipped 2026-05-20 (W4) — 20 behavioural tests ported into `tests/runtime/` (subtitle cleaner / merger / ingestion / multi-speaker guard / word_knowledge / onboarding). Runtime APIs matched the refactor exactly; no production code changed. Batches 2+ not yet started; `src/app/` and the rest of `tests/{subtitles,learning,exposure,pipeline}/` still in place pending further salvage.
+
+**Status (appended 2026-07-27):** batches 2–5 shipped and the tree is deleted — see the closing note at the top of this item. Batch 2: segmentation + onboarding tiers (23). Batch 3: quality filter + exposure (24). Batch 4: exposure state progression (13). Batch 5: eligibility + unit extraction (13). No runtime/refactor behaviour mismatch was found in any batch — every ported test passed on first run against the runtime modules, which is the evidence that deleting the refactor lost nothing already recovered.
 
 ### 18. ✅ Hardcoded language config in scraper — RESOLVED 2026-05-25
 **Was:** `subtitle-scraper/pipeline.py` hardcoded `LANG_MODEL_MAP` / `LANG_TRANSCRIPT_CODES` / `NO_MORPH_LANGS` as three separate dicts; adding a language meant editing all three (+ a duplicated `NO_MORPH_LANGS` in `profile_pipeline.py`).

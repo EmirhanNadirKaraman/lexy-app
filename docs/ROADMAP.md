@@ -605,7 +605,20 @@ the input signal before changing the readout.
 
 ## Tier 2 — Good next after Tier 1
 
-### T2.1 — #17 src/app salvage batch 1 (20 tests onto runtime)
+### T2.1 — #17 src/app salvage — ✅ RESOLVED 2026-07-27 (salvage complete, tree deleted)
+The plan below is preserved as written; what actually happened went further
+than batch 1. Phase 1 ran four more salvage batches (runtime coverage
+20 → **93** tests across nine files in `tests/runtime/`, including the first
+ever coverage of `eligibility.py`, the i+1 core). Phase 2 then deleted `src/`
+(3,462 lines), the 537 tests that only targeted it, and the root
+`conftest.py` sys.path hack. Root suite 744 → **207** (93 runtime + 114
+scraper), all against shipping code. Two accepted losses:
+`pipeline_diagnostics.py` (39 profiling tests, no runtime equivalent) and the
+11 end-to-end smoke tests (runtime is covered stage-by-stage instead).
+
+Original plan follows.
+
+
 - **Effort:** M (½ day per batch; plan already in TODO.md).
 - **Impact:** HIGH structural. Runtime root pipeline modules ship with zero
   modern coverage; `src/app/` has 537 tests but no callers. Port the top-20
@@ -754,8 +767,8 @@ what a Spanish learner gets.
   not a code task until a maintenance-review UX is designed.
 - #37 multi-track subtitles — blocked on a product decision, and the TODO
   explicitly warns against building the schema change speculatively.
-- New top-level Python files / new `src/app/` modules — that refactor is
-  being deleted, not extended.
+- New top-level Python files, or recreating a parallel package tree like the
+  old `src/app/` — that refactor was deleted 2026-07-27, not paused.
 
 **4. Reclassify as no longer worth doing.**
 - #5e (drop entirely).
@@ -765,12 +778,11 @@ what a Spanish learner gets.
   closed, Hole 19 is ranked on its own as P4.
 
 **5. What about the rest of #17 (`src/app/` salvage)?**
-Batch 1 shipped (W4, 20 tests onto `tests/runtime/`). Batches 2+ never
-started, so `src/app/` still carries ~1,065 lines with zero runtime
-callers while `tests/{subtitles,learning,exposure,pipeline}/` still test
-the refactor rather than the shipping code. Unranked deliberately: it is
-real debt but blocks nothing, and the salvage plan in `docs/TODO.md` §17
-is still accurate whenever it's picked up.
+~~Batch 1 shipped; batches 2+ never started.~~ **Done 2026-07-27.** Four more
+salvage batches took runtime coverage 20 → 93 tests, then `src/` (3,462
+lines), the 537 tests targeting it, and the `conftest.py` sys.path hack were
+all deleted. Root suite 744 → 207, every test now against shipping code.
+See T2.1 above.
 
 ---
 

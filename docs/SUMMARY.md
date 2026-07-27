@@ -163,7 +163,7 @@ One file per domain, thin fetch wrappers with `assertOk`:
 
 ## Pipeline (root) — in-memory utilities, NOT mounted on FastAPI
 
-Source files at repo root. Used by `subtitle-scraper/` and ad-hoc data prep. A refactored copy lives in `src/app/` (orphan — TODO #17).
+Source files at repo root. Used by `subtitle-scraper/` and ad-hoc data prep. **This is the only pipeline tree** — the `src/app/` repackaging that used to shadow it was deleted 2026-07-27 (TODO #17). Tests live in `tests/runtime/`.
 
 | Path | Owns |
 |---|---|
@@ -171,7 +171,7 @@ Source files at repo root. Used by `subtitle-scraper/` and ad-hoc data prep. A r
 | `subtitle_cleaner.py` | `SubtitleTextCleaner`, `SubtitleFragment` — HTML/formatting removal. |
 | `subtitle_merger.py` | `SubtitleMerger`, `MergedSubtitleWindow` — fragment merging, hyphenation. |
 | `subtitle_segmenter.py` | `SubtitleSegmenter`, `CandidateUtterance` — sentence segmentation via spaCy. |
-| ~~`subtitle_ingestion.py`~~ | **Does not exist at root.** SRT parsing lives in `pipeline.py` as `parse_srt` (row above). The refactor split it out as `src/app/subtitles/ingestion.py`, which is where the name came from. |
+| ~~`subtitle_ingestion.py`~~ | **Does not exist.** SRT parsing lives in `pipeline.py` as `parse_srt` (row above). The name came from the deleted `src/app/subtitles/ingestion.py`; an earlier draft of this index listed it as if it were a root module. |
 | `utterance_quality_filter.py` | `UtteranceQualityEvaluator` — length, noise, proper-noun filters. |
 | `utterance_unit_extractor.py` | `UtteranceUnitExtractor` — spaCy-driven unit extraction. |
 | `learning_units.py` | `LearningUnit`, `LearningUnitType` enum, lemmatisation. |
@@ -184,11 +184,11 @@ Source files at repo root. Used by `subtitle-scraper/` and ad-hoc data prep. A r
 | `eligibility.py` | `EligibilityFilter` — i+1 readiness. |
 | `validate_tier_lemmas.py` | One-shot B1 word list validator. |
 
-### `src/app/` (orphan refactor, not wired)
-Same shapes as above, reorganised under `src/app/{subtitles,pipeline,extraction,learning,exposure}/`. Don't edit unless consolidating per TODO #17.
-
 ### Tests — `tests/`
-Pytest tests for pipeline modules. Mostly hermetic (no DB).
+Pytest tests for pipeline modules. Mostly hermetic (no DB). 207 tests:
+`tests/runtime/` (93) covers the root pipeline modules above; `tests/*.py`
+(114) covers `subtitle-scraper/`. There is no longer a `src/app/` tree or
+tests targeting one — see TODO #17.
 
 ---
 
