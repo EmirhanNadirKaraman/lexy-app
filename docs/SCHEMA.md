@@ -29,15 +29,20 @@ Adjust the user/secrets handling per your own threat model.
 ### Vocabulary / catalog (shared, user-agnostic)
 | Table | Purpose |
 |---|---|
-| `word_table` | (word_id PK, language, word, lemma, pos) — the unit of learning for type='word'. |
+| `word_table` | (word_id PK, language, word, lemma, pos, frequency) — the unit of learning for type='word'. `frequency` (migration 032) backs the autocomplete ranking; refreshed by the scraper, not written per-request. |
 | `phrase_table` | (phrase_id PK, language, canonical, surface_form, phrase_type) — multi-token learning units. |
 | `grammar_rule_table` | (rule_id PK, title, short_explanation, applicable_phrase_types, applicable_lemmas) — passive-only direction. |
 | `language_table` | code → display config. |
 | `channel`, `video`, `sentence` | Subtitle pipeline output. |
 | `word_to_sentence`, `sentence_to_phrase`, `sentence_to_grammar_rule` | Many-to-many bridges between content tables. |
 | `llm_cache` | SHA256(prompt_key + model + params) → cached tool_use output, hit_count, expires_at. |
+| `lemma_override` | (language, observed_lemma) → corrected_lemma (migration 033). Consulted by the phrase extractor *before* trusting spaCy's lemma, because spaCy's Spanish lemmatizer hard-codes some wrong verbs. `surface_form`/`pos` are reserved for future context-sensitive rows. Written only by an admin accept (#39 slice 3B). |
 
 **None of these tables have a `user_id` column** — they survive any account deletion intact.
+
+Note `lemma_correction_candidate` (migration 034) is deliberately *not* in this
+group: it carries a nullable `user_id` and is listed under §Notifications /
+errors as a signal table. It is never read by the extractor or matcher.
 
 ### User learning state
 | Table | Purpose |
@@ -61,7 +66,7 @@ Adjust the user/secrets handling per your own threat model.
 ### Chat
 | Table | Purpose |
 |---|---|
-| `chat_sessions` | Free or guided session container. |
+| `chat_sessions` | Free or guided session container. Carries `language` (migration 031) so chat is not German-only; the column is nullable and readers fall back to `"de"` for pre-migration rows. |
 | `chat_messages` | Per-turn (user vs assistant), with `corrections`, `evaluation`, `word_matches` JSONB. |
 
 ### Recommendations / preferences
@@ -75,6 +80,7 @@ Adjust the user/secrets handling per your own threat model.
 |---|---|
 | `notification` | Per-user event queue. Used by the SSE handler in `routers/notifications.py`. Polling-based today; LISTEN/NOTIFY refactor is deferred (T2.2). |
 | `client_error_log` | W7 frontend crash sink. `user_id` is nullable (auth-optional) and becomes NULL on account deletion (signal preserved, anonymised). |
+| `lemma_correction_candidate` | Community-flag inbox for wrong lemmas (migration 034, #39 slice 3A). Pending rows dedup cross-user on `(language, surface_form, observed_lemma, suggested_lemma, context_text)` and bump `report_count`; `user_id` is deliberately outside that key and is SET NULL on deletion, so the signal outlives the reporter. Promotion into `lemma_override` requires a human admin accept. |
 
 ### Content requests
 | Table | Purpose |
@@ -162,6 +168,12 @@ remaining App-Store compliance checklist.
 | 026 | Transcript-click dedup — `word_usage_events.sentence_id` + stored `event_day` generated col + unique partial index (T1.1 / Hole 3 + Hole 4). |
 | 027 | `user_channel_preference` table — moves channel followed/liked/disliked out of `users.settings` JSONB into a relational shape (T1.4). |
 | 028 | `client_error_log` table — W7 backend sink for the frontend ErrorBoundary. |
+| 029 | `content_request` uniqueness scoped per user — the old global unique key meant one user's request blocked everyone else's for the same channel/video. |
+| 030 | Seeds Spanish into `language_table` (second-language plan, Stage 0). Idempotent. |
+| 031 | `chat_sessions.language` (nullable) — free/guided chat carries its target language instead of assuming German. Nullable so pre-existing rows keep working; readers fall back to `"de"` (closes Hole 20). |
+| 032 | `word_table.frequency` INT + functional prefix index on `(language, lower(word))` — backs the frequency-ranked autocomplete (#38). Backfilled from `word_to_sentence` counts; the scraper refreshes it via `recompute_word_frequencies()`. |
+| 033 | `lemma_override` table — curated corrections consulted before trusting spaCy's lemma (#39 slice 1). v1 keys on `(language, observed_lemma)`; `surface_form`/`pos` reserved for context-sensitive rows. |
+| 034 | `lemma_correction_candidate` table — the community-signal inbox (#39 slice 3A). A signal table only: never read by the extractor or matcher, and never mutates `lemma_override` without a human accept. |
 
 There is no migration for the orphan SRS cleanup or the active-card backfill
 — both are pure operational scripts under `scripts/` driven by services in

@@ -241,7 +241,7 @@ Triaged 288 `print()` calls across 17 files. **62 prints converted** to `logger`
 | `subtitle-scraper/debug_transcript.py` | 31 | Interactive debug tool — diagnostic data to stdout is the product. |
 | `subtitle-scraper/profile_pipeline.py` | 27 | Profiler emits timing/coverage tables. |
 | `subtitle-scraper/profile_full_pipeline.py` | 23 | Same. |
-| `subtitle-scraper/merge_channels.py` | 1 | Result of the merge to stdout. |
+| `subtitle-scraper/merge_channels.py` | 1 | Result of the merge to stdout. (File has since been deleted — see #7; the triage above is preserved as written.) |
 | `subtitle-scraper/channel_finder.py` | 4 (CLI block) | CLI summary on `python channel_finder.py`. |
 | `scripts/b1_word_finder.py` | 3 | Dev throwaway — `print(d)` for inspection. |
 | `scripts/known_words_fixer.py` | 1 | Same. |

@@ -7,7 +7,23 @@ this doc is decision-only.
 Companion to `docs/ROADMAP.md` (priority view) and `docs/TODO.md` #34
 (path-A through path-D analysis).
 
-Last updated: 2026-05-20.
+Last updated: 2026-05-20. Reviewed 2026-07-27 — the audit below still holds,
+with these deltas from the 2026-05-24 security pass that a wrap must account
+for (each already tracked in `docs/SECURITY.md`; noted here because they touch
+the mobile client or the hosted deployment):
+
+- **S3** — account deletion now needs password re-auth and sends a body on
+  DELETE. See §2.7.
+- **S1** — auth endpoints are throttled per IP and per (IP, email). A native
+  client behind carrier-grade NAT shares an IP with other users; if login 429s
+  in the field, that is the first thing to check.
+- **S4** — `DB_SSL_MODE` gates DB TLS and applies to the app, Alembic, and the
+  scraper. Set it for the hosted deploy (§ deploy gate in `docs/ROADMAP.md`).
+- **S5** — security headers ship by default; HSTS is opt-in via `ENABLE_HSTS`.
+- **S11** — API docs are off unless `ENABLE_DOCS` is set, so don't expect
+  `/docs` to answer on the hosted backend while testing the wrap.
+- **S2** — signup can be gated behind `REGISTRATION_CODE`. If that is set in
+  production, the native onboarding flow needs an invite-code field.
 
 ---
 
@@ -207,10 +223,19 @@ if (import.meta.env.PROD
       `tests/test_account_deletion.py` for the regression guards.
       Frontend: destructive Account section in `SettingsPanel`, two-step
       confirm, `signalAuthExpired` on success.
-- [ ] **Age rating** — German language-learning content with YouTube
-      embeds. Likely 12+ for "Infrequent/Mild Profanity or Crude Humor"
-      (depends on which channels users follow). Disclose in App Store
-      Connect.
+      **Changed since this doc was written (S3, 2026-05-24): the endpoint
+      now requires the current password in the DELETE body** in addition
+      to the bearer token; missing/wrong → 403. Two consequences for the
+      wrap: (a) the confirm step collects a password, so any native
+      re-implementation of that screen must too; (b) it **sends a body on
+      DELETE**, which a strict CDN/proxy in front of the API may strip —
+      verify against the hosted deployment before TestFlight.
+- [ ] **Age rating** — language-learning content with YouTube embeds.
+      German **and Spanish** as of 2026-05-21 (Spanish seeded in
+      `language_table` via migration 030), so the rating question spans
+      both corpora, not just the German channel set. Likely 12+ for
+      "Infrequent/Mild Profanity or Crude Humor" (depends on which
+      channels users follow). Disclose in App Store Connect.
 - [ ] **Support URL** — public-facing help page. Can be a simple GitHub
       pages site for v1.
 - [ ] **Data collection disclosure** — App Privacy section in App Store

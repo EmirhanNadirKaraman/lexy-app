@@ -98,10 +98,10 @@ the live list.
   coverage than German ones. That was acceptable while Spanish was a
   smoke test; it isn't once Spanish is a shipped language.
 
-### P4 — Hole 20: per-message language detection in free chat
+### P4 — Hole 19: per-message language detection in free chat
 - **Effort:** S–M. **Category:** correctness (second-language).
 - **Deferral expired, and it is now the *only* open half of the old W9.**
-  Hole 19 (the hardcoded `language='de'`) is **CLOSED** — see W9 below.
+  Hole 20 (the hardcoded `language='de'`) is **CLOSED** — see W9 below.
   What remains: `evaluate_and_reply` returns one `language_detected` per
   turn, so a mixed sentence ("Yesterday I bought Brot…") gets a single
   label for the whole message.
@@ -320,8 +320,8 @@ old Tier 2 ordering for the moment.
   root `pytest` → 562 passed (matches W4 baseline). Frontend
   `tsc --noEmit` clean, vitest 151 passed, `vite build` clean.
 
-### W9 — Hole 19 + Hole 20: free-chat multi-language + per-message detection — ✅ Hole 19 RESOLVED 2026-05-21 · Hole 20 still open (now tracked as P4)
-- **Hole 19 (hardcoded `language='de'`) — CLOSED.** Shipped in "Land Stage
+### W9 — Hole 19 + Hole 20: free-chat multi-language + per-message detection — ✅ Hole 20 RESOLVED 2026-05-21 · Hole 19 still open (now tracked as P4)
+- **Hole 20 (hardcoded `language='de'`) — CLOSED.** Shipped in "Land Stage
   3 of second-language plan: language-aware chat + LLM prompts"
   (2026-05-21). Migration 031 added a nullable `language` column to
   `chat_sessions`; `chat_service.create_session` takes and stores the
@@ -330,7 +330,7 @@ old Tier 2 ordering for the moment.
   a back-compat fallback for pre-Stage-3 rows, **not** a hardcode. Verified
   2026-07-27: the only `"de"` literals left in `routers/chat.py` are that
   legacy fallback and the comments documenting it.
-- **Hole 20 (per-message detection) — still open**, and partially
+- **Hole 19 (per-message detection) — still open**, and partially
   mitigated by the 2026-05-23 commit that credits target-language words
   inside English-classified messages. Re-ranked as **P4** in §Current
   priorities; it is no longer bundled with #19, which has shipped.
@@ -668,7 +668,7 @@ order. Do not start T3.1 until §8.1 (introduce `VITE_API_BASE_URL`) and
 | **#5e backfill of pre-2026-05-18 inflated active progress** | DROP (forward-only) | TODO.md recommends not running it. `status='known'` is the load-bearing field; inflation is invisible downstream. |
 | **#33 `tests/legacy/`** | Just delete it | Glob-ignored, no one looks. Decide once. |
 | **#27 remaining "media queries / 900px container"** | Mostly absorbed by #27a–g | Audit shows it's mostly done. Spot-check on a real phone instead of opening a new ticket. |
-| ~~**Hole 19/20 — free chat language hardcoded `'de'`**~~ | **Resolved / re-ranked** | Hole 19 shipped 2026-05-21 (Stage 3, migration 031). Hole 20 is now **P4** in §Current priorities — the "no second language exists yet" rationale expired when Spanish shipped. |
+| ~~**Hole 19/20 — free chat language hardcoded `'de'`**~~ | **Resolved / re-ranked** | Hole 20 (the hardcode) shipped 2026-05-21 (Stage 3, migration 031). Hole 19 (per-message detection) is now **P4** in §Current priorities — the "no second language exists yet" rationale expired when Spanish shipped. |
 
 ---
 
@@ -701,8 +701,8 @@ working feature. Nothing else open has that ratio.
 - #5e (drop entirely).
 - #5 / Hole 23 (defer indefinitely; reopen on signal).
 - #27 remaining stages (mostly absorbed by 27a–g; spot-check, don't ticket).
-- ~~Holes 19/20 bundled into #19~~ — obsolete: #19 shipped, Hole 19 is
-  closed, Hole 20 is ranked on its own as P4.
+- ~~Holes 19/20 bundled into #19~~ — obsolete: #19 shipped, Hole 20 is
+  closed, Hole 19 is ranked on its own as P4.
 
 **5. What about the rest of #17 (`src/app/` salvage)?**
 Batch 1 shipped (W4, 20 tests onto `tests/runtime/`). Batches 2+ never

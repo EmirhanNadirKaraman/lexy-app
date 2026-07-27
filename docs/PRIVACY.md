@@ -8,8 +8,13 @@ deletion fans out.
 ## Account deletion
 
 `DELETE /api/v1/account` (router: `lexy-app/backend/routers/account.py`).
-Auth-required. Runs `DELETE FROM users WHERE user_id = $1::uuid`; everything
-else falls out via Postgres FK declarations.
+Requires **both** a valid bearer token and the account's current password in
+the request body (password re-authentication, S3, 2026-05-24) — a stolen or
+long-lived token cannot delete an account on its own. A missing, empty, or
+wrong password returns **403** and leaves the account intact. Only after the
+password verifies does the route run
+`DELETE FROM users WHERE user_id = $1::uuid`; everything else falls out via
+Postgres FK declarations.
 
 ### Cascade tables (`ON DELETE CASCADE`)
 Removed atomically when the user is deleted:
@@ -39,7 +44,12 @@ No `user_id` column → not affected by user deletion:
 - `channel`, `video`, `sentence`
 - `word_to_sentence`, `sentence_to_phrase`, `sentence_to_grammar_rule`
 - `llm_cache`
-- `channel_names_cache` (display-name lookup, not user-specific)
+
+There is no separate `channel_names_cache` table (an earlier draft of this doc
+listed one). The channel display-name cache is the `channel_names` key inside
+`users.settings` JSONB — it is per-user data and therefore **deleted with the
+`users` row**, not shared catalog. Channel *preferences* live relationally in
+`user_channel_preference` and cascade (see the table above).
 
 ### Tests
 `lexy-app/backend/tests/test_account_deletion.py`:
@@ -48,6 +58,8 @@ No `user_id` column → not affected by user deletion:
 - shared catalog preserved (word_table, phrase_table, grammar_rule_table,
   channel, video counts unchanged)
 - unauthenticated + invalid-token rejected
+- password re-auth (S3): missing body / empty password / wrong password each
+  → 403 with the account and its cascade data intact
 - other users unaffected
 - second delete with same token → 401 (`get_current_user` returns "User not
   found" once the row is gone)

@@ -171,7 +171,7 @@ Source files at repo root. Used by `subtitle-scraper/` and ad-hoc data prep. A r
 | `subtitle_cleaner.py` | `SubtitleTextCleaner`, `SubtitleFragment` — HTML/formatting removal. |
 | `subtitle_merger.py` | `SubtitleMerger`, `MergedSubtitleWindow` — fragment merging, hyphenation. |
 | `subtitle_segmenter.py` | `SubtitleSegmenter`, `CandidateUtterance` — sentence segmentation via spaCy. |
-| `subtitle_ingestion.py` (if present) | SRT parsing with encoding fallback. |
+| ~~`subtitle_ingestion.py`~~ | **Does not exist at root.** SRT parsing lives in `pipeline.py` as `parse_srt` (row above). The refactor split it out as `src/app/subtitles/ingestion.py`, which is where the name came from. |
 | `utterance_quality_filter.py` | `UtteranceQualityEvaluator` — length, noise, proper-noun filters. |
 | `utterance_unit_extractor.py` | `UtteranceUnitExtractor` — spaCy-driven unit extraction. |
 | `learning_units.py` | `LearningUnit`, `LearningUnitType` enum, lemmatisation. |
