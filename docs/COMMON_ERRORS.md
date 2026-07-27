@@ -88,6 +88,37 @@ calls issued in parallel in the same message.
 result depends on location — especially when several suites share a directory
 name. Add `pwd` to the command when the output will be quoted in a report.
 
+### `ImportError: cannot import name 'markcoroutinefunction'` from a partially initialized `inspect`
+**Symptom:** A throwaway script that only does `import asyncio, asyncpg` dies with
+a traceback that ends inside `asyncpg/compat.py`:
+```
+ImportError: cannot import name 'markcoroutinefunction' from partially
+initialized module 'inspect' (most likely due to a circular import)
+```
+and the traceback names *your own script* as the `inspect` module.
+
+**Cause:** the script was named `inspect.py`. Its directory is first on
+`sys.path`, so it shadows the stdlib `inspect`; `asyncpg` imports `inspect`, gets
+the script back, and the "circular import" is really a name collision.
+
+**Why it's confusing:** the error blames `asyncpg`, which is innocent, and the
+code in the file is irrelevant — an empty `inspect.py` breaks the same way.
+
+**Fix:** never name a scratch file after a stdlib module. `inspect.py`,
+`types.py`, `token.py`, `select.py`, `copy.py` and `logging.py` are the usual
+offenders. Rename the file (deleting the stale `__pycache__` too if one exists).
+
+### Connecting to the DB from a scratch script: `psql` prompts for a password
+**Symptom:** `psql -d german_vocabulary -c '\d word_lists'` fails with
+`fe_sendauth: no password supplied`, so the live schema looks unreachable —
+even though `pytest` talks to the same database happily.
+**Cause:** the credentials live in the repo-root `.env`, which the backend loads
+explicitly (`database.py:6`); `psql` and a bare `load_dotenv()` from a scratchpad
+cwd both miss it.
+**Fix:** load that exact path from the script — `load_dotenv("<repo root>/.env")`
+— then read `DB_*` via `os.getenv`. This keeps the "never read `.env`" rule
+(§12): the process loads it, you never open or print it.
+
 ### Piping to `tail` hides the real exit code
 **Symptom:** `npm run build 2>&1 | tail -12; echo "EXIT: $?"` printed `EXIT: 0`
 while the build had actually failed with two TypeScript errors.
