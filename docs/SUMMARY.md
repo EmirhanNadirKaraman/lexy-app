@@ -248,9 +248,9 @@ tests targeting one — see TODO #17.
 
 | Path | Purpose |
 |---|---|
-| `data/final_result.txt` | German verb dictionary used by `phrase_finder`. |
+| `data/final_result.txt` | **Central vocabulary source, and load-bearing.** 5,156-row TSV: 4,075 headwords + 950 phrase blueprints. Seeds `phrase_table` at backend startup via `main.py` → `matcher_service.get_blueprint_map()` → `phrase_service.seed_from_blueprint_map()`, and read at import by `subtitle-scraper/phrase_finder.py`. Editing it changes the live phrase catalog. |
 | `data/PROVENANCE.md` | **Read before using anything in `data/`.** Per-file provenance, licence basis, measured content, and which file is preferred vs redundant. Exists because the directory previously had no attribution and an audit had to infer each file from its byte structure. |
-| `data/words_4000_old.txt` | **Preferred vocabulary source, despite the name** — 11-column TSV, 4,095 entries with translations (100%), examples (100%), POS (99%), conjugations (71%), ordered frequency-descending. `words_4000.txt` is strictly its column 0 and is redundant. |
+| `data/words_4000_old.txt` | **Metadata enrichment over `final_result.txt`'s headwords, despite the name** — 11-column TSV, 4,095 entries with translations (100%), examples (100%), POS (99%), conjugations (71%), ordered frequency-descending. Joins 1:1 on the headword. `words_4000.txt` is strictly its column 0 and is redundant. |
 | `data/b1_unparsed.txt`, `b1_parsed.txt` | B1 word list — unparsed is the entry set (2,840, 815 more than parsed); parsed is a strict subset adding gender + valency. Keep both. |
 | `data/known_words.txt`, `verbs.txt` | Reference lists; `known_words.txt` is personal study history and is read by `tests/test_free_chat_progression.py`. |
 | `files/book_pdfs/` | 29 German B1 books (PDFs). |

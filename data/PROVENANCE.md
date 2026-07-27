@@ -34,11 +34,47 @@ possible upstreams were **not** confirmed and are deliberately not recorded.
 
 ## Files
 
-### `words_4000_old.txt` — **preferred source. Do not be misled by the name.**
+### `final_result.txt` — **the central source, and already load-bearing**
+
+**This file is production infrastructure, not a candidate list.** It is read at
+backend startup: `main.py` → `matcher_service.get_blueprint_map()` →
+`phrase_service.seed_from_blueprint_map()`, which seeds `phrase_table`. It is
+also read at import by `subtitle-scraper/phrase_finder.py` for German phrase
+extraction. **Changing it changes the live phrase catalog** — treat edits as a
+production change, not a data tweak.
+
+2-column TSV, 5,156 rows (every row has exactly 2 columns):
+
+| Col | Content | Notes |
+|---|---|---|
+| 0 | headword / lemma, nouns carry their article | **4,075 unique** after article-stripping; 1,850 are nouns |
+| 1 | phrase blueprint, or the headword repeated | **5,037 unique**; 950 differ from col 0 (the real phrase patterns); 994 carry valency markers (`etw.` / `jdn.` / `jdm.` / `sich`) |
+
+Rows where col 0 == col 1 (4,206) are plain words. Rows where they differ (950)
+are verb-valency blueprints — `haben` → `etw./jdn. (Akk) haben`, `geben` →
+`jdm. (Dat) etw. (Akk) geben`. A headword may carry several patterns, which is
+why col 0 has fewer unique values than there are rows.
+
+**Coverage, measured 2026-07-27:**
+- **100% of its 950 patterns are live in `phrase_table`** (2,829 German rows
+  there in total).
+- 51% of its 4,075 headwords currently resolve in `word_table` — the catalog is
+  scraped-subtitle vocabulary and lacks ordinary words.
+- **Its headwords are a superset of `words_4000_old.txt`'s**: 4,069 shared,
+  **0 unique to `words_4000_old.txt`**, 6 unique to `final_result.txt`.
+
+**Use as:** the source of truth for *which* German words and phrases exist —
+the entry set for built-in lists, and the phrase half of them.
+
+### `words_4000_old.txt` — **metadata enrichment for the same headwords**
 
 **This is not an old version of `words_4000.txt`. It is the full-fidelity
-source**, and the single most valuable vocabulary asset in the repo (453 KB vs
-44 KB).
+metadata file** (453 KB vs 44 KB).
+
+It and `final_result.txt` describe **the same headword set from two angles** and
+join 1:1 on the headword — `final_result.txt` supplies the word/phrase
+inventory, this file supplies translations, examples, POS and conjugations for
+those same words. Neither replaces the other.
 
 11-column TSV, 4,095 entries:
 
@@ -60,8 +96,9 @@ source**, and the single most valuable vocabulary asset in the repo (453 KB vs
   defensible than inventing 1–500 bands.
 - 0 duplicates, clean UTF-8 umlauts, no punctuation-only lines.
 
-**Use as:** the source of truth for the German 4000 list, for seeding
-`word_table`, and for pre-seeding the gloss cache.
+**Use as:** the enrichment layer — seeding `word_table` with real POS and
+lemma, and pre-seeding the gloss cache from the translation column. Take the
+*entry set* from `final_result.txt`, the *metadata* from here.
 
 ### `words_4000.txt` — redundant
 
@@ -76,7 +113,7 @@ line). Carries no translation, example, POS or conjugation. 14 duplicates.
 duplicates. Contains **815 entries that `b1_parsed.txt` does not** (`Abfahrt`,
 `Abflug`, `Abgas`, `Ampel`, `Ankunft`, …).
 
-**Use as:** the B1 **entry set** — it has the better coverage.
+**Use as:** the B1 **entry set** — it has the better coverage. Supplemental to `final_result.txt`: it contributes **815 headwords that `final_result.txt` does not have**, while `final_result.txt` carries 2,050 that it lacks.
 
 ### `b1_parsed.txt` — B1 enrichment
 
@@ -97,7 +134,6 @@ simply those absent from that dictionary.
 
 | File | What it is | Product use |
 |---|---|---|
-| `final_result.txt` | 5,156-row TSV German verb + valency dictionary. **Read at import by `subtitle-scraper/phrase_finder.py` and by `lexy-app/backend/main.py`.** | Infrastructure — not a word list. Do not repurpose casually. |
 | `real_final_result.txt` | 4,089 lines; column 1 of `final_result.txt` | Derived; no independent value |
 | `known_words.txt`, `known_words_old.txt` | 771 / 1,008 entries — one person's personal study history | **Not** product list material. `known_words.txt` is also read by `lexy-app/backend/tests/test_free_chat_progression.py`. |
 | `verbs.txt` | 1,061 bare infinitives | Narrow; superseded by `words_4000_old.txt`'s 1,061 verbs, which carry conjugations |
@@ -107,15 +143,38 @@ simply those absent from that dictionary.
 
 ## Implementation notes (measured 2026-07-27)
 
-**Seed `word_table` before building any system list.** Only ~40% of these
-headwords currently resolve against `word_table`, because the German catalog
-(6,962 rows) is built from scraped YouTube subtitles and lacks ordinary
-vocabulary — `Abbildung`, `Abenteuer`, `Abfall`, `Adresse` are all missing. A
-list built today would read ~60% "unresolved". Importing the 2,432 absent
-entries is a ~44% catalog expansion.
+**The built-in lists should be word *and phrase* lists, not word lists.**
+`final_result.txt` carries 950 phrase blueprints alongside its 4,075 headwords,
+and all 950 are already live in `phrase_table`. A built-in list drawn from this
+file that silently dropped the phrases would discard the half of the data that
+is already wired.
 
-**Import with headword, POS and lemma** from `words_4000_old.txt`. This gives
-real POS rather than the sparse `pos='X'` rows that
+**Phrase support in the list feature is NOT complete today.** The schema is
+ready and the progression path is ready; the service is not:
+
+| Layer | State |
+|---|---|
+| `word_list_items.item_type` | ✅ column exists, already polymorphic |
+| `progression_service.apply_progression` | ✅ already called with `entry["item_type"]` — words and phrases share the `free_chat_*` / `status_marked_*` events |
+| SRS / review | ✅ `review_service.get_due_cards` joins the per-type display table |
+| `word_list_service._resolve_surfaces` | ❌ queries `word_table` only |
+| `word_list_service.create_list` | ❌ hardcodes `"word"` as the inserted `item_type` |
+| `word_list_service._load_entries` | ❌ late-status lookup pins `item_type = 'word'` |
+| Frontend | ❌ no per-type display; a phrase would render as a plain surface |
+
+**No migration is needed** — this is service + frontend work. Export needs no
+change (it emits stored surfaces). `mark-unknown-learning` needs the resolved
+`item_type` threaded through, which `apply_progression` already accepts.
+
+**Seed `word_table` before building any list.** Only ~51% of
+`final_result.txt`'s headwords resolve against `word_table` today, because the
+German catalog (6,962 rows) is built from scraped YouTube subtitles and lacks
+ordinary vocabulary — `Abbildung`, `Abenteuer`, `Abfall`, `Adresse` are all
+missing. A list built first would read roughly half "unresolved".
+
+**Import with headword, POS and lemma** — entry set from `final_result.txt`,
+POS and lemma joined from `words_4000_old.txt` on the headword. This gives real
+POS rather than the sparse `pos='X'` rows that
 `word_service.learn_word_anyway` creates.
 
 **Pre-seed the permanent gloss cache** from column 2.

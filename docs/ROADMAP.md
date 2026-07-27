@@ -112,7 +112,7 @@ P-numbers.
 - **N4b — real privacy contact email — admin/account.** `PrivacyPage.tsx` and `docs/PRIVACY.md` still ship the literal `<YOUR_REAL_PRIVACY_EMAIL_BEFORE_LAUNCH>` placeholder. Needs an address that will still exist in a year, not a decision.
 - These unblock **independently** — doing one does not advance the other. Everything else on the checklist in `docs/CAPACITOR_READINESS.md` is done: packages installed, `ios/` scaffolded, `VITE_API_BASE_URL` helper in place, responsive + theme + PWA shipped.
 
-### N5a — Wire the German vocabulary data into built-in lists — **code**
+### N5a — Wire the German word + phrase data into built-in lists — **code**
 *The first substantial repo task in the queue.* Ranked below N1–N3 because
 those are the non-repo infrastructure/admin steps, but this is the largest
 piece of shippable product work currently unblocked.
@@ -122,22 +122,35 @@ piece of shippable product work currently unblocked.
   What was missing was provenance documentation, now in
   [`data/PROVENANCE.md`](../data/PROVENANCE.md). **The task is wiring
   documented data files**, not inferring levels from `onboarding.py`'s tiers.
-- **`data/words_4000_old.txt` is the source of truth** — despite the name, it
-  is the full-fidelity file (4,095 entries; translations and examples at 100%,
-  POS 99%, conjugations 71%; frequency-descending order). `words_4000.txt` is
-  strictly its column 0 and is redundant.
-- **Order matters — catalog first, lists last.** Only ~40% of these headwords
-  resolve against `word_table` today, so a list built first would read ~60%
-  "unresolved":
-  1. Import into `word_table` (headword / POS / lemma) — ~2,432 missing
-     entries, a ~44% catalog expansion.
-  2. Pre-seed the permanent gloss cache from the translation column — 4,095
-     glosses replacing a permanently-cached LLM call per item on the SRS
-     due-card path.
-  3. System-list schema (`word_lists.user_id` is `NOT NULL`, so no shared-list
-     concept exists yet) + the built-in German 4000 and B1 lists.
-  4. Optionally later: preload example generation from the example column.
-- **Use the file's own ordering as the frequency rank**, not
+- **`data/final_result.txt` is the central source — and it is already
+  load-bearing.** It seeds `phrase_table` at backend startup
+  (`main.py` → `matcher_service.get_blueprint_map()` →
+  `phrase_service.seed_from_blueprint_map()`) and is read at import by
+  `subtitle-scraper/phrase_finder.py`. Editing it is a production change.
+  It holds 4,075 unique headwords **plus 950 phrase blueprints, 100% of which
+  are already live in `phrase_table`**, and its headwords are a *superset* of
+  `words_4000_old.txt`'s.
+- **This is a word *and phrase* feature.** `words_4000_old.txt` is the
+  enrichment layer over the same headwords (translations and examples at 100%,
+  POS 99%, conjugations 71%), joining 1:1. The B1 files stay supplemental —
+  `b1_unparsed.txt` adds 815 headwords `final_result.txt` lacks.
+- **Phrase support in the list feature is not complete yet.** `item_type`
+  exists and `apply_progression` is already polymorphic, but
+  `word_list_service` resolves against `word_table` only, hardcodes `"word"`
+  on insert, and pins `item_type = 'word'` in the late-status lookup; the
+  frontend has no per-type rendering. **No migration needed for that part** —
+  service + frontend work.
+- **Order matters — catalog first, lists last.** Only ~51% of
+  `final_result.txt`'s headwords resolve against `word_table` today, so a list
+  built first would read roughly half "unresolved":
+  1. Seed `word_table` — entry set from `final_result.txt`, POS/lemma joined
+     from `words_4000_old.txt`.
+  2. Pre-seed the permanent gloss cache from the translation column.
+  3. Add phrase support to `word_list_service` + per-type frontend rendering.
+  4. System-list schema (`word_lists.user_id` is `NOT NULL`, so no shared-list
+     concept exists) + the built-in word/phrase lists and the B1 list.
+  5. Optionally later: preload example generation from the example column.
+- **Use `words_4000_old.txt`'s own ordering as the frequency rank**, not
   `word_table.frequency` — that column is app-corpus (scraped-subtitle)
   frequency, where rank 2000 is the English word `trust`.
 - Full per-file measurements: `docs/TODO.md` #43 and `data/PROVENANCE.md`.

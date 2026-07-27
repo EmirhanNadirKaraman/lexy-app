@@ -544,28 +544,44 @@ Two defects:
 **Tests:** +61 in `test_llm_provider.py`. **Security:** new finding **S18** (LOW, opt-in) in `docs/SECURITY.md`.
 **Deliberately deferred — MockProvider.** `MOCK_LLM` fakes are computed from call arguments the provider never receives (`target_word in user_content`, `target_text` vs `user_answer`, the requested `language`). The provider sees those only as prose inside the prompt, so a MockProvider would have to regex them back out — coupling the mock to prompt wording and making it strictly worse. The 13 `if _MOCK:` branches stay at domain level.
 
-### 43. 🟡 Built-in / system vocabulary lists — INVESTIGATED 2026-07-27, ready to wire
-**Question asked:** can we ship built-in German vocabulary lists from data we already have? **Yes.** The blocker recorded in the first pass — "unsafe pending a licensing review" — was wrong: the project owner holds distribution licences. What the repo actually lacked was *provenance documentation*, now written up in [`data/PROVENANCE.md`](../data/PROVENANCE.md). Read that file before touching any of this; it carries the per-file measurements.
+### 43. 🟡 Built-in / system **word and phrase** lists — INVESTIGATED 2026-07-27, ready to wire
+**Question asked:** can we ship built-in German vocabulary lists from data we already have? **Yes**, and the central file is not the one first assumed. Full per-file measurements in [`data/PROVENANCE.md`](../data/PROVENANCE.md) — read it first.
 
-**The files exist, are git-tracked, and are usable — including for distribution.** What they are *not* yet is wired: none is read by `lexy-app/backend/`, and there is no system-list concept to expose them through.
+**`data/final_result.txt` is the source of truth, and it is already load-bearing.** It is read at backend startup (`main.py` → `matcher_service.get_blueprint_map()` → `phrase_service.seed_from_blueprint_map()`) to seed `phrase_table`, and at import by `subtitle-scraper/phrase_finder.py`. Editing it is a production change, not a data tweak.
 
-| File | Entries | Role |
-|---|---|---|
-| `data/words_4000_old.txt` | 4,095 | **Preferred source. Not an old version** — it is the full-fidelity 11-column TSV (translations 100%, examples 100%, POS 99%, conjugations 71%), ordered frequency-descending. Source of truth for the German 4000 list. |
-| `data/words_4000.txt` | 4,096 | **Redundant** — strictly column 0 of `_old`. Do not prefer it while `_old` is present. |
-| `data/b1_unparsed.txt` | 2,840 | B1 **entry set** — bare headwords, 815 of them absent from parsed. |
-| `data/b1_parsed.txt` | 2,032 | B1 **enrichment** — strict subset, adds gender + valency. Keep both; neither dominates. |
+| File | Role |
+|---|---|
+| `data/final_result.txt` | **Central.** 5,156-row TSV: 4,075 unique headwords + **950 phrase blueprints, 100% of which are already live in `phrase_table`**. Its headwords are a **superset** of `words_4000_old.txt`'s (0 unique to that file). |
+| `data/words_4000_old.txt` | **Enrichment, not a competing entry set.** Same headwords, viewed differently — translations 100%, examples 100%, POS 99%, conjugations 71%. Joins 1:1 on the headword. |
+| `data/words_4000.txt` | Redundant — strictly column 0 of `_old`. |
+| `data/b1_unparsed.txt` | Supplemental — contributes **815 headwords `final_result.txt` lacks**; `final_result.txt` carries 2,050 it lacks. |
+| `data/b1_parsed.txt` | Supplemental enrichment — strict subset of unparsed, adds gender + valency. |
 
-**Recommended order.** The first step is not a list at all — it is filling the catalog, because only ~40% of these headwords resolve against `word_table` today (the German catalog is 6,962 rows of scraped-subtitle vocabulary and lacks ordinary words like `Abbildung`, `Adresse`). A list built before this reads ~60% "unresolved".
+**This is a word *and phrase* feature.** 950 of the entries are phrases, already in `phrase_table`. Building "word lists" here would throw away the half of the data that is already wired.
 
-1. **Import `words_4000_old.txt` into `word_table`** — headword, POS, lemma. ~2,432 entries are missing today, a ~44% catalog expansion, and with real POS rather than the sparse `pos='X'` rows `learn_word_anyway` creates.
-2. **Pre-seed the permanent gloss cache** from column 2. `llm_service.translate_item_gloss` is one permanently-cached LLM call per item on the SRS due-card path; 4,095 human-quality glosses already exist in the file.
-3. **System-list schema + built-in lists.** `word_lists.user_id` is `NOT NULL` with `ON DELETE CASCADE`, so every list is user-owned — there is no system/default/shared concept. Needs a migration (nullable `user_id` + `is_system`, or a separate table) and widening the ownership filters in `word_list_service` from `user_id = $2::uuid`. Then the German 4000 list (chunkable by the file's own 169 groups) and the B1 list.
-4. **Optionally, later:** preload example generation from column 4, if the cache path supports it.
+**Phrase support is NOT complete in the list feature today.** Schema and progression are ready; the service and frontend are not:
 
-**Two labelling cautions, which survive the licence question because they are accuracy not law:**
-1. **`onboarding.py` tiers are not a CEFR source.** `LevelTier.A1/A2/B1` (150 / 310 / 471 cumulative lemmas) are self-described as labelling CEFR "informally" with "approximate" boundaries, from "hand-curated starting points"; the module is also unwired. They remain a reasonable *Starter German* seed, but the next implementation is **wiring the documented data files, not guessing CEFR from these tiers**.
-2. **`word_table.frequency` is app-corpus frequency, not general German frequency.** Migration 032 defines it as "number of sentences the word appears in". Measured: 5,558 alphabetic German words, 63% appearing in ≤1 sentence; rank 500 is `Hongkong`, rank 1000 `Olafs`, rank 2000 the English word `trust`, and punctuation ranks top-2. **Use `words_4000_old.txt`'s own ordering as the frequency rank.**
+| Layer | State |
+|---|---|
+| `word_list_items.item_type` | ✅ exists, polymorphic |
+| `progression_service.apply_progression` | ✅ already receives `entry["item_type"]` |
+| SRS review | ✅ `review_service.get_due_cards` joins per-type display table |
+| `word_list_service._resolve_surfaces` | ❌ `word_table` only |
+| `word_list_service.create_list` | ❌ hardcodes `"word"` on insert |
+| `word_list_service._load_entries` | ❌ late-status lookup pins `item_type = 'word'` |
+| Frontend `WordListsPage` | ❌ no per-type rendering |
+
+**No migration needed for phrases** — service + frontend work. Export is unaffected (it emits stored surfaces). `mark-unknown-learning` needs the resolved `item_type` threaded through, which `apply_progression` already accepts.
+
+**Recommended order.** Catalog first: only ~51% of `final_result.txt`'s headwords resolve against `word_table` today, so a list built first reads roughly half "unresolved".
+
+1. **Seed `word_table`** — entry set from `final_result.txt`, POS/lemma joined from `words_4000_old.txt`. Real POS beats the sparse `pos='X'` rows `learn_word_anyway` creates.
+2. **Pre-seed the permanent gloss cache** from `words_4000_old.txt`'s translation column — 4,095 glosses replacing a permanently-cached LLM call per item on the SRS due-card path.
+3. **Add phrase support to `word_list_service`** — the three word-only spots above, plus per-type frontend rendering.
+4. **System-list schema + built-in lists.** `word_lists.user_id` is `NOT NULL` with `ON DELETE CASCADE`, so no shared-list concept exists; needs a migration and widened ownership filters. Then the built-in German word+phrase lists, and the B1 list from `b1_unparsed.txt` enriched by `b1_parsed.txt`.
+5. **Optionally later:** preload example generation from `words_4000_old.txt`'s example column.
+
+**Two labelling cautions, accuracy not licensing:** `onboarding.py`'s `LevelTier.A1/A2/B1` label CEFR "informally" with "approximate" boundaries and are unwired — **the next implementation wires documented data files, it does not guess CEFR from those tiers**. And `word_table.frequency` is app-corpus (scraped-subtitle) frequency, where rank 2000 is the English word `trust` — use `words_4000_old.txt`'s own frequency-descending ordering instead.
 
 **Not started.** No code written; this entry plus `data/PROVENANCE.md` are the record.
 
