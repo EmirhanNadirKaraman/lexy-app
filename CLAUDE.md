@@ -53,7 +53,7 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 - **`pdf_text_extraction/`** — Docling + TATR + custom masking. Used for book ingestion.
 - **`masking/`** — alternative/older PDF pipeline (`latest_ingest.py`, table reconstruction).
 - **`postprocessing/`** — bulk extraction of phrases from already-scraped text into `word_occurrences`.
-- **`ilp/`** — PuLP-based book-selection optimiser (find minimum book set covering a target vocab list).
+- **`ilp/`** — PuLP-based book-selection optimiser (find minimum book set covering a target vocab list). Standalone CLI, still unwired. Its *technique* now also lives in `playlist_service.ilp_cover` as the opt-in `algorithm="ilp"` playlist mode — re-implemented for the request path, not imported, since the CLI reads word-list files and its own DB config.
 
 ---
 

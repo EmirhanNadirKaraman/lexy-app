@@ -65,7 +65,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `phrase_service.py` | `seed_from_blueprint_map`, `enrich_phrases`, phrase_type inference from blueprint. |
 | `lemma_correction_service.py` | `create_candidate` (INSERT…ON CONFLICT…report_count+1) + `list_candidates`; `accept_candidate` (transactional: upsert `lemma_override`, flip `accepted`) + `reject_candidate`; `adjudicate_candidate_dry_run` (read-only, injected adjudicator → advisory proposal) + `build_adjudication_input`/`format_adjudication_prompt` + domain exceptions (#39 3A/3B/3C). Accept is the only path from a user signal to `lemma_override`. |
 | `grammar_service.py` | `seed_rules` (curated DE list), `get_rules_for_phrase_type`, `get_rules_for_lemma`. |
-| `playlist_service.py` | Video playlist generation from target words. |
+| `playlist_service.py` | Video playlist generation from target words. Two optimizers behind one signature: `greedy_cover` (default, no deps) and `ilp_cover` (opt-in `algorithm="ilp"`, PuLP/CBC, optimal under `max_videos`). ILP solves **maximum coverage under the cap**, not minimum set cover, so it degrades to a partial playlist instead of going infeasible. `pulp` imports lazily — missing solver → 503, greedy unaffected. No frontend selector yet: API-only. |
 | `nlp_service.py` | spaCy wrapper utilities. |
 | `auth_service.py` | register, login. |
 | `settings_service.py` | get/update preferences from `users.settings` JSONB. Default values centralised here. |
@@ -248,7 +248,7 @@ tests targeting one — see TODO #17.
 | `data/words_4000.txt`, `b1_parsed.txt`, `known_words.txt`, `verbs.txt` | Reference word lists. |
 | `files/book_pdfs/` | 29 German B1 books (PDFs). |
 | `files/json/`, `files/masked/`, `files/text/` | PDF pipeline intermediates. |
-| `ilp/optimal_set_finder.py` | PuLP ILP — pick minimum books covering target vocab. Outputs in same dir. |
+| `ilp/optimal_set_finder.py` | PuLP ILP — pick minimum books covering target vocab. Standalone CLI, reads word-list files + its own DB config; outputs in same dir. **Still standalone and unchanged** — the playlist feature below re-implements the technique rather than importing this module. |
 | `scripts/*.py` | One-off data fixers (verb finder, b1 word finder, known words fixer, etc.). Mostly legacy. |
 | `youtube_category_test/main.py` | yt-dlp category proof-of-concept. |
 

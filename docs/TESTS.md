@@ -936,8 +936,13 @@ Run all three. The lint step is not optional.
 | Step | Command | Expected |
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
-| Backend | `cd lexy-app/backend && pytest -n auto` | 745 passed, 2 skipped |
+| Backend | `cd lexy-app/backend && pytest -n auto` | 760 passed, 2 skipped |
 | Root pipeline | `pytest tests/` *(repo root)* | 211 passed |
+
+Backend was 745 until the ILP playlist optimizer landed (+15: 11 unit tests for
+`ilp_cover`, 4 endpoint tests for the `algorithm` parameter — accepts `"ilp"`,
+422s an unknown value, 503s when the solver is unavailable, and defaults to
+greedy without invoking the solver).
 
 The root suite is **211 = 97 + 114**: `tests/runtime/` (97) covers the root
 pipeline modules, `tests/*.py` (114) covers `subtitle-scraper/`. It was 744

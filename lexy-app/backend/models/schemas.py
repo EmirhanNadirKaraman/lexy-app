@@ -343,7 +343,10 @@ class PlaylistGenerateRequest(BaseModel):
     item_type: Literal["word"] = "word"   # extend to "phrase" when supported
     language: str
     max_videos: int = Field(default=10, ge=1, le=50)
-    # algorithm: Literal["greedy"] = "greedy"   # add "ilp" here when implemented
+    # "greedy" is the default: no solver dependency, instant, good enough for
+    # most requests. "ilp" is optimal under the max_videos cap but runs a CBC
+    # solve, so it is opt-in per request rather than the default.
+    algorithm: Literal["greedy", "ilp"] = "greedy"
 
 
 class PlaylistVideoEntry(BaseModel):

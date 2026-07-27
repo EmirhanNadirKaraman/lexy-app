@@ -14,20 +14,21 @@ Two clean layers:
        _fetch_coverage(pool, item_ids, language)
        generate_playlist(pool, item_ids, item_type, language, max_videos, optimizer)
 
-ILP interface (deferred, no changes needed to call site)
----------------------------------------------------------
-Any optimizer that follows the same signature as greedy_cover can be passed
-as the `optimizer` argument to generate_playlist:
+Two optimizers, same signature
+------------------------------
+Any function matching greedy_cover's signature can be passed as the
+`optimizer` argument to generate_playlist. Two ship today:
 
-    def ilp_cover(
-        coverage: dict[str, set[int]],
-        targets: set[int],
-        max_videos: int,
-        video_durations: dict[str, float] | None = None,
-    ) -> list[str]:
-        # Requires: pip install pulp
-        # Variables: x[v] ∈ {0,1}; Minimize sum(x); cover all targets
-        ...
+  greedy_cover  — fast, no dependencies, (1 - 1/e) approximation.
+  ilp_cover     — optimal under the max_videos cap, via PuLP/CBC.
+
+The API exposes this as `algorithm: "greedy" | "ilp"` on the request; the
+router maps it to the function. Greedy stays the default: it needs no solver,
+returns instantly, and is good enough for most requests. ILP is worth asking
+for when the video pool is large enough that greedy's first-pick-wins
+heuristic leaves coverage on the table — see
+`test_playlist.py::TestIlpCover::test_ilp_beats_greedy_on_a_known_greedy_trap`
+for a concrete case where greedy covers 3 of 4 targets and ILP covers all 4.
 
 Phrase support (deferred)
 -------------------------
@@ -94,6 +95,119 @@ def greedy_cover(
         uncovered -= new_items
         del remaining[best_vid]
 
+    return selected
+
+
+def ilp_cover(
+    coverage: dict[str, set[int]],
+    targets: set[int],
+    max_videos: int,
+    video_durations: dict[str, float] | None = None,
+) -> list[str]:
+    """
+    Optimal set cover over vocabulary items, via integer linear programming.
+
+    Same signature and return contract as `greedy_cover`, so it drops straight
+    into `generate_playlist(optimizer=...)`.
+
+    **Formulation: maximum coverage under a cardinality cap — not minimum set
+    cover.** This is a deliberate choice. `ilp/optimal_set_finder.py` (the CLI
+    this is adapted from) minimises the number of sources needed to cover
+    *every* target, which is infeasible whenever the targets cannot all be
+    covered within `max_videos` — it would return nothing where `greedy_cover`
+    returns a useful partial playlist. Maximising coverage under the cap
+    degrades gracefully and matches the existing behaviour: the user asked for
+    at most N videos, so answer that question.
+
+        maximise    Σ y[t]  −  ε · Σ (normalised_duration[v] · x[v])
+        subject to  Σ x[v] ≤ max_videos
+                    y[t] ≤ Σ  x[v]   for every target t
+                            v covers t
+        where       x[v], y[t] ∈ {0, 1}
+
+    The ε term is the duration tiebreak, mirroring `greedy_cover`'s preference
+    for shorter videos. Durations are normalised to [0, 1] and ε is chosen so
+    the entire duration penalty is worth strictly less than a single target —
+    coverage therefore always dominates, and duration only separates solutions
+    that cover equally many items. It also makes a zero-contribution video
+    strictly worse than not selecting it, so useless videos are never chosen.
+
+    Determinism: CBC may return any one of several equally optimal solutions.
+    The selected set is therefore sorted before returning — by coverage
+    contribution (desc), then duration (asc), then video_id — so the same input
+    always yields the same ordered playlist. That ordering also matches
+    `greedy_cover`'s "best value first" contract, which `_build_result` relies
+    on for display order.
+
+    Raises RuntimeError if PuLP is unavailable, rather than silently falling
+    back to greedy — a caller that asked for the optimal playlist should be
+    told it could not be produced.
+    """
+    if not targets or not coverage or max_videos < 1:
+        return []
+
+    # PuLP is an optional dependency (declared in requirements.txt). Imported
+    # lazily so importing this module never fails on an install without it —
+    # only the ILP path does. Mirrors book_service's lazy `fitz` import.
+    try:
+        import pulp
+    except ImportError as exc:      # pragma: no cover - depends on install
+        raise RuntimeError(
+            "The 'ilp' playlist algorithm requires PuLP. Install it with "
+            "`pip install pulp`, or use algorithm='greedy'."
+        ) from exc
+
+    durations = video_durations or {}
+
+    # Only videos that actually contribute are candidates. Shrinks the model and
+    # removes any chance of selecting a video that covers nothing.
+    candidates = {
+        vid: items & targets
+        for vid, items in coverage.items()
+        if items & targets
+    }
+    if not candidates:
+        return []
+
+    # Normalise durations to [0, 1] so ε is meaningful regardless of units.
+    max_duration = max((durations.get(v, 0.0) for v in candidates), default=0.0)
+    norm = {
+        v: (durations.get(v, 0.0) / max_duration) if max_duration > 0 else 0.0
+        for v in candidates
+    }
+    # Total possible duration penalty < 1, i.e. less than one covered target.
+    epsilon = 1.0 / (2.0 * (len(candidates) + 1))
+
+    problem = pulp.LpProblem("playlist_max_coverage", pulp.LpMaximize)
+
+    # pulp mangles names with special characters; index by position instead of
+    # by video_id so arbitrary YouTube ids can't collide or break the model.
+    vids = sorted(candidates)
+    x = {v: pulp.LpVariable(f"x_{i}", cat="Binary") for i, v in enumerate(vids)}
+    covered_targets = sorted({t for items in candidates.values() for t in items})
+    y = {t: pulp.LpVariable(f"y_{i}", cat="Binary") for i, t in enumerate(covered_targets)}
+
+    problem += (
+        pulp.lpSum(y.values())
+        - epsilon * pulp.lpSum(norm[v] * x[v] for v in vids)
+    )
+    problem += pulp.lpSum(x.values()) <= max_videos
+
+    for t in covered_targets:
+        problem += y[t] <= pulp.lpSum(x[v] for v in vids if t in candidates[v])
+
+    problem.solve(pulp.PULP_CBC_CMD(msg=False))
+
+    if pulp.LpStatus[problem.status] != "Optimal":
+        raise RuntimeError(
+            f"ILP solver returned status {pulp.LpStatus[problem.status]!r}; "
+            "no optimal playlist could be produced."
+        )
+
+    selected = [v for v in vids if x[v].value() and round(x[v].value()) == 1]
+
+    # Deterministic, best-value-first ordering (see docstring).
+    selected.sort(key=lambda v: (-len(candidates[v]), durations.get(v, 0.0), v))
     return selected
 
 

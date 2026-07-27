@@ -18,6 +18,11 @@ psycopg2-binary
 # llm
 anthropic
 
+# playlist optimisation — the 'ilp' algorithm on POST /playlists/generate.
+# Optional at runtime: playlist_service imports it lazily, so a missing pulp
+# only fails the ilp path (503), never module import or the greedy default.
+pulp
+
 # youtube metadata
 yt-dlp
 

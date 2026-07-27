@@ -8,6 +8,11 @@ Unit tests (no DB) — test pure functions:
   - greedy_cover: stops when no remaining video covers anything new
   - greedy_cover: tiebreaks by shorter duration
   - greedy_cover: empty inputs
+  - ilp_cover: beats greedy on a known greedy trap (the reason it exists)
+  - ilp_cover: respects max_videos, covers all when the cap allows
+  - ilp_cover: never selects a zero-contribution video
+  - ilp_cover: duration tiebreak, best-value-first ordering, determinism
+  - ilp_cover: same empty/zero-cap contract as greedy_cover
   - compute_coverage_stats: correct counts and percentage
   - compute_coverage_stats: full coverage
   - compute_coverage_stats: no coverage
@@ -24,6 +29,10 @@ HTTP tests (FastAPI client):
   - POST /api/v1/playlists/generate returns 200 with correct shape
   - POST /api/v1/playlists/generate requires auth
   - POST /api/v1/playlists/generate with empty item_ids returns 422
+  - POST /api/v1/playlists/generate accepts algorithm="ilp"
+  - POST /api/v1/playlists/generate 422s an unknown algorithm
+  - POST /api/v1/playlists/generate 503s when the solver is unavailable
+  - POST /api/v1/playlists/generate defaults to greedy (never invokes the solver)
 """
 
 import pytest
@@ -32,6 +41,7 @@ from backend.services.playlist_service import (
     compute_coverage_stats,
     generate_playlist,
     greedy_cover,
+    ilp_cover,
 )
 from ._email_helper import make_test_email
 
@@ -111,6 +121,93 @@ class TestGreedyCover:
         coverage = {"vid_A": {1}}
         result = greedy_cover(coverage, {1}, max_videos=0)
         assert result == []
+
+
+class TestIlpCover:
+    """`ilp_cover` must satisfy the same contract as `greedy_cover` (it is a
+    drop-in `optimizer=`), and additionally be optimal under the max_videos cap."""
+
+    def test_ilp_beats_greedy_on_a_known_greedy_trap(self):
+        """The reason this optimizer exists.
+
+        Three videos each cover two targets, so greedy's first pick is decided
+        by its duration tiebreak — and vid_C is shortest. Taking vid_C first
+        strands one target: whatever greedy picks second adds only one new item,
+        so it covers 3 of 4. The optimal pair is A+B, which covers all 4.
+
+        If this test ever fails because greedy also gets 4, the trap has stopped
+        being a trap and the test is no longer proving anything — rebuild it
+        rather than deleting it.
+        """
+        coverage = {
+            "vid_A": {1, 2},
+            "vid_B": {3, 4},
+            "vid_C": {2, 3},
+        }
+        targets = {1, 2, 3, 4}
+        durations = {"vid_A": 300.0, "vid_B": 300.0, "vid_C": 100.0}
+
+        greedy = greedy_cover(coverage, targets, max_videos=2, video_durations=durations)
+        optimal = ilp_cover(coverage, targets, max_videos=2, video_durations=durations)
+
+        greedy_covered = set().union(*(coverage[v] for v in greedy))
+        optimal_covered = set().union(*(coverage[v] for v in optimal))
+
+        assert greedy_covered == {1, 2, 3}          # greedy strands target 4
+        assert optimal_covered == targets           # ILP covers everything
+        assert set(optimal) == {"vid_A", "vid_B"}
+
+    def test_respects_max_videos(self):
+        coverage = {"vid_A": {1}, "vid_B": {2}, "vid_C": {3}}
+        result = ilp_cover(coverage, {1, 2, 3}, max_videos=2)
+        assert len(result) == 2
+
+    def test_covers_everything_when_cap_allows(self):
+        coverage = {"vid_A": {1, 2}, "vid_B": {3}}
+        result = ilp_cover(coverage, {1, 2, 3}, max_videos=10)
+        assert set(result) == {"vid_A", "vid_B"}
+
+    def test_never_selects_a_video_that_covers_nothing(self):
+        """The ε duration penalty makes a zero-contribution pick strictly worse
+        than not picking, so the cap is not filled with useless videos."""
+        coverage = {"vid_A": {1, 2}, "vid_useless": {99}}
+        result = ilp_cover(coverage, {1, 2}, max_videos=10)
+        assert result == ["vid_A"]
+
+    def test_prefers_shorter_video_when_coverage_ties(self):
+        coverage = {"vid_long": {1, 2}, "vid_short": {1, 2}}
+        durations = {"vid_long": 900.0, "vid_short": 60.0}
+        result = ilp_cover(coverage, {1, 2}, max_videos=1, video_durations=durations)
+        assert result == ["vid_short"]
+
+    def test_result_is_ordered_best_value_first(self):
+        """_build_result renders in list order, so the highest-coverage video
+        must come first regardless of which optimal set CBC happened to return."""
+        coverage = {"vid_small": {4}, "vid_big": {1, 2, 3}}
+        result = ilp_cover(coverage, {1, 2, 3, 4}, max_videos=2)
+        assert result == ["vid_big", "vid_small"]
+
+    def test_deterministic_across_repeated_solves(self):
+        """CBC may return any equally-optimal solution; the sort must make the
+        output stable so the same request yields the same playlist."""
+        coverage = {"vid_A": {1, 2}, "vid_B": {3, 4}, "vid_C": {2, 3}}
+        targets = {1, 2, 3, 4}
+        runs = {tuple(ilp_cover(coverage, targets, max_videos=2)) for _ in range(5)}
+        assert len(runs) == 1
+
+    # --- same edge cases greedy_cover is held to -----------------------------
+
+    def test_empty_targets_returns_empty(self):
+        assert ilp_cover({"vid_A": {1}}, set(), max_videos=10) == []
+
+    def test_empty_coverage_returns_empty(self):
+        assert ilp_cover({}, {1, 2}, max_videos=10) == []
+
+    def test_max_videos_zero_returns_empty(self):
+        assert ilp_cover({"vid_A": {1}}, {1}, max_videos=0) == []
+
+    def test_no_video_covers_any_target_returns_empty(self):
+        assert ilp_cover({"vid_A": {99}}, {1, 2}, max_videos=10) == []
 
 
 class TestComputeCoverageStats:
@@ -328,3 +425,95 @@ async def test_endpoint_response_shape(client, db_pool):
         assert "start_time" in video
         assert "covered_item_ids" in video
         assert "covered_count" in video
+
+
+async def test_endpoint_accepts_ilp_algorithm(client, db_pool):
+    """The opt-in optimal mode is reachable over HTTP and returns the same shape."""
+    word_ids = await _word_ids_in_db(db_pool, 2)
+    language = await _language_for_word(db_pool, word_ids[0])
+    token = await _auth_token(client)
+
+    resp = await client.post(
+        "/api/v1/playlists/generate",
+        json={
+            "item_ids": word_ids,
+            "language": language,
+            "max_videos": 5,
+            "algorithm": "ilp",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "videos" in body
+    assert "coverage" in body
+
+
+async def test_endpoint_rejects_unknown_algorithm(client, db_pool):
+    """Pydantic gates the enum, so a typo never reaches the optimizer lookup."""
+    word_ids = await _word_ids_in_db(db_pool, 1)
+    language = await _language_for_word(db_pool, word_ids[0])
+    token = await _auth_token(client)
+
+    resp = await client.post(
+        "/api/v1/playlists/generate",
+        json={
+            "item_ids": word_ids,
+            "language": language,
+            "algorithm": "simulated_annealing",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422
+
+
+async def test_endpoint_returns_503_when_solver_unavailable(client, db_pool, monkeypatch):
+    """A missing PuLP (or a non-optimal solve) must surface as 503, not 500.
+
+    The request itself is valid — only the optimal backend is unavailable — and
+    retrying with algorithm='greedy' will succeed, so this is a service-
+    availability failure rather than a server error.
+    """
+    from backend.routers import playlists as playlists_router
+
+    def _no_solver(*_args, **_kwargs):
+        raise RuntimeError("The 'ilp' playlist algorithm requires PuLP.")
+
+    monkeypatch.setitem(playlists_router._OPTIMIZERS, "ilp", _no_solver)
+
+    word_ids = await _word_ids_in_db(db_pool, 2)
+    language = await _language_for_word(db_pool, word_ids[0])
+    token = await _auth_token(client)
+
+    resp = await client.post(
+        "/api/v1/playlists/generate",
+        json={
+            "item_ids": word_ids,
+            "language": language,
+            "algorithm": "ilp",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 503
+    assert "PuLP" in resp.json()["detail"]
+
+
+async def test_greedy_remains_the_default(client, db_pool, monkeypatch):
+    """Omitting `algorithm` must not invoke the solver — greedy stays default."""
+    from backend.routers import playlists as playlists_router
+
+    def _should_not_run(*_args, **_kwargs):
+        raise AssertionError("ilp_cover was called for a request with no algorithm")
+
+    monkeypatch.setitem(playlists_router._OPTIMIZERS, "ilp", _should_not_run)
+
+    word_ids = await _word_ids_in_db(db_pool, 2)
+    language = await _language_for_word(db_pool, word_ids[0])
+    token = await _auth_token(client)
+
+    resp = await client.post(
+        "/api/v1/playlists/generate",
+        json={"item_ids": word_ids, "language": language},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
