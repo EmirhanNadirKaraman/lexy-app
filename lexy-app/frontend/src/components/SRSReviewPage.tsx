@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import type { SRSReviewCard, SRSProductionResult } from '../types';
 import { getDueCards, skipCard, submitReviewAnswer, submitProductionAnswer } from '../api/srs';
 import { LANGUAGE_OPTIONS } from '../config/languages';
+import { LemmaFlagButton } from './LemmaFlagButton';
 
 interface Props {
     token: string;
@@ -172,6 +173,22 @@ export function SRSReviewPage({ token, language, onLanguageChange, onClose }: Pr
                 }}>
                     {current.answer_text ?? current.display_text}
                 </div>
+                {/* Flag the canonical the learner is looking at right now.
+                    Words and phrases only — grammar rules carry no lemma, and
+                    the backend's item_type is Literal["word","phrase"]. */}
+                {(current.item_type === 'word' || current.item_type === 'phrase') && (
+                    <div style={{ width: '100%', maxWidth: '340px' }}>
+                        <LemmaFlagButton
+                            key={current.card_id}
+                            token={token}
+                            language={language}
+                            surfaceForm={current.answer_text ?? current.display_text}
+                            observedLemma={current.answer_text ?? current.display_text}
+                            itemType={current.item_type}
+                            itemId={current.item_id}
+                        />
+                    </div>
+                )}
                 <div style={{
                     display: 'flex', gap: '10px', marginTop: '4px',
                     width: '100%', maxWidth: '340px',

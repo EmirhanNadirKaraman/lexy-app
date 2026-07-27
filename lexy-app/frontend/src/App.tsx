@@ -15,6 +15,7 @@ import { ReminderBanner } from './components/ReminderBanner';
 import { SRSReviewPage } from './components/SRSReviewPage';
 import { ReadingReviewPage } from './components/ReadingReviewPage';
 import { ContentRequestPage } from './components/ContentRequestPage';
+import { AdminLemmaQueuePage } from './components/AdminLemmaQueuePage';
 import { NotificationContainer } from './components/NotificationToast';
 import { useNotifications } from './hooks/useNotifications';
 import { useSearch } from './hooks/useSearch';
@@ -22,6 +23,7 @@ import { useReminders } from './hooks/useReminders';
 import { usePreferences } from './hooks/usePreferences';
 import { useResolvedTheme } from './hooks/useResolvedTheme';
 import { useViewport } from './hooks/useViewport';
+import { useIsLemmaAdmin } from './hooks/useIsLemmaAdmin';
 import { DEFAULT_LANGUAGE, languageLabel } from './config/languages';
 import { getToken } from './auth';
 import { AUTH_EXPIRED_EVENT } from './api/_http';
@@ -56,6 +58,10 @@ function Layout() {
   // macOS dark switches at runtime without re-saving.
   const resolvedTheme = useResolvedTheme(prefs.theme_mode);
   const { isMobile } = useViewport();
+  // Probe-based: `is_admin` is never sent to the client, so we ask the admin
+  // endpoint whether it answers. Hides the nav link only — `require_admin` on
+  // the routes themselves is the real gate.
+  const isLemmaAdmin = useIsLemmaAdmin(token);
 
   // Apply theme via the [data-theme] attribute on <html>. CSS variables in
   // index.css flip when this changes, so component inline styles using
@@ -131,6 +137,9 @@ function Layout() {
             {token && <NavLink to="/review" style={nlReview}>Review</NavLink>}
             {token && <NavLink to="/add-content" style={nl}>+ Add Content</NavLink>}
             {token && <NavLink to="/settings" style={nl}>Settings</NavLink>}
+            {token && isLemmaAdmin && (
+              <NavLink to="/admin/lemma-corrections" style={nl}>Lemma Queue</NavLink>
+            )}
             <LoginForm
               token={token}
               onLogin={t => { setToken(t); navigate('/'); }}
@@ -434,6 +443,17 @@ function AddContentPage() {
   return <ContentRequestPage token={token} onClose={() => navigate('/')} />;
 }
 
+// Reachable directly by URL on purpose — the nav link is hidden for non-admins,
+// but the server's require_admin is what actually enforces access. A non-admin
+// who navigates here sees the queue's inline error, not a fake client-side
+// "forbidden" screen that would imply the client is the gate.
+function AdminLemmaQueueRoute() {
+  const { token } = useAppCtx();
+  const navigate = useNavigate();
+  if (!token) return <Navigate to="/" />;
+  return <AdminLemmaQueuePage token={token} onClose={() => navigate('/')} />;
+}
+
 function SettingsPage() {
   const { token, prefs, savePreferences } = useAppCtx();
   const navigate = useNavigate();
@@ -454,6 +474,7 @@ export default function App() {
         <Route path="add-content" element={<AddContentPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="privacy" element={<PrivacyPage />} />
+        <Route path="admin/lemma-corrections" element={<AdminLemmaQueueRoute />} />
       </Route>
     </Routes>
   );
