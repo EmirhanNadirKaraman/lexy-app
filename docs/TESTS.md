@@ -67,7 +67,7 @@ line.
 | `test_reading_progression.py` | reading_selections save/review → main progression via find_catalog_item |
 | `test_reading_stats.py` | lemma coverage calculation |
 | `test_recommendations.py` | score_sentence, rank_sentences, recommend_videos, channel/category multipliers |
-| `test_settings.py` | preferences GET/PUT — ❌ 3 tests fail (pre-existing: expected key set out of sync with current default keys: `disliked_genres`, `auto_mark_known`, `dark_mode`, `liked_genres`) |
+| `test_settings.py` | preferences GET/PUT — ✅ passing (the 3 stale-`ALL_PREFERENCE_KEYS` failures were resolved 2026-05-19; see the resolved-failures table below) |
 | `test_srs_review.py` | `/srs/due` + `/srs/review/{card_id}` end-to-end |
 | `test_transcript_click.py` | `/words/word/{id}/transcript-click` → passive_level + create card |
 | `test_usage_events.py` | record_event + aggregations |

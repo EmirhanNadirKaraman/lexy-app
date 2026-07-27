@@ -4,35 +4,133 @@ ROI-ranked plan for remaining work. Companion to `docs/TODO.md` (which keeps the
 full item history, including resolved items) and `docs/WORKFLOW_AUDIT.md` (which
 numbers the workflow holes referenced below).
 
-Last re-ranked: 2026-05-20 (later same day — direction changed: finish
-polishing the web/desktop app to "bug free" first, then resume iOS
-migration. T1.1–T1.4, the four Capacitor-prereq Tier-1 items, are all
-done. W1–W8 + W10 + W11 + W12 + W13 also done; W1 verified clean
-(`npm audit` → 0 vulns); W8 #25 sub-task reported as overscoped and
-dropped; W10 BookReaderPage memoization deferred as
-architecture-not-memo; W11 shipped account-deletion endpoint +
-`/privacy` page + `docs/PRIVACY.md`; W12 closed the pre-launch
-placeholder, localStorage disclosure, T3.2 audit (0 rows), Hole 10
-orphan-SRS cleanup (0 rows), and #30 schema doc. W9 (free-chat
-multi-lang) stays deferred — bundle with #19 when a 2nd language
-ships. Web-polish + privacy + Tier-3/4 maintenance are
-**complete**. Capacitor itself partially installed (`npx cap add ios`
-complete, `xcode-select` needs full Xcode before next sync) —
-DEFERRED.
+Last re-ranked: **2026-07-27**. The previous ranking (2026-05-20 PM) went
+stale: roughly 35 commits landed between 2026-05-21 and 2026-05-25 —
+Spanish as a second language (stages 0–4), the S1–S17 security pass,
+the #39 lemma-override layer, #18 scraper language config, and four
+rounds of xdist test-isolation work — none of which was reflected here.
+Its "recommended next prompt" still pointed at T1.1, which had already
+shipped that same day.
+
+What that work changes about priorities: **a second language is now in
+production**, so every item deferred with the rationale "only German
+exists" has had its deferral condition expire. See §Current priorities.
+
+Historical (unchanged): T1.1–T1.4 done; W1–W8 + W10–W13 done; W1 verified
+clean (`npm audit` → 0 vulns); W8's #25 sub-task dropped as overscoped;
+W10's BookReaderPage memoization deferred as architecture-not-memo; W11
+shipped account-deletion + `/privacy` + `docs/PRIVACY.md`; W12 closed the
+pre-launch placeholder, localStorage disclosure, the T3.2 audit (0 rows),
+Hole 10 orphan-SRS cleanup (0 rows), and #30. Capacitor partially
+installed (`npx cap add ios` complete, `xcode-select` needs full Xcode)
+— still DEFERRED.
 
 ---
 
 ## Current state, in one paragraph
 
-Progression rules, SRS production review (Hole 12 / passive front-flip),
-reading review UI, mastered→known, mobile responsive #27a–g, PWA shell +
-icons, dark-mode tristate (T1.3), LLM rate limit, cache thundering-herd +
-call-site migration, print→logging, channel flat-files→DB, channel prefs
-relational (T1.4 / migration 027), transcript-click dedup (T1.1), `os.chdir`
-import hacks — all landed. Capacitor packages installed, `ios/` project
-scaffolded, `VITE_API_BASE_URL` helper in place, readiness checklist
-documented in `docs/CAPACITOR_READINESS.md`. iOS migration is DEFERRED on
-the user's call — finish web/desktop polish first.
+The German loop is complete and green. Progression rules, SRS production
+review (Hole 12 / passive front-flip), reading review UI, mastered→known,
+mobile responsive #27a–g, PWA shell + icons, dark-mode tristate (T1.3), LLM
+rate limit, cache thundering-herd + call-site migration, print→logging,
+channel flat-files→DB, channel prefs relational (T1.4 / migration 027),
+transcript-click dedup (T1.1), `os.chdir` import hacks — all landed. Since
+then: **Spanish shipped as a real second language** (scraper ingest,
+language-aware chat + LLM prompts, frontend generalisation, phrase
+extractor slices 1–4, `language_config.py` centralisation), a **security
+pass closed S1/S4/S5/S6/S7/S11/S15/S16/S17** (8 residuals open, none
+HIGH), and the **#39 lemma-override layer** shipped backend-complete
+through slice 3C (dry-run adjudication). Capacitor packages installed,
+`ios/` scaffolded, `VITE_API_BASE_URL` helper in place, checklist in
+`docs/CAPACITOR_READINESS.md`; iOS migration still DEFERRED per the
+user's call.
+
+Verified on 2026-07-27: backend **745 passed / 2 skipped**, root pipeline
+**671 passed**, frontend **219 passed**. Working tree clean.
+
+---
+
+## Current priorities (2026-07-27)
+
+Ranked. Everything above the line in §Web-polish path is history; this is
+the live list.
+
+### P1 — #39 frontend: flag button + admin review queue
+- **Effort:** M. **Category:** product / completes shipped backend.
+- **Why now:** slices 3A + 3B shipped the entire signal→authority chain
+  (`POST /api/v1/lemma-corrections`, admin accept/reject with a
+  transactional upsert into `lemma_override`). **None of it is reachable
+  from the UI.** Users cannot flag a wrong lemma; admins have no screen.
+  This is the highest value-per-effort item open — the expensive half is
+  already built and tested (41 tests in `test_lemma_corrections.py`).
+- **Scope:** a flag affordance where a canonical phrase is displayed, and
+  an admin list view over `GET /api/v1/admin/lemma-corrections` with
+  accept/reject buttons. No new backend work required.
+- **Related, separate:** the live-LLM adjudicator behind
+  `get_lemma_adjudicator` (currently returns `None` → 503). That one is a
+  product decision about cost, not a blocked frontend.
+
+### P2 — Single-worker deployment decision (S12 + #24 + T2.2)
+- **Effort:** S to decide, M to implement. **Category:** deploy-readiness.
+- **These are one decision, not three tickets.** All three assume a single
+  process and all three break together the moment the deploy goes
+  multi-worker:
+  - **S12** — `services/rate_limiter.py` in-memory sliding window; each
+    worker enforces its own quota, so N workers = N× the intended budget.
+  - **#24** — `llm_cache_service.get_or_compute`'s per-key `asyncio.Lock`
+    is in-process; two workers both miss and both call the provider.
+  - **T2.2 / #4b** — notification SSE polls every 3s per client instead of
+    `LISTEN/NOTIFY`; also wants the 30-day retention sweep.
+- **Decide first:** does the deploy stay single-worker? If yes, all three
+  are non-issues and should be labelled as such rather than sitting open.
+  If no, they share one answer (Redis, or `pg_advisory_xact_lock` for the
+  cache lock) and want a single pass.
+
+### P3 — #36 Spanish phrase extractor, remaining patterns
+- **Effort:** M. **Category:** product (second-language parity).
+- **Deferral expired.** Slices 1–4 shipped (reflexives, verb+prep,
+  clitic-attached infinitives, reflexive+prep combos on both finite and
+  infinitive forms). Still open: **imperatives** ("lávate",
+  "levántate") extract nothing because `es_core_news_sm` tags them as
+  non-verbs (regression-guarded today); the allowlist is hardcoded rather
+  than data/config; idioms, MWEs, and subjunctive are untouched.
+- **Why it matters now:** Spanish learners get materially thinner phrase
+  coverage than German ones. That was acceptable while Spanish was a
+  smoke test; it isn't once Spanish is a shipped language.
+
+### P4 — Hole 20: per-message language detection in free chat
+- **Effort:** S–M. **Category:** correctness (second-language).
+- **Deferral expired, and it is now the *only* open half of the old W9.**
+  Hole 19 (the hardcoded `language='de'`) is **CLOSED** — see W9 below.
+  What remains: `evaluate_and_reply` returns one `language_detected` per
+  turn, so a mixed sentence ("Yesterday I bought Brot…") gets a single
+  label for the whole message.
+- **Partial mitigation already shipped** (2026-05-23, "Credit
+  target-language words in English-classified free-chat messages"): the
+  target word is scanned regardless of the turn's classification, so the
+  worst case (losing credit entirely) is already handled. This is now a
+  precision improvement, not a correctness hole — ranked accordingly.
+- **Fix shape:** when the LLM returns `mixed`, fall back to spaCy and
+  score matched tokens per-language.
+
+### P5 — Security residuals (8 open, none HIGH)
+- **Effort:** S each. **Category:** deploy-readiness.
+- S2 (open signup when no `REGISTRATION_CODE` is set — needs email
+  verification or CAPTCHA), S3 (no token revocation; a leaked JWT is good
+  for up to 7 days), S9/S10 (minor, residual-only), S12 (see P2), S13/S14
+  (INFO). Full detail and per-finding verification checks live in
+  `docs/SECURITY.md` — that file, not this one, is the tracker.
+
+### Blocked on a product decision, not on engineering
+Do not start these as code work:
+- **#37 multi-track subtitle capture** — `docs/TODO.md` says explicitly
+  "Decision needed first… don't build the schema change speculatively."
+  Is bilingual capture actually wanted?
+- **#39 live-LLM adjudicator + community voting stretch** — cost and
+  moderation-policy call.
+- **T3.1 Capacitor wrap** — needs a full Xcode install on the dev machine
+  and a real privacy contact email (`PrivacyPage.tsx` still ships
+  `<YOUR_REAL_PRIVACY_EMAIL_BEFORE_LAUNCH>`).
 
 ---
 
@@ -222,16 +320,22 @@ old Tier 2 ordering for the moment.
   root `pytest` → 562 passed (matches W4 baseline). Frontend
   `tsc --noEmit` clean, vitest 151 passed, `vite build` clean.
 
-### W9 — Hole 19 + Hole 20: free-chat multi-language + per-message detection
-- **Effort:** M. Today `chat.py:175` hardcodes `language='de'` and
-  `evaluate_and_reply` returns one `language_detected` per turn — a
-  mixed sentence ("Yesterday I bought Brot…") may misclassify.
-- **Fix:** thread `current_user_language` through; if LLM returns
-  `mixed`, fall back to spaCy + scoring matched tokens per-language.
-- **Impact:** Currently zero practical impact (only German exists);
-  blocks any second language. Bundle with #19's multi-language phrase
-  extractor when adding a second language; otherwise defer.
-- **Category:** product (multi-language readiness).
+### W9 — Hole 19 + Hole 20: free-chat multi-language + per-message detection — ✅ Hole 19 RESOLVED 2026-05-21 · Hole 20 still open (now tracked as P4)
+- **Hole 19 (hardcoded `language='de'`) — CLOSED.** Shipped in "Land Stage
+  3 of second-language plan: language-aware chat + LLM prompts"
+  (2026-05-21). Migration 031 added a nullable `language` column to
+  `chat_sessions`; `chat_service.create_session` takes and stores the
+  target language, and `routers/chat.py` reads
+  `session_language = session.get("language") or "de"` — the `or "de"` is
+  a back-compat fallback for pre-Stage-3 rows, **not** a hardcode. Verified
+  2026-07-27: the only `"de"` literals left in `routers/chat.py` are that
+  legacy fallback and the comments documenting it.
+- **Hole 20 (per-message detection) — still open**, and partially
+  mitigated by the 2026-05-23 commit that credits target-language words
+  inside English-classified messages. Re-ranked as **P4** in §Current
+  priorities; it is no longer bundled with #19, which has shipped.
+- **Stale rationale removed:** this item used to read "zero practical
+  impact (only German exists)". Spanish shipped 2026-05-21.
 
 ### W10 — #21 memoization hotspots — ✅ RESOLVED 2026-05-20
 - **usePlayerSentences:** `baseTerms` → `useMemo([surface_form, query])`;
@@ -342,9 +446,11 @@ old Tier 2 ordering for the moment.
   before resuming: real privacy contact email, localStorage
   disclosure for EU, App Store Privacy Nutrient Label declarations,
   full Xcode install on the dev machine.
-- **T2.2 LISTEN/NOTIFY (#4b)** — cost not correctness. Defer until
-  user count + cost signal warrants it.
-- **T3.3 multi-language pipeline (#18, #19)** — feature, not a bug.
+- **T2.2 LISTEN/NOTIFY (#4b)** — cost not correctness. Now folded into
+  the single-worker decision (P2); don't cost it separately.
+- ~~**T3.3 multi-language pipeline (#18, #19)**~~ — **SHIPPED.** #19's
+  `extract_phrases(doc, language)` dispatcher landed 2026-05-21, #18's
+  `subtitle-scraper/language_config.py` landed 2026-05-25.
 - **Hole 27 spaced forgetting** — DEFERRED by product decision
   (2026-05-21). Re-classified from "open hole" to chosen behaviour;
   re-open when a maintenance-review UX is designed. Manual demotion
@@ -522,13 +628,18 @@ order. Do not start T3.1 until §8.1 (introduce `VITE_API_BASE_URL`) and
   summary.
 - **Category:** product / correctness.
 
-### T3.3 — #18 + #19 multi-language scraper + phrase extractor
-- **Effort:** L. Move `LANG_MODEL_MAP` / `LANG_TRANSCRIPT_CODES` /
-  `NO_MORPH_LANGS` to a `language_config` table; add
-  `extract_phrases(doc, language)` dispatcher with no-op stubs.
-- **Impact:** Unblocks a second language.
-- **Risk:** Low–medium. Big surface but mechanical.
-- **Category:** structural (product expansion).
+### T3.3 — #18 + #19 multi-language scraper + phrase extractor — ✅ RESOLVED
+- **#19 (2026-05-21):** `extract_phrases(doc, language)` dispatcher in
+  `subtitle-scraper/phrase_finder.py`; `de` → `extract_german_logic`,
+  other languages → `[]` (later `es` → `extract_spanish_logic`).
+- **#18 (2026-05-25):** `subtitle-scraper/language_config.py` is the
+  single source for spaCy model / transcript codes / morphology flag /
+  phrase extractor. `pipeline.py` re-exports the historical `LANG_*`
+  names, so all 11 call sites were unchanged. Adding a language = edit
+  one file. Chose a plain-Python module over YAML (PyYAML is only
+  transitively available). See `docs/MAINTENANCE.md`.
+- **Follow-on work is now product depth, not plumbing** — see P3
+  (Spanish extractor patterns).
 
 ---
 
@@ -557,135 +668,126 @@ order. Do not start T3.1 until §8.1 (introduce `VITE_API_BASE_URL`) and
 | **#5e backfill of pre-2026-05-18 inflated active progress** | DROP (forward-only) | TODO.md recommends not running it. `status='known'` is the load-bearing field; inflation is invisible downstream. |
 | **#33 `tests/legacy/`** | Just delete it | Glob-ignored, no one looks. Decide once. |
 | **#27 remaining "media queries / 900px container"** | Mostly absorbed by #27a–g | Audit shows it's mostly done. Spot-check on a real phone instead of opening a new ticket. |
-| **Hole 19/20 — free chat language hardcoded `'de'`** | Bundle into #19 | No second language exists yet. Don't fix in isolation. |
+| ~~**Hole 19/20 — free chat language hardcoded `'de'`**~~ | **Resolved / re-ranked** | Hole 19 shipped 2026-05-21 (Stage 3, migration 031). Hole 20 is now **P4** in §Current priorities — the "no second language exists yet" rationale expired when Spanish shipped. |
 
 ---
 
 ## Direct answers to common planning questions
 
-**1. Start #34 now, or one/two small items first?**
-Small items first. Specifically: T1.1 (transcript dedup), T1.2 (passive
-front-flip), T1.3 (theme tristate), T2.2 (LISTEN/NOTIFY + APNs prep), and
-ideally T1.4 (#6 channel prefs). Capacitor on top of inflatable passive
-signal + a half-fake passive review + boolean dark mode + polling SSE wastes
-the wrap's first impression.
+**1. Start #34 (Capacitor) now?**
+No — and the blocker is no longer engineering. T1.1–T1.4 and the whole
+web-polish path landed. What's left is a full Xcode install on the dev
+machine and a real privacy contact email. Until those two exist, T3.1
+cannot proceed regardless of code readiness.
 
 **2. Next single best task.**
-T1.1 — transcript-click dedup + error surfacing. Protects the `passive_level`
-signal that every downstream metric (auto-promotion, insights, ranking)
-already reads from. Must precede T1.2's passive-front flip — no point making
-review a real recall test against a counter that's still inflatable by
-dragging the seek bar. ~½ day end-to-end. See the recommended next prompt
-at the bottom of this file.
+**P1 — the #39 frontend (flag button + admin review queue).** The entire
+backend chain from user signal to `lemma_override` shipped through slice
+3B and is covered by 41 tests, but no UI reaches it. Finishing the cheap
+half turns a fully-built, fully-tested subsystem from dead code into a
+working feature. Nothing else open has that ratio.
 
 **3. Avoid right now.**
 - #5 reconciliation (Hole 23) — no user signal yet.
-- #5e backfill — recommended forward-only, don't touch prod data.
-- Hole 27 spaced forgetting — DEFERRED by product decision (2026-05-21); not a code task at all until a maintenance-review UX is designed.
-- Starting #34 before T1+T2 land.
-- New top-level Python files / new `src/app/` modules — refactor is being
-  deleted, not extended.
+- #5e backfill — forward-only by decision; don't touch prod data.
+- Hole 27 spaced forgetting — DEFERRED by product decision (2026-05-21);
+  not a code task until a maintenance-review UX is designed.
+- #37 multi-track subtitles — blocked on a product decision, and the TODO
+  explicitly warns against building the schema change speculatively.
+- New top-level Python files / new `src/app/` modules — that refactor is
+  being deleted, not extended.
 
 **4. Reclassify as no longer worth doing.**
 - #5e (drop entirely).
 - #5 / Hole 23 (defer indefinitely; reopen on signal).
-- #33 (just `git rm tests/legacy/`; don't restore).
 - #27 remaining stages (mostly absorbed by 27a–g; spot-check, don't ticket).
-- Holes 19/20 isolated fix (bundle into #19's eventual multi-language work).
+- ~~Holes 19/20 bundled into #19~~ — obsolete: #19 shipped, Hole 19 is
+  closed, Hole 20 is ranked on its own as P4.
+
+**5. What about the rest of #17 (`src/app/` salvage)?**
+Batch 1 shipped (W4, 20 tests onto `tests/runtime/`). Batches 2+ never
+started, so `src/app/` still carries ~1,065 lines with zero runtime
+callers while `tests/{subtitles,learning,exposure,pipeline}/` still test
+the refactor rather than the shipping code. Unranked deliberately: it is
+real debt but blocks nothing, and the salvage plan in `docs/TODO.md` §17
+is still accurate whenever it's picked up.
 
 ---
 
 ## Recommended next prompt (paste back to continue)
 
+> Replaced 2026-07-27. The previous contents of this section asked for
+> **T1.1 (transcript-click dedup)**, which had already shipped on
+> 2026-05-20 — the section was never updated after the item it pointed at
+> landed. See T1.1 above for what was actually delivered.
+
 ```
-Implement T1.1: transcript-click error surfacing + per-sentence dedup.
+Implement P1: the #39 lemma-correction frontend (flag button + admin review queue).
 
 Goal:
-Make transcript clicks useful as exposure events without allowing repeated
-clicks on the same word/sentence to inflate passive_level.
+Make the already-shipped lemma-correction backend reachable from the UI.
+Slices 3A + 3B built the full chain -- user signal -> admin decision ->
+lemma_override -- with 41 tests. None of it has a frontend, so users cannot
+report a wrong lemma and admins cannot review one.
 
-Current problem:
-Frontend useWordStatus.recordTranscriptClick is fire-and-forget. If the
-backend fails, the user never knows.
-Also, repeated clicks on the same word in the same sentence can repeatedly
-trigger transcript_clicked progression, inflating times_seen/passive_level
-and causing noisy auto-promotion.
+Do NOT change backend behaviour. This is a UI task against endpoints that
+already exist and are already tested.
 
-Desired behavior:
-1. Transcript click should be idempotent per:
-   - user_id
-   - item_id
-   - item_type
-   - sentence_id or stable transcript/sentence identifier
-   - calendar day or review/session window, whichever fits current schema best
+Existing backend surface (read before starting):
+- POST  /api/v1/lemma-corrections            auth, per-user 30/hr throttle
+                                             body: language, surface_form,
+                                             observed_lemma, optional
+                                             suggested_lemma + context_text
+                                             (missing/blank optionals normalize
+                                             to '' server-side)
+- GET   /api/v1/admin/lemma-corrections      require_admin, read-only queue
+- POST  /api/v1/admin/lemma-corrections/{id}/accept   require_admin
+                                             optional corrected_lemma in body;
+                                             falls back to the candidate's
+                                             suggested_lemma; 400 if neither
+- POST  /api/v1/admin/lemma-corrections/{id}/reject   require_admin
+- POST  /api/v1/admin/lemma-corrections/{id}/adjudicate  require_admin,
+                                             returns 503 today (no adjudicator
+                                             wired) -- do not build UI that
+                                             depends on it
 
-2. First click in that scope:
-   - records usage event
-   - applies progression("transcript_clicked") as today
-
-3. Duplicate click in that scope:
-   - should not apply progression again
-   - should not increment passive_level again
-   - should not increment times_seen again
-   - should return a harmless success/no-op response
-
-4. Frontend should not silently swallow errors:
-   - recordTranscriptClick should surface/log failure in a controlled way
-   - do not block word lookup/status modal on click failure
-   - but make debugging possible, e.g. console.warn or hook error state
-
-Backend tasks:
-- Inspect existing transcript-click endpoint:
-    POST /words/word/{id}/transcript-click
-- Inspect word_usage_events schema and whether it has sentence_id/context
-  metadata.
-- If a unique constraint/index is appropriate, add one.
-- If schema does not currently store sentence_id, use the best existing stable
-  identifier or extend minimally.
-- Implement dedup atomically, preferably with INSERT ... ON CONFLICT DO NOTHING.
-- Only call apply_progression when the insert is new.
+Service + schema detail: lexy-app/backend/services/lemma_correction_service.py,
+routers/lemma_corrections.py, docs/LEMMA_OVERRIDE_WORKFLOW.md.
 
 Frontend tasks:
-- Update useWordStatus.recordTranscriptClick or equivalent caller.
-- Keep it non-blocking for UX.
-- Replace silent failure with controlled warning/error state.
-- Preserve current word-click behavior.
+1. A flag affordance wherever a canonical phrase is displayed to a learner.
+   Opens a small form: what looks wrong, optional suggested lemma. Posts to
+   /api/v1/lemma-corrections. Success is quiet (a confirmation chip, not a
+   modal); a 429 surfaces the throttle message from _http.ts.
+2. An admin review screen listing pending candidates from
+   GET /api/v1/admin/lemma-corrections, showing surface_form, observed_lemma,
+   suggested_lemma, context_text, and report_count. Accept / Reject buttons
+   per row; accept optionally lets the admin type a corrected_lemma that
+   overrides the suggestion. Row updates in place on success.
+3. Route the admin screen behind the existing admin check. A non-admin user
+   must not see an entry point to it.
+4. Follow the house style: inline React.CSSProperties, var(--color-*) theme
+   tokens (no new hardcoded hex), 44px touch targets, 16px font on any input
+   (iOS focus-zoom guard), errors surfaced inline rather than swallowed.
 
-Tests:
-Backend:
-1. First transcript click applies progression.
-2. Duplicate transcript click for same user/item/sentence/day does not apply
-   progression.
-3. Different sentence still counts.
-4. Different user still counts.
-5. Different item still counts.
-6. Endpoint returns success for duplicate no-op.
-7. Passive_level/times_seen do not inflate on duplicate.
-
-Frontend:
-1. transcript click still fires when word is clicked.
-2. failed transcript click does not break word lookup/modal.
-3. failure is surfaced via console.warn or hook error state.
+Tests (Vitest):
+1. Flag form posts the expected body; blank optional fields are omitted.
+2. A failed submit surfaces an error and keeps the form open.
+3. Admin list renders pending candidates including report_count.
+4. Accept and Reject each call the right endpoint and update the row.
+5. The admin entry point does not render for a non-admin user.
 
 Run:
-python -m pytest tests/test_transcript_click.py tests/test_progression.py --tb=short
-python -m pytest --tb=no -q
-
-Frontend if touched:
-npx tsc --noEmit
-npx vitest run
-npm run build
+cd lexy-app/frontend && npx tsc --noEmit && npx vitest run && npm run build
+cd lexy-app/backend && python -m pytest tests/test_lemma_corrections.py -q
 
 Report:
-- existing transcript-click flow before change
-- dedup key chosen
-- schema/index changes, if any
-- exact duplicate behavior
-- frontend error-surfacing behavior
-- tests added/updated
-- backend/frontend results
+- components added/changed and where the flag button was placed
+- how admin gating is enforced client-side
+- exact test results for both suites
 ```
 
-After T1.1 lands, the follow-up prompt is T1.2 (flip passive SRS card front
-to the English gloss using the existing `prompt_text` / `answer_text`
-infrastructure from #0a-1).
+After P1 lands, the next decision is **P2 — single-worker or multi-worker
+deploy** (see §Current priorities). That one is a decision to make, not a
+task to hand off: answering it either closes S12 + #24 + T2.2 as
+non-issues or turns them into one Redis-shaped piece of work.
