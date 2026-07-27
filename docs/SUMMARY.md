@@ -250,7 +250,7 @@ tests targeting one — see TODO #17.
 | `files/json/`, `files/masked/`, `files/text/` | PDF pipeline intermediates. |
 | `ilp/optimal_set_finder.py` | PuLP ILP — pick minimum books covering target vocab. Standalone CLI, reads word-list files + its own DB config; outputs in same dir. **Still standalone and unchanged** — the playlist feature below re-implements the technique rather than importing this module. |
 | `scripts/*.py` | One-off data fixers (verb finder, b1 word finder, known words fixer, etc.). Mostly legacy. |
-| `youtube_category_test/main.py` | yt-dlp category proof-of-concept. |
+| ~~`youtube_category_test/main.py`~~ | **Deleted 2026-07-27.** yt-dlp category proof-of-concept, superseded by production code: `subtitle-scraper/pipeline.py` reads `info["categories"]` on every ingest, `backfill_categories.py` fills older rows, and the result feeds `video_category` / `user_video_category`. |
 
 ---
 
