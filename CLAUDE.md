@@ -274,6 +274,14 @@ python pipeline.py                  # full run
 python pipeline.py --requests-only  # consume content_request queue
 ```
 
+### Hit an error? Check `docs/COMMON_ERRORS.md` first
+Running log of errors actually hit in this repo, symptom-first so you can grep it
+by the error text in front of you. It already covers the traps that cost the most
+time here: `pytest-randomly` breaking every test at setup, `tsc --noEmit` passing
+while `npm run build` fails, `cd` persisting between shell calls and producing
+plausible-but-wrong numbers, and the ruff fixes that must **not** be applied.
+**Add an entry whenever you hit something new**, in the same change that fixes it.
+
 ### Lint — run this as part of every backend change
 ```bash
 # From the REPO ROOT (not lexy-app/backend) — covers backend, scraper,
@@ -334,6 +342,7 @@ MOCK_LLM=false            # set true to short-circuit LLM in tests
 - **Commit messages never mention AI.** No `Co-Authored-By: Claude` (or any AI tool) trailer, no "🤖 Generated with…" line, no "written by Claude / with AI assistance" phrasing anywhere in the subject or body. Write every commit as the author. (This overrides any default tooling that auto-appends such a trailer.)
 - **Use `docs/SUMMARY.md` as the file-level index.** "Where do I look to change X?" is answered there. Update it whenever a file is added, removed, or changes responsibility.
 - **Update `docs/TESTS.md` whenever you add, remove, or rename a test.** It tracks coverage, known pre-existing failures, and the xfail audit-hole pins (flip strict=True when the fix lands so the test enforces the new behaviour).
+- **Read `docs/COMMON_ERRORS.md` when something breaks, and add to it when something new breaks.** Symptom-first log of errors actually hit here — grep it by the error text before debugging from scratch. Several entries are traps where the obvious fix is wrong (ruff E402 on sibling imports, F401 on availability probes), so it is worth a look *before* "fixing" a lint or test failure, not only after being stuck.
 - **Consult and update `docs/SECURITY.md` for any security-relevant change.** It's the living tracker of open/resolved findings and the controls we rely on. See §14 for the read/update triggers and the four fields every finding must carry.
 - **All state changes go through `progression_service`.** Don't write directly to `user_word_knowledge` or `srs_cards` from a router.
 - **All LLM calls go through `llm_service` and cache via `llm_cache_service`.** Don't instantiate `AsyncAnthropic` ad-hoc.

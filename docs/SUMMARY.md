@@ -269,6 +269,7 @@ Pytest tests for pipeline modules. Mostly hermetic (no DB).
 | `docs/TODO.md` | Bugs + tasks, ordered by blocking dependency. |
 | `docs/WORKFLOW_AUDIT.md` | Full word-learning trace with numbered holes. |
 | `docs/TESTS.md` | Test inventory, coverage gaps, known failures. |
+| `docs/COMMON_ERRORS.md` | Symptom-first log of errors actually hit here (tooling, tests, build, lint, research). Grep it by the error text before debugging. |
 | `docs/SUMMARY.md` | This file. |
 
 ---

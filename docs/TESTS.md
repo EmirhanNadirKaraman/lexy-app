@@ -931,6 +931,13 @@ Run all three. The lint step is not optional.
 | Backend | `cd lexy-app/backend && pytest -n auto` | 745 passed, 2 skipped |
 | Root pipeline | `pytest tests/` *(repo root)* | 671 passed |
 
+**When one of these fails, check [`docs/COMMON_ERRORS.md`](./COMMON_ERRORS.md)
+before debugging.** It carries the failures that have actually happened here —
+including two that mislead rather than simply fail: `pytest-randomly` erroring
+every test at setup so no assertion runs, and a `cd` persisting between shell
+calls so `pytest tests/` silently runs the *backend* suite from
+`lexy-app/backend` and reports 745 instead of 671.
+
 Frontend changes additionally want
 `cd lexy-app/frontend && npx tsc --noEmit && npx vitest run && npm run build`
 (219 tests across 37 files).
