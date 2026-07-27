@@ -121,8 +121,53 @@ new token_version tests); a bug here logs everyone out.
 
 ## 3. Redis-backed shared rate limiter — S12
 
-**Residual:** `rate_limiter` + cache locks are per-process; multiple workers each
-keep their own counters, so the effective limit multiplies by worker count.
+**DECISION (ratified 2026-07-27, P2): single-worker is the chosen MVP posture,
+not merely an observation about the current `Procfile`.** Horizontal scale is
+gated on this section shipping first. Warnings are now at the three places
+someone would actually change it: `Procfile`, `lexy-app/backend/entrypoint.sh`,
+and the "Deploy posture" block in `.env.example`.
+
+**Residual:** `rate_limiter` is per-process; multiple workers each keep their own
+counters, so the effective limit multiplies by worker count.
+
+**The stake is security, not cost — this is what the earlier framing understated.**
+`rate_limiter._windows` is a single shared store, and `check_window` backs far
+more than the LLM budget (verified 2026-07-27 against `core/deps.py` +
+`routers/lemma_corrections.py`):
+
+| Consumer | Constant | What N workers does |
+|---|---|---|
+| Login, per (IP, email) | `LOGIN_MAX_ATTEMPTS=10` / 5 min | **10N attempts per account** — targeted brute-force allowance multiplies |
+| Login, per IP (spray guard) | `LOGIN_IP_MAX_ATTEMPTS=30` / 5 min | 30N — password-spraying across accounts multiplies |
+| Register, per IP | `REGISTER_MAX_ATTEMPTS=5` / hr | 5N — S2 signup-abuse guard weakens |
+| Client error report, per IP | `CLIENT_ERROR_MAX_REPORTS=30` / 10 min | 30N — S6 storage-DoS guard weakens |
+| Lemma-correction flags, per user | `LEMMA_CORRECTION_MAX_REPORTS=30` / hr | 30N |
+| LLM budget, per user | `PER_MINUTE=30`, `PER_HOUR=400` | 30N / 400N — the original S12 cost concern |
+
+So scaling out without shipping this **degrades the S1 brute-force control**
+(and S6, and S2's throttle), which is a security regression. The LLM bill is the
+least of it.
+
+**Scope correction — `rate_limiter` is the ONLY blocker.** Two things previously
+bundled with S12 are multi-worker *safe* today and must not gate the decision
+(both verified 2026-07-27):
+- **`llm_cache_service.get_or_compute` (#24)** — the per-key `asyncio.Lock` is a
+  thundering-herd *optimisation*. `set_cached` writes with
+  `INSERT … ON CONFLICT (cache_key) DO NOTHING`, so concurrent writers across
+  processes are safe. Worst case on a cold miss with N workers: N provider calls
+  instead of 1. **Cost, not correctness.**
+- **Notification SSE (T2.2 / #4b)** — `routers/notifications.py` holds no
+  module-level mutable state (`_POLL_INTERVAL_SECONDS` is a constant); delivery
+  is entirely DB-backed with per-row mark-after-yield. Multi-worker safe. The
+  duplicate-delivery race on two concurrent connections already exists with two
+  browser tabs on a single worker, so scaling out does not make it worse.
+  **Cost, not correctness.**
+
+**Also gated, and it bites first:** `entrypoint.sh` runs `alembic upgrade head`
+before `exec uvicorn`. Multiple *containers* therefore race on migrations —
+a distinct failure from multiple workers inside one container. Any move to
+multiple pods needs a migration strategy (a release-phase / init-container step)
+independent of the limiter work.
 
 - **Not needed for the current single-process deploy** (see threat-model note) —
   ship it **before scaling to `--workers N` or multiple pods**, not before launch.
@@ -172,8 +217,13 @@ paused** and return to product work.
 - **S3:** leaked token valid up to 7 days, no revocation. *Mitigated* by the
   password-re-auth gate already on account deletion (S3 partial) — the one
   destructive action a stolen token could do is already re-gated.
-- **S12:** harmless on single-process; **must not** scale horizontally without
-  shipping §3 first, or the rate limits silently weaken.
+- **S12:** harmless on single-process, and single-process is now the **ratified**
+  MVP posture (§3, 2026-07-27) rather than an accident of the current `Procfile`.
+  **Must not** scale horizontally without shipping §3 first. Note the weakening
+  is not limited to the LLM budget: the same in-memory store backs the S1 login
+  brute-force + spray guards, the S6 client-error guard, and #39's flood guard,
+  so N workers means N× the brute-force allowance. Treat horizontal scale as a
+  security change, not a capacity change.
 - **S13/S14 (INFO):** f-string SQL in one migration (constant, not user input);
   LLM prompt-injection from user content (inherent; guardrails only). Neither is a
   vuln today.

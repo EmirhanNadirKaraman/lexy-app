@@ -70,21 +70,39 @@ the live list.
   `get_lemma_adjudicator` (currently returns `None` → 503). That one is a
   product decision about cost, not a blocked frontend.
 
-### P2 — Single-worker deployment decision (S12 + #24 + T2.2)
-- **Effort:** S to decide, M to implement. **Category:** deploy-readiness.
-- **These are one decision, not three tickets.** All three assume a single
-  process and all three break together the moment the deploy goes
-  multi-worker:
-  - **S12** — `services/rate_limiter.py` in-memory sliding window; each
-    worker enforces its own quota, so N workers = N× the intended budget.
-  - **#24** — `llm_cache_service.get_or_compute`'s per-key `asyncio.Lock`
-    is in-process; two workers both miss and both call the provider.
-  - **T2.2 / #4b** — notification SSE polls every 3s per client instead of
-    `LISTEN/NOTIFY`; also wants the 30-day retention sweep.
-- **Decide first:** does the deploy stay single-worker? If yes, all three
-  are non-issues and should be labelled as such rather than sitting open.
-  If no, they share one answer (Redis, or `pg_advisory_xact_lock` for the
-  cache lock) and want a single pass.
+### P2 — Deploy shape — ✅ DECIDED 2026-07-27: single-worker MVP
+- **Decision:** the backend is **officially single-worker** for MVP. Both
+  deploy paths already were (`Procfile` and `entrypoint.sh` run one
+  uvicorn process, no `--workers`, no gunicorn in `requirements.txt`);
+  this ratifies it as the chosen posture and gates horizontal scale on a
+  shared rate-limit backend. Authoritative write-up:
+  [`docs/SECURITY_ARCHITECTURE_DECISIONS.md`](./SECURITY_ARCHITECTURE_DECISIONS.md) §3.
+  Warnings placed in `Procfile`, `lexy-app/backend/entrypoint.sh`, and the
+  "Deploy posture" block in `.env.example`.
+- **Correction to the previous entry.** This was ranked as "one decision,
+  three tickets (S12 + #24 + T2.2)". That grouping was wrong — verified
+  against the code 2026-07-27:
+  - **S12 / `rate_limiter.py` is the only real blocker.** `_windows` is a
+    single in-process store, and it backs the **S1 login brute-force and
+    password-spray guards**, the S6 client-error DoS guard, and #39's
+    flood guard — not just the LLM budget. N workers ⇒ N× the brute-force
+    allowance. That makes horizontal scale a **security** change.
+  - **#24 is NOT a blocker.** `set_cached` writes with
+    `ON CONFLICT (cache_key) DO NOTHING`, so cross-process writers are
+    safe; the in-process lock is a thundering-herd optimisation. Worst
+    case with N workers: N provider calls on a cold miss. Cost only.
+  - **T2.2 is NOT a blocker.** `routers/notifications.py` holds no
+    module-level mutable state and is entirely DB-backed. Multi-worker
+    safe today; the 3s poll is pure cost. Its duplicate-delivery race
+    already exists with two browser tabs on one worker.
+- **Also gated, and it fails first:** `entrypoint.sh` runs
+  `alembic upgrade head` before starting, so multiple *containers* race on
+  migrations regardless of `--workers`. Multi-pod needs a release-phase or
+  init-container migration step as well.
+- **When this reopens:** the trigger is a real capacity need, not a date.
+  Ship the Redis-backed limiter (`SECURITY_ARCHITECTURE_DECISIONS.md` §3)
+  before the first `--workers N` or second pod. #24 and T2.2 can then ride
+  along on the same Redis, but neither justifies standing it up alone.
 
 ### P3 — #36 Spanish phrase extractor, remaining patterns
 - **Effort:** M. **Category:** product (second-language parity).
