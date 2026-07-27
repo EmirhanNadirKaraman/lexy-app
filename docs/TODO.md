@@ -433,6 +433,26 @@ Coverage of the batch: 8 cleaner + 4 merger + 4 guard + 2 noise + 1 knowledge + 
   - **Slice B, if it happens at all, must be a deterministic exact-match strategy** — e.g. a small curated imperative→infinitive table (`lávate`→`lavarse`, `levántate`→`levantarse`, `siéntate`→`sentarse`, `acuérdate`→`acordarse`, …) keyed on the de-accented surface and emitting *only* on an exact hit. **Not** a stem heuristic: the high-frequency reflexive imperatives are exactly the stem-changing irregulars a heuristic gets wrong (`siéntate` → `sentarse`, `acuérdate` → `acordarse`).
     **A wrong canonical is worse than a missing one.** A miss costs one phrase; a wrong one writes a non-existent word into `phrase_table`, which then reaches recommendations and SRS and gets taught. That asymmetry is why the gerund path in slice A guards its lemma rather than trusting it, and it should govern slice B too.
     **Note the tagging blocker survives any table:** `Dúchate ahora.` is INTJ on `sm` and PROPN on `md`/`lg`, so the token never reaches the extractor at all. A table fixes lemma recovery, not tagging — expect partial coverage even after implementing it.
+  - **Corpus check 2026-07-27 — our own Spanish data does NOT justify building the table yet. Slice B stays deferred.**
+    Measured the local corpus to see whether it could seed and rank a first table:
+
+    | Metric | Value |
+    |---|---|
+    | Spanish videos | 248 |
+    | Spanish subtitle lines | 53,409 |
+    | Spanish tokens | 410,462 |
+    | Unique Spanish tokens | 26,513 |
+
+    Large enough in aggregate — but **the register is wrong**. 246 of 248 videos are UNED (open-university lecture/documentary Spanish), with one video each from `elrubiusOMG` and `enchufetv`. Lecture Spanish barely uses second-person commands, which is precisely the form slice B targets.
+
+    Probing 39 candidate forms found **55 occurrences across 12 forms**, and **8 of those 12 occur exactly once**. Only `fíjate` (24) is at all frequent — and it is arguably a discourse marker ("note that") rather than a learning unit. Every named target form is **absent**: `lávate`, `levántate`, `siéntate`, `dúchate`, `cállate`, `duérmete`, `ponte` = 0 occurrences; `acuérdate` and `vete` = 2 each. A table built from this data would be dominated by the one form we least want while missing everything a learner needs first.
+
+    The probe also re-confirmed the blocker on real corpus data rather than constructed sentences: **every** candidate's lemma was garbage (`fíjatar`, `damar`, `quédatir`, `escúchamir`), and the forms scatter across POS tags — `déjame` / `imagínate` / `muévete` tag PROPN, `olvídate` / `acuérdate` / `vámonos` tag NOUN. Most would never reach the verb loop no matter how good the table is.
+  - **Recommended future strategy — hybrid, but only once the Spanish corpus turns dialogue-heavy.** In that order, deliberately:
+      1. **Local corpus for frequency and examples.** Ranking should come from what our learners actually meet. It cannot do that job today (55 occurrences is not a frequency signal); it can once conversational channels are ingested — and that also sidesteps the licensing question entirely.
+      2. **External sources for supplemental ranking only, licence checked BEFORE vendoring anything.** Nothing has been downloaded or added. **Wiktionary** Spanish conjugation data (CC-BY-SA) is the most viable candidate — it maps imperative→infinitive directly, which *is* the table, and share-alike is manageable for a small derived file with attribution. Subtitle corpora (OpenSubtitles / OPUS) have the right register but are user-contributed with unclear rights: usable to derive a ranking offline, **not** to commit into this repo.
+
+    Revisit when the corpus has meaningful conversational content. Until then slice B would ship near-zero user value on the content we actually have, and the tagging blocker would cap it further.
   - Promote the allowlist to data/config; idioms, MWEs, subjunctive.
   - **Lemma quality** is handled by the override layer — see #39 (the `ducha`→`duchaber` family; note the clitic-infinitive path lemmatizes `duchar` correctly without an override).
 **Blocks:** nothing — purely additive. German behaviour untouched (regression-guarded by `tests/test_phrase_dispatcher.py` + backend `test_matcher.py`).
