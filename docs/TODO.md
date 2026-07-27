@@ -246,7 +246,7 @@ Triaged 288 `print()` calls across 17 files. **62 prints converted** to `logger`
 | `scripts/b1_word_finder.py` | 3 | Dev throwaway — `print(d)` for inspection. |
 | `scripts/known_words_fixer.py` | 1 | Same. |
 | `scripts/percentage_finder.py` | 46 | Vocab-coverage report tables to stdout. |
-| `scripts/validate_tier_lemmas.py` | 20 | Diagnostic mismatch report. |
+| `scripts/validate_tier_lemmas.py` | 20 | Diagnostic mismatch report. (File has since been deleted — refactor Phase 0; it was a broken duplicate of the root `validate_tier_lemmas.py`, importing `app.learning.onboarding`, which only resolves under pytest. The triage above is preserved as written.) |
 | `ilp/optimal_set_finder.py` | 57 | ILP solver progress + final coverage tables. |
 
 **Conventions used for converted sites:**
