@@ -553,7 +553,7 @@ def _demo() -> None:
     target = store.find_sole_unknown(USER, utterance_units_1)
     known_1 = [u.key for u in utterance_units_1 if store.is_known(USER, u)]
     unknown_1 = [u.key for u in utterance_units_1 if not store.is_known(USER, u)]
-    print(f"\n  Utterance: 'Ich fange mit dem Training an.'")
+    print("\n  Utterance: 'Ich fange mit dem Training an.'")
     print(f"  Known   : {known_1}")
     print(f"  Unknown : {unknown_1}")
     print(f"  i+1 target: {target.key if target else 'None — not i+1'}")
@@ -562,7 +562,7 @@ def _demo() -> None:
     utterance_units_2 = [anfangen, training, lemma("und"), lemma("durchhalten")]
     target2 = store.find_sole_unknown(USER, utterance_units_2)
     unknown_2 = [u.key for u in utterance_units_2 if not store.is_known(USER, u)]
-    print(f"\n  Utterance: 'Anfangen, Training und Durchhalten.'")
+    print("\n  Utterance: 'Anfangen, Training und Durchhalten.'")
     print(f"  Unknown : {unknown_2}")
     print(f"  i+1 target: {target2.key if target2 else 'None — 2+ unknowns, skip'}")
 

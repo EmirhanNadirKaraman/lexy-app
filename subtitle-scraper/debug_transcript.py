@@ -5,7 +5,6 @@ Usage: python subtitle-scraper/debug_transcript.py iF8crBezySA
 Interactive debugging tool: every print() emits diagnostic data to stdout,
 which IS the product. Intentionally left as print(), not logging.
 """
-import json
 import os
 import sys
 from pathlib import Path
@@ -13,7 +12,9 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-import yt_dlp
+# E402: this is a linear top-to-bottom debug script, not a module — the
+# load_dotenv() above must run before anything reads the environment.
+import yt_dlp  # noqa: E402
 
 video_id = sys.argv[1] if len(sys.argv) > 1 else "iF8crBezySA"
 language_codes = ["de", "de-DE", "en"]
@@ -105,12 +106,14 @@ try:
         content = response.read()
     print(f"  download OK — {len(content)} bytes")
     print(f"  first 200 chars: {content[:200]}")
-    print(); print("All steps passed."); sys.exit(0)
+    print()
+    print("All steps passed.")
+    sys.exit(0)
 except Exception as e:
     print(f"  urlopen FAILED: {e}")
 
 # ── Step 5: fallback — let yt-dlp write subtitles to a tempdir ───────────────
-import tempfile
+import tempfile  # noqa: E402  (linear debug script; kept beside the step that uses it)
 print()
 print("── Step 5: tempdir writesubtitles (no cookies, skip_download) ──")
 try:
@@ -134,4 +137,5 @@ try:
 except Exception as e:
     print(f"  tempdir FAILED: {e}")
 
-print(); print("Done.")
+print()
+print("Done.")

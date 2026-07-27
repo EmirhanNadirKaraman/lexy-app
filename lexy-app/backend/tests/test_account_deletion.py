@@ -13,7 +13,6 @@ service-layer mirror needed). Verifies:
 """
 import uuid
 
-import pytest
 from httpx import AsyncClient
 
 from ._email_helper import make_test_email

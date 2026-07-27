@@ -24,7 +24,6 @@ Usage:
 import argparse
 import cProfile
 import json
-import os
 import pstats
 import sys
 import time
@@ -40,17 +39,18 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 _SCRAPER_DIR = str(Path(__file__).resolve().parent)
 if _SCRAPER_DIR not in sys.path:
     sys.path.insert(0, _SCRAPER_DIR)
-from pipeline import (
+# E402: must import AFTER the sys.path.insert above — `pipeline` is a sibling
+# module in subtitle-scraper/, not an installed package (TODO #3). Do not hoist.
+from pipeline import (  # noqa: E402
     LANG_MODEL_MAP,
     NO_MORPH_LANGS,
     connect,
     get_transcript,
     populate,
-    insert_phrases,
     clean_sentence,
 )
 
-import spacy
+import spacy  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -263,13 +263,13 @@ def main():
     # ------------------------------------------------------------------
     # 4. Report
     # ------------------------------------------------------------------
-    print(f"\n── Data sizes ────────────────────────────────────────────")
+    print("\n── Data sizes ────────────────────────────────────────────")
     print(f"  Sentences processed:   {stats['sentences']}")
     print(f"  Total tokens:          {stats['tokens_total']}")
     print(f"  Unique word types:     {stats['word_types']}")
     print(f"  Grammar rule hits:     {stats['grammar_types']}")
     print(f"  word_to_sentence rows: {stats['w2s_links']}")
-    print(f"──────────────────────────────────────────────────────────")
+    print("──────────────────────────────────────────────────────────")
 
     timer.report()
 
@@ -295,7 +295,7 @@ def main():
         # Use a fake video id so populate() skips the duplicate check
         # and immediately exits — override to actually measure insert time.
         # We delete the test row after.
-        test_vid = f"__PROFILE_{args.video_id}__"
+        _test_vid = f"__PROFILE_{args.video_id}__"  # reserved for the override described above
         cursor.execute("SELECT 1 FROM video WHERE video_id = %s", (args.video_id,))
         already_exists = cursor.fetchone() is not None
 

@@ -7,7 +7,6 @@ session and message persistence is verified end-to-end.
 The LLM call (llm_service.evaluate_and_reply) is mocked in every test so
 no API key is required and tests stay fast and free.
 """
-import uuid
 from unittest.mock import AsyncMock, patch
 
 from httpx import AsyncClient

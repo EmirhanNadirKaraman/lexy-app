@@ -184,7 +184,7 @@ class SimplePDFProcessor:
                 if re.match(r'^(?:Page\s+)?\d+$', text, re.IGNORECASE):
                     # Check if it's in typical page number location (top 10% or bottom 10% of page)
                     # This is a heuristic - you may need to adjust
-                    y1, y2 = bbox.get('y1', 0), bbox.get('y2', 0)
+                    y1, _y2 = bbox.get('y1', 0), bbox.get('y2', 0)
                     # Assume page height ~792 points (US Letter)
                     if y1 < 80 or y1 > 700:  # Top or bottom margin
                         mask_regions.append({
@@ -292,7 +292,7 @@ class SimplePDFProcessor:
                     logger.info(f"  Created masked PDF: {output_path.name}")
                     return output_path
                 else:
-                    logger.warning(f"  No masking needed")
+                    logger.warning("  No masking needed")
                     return None
 
         except Exception as e:

@@ -70,8 +70,8 @@ from exposure_counter import CountingPolicy, ExposureEvent, QualifiedExposureCou
 from pipeline_diagnostics import PipelineRunDiagnostics
 from exposure_service import ExposureService
 from learning_units import LearningUnit
-from subtitle_cleaner import SubtitleCleanerConfig, SubtitleTextCleaner
-from subtitle_merger import MergedSubtitleWindow, SubtitleFragment, SubtitleMergeConfig, SubtitleMerger
+from subtitle_cleaner import SubtitleTextCleaner
+from subtitle_merger import SubtitleFragment, SubtitleMergeConfig, SubtitleMerger
 from subtitle_segmenter import CandidateUtterance, SegmentationConfig, SubtitleSegmenter
 from utterance_quality_filter import QualityFilterConfig, UtteranceQualityEvaluator
 from utterance_unit_extractor import UnitExtractionConfig, UtteranceExtractionResult, UtteranceUnitExtractor

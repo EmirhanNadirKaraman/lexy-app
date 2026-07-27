@@ -21,7 +21,6 @@ from app.learning.onboarding import (
     LevelTier,
     VocabularyOnboarding,
     _TIER_ORDER,
-    _make_lemma_unit,
 )
 from app.learning.knowledge import (
     ExposurePolicy,
@@ -124,7 +123,7 @@ class TestGetTierLemmas:
 class TestSeedFromLevel:
 
     def test_a1_seed_stores_units_as_known_passive(self, onboarding, store):
-        result = onboarding.seed_from_level("u1", LevelTier.A1, store)
+        onboarding.seed_from_level("u1", LevelTier.A1, store)
         for lemma in VocabularyOnboarding.get_tier_lemmas(LevelTier.A1):
             state = store.get_state("u1", _lemma(lemma))
             assert state == KnowledgeState.KNOWN_PASSIVE, f"{lemma!r} has state {state.name}"

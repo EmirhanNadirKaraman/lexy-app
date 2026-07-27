@@ -578,7 +578,7 @@ def _demo() -> None:
     from learning_units import LearningUnit, LearningUnitType
     mastered_unit = LearningUnit(LearningUnitType.LEMMA, "gehen", "gehen")
     store.set_state(USER, mastered_unit, KnowledgeState.MASTERED)
-    print(f"\n  Set 'gehen' to MASTERED manually.")
+    print("\n  Set 'gehen' to MASTERED manually.")
 
     # Re-seed A2 — 'gehen' should stay MASTERED
     result2 = onboarding.seed_from_level(USER, LevelTier.A2, store)

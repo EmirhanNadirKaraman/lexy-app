@@ -5,7 +5,6 @@ Process Docling JSON results to create masked PDFs.
 Run this AFTER you've run Docling to mask tables/figures in PDFs.
 """
 
-import json
 import fitz  # PyMuPDF
 from pathlib import Path
 import sys
@@ -43,11 +42,11 @@ def mask_pdf_from_json(pdf_path: Path, json_path: Path, output_dir: Path, return
         return None
 
     # Reconstruct tables from raw Docling elements
-    logger.info(f"  Reconstructing tables from elements...")
+    logger.info("  Reconstructing tables from elements...")
     elements = reconstruct_tables_from_lists(json_path)
 
     if not elements:
-        logger.info(f"  No figures/tables detected")
+        logger.info("  No figures/tables detected")
         return None
 
     # Count maskable elements
@@ -200,7 +199,7 @@ def main():
         # Check if already processed
         masked_pdf_path = output_base / f"{pdf_path.stem}_masked.pdf"
         if masked_pdf_path.exists():
-            logger.info(f"  ✓ Already processed, skipping")
+            logger.info("  ✓ Already processed, skipping")
             stats['skipped_already_done'] += 1
             continue
 
@@ -214,7 +213,7 @@ def main():
                 # No figures detected - copy original PDF
                 output_pdf = output_base / f"{pdf_path.stem}_masked.pdf"
                 shutil.copy2(pdf_path, output_pdf)
-                logger.info(f"  ℹ No figures detected - copied original PDF")
+                logger.info("  ℹ No figures detected - copied original PDF")
                 logger.info(f"  ✓ Saved: {output_pdf}\n")
                 stats['copied_no_figures'] += 1
 
@@ -225,7 +224,7 @@ def main():
     elapsed = time.time() - start_time
 
     logger.info(f"\n{'='*70}")
-    logger.info(f"✓ Processing complete!")
+    logger.info("✓ Processing complete!")
     logger.info(f"{'='*70}")
     logger.info(f"Total JSON files: {len(json_files)}")
     logger.info(f"Masked (with tables): {stats['processed']}")

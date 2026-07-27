@@ -11,12 +11,11 @@ Covers:
 We MOCK the LLM (env MOCK_LLM=1 returns a deterministic stub) so the tests
 don't need real Anthropic credentials and aren't subject to flake/latency.
 """
-import uuid
 
 import pytest
 from httpx import AsyncClient
 
-from backend.services import llm_service, review_service
+from backend.services import llm_service
 from ._email_helper import make_test_email
 
 SRS_DUE_URL = "/api/v1/srs/due"

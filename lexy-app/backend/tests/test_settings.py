@@ -27,7 +27,6 @@ HTTP tests (FastAPI client):
   - PUT empty body changes nothing
   - PUT only changes the specified field
 """
-import uuid
 
 import pytest
 

@@ -16,7 +16,6 @@ Covers:
     - word_id < 1 (path value 0) returns 422
     - Unauthenticated request returns 401
 """
-import uuid
 
 import pytest
 from httpx import AsyncClient

@@ -8,9 +8,6 @@ import pytest
 
 from app.subtitles.models import MergedSubtitleWindow, SubtitleFragment, CandidateUtterance
 from app.subtitles.quality import (
-    FilterMetrics,
-    QualityFilterConfig,
-    RuleMetrics,
     UtteranceQualityEvaluator,
 )
 

@@ -3,7 +3,6 @@ Auth tests — register, login, protected route access.
 
 Happy paths and the two main failure modes: duplicate email and wrong password.
 """
-import uuid
 
 from httpx import AsyncClient
 from ._email_helper import make_test_email

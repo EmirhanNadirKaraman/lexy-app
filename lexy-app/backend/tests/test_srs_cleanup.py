@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
 
 from backend.services.srs_cleanup_service import (
     cleanup_orphan_srs_cards,

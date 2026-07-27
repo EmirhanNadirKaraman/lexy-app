@@ -4,8 +4,6 @@
 # CLI demo, intentionally left as print rather than logging.
 
 import spacy
-import csv
-import os
 from functools import lru_cache
 from pathlib import Path
 

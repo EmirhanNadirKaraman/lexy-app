@@ -10,14 +10,13 @@ import logging
 import os
 import random
 import re
-import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger(__name__)
-
 import yt_dlp
+
+logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(__file__).parent / "transcript_cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -54,7 +53,7 @@ def _parse_vtt(content: str) -> list[dict]:
     segments = []
     for block in re.split(r"\n{2,}", content.strip()):
         lines = block.strip().splitlines()
-        ts_line = next((l for l in lines if "-->" in l), None)
+        ts_line = next((line for line in lines if "-->" in line), None)
         if ts_line is None:
             continue
         try:
@@ -65,8 +64,8 @@ def _parse_vtt(content: str) -> list[dict]:
         except (ValueError, IndexError):
             continue
         text_lines = [
-            re.sub(r"<[^>]+>", "", l).strip()
-            for l in lines[lines.index(ts_line) + 1:]
+            re.sub(r"<[^>]+>", "", line).strip()
+            for line in lines[lines.index(ts_line) + 1:]
         ]
         text = " ".join(t for t in text_lines if t)
         if text:
@@ -172,8 +171,12 @@ def fetch_with_retries(
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
 
+                # Manual tracks only. info["automatic_captions"] is deliberately
+                # NOT read: machine-transcribed captions are too unreliable to be
+                # safe learning material, so a video with no manual track in the
+                # target language is skipped rather than downgraded (TODO #35
+                # product policy, 2026-05-23).
                 subtitles = info.get("subtitles") or {}
-                auto_captions = info.get("automatic_captions") or {}
 
                 chosen_lang: Optional[str] = None
                 chosen_sub: Optional[dict] = None

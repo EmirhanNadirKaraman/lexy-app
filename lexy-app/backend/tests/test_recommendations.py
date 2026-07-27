@@ -39,7 +39,6 @@ HTTP tests (FastAPI client):
   - GET /api/v1/recommendations/videos requires auth → 403
   - GET /api/v1/recommendations/videos response shape is correct
 """
-import uuid
 
 import pytest
 

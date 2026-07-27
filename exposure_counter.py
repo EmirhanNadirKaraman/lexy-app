@@ -81,7 +81,7 @@ approaches:
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
@@ -637,7 +637,7 @@ def _demo() -> None:
     for _ in range(3):
         counter.record(USER, fantastisch, UTT_1)
     stats = counter.get_stats(USER, fantastisch)
-    print(f"\n  3× same utterance for 'fantastisch'")
+    print("\n  3× same utterance for 'fantastisch'")
     print(f"  raw_count       : {stats.raw_count}")
     print(f"  weighted_count  : {stats.weighted_count:.1f}")
     print(f"  unique_utterances: {stats.unique_utterances}")
@@ -681,9 +681,9 @@ def _demo() -> None:
 
     print()
     labels = [
-        f"Session A, UTT_1 (first)",
-        f"Session A, UTT_1 (replay in same session)",
-        f"Session B, UTT_1 (rewatching a week later)",
+        "Session A, UTT_1 (first)",
+        "Session A, UTT_1 (replay in same session)",
+        "Session B, UTT_1 (rewatching a week later)",
     ]
     for label, r in zip(labels, results):
         print(f"  {label:<45} → {'ACCEPTED' if r else 'REJECTED'}")
@@ -733,11 +733,11 @@ def _demo() -> None:
     for unit, uid in exposures:
         counter.record(USER, unit, uid)
 
-    print(f"\n  Threshold = 5 exposures (e.g. to advance to UNLOCKED)")
+    print("\n  Threshold = 5 exposures (e.g. to advance to UNLOCKED)")
     ready = counter.units_above_threshold(USER, threshold=5.0)
     print(f"  Units ready for advancement: {[u.key for u in ready]}")
 
-    print(f"\n  Full summary:")
+    print("\n  Full summary:")
     all_stats = counter.get_all_stats(USER)
     for stats in sorted(all_stats.values(), key=lambda s: -s.raw_count):
         bar = "█" * stats.raw_count

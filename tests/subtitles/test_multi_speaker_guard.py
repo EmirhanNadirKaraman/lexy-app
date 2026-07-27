@@ -3,7 +3,6 @@ test_multi_speaker_guard.py
 ---------------------------
 Focused tests for the two multi-speaker safeguards in SubtitleMerger.
 """
-import pytest
 
 from app.subtitles.merging import SubtitleMergeConfig, SubtitleMerger
 from app.subtitles.models import SubtitleFragment

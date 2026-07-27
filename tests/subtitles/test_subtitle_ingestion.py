@@ -12,7 +12,6 @@ from pathlib import Path
 import pytest
 
 from app.subtitles.ingestion import parse_srt
-from app.subtitles.cleaning import SubtitleCleanerConfig, SubtitleTextCleaner
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,6 @@
 """
 Tests for SubtitleMerger.
 """
-import pytest
 
 from app.subtitles.merging import SubtitleMergeConfig, SubtitleMerger
 from app.subtitles.models import SubtitleFragment

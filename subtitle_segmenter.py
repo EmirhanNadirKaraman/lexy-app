@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Iterator, Literal, Optional
+from typing import Literal, Optional
 
 from spacy.language import Language
 from spacy.tokens import Doc

@@ -121,7 +121,7 @@ def main() -> None:
         print("  python -m spacy download de_core_news_md")
         sys.exit(1)
 
-    from onboarding import LevelTier, VocabularyOnboarding, _TIER_DELTAS
+    from onboarding import LevelTier, _TIER_DELTAS
 
     tier_map = {
         "a1": (LevelTier.A1,  _TIER_DELTAS[LevelTier.A1]),
@@ -145,7 +145,7 @@ def main() -> None:
             for key, spacy_lemma in results["mismatch"]:
                 print(f"    {key:<30}  →  spaCy: {spacy_lemma!r}")
         else:
-            print(f"\n  Mismatches: none")
+            print("\n  Mismatches: none")
 
         # Separable verbs — always show (need manual verification)
         if results["separable"]:
@@ -168,7 +168,7 @@ def main() -> None:
     print(f"  TOTAL  ok={total_ok}  mismatch={total_mismatch}  separable(manual)={total_separable}")
 
     # Cross-tier duplicate assertion
-    print(f"\n  Cross-tier duplicate check:")
+    print("\n  Cross-tier duplicate check:")
     a1 = _TIER_DELTAS[LevelTier.A1]
     a2 = _TIER_DELTAS[LevelTier.A2]
     b1 = _TIER_DELTAS[LevelTier.B1]

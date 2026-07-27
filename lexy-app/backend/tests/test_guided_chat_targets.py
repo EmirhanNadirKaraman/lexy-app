@@ -5,7 +5,6 @@ Verifies that all three priority tiers (due active SRS card, learning item
 without active card, random fallback) now consider both words and phrases.
 The polymorphic shape `{item_id, item_type, word, lemma}` is preserved.
 """
-import uuid
 
 import pytest
 

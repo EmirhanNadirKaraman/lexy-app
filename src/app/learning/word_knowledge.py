@@ -24,7 +24,7 @@ All thresholds and spacing rules are configurable via EvidenceConfig.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from enum import Enum, IntEnum
 from typing import Optional
 

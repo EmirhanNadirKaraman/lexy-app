@@ -580,7 +580,7 @@ def _demo() -> None:
     print("  7. evaluate_all() — diagnostic view of each unit as target")
     print("─" * 62)
 
-    print(f"\n  Sentence: 'Der Film ist wirklich fantastisch.'")
+    print("\n  Sentence: 'Der Film ist wirklich fantastisch.'")
     print(f"  {'unit':<16} {'result':<12} {'detail'}")
     print(f"  {'─'*16} {'─'*12} {'─'*36}")
     for d in evaluator.evaluate_all(USER, units_s1):

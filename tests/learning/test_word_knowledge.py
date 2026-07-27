@@ -28,7 +28,6 @@ from app.learning.word_knowledge import (
     LearningState,
     PassiveEvidenceEvent,
     PassiveSource,
-    WordKnowledge,
 )
 
 

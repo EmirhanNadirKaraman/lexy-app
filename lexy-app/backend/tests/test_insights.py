@@ -9,7 +9,6 @@ Covers:
     Locked in as a failing-to-fix-it scenario via xfail; flip strict=True when the
     fix lands so the test enforces the new behaviour.
 """
-import uuid
 
 import pytest
 from httpx import AsyncClient

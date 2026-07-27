@@ -17,14 +17,12 @@ Integration tests (real DB) — test apply_progression:
   - status_marked_known boosts both levels and creates both SRS cards
   - passive auto-promotion: passive_level >= PASSIVE_PROMOTION_THRESHOLD → 'learning'
 """
-import uuid
 
 import pytest
 
 from backend.services.progression_service import (
     ACTIVE_MASTERY_THRESHOLD,
     PASSIVE_PROMOTION_THRESHOLD,
-    ProgressionDelta,
     _is_demotion,
     apply_progression,
     compute_delta,

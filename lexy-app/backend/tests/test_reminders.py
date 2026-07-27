@@ -4,9 +4,7 @@ Reminder summary endpoint.
 Covers GET /api/v1/reminders/summary — the small aggregation used by the
 frontend reminder banner to decide whether to nag the user.
 """
-import uuid
 
-import pytest
 from httpx import AsyncClient
 from ._email_helper import make_test_email
 

@@ -25,7 +25,6 @@ HTTP tests (FastAPI client):
   - POST /api/v1/playlists/generate requires auth
   - POST /api/v1/playlists/generate with empty item_ids returns 422
 """
-import uuid
 
 import pytest
 

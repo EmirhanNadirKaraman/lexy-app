@@ -30,14 +30,17 @@ from pathlib import Path
 
 import asyncpg
 
+from . import nlp_service
+
 _SCRAPER_PATH = str(Path(__file__).resolve().parents[3] / "subtitle-scraper")
 
 if _SCRAPER_PATH not in sys.path:
     sys.path.insert(0, _SCRAPER_PATH)
 
-import phrase_finder as _pf
-
-from . import nlp_service
+# E402: must import AFTER the sys.path.insert above — phrase_finder lives in
+# subtitle-scraper/, not an installed package. Deliberate replacement for the
+# old os.chdir() hack (TODO #3); do not hoist.
+import phrase_finder as _pf  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

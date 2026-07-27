@@ -21,7 +21,6 @@ load-bearing for any dashboard or tuning workflow built on top.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -238,7 +237,6 @@ def _build_pipeline_with_stubs(
     from app.pipeline.runner import GermanSubtitlePipeline
     from app.pipeline.models import PipelineConfig
 
-    nlp_mock = MagicMock()
     pipeline = GermanSubtitlePipeline.__new__(GermanSubtitlePipeline)
     pipeline.config = PipelineConfig()
 
@@ -280,7 +278,6 @@ def _build_pipeline_with_stubs(
     pipeline.store = store_mock
 
     # Stub exposure service (for record_exposures=True tests)
-    from app.exposure.models import ExposureEvent
     exposure_service_mock = MagicMock()
     pipeline.exposure_service = exposure_service_mock
 
@@ -561,14 +558,12 @@ class TestExposureTracking:
         return diag
 
     def test_record_exposures_false_does_not_call_record_exposure(self):
-        from app.exposure.models import ExposureEvent
         diag = self._run_eligible(record_exposures=False, exposure_return_value=MagicMock())
         # No exposure tracking at all
         assert diag.exposures_recorded == 0
         assert diag.exposures_deduplicated == 0
 
     def test_record_exposures_true_increments_recorded(self):
-        from app.exposure.models import ExposureEvent
         # Non-None return → accepted exposure
         diag = self._run_eligible(
             record_exposures=True,

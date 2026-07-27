@@ -306,7 +306,7 @@ async def test_notification_routes_to_submitting_user(client: AsyncClient, db_po
     cid = _channel_id()
     r_a = await client.post(URL, json={"request_type": "channel", "content_id": cid}, headers=headers_a)
     r_b = await client.post(URL, json={"request_type": "channel", "content_id": cid}, headers=headers_b)
-    a_id = r_a.json()["request_id"]
+    _a_id = r_a.json()["request_id"]  # unused below, but asserts the key exists
     b_id = r_b.json()["request_id"]
 
     # Mirror what _notify_user in subtitle-scraper/pipeline.py does:

@@ -30,12 +30,11 @@ from app.exposure.counter import QualifiedExposureCounter
 from app.exposure.models import CountingPolicy, DuplicateRule
 from app.exposure.service import ExposureService
 from app.learning.units import LearningUnit, LearningUnitType
-from app.subtitles.merging import SubtitleMergeConfig, SubtitleMerger
+from app.subtitles.merging import SubtitleMerger
 from app.subtitles.models import MergedSubtitleWindow, SubtitleFragment, CandidateUtterance
 from app.subtitles.segmentation import SegmentationConfig, SubtitleSegmenter
 from app.subtitles.quality import QualityFilterConfig, UtteranceQualityEvaluator
 from app.extraction.extractor import UtteranceUnitExtractor
-from app.extraction.models import UnitExtractionConfig
 from app.learning.knowledge import KnowledgeState, UserKnowledgeStore
 
 

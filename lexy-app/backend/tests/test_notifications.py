@@ -14,7 +14,6 @@ directly so we can step it without going through SSE/httpx machinery.
 import json
 import uuid
 
-import pytest
 
 from backend.routers.notifications import _yield_unseen
 from ._email_helper import make_test_email

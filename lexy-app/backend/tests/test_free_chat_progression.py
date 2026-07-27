@@ -19,7 +19,6 @@ Covers:
     - English label + no target word → no progression
     - free_chat_matched is NOT fired by the chat router (confirmed by event mapping)
 """
-import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -162,7 +161,7 @@ async def test_match_finds_word_by_lemma(client: AsyncClient, db_pool):
     if row is None:
         pytest.skip("No word with lemma != surface form in word_table")
 
-    word_id, word, lemma, language = row["word_id"], row["word"], row["lemma"], row["language"]
+    word_id, _word, lemma, language = row["word_id"], row["word"], row["lemma"], row["language"]
     headers, uid = await _register_and_login(client, db_pool, _email())
     await _mark_learning(db_pool, uid, word_id)
 

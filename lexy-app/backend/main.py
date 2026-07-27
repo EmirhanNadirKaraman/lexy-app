@@ -8,8 +8,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from .database import create_pool, close_pool, get_pool
-
-logger = logging.getLogger(__name__)
 from .routers.analytics import router as analytics_router
 from .routers.books import router as books_router
 from .routers.reading import router as reading_router
@@ -31,6 +29,8 @@ from .routers.notifications import router as notifications_router
 from .routers.errors import router as errors_router
 from .routers.account import router as account_router
 from .routers.lemma_corrections import router as lemma_corrections_router
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager

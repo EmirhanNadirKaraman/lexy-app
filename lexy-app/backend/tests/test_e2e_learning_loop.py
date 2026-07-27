@@ -32,7 +32,6 @@ The active-direction fast path takes care of evaluation without needing the
 mock evaluator: when the typed answer normalises to the target text, the
 endpoint short-circuits to correct=True before any LLM call.
 """
-import uuid
 
 import pytest
 from httpx import AsyncClient

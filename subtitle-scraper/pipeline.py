@@ -10,26 +10,29 @@ import json
 import logging
 import os
 import sys
-import time
 
 import psycopg2
 import yt_dlp
 
-logger = logging.getLogger(__name__)
 from scrapetube import scrapetube
 import spacy
 from langdetect import detect, LangDetectException
 from pathlib import Path
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
+
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 _SCRAPER_DIR = str(Path(__file__).resolve().parent)
 if _SCRAPER_DIR not in sys.path:
     sys.path.insert(0, _SCRAPER_DIR)
-from phrase_finder import extract_phrases
-from transcript_fetcher import fetch_with_retries
-from db_ssl import connect_kwargs
+# E402: these three must import AFTER the sys.path.insert above — they are
+# sibling modules in subtitle-scraper/, not an installed package. This is the
+# deliberate replacement for the old os.chdir() hack (TODO #3); do not hoist.
+from phrase_finder import extract_phrases  # noqa: E402
+from transcript_fetcher import fetch_with_retries  # noqa: E402
+from db_ssl import connect_kwargs  # noqa: E402
 
 # Language config (#18) — single source in language_config.py. Re-exported here
 # under the historical names so every call site (and the profile scripts) stays

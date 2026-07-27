@@ -14,7 +14,6 @@ Covers:
 
 Implementation matches feature spec — no fixes required.
 """
-import pytest
 from httpx import AsyncClient
 
 from backend.services.progression_service import compute_delta

@@ -6,7 +6,6 @@ from pathlib import Path
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
-from collections import OrderedDict
 
 # Add parent directory to Python path
 sys.path.insert(0, str(Path(__file__).parent.parent))

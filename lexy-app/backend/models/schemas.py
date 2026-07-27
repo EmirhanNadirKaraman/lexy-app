@@ -1,3 +1,4 @@
+import re as _re
 from datetime import datetime
 from typing import Any, Literal
 
@@ -532,9 +533,6 @@ class GenerateExamplesResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Settings / preferences
 # ---------------------------------------------------------------------------
-
-import re as _re
-
 
 def _hex_color(v: object) -> object:
     """Validator: accept None (optional field) or a 6-digit hex color string."""

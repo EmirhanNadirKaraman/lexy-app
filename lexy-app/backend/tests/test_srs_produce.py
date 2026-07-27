@@ -9,7 +9,6 @@ Covers:
   - "I don't know" path still goes through the existing /review/{id} endpoint.
   - Production response shape matches SRSProductionResponse.
 """
-import uuid
 
 import pytest
 from httpx import AsyncClient

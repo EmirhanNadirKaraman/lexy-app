@@ -22,12 +22,9 @@ Usage:
 """
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
-from contextlib import contextmanager
-from collections import defaultdict
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
@@ -36,10 +33,11 @@ _SCRAPER_DIR = str(Path(__file__).resolve().parent)
 if _SCRAPER_DIR not in sys.path:
     sys.path.insert(0, _SCRAPER_DIR)
 
-import pipeline
-from pipeline import (
-    connect, load_channels, process_pending_requests, _scan_channel_videos,
-    _process_channel_request, _process_video_request, populate, insert_phrases,
+# E402: must import AFTER the sys.path.insert above — `pipeline` is a sibling
+# module in subtitle-scraper/, not an installed package (TODO #3). Do not hoist.
+import pipeline  # noqa: E402
+from pipeline import (  # noqa: E402
+    connect, load_channels, process_pending_requests, _process_channel_request, populate,
 )
 
 # Profiling state
@@ -96,7 +94,7 @@ def report_stats():
     print("FULL PIPELINE PROFILING REPORT")
     print("="*70)
 
-    print(f"\n── Summary ────────────────────────────────────────────────────")
+    print("\n── Summary ────────────────────────────────────────────────────")
     print(f"  Videos processed:     {profile_stats['videos_processed']}")
     print(f"  Videos failed:        {profile_stats['videos_failed']}")
     print(f"  Total populate time:  {profile_stats['total_populate_time']:.3f}s")
@@ -109,7 +107,7 @@ def report_stats():
         print(f"  Avg per video:        {avg_populate:.3f}s populate + {avg_phrase:.3f}s phrases")
         print(f"  Throughput:           {profile_stats['videos_processed'] / (total_time + 0.001):.1f} videos/sec")
 
-    print(f"\n── Per-video breakdown (slowest first) ────────────────────────")
+    print("\n── Per-video breakdown (slowest first) ────────────────────────")
     # Sort by total time (populate + phrase)
     sorted_videos = sorted(
         profile_stats["video_times"],

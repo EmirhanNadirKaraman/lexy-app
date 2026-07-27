@@ -6,7 +6,6 @@ Endpoint: GET /api/v1/videos/{video_id}/reading-stats
 Tests hit the real development DB via the `client` fixture. Tests that need
 actual video/word data will be skipped if those tables are empty or missing.
 """
-import uuid
 
 import asyncpg
 import pytest
