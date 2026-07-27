@@ -147,18 +147,18 @@ alone does not prove the build is clean** — run `npm run build` too.
 ## Pipeline tests — `tests/`
 
 Hermetic pytest tests. Two sub-trees:
-- `tests/runtime/` — **93 tests** against the runtime root pipeline modules, in
-  nine files: subtitle cleaning / ingestion / merging / segmentation, quality
+- `tests/runtime/` — **97 tests** against the runtime root pipeline modules, in
+  ten files: subtitle cleaning / ingestion / merging / segmentation, quality
   filter, exposure service, eligibility + unit extraction, onboarding tiers,
-  learning invariants.
+  learning invariants, and a pipeline composition smoke test.
 - ~~`tests/{subtitles,learning,exposure,pipeline}/` — 537 tests against the
   `src/app/` refactor.~~ **Deleted 2026-07-27** with the refactor itself; the
   valuable behaviour was ported into `tests/runtime/` first (TODO #17).
 - Scraper-facing: `tests/test_scraper_channels.py`, `tests/test_scraper_es_path.py`, 🆕 `tests/test_scraper_db_ssl.py` (S4 residual — `subtitle-scraper/db_ssl.py` resolver matrix + `seed_channels.connect()` forwards `sslmode`; scraper modules imported via add-if-absent / `sys.modules.pop` fixtures so the file never pollutes `sys.path` for `test_scraper_channels`), and 🆕 `tests/test_language_config.py` (#18 — `language_config.py` values/order/helpers/unknown-lang/malformed-config + pipeline-no-longer-hardcodes; loaded by `spec_from_file_location` with **no `sys.path` mutation**, the round-3 lesson — a module-level insert here broke `test_scraper_channels` under churn).
 
-Root suite baseline: **207 passed** (93 runtime + 114 scraper). Run
+Root suite baseline: **211 passed** (97 runtime + 114 scraper). Run
 `pytest tests/` from repo root. Historical: 562 at W4, peaking at 744 before
-the `src/app/` deletion.
+the `src/app/` deletion, 207 immediately after it.
 
 Backend suite baseline (W13, 2026-05-20): **521 passed / 2 skipped** (xdist parallel run ~48s). Run: `pytest -n auto` from `lexy-app/backend/`.
 
@@ -936,9 +936,9 @@ Run all three. The lint step is not optional.
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
 | Backend | `cd lexy-app/backend && pytest -n auto` | 745 passed, 2 skipped |
-| Root pipeline | `pytest tests/` *(repo root)* | 207 passed |
+| Root pipeline | `pytest tests/` *(repo root)* | 211 passed |
 
-The root suite is **207 = 93 + 114**: `tests/runtime/` (93) covers the root
+The root suite is **211 = 97 + 114**: `tests/runtime/` (97) covers the root
 pipeline modules, `tests/*.py` (114) covers `subtitle-scraper/`. It was 744
 until 2026-07-27, when the `src/app/` refactor and the 537 tests that only
 targeted it were deleted — see the retirement note below.
@@ -970,13 +970,42 @@ been tested in its shipping form until batch 4.
 **Two accepted coverage losses, recorded rather than glossed:**
   - `pipeline_diagnostics.py` (290 lines) lost its only 39 tests and has **no
     runtime equivalent**. It emits profiling/timing tables with no product
-    behaviour, so this was judged acceptable — but it is now the one runtime
-    pipeline module with zero coverage.
-  - The 11 end-to-end `GermanSubtitlePipeline` smoke tests are gone. They bound
-    tightly to the refactor's class shape. Runtime is covered **stage by stage**
-    (ingestion → cleaning → merging → segmentation → extraction → eligibility →
-    quality → exposure) rather than by one end-to-end run, so a regression that
-    only appears in stage *composition* would not be caught today.
+    behaviour, so this was judged acceptable — but it remains the one runtime
+    pipeline module with zero coverage. Still open.
+  - ~~The 11 end-to-end `GermanSubtitlePipeline` smoke tests are gone, so a
+    regression that only appears in stage *composition* would not be caught.~~
+    **Closed 2026-07-27** by `tests/runtime/test_pipeline_smoke.py` — see below.
+    The 11 refactor-shape tests were not restored; four composition tests
+    replace them.
+
+🆕 **2026-07-27 — runtime pipeline composition smoke test (+4, root 207 → 211)**
+
+`tests/runtime/test_pipeline_smoke.py` covers the shipping
+`pipeline.GermanSubtitlePipeline` wiring, which the per-stage files
+structurally cannot:
+
+    fragments → merge → segment → quality filter → extract → i+1 filter → I1Match
+
+Four tests: construction wires all six stages (and `exposure_service.store is
+pipeline.store` — if those diverged, recorded exposures would never affect i+1
+decisions); the happy path yields one `I1Match` with the expected target; the
+**negative** path yields none when three units are unknown (if that ever returns
+a match, the i+1 filter has been bypassed in composition — the failure a
+stage-level test can never see); and the write path pipeline → exposure service
+→ store keyed by `utterance_id`, including dedup.
+
+Uses `run_fragments`, not `run`, so there is **no file I/O, no network and no
+external service** — fragments are built in memory. Only dependency is the
+spaCy model, skipped-if-missing like the sibling runtime tests.
+
+The i+1 scenario was probed against the real pipeline before being asserted:
+`"Ich gehe heute ins Kino."` extracts `{gehen, heute, kino}`, so seeding
+`gehen` + `heute` leaves `kino` as the sole unknown. The seed is derived from
+observed behaviour, not guessed — and unseeded the same sentence really does
+yield zero matches, which is what makes the negative test meaningful.
+
+Deliberately small: stage internals stay in the per-stage files. No production
+code was changed; the smoke test exposed no runtime bug.
 
 `conftest.py` was deleted outright, not rewritten. Runtime tests import root
 modules directly (`from subtitle_cleaner import …`) and the repo root reaches
