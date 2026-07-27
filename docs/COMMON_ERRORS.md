@@ -185,6 +185,83 @@ occurrence genuinely should change — the linter flagged only one of them.
 
 ---
 
+### A word exists in `word_table` but a vocabulary list reports it `unresolved`
+**Symptom:** `Öl`, `Übung` and `Änderung` are all present in `word_table`
+(`SELECT * FROM word_table WHERE word = 'Öl'` returns a row), yet
+`POST /api/v1/word-lists` reports them `unresolved` — even when the pasted
+spelling matches the stored row **byte for byte**. Plain ASCII words in the
+same list resolve fine. 50 German `word_table` rows and 18 `phrase_table`
+canonicals were affected — note it is *any* uppercase non-ASCII letter, not
+just a leading one, so multi-token `die Änderung` broke too.
+
+**Cause:** this database is `datcollate=C datctype=C`, so Postgres folds
+**ASCII only**:
+
+```sql
+SELECT lower('Öl');            -- 'Öl'   (unchanged!)
+SELECT 'Öl' ILIKE 'öl';        -- false
+SELECT lower('Ab');            -- 'ab'   (ASCII works, which is why this hides)
+```
+
+Python's `str.lower()` folds the whole Unicode range. The resolver sent
+Python-lowered keys (`'öl'`) into `WHERE lower(w.word) = ANY($1)`, where the
+SQL side produced `'Öl'`. The two keys never met.
+
+**Why it's confusing:** the query looks obviously correct, the row is visibly
+there, and every ASCII test passes. A fixture word without an umlaut cannot
+detect it.
+
+**Fix that does NOT work:** making both sides SQL — `lower(w.word) =
+lower($1)`. Under C locale *neither* side folds, so `'Öl'` vs `'öl'` stay
+unequal. Verify before believing any fix: `SELECT lower('Öl') = lower('öl');`
+should return `true`, and here it returns `false`.
+
+**Fix:** fold in Python and let SQL only fetch rows —
+`services/text_norm.normalize_key` (NFC + strip + `lower()`), applied to both
+the input and the fetched surface. See `word_list_service._resolve_surfaces`.
+
+**Two traps inside the fix:**
+- Use `lower()`, **not** `casefold()`. Casefold maps `ß` → `ss`, which merges
+  `schließen`/`schliessen`, `heißt`/`heisst`, `Großteil`/`Grossteil` — 7 real
+  pairs of *distinct* German rows — into one key, turning words that resolve
+  cleanly today into `ambiguous`.
+- A bounded "send a few case variants as exact matches" query is **not**
+  sufficient. No whole-string case transform turns a typed `Die Änderung` into
+  a stored `die Änderung`, so multi-token phrases stay broken. `lower(col
+  COLLATE "und-x-icu")` is correct and bounded if you ever need it (it agreed
+  with Python `lower()` on all 12,138 German word+phrase rows and leaves `ß` alone), at the
+  cost of requiring an ICU-enabled Postgres.
+
+**Same root cause, still open (audited 2026-07-27, not fixed):**
+- `reading_service.find_catalog_item:316` — `WHERE LOWER(word) = $1` fed
+  `canonical.lower()`. A reading selection of an umlaut word never binds to the
+  catalog, so it never propagates to the main SRS (CLAUDE.md §8b).
+- `reading_service.get_page_word_statuses:73` — `WHERE LOWER(w.word) = ANY($2)`
+  fed Python-lowered tokens. Umlaut words render without their status colour.
+- `word_service.lookup_word_by_text:63` and `learn_word_anyway:175` — `ILIKE`.
+- `search_service` — `ILIKE` (search) and `lower(word) LIKE lower($2) || '%'`
+  (suggest/autocomplete).
+
+**Cleared by the same audit:** `subtitle-scraper/pipeline.py` never asks
+Postgres to fold — it matches `(word, pos)` exactly and inserts with
+`ON CONFLICT DO NOTHING`, so it cannot hit this bug. It *can* create case
+variants as separate rows, which is the (pre-existing, unrelated) reason 417
+German and 1,944 Spanish surfaces report `ambiguous` in vocabulary lists.
+
+### Counting rows after `INSERT ... ON CONFLICT DO NOTHING` over-reports
+**Symptom:** `scripts/backfill_word_catalog.py --apply` logged
+`APPLY: inserted 17 word_table row(s)` on the second *and* third run, while
+`SELECT count(*) FROM word_table` did not move at all.
+**Cause:** the count was a separate `SELECT count(*) ... WHERE word =
+ANY($1::text[])` run after the insert. That counts rows matching the candidate
+list — including every row that was **already there**.
+**Fix:** get the number from the statement itself, with `RETURNING`, and take
+`len(rows)`. `ON CONFLICT DO NOTHING` suppresses the `RETURNING` row for a
+conflict, so the count is exactly what this call wrote.
+**Related:** here the *proximate* cause of the wrong number was the collation
+bug above — those 17 surfaces were umlaut-initial and looked missing every
+time. Fixing only the count would have left the pointless re-inserts.
+
 ## 2. Test suite
 
 ### `ValueError: Seed must be between 0 and 2**32 - 1` — every test errors

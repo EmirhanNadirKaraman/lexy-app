@@ -27,8 +27,8 @@ it creates a second row, and two rows for one surface is exactly what
 `word_list_service` reports as `ambiguous`. Seeding POS onto existing words
 would silently break lists that resolve cleanly today.
 
-So: insert only surfaces absent by `lower(word)`, and insert with `pos=''` to
-match the convention already in the table. Existing rows are never updated.
+So: insert only surfaces absent under `text_norm.normalize_key`, and insert
+with `pos=''` to match the convention already in the table. Existing rows are never updated.
 POS/gloss/example enrichment from `words_4000_old.txt` is deliberately out of
 scope — it needs a schema decision, not just a column.
 
@@ -43,6 +43,8 @@ import re
 from pathlib import Path
 
 import asyncpg
+
+from .text_norm import normalize_key
 
 #: Repo-root `data/final_result.txt`, resolved from this file so the script
 #: works from any cwd (the `os.chdir` trap in docs/COMMON_ERRORS.md).
@@ -119,8 +121,9 @@ def build_candidates(headwords: list[str]) -> tuple[list[str], dict[str, list[st
 
     Candidates are article-stripped, clean single tokens, deduplicated
     **case-insensitively** with the first spelling winning, in file order.
-    Case-insensitive dedup matches how `word_list_service` resolves, so the
-    candidate set and the lookup agree.
+    Dedup uses `text_norm.normalize_key` — the same key `word_list_service`
+    resolves with — so the candidate set and the lookup agree, including for
+    umlaut-initial surfaces that Postgres's C-locale `lower()` cannot fold.
 
     `skipped_by_reason` maps `SKIP_MULTIWORD` / `SKIP_ARTEFACT` to the
     article-stripped forms that failed the clean check.
@@ -139,7 +142,7 @@ def build_candidates(headwords: list[str]) -> tuple[list[str], dict[str, list[st
                 seen_skips.add(surface)
                 skipped[classify_skip(surface)].append(surface)
             continue
-        key = surface.lower()
+        key = normalize_key(surface)
         if key in seen:
             continue
         seen.add(key)
@@ -151,24 +154,27 @@ def build_candidates(headwords: list[str]) -> tuple[list[str], dict[str, list[st
 async def find_missing_words(
     pool: asyncpg.Pool, candidates: list[str], language: str = LANGUAGE,
 ) -> list[str]:
-    """Candidates with no `word_table` row for the same `lower(word)`.
+    """Candidates with no `word_table` row under the same `normalize_key`.
 
     Case-insensitive on purpose: a seeded `Haus` must not fork an existing
-    `haus`. One round-trip regardless of candidate count.
+    `haus` — `word_table`'s unique key includes `pos`, so a case variant does
+    NOT conflict, it creates a second row and makes the surface `ambiguous`.
+
+    The fold happens in Python. Under this database's C locale Postgres's
+    `lower()` is ASCII-only, so comparing Python-lowered keys against
+    `lower(w.word)` missed every umlaut-initial word — an existing `Öl` looked
+    absent when the candidate was `öl`, and the backfill would have forked it.
+    The query therefore fetches the language-scoped surfaces and the comparison
+    below decides; see `services/text_norm.py`. Still one round-trip regardless
+    of candidate count, and this runs from an admin script, not a request.
     """
     if not candidates:
         return []
     rows = await pool.fetch(
-        """
-        SELECT lower(w.word) AS key
-        FROM word_table w
-        WHERE w.language = $2
-          AND lower(w.word) = ANY($1::text[])
-        """,
-        sorted({c.lower() for c in candidates}), language,
+        "SELECT w.word FROM word_table w WHERE w.language = $1", language,
     )
-    present = {r["key"] for r in rows}
-    return [c for c in candidates if c.lower() not in present]
+    present = {normalize_key(r["word"]) for r in rows}
+    return [c for c in candidates if normalize_key(c) not in present]
 
 
 async def seed_word_catalog(
@@ -222,24 +228,23 @@ async def seed_word_catalog(
     # pos/tag empty and lemma == word: matches every existing German row. See
     # the module docstring for why a real POS would fork rows instead of
     # enriching them. `frequency` is left to the column default (0).
+    # One statement with RETURNING, so `inserted` counts rows this call
+    # actually wrote. Counting `word = ANY(missing)` afterwards instead would
+    # also count rows that were already there — which is how a second --apply
+    # pass reported "inserted 17" while writing nothing (fixed 2026-07-27).
+    # ON CONFLICT DO NOTHING suppresses the RETURNING row for a conflict, so a
+    # row taken by a concurrent scraper write is correctly not counted.
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.executemany(
+            inserted_rows = await conn.fetch(
                 """
                 INSERT INTO word_table (word, language, pos, tag, lemma)
-                VALUES ($1, $2, '', '', $1)
+                SELECT w, $2, '', '', w FROM unnest($1::text[]) AS w
                 ON CONFLICT (word, language, pos) DO NOTHING
-                """,
-                [(w, language) for w in missing],
-            )
-            # Count what actually landed rather than trusting executemany —
-            # a concurrent scraper insert could have taken some of them.
-            result["inserted"] = await conn.fetchval(
-                """
-                SELECT count(*) FROM word_table
-                 WHERE language = $2 AND pos = '' AND word = ANY($1::text[])
+                RETURNING word_id
                 """,
                 missing, language,
             )
+            result["inserted"] = len(inserted_rows)
     result["dry_run"] = False
     return result

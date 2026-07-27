@@ -29,7 +29,10 @@ before running:
 
 What it will and will not do
 ----------------------------
-- Inserts only surfaces absent from `word_table` by `lower(word)`.
+- Inserts only surfaces absent from `word_table` under
+  `services/text_norm.normalize_key` (Unicode casefold done in Python — this
+  database's C-locale `lower()` folds ASCII only, so `Öl` and `öl` would
+  otherwise look like different words and fork the surface).
 - Writes `pos=''`, `tag=''`, `lemma == word` — matching every existing German
   row. A real POS would NOT conflict with an existing `pos=''` row and would
   create a duplicate, which vocabulary lists then report as `ambiguous`.

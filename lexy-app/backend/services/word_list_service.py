@@ -48,6 +48,7 @@ from typing import NamedTuple
 import asyncpg
 
 from . import progression_service
+from .text_norm import index_by_key, normalize_key
 
 # Matches the Pydantic cap in WordListCreate. Duplicated as a service-level
 # guard so a non-HTTP caller can't blow past it.
@@ -106,6 +107,16 @@ def normalize_surfaces(words: list[str]) -> list[str]:
 
     Deduping here (not in SQL) keeps the unique index on
     (list_id, lower(surface)) a backstop rather than an error path.
+
+    Uses `normalize_key`, so `Öl` and `öl` collapse to one entry the same way
+    `Haus` and `haus` do — Python's Unicode-aware `lower()`, not Postgres's
+    ASCII-only one. See `services/text_norm.py`.
+
+    Note the index is a *weaker* backstop for non-ASCII surfaces than for
+    ASCII ones: its `lower()` runs under the C locale and would not consider
+    `Öl` and `öl` duplicates. That is fine only because this function runs
+    first and no duplicate pair ever reaches the insert. Don't drop it and
+    lean on the constraint.
     """
     seen: set[str] = set()
     out: list[str] = []
@@ -113,7 +124,7 @@ def normalize_surfaces(words: list[str]) -> list[str]:
         surface = raw.strip()
         if not surface:
             continue
-        key = surface.lower()
+        key = normalize_key(surface)
         if key in seen:
             continue
         seen.add(key)
@@ -128,14 +139,26 @@ async def _resolve_surfaces(
 ) -> dict[str, Resolution]:
     """
     Bulk-resolve surfaces against both catalogs, language-scoped and
-    case-insensitive. Returns lower(surface) → Resolution.
+    case-insensitive. Returns normalize_key(surface) → Resolution.
 
     Two round-trips for the whole list (one per table) rather than N lookups.
-    Both predicates are `lower(col) = ANY($1)` — not `ILIKE` — so the word
-    query uses `ix_word_table_lang_lower_word` from migration 032. Comparing
-    Python's `lower()` output against Postgres's also fails safe: if the two
-    ever disagree on some edge glyph the surface reports as `unresolved`
-    instead of binding to the wrong row.
+
+    Case-insensitivity is decided in **Python**, not SQL. This database runs
+    under the C locale, where Postgres's `lower()` and `ILIKE` fold ASCII only
+    — `lower('Öl')` is `'Öl'`, so the old `lower(col) = ANY(python_lowered)`
+    predicate never matched a surface with an uppercase non-ASCII letter: 50
+    German `word_table` rows and 18 `phrase_table` canonicals were unreachable
+    from vocabulary lists (found 2026-07-27). Making both sides SQL would not
+    have helped: neither side folds.
+
+    So each query fetches the whole language-scoped catalog and `normalize_key`
+    does the matching. That is more rows than a targeted lookup, and it is a
+    deliberate trade — a bounded query cannot express this fold correctly
+    without an ICU collation, and both callers here are cold paths (list
+    upload, late binding) measured at ~20 ms for German and ~40 ms for the
+    larger Spanish catalog. `services/text_norm.py` documents the sizes, the
+    ICU alternative, and why the obvious bounded scheme was rejected as
+    incomplete.
 
     Phrases match on `canonical`, not `surface_form`. `canonical` is the
     stable identity the rest of the app already keys on — `matcher_service`
@@ -147,38 +170,25 @@ async def _resolve_surfaces(
     if not surfaces:
         return {}
 
-    keys = sorted({s.lower() for s in surfaces})
-
     word_rows = await conn.fetch(
-        """
-        SELECT w.word_id AS item_id, lower(w.word) AS key
-        FROM word_table w
-        WHERE w.language = $2
-          AND lower(w.word) = ANY($1::text[])
-        ORDER BY lower(w.word), w.word_id
-        """,
-        keys, language,
+        "SELECT w.word_id AS item_id, w.word AS surface "
+        "FROM word_table w WHERE w.language = $1",
+        language,
     )
     phrase_rows = await conn.fetch(
-        """
-        SELECT p.phrase_id AS item_id, lower(p.canonical) AS key
-        FROM phrase_table p
-        WHERE p.language = $2
-          AND lower(p.canonical) = ANY($1::text[])
-        ORDER BY lower(p.canonical), p.phrase_id
-        """,
-        keys, language,
+        "SELECT p.phrase_id AS item_id, p.canonical AS surface "
+        "FROM phrase_table p WHERE p.language = $1",
+        language,
     )
 
-    by_type: dict[str, dict[str, list[int]]] = {ITEM_WORD: {}, ITEM_PHRASE: {}}
-    for r in word_rows:
-        by_type[ITEM_WORD].setdefault(r["key"], []).append(r["item_id"])
-    for r in phrase_rows:
-        by_type[ITEM_PHRASE].setdefault(r["key"], []).append(r["item_id"])
+    by_type: dict[str, dict[str, list[int]]] = {
+        ITEM_WORD: index_by_key(word_rows, "surface", "item_id"),
+        ITEM_PHRASE: index_by_key(phrase_rows, "surface", "item_id"),
+    }
 
     out: dict[str, Resolution] = {}
     for surface in surfaces:
-        key = surface.lower()
+        key = normalize_key(surface)
         first = preferred_type(surface)
         second = ITEM_WORD if first == ITEM_PHRASE else ITEM_PHRASE
         out[key] = _classify(
@@ -255,7 +265,7 @@ async def create_list(
                 # An unbound surface still records the type it was looked up
                 # as, so the row says what it was trying to be rather than
                 # defaulting everything to 'word'.
-                res = resolved[surface.lower()]
+                res = resolved[normalize_key(surface)]
                 rows.append((list_id, res.item_id, res.item_type, surface))
 
             await conn.executemany(
@@ -340,7 +350,7 @@ async def _load_entries(pool: asyncpg.Pool, user_id: str, list_id: int, language
         if item_id is not None:
             status = r["knowledge_status"] or STATUS_UNKNOWN
         else:
-            res = late.get(r["surface"].lower())
+            res = late.get(normalize_key(r["surface"]))
             if res is None:
                 item_id, item_type, status = None, item_type, STATUS_UNRESOLVED
             else:

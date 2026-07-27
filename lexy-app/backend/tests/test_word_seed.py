@@ -350,3 +350,163 @@ async def test_seeded_word_resolves_unknown_in_a_vocabulary_list(
     assert entry["status"] == "unknown", f"expected unknown, got {entry['status']}"
     assert entry["item_type"] == "word"
     assert entry["item_id"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Unicode presence checks (C-locale collation bug, fixed 2026-07-27)
+#
+# `find_missing_words` compared Python-lowered candidates against SQL
+# `lower(w.word)`. Postgres folds ASCII only here, so an existing `Öl` looked
+# absent when the candidate was `öl` — and inserting it would have forked the
+# surface into two rows, i.e. made it `ambiguous` in every vocabulary list.
+# This is the anti-fork guard again, for the case the guard used to miss.
+# ---------------------------------------------------------------------------
+
+
+def _umlaut_word() -> str:
+    return f"Özzseed{uuid.uuid4().hex[:10]}"
+
+
+async def test_existing_umlaut_word_is_seen_as_present_when_candidate_is_lowercased(
+    db_pool, tmp_path, seeded_words,
+):
+    existing = _umlaut_word()
+    seeded_words(existing)
+    await db_pool.execute(
+        "INSERT INTO word_table (word, language, pos, tag, lemma) "
+        "VALUES ($1, 'de', '', '', $1)", existing,
+    )
+
+    missing = await wss.find_missing_words(db_pool, [existing.lower()])
+
+    assert missing == [], "an existing Öl must be found when the candidate is öl"
+
+
+async def test_dry_run_missing_count_excludes_existing_umlaut_case_variants(
+    db_pool, tmp_path, seeded_words,
+):
+    existing = _umlaut_word()
+    seeded_words(existing)
+    await db_pool.execute(
+        "INSERT INTO word_table (word, language, pos, tag, lemma) "
+        "VALUES ($1, 'de', '', '', $1)", existing,
+    )
+    src = _source(tmp_path, existing.lower())
+
+    result = await wss.seed_word_catalog(db_pool, apply=False, source=src)
+
+    assert result["already_present"] == 1
+    assert result["missing"] == 0
+
+
+async def test_umlaut_case_variant_is_not_inserted_as_a_second_row(
+    db_pool, tmp_path, seeded_words,
+):
+    """The fork this backfill exists to avoid, for umlaut-initial surfaces."""
+    existing = _umlaut_word()
+    seeded_words(existing)
+    await db_pool.execute(
+        "INSERT INTO word_table (word, language, pos, tag, lemma) "
+        "VALUES ($1, 'de', '', '', $1)", existing,
+    )
+    src = _source(tmp_path, existing.lower())
+
+    result = await wss.seed_word_catalog(db_pool, apply=True, source=src)
+
+    assert result["inserted"] == 0
+    rows = await db_pool.fetch(
+        "SELECT word FROM word_table WHERE language='de' AND word = ANY($1::text[])",
+        [existing, existing.lower()],
+    )
+    assert [r["word"] for r in rows] == [existing], "case variant forked the surface"
+
+
+async def test_umlaut_word_is_seeded_when_genuinely_absent(
+    db_pool, tmp_path, seeded_words,
+):
+    """The fix must not swing the other way and treat every umlaut as present."""
+    word = _umlaut_word()
+    seeded_words(word)
+    src = _source(tmp_path, word)
+
+    result = await wss.seed_word_catalog(db_pool, apply=True, source=src)
+
+    assert result["missing"] == 1
+    assert result["inserted"] == 1
+
+
+async def test_sharp_s_spellings_are_seeded_as_separate_words(
+    db_pool, tmp_path, seeded_words,
+):
+    """`schließen` and `schliessen` are distinct entries, not case variants.
+
+    A casefold-based presence check would treat the second as already present
+    and silently drop it.
+    """
+    uniq = uuid.uuid4().hex[:10]
+    sharp, double = f"Zzschließen{uniq}", f"Zzschliessen{uniq}"
+    seeded_words(sharp, double)
+    src = _source(tmp_path, sharp, double)
+
+    result = await wss.seed_word_catalog(db_pool, apply=True, source=src)
+
+    assert result["candidates"] == 2, "dedup must not merge ß with ss"
+    assert result["inserted"] == 2
+
+
+# ---------------------------------------------------------------------------
+# inserted count reflects rows actually written
+# ---------------------------------------------------------------------------
+
+
+async def test_second_apply_reports_zero_inserted(db_pool, tmp_path, seeded_words):
+    """Re-running --apply must report `inserted 0`, not re-count existing rows.
+
+    The old implementation counted `word = ANY(missing)` after the INSERT,
+    which includes rows that were already there. In production a second and
+    third `--apply` both logged "inserted 17" while writing nothing.
+    """
+    word = f"Zzseedword{uuid.uuid4().hex[:10]}"
+    seeded_words(word)
+    src = _source(tmp_path, word)
+
+    first = await wss.seed_word_catalog(db_pool, apply=True, source=src)
+    second = await wss.seed_word_catalog(db_pool, apply=True, source=src)
+    third = await wss.seed_word_catalog(db_pool, apply=True, source=src)
+
+    assert first["inserted"] == 1
+    assert second["inserted"] == 0
+    assert third["inserted"] == 0
+
+
+async def test_inserted_counts_only_rows_this_call_wrote(
+    db_pool, tmp_path, seeded_words, monkeypatch,
+):
+    """A row already present must not be counted as inserted.
+
+    Forces the case the old count query got wrong: `missing` names two words
+    but one already exists (as a concurrent scraper write would leave it).
+    `ON CONFLICT DO NOTHING` suppresses its RETURNING row, so only the genuinely
+    new word counts. The old `SELECT count(*) ... WHERE word = ANY(missing)`
+    returned 2 here.
+    """
+    uniq = uuid.uuid4().hex[:10]
+    already, fresh = f"Zzseedpre{uniq}", f"Zzseednew{uniq}"
+    seeded_words(already, fresh)
+    await db_pool.execute(
+        "INSERT INTO word_table (word, language, pos, tag, lemma) "
+        "VALUES ($1, 'de', '', '', $1)", already,
+    )
+
+    async def _both_missing(pool, candidates, language=wss.LANGUAGE):
+        return [already, fresh]
+
+    monkeypatch.setattr(wss, "find_missing_words", _both_missing)
+    src = _source(tmp_path, already, fresh)
+
+    result = await wss.seed_word_catalog(db_pool, apply=True, source=src)
+
+    assert result["inserted"] == 1, "pre-existing row must not count as inserted"
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM word_table WHERE language='de' AND word=$1", already,
+    ) == 1

@@ -153,6 +153,42 @@ testing nothing. Fixtures now use a letter-initial `Zzseed…` prefix.
 `ruff check .` → All checks passed. Frontend not run — no frontend files
 changed. Root pipeline suite not run — no root files changed.
 
+
+🆕 **2026-07-27 — Unicode case-insensitive catalog resolution (+37 backend / +1 file)**
+
+Fixes the C-collation bug: this database is `datcollate=C datctype=C`, so
+Postgres's `lower()` and `ILIKE` fold **ASCII only**. The resolver compared
+Python-lowered keys against SQL `lower(col)`, so the two sides computed
+different keys for anything non-ASCII — 50 German `word_table` rows and 18
+`phrase_table` canonicals were unreachable and reported `unresolved` even for
+a byte-exact paste. Folding now
+happens in Python (`services/text_norm.py`).
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_text_norm.py` (NEW) | 15 | case variants share a key (Ö/Ü/Ä, single- and multi-token, ASCII, surrounding whitespace); NFC so decomposed `o`+U+0308 matches precomposed `ö`; **ß and ss are different keys** (parametrized over the three real pairs) while ß stays case-insensitive with itself; `index_by_key` groups case variants, sorts ids, and dedupes a repeated id |
+| `tests/test_word_lists.py` | +15 | umlaut word resolves **with its stored spelling** (the case that used to fail even byte-exact) and from lower/upper pastes, parametrized over Ö/Ü/Ä; a single umlaut row is `unknown`, **not** `ambiguous`; genuine umlaut duplicates are still `ambiguous`; **multi-token umlaut phrase** resolves from lower/upper/title casing; umlaut surfaces dedupe case-insensitively; **ß and ss resolve to different `word_id`s**; the five backfill sample words (`heißen`, `gelten`, `beginnen`, `entsprechen`, `sitzen`) still resolve |
+| `tests/test_word_seed.py` | +7 | an existing `Öl` is seen as present when the candidate is `öl`; dry-run `missing` excludes existing umlaut case-variants; a case variant is **not** inserted as a second row (the anti-fork guard, for the case it used to miss); a genuinely absent umlaut word is still seeded; ß/ss spellings seed as two separate words; **second and third `--apply` report `inserted 0`**; `inserted` counts only rows this call wrote (monkeypatched so `missing` names a row that already exists — the old count query returned 2) |
+
+**Both new behaviours are mutation-checked.** Switching `normalize_key` to
+`casefold()` fails the three ß tests; reducing it to an ASCII-only fold (what
+the C-locale SQL side did) fails six umlaut tests. Neither mutation is caught
+by any pre-existing test, which is why the umlaut fixtures carry a real umlaut
+rather than reusing the ASCII `_testword_` helper default.
+
+**Do not "simplify" the resolver back to a bounded query.** `_resolve_surfaces`
+fetches the whole language-scoped catalog on purpose (worst case is Spanish
+at 29,629 `word_table` rows, ~40 ms; German ~20 ms, flat in list size): no whole-string case transform turns a typed
+`Die Änderung` into a stored `die Änderung`, so a variant-based lookup is
+provably incomplete for multi-token surfaces. `lower(col COLLATE "und-x-icu")`
+is the correct bounded alternative if this ever gets hot.
+
+**Validation:** backend `-n auto` → **931 passed, 2 skipped** (894 + 37);
+`ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed. The backfill
+dry-run now reports `missing: 0` (was 17, all umlaut-initial), confirming the
+resolver and the seeder agree on what is already present.
+
 🆕 **2026-07-27 — word-list phrase support (+11 backend / +4 frontend)**
 
 Vocabulary lists now resolve against **both** `word_table` and `phrase_table`,

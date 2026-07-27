@@ -722,3 +722,173 @@ async def test_counts_include_phrase_entries(
     counts = (await _create(client, headers, [canonical, bare])).json()["counts"]
 
     assert counts["unknown"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Unicode case-insensitivity (C-locale collation bug, fixed 2026-07-27)
+#
+# Postgres here folds ASCII only: `lower('Öl')` is `'Öl'` and `'Öl' ILIKE 'öl'`
+# is false. The old resolver compared Python-lowered keys against SQL
+# `lower(col)`, so 48 German `word_table` rows starting with Ä/Ö/Ü were
+# unreachable — `Öl` existed yet a list reported it `unresolved`, even when the
+# pasted spelling matched the stored row exactly.
+#
+# These would all have passed against an ASCII-only fixture word, which is why
+# every fixture below carries a real umlaut.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("initial", ["Ö", "Ü", "Ä"])
+async def test_umlaut_word_resolves_with_the_stored_spelling(
+    client: AsyncClient, db_pool, initial,
+):
+    """The stored spelling itself did not resolve — not just case variants."""
+    _wid, surface = await insert_owned_word(
+        db_pool, word=f"{initial}zzu{uuid.uuid4().hex[:10]}",
+    )
+
+    headers = await _registered_headers(client)
+    entry = (await _create(client, headers, [surface])).json()["entries"][0]
+
+    assert entry["status"] == "unknown", "an existing word must not read as unresolved"
+    assert entry["item_type"] == "word"
+    assert entry["item_id"] is not None
+
+
+@pytest.mark.parametrize("initial", ["Ö", "Ü", "Ä"])
+async def test_umlaut_word_resolves_from_a_lowercased_paste(
+    client: AsyncClient, db_pool, initial,
+):
+    wid, surface = await insert_owned_word(
+        db_pool, word=f"{initial}zzu{uuid.uuid4().hex[:10]}",
+    )
+
+    headers = await _registered_headers(client)
+    entry = (await _create(client, headers, [surface.lower()])).json()["entries"][0]
+
+    assert entry["status"] == "unknown"
+    assert entry["item_id"] == wid
+
+
+async def test_umlaut_word_resolves_from_an_uppercased_paste(
+    client: AsyncClient, db_pool,
+):
+    wid, surface = await insert_owned_word(db_pool, word=f"Özzu{uuid.uuid4().hex[:10]}")
+
+    headers = await _registered_headers(client)
+    entry = (await _create(client, headers, [surface.upper()])).json()["entries"][0]
+
+    assert entry["item_id"] == wid
+
+
+async def test_single_umlaut_row_is_not_ambiguous(client: AsyncClient, db_pool):
+    """One row means one binding — the fix must not manufacture duplicates.
+
+    The resolver now groups rows by a Python key, so a grouping bug would show
+    up here as a surface that suddenly reports `ambiguous`.
+    """
+    _wid, surface = await insert_owned_word(db_pool, word=f"Üzzu{uuid.uuid4().hex[:10]}")
+
+    headers = await _registered_headers(client)
+    entry = (await _create(client, headers, [surface])).json()["entries"][0]
+
+    assert entry["status"] != "ambiguous"
+    assert entry["status"] == "unknown"
+
+
+async def test_umlaut_duplicate_rows_are_still_ambiguous(client: AsyncClient, db_pool):
+    """Genuine duplicates keep reporting `ambiguous` — behaviour unchanged."""
+    surface = f"Özzu{uuid.uuid4().hex[:10]}"
+    await insert_owned_word(db_pool, word=surface, pos="NOUN")
+    await insert_owned_word(db_pool, word=surface.lower(), pos="VERB")
+
+    headers = await _registered_headers(client)
+    entry = (await _create(client, headers, [surface])).json()["entries"][0]
+
+    assert entry["status"] == "ambiguous"
+    assert entry["item_id"] is None
+
+
+@pytest.mark.parametrize("paste", [str.lower, str.upper, str.title])
+async def test_umlaut_phrase_resolves_case_insensitively(
+    client: AsyncClient, make_phrase, paste,
+):
+    """Multi-token surfaces need per-token folding, not a whole-string variant.
+
+    A stored `die Änderung` is unreachable from a typed `Die Änderung` by any
+    whole-string case transform, which is why resolution folds in Python
+    rather than sending a bounded set of spellings to SQL.
+    """
+    canonical = f"die Änderung zzu{uuid.uuid4().hex[:10]}"
+    pid = await make_phrase(canonical)
+
+    headers = await _registered_headers(client)
+    entry = (await _create(client, headers, [paste(canonical)])).json()["entries"][0]
+
+    assert entry["status"] == "unknown"
+    assert entry["item_type"] == "phrase"
+    assert entry["item_id"] == pid
+
+
+async def test_umlaut_surfaces_dedupe_case_insensitively(client: AsyncClient, db_pool):
+    _wid, surface = await insert_owned_word(db_pool, word=f"Äzzu{uuid.uuid4().hex[:10]}")
+
+    headers = await _registered_headers(client)
+    detail = (await _create(client, headers, [surface, surface.lower()])).json()
+
+    assert len(detail["entries"]) == 1, "case variants are one entry, as for ASCII"
+    assert detail["entries"][0]["surface"] == surface
+
+
+# ---------------------------------------------------------------------------
+# ß spellings stay distinct — the reason normalize_key uses lower(), not casefold
+# ---------------------------------------------------------------------------
+
+
+async def test_sharp_s_and_double_s_resolve_to_different_words(
+    client: AsyncClient, db_pool,
+):
+    """`schließen` and `schliessen` are separate catalog rows, not duplicates.
+
+    `casefold()` maps ß → ss and would merge them into one key, reporting both
+    as `ambiguous`. German `word_table` holds 7 such pairs, so a future switch
+    to casefold would silently break words that resolve cleanly today.
+    """
+    uniq = uuid.uuid4().hex[:10]
+    sharp_id, sharp = await insert_owned_word(db_pool, word=f"schließen{uniq}")
+    double_id, double = await insert_owned_word(db_pool, word=f"schliessen{uniq}")
+
+    headers = await _registered_headers(client)
+    by_surface = _by_surface((await _create(client, headers, [sharp, double])).json())
+
+    assert by_surface[sharp]["item_id"] == sharp_id
+    assert by_surface[double]["item_id"] == double_id
+    assert by_surface[sharp]["status"] == "unknown"
+    assert by_surface[double]["status"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Regression: plain ASCII resolution is untouched by the fold change
+# ---------------------------------------------------------------------------
+
+
+async def test_ascii_sample_words_still_resolve(client: AsyncClient, db_pool):
+    """The five surfaces used to sanity-check the catalog backfill.
+
+    `heißen` carries a ß, the rest are plain ASCII — together they cover both
+    sides of the `lower()`-vs-`casefold()` choice.
+    """
+    uniq = uuid.uuid4().hex[:10]
+    samples = [f"{stem}{uniq}" for stem in
+               ("heißen", "gelten", "beginnen", "entsprechen", "sitzen")]
+    ids = {}
+    for s in samples:
+        wid, surface = await insert_owned_word(db_pool, word=s)
+        ids[surface] = wid
+
+    headers = await _registered_headers(client)
+    by_surface = _by_surface((await _create(client, headers, samples)).json())
+
+    for s in samples:
+        assert by_surface[s]["status"] == "unknown", f"{s} regressed"
+        assert by_surface[s]["item_id"] == ids[s]
