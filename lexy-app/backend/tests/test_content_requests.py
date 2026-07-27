@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 from httpx import AsyncClient
 from ._email_helper import make_test_email
+from ._auth_helper import register_and_login
 
 REGISTER = "/api/v1/auth/register"
 LOGIN    = "/api/v1/auth/login"
@@ -49,11 +50,11 @@ def _video_id() -> str:
 
 
 async def _register_and_get_user(client: AsyncClient, db_pool, email: str) -> tuple[dict, str]:
-    await client.post(REGISTER, json={"email": email, "password": "password123"})
-    r = await client.post(LOGIN, json={"email": email, "password": "password123"})
-    headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
-    uid = str(await db_pool.fetchval("SELECT user_id FROM users WHERE email = $1", email))
-    return headers, uid
+    """Register + login. Returns (auth_headers, user_id_str).
+
+    Delegates to the shared helper; see tests/_auth_helper.py.
+    """
+    return await register_and_login(client, db_pool, email)
 
 
 @pytest.fixture(autouse=True)

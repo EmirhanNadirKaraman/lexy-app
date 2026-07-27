@@ -15,6 +15,7 @@ from httpx import AsyncClient
 
 from backend.services import llm_service
 from ._email_helper import make_test_email
+from ._auth_helper import register_and_login
 
 SRS_DUE     = "/api/v1/srs/due"
 SRS_REVIEW  = "/api/v1/srs/review"
@@ -27,11 +28,11 @@ def _email() -> str:
 
 
 async def _register(client: AsyncClient, db_pool, email: str) -> tuple[dict, str]:
-    await client.post(REGISTER, json={"email": email, "password": "password123"})
-    r = await client.post(LOGIN, json={"email": email, "password": "password123"})
-    headers = {"Authorization": f"Bearer {r.json()['access_token']}"}
-    uid = str(await db_pool.fetchval("SELECT user_id FROM users WHERE email = $1", email))
-    return headers, uid
+    """Register + login. Returns (auth_headers, user_id_str).
+
+    Delegates to the shared helper; see tests/_auth_helper.py.
+    """
+    return await register_and_login(client, db_pool, email)
 
 
 async def _get_word(db_pool) -> tuple[int, str, str]:
