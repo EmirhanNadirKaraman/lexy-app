@@ -3,7 +3,8 @@ import type { PlaylistResult, PlaylistVideo, SearchResult, Suggestion } from '..
 import { fetchItemRecommendations } from '../api/recommendations';
 import { lookupWord, pickSingleOrFirst } from '../api/words';
 import { fetchSuggestions } from '../api/suggest';
-import { generatePlaylist } from '../api/playlists';
+import { generatePlaylist, PlaylistSolverUnavailableError } from '../api/playlists';
+import type { PlaylistAlgorithm } from '../api/playlists';
 import { formatDuration } from '../utils/recommendationUtils';
 import { LANGUAGE_OPTIONS } from '../config/languages';
 
@@ -32,6 +33,9 @@ export function PlaylistPanel({ token, language, onLanguageChange, onWatch, onCl
     const [view, setView] = useState<'build' | 'result'>('build');
     const [targets, setTargets] = useState<Target[]>([]);
     const [maxVideos, setMaxVideos] = useState(5);
+    // 'greedy' is the default, matching the backend. 'ilp' is opt-in: it runs a
+    // solver, so the user asks for it explicitly.
+    const [algorithm, setAlgorithm] = useState<PlaylistAlgorithm>('greedy');
     const [loadingRecs, setLoadingRecs] = useState(false);
     const [generating, setGenerating] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -92,11 +96,20 @@ export function PlaylistPanel({ token, language, onLanguageChange, onWatch, onCl
         setGenerating(true);
         setError(null);
         try {
-            const res = await generatePlaylist(token, targets.map(t => t.item_id), language, maxVideos);
+            const res = await generatePlaylist(
+                token, targets.map(t => t.item_id), language, maxVideos, algorithm,
+            );
             setResult(res);
             setView('result');
-        } catch {
-            setError('Failed to generate playlist. Try again.');
+        } catch (e) {
+            // The optimal planner has an optional backend. Point the user at the
+            // fast one rather than showing the operator-facing PuLP message or a
+            // generic failure they can do nothing about.
+            setError(
+                e instanceof PlaylistSolverUnavailableError
+                    ? 'Optimal planning is unavailable right now. Switch to Fast and try again.'
+                    : 'Failed to generate playlist. Try again.',
+            );
         } finally {
             setGenerating(false);
         }
@@ -155,6 +168,8 @@ export function PlaylistPanel({ token, language, onLanguageChange, onWatch, onCl
                     onRemoveTarget={removeTarget}
                     maxVideos={maxVideos}
                     onMaxVideosChange={setMaxVideos}
+                    algorithm={algorithm}
+                    onAlgorithmChange={setAlgorithm}
                     addInput={addInput}
                     onAddInputChange={setAddInput}
                     addLoading={addLoading}
@@ -187,6 +202,8 @@ interface BuildViewProps {
     onRemoveTarget: (id: number) => void;
     maxVideos: number;
     onMaxVideosChange: (n: number) => void;
+    algorithm: PlaylistAlgorithm;
+    onAlgorithmChange: (a: PlaylistAlgorithm) => void;
     addInput: string;
     onAddInputChange: (s: string) => void;
     addLoading: boolean;
@@ -205,6 +222,7 @@ function BuildView({
     language, onLanguageChange,
     targets, onRemoveTarget,
     maxVideos, onMaxVideosChange,
+    algorithm, onAlgorithmChange,
     addInput, onAddInputChange, addLoading, addError, onAddWord, inputRef,
     loadingRecs, onLoadRecommended,
     generating, error, onGenerate,
@@ -447,6 +465,32 @@ function BuildView({
                     onChange={e => onMaxVideosChange(Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 1)))}
                     style={{ ...inputStyle, width: '64px' }}
                 />
+            </div>
+
+            {/* Planner: greedy (default) vs optimal ILP. Copy is user-facing —
+                "Fast"/"Optimal" rather than the algorithm names. */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                <label
+                    htmlFor="playlist-algorithm"
+                    style={{ fontSize: '13px', color: 'var(--color-text)', fontWeight: 600, whiteSpace: 'nowrap' }}
+                >
+                    Planning
+                </label>
+                <select
+                    id="playlist-algorithm"
+                    data-testid="playlist-algorithm"
+                    value={algorithm}
+                    onChange={e => onAlgorithmChange(e.target.value as PlaylistAlgorithm)}
+                    style={{ ...inputStyle, cursor: 'pointer' }}
+                >
+                    <option value="greedy">Fast</option>
+                    <option value="ilp">Optimal (slower)</option>
+                </select>
+                <span style={{ fontSize: '12px', color: 'var(--color-text-subtle)' }}>
+                    {algorithm === 'ilp'
+                        ? 'Covers the most words possible within your video limit.'
+                        : 'Good results, returns instantly.'}
+                </span>
             </div>
 
             {error && (

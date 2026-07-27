@@ -89,7 +89,8 @@ These were failing before #0b and are tracked here so they don't get blamed on f
 
 Test runner: Vitest + @testing-library/react + jsdom. Setup: `src/test/setup.ts`.
 
-**Current count (2026-07-27): 248 tests across 41 files.** Was 238/40 before the
+**Current count (2026-07-27): 261 tests across 43 files.** Was 248/41 before the
+playlist optimizer selector, 238/40 before the
 `auth.ts` error-parser dedup, and 219 across 37
 files before the #39 lemma-correction UI landed (+19 tests, +3 files).
 Historical baseline: ~179 across ~31 files at W13 (2026-05-20).
@@ -113,6 +114,31 @@ full picture):
   `PrivacyPage`.
 - Theme tokens: `src/test/theme.test.tsx` (across #20a/b).
 - Lemma corrections (#39 frontend, 2026-07-27) — see the dated row below.
+
+🆕 **2026-07-27 — playlist optimizer selector (frontend only, +13 tests / +2 files)**
+
+Surfaces the backend's opt-in `algorithm` parameter in `PlaylistPanel` as a
+**Planning** control: *Fast* (greedy, default) vs *Optimal (slower)* (ILP).
+
+| File | Tests | Covers |
+|---|---|---|
+| `api/playlists.test.ts` | 7 | `algorithm` defaults to `"greedy"` and is **always sent explicitly** (never omitted, so the request states the choice rather than depending on the backend default); explicit `"ilp"`/`"greedy"`; 503 → `PlaylistSolverUnavailableError`; the operator-facing PuLP detail never reaches the message; non-503 stays an ordinary `Error`; success parses |
+| `components/PlaylistPanel.test.tsx` | 6 | defaults to Fast; untouched → `"greedy"`; selecting Optimal → `"ilp"`; **503 shows an inline "switch to Fast" recovery message** with no PuLP text and the page intact; non-503 keeps the generic message; 16px font + 44px touch target |
+
+**Why the 503 is handled in `api/playlists.ts` rather than `_http.ts`:** 503 has
+no shared meaning across the API — this is the only endpoint whose backend is
+optional (PuLP) and can be absent while the request is perfectly valid. A typed
+`PlaylistSolverUnavailableError` lets the panel say *"Optimal planning is
+unavailable right now. Switch to Fast and try again."* instead of `assertOk`'s
+generic error or the backend's `pip install pulp` string.
+
+**Gotcha worth remembering:** the first run reported `6 passed` but **exited 1**.
+Vitest logged 2 *unhandled errors* — the stubbed playlist response carried a
+partial `coverage` object, and on success the panel renders `ResultView`, which
+reads `uncovered_item_ids.length`. The fixture, not the product, was wrong (the
+backend always sends all five coverage fields — see
+`test_endpoint_response_shape`). **A passing test count is not a passing run:
+check the exit code and the Errors line.**
 
 🆕 **2026-07-27 — #39 lemma-correction UI (frontend only, +19 tests / +3 files)**
 
@@ -958,7 +984,7 @@ calls so `pytest tests/` silently runs the *backend* suite from
 
 Frontend changes additionally want
 `cd lexy-app/frontend && npx tsc --noEmit && npx vitest run && npm run build`
-(248 tests across 41 files).
+(261 tests across 43 files).
 
 🆕 **2026-07-27 — `src/app/` retired; root suite 744 → 207**
 
