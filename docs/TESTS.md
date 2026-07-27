@@ -883,3 +883,44 @@ When closing each TODO/audit hole, remove the `@pytest.mark.xfail` (or set `stri
 3. **HTTP-level tests use the `client` fixture.** Use the bearer token from `_register_and_login` helpers.
 4. **Lock in audit holes with xfail or assertion-of-current-behaviour** so that when the fix lands, the test naturally flips to passing without rewriting. Mark with `@pytest.mark.xfail(reason="TODO #X: …", strict=False)`.
 5. **After adding tests, update this file** (TESTS.md). The CLAUDE.md convention says so.
+6. **Run `ruff check .` from the repo root** before calling a Python change done —
+   it is part of backend validation, not a separate cleanup task. See the
+   Validation commands section below.
+
+---
+
+## Validation commands — the full set for a Python change
+
+Run all three. The lint step is not optional.
+
+| Step | Command | Expected |
+|---|---|---|
+| Lint | `ruff check .` *(repo root)* | `All checks passed!` |
+| Backend | `cd lexy-app/backend && pytest -n auto` | 745 passed, 2 skipped |
+| Root pipeline | `pytest tests/` *(repo root)* | 671 passed |
+
+Frontend changes additionally want
+`cd lexy-app/frontend && npx tsc --noEmit && npx vitest run && npm run build`
+(219 tests across 37 files).
+
+**Ruff baseline (2026-07-27): zero findings**, down from 153. Verified with
+ruff 0.14.1. There is no `ruff.toml`, so this uses ruff's default rule set —
+which can shift between ruff versions. If the ruleset ever needs to be stable
+across machines or CI, pin it in a config; that is an open choice, not an
+oversight.
+
+What the 153 were, and the two traps in re-fixing them:
+
+| Rule | Count | Notes |
+|---|---|---|
+| F401 unused-import | 72 | 71 auto-fixed. The 72nd is `masking/latest_ingest.py`'s `visualize_docling_full` import — **the import IS an availability probe**, so it keeps a `noqa`. `importlib.util.find_spec` is not a substitute: it proves the module resolves, not that the symbol exists. |
+| E402 import-not-at-top | 41 | 27 were a genuine bug — a stray `logger = logging.getLogger(__name__)` sat above the import block in `main.py` (21), `subtitle-scraper/pipeline.py` and `transcript_fetcher.py`. The other 14 are the **deliberate `sys.path.insert`-then-import pattern** (TODO #3) and carry `noqa` + a "do not hoist" comment. Hoisting them breaks the scraper. |
+| F541 f-string w/o placeholder | 27 | auto-fixed |
+| F841 unused local | 7 | `_`-prefixed where the value documents a tuple shape or the expression still asserts something; deleted where dead |
+| E702 semicolon statements | 3 | split onto separate lines |
+| E741 ambiguous name `l` | 3 | renamed to `line` / `level` |
+
+Note `compileall` is **not** sufficient to validate an F401 sweep — it checks
+syntax, not import resolution. The scraper modules that ruff edited
+(`pipeline.py`, `phrase_finder.py`, `transcript_fetcher.py`) are imported by no
+test, so they were smoke-tested directly with `python -c "import <module>"`.

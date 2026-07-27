@@ -274,12 +274,35 @@ python pipeline.py                  # full run
 python pipeline.py --requests-only  # consume content_request queue
 ```
 
+### Lint — run this as part of every backend change
+```bash
+# From the REPO ROOT (not lexy-app/backend) — covers backend, scraper,
+# root pipeline, scripts, masking and ilp in one pass:
+ruff check .                        # must report "All checks passed!"
+ruff check . --fix                  # apply the auto-fixable subset
+```
+Ruff is **part of backend validation, not an optional extra** — run it alongside
+`pytest` before calling any Python change done. Baseline as of 2026-07-27: zero
+findings (was 153; see the ruff entry in `docs/TESTS.md`).
+
+Two things to know before "fixing" what it reports:
+  - **`# noqa: E402` on a sibling import is load-bearing.** `subtitle-scraper/`
+    modules import each other after a `sys.path.insert` — the deliberate
+    replacement for the old `os.chdir` hack (§10 / TODO #3). Hoisting those
+    imports to the top breaks the scraper. Each carries a comment saying so.
+  - **There is no `ruff.toml`**, so this runs ruff's *default* rule set, which
+    can shift between ruff versions. Pin a config if the ruleset ever needs to
+    be stable across machines/CI. Verified with ruff 0.14.1.
+
 ### Backend tests
 ```bash
 cd lexy-app/backend
-pytest                              # serial — ~165s for 433 tests
-pytest -n auto                      # parallel via pytest-xdist — ~48s (3.4× speedup)
+pytest                              # serial
+pytest -n auto                      # parallel via pytest-xdist — ~44s for 745 tests
 ```
+`pytest-randomly` is blocked via `addopts = -p no:randomly` in both ini files.
+That is deliberate and load-bearing — see `docs/TESTS.md` for the spaCy/thinc
+seed conflict it works around. Don't remove it.
 Each test user's email is tagged with `PYTEST_XDIST_WORKER` (or `main` when serial)
 via `tests/_email_helper.make_test_email()`; the autouse cleanup fixture uses the
 same per-worker LIKE pattern, so parallel workers don't trample each other's rows.
