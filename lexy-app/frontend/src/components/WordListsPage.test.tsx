@@ -1,0 +1,292 @@
+/**
+ * WordListsPage tests — vocabulary list upload/download.
+ *
+ * Covers:
+ *   - paste flow posts the parsed words
+ *   - .txt upload parses words into the textarea
+ *   - all five status counts render, and unresolved/ambiguous surfaces are visible
+ *   - ambiguous gets its own explanation, distinct from unresolved
+ *   - mark-as-learning calls the endpoint and refreshes
+ *   - download triggers the export endpoint
+ *   - empty and oversized lists are refused client-side with an inline error
+ *   - server errors surface inline
+ */
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+
+import { WordListsPage } from './WordListsPage';
+import type { WordListDetail } from '../api/wordLists';
+
+type FetchCall = { url: string; init: RequestInit | undefined };
+let calls: FetchCall[] = [];
+
+function installFetch(handler: (url: string, init: RequestInit | undefined) => Response | Promise<Response>) {
+    const stub = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = typeof input === 'string' ? input : input.toString();
+        calls.push({ url, init });
+        return handler(url, init);
+    });
+    vi.stubGlobal('fetch', stub);
+    return stub;
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+    });
+}
+
+function makeDetail(overrides: Partial<WordListDetail> = {}): WordListDetail {
+    return {
+        list_id: 1,
+        name: 'My list',
+        language: 'de',
+        description: null,
+        created_at: '2026-07-27T10:00:00Z',
+        total: 4,
+        counts: { known: 1, learning: 0, unknown: 1, unresolved: 1, ambiguous: 1 },
+        entries: [
+            { id: 1, surface: 'Haus', item_id: 10, item_type: 'word', status: 'known' },
+            { id: 2, surface: 'Straße', item_id: 11, item_type: 'word', status: 'unknown' },
+            { id: 3, surface: 'Blorptzk', item_id: null, item_type: 'word', status: 'unresolved' },
+            { id: 4, surface: 'Bank', item_id: null, item_type: 'word', status: 'ambiguous' },
+        ],
+        ...overrides,
+    };
+}
+
+function renderPage() {
+    return render(<WordListsPage token="tok" language="de" onClose={() => {}} />);
+}
+
+/** Empty index, then whatever POST/GET the test cares about. */
+function installIndexThen(handler: (url: string, init: RequestInit | undefined) => Response) {
+    installFetch((url, init) => {
+        if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+            return jsonResponse([]);
+        }
+        return handler(url, init);
+    });
+}
+
+beforeEach(() => {
+    calls = [];
+});
+
+afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+});
+
+describe('WordListsPage', () => {
+    it('posts the parsed words from a pasted list', async () => {
+        installIndexThen(() => jsonResponse(makeDetail(), 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-name'), { target: { value: 'Goethe B1' } });
+        fireEvent.change(screen.getByTestId('word-list-input'), {
+            target: { value: 'Haus\nStraße\n\nlaufen' },
+        });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+
+        const post = calls.find(c => c.init?.method === 'POST');
+        expect(post).toBeTruthy();
+        const body = JSON.parse(post!.init!.body as string);
+        // Blank line dropped, order preserved, language passed through.
+        expect(body.words).toEqual(['Haus', 'Straße', 'laufen']);
+        expect(body.name).toBe('Goethe B1');
+        expect(body.language).toBe('de');
+    });
+
+    it('splits comma-separated input and shows a live count', async () => {
+        installIndexThen(() => jsonResponse(makeDetail(), 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), {
+            target: { value: 'Haus, Straße; laufen' },
+        });
+
+        expect(screen.getByTestId('word-list-count').textContent).toContain('3 words');
+    });
+
+    it('parses an uploaded .txt into the input', async () => {
+        installIndexThen(() => jsonResponse(makeDetail(), 201));
+        renderPage();
+
+        const file = new File(['Haus\nStraße\nlaufen\n'], 'goethe.txt', { type: 'text/plain' });
+        // jsdom's File.text() is not always implemented — provide it explicitly.
+        Object.defineProperty(file, 'text', { value: async () => 'Haus\nStraße\nlaufen\n' });
+
+        fireEvent.change(screen.getByTestId('word-list-file'), { target: { files: [file] } });
+
+        await waitFor(() =>
+            expect((screen.getByTestId('word-list-input') as HTMLTextAreaElement).value)
+                .toContain('Straße'),
+        );
+        expect(screen.getByTestId('word-list-count').textContent).toContain('3 words');
+        // Filename (without extension) becomes the default list name.
+        expect((screen.getByTestId('word-list-name') as HTMLInputElement).value).toBe('goethe');
+    });
+
+    it('renders all five counts and shows unresolved + ambiguous surfaces', async () => {
+        installIndexThen(() => jsonResponse(makeDetail(), 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+
+        expect(screen.getByTestId('word-list-count-known').textContent).toContain('1');
+        expect(screen.getByTestId('word-list-count-learning').textContent).toContain('0');
+        expect(screen.getByTestId('word-list-count-unknown').textContent).toContain('1');
+        expect(screen.getByTestId('word-list-count-unresolved').textContent).toContain('1');
+        expect(screen.getByTestId('word-list-count-ambiguous').textContent).toContain('1');
+
+        // The words themselves stay visible — not silently dropped from the list.
+        expect(screen.getByTestId('word-list-entry-Blorptzk')).toBeTruthy();
+        expect(screen.getByTestId('word-list-entry-Bank')).toBeTruthy();
+    });
+
+    it('explains ambiguous entries separately from unresolved ones', async () => {
+        installIndexThen(() => jsonResponse(makeDetail(), 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Bank' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+
+        await waitFor(() => expect(screen.getByTestId('word-list-ambiguous-note')).toBeTruthy());
+        expect(screen.getByTestId('word-list-ambiguous-note').textContent)
+            .toMatch(/several dictionary entries/i);
+    });
+
+    it('omits the ambiguous note when nothing is ambiguous', async () => {
+        const detail = makeDetail({
+            counts: { known: 1, learning: 0, unknown: 1, unresolved: 0, ambiguous: 0 },
+            entries: [{ id: 1, surface: 'Haus', item_id: 10, item_type: 'word', status: 'known' }],
+        });
+        installIndexThen(() => jsonResponse(detail, 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+        expect(screen.queryByTestId('word-list-ambiguous-note')).toBeNull();
+    });
+
+    it('calls the mark-unknown-learning endpoint and reports what was skipped', async () => {
+        installIndexThen((url, init) => {
+            if (url.includes('mark-unknown-learning')) {
+                return jsonResponse({
+                    list_id: 1, marked: 1, marked_item_ids: [11],
+                    skipped_unresolved: 1, skipped_ambiguous: 1,
+                });
+            }
+            if (init?.method === 'POST') return jsonResponse(makeDetail(), 201);
+            return jsonResponse(makeDetail());
+        });
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+
+        fireEvent.click(screen.getByTestId('word-list-mark-learning'));
+
+        await waitFor(() => expect(screen.getByTestId('word-list-notice')).toBeTruthy());
+        expect(calls.some(c => c.url.includes('/mark-unknown-learning') && c.init?.method === 'POST')).toBe(true);
+        const notice = screen.getByTestId('word-list-notice').textContent ?? '';
+        expect(notice).toContain('Marked 1 word');
+        expect(notice).toContain('Skipped 2');
+    });
+
+    it('disables mark-as-learning when nothing is unknown', async () => {
+        const detail = makeDetail({
+            counts: { known: 1, learning: 0, unknown: 0, unresolved: 0, ambiguous: 0 },
+            entries: [{ id: 1, surface: 'Haus', item_id: 10, item_type: 'word', status: 'known' }],
+        });
+        installIndexThen(() => jsonResponse(detail, 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+
+        expect((screen.getByTestId('word-list-mark-learning') as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it('triggers the export endpoint on download', async () => {
+        vi.stubGlobal('URL', {
+            ...URL,
+            createObjectURL: vi.fn(() => 'blob:mock'),
+            revokeObjectURL: vi.fn(),
+        });
+        installIndexThen((url, init) => {
+            if (url.includes('/export')) {
+                return new Response('Haus\nStraße\nBlorptzk\nBank', {
+                    status: 200,
+                    headers: { 'Content-Type': 'text/plain' },
+                });
+            }
+            if (init?.method === 'POST') return jsonResponse(makeDetail(), 201);
+            return jsonResponse(makeDetail());
+        });
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+
+        fireEvent.click(screen.getByTestId('word-list-download'));
+
+        await waitFor(() => expect(calls.some(c => c.url.includes('/export'))).toBe(true));
+    });
+
+    it('refuses an empty list inline without calling the API', async () => {
+        installIndexThen(() => jsonResponse(makeDetail(), 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: '   \n  ' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+
+        await waitFor(() => expect(screen.getByTestId('word-list-create-error')).toBeTruthy());
+        expect(screen.getByTestId('word-list-create-error').textContent).toMatch(/at least one word/i);
+        expect(calls.some(c => c.init?.method === 'POST')).toBe(false);
+    });
+
+    it('refuses an oversized list inline without calling the API', async () => {
+        installIndexThen(() => jsonResponse(makeDetail(), 201));
+        renderPage();
+
+        const tooMany = Array.from({ length: 501 }, (_, i) => `w${i}`).join('\n');
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: tooMany } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+
+        await waitFor(() => expect(screen.getByTestId('word-list-create-error')).toBeTruthy());
+        expect(screen.getByTestId('word-list-create-error').textContent).toMatch(/limit is 500/i);
+        expect(calls.some(c => c.init?.method === 'POST')).toBe(false);
+    });
+
+    it('shows a server error inline', async () => {
+        installIndexThen(() => jsonResponse({ detail: 'word list is empty' }, 422));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+
+        await waitFor(() => expect(screen.getByTestId('word-list-create-error')).toBeTruthy());
+        expect(screen.getByTestId('word-list-create-error').textContent).toContain('word list is empty');
+    });
+
+    it('shows a load error inline when the index request fails', async () => {
+        installFetch(() => jsonResponse({ detail: 'boom' }, 500));
+        renderPage();
+
+        await waitFor(() => expect(screen.getByTestId('word-list-load-error')).toBeTruthy());
+        expect(screen.getByTestId('word-list-load-error').textContent).toContain('boom');
+    });
+});

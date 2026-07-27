@@ -114,6 +114,41 @@ full picture):
   `PrivacyPage`.
 - Theme tokens: `src/test/theme.test.tsx` (across #20a/b).
 - Lemma corrections (#39 frontend, 2026-07-27) — see the dated row below.
+- Vocabulary lists: `WordListsPage` + `tests/test_word_lists.py` (2026-07-27).
+
+🆕 **2026-07-27 — vocabulary list upload/download (+39 tests / +2 files)**
+
+New feature: paste or upload a word list, see what you already know, mark the
+unknown ones as learning, export the list. Backend `word_list_service` +
+`routers/word_lists.py`; frontend `api/wordLists.ts` + `components/WordListsPage.tsx`
+at route `/lists`. Migration **035** made the dormant 001 tables usable
+(`word_lists.language`, `word_list_items.surface NOT NULL`, nullable `item_id`,
+unique on `(list_id, lower(surface))`).
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_word_lists.py` (NEW) | 26 | migration-035 schema shape (incl. **the 001 unique constraint is gone**, not merely shadowed); create + resolve; case-insensitive resolution; **language scoping** (same surface, `es` list → unresolved); unresolved stored not dropped, and still there on re-read; **ambiguous never first-match resolved** (asserts the stored `item_id` is NULL); dedupe by `lower(surface)` with first-spelling-wins; blank entries skipped; all five counts; 422 on empty/oversized, 201 at exactly 500; export round-trips **all** surfaces in insertion order incl. unresolved/ambiguous, `text/plain`; cross-user 404 on read/export/delete/**mark-learning** (parametrized) + a dedicated test that a cross-user mark creates **no** knowledge row; mark-learning creates knowledge + **both** SRS directions; skips unresolved/ambiguous; leaves `known` alone; idempotent; delete cascades entries |
+| `components/WordListsPage.test.tsx` (NEW) | 13 | paste flow posts parsed words (blank lines dropped, order kept); comma/semicolon splitting + live count; `.txt` upload fills the textarea and defaults the list name; all five counts render; unresolved + ambiguous surfaces stay **visible**; the ambiguous explanation shows only when something is ambiguous; mark-learning hits the endpoint and reports skips; the button disables at 0 unknown; download hits `/export`; empty and oversized lists refused **client-side with no POST**; server 422 and index-load 500 both surface inline |
+
+**Why `ambiguous` is a first-class state rather than a first-match pick.**
+`word_service.lookup_word_by_text` deliberately refuses to choose between
+several `word_table` rows for one surface (*die Bank* = bench vs. bank) — the
+W3 / Hole 2 fix. A 500-word upload has no interactive picker, so rather than
+reviving the silent-pick bug in bulk, an ambiguous surface is stored unbound
+and reported as such. `mark-unknown-learning` skips it. Two tests pin this: one
+asserts the persisted `item_id` is NULL, one asserts neither candidate sense
+gains a `user_word_knowledge` row.
+
+**Resolution rule under test:** `lower(w.word) = ANY($1::text[]) AND w.language = $2`,
+one round-trip for the whole list. Not `ILIKE` — that would not use
+`ix_word_table_lang_lower_word` (migration 032). Comparing Python's `lower()`
+against Postgres's also fails safe: a disagreement on an edge glyph reports the
+word as *unresolved* rather than binding it to the wrong row.
+
+**Validation:** backend `-n auto` → **786 passed, 2 skipped**; frontend
+**274 passed** (44 files); `tsc --noEmit` clean; `npm run build` clean;
+`ruff check .` → All checks passed. Root pipeline suite not run — no root files
+changed.
 
 🆕 **2026-07-27 — playlist optimizer selector (frontend only, +13 tests / +2 files)**
 

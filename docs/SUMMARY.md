@@ -40,6 +40,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `videos.py` | `/videos/{id}/reading-stats` | `reading_stats_service` |
 | `content_requests.py` | `/content-requests` POST/GET. Spawns `subtitle-scraper/pipeline.py --requests-only` subprocess. | direct SQL + subprocess |
 | `notifications.py` | `/notifications/stream` (SSE). Per-row mark-after-yield ordering (disconnect leaves un-yielded rows unseen for re-delivery). LISTEN/NOTIFY refactor deferred (TODO #4b). | direct SQL |
+| `word_lists.py` | `/word-lists` POST/GET, `/word-lists/{id}` GET/DELETE, `/word-lists/{id}/export` (text/plain), `/word-lists/{id}/mark-unknown-learning`. All routes user-scoped, 404 (not 403) on someone else's id. | `word_list_service`, `progression_service` |
 | `lemma_corrections.py` | `POST /lemma-corrections` (auth + throttle, flag → candidate) + `GET /admin/lemma-corrections` (`require_admin`, queue) + `POST /admin/lemma-corrections/{id}/{accept,reject}` (`require_admin`; accept transactionally upserts `lemma_override`) + `…/{id}/adjudicate` (`require_admin`, read-only dry-run LLM proposal via injected `get_lemma_adjudicator` → 503 if none) — #39 3A/3B/3C. | `lemma_correction_service` |
 
 ### Services (business logic) — `lexy-app/backend/services/`
@@ -47,6 +48,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 |---|---|
 | `progression_service.py` | **Single source of truth** for knowledge-state changes. `_RULES` dict maps event → ProgressionDelta. `apply_progression` is transactional (line 178). `_update_srs` runs SM-2 and now skips active-card creation for grammar_rule (line 268). |
 | `review_service.py` | Real SRS implementation. `get_due_cards` joins per-type display table. `submit_answer` maps to `progression_service`. |
+| `word_list_service.py` | User vocabulary lists (upload/paste → resolve → export). Bulk resolution via `lower(word) = ANY($1)` (uses `ix_word_table_lang_lower_word`, not ILIKE), language-scoped. Five entry states: known/learning/unknown/**unresolved** (no match) / **ambiguous** (several matches, never auto-bound). `mark_unknown_as_learning` goes through `progression_service`; it never writes `user_word_knowledge` or `srs_cards`. |
 | `word_service.py` | `lookup_word_by_text` (ILIKE on word_table; ambiguous on POS), `get_user_knowledge`. (`upsert_word_status` was deleted 2026-05-19 — `progression_service.apply_progression(..., status_override=...)` is now the single writer.) |
 | `chat_service.py` | session/message CRUD + `match_learning_words` (free-chat matching against the user's vocab — words **and** phrases, via `matcher_service.match_sentence_with_ids` for the phrase half). |
 | `guided_chat_service.py` | `get_next_target` (priority: due active → learning without active → random; considers words AND phrases at every tier), `update_progress` (event mapping). |
@@ -135,6 +137,7 @@ Grouped by feature:
 
 **Other**
 - `PlaylistPanel.tsx`, `LoginForm.tsx`, `NotificationToast.tsx`, `ReminderBanner.tsx`, `FollowedChannelsSection.tsx`, `SettingsPanel.tsx`, `ContentRequestPage.tsx`, `SRSReviewPage.tsx`, `icons.tsx`
+- `WordListsPage.tsx` — vocabulary lists: paste or upload a `.txt`, see per-word known/learning/unknown/unresolved/ambiguous, mark unknown as learning, download. Route `/lists`, nav entry "Lists".
 
 ### Hooks — `src/hooks/`
 | Hook | Purpose |
@@ -150,7 +153,7 @@ Grouped by feature:
 
 ### API clients — `src/api/`
 One file per domain, thin fetch wrappers with `assertOk`:
-`auth.ts`, `books.ts`, `chat.ts`, `contentRequests.ts`, `insights.ts`, `playlists.ts`, `reading.ts`, `recommendations.ts`, `reminders.ts`, `search.ts`, `settings.ts`, `srs.ts`, `suggest.ts`, `words.ts`.
+`auth.ts`, `books.ts`, `chat.ts`, `contentRequests.ts`, `insights.ts`, `playlists.ts`, `reading.ts`, `recommendations.ts`, `reminders.ts`, `search.ts`, `settings.ts`, `srs.ts`, `suggest.ts`, `wordLists.ts`, `words.ts`.
 
 ### Types + config + utils
 - `src/types/index.ts` — every shared interface (~416 lines, single file).

@@ -914,3 +914,77 @@ class LemmaCorrectionAdjudication(BaseModel):
     proposed_corrected_lemma: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary lists — paste/upload a word list, see what you know, export it.
+# See services/word_list_service.py for the five-state model and why an
+# ambiguous surface is never auto-bound to a first match.
+# ---------------------------------------------------------------------------
+
+
+WordListEntryStatus = Literal["known", "learning", "unknown", "unresolved", "ambiguous"]
+
+# Keep in sync with word_list_service.MAX_LIST_WORDS.
+WORD_LIST_MAX_WORDS = 500
+
+
+class WordListCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    language: str = Field(min_length=1, max_length=16)
+    # Cap enforced on the raw list, before dedupe, so a 422 is predictable from
+    # what the user actually pasted rather than from what survived normalizing.
+    words: list[str] = Field(min_length=1, max_length=WORD_LIST_MAX_WORDS)
+    description: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("name", "language")
+    @classmethod
+    def _strip_required(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+    @field_validator("words")
+    @classmethod
+    def _require_a_real_word(cls, v: list[str]) -> list[str]:
+        # min_length=1 alone would accept [""] / ["   "].
+        if not any(w.strip() for w in v):
+            raise ValueError("word list is empty")
+        return v
+
+
+class WordListEntryRead(BaseModel):
+    id: int
+    surface: str
+    item_id: int | None
+    item_type: str
+    status: WordListEntryStatus
+
+
+class WordListSummary(BaseModel):
+    list_id: int
+    name: str
+    language: str
+    description: str | None = None
+    created_at: datetime
+    total: int
+
+
+class WordListDetail(BaseModel):
+    list_id: int
+    name: str
+    language: str
+    description: str | None = None
+    created_at: datetime
+    total: int
+    counts: dict[str, int]
+    entries: list[WordListEntryRead]
+
+
+class WordListMarkLearningResult(BaseModel):
+    list_id: int
+    marked: int
+    marked_item_ids: list[int]
+    skipped_unresolved: int
+    skipped_ambiguous: int

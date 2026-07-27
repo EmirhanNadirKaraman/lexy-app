@@ -114,6 +114,7 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
   - Chat: `_require_session` rejects sessions not owned by the caller (`routers/chat.py:366`).
   - Reading: `delete_selection(pool, selection_id, user_id)` is user-scoped (`routers/reading.py:356`).
   - SRS: card lookup filters `card_id AND user_id` (`services/review_service.py:174`) — **verified, no IDOR**.
+  - Word lists: every `/word-lists/{id}` handler resolves the row through `word_list_service._load_list_row`, which filters `list_id = $1 AND user_id = $2::uuid`; `delete_list` and `export_list` are scoped the same way. Misses return **404, not 403**, so list ids can't be enumerated. Covered by a parametrized cross-user test over read/export/delete/mark-learning plus a dedicated test that a cross-user `mark-unknown-learning` creates no `user_word_knowledge` row (`tests/test_word_lists.py`).
 - **Privilege escalation is blocked at the settings write.** `update_preferences` only merges keys present in `DEFAULTS` (`services/settings_service.py:223`); `is_admin` is not in `DEFAULTS` (`settings_service.py:15`), so a user cannot grant themselves admin via `PUT /settings/preferences`. Enforced by `tests/test_settings.py`. **Do not widen this to a blind `{**current, **updates}` merge.**
 - **Passwords** use bcrypt with per-password salt (`core/security.py:19`). **Login does not leak account existence** — generic "Invalid email or password" (`auth_service.py:37`).
 - **CORS** is an explicit allow-list, not `*`, and credentials mode is not enabled; auth is Bearer-header (not cookies), so **CSRF does not apply** to the current design. (Revisit if S3's cookie option is taken.)
@@ -219,6 +220,8 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-07-27** — **Vocabulary lists added (no new findings).** New `routers/word_lists.py` + `services/word_list_service.py` (migration 035). Security-relevant properties, all test-pinned: every route is ownership-filtered and answers 404 on another user's id (no enumeration); the only state-changing route (`mark-unknown-learning`) goes through `progression_service` and writes neither `user_word_knowledge` nor `srs_cards` directly; list size is capped at 500 by Pydantic before any DB work; all SQL is parameterized (bulk resolution passes a `text[]` via `$1`, no interpolation). **The `.txt` upload is read client-side only** (`File.text()` in `WordListsPage`) and posted as a JSON string array — there is no server-side file-upload path here, so S8's upload surface is unchanged. Export sets `Content-Disposition: attachment` with a server-generated filename (`word-list-{id}.txt`), not user input.
 
 - **2026-05-24** — Initial audit. 17 open findings (S1–S17), verified-strengths baseline recorded. Swept all 21 routers for auth; only `POST /sentences/match` (S16) is unauthenticated.
 - **2026-05-24** — **S1 (auth throttling)** and **S5 (HTTP security headers)** resolved. 17 new tests (`test_auth_throttle.py`, `test_security_headers.py`); added env vars `ENABLE_HSTS`, `TRUST_PROXY_HEADERS`. 15 findings remain open (S2–S4, S6–S17).

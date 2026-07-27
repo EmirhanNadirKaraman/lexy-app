@@ -15,6 +15,7 @@ import { ReminderBanner } from './components/ReminderBanner';
 import { SRSReviewPage } from './components/SRSReviewPage';
 import { ReadingReviewPage } from './components/ReadingReviewPage';
 import { ContentRequestPage } from './components/ContentRequestPage';
+import { WordListsPage } from './components/WordListsPage';
 import { AdminLemmaQueuePage } from './components/AdminLemmaQueuePage';
 import { NotificationContainer } from './components/NotificationToast';
 import { useNotifications } from './hooks/useNotifications';
@@ -134,6 +135,7 @@ function Layout() {
             {token && <NavLink to="/for-you" style={nl}>For You</NavLink>}
             {token && <NavLink to="/playlist" style={nl}>Playlist</NavLink>}
             {token && <NavLink to="/books" style={nl}>Books</NavLink>}
+            {token && <NavLink to="/lists" style={nl}>Lists</NavLink>}
             {token && <NavLink to="/review" style={nlReview}>Review</NavLink>}
             {token && <NavLink to="/add-content" style={nl}>+ Add Content</NavLink>}
             {token && <NavLink to="/settings" style={nl}>Settings</NavLink>}
@@ -443,6 +445,19 @@ function AddContentPage() {
   return <ContentRequestPage token={token} onClose={() => navigate('/')} />;
 }
 
+function ListsPage() {
+  const { token, recLanguage } = useAppCtx();
+  const navigate = useNavigate();
+  if (!token) return <Navigate to="/" />;
+  return (
+    <WordListsPage
+      token={token}
+      language={recLanguage || DEFAULT_LANGUAGE}
+      onClose={() => navigate('/')}
+    />
+  );
+}
+
 // Reachable directly by URL on purpose — the nav link is hidden for non-admins,
 // but the server's require_admin is what actually enforces access. A non-admin
 // who navigates here sees the queue's inline error, not a fake client-side
@@ -469,6 +484,7 @@ export default function App() {
         <Route path="for-you" element={<ForYouPage />} />
         <Route path="playlist" element={<PlaylistPage />} />
         <Route path="books" element={<BooksPage />} />
+        <Route path="lists" element={<ListsPage />} />
         <Route path="review" element={<ReviewPage />} />
         <Route path="reading-review" element={<ReadingReviewRoute />} />
         <Route path="add-content" element={<AddContentPage />} />

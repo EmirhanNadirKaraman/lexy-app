@@ -29,6 +29,7 @@ from .routers.notifications import router as notifications_router
 from .routers.errors import router as errors_router
 from .routers.account import router as account_router
 from .routers.lemma_corrections import router as lemma_corrections_router
+from .routers.word_lists import router as word_lists_router
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,7 @@ app.include_router(notifications_router,    prefix="/api/v1")  # /api/v1/notific
 app.include_router(errors_router,           prefix="/api/v1")  # /api/v1/errors/client
 app.include_router(account_router,          prefix="/api/v1")  # /api/v1/account (DELETE)
 app.include_router(lemma_corrections_router, prefix="/api/v1")  # /api/v1/lemma-corrections, /api/v1/admin/lemma-corrections
+app.include_router(word_lists_router,       prefix="/api/v1")  # /api/v1/word-lists, /word-lists/{id}/export
 
 frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
 if frontend_dist.exists():
