@@ -183,9 +183,10 @@ Hermetic pytest tests. Two sub-trees:
   valuable behaviour was ported into `tests/runtime/` first (TODO #17).
 - Scraper-facing: `tests/test_scraper_channels.py`, `tests/test_scraper_es_path.py`, 🆕 `tests/test_scraper_db_ssl.py` (S4 residual — `subtitle-scraper/db_ssl.py` resolver matrix + `seed_channels.connect()` forwards `sslmode`; scraper modules imported via add-if-absent / `sys.modules.pop` fixtures so the file never pollutes `sys.path` for `test_scraper_channels`), and 🆕 `tests/test_language_config.py` (#18 — `language_config.py` values/order/helpers/unknown-lang/malformed-config + pipeline-no-longer-hardcodes; loaded by `spec_from_file_location` with **no `sys.path` mutation**, the round-3 lesson — a module-level insert here broke `test_scraper_channels` under churn).
 
-Root suite baseline: **211 passed** (97 runtime + 114 scraper). Run
+Root suite baseline: **221 passed** (97 runtime + 124 scraper). Run
 `pytest tests/` from repo root. Historical: 562 at W4, peaking at 744 before
-the `src/app/` deletion, 207 immediately after it.
+the `src/app/` deletion, 207 immediately after it, 211 before the Spanish
+gerund slice.
 
 Backend suite baseline (W13, 2026-05-20): **521 passed / 2 skipped** (xdist parallel run ~48s). Run: `pytest -n auto` from `lexy-app/backend/`.
 
@@ -963,17 +964,48 @@ Run all three. The lint step is not optional.
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
 | Backend | `cd lexy-app/backend && pytest -n auto` | 760 passed, 2 skipped |
-| Root pipeline | `pytest tests/` *(repo root)* | 211 passed |
+| Root pipeline | `pytest tests/` *(repo root)* | 221 passed |
 
 Backend was 745 until the ILP playlist optimizer landed (+15: 11 unit tests for
 `ilp_cover`, 4 endpoint tests for the `algorithm` parameter — accepts `"ilp"`,
 422s an unknown value, 503s when the solver is unavailable, and defaults to
 greedy without invoking the solver).
 
-The root suite is **211 = 97 + 114**: `tests/runtime/` (97) covers the root
-pipeline modules, `tests/*.py` (114) covers `subtitle-scraper/`. It was 744
+The root suite is **221 = 97 + 124**: `tests/runtime/` (97) covers the root
+pipeline modules, `tests/*.py` (124) covers `subtitle-scraper/`. It was 744
 until 2026-07-27, when the `src/app/` refactor and the 537 tests that only
 targeted it were deleted — see the retirement note below.
+
+🆕 **2026-07-27 — Spanish gerund enclitics (#36 slice A, +10 root tests)**
+
+`tests/test_spanish_phrase_extractor.py` 52 → 62. **Note this is the ROOT
+suite, not the backend** — `phrase_finder.py` lives in `subtitle-scraper/`, and
+no backend test imports `extract_spanish_logic` directly (the backend touches
+it only indirectly, through `matcher_service` in `test_matcher.py`).
+
+Now covered: `Está lavándose…` → `lavarse`, `duchándome` → `ducharse`,
+`levantándose` → `levantarse`, emitted with a distinct
+`match_type="es_reflexive_gerund"` (a gerund is not an infinitive, and
+conflating the two would misreport provenance downstream).
+
+**The load-bearing test is the garbage-lemma rejection.** For `preguntándome`
+the model returns the lemma `preguntándomar`, which *ends in `-ar`* and so
+passes a naive infinitive check while being nonsense — accepting it would put
+`preguntándomarse` into `phrase_table` and teach a word that does not exist.
+One test pins the rejection through the real model; a second exercises
+`_es_gerund_base` directly with fabricated lemmas, so the guard stays proven
+even if the model's output changes.
+
+**Still unsupported, deliberately pinned (slice B):** positive fused
+imperatives. `Lávate las manos.` tags VERB/`Fin` with the clitic fused and a
+garbage lemma (`lávatir`); `Levántate ahora.` tags **PROPN** at sentence start
+(the same word tags VERB mid-sentence — the mistagging is positional). Both
+assert *no* extraction, so a model upgrade surfaces as a visible test change
+rather than silent drift.
+
+Also corrected while pinning: **negative imperatives always worked.**
+`No te levantes.` → `levantarse` via block 1, because the clitic is a separate
+token. `docs/TODO.md` had claimed imperatives extract nothing at all.
 
 **When one of these fails, check [`docs/COMMON_ERRORS.md`](./COMMON_ERRORS.md)
 before debugging.** It carries the failures that have actually happened here —

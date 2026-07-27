@@ -488,3 +488,96 @@ def test_clitic_infinitive_combo_no_duplicate_bare(es_nlp):
     out = _canonicals(es_nlp, "Quiero acordarme de ti.")
     assert out.count("acordarse de") == 1
     assert "acordarse" not in out
+
+
+# ---------------------------------------------------------------------------
+# Gerund + enclitic reflexive (#36 slice A, 2026-07-27)
+#
+# Block 3's gate used to be VerbForm=Inf only, so "Está lavándose…" fell through
+# BOTH paths: block 1 finds no separate clitic child (it is fused into the
+# token), and block 3 skipped anything that was not an infinitive. The gate now
+# accepts Ger as well.
+#
+# Gerunds cannot reuse the infinitive's surface strip: 'lavándose' - 'se' =
+# 'lavándo', not an infinitive. The base comes from the lemma instead
+# ('lavar él' -> 'lavar'), under the guard in _es_gerund_base.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sentence,canonical", [
+    ("Está lavándose las manos.", "lavarse"),
+    ("Estoy duchándome.",         "ducharse"),
+    ("Está levantándose ahora.",  "levantarse"),
+])
+def test_gerund_enclitic_emits_reflexive(es_nlp, sentence, canonical):
+    assert canonical in _canonicals(es_nlp, sentence)
+
+
+def test_gerund_match_type_is_distinct_from_infinitive(es_nlp):
+    """match_type must name the form actually seen — a gerund is not an
+    infinitive, and conflating them would misreport provenance downstream."""
+    doc = es_nlp("Está lavándose las manos.")
+    types = {p["dictionary_entry"]: p["match_type"]
+             for p in pf.extract_phrases(doc, "es")}
+    assert types["lavarse"] == "es_reflexive_gerund"
+
+
+def test_gerund_garbage_lemma_is_rejected(es_nlp):
+    """The load-bearing guard. For 'preguntándome' the model returns the lemma
+    'preguntándomar', which ENDS IN -ar and so passes a naive infinitive check
+    while being nonsense. Accepting it would put 'preguntándomarse' into
+    phrase_table and teach a word that does not exist."""
+    out = _canonicals(es_nlp, "Sigo preguntándome eso.")
+    assert not any("preguntándom" in c for c in out)
+    assert "preguntarse" not in out          # we do NOT guess the real answer
+
+
+def test_gerund_base_guard_rejects_a_fake_lemma_directly(es_nlp):
+    """Unit-level proof of the guard, independent of what the model happens to
+    return today: a lemma that merely looks infinitive-like is refused."""
+    doc = es_nlp("Está lavándose las manos.")
+    tok = next(t for t in doc if t.text.lower() == "lavándose")
+
+    class _FakeToken:
+        """Same duck-type surface _es_gerund_base reads: .lemma_ and .text."""
+        def __init__(self, lemma, text):
+            self.lemma_, self.text = lemma, text
+
+    # Real lemma → accepted.
+    assert pf._es_gerund_base(tok, "se") == "lavar"
+    # Surface-derived garbage that ends in -ar → rejected (too long, bad prefix).
+    assert pf._es_gerund_base(_FakeToken("lavándosar", "lavándose"), "se") is None
+    # Right length but unrelated stem → rejected by the prefix check.
+    assert pf._es_gerund_base(_FakeToken("comer", "lavándose"), "se") is None
+    # Not infinitive-shaped at all → rejected by the ending check.
+    assert pf._es_gerund_base(_FakeToken("lavándo", "lavándose"), "se") is None
+
+
+def test_gerund_tagged_as_non_verb_extracts_nothing(es_nlp):
+    """'Vamos acordándonos de eso.' — es_core_news_sm tags 'acordándonos' as
+    NOUN, so the extractor never sees it. Pinned deliberately: if a model
+    upgrade starts tagging it VERB, this test fails and tells us the coverage
+    changed rather than letting it shift silently."""
+    assert _canonicals(es_nlp, "Vamos acordándonos de eso.") == []
+
+
+# ---------------------------------------------------------------------------
+# Imperatives — current state, pinned (slice B, NOT implemented)
+# ---------------------------------------------------------------------------
+
+def test_negative_imperative_already_works(es_nlp):
+    """Not a regression guard for new code — a correction to the record.
+    docs/TODO.md long claimed imperatives extract nothing. Negative imperatives
+    always worked: the clitic is a SEPARATE token, so block 1 catches them."""
+    assert "levantarse" in _canonicals(es_nlp, "No te levantes.")
+
+
+@pytest.mark.parametrize("sentence", [
+    "Lávate las manos.",      # VERB, VerbForm=Fin, clitic fused → no path
+    "Levántate ahora.",       # tagged PROPN at sentence start → invisible
+])
+def test_positive_fused_imperative_still_unsupported(es_nlp, sentence):
+    """Slice B is deliberately not implemented. Two different causes:
+    a fused enclitic on a FINITE verb (whose lemma is the garbage 'lávatir'),
+    and sentence-initial PROPN mistagging. Recovering the infinitive from
+    'lávate' needs real morphology — see docs/TODO.md #36."""
+    assert _canonicals(es_nlp, sentence) == []

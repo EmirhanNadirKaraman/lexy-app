@@ -3,6 +3,8 @@
 # as a script (`python phrase_finder.py`) — stdout IS the product for that
 # CLI demo, intentionally left as print rather than logging.
 
+import unicodedata
+
 import spacy
 from functools import lru_cache
 from pathlib import Path
@@ -505,6 +507,54 @@ def _es_prep_candidates(verb):
     return out
 
 
+def _es_deaccent(text):
+    """Strip combining accents: 'lavándo' -> 'lavando'. Used only to compare a
+    recovered infinitive against an accented surface form."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def _es_gerund_base(token, clitic):
+    """Recover the infinitive from a gerund carrying an enclitic, or None.
+
+    Why the lemma and not a surface strip: stripping the clitic from
+    'lavándose' leaves 'lavándo', which is not an infinitive — unlike the
+    infinitive path, where 'lavarme' - 'me' = 'lavar' directly. For gerunds
+    es_core_news_sm puts the infinitive in the lemma alongside a pronoun
+    ('lavándose' -> 'lavar él'), so the first whitespace-separated piece is the
+    form we want.
+
+    That lemma is unreliable, and unreliable in a dangerous way: for
+    'preguntándome' the model returns 'preguntándomar', which *ends in -ar* and
+    so passes a naive infinitive check while being nonsense. Emitting it would
+    put 'preguntándomarse' in phrase_table and teach a word that does not exist.
+    Three checks reject it (verified against the live model):
+
+      1. ends in -ar / -er / -ir                      'preguntándomar' passes (!)
+      2. shorter than the surface minus its clitic    fails: 14 >= 12
+      3. de-accented stem prefixes the surface        fails
+
+    A real gerund is always longer than its infinitive (it adds -ando/-iendo),
+    so check 2 alone separates the cases; check 3 guards against a coincidence
+    of length. Both are cheap, and a false accept is worse than a miss here.
+    """
+    lemma_first = (token.lemma_ or "").split()
+    if not lemma_first:
+        return None
+    base = lemma_first[0].lower()
+    if not base.endswith(("ar", "er", "ir")) or len(base) <= 2:
+        return None
+
+    stem = token.text.lower()[: -len(clitic)]
+    if len(base) >= len(stem):
+        return None
+    if not _es_deaccent(stem).startswith(_es_deaccent(base[:-2])):
+        return None
+    return base
+
+
 def extract_spanish_logic(doc, overrides=None):
     """Spanish phrase extractor (finite reflexives + reflexive+preposition combos
     + allowlisted verb+preposition + clitic-attached reflexive infinitives).
@@ -591,15 +641,30 @@ def extract_spanish_logic(doc, overrides=None):
         #    surface, not the lemma. (The override is applied to the recovered
         #    base; block 1's finite path applies it to the spaCy lemma instead —
         #    two override application points, one per recovery method.)
-        if "Inf" in token.morph.get("VerbForm"):
+        verb_form = token.morph.get("VerbForm")
+        if "Inf" in verb_form or "Ger" in verb_form:
             surface = token.text.lower()
             # Longest clitic first: 'nos' before 'os', else 'lavarnos' strips to
             # 'lavarn', fails the ends-in-'r' check, and the match is lost.
             for clitic in ("nos", "me", "te", "se", "os"):
                 if surface.endswith(clitic):
-                    base = surface[: -len(clitic)]
-                    if base.endswith("r"):  # a real Spanish infinitive base
+                    if "Inf" in verb_form:
+                        # 'lavarme' - 'me' = 'lavar': the strip yields the
+                        # infinitive directly.
+                        base = surface[: -len(clitic)]
+                        base = base if base.endswith("r") else None
+                    else:
+                        # Gerund: the strip yields 'lavándo', not an infinitive,
+                        # so recover from the lemma under guard. See
+                        # _es_gerund_base for why the guard is not optional.
+                        base = _es_gerund_base(token, clitic)
+                    if base:
                         base = overrides.get(base, base)
+                        # Label by the form actually seen, so match_type stays
+                        # honest about provenance (a gerund is not an infinitive).
+                        form_name = "infinitive" if "Inf" in verb_form else "gerund"
+                        bare_type = ("es_reflexive_infinitive" if "Inf" in verb_form
+                                     else "es_reflexive_gerund")
                         # 3a. Reflexive + preposition on the infinitive (slice 4)
                         #     — same priority/suppression rule as the finite path
                         #     (block 1a): the combo wins, the bare reflexive is
@@ -613,11 +678,11 @@ def extract_spanish_logic(doc, overrides=None):
                                 _emit(f"{base}se {prep_lemma}",
                                       [token.i, prep_i],
                                       "es_reflexive_prep",
-                                      f"{base} + -{clitic} + {prep_lemma} (clitic infinitive + prep)")
+                                      f"{base} + -{clitic} + {prep_lemma} (clitic {form_name} + prep)")
                                 break
                         if not combo:
-                            _emit(f"{base}se", [token.i], "es_reflexive_infinitive",
-                                  f"{base} + -{clitic} (clitic infinitive)")
+                            _emit(f"{base}se", [token.i], bare_type,
+                                  f"{base} + -{clitic} (clitic {form_name})")
                     break
 
     return result
