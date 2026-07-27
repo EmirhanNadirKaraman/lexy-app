@@ -74,7 +74,9 @@ wrapping the command.
 twice in one session:
 - `python -m pytest tests/` reported **745 passed** (the backend suite) instead
   of the root pipeline suite's **671** — because a previous call had `cd`'d into
-  `lexy-app/backend`, where a `tests/` directory also exists.
+  `lexy-app/backend`, where a `tests/` directory also exists. (Counts as-measured
+  that day; both suites have since moved — 847 and 221 as of 2026-07-27. The trap
+  is unchanged, and it recurred three times during the LLM-provider work.)
 - `python -m compileall subtitle-scraper scripts …` printed
   `Can't list 'subtitle-scraper'` for every path.
 

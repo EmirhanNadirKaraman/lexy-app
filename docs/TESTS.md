@@ -33,6 +33,11 @@ Observed impact with the plugin active and the block removed:
 | backend `pytest -n auto` | 211 passed, **1036 errors** | 745 passed, 2 skipped |
 | root `pytest tests/` | 1 passed, **1339 errors** | 671 passed |
 
+(Those counts are the suite sizes **as measured during that investigation** —
+745 backend / 671 root. Both have since moved; see the current baselines at the
+bottom of this file. They are kept as-recorded because the point of the table is
+the with/without ratio, not the absolute numbers.)
+
 Note this is an *environment* failure, not a test-quality signal — every error is
 a setup/teardown crash, and no assertion ever runs. If you genuinely want
 randomised ordering later, the fix is upstream-shaped (mask the seed before
@@ -1075,13 +1080,21 @@ Run all three. The lint step is not optional.
 | Step | Command | Expected |
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
-| Backend | `cd lexy-app/backend && pytest -n auto` | 760 passed, 2 skipped |
+| Backend | `cd lexy-app/backend && pytest -n auto` | 847 passed, 2 skipped |
 | Root pipeline | `pytest tests/` *(repo root)* | 221 passed |
 
-Backend was 745 until the ILP playlist optimizer landed (+15: 11 unit tests for
-`ilp_cover`, 4 endpoint tests for the `algorithm` parameter — accepts `"ilp"`,
-422s an unknown value, 503s when the solver is unavailable, and defaults to
-greedy without invoking the solver).
+How the backend baseline got to 847, newest last:
+
+| Count | What landed |
+|---|---|
+| 745 | after #39 slice 3C |
+| 760 | ILP playlist optimizer (+15: 11 unit tests for `ilp_cover`, 4 endpoint tests for the `algorithm` parameter — accepts `"ilp"`, 422s an unknown value, 503s when the solver is unavailable, and defaults to greedy without invoking it) |
+| 786 | vocabulary lists (+26, migration 035) |
+| 817 | LLM provider seam (+31) |
+| **847** | OpenAI-compatible provider (+30) |
+
+Frontend baseline: **274 passed across 44 files** (`npx vitest run` in
+`lexy-app/frontend`).
 
 The root suite is **221 = 97 + 124**: `tests/runtime/` (97) covers the root
 pipeline modules, `tests/*.py` (124) covers `subtitle-scraper/`. It was 744

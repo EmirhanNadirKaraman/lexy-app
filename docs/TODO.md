@@ -522,6 +522,28 @@ Two defects:
 **Risk:** low — additive query change in one function; `/suggest` is already auth-gated (#7) and has no dedicated test, so add one (word suggestions returned for `es`, language filter respected, German still gets phrase suggestions).
 **Relation:** independent of #35/#37; pure search-UX fix. Pairs naturally with confirming search/suggest parity across languages.
 
+### 40. ✅ ILP playlist optimizer — RESOLVED 2026-07-27
+**What shipped:** the `ilp/` folder held a PuLP-based minimum-set-cover CLI that was never wired to the app. Its *technique* now also lives in `playlist_service.ilp_cover` as an opt-in `algorithm="ilp"` mode on `POST /api/v1/playlists/generate`, alongside the existing greedy cover. Re-implemented for the request path rather than imported — the CLI reads word-list files and carries its own DB config.
+**Frontend:** `PlaylistPanel` gained a **Planning** control — *Fast* (greedy, default) vs *Optimal (slower)* (ILP).
+**Error shape:** PuLP missing or a non-optimal solve raises `RuntimeError` → 503, surfaced by a typed `PlaylistSolverUnavailableError` in `api/playlists.ts` so the panel can say "switch to Fast" instead of leaking the operator-facing `pip install pulp` string. 503 is handled in the API module, not `_http.ts`, because it has no shared meaning across the API — this is the only endpoint whose backend is optional while the request itself is valid.
+**Tests:** +15 backend (11 unit on `ilp_cover`, 4 endpoint), +13 frontend. **Commits:** `7735f8b`, `7e6f376`.
+**Still open (unchanged):** the standalone `ilp/` CLI remains unwired. That is deliberate, not debt — see §Directory map in `CLAUDE.md`.
+
+### 41. ✅ Vocabulary lists — upload / resolve / export — RESOLVED 2026-07-27
+**What shipped:** `POST|GET /api/v1/word-lists`, `GET|DELETE /word-lists/{id}`, `GET /word-lists/{id}/export` (text/plain), `POST /word-lists/{id}/mark-unknown-learning`, plus a `/lists` page. Closes the gap between a pasted vocabulary list and the ILP playlist optimiser: every resolved entry carries a `word_table.word_id`, which is exactly the `item_ids` shape `playlist_service.generate_playlist` consumes.
+**Schema:** the `word_lists` / `word_list_items` tables have existed unused since migration 001 and could not represent the feature — no `language`, no text column, and `item_id NOT NULL`. Migration **035** adds `word_lists.language`, `word_list_items.surface NOT NULL`, makes `item_id` nullable, and replaces `UNIQUE (list_id, item_id, item_type)` with a unique index on `(list_id, lower(surface))`. The old constraint had to go rather than be supplemented: NULLs are distinct in Postgres so it could not dedupe unbound rows, and case-insensitive resolution makes two spellings collide on one `word_id`.
+**Five states, not four.** A surface with several catalog matches is stored unbound and reported `ambiguous` rather than resolved to a first match — bulk upload has no interactive picker, and a wrong binding attaches mastery progress to the wrong sense invisibly (the W3 / Hole 2 concern). `mark-unknown-learning` skips ambiguous and unresolved entries and routes everything else through `progression_service`.
+**Tests:** +26 backend, +13 frontend. **Commit:** `9977a4e`.
+**Known scope limit:** entries are `item_type='word'` and resolve against `word_table` only, so a multi-word surface reports `unresolved` even when `phrase_table` holds it. Wiring phrases needs no schema change.
+
+### 42. ✅ LLM provider seam + OpenAI-compatible provider — RESOLVED 2026-07-27
+**Problem:** `CLAUDE.md` §12 said "don't instantiate `AsyncAnthropic` ad-hoc" while three services each did exactly that (`llm_service`, `book_llm_service`, `reading_llm_service`), repeating the model literal alongside it.
+**What shipped (step 1, `ac5be57`):** `services/llm_provider.py` is now the only place a client is constructed. All 13 call sites go through `structured(system, messages, schema, max_tokens) -> dict`. The interface is one method wide because every call already had one shape: non-streaming, exactly one forced tool, tool input parsed as structured JSON — `tools` was only ever a JSON-schema enforcement mechanism. `title`/`description` ride as JSON Schema keywords so the same dict maps onto either provider. Byte-identity against the pre-seam tool definitions is test-pinned (14 checks): leaving those keys inside `input_schema` would be accepted by the API with no error while changing the prompt the model sees.
+**What shipped (step 2, `41f39c7`):** `OpenAICompatibleProvider` POSTs `{LLM_BASE_URL}/chat/completions` via `httpx` (already a declared dependency — no new one added). One adapter covers Ollama `/v1`, llama.cpp's llama-server, vLLM, LM Studio and TGI, so changing runtime is a `LLM_BASE_URL` change. **No host is assumed** — the intended target is a GPU desktop over Tailscale.
+**Selection:** `LLM_PROVIDER` (`anthropic` default | `openai_compatible`). Unset ⇒ unchanged behaviour. Misconfiguration raises at import, since `get_provider()` runs at module import — a backend that cannot reach its model server should fail at boot, not on the first learner's message.
+**Tests:** +61 in `test_llm_provider.py`. **Security:** new finding **S18** (LOW, opt-in) in `docs/SECURITY.md`.
+**Deliberately deferred — MockProvider.** `MOCK_LLM` fakes are computed from call arguments the provider never receives (`target_word in user_content`, `target_text` vs `user_answer`, the requested `language`). The provider sees those only as prose inside the prompt, so a MockProvider would have to regex them back out — coupling the mock to prompt wording and making it strictly worse. The 13 `if _MOCK:` branches stay at domain level.
+
 ### 20. ✅ Dark mode theme system — RESOLVED 2026-05-19
 **What landed**
 

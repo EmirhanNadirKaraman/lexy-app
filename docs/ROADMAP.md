@@ -45,13 +45,105 @@ through slice 3C (dry-run adjudication). Capacitor packages installed,
 `docs/CAPACITOR_READINESS.md`; iOS migration still DEFERRED per the
 user's call.
 
-Verified on 2026-07-27: backend **745 passed / 2 skipped**, root pipeline
-**671 passed**, frontend **238 passed across 40 files** (was 219/37 before
-the #39 UI landed), `ruff check .` clean.
+Since that paragraph was written, four more features shipped the same day:
+the **ILP playlist optimizer** (backend `greedy`/`ilp` + a Fast/Optimal
+selector), **vocabulary lists** (migration 035 — paste or upload a word
+list, unresolved and ambiguous surfaces preserved rather than dropped,
+mark-unknown-as-learning through `progression_service`, export
+round-trips), the **LLM provider seam** (the three ad-hoc
+`AsyncAnthropic` constructions centralised into `services/llm_provider.py`),
+and an **OpenAI-compatible provider** so the backend can target a
+self-hosted model server. Anthropic remains the default throughout.
+
+Verified on 2026-07-27 (current): backend **847 passed / 2 skipped**, root
+pipeline **221 passed**, frontend **274 passed across 44 files**,
+`ruff check .` clean.
+
+> Historical baselines quoted elsewhere in this file (745 backend, 671
+> root, 238 frontend) are as-measured at the time of the entry that quotes
+> them. The root suite moved 744 → 221 when `src/app/` and the 537 tests
+> targeting it were deleted; it is not a regression.
 
 ---
 
-## Current priorities (2026-07-27)
+## Remaining work — re-ranked 2026-07-27 (evening)
+
+**This section supersedes §Current priorities below**, which is kept for its
+per-item detail and its P-numbers (other docs and the "Direct answers"
+section reference `P2`–`P5` by number, so they are not renumbered). Where an
+old P-item is still live it is cross-referenced here; where it shipped or was
+deferred, its status is updated in place.
+
+Items are labelled **N1–N6** — a fresh namespace, deliberately not reusing
+P-numbers.
+
+### How to read the categories
+
+| Category | Meaning |
+|---|---|
+| **code** | Work in this repo. Normal ruff + pytest loop. |
+| **infra/machine** | Happens on a physical machine (desktop, laptop, network). Not a repo change, and mostly not testable from here. |
+| **admin/account** | Needs money, identity, or a third-party account. No engineering. |
+| **research/deferred** | Investigated, parked with a stated reason. Not actionable until the reason changes. |
+| **optional/fun** | Explicitly not core. Never blocks anything. |
+
+---
+
+### N1 — Desktop model server + Tailscale reachability — **infra/machine**
+- **Where it happens:** the RTX 4070 desktop and the local network. **Not a repo task** — no code change is expected, and nothing here is verifiable by the backend test suite.
+- **The repo side is already done.** `LLM_PROVIDER=openai_compatible` + `LLM_BASE_URL` + `LLM_MODEL` is all the backend needs; see `.env.example` and `CLAUDE.md` §11. `LLM_BASE_URL` accepts any host and is regression-tested against a Tailscale machine name, a `100.x` address and a non-default port.
+- **Done when:** a model server is running on the desktop, reachable from the backend host over Tailscale, and one minimal structured request round-trips. The cheapest smoke test is a single `structured()` call against a small schema — if it returns a dict, the seam works end to end.
+- **Constraint:** keep the server on Tailscale or another authenticated tunnel. Ollama and llama.cpp ship without meaningful auth; anyone who can reach the port can use the model and read what is sent to it. Recorded as **S18** in `docs/SECURITY.md`.
+
+### N2 — Local-model quality evaluation — **code + measurement**
+- **Depends on N1.** Nothing to measure until a server answers.
+- **The point:** decide *which call sites* may move off Anthropic, not whether the provider works. The seam makes swapping trivial, which is exactly why this needs a gate.
+- **Do not move the grading paths without numbers.** `guided_evaluate` and `evaluate_production` write real SRS state through `progression_service`. A weaker model there corrupts scheduling silently — the user sees wrong intervals weeks later, not a bad answer today. Translations, glosses and OCR repair are the safe places to start: wrong output is visible immediately and cached rather than persisted as progression state.
+- **Also worth measuring:** JSON-schema conformance rate. Anthropic's forced tool use is a hard guarantee; local constrained decoding is good but not equivalent. The provider retries once and then raises — a high retry rate is a quality signal, not just latency.
+- **Cache note:** switching models re-namespaces every `llm_cache` key (the model is part of the hash). Correct, but expect a cold start and plan for the permanently-cached translations/glosses being rebuilt.
+
+### N3 — Deployment / domain path — **infra/machine + admin/account**
+- **Two halves.** *Admin:* buy a domain, pick a host. *Infra:* decide how the backend reaches the model server from wherever it is deployed.
+- **The unobvious constraint:** if the backend is deployed off-desktop, it still needs a private path to the model server. Do not open the model server to the internet to solve this — put the deployment host on the same tailnet, or keep the LLM on the deploy host.
+- **Already decided, don't relitigate:** single-worker MVP (see P2 below and `docs/SECURITY_ARCHITECTURE_DECISIONS.md` §3). Horizontal scale is gated on a Redis-backed rate limiter, because the in-process limiter also backs the login brute-force guard.
+
+### N4 — Capacitor / native installability — **two independent blockers**
+- **N4a — full Xcode — machine.** `xcode-select` points at CommandLineTools; `cap sync` and signing need the full install. Costs disk space and time, nothing else.
+- **N4b — real privacy contact email — admin/account.** `PrivacyPage.tsx` and `docs/PRIVACY.md` still ship the literal `<YOUR_REAL_PRIVACY_EMAIL_BEFORE_LAUNCH>` placeholder. Needs an address that will still exist in a year, not a decision.
+- These unblock **independently** — doing one does not advance the other. Everything else on the checklist in `docs/CAPACITOR_READINESS.md` is done: packages installed, `ios/` scaffolded, `VITE_API_BASE_URL` helper in place, responsive + theme + PWA shipped.
+
+### N5 — Hole 19: per-message language detection in free chat — **code**
+- Unchanged from **P4** below; still the accurate write-up. Low/medium priority: the worst case (losing target-word credit entirely) is already mitigated, so this is a precision improvement.
+- **Raise it only if** multilingual chat becomes a product priority. It is not currently one.
+
+### N6 — Idle mini-game — **optional/fun**
+- Explicitly not core, blocks nothing, and has no design yet. Listed so it is not lost, not because it is queued.
+
+---
+
+### Still open, unranked here (see §Current priorities for detail)
+
+| Item | Status |
+|---|---|
+| **P5** security residuals (8, none HIGH) + new **S18** | small, deploy-adjacent; `docs/SECURITY.md` is the tracker |
+| **#39** live-LLM adjudicator | product/cost decision, not engineering |
+| **#37** multi-track subtitle capture | blocked on a product decision |
+| **T2.2** LISTEN/NOTIFY | cost-only; not a multi-worker blocker |
+
+### Deferred — do not start as code work
+
+- **#36 Spanish positive fused imperatives** (*"lávate"*, *"levántate"*). Slice A (gerund reflexives) shipped 2026-07-27; positive fused imperatives are **parked with a measured reason, not merely unscheduled**:
+  1. **The model swap was measured and rejected.** `es_core_news_md` / `_lg` were compared against `_sm` and do not fix the tagging — this is an upstream tagging issue, not a model-size one.
+  2. **The local corpus cannot validate the feature.** It is mostly UNED lecture register, where the target imperatives are essentially absent — so even a correct extractor would have nothing to extract, and no way to show it works.
+  Reopening needs one of: an upstream spaCy fix, a normalisation pass that does not depend on the tagger, or a corpus in a register that actually uses imperatives. See `docs/TODO.md` #36.
+
+---
+
+## Current priorities (2026-07-27, morning) — SUPERSEDED
+
+> Kept for detail and stable P-numbers. See §Remaining work above for the
+> live ordering. Statuses below are current.
+
 
 Ranked. Everything above the line in §Web-polish path is history; this is
 the live list.
@@ -139,14 +231,20 @@ are still open and both are **product decisions, not blocked engineering**
   before the first `--workers N` or second pod. #24 and T2.2 can then ride
   along on the same Redis, but neither justifies standing it up alone.
 
-### P3 — #36 Spanish phrase extractor, remaining patterns
+### P3 — #36 Spanish phrase extractor, remaining patterns — ⏸ PARTLY SHIPPED, REST DEFERRED 2026-07-27
 - **Effort:** M. **Category:** product (second-language parity).
-- **Deferral expired.** Slices 1–4 shipped (reflexives, verb+prep,
-  clitic-attached infinitives, reflexive+prep combos on both finite and
-  infinitive forms). Still open: **imperatives** ("lávate",
-  "levántate") extract nothing because `es_core_news_sm` tags them as
-  non-verbs (regression-guarded today); the allowlist is hardcoded rather
-  than data/config; idioms, MWEs, and subjunctive are untouched.
+- **Slice A shipped 2026-07-27** — gerund reflexives (`24c49f9`).
+- **Positive fused imperatives are now DEFERRED with a measured reason**,
+  not merely unscheduled. Two findings, both recorded in `docs/TODO.md` #36:
+  (1) the `es_core_news_md` / `_lg` swap was measured and **rejected** — the
+  mis-tagging is upstream, not a model-size problem; (2) the local corpus is
+  mostly **UNED lecture register**, where the target imperatives are
+  essentially absent, so a correct extractor would have nothing to extract
+  and no way to demonstrate itself. Reopen on an upstream spaCy fix, a
+  tagger-independent normalisation pass, or a corpus in a register that uses
+  imperatives.
+- Still open and *not* blocked: the verb+preposition allowlist is hardcoded
+  rather than data/config; idioms, MWEs and subjunctive are untouched.
 - **Why it matters now:** Spanish learners get materially thinner phrase
   coverage than German ones. That was acceptable while Spanish was a
   smoke test; it isn't once Spanish is a shipped language.
@@ -752,13 +850,16 @@ priorities). The signal→authority chain is now reachable end to end:
 learners can flag, admins can accept/reject, accepting writes the
 override.
 
-Next up is **P3 — the remaining Spanish extractor patterns (#36)**.
-Spanish is a shipped language whose phrase coverage is materially thinner
-than German's — imperatives extract nothing, and the verb+preposition
-allowlist is hardcoded rather than data. P2 is decided, P4 is a precision
-improvement on an already-mitigated path, and P5 is small residuals, so
-P3 is the largest remaining gap between what a German learner gets and
-what a Spanish learner gets.
+~~Next up is **P3** — the remaining Spanish extractor patterns.~~
+**Superseded 2026-07-27 (evening).** Slice A shipped; positive fused
+imperatives are deferred on measured grounds (model swap rejected, local
+corpus in the wrong register — see P3 above).
+
+The next step is **N1 — stand up the model server on the desktop and reach
+it over Tailscale.** Note the shape change: that is an
+**infrastructure/machine task, not a repo change**. There is no code to
+write, no test to add, and the backend side already ships. See §Remaining
+work for the full N1–N6 ordering.
 
 **3. Avoid right now.**
 - #5 reconciliation (Hole 23) — no user signal yet.
@@ -788,60 +889,72 @@ See T2.1 above.
 
 ## Recommended next prompt (paste back to continue)
 
-> Replaced 2026-07-27. The previous contents asked for the **#39 frontend
-> (flag button + admin queue)**, which shipped that day — see P1 in
-> §Current priorities. Before that it asked for **T1.1**, which had also
-> already shipped. If you are reading this section, check the item is
-> still open before pasting it.
+> Replaced **2026-07-27 (evening)**. The previous contents asked for the
+> remaining **Spanish extractor patterns (#36 / P3)** — that work is now
+> partly shipped (slice A) and partly **deferred on measured grounds**, so
+> pasting it would start work that was deliberately parked. Before that it
+> asked for the #39 frontend, and before that T1.1 — both already shipped
+> when they were read. **Check the item is still open before pasting.**
+
+**The next step (N1) is not a repo task.** It happens on the RTX 4070
+desktop: install a model server, expose it over Tailscale, confirm the
+backend can reach it. There is no code to write — `LLM_PROVIDER`,
+`LLM_BASE_URL` and `LLM_MODEL` already ship, and `LLM_BASE_URL` is
+regression-tested against Tailscale-style hosts. So there is no prompt to
+paste for N1; the checklist is:
+
+1. Run an OpenAI-compatible server on the desktop (Ollama's `/v1`,
+   llama.cpp's `llama-server`, vLLM, LM Studio — the adapter covers all of
+   them).
+2. Put both machines on the tailnet. **Do not port-forward or bind the
+   model server to a public interface** — it has no meaningful auth (S18).
+3. On the backend host, set:
+   ```
+   LLM_PROVIDER=openai_compatible
+   LLM_BASE_URL=http://<desktop-tailscale-name>:11434/v1
+   LLM_MODEL=<the model the server serves>
+   ```
+4. Smoke-test one structured call. A misconfigured pair fails at **import**
+   by design, so a backend that starts at all has already proved it can
+   construct the provider.
+
+Once a server answers, **N2** is the first real repo task, and it is
+measurement rather than construction:
 
 ```
-Implement P3: the remaining Spanish phrase-extractor patterns (#36).
+Evaluate local-model quality against the current Anthropic baseline, and
+recommend which LLM call sites (if any) can move off Anthropic.
 
 Context:
-Spanish is a shipped language (stages 0-4, 2026-05-21), but its phrase
-coverage is materially thinner than German's. Slices 1-4 shipped reflexives,
-verb+preposition, clitic-attached infinitives, and reflexive+prep combos on
-both finite and infinitive forms. Read docs/TODO.md #36 for exactly what each
-slice covers before adding anything.
+- services/llm_provider.py has two backends behind one interface. Anthropic
+  is the default; OpenAICompatibleProvider points at a self-hosted server.
+- Switching is an env-var change, which is exactly why this needs a gate.
+- Read docs/TODO.md #42 and CLAUDE.md section 11 before starting.
 
-Open, in rough value order:
-1. Imperatives ("lavate", "levantate") extract nothing -- es_core_news_sm tags
-   them as non-verbs. This is regression-guarded today, so the guard tests
-   encode the CURRENT (empty) behaviour and will need updating. Needs either a
-   model that tags imperatives or a normalization pass; establish which by
-   probing the model before writing extractor code.
-2. The verb+preposition allowlist is hardcoded in phrase_finder.py. Promote it
-   to data/config so adding a collocation is not a code change.
-3. Idioms, MWEs, subjunctive -- larger, scope separately.
+The gate that matters:
+guided_evaluate and evaluate_production write real SRS state through
+progression_service. A weaker model there corrupts scheduling silently -
+the user sees wrong review intervals weeks later, not a bad answer today.
+Translations, glosses and OCR repair are the safe places to start: wrong
+output is visible immediately and cached rather than persisted as
+progression state.
+
+Measure, per call site, on a fixed input set run through both providers:
+1. JSON-schema conformance rate. Anthropic forced tool use is a hard
+   guarantee; local constrained decoding is not equivalent. The provider
+   retries once then raises, so a high retry rate is a quality signal.
+2. Output quality against the Anthropic response as reference.
+3. Latency, including the retry path.
 
 Constraints:
-- German behaviour must not change. It is regression-guarded by
-  tests/test_phrase_dispatcher.py and backend tests/test_matcher.py; both must
-  stay green.
-- Output shape must stay identical to the German extractor
-  (dictionary_entry / sentence_phrase / logic / match_type / indices) so
-  pipeline.insert_phrases consumes it unchanged.
-- Lemma quality is NOT this task -- that is the #39 override layer. If spaCy
-  returns a wrong lemma, add a lemma_override row, do not special-case it in
-  the extractor.
-- Probe es_core_news_sm directly before assuming any tagging behaviour. Slices
-  3 and 4 both turned on what the model actually produces, not what the docs
-  suggest.
+- Do not change provider selection defaults. Anthropic stays default until
+  the numbers say otherwise.
+- Do not move guided_evaluate or evaluate_production in the same change as
+  the measurement.
+- Note that changing the model re-namespaces every llm_cache key (model is
+  part of the hash), so a switch means a cold cache, including the
+  permanently-cached translations and glosses.
 
-Tests:
-Add to tests/test_spanish_phrase_extractor.py. Cover a verb matrix per new
-pattern, a negative case per pattern, and a guard that the bare form is
-suppressed where a combo form is emitted.
-
-Run:
-ruff check .
-pytest tests/test_spanish_phrase_extractor.py tests/test_phrase_dispatcher.py -q
-cd lexy-app/backend && python -m pytest tests/test_matcher.py -q
-
-Report which model behaviours you probed and what they returned, since that is
-what determines whether a pattern is implementable at all.
+Report the per-call-site numbers and an explicit recommendation of which
+sites may move, which may not, and why.
 ```
-
-After P3, the open list is P4 (Hole 19 per-message language detection) and P5
-(security residuals). #39 stays open overall until the live-LLM adjudicator is
-either wired or formally dropped — that is a cost decision, not engineering.

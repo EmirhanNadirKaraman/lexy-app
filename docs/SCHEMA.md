@@ -48,7 +48,7 @@ errors as a signal table. It is never read by the extractor or matcher.
 | Table | Purpose |
 |---|---|
 | `user_word_knowledge` | Polymorphic per-user-per-item state: `(user_id, item_id, item_type) → (status, passive_level, active_level, times_seen, times_used_correctly, notes, last_seen)`. `item_type ∈ {word, phrase, grammar_rule}`. Single source of truth — only `progression_service` writes. |
-| `word_lists` (+ `word_list_entries`) | Saved word lists (early feature). |
+| `word_lists` (+ `word_list_items`) | User vocabulary lists — paste or upload a word list, see per-word known/learning/unknown/**unresolved**/**ambiguous**, mark unknown as learning, export. Every entry stores its original `surface`; `item_id` is NULL when the surface didn't bind to exactly one `word_table` row. Shipped 2026-07-27 (migration 035). **The entry table is `word_list_items`** — this doc previously called it `word_list_entries`, which has never existed. |
 
 ### SRS
 | Table | Purpose |
@@ -109,8 +109,8 @@ users (user_id PK)
   │     └── reading_selections (user_id FK, doc_id FK)
   ├── notification           (user_id FK)
   ├── user_channel_preference (user_id FK, youtube_channel_id, preference_kind)
-  ├── word_lists             (user_id FK)
-  │     └── word_list_entries (list_id FK)
+  ├── word_lists             (user_id FK, language)
+  │     └── word_list_items   (list_id FK, surface, nullable item_id)
   ├── content_request        (user_id FK, ON DELETE SET NULL — anonymised, not deleted)
   └── client_error_log       (user_id FK, ON DELETE SET NULL — anonymised, not deleted)
 
@@ -145,7 +145,7 @@ Implemented by `DELETE /api/v1/account` (router: `routers/account.py`).
 - A single statement: `DELETE FROM users WHERE user_id = $1::uuid`.
 - FK declarations carry the fan-out:
   - **CASCADE** (removed atomically): `user_word_knowledge`, `srs_cards`,
-    `chat_sessions` (+ `chat_messages`), `word_lists` (+ `word_list_entries`),
+    `chat_sessions` (+ `chat_messages`), `word_lists` (+ `word_list_items`),
     `word_usage_events`, `book_documents` (+ `book_pages` + `book_blocks`),
     `reading_selections`, `notification`, `user_channel_preference`.
   - **SET NULL** (kept, anonymised): `content_request`, `client_error_log`, `lemma_correction_candidate` (`user_id` + `reviewed_by` — the community correction signal survives the reporter's deletion).
@@ -173,6 +173,7 @@ remaining App-Store compliance checklist.
 | 031 | `chat_sessions.language` (nullable) — free/guided chat carries its target language instead of assuming German. Nullable so pre-existing rows keep working; readers fall back to `"de"` (closes Hole 20). |
 | 032 | `word_table.frequency` INT + functional prefix index on `(language, lower(word))` — backs the frequency-ranked autocomplete (#38). Backfilled from `word_to_sentence` counts; the scraper refreshes it via `recompute_word_frequencies()`. |
 | 033 | `lemma_override` table — curated corrections consulted before trusting spaCy's lemma (#39 slice 1). v1 keys on `(language, observed_lemma)`; `surface_form`/`pos` reserved for context-sensitive rows. |
+| 035 | `word_lists.language`, `word_list_items.surface` NOT NULL, `item_id` made nullable, and `UNIQUE (list_id, item_id, item_type)` replaced by a unique index on `(list_id, lower(surface))`. Makes the dormant 001 tables usable: a NULL `item_id` is how an unresolved or ambiguous surface is stored instead of being dropped. The old constraint could not dedupe those (NULLs are distinct in Postgres) and would reject two case-variants resolving to the same `word_id`. |
 | 034 | `lemma_correction_candidate` table — the community-signal inbox (#39 slice 3A). A signal table only: never read by the extractor or matcher, and never mutates `lemma_override` without a human accept. |
 
 There is no migration for the orphan SRS cleanup or the active-card backfill
