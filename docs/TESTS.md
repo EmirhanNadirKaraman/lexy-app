@@ -8,6 +8,37 @@ Test inventory and coverage status. **Update this file whenever you add, remove,
 
 Test runner: pytest + pytest-asyncio. Fixtures in `conftest.py` provide `db_pool` (real Postgres) and `client` (httpx.AsyncClient against the app).
 
+### ⚠️ `pytest-randomly` is blocked repo-side — do not remove the block
+
+Both ini files (`lexy-app/pytest.ini` for the backend suite, `pytest.ini` for the
+root pipeline suite) carry `addopts = -p no:randomly`. **This is load-bearing
+whenever `pytest-randomly` is present in the environment** — it does not have to
+be a declared dependency to break the suite, and it is not in any
+`requirements.txt` (it arrived transitively; observed as 4.1.0 on 2026-07-27).
+
+The conflict, briefly: pytest-randomly reseeds before and after every test with
+`seed = session_seed + offset`, where `offset` is a crc32 of the test nodeid
+spread across the full 32-bit range. It masks that value for **its own** numpy
+call (`np_random.seed(seed % 2**32)`) but forwards the **unmasked** sum to every
+`pytest_randomly.random_seeder` entry point. spaCy's thinc registers
+`thinc.api:fix_random_seed` there, and that function calls `numpy.random.seed()`
+directly with no mask. numpy rejects any seed ≥ 2**32, so the sum overflows and
+raises `ValueError: Seed must be between 0 and 2**32 - 1` at both setup and
+teardown of nearly every test.
+
+Observed impact with the plugin active and the block removed:
+
+| Suite | Without the block | With the block |
+|---|---|---|
+| backend `pytest -n auto` | 211 passed, **1036 errors** | 745 passed, 2 skipped |
+| root `pytest tests/` | 1 passed, **1339 errors** | 671 passed |
+
+Note this is an *environment* failure, not a test-quality signal — every error is
+a setup/teardown crash, and no assertion ever runs. If you genuinely want
+randomised ordering later, the fix is upstream-shaped (mask the seed before
+handing it to entry points, or drop thinc's seeder), not deleting the `addopts`
+line.
+
 ### Status legend
 - ✅ passing
 - ❌ failing (pre-existing, not introduced by current work)
@@ -148,7 +179,7 @@ Registration now returns a single generic failure for duplicate-email and bad/mi
 
 🆕 **2026-05-24 — Test isolation: own the test word (global-table race)**
 
-Root cause of the growing flake cluster (`test_srs_review.py` 1→2→4→6 failures across full-suite runs, plus intermittent `test_suggest` / `test_srs_backfill` / `test_account_deletion`): tests grabbed a **shared** `word_table` row via an unfiltered `SELECT ... LIMIT N` (no `ORDER BY`). Under `pytest -n auto`, another worker's `_reap_word_ids` (conftest teardown) could delete that exact row mid-test; `review_service.get_due_cards`' filter `WHERE wt.word_id IS NOT NULL` then silently dropped the card and the assert failed. Order-independent (no `pytest-randomly` installed), concurrency-triggered (passed serially / in isolation).
+Root cause of the growing flake cluster (`test_srs_review.py` 1→2→4→6 failures across full-suite runs, plus intermittent `test_suggest` / `test_srs_backfill` / `test_account_deletion`): tests grabbed a **shared** `word_table` row via an unfiltered `SELECT ... LIMIT N` (no `ORDER BY`). Under `pytest -n auto`, another worker's `_reap_word_ids` (conftest teardown) could delete that exact row mid-test; `review_service.get_due_cards`' filter `WHERE wt.word_id IS NOT NULL` then silently dropped the card and the assert failed. Order-independent (test order was not randomised — see the pytest-randomly note dated 2026-07-27 below), concurrency-triggered (passed serially / in isolation).
 
 Fix (tests only — **no production change**). Two shared, race-safe patterns now exist; both prevent selecting a row another worker can reap:
 | Pattern | Where it lives | When to use |
