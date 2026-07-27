@@ -290,9 +290,13 @@ Two things to know before "fixing" what it reports:
     modules import each other after a `sys.path.insert` — the deliberate
     replacement for the old `os.chdir` hack (§10 / TODO #3). Hoisting those
     imports to the top breaks the scraper. Each carries a comment saying so.
-  - **There is no `ruff.toml`**, so this runs ruff's *default* rule set, which
-    can shift between ruff versions. Pin a config if the ruleset ever needs to
-    be stable across machines/CI. Verified with ruff 0.14.1.
+  - **The rule set is pinned in `/ruff.toml`** (`select = ["E", "F"]`,
+    `ignore = ["E501"]`) and ruff itself is pinned to `0.14.1` in
+    `lexy-app/backend/requirements.txt`. Don't rely on ruff's built-in defaults
+    — they're narrower (E4/E7/E9 + F) and shift between releases. **E501
+    (line-too-long) is off deliberately**: enabling it reports 405 pre-existing
+    violations, i.e. a repo-wide reflow, not a lint fix. Import sorting (`I`) is
+    off for the same reason plus the E402 trap above.
 
 ### Backend tests
 ```bash

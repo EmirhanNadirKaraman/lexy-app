@@ -903,11 +903,25 @@ Frontend changes additionally want
 `cd lexy-app/frontend && npx tsc --noEmit && npx vitest run && npm run build`
 (219 tests across 37 files).
 
-**Ruff baseline (2026-07-27): zero findings**, down from 153. Verified with
-ruff 0.14.1. There is no `ruff.toml`, so this uses ruff's default rule set —
-which can shift between ruff versions. If the ruleset ever needs to be stable
-across machines or CI, pin it in a config; that is an open choice, not an
-oversight.
+**Ruff baseline (2026-07-27): zero findings**, down from 153.
+
+The check is reproducible: the rule set lives in `/ruff.toml`
+(`select = ["E", "F"]`, `ignore = ["E501"]`, `line-length = 100`,
+`target-version = "py311"`) and ruff is pinned to `0.14.1` in
+`lexy-app/backend/requirements.txt` — the one pinned dependency in that file,
+because ruff's default selections change between releases and an unpinned ruff
+reports differently machine-to-machine.
+
+The selected set is *broader* than ruff's built-in default (E4/E7/E9 + F): full
+`E` adds E1/E2/E3, all already clean. Two rule families are off on purpose:
+  - **E501 line-too-long** — enabling it reports 405 violations across existing
+    files. That's a repo-wide reflow, not a lint fix. `line-length = 100`
+    therefore doesn't affect `ruff check` today; it's there so a future
+    `ruff format` has an agreed width.
+  - **`I` import sorting** — would reorder imports repo-wide, and several
+    `subtitle-scraper/` modules depend on import *order* (sibling imports after
+    a `sys.path.insert`, TODO #3). Needs those sites checked by hand, not a
+    blanket `--fix`.
 
 What the 153 were, and the two traps in re-fixing them:
 

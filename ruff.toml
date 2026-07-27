@@ -1,0 +1,35 @@
+# Ruff configuration.
+#
+# Run from the REPO ROOT — `ruff check .` — not from lexy-app/backend. This
+# config covers the backend, the scraper, the root pipeline modules, scripts,
+# masking and ilp in one pass. See CLAUDE.md §11 "Lint".
+#
+# Deliberately boring: it pins the rule set that the 2026-07-27 cleanup
+# (153 findings -> 0) actually cleared, so the baseline is reproducible across
+# machines and future sessions. Ruff's *defaults* are E4/E7/E9 + F and can shift
+# between releases; naming the set here is the whole point of the file.
+
+line-length = 100
+target-version = "py311"
+
+[lint]
+# Broader than ruff's default: full E adds E1 (indentation), E2 (whitespace) and
+# E3 (blank lines) on top of the default E4/E7/E9. All three are already clean,
+# so this tightens the gate without asking for a single code change.
+select = ["E", "F"]
+
+# E501 (line-too-long) is OFF on purpose. Turning it on reports 405 violations
+# across the existing codebase — a mass-reflow pass that would bury real
+# findings and touch files nobody is working on. Revisit only as a deliberate,
+# separate formatting decision.
+#
+# `line-length = 100` above therefore has no effect on `ruff check` today; it is
+# kept so that any future `ruff format` run has an agreed width to target.
+ignore = ["E501"]
+
+# Import sorting ("I") is intentionally NOT enabled. It would reorder imports
+# across the whole repo, and several modules in subtitle-scraper/ rely on import
+# ORDER — they import sibling modules only after a sys.path.insert (the
+# deliberate replacement for the old os.chdir hack, TODO #3). Those lines carry
+# `# noqa: E402` and a "do not hoist" comment. Enabling "I" needs those call
+# sites checked by hand first, not a blanket --fix.

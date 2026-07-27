@@ -32,3 +32,8 @@ httpx
 pytest
 pytest-asyncio
 pytest-xdist
+# Pinned deliberately, unlike everything else in this file: ruff's rule set and
+# its default selections change between releases, so an unpinned ruff would make
+# `ruff check .` report differently machine-to-machine. Config lives in
+# /ruff.toml at the repo root.
+ruff==0.14.1
