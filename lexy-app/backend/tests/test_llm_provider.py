@@ -284,16 +284,29 @@ class _AsyncNone:
 # ---------------------------------------------------------------------------
 
 
+#: Last revision whose service modules still constructed `AsyncAnthropic`
+#: directly — i.e. the state these tests diff against. Pinned rather than
+#: discovered: the original sliding `HEAD~n` window silently aged out as
+#: unrelated commits landed, and 14 byte-identity checks degraded to skips
+#: without anyone noticing. A pin cannot drift.
+PRE_SEAM_REV = "9977a4e"
+
+#: Tried before the pin so the tests still work while the refactor is
+#: uncommitted or has just been amended/rebased (the SHA changes then).
+_PRE_SEAM_SEARCH = ("HEAD", "HEAD~1", "HEAD~2", PRE_SEAM_REV)
+
+
 def _pre_seam_module(path: str, modname: str):
     """Load a service module as it existed before the seam, from git.
 
-    Returns None when the pre-seam revision isn't reachable (shallow clone,
-    or the refactor already committed and squashed) — the test skips rather
-    than failing on repo shape.
+    Returns None when no candidate revision is reachable — a shallow clone
+    that lacks `PRE_SEAM_REV`, or a history rewrite that dropped it. The test
+    skips rather than failing on repo shape, but that path is now genuinely
+    exceptional rather than the normal outcome after a few commits.
     """
     import types
 
-    for rev in ("HEAD", "HEAD~1", "HEAD~2"):
+    for rev in _PRE_SEAM_SEARCH:
         try:
             src = subprocess.check_output(
                 ["git", "show", f"{rev}:{path}"],
@@ -338,7 +351,10 @@ _CONSTANT_PAIRS = [
 def test_rebuilt_tool_dicts_are_byte_identical_to_pre_seam(path, old_name, new_name, module):
     old = _pre_seam_module(path, f"pre_seam_{old_name}")
     if old is None or not hasattr(old, old_name):
-        pytest.skip("pre-seam revision not reachable from this checkout")
+        pytest.skip(
+            f"pre-seam revision not reachable (tried {', '.join(_PRE_SEAM_SEARCH)}) "
+            "— shallow clone or rewritten history"
+        )
 
     name, description, body = llm_provider.split_schema(getattr(module, new_name))
     rebuilt = {"name": name, "description": description, "input_schema": body}
@@ -353,7 +369,10 @@ def test_rebuilt_language_factory_tools_are_byte_identical(language):
     survive the rewrite too."""
     old = _pre_seam_module(f"{_BASE}/llm_service.py", "pre_seam_factories")
     if old is None or not hasattr(old, "_make_eval_tool"):
-        pytest.skip("pre-seam revision not reachable from this checkout")
+        pytest.skip(
+            f"pre-seam revision not reachable (tried {', '.join(_PRE_SEAM_SEARCH)}) "
+            "— shallow clone or rewritten history"
+        )
 
     for old_fn, new_fn in (
         (old._make_eval_tool, llm_service._make_eval_schema),
