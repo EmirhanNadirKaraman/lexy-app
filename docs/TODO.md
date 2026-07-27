@@ -397,7 +397,7 @@ Coverage of the batch: 8 cleaner + 4 merger + 4 guard + 2 noise + 1 knowledge + 
   - 🟡 **Part 3 (per-format audio-track inspection) — deferred, optional.** Current impl uses the single `info["language"]` hint, not per-stream dub detection. Sufficient for now; revisit only if mis-tagging recurs on bilingual-audio videos.
   - The `--requests-only` video path benefits automatically from parts 1 & 2 (it calls `get_transcript` with no language).
 
-### 36. 🟡 Spanish phrase extractor — slices 1–4 shipped 2026-05-24, slice A (gerunds) 2026-07-27; positive imperatives deferred
+### 36. 🟡 Spanish phrase extractor — slices 1–4 shipped 2026-05-24, slice A (gerunds) 2026-07-27; positive imperatives deferred, model swap measured and rejected
 **File:** `subtitle-scraper/phrase_finder.py` (`extract_spanish_logic`, registered under `'es'` in `_LANGUAGE_EXTRACTORS`)
 **Problem:** Spanish v1 was words-only — `extract_phrases(doc, 'es')` returned `[]`.
 **Status (first slice, #36):** ✅ `extract_spanish_logic(doc)` ships two pattern families:
@@ -423,7 +423,16 @@ Coverage of the batch: 8 cleaner + 4 merger + 4 guard + 2 noise + 1 knowledge + 
       2. **Positive fused imperatives** (`Lávate las manos.`) tag as VERB with `VerbForm=Fin` and the clitic fused, so no path applies. The lemma is garbage (`lávate` → `lávatir`) and the surface strip leaves `láva`, which is not an infinitive — recovering `lavar` needs real morphology (de-accent + conjugation), not a suffix rule.
       3. **Sentence-initial PROPN mistagging is positional, not categorical.** `Levántate ahora.` → PROPN, but `Por favor, levántate ahora.` → VERB. Capitalisation at sentence start is the trigger. Unfixable inside the extractor.
     Current state is pinned by tests so a model change surfaces visibly.
-  - **Measure `es_core_news_md` before choosing an imperative strategy.** Untested so far. If the larger model fixes both the PROPN tagging and the lemma, slice B collapses to a model swap and no verb table is needed. Do that measurement first — the alternatives (verb-form lookup table, or a de-accent + stem heuristic) both cost real work, and a wrong canonical is worse than none.
+  - ~~**Measure `es_core_news_md` before choosing an imperative strategy.**~~ **MEASURED 2026-07-27 — both larger models REJECTED. Stay on `es_core_news_sm`. A model swap does not solve slice B; do not re-run this.**
+    Compared `sm` / `md` / `lg` over 13 sentences (8 positive fused imperatives + the working reflexive, gerund and verb+prep cases):
+      - **0 of 8 positive fused imperatives extract on any model.** Not one.
+      - **Usable lemmas: 1 of 8, and only on `md`** (`Lávate` → `lavar tú`, `Reflex=Yes`). Everything else is garbage on every model — `levántatar`, `siéntatir`, `acuérdatir`.
+      - **PROPN mistagging moves rather than disappears.** `md`/`lg` fix `Levántate` / `Siéntate`, but *introduce* it on `Dúchate`, `Lavaos` and `duchándome`.
+      - **Regression scorecard against the 15 canonicals the suite already expects: `sm` 15/15, `md` 11/15, `lg` 11/15.** The larger models break `No te levantes.` (→ ADJ), `Estoy duchándome.` (→ PROPN, i.e. **slice A**), `Dependo de mis padres.`, `Nos acostamos tarde.` (md) and `Me acuerdo de eso.` (lg).
+    So `md`/`lg` add nothing on the target problem and cost five working behaviours. Measurement was local-only; no dependency file changed and the model choice is unchanged.
+  - **Slice B, if it happens at all, must be a deterministic exact-match strategy** — e.g. a small curated imperative→infinitive table (`lávate`→`lavarse`, `levántate`→`levantarse`, `siéntate`→`sentarse`, `acuérdate`→`acordarse`, …) keyed on the de-accented surface and emitting *only* on an exact hit. **Not** a stem heuristic: the high-frequency reflexive imperatives are exactly the stem-changing irregulars a heuristic gets wrong (`siéntate` → `sentarse`, `acuérdate` → `acordarse`).
+    **A wrong canonical is worse than a missing one.** A miss costs one phrase; a wrong one writes a non-existent word into `phrase_table`, which then reaches recommendations and SRS and gets taught. That asymmetry is why the gerund path in slice A guards its lemma rather than trusting it, and it should govern slice B too.
+    **Note the tagging blocker survives any table:** `Dúchate ahora.` is INTJ on `sm` and PROPN on `md`/`lg`, so the token never reaches the extractor at all. A table fixes lemma recovery, not tagging — expect partial coverage even after implementing it.
   - Promote the allowlist to data/config; idioms, MWEs, subjunctive.
   - **Lemma quality** is handled by the override layer — see #39 (the `ducha`→`duchaber` family; note the clitic-infinitive path lemmatizes `duchar` correctly without an override).
 **Blocks:** nothing — purely additive. German behaviour untouched (regression-guarded by `tests/test_phrase_dispatcher.py` + backend `test_matcher.py`).
