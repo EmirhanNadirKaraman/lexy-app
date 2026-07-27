@@ -17,7 +17,16 @@ interface ErrorBody {
     detail?: unknown;
 }
 
-function detailToMessage(detail: unknown, fallback: string): string {
+/**
+ * Turn a FastAPI/Pydantic `detail` payload into a user-facing message.
+ *
+ * Exported so `auth.ts` can reuse it. `auth.ts` deliberately does NOT use
+ * `assertOk` — a 401 from login/register means "wrong credentials", not
+ * "session expired", and routing it through `assertOk` would fire
+ * `signalAuthExpired` and sign the user out mid-login. It shares only this
+ * parser, not the 401 handling.
+ */
+export function detailToMessage(detail: unknown, fallback: string): string {
     if (!detail) return fallback;
     if (typeof detail === 'string') return detail || fallback;
     if (Array.isArray(detail) && detail.length > 0) {

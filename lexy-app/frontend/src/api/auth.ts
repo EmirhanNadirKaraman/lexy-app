@@ -1,19 +1,10 @@
+// Auth is the one API client that must NOT use `assertOk`. A 401 here means
+// "wrong email or password", not "your session expired" — routing it through
+// the shared handler would fire `signalAuthExpired`, clear storage and bounce
+// the user home while they are trying to log in. So this file keeps its own
+// `if (!res.ok) throw` blocks and shares only the message parser.
 import { apiUrl } from './_baseUrl';
-
-function extractDetail(detail: unknown, fallback: string): string {
-    if (!detail) return fallback;
-    if (typeof detail === 'string') return detail || fallback;
-    if (Array.isArray(detail) && detail.length > 0) {
-        return detail
-            .map((d: { msg?: string; loc?: unknown[] }) => {
-                const field = d.loc?.findLast(s => s !== 'body');
-                const msg = d.msg ?? 'Invalid value';
-                return field ? `${String(field).charAt(0).toUpperCase() + String(field).slice(1)}: ${msg}` : msg;
-            })
-            .join('. ');
-    }
-    return fallback;
-}
+import { detailToMessage } from './_http';
 
 export async function login(email: string, password: string): Promise<string> {
     const res = await fetch(apiUrl('/api/v1/auth/login'), {
@@ -23,7 +14,7 @@ export async function login(email: string, password: string): Promise<string> {
     });
     if (!res.ok) {
         const err = await res.json().catch(() => ({})) as { detail?: unknown };
-        throw new Error(extractDetail(err.detail, `Login failed (${res.status})`));
+        throw new Error(detailToMessage(err.detail, `Login failed (${res.status})`));
     }
     const data = await res.json() as { access_token: string };
     return data.access_token;
@@ -46,6 +37,6 @@ export async function register(
     });
     if (!res.ok) {
         const err = await res.json().catch(() => ({})) as { detail?: unknown };
-        throw new Error(extractDetail(err.detail, `Registration failed (${res.status})`));
+        throw new Error(detailToMessage(err.detail, `Registration failed (${res.status})`));
     }
 }

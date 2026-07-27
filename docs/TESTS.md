@@ -89,7 +89,8 @@ These were failing before #0b and are tracked here so they don't get blamed on f
 
 Test runner: Vitest + @testing-library/react + jsdom. Setup: `src/test/setup.ts`.
 
-**Current count (2026-07-27): 238 tests across 40 files.** Was 219 across 37
+**Current count (2026-07-27): 248 tests across 41 files.** Was 238/40 before the
+`auth.ts` error-parser dedup, and 219 across 37
 files before the #39 lemma-correction UI landed (+19 tests, +3 files).
 Historical baseline: ~179 across ~31 files at W13 (2026-05-20).
 The full per-file inventory is below in the dated "Tests added in this session"
@@ -952,7 +953,7 @@ calls so `pytest tests/` silently runs the *backend* suite from
 
 Frontend changes additionally want
 `cd lexy-app/frontend && npx tsc --noEmit && npx vitest run && npm run build`
-(238 tests across 40 files).
+(248 tests across 41 files).
 
 🆕 **2026-07-27 — `src/app/` retired; root suite 744 → 207**
 
