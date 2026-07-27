@@ -112,9 +112,69 @@ P-numbers.
 - **N4b — real privacy contact email — admin/account.** `PrivacyPage.tsx` and `docs/PRIVACY.md` still ship the literal `<YOUR_REAL_PRIVACY_EMAIL_BEFORE_LAUNCH>` placeholder. Needs an address that will still exist in a year, not a decision.
 - These unblock **independently** — doing one does not advance the other. Everything else on the checklist in `docs/CAPACITOR_READINESS.md` is done: packages installed, `ios/` scaffolded, `VITE_API_BASE_URL` helper in place, responsive + theme + PWA shipped.
 
-### N5 — Hole 19: per-message language detection in free chat — **code**
-- Unchanged from **P4** below; still the accurate write-up. Low/medium priority: the worst case (losing target-word credit entirely) is already mitigated, so this is a precision improvement.
-- **Raise it only if** multilingual chat becomes a product priority. It is not currently one.
+### N5 — Hole 19: per-message language detection — **measurement-first, deferred**
+*Investigated 2026-07-27 (no code written). Real, but far narrower than it
+had been described — and the direction of the risk argues against fixing it
+now.*
+
+- **Scope is free chat only.** Guided chat persists `language_detected` but
+  never gates on it; it uses `target_counted` from the richer evaluation.
+- **One decision site in the whole codebase:** `routers/chat.py:204`, choosing
+  between `free_chat_used_correctly` (passive+1, **active+1**, active SRS
+  card) and `free_chat_mixed_lang` (passive only). Everywhere else the label
+  is persisted to `chat_messages` or declared in `types/index.ts:78` and
+  **never rendered by any component**.
+- **Per-token evidence already exists.** `chat_service.match_learning_words`
+  matches against `word_table` with `wt.language = <session language>` and
+  `uwk.status != 'known'`. A match already proves that token is a
+  target-language item the learner is tracking. The whole-message label
+  *overrides* evidence the code has already computed.
+
+**Why not to fix it now — the failure directions are asymmetric.**
+
+| | Today (under-grant) | Naive fix (over-grant) |
+|---|---|---|
+| What happens | Learner produces the word once more in a cleaner sentence | A homograph in an English sentence grants active credit |
+| Recovery | Self-correcting, costs one turn | **None automatic** |
+
+`active_level` drives auto-promotion to `known`, and per `CLAUDE.md` §8b
+**auto-promotion is one-way — no event auto-demotes `known`.** So
+over-granting silently retires a word the learner cannot produce, and only
+manual demotion recovers it. The learner never sees the mistake. German
+homographs that read as ordinary English make this concrete: *war*, *die*,
+*bald*, *Gift*, *Hut*, *Rat*.
+
+**Concrete cases:**
+- `"Ich möchte ein bread kaufen und Brot essen."` — **may under-grant
+  today.** *Brot* sat in correct German, but the turn is labelled `mixed`,
+  so it earns passive credit only. This is the genuine miss.
+- `"I war there yesterday."` — **must never earn active German credit.**
+  Any fix that trusts a match alone fires here too.
+
+**Recommended next step is a query, not a feature.**
+`chat_messages.language_detected` is already persisted for every turn, so
+the evidence is sitting in the database and nobody has looked. Read-only:
+count `mixed` free-chat turns, and how many of those also had matched
+learning words. If that number is ~0, the hole is theoretical and should be
+closed rather than built. **No implementation before that measurement.**
+
+**Reopen when** either holds:
+1. Real chat logs show frequent mixed-language turns *with* target-language
+   context (the measurement above), or
+2. spaced forgetting / auto-demotion ships — that removes the one-way
+   promotion asymmetry and makes over-granting recoverable, which is what
+   currently makes the cheap fix unsafe.
+
+**If built anyway,** the shape is **per-match, not per-message**: keep the
+label as a gate and additionally require the matched token to sit in
+target-language context. Never widen on a match alone. Files:
+`services/chat_service.py` (return per-match context), `routers/chat.py`
+(per-match event choice), `services/matcher_service.py` (expose the spaCy
+Doc it already builds). No frontend change, no schema change, no new
+dependency. The existing `mixed → passive only` test in
+`tests/test_free_chat_progression.py` encodes today's behaviour and would
+need rewriting; a homograph regression test (`"I war there"` must not grant
+active credit) is the one that protects the asymmetry above.
 
 ### N6 — Idle mini-game — **optional/fun**
 - Explicitly not core, blocks nothing, and has no design yet. Listed so it is not lost, not because it is queued.
@@ -261,8 +321,14 @@ are still open and both are **product decisions, not blocked engineering**
   target word is scanned regardless of the turn's classification, so the
   worst case (losing credit entirely) is already handled. This is now a
   precision improvement, not a correctness hole — ranked accordingly.
-- **Fix shape:** when the LLM returns `mixed`, fall back to spaCy and
-  score matched tokens per-language.
+- ~~**Fix shape:** when the LLM returns `mixed`, fall back to spaCy and
+  score matched tokens per-language.~~ **Corrected 2026-07-27:** that
+  describes machinery the code already has —
+  `chat_service.match_learning_words` is already spaCy-backed and scoped to
+  `wt.language = <session language>`, so matched tokens *are* per-language
+  evidence. The gap is that the whole-message label overrides it, not that
+  the scoring is missing. Superseded by **N5** in §Remaining work, which
+  reclassifies this as measurement-first and deferred.
 
 ### P5 — Security residuals (8 open, none HIGH)
 - **Effort:** S each. **Category:** deploy-readiness.
@@ -485,6 +551,9 @@ old Tier 2 ordering for the moment.
   mitigated by the 2026-05-23 commit that credits target-language words
   inside English-classified messages. Re-ranked as **P4** in §Current
   priorities; it is no longer bundled with #19, which has shipped.
+  **Investigated 2026-07-27** and reclassified as measurement-first /
+  deferred — free chat only, one decision site, and the cheap fix risks
+  unrecoverable over-granting. See **N5** in §Remaining work.
 - **Stale rationale removed:** this item used to read "zero practical
   impact (only German exists)". Spanish shipped 2026-05-21.
 

@@ -190,6 +190,7 @@ The thing to internalise — every other service depends on it.
 - **Two directions per item**: `passive` (recognise) and `active` (produce). Each has its own SRS card and its own level (0 → mastered).
 - **Status enum** on `user_word_knowledge`: `unknown` → `learning` → `known`. Driven by passive/active level crossings.
 - **Auto-promotion** happens inside `progression_service` on every recorded event (transcript click, status change, SRS review correct/incorrect, guided chat target_counted, free chat language_detected use).
+  - The free-chat branch is the one to be careful with: `language_detected == session_language` is the *only* gate between passive-only and active credit (`routers/chat.py:204`), and active credit feeds one-way auto-promotion to `known`. Widening that gate over-grants unrecoverably — see Hole 19 / **N5** in `docs/ROADMAP.md` before touching it.
 - **SM-2** scheduling lives in `progression_service._update_srs(conn, ..., direction, action)`.
 - **Transactions:** `apply_progression` wraps the upsert + promotion + SRS update in a single `async with conn.transaction():` (line 178). Don't add a competing outer transaction.
 - **Events are deferred / fire-and-forget** for non-critical analytics (`usage_events_service.record_event` via `asyncio.create_task`).
