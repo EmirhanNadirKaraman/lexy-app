@@ -142,8 +142,12 @@ piece of shippable product work currently unblocked.
 - **Order matters — catalog first, lists last.** Only ~51% of
   `final_result.txt`'s headwords resolve against `word_table` today, so a list
   built first would read roughly half "unresolved":
-  1. Seed `word_table` — entry set from `final_result.txt`, POS/lemma joined
-     from `words_4000_old.txt`.
+  1. ✅ **Shipped 2026-07-27** — `scripts/backfill_word_catalog.py` (dry-run
+     by default, `--apply` to write, idempotent; ~2,351 rows to insert).
+     **POS enrichment dropped on purpose:** `pos` is part of `word_table`'s
+     unique key and every existing row has `pos=''`, so writing a real POS
+     forks rows rather than enriching them — turning resolvable words
+     `ambiguous`. Seeds `pos=''`; enrichment needs a schema decision.
   2. Pre-seed the permanent gloss cache from the translation column.
   3. ~~Add phrase support to `word_list_service` + per-type frontend rendering.~~ ✅ done 2026-07-27.
   4. System-list schema (`word_lists.user_id` is `NOT NULL`, so no shared-list

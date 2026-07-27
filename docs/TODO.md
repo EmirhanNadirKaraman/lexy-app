@@ -575,7 +575,7 @@ Two defects:
 
 **Recommended order.** Catalog first: only ~51% of `final_result.txt`'s headwords resolve against `word_table` today, so a list built first reads roughly half "unresolved".
 
-1. **Seed `word_table`** — entry set from `final_result.txt`, POS/lemma joined from `words_4000_old.txt`. Real POS beats the sparse `pos='X'` rows `learn_word_anyway` creates.
+1. ✅ **Seed `word_table`** — **shipped 2026-07-27** as `scripts/backfill_word_catalog.py` + `services/word_seed_service.py`. Entry set from `final_result.txt` column 0; ~2,351 rows to insert. **POS enrichment was deliberately dropped**: `pos` is part of `UNIQUE (word, language, pos)` and every existing row has `pos=''`, so writing a real POS forks rows instead of enriching them, turning resolvable words `ambiguous`. Seeds with `pos=''`; enrichment needs a schema decision. See `docs/MAINTENANCE.md`.
 2. **Pre-seed the permanent gloss cache** from `words_4000_old.txt`'s translation column — 4,095 glosses replacing a permanently-cached LLM call per item on the SRS due-card path.
 3. ~~**Add phrase support to `word_list_service`**~~ — ✅ **done 2026-07-27** (+11 backend / +4 frontend tests).
 4. **System-list schema + built-in lists.** `word_lists.user_id` is `NOT NULL` with `ON DELETE CASCADE`, so no shared-list concept exists; needs a migration and widened ownership filters. Then the built-in German word+phrase lists, and the B1 list from `b1_unparsed.txt` enriched by `b1_parsed.txt`.

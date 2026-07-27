@@ -122,6 +122,37 @@ full picture):
 - Vocabulary lists: `WordListsPage` + `tests/test_word_lists.py` (2026-07-27).
 - LLM provider seam + OpenAI-compatible backend: `tests/test_llm_provider.py` (2026-07-27, 61 tests).
 
+🆕 **2026-07-27 — German catalog backfill (+36 backend / +1 file)**
+
+`scripts/backfill_word_catalog.py` + `services/word_seed_service.py` seed
+missing German words from `data/final_result.txt` column 0, so vocabulary
+lists resolve its headwords instead of reporting ~half unresolved. Thin CLI
+over a testable service, matching the `cleanup_orphan_srs_cards.py` /
+`srs_cleanup_service.py` split. No migration.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_word_seed.py` (NEW) | 36 | article stripping incl. casing and the *derartig*/*dasselbe* false-positive guard; clean-candidate accept/reject; **skip reasons split** into multi-word vs multi-entry-cell; case-insensitive dedup with first-spelling-wins; file order preserved; **column 1 blueprints never become candidates**; dry-run writes nothing; apply inserts with `pos=''`/`tag=''`/`lemma==word`/`frequency=0`; idempotence; **existing word not re-inserted case-insensitively**; article nouns seeded bare while the article form stays out of `word_table`; unclean entries never inserted; language scoping; and an end-to-end regression that a seeded word flips a list entry from `unresolved` to `unknown` |
+
+**The load-bearing test is `test_existing_word_is_not_reinserted_case_insensitively`.**
+`word_table` has `UNIQUE (word, language, pos)` with `pos` *in the key*, and
+every existing German row carries `pos = ''`. An insert differing only in case
+or POS does **not** conflict — it creates a second row, and two rows for one
+surface is exactly what `word_list_service` reports as `ambiguous`. A careless
+backfill would have turned thousands of currently-resolvable words ambiguous
+while every existing test stayed green.
+
+**A fixture-naming trap worth remembering.** The first run had all 7 DB tests
+failing with `missing == 0`. Cause: fixtures used the repo's usual
+`_testword_…` prefix, but `is_clean_candidate` rejects a leading underscore by
+design — so no fixture ever became a candidate. Had the assertions been
+weaker (`>= 0` rather than `== 1`), the tests would have *passed* while
+testing nothing. Fixtures now use a letter-initial `Zzseed…` prefix.
+
+**Validation:** backend `-n auto` → **894 passed, 2 skipped** (858 + 36);
+`ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — word-list phrase support (+11 backend / +4 frontend)**
 
 Vocabulary lists now resolve against **both** `word_table` and `phrase_table`,
@@ -1109,7 +1140,7 @@ Run all three. The lint step is not optional.
 | Step | Command | Expected |
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
-| Backend | `cd lexy-app/backend && pytest -n auto` | 858 passed, 2 skipped |
+| Backend | `cd lexy-app/backend && pytest -n auto` | 894 passed, 2 skipped |
 | Root pipeline | `pytest tests/` *(repo root)* | 221 passed |
 
 How the backend baseline got to 847, newest last:
@@ -1121,7 +1152,8 @@ How the backend baseline got to 847, newest last:
 | 786 | vocabulary lists (+26, migration 035) |
 | 817 | LLM provider seam (+31) |
 | 847 | OpenAI-compatible provider (+30) |
-| **858** | word-list phrase support (+11), plus 14 provider byte-identity tests restored from skips — see below |
+| 858 | word-list phrase support (+11), plus 14 provider byte-identity tests restored from skips — see below |
+| **894** | German catalog backfill (+36) |
 
 Frontend baseline: **278 passed across 44 files** (`npx vitest run` in
 `lexy-app/frontend`).

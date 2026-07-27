@@ -6,6 +6,73 @@ here when a new maintenance script ships.
 
 ---
 
+## German catalog backfill from `final_result.txt` (N5a step 1)
+
+`word_table` is scraper-derived, so it holds whatever appeared in scraped
+YouTube subtitles rather than a curated vocabulary. Ordinary words —
+*Abbildung*, *Abenteuer*, *Abfall*, *Adresse* — are simply absent, and about
+half of `data/final_result.txt`'s headwords therefore report **unresolved** in
+a vocabulary list. This one-shot backfill inserts the missing ones.
+
+**Dry-run (the default — audits and prints, writes nothing):**
+
+```bash
+set -a && source .env && set +a && python scripts/backfill_word_catalog.py
+```
+
+**Apply:**
+
+```bash
+set -a && source .env && set +a && python scripts/backfill_word_catalog.py --apply
+```
+
+Idempotent — a second `--apply` run reports `inserted == 0`. `--source PATH`
+overrides the input file (used by tests).
+
+Current dry-run against `data/final_result.txt`:
+
+| | |
+|---|---|
+| source rows read | 5,156 |
+| clean candidates | 3,942 |
+| already in `word_table` | 1,591 |
+| **would insert** | **2,351** |
+| skipped, multi-word | 37 — *sich setzen*, *ein paar*; these belong to `phrase_table` |
+| skipped, multi-entry cell | 43 — *der, die, das*; a source-data defect |
+
+### What it deliberately does not do
+
+- **Reads column 0 only.** Column 1 holds phrase blueprints, which
+  `phrase_service.seed_from_blueprint_map` already seeds into `phrase_table`
+  at backend startup. That path is untouched.
+- **Insert-only; never updates an existing row.** `word_table` has
+  `UNIQUE (word, language, pos)` with `pos` *in the key*, and every existing
+  German row carries `pos = ''`. An insert differing only in POS therefore
+  does **not** conflict — it creates a second row, and two rows for one
+  surface is exactly what `word_list_service` reports as `ambiguous`.
+  Enriching POS on existing rows would silently make thousands of
+  currently-resolvable words ambiguous.
+- **Writes `pos=''`, `tag=''`, `lemma == word`** for the same reason.
+  POS/gloss/example enrichment from `words_4000_old.txt` needs a schema
+  decision and is out of scope.
+- **Leaves `frequency` at the default.** That column means "number of
+  sentences the word appears in" (migration 032) — app-corpus frequency. A
+  seeded word has appeared in zero scraped sentences; writing a rank from
+  another source would corrupt the column's meaning.
+- **Strips `der`/`die`/`das` for `word_table` only.** `das Haus` is seeded as
+  `Haus`; the article form stays in `phrase_table`, which is what keeps the
+  two independently trackable.
+
+### Known adjacent bug — not fixed by this script
+
+`word_service.learn_word_anyway` inserts with `pos='X'` and
+`ON CONFLICT (word, language, pos)`. That conflict only fires against another
+`pos='X'` row, so learning a word the scraper already knows (`pos=''`) **forks
+it into a second row**, making it `ambiguous` in vocabulary lists. Pre-existing
+and tracked separately; deliberately not mixed into this backfill.
+
+---
+
 ## Orphan SRS card cleanup (Hole 10)
 
 An `srs_cards` row becomes orphaned when no matching
