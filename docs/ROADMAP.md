@@ -197,6 +197,22 @@ active credit) is the one that protects the asymmetry above.
   2. **The local corpus cannot validate the feature.** It is mostly UNED lecture register, where the target imperatives are essentially absent — so even a correct extractor would have nothing to extract, and no way to show it works.
   Reopening needs one of: an upstream spaCy fix, a normalisation pass that does not depend on the tagger, or a corpus in a register that actually uses imperatives. See `docs/TODO.md` #36.
 
+- **Built-in "B1" and "top 4000" vocabulary lists** — blocked on a provenance
+  review, not on engineering. **The source files exist and are git-tracked**
+  (`data/b1_parsed.txt`, `data/b1_unparsed.txt`, `data/words_4000.txt`); what
+  they are *not* is wired into the backend or exposed as built-in/system word
+  lists. They are read only by one-off scripts and the unwired `ilp/` CLI.
+  The `b1_*` pair matches the shape of the Goethe-Institut B1 Wortliste, and
+  `words_4000.txt` has no recorded source, so **they are not safe to expose
+  under CEFR or "top 4000" labels until provenance and licence are verified.**
+  Two separate labelling hazards apply even if the licence clears:
+  `onboarding.py`'s A1/A2/B1 tiers are self-described as *informal*, not CEFR;
+  and `word_table.frequency` is app-corpus (scraped-subtitle) frequency, not
+  general German frequency — a German "top 4000" built from it is mostly
+  proper nouns and one-offs. **Safer first step:** built-in *Starter German*
+  lists from the project-authored `onboarding.py` tiers (150/310/471), named
+  for what they are. Full record and measurements in `docs/TODO.md` #43.
+
 ---
 
 ## Current priorities (2026-07-27, morning) — SUPERSEDED
