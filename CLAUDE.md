@@ -45,7 +45,7 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 - **React 19** + **React Router 7** + **Vite 8** + **TypeScript** (strict)
 - **No state library** — `useOutletContext` + custom hooks + `localStorage` for token
 - **No CSS framework** — inline `React.CSSProperties` everywhere, dark mode via boolean prop
-- **Vitest** + jsdom (274 tests across 44 files)
+- **Vitest** + jsdom (278 tests across 44 files)
 - Dev proxy: `/api → http://localhost:8000`
 
 ### Data pipelines
@@ -317,7 +317,7 @@ Two things to know before "fixing" what it reports:
 ```bash
 cd lexy-app/backend
 pytest                              # serial
-pytest -n auto                      # parallel via pytest-xdist — ~45s for 847 tests
+pytest -n auto                      # parallel via pytest-xdist — ~47s for 858 tests
 ```
 `pytest-randomly` is blocked via `addopts = -p no:randomly` in both ini files.
 That is deliberate and load-bearing — see `docs/TESTS.md` for the spaCy/thinc

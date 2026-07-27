@@ -559,17 +559,17 @@ Two defects:
 
 **This is a word *and phrase* feature.** 950 of the entries are phrases, already in `phrase_table`. Building "word lists" here would throw away the half of the data that is already wired.
 
-**Phrase support is NOT complete in the list feature today.** Schema and progression are ready; the service and frontend are not:
+**Phrase support: ✅ SHIPPED 2026-07-27.** Schema and progression were already ready; the service and frontend have now caught up. No migration was needed.
 
 | Layer | State |
 |---|---|
 | `word_list_items.item_type` | ✅ exists, polymorphic |
 | `progression_service.apply_progression` | ✅ already receives `entry["item_type"]` |
 | SRS review | ✅ `review_service.get_due_cards` joins per-type display table |
-| `word_list_service._resolve_surfaces` | ❌ `word_table` only |
-| `word_list_service.create_list` | ❌ hardcodes `"word"` on insert |
-| `word_list_service._load_entries` | ❌ late-status lookup pins `item_type = 'word'` |
-| Frontend `WordListsPage` | ❌ no per-type rendering |
+| `word_list_service._resolve_surfaces` | ✅ **shipped 2026-07-27** — resolves both catalogs |
+| `word_list_service.create_list` | ✅ **shipped** — persists the resolved `item_type` |
+| `word_list_service._load_entries` | ✅ **shipped** — per-type status lookup |
+| Frontend `WordListsPage` | ✅ **shipped** — word/phrase badge on resolved entries |
 
 **No migration needed for phrases** — service + frontend work. Export is unaffected (it emits stored surfaces). `mark-unknown-learning` needs the resolved `item_type` threaded through, which `apply_progression` already accepts.
 
@@ -577,7 +577,7 @@ Two defects:
 
 1. **Seed `word_table`** — entry set from `final_result.txt`, POS/lemma joined from `words_4000_old.txt`. Real POS beats the sparse `pos='X'` rows `learn_word_anyway` creates.
 2. **Pre-seed the permanent gloss cache** from `words_4000_old.txt`'s translation column — 4,095 glosses replacing a permanently-cached LLM call per item on the SRS due-card path.
-3. **Add phrase support to `word_list_service`** — the three word-only spots above, plus per-type frontend rendering.
+3. ~~**Add phrase support to `word_list_service`**~~ — ✅ **done 2026-07-27** (+11 backend / +4 frontend tests).
 4. **System-list schema + built-in lists.** `word_lists.user_id` is `NOT NULL` with `ON DELETE CASCADE`, so no shared-list concept exists; needs a migration and widened ownership filters. Then the built-in German word+phrase lists, and the B1 list from `b1_unparsed.txt` enriched by `b1_parsed.txt`.
 5. **Optionally later:** preload example generation from `words_4000_old.txt`'s example column.
 

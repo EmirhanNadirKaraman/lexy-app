@@ -1,24 +1,39 @@
 """User vocabulary lists — upload a word list, see what you already know, export it.
 
 Closes the gap between a pasted/uploaded vocabulary list and the rest of the
-app: every resolved entry carries a `word_table.word_id`, which is exactly the
+app: a resolved word entry carries a `word_table.word_id`, which is exactly the
 `item_ids` shape `playlist_service.generate_playlist` consumes.
 
 Storage lives in `word_lists` / `word_list_items` (migration 001, extended by
 035). Every entry stores its original `surface`; `item_id` is the binding to
-`word_table` and is NULL when the surface did not bind.
+`word_table` or `phrase_table` (per `item_type`) and is NULL when the surface
+did not bind.
 
 Entry states surfaced to the user (five, not four):
   known / learning / unknown  — bound to a catalog row, from user_word_knowledge
-  unresolved                  — no language-scoped match in word_table
+  unresolved                  — no language-scoped match in either table
   ambiguous                   — several matches; deliberately NOT auto-picked
 
-Scope: entries are `item_type = 'word'` and resolve against `word_table` only.
-Phrases are deliberately out of scope for this first version, so a multi-word
-surface (*sich freuen auf*) reports `unresolved` even though `phrase_table`
-may hold it. The frontend's `parseWordInput` does not split on spaces, so such
-surfaces do reach here intact — wiring them to `phrase_table` is the natural
-next step and needs no schema change (`item_type` already carries the column).
+Scope: entries resolve against **both** `word_table` and `phrase_table`, and
+carry the matching `item_type` (`word` | `phrase`). `phrase_table` is seeded
+from `data/final_result.txt` at startup (`main.py` →
+`matcher_service.get_blueprint_map` → `phrase_service.seed_from_blueprint_map`),
+so a pasted blueprint like *jdm. (Dat) etw. (Akk) sagen* binds to the same
+phrase row the chat matcher and SRS already use. Nothing about that seeding
+changes here.
+
+Precedence is decided by the surface's own shape, not by which table answers
+first:
+
+  multi-token surface  → phrase first, word as fallback
+  single-token surface → word first, phrase as fallback
+
+That keeps *das Haus* (a `collocation` row in `phrase_table`) and *Haus* (a
+`word_table` row) as two distinct, individually-trackable entries rather than
+silently collapsing them — article/noun normalisation is deliberately NOT
+attempted here. Within the preferred type, several matches still mean
+`ambiguous`; the fallback type is only consulted when the preferred one has
+none.
 
 `ambiguous` exists because `word_service.lookup_word_by_text` refuses to guess
 between several rows for one surface (*die Bank* = bench vs. bank — different
@@ -28,6 +43,8 @@ first-match, an ambiguous surface is stored with `item_id = NULL` and reported
 as such. A wrong binding would attach mastery progress to the wrong meaning
 invisibly; an ambiguous label is recoverable.
 """
+from typing import NamedTuple
+
 import asyncpg
 
 from . import progression_service
@@ -49,6 +66,36 @@ ALL_STATUSES = (
     STATUS_UNRESOLVED,
     STATUS_AMBIGUOUS,
 )
+
+ITEM_WORD = "word"
+ITEM_PHRASE = "phrase"
+
+
+class Resolution(NamedTuple):
+    """What a surface resolved to.
+
+    `status` is a *forced* status — `unresolved` or `ambiguous` — and is None
+    when the surface bound to exactly one row, in which case the real status
+    comes from `user_word_knowledge`. `item_type` is meaningful even when
+    `item_id` is None: it records which table we looked in first, so an
+    unbound row still says what it was trying to be.
+    """
+
+    item_id: int | None
+    item_type: str
+    status: str | None
+
+
+def preferred_type(surface: str) -> str:
+    """Which catalog a surface should be looked up in first.
+
+    Shape-based on purpose. A pasted blueprint (*jdm. (Dat) etw. (Akk) sagen*)
+    or an article+noun (*das Haus*) is multi-token and belongs to
+    `phrase_table`; a bare headword (*sagen*, *Haus*) belongs to `word_table`.
+    Deciding by shape rather than by which query happens to return a row keeps
+    *das Haus* and *Haus* independently trackable.
+    """
+    return ITEM_PHRASE if " " in surface.strip() else ITEM_WORD
 
 
 def normalize_surfaces(words: list[str]) -> list[str]:
@@ -78,52 +125,99 @@ async def _resolve_surfaces(
     conn: asyncpg.Connection | asyncpg.Pool,
     surfaces: list[str],
     language: str,
-) -> dict[str, list[int]]:
+) -> dict[str, Resolution]:
     """
-    Bulk-resolve surfaces against word_table, language-scoped and
-    case-insensitive. Returns lower(surface) → [word_id, ...] (ordered).
+    Bulk-resolve surfaces against both catalogs, language-scoped and
+    case-insensitive. Returns lower(surface) → Resolution.
 
-    One round-trip for the whole list rather than N lookups. The predicate is
-    `lower(w.word) = ANY($1)` — not `ILIKE` — so it uses
-    `ix_word_table_lang_lower_word (language, lower(word) text_pattern_ops)`
-    from migration 032. Comparing Python's `lower()` output against
-    Postgres's also fails safe: if the two ever disagree on some edge glyph
-    the word reports as `unresolved` instead of binding to the wrong row.
+    Two round-trips for the whole list (one per table) rather than N lookups.
+    Both predicates are `lower(col) = ANY($1)` — not `ILIKE` — so the word
+    query uses `ix_word_table_lang_lower_word` from migration 032. Comparing
+    Python's `lower()` output against Postgres's also fails safe: if the two
+    ever disagree on some edge glyph the surface reports as `unresolved`
+    instead of binding to the wrong row.
+
+    Phrases match on `canonical`, not `surface_form`. `canonical` is the
+    stable identity the rest of the app already keys on — `matcher_service`
+    looks phrases up by it, and it is what `phrase_table`'s unique constraint
+    covers. `surface_form` is a display convenience derived by stripping
+    `jdm./jdn./etw.` placeholders, so matching it too would let one pasted
+    line hit two rows and turn resolvable entries ambiguous for no gain.
     """
     if not surfaces:
         return {}
 
     keys = sorted({s.lower() for s in surfaces})
-    rows = await conn.fetch(
+
+    word_rows = await conn.fetch(
         """
-        SELECT w.word_id, lower(w.word) AS key
+        SELECT w.word_id AS item_id, lower(w.word) AS key
         FROM word_table w
         WHERE w.language = $2
           AND lower(w.word) = ANY($1::text[])
         ORDER BY lower(w.word), w.word_id
         """,
-        keys,
-        language,
+        keys, language,
+    )
+    phrase_rows = await conn.fetch(
+        """
+        SELECT p.phrase_id AS item_id, lower(p.canonical) AS key
+        FROM phrase_table p
+        WHERE p.language = $2
+          AND lower(p.canonical) = ANY($1::text[])
+        ORDER BY lower(p.canonical), p.phrase_id
+        """,
+        keys, language,
     )
 
-    resolved: dict[str, list[int]] = {}
-    for r in rows:
-        resolved.setdefault(r["key"], []).append(r["word_id"])
-    return resolved
+    by_type: dict[str, dict[str, list[int]]] = {ITEM_WORD: {}, ITEM_PHRASE: {}}
+    for r in word_rows:
+        by_type[ITEM_WORD].setdefault(r["key"], []).append(r["item_id"])
+    for r in phrase_rows:
+        by_type[ITEM_PHRASE].setdefault(r["key"], []).append(r["item_id"])
+
+    out: dict[str, Resolution] = {}
+    for surface in surfaces:
+        key = surface.lower()
+        first = preferred_type(surface)
+        second = ITEM_WORD if first == ITEM_PHRASE else ITEM_PHRASE
+        out[key] = _classify(
+            by_type[first].get(key, []), first,
+            by_type[second].get(key, []), second,
+        )
+    return out
 
 
-def _classify(word_ids: list[int]) -> tuple[int | None, str | None]:
+def _classify(
+    preferred_ids: list[int],
+    preferred_type_: str,
+    fallback_ids: list[int],
+    fallback_type: str,
+) -> Resolution:
     """
-    (item_id, forced_status) for a surface's match list.
+    Apply the precedence rule to one surface's candidates.
 
-    0 matches → (None, 'unresolved'); 2+ → (None, 'ambiguous'); exactly 1 →
-    (word_id, None), meaning "bound — read the real status from knowledge".
+    The preferred type is decided first and decisively: several matches there
+    mean `ambiguous`, and the fallback is NOT consulted — a surface that is
+    genuinely ambiguous as a word should not quietly become a phrase. The
+    fallback is only reached when the preferred type produced nothing at all.
+
+    Never first-match: two candidates of the same type always yield
+    `ambiguous` with `item_id = None`, because a bulk upload has no
+    interactive picker and a wrong binding would attach mastery progress to
+    the wrong sense invisibly (the W3 / Hole 2 concern).
     """
-    if not word_ids:
-        return None, STATUS_UNRESOLVED
-    if len(word_ids) > 1:
-        return None, STATUS_AMBIGUOUS
-    return word_ids[0], None
+    if len(preferred_ids) == 1:
+        return Resolution(preferred_ids[0], preferred_type_, None)
+    if len(preferred_ids) > 1:
+        return Resolution(None, preferred_type_, STATUS_AMBIGUOUS)
+
+    if len(fallback_ids) == 1:
+        return Resolution(fallback_ids[0], fallback_type, None)
+    if len(fallback_ids) > 1:
+        return Resolution(None, fallback_type, STATUS_AMBIGUOUS)
+
+    return Resolution(None, preferred_type_, STATUS_UNRESOLVED)
 
 
 async def create_list(
@@ -158,8 +252,11 @@ async def create_list(
             resolved = await _resolve_surfaces(conn, surfaces, language)
             rows = []
             for surface in surfaces:
-                item_id, _forced = _classify(resolved.get(surface.lower(), []))
-                rows.append((list_id, item_id, "word", surface))
+                # An unbound surface still records the type it was looked up
+                # as, so the row says what it was trying to be rather than
+                # defaulting everything to 'word'.
+                res = resolved[surface.lower()]
+                rows.append((list_id, res.item_id, res.item_type, surface))
 
             await conn.executemany(
                 """
@@ -219,32 +316,43 @@ async def _load_entries(pool: asyncpg.Pool, user_id: str, list_id: int, language
     late = await _resolve_surfaces(pool, unbound, language)
 
     # Freshly-resolved surfaces need their knowledge status too — one extra
-    # round-trip, only when some entry actually resolved late.
-    late_ids = [ids[0] for ids in late.values() if len(ids) == 1]
-    late_status: dict[int, str] = {}
-    if late_ids:
+    # round-trip, only when some entry actually resolved late. Keyed by
+    # (item_id, item_type): a word and a phrase can share an id, since the two
+    # catalogs have independent SERIAL sequences.
+    late_keys = [(r.item_id, r.item_type) for r in late.values() if r.item_id is not None]
+    late_status: dict[tuple[int, str], str] = {}
+    if late_keys:
         krows = await pool.fetch(
             """
-            SELECT item_id, status FROM user_word_knowledge
-            WHERE user_id = $2::uuid AND item_type = 'word' AND item_id = ANY($1::int[])
+            SELECT item_id, item_type, status FROM user_word_knowledge
+            WHERE user_id = $3::uuid
+              AND item_id   = ANY($1::int[])
+              AND item_type = ANY($2::text[])
             """,
-            late_ids, user_id,
+            [k[0] for k in late_keys], sorted({k[1] for k in late_keys}), user_id,
         )
-        late_status = {r["item_id"]: r["status"] for r in krows}
+        late_status = {(r["item_id"], r["item_type"]): r["status"] for r in krows}
 
     entries = []
     for r in rows:
         item_id = r["item_id"]
+        item_type = r["item_type"]
         if item_id is not None:
             status = r["knowledge_status"] or STATUS_UNKNOWN
         else:
-            item_id, forced = _classify(late.get(r["surface"].lower(), []))
-            status = forced or late_status.get(item_id) or STATUS_UNKNOWN
+            res = late.get(r["surface"].lower())
+            if res is None:
+                item_id, item_type, status = None, item_type, STATUS_UNRESOLVED
+            else:
+                item_id, item_type = res.item_id, res.item_type
+                status = res.status or late_status.get(
+                    (item_id, item_type)
+                ) or STATUS_UNKNOWN
         entries.append({
             "id": r["id"],
             "surface": r["surface"],
             "item_id": item_id,
-            "item_type": r["item_type"],
+            "item_type": item_type,
             "status": status,
         })
     return entries
@@ -343,10 +451,16 @@ async def mark_unknown_as_learning(
 
     # Persist bindings discovered by late re-resolution, so the stored row
     # matches the progression we are about to apply.
-    late_binds = [(e["item_id"], e["id"]) for e in targets]
+    # Persist `item_type` alongside `item_id`. A late resolution can land on
+    # the *fallback* catalog — a multi-token surface that only later gains a
+    # word_table row resolves as 'word' though it was stored as 'phrase' — so
+    # writing the id without the type would leave a row whose join points at
+    # the wrong catalog.
+    late_binds = [(e["item_id"], e["item_type"], e["id"]) for e in targets]
     if late_binds:
         await pool.executemany(
-            "UPDATE word_list_items SET item_id = $1 WHERE id = $2 AND item_id IS NULL",
+            "UPDATE word_list_items SET item_id = $1, item_type = $2 "
+            "WHERE id = $3 AND item_id IS NULL",
             late_binds,
         )
 

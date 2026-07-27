@@ -290,3 +290,82 @@ describe('WordListsPage', () => {
         expect(screen.getByTestId('word-list-load-error').textContent).toContain('boom');
     });
 });
+
+describe('WordListsPage — phrase entries', () => {
+    const PHRASE = 'jdm. (Dat) etw. (Akk) sagen';
+
+    // Own fixture rather than extending the shared one: the existing tests
+    // assert exact counts, and adding an entry there would change them.
+    const withPhrase = () => makeDetail({
+        total: 5,
+        counts: { known: 1, learning: 0, unknown: 2, unresolved: 1, ambiguous: 1 },
+        entries: [
+            ...makeDetail().entries,
+            { id: 5, surface: PHRASE, item_id: 7, item_type: 'phrase', status: 'unknown' },
+        ],
+    });
+
+    it('renders a type badge on resolved word and phrase entries', async () => {
+        installIndexThen(() => jsonResponse(withPhrase(), 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+
+        expect(screen.getByTestId('word-list-type-Haus').textContent).toBe('word');
+        expect(screen.getByTestId(`word-list-type-${PHRASE}`).textContent).toBe('phrase');
+    });
+
+    it('shows phrases alongside words in the same list', async () => {
+        installIndexThen(() => jsonResponse(withPhrase(), 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+
+        expect(screen.getByTestId('word-list-entry-Haus')).toBeTruthy();
+        expect(screen.getByTestId(`word-list-entry-${PHRASE}`)).toBeTruthy();
+    });
+
+    it('omits the type badge on unresolved and ambiguous entries', async () => {
+        // They have no catalog row, so there is no type to report.
+        installIndexThen(() => jsonResponse(withPhrase(), 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+
+        expect(screen.queryByTestId('word-list-type-Blorptzk')).toBeNull();
+        expect(screen.queryByTestId('word-list-type-Bank')).toBeNull();
+        // ...while the entries themselves still render.
+        expect(screen.getByTestId('word-list-entry-Blorptzk')).toBeTruthy();
+        expect(screen.getByTestId('word-list-entry-Bank')).toBeTruthy();
+    });
+
+    it('marks unknown as learning when the list contains phrases', async () => {
+        installIndexThen((url, init) => {
+            if (url.includes('mark-unknown-learning')) {
+                return jsonResponse({
+                    list_id: 1, marked: 2, marked_item_ids: [11, 7],
+                    skipped_unresolved: 1, skipped_ambiguous: 1,
+                });
+            }
+            if (init?.method === 'POST') return jsonResponse(withPhrase(), 201);
+            return jsonResponse(withPhrase());
+        });
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+        await waitFor(() => expect(screen.getByTestId('word-list-detail')).toBeTruthy());
+
+        fireEvent.click(screen.getByTestId('word-list-mark-learning'));
+
+        await waitFor(() => expect(screen.getByTestId('word-list-notice')).toBeTruthy());
+        expect(calls.some(c => c.url.includes('/mark-unknown-learning'))).toBe(true);
+        expect(screen.getByTestId('word-list-notice').textContent).toContain('Marked 2 words');
+    });
+});

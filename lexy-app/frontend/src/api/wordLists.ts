@@ -17,11 +17,18 @@ export type WordListEntryStatus =
     | 'unresolved'
     | 'ambiguous';
 
+/**
+ * Which catalog a resolved entry is bound to. Set even when `item_id` is null —
+ * it records which table the surface was looked up in, so an unresolved entry
+ * still says what it was trying to be.
+ */
+export type WordListItemType = 'word' | 'phrase';
+
 export interface WordListEntry {
     id: number;
     surface: string;
     item_id: number | null;
-    item_type: string;
+    item_type: WordListItemType;
     status: WordListEntryStatus;
 }
 

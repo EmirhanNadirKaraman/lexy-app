@@ -122,6 +122,35 @@ full picture):
 - Vocabulary lists: `WordListsPage` + `tests/test_word_lists.py` (2026-07-27).
 - LLM provider seam + OpenAI-compatible backend: `tests/test_llm_provider.py` (2026-07-27, 61 tests).
 
+🆕 **2026-07-27 — word-list phrase support (+11 backend / +4 frontend)**
+
+Vocabulary lists now resolve against **both** `word_table` and `phrase_table`,
+so a pasted blueprint (*jdm. (Dat) etw. (Akk) sagen*) binds to the same phrase
+row the chat matcher and SRS already use. No migration: `item_type` already
+existed and `apply_progression` was already polymorphic.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_word_lists.py` | +11 | phrase surface resolves from `phrase_table`; blueprint resolves as `item_type="phrase"` while its bare verb stays a word; **a single-token surface never binds to a multi-token phrase** even when a phrase canonical ends with that word; `das Haus` (phrase) and `Haus` (word) stay two entries; ambiguous phrase reported, not first-match resolved; unmatched multi-token surface is `unresolved` *as a phrase*; `create_list` persists the resolved `item_type`; mark-unknown-learning progresses phrases through `progression_service` and writes `item_type='phrase'`; unresolved/ambiguous phrases skipped; export keeps phrase surfaces in insertion order; counts include phrases |
+| `components/WordListsPage.test.tsx` | +4 | type badge renders `word` / `phrase` on resolved entries; badge omitted on unresolved/ambiguous (no catalog row to describe); phrases render alongside words; mark-as-learning works on a mixed list |
+
+**Precedence is decided by surface shape, not by which table answers first:**
+multi-token → phrase first, word as fallback; single-token → word first,
+phrase as fallback. Within the preferred type, several matches mean
+`ambiguous` and the fallback is *not* consulted — a surface that is genuinely
+ambiguous as a word must not quietly become a phrase.
+
+**Phrase ambiguity is currently unreachable in real data** —
+`UNIQUE (canonical, language)` is exact and there are zero case-collisions in
+the seeded German rows. The test reaches it synthetically by inserting two
+canonicals differing only by case, so the branch is covered without claiming
+it occurs today.
+
+**One non-obvious fix:** the late-binding UPDATE in `mark_unknown_as_learning`
+now writes `item_type` alongside `item_id`. A multi-token surface stored as
+`phrase` can later resolve via the *fallback* to a word, and persisting the id
+without the type would have left a row whose join points at the wrong catalog.
+
 🆕 **2026-07-27 — OpenAI-compatible provider (+30 tests, same file)**
 
 Second backend behind the seam: `OpenAICompatibleProvider` POSTs
@@ -1080,7 +1109,7 @@ Run all three. The lint step is not optional.
 | Step | Command | Expected |
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
-| Backend | `cd lexy-app/backend && pytest -n auto` | 847 passed, 2 skipped |
+| Backend | `cd lexy-app/backend && pytest -n auto` | 858 passed, 2 skipped |
 | Root pipeline | `pytest tests/` *(repo root)* | 221 passed |
 
 How the backend baseline got to 847, newest last:
@@ -1091,10 +1120,22 @@ How the backend baseline got to 847, newest last:
 | 760 | ILP playlist optimizer (+15: 11 unit tests for `ilp_cover`, 4 endpoint tests for the `algorithm` parameter — accepts `"ilp"`, 422s an unknown value, 503s when the solver is unavailable, and defaults to greedy without invoking it) |
 | 786 | vocabulary lists (+26, migration 035) |
 | 817 | LLM provider seam (+31) |
-| **847** | OpenAI-compatible provider (+30) |
+| 847 | OpenAI-compatible provider (+30) |
+| **858** | word-list phrase support (+11), plus 14 provider byte-identity tests restored from skips — see below |
 
-Frontend baseline: **274 passed across 44 files** (`npx vitest run` in
+Frontend baseline: **278 passed across 44 files** (`npx vitest run` in
 `lexy-app/frontend`).
+
+> **A sliding `HEAD~n` window silently disarmed 14 tests — fixed 2026-07-27.**
+> The `test_llm_provider.py` byte-identity checks read the pre-seam service
+> modules out of git, searching `HEAD`, `HEAD~1`, `HEAD~2` for a revision still
+> constructing `AsyncAnthropic`. As unrelated commits landed that revision
+> drifted to HEAD~8, and all 14 degraded to skips — the suite stayed green
+> while the assertions stopped running. The lookup now also tries a pinned
+> `PRE_SEAM_REV = "9977a4e"`, which cannot drift; the graceful skip survives
+> for shallow clones and rewritten history, but is no longer the normal
+> outcome. **Lesson: a test that skips on a moving reference goes quiet
+> instead of failing — pin the reference.**
 
 The root suite is **221 = 97 + 124**: `tests/runtime/` (97) covers the root
 pipeline modules, `tests/*.py` (124) covers `subtitle-scraper/`. It was 744

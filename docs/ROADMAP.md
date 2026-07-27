@@ -134,19 +134,18 @@ piece of shippable product work currently unblocked.
   enrichment layer over the same headwords (translations and examples at 100%,
   POS 99%, conjugations 71%), joining 1:1. The B1 files stay supplemental —
   `b1_unparsed.txt` adds 815 headwords `final_result.txt` lacks.
-- **Phrase support in the list feature is not complete yet.** `item_type`
-  exists and `apply_progression` is already polymorphic, but
-  `word_list_service` resolves against `word_table` only, hardcodes `"word"`
-  on insert, and pins `item_type = 'word'` in the late-status lookup; the
-  frontend has no per-type rendering. **No migration needed for that part** —
-  service + frontend work.
+- **Phrase support in the list feature: ✅ shipped 2026-07-27.**
+  `word_list_service` now resolves both catalogs with shape-based precedence
+  (multi-token → phrase first, single-token → word first), persists the
+  resolved `item_type`, and the frontend badges each resolved entry. No
+  migration was needed. +11 backend / +4 frontend tests.
 - **Order matters — catalog first, lists last.** Only ~51% of
   `final_result.txt`'s headwords resolve against `word_table` today, so a list
   built first would read roughly half "unresolved":
   1. Seed `word_table` — entry set from `final_result.txt`, POS/lemma joined
      from `words_4000_old.txt`.
   2. Pre-seed the permanent gloss cache from the translation column.
-  3. Add phrase support to `word_list_service` + per-type frontend rendering.
+  3. ~~Add phrase support to `word_list_service` + per-type frontend rendering.~~ ✅ done 2026-07-27.
   4. System-list schema (`word_lists.user_id` is `NOT NULL`, so no shared-list
      concept exists) + the built-in word/phrase lists and the B1 list.
   5. Optionally later: preload example generation from the example column.

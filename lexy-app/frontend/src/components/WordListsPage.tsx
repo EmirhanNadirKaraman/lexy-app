@@ -13,6 +13,7 @@ import type {
     WordListDetail,
     WordListSummary,
     WordListEntryStatus,
+    WordListItemType,
 } from '../api/wordLists';
 
 interface Props {
@@ -51,6 +52,26 @@ const STATUS_STYLE: Record<WordListEntryStatus, React.CSSProperties> = {
         color: 'var(--color-warning)',
         border: '1px solid var(--color-warning-border)',
     },
+};
+
+// Shown only on resolved entries — an unresolved surface has no catalog row to
+// describe. Borrows the surrounding pill's colour via `currentColor` so it
+// stays legible on all five status backgrounds without new palette entries.
+const TYPE_BADGE: React.CSSProperties = {
+    fontSize: '10px',
+    fontWeight: 700,
+    letterSpacing: '0.03em',
+    textTransform: 'uppercase',
+    marginLeft: '6px',
+    padding: '1px 5px',
+    borderRadius: '4px',
+    border: '1px solid currentColor',
+    opacity: 0.75,
+};
+
+const TYPE_HELP: Record<WordListItemType, string> = {
+    word: 'Single word — tracked in the word catalog.',
+    phrase: 'Phrase or verb pattern — tracked in the phrase catalog.',
 };
 
 const STATUS_ORDER: WordListEntryStatus[] = [
@@ -487,6 +508,15 @@ export function WordListsPage({ token, language, onClose }: Props) {
                                 }}
                             >
                                 {entry.surface}
+                                {entry.item_id !== null && (
+                                    <span
+                                        data-testid={`word-list-type-${entry.surface}`}
+                                        title={TYPE_HELP[entry.item_type]}
+                                        style={TYPE_BADGE}
+                                    >
+                                        {entry.item_type}
+                                    </span>
+                                )}
                                 <span style={{ fontSize: '11px', opacity: 0.8, marginLeft: '6px' }}>
                                     {entry.status}
                                 </span>

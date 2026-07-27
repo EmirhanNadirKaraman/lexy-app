@@ -465,3 +465,260 @@ async def test_delete_removes_list_and_entries(client: AsyncClient, db_pool):
         "SELECT COUNT(*) FROM word_list_items WHERE list_id = $1", list_id,
     )
     assert remaining == 0
+
+
+# ---------------------------------------------------------------------------
+# Phrase support — resolution against phrase_table
+#
+# `phrase_table` is seeded from data/final_result.txt at startup, so a pasted
+# blueprint binds to the same row the chat matcher and SRS already use. These
+# tests create their own phrase rows rather than relying on that seed: under
+# `pytest -n auto` the shared catalog is mutated by other workers, and an
+# owned row with a uuid-suffixed canonical can't be picked by anyone else.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def make_phrase(db_pool):
+    """Insert phrase_table rows and reap them afterwards."""
+    created: list[int] = []
+
+    async def _make(canonical: str, *, language: str = "de", surface_form: str | None = None) -> int:
+        pid = await db_pool.fetchval(
+            "INSERT INTO phrase_table (canonical, surface_form, phrase_type, language) "
+            "VALUES ($1, $2, 'verb_pattern', $3) RETURNING phrase_id",
+            canonical, surface_form or canonical, language,
+        )
+        created.append(pid)
+        return pid
+
+    yield _make
+
+    if created:
+        await db_pool.execute(
+            "DELETE FROM user_word_knowledge WHERE item_type='phrase' AND item_id = ANY($1::int[])",
+            created,
+        )
+        await db_pool.execute(
+            "DELETE FROM srs_cards WHERE item_type='phrase' AND item_id = ANY($1::int[])", created,
+        )
+        await db_pool.execute("DELETE FROM phrase_table WHERE phrase_id = ANY($1::int[])", created)
+
+
+def _blueprint(uniq: str) -> str:
+    """A multi-token canonical shaped like the real final_result.txt rows."""
+    return f"jdm. (Dat) etw. (Akk) _tp_{uniq}"
+
+
+async def test_phrase_surface_resolves_from_phrase_table(
+    client: AsyncClient, make_phrase,
+):
+    canonical = _blueprint(uuid.uuid4().hex[:10])
+    pid = await make_phrase(canonical)
+    headers = await _registered_headers(client)
+
+    resp = await _create(client, headers, [canonical])
+
+    entry = resp.json()["entries"][0]
+    assert entry["item_type"] == "phrase"
+    assert entry["item_id"] == pid
+    assert entry["status"] == "unknown"
+
+
+async def test_verb_blueprint_resolves_as_phrase_not_word(
+    client: AsyncClient, db_pool, make_phrase,
+):
+    """The blueprint and its bare verb are two separate trackable entries."""
+    uniq = uuid.uuid4().hex[:10]
+    canonical = _blueprint(uniq)
+    pid = await make_phrase(canonical)
+    wid, bare = await insert_owned_word(db_pool, language="de")
+    headers = await _registered_headers(client)
+
+    resp = await _create(client, headers, [canonical, bare])
+
+    by = _by_surface(resp.json())
+    assert (by[canonical]["item_type"], by[canonical]["item_id"]) == ("phrase", pid)
+    assert (by[bare]["item_type"], by[bare]["item_id"]) == ("word", wid)
+
+
+async def test_bare_verb_is_not_silently_upgraded_to_a_blueprint(
+    client: AsyncClient, db_pool, make_phrase,
+):
+    """A single-token surface must never bind to a multi-token phrase row.
+
+    Uploading `sagen` should not quietly become `jdm. (Dat) etw. (Akk) sagen`
+    — that would attach progress to an item the learner never typed.
+    """
+    wid, bare = await insert_owned_word(db_pool, language="de")
+    # A phrase whose canonical ENDS with the bare word, as the real data does.
+    await make_phrase(f"jdm. (Dat) etw. (Akk) {bare}")
+    headers = await _registered_headers(client)
+
+    resp = await _create(client, headers, [bare])
+
+    entry = resp.json()["entries"][0]
+    assert entry["item_type"] == "word"
+    assert entry["item_id"] == wid
+
+
+async def test_article_noun_resolves_as_phrase_bare_noun_as_word(
+    client: AsyncClient, db_pool, make_phrase,
+):
+    """`das Haus` and `Haus` stay two distinct entries — no article folding."""
+    wid, noun = await insert_owned_word(db_pool, language="de")
+    with_article = f"das {noun}"
+    pid = await make_phrase(with_article)
+    headers = await _registered_headers(client)
+
+    resp = await _create(client, headers, [with_article, noun])
+
+    by = _by_surface(resp.json())
+    assert (by[with_article]["item_type"], by[with_article]["item_id"]) == ("phrase", pid)
+    assert (by[noun]["item_type"], by[noun]["item_id"]) == ("word", wid)
+    assert resp.json()["total"] == 2, "article and bare forms must not collapse"
+
+
+async def test_ambiguous_phrase_is_reported_not_first_match_resolved(
+    client: AsyncClient, make_phrase,
+):
+    """Two canonicals differing only by case collide under lower().
+
+    `UNIQUE (canonical, language)` is case-sensitive, so this is reachable
+    even though the seeded data currently has no such pair.
+    """
+    uniq = uuid.uuid4().hex[:10]
+    canonical = _blueprint(uniq)
+    pid_a = await make_phrase(canonical)
+    pid_b = await make_phrase(canonical.upper())
+    headers = await _registered_headers(client)
+
+    resp = await _create(client, headers, [canonical])
+
+    entry = resp.json()["entries"][0]
+    assert entry["status"] == "ambiguous"
+    assert entry["item_id"] is None
+    assert entry["item_id"] not in (pid_a, pid_b)
+    assert entry["item_type"] == "phrase"
+
+
+async def test_unmatched_multiword_surface_is_unresolved_as_phrase(
+    client: AsyncClient,
+):
+    """An unbound row still records the type it was looked up as."""
+    headers = await _registered_headers(client)
+    surface = f"jdm. (Dat) etw. (Akk) _nomatch_{uuid.uuid4().hex[:10]}"
+
+    resp = await _create(client, headers, [surface])
+
+    entry = resp.json()["entries"][0]
+    assert entry["status"] == "unresolved"
+    assert entry["item_id"] is None
+    assert entry["item_type"] == "phrase"
+
+
+async def test_create_list_persists_the_resolved_item_type(
+    client: AsyncClient, db_pool, make_phrase,
+):
+    canonical = _blueprint(uuid.uuid4().hex[:10])
+    await make_phrase(canonical)
+    _wid, bare = await insert_owned_word(db_pool, language="de")
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, [canonical, bare])).json()["list_id"]
+
+    stored = {
+        r["surface"]: r["item_type"]
+        for r in await db_pool.fetch(
+            "SELECT surface, item_type FROM word_list_items WHERE list_id = $1", list_id,
+        )
+    }
+
+    assert stored[canonical] == "phrase"
+    assert stored[bare] == "word"
+
+
+async def test_mark_unknown_learning_progresses_phrase_entries(
+    client: AsyncClient, db_pool, make_phrase,
+):
+    """Phrases go through progression_service exactly like words do."""
+    canonical = _blueprint(uuid.uuid4().hex[:10])
+    pid = await make_phrase(canonical)
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, [canonical])).json()["list_id"]
+
+    resp = await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["marked"] == 1
+    assert resp.json()["marked_item_ids"] == [pid]
+
+    row = await db_pool.fetchrow(
+        "SELECT status, passive_level FROM user_word_knowledge "
+        "WHERE item_id = $1 AND item_type = 'phrase'",
+        pid,
+    )
+    assert row is not None, "progression must write with item_type='phrase'"
+    assert row["status"] == "learning"
+    assert row["passive_level"] >= 1
+
+    detail = await client.get(f"{LISTS}/{list_id}", headers=headers)
+    assert detail.json()["entries"][0]["status"] == "learning"
+
+
+async def test_mark_unknown_learning_skips_unresolved_and_ambiguous_phrases(
+    client: AsyncClient, db_pool, make_phrase,
+):
+    uniq = uuid.uuid4().hex[:10]
+    good = _blueprint(uniq)
+    pid = await make_phrase(good)
+    amb = _blueprint(f"amb{uniq}")
+    amb_a = await make_phrase(amb)
+    amb_b = await make_phrase(amb.upper())
+    missing = f"jdm. (Dat) etw. (Akk) _nomatch_{uniq}"
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, [good, amb, missing])).json()["list_id"]
+
+    body = (await client.post(
+        f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers,
+    )).json()
+
+    assert body["marked"] == 1
+    assert body["marked_item_ids"] == [pid]
+    assert body["skipped_unresolved"] == 1
+    assert body["skipped_ambiguous"] == 1
+    for other in (amb_a, amb_b):
+        rows = await db_pool.fetch(
+            "SELECT 1 FROM user_word_knowledge WHERE item_id = $1 AND item_type = 'phrase'",
+            other,
+        )
+        assert rows == []
+
+
+async def test_export_includes_phrase_surfaces_in_insertion_order(
+    client: AsyncClient, db_pool, make_phrase,
+):
+    canonical = _blueprint(uuid.uuid4().hex[:10])
+    await make_phrase(canonical)
+    _wid, bare = await insert_owned_word(db_pool, language="de")
+    missing = f"jdm. (Dat) etw. (Akk) _nomatch_{uuid.uuid4().hex[:10]}"
+    uploaded = [canonical, bare, missing]
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, uploaded)).json()["list_id"]
+
+    resp = await client.get(f"{LISTS}/{list_id}/export", headers=headers)
+
+    assert resp.status_code == 200
+    assert resp.text.split("\n") == uploaded
+
+
+async def test_counts_include_phrase_entries(
+    client: AsyncClient, db_pool, make_phrase,
+):
+    canonical = _blueprint(uuid.uuid4().hex[:10])
+    await make_phrase(canonical)
+    _wid, bare = await insert_owned_word(db_pool, language="de")
+    headers = await _registered_headers(client)
+
+    counts = (await _create(client, headers, [canonical, bare])).json()["counts"]
+
+    assert counts["unknown"] == 2
