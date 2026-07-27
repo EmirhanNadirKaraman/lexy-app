@@ -15,7 +15,7 @@ don't need real Anthropic credentials and aren't subject to flake/latency.
 import pytest
 from httpx import AsyncClient
 
-from backend.services import llm_service
+from backend.services import llm_service, llm_provider
 from ._email_helper import make_test_email
 from ._auth_helper import register_and_login
 
@@ -104,15 +104,15 @@ async def test_translate_item_gloss_cache_key_is_text_case_insensitive(db_pool, 
 
     # Inspect the cache directly via the same make_cache_key inputs.
     key_lower = llm_cache_service.make_cache_key(
-        "item_gloss", llm_service._MODEL,
+        "item_gloss", llm_service._provider.model_id,
         {"text": "apfel", "item_type": "word", "language": "de"},
     )
     # Mock mode SKIPS the cache (returns immediately) so the key may not exist;
-    # exercise the real (non-mock) caching path with monkeypatched _client too
+    # exercise the real (non-mock) caching path with a monkeypatched provider too
     # via a separate test below. Here we just confirm same-text-different-case
     # would map to the same key.
     key_orig = llm_cache_service.make_cache_key(
-        "item_gloss", llm_service._MODEL,
+        "item_gloss", llm_service._provider.model_id,
         {"text": "Apfel".lower(), "item_type": "word", "language": "de"},
     )
     assert key_lower == key_orig
@@ -178,8 +178,8 @@ async def test_active_due_card_has_prompt_text_in_english(client: AsyncClient, d
 async def test_second_due_call_uses_cache_no_llm_invocation(client: AsyncClient, db_pool, monkeypatch):
     """Stash the LLM call count; second /srs/due call must not increment it.
 
-    We replace `_client.messages.create` with a counting stub and turn OFF
-    mock mode so the real cache pathway runs.
+    We swap `llm_service._provider` for a counting fake and turn OFF mock
+    mode so the real cache pathway runs.
     """
     word_id, _, language = await _get_word(db_pool)
     headers, _ = await _register(client, db_pool, _email())
@@ -191,19 +191,15 @@ async def test_second_due_call_uses_cache_no_llm_invocation(client: AsyncClient,
 
     call_count = {"n": 0}
 
-    class _StubBlock:
-        type = "tool_use"
-        input = {"gloss": "stub gloss"}
+    class _CountingProvider:
+        model_id = llm_provider.DEFAULT_ANTHROPIC_MODEL
 
-    class _StubResp:
-        content = [_StubBlock()]
-
-    async def _stub_create(**kwargs):
-        call_count["n"] += 1
-        return _StubResp()
+        async def structured(self, system, messages, schema, max_tokens):
+            call_count["n"] += 1
+            return {"gloss": "stub gloss"}
 
     monkeypatch.setattr(llm_service, "_MOCK", False)
-    monkeypatch.setattr(llm_service._client.messages, "create", _stub_create)
+    monkeypatch.setattr(llm_service, "_provider", _CountingProvider())
 
     # First call: may or may not invoke the LLM depending on whether a previous
     # test in the suite already populated the cache for the same word. The key
@@ -245,12 +241,15 @@ async def test_grammar_rule_card_uses_short_explanation_no_llm(client: AsyncClie
         headers=headers,
     )
 
-    # Sentinel: real LLM stub that ASSERTS it is never invoked.
-    async def _explode_create(**kwargs):
-        raise AssertionError("LLM must not be called for grammar_rule cards")
+    # Sentinel: provider that ASSERTS it is never invoked.
+    class _ExplodingProvider:
+        model_id = llm_provider.DEFAULT_ANTHROPIC_MODEL
+
+        async def structured(self, system, messages, schema, max_tokens):
+            raise AssertionError("LLM must not be called for grammar_rule cards")
 
     monkeypatch.setattr(llm_service, "_MOCK", False)
-    monkeypatch.setattr(llm_service._client.messages, "create", _explode_create)
+    monkeypatch.setattr(llm_service, "_provider", _ExplodingProvider())
 
     resp = await client.get(SRS_DUE_URL, params={"language": language}, headers=headers)
     assert resp.status_code == 200

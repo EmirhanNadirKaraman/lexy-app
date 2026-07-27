@@ -14,33 +14,30 @@ from __future__ import annotations
 
 import os
 
-import anthropic
 import asyncpg
 
-from . import llm_cache_service
+from . import llm_cache_service, llm_provider
 
-_client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+_provider = llm_provider.get_provider()
 _MOCK = os.getenv("MOCK_LLM", "").lower() in ("1", "true", "yes")
-_MODEL = "claude-haiku-4-5-20251001"
 
 
 # ---------------------------------------------------------------------------
 # Sentence translation
 # ---------------------------------------------------------------------------
 
-_TRANSLATE_TOOL: anthropic.types.ToolParam = {
-    "name": "translate_sentence",
+_TRANSLATE_SCHEMA = {
+    "title": "translate_sentence",
     "description": "Translate a sentence into natural English.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "translation": {
-                "type": "string",
-                "description": "A natural, fluent English translation of the sentence.",
-            }
-        },
-        "required": ["translation"],
+    "type": "object",
+    "properties": {
+        "translation": {
+            "type": "string",
+            "description": "A natural, fluent English translation of the sentence.",
+        }
     },
+    "required": ["translation"],
+
 }
 
 
@@ -60,30 +57,27 @@ async def translate_sentence(
         return f"[Mock translation of {language} sentence: \"{sentence[:60]}\"]"
 
     async def _compute() -> dict:
-        response = await _client.messages.create(
-            model=_MODEL,
-            max_tokens=256,
+        response = await _provider.structured(
             system=(
                 f"You are a precise translator. Translate the following {language} sentence into "
                 f"natural, fluent English. Preserve the meaning faithfully. "
                 f"You MUST call the translate_sentence tool."
             ),
-            tools=[_TRANSLATE_TOOL],
-            tool_choice={"type": "tool", "name": "translate_sentence"},
             messages=[{"role": "user", "content": f"Translate: {sentence}"}],
+            schema=_TRANSLATE_SCHEMA,
+            max_tokens=256,
         )
-        tool_block = next(b for b in response.content if b.type == "tool_use")
-        return {"translation": tool_block.input["translation"]}
+        return {"translation": response["translation"]}
 
     if pool is None:
         return (await _compute())["translation"]
 
     cache_key = llm_cache_service.make_cache_key(
-        "reading_translate", _MODEL,
+        "reading_translate", _provider.model_id,
         {"sentence": sentence, "language": language},
     )
     result = await llm_cache_service.get_or_compute(
-        pool, cache_key, "reading_translate", _MODEL, _compute,
+        pool, cache_key, "reading_translate", _provider.model_id, _compute,
     )
     return result["translation"]
 
@@ -92,23 +86,22 @@ async def translate_sentence(
 # Contextual explanation
 # ---------------------------------------------------------------------------
 
-_EXPLAIN_TOOL: anthropic.types.ToolParam = {
-    "name": "explain_in_context",
+_EXPLAIN_SCHEMA = {
+    "title": "explain_in_context",
     "description": "Explain the meaning and usage of a selected word or phrase within its sentence.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "explanation": {
-                "type": "string",
-                "description": (
-                    "2-3 sentences explaining the selected text specifically in this sentence. "
-                    "Cover: (1) what it means here, (2) its grammatical role or structure, "
-                    "(3) any useful pattern or usage note for learners."
-                ),
-            }
-        },
-        "required": ["explanation"],
+    "type": "object",
+    "properties": {
+        "explanation": {
+            "type": "string",
+            "description": (
+                "2-3 sentences explaining the selected text specifically in this sentence. "
+                "Cover: (1) what it means here, (2) its grammatical role or structure, "
+                "(3) any useful pattern or usage note for learners."
+            ),
+        }
     },
+    "required": ["explanation"],
+
 }
 
 
@@ -134,9 +127,7 @@ async def explain_in_context(
         )
 
     async def _compute() -> dict:
-        response = await _client.messages.create(
-            model=_MODEL,
-            max_tokens=512,
+        response = await _provider.structured(
             system=(
                 f"You are a {language} language learning assistant helping an intermediate learner "
                 f"understand a word or phrase in context. "
@@ -144,8 +135,6 @@ async def explain_in_context(
                 f"Mention grammatical structure only when it matters for understanding. "
                 f"You MUST call the explain_in_context tool."
             ),
-            tools=[_EXPLAIN_TOOL],
-            tool_choice={"type": "tool", "name": "explain_in_context"},
             messages=[{
                 "role": "user",
                 "content": (
@@ -154,15 +143,16 @@ async def explain_in_context(
                     f"Explain what \"{selection}\" means and how it works in this sentence."
                 ),
             }],
+            schema=_EXPLAIN_SCHEMA,
+            max_tokens=512,
         )
-        tool_block = next(b for b in response.content if b.type == "tool_use")
-        return {"explanation": tool_block.input["explanation"]}
+        return {"explanation": response["explanation"]}
 
     if pool is None:
         return (await _compute())["explanation"]
 
     cache_key = llm_cache_service.make_cache_key(
-        "reading_explain", _MODEL,
+        "reading_explain", _provider.model_id,
         {
             "selection": selection.lower(),
             "sentence": sentence,
@@ -170,6 +160,6 @@ async def explain_in_context(
         },
     )
     result = await llm_cache_service.get_or_compute(
-        pool, cache_key, "reading_explain", _MODEL, _compute,
+        pool, cache_key, "reading_explain", _provider.model_id, _compute,
     )
     return result["explanation"]

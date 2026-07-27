@@ -52,6 +52,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `word_service.py` | `lookup_word_by_text` (ILIKE on word_table; ambiguous on POS), `get_user_knowledge`. (`upsert_word_status` was deleted 2026-05-19 — `progression_service.apply_progression(..., status_override=...)` is now the single writer.) |
 | `chat_service.py` | session/message CRUD + `match_learning_words` (free-chat matching against the user's vocab — words **and** phrases, via `matcher_service.match_sentence_with_ids` for the phrase half). |
 | `guided_chat_service.py` | `get_next_target` (priority: due active → learning without active → random; considers words AND phrases at every tier), `update_progress` (event mapping). |
+| `llm_provider.py` | **The only place an LLM client is constructed.** `LLMProvider` Protocol — `structured(system, messages, schema, max_tokens) -> dict` + `model_id`. `AnthropicProvider` maps a JSON Schema (`title`/`description` + body) onto a forced single-tool call; `split_schema` strips those two keys so the wire bytes match the pre-seam tool dicts. `LLMProviderError` replaces the old bare `StopIteration`. Local/OpenAI-compatible adapter is NOT here yet. |
 | `llm_service.py` | All Claude Haiku calls. tool_use for structured outputs. Cached via `llm_cache_service`. Has `MOCK_LLM=true` mode. |
 | `llm_cache_service.py` | SHA256(prompt_key+model+params) → `llm_cache` table. TTL or permanent. |
 | `book_service.py` | PDF upload, docling+masking ingestion, page/block CRUD, sentence_count, user_text_override. |

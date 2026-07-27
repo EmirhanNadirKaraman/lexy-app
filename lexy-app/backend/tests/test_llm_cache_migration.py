@@ -6,9 +6,9 @@ invoke the underlying provider exactly once, even under high concurrency.
 
 Strategy:
   - Monkeypatch `_MOCK = False` so the real cache pathway runs.
-  - Monkeypatch the underlying provider call (`_client.messages.create`
-    for llm_service + reading_llm_service, `_call_llm` for book_llm_service)
-    with a counter+event stub.
+  - Swap the module's `_provider` for a counting fake (llm_service +
+    reading_llm_service); book_llm_service is stubbed at `_call_llm`, one
+    layer above its provider call.
   - Use a unique cache key per test (uuid in the input) so prior runs don't
     contaminate.
   - Fire N concurrent callers, hold the stub in `event.wait()` until all
@@ -26,6 +26,7 @@ import pytest
 from backend.services import (
     book_llm_service,
     llm_cache_service,
+    llm_provider,
     llm_service,
     reading_llm_service,
 )
@@ -47,30 +48,29 @@ def _unique_de_word() -> str:
     return f"testword_{uuid.uuid4().hex[:10]}"
 
 
-class _StubBlock:
-    """A fake Anthropic tool_use response block. `input` is set per call."""
-    type = "tool_use"
+class _FakeProvider:
+    """Counting stand-in for an `llm_provider.LLMProvider`.
 
-    def __init__(self, payload: dict):
-        self.input = payload
-
-
-class _StubResp:
-    def __init__(self, payload: dict):
-        self.content = [_StubBlock(payload)]
-
-
-def _gated_stub(payload: dict, gate: asyncio.Event, counter: dict):
-    """Build an async stub for `_client.messages.create` that:
-      - increments counter['n'] on each call
-      - awaits gate before returning, so callers queue on the lock
-      - returns a fake tool_use response with `payload`
+    Post-seam the services depend on the provider Protocol, not on the
+    Anthropic SDK, so the fake returns the structured dict directly instead
+    of a fake `tool_use` content block. `model_id` keeps the real default so
+    cache keys hash exactly as they do in production.
     """
-    async def _stub(**_kwargs):
-        counter["n"] += 1
-        await gate.wait()
-        return _StubResp(payload)
-    return _stub
+
+    def __init__(self, payload: dict, counter: dict, gate: asyncio.Event | None = None):
+        self._payload = payload
+        self._counter = counter
+        self._gate = gate
+
+    @property
+    def model_id(self) -> str:
+        return llm_provider.DEFAULT_ANTHROPIC_MODEL
+
+    async def structured(self, system, messages, schema, max_tokens) -> dict:
+        self._counter["n"] += 1
+        if self._gate is not None:
+            await self._gate.wait()
+        return dict(self._payload)
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +85,8 @@ async def test_translate_item_gloss_concurrent_same_key_one_provider_call(
     counter = {"n": 0}
     gate = asyncio.Event()
     monkeypatch.setattr(
-        llm_service._client.messages, "create",
-        _gated_stub({"gloss": "stub"}, gate, counter),
+        llm_service, "_provider",
+        _FakeProvider({"gloss": "stub"}, counter, gate),
     )
 
     word = _unique_de_word()
@@ -120,8 +120,8 @@ async def test_reading_translate_concurrent_same_key_one_provider_call(
     counter = {"n": 0}
     gate = asyncio.Event()
     monkeypatch.setattr(
-        reading_llm_service._client.messages, "create",
-        _gated_stub({"translation": "stub translation"}, gate, counter),
+        reading_llm_service, "_provider",
+        _FakeProvider({"translation": "stub translation"}, counter, gate),
     )
 
     sentence = f"Unique reading sentence {uuid.uuid4().hex[:10]}."
@@ -152,8 +152,8 @@ async def test_reading_explain_concurrent_same_key_one_provider_call(
     counter = {"n": 0}
     gate = asyncio.Event()
     monkeypatch.setattr(
-        reading_llm_service._client.messages, "create",
-        _gated_stub({"explanation": "stub explanation"}, gate, counter),
+        reading_llm_service, "_provider",
+        _FakeProvider({"explanation": "stub explanation"}, counter, gate),
     )
 
     suffix   = uuid.uuid4().hex[:10]
@@ -175,14 +175,14 @@ async def test_reading_explain_concurrent_same_key_one_provider_call(
 
 
 # ---------------------------------------------------------------------------
-# book_llm_service.repair_block — different stub shape (no _client)
+# book_llm_service.repair_block — stubbed one layer above the provider
 # ---------------------------------------------------------------------------
 
 async def test_book_repair_concurrent_same_key_one_provider_call(
     db_pool, monkeypatch,
 ):
     """book_llm_service.repair_block goes through `_call_llm` (its own helper),
-    not the shared `_client.messages.create`. Stub at that layer."""
+    which wraps the provider call. Stub at that layer."""
     counter = {"n": 0}
     gate = asyncio.Event()
 
@@ -227,15 +227,13 @@ async def test_evaluate_production_remains_uncached(db_pool, monkeypatch):
 
     counter = {"n": 0}
 
-    async def _stub(**_kwargs):
-        counter["n"] += 1
-        return _StubResp({
-            "correct":        True,
-            "feedback":       "ok",
-            "corrected_form": "Hund",
-        })
-
-    monkeypatch.setattr(llm_service._client.messages, "create", _stub)
+    monkeypatch.setattr(
+        llm_service, "_provider",
+        _FakeProvider(
+            {"correct": True, "feedback": "ok", "corrected_form": "Hund"},
+            counter,
+        ),
+    )
 
     await llm_service.evaluate_production("Hund", "hund", "Hund", "de")
     await llm_service.evaluate_production("Hund", "hund", "Hund", "de")
@@ -260,11 +258,9 @@ async def test_translate_item_gloss_second_call_skips_provider(
 
     counter = {"n": 0}
 
-    async def _stub(**_kwargs):
-        counter["n"] += 1
-        return _StubResp({"gloss": "first call"})
-
-    monkeypatch.setattr(llm_service._client.messages, "create", _stub)
+    monkeypatch.setattr(
+        llm_service, "_provider", _FakeProvider({"gloss": "first call"}, counter),
+    )
 
     word = _unique_de_word()
 

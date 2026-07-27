@@ -1,14 +1,21 @@
 import os
 import random
 
-import anthropic
 import asyncpg
 
-from . import llm_cache_service
+from . import llm_cache_service, llm_provider
 
-_client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+# Module-level so tests can swap the whole backend with
+# `monkeypatch.setattr(llm_service, "_provider", Fake())`. Built at import
+# time, matching when the raw AsyncAnthropic client used to read its key.
+_provider = llm_provider.get_provider()
+
+# MOCK_LLM stays a domain-level short-circuit rather than a MockProvider:
+# these fakes are computed from call arguments (target word, user answer,
+# requested language) that the provider interface never receives — it sees
+# those values only as prose inside the prompt. Reconstructing them there
+# would couple the mock to prompt wording. See docs/TESTS.md.
 _MOCK = os.getenv("MOCK_LLM", "").lower() in ("1", "true", "yes")
-_MODEL = "claude-haiku-4-5-20251001"
 
 _MOCK_REPLIES = [
     "Das ist gut! Kannst du mir mehr erzählen?",
@@ -102,42 +109,41 @@ def _make_system(language: str) -> str:
     )
 
 
-def _make_eval_tool(language: str) -> anthropic.types.ToolParam:
+def _make_eval_schema(language: str) -> dict:
     """Build the free-chat evaluator tool definition for a given target
     language. `language_detected` enum is parameterised so the LLM picks
     between the active target language, English, and `mixed` — pre-Stage-3
     this was hardcoded to `['de', 'en', 'mixed']`."""
     return {
-        "name": "evaluate_and_reply",
+        "title": "evaluate_and_reply",
         "description": "Produce a structured response: a conversational reply plus any corrections.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "reply": {
-                    "type": "string",
-                    "description": "Your conversational reply.",
-                },
-                "language_detected": {
-                    "type": "string",
-                    "enum": [language, "en", "mixed"] if language != "en" else ["en", "mixed"],
-                    "description": "Dominant language of the user's message.",
-                },
-                "corrections": {
-                    "type": "array",
-                    "description": "Language errors found. Empty list if none.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "original":    {"type": "string"},
-                            "corrected":   {"type": "string"},
-                            "explanation": {"type": "string"},
-                        },
-                        "required": ["original", "corrected", "explanation"],
+        "type": "object",
+        "properties": {
+            "reply": {
+                "type": "string",
+                "description": "Your conversational reply.",
+            },
+            "language_detected": {
+                "type": "string",
+                "enum": [language, "en", "mixed"] if language != "en" else ["en", "mixed"],
+                "description": "Dominant language of the user's message.",
+            },
+            "corrections": {
+                "type": "array",
+                "description": "Language errors found. Empty list if none.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "original":    {"type": "string"},
+                        "corrected":   {"type": "string"},
+                        "explanation": {"type": "string"},
                     },
+                    "required": ["original", "corrected", "explanation"],
                 },
             },
-            "required": ["reply", "language_detected", "corrections"],
         },
+        "required": ["reply", "language_detected", "corrections"],
+    
     }
 
 
@@ -145,19 +151,18 @@ def _make_eval_tool(language: str) -> anthropic.types.ToolParam:
 # Guided chat — opener
 # ---------------------------------------------------------------------------
 
-_GUIDED_OPEN_TOOL: anthropic.types.ToolParam = {
-    "name": "open_conversation",
+_GUIDED_OPEN_SCHEMA = {
+    "title": "open_conversation",
     "description": "Generate the opening message of a guided conversation scenario.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "opening": {
-                "type": "string",
-                "description": "The opening message in the target language (2-3 sentences).",
-            }
-        },
-        "required": ["opening"],
+    "type": "object",
+    "properties": {
+        "opening": {
+            "type": "string",
+            "description": "The opening message in the target language (2-3 sentences).",
+        }
     },
+    "required": ["opening"],
+
 }
 
 
@@ -188,26 +193,23 @@ async def guided_open(
     )
 
     async def _compute() -> dict:
-        response = await _client.messages.create(
-            model=_MODEL,
-            max_tokens=256,
+        response = await _provider.structured(
             system=system,
-            tools=[_GUIDED_OPEN_TOOL],
-            tool_choice={"type": "tool", "name": "open_conversation"},
             messages=[{"role": "user", "content": "Start the conversation."}],
+            schema=_GUIDED_OPEN_SCHEMA,
+            max_tokens=256,
         )
-        tool_block = next(b for b in response.content if b.type == "tool_use")
-        return {"opening": tool_block.input["opening"]}
+        return {"opening": response["opening"]}
 
     if pool is None:
         # No pool → uncacheable single-shot path.
         return (await _compute())["opening"]
 
     cache_key = llm_cache_service.make_cache_key(
-        "guided_open", _MODEL, {"target_word": target_word, "language": language}
+        "guided_open", _provider.model_id, {"target_word": target_word, "language": language}
     )
     result = await llm_cache_service.get_or_compute(
-        pool, cache_key, "guided_open", _MODEL, _compute,
+        pool, cache_key, "guided_open", _provider.model_id, _compute,
     )
     return result["opening"]
 
@@ -216,44 +218,43 @@ async def guided_open(
 # Guided chat — progressive hints
 # ---------------------------------------------------------------------------
 
-def _make_guided_hints_tool(language: str) -> anthropic.types.ToolParam:
+def _make_guided_hints_schema(language: str) -> dict:
     """Stage 3: tool description text interpolates the target-language name
     so the LLM is told to produce hints in the right language. Pre-Stage-3
     this was a module-level constant whose descriptions hardcoded German.
     """
     name = _language_name(language)
     return {
-        "name": "generate_hints",
+        "title": "generate_hints",
         "description": "Generate three progressive learning hints for a target word/phrase.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "intent_hint": {
-                    "type": "string",
-                    "description": (
-                        "One sentence in English describing the concept or action to express. "
-                        "Must NOT name the target word, its direct translation, or a clear synonym. "
-                        "Describes what kind of meaning the learner should convey."
-                    ),
-                },
-                "anchor_hint": {
-                    "type": "string",
-                    "description": (
-                        f"A short {name} clue — a related word, a prefix hint, "
-                        f"or a closely related concept — that narrows the search "
-                        f"without giving the full answer. Must NOT be the target word itself."
-                    ),
-                },
-                "example": {
-                    "type": "string",
-                    "description": (
-                        f"A complete, natural {name} sentence that uses the target word in a realistic context. "
-                        f"The target word must appear exactly as-is or in a natural inflected form."
-                    ),
-                },
+        "type": "object",
+        "properties": {
+            "intent_hint": {
+                "type": "string",
+                "description": (
+                    "One sentence in English describing the concept or action to express. "
+                    "Must NOT name the target word, its direct translation, or a clear synonym. "
+                    "Describes what kind of meaning the learner should convey."
+                ),
             },
-            "required": ["intent_hint", "anchor_hint", "example"],
+            "anchor_hint": {
+                "type": "string",
+                "description": (
+                    f"A short {name} clue — a related word, a prefix hint, "
+                    f"or a closely related concept — that narrows the search "
+                    f"without giving the full answer. Must NOT be the target word itself."
+                ),
+            },
+            "example": {
+                "type": "string",
+                "description": (
+                    f"A complete, natural {name} sentence that uses the target word in a realistic context. "
+                    f"The target word must appear exactly as-is or in a natural inflected form."
+                ),
+            },
         },
+        "required": ["intent_hint", "anchor_hint", "example"],
+    
     }
 
 
@@ -291,29 +292,26 @@ async def guided_hints(
     )
 
     async def _compute() -> dict:
-        response = await _client.messages.create(
-            model=_MODEL,
-            max_tokens=512,
+        response = await _provider.structured(
             system=system,
-            tools=[_make_guided_hints_tool(language)],
-            tool_choice={"type": "tool", "name": "generate_hints"},
             messages=[{"role": "user", "content": "Generate the hints now."}],
+            schema=_make_guided_hints_schema(language),
+            max_tokens=512,
         )
-        tool_block = next(b for b in response.content if b.type == "tool_use")
         return {
-            "intent_hint": tool_block.input["intent_hint"],
-            "anchor_hint":  tool_block.input["anchor_hint"],
-            "example":      tool_block.input["example"],
+            "intent_hint": response["intent_hint"],
+            "anchor_hint":  response["anchor_hint"],
+            "example":      response["example"],
         }
 
     if pool is None:
         return await _compute()
 
     cache_key = llm_cache_service.make_cache_key(
-        "guided_hints", _MODEL, {"target_word": target_word, "language": language}
+        "guided_hints", _provider.model_id, {"target_word": target_word, "language": language}
     )
     return await llm_cache_service.get_or_compute(
-        pool, cache_key, "guided_hints", _MODEL, _compute,
+        pool, cache_key, "guided_hints", _provider.model_id, _compute,
     )
 
 
@@ -321,63 +319,62 @@ async def guided_hints(
 # Guided chat — per-turn evaluation + reply
 # ---------------------------------------------------------------------------
 
-_GUIDED_EVAL_TOOL: anthropic.types.ToolParam = {
-    "name": "guided_evaluate",
+_GUIDED_EVAL_SCHEMA = {
+    "title": "guided_evaluate",
     "description": "Evaluate the learner's message and produce a structured reply for guided practice.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "reply": {
-                "type": "string",
-                "description": "Conversational follow-up in the target language.",
-            },
-            "language_detected": {
-                "type": "string",
-                "enum": ["de", "en", "mixed"],
-                "description": "Dominant language of the user's message.",
-            },
-            "corrections": {
-                "type": "array",
-                "description": "Genuine language errors only. Empty list if none.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "original":    {"type": "string"},
-                        "corrected":   {"type": "string"},
-                        "explanation": {"type": "string"},
-                    },
-                    "required": ["original", "corrected", "explanation"],
+    "type": "object",
+    "properties": {
+        "reply": {
+            "type": "string",
+            "description": "Conversational follow-up in the target language.",
+        },
+        "language_detected": {
+            "type": "string",
+            "enum": ["de", "en", "mixed"],
+            "description": "Dominant language of the user's message.",
+        },
+        "corrections": {
+            "type": "array",
+            "description": "Genuine language errors only. Empty list if none.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "original":    {"type": "string"},
+                    "corrected":   {"type": "string"},
+                    "explanation": {"type": "string"},
                 },
-            },
-            "target_used": {
-                "type": "boolean",
-                "description": "True if the learner used the target word/phrase or a clear inflection of it.",
-            },
-            "target_counted": {
-                "type": "boolean",
-                "description": (
-                    "True only if the usage is in natural, correct target-language context "
-                    "and counts toward mastery. False if used in English, forced, or grammatically wrong."
-                ),
-            },
-            "feedback_short": {
-                "type": "string",
-                "description": (
-                    "One brief encouraging sentence about the target usage (e.g. 'Sehr gut, du hast X perfekt benutzt!'). "
-                    "Empty string if the target was not used."
-                ),
-            },
-            "naturalness": {
-                "type": "string",
-                "enum": ["high", "medium", "low"],
-                "description": "Overall naturalness and quality of the learner's target-language usage in this turn.",
+                "required": ["original", "corrected", "explanation"],
             },
         },
-        "required": [
-            "reply", "language_detected", "corrections",
-            "target_used", "target_counted", "feedback_short", "naturalness",
-        ],
+        "target_used": {
+            "type": "boolean",
+            "description": "True if the learner used the target word/phrase or a clear inflection of it.",
+        },
+        "target_counted": {
+            "type": "boolean",
+            "description": (
+                "True only if the usage is in natural, correct target-language context "
+                "and counts toward mastery. False if used in English, forced, or grammatically wrong."
+            ),
+        },
+        "feedback_short": {
+            "type": "string",
+            "description": (
+                "One brief encouraging sentence about the target usage (e.g. 'Sehr gut, du hast X perfekt benutzt!'). "
+                "Empty string if the target was not used."
+            ),
+        },
+        "naturalness": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "Overall naturalness and quality of the learner's target-language usage in this turn.",
+        },
     },
+    "required": [
+        "reply", "language_detected", "corrections",
+        "target_used", "target_counted", "feedback_short", "naturalness",
+    ],
+
 }
 
 
@@ -434,26 +431,21 @@ async def guided_evaluate(
     messages = [{"role": m["role"], "content": m["content"]} for m in history]
     messages.append({"role": "user", "content": user_content})
 
-    response = await _client.messages.create(
-        model=_MODEL,
-        max_tokens=1024,
+    response = await _provider.structured(
         system=system,
-        tools=[_GUIDED_EVAL_TOOL],
-        tool_choice={"type": "tool", "name": "guided_evaluate"},
         messages=messages,
+        schema=_GUIDED_EVAL_SCHEMA,
+        max_tokens=1024,
     )
 
-    tool_block = next(b for b in response.content if b.type == "tool_use")
-    result = tool_block.input
-
     return {
-        "reply":             result["reply"],
-        "language_detected": result["language_detected"],
-        "corrections":       result.get("corrections", []),
-        "target_used":       result["target_used"],
-        "target_counted":    result["target_counted"],
-        "feedback_short":    result.get("feedback_short", ""),
-        "naturalness":       result.get("naturalness", "medium"),
+        "reply":             response["reply"],
+        "language_detected": response["language_detected"],
+        "corrections":       response.get("corrections", []),
+        "target_used":       response["target_used"],
+        "target_counted":    response["target_counted"],
+        "feedback_short":    response.get("feedback_short", ""),
+        "naturalness":       response.get("naturalness", "medium"),
     }
 
 
@@ -461,35 +453,34 @@ async def guided_evaluate(
 # Prep view — item info (translation + grammar explanation)
 # ---------------------------------------------------------------------------
 
-_PREP_INFO_TOOL: anthropic.types.ToolParam = {
-    "name": "item_prep_info",
+_PREP_INFO_SCHEMA = {
+    "title": "item_prep_info",
     "description": "Provide structured language-learning prep information for a vocabulary item.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "translation": {
-                "type": "string",
-                "description": "Concise English translation. For verbs include the base form (e.g. 'to spend (time)').",
-            },
-            "grammar_structure": {
-                "type": "string",
-                "description": (
-                    "The core grammatical pattern in compact form. "
-                    "Examples: 'verbringen + Akkusativ', 'sich freuen + über + Akkusativ', "
-                    "'Nomen (der/die/das)'. Keep it under 60 characters."
-                ),
-            },
-            "grammar_explanation": {
-                "type": "string",
-                "description": (
-                    "2–4 sentences covering: (1) meaning and grammatical role, "
-                    "(2) required case/preposition/reflexive structure, "
-                    "(3) one common learner mistake to avoid."
-                ),
-            },
+    "type": "object",
+    "properties": {
+        "translation": {
+            "type": "string",
+            "description": "Concise English translation. For verbs include the base form (e.g. 'to spend (time)').",
         },
-        "required": ["translation", "grammar_structure", "grammar_explanation"],
+        "grammar_structure": {
+            "type": "string",
+            "description": (
+                "The core grammatical pattern in compact form. "
+                "Examples: 'verbringen + Akkusativ', 'sich freuen + über + Akkusativ', "
+                "'Nomen (der/die/das)'. Keep it under 60 characters."
+            ),
+        },
+        "grammar_explanation": {
+            "type": "string",
+            "description": (
+                "2–4 sentences covering: (1) meaning and grammatical role, "
+                "(2) required case/preposition/reflexive structure, "
+                "(3) one common learner mistake to avoid."
+            ),
+        },
     },
+    "required": ["translation", "grammar_structure", "grammar_explanation"],
+
 }
 
 
@@ -525,33 +516,30 @@ async def prep_item_info(
     )
 
     async def _compute() -> dict:
-        response = await _client.messages.create(
-            model=_MODEL,
-            max_tokens=512,
+        response = await _provider.structured(
             system=system,
-            tools=[_PREP_INFO_TOOL],
-            tool_choice={"type": "tool", "name": "item_prep_info"},
             messages=[{
                 "role": "user",
                 "content": f"Provide prep information for the {language} {item_type}: \"{display_text}\"",
             }],
+            schema=_PREP_INFO_SCHEMA,
+            max_tokens=512,
         )
-        tool_block = next(b for b in response.content if b.type == "tool_use")
         return {
-            "translation":         tool_block.input["translation"],
-            "grammar_structure":   tool_block.input["grammar_structure"],
-            "grammar_explanation": tool_block.input["grammar_explanation"],
+            "translation":         response["translation"],
+            "grammar_structure":   response["grammar_structure"],
+            "grammar_explanation": response["grammar_explanation"],
         }
 
     if pool is None:
         return await _compute()
 
     cache_key = llm_cache_service.make_cache_key(
-        "prep_item_info", _MODEL,
+        "prep_item_info", _provider.model_id,
         {"display_text": display_text, "item_type": item_type, "language": language},
     )
     return await llm_cache_service.get_or_compute(
-        pool, cache_key, "prep_item_info", _MODEL, _compute,
+        pool, cache_key, "prep_item_info", _provider.model_id, _compute,
     )
 
 
@@ -559,30 +547,29 @@ async def prep_item_info(
 # Prep view — examples + templates (on-demand)
 # ---------------------------------------------------------------------------
 
-_PREP_EXAMPLES_TOOL: anthropic.types.ToolParam = {
-    "name": "item_examples",
+_PREP_EXAMPLES_SCHEMA = {
+    "title": "item_examples",
     "description": "Generate a usage example and two reusable production templates for a vocabulary item.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "example": {
-                "type": "string",
-                "description": "One clear, natural sentence in the target language using the item in a realistic context.",
-            },
-            "templates": {
-                "type": "array",
-                "description": (
-                    "Exactly 2 reusable sentence templates for production practice. "
-                    "Use [square bracket slots] for variable parts (e.g. [Zeit], [Person], [Ort]). "
-                    "Each template should be a complete sentence skeleton."
-                ),
-                "items": {"type": "string"},
-                "minItems": 2,
-                "maxItems": 2,
-            },
+    "type": "object",
+    "properties": {
+        "example": {
+            "type": "string",
+            "description": "One clear, natural sentence in the target language using the item in a realistic context.",
         },
-        "required": ["example", "templates"],
+        "templates": {
+            "type": "array",
+            "description": (
+                "Exactly 2 reusable sentence templates for production practice. "
+                "Use [square bracket slots] for variable parts (e.g. [Zeit], [Person], [Ort]). "
+                "Each template should be a complete sentence skeleton."
+            ),
+            "items": {"type": "string"},
+            "minItems": 2,
+            "maxItems": 2,
+        },
     },
+    "required": ["example", "templates"],
+
 }
 
 
@@ -615,32 +602,29 @@ async def prep_generate_examples(
     )
 
     async def _compute() -> dict:
-        response = await _client.messages.create(
-            model=_MODEL,
-            max_tokens=256,
+        response = await _provider.structured(
             system=system,
-            tools=[_PREP_EXAMPLES_TOOL],
-            tool_choice={"type": "tool", "name": "item_examples"},
             messages=[{
                 "role": "user",
                 "content": f"Generate an example and templates for the {language} {item_type}: \"{display_text}\"",
             }],
+            schema=_PREP_EXAMPLES_SCHEMA,
+            max_tokens=256,
         )
-        tool_block = next(b for b in response.content if b.type == "tool_use")
         return {
-            "example":   tool_block.input["example"],
-            "templates": tool_block.input["templates"][:2],
+            "example":   response["example"],
+            "templates": response["templates"][:2],
         }
 
     if pool is None:
         return await _compute()
 
     cache_key = llm_cache_service.make_cache_key(
-        "prep_examples", _MODEL,
+        "prep_examples", _provider.model_id,
         {"display_text": display_text, "item_type": item_type, "language": language},
     )
     return await llm_cache_service.get_or_compute(
-        pool, cache_key, "prep_examples", _MODEL, _compute,
+        pool, cache_key, "prep_examples", _provider.model_id, _compute,
     )
 
 
@@ -658,7 +642,7 @@ async def get_examples_if_cached(
     if pool is None:
         return None
     cache_key = llm_cache_service.make_cache_key(
-        "prep_examples", _MODEL,
+        "prep_examples", _provider.model_id,
         {"display_text": display_text, "item_type": item_type, "language": language},
     )
     return await llm_cache_service.get_cached(pool, cache_key)
@@ -668,34 +652,33 @@ async def get_examples_if_cached(
 # Guided chat — post-session summary
 # ---------------------------------------------------------------------------
 
-_GUIDED_SUMMARY_TOOL: anthropic.types.ToolParam = {
-    "name": "guided_session_summary",
+_GUIDED_SUMMARY_SCHEMA = {
+    "title": "guided_session_summary",
     "description": "Generate concise post-session feedback for a completed guided practice session.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "what_went_well": {
-                "type": "string",
-                "description": "One specific sentence about what the learner did well.",
-            },
-            "what_to_improve": {
-                "type": "string",
-                "description": (
-                    "One sentence on the single most important thing to improve. "
-                    "Empty string if there is nothing significant."
-                ),
-            },
-            "corrective_note": {
-                "type": "string",
-                "description": (
-                    "A direct corrective comment on the most critical grammar or usage error observed. "
-                    "Format: 'Use X instead of Y because...' "
-                    "Empty string if no significant errors were observed."
-                ),
-            },
+    "type": "object",
+    "properties": {
+        "what_went_well": {
+            "type": "string",
+            "description": "One specific sentence about what the learner did well.",
         },
-        "required": ["what_went_well", "what_to_improve", "corrective_note"],
+        "what_to_improve": {
+            "type": "string",
+            "description": (
+                "One sentence on the single most important thing to improve. "
+                "Empty string if there is nothing significant."
+            ),
+        },
+        "corrective_note": {
+            "type": "string",
+            "description": (
+                "A direct corrective comment on the most critical grammar or usage error observed. "
+                "Format: 'Use X instead of Y because...' "
+                "Empty string if no significant errors were observed."
+            ),
+        },
     },
+    "required": ["what_went_well", "what_to_improve", "corrective_note"],
+
 }
 
 
@@ -774,20 +757,17 @@ async def guided_summarize(
         f"You MUST call the guided_session_summary tool."
     )
 
-    response = await _client.messages.create(
-        model=_MODEL,
-        max_tokens=384,
+    response = await _provider.structured(
         system=system,
-        tools=[_GUIDED_SUMMARY_TOOL],
-        tool_choice={"type": "tool", "name": "guided_session_summary"},
         messages=[{"role": "user", "content": "Generate the session summary now."}],
+        schema=_GUIDED_SUMMARY_SCHEMA,
+        max_tokens=384,
     )
 
-    tool_block = next(b for b in response.content if b.type == "tool_use")
     return {
-        "what_went_well":  tool_block.input.get("what_went_well", ""),
-        "what_to_improve": tool_block.input.get("what_to_improve", ""),
-        "corrective_note": tool_block.input.get("corrective_note", ""),
+        "what_went_well":  response.get("what_went_well", ""),
+        "what_to_improve": response.get("what_to_improve", ""),
+        "corrective_note": response.get("corrective_note", ""),
     }
 
 
@@ -795,25 +775,24 @@ async def guided_summarize(
 # Grammar rule — long explanation (on-demand, cached permanently)
 # ---------------------------------------------------------------------------
 
-_GRAMMAR_EXPLAIN_TOOL: anthropic.types.ToolParam = {
-    "name": "grammar_rule_explanation",
+_GRAMMAR_EXPLAIN_SCHEMA = {
+    "title": "grammar_rule_explanation",
     "description": "Generate a detailed, learner-friendly explanation of a grammar rule.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "long_explanation": {
-                "type": "string",
-                "description": (
-                    "3–5 sentences covering: (1) what the rule is and why it matters, "
-                    "(2) how it works with concrete examples, "
-                    "(3) the most common learner mistake and how to avoid it. "
-                    "Write directly for an intermediate language learner. "
-                    "Include at least two example sentences in the target language."
-                ),
-            },
+    "type": "object",
+    "properties": {
+        "long_explanation": {
+            "type": "string",
+            "description": (
+                "3–5 sentences covering: (1) what the rule is and why it matters, "
+                "(2) how it works with concrete examples, "
+                "(3) the most common learner mistake and how to avoid it. "
+                "Write directly for an intermediate language learner. "
+                "Include at least two example sentences in the target language."
+            ),
         },
-        "required": ["long_explanation"],
     },
+    "required": ["long_explanation"],
+
 }
 
 
@@ -847,12 +826,8 @@ async def grammar_rule_explanation(
     )
 
     async def _compute() -> dict:
-        response = await _client.messages.create(
-            model=_MODEL,
-            max_tokens=512,
+        response = await _provider.structured(
             system=system,
-            tools=[_GRAMMAR_EXPLAIN_TOOL],
-            tool_choice={"type": "tool", "name": "grammar_rule_explanation"},
             messages=[{
                 "role": "user",
                 "content": (
@@ -860,18 +835,19 @@ async def grammar_rule_explanation(
                     f"Short summary: {short_explanation}"
                 ),
             }],
+            schema=_GRAMMAR_EXPLAIN_SCHEMA,
+            max_tokens=512,
         )
-        tool_block = next(b for b in response.content if b.type == "tool_use")
-        return {"long_explanation": tool_block.input["long_explanation"]}
+        return {"long_explanation": response["long_explanation"]}
 
     if pool is None:
         return (await _compute())["long_explanation"]
 
     cache_key = llm_cache_service.make_cache_key(
-        "grammar_rule_explanation", _MODEL, {"slug": slug, "language": language}
+        "grammar_rule_explanation", _provider.model_id, {"slug": slug, "language": language}
     )
     result = await llm_cache_service.get_or_compute(
-        pool, cache_key, "grammar_rule_explanation", _MODEL, _compute,
+        pool, cache_key, "grammar_rule_explanation", _provider.model_id, _compute,
     )
     return result["long_explanation"]
 
@@ -889,7 +865,7 @@ async def get_grammar_explanation_if_cached(
     if pool is None:
         return None
     cache_key = llm_cache_service.make_cache_key(
-        "grammar_rule_explanation", _MODEL, {"slug": slug, "language": language}
+        "grammar_rule_explanation", _provider.model_id, {"slug": slug, "language": language}
     )
     cached = await llm_cache_service.get_cached(pool, cache_key)
     return cached["long_explanation"] if cached else None
@@ -933,22 +909,17 @@ async def evaluate_and_reply(
     messages = [{"role": m["role"], "content": m["content"]} for m in history]
     messages.append({"role": "user", "content": user_content})
 
-    response = await _client.messages.create(
-        model=_MODEL,
-        max_tokens=1024,
+    response = await _provider.structured(
         system=_make_system(language),
-        tools=[_make_eval_tool(language)],
-        tool_choice={"type": "tool", "name": "evaluate_and_reply"},
         messages=messages,
+        schema=_make_eval_schema(language),
+        max_tokens=1024,
     )
 
-    tool_block = next(b for b in response.content if b.type == "tool_use")
-    result = tool_block.input
-
     return {
-        "reply": result["reply"],
-        "language_detected": result["language_detected"],
-        "corrections": result.get("corrections", []),
+        "reply": response["reply"],
+        "language_detected": response["language_detected"],
+        "corrections": response.get("corrections", []),
         "word_matches": [],
     }
 
@@ -957,23 +928,22 @@ async def evaluate_and_reply(
 # Item gloss — short English label for SRS review prompts/answers (#0a-1)
 # ---------------------------------------------------------------------------
 
-_GLOSS_TOOL: anthropic.types.ToolParam = {
-    "name": "item_gloss",
+_GLOSS_SCHEMA = {
+    "title": "item_gloss",
     "description": "Return a short English gloss for a foreign-language word or phrase.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "gloss": {
-                "type": "string",
-                "description": (
-                    "A concise English translation of the item — ideally 1-4 words. "
-                    "Not a full explanation. For verbs use the English infinitive (e.g. 'to eat'). "
-                    "For phrases give the natural English equivalent. Lowercase unless a proper noun."
-                ),
-            }
-        },
-        "required": ["gloss"],
+    "type": "object",
+    "properties": {
+        "gloss": {
+            "type": "string",
+            "description": (
+                "A concise English translation of the item — ideally 1-4 words. "
+                "Not a full explanation. For verbs use the English infinitive (e.g. 'to eat'). "
+                "For phrases give the natural English equivalent. Lowercase unless a proper noun."
+            ),
+        }
     },
+    "required": ["gloss"],
+
 }
 
 
@@ -981,32 +951,31 @@ _GLOSS_TOOL: anthropic.types.ToolParam = {
 # SRS production evaluation (#0a-2)
 # ---------------------------------------------------------------------------
 
-_PRODUCTION_EVAL_TOOL: anthropic.types.ToolParam = {
-    "name": "evaluate_production",
+_PRODUCTION_EVAL_SCHEMA = {
+    "title": "evaluate_production",
     "description": (
         "Judge whether the learner's answer correctly produces the target item. "
         "Accept reasonable inflections and minor capitalization differences. "
         "Reject answers that are clearly the wrong word, English instead of the "
         "target language, or meaningfully different in meaning."
     ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "correct": {
-                "type": "boolean",
-                "description": "True if the learner produced the target item correctly (allowing reasonable inflection / case differences).",
-            },
-            "feedback": {
-                "type": "string",
-                "description": "One short sentence (<= 120 chars) explaining the verdict to the learner.",
-            },
-            "corrected_form": {
-                "type": "string",
-                "description": "The canonical target form. Empty string when not applicable.",
-            },
+    "type": "object",
+    "properties": {
+        "correct": {
+            "type": "boolean",
+            "description": "True if the learner produced the target item correctly (allowing reasonable inflection / case differences).",
         },
-        "required": ["correct", "feedback", "corrected_form"],
+        "feedback": {
+            "type": "string",
+            "description": "One short sentence (<= 120 chars) explaining the verdict to the learner.",
+        },
+        "corrected_form": {
+            "type": "string",
+            "description": "The canonical target form. Empty string when not applicable.",
+        },
     },
+    "required": ["correct", "feedback", "corrected_form"],
+
 }
 
 
@@ -1040,17 +1009,13 @@ async def evaluate_production(
         }
 
     lemma_clause = f"\nTarget lemma: {target_lemma}" if target_lemma else ""
-    response = await _client.messages.create(
-        model=_MODEL,
-        max_tokens=256,
+    response = await _provider.structured(
         system=(
             f"You judge whether a learner's single-shot answer correctly produces a target "
             f"{language} item (word or phrase). Be lenient on inflection, case, and minor "
             f"spelling slips; be strict on meaning. Empty / wrong-language / unrelated answers "
             f"are incorrect. You MUST call the evaluate_production tool."
         ),
-        tools=[_PRODUCTION_EVAL_TOOL],
-        tool_choice={"type": "tool", "name": "evaluate_production"},
         messages=[{
             "role": "user",
             "content": (
@@ -1059,12 +1024,13 @@ async def evaluate_production(
                 f"Did the learner produce the target correctly?"
             ),
         }],
+        schema=_PRODUCTION_EVAL_SCHEMA,
+        max_tokens=256,
     )
-    tool_block = next(b for b in response.content if b.type == "tool_use")
     return {
-        "correct":        bool(tool_block.input["correct"]),
-        "feedback":       str(tool_block.input["feedback"]),
-        "corrected_form": str(tool_block.input.get("corrected_form") or target_text),
+        "correct":        bool(response["correct"]),
+        "feedback":       str(response["feedback"]),
+        "corrected_form": str(response.get("corrected_form") or target_text),
     }
 
 
@@ -1094,29 +1060,26 @@ async def translate_item_gloss(
         return f"[gloss:{text}]"
 
     async def _compute() -> dict:
-        response = await _client.messages.create(
-            model=_MODEL,
-            max_tokens=64,
+        response = await _provider.structured(
             system=(
                 f"You produce concise English glosses for {language}-language learning vocabulary. "
                 f"Keep the gloss minimal (1-4 words for single words, short phrase for multi-word items). "
                 f"You MUST call the item_gloss tool."
             ),
-            tools=[_GLOSS_TOOL],
-            tool_choice={"type": "tool", "name": "item_gloss"},
             messages=[{"role": "user", "content": f"Item: {text}\nType: {item_type}"}],
+            schema=_GLOSS_SCHEMA,
+            max_tokens=64,
         )
-        tool_block = next(b for b in response.content if b.type == "tool_use")
-        return {"gloss": tool_block.input["gloss"]}
+        return {"gloss": response["gloss"]}
 
     if pool is None:
         return (await _compute())["gloss"]
 
     cache_key = llm_cache_service.make_cache_key(
-        "item_gloss", _MODEL,
+        "item_gloss", _provider.model_id,
         {"text": text.lower(), "item_type": item_type, "language": language},
     )
     result = await llm_cache_service.get_or_compute(
-        pool, cache_key, "item_gloss", _MODEL, _compute,
+        pool, cache_key, "item_gloss", _provider.model_id, _compute,
     )
     return result["gloss"]

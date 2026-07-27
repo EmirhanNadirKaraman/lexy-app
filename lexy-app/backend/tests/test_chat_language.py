@@ -27,8 +27,8 @@ from httpx import AsyncClient
 
 from backend.services.llm_service import (
     _language_name,
-    _make_eval_tool,
-    _make_guided_hints_tool,
+    _make_eval_schema,
+    _make_guided_hints_schema,
     _make_system,
 )
 from ._email_helper import make_test_email
@@ -66,17 +66,17 @@ def test_make_system_es_contains_spanish_and_no_german():
     assert "language tutor" in prompt
 
 
-def test_make_eval_tool_de_enum_includes_de():
-    tool = _make_eval_tool("de")
-    enum = tool["input_schema"]["properties"]["language_detected"]["enum"]
+def test_make_eval_schema_de_enum_includes_de():
+    schema = _make_eval_schema("de")
+    enum = schema["properties"]["language_detected"]["enum"]
     assert "de" in enum
     assert "en" in enum
     assert "mixed" in enum
 
 
-def test_make_eval_tool_es_enum_includes_es_not_de():
-    tool = _make_eval_tool("es")
-    enum = tool["input_schema"]["properties"]["language_detected"]["enum"]
+def test_make_eval_schema_es_enum_includes_es_not_de():
+    schema = _make_eval_schema("es")
+    enum = schema["properties"]["language_detected"]["enum"]
     assert "es" in enum
     assert "en" in enum
     assert "mixed" in enum
@@ -84,10 +84,10 @@ def test_make_eval_tool_es_enum_includes_es_not_de():
 
 
 def test_guided_hints_tool_es_mentions_spanish_not_german():
-    tool = _make_guided_hints_tool("es")
+    schema = _make_guided_hints_schema("es")
     descs = [
         p["description"]
-        for p in tool["input_schema"]["properties"].values()
+        for p in schema["properties"].values()
         if "description" in p
     ]
     joined = " ".join(descs)
@@ -96,10 +96,10 @@ def test_guided_hints_tool_es_mentions_spanish_not_german():
 
 
 def test_guided_hints_tool_de_still_mentions_german():
-    tool = _make_guided_hints_tool("de")
+    schema = _make_guided_hints_schema("de")
     descs = [
         p["description"]
-        for p in tool["input_schema"]["properties"].values()
+        for p in schema["properties"].values()
         if "description" in p
     ]
     joined = " ".join(descs)

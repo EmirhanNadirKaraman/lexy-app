@@ -115,6 +115,50 @@ full picture):
 - Theme tokens: `src/test/theme.test.tsx` (across #20a/b).
 - Lemma corrections (#39 frontend, 2026-07-27) — see the dated row below.
 - Vocabulary lists: `WordListsPage` + `tests/test_word_lists.py` (2026-07-27).
+- LLM provider seam: `tests/test_llm_provider.py` (2026-07-27).
+
+🆕 **2026-07-27 — LLM provider seam, step 1 (+31 tests / +1 file)**
+
+Removed the three ad-hoc `AsyncAnthropic` constructions (`llm_service`,
+`book_llm_service`, `reading_llm_service`) and routed all 13 call sites through
+`services/llm_provider.py`. Anthropic behaviour preserved exactly — no local /
+OpenAI-compatible adapter yet.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_llm_provider.py` (NEW) | 31 | `split_schema` (extract name/description, **strip both from the body**, missing-title → `LLMProviderError`); request shape (one tool, forced `tool_choice`, model/system/messages/max_tokens pass-through); tool-input extraction incl. a leading text block; missing/empty `tool_use` → `LLMProviderError` naming schema + model; `model_id` default, `LLM_MODEL` override, explicit-arg precedence; all three services expose `_provider` and **no** `_client`/`_MODEL`; the two read-only cache lookups key on `provider.model_id`; **14 byte-identity checks** rebuilding every tool dict from its schema and diffing against the pre-seam definition read out of git |
+
+**The load-bearing assertion is byte-identity.** `title` and `description` are
+carried as JSON Schema keywords (so the interface stays four arguments wide and
+a future OpenAI-compatible adapter maps the same dict onto
+`response_format.json_schema`), and `split_schema` strips them before building
+`input_schema`. Leaving them in would be *accepted by the API without error*
+while changing the prompt the model sees — exactly the silent regression
+"preserve behaviour exactly" is meant to rule out. 11 constants + 2 factories ×
+3 languages all reconstruct identically.
+
+**Retargeted, not deleted:**
+
+| File | Change |
+|---|---|
+| `tests/test_llm_cache_migration.py` | `_StubBlock`/`_StubResp` (fake Anthropic content blocks) → one `_FakeProvider` returning the dict directly; 5 monkeypatches move from `_client.messages.create` to `_provider`. `model_id` returns the real default so cache keys hash as in production. |
+| `tests/test_srs_gloss.py` | 2 client stubs → `_CountingProvider` / `_ExplodingProvider`; 2 `llm_service._MODEL` reads → `_provider.model_id`. |
+| `tests/test_chat_language.py` | `_make_eval_tool` / `_make_guided_hints_tool` → `_make_eval_schema` / `_make_guided_hints_schema`; assertions read top-level `["properties"]` instead of `["input_schema"]["properties"]`. |
+
+**MockProvider deferred — wrong layer, not too big.** `MOCK_LLM` fakes are
+computed from *call arguments* the provider never receives: `guided_evaluate`
+needs `target_word in user_content`, `evaluate_production` substring-matches
+`target_text` against `user_answer`, `translate_item_gloss` returns
+`[gloss:{text}]`, `evaluate_and_reply` echoes the requested `language`. The
+provider sees those only as prose inside the prompt, so a MockProvider would
+have to regex them back out — coupling the mock to prompt wording and making it
+strictly worse. `test_srs_produce.py`, `test_free_chat_progression.py` and
+`test_srs_gloss.py` depend on those exact semantics. The 16 `_MOCK` branches
+stay where they are.
+
+**Validation:** backend `-n auto` → **817 passed, 2 skipped** (786 baseline
++ 31); `ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed.
 
 🆕 **2026-07-27 — vocabulary list upload/download (+39 tests / +2 files)**
 

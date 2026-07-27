@@ -37,7 +37,7 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 - **FastAPI** + **asyncpg** (async Postgres driver, pool-based)
 - **Alembic** migrations (25+ files in `alembic/versions/`)
 - **JWT auth** (HS256, secret in `SECRET_KEY` env)
-- **Anthropic SDK** → `claude-haiku-4-5-20251001`. All LLM calls use tool_use for structured output.
+- **Anthropic SDK** → `claude-haiku-4-5-20251001` (override with `LLM_MODEL`). All LLM calls go through `services/llm_provider.py`, which maps a JSON Schema onto a forced single-tool call. One call shape everywhere: non-streaming, structured JSON out.
 - **LLM cache**: SHA256(prompt_key + model + params) → `llm_cache` table, with TTL.
 - **spaCy** (`de_core_news_md` etc.) for tokenisation/lemmatisation.
 
@@ -351,7 +351,7 @@ MOCK_LLM=false            # set true to short-circuit LLM in tests
 - **Read `docs/COMMON_ERRORS.md` when something breaks, and add to it when something new breaks.** Symptom-first log of errors actually hit here — grep it by the error text before debugging from scratch. Several entries are traps where the obvious fix is wrong (ruff E402 on sibling imports, F401 on availability probes), so it is worth a look *before* "fixing" a lint or test failure, not only after being stuck.
 - **Consult and update `docs/SECURITY.md` for any security-relevant change.** It's the living tracker of open/resolved findings and the controls we rely on. See §14 for the read/update triggers and the four fields every finding must carry.
 - **All state changes go through `progression_service`.** Don't write directly to `user_word_knowledge` or `srs_cards` from a router.
-- **All LLM calls go through `llm_service` and cache via `llm_cache_service`.** Don't instantiate `AsyncAnthropic` ad-hoc.
+- **All LLM calls go through `llm_provider` and cache via `llm_cache_service`.** Don't instantiate `AsyncAnthropic` ad-hoc — `services/llm_provider.py` holds the only construction (true since 2026-07-27; `llm_service`, `book_llm_service` and `reading_llm_service` each built their own before that). New LLM call sites take a JSON Schema and call `_provider.structured(...)`.
 - **Polymorphic key everywhere:** if you add a new tracked content type, it gets an `item_type`, lives in its own content table (with `display_text` available), and plugs into `user_word_knowledge` / `srs_cards`.
 - **Migrations are append-only** — never edit an existing migration once it's been run anywhere.
 - **Tests live next to the layer they test** (backend tests under `lexy-app/backend/tests/`, pipeline tests under `tests/`).

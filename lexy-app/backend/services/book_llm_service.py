@@ -16,16 +16,14 @@ from __future__ import annotations
 import logging
 import os
 
-import anthropic
 import asyncpg
 
-from . import llm_cache_service
+from . import llm_cache_service, llm_provider
 
 logger = logging.getLogger(__name__)
 
-_client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-_MODEL  = "claude-haiku-4-5-20251001"
-_MOCK   = os.getenv("MOCK_LLM", "").lower() in ("1", "true", "yes")
+_provider = llm_provider.get_provider()
+_MOCK     = os.getenv("MOCK_LLM", "").lower() in ("1", "true", "yes")
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
@@ -41,19 +39,17 @@ Rules:
 - You MUST call the fix_ocr_text tool — never respond with raw text.
 """
 
-_FIX_TOOL: anthropic.types.ToolParam = {
-    "name": "fix_ocr_text",
+_FIX_SCHEMA = {
+    "title": "fix_ocr_text",
     "description": "Return the OCR-corrected version of the block text.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "corrected_text": {
-                "type": "string",
-                "description": "The corrected text. Identical to input if no OCR errors found.",
-            },
+    "type": "object",
+    "properties": {
+        "corrected_text": {
+            "type": "string",
+            "description": "The corrected text. Identical to input if no OCR errors found.",
         },
-        "required": ["corrected_text"],
     },
+    "required": ["corrected_text"],
 }
 
 
@@ -71,25 +67,23 @@ async def _call_llm(user_message: str) -> str:
     if _MOCK:
         return user_message  # echo back unchanged in mock mode
 
-    response = await _client.messages.create(
-        model=_MODEL,
-        max_tokens=1024,
-        system=_SYSTEM,
-        tools=[_FIX_TOOL],
-        tool_choice={"type": "tool", "name": "fix_ocr_text"},
-        messages=[{"role": "user", "content": user_message}],
-    )
+    # The pre-seam version had a second fallback here: if no tool_use block
+    # came back, it returned the response's raw text before giving up. Forced
+    # tool_choice makes that branch unreachable, no test covered it, and the
+    # provider owns response parsing now — so it is deliberately dropped. The
+    # observable contract is unchanged: no usable output still raises
+    # RuntimeError with the same message.
+    try:
+        result = await _provider.structured(
+            system=_SYSTEM,
+            messages=[{"role": "user", "content": user_message}],
+            schema=_FIX_SCHEMA,
+            max_tokens=1024,
+        )
+    except llm_provider.LLMProviderError as exc:
+        raise RuntimeError("LLM returned no usable output") from exc
 
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "fix_ocr_text":
-            return block.input.get("corrected_text", "")
-
-    # Fallback: return the raw text content if tool use somehow wasn't called
-    for block in response.content:
-        if hasattr(block, "text"):
-            return block.text.strip()
-
-    raise RuntimeError("LLM returned no usable output")
+    return result.get("corrected_text", "")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -124,7 +118,7 @@ async def repair_block(
 
     cache_key = llm_cache_service.make_cache_key(
         "book_ocr_repair",
-        _MODEL,
+        _provider.model_id,
         {
             "text": source_text,
             "prev": prev_clean_text or "",
@@ -138,7 +132,7 @@ async def repair_block(
         return {"text": corrected}
 
     result = await llm_cache_service.get_or_compute(
-        pool, cache_key, "book_ocr_repair", _MODEL, _compute,
+        pool, cache_key, "book_ocr_repair", _provider.model_id, _compute,
     )
     return result.get("text", "")
 
