@@ -617,6 +617,38 @@ stay where they are.
 + 31); `ruff check .` → All checks passed. Frontend not run — no frontend files
 changed. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-28 — System list seeding, phase 2 (+26 backend / +2 files)**
+
+Two built-in lists seeded from `data/final_result.txt` — **9,122 items** —
+using `catalog_resolver`, the same rule user lists and reading use.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_system_list_seed.py` (NEW) | 26 | parser splits the two columns, counts a tab-less line as malformed while treating a whitespace-only line as blank, and keeps a row with one cell filled; dedupe is case-insensitive first-spelling-wins, **folds umlauts stricter than the DB index**, preserves file order, drops blanks; list names/descriptions are stable (the name *is* the idempotency key); a `seed_system_lists` dry-run plans exactly the two production lists; dry-run writes nothing; apply creates a row with `user_id NULL` / `is_system true` / `language de`; apply is idempotent; an existing list is reused and only new surfaces appended; inserted counts exclude pre-existing rows; duplicate system names are impossible; original surfaces stored; words *and* phrases bind with the right `item_type`; **ambiguous and unresolved surfaces are kept with `item_id=NULL`, never dropped or first-matched**; counts add up to the surface total; seeding makes no LLM calls. Through the public API: a seeded list is visible to multiple users, cannot be deleted, `mark-unknown-learning` leaves the shared rows untouched while skipping ambiguous entries, two users stay independent, and user-created lists are unaffected |
+
+**Behaviour tests call `seed_one_list` with a unique per-test name**, never
+`seed_system_lists`. The latter uses the two fixed production names and seeding
+is append-only, so a test running it against a fixture source would silently
+add its surfaces to the real *Top German Words* list. Same shared-state trap as
+the `curated_rows` fixture that wiped the gloss seed — assert and write against
+your own rows, not a class-wide name.
+
+**One dead branch removed rather than tested.** The parser had a
+"both cells empty" case that is unreachable: a line with any non-whitespace
+content must put it in some cell, and a whitespace-only line is already caught
+as blank. The first version of the test asserted `skipped == 2` and failed,
+which is what surfaced it.
+
+**Seeder verified end to end:** dry-run (no writes) → apply (9,122 items) →
+dry-run again (`items inserted 0`, `already present 4087 / 5035`) → apply again
+(`inserted 0`). A full `-n auto` run left the seeded lists at exactly 2 lists /
+9,122 items.
+
+**Validation:** backend `-n auto` → **1129 passed, 2 skipped** (1103 + 26);
+`ruff check .` → All checks passed; alembic unchanged at **037**. Frontend not
+run — no frontend files changed. Root pipeline suite not run — no root files
+changed.
+
 🆕 **2026-07-27 — vocabulary list upload/download (+39 tests / +2 files)**
 
 New feature: paste or upload a word list, see what you already know, mark the

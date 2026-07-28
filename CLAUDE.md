@@ -319,7 +319,7 @@ Two things to know before "fixing" what it reports:
 ```bash
 cd lexy-app/backend
 pytest                              # serial
-pytest -n auto                      # parallel via pytest-xdist — ~92s for 1103 tests
+pytest -n auto                      # parallel via pytest-xdist — ~80s for 1129 tests
 ```
 `pytest-randomly` is blocked via `addopts = -p no:randomly` in both ini files.
 That is deliberate and load-bearing — see `docs/TESTS.md` for the spaCy/thinc
