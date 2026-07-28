@@ -505,6 +505,44 @@ not just that tests pass.**
 `ruff check .` → All checks passed. Frontend not run — no frontend files
 changed. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-28 — Curated gloss-cache seeding (+43 backend / +2 files)**
+
+`review_service.get_due_cards` asks `translate_item_gloss` for a gloss on every
+non-grammar due card — an LLM call per never-glossed item, on the review hot
+path. **3,622 curated glosses** are now pre-seeded from
+`data/words_4000_old.txt` under the sentinel model `curated:words_4000_old`,
+which `translate_item_gloss` checks *before* the model-specific key.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_gloss_seed.py` (NEW) | 43 | parser reads columns 1+3 and skips blank/malformed lines; article stripping incl. the *derartig* false positive; gloss-shape rules with the 4-word boundary asserted on both sides; multi-entry cells, multi-sense and long rows skipped; candidates keyed by `.lower()` with first-spelling-wins; **the seeder's key equals what `translate_item_gloss` computes** (parametrized over umlauts and `straße`) rather than being asserted in isolation; umlaut case variants share one key; the sentinel is neither a real model nor reapable by the test cleanup; dry-run writes nothing; apply inserts with `expires_at IS NULL`; apply is idempotent; **inserted count excludes pre-existing rows**; surfaces absent from the catalog are not seeded; **an ambiguous catalog surface IS seedable** (the key is text, not `item_id`); a curated gloss is served **without calling the provider** (an exploding fake proves it); **it survives a model switch**; an uncurated word still falls back to the model cache and computes exactly once; `MOCK_LLM` semantics unchanged; seeding never calls the provider |
+
+**Two mistakes I made here, both caught by measurement rather than by a green
+suite — worth reading before writing a fixture that touches a shared table.**
+
+1. **A fixture wiped production data.** The first `curated_rows` fixture did a
+   blanket `DELETE FROM llm_cache WHERE model = CURATED_MODEL`. Every test
+   using it deleted **all 3,622 seeded rows**, not just its own writes. The
+   suite passed; the row count afterwards was 0. It now registers keys
+   explicitly (`curated_rows(word)`), the same shape as `tracked_words`, so a
+   worker can only delete keys it computed itself.
+2. **A test asserted a global count.** `count(*) WHERE model = CURATED_MODEL == 1`
+   passed only while the table was empty and failed the moment real rows
+   existed. Scoped to the test's own `cache_key`.
+
+Both are the same lesson: **on a shared table, assert and delete by your own
+keys, never by a class-wide predicate.**
+
+**Verified end to end:** seed → full `-n auto` run → curated rows still 3,622,
+total 3,622, zero `zztest-model-%` residue; a follow-up dry-run reports
+`already cached 3622 / missing 0`. Live spot-check with an exploding provider:
+`Haus`→`house`, `haus`→`house`, `Öl`→`oil`, `Übung`→`exercise, practice`,
+`ich`→`I`, all without an LLM call.
+
+**Validation:** backend `-n auto` → **1083 passed, 2 skipped** (1040 + 43);
+`ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — LLM provider seam, step 1 (+31 tests / +1 file)**
 
 Removed the three ad-hoc `AsyncAnthropic` constructions (`llm_service`,

@@ -1052,12 +1052,41 @@ async def translate_item_gloss(
 
     Cache key shape (prompt_key='item_gloss'):
         {"text": text.lower(), "item_type": item_type, "language": language}
+
+    Two cache reads, in order (2026-07-28):
+
+    1. the **curated** key — same params, but model `curated:words_4000_old`
+       (`gloss_seed_service.CURATED_MODEL`), holding human translations seeded
+       from `data/words_4000_old.txt`;
+    2. the model-specific key, computing and caching on a miss exactly as
+       before.
+
+    Curated first because `make_cache_key` includes the model: rows written
+    under one model id miss entirely once `LLM_MODEL` changes, which is the
+    whole point of the provider seam. Checking the model-independent key first
+    lets curated glosses survive a switch while genuine LLM output stays
+    correctly model-scoped. Nothing here ever *writes* a curated row — only
+    `scripts/seed_gloss_cache.py --apply` does.
     """
     if item_type not in ("word", "phrase"):
         raise ValueError(f"translate_item_gloss handles 'word'/'phrase', got {item_type!r}")
 
     if _MOCK:
         return f"[gloss:{text}]"
+
+    params = {"text": text.lower(), "item_type": item_type, "language": language}
+
+    if pool is not None:
+        # Local import: gloss_seed_service imports llm_cache_service, and a
+        # module-level import here would make llm_service depend on a seeding
+        # module it never otherwise needs.
+        from .gloss_seed_service import CURATED_MODEL
+
+        curated = await llm_cache_service.get_cached(
+            pool, llm_cache_service.make_cache_key("item_gloss", CURATED_MODEL, params),
+        )
+        if curated is not None:
+            return curated["gloss"]
 
     async def _compute() -> dict:
         response = await _provider.structured(
@@ -1076,8 +1105,7 @@ async def translate_item_gloss(
         return (await _compute())["gloss"]
 
     cache_key = llm_cache_service.make_cache_key(
-        "item_gloss", _provider.model_id,
-        {"text": text.lower(), "item_type": item_type, "language": language},
+        "item_gloss", _provider.model_id, params,
     )
     result = await llm_cache_service.get_or_compute(
         pool, cache_key, "item_gloss", _provider.model_id, _compute,

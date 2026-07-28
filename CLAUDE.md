@@ -38,7 +38,7 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 - **Alembic** migrations (25+ files in `alembic/versions/`)
 - **JWT auth** (HS256, secret in `SECRET_KEY` env)
 - **LLM** → `services/llm_provider.py` is the only place a client is constructed. Two backends, selected by `LLM_PROVIDER`: `anthropic` (default, `claude-haiku-4-5-20251001`) and `openai_compatible` (any `/chat/completions` server — Ollama `/v1`, llama.cpp, vLLM, LM Studio). One call shape everywhere: non-streaming, JSON Schema in, structured dict out. **No host is assumed** — `LLM_BASE_URL` is built for a GPU box over Tailscale, not localhost. See §11 for the env vars.
-- **LLM cache**: SHA256(prompt_key + model + params) → `llm_cache` table, with TTL.
+- **LLM cache**: SHA256(prompt_key + model + params) → `llm_cache` table, with TTL. Curated human glosses live in the same table under the sentinel model `curated:words_4000_old`, which `translate_item_gloss` checks before the model-specific key so they survive an `LLM_MODEL` switch.
 - **spaCy** (`de_core_news_md` etc.) for tokenisation/lemmatisation.
 
 ### Frontend (`lexy-app/frontend/`)
@@ -318,7 +318,7 @@ Two things to know before "fixing" what it reports:
 ```bash
 cd lexy-app/backend
 pytest                              # serial
-pytest -n auto                      # parallel via pytest-xdist — ~57s for 1040 tests
+pytest -n auto                      # parallel via pytest-xdist — ~80s for 1083 tests
 ```
 `pytest-randomly` is blocked via `addopts = -p no:randomly` in both ini files.
 That is deliberate and load-bearing — see `docs/TESTS.md` for the spaCy/thinc
