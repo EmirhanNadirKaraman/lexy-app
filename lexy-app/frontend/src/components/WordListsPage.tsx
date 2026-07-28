@@ -76,6 +76,16 @@ const TYPE_BADGE: React.CSSProperties = {
  * the cap ever does: a user who confirms should get their whole request, not a
  * surprise chunk. Small user lists never see it.
  */
+/**
+ * How many detail entries to mount at once.
+ *
+ * The seeded built-in lists hold 4,087 and 5,035 entries, and `get_list`
+ * returns all of them (406 KB / 514 KB). Rendering that in one flat `.map()`
+ * mounts thousands of DOM nodes synchronously — a visible freeze on a phone.
+ * The response is unchanged; this only bounds what is on screen.
+ */
+const ENTRY_CHUNK = 200;
+
 const MARK_CONFIRM_THRESHOLD = 200;
 
 const SYSTEM_BADGE: React.CSSProperties = {
@@ -169,6 +179,7 @@ const errorStyle: React.CSSProperties = {
 export function WordListsPage({ token, language, onClose }: Props) {
     const [lists, setLists] = useState<WordListSummary[]>([]);
     const [detail, setDetail] = useState<WordListDetail | null>(null);
+    const [visibleCount, setVisibleCount] = useState(ENTRY_CHUNK);
     const [name, setName] = useState('');
     const [text, setText] = useState('');
     const [creating, setCreating] = useState(false);
@@ -177,6 +188,19 @@ export function WordListsPage({ token, language, onClose }: Props) {
     const [loadError, setLoadError] = useState<string | null>(null);
     const [actionError, setActionError] = useState<string | null>(null);
     const [notice, setNotice] = useState<string | null>(null);
+
+    /**
+     * Swap the open list and reset how much of it is shown.
+     *
+     * Every `setDetail` goes through here so the slice can never outlive the
+     * list it belongs to — opening another list, refreshing after
+     * mark-learning, and closing all reset together. Resetting at each call
+     * site instead would work until the next one forgets.
+     */
+    function showDetail(next: WordListDetail | null) {
+        setDetail(next);
+        setVisibleCount(ENTRY_CHUNK);
+    }
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     useEffect(() => {
@@ -209,7 +233,7 @@ export function WordListsPage({ token, language, onClose }: Props) {
             const created = await createWordList(
                 token, name.trim() || 'Untitled list', language, words,
             );
-            setDetail(created);
+            showDetail(created);
             setLists(prev => [
                 {
                     list_id: created.list_id,
@@ -248,7 +272,7 @@ export function WordListsPage({ token, language, onClose }: Props) {
         setActionError(null);
         setNotice(null);
         try {
-            setDetail(await getWordList(token, listId));
+            showDetail(await getWordList(token, listId));
         } catch (err: unknown) {
             setActionError(err instanceof Error ? err.message : 'Unknown error');
         }
@@ -271,7 +295,7 @@ export function WordListsPage({ token, language, onClose }: Props) {
         setNotice(null);
         try {
             const result = await markUnknownAsLearning(token, detail.list_id);
-            setDetail(await getWordList(token, detail.list_id));
+            showDetail(await getWordList(token, detail.list_id));
             const skipped = result.skipped_unresolved + result.skipped_ambiguous;
             const remaining = result.remaining ?? 0;
             setNotice(
@@ -311,7 +335,7 @@ export function WordListsPage({ token, language, onClose }: Props) {
         try {
             await deleteWordList(token, listId);
             setLists(prev => prev.filter(l => l.list_id !== listId));
-            if (detail?.list_id === listId) setDetail(null);
+            if (detail?.list_id === listId) showDetail(null);
         } catch (err: unknown) {
             setActionError(err instanceof Error ? err.message : 'Unknown error');
         }
@@ -632,7 +656,7 @@ export function WordListsPage({ token, language, onClose }: Props) {
                         listStyle: 'none', margin: '12px 0 0', padding: 0,
                         display: 'flex', flexWrap: 'wrap', gap: '8px',
                     }}>
-                        {detail.entries.map(entry => (
+                        {detail.entries.slice(0, visibleCount).map(entry => (
                             <li
                                 key={entry.id}
                                 data-testid={`word-list-entry-${entry.surface}`}
@@ -658,6 +682,31 @@ export function WordListsPage({ token, language, onClose }: Props) {
                             </li>
                         ))}
                     </ul>
+
+                    {/* Only when something is hidden. A short list shows no
+                        extra chrome at all. Deliberately no "Show all": that
+                        would put the freeze back one click away. */}
+                    {detail.entries.length > visibleCount && (
+                        <div
+                            data-testid="word-list-more"
+                            style={{
+                                display: 'flex', alignItems: 'center', gap: '10px',
+                                flexWrap: 'wrap', marginTop: '12px',
+                            }}
+                        >
+                            <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                                Showing {visibleCount.toLocaleString()} of{' '}
+                                {detail.entries.length.toLocaleString()} entries
+                            </span>
+                            <button
+                                data-testid="word-list-show-more"
+                                onClick={() => setVisibleCount(c => c + ENTRY_CHUNK)}
+                                style={buttonStyle}
+                            >
+                                Show more
+                            </button>
+                        </div>
+                    )}
                 </div>
             )}
         </div>

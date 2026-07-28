@@ -721,6 +721,41 @@ frontend `npx vitest run` → **296 passed across 44 files** (289 + 7);
 `npx tsc --noEmit` clean; `npm run build` succeeded; `ruff check .` → All
 checks passed. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-29 — Large-list render guard (+10 frontend)**
+
+`get_list` returns every entry — 4,087 and 5,035 for the seeded built-in lists,
+406 KB / 514 KB — and the detail view mounted all of them in one flat `.map()`.
+Entries now render `ENTRY_CHUNK` (200) at a time behind a “Showing N of M
+entries / Show more” control. **Frontend-only**: the response, the API, and
+every count are unchanged; only what is on screen is bounded.
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/components/WordListsPage.test.tsx` | +10 | a 5,035-entry list mounts exactly 200 rows and `w200` is absent; the footer reads `Showing 200 of 5,035 entries`; Show more reveals the next 200; a 450-entry list reaches its final partial chunk and the control then disappears; a small list renders in full with **no** extra chrome; **ambiguous and unresolved entries are not filtered out** of the slice (it is positional); the count resets when a different list is opened **and** after a mark-learning refresh; counts, export and mark-learning still read the **full** response (5,035 shown in the badge and button while 200 rows are mounted); the built-in badge and delete-hiding are untouched |
+
+**Both halves mutation-checked.** Dropping the slice
+(`entries.slice(0, visibleCount)` → `entries`) fails 5 tests; dropping the
+reset inside `showDetail` fails exactly the 2 reset tests — so the guard and
+its lifetime are pinned independently.
+
+**The reset is structural, not by convention.** There were four `setDetail`
+call sites; they now all go through `showDetail()`, which sets the detail and
+resets the slice together. Resetting at each call site would work until the
+next one forgets.
+
+**No “Show all” button, deliberately.** It would put the freeze one click away,
+which is the thing this change exists to prevent.
+
+**Still open:** the 406 KB / 514 KB payload itself. Reducing it needs backend
+pagination — query params, a stable cursor, and a story for keeping status
+counts whole-list — which is a larger design question than the render freeze
+was. Tracked in `docs/TODO.md`.
+
+**Validation:** frontend `npx vitest run` → **306 passed across 44 files**
+(296 + 10); `npx tsc --noEmit` clean; `npm run build` succeeded;
+`ruff check .` → All checks passed. Backend pytest not run — **no backend files
+changed**. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — vocabulary list upload/download (+39 tests / +2 files)**
 
 New feature: paste or upload a word list, see what you already know, mark the

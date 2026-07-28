@@ -650,3 +650,193 @@ describe('WordListsPage — bulk mark guard', () => {
         expect(notice).not.toHaveTextContent('remaining');
     });
 });
+
+/**
+ * Large-list render guard.
+ *
+ * `get_list` returns every entry — 4,087 and 5,035 for the seeded built-in
+ * lists — and the detail view used to mount all of them in one flat `.map()`.
+ * The response is unchanged; only what is on screen is bounded. Counts,
+ * export, and mark-learning all still work off the full response.
+ */
+describe('WordListsPage — large detail rendering', () => {
+    const CHUNK = 200;
+
+    function bigDetail(n: number, overrides: Partial<WordListDetail> = {}): WordListDetail {
+        return makeDetail({
+            list_id: 2,
+            name: 'Top German Words',
+            is_system: true,
+            total: n,
+            counts: { known: 0, learning: 0, unknown: n, unresolved: 0, ambiguous: 0 },
+            entries: Array.from({ length: n }, (_, i) => ({
+                id: i + 1,
+                surface: `w${i}`,
+                item_id: i + 1,
+                item_type: 'word' as const,
+                status: 'unknown' as const,
+            })),
+            ...overrides,
+        });
+    }
+
+    function installLists(listSummaries: unknown[], detailFor: (id: string) => WordListDetail,
+                          markResult?: unknown) {
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse(listSummaries);
+            }
+            if (url.includes('mark-unknown-learning')) {
+                return jsonResponse(markResult ?? {
+                    list_id: 2, marked: 0, marked_item_ids: [],
+                    skipped_unresolved: 0, skipped_ambiguous: 0, remaining: 0, capped: false,
+                });
+            }
+            const id = url.match(/word-lists\/(\d+)/)?.[1] ?? '2';
+            return jsonResponse(detailFor(id));
+        });
+    }
+
+    function visibleEntries() {
+        return screen.queryAllByTestId(/^word-list-entry-/);
+    }
+
+    it('renders only the first chunk of a large list', async () => {
+        installLists([summary({ list_id: 2, name: 'Top German Words', is_system: true })],
+            () => bigDetail(5035));
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-detail');
+
+        expect(visibleEntries()).toHaveLength(CHUNK);
+        expect(screen.getByTestId('word-list-entry-w0')).toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-entry-w200')).not.toBeInTheDocument();
+    });
+
+    it('shows how many of the total are visible', async () => {
+        installLists([summary({ list_id: 2, name: 'Top German Words', is_system: true })],
+            () => bigDetail(5035));
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+
+        expect(await screen.findByTestId('word-list-more')).toHaveTextContent(
+            'Showing 200 of 5,035 entries',
+        );
+    });
+
+    it('reveals the next chunk on Show more', async () => {
+        installLists([summary({ list_id: 2, name: 'Top German Words', is_system: true })],
+            () => bigDetail(5035));
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-detail');
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+
+        expect(visibleEntries()).toHaveLength(CHUNK * 2);
+        expect(screen.getByTestId('word-list-entry-w200')).toBeInTheDocument();
+    });
+
+    it('reaches the final partial chunk and then hides the control', async () => {
+        installLists([summary({ list_id: 2, name: 'Small system', is_system: true })],
+            () => bigDetail(450));
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-detail');
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));   // 400
+        expect(visibleEntries()).toHaveLength(400);
+        fireEvent.click(screen.getByTestId('word-list-show-more'));   // 450, the remainder
+
+        expect(visibleEntries()).toHaveLength(450);
+        expect(screen.queryByTestId('word-list-more')).not.toBeInTheDocument();
+    });
+
+    it('renders a small list in full with no extra controls', async () => {
+        installLists([summary({ list_id: 1, is_system: false })], () => makeDetail({ list_id: 1 }));
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-1'));
+        await screen.findByTestId('word-list-detail');
+
+        expect(visibleEntries()).toHaveLength(4);
+        expect(screen.queryByTestId('word-list-more')).not.toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-show-more')).not.toBeInTheDocument();
+    });
+
+    it('does not hide ambiguous or unresolved entries from the slice', async () => {
+        // They sort in with everything else — the slice is positional, never
+        // filtered by status.
+        const detail = bigDetail(3);
+        detail.entries[1] = { id: 2, surface: 'Bank', item_id: null, item_type: 'word', status: 'ambiguous' };
+        detail.entries[2] = { id: 3, surface: 'Blorptzk', item_id: null, item_type: 'word', status: 'unresolved' };
+        installLists([summary({ list_id: 2, is_system: true })], () => detail);
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+
+        expect(await screen.findByTestId('word-list-entry-Bank')).toBeInTheDocument();
+        expect(screen.getByTestId('word-list-entry-Blorptzk')).toBeInTheDocument();
+    });
+
+    it('resets the visible count when a different list is opened', async () => {
+        installLists(
+            [summary({ list_id: 2, name: 'Big', is_system: true }),
+             summary({ list_id: 3, name: 'Also big', is_system: true })],
+            id => bigDetail(5035, { list_id: Number(id) }),
+        );
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-detail');
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        expect(visibleEntries()).toHaveLength(CHUNK * 2);
+
+        fireEvent.click(screen.getByTestId('word-list-open-3'));
+
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK));
+    });
+
+    it('resets the visible count after a mark-learning refresh', async () => {
+        installLists([summary({ list_id: 2, is_system: true })], () => bigDetail(5035));
+        vi.spyOn(window, 'confirm').mockReturnValue(true);
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-detail');
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        expect(visibleEntries()).toHaveLength(CHUNK * 2);
+
+        fireEvent.click(screen.getByTestId('word-list-mark-learning'));
+
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK));
+    });
+
+    it('keeps counts, export and mark-learning driven by the FULL response', async () => {
+        installLists([summary({ list_id: 2, is_system: true })], () => bigDetail(5035));
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-detail');
+
+        // 5,035 unknown, though only 200 rows are mounted.
+        expect(screen.getByTestId('word-list-count-unknown')).toHaveTextContent('5035');
+        expect(screen.getByTestId('word-list-mark-learning')).toHaveTextContent('5035');
+        expect(screen.getByTestId('word-list-download')).toBeInTheDocument();
+    });
+
+    it('leaves the built-in badge and delete-hiding untouched', async () => {
+        installLists([summary({ list_id: 2, name: 'Top German Words', is_system: true })],
+            () => bigDetail(5035));
+        renderPage();
+
+        expect(await screen.findByTestId('word-list-system-badge-2')).toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-delete-2')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByTestId('word-list-open-2'));
+        expect(await screen.findByTestId('word-list-detail-system-badge')).toBeInTheDocument();
+    });
+});
