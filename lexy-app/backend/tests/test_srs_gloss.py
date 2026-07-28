@@ -15,7 +15,8 @@ don't need real Anthropic credentials and aren't subject to flake/latency.
 import pytest
 from httpx import AsyncClient
 
-from backend.services import llm_service, llm_provider
+from backend.services import llm_service
+from ._cache_helper import test_model
 from ._email_helper import make_test_email
 from ._auth_helper import register_and_login
 
@@ -192,7 +193,7 @@ async def test_second_due_call_uses_cache_no_llm_invocation(client: AsyncClient,
     call_count = {"n": 0}
 
     class _CountingProvider:
-        model_id = llm_provider.DEFAULT_ANTHROPIC_MODEL
+        model_id = test_model()
 
         async def structured(self, system, messages, schema, max_tokens):
             call_count["n"] += 1
@@ -243,7 +244,7 @@ async def test_grammar_rule_card_uses_short_explanation_no_llm(client: AsyncClie
 
     # Sentinel: provider that ASSERTS it is never invoked.
     class _ExplodingProvider:
-        model_id = llm_provider.DEFAULT_ANTHROPIC_MODEL
+        model_id = test_model()
 
         async def structured(self, system, messages, schema, max_tokens):
             raise AssertionError("LLM must not be called for grammar_rule cards")

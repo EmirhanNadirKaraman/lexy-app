@@ -26,10 +26,10 @@ import pytest
 from backend.services import (
     book_llm_service,
     llm_cache_service,
-    llm_provider,
     llm_service,
     reading_llm_service,
 )
+from ._cache_helper import test_model
 
 
 # ---------------------------------------------------------------------------
@@ -48,13 +48,35 @@ def _unique_de_word() -> str:
     return f"testword_{uuid.uuid4().hex[:10]}"
 
 
+class _ModelIdOnly:
+    """Exposes only `model_id`, for call sites stubbed above the provider.
+
+    `book_llm_service.repair_block` is stubbed at `_call_llm`, so its provider
+    is never invoked — but `model_id` still feeds `make_cache_key`. Without
+    this the cached row lands under the production model id: unreapable, and
+    sitting on a real production cache key.
+    """
+
+    @property
+    def model_id(self) -> str:
+        return test_model()
+
+
 class _FakeProvider:
     """Counting stand-in for an `llm_provider.LLMProvider`.
 
     Post-seam the services depend on the provider Protocol, not on the
     Anthropic SDK, so the fake returns the structured dict directly instead
-    of a fake `tool_use` content block. `model_id` keeps the real default so
-    cache keys hash exactly as they do in production.
+    of a fake `tool_use` content block.
+
+    `model_id` returns a worker-tagged TEST model, not the production default.
+    The key still hashes through the same `make_cache_key` with the same
+    prompt_key and params, so the concurrency behaviour under test is
+    identical — only the model component differs. That difference is
+    load-bearing: with the production model id these fakes wrote
+    `{"gloss": "stub"}` onto the exact keys real glosses use, so a test run
+    could serve a stub to a real SRS card, and the rows were unreapable. See
+    `tests/_cache_helper.py`.
     """
 
     def __init__(self, payload: dict, counter: dict, gate: asyncio.Event | None = None):
@@ -64,7 +86,7 @@ class _FakeProvider:
 
     @property
     def model_id(self) -> str:
-        return llm_provider.DEFAULT_ANTHROPIC_MODEL
+        return test_model()
 
     async def structured(self, system, messages, schema, max_tokens) -> dict:
         self._counter["n"] += 1
@@ -192,6 +214,12 @@ async def test_book_repair_concurrent_same_key_one_provider_call(
         return "corrected by stub"
 
     monkeypatch.setattr(book_llm_service, "_call_llm", _stub_call_llm)
+    # `_call_llm` is stubbed, so `_provider` is consulted only for `model_id`
+    # when building the cache key. Tag it so the row this test writes carries
+    # the worker tag and gets reaped — stubbing one layer above the provider
+    # would otherwise leave a `book_ocr_repair` row under the PRODUCTION model
+    # id, which is how this suite used to pollute the shared table.
+    monkeypatch.setattr(book_llm_service, "_provider", _ModelIdOnly())
 
     block = {
         "block_id": 1,

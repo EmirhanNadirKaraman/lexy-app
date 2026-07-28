@@ -461,6 +461,50 @@ model server should fail at boot, not on the first learner's message.
 `ruff check .` → All checks passed. Frontend not run — no frontend files
 changed. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-28 — `llm_cache` test isolation (+7 backend / +1 file)**
+
+`llm_cache` is GLOBAL with no user FK, so the autouse user cleanup could not
+reach it and **no fixture ever did**. A dev database had accumulated **2,762
+rows of pure test residue**. Two distinct problems, not one:
+
+- **Residue** — `test_llm_cache.py` wrote 26 times per run and deleted nothing.
+- **Collision** — the provider fakes in `test_llm_cache_migration.py` and
+  `test_srs_gloss.py` reported the **production** `model_id`, so their output
+  landed on the exact cache keys production uses. All 335 `item_gloss` rows
+  were fakes' `{"gloss": "stub"}` — a test run could hand `"stub gloss"` to a
+  real SRS card, and a curated gloss seed (TODO #43 step 2) would have
+  collided with them.
+
+**The tag lives in `model`, not `prompt_key`.** `model` is the one field every
+write path controls — direct `set_cached` calls *and* the fakes, whose
+`model_id` feeds `make_cache_key`. Tagging prompt keys would miss the fakes,
+which must keep real keys (`item_gloss`) for the code under test to behave
+normally. **Cleanup must never key on `prompt_key`** — `item_gloss` will hold
+real curated rows.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/_cache_helper.py` (NEW) | — | `test_model()` / `cleanup_pattern()`, mirroring `_email_helper`'s per-worker pattern |
+| `tests/conftest.py` | — | autouse `cleanup` also reaps `llm_cache WHERE model LIKE <worker pattern>` |
+| `tests/test_llm_cache.py` | +4 | rows are tagged with a non-production model (and never look like `claude*` or `curated*`); the pattern matches only this worker's rows; **a seeded `curated:*` row and a production row are both spared**; and an end-to-end proof the fixture reaps — a later test finds zero tagged rows from earlier ones |
+
+**Parallel-safe.** The pattern embeds `PYTEST_XDIST_WORKER` (or `main`
+serially), so a finishing worker cannot delete another worker's in-flight rows.
+Verified on both paths: a full `-n auto` run and a serial run each left the
+table at **exactly 2,762 rows**, with 0 `zztest%` rows remaining.
+
+**One write path was missed on the first pass and caught by measurement, not
+by reading.** `book_llm_service.repair_block` is stubbed at `_call_llm` — one
+layer *above* the provider — so retagging the fake providers didn't reach it
+and it kept writing `book_ocr_repair` rows under the production model id. The
+before/after row count showed +1; the fix patches `_provider` with a
+`_ModelIdOnly` stand-in used solely for the cache key. **Check the row delta,
+not just that tests pass.**
+
+**Validation:** backend `-n auto` → **1040 passed, 2 skipped** (1033 + 7);
+`ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — LLM provider seam, step 1 (+31 tests / +1 file)**
 
 Removed the three ad-hoc `AsyncAnthropic` constructions (`llm_service`,

@@ -23,6 +23,7 @@ from httpx import ASGITransport, AsyncClient
 
 from backend.database import _resolve_ssl
 from . import _word_helper
+from ._cache_helper import cleanup_pattern as cache_cleanup_pattern
 from ._email_helper import cleanup_pattern
 
 # .env is four levels up from this file:
@@ -75,6 +76,16 @@ async def cleanup(db_pool):
     await db_pool.execute(
         "DELETE FROM users WHERE email LIKE $1",
         cleanup_pattern(),
+    )
+    # llm_cache is GLOBAL with no user FK, so the delete above cannot reach it.
+    # Scoped to rows whose model carries THIS worker's tag (see _cache_helper):
+    # never a real model id, never the `curated:*` sentinel a future gloss seed
+    # would use, and never another worker's in-flight rows. Deliberately NOT
+    # keyed on prompt_key — `item_gloss` will hold real curated rows once
+    # TODO #43 step 2 lands.
+    await db_pool.execute(
+        "DELETE FROM llm_cache WHERE model LIKE $1",
+        cache_cleanup_pattern(),
     )
     # Reset in-process LLM rate limiter (#12). Importing here keeps the
     # fixture cheap when the limiter module isn't loaded.

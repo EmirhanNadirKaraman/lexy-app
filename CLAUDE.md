@@ -318,7 +318,7 @@ Two things to know before "fixing" what it reports:
 ```bash
 cd lexy-app/backend
 pytest                              # serial
-pytest -n auto                      # parallel via pytest-xdist — ~53s for 1033 tests
+pytest -n auto                      # parallel via pytest-xdist — ~57s for 1040 tests
 ```
 `pytest-randomly` is blocked via `addopts = -p no:randomly` in both ini files.
 That is deliberate and load-bearing — see `docs/TESTS.md` for the spaCy/thinc
@@ -328,6 +328,10 @@ via `tests/_email_helper.make_test_email()`; the autouse cleanup fixture uses th
 same per-worker LIKE pattern, so parallel workers don't trample each other's rows.
 Tests that need to look up "a test user" must filter via `cleanup_pattern()`
 instead of bare `'test+%@example.com'` — see `test_words.py` / `test_recommendations.py`.
+`llm_cache` is global with no user FK, so it has its own per-worker tag in
+`tests/_cache_helper.py`: every row a test causes to be written carries a
+`zztest-model-{worker}` model, and the autouse cleanup reaps that pattern.
+Never clean it by `prompt_key` — `item_gloss` is a real production key.
 
 ### Root-pipeline tests
 ```bash

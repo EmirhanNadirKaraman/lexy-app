@@ -32,6 +32,7 @@ from backend.services.llm_cache_service import (
     make_cache_key,
     set_cached,
 )
+from ._cache_helper import test_model
 
 # ---------------------------------------------------------------------------
 # Unit tests — no DB required
@@ -76,7 +77,7 @@ def test_make_cache_key_returns_hex_string():
 
 def _unique_key() -> str:
     """Return a cache key that is guaranteed not to exist yet."""
-    return make_cache_key("test_prompt", "test-model", {"uuid": uuid.uuid4().hex})
+    return make_cache_key("test_prompt", test_model(), {"uuid": uuid.uuid4().hex})
 
 
 async def test_cache_miss_returns_none(db_pool):
@@ -88,7 +89,7 @@ async def test_set_and_get_returns_stored_value(db_pool):
     key = _unique_key()
     payload = {"opening": "Hallo, wie geht es dir?", "extra": 42}
 
-    await set_cached(db_pool, key, "test_prompt", "test-model", payload)
+    await set_cached(db_pool, key, "test_prompt", test_model(), payload)
 
     result = await get_cached(db_pool, key)
     assert result == payload
@@ -96,7 +97,7 @@ async def test_set_and_get_returns_stored_value(db_pool):
 
 async def test_hit_count_increments(db_pool):
     key = _unique_key()
-    await set_cached(db_pool, key, "test_prompt", "test-model", {"v": 1})
+    await set_cached(db_pool, key, "test_prompt", test_model(), {"v": 1})
 
     await get_cached(db_pool, key)
     await get_cached(db_pool, key)
@@ -109,7 +110,7 @@ async def test_hit_count_increments(db_pool):
 
 async def test_last_hit_at_is_updated(db_pool):
     key = _unique_key()
-    await set_cached(db_pool, key, "test_prompt", "test-model", {"v": 1})
+    await set_cached(db_pool, key, "test_prompt", test_model(), {"v": 1})
 
     before = await db_pool.fetchrow(
         "SELECT last_hit_at FROM llm_cache WHERE cache_key = $1", key
@@ -127,8 +128,8 @@ async def test_last_hit_at_is_updated(db_pool):
 async def test_second_set_cached_is_noop(db_pool):
     """ON CONFLICT DO NOTHING — the first stored value wins."""
     key = _unique_key()
-    await set_cached(db_pool, key, "test_prompt", "test-model", {"v": "first"})
-    await set_cached(db_pool, key, "test_prompt", "test-model", {"v": "second"})
+    await set_cached(db_pool, key, "test_prompt", test_model(), {"v": "first"})
+    await set_cached(db_pool, key, "test_prompt", test_model(), {"v": "second"})
 
     result = await get_cached(db_pool, key)
     assert result["v"] == "first"
@@ -140,10 +141,10 @@ async def test_expired_entry_is_treated_as_miss(db_pool):
     await db_pool.execute(
         """
         INSERT INTO llm_cache (cache_key, prompt_key, model, response, expires_at)
-        VALUES ($1, 'test', 'test-model', '{"v":1}'::jsonb,
+        VALUES ($1, 'test', $2, '{"v":1}'::jsonb,
                 NOW() - INTERVAL '1 second')
         """,
-        key,
+        key, test_model(),
     )
 
     result = await get_cached(db_pool, key)
@@ -152,7 +153,7 @@ async def test_expired_entry_is_treated_as_miss(db_pool):
 
 async def test_non_expiring_entry_is_returned(db_pool):
     key = _unique_key()
-    await set_cached(db_pool, key, "test_prompt", "test-model", {"v": "permanent"})
+    await set_cached(db_pool, key, "test_prompt", test_model(), {"v": "permanent"})
 
     result = await get_cached(db_pool, key)
     assert result == {"v": "permanent"}
@@ -160,7 +161,7 @@ async def test_non_expiring_entry_is_returned(db_pool):
 
 async def test_ttl_entry_is_returned_before_expiry(db_pool):
     key = _unique_key()
-    await set_cached(db_pool, key, "test_prompt", "test-model", {"v": "ttl"}, ttl_seconds=3600)
+    await set_cached(db_pool, key, "test_prompt", test_model(), {"v": "ttl"}, ttl_seconds=3600)
 
     result = await get_cached(db_pool, key)
     assert result == {"v": "ttl"}
@@ -183,7 +184,7 @@ def _reset_locks_between_tests():
 async def test_get_or_compute_hit_does_not_call_compute(db_pool):
     """If the cache already has a value, compute() is never invoked."""
     key = _unique_key()
-    await set_cached(db_pool, key, "test_prompt", "test-model", {"v": "cached"})
+    await set_cached(db_pool, key, "test_prompt", test_model(), {"v": "cached"})
 
     calls = 0
     async def _compute():
@@ -191,7 +192,7 @@ async def test_get_or_compute_hit_does_not_call_compute(db_pool):
         calls += 1
         return {"v": "fresh"}
 
-    result = await get_or_compute(db_pool, key, "test_prompt", "test-model", _compute)
+    result = await get_or_compute(db_pool, key, "test_prompt", test_model(), _compute)
     assert result == {"v": "cached"}
     assert calls == 0
 
@@ -206,12 +207,12 @@ async def test_get_or_compute_miss_writes_and_returns(db_pool):
         calls += 1
         return {"v": "fresh"}
 
-    result = await get_or_compute(db_pool, key, "test_prompt", "test-model", _compute)
+    result = await get_or_compute(db_pool, key, "test_prompt", test_model(), _compute)
     assert result == {"v": "fresh"}
     assert calls == 1
 
     # Persisted: a second call reads from cache, doesn't call compute.
-    result2 = await get_or_compute(db_pool, key, "test_prompt", "test-model", _compute)
+    result2 = await get_or_compute(db_pool, key, "test_prompt", test_model(), _compute)
     assert result2 == {"v": "fresh"}
     assert calls == 1
 
@@ -234,7 +235,7 @@ async def test_concurrent_same_key_calls_compute_exactly_once(db_pool):
         return {"v": "fresh", "n": calls}
 
     async def _caller():
-        return await get_or_compute(db_pool, key, "test_prompt", "test-model", _compute)
+        return await get_or_compute(db_pool, key, "test_prompt", test_model(), _compute)
 
     # Fire 10 callers concurrently.
     tasks = [asyncio.create_task(_caller()) for _ in range(10)]
@@ -270,10 +271,10 @@ async def test_concurrent_different_keys_do_not_block(db_pool):
         return {"k": "b"}
 
     task_a = asyncio.create_task(
-        get_or_compute(db_pool, key_a, "p", "m", _compute_a)
+        get_or_compute(db_pool, key_a, test_model("-p"), test_model(), _compute_a)
     )
     task_b = asyncio.create_task(
-        get_or_compute(db_pool, key_b, "p", "m", _compute_b)
+        get_or_compute(db_pool, key_b, test_model("-p"), test_model(), _compute_b)
     )
 
     # Tight timeout — if locking is wrong this hangs forever.
@@ -295,7 +296,7 @@ async def test_compute_exception_releases_lock_and_allows_retry(db_pool):
         raise RuntimeError("provider blew up")
 
     with pytest.raises(RuntimeError, match="provider blew up"):
-        await get_or_compute(db_pool, key, "test_prompt", "test-model", _failing)
+        await get_or_compute(db_pool, key, "test_prompt", test_model(), _failing)
 
     assert attempts == 1
     # Cache was NOT populated.
@@ -306,7 +307,7 @@ async def test_compute_exception_releases_lock_and_allows_retry(db_pool):
     async def _working():
         return {"v": "fresh"}
 
-    result = await get_or_compute(db_pool, key, "test_prompt", "test-model", _working)
+    result = await get_or_compute(db_pool, key, "test_prompt", test_model(), _working)
     assert result == {"v": "fresh"}
 
 
@@ -334,7 +335,7 @@ async def test_double_check_returns_first_writers_value(db_pool):
         return {"v": "second-writer"}
 
     first_task = asyncio.create_task(
-        get_or_compute(db_pool, key, "p", "m", _first_compute)
+        get_or_compute(db_pool, key, test_model("-p"), test_model(), _first_compute)
     )
     # Yield so the first task acquires the lock and enters compute().
     await asyncio.sleep(0.05)
@@ -342,7 +343,7 @@ async def test_double_check_returns_first_writers_value(db_pool):
     # Now fire the second caller. It'll cache-miss on the fast path, queue on
     # the lock, and only enter the critical section after the first finishes.
     second_task = asyncio.create_task(
-        get_or_compute(db_pool, key, "p", "m", _second_compute)
+        get_or_compute(db_pool, key, test_model("-p"), test_model(), _second_compute)
     )
     await asyncio.sleep(0.05)
 
@@ -355,3 +356,89 @@ async def test_double_check_returns_first_writers_value(db_pool):
         "second caller must see the first writer's value, not its own"
     assert second_compute_called is False, \
         "double-check must short-circuit the waiter's compute()"
+
+
+# ---------------------------------------------------------------------------
+# Isolation — these tests must not leave residue in the shared table
+#
+# `llm_cache` is GLOBAL with no user FK, so the autouse user cleanup cannot
+# reach it. Before the `_cache_helper` tag, a dev database had accumulated
+# 2,760 rows of pure test residue, 335 of them sitting on real `item_gloss`
+# keys with the production model id — i.e. a test run could hand `"stub gloss"`
+# to a real SRS card, and a future curated gloss seed would have collided with
+# them. See tests/_cache_helper.py.
+# ---------------------------------------------------------------------------
+
+
+async def test_cache_writes_are_tagged_with_a_non_production_model(db_pool):
+    """Every row a test writes must be reapable AND unable to collide.
+
+    The tag lives in `model` because that is the one field every write path
+    controls — direct `set_cached` calls and the provider fakes, whose
+    `model_id` feeds `make_cache_key`.
+    """
+    key = _unique_key()
+    await set_cached(db_pool, key, "test_prompt", test_model(), {"v": 1})
+
+    model = await db_pool.fetchval(
+        "SELECT model FROM llm_cache WHERE cache_key = $1", key,
+    )
+
+    assert model.startswith("zztest-model"), model
+    assert not model.startswith("claude"), "must never look like a production model"
+    assert not model.startswith("curated"), "must never look like a seeded curated row"
+
+
+async def test_cleanup_pattern_only_matches_this_workers_rows(db_pool):
+    """Parallel safety: a finishing worker must not reap another's live rows."""
+    from ._cache_helper import cleanup_pattern, worker_id
+
+    pattern = cleanup_pattern()
+    assert pattern.endswith("%")
+    assert worker_id() in pattern
+
+    mine = test_model()
+    other = f"zztest-model-gw{worker_id()}-other"
+    matches = await db_pool.fetchrow(
+        "SELECT $1::text LIKE $3 AS mine_matches, $2::text LIKE $3 AS other_matches",
+        mine, other, pattern,
+    )
+    assert matches["mine_matches"] is True
+    assert matches["other_matches"] is False
+
+
+async def test_cleanup_would_spare_a_seeded_curated_row(db_pool):
+    """The fixture must not reach rows a future gloss seed writes.
+
+    Pinned because the obvious cleanup predicate — `prompt_key='item_gloss'` —
+    would wipe exactly those rows. Cleanup keys on the tagged model instead.
+    """
+    from ._cache_helper import cleanup_pattern
+
+    spared = await db_pool.fetchrow(
+        "SELECT $1::text LIKE $3 AS curated, $2::text LIKE $3 AS production",
+        "curated:words_4000_old", "claude-haiku-4-5-20251001", cleanup_pattern(),
+    )
+    assert spared["curated"] is False
+    assert spared["production"] is False
+
+
+async def test_suite_leaves_no_tagged_rows_behind(db_pool):
+    """End-to-end proof the autouse fixture actually reaps.
+
+    Writes a tagged row, then asserts a *previous* test's tagged rows are
+    already gone — i.e. exactly one row (this test's own) carries the tag at
+    this point in the run.
+    """
+    from ._cache_helper import cleanup_pattern
+
+    before = await db_pool.fetchval(
+        "SELECT count(*) FROM llm_cache WHERE model LIKE $1", cleanup_pattern(),
+    )
+    assert before == 0, f"{before} tagged rows survived earlier tests"
+
+    await set_cached(db_pool, _unique_key(), "test_prompt", test_model(), {"v": 1})
+
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM llm_cache WHERE model LIKE $1", cleanup_pattern(),
+    ) == 1
