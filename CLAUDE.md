@@ -57,61 +57,10 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 
 ---
 
-## 4. Directory map
-
-```
-language-app/
-├── lexy-app/
-│   ├── backend/                   ← FastAPI app (production)
-│   │   ├── main.py                ← lifespan: pool + seed phrases + seed grammar + resume requests
-│   │   ├── database.py            ← asyncpg pool
-│   │   ├── core/{deps,security}.py
-│   │   ├── routers/               ← 14 routers (auth, words, srs, chat, books, reading, …)
-│   │   ├── services/              ← 27 services (see §6)
-│   │   ├── models/schemas.py      ← Pydantic
-│   │   └── alembic/versions/      ← 25+ migrations
-│   └── frontend/
-│       └── src/
-│           ├── App.tsx            ← router + Layout
-│           ├── api/               ← 14 fetch wrappers
-│           ├── components/        ← 35 components
-│           ├── hooks/             ← 12 custom hooks
-│           ├── types/index.ts     ← all shared interfaces (~416 lines)
-│           └── config/wordColors.ts
-├── pipeline.py + (subtitle/learning/exposure root .py)   ← standalone pipeline
-├── subtitle-scraper/               ← yt-dlp scraper
-├── pdf_text_extraction/            ← Docling-based PDF pipeline
-├── masking/, postprocessing/, ilp/ ← supporting data jobs
-├── data/                           ← word lists, dictionaries (final_result.txt, words_4000.txt, …)
-├── files/                          ← book_pdfs/, json/, masked/, text/
-├── scripts/                        ← one-off backfills
-├── tests/                          ← pytest tests for root pipeline modules
-└── Procfile                        ← deploys lexy-app backend
-```
-
----
-
 ## 5. Database (Postgres, asyncpg, Alembic)
 
 ### Core polymorphic key
 `(item_id, item_type)` where `item_type ∈ {word, phrase, grammar_rule}`. This is the join used by every progression / review / analytics row.
-
-### Tables (selected)
-| Table | Purpose |
-|---|---|
-| `users` | UUID, email, password_hash, `settings` (JSONB) |
-| `user_word_knowledge` | per (user, item_id, item_type) — `status`, `passive_level`, `active_level`, `times_seen`, `times_used_correctly`, `last_seen`, `notes` |
-| `srs_cards` | per (user, item, direction=passive\|active) — `due_date`, `repetitions`, `ease_factor`, `interval` |
-| `word_table`, `phrase_table`, `grammar_rule_table` | content tables (display surface lives here) |
-| `chat_sessions`, `chat_messages` | free/guided sessions, with `corrections`, `evaluation`, `word_matches` |
-| `llm_cache` | prompt-keyed cache, hit_count, expires_at |
-| `word_usage_events` | analytics: context (transcript/status_change/srs_review/…), outcome (seen/used/correct/incorrect), metadata |
-| `video`, `channel`, `sentence`, `word_to_sentence`, `sentence_to_phrase`, `sentence_to_grammar_rule` | scraper-populated content |
-| `book_documents`, `book_pages`, `book_blocks` | uploaded PDFs (OCR tokens stored on block.tokens JSONB) |
-| `reading_selections` | LingQ-style multi-token selections with anchors (`[{block_id, token_id, surface}]`) |
-| `content_request` | user-submitted channel/video adds, status pending → processing → done/failed |
-| `notification` | exists, table populated lazily, **generation logic largely missing** |
-| `reading_review` | columns on `reading_selections` (`review_count`, `next_review_at`), driven by `/reading/selections/{id}/review` + `ReadingReviewPage` |
 
 ### Notable migrations
 - **001** — users / user_word_knowledge / srs_cards baseline
@@ -147,41 +96,6 @@ language-app/
 | `settings_service` | reads/writes `users.settings` JSONB (channel prefs etc. live here) |
 | `usage_events_service` | records `word_usage_events` (analytics, fire-and-forget) |
 | `search_service` | full-text search over videos/subtitles |
-
----
-
-## 7. API surface (selected)
-
-All v1 routes are bearer-token gated; `/api/search`, `/api/suggest`, `/api/video-sentences`, `/api/word-forms`, `/api/languages`, `/api/categories` are public legacy endpoints.
-
-```
-auth         POST /api/v1/auth/register | /login
-words        GET  /api/v1/words/by-text?word=&language=
-             GET  /api/v1/words/knowledge
-             PUT  /api/v1/words/{item_type}/{item_id}/status
-             POST /api/v1/words/word/{word_id}/transcript-click
-srs          GET  /api/v1/srs/due?language=&limit=
-             POST /api/v1/srs/review/{card_id}
-chat         POST /api/v1/chat/sessions, /guided-sessions
-             POST /api/v1/chat/guided-sessions/{sid}/messages, /complete
-books        POST /api/v1/books/upload
-             GET  /api/v1/books, /api/v1/books/{doc}/pages, /pages/{n}
-             PATCH /api/v1/books/{doc}/blocks/{bid}
-             POST /api/v1/books/{doc}/blocks/{bid}/llm-repair
-             POST /api/v1/books/{doc}/pages/{n}/batch-llm-repair
-reading      GET  /api/v1/books/{doc}/pages/{n}/word-statuses
-             POST /api/v1/books/{doc}/selections
-             POST /api/v1/reading/translate, /explain
-             PATCH/DELETE /api/v1/reading/selections/{sid}
-phrases      POST /api/v1/phrases/match
-insights     GET  /api/v1/insights/cards, /prep
-             POST /api/v1/insights/prep/generate-examples
-analytics    GET  /api/v1/analytics/unknown-frequent | learning-frequent | recently-failed | most-interacted
-content-req  POST/GET /api/v1/content-requests
-recs         GET  /api/v1/recommendations/items | videos | sentences
-misc         GET  /api/v1/settings/preferences, /reminders/summary, /notifications/stream (SSE),
-                  /videos/{vid}/reading-stats
-```
 
 ---
 
