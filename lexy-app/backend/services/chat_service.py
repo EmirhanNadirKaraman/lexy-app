@@ -1,7 +1,9 @@
+import json
 import re
 
 import asyncpg
-import json
+
+from .text_norm import normalize_key
 
 
 async def create_session(
@@ -110,8 +112,8 @@ async def match_learning_words(
     Find non-mastered vocabulary items the user is tracking that appear in `text`.
 
     Two paths combined:
-      WORDS   — tokenises the message into lowercase alphabetic words and matches
-                against word_table (surface OR lemma).
+      WORDS   — tokenises the message and matches the tokens against the words
+                the user is tracking, on surface OR lemma.
       PHRASES — delegates to matcher_service.match_sentence_with_ids, which runs
                 the spaCy-based phrase extractor (verb patterns, separable verbs,
                 reflexive verbs) and returns canonical phrase IDs. This catches
@@ -124,26 +126,57 @@ async def match_learning_words(
     The polymorphic shape lets routers/chat.py:send_message iterate the matches
     and call apply_progression(..., item_type, ...) for each — words and phrases
     advance through the same free_chat_* events.
+
+    Case-insensitivity is decided in **Python**, via `text_norm.normalize_key`.
+    The word query used to push it into SQL — `LOWER(wt.word) = ANY($2)` fed
+    Python-lowered tokens — but this database runs under the C locale, where
+    Postgres folds ASCII only: `LOWER('Öl')` is `'Öl'`, never `'öl'`. Producing
+    an umlaut word in free chat therefore matched nothing and earned **no
+    progression or SRS credit**, silently. Fixed 2026-07-28; see
+    `services/text_norm.py` for the collation evidence.
+
+    The join is inverted rather than widened: fetch the words this user is
+    tracking and filter them in Python. That is bounded by the user's own
+    vocabulary (tens of rows), so it is *cheaper* than the old query as well as
+    correct — unlike `word_list_service`, this needs no whole-catalog fetch.
+
+    The phrase path is unaffected: it matches on `phrase_id`s the spaCy
+    extractor returns, and never asks Postgres to fold case.
     """
-    tokens = list({w.lower() for w in re.findall(r"[^\W\d_]+", text, re.UNICODE)})
+    tokens = {normalize_key(w) for w in re.findall(r"[^\W\d_]+", text, re.UNICODE)}
+    tokens.discard("")
     if not tokens:
         return []
 
-    word_rows = await pool.fetch(
+    # Every non-mastered word this user tracks in this language. ORDER BY makes
+    # the result order deterministic; the old query had none.
+    tracked = await pool.fetch(
         """
-        SELECT DISTINCT wt.word_id AS item_id, 'word'::text AS item_type, wt.word
+        SELECT wt.word_id AS item_id, wt.word, wt.lemma
           FROM word_table wt
           JOIN user_word_knowledge uwk
                ON uwk.item_id   = wt.word_id
               AND uwk.item_type = 'word'
               AND uwk.user_id   = $1::uuid
-         WHERE (LOWER(wt.word) = ANY($2::text[]) OR LOWER(wt.lemma) = ANY($2::text[]))
-           AND wt.language    = $3
-           AND uwk.status    != 'known'
+         WHERE wt.language   = $2
+           AND uwk.status   != 'known'
+         ORDER BY wt.word_id
         """,
-        user_id, tokens, language,
+        user_id, language,
     )
-    results: list[dict] = [dict(r) for r in word_rows]
+
+    results: list[dict] = []
+    seen: set[int] = set()
+    for r in tracked:
+        if r["item_id"] in seen:
+            continue
+        # Surface OR lemma, matching the old predicate exactly.
+        if (normalize_key(r["word"]) in tokens
+                or normalize_key(r["lemma"] or "") in tokens):
+            seen.add(r["item_id"])
+            results.append(
+                {"item_id": r["item_id"], "item_type": "word", "word": r["word"]}
+            )
 
     # Phrase matching — defer the import to avoid the matcher_service module-level
     # spaCy/phrase_finder bootstrap during chat_service import (and to make tests

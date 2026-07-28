@@ -19,6 +19,7 @@ Covers:
     - English label + no target word → no progression
     - free_chat_matched is NOT fired by the chat router (confirmed by event mapping)
 """
+import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -466,3 +467,221 @@ async def test_english_message_without_target_word_triggers_no_progression(clien
     if after and before:
         assert after["passive_level"] == before["passive_level"], "No progression when no target word present"
         assert after["active_level"]  == before["active_level"],  "No progression when no target word present"
+
+
+# ---------------------------------------------------------------------------
+# Unicode matching (C-collation bug, fixed 2026-07-28)
+#
+# `match_learning_words` pushed case-folding into SQL — `LOWER(wt.word) =
+# ANY($2)` fed Python-lowered tokens. This database is `datcollate=C`, so
+# Postgres folds ASCII only: `LOWER('Öl')` is `'Öl'`, never `'öl'`. Producing
+# an umlaut word in free chat therefore matched nothing and earned **no
+# progression or SRS credit** — silently, with no error anywhere.
+#
+# Fixture surfaces are letters-only on purpose: the message tokenizer is
+# `[^\W\d_]+`, so a digit or underscore in the surface makes it untokenizable
+# and every assertion below would pass vacuously against a word that can never
+# match. That is the same trap documented on `_get_word` above.
+# ---------------------------------------------------------------------------
+
+
+def _letters(n: int = 12) -> str:
+    """A unique letters-only suffix (uuid hex would smuggle in digits)."""
+    return "".join(chr(ord("a") + int(c, 16)) for c in uuid.uuid4().hex[:n])
+
+
+async def _owned_word(db_pool, tracked: list[int], surface: str, *,
+                      lemma: str | None = None, language: str = "de") -> int:
+    wid = await db_pool.fetchval(
+        "INSERT INTO word_table (word, language, pos, tag, lemma) "
+        "VALUES ($1, $2, '', '', $3) RETURNING word_id",
+        surface, language, lemma or surface,
+    )
+    tracked.append(wid)
+    return wid
+
+
+@pytest.mark.parametrize("initial", ["Ö", "Ü", "Ä"])
+async def test_match_finds_tracked_umlaut_word_from_lowercase_message(
+    client: AsyncClient, db_pool, tracked_words, initial,
+):
+    """Tracking `Öl`, writing `öl` — the case that earned no credit."""
+    surface = f"{initial}zzc{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    await _mark_learning(db_pool, uid, word_id)
+
+    matches = await match_learning_words(db_pool, uid, f"ich mag {surface.lower()}", "de")
+
+    assert any(m["item_id"] == word_id for m in matches), \
+        f"tracked {surface!r} did not match produced {surface.lower()!r}"
+
+
+async def test_match_finds_tracked_umlaut_word_from_exact_spelling(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    surface = f"Özzc{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    await _mark_learning(db_pool, uid, word_id)
+
+    matches = await match_learning_words(db_pool, uid, f"das {surface} hier", "de")
+
+    assert any(m["item_id"] == word_id for m in matches)
+
+
+async def test_match_finds_tracked_umlaut_word_from_uppercase_message(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    surface = f"Üzzc{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    await _mark_learning(db_pool, uid, word_id)
+
+    matches = await match_learning_words(db_pool, uid, surface.upper(), "de")
+
+    assert any(m["item_id"] == word_id for m in matches)
+
+
+async def test_match_finds_umlaut_word_by_lemma_case_variant(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """The lemma half of the predicate needs the same fold as the surface."""
+    lemma = f"Äzzc{_letters()}"
+    surface = f"Bzzc{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface, lemma=lemma)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    await _mark_learning(db_pool, uid, word_id)
+
+    matches = await match_learning_words(db_pool, uid, lemma.lower(), "de")
+
+    assert any(m["item_id"] == word_id for m in matches)
+
+
+async def test_match_ascii_word_still_works(client: AsyncClient, db_pool, tracked_words):
+    """Regression guard — the ASCII path was never broken and must stay."""
+    surface = f"Zzc{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    await _mark_learning(db_pool, uid, word_id)
+
+    matches = await match_learning_words(db_pool, uid, surface.lower(), "de")
+
+    assert any(m["item_id"] == word_id for m in matches)
+
+
+@pytest.mark.parametrize("sharp_s,double_s", [("straße", "strasse"), ("schließen", "schliessen")])
+async def test_match_does_not_merge_sharp_s_with_double_s(
+    client: AsyncClient, db_pool, tracked_words, sharp_s, double_s,
+):
+    """`casefold()` maps ß to ss and would grant credit for the wrong word.
+
+    These are distinct German entries, so `normalize_key` uses `lower()`.
+    Tracking the ß spelling and writing the ss spelling must NOT match.
+    """
+    uniq = _letters()
+    sharp_id = await _owned_word(db_pool, tracked_words, f"{sharp_s}{uniq}")
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    await _mark_learning(db_pool, uid, sharp_id)
+
+    matches = await match_learning_words(db_pool, uid, f"{double_s}{uniq}", "de")
+
+    assert not any(m["item_id"] == sharp_id for m in matches), \
+        "ss spelling must not earn credit for the ß word"
+
+
+async def test_match_excludes_known_umlaut_words(client: AsyncClient, db_pool, tracked_words):
+    """Mastered items stay excluded — the fix must not widen the status gate."""
+    surface = f"Özzc{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    await db_pool.execute(
+        "INSERT INTO user_word_knowledge (user_id, item_id, item_type, status) "
+        "VALUES ($1::uuid, $2, 'word', 'known')",
+        uid, word_id,
+    )
+
+    matches = await match_learning_words(db_pool, uid, surface.lower(), "de")
+
+    assert not any(m["item_id"] == word_id for m in matches)
+
+
+async def test_match_umlaut_word_is_language_scoped(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    surface = f"Üzzc{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface, language="es")
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    await _mark_learning(db_pool, uid, word_id)
+
+    matches = await match_learning_words(db_pool, uid, surface.lower(), "de")
+
+    assert not any(m["item_id"] == word_id for m in matches)
+
+
+async def test_match_does_not_return_untracked_umlaut_words(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Only items the user tracks — the inverted join must not widen scope."""
+    surface = f"Äzzc{_letters()}"
+    await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+
+    matches = await match_learning_words(db_pool, uid, surface.lower(), "de")
+
+    assert matches == []
+
+
+async def test_match_collapses_mixed_case_spellings_of_one_umlaut_word(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Three *different spellings* of one word yield one match, not three.
+
+    Plain dedup of a repeated token is already covered by
+    `test_match_deduplicates_repeated_word` (ASCII, unaffected by the fold).
+    What this adds is that case variants collapse to the same item — the fold
+    happens before dedup, so `öl öl Öl` cannot be credited twice.
+    """
+    surface = f"Özzc{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    await _mark_learning(db_pool, uid, word_id)
+
+    low = surface.lower()
+    matches = await match_learning_words(db_pool, uid, f"{low} {low} {surface}", "de")
+
+    assert len([m for m in matches if m["item_id"] == word_id]) == 1
+
+
+async def test_umlaut_word_in_german_message_advances_both_tracks(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """End-to-end: the credit that was silently lost is now granted.
+
+    Mirrors `test_german_message_advances_both_tracks` with an umlaut surface
+    written in lower case — before the fix neither level moved and nothing
+    surfaced the failure.
+    """
+    surface = f"Özzc{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    headers, uid = await _register_and_login(client, db_pool, _email())
+    await _mark_learning(db_pool, uid, word_id)
+    session_id = await _create_free_session(client, headers)
+
+    before = await _get_knowledge(db_pool, uid, word_id)
+
+    with patch(
+        "backend.routers.chat.llm_service.evaluate_and_reply",
+        new_callable=AsyncMock,
+        return_value=_llm_result("de"),
+    ):
+        resp = await client.post(
+            f"{SESSIONS}/{session_id}/messages",
+            json={"content": surface.lower()},
+            headers=headers,
+        )
+    assert resp.status_code == 201
+
+    after = await _get_knowledge(db_pool, uid, word_id)
+    assert after["passive_level"] > before["passive_level"], "passive credit lost"
+    assert after["active_level"] > before["active_level"], "active credit lost"

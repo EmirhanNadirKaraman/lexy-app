@@ -221,6 +221,41 @@ pins that; the case-variant tests are the ones that were broken.
 `ruff check .` → All checks passed. Frontend not run — no frontend files
 changed. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-28 — Unicode free-chat progression (+14 backend)**
+
+`chat_service.match_learning_words` pushed case-folding into SQL —
+`LOWER(wt.word) = ANY($2)` fed Python-lowered tokens. Postgres folds ASCII
+only here, so producing an umlaut word in free chat matched nothing and earned
+**no progression or SRS credit**, silently. The word half now inverts the join
+(fetch the user's tracked non-known words, filter with `normalize_key`); the
+phrase half was never affected, since it matches on spaCy-returned
+`phrase_id`s.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_free_chat_progression.py` | +14 | tracked umlaut word matches a lowercase message, parametrized over Ö/Ü/Ä; also from the exact stored spelling and an uppercase message; **lemma** half folds too (lemma-only case variant matches); ASCII still matches; `straße`/`strasse` and `schließen`/`schliessen` do **not** cross-match, so no credit leaks to the wrong word; `known` items stay excluded; language scoping holds; untracked words are never returned (the inverted join must not widen scope); three different case *spellings* of one word collapse to a single match, so the fold cannot credit it twice (plain repeated-token dedup stays covered by the pre-existing ASCII test); and end-to-end, an umlaut word in a German message advances **both** passive and active levels |
+
+**Mutation-checked.** Reverting `services/chat_service.py` fails 8 of the 14 —
+all three lowercase params, exact-spelling, uppercase, lemma-variant,
+case-variant-collapse, and the end-to-end progression test. Note the
+case-variant-collapse test fails on old code because the word matched *zero*
+times, not because dedup broke — dedup itself is unaffected by the fold. The other 6 pass either way by design:
+they guard scope and status behaviour the fix must not widen (ASCII, ß/ss
+separation, known-excluded, language scoping, untracked-excluded).
+
+**Note the exact-spelling case was broken here too**, unlike `/words/by-text`.
+Chat lowercases message tokens before querying, so even a byte-exact umlaut
+surface missed — the failure was not limited to case variants.
+
+**Fixture surfaces are letters-only** (`_letters()` maps uuid hex to a–p).
+The tokenizer is `[^\W\d_]+`, so a digit or underscore makes a surface
+untokenizable and every assertion would pass vacuously against a word that can
+never match — the same trap already documented on `_get_word`.
+
+**Validation:** backend `-n auto` → **963 passed, 2 skipped** (949 + 14);
+`ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — word-list phrase support (+11 backend / +4 frontend)**
 
 Vocabulary lists now resolve against **both** `word_table` and `phrase_table`,
