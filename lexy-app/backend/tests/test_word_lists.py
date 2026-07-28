@@ -246,15 +246,25 @@ async def test_empty_list_returns_422(client: AsyncClient):
 
 
 async def test_list_index_returns_only_own_lists(client: AsyncClient, db_pool):
+    """User B never sees user A's private list.
+
+    Asserted as "no non-system list belongs to anyone else" rather than
+    "the index is empty". Since migration 037 the index legitimately includes
+    built-in system lists, and `word_lists` is global, so under
+    `pytest -n auto` another worker's system fixture can be present too. The
+    property that matters — private lists stay private — is unchanged.
+    """
     _wid, surface = await insert_owned_word(db_pool, language="de")
     headers_a = await _registered_headers(client)
     headers_b = await _registered_headers(client)
-    await _create(client, headers_a, [surface], name="A list")
+    a_list_id = (await _create(client, headers_a, [surface], name="A list")).json()["list_id"]
 
     resp = await client.get(LISTS, headers=headers_b)
 
     assert resp.status_code == 200
-    assert resp.json() == []
+    body = resp.json()
+    assert a_list_id not in [r["list_id"] for r in body]
+    assert all(r["is_system"] for r in body), "B owns nothing, so only built-ins may show"
 
 
 async def test_export_round_trips_all_surfaces_in_order(client: AsyncClient, db_pool):
@@ -892,3 +902,365 @@ async def test_ascii_sample_words_still_resolve(client: AsyncClient, db_pool):
     for s in samples:
         assert by_surface[s]["status"] == "unknown", f"{s} regressed"
         assert by_surface[s]["item_id"] == ids[s]
+
+
+# ---------------------------------------------------------------------------
+# Built-in / system lists — Phase 1 (migration 037)
+#
+# `word_lists.user_id` is now nullable and `is_system` marks a shared, built-in
+# list. The read filters widened from `user_id = $2` to
+# `(user_id = $2 OR is_system)`, and that widening is exactly where a private
+# list could leak — so the cross-user isolation tests above are re-pinned here
+# against a database that now contains system rows.
+#
+# The CHECK constraint is what makes the widening safe: it renders a system
+# list with an owner, and an ownerless private list, unrepresentable. A boolean
+# alone would leave both states writable and the `OR` could then return a
+# hybrid row.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def make_system_list(db_pool):
+    """Insert a system list (no owner) and reap it afterwards.
+
+    Created with raw SQL on purpose: there is deliberately **no** public API
+    that can mint a system list, which several tests below assert.
+    """
+    created: list[int] = []
+
+    async def _make(name: str | None = None, *, language: str = "de",
+                    surfaces: list[str] | None = None) -> int:
+        list_id = await db_pool.fetchval(
+            "INSERT INTO word_lists (user_id, name, language, is_system) "
+            "VALUES (NULL, $1, $2, true) RETURNING list_id",
+            name or f"Zz System {uuid.uuid4().hex[:8]}", language,
+        )
+        created.append(list_id)
+        for surface in surfaces or []:
+            await db_pool.execute(
+                "INSERT INTO word_list_items (list_id, item_id, item_type, surface) "
+                "VALUES ($1, NULL, 'word', $2)",
+                list_id, surface,
+            )
+        return list_id
+
+    yield _make
+
+    if created:
+        await db_pool.execute(
+            "DELETE FROM word_lists WHERE list_id = ANY($1::int[])", created)
+
+
+async def _bind(db_pool, list_id: int, surface: str, word_id: int) -> None:
+    """Point a system-list row at a catalog id, as the future seeder will."""
+    await db_pool.execute(
+        "UPDATE word_list_items SET item_id = $1 WHERE list_id = $2 AND surface = $3",
+        word_id, list_id, surface,
+    )
+
+
+# --- schema -----------------------------------------------------------------
+
+
+async def test_user_lists_default_to_is_system_false(client: AsyncClient, db_pool):
+    headers = await _registered_headers(client)
+    detail = (await _create(client, headers, ["Haus"])).json()
+
+    assert detail["is_system"] is False
+    assert await db_pool.fetchval(
+        "SELECT is_system FROM word_lists WHERE list_id = $1", detail["list_id"],
+    ) is False
+
+
+async def test_check_rejects_a_system_list_with_an_owner(client: AsyncClient, db_pool):
+    """The state that would let a widened read filter return a private row."""
+    import asyncpg as _asyncpg
+
+    # Take the owner id from a list this user just created, rather than
+    # guessing at `users` — no email-pattern lookup, no xdist ambiguity.
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, ["Haus"])).json()["list_id"]
+    owner = await db_pool.fetchval(
+        "SELECT user_id FROM word_lists WHERE list_id = $1", list_id,
+    )
+    assert owner is not None
+
+    with pytest.raises(_asyncpg.IntegrityConstraintViolationError):
+        await db_pool.execute(
+            "INSERT INTO word_lists (user_id, name, language, is_system) "
+            "VALUES ($1, 'Zz bad hybrid', 'de', true)",
+            owner,
+        )
+
+
+async def test_check_rejects_an_ownerless_private_list(db_pool):
+    import asyncpg as _asyncpg
+
+    with pytest.raises(_asyncpg.IntegrityConstraintViolationError):
+        await db_pool.execute(
+            "INSERT INTO word_lists (user_id, name, language, is_system) "
+            "VALUES (NULL, 'Zz bad orphan', 'de', false)",
+        )
+
+
+async def test_system_list_names_are_unique(db_pool, make_system_list):
+    import asyncpg as _asyncpg
+
+    name = f"Zz System {uuid.uuid4().hex[:8]}"
+    await make_system_list(name)
+
+    with pytest.raises(_asyncpg.UniqueViolationError):
+        await make_system_list(name)
+
+
+async def test_duplicate_user_list_names_are_still_allowed(client: AsyncClient, db_pool):
+    """The unique index is partial — user lists keep their existing freedom."""
+    headers = await _registered_headers(client)
+
+    first = await _create(client, headers, ["Haus"], name="Same name")
+    second = await _create(client, headers, ["Auto"], name="Same name")
+
+    assert first.status_code == 201 and second.status_code == 201
+
+
+async def test_a_user_list_may_reuse_a_system_list_name(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    name = f"Zz System {uuid.uuid4().hex[:8]}"
+    await make_system_list(name)
+    headers = await _registered_headers(client)
+
+    assert (await _create(client, headers, ["Haus"], name=name)).status_code == 201
+
+
+# --- read isolation, re-pinned with system rows present ---------------------
+
+
+async def test_owner_can_read_their_private_list(client: AsyncClient, db_pool, make_system_list):
+    await make_system_list()
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, ["Haus"])).json()["list_id"]
+
+    assert (await client.get(f"{LISTS}/{list_id}", headers=headers)).status_code == 200
+
+
+async def test_other_user_still_cannot_read_a_private_list(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    """The regression the widened `OR is_system` filter could introduce."""
+    await make_system_list()
+    headers_a = await _registered_headers(client)
+    list_id = (await _create(client, headers_a, ["Haus"])).json()["list_id"]
+    headers_b = await _registered_headers(client)
+
+    assert (await client.get(f"{LISTS}/{list_id}", headers=headers_b)).status_code == 404
+    assert (await client.get(f"{LISTS}/{list_id}/export", headers=headers_b)).status_code == 404
+
+
+async def test_private_lists_never_appear_in_another_users_index(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    await make_system_list()
+    headers_a = await _registered_headers(client)
+    private_id = (await _create(client, headers_a, ["Haus"], name="A private")).json()["list_id"]
+    headers_b = await _registered_headers(client)
+
+    ids = [r["list_id"] for r in (await client.get(LISTS, headers=headers_b)).json()]
+
+    assert private_id not in ids
+
+
+async def test_system_list_is_visible_to_every_user(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    list_id = await make_system_list(surfaces=["Haus"])
+
+    for _ in range(2):
+        headers = await _registered_headers(client)
+        summaries = (await client.get(LISTS, headers=headers)).json()
+        assert list_id in [r["list_id"] for r in summaries]
+        assert next(r for r in summaries if r["list_id"] == list_id)["is_system"] is True
+
+
+async def test_brand_new_user_sees_system_lists(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    """A user who has created nothing still gets the built-ins.
+
+    Asserted as "contains mine, and every row is a system list" rather than
+    exact equality: `word_lists` is global, so under `pytest -n auto` another
+    worker's system list can legitimately be present at the same time.
+    """
+    list_id = await make_system_list(surfaces=["Haus"])
+    headers = await _registered_headers(client)
+
+    summaries = (await client.get(LISTS, headers=headers)).json()
+
+    assert list_id in [r["list_id"] for r in summaries]
+    assert all(r["is_system"] for r in summaries), \
+        "a user who created nothing must see only system lists"
+
+
+async def test_system_list_detail_and_export_are_readable(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    list_id = await make_system_list(surfaces=["Haus", "Auto"])
+    headers = await _registered_headers(client)
+
+    detail = await client.get(f"{LISTS}/{list_id}", headers=headers)
+    export = await client.get(f"{LISTS}/{list_id}/export", headers=headers)
+
+    assert detail.status_code == 200
+    assert detail.json()["is_system"] is True
+    assert detail.json()["total"] == 2
+    assert export.status_code == 200
+    assert export.text.splitlines() == ["Haus", "Auto"]
+
+
+# --- write protection -------------------------------------------------------
+
+
+async def test_normal_user_cannot_delete_a_system_list(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    list_id = await make_system_list(surfaces=["Haus"])
+    headers = await _registered_headers(client)
+
+    resp = await client.delete(f"{LISTS}/{list_id}", headers=headers)
+
+    assert resp.status_code == 404, "system lists must not be deletable"
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM word_lists WHERE list_id = $1", list_id,
+    ) == 1
+
+
+async def test_no_public_api_can_create_a_system_list(client: AsyncClient, db_pool):
+    """Even if a client sends `is_system`, creation stays user-owned."""
+    headers = await _registered_headers(client)
+
+    resp = await client.post(
+        LISTS,
+        json={"name": "Zz sneaky", "language": "de", "words": ["Haus"], "is_system": True},
+        headers=headers,
+    )
+
+    assert resp.status_code == 201
+    assert resp.json()["is_system"] is False
+    assert await db_pool.fetchval(
+        "SELECT user_id IS NOT NULL FROM word_lists WHERE list_id = $1",
+        resp.json()["list_id"],
+    ) is True
+
+
+async def test_owner_can_still_delete_their_own_list(client: AsyncClient, db_pool):
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, ["Haus"])).json()["list_id"]
+
+    assert (await client.delete(f"{LISTS}/{list_id}", headers=headers)).status_code == 204
+
+
+# --- mark-unknown-learning on a shared list ---------------------------------
+
+
+async def test_mark_learning_on_system_list_does_not_mutate_shared_rows(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    """The sharp edge: late binding is a user action writing to shared rows.
+
+    On a user list it persists a late resolution. On a system list it would
+    mutate what every other user sees, and two users marking at once would race
+    on the same rows — so it is suppressed. Progression still runs, per user.
+    """
+    word_id, surface = await insert_owned_word(db_pool, word=f"Zzsys{uuid.uuid4().hex[:10]}")
+    list_id = await make_system_list(surfaces=[surface])
+    headers = await _registered_headers(client)
+
+    before = await db_pool.fetchrow(
+        "SELECT item_id, item_type FROM word_list_items WHERE list_id = $1", list_id)
+    resp = await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)
+    after = await db_pool.fetchrow(
+        "SELECT item_id, item_type FROM word_list_items WHERE list_id = $1", list_id)
+
+    assert resp.status_code == 200
+    assert resp.json()["marked"] == 1, "progression must still run for the user"
+    assert (after["item_id"], after["item_type"]) == (before["item_id"], before["item_type"]), \
+        "system list rows must be read-only"
+    assert before["item_id"] is None, "fixture starts unbound, so this is a real check"
+    assert word_id
+
+
+async def test_mark_learning_on_system_list_creates_only_this_users_progress(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    word_id, surface = await insert_owned_word(db_pool, word=f"Zzsys{uuid.uuid4().hex[:10]}")
+    list_id = await make_system_list(surfaces=[surface])
+    headers_a = await _registered_headers(client)
+    headers_b = await _registered_headers(client)
+
+    await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers_a)
+
+    rows = await db_pool.fetch(
+        "SELECT user_id FROM user_word_knowledge WHERE item_id = $1 AND item_type = 'word'",
+        word_id,
+    )
+    assert len(rows) == 1, "only the acting user gains progress"
+    assert (await client.get(f"{LISTS}/{list_id}", headers=headers_b)).json()[
+        "counts"]["unknown"] == 1, "user B is unaffected"
+
+
+async def test_two_users_marking_one_system_list_stay_independent(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    word_id, surface = await insert_owned_word(db_pool, word=f"Zzsys{uuid.uuid4().hex[:10]}")
+    list_id = await make_system_list(surfaces=[surface])
+    headers_a = await _registered_headers(client)
+    headers_b = await _registered_headers(client)
+
+    a = await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers_a)
+    b = await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers_b)
+
+    assert a.json()["marked"] == 1
+    assert b.json()["marked"] == 1, "B's own state is still unknown, so B marks it too"
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM user_word_knowledge WHERE item_id = $1 AND item_type = 'word'",
+        word_id,
+    ) == 2
+    assert word_id
+
+
+async def test_same_system_list_shows_per_user_counts(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    """`_load_entries` joins user_word_knowledge per user, so counts diverge."""
+    _wid, surface = await insert_owned_word(db_pool, word=f"Zzsys{uuid.uuid4().hex[:10]}")
+    list_id = await make_system_list(surfaces=[surface])
+    headers_a = await _registered_headers(client)
+    headers_b = await _registered_headers(client)
+
+    await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers_a)
+
+    counts_a = (await client.get(f"{LISTS}/{list_id}", headers=headers_a)).json()["counts"]
+    counts_b = (await client.get(f"{LISTS}/{list_id}", headers=headers_b)).json()["counts"]
+
+    assert counts_a["learning"] == 1 and counts_a["unknown"] == 0
+    assert counts_b["unknown"] == 1 and counts_b["learning"] == 0
+
+
+async def test_user_list_late_binding_still_persists(client: AsyncClient, db_pool):
+    """Unchanged behaviour for owned lists — the suppression is system-only.
+
+    The surface is unresolvable at create time and gains a `word_table` row
+    before mark-learning, so the stored row must be updated in place.
+    """
+    surface = f"Zzlate{uuid.uuid4().hex[:10]}"
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, [surface])).json()["list_id"]
+    assert await db_pool.fetchval(
+        "SELECT item_id FROM word_list_items WHERE list_id = $1", list_id) is None
+
+    word_id, _ = await insert_owned_word(db_pool, word=surface)
+    await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)
+
+    assert await db_pool.fetchval(
+        "SELECT item_id FROM word_list_items WHERE list_id = $1", list_id) == word_id

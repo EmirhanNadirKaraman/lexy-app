@@ -543,6 +543,37 @@ total 3,622, zero `zztest-model-%` residue; a follow-up dry-run reports
 `ruff check .` → All checks passed. Frontend not run — no frontend files
 changed. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-28 — System word lists, phase 1 (+20 backend / migration 037)**
+
+`word_lists.user_id` is nullable and `is_system` marks a shared built-in list.
+The read filters widened to `(user_id = $2 OR is_system)` — which is exactly
+where a private list could leak — so the pre-existing cross-user isolation
+tests now run against a database that contains system rows.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_word_lists.py` | +20 | **Schema:** user lists default `is_system=false`; the CHECK rejects *both* hybrid states (system-with-owner, ownerless-private); system names are unique while duplicate **user** list names still work and a user may reuse a system list's name. **Reads:** owner reads their own; another user still gets 404 on detail *and* export; a private list never appears in another user's index; a system list is visible to every user including a brand-new one; system detail/export readable. **Writes:** a normal user cannot delete a system list (404, row survives); no public API can create one even when the client sends `is_system: true`; owners can still delete their own. **Mark-learning:** on a system list the shared `word_list_items` row is **not** mutated while progression still runs; only the acting user gains a knowledge row; two users marking the same list keep separate progress; the same list shows different counts per user; and user-list late binding still persists as before |
+
+**Both guards are mutation-checked.** Reverting the late-binding suppression
+(`if not row["is_system"]` → `if True`) fails
+`test_mark_learning_on_system_list_does_not_mutate_shared_rows`; widening
+`list_lists` to all rows fails both index-isolation tests.
+
+**Two tests had to change, and the distinction matters.**
+`test_list_index_returns_only_own_lists` asserted `resp.json() == []`; the index
+now legitimately includes system lists, so it asserts the property it was
+really about — user A's list id is absent, and every row B sees is a system
+row. And `test_brand_new_user_sees_system_lists` first asserted exact equality
+with one id, which **passed serially and failed under `-n auto`**: `word_lists`
+is global, so another worker's system fixture can be present concurrently.
+Same shared-table trap as the `_get_word` and `%`-token cases above — on a
+global table, assert your own rows, not the whole result set.
+
+**Validation:** backend `-n auto` → **1103 passed, 2 skipped** (1083 + 20);
+`ruff check .` → All checks passed; `alembic current` → **037 (head)**.
+Frontend not run — no frontend files changed. Root pipeline suite not run — no
+root files changed.
+
 🆕 **2026-07-27 — LLM provider seam, step 1 (+31 tests / +1 file)**
 
 Removed the three ad-hoc `AsyncAnthropic` constructions (`llm_service`,

@@ -121,6 +121,7 @@ language-app/
 - **009** — reading_selections
 - **013–022** — channel surrogate-key refactor (3-phase: youtube_channel_id string → internal SERIAL id)
 - **036** — generated `word_norm` / `lookup_key_norm` columns (ICU-normalized) + prefix index, so autocomplete folds Unicode correctly under the C-locale DB
+- **037** — `word_lists.user_id` nullable + `is_system` + a CHECK pairing them, so built-in shared lists can exist without a synthetic owner
 - **023** — notification
 
 ---
@@ -318,7 +319,7 @@ Two things to know before "fixing" what it reports:
 ```bash
 cd lexy-app/backend
 pytest                              # serial
-pytest -n auto                      # parallel via pytest-xdist — ~80s for 1083 tests
+pytest -n auto                      # parallel via pytest-xdist — ~92s for 1103 tests
 ```
 `pytest-randomly` is blocked via `addopts = -p no:randomly` in both ini files.
 That is deliberate and load-bearing — see `docs/TESTS.md` for the spaCy/thinc

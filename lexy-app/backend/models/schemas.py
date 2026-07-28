@@ -966,6 +966,9 @@ class WordListSummary(BaseModel):
     list_id: int
     name: str
     language: str
+    #: Built-in list, shared by every user and not user-editable
+    #: (migration 037). Existing user lists are always False.
+    is_system: bool = False
     description: str | None = None
     created_at: datetime
     total: int
@@ -975,6 +978,9 @@ class WordListDetail(BaseModel):
     list_id: int
     name: str
     language: str
+    #: Built-in list, shared by every user and not user-editable
+    #: (migration 037). Existing user lists are always False.
+    is_system: bool = False
     description: str | None = None
     created_at: datetime
     total: int

@@ -137,6 +137,8 @@ async def create_list(
         async with conn.transaction():
             list_id = await conn.fetchval(
                 """
+                -- user-owned by construction: `is_system` keeps its false
+                -- default, so no public path can mint a shared list.
                 INSERT INTO word_lists (user_id, name, language, description)
                 VALUES ($1::uuid, $2, $3, $4)
                 RETURNING list_id
@@ -165,12 +167,24 @@ async def create_list(
 
 
 async def _load_list_row(pool: asyncpg.Pool, user_id: str, list_id: int) -> dict | None:
-    """Ownership filter lives here — every public entry point goes through it."""
+    """Read gate — every public entry point goes through it.
+
+    Readable means "mine, or built-in". System lists (migration 037) have
+    `user_id IS NULL` and are visible to everyone; a private list is still
+    visible only to its owner, and a miss returns None so the router answers
+    404 rather than 403 (ids stay unenumerable).
+
+    The widening is safe because migration 037's CHECK makes a hybrid row —
+    a system list with an owner, or an ownerless private one — impossible to
+    store. Without that constraint this OR would be the leak.
+
+    `is_system` comes back so write paths can refuse shared rows.
+    """
     row = await pool.fetchrow(
         """
-        SELECT list_id, name, language, description, created_at
+        SELECT list_id, name, language, description, created_at, is_system
         FROM word_lists
-        WHERE list_id = $1 AND user_id = $2::uuid
+        WHERE list_id = $1 AND (user_id = $2::uuid OR is_system)
         """,
         list_id, user_id,
     )
@@ -275,15 +289,21 @@ async def get_list(pool: asyncpg.Pool, user_id: str, list_id: int) -> dict | Non
 
 
 async def list_lists(pool: asyncpg.Pool, user_id: str) -> list[dict]:
-    """Summaries (no entries) for the current user, newest first."""
+    """Summaries (no entries) the current user may read, newest first.
+
+    That is their own lists plus every system list. Another user's private
+    list is never included — the CHECK in migration 037 guarantees a system
+    row has no owner, so `OR wl.is_system` cannot pull one in.
+    """
     rows = await pool.fetch(
         """
         SELECT
             wl.list_id, wl.name, wl.language, wl.description, wl.created_at,
+            wl.is_system,
             COUNT(wli.id) AS total
         FROM word_lists wl
         LEFT JOIN word_list_items wli ON wli.list_id = wl.list_id
-        WHERE wl.user_id = $1::uuid
+        WHERE wl.user_id = $1::uuid OR wl.is_system
         GROUP BY wl.list_id
         ORDER BY wl.created_at DESC, wl.list_id DESC
         """,
@@ -351,13 +371,18 @@ async def mark_unknown_as_learning(
     # word_table row resolves as 'word' though it was stored as 'phrase' — so
     # writing the id without the type would leave a row whose join points at
     # the wrong catalog.
-    late_binds = [(e["item_id"], e["item_type"], e["id"]) for e in targets]
-    if late_binds:
-        await pool.executemany(
-            "UPDATE word_list_items SET item_id = $1, item_type = $2 "
-            "WHERE id = $3 AND item_id IS NULL",
-            late_binds,
-        )
+    # NEVER on a system list. The rows are shared, so this user-triggered
+    # write would mutate what every other user sees, and two users marking the
+    # same list would race on the same rows. Progression below is per-user and
+    # still runs — a system list is readable and learnable, just not writable.
+    if not row["is_system"]:
+        late_binds = [(e["item_id"], e["item_type"], e["id"]) for e in targets]
+        if late_binds:
+            await pool.executemany(
+                "UPDATE word_list_items SET item_id = $1, item_type = $2 "
+                "WHERE id = $3 AND item_id IS NULL",
+                late_binds,
+            )
 
     for entry in targets:
         await progression_service.apply_progression(
@@ -376,7 +401,14 @@ async def mark_unknown_as_learning(
 
 
 async def delete_list(pool: asyncpg.Pool, user_id: str, list_id: int) -> bool:
-    """True when a row was deleted. Entries go with it via ON DELETE CASCADE."""
+    """True when a row was deleted. Entries go with it via ON DELETE CASCADE.
+
+    Deliberately filters on `user_id` alone rather than going through
+    `_load_list_row`. A system list has `user_id IS NULL`, so it can never
+    match and a normal user cannot delete one — the refusal falls out of the
+    ownership filter rather than depending on a separate `is_system` check
+    that a later refactor could drop. Test-pinned.
+    """
     result = await pool.execute(
         "DELETE FROM word_lists WHERE list_id = $1 AND user_id = $2::uuid",
         list_id, user_id,
