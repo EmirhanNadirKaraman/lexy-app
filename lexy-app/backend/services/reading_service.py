@@ -14,6 +14,8 @@ import re
 
 import asyncpg
 
+from . import catalog_resolver
+
 
 async def get_word_statuses_for_page(
     pool: asyncpg.Pool,
@@ -61,22 +63,42 @@ async def get_word_statuses_for_page(
     if not all_words:
         return {}
 
-    words_list = list(all_words)
+    # Fold in Python, and key the result the way the frontend looks it up.
+    #
+    # Both halves were broken by the C collation. The filter compared
+    # Python-lowered page tokens against SQL `LOWER(w.word)`, which folds ASCII
+    # only, so an umlaut word never matched; and the returned key was that same
+    # SQL-lowered value, so even a match would have been filed under `'Öl'`
+    # while `BookReaderPage.tsx` looks it up as `tok.text.toLowerCase()` →
+    # `'öl'`. Fixed 2026-07-28.
+    #
+    # The filter moves to Python rather than being widened: the join already
+    # scopes rows to this user's tracked words (tens of rows), so SQL narrowing
+    # bought nothing.
+    #
+    # Keys use plain `.lower()`, deliberately NOT `normalize_key`. The frontend
+    # has no `.normalize()` call anywhere, so an NFC-normalised key would be
+    # unlookupable for decomposed text. `.lower()` is exactly what JS
+    # `toLowerCase()` produces. Adding NFC on both sides is a separate frontend
+    # change; no book block currently carries combining diacritics.
     status_rows = await pool.fetch(
         """
-        SELECT LOWER(w.word) AS word_lc, uwk.status
+        SELECT w.word, uwk.status
           FROM word_table w
           JOIN user_word_knowledge uwk
                ON uwk.item_id   = w.word_id
               AND uwk.item_type = 'word'
               AND uwk.user_id   = $1::uuid
-         WHERE LOWER(w.word) = ANY($2::text[])
-           AND w.language    = $3
+         WHERE w.language = $2
         """,
-        user_id, words_list, language,
+        user_id, language,
     )
 
-    return {r["word_lc"]: r["status"] for r in status_rows}
+    return {
+        key: r["status"]
+        for r in status_rows
+        if (key := r["word"].lower()) in all_words
+    }
 
 
 async def save_selection(
@@ -296,11 +318,38 @@ async def find_catalog_item(
     """
     Look up a reading selection's canonical text in the word/phrase catalog.
 
-    Returns (item_id, item_type) if a match is found in word_table or phrase_table
-    for the document's language, or None if the canonical has no catalog entry
-    (e.g. multi-word expressions not yet in phrase_table).
+    Returns (item_id, item_type) if the text binds to exactly one row for the
+    document's language, or None if it binds to none — or to several.
 
     Used to wire reading saves/reviews into the main progression system.
+
+    Delegates to `catalog_resolver`, which is the same rule vocabulary lists
+    use. Three things changed when it did (2026-07-28):
+
+    **Unicode.** The old predicates were `LOWER(word) = $1` fed
+    `canonical.lower()`. Under this database's C locale Postgres folds ASCII
+    only, so `LOWER('Öl')` is `'Öl'` and a selection of *öl* never bound —
+    meaning it never propagated to the main SRS. Folding now happens in
+    Python. See `services/text_norm.py`.
+
+    **Phrases match `canonical`, not `surface_form`.** Vocabulary lists always
+    matched `canonical`; reading matched `surface_form`, and 773 German rows
+    differ, so the same phrase could bind to different rows depending on where
+    the user entered it. `canonical` wins because it is the identity the rest
+    of the app keys on (`matcher_service`, `phrase_table`'s unique constraint).
+    Nothing is lost in practice: every differing row is a placeholder
+    blueprint whose `surface_form` is a fragment like `(Dat) (Akk) geben`,
+    which no book selection produces.
+
+    **Ambiguity fails safe.** This used to be a bare `fetchrow`, silently
+    binding to whichever row came back first — a coin flip between *die Bank*
+    the bench and *die Bank* the institution, attaching mastery to the wrong
+    sense invisibly. A surface with several catalog rows now returns None, so
+    the selection is still saved and reviewable on its own schedule but does
+    not advance a possibly-wrong catalog item. 410 German word surfaces have
+    duplicate rows today, so this does reduce propagation coverage; that is
+    the intended trade, and `word_list_service` has reported those same
+    surfaces as `ambiguous` since it shipped.
     """
     doc = await pool.fetchrow(
         "SELECT language FROM book_documents WHERE doc_id = $1::uuid",
@@ -309,26 +358,10 @@ async def find_catalog_item(
     if not doc:
         return None
 
-    language = doc["language"]
-    canonical_lc = canonical.lower()
-
-    # Single-word case: match against word_table
-    row = await pool.fetchrow(
-        "SELECT word_id FROM word_table WHERE LOWER(word) = $1 AND language = $2",
-        canonical_lc, language,
-    )
-    if row:
-        return (row["word_id"], "word")
-
-    # Multi-word case: match against phrase_table surface form
-    row = await pool.fetchrow(
-        "SELECT phrase_id FROM phrase_table WHERE LOWER(surface_form) = $1 AND language = $2",
-        canonical_lc, language,
-    )
-    if row:
-        return (row["phrase_id"], "phrase")
-
-    return None
+    res = await catalog_resolver.resolve_one(pool, canonical, doc["language"])
+    if res.item_id is None:
+        return None
+    return (res.item_id, res.item_type)
 
 
 async def get_due_selections(

@@ -256,6 +256,48 @@ never match — the same trap already documented on `_get_word`.
 `ruff check .` → All checks passed. Frontend not run — no frontend files
 changed. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-28 — Reading catalog binding + shared resolver (+21 backend / +1 file)**
+
+Extracted `services/catalog_resolver.py` so vocabulary lists and interactive
+reading resolve a surface identically. `find_catalog_item` had three bugs, all
+closed: SQL-side folding (an umlaut selection never bound, so it never reached
+the main SRS); matching `phrase_table.surface_form` where lists match
+`canonical` (**773 German rows differ**); and a bare `fetchrow` that silently
+first-matched an ambiguous surface. `get_word_statuses_for_page` is fixed in
+the same pass — its keys were SQL-lowered, so an umlaut word was filed under
+`'Öl'` while the frontend looks up `'öl'`.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_reading_progression.py` | +21 | `find_catalog_item` binds an umlaut word from a lowercased selection (Ö/Ü/Ä) and from the stored spelling; `straße`/`strasse` and `schließen`/`schliessen` bind to their own rows; **ambiguous surfaces bind to nothing** (two POS rows, and two Unicode case-variant rows); language scoping; phrases match **`canonical`** and a `surface_form` fragment no longer binds; umlaut phrase canonical binds; **reading and `catalog_resolver.resolve_one` return the same phrase row**; end-to-end, an umlaut selection creates the knowledge row and **both** SRS cards. Plus first-ever coverage of `get_word_statuses_for_page`: umlaut words appear (Ö/Ü/Ä), the key is the **JS-`toLowerCase()`-compatible** form and the stored spelling is *not* a key, ASCII still works, off-page words stay excluded (the Python filter must not widen scope), and language scoping holds. Also pins the sharpest edge of the fail-safe: **`mastered` on an ambiguous surface promotes neither candidate to `known`**, while the reading row still records the user's action |
+
+**Mutation-checked.** Reverting `services/reading_service.py` fails 15 of the
+21. The 5 that pass either way are guards: ß/ss separation (×2), language
+scoping (×2), and the ASCII page-status path.
+
+**Two existing tests were changed, both deliberately.**
+`_get_word` now picks an **unambiguous** word — its old lowest-`word_id` pick
+was `das`, which has two German rows, so 8 binding tests were passing only
+because the resolver used to guess. Uniqueness is checked with `normalize_key`,
+not SQL `lower()`, so it agrees with the resolver. And
+`test_save_selection_with_phrase_match_marks_learning` now selects on
+`canonical` with `ORDER BY phrase_id` (it used `surface_form` and a bare
+`LIMIT 1` — the unordered-pick flake documented above).
+
+**Behaviour change worth knowing:** ambiguity fails safe, and 410 German word
+surfaces have duplicate rows. Reading selections of those no longer propagate
+to the catalog — including `mastered`, where a user *explicitly declares*
+mastery and now gets no catalog effect. That is the intended direction: the
+old behaviour promoted a coin-flip row to `known`, and auto-promotion is
+one-way, so a wrong `known` is unrecoverable. They are still saved and reviewable on the reading schedule —
+the trade is losing a coin-flip binding rather than gaining a wrong one, and
+`word_list_service` has reported those same surfaces as `ambiguous` since it
+shipped.
+
+**Validation:** backend `-n auto` → **984 passed, 2 skipped** (963 + 21);
+`ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — word-list phrase support (+11 backend / +4 frontend)**
 
 Vocabulary lists now resolve against **both** `word_table` and `phrase_table`,

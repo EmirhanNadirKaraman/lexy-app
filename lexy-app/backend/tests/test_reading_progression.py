@@ -24,7 +24,9 @@ import uuid
 import pytest
 from httpx import AsyncClient
 
+from backend.services import catalog_resolver, reading_service
 from backend.services.reading_service import _interval_days, find_catalog_item
+from backend.services.text_norm import normalize_key
 from ._email_helper import make_test_email
 from ._auth_helper import register_and_login
 
@@ -55,13 +57,27 @@ async def _get_word(db_pool) -> tuple[int, str, str]:
     # as test_words.py: exclude synthetic surfaces (digits/underscores, which
     # real words never carry) and pick deterministically by word_id, so no
     # reapable row can ever be selected. (See docs/TESTS.md.)
-    row = await db_pool.fetchrow(
+    #
+    # It must ALSO be unambiguous. Since 2026-07-28 `find_catalog_item` fails
+    # safe on a surface with several catalog rows instead of silently binding
+    # to whichever one Postgres returned first, so an ambiguous pick makes
+    # every binding assertion below fail. The old lowest-word_id pick was
+    # `das`, which has two German rows — these tests were passing only because
+    # the resolver used to guess. Uniqueness is checked with `normalize_key`,
+    # not SQL `lower()`, so it agrees with the resolver under the C collation.
+    rows = await db_pool.fetch(
         "SELECT word_id, word, language FROM word_table "
-        "WHERE word !~ '[0-9_]' ORDER BY word_id LIMIT 1"
+        "WHERE word !~ '[0-9_]' ORDER BY word_id LIMIT 2000"
     )
-    if row is None:
-        pytest.skip("word_table has no plain word — run the subtitle pipeline first")
-    return row["word_id"], row["word"], row["language"]
+    counts: dict[tuple[str, str], int] = {}
+    for r in rows:
+        counts[(normalize_key(r["word"]), r["language"])] = (
+            counts.get((normalize_key(r["word"]), r["language"]), 0) + 1
+        )
+    for r in rows:
+        if counts[(normalize_key(r["word"]), r["language"])] == 1:
+            return r["word_id"], r["word"], r["language"]
+    pytest.skip("word_table has no unambiguous plain word — run the subtitle pipeline first")
 
 
 async def _create_doc(db_pool, uid: str, language: str) -> str:
@@ -345,23 +361,31 @@ async def test_save_selection_creates_both_srs_cards_for_word_match(
 async def test_save_selection_with_phrase_match_marks_learning(
     client: AsyncClient, db_pool
 ):
-    """Same contract for phrase_table matches."""
+    """Same contract for phrase_table matches.
+
+    Selects on `canonical`, which is what `find_catalog_item` has matched
+    since 2026-07-28 (it used to match `surface_form`, disagreeing with
+    vocabulary lists on the 773 German rows where the two columns differ).
+    `ORDER BY phrase_id` makes the pick deterministic — a bare `LIMIT 1` was
+    an xdist flake waiting to happen (docs/TESTS.md).
+    """
     phrase_row = await db_pool.fetchrow(
-        "SELECT phrase_id, surface_form, language FROM phrase_table LIMIT 1"
+        "SELECT phrase_id, canonical, language FROM phrase_table "
+        "ORDER BY phrase_id LIMIT 1"
     )
     if phrase_row is None:
         pytest.skip("phrase_table is empty")
 
-    phrase_id     = phrase_row["phrase_id"]
-    surface_form  = phrase_row["surface_form"]
-    language      = phrase_row["language"]
+    phrase_id = phrase_row["phrase_id"]
+    canonical = phrase_row["canonical"]
+    language  = phrase_row["language"]
 
     headers, uid = await _register_and_login(client, db_pool, _email())
     doc_id = await _create_doc(db_pool, uid, language)
 
     resp = await client.post(
         f"/api/v1/books/{doc_id}/selections",
-        json=_sel_body(surface_form),
+        json=_sel_body(canonical),
         headers=headers,
     )
     assert resp.status_code == 201
@@ -636,3 +660,408 @@ async def test_due_selections_excludes_mastered(client: AsyncClient, db_pool):
     resp = await client.get("/api/v1/reading/selections/due", headers=headers)
     assert resp.status_code == 200
     assert not any(s["canonical"] == word for s in resp.json())
+
+
+# ---------------------------------------------------------------------------
+# Unicode + shared-resolver binding (2026-07-28)
+#
+# `find_catalog_item` had three problems, all fixed by delegating to
+# `catalog_resolver`:
+#   1. `LOWER(word) = $1` fed `canonical.lower()`. Postgres folds ASCII only
+#      here, so a selection of `öl` never bound and never reached the main SRS.
+#   2. Phrases matched `phrase_table.surface_form` while vocabulary lists
+#      matched `canonical`; 773 German rows differ, so the same phrase bound to
+#      different rows depending on entry point.
+#   3. A bare `fetchrow` silently first-matched an ambiguous surface, attaching
+#      mastery to a coin-flip sense.
+# ---------------------------------------------------------------------------
+
+def _letters(n: int = 12) -> str:
+    return "".join(chr(ord("a") + int(c, 16)) for c in uuid.uuid4().hex[:n])
+
+
+async def _owned_word(db_pool, tracked: list[int], word: str, *,
+                      pos: str = "", language: str = "de") -> int:
+    wid = await db_pool.fetchval(
+        "INSERT INTO word_table (word, language, pos, tag, lemma) "
+        "VALUES ($1, $2, $3, '', $1) RETURNING word_id",
+        word, language, pos,
+    )
+    tracked.append(wid)
+    return wid
+
+
+@pytest.mark.parametrize("initial", ["Ö", "Ü", "Ä"])
+async def test_find_catalog_item_resolves_umlaut_word_from_lowercase(
+    client: AsyncClient, db_pool, tracked_words, initial,
+):
+    """The selection text arrives lowercased from the frontend."""
+    surface = f"{initial}zzr{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    result = await find_catalog_item(db_pool, doc_id, surface.lower())
+
+    assert result == (word_id, "word")
+
+
+async def test_find_catalog_item_resolves_umlaut_word_from_stored_spelling(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    surface = f"Özzr{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    assert await find_catalog_item(db_pool, doc_id, surface) == (word_id, "word")
+
+
+@pytest.mark.parametrize("sharp_s,double_s", [("straße", "strasse"), ("schließen", "schliessen")])
+async def test_find_catalog_item_does_not_merge_sharp_s_with_double_s(
+    client: AsyncClient, db_pool, tracked_words, sharp_s, double_s,
+):
+    """`casefold()` would merge these and bind the wrong catalog row."""
+    uniq = _letters()
+    sharp_id = await _owned_word(db_pool, tracked_words, f"{sharp_s}{uniq}")
+    double_id = await _owned_word(db_pool, tracked_words, f"{double_s}{uniq}")
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    assert await find_catalog_item(db_pool, doc_id, f"{sharp_s}{uniq}") == (sharp_id, "word")
+    assert await find_catalog_item(db_pool, doc_id, f"{double_s}{uniq}") == (double_id, "word")
+
+
+async def test_find_catalog_item_fails_safe_on_ambiguous_surface(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Two rows for one surface must bind to NEITHER.
+
+    This used to be a bare `fetchrow`, so it silently took whichever row came
+    back first — a coin flip between two senses, attaching mastery to the wrong
+    one invisibly. Reading has no ambiguity response shape, so it fails safe:
+    the selection is still saved and reviewable on its own schedule, it just
+    does not advance a possibly-wrong catalog item.
+    """
+    surface = f"Zzr{_letters()}"
+    await _owned_word(db_pool, tracked_words, surface, pos="NOUN")
+    await _owned_word(db_pool, tracked_words, surface, pos="VERB")
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    assert await find_catalog_item(db_pool, doc_id, surface) is None
+
+
+async def test_find_catalog_item_umlaut_case_variants_are_ambiguous_together(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """`Öl` + `öl` are one key now, so two such rows are a genuine duplicate."""
+    surface = f"Özzr{_letters()}"
+    await _owned_word(db_pool, tracked_words, surface, pos="NOUN")
+    await _owned_word(db_pool, tracked_words, surface.lower(), pos="VERB")
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    assert await find_catalog_item(db_pool, doc_id, surface.lower()) is None
+
+
+async def test_find_catalog_item_is_language_scoped(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    surface = f"Üzzr{_letters()}"
+    await _owned_word(db_pool, tracked_words, surface, language="es")
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    assert await find_catalog_item(db_pool, doc_id, surface.lower()) is None
+
+
+# --- canonical, not surface_form -------------------------------------------
+
+
+@pytest.fixture
+async def owned_phrase(db_pool):
+    """A phrase whose `canonical` differs from its `surface_form`."""
+    created: list[int] = []
+
+    async def _make(canonical: str, surface_form: str, *, language: str = "de") -> int:
+        pid = await db_pool.fetchval(
+            "INSERT INTO phrase_table (canonical, surface_form, phrase_type, language) "
+            "VALUES ($1, $2, 'verb_pattern', $3) RETURNING phrase_id",
+            canonical, surface_form, language,
+        )
+        created.append(pid)
+        return pid
+
+    yield _make
+
+    if created:
+        await db_pool.execute(
+            "DELETE FROM user_word_knowledge WHERE item_type='phrase' AND item_id = ANY($1::int[])",
+            created,
+        )
+        await db_pool.execute(
+            "DELETE FROM srs_cards WHERE item_type='phrase' AND item_id = ANY($1::int[])", created,
+        )
+        await db_pool.execute("DELETE FROM phrase_table WHERE phrase_id = ANY($1::int[])", created)
+
+
+async def test_find_catalog_item_matches_phrase_canonical_not_surface_form(
+    client: AsyncClient, db_pool, owned_phrase,
+):
+    """773 German rows have canonical != surface_form. Canonical is the identity."""
+    uniq = _letters()
+    canonical = f"jdm zzr{uniq} geben"
+    surface_form = f"zzr{uniq} geben"
+    phrase_id = await owned_phrase(canonical, surface_form)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    assert await find_catalog_item(db_pool, doc_id, canonical) == (phrase_id, "phrase")
+    assert await find_catalog_item(db_pool, doc_id, surface_form) is None, \
+        "surface_form must no longer bind — it disagreed with vocabulary lists"
+
+
+async def test_find_catalog_item_matches_umlaut_phrase_canonical(
+    client: AsyncClient, db_pool, owned_phrase,
+):
+    uniq = _letters()
+    canonical = f"die Änderung zzr{uniq}"
+    phrase_id = await owned_phrase(canonical, canonical)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    assert await find_catalog_item(db_pool, doc_id, canonical.lower()) == (phrase_id, "phrase")
+
+
+async def test_reading_and_vocabulary_list_agree_on_the_phrase_row(
+    client: AsyncClient, db_pool, owned_phrase,
+):
+    """The point of the shared resolver: one surface, one binding, either path."""
+    uniq = _letters()
+    canonical = f"sich Öffnen zzr{uniq} auf"
+    phrase_id = await owned_phrase(canonical, f"Öffnen zzr{uniq} auf")
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    reading = await find_catalog_item(db_pool, doc_id, canonical.lower())
+    listed = await catalog_resolver.resolve_one(db_pool, canonical.lower(), "de")
+
+    assert reading == (phrase_id, "phrase")
+    assert (listed.item_id, listed.item_type) == reading
+
+
+async def test_umlaut_selection_propagates_to_main_srs(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """End-to-end: the SRS credit that used to be silently lost.
+
+    Saving a selection routes through `status_marked_learning`, which creates
+    both SRS cards. Before the fix the umlaut canonical bound to nothing, so
+    no card and no knowledge row appeared and nothing reported the failure.
+    """
+    surface = f"Özzr{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    resp = await client.post(
+        f"/api/v1/books/{doc_id}/selections",
+        json=_sel_body(surface.lower()),
+        headers=headers,
+    )
+    assert resp.status_code == 201
+
+    uwk = await db_pool.fetchrow(
+        "SELECT status FROM user_word_knowledge "
+        " WHERE user_id = $1::uuid AND item_id = $2 AND item_type = 'word'",
+        uid, word_id,
+    )
+    assert uwk is not None, "umlaut selection did not reach the catalog"
+    assert uwk["status"] == "learning"
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM srs_cards "
+        " WHERE user_id = $1::uuid AND item_id = $2 AND item_type = 'word'",
+        uid, word_id,
+    ) == 2
+
+
+# ---------------------------------------------------------------------------
+# get_word_statuses_for_page — status colours for umlaut words (2026-07-28)
+#
+# Two independent breakages, both from the C collation:
+#   - the filter compared Python-lowered page tokens to SQL `LOWER(w.word)`,
+#     which folds ASCII only, so an umlaut word never matched at all;
+#   - the returned KEY was that same SQL-lowered value, so even a match would
+#     have been filed under `'Öl'` while BookReaderPage.tsx looks it up as
+#     `tok.text.toLowerCase()` → `'öl'`.
+#
+# Keys are plain `.lower()`, deliberately not `normalize_key`: the frontend has
+# no `.normalize()` call, so an NFC key would be unlookupable for decomposed
+# text. These tests pin the frontend contract, not just the match.
+# ---------------------------------------------------------------------------
+
+
+async def _page_with_text(db_pool, doc_id: str, text: str, page_number: int = 1) -> None:
+    page_id = await db_pool.fetchval(
+        "INSERT INTO book_pages (doc_id, page_number) VALUES ($1::uuid, $2) RETURNING page_id",
+        doc_id, page_number,
+    )
+    await db_pool.execute(
+        "INSERT INTO book_blocks (page_id, doc_id, block_index, block_type, clean_text) "
+        "VALUES ($1, $2::uuid, 0, 'text', $3)",
+        page_id, doc_id, text,
+    )
+
+
+async def _mark(db_pool, uid: str, word_id: int, status: str) -> None:
+    await db_pool.execute(
+        "INSERT INTO user_word_knowledge (user_id, item_id, item_type, status) "
+        "VALUES ($1::uuid, $2, 'word', $3)",
+        uid, word_id, status,
+    )
+
+
+@pytest.mark.parametrize("initial", ["Ö", "Ü", "Ä"])
+async def test_page_word_statuses_include_umlaut_words(
+    client: AsyncClient, db_pool, tracked_words, initial,
+):
+    surface = f"{initial}zzp{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+    await _page_with_text(db_pool, doc_id, f"Hier steht {surface} im Text.")
+    await _mark(db_pool, uid, word_id, "learning")
+
+    statuses = await reading_service.get_word_statuses_for_page(
+        db_pool, uid, doc_id, 1, "de",
+    )
+
+    assert statuses.get(surface.lower()) == "learning"
+
+
+async def test_page_word_statuses_key_matches_js_tolowercase(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Frontend contract: `BookReaderPage.tsx` does `tok.text.toLowerCase()`.
+
+    Python `.lower()` and JS `toLowerCase()` agree for `Ö` → `ö`. Keying with
+    the stored spelling (or an NFC-normalised form) would be unlookupable.
+    """
+    surface = f"Özzp{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+    await _page_with_text(db_pool, doc_id, surface)
+    await _mark(db_pool, uid, word_id, "known")
+
+    statuses = await reading_service.get_word_statuses_for_page(
+        db_pool, uid, doc_id, 1, "de",
+    )
+
+    assert surface.lower() in statuses, "key must be the JS-lowercased token"
+    assert surface not in statuses, "the stored spelling is not a usable key"
+
+
+async def test_page_word_statuses_still_work_for_ascii(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Regression guard — the ASCII path was never broken."""
+    surface = f"Zzp{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+    await _page_with_text(db_pool, doc_id, f"ein {surface} hier")
+    await _mark(db_pool, uid, word_id, "known")
+
+    statuses = await reading_service.get_word_statuses_for_page(
+        db_pool, uid, doc_id, 1, "de",
+    )
+
+    assert statuses.get(surface.lower()) == "known"
+
+
+async def test_page_word_statuses_exclude_words_not_on_the_page(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """The Python-side filter must not widen scope to the whole vocabulary."""
+    on_page = f"Özzp{_letters()}"
+    off_page = f"Üzzp{_letters()}"
+    on_id = await _owned_word(db_pool, tracked_words, on_page)
+    off_id = await _owned_word(db_pool, tracked_words, off_page)
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+    await _page_with_text(db_pool, doc_id, on_page)
+    await _mark(db_pool, uid, on_id, "learning")
+    await _mark(db_pool, uid, off_id, "learning")
+
+    statuses = await reading_service.get_word_statuses_for_page(
+        db_pool, uid, doc_id, 1, "de",
+    )
+
+    assert on_page.lower() in statuses
+    assert off_page.lower() not in statuses
+
+
+async def test_page_word_statuses_are_language_scoped(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    surface = f"Äzzp{_letters()}"
+    word_id = await _owned_word(db_pool, tracked_words, surface, language="es")
+    _headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+    await _page_with_text(db_pool, doc_id, surface)
+    await _mark(db_pool, uid, word_id, "learning")
+
+    statuses = await reading_service.get_word_statuses_for_page(
+        db_pool, uid, doc_id, 1, "de",
+    )
+
+    assert surface.lower() not in statuses
+
+
+async def test_mastered_on_ambiguous_surface_leaves_the_catalog_untouched(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """The sharpest edge of the ambiguity fail-safe — pinned deliberately.
+
+    `mastered` maps to `status_marked_known` with `status_override="known"`
+    (CLAUDE.md §8b), so this is a user *explicitly declaring mastery*. On a
+    surface with several catalog rows, `find_catalog_item` now returns None and
+    that declaration has no catalog effect at all — where before it advanced a
+    coin-flip row to `known`, which is unrecoverable (auto-promotion is
+    one-way). 410 German word surfaces are in this state today.
+
+    The reading row itself still records `mastered`, so nothing the user did is
+    lost on the reading schedule.
+    """
+    surface = f"Zzm{_letters()}"
+    ids = [
+        await _owned_word(db_pool, tracked_words, surface, pos="NOUN"),
+        await _owned_word(db_pool, tracked_words, surface, pos="VERB"),
+    ]
+    headers, uid = await _register_and_login(client, db_pool, _email())
+    doc_id = await _create_doc(db_pool, uid, "de")
+
+    save = await client.post(
+        f"/api/v1/books/{doc_id}/selections",
+        json=_sel_body(surface), headers=headers,
+    )
+    assert save.status_code == 201
+    selection_id = save.json()["selection_id"]
+
+    review = await client.post(
+        f"/api/v1/reading/selections/{selection_id}/review",
+        json={"outcome": "mastered"}, headers=headers,
+    )
+    assert review.status_code == 200
+
+    assert await db_pool.fetchval(
+        "SELECT status FROM reading_selections WHERE selection_id = $1::uuid", selection_id,
+    ) == "mastered", "the reading row must still record the user's action"
+
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM user_word_knowledge "
+        " WHERE user_id = $1::uuid AND item_type = 'word' AND item_id = ANY($2::int[])",
+        uid, ids,
+    ) == 0, "an ambiguous surface must not promote either candidate to known"
