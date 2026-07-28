@@ -86,6 +86,33 @@ async def _resolve_word_ids(
     return sorted(surface + lemma_only), sorted(surface)
 
 
+#: Postgres ARE (advanced regular expression) metacharacters. Escaping these
+#: turns a user's query into a literal, which is what autocomplete wants and
+#: what keeps a typed pattern from being *executed* — see docs/SECURITY.md S20.
+#: Python's `re.escape` targets Python's dialect, so the set is spelled out
+#: here rather than borrowed.
+_ARE_METACHARS = set(r"\^$.[]|()*+?{}")
+
+
+def _escape_regex(term: str) -> str:
+    """Make `term` match itself literally inside a Postgres ARE."""
+    return "".join("\\" + c if c in _ARE_METACHARS else c for c in term)
+
+
+def _escape_like_prefix(term: str) -> str:
+    """Make `term` a literal LIKE prefix, for use with `ESCAPE '\\'`.
+
+    Backslash first, or it would double-escape the escapes added after it.
+    Without this a user typing `%` matches the entire catalog and `_` matches
+    any single character — both silently wrong rather than errors.
+    """
+    return (
+        term.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
 async def _resolve_blueprint_ids(
     pool: asyncpg.Pool, query: str, *, whole_word: bool,
 ) -> list[int]:
@@ -120,6 +147,12 @@ async def _resolve_blueprint_ids(
 
 
 SIMILARITY_THRESHOLD = 0.3
+
+#: `_suggest_phrases` filters word boundaries in Python, so SQL must return
+#: more than `limit` candidates or the filter could empty the result. Similarity
+#: ordering puts exact whole-word hits (~1.0) first, so this only ever drops
+#: weak tail candidates.
+_PHRASE_CANDIDATE_FACTOR = 10
 
 
 def _build_multi_word_sentence_query(terms: list[str], language: str | None) -> tuple[str, list]:
@@ -398,48 +431,106 @@ PHRASE_LANGUAGES = ("de",)
 async def _suggest_words(pool, query: str, language: str, limit: int) -> list[dict]:
     """Frequency-ranked word prefix match, language-scoped (TODO #38 route B).
 
-    Case-insensitive prefix over word_table; DISTINCT ON (lower(word))
-    collapses casing variants to the highest-frequency casing; ranked by the
-    precomputed `frequency` column (migration 032). Index-assisted via
-    ix_word_table_lang_lower_word.
+    Matches `word_table.word_norm`, the generated column added in migration
+    036, against a `normalize_key`-folded prefix. Both sides therefore use the
+    *same* Unicode fold — the column's SQL expression was verified to
+    reproduce `normalize_key` on every current row.
+
+    The old predicate folded case on both sides in SQL, which looks
+    self-consistent but is not: under this database's C locale Postgres folds
+    ASCII only, so lowercasing `Öl` leaves it unchanged and typing *öl* never
+    reached it. This is the one lookup in the app that cannot be fixed by
+    folding in Python and filtering — autocomplete fires per keystroke and
+    needs an indexed prefix, which is why 036 persists the normalization.
+
+    `DISTINCT ON (word_norm)` now genuinely collapses casing variants; with the
+    old SQL-lowered key it could not, so `Folgen` and `folgen` appeared as two
+    suggestions. 417 German keys have more than one row; each is now a single
+    suggestion showing the highest-frequency spelling.
+
+    Ranking, response shape and `limit` are unchanged.
     """
+    key = normalize_key(query)
+    if not key:
+        return []
+
     rows = await pool.fetch(
-        """
+        r"""
         SELECT word, frequency
           FROM (
-              SELECT DISTINCT ON (lower(word)) word, frequency
+              SELECT DISTINCT ON (word_norm) word, frequency
                 FROM word_table
                WHERE language = $1
-                 AND lower(word) LIKE lower($2) || '%'
-               ORDER BY lower(word), frequency DESC
+                 AND word_norm LIKE $2 || '%' ESCAPE '\'
+               ORDER BY word_norm, frequency DESC
           ) t
          ORDER BY frequency DESC, word ASC
          LIMIT $3
         """,
-        language, query, limit,
+        language, _escape_like_prefix(key), limit,
     )
     return [{"word": r["word"], "score": float(r["frequency"]), "type": "word"} for r in rows]
 
 
 async def _suggest_phrases(pool, query: str, limit: int) -> list[dict]:
-    """German verb-blueprint phrase suggestions (the pre-route-B behaviour).
+    r"""German verb-blueprint phrase suggestions (the pre-route-B behaviour).
 
     phrase_blueprint has no language column — it's German-only — so callers
     gate this on PHRASE_LANGUAGES. Ranked by trigram similarity to the
     typed query.
+
+    Three problems fixed 2026-07-28. The old predicate paired
+    `strict_word_similarity` with a **case-insensitive regex** whose pattern
+    was the raw search term concatenated between Postgres word-boundary
+    escapes.
+
+    **Unicode fold.** That operator folds ASCII only under this database's C
+    locale, so an umlaut-bearing blueprint never matched a lowercase query.
+    Both sides now use `lookup_key_norm` (migration 036) against a
+    `normalize_key`-folded needle, so no case folding happens in SQL.
+
+    **Word boundaries were broken for non-ASCII anyway.** Postgres's `\m` /
+    `\M` depend on the ctype's notion of a word character, and under the C
+    locale `ö` is not one — so the boundary before an umlaut-initial token
+    never matched, with or without the fold. Verified directly:
+    `'jdm öl geben' ~ ('\m' || 'öl' || '\M')` is **false** while the ASCII
+    equivalent is true. That is why the check moved to Python, where `\w` is
+    Unicode-aware, rather than being rewritten as a different SQL regex.
+
+    **Regex sink (docs/SECURITY.md S20).** The term was parameterised — so not
+    SQL injection — but it was still *evaluated as a pattern*: `.*` matched all
+    43,549 rows, and a backtracking pattern would run against every one of them
+    inside a request. There is now **no user-controlled pattern in the SQL at
+    all**; the Python side compiles a `re.escape`d literal.
+
+    Ordering is unchanged (similarity descending). SQL over-fetches by
+    `_PHRASE_CANDIDATE_FACTOR` so the Python filter still has `limit` rows to
+    return; an exact whole-word hit scores ~1.0 and sorts to the top, so the
+    cap only ever drops far-weaker candidates.
     """
+    key = normalize_key(query)
+    if not key:
+        return []
+
     rows = await pool.fetch(
-        r"""
-        SELECT blueprint AS word, strict_word_similarity($1, lookup_key) AS score
+        """
+        SELECT blueprint,
+               strict_word_similarity($1, lookup_key_norm) AS score,
+               lookup_key_norm
           FROM phrase_blueprint
-         WHERE strict_word_similarity($1, lookup_key) > 0.3
-           AND lookup_key ~* ('\m' || $1 || '\M')
+         WHERE strict_word_similarity($1, lookup_key_norm) > 0.3
          ORDER BY score DESC
          LIMIT $2
         """,
-        query, limit,
+        key, limit * _PHRASE_CANDIDATE_FACTOR,
     )
-    return [{"word": r["word"], "score": float(r["score"]), "type": "phrase"} for r in rows]
+
+    boundary = re.compile(rf"(?<!\w){re.escape(key)}(?!\w)")
+    return [
+        {"word": r["blueprint"], "score": float(r["score"]), "type": "phrase"}
+        for r in rows
+        if boundary.search(r["lookup_key_norm"])
+    ][:limit]
 
 
 async def suggest(

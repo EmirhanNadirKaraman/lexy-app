@@ -8,11 +8,13 @@ is false — and searching *öl* returned nothing even though `Öl` was indexed
 against real sentences. Both paths now resolve to ids in Python via
 `normalize_key` and the SQL matches on `= ANY(...)`.
 
-Scope note: `_suggest_words` (autocomplete) is deliberately NOT covered or
-changed here. A Unicode-correct *prefix* match needs a normalized generated
-column plus an index — a migration, tracked as its own task. The last test in
-this file pins that it is still the unfixed version, so nobody assumes
-otherwise.
+Autocomplete (`_suggest_words` / `_suggest_phrases`) was deferred when this
+file was written and fixed on 2026-07-28 by migration 036, which adds generated
+`word_table.word_norm` and `phrase_blueprint.lookup_key_norm` columns. It could
+not use the fold-in-Python approach the rest of the app uses: `/api/suggest`
+fires on every keystroke and needs an *indexed prefix*, so the normalization is
+persisted instead. The deferral tests at the end of this file were inverted
+rather than deleted.
 
 Every fixture builds its own video/sentence/word rows and reaps them, because
 `video`, `sentence` and `word_table` are global (docs/TESTS.md).
@@ -23,6 +25,7 @@ import pytest
 from httpx import AsyncClient
 
 from backend.services import search_service
+from backend.services.text_norm import normalize_key
 from ._auth_helper import register_and_login
 from ._email_helper import make_test_email
 
@@ -41,7 +44,8 @@ async def corpus(db_pool):
     videos: list[str] = []
     words: list[int] = []
 
-    async def _make(word: str, *, lemma: str | None = None, language: str = "de") -> int:
+    async def _make(word: str, *, lemma: str | None = None, language: str = "de",
+                    frequency: int = 0) -> int:
         vid = f"zzsrch{_letters(10)}"
         await db_pool.execute(
             "INSERT INTO video (video_id, title, thumbnail_url, duration, language, "
@@ -56,9 +60,9 @@ async def corpus(db_pool):
             vid, f"Ein Satz mit {word} darin.",
         )
         word_id = await db_pool.fetchval(
-            "INSERT INTO word_table (word, language, pos, tag, lemma) "
-            "VALUES ($1, $2, '', '', $3) RETURNING word_id",
-            word, language, lemma or word,
+            "INSERT INTO word_table (word, language, pos, tag, lemma, frequency) "
+            "VALUES ($1, $2, '', '', $3, $4) RETURNING word_id",
+            word, language, lemma or word, frequency,
         )
         words.append(word_id)
         await db_pool.execute(
@@ -320,26 +324,20 @@ async def test_blueprint_search_escapes_regex_metacharacters(db_pool, blueprint_
 # ---------------------------------------------------------------------------
 
 
-async def test_suggest_words_is_still_the_unfixed_sql_version(db_pool, corpus):
-    """Pins the deferral so it is a decision, not an oversight.
+async def test_suggest_words_finds_umlaut_word_from_lowercase_prefix(db_pool, corpus):
+    """Was `test_suggest_words_is_still_the_unfixed_sql_version` — now inverted.
 
-    `_suggest_words` still prefix-matches with SQL `lower(word) LIKE lower($2)`,
-    which folds ASCII only here — so a lowercase umlaut prefix finds nothing. A
-    Unicode-correct prefix match needs a normalized generated column plus an
-    index (a migration), tracked separately in docs/TODO.md.
-
-    When that lands, this test SHOULD fail. Flip it to assert the suggestion is
-    returned rather than deleting it.
+    That test asserted autocomplete returned nothing for a lowercase umlaut
+    prefix, and instructed whoever fixed it to flip the assertion rather than
+    delete the coverage. This is that flip: migration 036's `word_norm` column
+    makes the prefix match Unicode-correct.
     """
     word = f"Özzs{_letters()}"
     await corpus(word)
 
     hits = await search_service._suggest_words(db_pool, word.lower()[:6], "de", 10)
 
-    assert hits == [], (
-        "autocomplete now folds Unicode — invert this assertion and close the "
-        "deferral in docs/TODO.md"
-    )
+    assert any(h["word"] == word for h in hits), "lowercase umlaut prefix found nothing"
 
 
 async def test_suggest_words_still_works_for_ascii(db_pool, corpus):
@@ -373,3 +371,237 @@ async def test_search_route_shape_unchanged(client: AsyncClient, db_pool, corpus
         "video_id", "title", "thumbnail_url", "language",
         "start_time", "start_time_int", "content", "surface_form", "match_type",
     }
+
+
+# ---------------------------------------------------------------------------
+# Autocomplete — migration 036 (`word_norm` / `lookup_key_norm`)
+#
+# `/api/suggest` is the one lookup that could not be fixed by folding in Python
+# and filtering: it fires per keystroke and needs an indexed prefix. So the
+# normalization is persisted as a generated column whose SQL expression
+# reproduces `normalize_key`, and the query matches a folded prefix against it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("prefix_of", ["lower", "exact", "upper"])
+async def test_suggest_words_finds_umlaut_word_from_any_casing(db_pool, corpus, prefix_of):
+    word = f"Özzs{_letters()}"
+    await corpus(word)
+    typed = {"lower": word.lower(), "exact": word, "upper": word.upper()}[prefix_of]
+
+    hits = await search_service._suggest_words(db_pool, typed[:6], "de", 10)
+
+    assert any(h["word"] == word for h in hits), f"{typed[:6]!r} found nothing"
+
+
+@pytest.mark.parametrize("initial", ["Ö", "Ü", "Ä"])
+async def test_suggest_words_umlaut_initial_prefix(db_pool, corpus, initial):
+    """`üb` → `Übung`, `änd` → `Änderung` — the prefix itself carries the umlaut."""
+    word = f"{initial}zzs{_letters()}"
+    await corpus(word)
+
+    hits = await search_service._suggest_words(db_pool, word.lower()[:4], "de", 10)
+
+    assert any(h["word"] == word for h in hits)
+
+
+async def test_suggest_words_is_language_scoped(db_pool, corpus):
+    word = f"Özzs{_letters()}"
+    await corpus(word, language="es")
+
+    assert await search_service._suggest_words(db_pool, word.lower()[:6], "de", 10) == []
+    assert await search_service._suggest_words(db_pool, word.lower()[:6], "es", 10)
+
+
+async def test_suggest_words_honours_limit(db_pool, corpus):
+    stem = f"Özzlim{_letters(6)}"
+    for i in range(5):
+        await corpus(f"{stem}{'abcde'[i]}")
+
+    assert len(await search_service._suggest_words(db_pool, stem.lower(), "de", 3)) == 3
+    assert len(await search_service._suggest_words(db_pool, stem.lower(), "de", 10)) == 5
+
+
+async def test_suggest_words_ranks_by_frequency_desc(db_pool, corpus):
+    stem = f"Özzrank{_letters(6)}"
+    await corpus(f"{stem}a", frequency=5)
+    await corpus(f"{stem}b", frequency=99)
+    await corpus(f"{stem}c", frequency=50)
+
+    hits = await search_service._suggest_words(db_pool, stem.lower(), "de", 10)
+
+    assert [h["word"] for h in hits] == [f"{stem}b", f"{stem}c", f"{stem}a"]
+    assert hits[0]["score"] == 99.0
+
+
+async def test_suggest_words_collapses_case_variants_highest_frequency_wins(db_pool, corpus):
+    """417 German keys have several rows; each is now ONE suggestion.
+
+    The old `DISTINCT ON (lower(word))` could not collapse `Folgen`/`folgen`
+    because SQL `lower()` left the umlaut/casing pair distinct under the C
+    locale. This is a visible change to the dropdown, and intended.
+    """
+    word = f"Özzdup{_letters(6)}"
+    await corpus(word, frequency=3)
+    await corpus(word.lower(), frequency=42)
+
+    hits = await search_service._suggest_words(db_pool, word.lower(), "de", 10)
+
+    matching = [h for h in hits if h["word"].lower() == word.lower()]
+    assert len(matching) == 1, "case variants must collapse to one suggestion"
+    assert matching[0]["word"] == word.lower(), "highest-frequency spelling wins"
+    assert matching[0]["score"] == 42.0
+
+
+@pytest.mark.parametrize("sharp_s,double_s", [("straße", "strasse"), ("schließen", "schliessen")])
+async def test_suggest_words_does_not_merge_sharp_s_with_double_s(
+    db_pool, corpus, sharp_s, double_s,
+):
+    """ICU `lower()` leaves ß alone; `casefold()` would map it to ss and merge.
+
+    Both spellings must remain separate suggestions, and each prefix must find
+    only its own word.
+    """
+    uniq = _letters()
+    sharp, double = f"{sharp_s}{uniq}", f"{double_s}{uniq}"
+    await corpus(sharp)
+    await corpus(double)
+
+    sharp_hits = [h["word"] for h in await search_service._suggest_words(db_pool, sharp, "de", 10)]
+    double_hits = [h["word"] for h in await search_service._suggest_words(db_pool, double, "de", 10)]
+
+    assert sharp_hits == [sharp]
+    assert double_hits == [double]
+
+
+@pytest.mark.parametrize("wildcard", ["%", "_"])
+async def test_suggest_words_treats_like_wildcards_literally(db_pool, corpus, wildcard):
+    """A typed `%` used to match the entire catalog; `_` any single character.
+
+    Asserted as "does not match an unrelated word", not "returns nothing": the
+    real corpus tokenizes punctuation, so `%` is itself a `word_table` row
+    (frequency 5) and legitimately matches *itself*. Asserting emptiness would
+    be testing the corpus, not the escaping.
+    """
+    unrelated = f"Özzwild{_letters()}"
+    await corpus(unrelated, frequency=999)
+
+    hits = await search_service._suggest_words(db_pool, wildcard, "de", 10)
+
+    assert all(h["word"] != unrelated for h in hits), \
+        f"{wildcard!r} expanded as a wildcard instead of matching literally"
+    assert all(h["word"].lower().startswith(wildcard) for h in hits), \
+        "every hit must literally start with the typed character"
+
+
+async def test_suggest_words_finds_a_word_containing_a_literal_wildcard(db_pool, corpus):
+    """Escaping must not break matching a surface that really contains `_`."""
+    word = f"Özz_wild{_letters(6)}"
+    await corpus(word)
+
+    hits = await search_service._suggest_words(db_pool, word.lower(), "de", 10)
+
+    assert any(h["word"] == word for h in hits)
+
+
+async def test_suggest_words_blank_query_returns_nothing(db_pool):
+    assert await search_service._suggest_words(db_pool, "   ", "de", 10) == []
+
+
+# --- the generated column itself -------------------------------------------
+
+
+async def test_migration_populated_word_norm_for_existing_rows(db_pool):
+    """036 backfills via the ADD COLUMN rewrite — no manual UPDATE."""
+    total, filled = await db_pool.fetchrow(
+        "SELECT count(*) AS total, count(word_norm) AS filled FROM word_table",
+    )
+    assert total > 0
+    assert filled == total, "every existing row must have word_norm"
+
+
+async def test_word_norm_matches_normalize_key_on_real_rows(db_pool):
+    """The whole design rests on the SQL expression reproducing normalize_key."""
+    rows = await db_pool.fetch(
+        "SELECT word, word_norm FROM word_table WHERE word ~ '[^\\x01-\\x7F]' LIMIT 500",
+    )
+    if not rows:
+        pytest.skip("no non-ASCII rows in word_table")
+    mismatched = [(r["word"], r["word_norm"]) for r in rows
+                  if r["word_norm"] != normalize_key(r["word"])]
+    assert mismatched == []
+
+
+async def test_new_word_gets_word_norm_without_application_code(db_pool, tracked_words):
+    """GENERATED means no insert path can forget it — the reason it beats a
+    column the application maintains (three code paths insert into word_table,
+    one of them the scraper in a separate process)."""
+    word = f"Özzgen{_letters()}"
+    wid = await db_pool.fetchval(
+        "INSERT INTO word_table (word, language, pos, tag, lemma) "
+        "VALUES ($1, 'de', '', '', $1) RETURNING word_id",
+        word,
+    )
+    tracked_words.append(wid)
+
+    stored = await db_pool.fetchval("SELECT word_norm FROM word_table WHERE word_id = $1", wid)
+
+    assert stored == normalize_key(word) == word.lower()
+
+
+async def test_word_norm_is_generated_and_cannot_be_written(db_pool, tracked_words):
+    import asyncpg as _asyncpg
+    with pytest.raises(_asyncpg.PostgresError):
+        await db_pool.execute(
+            "INSERT INTO word_table (word, language, pos, tag, lemma, word_norm) "
+            "VALUES ($1, 'de', '', '', $1, 'nope')",
+            f"Özzro{_letters()}",
+        )
+
+
+# --- _suggest_phrases -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "metachar", [".*", ".+", "(", "[a-z]+", "\\", "Ö.*geben"],
+)
+async def test_suggest_phrases_treats_regex_metacharacters_literally(
+    db_pool, blueprint_corpus, metachar,
+):
+    """SECURITY.md S20 — the query is data, not a pattern.
+
+    The old predicate concatenated the raw term into a Postgres ARE, so `.*`
+    matched all 43,549 blueprints and a backtracking pattern would run against
+    every one of them inside a request.
+    """
+    token = f"özzp{_letters()}"
+    await blueprint_corpus(f"jdm {token} geben")
+
+    hits = await search_service._suggest_phrases(db_pool, metachar, 10)
+
+    assert not any(token in h["word"] for h in hits), \
+        f"{metachar!r} was evaluated as a pattern"
+
+
+async def test_suggest_phrases_finds_umlaut_blueprint_from_lowercase(
+    db_pool, blueprint_corpus,
+):
+    """The blueprint carries original casing; the query is lowercased."""
+    token = f"Özzp{_letters()}"
+    await blueprint_corpus(f"jdm {token} geben")
+
+    hits = await search_service._suggest_phrases(db_pool, token.lower(), 10)
+
+    assert any(token in h["word"] for h in hits)
+
+
+async def test_suggest_phrases_literal_token_still_matches(db_pool, blueprint_corpus):
+    """Control: escaping must not simply break matching."""
+    token = f"özzp{_letters()}"
+    await blueprint_corpus(f"jdm {token} geben")
+
+    assert any(token in h["word"] for h in await search_service._suggest_phrases(db_pool, token, 10))
+
+
+async def test_suggest_phrases_blank_query_returns_nothing(db_pool):
+    assert await search_service._suggest_phrases(db_pool, "  ", 10) == []

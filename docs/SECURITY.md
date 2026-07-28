@@ -176,37 +176,64 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 
 ## Resolved findings
 
-### S19 — Raw user input concatenated into a Postgres regex in corpus search — LOW — RESOLVED 2026-07-28
-**Was:** `search_service.PHRASE_WORD_QUERY` matched blueprints with
-`pb.blueprint ~* ('\m' || $1 || '\M')`, where `$1` is the user's search term.
-The term was parameterised (so **not** SQL injection) but was still evaluated as
-a **regular expression**: `.*` matched every one of the 43,549 `phrase_blueprint`
-rows, and a catastrophic-backtracking pattern (`(a+)+$`-style) would be run
-against all of them inside a request. `/api/search` is auth-gated
-(`routers/search.py:20` — `APIRouter(dependencies=[Depends(get_current_user)])`),
-so this needed a logged-in account; that is what keeps it LOW rather than MEDIUM.
+### S19 — Raw user input concatenated into a Postgres regex in corpus **search** — LOW — RESOLVED 2026-07-28
+**Was:** `search_service.PHRASE_WORD_QUERY` matched blueprints with a
+case-insensitive regex built by concatenating the user's search term between
+word-boundary escapes. The term was parameterised (so **not** SQL injection)
+but was still evaluated as a **regular expression**: `.*` matched every one of
+the 43,549 `phrase_blueprint` rows, and a catastrophic-backtracking pattern
+(`(a+)+$`-style) would be run against all of them inside a request.
+`/api/search` is auth-gated (`routers/search.py:20` —
+`APIRouter(dependencies=[Depends(get_current_user)])`), so this needed a
+logged-in account; that is what keeps it LOW rather than MEDIUM.
 **file:line:** `lexy-app/backend/services/search_service.py:52` (pre-fix).
-**Fix shipped:** blueprint matching moved to Python in `_resolve_blueprint_ids`,
-which `re.escape`s the term before compiling it, so the query is matched as a
-literal. The SQL now takes pre-resolved `blueprint_id`s (`= ANY($1::int[])`) and
-contains no user-controlled pattern at all. The change was made for Unicode
-correctness (C-collation case folding); removing the regex sink came with it.
-**Verification check:** `rg -n '~\*' lexy-app/backend/services/search_service.py`
-returns nothing, and `rg -n 're.escape' lexy-app/backend/services/search_service.py`
-shows the escape in `_resolve_blueprint_ids`.
+**Fix shipped:** blueprint matching for `search()` moved to Python in
+`_resolve_blueprint_ids`, which `re.escape`s the term before compiling it, so
+the query is matched as a literal. That SQL now takes pre-resolved
+`blueprint_id`s (`= ANY($1::int[])`).
+
+> **Scope correction (2026-07-28).** As first written this finding claimed the
+> file "contains no user-controlled pattern at all". **That was wrong**, and
+> its verification check failed the moment anyone ran it: `_suggest_phrases`
+> still built the same kind of pattern. S19 covers the `search()` path only;
+> the autocomplete occurrence is tracked as **S20** below and is now also
+> resolved. The claim is corrected rather than deleted because a resolved
+> finding with a failing check is worse than an open one — the next reader
+> greps it, sees a hit, and cannot tell whether the fix regressed or the doc
+> was always wrong.
+
+**Verification check:** `rg -n 're.escape' lexy-app/backend/services/search_service.py`
+shows the escape in `_resolve_blueprint_ids`. The file-wide grep is under S20.
 **Tests:** `tests/test_search_unicode.py::test_blueprint_search_escapes_regex_metacharacters`
 asserts `.*`, `.+`, `(`, `[a-z]+` and `Ö.*geben` do **not** match a fixture
 blueprint, with a control asserting the literal token still does.
 
-### S1 — No brute-force / rate limit on auth endpoints — HIGH — RESOLVED 2026-05-24
-**Was:** `/api/v1/auth/login` and `/register` accepted unlimited attempts (the rate limiter only guarded LLM routes) → password brute-force, credential-stuffing, signup floods.
-**Fix shipped:** Added a generic single-window limiter `rate_limiter.check_window(key, limit, window_seconds, …)` (reuses the existing in-process store + lock) and two web-layer helpers in `core/deps.py` called at the top of each handler *before* any DB/bcrypt work:
-- `rate_limit_login(request, email)` — **two-tier** (deliberate; the original finding said "or", we did both): per `(ip, email)` **10 / 5 min** (targeted brute-force on one account) **and** per `ip` **30 / 5 min** (password-spraying across accounts).
-- `rate_limit_register(request)` — per `ip` **5 / hour**.
-Throttled requests get **429** with a generic body `"Too many attempts. Try again later."` — identical for login and register and independent of whether the account exists, so the throttle never leaks account existence. Client IP comes from `request.client.host`; `X-Forwarded-For` is honoured only when `TRUST_PROXY_HEADERS=true` (spoofable otherwise). Limits are module constants in `rate_limiter.py` (monkeypatchable in tests).
-**Still in-process (caveat):** like the LLM limiter, this is per-worker — a multi-worker deploy needs a shared backend (Redis). Tracked under S12.
-**Tests:** `tests/test_auth_throttle.py` (9 tests — below-limit success, per-email 429, per-IP spray-guard 429, register 429, no-enumeration, reset, validation-not-throttled). Existing `tests/test_auth.py` still green.
-**Re-check:** `rg -n 'rate_limit_login|rate_limit_register' lexy-app/backend/routers/auth.py` shows both wired; `cd lexy-app && MOCK_LLM=true python -m pytest backend/tests/test_auth_throttle.py backend/tests/test_auth.py -q` passes.
+### S20 — Same regex sink in `/api/suggest` autocomplete — LOW — RESOLVED 2026-07-28
+**Was:** `search_service._suggest_phrases` matched `phrase_blueprint.lookup_key`
+with a case-insensitive regex whose pattern was the raw search term
+concatenated between word-boundary escapes — the same shape as S19, in the
+function S19's fix deliberately left alone. Found while investigating the
+autocomplete Unicode bug, *after* S19 was committed claiming the file was
+clean. Autocomplete fires on **every keystroke**, so the per-request cost of a
+hostile pattern is paid more often here than in search; `/api/suggest` is
+auth-gated on the same router.
+**file:line:** `lexy-app/backend/services/search_service.py:436` (pre-fix).
+**Fix shipped:** `_suggest_phrases` now folds the query with
+`text_norm.normalize_key` and passes it through `_escape_regex`, which escapes
+every Postgres ARE metacharacter (`\^$.[]|()*+?{}`) so the term matches
+itself literally. The operator is also now the case-**sensitive** `~` against
+the generated `lookup_key_norm` column (migration 036), so no case folding
+happens in SQL either. `_escape_like_prefix` does the equivalent for
+`_suggest_words`' `LIKE` prefix — previously a typed `%` matched the entire
+catalog and `_` matched any character.
+**Verification check:** `rg -n '~\*' lexy-app/backend/services/search_service.py`
+returns **nothing** (no case-insensitive regex operator anywhere in the file,
+including in comments, so the grep stays meaningful), and
+`rg -n '_escape_regex|_escape_like_prefix' lexy-app/backend/services/search_service.py`
+shows both escapes wired into the two suggest functions.
+**Tests:** `tests/test_search_unicode.py` — `_suggest_phrases` treats `.*`,
+`.+`, `(`, `[a-z]+`, `\` and `Ö.*geben` literally (with a literal-token
+control), and `_suggest_words` treats `%` and `_` literally.
 
 ### S5 — No HTTP security headers — MEDIUM — RESOLVED 2026-05-24
 **Was:** Only `CORSMiddleware` was installed; no CSP/HSTS/X-Frame-Options/X-Content-Type-Options/Referrer-Policy/Permissions-Policy.
@@ -284,6 +311,8 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-07-28** — **Autocomplete Unicode fix; second regex sink closed (S20), S19 scope corrected.** Migration 036 adds generated `word_table.word_norm` and `phrase_blueprint.lookup_key_norm` columns (`lower(btrim(normalize(col, NFC)) COLLATE "und-x-icu")`) plus a prefix index, so `/api/suggest` matches a `normalize_key`-folded prefix on an indexed column instead of folding in SQL. While implementing it, `_suggest_phrases` was found to still carry the raw-regex pattern S19 claimed the file no longer had — filed and fixed as **S20**, and S19 narrowed to the `search()` path with a corrected verification check. Both suggest functions now escape user input (`_escape_regex` for the ARE, `_escape_like_prefix` for the `LIKE` prefix). No new route, no auth change; both endpoints stay auth-gated.
 
 - **2026-07-28** — **Corpus search rewritten for Unicode; regex sink removed (S19 RESOLVED).** `search_service.search` folded case in SQL (`ILIKE` on `word`/`lemma`, `ILIKE`/`~*` on `phrase_blueprint`), which under this database's C collation folds ASCII only — a Unicode bug whose fix also removed a security sink. The single-word blueprint predicate concatenated the raw search term into a Postgres regex (`~* ('\m' || $1 || '\M')`); it is now a Python `re.escape`d literal in `_resolve_blueprint_ids`, and the SQL takes pre-resolved integer ids. No new user-controlled SQL or pattern anywhere in the path; all remaining predicates are `= ANY($1)` over ids the server computed. `/api/search` was and remains auth-gated. `_suggest_words` (autocomplete) is deliberately untouched — it uses `LIKE` with a parameterised prefix, no regex, and its Unicode fix needs a migration.
 

@@ -343,6 +343,62 @@ blueprint predicate concatenated the raw search term into a Postgres regex.
 `ruff check .` → All checks passed. Frontend not run — no frontend files
 changed. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-28 — Unicode autocomplete, migration 036 (+29 backend / +1 migration)**
+
+The last C-collation Unicode site. `/api/suggest` could not use the
+fold-in-Python approach the rest of the app uses — it fires per keystroke and
+needs an **indexed prefix** — so migration 036 persists the normalization as
+generated columns `word_table.word_norm` and `phrase_blueprint.lookup_key_norm`
+(`lower(btrim(normalize(col, NFC)) COLLATE "und-x-icu")`), plus
+`ix_word_table_lang_word_norm (language, word_norm text_pattern_ops)`.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_search_unicode.py` | +29 | `_suggest_words` finds an umlaut word from lower/exact/upper prefixes and from umlaut-*initial* prefixes (Ö/Ü/Ä); language scoping; `limit`; **frequency ordering**; **case variants collapse to one suggestion, highest-frequency spelling winning**; `straße`/`strasse` and `schließen`/`schliessen` stay separate; `%` and `_` treated literally *and* a word containing a literal `_` still found; blank query. The generated column itself: 036 populated **every** existing row; `word_norm` matches `normalize_key` on real non-ASCII rows; a new insert gets it **without any application code setting it**; writing it directly raises. `_suggest_phrases`: regex metacharacters (`.*`, `.+`, `(`, `[a-z]+`, `\`, `Ö.*geben`) treated literally with a literal-token control; umlaut blueprint found from a lowercase query; blank query |
+
+**Mutation-checked.** Reverting `services/search_service.py` (leaving the
+migration applied) fails **14 of the 29**.
+
+**The deferral test was inverted, not deleted.**
+`test_suggest_words_is_still_the_unfixed_sql_version` became
+`test_suggest_words_finds_umlaut_word_from_lowercase_prefix`, as its own
+docstring had instructed.
+
+**EXPLAIN (after `ANALYZE word_table`):**
+```
+Index Scan using ix_word_table_lang_word_norm on word_table
+  Index Cond: ((language = 'de') AND (word_norm ~>=~ 'öl') AND (word_norm ~<~ 'öm'))
+  Filter: (word_norm ~~ 'öl%')
+Execution Time: 0.072 ms   Buffers: shared hit=3 read=2
+```
+
+**Three bugs the tests found that reading alone did not.**
+1. Postgres's `\m`/`\M` word boundaries are **ctype-dependent**: under the C
+   locale `ö` is not a word character, so `'jdm öl geben' ~ ('\m' || 'öl' || '\M')`
+   is **false** while the ASCII equivalent is true. Phrase autocomplete was
+   broken for umlauts independently of the case fold. The boundary check moved
+   to Python (`\w` is Unicode-aware there), which also removed the last
+   user-controlled pattern from that SQL.
+2. A patch script silently ate a backslash, shipping `ESCAPE ''` instead of
+   `ESCAPE '\'`. Direct SQL worked while the service returned nothing —
+   the test caught it. (Same class as the COMMON_ERRORS entry on scripted
+   multi-step edits.)
+3. **A test assumption was wrong, again, and got corrected rather than
+   weakened.** `_suggest_words("%")` was asserted to return `[]`; the real
+   corpus tokenizes punctuation, so `%` is itself a `word_table` row
+   (frequency 5) and legitimately matches *itself*. It now asserts the typed
+   character does not expand — an unrelated high-frequency word is absent and
+   every hit literally starts with it. Same shape as the earlier `(` case; when
+   a corpus-backed assertion fails, check the corpus before the code.
+
+**Security:** closed **S20** and corrected **S19**'s scope in
+`docs/SECURITY.md`. Both findings' verification greps were run and pass.
+
+**Validation:** backend `-n auto` → **1033 passed, 2 skipped** (1004 + 29);
+`ruff check .` → All checks passed; `alembic upgrade head` → **036**. Frontend
+not run — no frontend files changed. Root pipeline suite not run — no root
+files changed.
+
 🆕 **2026-07-27 — word-list phrase support (+11 backend / +4 frontend)**
 
 Vocabulary lists now resolve against **both** `word_table` and `phrase_table`,
