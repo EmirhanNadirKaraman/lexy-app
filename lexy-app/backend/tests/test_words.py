@@ -683,3 +683,313 @@ async def test_reap_word_ids_removes_synthetic_rows(db_pool):
     # Idempotent: reaping already-gone ids (and an empty list) must not error.
     await _reap_word_ids(db_pool, ids)
     await _reap_word_ids(db_pool, [])
+
+
+# ---------------------------------------------------------------------------
+# Unicode lookup + learn-anyway de-duplication (C-collation bug, 2026-07-28)
+#
+# The database folds ASCII only (`'Öl' ILIKE 'öl'` is false), so the old
+# `WHERE w.word ILIKE $1` lookup missed every catalog word carrying an
+# uppercase non-ASCII letter. That miss was not just a display bug: the picker
+# then offered "Learn anyway", and learn-anyway's
+# `ON CONFLICT (word, language, pos)` cannot conflict with a row stored under a
+# different `pos`, so accepting forked the surface into a second row — which
+# `word_list_service` reports as `ambiguous` for every user, permanently.
+#
+# Both halves are covered here. Fixtures carry real umlauts on purpose: an
+# ASCII fixture passes against the broken code.
+# ---------------------------------------------------------------------------
+
+
+async def _insert_word(db_pool, tracked: list[int], word: str, *, pos: str = "",
+                       language: str = "de") -> int:
+    """Insert one catalog row and register it for reaping."""
+    wid = await db_pool.fetchval(
+        "INSERT INTO word_table (word, language, pos, tag, lemma) "
+        "VALUES ($1, $2, $3, '', $1) RETURNING word_id",
+        word, language, pos,
+    )
+    tracked.append(wid)
+    return wid
+
+
+def _umlaut_surface(initial: str) -> str:
+    return f"{initial}zzw{uuid.uuid4().hex[:10]}"
+
+
+@pytest.mark.parametrize("initial", ["Ö", "Ü", "Ä"])
+async def test_by_text_finds_umlaut_word_with_stored_spelling(
+    client: AsyncClient, db_pool, tracked_words, initial,
+):
+    """Baseline guard: the stored spelling must keep resolving.
+
+    Unlike vocabulary lists (which lowered in Python before querying), this
+    endpoint passed the raw input to `ILIKE`, so a byte-exact spelling already
+    worked. This pins that it still does after the switch to `resolve_word_ids`
+    — it is a regression guard, not a bug reproduction. The case-variant tests
+    below are the ones that failed before the fix.
+    """
+    surface = _umlaut_surface(initial)
+    wid = await _insert_word(db_pool, tracked_words, surface)
+
+    token = await _registered_token(client)
+    resp = await client.get(
+        BY_TEXT, params={"word": surface, "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "single", f"expected single, got {body['status']}"
+    assert body["item"]["word_id"] == wid
+
+
+@pytest.mark.parametrize("initial", ["Ö", "Ü", "Ä"])
+async def test_by_text_finds_umlaut_word_from_lowercased_input(
+    client: AsyncClient, db_pool, tracked_words, initial,
+):
+    surface = _umlaut_surface(initial)
+    wid = await _insert_word(db_pool, tracked_words, surface)
+
+    token = await _registered_token(client)
+    resp = await client.get(
+        BY_TEXT, params={"word": surface.lower(), "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.json()["item"]["word_id"] == wid, "öl must find the stored Öl"
+
+
+async def test_by_text_finds_umlaut_word_from_uppercased_input(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    surface = _umlaut_surface("Ö")
+    wid = await _insert_word(db_pool, tracked_words, surface)
+
+    token = await _registered_token(client)
+    resp = await client.get(
+        BY_TEXT, params={"word": surface.upper(), "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.json()["item"]["word_id"] == wid
+
+
+async def test_by_text_returns_the_stored_spelling_not_the_typed_one(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """A case-variant hit must report the canonical stored surface."""
+    surface = _umlaut_surface("Ö")
+    await _insert_word(db_pool, tracked_words, surface)
+
+    token = await _registered_token(client)
+    resp = await client.get(
+        BY_TEXT, params={"word": surface.lower(), "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.json()["item"]["word"] == surface
+
+
+@pytest.mark.parametrize(
+    "sharp_s,double_s",
+    [("straße", "strasse"), ("schließen", "schliessen")],
+)
+async def test_sharp_s_and_double_s_are_not_merged(
+    client: AsyncClient, db_pool, tracked_words, sharp_s, double_s,
+):
+    """`casefold()` maps ß to ss and would merge these into one ambiguous key.
+
+    They are distinct German entries (Swiss vs. standard orthography), so
+    `normalize_key` uses `lower()`. Each must resolve to its own row, `single`
+    rather than `ambiguous`.
+    """
+    uniq = uuid.uuid4().hex[:10]
+    sharp_id = await _insert_word(db_pool, tracked_words, f"{sharp_s}{uniq}")
+    double_id = await _insert_word(db_pool, tracked_words, f"{double_s}{uniq}")
+
+    token = await _registered_token(client)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    r_sharp = await client.get(
+        BY_TEXT, params={"word": f"{sharp_s}{uniq}", "language": "de"}, headers=headers)
+    r_double = await client.get(
+        BY_TEXT, params={"word": f"{double_s}{uniq}", "language": "de"}, headers=headers)
+
+    assert r_sharp.json()["status"] == "single"
+    assert r_double.json()["status"] == "single"
+    assert r_sharp.json()["item"]["word_id"] == sharp_id
+    assert r_double.json()["item"]["word_id"] == double_id
+
+
+async def test_by_text_umlaut_duplicates_still_report_ambiguous(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Genuine duplicates are still never first-matched (W3 / Hole 2)."""
+    surface = _umlaut_surface("Ö")
+    await _insert_word(db_pool, tracked_words, surface, pos="NOUN")
+    await _insert_word(db_pool, tracked_words, surface.lower(), pos="VERB")
+
+    token = await _registered_token(client)
+    resp = await client.get(
+        BY_TEXT, params={"word": surface, "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    body = resp.json()
+    assert body["status"] == "ambiguous"
+    assert body["item"] is None
+    assert len(body["candidates"]) == 2
+
+
+async def test_by_text_is_still_language_scoped(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    surface = _umlaut_surface("Ü")
+    await _insert_word(db_pool, tracked_words, surface, language="es")
+
+    token = await _registered_token(client)
+    resp = await client.get(
+        BY_TEXT, params={"word": surface, "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.json()["status"] == "not_found"
+
+
+# --- learn-anyway must reuse, never fork ------------------------------------
+
+
+async def test_learn_anyway_reuses_existing_pos_empty_row(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """The core anti-fork case: backfilled rows carry pos=''.
+
+    `ON CONFLICT (word, language, pos)` on a pos='X' insert does NOT conflict
+    with a pos='' row, so the old code added a second row and made the surface
+    permanently ambiguous in vocabulary lists.
+    """
+    surface = f"Zzlearn{uuid.uuid4().hex[:10]}"
+    existing_id = await _insert_word(db_pool, tracked_words, surface, pos="")
+
+    token = await _registered_token(client)
+    resp = await client.post(
+        LEARN_ANYWAY, json={"text": surface, "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["word_id"] == existing_id, "must reuse, not create"
+    rows = await db_pool.fetch(
+        "SELECT pos FROM word_table WHERE word = $1 AND language = 'de'", surface)
+    assert [r["pos"] for r in rows] == [""], "a pos='X' row would fork the surface"
+
+
+async def test_learn_anyway_reuses_existing_scraper_pos_row(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Scraper rows carry a real POS — same fork risk as pos=''."""
+    surface = f"Zzlearn{uuid.uuid4().hex[:10]}"
+    existing_id = await _insert_word(db_pool, tracked_words, surface, pos="NOUN")
+
+    token = await _registered_token(client)
+    resp = await client.post(
+        LEARN_ANYWAY, json={"text": surface, "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.json()["word_id"] == existing_id
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM word_table WHERE word = $1 AND language = 'de'", surface,
+    ) == 1
+
+
+async def test_learn_anyway_reuses_existing_row_for_unicode_case_variant(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Existing `Öl`, user adopts `öl` — the exact production fork path.
+
+    The lookup used to miss (ILIKE folds ASCII only), the picker offered
+    "Learn anyway", and accepting created a second row.
+    """
+    surface = _umlaut_surface("Ö")
+    existing_id = await _insert_word(db_pool, tracked_words, surface, pos="")
+
+    token = await _registered_token(client)
+    resp = await client.post(
+        LEARN_ANYWAY, json={"text": surface.lower(), "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.json()["word_id"] == existing_id
+    rows = await db_pool.fetch(
+        "SELECT word FROM word_table WHERE language = 'de' AND word = ANY($1::text[])",
+        [surface, surface.lower()],
+    )
+    assert [r["word"] for r in rows] == [surface], "case variant forked the surface"
+
+
+async def test_learn_anyway_still_creates_a_row_for_a_genuinely_new_word(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """The fix must not swing the other way and refuse to adopt new words."""
+    surface = _umlaut_surface("Ä")
+
+    token = await _registered_token(client)
+    resp = await client.post(
+        LEARN_ANYWAY, json={"text": surface, "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    body = resp.json()
+    tracked_words.append(body["word_id"])
+    assert body["current_status"] == "learning"
+    row = await db_pool.fetchrow(
+        "SELECT pos, lemma FROM word_table WHERE word = $1 AND language = 'de'", surface)
+    assert row is not None
+    assert row["pos"] == "X", "genuinely new words keep the sparse placeholder"
+    assert row["lemma"] == surface
+
+
+async def test_learn_anyway_on_ambiguous_surface_does_not_add_a_third_row(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """An already-forked surface must not be forked further.
+
+    The response model is a single WordLookupResult, so this reuses the lowest
+    word_id — the same row the old code returned via `_lookup_first_match`,
+    minus the extra insert.
+    """
+    surface, ids = await _create_ambiguous_word(db_pool, tracked_words)
+
+    token = await _registered_token(client)
+    resp = await client.post(
+        LEARN_ANYWAY, json={"text": surface, "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["word_id"] == min(ids)
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM word_table WHERE word = $1 AND language = 'de'", surface,
+    ) == 2, "no third row"
+
+
+async def test_learn_anyway_is_language_scoped(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """A Spanish row must not satisfy a German adopt."""
+    surface = f"Zzlearn{uuid.uuid4().hex[:10]}"
+    await _insert_word(db_pool, tracked_words, surface, language="es")
+
+    token = await _registered_token(client)
+    resp = await client.post(
+        LEARN_ANYWAY, json={"text": surface, "language": "de"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    body = resp.json()
+    tracked_words.append(body["word_id"])
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM word_table WHERE word = $1 AND language = 'de'", surface,
+    ) == 1

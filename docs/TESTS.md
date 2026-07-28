@@ -189,6 +189,38 @@ changed. Root pipeline suite not run — no root files changed. The backfill
 dry-run now reports `missing: 0` (was 17, all umlaut-initial), confirming the
 resolver and the seeder agree on what is already present.
 
+
+🆕 **2026-07-28 — Unicode word lookup + learn-anyway de-duplication (+18 backend)**
+
+Closes the **data-corrupting** half of the C-collation bug. `ILIKE` folds ASCII
+only here (`'Öl' ILIKE 'öl'` → false), so `/words/by-text?word=öl` reported
+`not_found` while `Öl` sat in `word_table`. The picker then offered "Learn
+anyway", and its `pos='X'` INSERT with `ON CONFLICT (word, language, pos)`
+cannot conflict with the same word stored as `pos=''` or `pos='NOUN'` — so
+accepting **forked the surface into a second row**, which `word_list_service`
+reports as `ambiguous` for every user, permanently. `word_service` now resolves
+through `resolve_word_ids` (Python `normalize_key`) and reuses an existing row.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_words.py` | +18 | `/words/by-text` finds an umlaut word from lower- and upper-cased input, parametrized over Ö/Ü/Ä; a case-variant hit returns the **stored** spelling, not the typed one; `straße`/`strasse` and `schließen`/`schliessen` each resolve `single` to their own row (never merged); umlaut duplicates still report `ambiguous` with `item=None` and 2 candidates (W3 / Hole 2 intact); lookup stays language-scoped; **learn-anyway reuses an existing `pos=''` row**, an existing scraper `pos='NOUN'` row, and an existing row when the user submits a Unicode case variant (`Öl` stored, `öl` submitted) — asserting in each case that no second row appears; a genuinely new word still gets its sparse `pos='X'` row; learn-anyway on an already-ambiguous surface reuses the lowest `word_id` and adds **no third row**; learn-anyway stays language-scoped |
+
+**Mutation-checked.** Reverting `services/word_service.py` to its pre-fix state
+fails 9 of the 18 (the three lowercased-input params, stored-spelling-returned,
+umlaut-duplicates-ambiguous, and all four learn-anyway reuse/no-fork cases).
+The other 9 pass before and after by design — they are regression guards on
+behaviour that must not change (byte-exact lookup, ß/ss separation, language
+scoping, new-word creation).
+
+**Note one test is a guard, not a reproduction.** Unlike vocabulary lists,
+`/words/by-text` passed the raw input to `ILIKE`, so a byte-exact umlaut
+spelling already worked. `test_by_text_finds_umlaut_word_with_stored_spelling`
+pins that; the case-variant tests are the ones that were broken.
+
+**Validation:** backend `-n auto` → **949 passed, 2 skipped** (931 + 18);
+`ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — word-list phrase support (+11 backend / +4 frontend)**
 
 Vocabulary lists now resolve against **both** `word_table` and `phrase_table`,

@@ -1,8 +1,43 @@
 
 import asyncpg
 
+from .text_norm import normalize_key
 
 LOOKUP_CANDIDATE_CAP = 10
+
+
+async def resolve_word_ids(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    text: str,
+    language: str,
+) -> list[int]:
+    """Every `word_table` row whose surface matches `text` case-insensitively.
+
+    Returns sorted `word_id`s: `[]` = no match, one = unambiguous, several =
+    ambiguous. Callers decide what ambiguity means; this never picks for them
+    (the W3 / Hole 2 rule).
+
+    Case-insensitivity is decided in **Python**, via `text_norm.normalize_key`.
+    `ILIKE` and `lower()` cannot do it here: the database runs under the C
+    locale, where both fold ASCII only, so `'Öl' ILIKE 'öl'` is false and
+    `lower('Öl')` is `'Öl'`. Every German word with an uppercase non-ASCII
+    letter was therefore invisible to a case-variant lookup. See
+    `services/text_norm.py` for the collation evidence and the rejected
+    alternatives.
+
+    Fetching the language-scoped surfaces is the same trade
+    `word_list_service._resolve_surfaces` makes, for the same reason — a
+    bounded predicate cannot express this fold without an ICU collation.
+    Measured ~20 ms for German, ~40 ms for the larger Spanish catalog.
+    """
+    key = normalize_key(text)
+    if not key:
+        return []
+    rows = await conn.fetch(
+        "SELECT w.word_id, w.word FROM word_table w WHERE w.language = $1",
+        language,
+    )
+    return sorted(r["word_id"] for r in rows if normalize_key(r["word"]) == key)
 
 
 async def lookup_word_by_text(
@@ -29,10 +64,22 @@ async def lookup_word_by_text(
     all when there's more than one; the caller (interactive picker) decides.
 
     Sort order (deterministic):
-      1. exact case-insensitive `word` match first (typed surface wins)
+      1. exact `word` match first (the typed spelling wins)
       2. then by `lemma` ascending
       3. then by `word_id` ascending (stability tie-breaker)
+
+    Matching runs through `resolve_word_ids`, not `ILIKE`. The old predicate
+    (`w.word ILIKE $1`) folded ASCII only under this database's C collation,
+    so a user clicking *öl* got `not_found` while `Öl` sat in the table — and
+    the picker then offered "Learn anyway", which forked the surface into a
+    second row. Sort key 1 used to be a case-insensitive comparison; every
+    candidate is now case-insensitively equal by construction, so it compares
+    the exact spelling instead.
     """
+    word_ids = await resolve_word_ids(pool, word, language)
+    if not word_ids:
+        return {"status": "not_found", "item": None, "candidates": []}
+
     rows = await pool.fetch(
         """
         SELECT
@@ -60,16 +107,16 @@ async def lookup_word_by_text(
               AND sc_a.item_type = 'word'
               AND sc_a.user_id   = $2::uuid
               AND sc_a.direction = 'active'
-        WHERE w.word ILIKE $1 AND w.language = $3
+        WHERE w.word_id = ANY($1::int[])
         ORDER BY
-            CASE WHEN LOWER(w.word) = LOWER($1) THEN 0 ELSE 1 END,
+            CASE WHEN w.word = $3 THEN 0 ELSE 1 END,
             w.lemma ASC,
             w.word_id ASC
         LIMIT $4
         """,
-        word,
+        word_ids,
         user_id,
-        language,
+        word.strip(),
         LOOKUP_CANDIDATE_CAP,
     )
 
@@ -130,14 +177,39 @@ async def learn_word_anyway(
     Behaviour:
       - text is trimmed; raises ValueError on empty input. Callers validate
         length again at the route layer (Pydantic).
-      - word_table is sparsely populated for unscraped words: pos='X'
+      - An existing row is REUSED, never duplicated. `resolve_word_ids`
+        decides that case-insensitively in Python; see the anti-fork note
+        below for why the INSERT's own conflict clause cannot.
+      - Only a genuinely new word gets a row, and it is sparse: pos='X'
         (spaCy's universal "other" tag), tag='', lemma=text. A future
         enrichment pass (e.g. when the scraper sees the word in context)
         may patch the row in place — we don't fabricate POS/lemma now.
-      - The unique key on (word, language, pos) means re-running with the
-        same input no-ops at the INSERT level. We still re-fetch the
-        existing row's word_id and run apply_progression so the user
-        always ends up in the 'learning' state regardless of prior status.
+      - Re-running with the same input is a no-op at the catalog level. We
+        still run apply_progression so the user always ends up in the
+        'learning' state regardless of prior status.
+
+    Anti-fork (2026-07-28)
+    ----------------------
+    `word_table` is UNIQUE (word, language, pos) with `pos` *in the key*, so
+    `ON CONFLICT (word, language, pos)` on a `pos='X'` insert does NOT conflict
+    with the same word stored as `pos=''` (backfilled) or `pos='NOUN'`
+    (scraper). It inserted a second row, and two rows for one surface is what
+    `word_list_service` reports as `ambiguous` — permanently, for every user.
+    Two such forked rows exist in the database from before this fix; cleaning
+    them up is a separate data decision.
+
+    Reaching that fork needed the lookup to miss while the row existed, which
+    the C-collation `ILIKE` bug made easy: clicking *öl* when `Öl` was stored
+    returned `not_found`, the picker offered "Learn anyway", and the user
+    forked the word by accepting. Both halves are fixed here — resolve first,
+    insert only when nothing matched.
+
+    Several matches (an already-ambiguous surface) reuse the lowest `word_id`
+    rather than inserting. That is the same row this function already returned
+    in that case, since `_lookup_first_match` falls back to `candidates[0]`;
+    the change is that it no longer adds a third row first. The response model
+    is a single `WordLookupResult`, so surfacing ambiguity here would be an
+    API change — tracked separately.
       - Progression: 'status_marked_learning' with status_override='learning'
         creates both passive AND active SRS cards (#0b) without inflating
         active_level / times_used_correctly (rule is exposure-only).
@@ -151,53 +223,64 @@ async def learn_word_anyway(
     if not text:
         raise ValueError("text must be non-empty")
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            # INSERT returns the new row's word_id; on conflict we fall back
-            # to a SELECT to find the existing one. We don't UPDATE existing
-            # rows — if the scraper later enriches POS/lemma it should win
-            # over our 'X' placeholder.
-            row = await conn.fetchrow(
-                """
-                INSERT INTO word_table (word, language, pos, tag, lemma)
-                VALUES ($1, $2, 'X', '', $1)
-                ON CONFLICT (word, language, pos) DO NOTHING
-                RETURNING word_id
-                """,
-                text, language,
-            )
-            if row is None:
-                # Existing row — fetch its id. ILIKE matches the lookup
-                # behaviour so capitalisation differences don't fork rows.
+    # Resolve BEFORE inserting. This is the anti-fork guard: the INSERT's own
+    # ON CONFLICT cannot see a row stored under a different pos, and ILIKE
+    # cannot see a Unicode case variant. Deliberately outside the transaction
+    # below — it is a read, and it fetches the language-scoped catalog
+    # (~9.3k de / ~29.6k es rows), which has no business being held open
+    # inside a write transaction. An existing word needs no write at all.
+    existing = await resolve_word_ids(pool, text, language)
+    if existing:
+        # Reuse. We don't UPDATE the row — if the scraper enriched POS/lemma
+        # it should win over an 'X' placeholder.
+        word_id = existing[0]
+    else:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
                 row = await conn.fetchrow(
                     """
-                    SELECT word_id FROM word_table
-                     WHERE word ILIKE $1 AND language = $2
-                     ORDER BY word_id ASC
-                     LIMIT 1
+                    INSERT INTO word_table (word, language, pos, tag, lemma)
+                    VALUES ($1, $2, 'X', '', $1)
+                    ON CONFLICT (word, language, pos) DO NOTHING
+                    RETURNING word_id
                     """,
                     text, language,
                 )
                 if row is None:
-                    # Should be unreachable — the INSERT either succeeded or
-                    # the row exists for ILIKE-equivalent surface. Defensive.
-                    raise RuntimeError("learn_word_anyway: row vanished after conflict")
-            word_id = row["word_id"]
+                    # Only reachable if a concurrent caller inserted the
+                    # byte-identical surface with pos='X' between the resolve
+                    # and here — that is exactly what the conflict target
+                    # covers, so an exact indexed lookup finds it. Not a
+                    # re-resolve: no need to re-scan the catalog for a row we
+                    # know the precise key of.
+                    row = await conn.fetchrow(
+                        """
+                        SELECT word_id FROM word_table
+                         WHERE word = $1 AND language = $2 AND pos = 'X'
+                        """,
+                        text, language,
+                    )
+                    if row is None:
+                        raise RuntimeError(
+                            "learn_word_anyway: row vanished after conflict"
+                        )
+                word_id = row["word_id"]
 
-        # progression_service.apply_progression opens its own transaction
-        # inside the same connection. Keeping the conn allocation visible
-        # here ensures the INSERT + progression share a session even though
-        # they're separate tx — equivalent to the existing words.py route.
+    # progression_service.apply_progression opens its own transaction on a
+    # pool connection. The catalog write above is already committed by this
+    # point — same split the words.py status route uses.
     await progression_service.apply_progression(
         pool, user_id, word_id, "word",
         "status_marked_learning",
         status_override="learning",
     )
 
-    # Read back the canonical row for the response. We just inserted with
-    # pos='X' so we use the internal first-match helper rather than the
-    # full discriminated response — the caller (POST /learn-anyway) expects
-    # a single WordLookupResult shape.
+    # Read back the canonical row for the response. The caller (POST
+    # /learn-anyway) expects a single WordLookupResult, so this uses the
+    # internal first-match helper rather than the discriminated response.
+    # Note the row read back may be a pre-existing scraper/backfill row we
+    # reused, not the 'X' placeholder — so `pos` and `lemma` in the response
+    # are whatever the catalog already knew, which is the point of the fix.
     result = await _lookup_first_match(pool, user_id, text, language)
     if result is None:
         raise RuntimeError("learn_word_anyway: lookup failed after insert")
