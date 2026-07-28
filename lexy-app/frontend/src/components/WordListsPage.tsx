@@ -69,6 +69,15 @@ const TYPE_BADGE: React.CSSProperties = {
     opacity: 0.75,
 };
 
+/**
+ * Confirm before marking more than this many words at once.
+ *
+ * Chosen well below the backend's 500-per-call cap so the dialog fires before
+ * the cap ever does: a user who confirms should get their whole request, not a
+ * surprise chunk. Small user lists never see it.
+ */
+const MARK_CONFIRM_THRESHOLD = 200;
+
 const SYSTEM_BADGE: React.CSSProperties = {
     ...TYPE_BADGE,
     marginLeft: '8px',
@@ -247,6 +256,16 @@ export function WordListsPage({ token, language, onClose }: Props) {
 
     async function handleMarkLearning() {
         if (!detail) return;
+        // Confirm before a bulk add. Marking is irreversible in practice —
+        // auto-promotion is one-way and there is no un-mark — so a built-in
+        // list with thousands of unknown words is a click away from burying
+        // the user's review queue. Small lists are unaffected.
+        if (unknownCount > MARK_CONFIRM_THRESHOLD) {
+            const ok = window.confirm(
+                `This will add ${unknownCount} words to your reviews. Continue?`,
+            );
+            if (!ok) return;
+        }
         setMarking(true);
         setActionError(null);
         setNotice(null);
@@ -254,9 +273,13 @@ export function WordListsPage({ token, language, onClose }: Props) {
             const result = await markUnknownAsLearning(token, detail.list_id);
             setDetail(await getWordList(token, detail.list_id));
             const skipped = result.skipped_unresolved + result.skipped_ambiguous;
+            const remaining = result.remaining ?? 0;
             setNotice(
                 `Marked ${result.marked} word${result.marked === 1 ? '' : 's'} as learning.` +
-                (skipped > 0 ? ` Skipped ${skipped} that could not be matched to a single dictionary entry.` : ''),
+                (skipped > 0 ? ` Skipped ${skipped} that could not be matched to a single dictionary entry.` : '') +
+                // The backend caps each call, so say plainly that the work is
+                // unfinished and that clicking again continues it.
+                (result.capped ? ` ${remaining} remaining — click again to continue.` : ''),
             );
         } catch (err: unknown) {
             setActionError(err instanceof Error ? err.message : 'Unknown error');

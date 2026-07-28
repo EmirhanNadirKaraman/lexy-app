@@ -522,3 +522,131 @@ describe('WordListsPage — built-in lists', () => {
         expect(screen.queryByTestId('word-list-detail-system-note')).not.toBeInTheDocument();
     });
 });
+
+/**
+ * Bulk-marking guard.
+ *
+ * Marking is irreversible in practice — auto-promotion is one-way and there is
+ * no un-mark — so a built-in list with thousands of unknown words is one click
+ * from burying the user's review queue. The backend caps each call at 500; the
+ * UI confirms above 200 so the dialog fires before the cap ever does.
+ */
+describe('WordListsPage — bulk mark guard', () => {
+    function detailWithUnknown(n: number): WordListDetail {
+        return makeDetail({
+            list_id: 2,
+            name: 'Top German Words',
+            is_system: true,
+            total: n,
+            counts: { known: 0, learning: 0, unknown: n, unresolved: 0, ambiguous: 0 },
+            entries: Array.from({ length: 3 }, (_, i) => ({
+                id: i + 1, surface: `w${i}`, item_id: i + 1,
+                item_type: 'word' as const, status: 'unknown' as const,
+            })),
+        });
+    }
+
+    function installDetail(detail: WordListDetail, markResult: unknown) {
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse([summary({ list_id: 2, name: 'Top German Words', is_system: true })]);
+            }
+            if (url.includes('mark-unknown-learning')) return jsonResponse(markResult);
+            return jsonResponse(detail);
+        });
+    }
+
+    async function openDetail() {
+        renderPage();
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        return screen.findByTestId('word-list-mark-learning');
+    }
+
+    it('asks for confirmation when the unknown count is over the threshold', async () => {
+        const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+        installDetail(detailWithUnknown(3831), {
+            list_id: 2, marked: 500, marked_item_ids: [], skipped_unresolved: 0,
+            skipped_ambiguous: 0, remaining: 3331, capped: true,
+        });
+
+        fireEvent.click(await openDetail());
+
+        await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+        expect(confirmSpy.mock.calls[0][0]).toContain('3831');
+    });
+
+    it('does not ask for confirmation below the threshold', async () => {
+        const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+        installDetail(detailWithUnknown(5), {
+            list_id: 2, marked: 5, marked_item_ids: [], skipped_unresolved: 0,
+            skipped_ambiguous: 0, remaining: 0, capped: false,
+        });
+
+        fireEvent.click(await openDetail());
+
+        await screen.findByTestId('word-list-notice');
+        expect(confirmSpy).not.toHaveBeenCalled();
+    });
+
+    it('makes no API call when the confirmation is cancelled', async () => {
+        vi.spyOn(window, 'confirm').mockReturnValue(false);
+        installDetail(detailWithUnknown(3831), {});
+
+        fireEvent.click(await openDetail());
+
+        await waitFor(() => expect(window.confirm).toHaveBeenCalled());
+        expect(calls.some(c => c.url.includes('mark-unknown-learning'))).toBe(false);
+    });
+
+    it('calls the API when the confirmation is accepted', async () => {
+        vi.spyOn(window, 'confirm').mockReturnValue(true);
+        installDetail(detailWithUnknown(3831), {
+            list_id: 2, marked: 500, marked_item_ids: [], skipped_unresolved: 0,
+            skipped_ambiguous: 0, remaining: 3331, capped: true,
+        });
+
+        fireEvent.click(await openDetail());
+
+        await waitFor(() =>
+            expect(calls.some(c => c.url.includes('mark-unknown-learning'))).toBe(true));
+    });
+
+    it('reports the remaining count after a capped response', async () => {
+        vi.spyOn(window, 'confirm').mockReturnValue(true);
+        installDetail(detailWithUnknown(3831), {
+            list_id: 2, marked: 500, marked_item_ids: [], skipped_unresolved: 0,
+            skipped_ambiguous: 0, remaining: 3331, capped: true,
+        });
+
+        fireEvent.click(await openDetail());
+
+        const notice = await screen.findByTestId('word-list-notice');
+        expect(notice).toHaveTextContent('Marked 500 words as learning.');
+        expect(notice).toHaveTextContent('3331 remaining — click again to continue.');
+    });
+
+    it('leaves the uncapped message unchanged', async () => {
+        installDetail(detailWithUnknown(5), {
+            list_id: 2, marked: 5, marked_item_ids: [], skipped_unresolved: 0,
+            skipped_ambiguous: 0, remaining: 0, capped: false,
+        });
+
+        fireEvent.click(await openDetail());
+
+        const notice = await screen.findByTestId('word-list-notice');
+        expect(notice).toHaveTextContent('Marked 5 words as learning.');
+        expect(notice).not.toHaveTextContent('remaining');
+    });
+
+    it('handles a pre-cap backend that omits remaining/capped', async () => {
+        installDetail(detailWithUnknown(5), {
+            list_id: 2, marked: 5, marked_item_ids: [], skipped_unresolved: 0, skipped_ambiguous: 0,
+        });
+
+        fireEvent.click(await openDetail());
+
+        const notice = await screen.findByTestId('word-list-notice');
+        expect(notice).toHaveTextContent('Marked 5 words as learning.');
+        expect(notice).not.toHaveTextContent('remaining');
+    });
+});

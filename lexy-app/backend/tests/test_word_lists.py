@@ -1264,3 +1264,195 @@ async def test_user_list_late_binding_still_persists(client: AsyncClient, db_poo
 
     assert await db_pool.fetchval(
         "SELECT item_id FROM word_list_items WHERE list_id = $1", list_id) == word_id
+
+
+# ---------------------------------------------------------------------------
+# mark-unknown-learning is capped at MAX_LIST_WORDS per call
+#
+# Each entry costs its own apply_progression transaction, so an uncapped call
+# on a seeded system list would be ~4,800 sequential round-trips and could add
+# ~9,600 SRS cards to one user in a single click — with no undo, since
+# auto-promotion is one-way. The cap is the same 500 user lists have always
+# been bounded to, so anything under it behaves exactly as before.
+#
+# Capping works *because* the call is idempotent: it degrades into chunking
+# rather than truncation, and repeated calls drain the list front to back.
+# ---------------------------------------------------------------------------
+
+from backend.services.word_list_service import MAX_LIST_WORDS  # noqa: E402
+
+
+async def _system_list_with_words(db_pool, tracked, n: int, *, extra=()):
+    """A system list holding `n` resolvable words plus any `extra` surfaces."""
+    list_id = await db_pool.fetchval(
+        "INSERT INTO word_lists (user_id, name, language, is_system) "
+        "VALUES (NULL, $1, 'de', true) RETURNING list_id",
+        f"Zz Cap {uuid.uuid4().hex[:8]}",
+    )
+    surfaces = []
+    for _ in range(n):
+        wid, surface = await insert_owned_word(db_pool, word=f"Zzcap{uuid.uuid4().hex[:12]}")
+        tracked.append(wid)
+        surfaces.append(surface)
+    for surface in list(surfaces) + list(extra):
+        await db_pool.execute(
+            "INSERT INTO word_list_items (list_id, item_id, item_type, surface) "
+            "VALUES ($1, NULL, 'word', $2)", list_id, surface,
+        )
+    return list_id, surfaces
+
+
+@pytest.fixture
+async def reap_lists(db_pool):
+    created: list[int] = []
+    yield created
+    if created:
+        await db_pool.execute("DELETE FROM word_lists WHERE list_id = ANY($1::int[])", created)
+
+
+async def test_under_cap_list_reports_nothing_remaining(client: AsyncClient, db_pool):
+    """Regression: a normal user list behaves exactly as before the cap."""
+    _wid, surface = await insert_owned_word(db_pool, word=f"Zzcap{uuid.uuid4().hex[:10]}")
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, [surface])).json()["list_id"]
+
+    body = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)).json()
+
+    assert body["marked"] == 1
+    assert body["remaining"] == 0
+    assert body["capped"] is False
+
+
+async def test_over_cap_marks_exactly_the_cap(
+    client: AsyncClient, db_pool, tracked_words, reap_lists,
+):
+    list_id, _ = await _system_list_with_words(db_pool, tracked_words, MAX_LIST_WORDS + 7)
+    reap_lists.append(list_id)
+    headers = await _registered_headers(client)
+
+    body = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)).json()
+
+    assert body["marked"] == MAX_LIST_WORDS
+    assert body["remaining"] == 7
+    assert body["capped"] is True
+    assert len(body["marked_item_ids"]) == MAX_LIST_WORDS
+
+
+async def test_marked_entries_are_the_first_in_list_order(
+    client: AsyncClient, db_pool, tracked_words, reap_lists,
+):
+    """Stable front-to-back order is what makes repeated calls converge.
+
+    A different subset per call would re-roll the chunk and could starve the
+    tail indefinitely.
+    """
+    list_id, _ = await _system_list_with_words(db_pool, tracked_words, MAX_LIST_WORDS + 5)
+    reap_lists.append(list_id)
+    headers = await _registered_headers(client)
+
+    body = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)).json()
+
+    # Stored item_id is NULL on a system list — entries resolve late on read
+    # and the shared-row binding write is suppressed — so compare via the
+    # surfaces in list order, resolved to their catalog ids.
+    expected = [
+        r["word_id"] for r in await db_pool.fetch(
+            """
+            SELECT wt.word_id
+              FROM word_list_items wli
+              JOIN word_table wt ON wt.word = wli.surface AND wt.language = 'de'
+             WHERE wli.list_id = $1
+             ORDER BY wli.id
+             LIMIT $2
+            """,
+            list_id, MAX_LIST_WORDS,
+        )
+    ]
+    assert len(expected) == MAX_LIST_WORDS
+    assert body["marked_item_ids"] == expected
+
+
+async def test_repeated_calls_drain_to_zero(
+    client: AsyncClient, db_pool, tracked_words, reap_lists,
+):
+    total = MAX_LIST_WORDS + 3
+    list_id, _ = await _system_list_with_words(db_pool, tracked_words, total)
+    reap_lists.append(list_id)
+    headers = await _registered_headers(client)
+
+    first = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)).json()
+    second = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)).json()
+    third = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)).json()
+
+    assert (first["marked"], first["remaining"], first["capped"]) == (MAX_LIST_WORDS, 3, True)
+    assert (second["marked"], second["remaining"], second["capped"]) == (3, 0, False)
+    assert (third["marked"], third["remaining"], third["capped"]) == (0, 0, False)
+    assert first["marked"] + second["marked"] == total
+
+
+async def test_ambiguous_and_unresolved_do_not_consume_the_cap(
+    client: AsyncClient, db_pool, tracked_words, reap_lists,
+):
+    """They are not eligible at all, so they can't crowd out real work."""
+    ambiguous = f"Zzamb{uuid.uuid4().hex[:10]}"
+    await insert_owned_word(db_pool, word=ambiguous, pos="NOUN")
+    await insert_owned_word(db_pool, word=ambiguous, pos="VERB")
+    unresolved = f"Zzunres{uuid.uuid4().hex[:10]}"
+    list_id, _ = await _system_list_with_words(
+        db_pool, tracked_words, 3, extra=(ambiguous, unresolved))
+    reap_lists.append(list_id)
+    headers = await _registered_headers(client)
+
+    body = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)).json()
+
+    assert body["marked"] == 3
+    assert body["remaining"] == 0 and body["capped"] is False
+    assert body["skipped_ambiguous"] == 1
+    assert body["skipped_unresolved"] == 1
+
+
+async def test_already_learning_entries_are_not_counted_as_remaining(
+    client: AsyncClient, db_pool, tracked_words, reap_lists,
+):
+    list_id, _ = await _system_list_with_words(db_pool, tracked_words, 4)
+    reap_lists.append(list_id)
+    headers = await _registered_headers(client)
+
+    await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)
+    again = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)).json()
+
+    assert again["marked"] == 0
+    assert again["remaining"] == 0, "already-learning entries are not eligible"
+    assert again["capped"] is False
+
+
+async def test_capped_call_on_a_system_list_leaves_shared_rows_alone(
+    client: AsyncClient, db_pool, tracked_words, reap_lists,
+):
+    list_id, _ = await _system_list_with_words(db_pool, tracked_words, MAX_LIST_WORDS + 2)
+    reap_lists.append(list_id)
+    headers = await _registered_headers(client)
+
+    before = await db_pool.fetch(
+        "SELECT id, item_id, item_type FROM word_list_items WHERE list_id = $1 ORDER BY id", list_id)
+    await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)
+    after = await db_pool.fetch(
+        "SELECT id, item_id, item_type FROM word_list_items WHERE list_id = $1 ORDER BY id", list_id)
+
+    assert [dict(r) for r in before] == [dict(r) for r in after]
+
+
+async def test_two_users_capped_marking_stays_independent(
+    client: AsyncClient, db_pool, tracked_words, reap_lists,
+):
+    list_id, surfaces = await _system_list_with_words(db_pool, tracked_words, MAX_LIST_WORDS + 2)
+    reap_lists.append(list_id)
+    headers_a = await _registered_headers(client)
+    headers_b = await _registered_headers(client)
+
+    a = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers_a)).json()
+    b = (await client.post(f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers_b)).json()
+
+    assert a["marked"] == b["marked"] == MAX_LIST_WORDS
+    assert a["remaining"] == b["remaining"] == 2, "B's own state is untouched by A"
+    assert surfaces

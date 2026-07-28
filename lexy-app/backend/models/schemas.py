@@ -994,3 +994,10 @@ class WordListMarkLearningResult(BaseModel):
     marked_item_ids: list[int]
     skipped_unresolved: int
     skipped_ambiguous: int
+    #: Eligible (resolved + still unknown) entries this call did not reach,
+    #: because marking is capped at MAX_LIST_WORDS per request. Call again to
+    #: mark the next chunk — the operation is idempotent.
+    remaining: int = 0
+    #: True while `remaining > 0`. Defaulted so a client built against the
+    #: pre-cap response still validates.
+    capped: bool = False

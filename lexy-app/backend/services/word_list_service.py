@@ -342,6 +342,20 @@ async def mark_unknown_as_learning(
     what this feature refuses to do. Already-learning and already-known
     entries are left alone so the call is idempotent.
 
+    **Capped at MAX_LIST_WORDS per call.** Each entry costs its own
+    `apply_progression` transaction, so an uncapped call on a seeded system
+    list would be ~4,800 sequential round-trips — multiple seconds with the
+    request held open — and would add up to ~9,600 SRS cards to one user in a
+    single click, with no undo (auto-promotion is one-way). The cap is the
+    same 500 user-uploaded lists have always been bounded to, so lists under
+    it behave exactly as before.
+
+    Because the call is idempotent, capping degrades cleanly into chunking:
+    the response reports `remaining` and `capped`, and calling again marks the
+    next chunk. Targets are taken in stable `word_list_items.id` order
+    (`_load_entries` sorts by it), so repeated calls drain the list front to
+    back rather than re-rolling a different subset each time.
+
     State goes through `progression_service.apply_progression` with the same
     event the words.py status path uses, so levels, auto-promotion and both
     SRS cards behave identically to marking the word learning by hand. This
@@ -362,7 +376,13 @@ async def mark_unknown_as_learning(
         return None
 
     entries = await _load_entries(pool, user_id, list_id, row["language"])
-    targets = [e for e in entries if e["status"] == STATUS_UNKNOWN and e["item_id"] is not None]
+    # Eligible = resolved AND still unknown. Ambiguous/unresolved entries are
+    # not eligible at all, so they never consume cap budget, and
+    # already-learning/known entries are already excluded — which is what
+    # makes `remaining` drain to 0 across repeated calls.
+    eligible = [e for e in entries if e["status"] == STATUS_UNKNOWN and e["item_id"] is not None]
+    targets = eligible[:MAX_LIST_WORDS]
+    remaining = len(eligible) - len(targets)
 
     # Persist bindings discovered by late re-resolution, so the stored row
     # matches the progression we are about to apply.
@@ -397,6 +417,10 @@ async def mark_unknown_as_learning(
         "marked_item_ids": [e["item_id"] for e in targets],
         "skipped_unresolved": sum(1 for e in entries if e["status"] == STATUS_UNRESOLVED),
         "skipped_ambiguous": sum(1 for e in entries if e["status"] == STATUS_AMBIGUOUS),
+        # Eligible entries this call did NOT reach. `capped` is derived rather
+        # than a separate signal so the two can never disagree.
+        "remaining": remaining,
+        "capped": remaining > 0,
     }
 
 

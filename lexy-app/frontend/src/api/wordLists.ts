@@ -62,6 +62,15 @@ export interface MarkLearningResult {
     marked_item_ids: number[];
     skipped_unresolved: number;
     skipped_ambiguous: number;
+    /**
+     * Eligible entries this call did not reach — marking is capped at
+     * MAX_LIST_WORDS per request so one click on a 5,000-item built-in list
+     * cannot flood a user's reviews. The call is idempotent, so the fix is
+     * simply to call again. Optional for a pre-cap backend.
+     */
+    remaining?: number;
+    /** True while `remaining > 0`. */
+    capped?: boolean;
 }
 
 /** Max words per list — must match WORD_LIST_MAX_WORDS in the backend schemas. */

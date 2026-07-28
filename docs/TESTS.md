@@ -678,6 +678,49 @@ the next seed.
 `ruff check .` → All checks passed. Backend pytest not run — **no backend files
 changed**. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-29 — Mass-marking guard (+8 backend / +7 frontend)**
+
+Seeding built-in lists made `mark-unknown-learning` dangerous: each entry costs
+its own `apply_progression` transaction, so one click on a 5,035-item list was
+thousands of sequential round-trips (measured floor ≥5.5 s) and up to **9,560
+SRS cards for one user, with no undo** — auto-promotion is one-way. Marking is
+now capped at `MAX_LIST_WORDS` (500) per call, and the response carries
+`remaining` / `capped`.
+
+Capping is safe *because* the call is idempotent: it degrades into chunking
+rather than truncation, and targets are taken in stable `word_list_items.id`
+order so repeated calls drain front-to-back instead of re-rolling a subset.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_word_lists.py` | +8 | an under-cap user list is unchanged and reports `remaining 0 / capped false`; an over-cap list marks **exactly** 500 and reports the true remainder; the marked ids are the **first** eligible entries in list order; repeated calls drain 500 → 3 → 0 and end `capped false`; ambiguous/unresolved are skipped and **do not consume cap budget**; already-learning entries are not counted as remaining (so the drain terminates); a capped call on a system list still leaves the shared rows untouched; two users capping the same list stay independent |
+| `src/components/WordListsPage.test.tsx` | +7 | confirmation appears above the 200 threshold and names the count; no confirmation below it; **cancelling makes no API call**; accepting does call; a capped response renders `3331 remaining — click again to continue`; the uncapped message is unchanged; and a pre-cap backend omitting `remaining`/`capped` still renders correctly |
+
+**Both guards mutation-checked.** Removing the backend slice
+(`eligible[:MAX_LIST_WORDS]` → `eligible`) fails 4 backend tests; disabling the
+frontend threshold fails 2, including the cancel-makes-no-call test.
+
+**One test assumption corrected.** The ordering test first read `item_id`
+straight from `word_list_items` — but on a system list those are NULL (entries
+resolve late on read, and the shared-row binding write is suppressed), so it
+compared against a list of `None`. It now joins surfaces to `word_table` in
+`wli.id` order. Same shared-state shape as the earlier fixtures: on system
+lists, stored bindings are not the source of truth.
+
+**Threshold vs cap are deliberately different numbers.** The UI confirms at
+200, well below the backend's 500, so the dialog always fires before the cap
+does — a user who confirms gets their whole request rather than a surprise
+chunk.
+
+**Not addressed here:** `get_list` still returns 406 KB / 514 KB and renders
+every entry in a flat `.map()`. Slow, but recoverable; a flooded review queue
+is not. Tracked in `docs/TODO.md`.
+
+**Validation:** backend `-n auto` → **1137 passed, 2 skipped** (1129 + 8);
+frontend `npx vitest run` → **296 passed across 44 files** (289 + 7);
+`npx tsc --noEmit` clean; `npm run build` succeeded; `ruff check .` → All
+checks passed. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — vocabulary list upload/download (+39 tests / +2 files)**
 
 New feature: paste or upload a word list, see what you already know, mark the
