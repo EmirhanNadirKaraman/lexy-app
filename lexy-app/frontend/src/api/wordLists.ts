@@ -39,6 +39,15 @@ export interface WordListSummary {
     description: string | null;
     created_at: string;
     total: number;
+    /**
+     * Built-in list, shared by every user and not user-editable (backend
+     * migration 037). The backend refuses to delete one and suppresses its own
+     * writes to shared rows, so hiding destructive controls in the UI is a
+     * courtesy, not the guarantee — the guarantee is server-side.
+     *
+     * Optional so a response from a backend older than 037 still parses.
+     */
+    is_system?: boolean;
 }
 
 export interface WordListDetail extends Omit<WordListSummary, 'total'> {

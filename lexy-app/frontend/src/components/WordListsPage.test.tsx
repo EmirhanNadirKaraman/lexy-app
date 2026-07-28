@@ -369,3 +369,156 @@ describe('WordListsPage — phrase entries', () => {
         expect(screen.getByTestId('word-list-notice').textContent).toContain('Marked 2 words');
     });
 });
+
+/**
+ * Built-in / system lists (backend migration 037 + phase 2 seeding).
+ *
+ * The backend already guarantees the important half: a system list has no
+ * owner, so the ownership-filtered delete can never match it and answers 404,
+ * and `mark-unknown-learning` suppresses its write to the shared rows. These
+ * tests cover the UI contract on top of that — separation, labelling, and not
+ * offering a control that would only produce an error.
+ */
+function summary(overrides: Partial<import('../api/wordLists').WordListSummary> = {}) {
+    return {
+        list_id: 1,
+        name: 'My list',
+        language: 'de',
+        description: null,
+        created_at: '2026-07-27T10:00:00Z',
+        total: 3,
+        is_system: false,
+        ...overrides,
+    };
+}
+
+/** Index returns `lists`; everything else falls through to `handler`. */
+function installIndex(lists: unknown[], handler?: (url: string, init: RequestInit | undefined) => Response) {
+    installFetch((url, init) => {
+        if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+            return jsonResponse(lists);
+        }
+        return handler ? handler(url, init) : jsonResponse({}, 404);
+    });
+}
+
+describe('WordListsPage — built-in lists', () => {
+    it('renders system lists in their own section, separate from the user’s', async () => {
+        installIndex([
+            summary({ list_id: 1, name: 'My list', is_system: false }),
+            summary({ list_id: 2, name: 'German Verb & Phrase Patterns', is_system: true, total: 5035 }),
+        ]);
+        renderPage();
+
+        const section = await screen.findByTestId('word-list-system-section');
+        expect(section).toHaveTextContent('Built-in lists');
+        expect(section).toHaveTextContent('German Verb & Phrase Patterns');
+        expect(section).not.toHaveTextContent('My list');
+        expect(screen.getByText('Your lists')).toBeInTheDocument();
+    });
+
+    it('shows a Built-in badge on a system list', async () => {
+        installIndex([summary({ list_id: 2, name: 'German Verb & Phrase Patterns', is_system: true })]);
+        renderPage();
+
+        const badge = await screen.findByTestId('word-list-system-badge-2');
+        expect(badge).toHaveTextContent('Built-in');
+    });
+
+    it('hides Delete for a system list but keeps Open', async () => {
+        installIndex([summary({ list_id: 2, name: 'German Verb & Phrase Patterns', is_system: true })]);
+        renderPage();
+
+        expect(await screen.findByTestId('word-list-open-2')).toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-delete-2')).not.toBeInTheDocument();
+    });
+
+    it('still shows Delete for a user-created list', async () => {
+        installIndex([summary({ list_id: 1, is_system: false })]);
+        renderPage();
+
+        expect(await screen.findByTestId('word-list-delete-1')).toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-system-badge-1')).not.toBeInTheDocument();
+    });
+
+    it('treats a list with no is_system field as user-owned', async () => {
+        // A response from a backend older than migration 037 must not silently
+        // become read-only.
+        const { is_system: _omitted, ...legacy } = summary({ list_id: 7 });
+        installIndex([legacy]);
+        renderPage();
+
+        expect(await screen.findByTestId('word-list-delete-7')).toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-system-section')).not.toBeInTheDocument();
+    });
+
+    it('shows an empty state under Your lists when only built-ins exist', async () => {
+        installIndex([summary({ list_id: 2, name: 'Top German Words', is_system: true })]);
+        renderPage();
+
+        expect(await screen.findByTestId('word-list-mine-empty')).toBeInTheDocument();
+    });
+
+    it('omits the built-in section entirely when there are none', async () => {
+        installIndex([summary({ list_id: 1, is_system: false })]);
+        renderPage();
+
+        await screen.findByTestId('word-list-delete-1');
+        expect(screen.queryByTestId('word-list-system-section')).not.toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-mine-empty')).not.toBeInTheDocument();
+    });
+
+    it('overrides the display name of Top German Words without renaming it', async () => {
+        // The stored name is the seeding idempotency key, so the clearer label
+        // is frontend-only.
+        installIndex([summary({ list_id: 2, name: 'Top German Words', is_system: true })]);
+        renderPage();
+
+        const section = await screen.findByTestId('word-list-system-section');
+        expect(section).toHaveTextContent('Top German Words & Phrases');
+    });
+
+    it('shows a built-in badge and note on the detail view', async () => {
+        installIndex(
+            [summary({ list_id: 2, name: 'Top German Words', is_system: true })],
+            () => jsonResponse(makeDetail({ list_id: 2, name: 'Top German Words', is_system: true })),
+        );
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+
+        expect(await screen.findByTestId('word-list-detail-system-badge')).toBeInTheDocument();
+        expect(screen.getByTestId('word-list-detail-system-note')).toHaveTextContent(
+            /read-only/i,
+        );
+    });
+
+    it('keeps export and mark-learning available on a system list detail', async () => {
+        installIndex(
+            [summary({ list_id: 2, name: 'Top German Words', is_system: true })],
+            () => jsonResponse(makeDetail({ list_id: 2, name: 'Top German Words', is_system: true })),
+        );
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+
+        expect(await screen.findByTestId('word-list-download')).toBeInTheDocument();
+        const mark = screen.getByTestId('word-list-mark-learning');
+        expect(mark).toBeInTheDocument();
+        expect(mark).not.toBeDisabled();
+    });
+
+    it('shows no built-in badge on a user list detail', async () => {
+        installIndex(
+            [summary({ list_id: 1, is_system: false })],
+            () => jsonResponse(makeDetail({ list_id: 1, is_system: false })),
+        );
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-1'));
+
+        await screen.findByTestId('word-list-detail');
+        expect(screen.queryByTestId('word-list-detail-system-badge')).not.toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-detail-system-note')).not.toBeInTheDocument();
+    });
+});

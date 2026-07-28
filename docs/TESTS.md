@@ -649,6 +649,35 @@ dry-run again (`items inserted 0`, `already present 4087 / 5035`) → apply agai
 run — no frontend files changed. Root pipeline suite not run — no root files
 changed.
 
+🆕 **2026-07-29 — Built-in lists in the UI, phase 3 (+11 frontend)**
+
+`WordListsPage` now splits the index into *Built-in lists* and *Your lists*.
+**Frontend-only** — no backend file was touched.
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/components/WordListsPage.test.tsx` | +11 | system lists render in their own section and the user's do not appear there; a “Built-in” badge shows on a system list and not on a user list; **Delete is hidden for a system list while Open remains**; Delete still renders for a user list; **a list with no `is_system` field is treated as user-owned** (a pre-037 backend must not silently make lists read-only); an empty-state line under *Your lists* when only built-ins exist, and no built-in section at all when there are none; the display-name override renders without the stored name changing; the detail view shows the badge and read-only note; **export and mark-unknown-learning stay available and enabled on a system list**; and a user-list detail shows neither badge nor note |
+
+**Mutation-checked.** Rendering every list under *Your lists*
+(`myLists = lists`) fails 4 tests, including the one asserting Delete is absent.
+
+**Hiding Delete is a courtesy, not the guarantee.** The backend already answers
+404 for a system-list delete, because a system list has no owner and the
+ownership filter can never match it. The UI change only avoids offering a
+control that would produce an error.
+
+**The stored list name was not changed.** *Top German Words* is 46%
+phrase-typed (articled nouns bind to `phrase_table` collocations), so the UI
+shows “Top German Words & Phrases” via `SYSTEM_DISPLAY_NAME` — display only,
+because the backend name is the seeding idempotency key
+(`ON CONFLICT (name) WHERE is_system`) and renaming it would fork the list on
+the next seed.
+
+**Validation:** frontend `npx vitest run` → **289 passed across 44 files**
+(278 + 11); `npx tsc --noEmit` clean; `npm run build` succeeded.
+`ruff check .` → All checks passed. Backend pytest not run — **no backend files
+changed**. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — vocabulary list upload/download (+39 tests / +2 files)**
 
 New feature: paste or upload a word list, see what you already know, mark the

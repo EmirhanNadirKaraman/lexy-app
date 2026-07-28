@@ -69,6 +69,34 @@ const TYPE_BADGE: React.CSSProperties = {
     opacity: 0.75,
 };
 
+const SYSTEM_BADGE: React.CSSProperties = {
+    ...TYPE_BADGE,
+    marginLeft: '8px',
+    opacity: 1,
+    color: 'var(--color-accent)',
+};
+
+const SYSTEM_HELP =
+    'Built-in list — shared with everyone and read-only. Your progress on it is still your own.';
+
+/**
+ * Display-only label for a seeded system list.
+ *
+ * The backend name is the seeding idempotency key (`ON CONFLICT (name) WHERE
+ * is_system`), so renaming it there would fork the list on the next seed. Where
+ * the stored name undersells the content, override it here instead. "Top German
+ * Words" is 46% phrase-typed because column 0 keeps noun articles — `das Haus`
+ * binds to a phrase_table collocation, which is correct German (the article is
+ * part of the learning unit) but not what "Words" suggests.
+ */
+const SYSTEM_DISPLAY_NAME: Record<string, string> = {
+    'Top German Words': 'Top German Words & Phrases',
+};
+
+function displayName(list: { name: string; is_system?: boolean }): string {
+    return (list.is_system && SYSTEM_DISPLAY_NAME[list.name]) || list.name;
+}
+
 const TYPE_HELP: Record<WordListItemType, string> = {
     word: 'Single word — tracked in the word catalog.',
     phrase: 'Phrase or verb pattern — tracked in the phrase catalog.',
@@ -87,6 +115,17 @@ const STATUS_HELP: Record<WordListEntryStatus, string> = {
 };
 
 // 44px minimum so every control is finger-tappable (mobile polish rules).
+const listStyle: React.CSSProperties = {
+    listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: '8px',
+};
+
+const listRowStyle: React.CSSProperties = {
+    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+    gap: '10px', flexWrap: 'wrap', padding: '8px 12px',
+    borderRadius: '6px', background: 'var(--color-surface-sunken)',
+    border: '1px solid var(--color-border-subtle)',
+};
+
 const buttonStyle: React.CSSProperties = {
     minHeight: '44px',
     padding: '0 16px',
@@ -257,6 +296,12 @@ export function WordListsPage({ token, language, onClose }: Props) {
 
     const unknownCount = detail?.counts.unknown ?? 0;
 
+    // Split on the backend's `is_system` flag. Hiding Delete for these is a
+    // courtesy — the guarantee is server-side (a system list has no owner, so
+    // the ownership-filtered delete can never match it and answers 404).
+    const systemLists = lists.filter(l => l.is_system);
+    const myLists = lists.filter(l => !l.is_system);
+
     return (
         <div style={{
             background: 'var(--color-surface)', color: 'var(--color-text)', borderRadius: '10px',
@@ -373,23 +418,68 @@ export function WordListsPage({ token, language, onClose }: Props) {
                 <p data-testid="word-list-load-error" role="alert" style={errorStyle}>{loadError}</p>
             )}
 
+            {/* Built-in lists — shared, read-only. Rendered first because a new
+                user has nothing of their own yet, so this is the only thing on
+                the page that gives them somewhere to start. */}
+            {systemLists.length > 0 && (
+                <div data-testid="word-list-system-section" style={{ marginTop: '28px' }}>
+                    <h3 style={{ fontSize: '14px', margin: '0 0 4px', color: 'var(--color-text-strong)' }}>
+                        Built-in lists
+                    </h3>
+                    <p style={{ margin: '0 0 10px', fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                        Shared, read-only vocabulary lists. Your progress on them is your own.
+                    </p>
+                    <ul style={listStyle}>
+                        {systemLists.map(l => (
+                            <li key={l.list_id} style={listRowStyle}>
+                                <span style={{ fontSize: '14px' }}>
+                                    {displayName(l)}
+                                    <span
+                                        data-testid={`word-list-system-badge-${l.list_id}`}
+                                        title={SYSTEM_HELP}
+                                        style={SYSTEM_BADGE}
+                                    >
+                                        Built-in
+                                    </span>{' '}
+                                    <span style={{ color: 'var(--color-text-muted)', fontSize: '12px' }}>
+                                        ({l.total} word{l.total === 1 ? '' : 's'}, {l.language})
+                                    </span>
+                                </span>
+                                {/* No Delete: the backend refuses it (404) for a system
+                                    list, so offering the control would only produce an
+                                    error. Open/export/mark-learning all still work. */}
+                                <span style={{ display: 'flex', gap: '8px' }}>
+                                    <button
+                                        data-testid={`word-list-open-${l.list_id}`}
+                                        onClick={() => handleOpen(l.list_id)}
+                                        style={buttonStyle}
+                                    >
+                                        Open
+                                    </button>
+                                </span>
+                            </li>
+                        ))}
+                    </ul>
+                </div>
+            )}
+
             {/* Saved lists */}
-            {lists.length > 0 && (
+            {(myLists.length > 0 || systemLists.length > 0) && (
                 <div style={{ marginTop: '28px' }}>
                     <h3 style={{ fontSize: '14px', margin: '0 0 10px', color: 'var(--color-text-strong)' }}>
                         Your lists
                     </h3>
-                    <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: '8px' }}>
-                        {lists.map(l => (
-                            <li
-                                key={l.list_id}
-                                style={{
-                                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                                    gap: '10px', flexWrap: 'wrap', padding: '8px 12px',
-                                    borderRadius: '6px', background: 'var(--color-surface-sunken)',
-                                    border: '1px solid var(--color-border-subtle)',
-                                }}
-                            >
+                    {myLists.length === 0 && (
+                        <p
+                            data-testid="word-list-mine-empty"
+                            style={{ margin: '0 0 10px', fontSize: '13px', color: 'var(--color-text-muted)' }}
+                        >
+                            You haven't created a list yet. Paste or upload one above.
+                        </p>
+                    )}
+                    <ul style={listStyle}>
+                        {myLists.map(l => (
+                            <li key={l.list_id} style={listRowStyle}>
                                 <span style={{ fontSize: '14px' }}>
                                     {l.name}{' '}
                                     <span style={{ color: 'var(--color-text-muted)', fontSize: '12px' }}>
@@ -426,8 +516,30 @@ export function WordListsPage({ token, language, onClose }: Props) {
             {detail && (
                 <div data-testid="word-list-detail" style={{ marginTop: '28px' }}>
                     <h3 style={{ fontSize: '14px', margin: '0 0 10px', color: 'var(--color-text-strong)' }}>
-                        {detail.name}
+                        {displayName(detail)}
+                        {detail.is_system && (
+                            <span
+                                data-testid="word-list-detail-system-badge"
+                                title={SYSTEM_HELP}
+                                style={SYSTEM_BADGE}
+                            >
+                                Built-in
+                            </span>
+                        )}
                     </h3>
+
+                    {detail.is_system && (
+                        <p
+                            data-testid="word-list-detail-system-note"
+                            style={{
+                                margin: '0 0 12px', fontSize: '13px', lineHeight: 1.4,
+                                color: 'var(--color-text-muted)',
+                            }}
+                        >
+                            This is a built-in list, shared with everyone and read-only. Marking
+                            words as learning still records progress on your account only.
+                        </p>
+                    )}
 
                     <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '12px' }}>
                         {STATUS_ORDER.map(status => (
