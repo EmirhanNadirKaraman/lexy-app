@@ -298,6 +298,51 @@ shipped.
 `ruff check .` → All checks passed. Frontend not run — no frontend files
 changed. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-28 — Unicode corpus search (+20 backend / +1 file)**
+
+`search_service.search` folded case in SQL on both halves — `w.word ILIKE $1 OR
+w.lemma ILIKE $1` for words, and an `ILIKE`/word-boundary-regex pair against
+`phrase_blueprint`. Postgres folds ASCII only here, so searching *öl* returned
+nothing though `Öl` was indexed against real sentences. Both halves now resolve
+to ids in Python via `normalize_key`; the SQL matches `= ANY(...)`.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_search_unicode.py` (NEW) | 20 | umlaut word found from lowercase (Ö/Ü/Ä), exact and uppercase queries; ASCII regression guard; **`match_type` still distinguishes a surface hit from a lemma-only hit**, and the lemma half folds too; `straße`/`strasse` and `schließen`/`schliessen` return their own sentence and not each other's; language scoping (on the *video's* language, as before) and the no-language case; several videos sharing one normalized surface all surface (resolving to ids must not collapse them); unknown word returns nothing; umlaut **blueprint** token matches; single-word blueprint search still requires a whole word (*ist* must not match inside *Tadschikistan*); multi-word search keeps substring behaviour; **regex metacharacters are escaped** (`.*`, `.+`, `(`, `[a-z]+`, `Ö.*geben` do not match, with a literal-token control); route response shape unchanged; and **two tests pinning that `_suggest_words` is still the unfixed version** |
+
+**Mutation-checked.** Reverting `services/search_service.py` fails 10 of the
+20. The 10 that pass either way are guards — notably
+`test_search_finds_umlaut_word_from_exact_query`, because this endpoint passed
+the raw query to `ILIKE`, so a byte-exact umlaut spelling already worked. Only
+case variants were broken.
+
+**The deferral is test-pinned, not just documented.**
+`test_suggest_words_is_still_the_unfixed_sql_version` asserts autocomplete
+returns nothing for a lowercase umlaut prefix. When autocomplete is fixed that
+test **should** fail — invert the assertion and close the item in
+`docs/TODO.md` rather than deleting it.
+
+**A test assumption that was wrong and got corrected.** The escaping test first
+asserted `search(db_pool, "(") == []`. It failed — the real corpus has
+punctuation tokens in `word_table`, so `(` has legitimate word hits that say
+nothing about regex handling. It now asserts against `_resolve_blueprint_ids`
+directly.
+
+**Fixture note:** `video.category` has an FK to `video_category`, so fixtures
+insert `'other'` rather than `''`.
+
+**Seven `print(f"[search] …")` debug statements were removed** from the
+single-word branch in the same change. They fired on every production search
+and buried this suite's output in per-row dumps. They were a pure side-effect
+block — nothing downstream read them — so search behaviour is unchanged.
+
+**Security:** this closed **S19** in `docs/SECURITY.md` — the old word-boundary
+blueprint predicate concatenated the raw search term into a Postgres regex.
+
+**Validation:** backend `-n auto` → **1004 passed, 2 skipped** (984 + 20);
+`ruff check .` → All checks passed. Frontend not run — no frontend files
+changed. Root pipeline suite not run — no root files changed.
+
 🆕 **2026-07-27 — word-list phrase support (+11 backend / +4 frontend)**
 
 Vocabulary lists now resolve against **both** `word_table` and `phrase_table`,

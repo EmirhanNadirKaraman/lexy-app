@@ -176,6 +176,28 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 
 ## Resolved findings
 
+### S19 — Raw user input concatenated into a Postgres regex in corpus search — LOW — RESOLVED 2026-07-28
+**Was:** `search_service.PHRASE_WORD_QUERY` matched blueprints with
+`pb.blueprint ~* ('\m' || $1 || '\M')`, where `$1` is the user's search term.
+The term was parameterised (so **not** SQL injection) but was still evaluated as
+a **regular expression**: `.*` matched every one of the 43,549 `phrase_blueprint`
+rows, and a catastrophic-backtracking pattern (`(a+)+$`-style) would be run
+against all of them inside a request. `/api/search` is auth-gated
+(`routers/search.py:20` — `APIRouter(dependencies=[Depends(get_current_user)])`),
+so this needed a logged-in account; that is what keeps it LOW rather than MEDIUM.
+**file:line:** `lexy-app/backend/services/search_service.py:52` (pre-fix).
+**Fix shipped:** blueprint matching moved to Python in `_resolve_blueprint_ids`,
+which `re.escape`s the term before compiling it, so the query is matched as a
+literal. The SQL now takes pre-resolved `blueprint_id`s (`= ANY($1::int[])`) and
+contains no user-controlled pattern at all. The change was made for Unicode
+correctness (C-collation case folding); removing the regex sink came with it.
+**Verification check:** `rg -n '~\*' lexy-app/backend/services/search_service.py`
+returns nothing, and `rg -n 're.escape' lexy-app/backend/services/search_service.py`
+shows the escape in `_resolve_blueprint_ids`.
+**Tests:** `tests/test_search_unicode.py::test_blueprint_search_escapes_regex_metacharacters`
+asserts `.*`, `.+`, `(`, `[a-z]+` and `Ö.*geben` do **not** match a fixture
+blueprint, with a control asserting the literal token still does.
+
 ### S1 — No brute-force / rate limit on auth endpoints — HIGH — RESOLVED 2026-05-24
 **Was:** `/api/v1/auth/login` and `/register` accepted unlimited attempts (the rate limiter only guarded LLM routes) → password brute-force, credential-stuffing, signup floods.
 **Fix shipped:** Added a generic single-window limiter `rate_limiter.check_window(key, limit, window_seconds, …)` (reuses the existing in-process store + lock) and two web-layer helpers in `core/deps.py` called at the top of each handler *before* any DB/bcrypt work:
@@ -262,6 +284,8 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-07-28** — **Corpus search rewritten for Unicode; regex sink removed (S19 RESOLVED).** `search_service.search` folded case in SQL (`ILIKE` on `word`/`lemma`, `ILIKE`/`~*` on `phrase_blueprint`), which under this database's C collation folds ASCII only — a Unicode bug whose fix also removed a security sink. The single-word blueprint predicate concatenated the raw search term into a Postgres regex (`~* ('\m' || $1 || '\M')`); it is now a Python `re.escape`d literal in `_resolve_blueprint_ids`, and the SQL takes pre-resolved integer ids. No new user-controlled SQL or pattern anywhere in the path; all remaining predicates are `= ANY($1)` over ids the server computed. `/api/search` was and remains auth-gated. `_suggest_words` (autocomplete) is deliberately untouched — it uses `LIKE` with a parameterised prefix, no regex, and its Unicode fix needs a migration.
 
 - **2026-07-27** — **OpenAI-compatible provider added (opt-in; new finding S18).** `OpenAICompatibleProvider` lets the backend target a self-hosted `/chat/completions` server. Default behaviour is unchanged — with no new env vars the provider is Anthropic, and the new class is never constructed. New finding **S18** (LOW) records what enabling it means: the target server usually has no auth, and `LLM_BASE_URL` is an operator-set egress destination for prompt content (read from env at import, never from a request, so not user-controllable). Credential hygiene is test-pinned: `LLM_API_KEY` never appears in an error, and `_redact()` strips `user:pass@` userinfo from the base URL in error strings. No new dependency — `httpx` was already in requirements.txt.
 

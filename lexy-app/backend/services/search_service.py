@@ -1,23 +1,39 @@
 import math
+import re
+
 import asyncpg
 
-# Exact case-insensitive word/lemma match
+from .text_norm import normalize_key
+
+# Exact case-insensitive word/lemma match, by pre-resolved word_id.
+#
+# `$1` is every matching word_id, `$3` the subset that matched on the SURFACE
+# (the rest matched only on `lemma`), which is what `match_type` reports.
+# Resolution happens in Python — see `_resolve_word_ids` for why a SQL-side
+# case-insensitive predicate cannot do it here.
 WORD_QUERY = """
     SELECT DISTINCT ON (v.video_id)
         v.video_id, v.title, v.thumbnail_url, v.language,
         s.sentence_id, s.start_time, s.content,
         NULL::text AS surface_form,
-        CASE WHEN w.word ILIKE $1 THEN 'word' ELSE 'lemma' END AS match_type
+        CASE WHEN w.word_id = ANY($3::int[]) THEN 'word' ELSE 'lemma' END AS match_type
     FROM word_table w
     JOIN word_to_sentence wts ON wts.word_id = w.word_id
     JOIN sentence s           ON s.sentence_id = wts.sentence_id
     JOIN video v              ON v.video_id = s.video_id
-    WHERE (w.word ILIKE $1 OR w.lemma ILIKE $1)
+    WHERE w.word_id = ANY($1::int[])
       AND ($2::text IS NULL OR v.language = $2)
     ORDER BY v.video_id, s.start_time
 """
 
-# Partial match on blueprint (e.g. "geben jdm." matches "geben jdm. etw.")
+# Blueprint hits, by pre-resolved blueprint_id.
+#
+# Replaces two near-identical queries: a substring match for multi-word
+# searches and a word-boundary regex for single-word ones (so "ist" does not
+# match inside "Tadschikistan"). Both folded case in SQL and so missed umlauts;
+# the distinction now lives in `_resolve_blueprint_ids(whole_word=...)`, which
+# also escapes the term — the old word-boundary form interpolated raw user
+# input into a regex.
 PHRASE_QUERY = """
     SELECT DISTINCT ON (v.video_id)
         v.video_id, v.title, v.thumbnail_url, v.language,
@@ -28,27 +44,80 @@ PHRASE_QUERY = """
     JOIN sentence_to_phrase stp ON stp.blueprint_id = pb.blueprint_id
     JOIN sentence s             ON s.sentence_id = stp.sentence_id
     JOIN video v                ON v.video_id = s.video_id
-    WHERE pb.blueprint ILIKE $1
+    WHERE pb.blueprint_id = ANY($1::int[])
       AND ($2::text IS NULL OR v.language = $2)
     ORDER BY v.video_id, s.start_time
 """
 
-# Same as PHRASE_QUERY but matches $1 as a whole word (word-boundary regex).
-# Used for single-word searches so "ist" doesn't match inside "Tadschikistan".
-PHRASE_WORD_QUERY = """
-    SELECT DISTINCT ON (v.video_id)
-        v.video_id, v.title, v.thumbnail_url, v.language,
-        s.sentence_id, s.start_time, s.content,
-        stp.surface_form,
-        stp.match_type
-    FROM phrase_blueprint pb
-    JOIN sentence_to_phrase stp ON stp.blueprint_id = pb.blueprint_id
-    JOIN sentence s             ON s.sentence_id = stp.sentence_id
-    JOIN video v                ON v.video_id = s.video_id
-    WHERE pb.blueprint ~* ('\m' || $1 || '\M')
-      AND ($2::text IS NULL OR v.language = $2)
-    ORDER BY v.video_id, s.start_time
-"""
+
+async def _resolve_word_ids(
+    pool: asyncpg.Pool, term: str,
+) -> tuple[list[int], list[int]]:
+    """`(all matching word_ids, the subset that matched on the surface)`.
+
+    Replaces a SQL-side case-insensitive match on `word` OR `lemma`. That
+    predicate folded case in SQL, and this database runs under the C locale
+    where Postgres folds ASCII only — `'Öl'` and `'öl'` never compared equal.
+    Searching *öl* returned nothing even though `Öl` was indexed against real
+    sentences. Making both sides SQL would not help: neither side folds. The
+    fold happens in Python via `text_norm.normalize_key`; see
+    `services/text_norm.py`.
+
+    `word_table` is fetched unscoped because the original predicate was too —
+    `WORD_QUERY` scopes on the *video's* language, not the word's. ~39k short
+    rows, measured at ~12 ms, on an explicit user action.
+
+    Surface matches are reported separately so `match_type` keeps meaning what
+    it did: `'word'` when the typed text equals the surface, `'lemma'` when it
+    only equals the lemma.
+    """
+    key = normalize_key(term)
+    if not key:
+        return [], []
+
+    rows = await pool.fetch("SELECT word_id, word, lemma FROM word_table")
+    surface: list[int] = []
+    lemma_only: list[int] = []
+    for r in rows:
+        if normalize_key(r["word"]) == key:
+            surface.append(r["word_id"])
+        elif normalize_key(r["lemma"] or "") == key:
+            lemma_only.append(r["word_id"])
+    return sorted(surface + lemma_only), sorted(surface)
+
+
+async def _resolve_blueprint_ids(
+    pool: asyncpg.Pool, query: str, *, whole_word: bool,
+) -> list[int]:
+    """Blueprint ids whose text contains `query`, case-insensitively.
+
+    `whole_word=True` reproduces the old word-boundary regex used for
+    single-word searches, so *ist* does not match inside *Tadschikistan*;
+    `False` reproduces the old substring behaviour for multi-word searches.
+
+    Both used to fold in SQL and so missed every umlaut-bearing blueprint —
+    6,921 of 43,549 rows carry non-ASCII text. Folding is now Python-side.
+
+    Escaping the term is a second fix: the old word-boundary predicate
+    concatenated raw user input into a regex, so a crafted query was evaluated
+    as a pattern against 43k rows. `re.escape` makes that impossible.
+    """
+    key = normalize_key(query)
+    if not key:
+        return []
+
+    rows = await pool.fetch("SELECT blueprint_id, blueprint FROM phrase_blueprint")
+    if whole_word:
+        pattern = re.compile(rf"(?<!\w){re.escape(key)}(?!\w)")
+        return sorted(
+            r["blueprint_id"] for r in rows
+            if pattern.search(normalize_key(r["blueprint"] or ""))
+        )
+    return sorted(
+        r["blueprint_id"] for r in rows
+        if key in normalize_key(r["blueprint"] or "")
+    )
+
 
 SIMILARITY_THRESHOLD = 0.3
 
@@ -167,7 +236,11 @@ async def search(
     if len(terms) > 1:
         # A selected phrase chip (e.g. "geben jdm. etw.") has spaces but should
         # go through phrase search, not multi-word. Try phrase first.
-        phrase_rows = await pool.fetch(PHRASE_QUERY, f"%{query}%", language)
+        blueprint_ids = await _resolve_blueprint_ids(pool, query, whole_word=False)
+        phrase_rows = (
+            await pool.fetch(PHRASE_QUERY, blueprint_ids, language)
+            if blueprint_ids else []
+        )
         if phrase_rows:
             results = [_to_dict(r) for r in phrase_rows]
         else:
@@ -186,16 +259,16 @@ async def search(
     else:
         # Single word: exact match + phrase blueprint, merged.
         # Use word-boundary phrase query so "ist" doesn't match "Tadschikistan".
-        word_rows = await pool.fetch(WORD_QUERY, query, language)
-        phrase_rows = await pool.fetch(PHRASE_WORD_QUERY, query, language)
-
-        print(f"[search] query={query!r}")
-        print(f"[search] word_rows ({len(word_rows)}):")
-        for r in word_rows:
-            print(f"  video={r['video_id']} sentence={r['sentence_id']} t={r['start_time']:.1f} | {r['content'][:80]}")
-        print(f"[search] phrase_rows ({len(phrase_rows)}):")
-        for r in phrase_rows:
-            print(f"  video={r['video_id']} sentence={r['sentence_id']} surface={r['surface_form']!r} | {r['content'][:80]}")
+        word_ids, surface_ids = await _resolve_word_ids(pool, query)
+        word_rows = (
+            await pool.fetch(WORD_QUERY, word_ids, language, surface_ids)
+            if word_ids else []
+        )
+        blueprint_ids = await _resolve_blueprint_ids(pool, query, whole_word=True)
+        phrase_rows = (
+            await pool.fetch(PHRASE_QUERY, blueprint_ids, language)
+            if blueprint_ids else []
+        )
 
         seen = {r["sentence_id"] for r in phrase_rows}
         extra = [r for r in word_rows if r["sentence_id"] not in seen]
