@@ -345,6 +345,19 @@ it neither causes nor fixes the ambiguity described above.
 ### N6 — Idle mini-game — **optional/fun**
 - Explicitly not core, blocks nothing, and has no design yet. Listed so it is not lost, not because it is queued.
 
+### N7 — Document-ingestion boundary: nlp-histo worker → package → sentence reader — **code**
+
+Full design: [`docs/INGESTION_PIPELINE.md`](./INGESTION_PIPELINE.md). Designed 2026-07-29; **A1 (evaluation harness) and A2 (package import boundary) shipped the same day** — see the task board in that doc's §13; the rest is not started.
+
+- **The problem:** the book reader's unit is a *block*. Sentences are split in the browser by `/(?<=[.!?])\s+/u` (`BookReaderPage.tsx:24`) and only a count is persisted (`book_pages.sentence_count`, migration 012). No sentence text, IDs, offsets, or provenance exist server-side, and `book_blocks.block_type` is only ever `'text'`.
+- **The decision:** an offline `nlp-histo` worker emits a versioned, checksummed **document package**; the backend validates and imports it. Docling/Torch/Transformers stay **out** of the API process — `nlp-histo/.venv` already carries them (2.2 G) against a 135 M backend venv, so the split costs zero extra disk while adopting them in-backend would duplicate ~2.2 G.
+- **Measured on `files/json` (27 books, 1699 pages), not assumed:** 43.5% of prose blocks lack terminal punctuation; 21.6% start lowercase; 1964 bare-number blocks against 5 `PAGE_HEADER` labels; 259 unterminated blocks sit immediately before a page break.
+- **Constraint — the worker's linguistics are English-biomedical.** `is_relevant_para` drops **30.5%** of German prose (short dialogue fails its verb-or-bio-entity test); `remove_citations` mutates 9.1%; `_is_cut_off` fires on only 4.0% of unterminated German blocks, where a German-tuned rule reaches 41.1%. **Reuse the geometry, not the linguistics.**
+- **Constraint — coordinates differ, 100% consistently.** Docling is bottom-left/y-up (`y1 > y2`); `book_blocks` stores fitz top-left/y-down. One conversion point, tested both directions.
+- **Where the LLM sits:** optional, page-level, gated by deterministic validators, limited to a closed operation vocabulary with edit-distance and deletion-budget guards. Verbatim text is never overwritten; rollback is re-derivation with ops disabled.
+- **Done when:** a package imports into `book_sentences` with provenance back to `(page, element_id, block_id, token_id)`, the reader renders sentences server-side, and the benchmark reports before/after with false-deletion count as the headline metric.
+- **The point:** tasks A1–A6 ship a working sentence reader with the LLM entirely switched off. That is the shippable core; the AI stages are measured against it, not assumed to help.
+
 ---
 
 ### Still open, unranked here (see §Current priorities for detail)

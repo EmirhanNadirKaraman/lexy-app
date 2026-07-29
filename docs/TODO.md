@@ -771,6 +771,32 @@ Regression-guarded by 6 new tests in `tests/test_llm_cache_migration.py`: concur
 **Fix (not pursued):** Extract a single accessor and route all reads through it.
 **Decision (2026-05-23):** 🚫 dropped. Audit found the call sites read different column subsets for different purposes, so a single accessor would either over-fetch or grow a pile of flags — no clean shared shape, zero would-be adopters that benefit. Reopen only if a concrete refactor is actually blocked by the duplication.
 
+### 44. 🟠 Document-ingestion boundary + sentence-by-sentence reader — IN PROGRESS (A1 shipped 2026-07-29)
+
+**Progress:** task board in [`docs/INGESTION_PIPELINE.md`](./INGESTION_PIPELINE.md) §13.
+- ✅ **A1** — evaluation harness (`evaluation/`) + benchmark corpus (`benchmark/documents/`) + 147 tests. Two-stage metrics enforcing the information-preservation principle (§2b): false deletions weighted 10× retained artifacts, comparison sorted by reversibility not magnitude.
+- ✅ **A2** — document-package import boundary (`services/document_package/`, `book_import_service`, `POST /api/v1/books/import`): `verify → validate → dry-run → persist`, containment chokepoint, 107 hermetic tests against synthetic packages. Shipped 2026-07-29. *Real-package* runs still wait on the worker emitting one (H3/H4, sibling repo); non-dry-run persistence waits on A3 (migration 038) and is refused with a diagnostic until then.
+- ⬜ Everything else. Next unblocked: **A11** (delete dead trees — unblocked now that A1 froze the baseline constants), **A3** (migration 038 + `book_sentences`), **A7** (`llm_provider` image normalizer).
+
+**Design:** [`docs/INGESTION_PIPELINE.md`](./INGESTION_PIPELINE.md) — full architecture, package schemas, coordinate conventions, evaluation plan, and the A/H/C/E task breakdown. ROADMAP item **N7**.
+
+**Files:** new `services/{book_import,reconstruction,sentence,page_review}_service.py`, `migrations/versions/038_book_sentences.py`, `services/llm_provider.py`, `routers/books.py`; worker-side work in the sibling `nlp-histo` repo.
+
+**Problem:** no server-side sentence entity. `book_pages.sentence_count` (migration 012) is a client-computed integer — the browser splits on `/(?<=[.!?])\s+/u` and PATCHes the count back. `book_blocks.block_type` is only ever `'text'` (`book_service.py:431`); no reading order and no character offsets exist anywhere.
+
+**Fix:** an offline `nlp-histo` worker emits a versioned, checksummed document package (manifest + document + page images). The backend validates and imports it, reconstructs continuous text with German-tuned stitching, segments with spaCy `de`, and persists `book_sentences` anchored to `(start_token_id, end_token_id)` — so `retokenize_with_preservation` keeps saved reading progress stable across block edits. AI review is optional, page-level, gated by deterministic validators, and limited to a closed operation vocabulary; verbatim text is never overwritten and rollback is re-derivation with ops disabled.
+
+**Measured before designing** (27 German graded readers, 1699 pages, aggregate stats): 43.5% of prose blocks lack terminal punctuation; 1964 bare-number blocks vs 5 `PAGE_HEADER` labels; spaCy `de_core_news_md` already handles 7/8 hard German segmentation cases, so the AI's job is narrow and specific.
+
+**Risk:** false deletions. The worker's `is_relevant_para` would remove **30.5%** of German prose (its 4–19-word branch needs a verb or a biomedical entity, which short dialogue lacks). The biomedical profile must be refused at import, and per-page deletion budgets enforced.
+
+**Security:** package paths are a traversal sink — validate containment at the import boundary before anything reaches the filesystem. Precedent: the S7 note in `routers/content_requests.py`. Update `docs/SECURITY.md` in the same PR.
+
+**Migration trap:** do **not** add a unique constraint on `(page_id, block_index)` in the same step as the backfill — native-path `block_index` is PyMuPDF `block_no` with blocks skipped and not renumbered, and duplicates in live data are unverified. Migrations are append-only.
+
+**Blocks:** learner correction layer; sentence-granularity reading SRS.
+**Relation:** supersedes the client-side `splitSentences()` in `BookReaderPage.tsx:24`.
+
 ---
 
 ## P4 — Polish. Pleasant to do, not load-bearing.
