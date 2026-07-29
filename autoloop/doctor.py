@@ -26,7 +26,13 @@ from .git_gateway import GitGateway
 from .lock import LoopLock
 from .policy import PolicyEngine
 
-_CHATGPT_URL = re.compile(r"^https://chatgpt\.com/c/[A-Za-z0-9_-]+")
+# A conversation URL is either a plain `/c/<id>` or a project- / GPT-scoped
+# `/g/<slug>/c/<id>` (chatgpt.com Projects put the conversation under the
+# project). Both are valid targets; only the `/c/<id>` part identifies the
+# conversation, and the loop navigates to whatever full URL is configured.
+_CHATGPT_URL = re.compile(
+    r"^https://chatgpt\.com(?:/g/[A-Za-z0-9_-]+)?/c/[A-Za-z0-9_-]+/?(?:[?#].*)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -154,7 +160,8 @@ def run_doctor(
                 "conversation_url",
                 "fail",
                 f"'{config.browser.conversation_url}' does not look like "
-                "https://chatgpt.com/c/<id>",
+                "https://chatgpt.com/c/<id> or "
+                "https://chatgpt.com/g/<project>/c/<id>",
             )
 
     # 10. live browser: login + conversation + selectors. Never submits.

@@ -4,6 +4,8 @@ playwright — and proof that it never submits a message."""
 import json
 import socket
 
+import pytest
+
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.doctor import DoctorProbes, exit_code, run_doctor
 from autoloop.errors import LoginExpiredError
@@ -152,11 +154,53 @@ def test_stale_lock_reported_as_failure(tmp_path):
     assert "unlock" in named["lock"].detail
 
 
-def test_bad_conversation_url_fails(tmp_path):
+def url_check(tmp_path, url):
     config = AutoloopConfig(
-        browser=BrowserConfig(conversation_url="https://example.com/not-chatgpt"),
+        browser=BrowserConfig(conversation_url=url),
         policy=PolicyConfig(),
         state_dir=tmp_path / ".al",
     )
-    results = run_doctor(config, tmp_path, probes(FakeConversation()))
-    assert by_name(results)["conversation_url"].status == "fail"
+    return by_name(run_doctor(config, tmp_path, probes(FakeConversation())))[
+        "conversation_url"
+    ]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://chatgpt.com/c/6a6a6bd5-b3d4-83ed-b404-731450216bf2",
+        # Project-scoped conversation — the form chatgpt.com Projects actually
+        # produce, and what the real engineering-review conversation uses.
+        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77"
+        "/c/6a6a6bd5-b3d4-83ed-b404-731450216bf2",
+        # Custom-GPT scoped, and a trailing query string.
+        "https://chatgpt.com/g/g-abc123/c/def456",
+        "https://chatgpt.com/c/def456?model=gpt-5",
+        "https://chatgpt.com/c/def456/",
+    ],
+)
+def test_accepted_conversation_urls(tmp_path, url):
+    assert url_check(tmp_path, url).status == "ok"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/not-chatgpt",
+        "https://chatgpt.com/",
+        # A project root is not a conversation.
+        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77",
+        "http://chatgpt.com/c/def456",  # not https
+        "https://chatgpt.com/c/",  # no conversation id
+    ],
+)
+def test_rejected_conversation_urls(tmp_path, url):
+    assert url_check(tmp_path, url).status == "fail"
+
+
+def test_placeholder_conversation_url_fails(tmp_path):
+    # Shape-valid but obviously unset — caught before the regex so the message
+    # names the real problem.
+    check = url_check(tmp_path, "https://chatgpt.com/c/REPLACE-ME")
+    assert check.status == "fail"
+    assert "placeholder" in check.detail
