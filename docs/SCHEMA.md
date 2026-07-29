@@ -4,6 +4,10 @@ A lightweight map of the Postgres tables in this project. Source of truth is
 the `lexy-app/backend/migrations/versions/` directory; this document is a
 plain-text companion. Update it when a migration changes the shape of a group.
 
+**Current as of alembic head `037` (2026-07-29.)** This is a current-state
+map, not a migration log — the table at the bottom lists only high-impact
+migrations, and only where the *why* is worth keeping.
+
 No ERD image is generated. `eralchemy` / `schemacrawler` aren't installed and
 their Graphviz toolchain is more pain than the diagram is worth here — the
 text grouping below is what people actually read when they're new to the repo.
@@ -29,8 +33,9 @@ Adjust the user/secrets handling per your own threat model.
 ### Vocabulary / catalog (shared, user-agnostic)
 | Table | Purpose |
 |---|---|
-| `word_table` | (word_id PK, language, word, lemma, pos, frequency) — the unit of learning for type='word'. `frequency` (migration 032) backs the autocomplete ranking; refreshed by the scraper, not written per-request. |
-| `phrase_table` | (phrase_id PK, language, canonical, surface_form, phrase_type) — multi-token learning units. |
+| `word_table` | (word_id PK, language, word, lemma, pos, frequency, **word_norm**) — the unit of learning for type='word'. `frequency` (migration 032) backs the autocomplete ranking; refreshed by the scraper, not written per-request. `word_norm` (migration 036) is a **generated STORED** ICU-normalized copy of `word` — see §Unicode lookups. **`pos` is part of `UNIQUE (word, language, pos)`** and every row currently holds `pos = ''`; writing a real POS forks rows rather than enriching them, which is why the catalog backfill deliberately seeds `pos = ''`. |
+| `phrase_table` | (phrase_id PK, language, canonical, surface_form, phrase_type) — multi-token learning units. Resolution matches `canonical`, **never** `surface_form` (773 German rows differ). |
+| `phrase_blueprint` | (blueprint_id PK, blueprint, lookup_key, **lookup_key_norm**) — the phrase-suggestion source behind `/api/suggest`. German-only; it has **no `language` column**, so callers scope it themselves. `lookup_key_norm` (migration 036) is the generated STORED normalized form. |
 | `grammar_rule_table` | (rule_id PK, title, short_explanation, applicable_phrase_types, applicable_lemmas) — passive-only direction. |
 | `language_table` | code → display config. |
 | `channel`, `video`, `sentence` | Subtitle pipeline output. |
@@ -48,7 +53,83 @@ errors as a signal table. It is never read by the extractor or matcher.
 | Table | Purpose |
 |---|---|
 | `user_word_knowledge` | Polymorphic per-user-per-item state: `(user_id, item_id, item_type) → (status, passive_level, active_level, times_seen, times_used_correctly, notes, last_seen)`. `item_type ∈ {word, phrase, grammar_rule}`. Single source of truth — only `progression_service` writes. |
-| `word_lists` (+ `word_list_items`) | User vocabulary lists — paste or upload a word list, see per-word known/learning/unknown/**unresolved**/**ambiguous**, mark unknown as learning, export. Every entry stores its original `surface`; `item_id` is NULL when the surface didn't bind to exactly one `word_table` row. Shipped 2026-07-27 (migration 035). **The entry table is `word_list_items`** — this doc previously called it `word_list_entries`, which has never existed. |
+| `word_lists` (+ `word_list_items`) | Vocabulary lists — **both user-owned and shared built-in ones**. Paste or upload a list, see per-entry known/learning/unknown/**unresolved**/**ambiguous**, mark unknown as learning, export. Every entry stores its original `surface`; `item_id` is NULL when the surface didn't bind to exactly one catalog row (it resolves against `word_table` *and* `phrase_table`). Shipped 2026-07-27 (migration 035); shared lists added 2026-07-28 (migration 037). **The entry table is `word_list_items`** — this doc once called it `word_list_entries`, which has never existed. See §Word lists: ownership below. |
+
+#### Word lists: ownership (migration 037)
+
+`word_lists.user_id` is **nullable**, paired with
+`is_system BOOLEAN NOT NULL DEFAULT false`:
+
+| Kind | `user_id` | `is_system` |
+|---|---|---|
+| User-owned list | `NOT NULL` | `false` |
+| Built-in / system list | `NULL` | `true` |
+
+**The CHECK constraint is the load-bearing part, not the flag.**
+`word_lists_owner_ck` enforces
+`(is_system AND user_id IS NULL) OR (NOT is_system AND user_id IS NOT NULL)`,
+which makes the two dangerous rows *unrepresentable*: a "system" list someone
+owns, and an ownerless private list. Reads widened from `user_id = $2` to
+`(user_id = $2 OR is_system)`, and that widening is exactly where a private
+list could leak — the constraint is what makes it safe regardless of what the
+application does.
+
+`uq_word_lists_system_name` is a **partial** unique index on `(name)
+WHERE is_system`, so seeding is idempotent by name while users keep their
+existing freedom to name their own lists anything, including a name a system
+list already uses. The stored name is therefore a key: renaming a seeded list
+would fork it on the next seed, which is why the frontend overrides the
+display name instead.
+
+Nullable-owner rather than a synthetic system user: a `users` row that must
+never authenticate is a standing auth hazard, and its `ON DELETE CASCADE`
+would make deleting it silently destroy every built-in list.
+
+Writes stay user-only: `delete_list` still filters on `user_id` alone, so a
+system list answers **404**; `mark_unknown_as_learning` suppresses its
+late-binding UPDATE on shared rows while still applying per-user progression,
+so two users marking the same built-in list never interfere.
+
+**Reading a list is paged.** `GET /word-lists/{id}` takes optional `limit`
+(1–1000) and `offset` (≥0) which window **`entries` only** — `total` and
+`counts` stay whole-list on every page, because they drive the status badges
+and the mark-learning count, which describe the list rather than the window.
+Omitting both returns the full pre-pagination response unchanged. Ownership
+resolves before the params are read, so paging cannot widen access.
+
+### Unicode lookups under the C locale (migration 036)
+
+The database runs `datcollate=C datctype=C`, so Postgres's `lower()`,
+`upper()` and `ILIKE` fold **ASCII only** — `lower('Öl') = 'Öl'` and
+`'Öl' ILIKE 'öl'` is false. Most case-insensitive lookups fix this by folding
+in Python (`services/text_norm.normalize_key` — NFC + strip + `lower()`) and
+matching on ids or equality in SQL.
+
+Autocomplete cannot: it fires per keystroke and needs an **indexed prefix**
+match. So the normalization is persisted as generated STORED columns whose
+expression reproduces `normalize_key` exactly:
+
+```sql
+word_norm       = lower(btrim(normalize(word,       NFC)) COLLATE "und-x-icu")
+lookup_key_norm = lower(btrim(normalize(lookup_key, NFC)) COLLATE "und-x-icu")
+```
+
+- `word_table.word_norm` is backed by `ix_word_table_lang_word_norm` on
+  `(language, word_norm text_pattern_ops)` — `text_pattern_ops` keeps
+  `LIKE 'x%'` index-usable regardless of database collation.
+- `phrase_blueprint.lookup_key_norm` has **no index of its own**; it exists so
+  `_suggest_phrases` stops folding with `~*`.
+- **`ß` is deliberately preserved** — ICU `lower()` maps `Straße` → `straße`,
+  not `strasse`, matching `normalize_key`'s `lower()` rather than `casefold()`.
+  German `word_table` holds `schließen` *and* `schliessen` as distinct rows;
+  folding ß→ss would merge them.
+- **Requires an ICU-enabled Postgres.** `"und-x-icu"` is built in; on a build
+  without ICU the `ALTER TABLE` fails outright, deliberately — a silent
+  fallback to C-locale `lower()` would reintroduce the bug.
+- Generated rather than application-maintained because three code paths insert
+  into `word_table` (`word_seed_service`, `word_service`,
+  `subtitle-scraper/pipeline.py` in a separate process); a column any of them
+  could forget would silently make words unsearchable.
 
 ### SRS
 | Table | Purpose |
@@ -109,8 +190,11 @@ users (user_id PK)
   │     └── reading_selections (user_id FK, doc_id FK)
   ├── notification           (user_id FK)
   ├── user_channel_preference (user_id FK, youtube_channel_id, preference_kind)
-  ├── word_lists             (user_id FK, language)
-  │     └── word_list_items   (list_id FK, surface, nullable item_id)
+  ├── word_lists             (NULLABLE user_id FK, language, is_system)
+  │     │                     user list: user_id NOT NULL, is_system false
+  │     │                     built-in : user_id NULL,     is_system true  → owned by nobody,
+  │     │                                                                    readable by everyone
+  │     └── word_list_items   (list_id FK, surface, nullable item_id, item_type)
   ├── content_request        (user_id FK, ON DELETE SET NULL — anonymised, not deleted)
   └── client_error_log       (user_id FK, ON DELETE SET NULL — anonymised, not deleted)
 
@@ -173,8 +257,10 @@ remaining App-Store compliance checklist.
 | 031 | `chat_sessions.language` (nullable) — free/guided chat carries its target language instead of assuming German. Nullable so pre-existing rows keep working; readers fall back to `"de"` (closes Hole 20). |
 | 032 | `word_table.frequency` INT + functional prefix index on `(language, lower(word))` — backs the frequency-ranked autocomplete (#38). Backfilled from `word_to_sentence` counts; the scraper refreshes it via `recompute_word_frequencies()`. |
 | 033 | `lemma_override` table — curated corrections consulted before trusting spaCy's lemma (#39 slice 1). v1 keys on `(language, observed_lemma)`; `surface_form`/`pos` reserved for context-sensitive rows. |
-| 035 | `word_lists.language`, `word_list_items.surface` NOT NULL, `item_id` made nullable, and `UNIQUE (list_id, item_id, item_type)` replaced by a unique index on `(list_id, lower(surface))`. Makes the dormant 001 tables usable: a NULL `item_id` is how an unresolved or ambiguous surface is stored instead of being dropped. The old constraint could not dedupe those (NULLs are distinct in Postgres) and would reject two case-variants resolving to the same `word_id`. |
 | 034 | `lemma_correction_candidate` table — the community-signal inbox (#39 slice 3A). A signal table only: never read by the extractor or matcher, and never mutates `lemma_override` without a human accept. |
+| 035 | `word_lists.language`, `word_list_items.surface` NOT NULL, `item_id` made nullable, and `UNIQUE (list_id, item_id, item_type)` replaced by a unique index on `(list_id, lower(surface))`. Makes the dormant 001 tables usable: a NULL `item_id` is how an unresolved or ambiguous surface is stored instead of being dropped. The old constraint could not dedupe those (NULLs are distinct in Postgres) and would reject two case-variants resolving to the same `word_id`. |
+| 036 | `word_table.word_norm` + `phrase_blueprint.lookup_key_norm` — generated STORED ICU-normalized columns, plus `ix_word_table_lang_word_norm`. Makes autocomplete fold Unicode correctly under this C-locale database. See §Unicode lookups. |
+| **037 (head)** | `word_lists.user_id` made **nullable** + `is_system BOOLEAN NOT NULL DEFAULT false` + the `word_lists_owner_ck` CHECK pairing them + the partial unique index `uq_word_lists_system_name`. Opens the shape for shared built-in lists; **creates none** — seeding is a separate reviewed script. See §Word lists: ownership. |
 
 There is no migration for the orphan SRS cleanup or the active-card backfill
 — both are pure operational scripts under `scripts/` driven by services in

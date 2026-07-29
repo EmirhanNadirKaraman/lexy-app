@@ -45,6 +45,16 @@ through slice 3C (dry-run adjudication). Capacitor packages installed,
 `docs/CAPACITOR_READINESS.md`; iOS migration still DEFERRED per the
 user's call.
 
+**Since 2026-07-28 a further arc shipped, all German-vocabulary plumbing:**
+a **Unicode/C-collation lookup sweep** (the DB runs `datcollate=C`, so
+Postgres `lower()`/`ILIKE` fold ASCII only — seven lookup paths fixed, plus
+migration **036**'s ICU-normalized generated columns for the one path that
+needs an index rather than a Python fold), **`llm_cache` test isolation** and
+residue cleanup, **curated gloss seeding** (3,622 rows), and the whole of
+**N5a step 4** — system-list schema (migration **037**), seeding, built-in-list
+UI, a mark-learning cap, render chunking, and list-detail pagination on both
+sides of the wire.
+
 Since that paragraph was written, four more features shipped the same day:
 the **ILP playlist optimizer** (backend `greedy`/`ilp` + a Fast/Optimal
 selector), **vocabulary lists** (migration 035 — paste or upload a word
@@ -55,14 +65,15 @@ round-trips), the **LLM provider seam** (the three ad-hoc
 and an **OpenAI-compatible provider** so the backend can target a
 self-hosted model server. Anthropic remains the default throughout.
 
-Verified on 2026-07-27 (current): backend **847 passed / 2 skipped**, root
-pipeline **221 passed**, frontend **274 passed across 44 files**,
-`ruff check .` clean.
+Verified on **2026-07-29** (current): backend **1151 passed / 2 skipped**,
+frontend **322 passed across 44 files**, root pipeline **221 passed**,
+`ruff check .` clean, alembic head **037**.
 
-> Historical baselines quoted elsewhere in this file (745 backend, 671
-> root, 238 frontend) are as-measured at the time of the entry that quotes
-> them. The root suite moved 744 → 221 when `src/app/` and the 537 tests
-> targeting it were deleted; it is not a regression.
+> Historical baselines quoted elsewhere in this file (847/274 as of
+> 2026-07-27, and 745 backend / 671 root / 238 frontend before that) are
+> as-measured at the time of the entry that quotes them. The root suite
+> moved 744 → 221 when `src/app/` and the 537 tests targeting it were
+> deleted; it is not a regression.
 
 ---
 
@@ -112,10 +123,19 @@ P-numbers.
 - **N4b — real privacy contact email — admin/account.** `PrivacyPage.tsx` and `docs/PRIVACY.md` still ship the literal `<YOUR_REAL_PRIVACY_EMAIL_BEFORE_LAUNCH>` placeholder. Needs an address that will still exist in a year, not a decision.
 - These unblock **independently** — doing one does not advance the other. Everything else on the checklist in `docs/CAPACITOR_READINESS.md` is done: packages installed, `ios/` scaffolded, `VITE_API_BASE_URL` helper in place, responsive + theme + PWA shipped.
 
-### N5a — Wire the German word + phrase data into built-in lists — **code**
-*The first substantial repo task in the queue.* Ranked below N1–N3 because
-those are the non-repo infrastructure/admin steps, but this is the largest
-piece of shippable product work currently unblocked.
+### N5a — Wire the German word + phrase data into built-in lists — ✅ **SHIPPED 2026-07-28/29**
+
+> **Status update 2026-07-29.** Every numbered step below except the optional
+> step 5 has shipped, plus safety and payload work the original plan did not
+> anticipate. Two built-in lists are live and readable by every user. The body
+> below is preserved as the record of how the work was scoped; **the step list
+> carries the current status inline.** `docs/TODO.md` #43 is the authoritative
+> per-phase tracker.
+>
+> What remains from this line of work is tracked separately, not here:
+> **#43 phase 4** (copy-to-my-lists, admin management of system lists), the
+> **POS enrichment schema decision** deferred by step 1, and the **453
+> ambiguous/unresolved entries** the seeding deliberately kept.
 
 - **Not blocked, and not CEFR guesswork.** The earlier "unsafe pending
   licensing" classification was wrong — the owner holds distribution licences.
@@ -148,11 +168,28 @@ piece of shippable product work currently unblocked.
      unique key and every existing row has `pos=''`, so writing a real POS
      forks rows rather than enriching them — turning resolvable words
      `ambiguous`. Seeds `pos=''`; enrichment needs a schema decision.
-  2. Pre-seed the permanent gloss cache from the translation column.
+  2. ✅ **Shipped 2026-07-28** (`aa14d36`) — the permanent gloss cache is
+     pre-seeded from the translation column by `scripts/seed_gloss_cache.py` +
+     `services/gloss_seed_service.py`. **3,622 curated glosses**, stored under
+     the sentinel model `curated:words_4000_old`, which `translate_item_gloss`
+     checks *before* the model-specific key — so they are honestly attributed
+     and survive an `LLM_MODEL` switch. Makes no LLM calls.
   3. ~~Add phrase support to `word_list_service` + per-type frontend rendering.~~ ✅ done 2026-07-27.
-  4. System-list schema (`word_lists.user_id` is `NOT NULL`, so no shared-list
-     concept exists) + the built-in word/phrase lists and the B1 list.
-  5. Optionally later: preload example generation from the example column.
+  4. ✅ **Shipped 2026-07-28/29, in four phases.** Migration **037** made
+     `word_lists.user_id` **nullable** and added `is_system BOOLEAN NOT NULL
+     DEFAULT false`, with a CHECK making a system list with an owner — and an
+     ownerless private list — unrepresentable. *(The earlier note here said
+     `user_id` is `NOT NULL` "so no shared-list concept exists". That was true
+     when written and is now false; 037 is exactly the migration that changed
+     it.)* Then: seeding (`5cc1e76`) created two lists / **9,122 items**;
+     the frontend (`5cc8c76`) split the index into *Built-in* and *Your lists*;
+     a mark-learning cap (`c7512eb`) and render chunking (`3faf45b`) followed;
+     and detail pagination shipped backend-first (`81a2425`) then frontend
+     (`98717ff`). The **B1 list is the one part of this step not built** —
+     `b1_parsed.txt` (90% resolvable) is a candidate, `b1_unparsed.txt` is not
+     (69%, 641 unresolved).
+  5. **Still open, still optional:** preload example generation from the
+     example column.
 - **Use `words_4000_old.txt`'s own ordering as the frequency rank**, not
   `word_table.frequency` — that column is app-corpus (scraped-subtitle)
   frequency, where rank 2000 is the English word `trust`.
@@ -222,6 +259,29 @@ dependency. The existing `mixed → passive only` test in
 need rewriting; a homograph regression test (`"I war there"` must not grant
 active credit) is the one that protects the asymmetry above.
 
+### N5b — Ambiguous built-in-list entries + the POS decision — **code, investigate first**
+*Added 2026-07-29, as the largest thing N5a left behind.* Not a new idea —
+both halves are consequences already recorded in `docs/TODO.md` #43.
+
+- **453 seeded entries carry `item_id = NULL`** — 227 ambiguous + 29
+  unresolved in *Top German Words*, 226 + 29 in *German Verb & Phrase
+  Patterns*. An entry with no `item_id` cannot be marked learning, cannot
+  enter SRS, and cannot be reviewed.
+- **The ambiguous ones are the top of the language** — `ein`, `zu`, `im`,
+  `auf`, `ich`. So the most-used words in a "top words" list are exactly the
+  inert ones.
+- **The cheap fix is the forbidden one.** First-matching binds mastery to a
+  coin-flip sense; that is the W3 / Hole 2 rule, and it is why the seeder
+  keeps these rows rather than guessing. Any fix has to *disambiguate*.
+- **Entangled with POS.** N5a step 1 dropped POS enrichment because `pos` is
+  part of `word_table`'s `UNIQUE (word, language, pos)` and every existing row
+  has `pos = ''` — writing a real POS forks rows instead of enriching them,
+  which would turn currently-resolvable words ambiguous. Resolving ambiguity
+  by sense and enriching POS are plausibly the same decision.
+- **Investigate before implementing.** The output wanted is the option set and
+  its cost (a disambiguation picker in the UI? a POS-aware schema change? both?),
+  not a patch.
+
 ### N6 — Idle mini-game — **optional/fun**
 - Explicitly not core, blocks nothing, and has no design yet. Listed so it is not lost, not because it is queued.
 
@@ -231,7 +291,10 @@ active credit) is the one that protects the asymmetry above.
 
 | Item | Status |
 |---|---|
-| **P5** security residuals (8, none HIGH) + new **S18** | small, deploy-adjacent; `docs/SECURITY.md` is the tracker |
+| **P5** security residuals (8, none HIGH) + **S18** | small, deploy-adjacent; `docs/SECURITY.md` is the tracker |
+| **#43 phase 4** copy-to-my-lists + admin management of system lists | ready; built-ins are read-only today, so a learner cannot fork one and prune it |
+| **T2.3** deploy gate sweep (repo half) | ready; the prod half needs N3 |
+| **Hole 10** orphan-SRS cleanup scheduling | script + runbook shipped (`docs/MAINTENANCE.md`); the cron was never wired, and needs a deploy target |
 | **#39** live-LLM adjudicator | product/cost decision, not engineering |
 | **#37** multi-track subtitle capture | blocked on a product decision |
 | **T2.2** LISTEN/NOTIFY | cost-only; not a multi-worker blocker |
@@ -246,8 +309,10 @@ active credit) is the one that protects the asymmetry above.
 - ~~**Built-in "B1" and "top 4000" vocabulary lists** — blocked on a provenance
   review.~~ **Corrected 2026-07-27:** not blocked. The owner holds distribution
   licences; what was missing was provenance *documentation*, now written up in
-  `data/PROVENANCE.md`. Promoted to a real code task — see **N5a** in
-  §Remaining work.
+  `data/PROVENANCE.md`. Promoted to a real code task as **N5a**, and
+  **shipped 2026-07-28/29** — two built-in lists are live. The **B1 list is
+  the one part not built**: `b1_parsed.txt` resolves at 90% and is a
+  candidate, `b1_unparsed.txt` at 69% (641 unresolved) is not.
 
 ---
 
@@ -932,16 +997,16 @@ order. Do not start T3.1 until §8.1 (introduce `VITE_API_BASE_URL`) and
 
 | # | Title | Effort | Impact | Notes |
 |---|---|---|---|---|
-| #21 | Memoization (`useMemo`, `React.memo`, search debounce) | S–M | Perf at scale | Do once Capacitor exposes real device perf gaps. |
-| #25 | Single `word_service.get_knowledge(user, item, type)` accessor | S | Cleanup | Painless refactor; do alongside any service touching `user_word_knowledge`. |
+| #21 | Memoization (`useMemo`, `React.memo`, search debounce) | S–M | Perf at scale | W10 landed the bulk; `BookReaderPage` was deferred as architecture-not-memo. Do the rest once Capacitor exposes real device perf gaps. |
 | #26 | Accessibility (ARIA, focus management, alt text) | M | Required for some App Store regions | Pair with Capacitor review prep. |
 | #28 | Clean `index.css` + `App.css` of Panda/Vite leftovers | XS | Polish | 10 min. |
-| #30 | ERD / `docs/SCHEMA.md` | S | Onboarding | `eralchemy` one-shot. |
 | #31 | Extractor thresholds validation harness | M | Robustness | Only if PDF imports start failing. |
 | Hole 27 | Spaced forgetting (auto-demote `known` after long silence) | M–L | Real product change | **Deferred by product decision (2026-05-21)** — manual demotion via Hole 26 already covers "I forgot this". Re-open behind a maintenance-review UX, not as a silent behaviour change. |
-| Hole 10 | Orphan SRS cards cleanup | XS | Operational hygiene | Script + scheduling docs landed 2026-05-21. See [docs/MAINTENANCE.md](./MAINTENANCE.md) — recommended weekly `--apply` at a quiet hour, wire into Render cron or platform scheduler. |
-| Hole 14 | Skip ≠ defer in SRS review | S | UX nit | Tell backend to bury for today. |
+| Hole 10 | Orphan SRS cards cleanup | XS | Operational hygiene | Script + scheduling docs landed 2026-05-21. See [docs/MAINTENANCE.md](./MAINTENANCE.md) — recommended weekly `--apply` at a quiet hour, wire into Render cron or platform scheduler. **Still unwired**, so it is also listed in §Still open. |
 | Hole 33/34 | Per-direction `last_seen`, `(item_id, item_type)` rec keys | S–M | Future-proofing | Do before adding phrase coverage to ranking. |
+| — | ~~`#25` single `get_knowledge` accessor~~ | — | — | **Dropped 2026-05-23** as overscoped (W8) — see `docs/TODO.md` #25. Removed from this table 2026-07-29; it was listed as open here long after the decision. |
+| — | ~~`#30` ERD / `docs/SCHEMA.md`~~ | — | — | **Done.** [`docs/SCHEMA.md`](./SCHEMA.md) exists and is maintained; it deliberately ships *no* ERD image, with the reasoning at the top of that file. Removed 2026-07-29. |
+| — | ~~`Hole 14` skip ≠ defer~~ | — | — | **Resolved 2026-05-20** — see W5 in §Web-polish path, in this same file. Removed 2026-07-29. |
 
 ---
 
@@ -966,21 +1031,30 @@ machine and a real privacy contact email. Until those two exist, T3.1
 cannot proceed regardless of code readiness.
 
 **2. Next single best task.**
-~~P1 — the #39 frontend.~~ **Shipped 2026-07-27** (see §Current
-priorities). The signal→authority chain is now reachable end to end:
-learners can flag, admins can accept/reject, accepting writes the
-override.
+*Answered 2026-07-29. Every previous answer in this slot had already
+shipped by the time it was read — check the item is still open before
+acting on it.*
 
-~~Next up is **P3** — the remaining Spanish extractor patterns.~~
-**Superseded 2026-07-27 (evening).** Slice A shipped; positive fused
-imperatives are deferred on measured grounds (model swap rejected, local
-corpus in the wrong register — see P3 above).
+~~P1 #39 frontend~~ shipped 2026-07-27. ~~P3 Spanish extractor patterns~~
+partly shipped, rest deferred on measured grounds. ~~N5a built-in lists~~
+shipped 2026-07-28/29.
 
-The next step is **N1 — stand up the model server on the desktop and reach
-it over Tailscale.** Note the shape change: that is an
-**infrastructure/machine task, not a repo change**. There is no code to
-write, no test to add, and the backend side already ships. See §Remaining
-work for the full N1–N6 ordering.
+**N1 remains the top of the queue and is still not a repo task** — stand up
+a model server on the desktop and reach it over Tailscale. No code, no
+tests; the backend side already ships.
+
+**The best available *repo* work, in order:**
+1. **N5b** — investigate the 453 ambiguous/unresolved built-in-list entries
+   and the POS decision they are entangled with. Investigation first: the
+   output wanted is the option set and its cost, not a patch.
+2. **T2.3** — the repo half of the deploy gate sweep. Small, and required
+   before anything is deployed.
+3. **#43 phase 4** — copy-to-my-lists, so a learner can fork a built-in list
+   and prune it. Needs its own bound, for the same reason the mark-learning
+   cap does.
+
+Cleanup items (#28, `tests/legacy/`, `ilp/`) are XS each and fine to bundle
+behind any of the above; none blocks anything.
 
 **3. Avoid right now.**
 - #5 reconciliation (Hole 23) — no user signal yet.
@@ -1010,12 +1084,15 @@ See T2.1 above.
 
 ## Recommended next prompt (paste back to continue)
 
-> Replaced **2026-07-27 (evening)**. The previous contents asked for the
-> remaining **Spanish extractor patterns (#36 / P3)** — that work is now
-> partly shipped (slice A) and partly **deferred on measured grounds**, so
-> pasting it would start work that was deliberately parked. Before that it
-> asked for the #39 frontend, and before that T1.1 — both already shipped
-> when they were read. **Check the item is still open before pasting.**
+> Re-checked **2026-07-29**. N1 below is still accurate and still not a repo
+> task. **The repo-side prompt has been added underneath it** — the previous
+> revision offered N2 as "the first real repo task", which is true only once
+> a model server answers, leaving nothing pasteable in the meantime.
+>
+> This block has now been rewritten four times because the item it pointed
+> at had already shipped (T1.1, then the #39 frontend, then #36/P3, then
+> N5a). **Check the item is still open before pasting** — that is the
+> failure mode this file keeps reproducing, not a coincidence.
 
 **The next step (N1) is not a repo task.** It happens on the RTX 4070
 desktop: install a model server, expose it over Tailscale, confirm the
@@ -1039,8 +1116,39 @@ paste for N1; the checklist is:
    by design, so a backend that starts at all has already proved it can
    construct the provider.
 
-Once a server answers, **N2** is the first real repo task, and it is
-measurement rather than construction:
+**If you want repo work now, paste this instead** — it does not depend on
+N1, and it is the largest thing N5a left behind:
+
+```
+Investigate the ambiguous and unresolved entries in the built-in vocabulary
+lists, and the POS enrichment decision they are entangled with. Do not edit
+files. Do not modify the database.
+
+Context:
+- Seeding kept 453 entries with item_id = NULL: 227 ambiguous + 29
+  unresolved in "Top German Words", 226 + 29 in the phrase-pattern list.
+- An entry with no item_id cannot be marked learning, cannot enter SRS and
+  cannot be reviewed. The ambiguous ones are the highest-frequency words in
+  the language (ein, zu, im, auf, ich).
+- First-matching them is forbidden: it binds mastery to a coin-flip sense.
+  That is the W3 / Hole 2 rule, and it is why catalog_resolver reports
+  `ambiguous` rather than picking.
+- N5a step 1 dropped POS enrichment because `pos` is part of word_table's
+  UNIQUE (word, language, pos) and every row has pos = ''. Writing a real
+  POS forks rows instead of enriching them, which would make currently
+  resolvable words ambiguous.
+- Read docs/TODO.md #43, services/catalog_resolver.py and
+  services/word_seed_service.py before starting.
+
+Produce: the option set with costs and risks. A UI disambiguation picker, a
+POS-aware schema change, both, or neither — and what each would do to the
+453 entries and to the words that resolve cleanly today. Say which entries
+are genuinely ambiguous senses versus artefacts of pos = '' duplication;
+that distinction decides whether this is a UX problem or a schema one.
+```
+
+Once a server answers, **N2** is the first repo task that depends on N1,
+and it is measurement rather than construction:
 
 ```
 Evaluate local-model quality against the current Anthropic baseline, and
