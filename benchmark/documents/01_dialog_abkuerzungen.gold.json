@@ -1,0 +1,33 @@
+{
+  "title": "Sprechstunde",
+  "note": "Original text written for this benchmark. Not from any published work.",
+  "phenomena": [
+    "dialogue",
+    "abbreviation",
+    "quotation",
+    "split_across_blocks",
+    "running_header",
+    "page_number"
+  ],
+  "expected_removals": [
+    { "text": "Praxis am Markt", "kind": "running_header", "pages": [1] },
+    { "text": "7", "kind": "page_number", "pages": [1] }
+  ],
+  "difficult_regions": [
+    {
+      "sentence_index": 0,
+      "phenomenon": "abbreviation",
+      "note": "'Dr.' must not end the sentence."
+    },
+    {
+      "sentence_index": 1,
+      "phenomenon": "split_across_blocks",
+      "note": "'Es war kurz nach' and '8 Uhr.' arrive as two separate blocks."
+    },
+    {
+      "sentence_index": 4,
+      "phenomenon": "abbreviation",
+      "note": "'usw.' is mid-sentence, followed by 'mit.' which IS the sentence end."
+    }
+  ]
+}

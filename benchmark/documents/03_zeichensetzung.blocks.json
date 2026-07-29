@@ -1,0 +1,26 @@
+{
+  "document_id": "03_zeichensetzung",
+  "note": "Simulated extractor output. b4 has lost the period after 'noch einmal' — the OCR punctuation defect. b3 is an isolated decorative asterisk that must not become a reader unit.",
+  "pages": [{ "page": 1, "width": 383.0, "height": 581.4 }],
+  "blocks": [
+    {
+      "block_id": "b1",
+      "page": 1,
+      "type": "TEXT",
+      "text": "Sie zögerte … dann öffnete sie den Umschlag. Der Brief – dünn und mehrfach gefaltet – lag ganz unten."
+    },
+    {
+      "block_id": "b2",
+      "page": 1,
+      "type": "TEXT",
+      "text": "»Das kann nicht stimmen«, murmelte sie."
+    },
+    { "block_id": "b3", "page": 1, "type": "TEXT", "text": "*" },
+    {
+      "block_id": "b4",
+      "page": 1,
+      "type": "TEXT",
+      "text": "Sie las die erste Zeile noch einmal Danach stand sie langsam auf."
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+# Phenomena: dialogue, German abbreviations, „…" quotation, sentence split across blocks,
+# running header and page number that must NOT become reader units.
+==== PAGE 1 ====
+Dr. Weber öffnete die Tür zum Wartezimmer.
+Es war kurz nach 8 Uhr.
+
+„Guten Morgen", sagte er freundlich.
+„Bitte nehmen Sie Platz."
+
+Die Patientin brachte Unterlagen, Rezepte usw. mit.
+Sie legte alles auf den kleinen Tisch am Fenster.

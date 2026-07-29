@@ -1,0 +1,31 @@
+{
+  "title": "Der Umschlag",
+  "note": "Original text written for this benchmark. Not from any published work.",
+  "phenomena": [
+    "ellipsis",
+    "em_dash",
+    "guillemet_quotation",
+    "ocr_missing_period",
+    "punctuation_only_block"
+  ],
+  "expected_removals": [
+    { "text": "*", "kind": "isolated_punctuation", "pages": [1] }
+  ],
+  "difficult_regions": [
+    {
+      "sentence_index": 0,
+      "phenomenon": "ellipsis",
+      "note": "The ellipsis is mid-sentence and must not create a boundary."
+    },
+    {
+      "sentence_index": 1,
+      "phenomenon": "em_dash",
+      "note": "Em dashes are parenthetical here, not sentence separators."
+    },
+    {
+      "sentence_index": 3,
+      "phenomenon": "ocr_missing_period",
+      "note": "The extractor loses the period after 'noch einmal'. A deterministic segmenter CANNOT recover this boundary — expect it to fail here, and expect AI review (A8) to be what fixes it. This document is the regression pin for that claim."
+    }
+  ]
+}

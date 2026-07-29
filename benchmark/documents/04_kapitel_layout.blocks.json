@@ -1,0 +1,48 @@
+{
+  "document_id": "04_kapitel_layout",
+  "note": "Simulated extractor output. b2 is a SECTION_HEADER, b5 a PICTURE with a CAPTION (b6) interrupting a paragraph. On page 2 the right column (b8) precedes the left (b9) in extraction order — a genuine reading-order fault.",
+  "pages": [
+    { "page": 1, "width": 383.0, "height": 581.4 },
+    { "page": 2, "width": 383.0, "height": 581.4 }
+  ],
+  "blocks": [
+    { "block_id": "b2", "page": 1, "type": "SECTION_HEADER", "text": "Kapitel 2" },
+    {
+      "block_id": "b3",
+      "page": 1,
+      "type": "TEXT",
+      "text": "Am Morgen war der Hof noch still. Nur die Katze lief zwischen den Kisten hin und her."
+    },
+    {
+      "block_id": "b4",
+      "page": 1,
+      "type": "TEXT",
+      "text": "Später kam der Nachbar herüber und fragte nach dem Werkzeug."
+    },
+    { "block_id": "b5", "page": 1, "type": "PICTURE", "text": "" },
+    {
+      "block_id": "b6",
+      "page": 1,
+      "type": "CAPTION",
+      "text": "Abbildung 1: Der Hof im Sommer"
+    },
+    {
+      "block_id": "b7",
+      "page": 1,
+      "type": "TEXT",
+      "text": "Er blieb länger, als er eigentlich wollte."
+    },
+    {
+      "block_id": "b8",
+      "page": 2,
+      "type": "TEXT",
+      "text": "Die rechte Spalte gehört schon zum nächsten Gedanken."
+    },
+    {
+      "block_id": "b9",
+      "page": 2,
+      "type": "TEXT",
+      "text": "Die linke Spalte erzählt weiter von dem Werkzeug."
+    }
+  ]
+}

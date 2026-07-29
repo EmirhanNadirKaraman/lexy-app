@@ -1,0 +1,13 @@
+# Phenomena: chapter heading, a PICTURE block interrupting a paragraph mid-sentence,
+# a caption that must not become a reader unit, and a two-column page whose blocks
+# arrive out of reading order.
+==== PAGE 1 ====
+Am Morgen war der Hof noch still.
+Nur die Katze lief zwischen den Kisten hin und her.
+
+Später kam der Nachbar herüber und fragte nach dem Werkzeug.
+Er blieb länger, als er eigentlich wollte.
+
+==== PAGE 2 ====
+Die linke Spalte erzählt weiter von dem Werkzeug.
+Die rechte Spalte gehört schon zum nächsten Gedanken.

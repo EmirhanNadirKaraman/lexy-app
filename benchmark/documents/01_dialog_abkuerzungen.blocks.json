@@ -1,0 +1,28 @@
+{
+  "document_id": "01_dialog_abkuerzungen",
+  "note": "Simulated extractor output. Deliberately damaged: running header and page number arrive as TEXT (as they do on the real corpus, where 1964 bare-number blocks carry no PAGE_HEADER label), and one sentence is split across two blocks.",
+  "pages": [{ "page": 1, "width": 383.0, "height": 581.4 }],
+  "blocks": [
+    { "block_id": "b1", "page": 1, "type": "TEXT", "text": "Praxis am Markt" },
+    {
+      "block_id": "b2",
+      "page": 1,
+      "type": "TEXT",
+      "text": "Dr. Weber öffnete die Tür zum Wartezimmer. Es war kurz nach"
+    },
+    { "block_id": "b3", "page": 1, "type": "TEXT", "text": "8 Uhr." },
+    {
+      "block_id": "b4",
+      "page": 1,
+      "type": "LIST_ITEM",
+      "text": "„Guten Morgen\", sagte er freundlich. „Bitte nehmen Sie Platz.\""
+    },
+    {
+      "block_id": "b5",
+      "page": 1,
+      "type": "TEXT",
+      "text": "Die Patientin brachte Unterlagen, Rezepte usw. mit. Sie legte alles auf den kleinen Tisch am Fenster."
+    },
+    { "block_id": "b6", "page": 1, "type": "TEXT", "text": "7" }
+  ]
+}

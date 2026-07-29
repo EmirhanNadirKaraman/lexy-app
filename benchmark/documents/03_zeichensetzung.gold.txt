@@ -1,0 +1,11 @@
+# Phenomena: ellipsis, em dash as parenthetical, »…« quotation, and an OCR defect
+# where a terminal period is missing entirely. The last case is the one no
+# deterministic segmenter can fix — it needs evidence from the page.
+==== PAGE 1 ====
+Sie zögerte … dann öffnete sie den Umschlag.
+Der Brief – dünn und mehrfach gefaltet – lag ganz unten.
+
+»Das kann nicht stimmen«, murmelte sie.
+
+Sie las die erste Zeile noch einmal.
+Danach stand sie langsam auf.

@@ -1,0 +1,37 @@
+{
+  "document_id": "02_seitenumbruch",
+  "note": "Simulated extractor output. The page-spanning sentence is split across b3/b6, with a footer (b4) and page number (b5) interleaved between its halves — the ordering trap that makes naive concatenation produce garbage.",
+  "pages": [
+    { "page": 1, "width": 383.0, "height": 581.4 },
+    { "page": 2, "width": 383.0, "height": 581.4 }
+  ],
+  "blocks": [
+    {
+      "block_id": "b1",
+      "page": 1,
+      "type": "TEXT",
+      "text": "Der Zug fuhr langsam aus dem Bahnhof. Draußen wurde es allmählich dunkel."
+    },
+    {
+      "block_id": "b3",
+      "page": 1,
+      "type": "TEXT",
+      "text": "Am Fenster saß ein junger Mann, der seit einer Stunde"
+    },
+    { "block_id": "b4", "page": 1, "type": "TEXT", "text": "Kapitel 1 · Die Abfahrt" },
+    { "block_id": "b5", "page": 1, "type": "TEXT", "text": "12" },
+    {
+      "block_id": "b6",
+      "page": 2,
+      "type": "TEXT",
+      "text": "auf denselben Punkt starrte. Er hatte den Koffer kein einziges Mal los-"
+    },
+    {
+      "block_id": "b7",
+      "page": 2,
+      "type": "TEXT",
+      "text": "gelassen. Erst als der Schaffner kam, sah er kurz auf."
+    },
+    { "block_id": "b8", "page": 2, "type": "TEXT", "text": "13" }
+  ]
+}

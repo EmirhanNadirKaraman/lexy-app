@@ -57,3 +57,15 @@ lexy-app/uploads
 # by subtitle-scraper/pipeline.py on every run. Not source.
 subtitle-scraper/transcript_cache/
 
+
+# Evaluation harness run artifacts (evaluation/, roadmap A1) — regenerable.
+out/eval/
+
+# Autoloop runtime state (state.json, transcript.jsonl, diagnostics/, PAUSE).
+# Config lives here too and may reference a private conversation URL.
+.autoloop/
+
+# Deliberately-untracked vendored copy of the nlp-histo extraction stage —
+# reference-only for the ingestion design; deleted by roadmap A11 after the
+# worker work upstreams. See docs/INGESTION_PIPELINE.md §9.
+nlp_histo/

@@ -1,0 +1,28 @@
+{
+  "title": "Der Hof",
+  "note": "Original text written for this benchmark. Not from any published work.",
+  "phenomena": [
+    "chapter_heading",
+    "image_interrupting_text",
+    "caption",
+    "two_column_layout",
+    "reading_order_error"
+  ],
+  "expected_removals": [
+    { "text": "Kapitel 2", "kind": "chapter_heading", "pages": [1] },
+    { "text": "Abbildung 1: Der Hof im Sommer", "kind": "caption", "pages": [1] }
+  ],
+  "difficult_regions": [
+    {
+      "sentence_index": 2,
+      "phenomenon": "image_interrupting_text",
+      "note": "A PICTURE block and its caption sit between the two halves of this paragraph. Joining must skip them without swallowing the caption into the prose."
+    },
+    {
+      "sentence_index": 4,
+      "phenomenon": "reading_order_error",
+      "note": "On page 2 the right column arrives before the left in extraction order. Correct reading order is left column first — this is the ordering_errors metric."
+    }
+  ],
+  "design_note": "A chapter heading is listed under expected_removals because it is not a SENTENCE a learner should be shown as a reader unit. It remains useful as structure (chapter_id on book_sentences, per docs/INGESTION_PIPELINE.md §7); this benchmark measures reader units only."
+}

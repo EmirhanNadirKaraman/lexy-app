@@ -1,0 +1,28 @@
+{
+  "title": "Die Abfahrt",
+  "note": "Original text written for this benchmark. Not from any published work.",
+  "phenomena": [
+    "page_spanning_sentence",
+    "page_footer",
+    "page_number",
+    "hyphen_split_word",
+    "cross_page_join"
+  ],
+  "expected_removals": [
+    { "text": "Kapitel 1 · Die Abfahrt", "kind": "running_footer", "pages": [1, 2] },
+    { "text": "12", "kind": "page_number", "pages": [1] },
+    { "text": "13", "kind": "page_number", "pages": [2] }
+  ],
+  "difficult_regions": [
+    {
+      "sentence_index": 2,
+      "phenomenon": "page_spanning_sentence",
+      "note": "Runs across the page break, with a footer and a page number physically between its two halves. Recovering it as ONE reader unit is the whole point of this document."
+    },
+    {
+      "sentence_index": 3,
+      "phenomenon": "hyphen_split_word",
+      "note": "'los-' / 'gelassen' is hyphen-split at the block boundary and must rejoin as 'losgelassen'."
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+# Phenomena: a sentence spanning a page break, a footer and page number between the
+# two halves, and a hyphen-split word across the same break.
+==== PAGE 1 ====
+Der Zug fuhr langsam aus dem Bahnhof.
+Draußen wurde es allmählich dunkel.
+
+Am Fenster saß ein junger Mann, der seit einer Stunde <PB/> auf denselben Punkt starrte.
+
+==== PAGE 2 ====
+Er hatte den Koffer kein einziges Mal losgelassen.
+Erst als der Schaffner kam, sah er kurz auf.
