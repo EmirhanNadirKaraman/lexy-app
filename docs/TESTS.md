@@ -940,12 +940,124 @@ Hermetic pytest tests. Two sub-trees:
   valuable behaviour was ported into `tests/runtime/` first (TODO #17).
 - Scraper-facing: `tests/test_scraper_channels.py`, `tests/test_scraper_es_path.py`, 🆕 `tests/test_scraper_db_ssl.py` (S4 residual — `subtitle-scraper/db_ssl.py` resolver matrix + `seed_channels.connect()` forwards `sslmode`; scraper modules imported via add-if-absent / `sys.modules.pop` fixtures so the file never pollutes `sys.path` for `test_scraper_channels`), and 🆕 `tests/test_language_config.py` (#18 — `language_config.py` values/order/helpers/unknown-lang/malformed-config + pipeline-no-longer-hardcodes; loaded by `spec_from_file_location` with **no `sys.path` mutation**, the round-3 lesson — a module-level insert here broke `test_scraper_channels` under churn).
 
-Root suite baseline: **221 passed** (97 runtime + 124 scraper). Run
-`pytest tests/` from repo root. Historical: 562 at W4, peaking at 744 before
-the `src/app/` deletion, 207 immediately after it, 211 before the Spanish
-gerund slice.
+- 🆕 `tests/evaluation/` — **147 tests** in six files against the
+  document-ingestion evaluation harness (`evaluation/`, roadmap **A1**). No LLM,
+  no `nlp_histo` import, no Docling/torch. spaCy `de_core_news_md` is the only
+  heavy dependency and `evaluation/segmentation.py` falls back to
+  `spacy.blank("de")` + sentencizer when it is absent, so the suite runs in a
+  bare environment. `tests/evaluation/conftest.py` supplies `benchmark_dir`
+  (the committed corpus) and `tiny_corpus` (a two-sentence tmp_path fixture).
+
+Root suite baseline: **368 passed** (97 runtime + 124 scraper + 147 evaluation).
+Run `pytest tests/` from repo root. Historical: 221 before the A1 harness,
+562 at W4, peaking at 744 before the `src/app/` deletion, 207 immediately after
+it, 211 before the Spanish gerund slice.
+
+🆕 **2026-07-29 — Document-package import, roadmap A2 (+89 backend / +1 file)**
+
+`tests/test_document_package.py`. Mostly hermetic — every fixture is a small
+synthetic package built in `tmp_path` rather than a committed blob, so a test
+names the exact defect it introduces. Only the five `TestImportEndpoint` cases
+need `client`/`db_pool`.
+
+Three groups worth knowing before changing `services/document_package/`:
+
+- **`TestBoundary`** asserts `nlp_histo`, `docling`, `torch` and `transformers`
+  are absent from `sys.modules` after importing the backend. The package-on-disk
+  boundary is the whole point of the design (§3); an accidental import would
+  drag GPU dependencies into the API process and undo it silently.
+- **`TestContainment`** is the security suite for the traversal chokepoint —
+  parametrized over `../`, absolute paths, a real symlink escape, a hostile
+  `page_images.path_template`, and a hostile package name. See the matching
+  entry in `docs/SECURITY.md` under *Verified strengths*.
+- **Severity pins.** Several tests assert a defect is a *warning* rather than
+  fatal (unknown element type, reading-order gaps, inverted y, malformed
+  confidence, missing provenance) and vice-versa (duplicate reading order,
+  coordinate-space mismatch, bbox off-page). That split is the
+  information-preservation principle (§2b) expressed as tests: losing content is
+  irreversible, so only misplacement/loss is allowed to block an import.
+  Flipping one of these is a design change, not a test fix.
+
+`test_real_persistence_refuses_until_a3` and
+`test_real_import_refuses_and_reports_rather_than_raising` are the pins that
+flip when **A3** lands.
+
+🆕 **2026-07-29 — Document-ingestion evaluation harness (+147 root / +6 files)**
+
+`tests/evaluation/{test_normalize,test_annotation,test_metrics,test_fidelity,test_report_and_compare,test_integration}.py`.
+
+Three of these encode design invariants rather than mere behaviour, and are the
+ones to read before changing `evaluation/metrics.py`:
+
+- **`test_fidelity.py`** pins the information-preservation principle: deleting
+  genuine content is *irreversible* (the multimodal reviewer never sees it),
+  retaining an artifact is *recoverable*. `FALSE_DELETION_WEIGHT` is asserted to
+  be ≥10× `RETAINED_ARTIFACT_WEIGHT`, deleting is asserted to score worse than
+  retaining comparable text, and keeping-plus-flagging (`uncertain=True`) is
+  asserted cheaper than leaving unflagged but **not free**. A pipeline that
+  cannot report what it deleted scores `None`, never zero.
+- **`test_report_and_compare.py`** pins severity ordering: a *critical*
+  regression sorts above a numerically larger *normal* one, and descriptive
+  counts (`predicted_boundaries`, `total_units`) carry no direction at all.
+  Also the comparability guards — differing schema version, corpus hash or
+  segmenter **raise** rather than diff, so an edited annotation can never read
+  as a code regression.
+- **`test_annotation.py::TestRoundTrip`** — `parse → serialize` byte-identity.
+  This caught a real serializer bug: the page-break marker `<PB/>` does not
+  advance the parser's page counter, so advancing it on serialize swallowed the
+  following `==== PAGE n ====` header and silently reassigned later sentences.
+
+Two known-limitation pins that should flip when later roadmap items land:
+`test_page_spanning_sentence_is_not_recovered_by_naive_join` (0/1 today → 1/1
+with **A4** reconstruction), and `03_zeichensetzung`'s OCR-missing-period case
+(needs **A8** AI review). Both are asserted at their current value rather than
+xfailed, so the improvement is visible as a test change.
 
 Backend suite baseline (W13, 2026-05-20): **521 passed / 2 skipped** (xdist parallel run ~48s). Run: `pytest -n auto` from `lexy-app/backend/`.
+
+---
+
+## Autoloop tests — `autoloop/tests/`
+
+Added 2026-07-29 with the Fable ↔ ChatGPT orchestration infrastructure
+(`autoloop/`, see `docs/AUTOLOOP.md`); expanded the same day by Phase 2 (task
+registry, contract v2 review-integrity stamps, template library,
+`LLMConversation` seam, review context) and Phase 3 (single-instance locking,
+task-owned change manifests / exact-path staging, `doctor` + `smoke-browser`,
+the audit executor with read-only claude-CLI subagents, phase gating).
+**329 tests, fully hermetic** — no network, no ChatGPT, no playwright import,
+no live `claude` CLI (agent runner stubbed), no app DB. `test_git_gateway.py`,
+`test_manifest.py` and `test_audit_executor.py` use real `git` against
+throwaway `tmp_path` repos; `test_lock.py` uses real separate processes.
+
+Run: `pytest autoloop/tests` from the repo root. **Not included in bare
+`pytest`** — root `testpaths` still points at `tests/` only.
+
+| File | Count | Covers |
+|---|---|---|
+| `test_contract.py` | 50 | Contract v3 parsing: valid form for every decision (plan batches, task-id work, `reviewed` stamps, **required non-empty `commit.paths`**); strict rejection codes; last-json-block-wins; `verify_review` accept + all three mismatch codes. |
+| `test_policy.py` | 54 | Directive authorization (git gating, protected branches, task-reference checks, **phase gate**: implement/revise-of-task denied by default, revise-of-audit allowed); git whitelist (**`add -A` denied, `restore` only with `--staged`**, force-push escape-hatch absence); budgets. |
+| `test_tasks.py` | 34 | Task registry/graph: ids, duplicates, unknown deps, cycles, batch atomicity, derived ready/blocked, `next_ready`, lifecycle guards, persistence. |
+| `test_lock.py` | 8 | Single-instance lock: roundtrip; live-lock fail-closed against a REAL separate process; stale detection via a verifiably-dead pid + explicit `unlock` recovery; foreign-host = live; corrupt-lock diagnosis; run-id-guarded release (zombie can't remove a successor's lock). |
+| `test_manifest.py` | 15 | Change manifests on real git: created/modified/deleted classification (untracked vs clean-tracked-then-modified, renames as delete+create, reverted dirt excluded, pre-existing dirt excluded); `verify_commit` rules (empty paths, unfinished manifest, pre-existing path, untouched path, task deletions allowed); store roundtrip. |
+| `test_doctor.py` | 7 | Doctor with mocked boundaries: all-green, git identity + protected-branch warning, CDP-unreachable → live check skipped, playwright missing, logged-out browser, stale lock reported, bad conversation URL — and proof it never submits. |
+| `test_smoke.py` | 3 | smoke-browser through the real CLI with a fake registered provider: full contract path (request id, stamped CONTEXT, parser, transcript), isolated smoke state, clean `stopped` terminal, FAIL path, executor provably never invoked. |
+| `test_audit_findings.py` | 14 | Strict agent-output contract: field-by-field validation, per-item rejection with reasons, duplicate ids, non-JSON output, wrong top-level shape. |
+| `test_audit_reconcile.py` | 7 | Bucket classification, cross-agent dedupe keeping the higher-quality instance, speculation + style hard-rejected from promotion. |
+| `test_audit_taskgen.py` | 8 | Priority ordering per the mandated ranking, `au-NNN` ids skipping registry collisions (never A1-style ids), finding→task dependency mapping (incl. deps on existing roadmap tasks; unresolved deps noted, not invented), human decisions skipped, full task structure. |
+| `test_audit_executor.py` | 6 | End-to-end with fake agents + stubbed validation: 6-domain fan-out with scope/feedback threading, raw reports persisted separately, one dated Markdown report as the only repo write, proposal JSON, agent failure → honest "COVERAGE INCOMPLETE", non-audit decisions refused, unsafe validation binaries refused. |
+| `test_markdown_policy.py` | 7 | Markdown-only gate: canonical files ok, ONE dated report max, production code / non-canonical md / traversal / absolute paths refused. |
+| `test_audit_agents.py` | 6 | ClaudeCliRunner with stubbed subprocess: read-only headless argv (allow Read/Grep/Glob, disallow Edit/Write/Bash/Task/…), result-JSON unwrap, timeout / missing binary / non-zero exit reported not raised. |
+| `test_prompts.py` | 22 | Template library incl. `audit_kickoff` + `smoke_test`; strict rendering; payload helpers. |
+| `test_context.py` | 8 | Review context: stamp values, porcelain parsing, previous decision/task, validation + roadmap summaries, truncation. |
+| `test_conversation.py` | 5 | Provider registry + interface conformance without playwright. |
+| `test_state.py` | 10 | Round-trip (incl. stamps + manifest pointer), atomic save, corruption handling, archive. |
+| `test_chatgpt_client.py` | 15 | Browser abstraction on a fake session + virtual clock (submit/dedup/stale/streaming/login/timeouts+diagnostics). |
+| `test_orchestrator.py` | 36 | Audit flow end-to-end (manifest begin/finish, audit template, revision loop, crash-recovery redispatch); **commit gate** (no-manifest refused, pre-existing dirty path refused, untouched path refused, task-modified-on-top-of-dirt committable, exact paths forwarded, task completion on commit); phase gate reprompts; review integrity (stale stamp, HEAD-moved, budget, crash re-verification); context propagation; parse/policy/git/browser failure routing; duplicate-submission prevention + byte-identical resend; budgets; pause; persistence. |
+| `test_git_gateway.py` | 14 | Real git: reads; **exact-path staging** (unapproved dirty files untouched, pre-staged index entries refused AND unstaged, deletions/renames/untracked, staged-diff summary, empty-paths refused, idempotent recovery with other files still dirty); push to bare remote; detached-HEAD; force-push + `add -A` denied; denied commands never reach subprocess. |
+
+Fakes live in the test files themselves; `conftest.py` only inserts the repo
+root on `sys.path`.
 
 ---
 
@@ -1720,8 +1832,18 @@ Run all three. The lint step is not optional.
 | Step | Command | Expected |
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
-| Backend | `cd lexy-app/backend && pytest -n auto` | 894 passed, 2 skipped |
-| Root pipeline | `pytest tests/` *(repo root)* | 221 passed |
+| Backend | `cd lexy-app/backend && python3 -m pytest -n auto` | 1258 passed, 2 skipped |
+| Root pipeline | `pytest tests/` *(repo root)* | 368 passed |
+| Autoloop | `pytest autoloop/tests` *(repo root; only when touching `autoloop/`)* | 329 passed |
+
+> **Backend command reconciled 2026-07-29:** it must be `python3 -m pytest`,
+> NOT the bare `pytest` entrypoint. `python -m` puts the cwd on `sys.path`,
+> which `tests/test_document_package.py` (A2, 107 tests) requires for its bare
+> `from services import …` imports; the console script omits cwd and that one
+> file fails collection, reporting `1151 passed + 1 error`. 1151 + 107 = 1258.
+> Full mechanism in `docs/COMMON_ERRORS.md` §2. (The 894 previously listed
+> here predated the A2/backfill work; the 221 root figure predated the
+> evaluation-harness tests — both were stale doc claims, now measured.)
 
 How the backend baseline got to 847, newest last:
 

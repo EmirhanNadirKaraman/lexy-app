@@ -17,7 +17,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `core/security.py` | password hashing (bcrypt), `encode_token` / `decode_token`. |
 | `models/schemas.py` | All Pydantic request/response models. ~600 lines, one file. |
 | `alembic.ini`, `migrations/env.py` | Alembic config. `env.py` builds the URL from `DB_*` env + appends `?sslmode=` via `database.resolve_sslmode` (S4). |
-| `migrations/versions/0XX_*.py` | 25 migrations, append-only. Schema lives here. |
+| `migrations/versions/0XX_*.py` | 37 migrations (head `037`), append-only. Schema lives here. |
 
 ### Routers (HTTP surface) — `lexy-app/backend/routers/`
 | Path | Endpoints | Calls |
@@ -58,7 +58,7 @@ Conventions: each entry is `path — purpose. Touchpoints.` Touchpoints list adj
 | `word_service.py` | `resolve_word_ids` (Unicode-correct case-insensitive match via `text_norm.normalize_key` — **not** `ILIKE`, which folds ASCII only under this DB's C collation), `lookup_word_by_text` (resolves then enriches; ambiguous on POS, never first-matched), `learn_word_anyway` (**resolves before inserting** so an existing `pos=''`/scraper row is reused instead of forked — `ON CONFLICT (word, language, pos)` cannot see a row under a different `pos`), `get_user_knowledge`. (`upsert_word_status` was deleted 2026-05-19 — `progression_service.apply_progression(..., status_override=...)` is now the single writer.) |
 | `chat_service.py` | session/message CRUD + `match_learning_words` (free-chat matching against the user's vocab — words **and** phrases, via `matcher_service.match_sentence_with_ids` for the phrase half). `match_learning_words` folds case in **Python** via `text_norm.normalize_key`, inverting the join (fetch the user's tracked non-known words, filter in Python) — SQL `LOWER()` folds ASCII only under this DB's C collation, so umlaut words earned no free-chat credit. The phrase half matches on spaCy-returned `phrase_id`s and never folds. |
 | `guided_chat_service.py` | `get_next_target` (priority: due active → learning without active → random; considers words AND phrases at every tier), `update_progress` (event mapping). |
-| `llm_provider.py` | **The only place an LLM client is constructed.** Two backends behind `LLM_PROVIDER`: `AnthropicProvider` (default) and `OpenAICompatibleProvider` (POSTs `{LLM_BASE_URL}/chat/completions` via `httpx`, `response_format=json_schema`, one retry falling back to `json_object`). Any host — built for a GPU desktop over Tailscale, not localhost. `LLMProviderError` carries provider/model/base-url and never the API key (`_redact` scrubs URL userinfo too). `LLMProvider` Protocol — `structured(system, messages, schema, max_tokens) -> dict` + `model_id`. `AnthropicProvider` maps a JSON Schema (`title`/`description` + body) onto a forced single-tool call; `split_schema` strips those two keys so the wire bytes match the pre-seam tool dicts. `LLMProviderError` replaces the old bare `StopIteration`. Local/OpenAI-compatible adapter is NOT here yet. |
+| `llm_provider.py` | **The only place an LLM client is constructed.** Two backends behind `LLM_PROVIDER`: `AnthropicProvider` (default) and `OpenAICompatibleProvider` (POSTs `{LLM_BASE_URL}/chat/completions` via `httpx`, `response_format=json_schema`, one retry falling back to `json_object`). Any host — built for a GPU desktop over Tailscale, not localhost. `LLMProviderError` carries provider/model/base-url and never the API key (`_redact` scrubs URL userinfo too). `LLMProvider` Protocol — `structured(system, messages, schema, max_tokens) -> dict` + `model_id`. `AnthropicProvider` maps a JSON Schema (`title`/`description` + body) onto a forced single-tool call; `split_schema` strips those two keys so the wire bytes match the pre-seam tool dicts. `LLMProviderError` replaces the old bare `StopIteration`. **No image/multimodal support yet** — both backends pass `messages` through verbatim, so adding it means a neutral image content-block normalizer here (the two wire formats diverge). See `docs/INGESTION_PIPELINE.md` §8. |
 | `llm_service.py` | All Claude Haiku calls. tool_use for structured outputs. Cached via `llm_cache_service`. Has `MOCK_LLM=true` mode. `translate_item_gloss` reads the **curated** cache key (model `curated:words_4000_old`) before the model-specific one, so seeded human glosses survive an `LLM_MODEL` switch while genuine LLM output stays model-scoped. It never *writes* curated rows. |
 | `llm_cache_service.py` | SHA256(prompt_key+model+params) → `llm_cache` table. TTL or permanent. |
 | `book_service.py` | PDF upload, docling+masking ingestion, page/block CRUD, sentence_count, user_text_override. |
@@ -267,6 +267,37 @@ tests targeting one — see TODO #17.
 
 ---
 
+## Autoloop — `autoloop/` (Fable ↔ ChatGPT orchestration)
+
+Infrastructure for the autonomous engineering loop — see `docs/AUTOLOOP.md`.
+ChatGPT is driven through a real browser (Playwright over CDP against a
+dedicated, pre-logged-in Chrome profile), **never the OpenAI API**. Runtime
+state in `.autoloop/` (gitignored). The audit/implement executor is a stub by
+design (`NullExecutor`).
+
+| Path | Purpose |
+|---|---|
+| `orchestrator.py` | Persisted state machine: ready → submitting → awaiting → executing (+ needs_user / stopped / failed). Failure routing, budgets, review-integrity enforcement. |
+| `tasks.py` | Task registry / graph: stable slug ids, dependencies, derived ready/blocked (never stored), `next_ready()`, cycle detection, atomic `tasks.json` persistence. ChatGPT authorizes work by task id only. |
+| `conversation.py` | `LLMConversation` abstract interface + provider registry — `browser_chatgpt` built in; a Claude.ai/Gemini adapter is one class + `register_provider`. |
+| `context.py` | Automatic CONTEXT block per request: review-integrity stamp (request_id/timestamp/head_sha/base_sha/report_sha256) + previous decision/task, roadmap, git summary, changed files, validation summary. |
+| `browser/chatgpt.py` | `BrowserChatGPT` (the browser LLMConversation): submit + await; request-id duplicate guard, stale-reply guard, streaming stability window, login-expiry detection, failure diagnostics. |
+| `browser/playwright_session.py` | The only Playwright code. Lazy import; connects over CDP; never launches a browser or touches login. |
+| `browser/session.py`, `browser/selectors.py` | Mockable session protocol; every DOM selector in one dataclass (UI-drift fix point). |
+| `contract.py` | Response contract **v3** (audit/plan/implement/revise/commit/push/commit_and_push/stop/ask_user; task-id work authorization; `reviewed` stamp on git approvals; **required non-empty `commit.paths`**) + strict parser + `verify_review` — coded rejects, never guesses. |
+| `lock.py` | Single-instance lock per state dir: atomic create, pid/host/start/run-id recorded, live-vs-stale distinction, fail-closed, `unlock`-only recovery (refuses live locks), run-id-guarded release. |
+| `manifest.py` | Task-owned change manifests: content-hash snapshots before/after each executor run; `verify_commit` refuses pre-existing or untouched paths — the mechanism that replaced `git add -A` (which the git whitelist now rejects outright). |
+| `doctor.py` | Non-destructive preflight: config, state dir, lock, git identity, branch policy, CDP, playwright, provider, conversation URL, live login/selector check. Never submits. |
+| `audit/` | Phase-3 audit executor: `findings` (strict agent contract), `agents` (read-only headless `claude -p` runner), `reconcile` (dedupe/classify/reject speculation+style), `taskgen` (`au-NNN` proposal graph), `markdown` (Markdown-only gate, one dated report), `report`, `executor`. |
+| `policy.py` | Deterministic safety layer: directive authorization (git gating + task-graph reference checks), git command whitelist (force push structurally impossible), iteration/failure/parse/denial budgets. |
+| `git_gateway.py` | The only git runner — argv subprocess (no shell), policy-validated per call, idempotent commit for crash recovery, explicit-refspec push. |
+| `state.py`, `transcript.py` | Atomic crash-safe JSON state (schema v2, stamped requests); append-only JSONL audit log. |
+| `executor.py` | `TaskExecutor` seam (`execute(directive, task)` → outcome incl. validation summary); `NullExecutor` reports honestly today. |
+| `prompts.py`, `config.py`, `cli.py` | Strict `PromptTemplate` library (+ `audit_kickoff`, `smoke_test`); strict TOML config (`[executor]`, `[audit]` sections); `run/status/tasks/doctor/smoke-browser/pause/resume/unlock/reset` CLI with locking on mutating commands. |
+| `tests/` | 329 hermetic tests — no network, no playwright, no live claude CLI (see `docs/TESTS.md`). |
+
+---
+
 ## Config + entry
 
 | Path | Purpose |
@@ -281,6 +312,11 @@ tests targeting one — see TODO #17.
 | `CLAUDE.md` | This project's master guide (read first). |
 | `docs/TODO.md` | Bugs + tasks, ordered by blocking dependency. |
 | `docs/WORKFLOW_AUDIT.md` | Full word-learning trace with numbered holes. |
+| `services/book_import_service.py` | **Document-package import orchestration (roadmap A2).** `verify → validate → dry-run → persist`, no DB mutation before every gate passes. `list_packages`, `validate_package`, `import_package`, `dry_run_package`. Scope is narrow by design: no reconstruction (A4), segmentation (A5), AI review (A8) or worker invocation (A10). |
+| `services/document_package/` | The A2 internals. `contract.py` (versions, element enum, coordinate space — no logic), `issues.py` (fatal/warning/info collector), `loader.py` (discovery, checksums, **path-containment chokepoint**), `validators.py` (individually testable structural validators), `coordinates.py` (the single Docling↔fitz flip), `persistence.py` (`PersistenceBackend` seam + dry-run + the A3 placeholder), `result.py` (`import_result.json`). Imports nothing from `nlp_histo`/Docling/Torch — asserted by a test. |
+| `evaluation/` | **Document-ingestion evaluation harness (roadmap A1).** No LLM, no `nlp_histo` import, no Docling/torch. `normalize.py` (the single shared normalizer every offset depends on), `annotation.py` (gold format + round-trip), `metrics.py` (Stage 1 fidelity + Stage 2 boundary/reader), `model.py` (`PredictedDocument` + the `DocumentSource` adapter seam), `adapters.py`, `segmentation.py` (spaCy `de` baseline), `runner.py`, `report.py`, `compare.py`, `baselines.py` (frozen constants), `cli.py`. Run: `python -m evaluation run --label X`. |
+| `benchmark/documents/` | Gold corpus for the harness — original German text, three files per document (`.blocks.json` input, `.gold.txt` expected units, `.gold.json` sidecar). See `benchmark/README.md`. The real graded readers are commercial and stay in gitignored `files/`. |
+| `docs/INGESTION_PIPELINE.md` | Design for the document-ingestion boundary: offline `nlp-histo` worker → versioned document package → import → reconstruction → `book_sentences` → sentence-by-sentence reader. Package schemas, coordinate conventions, AI-review op contract, evaluation plan, task breakdown. ROADMAP **N7** / TODO **#44**. |
 | `docs/TESTS.md` | Test inventory, coverage gaps, known failures. |
 | `docs/COMMON_ERRORS.md` | Symptom-first log of errors actually hit here (tooling, tests, build, lint, research). Grep it by the error text before debugging. |
 | `docs/SUMMARY.md` | This file. |
@@ -303,3 +339,4 @@ tests targeting one — see TODO #17.
 | Where do notifications get written? | `subtitle-scraper/pipeline.py:_notify_user` for success (`video_done`, `channel_done`); `_mark_request` emits `request_failed` whenever `status='failed'`. |
 | Where is auth enforced? | `core/deps.py:get_current_user` — every router uses it as a Depends |
 | What seeds run on startup? | `main.py` lifespan: `phrase_service.seed_from_blueprint_map`, `grammar_service.seed_rules`, resume pending content_requests |
+| Where is the ChatGPT engineering loop? | `autoloop/orchestrator.py` (state machine); full doc in `docs/AUTOLOOP.md` |
