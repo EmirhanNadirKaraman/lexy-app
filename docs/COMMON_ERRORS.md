@@ -264,6 +264,25 @@ time. Fixing only the count would have left the pointless re-inserts.
 
 ## 2. Test suite
 
+### `ModuleNotFoundError: No module named 'services'` — only `test_document_package.py` fails collection
+**Symptom:** Backend suite reports `1151 passed, 2 skipped, 1 error` — the
+error is an ImportError collecting `tests/test_document_package.py`. The A2
+session had verified `1258 passed, 2 skipped` on the same tree.
+**Cause (verified 2026-07-29):** invocation form, not branch state or missing
+files. All A2 files exist (untracked on `main`). `test_document_package.py` is
+the only backend test importing bare `from services import …`; every other
+test uses `from backend.services …`, resolvable because the package chain
+(`backend/__init__.py` + `backend/tests/__init__.py`) puts `lexy-app/` on
+`sys.path`. Bare `services` additionally needs `lexy-app/backend` on
+`sys.path` — which only happens when **cwd is on sys.path**, i.e. with
+`python -m pytest` (Python inserts cwd) but NOT with the `pytest` console
+script. 1151 + 107 (that file) = 1258 exactly.
+**Fix:** run the backend suite as
+`cd lexy-app/backend && python3 -m pytest -n auto` (the reconciled canonical
+command; CLAUDE.md §11 and docs/TESTS.md updated). The A2 test file was left
+untouched — aligning its imports with the `backend.services` convention is a
+proposed follow-up task, not something to do as a drive-by.
+
 ### `ValueError: Seed must be between 0 and 2**32 - 1` — every test errors
 **Symptom:** Backend suite reports `211 passed, 1036 errors`; root suite
 `1 passed, 1339 errors`. Every error is at test **setup and teardown**, so no

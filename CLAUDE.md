@@ -232,9 +232,14 @@ Two things to know before "fixing" what it reports:
 ### Backend tests
 ```bash
 cd lexy-app/backend
-pytest                              # serial
-pytest -n auto                      # parallel via pytest-xdist — ~133s for 1151 tests
+python3 -m pytest                   # serial
+python3 -m pytest -n auto           # parallel via pytest-xdist — ~60s for 1258 tests
 ```
+**Use `python3 -m pytest`, not the bare `pytest` entrypoint.** `python -m`
+puts the cwd on `sys.path`, which `tests/test_document_package.py` (A2) needs
+for its bare `from services import …` imports; the `pytest` console script
+does not, and the file then fails collection (1151 instead of 1258 — see
+`docs/COMMON_ERRORS.md` §2).
 `pytest-randomly` is blocked via `addopts = -p no:randomly` in both ini files.
 That is deliberate and load-bearing — see `docs/TESTS.md` for the spaCy/thinc
 seed conflict it works around. Don't remove it.
