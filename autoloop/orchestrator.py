@@ -3,8 +3,13 @@
 Phases (see state.Phase):
 
     ready ──► submitting ──► awaiting ──► executing ─┬─► ready        (loop)
-                                                     ├─► stopped      (stop)
-                                                     └─► needs_user   (ask_user / budgets)
+                   │                                 ├─► stopped      (stop)
+                   │ send attempted,                  └─► needs_user  (ask_user / budgets)
+                   │ acceptance unknown
+                   ▼
+       submission_unconfirmed ──reconcile──┬─► awaiting   (it did persist)
+                                           └─► needs_user (ambiguous; NEVER
+                                                           an automatic resend)
 
 Phase 2 additions on top of the v1 machine:
 
@@ -18,6 +23,19 @@ Phase 2 additions on top of the v1 machine:
   resubmits byte-identical content and the stamps stay truthful.
 * All outgoing payloads come from `prompts.TEMPLATES`; the CONTEXT block is
   built by `context.build_context` from state + git + registry.
+
+Phase 3.1 (browser-transport repair) additions:
+
+* `submitting` reconciles once (controlled reload) BEFORE sending, so the
+  duplicate check reads persisted history — an optimistic user bubble in the
+  live DOM is never taken as proof a message was accepted.
+* An attempted-but-unconfirmed send lands in `submission_unconfirmed`, which
+  only ever reconciles. It never resends: the backend may have accepted a
+  message the browser failed to observe, so an automatic retry could
+  double-post. Resolution is either "it did persist" → awaiting, or a park for
+  the operator (`run --retry` to reconcile again, `run --resubmit` to allow one
+  more send of the same request id).
+* `awaiting` performs no navigation at all, so a streaming answer survives.
 
 Failure routing:
 
@@ -34,6 +52,7 @@ Failure routing:
 
 from __future__ import annotations
 
+from .browser.chatgpt import SubmitResult
 from .config import AutoloopConfig
 from .context import build_context, render_context
 from .contract import (
@@ -141,6 +160,8 @@ class Orchestrator:
             self._step_ready()
         elif phase is Phase.SUBMITTING:
             self._step_submitting()
+        elif phase is Phase.SUBMISSION_UNCONFIRMED:
+            self._step_submission_unconfirmed()
         elif phase is Phase.AWAITING:
             self._step_awaiting()
         elif phase is Phase.EXECUTING:
@@ -195,19 +216,105 @@ class Orchestrator:
         if req is None:
             raise StateError("phase=submitting but no pending request")
         client = self._get_client()
-        client.open()
-        if client.already_submitted(req.request_id):
-            # Crash after send but before save, or a re-entered phase: the
-            # conversation already has this request — never send it twice.
+        client.attach()
+        # One controlled reload BEFORE sending, so the duplicate check reads
+        # persisted history rather than whatever the DOM happens to show (a
+        # crashed previous run can leave an optimistic bubble behind).
+        req.reconcile_attempts += 1
+        if client.reconcile(req.request_id):
             self._log("request_already_submitted", request_id=req.request_id)
-        else:
-            client.submit(req.request_id, req.prompt)
+            req.submitted = True
+            state.phase = Phase.AWAITING.value
+            self._store.save(state)
+            return
+
+        if req.send_attempted:
+            # A send was already attempted for this id and reconciliation says
+            # it did not persist. Resending is forbidden without an explicit
+            # operator decision (`run --resubmit`): the backend may have
+            # accepted a message the browser never observed.
+            self._park_ambiguous(req, reconciled=True)
+            return
+
+        # Mark PESSIMISTICALLY and durably before handing control to the
+        # transport: from here on a send may have happened, so any crash or
+        # exception must lead recovery to reconcile rather than resend. The
+        # marker is cleared below only when the transport proves nothing left
+        # the browser. (Setting it after submit() returns would lose the fact
+        # whenever submit raised *after* clicking Send — e.g. login expiry
+        # during confirmation, a dying page, or SIGKILL — and the next run
+        # would happily post a duplicate.)
+        req.send_attempted = True
+        self._store.save(state)
+        try:
+            result = client.submit(req.request_id, req.prompt)
+        except BrowserError:
+            if not getattr(client, "send_attempted", True):
+                # Nothing was sent (composer/Send never accepted the input), so
+                # a later retry is unambiguous and may submit normally.
+                req.send_attempted = False
+                self._store.save(state)
+            raise
+        if result is SubmitResult.UNCONFIRMED:
+            # Ambiguous: the send was clicked but acceptance is unknown. Park in
+            # a dedicated phase — resending here could double-post.
+            state.phase = Phase.SUBMISSION_UNCONFIRMED.value
             self._log(
-                "request_submitted", request_id=req.request_id, data={"prompt": req.prompt}
+                "submission_unconfirmed",
+                request_id=req.request_id,
+                data={"note": "send attempted, acceptance unknown — reconciling next"},
             )
+            self._store.save(state)
+            return
+
         req.submitted = True
         state.phase = Phase.AWAITING.value
+        self._log(
+            "request_submitted",
+            request_id=req.request_id,
+            data={"result": result.value, "prompt": req.prompt},
+        )
         self._store.save(state)
+
+    def _step_submission_unconfirmed(self) -> None:
+        """Resolve an ambiguous send by reconciliation only — never by resending."""
+        state = self.state
+        req = state.pending_request
+        if req is None:
+            raise StateError("phase=submission_unconfirmed but no pending request")
+        client = self._get_client()
+        client.attach()
+        req.reconcile_attempts += 1
+        persisted = client.reconcile(req.request_id)
+        self._log(
+            "reconciled",
+            request_id=req.request_id,
+            data={"persisted": persisted, "attempts": req.reconcile_attempts},
+        )
+        if persisted:
+            req.submitted = True
+            state.phase = Phase.AWAITING.value
+            self._store.save(state)
+            return
+        self._park_ambiguous(req, reconciled=True)
+
+    def _park_ambiguous(self, req: PendingRequest, reconciled: bool) -> None:
+        """Stop on an ambiguous submission. Never resends automatically."""
+        self._log(
+            "submission_ambiguous",
+            request_id=req.request_id,
+            data={"reconciled": reconciled, "reconcile_attempts": req.reconcile_attempts},
+        )
+        self._to_needs_user(
+            f"submission of {req.request_id} is AMBIGUOUS: a send was attempted but "
+            "the request is not in persisted history after reconciliation. Autoloop "
+            "will not resend on its own — the backend may have accepted a message "
+            "the browser never observed, so resending risks a duplicate post. "
+            "Inspect the conversation, then either `run --retry` (reconcile again) "
+            "or `run --resubmit` (send this same request id once more; if it did "
+            "land, it is detected and not duplicated).",
+            resume_phase=Phase.SUBMISSION_UNCONFIRMED.value,
+        )
 
     def _step_awaiting(self) -> None:
         state = self.state
@@ -215,7 +322,9 @@ class Orchestrator:
         if req is None:
             raise StateError("phase=awaiting but no pending request")
         client = self._get_client()
-        client.open()
+        # attach() navigates only when the page is absent or elsewhere — never a
+        # reload here, or a streaming answer would be destroyed mid-flight.
+        client.attach()
         raw = client.await_response(req.request_id)
         state.last_response = LastResponse(
             request_id=req.request_id,

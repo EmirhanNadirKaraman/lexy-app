@@ -281,10 +281,10 @@ design (`NullExecutor`).
 | `tasks.py` | Task registry / graph: stable slug ids, dependencies, derived ready/blocked (never stored), `next_ready()`, cycle detection, atomic `tasks.json` persistence. ChatGPT authorizes work by task id only. |
 | `conversation.py` | `LLMConversation` abstract interface + provider registry — `browser_chatgpt` built in; a Claude.ai/Gemini adapter is one class + `register_provider`. |
 | `context.py` | Automatic CONTEXT block per request: review-integrity stamp (request_id/timestamp/head_sha/base_sha/report_sha256) + previous decision/task, roadmap, git summary, changed files, validation summary. |
-| `browser/chatgpt.py` | `BrowserChatGPT` (the browser LLMConversation): submit + await; request-id duplicate guard, stale-reply guard, streaming stability window, login-expiry detection, failure diagnostics. |
+| `browser/chatgpt.py` | `BrowserChatGPT` (the browser LLMConversation): `attach` / `submit` / `reconcile` / `await_response`. **Optimistic rendering is never treated as submission** — confirmation needs an assistant turn or a reconciliation reload; ambiguity returns UNCONFIRMED and never auto-retries. Realistic composer input (focus + keyboard clear + `insert_text` + content verification + Send-enabled wait), no navigation while awaiting, per-stage bounded timeouts, structured secret-free diagnostics. |
 | `browser/playwright_session.py` | The only Playwright code. Lazy import; connects over CDP; never launches a browser or touches login. |
 | `browser/session.py`, `browser/selectors.py` | Mockable session protocol; every DOM selector in one dataclass (UI-drift fix point). |
-| `contract.py` | Response contract **v3** (audit/plan/implement/revise/commit/push/commit_and_push/stop/ask_user; task-id work authorization; `reviewed` stamp on git approvals; **required non-empty `commit.paths`**) + strict parser + `verify_review` — coded rejects, never guesses. |
+| `contract.py` | Response contract **v3** (audit/plan/implement/revise/commit/push/commit_and_push/stop/ask_user; task-id work authorization; `reviewed` stamp on git approvals; **required non-empty `commit.paths`**) + strict single-envelope parser (one fenced block, or a rendered/plain object with an optional language label; a second object or trailing text is rejected, never resolved by position) + `verify_review` — coded rejects, never guesses. |
 | `lock.py` | Single-instance lock per state dir: atomic create, pid/host/start/run-id recorded, live-vs-stale distinction, fail-closed, `unlock`-only recovery (refuses live locks), run-id-guarded release. |
 | `manifest.py` | Task-owned change manifests: content-hash snapshots before/after each executor run; `verify_commit` refuses pre-existing or untouched paths — the mechanism that replaced `git add -A` (which the git whitelist now rejects outright). |
 | `doctor.py` | Non-destructive preflight: config, state dir, lock, git identity, branch policy, CDP, playwright, provider, conversation URL, live login/selector check. Never submits. |
@@ -294,7 +294,7 @@ design (`NullExecutor`).
 | `state.py`, `transcript.py` | Atomic crash-safe JSON state (schema v2, stamped requests); append-only JSONL audit log. |
 | `executor.py` | `TaskExecutor` seam (`execute(directive, task)` → outcome incl. validation summary); `NullExecutor` reports honestly today. |
 | `prompts.py`, `config.py`, `cli.py` | Strict `PromptTemplate` library (+ `audit_kickoff`, `smoke_test`); strict TOML config (`[executor]`, `[audit]` sections); `run/status/tasks/doctor/smoke-browser/pause/resume/unlock/reset` CLI with locking on mutating commands. |
-| `tests/` | 329 hermetic tests — no network, no playwright, no live claude CLI (see `docs/TESTS.md`). |
+| `tests/` | 396 hermetic tests — no network, no playwright, no live claude CLI (see `docs/TESTS.md`). |
 
 ---
 

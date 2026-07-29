@@ -177,7 +177,9 @@ def run_doctor(
     conversation = None
     try:
         conversation = factory()
-        conversation.open()  # navigates, checks login + composer selector
+        # attach() navigates only if the page is elsewhere, then waits for the
+        # composer and checks login. It never types and never submits.
+        conversation.attach()
         messages = getattr(conversation, "messages", None)
         if callable(messages):
             count = len(messages())

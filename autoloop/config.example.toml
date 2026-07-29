@@ -9,10 +9,15 @@ conversation_url = "https://chatgpt.com/c/REPLACE-ME"
 # Chrome DevTools endpoint of the dedicated profile (see docs/AUTOLOOP.md for
 # the launch command).
 cdp_url = "http://127.0.0.1:9222"
-# How long to wait for ChatGPT to finish answering one prompt.
-response_timeout_seconds = 900.0
-# How long to wait for a submitted prompt to appear in the conversation.
-submit_timeout_seconds = 60.0
+# Every wait is bounded separately so a stuck channel fails fast with a
+# specific diagnosis instead of hanging on one giant timeout.
+composer_timeout_seconds = 30.0     # composer element ready
+input_sync_timeout_seconds = 30.0   # editor really holds the whole request
+send_ready_timeout_seconds = 30.0   # Send control enabled
+submit_timeout_seconds = 60.0       # evidence the server accepted the turn
+response_start_timeout_seconds = 120.0  # assistant begins answering
+response_timeout_seconds = 900.0    # a started answer settles
+reconcile_timeout_seconds = 30.0    # persisted-history check after a reload
 poll_interval_seconds = 2.0
 # The answer must be unchanged this long (and generation stopped) to count.
 stability_seconds = 3.0

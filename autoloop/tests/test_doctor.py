@@ -22,7 +22,7 @@ class FakeConversation:
         self.submits = []
         self.closed = False
 
-    def open(self):
+    def attach(self):
         self.opened += 1
         if self.login_expired:
             raise LoginExpiredError("logged out")
@@ -30,8 +30,11 @@ class FakeConversation:
     def messages(self):
         return [("user", "hi")]
 
-    def already_submitted(self, request_id):
+    def has_request(self, request_id):
         return False
+
+    def reconcile(self, request_id):
+        raise AssertionError("doctor must never reconcile (it would reload)")
 
     def submit(self, request_id, prompt):
         self.submits.append((request_id, prompt))

@@ -11,12 +11,15 @@ from pathlib import Path
 import pytest
 
 from autoloop.config import AutoloopConfig, BrowserConfig
+from autoloop.browser.chatgpt import SubmitResult
 from autoloop.contract import Decision
 from autoloop.errors import (
     GitCommandError,
     LoginExpiredError,
+    ResponseTimeoutError,
     SessionLostError,
     StateError,
+    SubmissionError,
 )
 from autoloop.executor import ExecutionOutcome
 from autoloop.manifest import ManifestStore
@@ -105,28 +108,48 @@ def approval(decision="commit", paths=("out.md",), task_id=None, message="docs: 
 
 
 class FakeClient:
-    def __init__(self, responses=()):
+    """Conversation double for the post-repair interface.
+
+    `persisted` is server truth. `submit_result` decides what the transport
+    reports; UNCONFIRMED deliberately does NOT add to `persisted`, modelling a
+    send whose acceptance is unknown.
+    """
+
+    def __init__(self, responses=(), submit_result=SubmitResult.CONFIRMED):
         self.responses = list(responses)
         self.submitted: list[tuple[str, str]] = []
-        self.already: set[str] = set()
-        self.open_calls = 0
+        self.persisted: set[str] = set()
+        self.attach_calls = 0
+        self.reconcile_calls: list[str] = []
         self.closed = False
-        self.open_errors: list[Exception] = []
+        self.attach_errors: list[Exception] = []
         self.submit_errors: list[Exception] = []
+        self.submit_result = submit_result
+        #: Mirrors BrowserChatGPT.send_attempted — False until Send is clicked.
+        #: The orchestrator reads it to decide whether a resend is provably safe.
+        self.send_attempted = False
 
-    def open(self):
-        self.open_calls += 1
-        if self.open_errors:
-            raise self.open_errors.pop(0)
+    def attach(self):
+        self.attach_calls += 1
+        if self.attach_errors:
+            raise self.attach_errors.pop(0)
 
-    def already_submitted(self, request_id):
-        return request_id in self.already
+    def has_request(self, request_id):
+        return request_id in self.persisted
+
+    def reconcile(self, request_id):
+        self.reconcile_calls.append(request_id)
+        return request_id in self.persisted
 
     def submit(self, request_id, prompt):
         if self.submit_errors:
-            raise self.submit_errors.pop(0)
+            raise self.submit_errors.pop(0)  # fails BEFORE clicking Send
+        self.send_attempted = True
         self.submitted.append((request_id, prompt))
-        self.already.add(request_id)
+        result = self.submit_result
+        if result is SubmitResult.CONFIRMED:
+            self.persisted.add(request_id)
+        return result
 
     def await_response(self, request_id):
         if not self.responses:
@@ -718,7 +741,7 @@ def test_browser_failure_budget_leads_to_failed(tmp_path):
 
 def test_login_expiry_parks_with_resume_phase(tmp_path):
     client = FakeClient()
-    client.open_errors = [LoginExpiredError("ChatGPT session is logged out")]
+    client.attach_errors = [LoginExpiredError("ChatGPT session is logged out")]
     orch, _, _, _, _, _, _ = build(tmp_path, clients=[client])
     assert orch.run() == Phase.NEEDS_USER.value
     assert orch.state.resume_phase == Phase.SUBMITTING.value
@@ -735,7 +758,7 @@ def test_recovery_never_resubmits_a_submitted_request(tmp_path):
         request_id="alr-crash-0001", payload="payload", prompt="THE PROMPT", submitted=False
     )
     client = FakeClient(responses=[stop_block()])
-    client.already.add("alr-crash-0001")
+    client.persisted.add("alr-crash-0001")
     orch, _, _, _, _, _, _ = build(tmp_path, clients=[client], state=state)
     assert orch.run() == Phase.STOPPED.value
     assert client.submitted == []
@@ -795,3 +818,226 @@ def test_state_persists_across_reload(tmp_path):
     assert reloaded.iteration == 1
     assert reloaded.last_decision == "audit"
     assert reloaded.last_manifest_id == orch.state.last_manifest_id
+
+
+# ---- submission confirmation & ambiguity (Phase 3.1 transport repair) -------
+
+
+def test_submitting_reconciles_before_sending(tmp_path):
+    """Persisted history — not the live DOM — decides whether to send."""
+    orch, _, _, _, clients, _, _ = build(tmp_path, responses=[stop_block()])
+    orch.run()
+    client = clients[0]
+    # exactly one reconciliation before the single send
+    assert client.reconcile_calls == [client.submitted[0][0]]
+    assert len(client.submitted) == 1
+
+
+def test_awaiting_never_reconciles(tmp_path):
+    """A reload during awaiting would destroy a streaming answer."""
+    orch, _, _, _, clients, _, _ = build(tmp_path, responses=[stop_block()])
+    orch.run()
+    # one reconcile total (from submitting), none from awaiting
+    assert len(clients[0].reconcile_calls) == 1
+
+
+def test_unconfirmed_submission_parks_and_never_resends(tmp_path):
+    client = FakeClient(submit_result=SubmitResult.UNCONFIRMED)
+    orch, store, _, _, _, _, _ = build(tmp_path, clients=[client])
+    assert orch.run() == Phase.NEEDS_USER.value
+    # one send attempt only — the ambiguity must not trigger another
+    assert len(client.submitted) == 1
+    assert orch.state.resume_phase == Phase.SUBMISSION_UNCONFIRMED.value
+    assert "AMBIGUOUS" in orch.state.question
+    assert "will not resend on its own" in orch.state.question
+    req = orch.state.pending_request
+    assert req.send_attempted is True
+    assert req.submitted is False
+    # the request id and prompt survive for the operator / a later resubmit
+    reloaded = store.load()
+    assert reloaded.pending_request.request_id == req.request_id
+    assert reloaded.pending_request.prompt == req.prompt
+
+
+def test_unconfirmed_then_late_persistence_resolves_to_awaiting(tmp_path):
+    """The backend accepted it after all: reconciliation finds it and the loop
+    continues without resending."""
+    client = FakeClient(responses=[stop_block()], submit_result=SubmitResult.UNCONFIRMED)
+    orch, _, _, _, _, _, _ = build(tmp_path, clients=[client])
+    orch.run(max_steps=2)  # ready -> submitting (unconfirmed)
+    assert orch.state.phase == Phase.SUBMISSION_UNCONFIRMED.value
+    # message shows up in persisted history before the reconciliation step
+    client.persisted.add(orch.state.pending_request.request_id)
+    assert orch.run() == Phase.STOPPED.value
+    assert len(client.submitted) == 1  # never sent twice
+
+
+def test_resumed_submission_unconfirmed_reconciles_before_acting(tmp_path):
+    """Crash recovery straight into the ambiguous phase: reconcile first."""
+    state = LoopState.new(URL)
+    state.iteration = 1
+    state.phase = Phase.SUBMISSION_UNCONFIRMED.value
+    state.pending_request = PendingRequest(
+        request_id="alr-crash-0001",
+        payload="p",
+        prompt="THE PROMPT",
+        send_attempted=True,
+    )
+    client = FakeClient(responses=[stop_block()])
+    client.persisted.add("alr-crash-0001")  # it did land
+    orch, _, _, _, _, _, _ = build(tmp_path, clients=[client], state=state)
+    assert orch.run() == Phase.STOPPED.value
+    assert client.reconcile_calls == ["alr-crash-0001"]
+    assert client.submitted == []  # reconciliation replaced the resend
+
+
+def test_attempted_send_is_never_auto_resent_after_reentering_submitting(tmp_path):
+    """Even if the machine re-enters `submitting`, a prior send attempt blocks
+    an automatic resend — only an operator `--resubmit` may clear it."""
+    state = LoopState.new(URL)
+    state.iteration = 1
+    state.phase = Phase.SUBMITTING.value
+    state.pending_request = PendingRequest(
+        request_id="alr-crash-0002",
+        payload="p",
+        prompt="THE PROMPT",
+        send_attempted=True,
+    )
+    client = FakeClient()  # not persisted -> reconcile fails
+    orch, _, _, _, _, _, _ = build(tmp_path, clients=[client], state=state)
+    assert orch.run() == Phase.NEEDS_USER.value
+    assert client.submitted == []
+    assert client.reconcile_calls == ["alr-crash-0002"]
+    assert "AMBIGUOUS" in orch.state.question
+
+
+# ---- exactly-once: the durable send marker ---------------------------------
+
+
+def test_send_marker_is_persisted_before_the_click(tmp_path):
+    """A crash between clicking Send and observing acceptance must not lose the
+    fact that a send happened — otherwise recovery double-posts."""
+    seen = {}
+
+    class RecordingClient(FakeClient):
+        def __init__(self, store, **kw):
+            super().__init__(**kw)
+            self._store = store
+
+        def submit(self, request_id, prompt):
+            # What is ALREADY on disk at the moment the transport takes over?
+            seen["persisted_before_submit"] = (
+                self._store.load().pending_request.send_attempted
+            )
+            return super().submit(request_id, prompt)
+
+    config_store = StateStore(tmp_path / ".al" / "state.json")
+    client = RecordingClient(config_store, responses=[stop_block()])
+    orch, _, _, _, _, _, _ = build(tmp_path, clients=[client])
+    orch.run()
+    assert seen["persisted_before_submit"] is True
+
+
+def test_login_expiry_after_the_click_never_resends(tmp_path):
+    """The live-realistic hole: submit() raises AFTER Send was clicked. The
+    message may have been accepted, so recovery must reconcile, not resend."""
+
+    class ClickThenExplode(FakeClient):
+        def submit(self, request_id, prompt):
+            self.submitted.append((request_id, prompt))
+            self.send_attempted = True  # Send WAS clicked...
+            raise LoginExpiredError("logged out right after clicking send")
+
+    first = ClickThenExplode()
+    orch, store, _, _, _, _, _ = build(tmp_path, clients=[first])
+    assert orch.run() == Phase.NEEDS_USER.value
+    saved = store.load()
+    assert saved.pending_request.send_attempted is True  # durably remembered
+    assert saved.resume_phase == Phase.SUBMITTING.value
+
+    # Operator logs back in and retries. The message did NOT persist, so the
+    # loop must PARK, not post a second copy.
+    saved.phase = saved.resume_phase
+    saved.resume_phase = None
+    store.save(saved)
+    second = FakeClient()  # reconcile finds nothing
+    orch2, _, _, _, _, _, _ = build(tmp_path, clients=[second], state=saved)
+    assert orch2.run() == Phase.NEEDS_USER.value
+    assert second.submitted == []  # <- the duplicate that must never happen
+    assert second.reconcile_calls == [saved.pending_request.request_id]
+    assert "AMBIGUOUS" in orch2.state.question
+
+
+def test_provable_no_send_clears_the_marker_so_retry_may_submit(tmp_path):
+    """If the composer/Send never accepted the input, nothing was sent — that
+    is unambiguous, so a retry must be allowed to submit normally."""
+
+    class NeverSent(FakeClient):
+        def submit(self, request_id, prompt):
+            # send_attempted stays False: the click provably never happened.
+            raise SubmissionError("Send control never became enabled")
+
+    first = NeverSent()
+    orch, store, _, _, _, _, _ = build(
+        tmp_path, clients=[first], policy=PolicyConfig(max_consecutive_failures=0)
+    )
+    assert orch.run() == Phase.FAILED.value
+    saved = store.load()
+    assert saved.pending_request.send_attempted is False  # marker cleared
+
+    saved.phase = saved.resume_phase
+    saved.resume_phase = None
+    store.save(saved)
+    second = FakeClient(responses=[stop_block()])
+    orch2, _, _, _, _, _, _ = build(tmp_path, clients=[second], state=saved)
+    assert orch2.run() == Phase.STOPPED.value
+    assert len(second.submitted) == 1  # allowed to send, exactly once
+
+
+def test_exactly_once_across_restart_when_the_message_did_land(tmp_path):
+    """Same crash, but the message DID persist: recovery adopts it and awaits —
+    still exactly one submission in the conversation."""
+
+    class ClickThenExplode(FakeClient):
+        def submit(self, request_id, prompt):
+            self.submitted.append((request_id, prompt))
+            self.send_attempted = True
+            raise SessionLostError("browser died after clicking send")
+
+    first = ClickThenExplode()
+    orch, store, _, _, _, _, _ = build(
+        tmp_path, clients=[first], policy=PolicyConfig(max_consecutive_failures=0)
+    )
+    assert orch.run() == Phase.FAILED.value
+    saved = store.load()
+    request_id = saved.pending_request.request_id
+    saved.phase = saved.resume_phase
+    saved.resume_phase = None
+    store.save(saved)
+
+    # Fresh process, fresh client: the request is in persisted history.
+    second = FakeClient(responses=[stop_block()])
+    second.persisted.add(request_id)
+    orch2, _, _, _, _, _, _ = build(tmp_path, clients=[second], state=saved)
+    assert orch2.run() == Phase.STOPPED.value
+    assert second.submitted == []  # adopted, never re-sent
+    assert second.reconcile_calls == [request_id]
+
+
+def test_await_timeout_exits_with_recoverable_state(tmp_path):
+    """A response timeout must fail cleanly and leave a resumable phase."""
+
+    class TimesOut(FakeClient):
+        def await_response(self, request_id):
+            raise ResponseTimeoutError("no assistant response began within 90.0s")
+
+    orch, store, _, _, _, _, _ = build(
+        tmp_path,
+        clients=[TimesOut(), TimesOut()],
+        policy=PolicyConfig(max_consecutive_failures=1),
+    )
+    assert orch.run() == Phase.FAILED.value
+    saved = store.load()
+    assert saved.resume_phase == Phase.AWAITING.value  # recoverable via --retry
+    assert "no assistant response" in saved.stop_reason
+    assert saved.pending_request is not None  # request id + prompt preserved

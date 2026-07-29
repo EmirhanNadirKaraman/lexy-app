@@ -110,6 +110,95 @@ time, policy authorization, and now the manifest gate + exact staging.
 
 ---
 
+## 5b. Browser transport: submission confirmation, reconciliation, input
+
+This section exists because of a concrete production failure (2026-07-29): a
+prompt was typed, Send was clicked, ChatGPT drew the user bubble
+**optimistically**, the client accepted that bubble as proof of submission, and
+the message was never persisted. A reload then erased the evidence and the loop
+waited 15 minutes for an answer that could not exist.
+
+**Optimistic rendering is not submission.** A user bubble in the current,
+unreloaded DOM proves only that the browser drew something. Submission counts as
+`CONFIRMED` only on evidence that the *server* accepted the turn:
+
+* an assistant response for **our** turn has begun (a node after our request, or
+  generation is running), or
+* an explicit `reconcile()` — a controlled reload — finds our request id in
+  persisted conversation history.
+
+Composer clearing and Send-button state are explicitly **not** evidence.
+
+**The "a send may have happened" fact is durable, and pessimistic.** The
+orchestrator persists `pending_request.send_attempted = True` *before* handing
+the prompt to the transport, and clears it only when the transport can prove the
+click never happened (`BrowserChatGPT.send_attempted` is False — composer or Send
+never accepted the input). Recording it after the fact would lose it whenever
+`submit()` raised *after* clicking Send — login expiry during confirmation, a
+dying page, or SIGKILL — and the next run would post a duplicate. With the
+marker durable, recovery always reconciles first and parks rather than reposting.
+
+**Ambiguity is never a retry.** Anything weaker yields `UNCONFIRMED`, and the
+loop parks in `submission_unconfirmed`. The backend may have accepted a message
+the browser failed to observe, so an automatic resend could double-post. The
+only resolutions are: reconciliation finds it (→ awaiting), `run --retry`
+(reconcile again), or `run --resubmit` — an explicit operator decision that
+authorizes exactly one more send **of the same request id**, so a message that
+did land is detected and not duplicated. A prior send attempt also blocks an
+automatic resend if the machine re-enters `submitting`.
+
+**Navigation is explicit.** `attach()` navigates only when there is no page on
+the conversation (URL compared without query/fragment/trailing slash);
+`reconcile()` is the only reload; `awaiting` never navigates, so a streaming
+answer is never interrupted. If the page drifts off the conversation mid-await,
+that is an error the orchestrator recovers from by re-attaching — not a silent
+renavigation.
+
+**Composer input is browser-realistic.** `fill()` is gone: setting a
+contenteditable's text does not drive the events ChatGPT's ProseMirror editor
+listens for, which is how a full-looking DOM sent nothing. The client now
+focuses the composer with a real click, clears it with `ControlOrMeta+A` +
+`Delete`, inserts the prompt with `keyboard.insert_text` (emits
+beforeinput/input via CDP, one round-trip for a multi-thousand-character prompt,
+and no key events so it cannot trigger an accidental send), **verifies the
+editor holds the whole request** (request id + prompt tail), and waits for the
+Send control to be genuinely enabled before clicking. If the editor never
+enables Send, the run fails *before* sending — an unambiguous outcome that is
+safe to retry.
+
+**Every wait is bounded separately** (`[browser]` in the config): composer
+readiness, input synchronisation, Send readiness, submission confirmation,
+response start, response completion, reconciliation. On timeout a structured
+`meta.json` lands in `.autoloop/diagnostics/<stamp>-<tag>/` with the request id,
+stage, configured vs actual URL, composer state, matching user-message count,
+whether an assistant turn started, whether a send was attempted, whether
+reconciliation ran, and whether retry is prohibited. Diagnostics carry **no
+cookies, tokens or storage** — the session protocol cannot read them.
+
+**Replies are read from a rendered page, and the envelope is strict.** ChatGPT
+renders a fenced code block as a widget whose text is the language label
+followed by the code — the backticks never appear in `innerText`. Exactly two
+representations are accepted, and both must contain exactly one directive:
+
+* **canonical fenced** — one ```json block (raw markdown / other providers);
+  prose outside it is fine because the fence delimits the directive. Two blocks
+  are rejected (`multiple_json_blocks`).
+* **rendered / plain** — the whole reply is the JSON value, optionally preceded
+  by one language-label line. Nothing else may surround it.
+
+**Position is never used to disambiguate.** A second object, another decision,
+or trailing text is rejected (`trailing_content`), not silently resolved by
+first- or last-wins. A directive can authorize a commit or a push, so "guess
+which one they meant" is not an acceptable rule; the loop re-prompts instead.
+Parsing failure is always a safe stop — it can never authorize execution.
+
+**Response matching is scoped to the turn**: the reply must be the last message,
+authored by the assistant, positioned *after* the user message carrying the
+current request id. An earlier assistant message (e.g. the conversation's
+opening `Understood.`) can never satisfy a later request.
+
+---
+
 ## 6. Preflight: `doctor` and the live smoke test
 
 ```bash
@@ -128,8 +217,14 @@ resolving. Exit 0/1.
 parser, transcript, diagnostics-on-failure) against an **isolated** smoke
 state (`.autoloop/smoke/`), sending one prompt that identifies itself as a
 smoke test and demands a contract-v3 `stop`. PASS = the loop terminal state is
-`stopped`. It can never invoke an executor (a guard executor raises if
-dispatch were ever reached) and never touches the main session state.
+`stopped`. It is **exactly one round-trip**: `max_iterations=1`,
+`max_parse_retries=0`, `max_policy_denials=0`, `max_consecutive_failures=1`, so a
+malformed reply is a FAILURE rather than a corrective re-prompt in a reserved
+channel. It can never invoke an executor (a guard executor raises if
+dispatch were ever reached) and never touches the main session state. Its waits
+are tightened (reply bounds in minutes, one browser failure ends it) so a broken
+channel fails fast instead of grinding through retries, and any previously
+parked smoke session is archived rather than resumed.
 
 Manual prerequisites for both live commands: the dedicated Chrome profile
 running with `--remote-debugging-port=9222`, logged into chatgpt.com, and
@@ -216,8 +311,8 @@ python -m autoloop run --kickoff-audit
 for review, and the loop continues until `stop`/`ask_user`/budget.
 
 Ongoing control: `status`, `tasks`, `pause`/`resume`, `run --answer "..."`,
-`run --retry`, `reset --yes`, `unlock`. `run --null-executor` dry-runs the
-loop without executing anything.
+`run --retry`, `run --resubmit` (§5b), `reset --yes`, `unlock`.
+`run --null-executor` dry-runs the loop without executing anything.
 
 ## 10. Recovery procedures
 
@@ -228,6 +323,8 @@ loop without executing anything.
 | Logged out mid-run (`needs_user`) | Log the profile back in, `run --retry`. |
 | Browser dead / CDP unreachable | Relaunch the profile (§8), `run --retry` (or just `run` if not parked). |
 | Repeated malformed replies / denials | Loop parks with the reason; talk to the conversation manually if needed, then `run --answer "..."`. |
+| **Ambiguous submission** (`needs_user`, "submission … is AMBIGUOUS") | Open the conversation and look. If the request is there, `run --retry` (reconciles and continues). If it is genuinely absent, `run --resubmit` authorizes exactly one more send of the same id. Autoloop will not decide this for you — see §5b. |
+| `send-not-ready` / `composer-not-synchronised` diagnostics | The editor never accepted the input, so **nothing was sent**: safe to `run --retry`. If it repeats, the composer selectors or the input method need attention (`browser/selectors.py`, `browser/chatgpt.py::_enter_prompt`). |
 | Crash mid-audit | `run` — the audit directive re-dispatches (a fresh agent fan-out; prior run's raw reports remain under `.autoloop/audit/`). |
 | Crash mid-commit | `run` — commit is idempotent (clean approved paths + matching HEAD message → recognized as done). |
 
@@ -246,5 +343,19 @@ loop without executing anything.
   smoke-browser has actually passed on your machine.
 * One loop per state dir (enforced); multiple state dirs are possible but
   share nothing.
+* An ambiguous submission needs a human to look at the conversation. That is
+  deliberate — the alternative is a possible duplicate post — but it does mean
+  the loop is not fully unattended in that one case.
+* `submitting` costs one reload per request (the pre-send reconciliation). That
+  is the price of never trusting an optimistic bubble.
+* **ChatGPT virtualizes the message DOM.** Measured live 2026-07-30: a
+  10-message conversation mounted only the 6 most recent nodes (3 turns);
+  older turns exist server-side but are not in `innerText` until you scroll.
+  Everything the loop needs is in the newest turn, so this is currently
+  harmless — `reconcile` checks the request that was just sent, and
+  `await_response` needs the last message. But it means **a DOM read is not a
+  full history read**: never infer "the conversation contains only X" from a
+  message count, and if a future change needs older turns it must scroll them
+  in rather than assume they are present.
 * Selector defaults will drift with ChatGPT's UI eventually
   (`browser/selectors.py` is the fix point).

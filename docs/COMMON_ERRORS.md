@@ -396,6 +396,54 @@ it's open" is not evidence.
 
 ---
 
+## 6. Autoloop browser transport
+
+Both entries below are from the same day of live bring-up (2026-07-29/30) and
+share one lesson: **a browser is not an API. What the DOM shows is not what the
+server did, and what the model wrote is not what `innerText` returns.**
+
+### Loop hangs in `awaiting` forever; the conversation shows no new message
+**Symptom:** `python -m autoloop smoke-browser` recorded `request_submitted`,
+then sat in phase `awaiting` for 15 minutes. The conversation contained only its
+baseline messages and **no user message carried the request id**.
+**Cause:** ChatGPT renders your message bubble *optimistically*, before the
+server accepts it. `submit()` polled the current, unreloaded DOM, saw that
+bubble, and reported success. The send had failed (`fill()` on the ProseMirror
+contenteditable never drove the editor's own state), and the next phase's
+unconditional `goto()` reloaded the page and erased the evidence.
+**Fix:** applied in `autoloop/browser/chatgpt.py`. Submission is CONFIRMED only
+when an assistant turn for that request begins, or a controlled `reconcile()`
+reload finds the request id in persisted history. Ambiguity → `UNCONFIRMED` →
+phase `submission_unconfirmed`, which never auto-resends (the backend may have
+accepted a message the browser missed). Input is now focus + `ControlOrMeta+A` +
+`Delete` + `keyboard.insert_text` + content verification + wait-for-Send-enabled.
+`fill()` was removed from the session protocol so it cannot come back.
+**Do not** treat an optimistic bubble, a cleared composer, or Send-button state
+as proof a message was sent.
+
+### `no_json_block: no fenced ```json block found in response` — but the reply IS a fenced block
+**Symptom:** three consecutive smoke replies rejected as malformed. The
+transcript's captured text was
+`'JSON\n{"version":3,"decision":"stop","reason":"smoke test acknowledged"}'`.
+**Cause:** the loop reads replies from a **rendered** page. ChatGPT renders a
+fenced code block as a widget whose `innerText` is the language label on its own
+line followed by the code — **the backticks do not exist in the DOM**. The
+fence regex could never match, and the bare-object fallback failed because the
+text starts with `JSON\n`. ChatGPT had complied perfectly every time.
+**Fix:** `autoloop/contract.py` accepts exactly two envelopes — one fenced
+```json block, or the whole reply as one JSON value preceded by an optional
+language-label line. A second object, another decision, or trailing text is
+rejected (`trailing_content`); **position is never used to pick between
+candidates**, because a directive can authorize a commit or push. (The first fix
+attempt did use a last-object-wins brace scanner; that was replaced before any
+live use — a positional rule is a silent-mis-selection risk, not a convenience.)
+Regression tests use the byte-exact captured text.
+**Lesson:** when a parser consumes rendered HTML rather than raw model output,
+test it against bytes captured from the real page, not against what you believe
+the model sends.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found

@@ -21,8 +21,18 @@ from .policy import PolicyConfig
 class BrowserConfig:
     conversation_url: str
     cdp_url: str = "http://127.0.0.1:9222"
-    response_timeout_seconds: float = 900.0
+    #: Every wait below is bounded separately, so a stuck channel fails fast
+    #: with a specific diagnosis instead of hanging on one giant timeout.
+    composer_timeout_seconds: float = 30.0
+    input_sync_timeout_seconds: float = 30.0
+    send_ready_timeout_seconds: float = 30.0
+    #: How long to wait for evidence the server accepted a submitted turn.
     submit_timeout_seconds: float = 60.0
+    #: How long to wait for the assistant to START answering.
+    response_start_timeout_seconds: float = 120.0
+    #: How long to wait for a started answer to settle.
+    response_timeout_seconds: float = 900.0
+    reconcile_timeout_seconds: float = 30.0
     poll_interval_seconds: float = 2.0
     stability_seconds: float = 3.0
 

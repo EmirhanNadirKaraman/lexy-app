@@ -8,6 +8,7 @@ from autoloop.browser.chatgpt import BrowserChatGPT
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.conversation import (
     LLMConversation,
+    SubmitResult,
     available_providers,
     create_conversation,
     register_provider,
@@ -41,14 +42,17 @@ def test_register_custom_provider(tmp_path):
     created = {}
 
     class FakeConversation:
-        def open(self):
+        def attach(self):
             pass
 
-        def already_submitted(self, request_id):
+        def has_request(self, request_id):
+            return False
+
+        def reconcile(self, request_id):
             return False
 
         def submit(self, request_id, prompt):
-            pass
+            return SubmitResult.CONFIRMED
 
         def await_response(self, request_id):
             return ""
@@ -75,7 +79,14 @@ def test_register_custom_provider(tmp_path):
 def test_browser_chatgpt_satisfies_interface():
     # Structural check without instantiating a browser: every protocol method
     # exists and is callable on the class.
-    for method in ("open", "already_submitted", "submit", "await_response", "close"):
+    for method in (
+        "attach",
+        "has_request",
+        "reconcile",
+        "submit",
+        "await_response",
+        "close",
+    ):
         assert callable(getattr(BrowserChatGPT, method)), method
 
 

@@ -142,6 +142,9 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
         state.policy_denials = 0
         state.phase = Phase.READY.value
         store.save(state)
+    elif args.resubmit:
+        _authorize_resubmit(state)
+        store.save(state)
     elif args.retry:
         if state.resume_phase is None:
             raise StateError(
@@ -163,6 +166,27 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
     print(_summary(config, orchestrator.state, registry))
     print(f"\nLoop ended: {outcome}")
     return 2 if outcome in (Phase.NEEDS_USER.value, Phase.FAILED.value) else 0
+
+
+def _authorize_resubmit(state: LoopState) -> None:
+    """Operator override for an ambiguous submission — the ONLY way a send is
+    repeated. Reuses the same request id on purpose: if the earlier attempt did
+    land, reconciliation detects it and nothing is duplicated."""
+    ambiguous = Phase(state.phase) is Phase.SUBMISSION_UNCONFIRMED or (
+        Phase(state.phase) is Phase.NEEDS_USER
+        and state.resume_phase == Phase.SUBMISSION_UNCONFIRMED.value
+    )
+    if not ambiguous or state.pending_request is None:
+        raise StateError(
+            "--resubmit is only valid on an ambiguous submission "
+            "(phase=submission_unconfirmed, or parked with it as the resumable "
+            "phase). Use --retry for ordinary recoverable failures."
+        )
+    state.pending_request.send_attempted = False
+    state.phase = Phase.SUBMITTING.value
+    state.resume_phase = None
+    state.question = None
+    state.consecutive_failures = 0
 
 
 def _summary(config: AutoloopConfig, state: LoopState, registry: TaskRegistry) -> str:
@@ -253,17 +277,42 @@ def _cmd_smoke_browser(args: argparse.Namespace) -> int:
         state = LoopState.new(config.browser.conversation_url)
         state.outbox = TEMPLATES["smoke_test"].render()
         store.save(state)
-        smoke_policy = dataclasses.replace(config.policy, max_iterations=3)
+        # A smoke test must fail fast and must not grind through retries: one
+        # browser failure ends it, and the reply bounds are minutes, not the
+        # 15-minute audit-grade ceiling.
+        # A smoke test is exactly ONE round-trip: one message, one reply. No
+        # corrective re-prompts (parse retries), no second iteration, one
+        # browser failure ends it. A malformed reply is a smoke FAILURE, not
+        # something to negotiate over several messages in a reserved channel.
+        smoke_policy = dataclasses.replace(
+            config.policy,
+            max_iterations=1,
+            max_consecutive_failures=1,
+            max_parse_retries=0,
+            max_policy_denials=0,
+        )
+        smoke_config = dataclasses.replace(
+            config,
+            browser=dataclasses.replace(
+                config.browser,
+                response_start_timeout_seconds=min(
+                    config.browser.response_start_timeout_seconds, 90.0
+                ),
+                response_timeout_seconds=min(config.browser.response_timeout_seconds, 120.0),
+            ),
+        )
         policy = PolicyEngine(smoke_policy)
         orchestrator = Orchestrator(
-            config=config,
+            config=smoke_config,
             store=store,
             state=state,
             policy=policy,
             git=GitGateway(Path.cwd(), policy),
             executor=_SmokeNeverExecutor(),
             transcript=TranscriptLogger(config.transcript_file),
-            client_factory=lambda: create_conversation(config.conversation.provider, config),
+            client_factory=lambda: create_conversation(
+                smoke_config.conversation.provider, smoke_config
+            ),
             registry=TaskRegistry(),
             task_store=TaskStore(config.smoke_dir / "tasks.json"),
             manifest_store=ManifestStore(config.smoke_dir / "manifests"),
@@ -311,6 +360,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     args.kickoff_audit = False
     args.answer = None
     args.retry = False
+    args.resubmit = False
     args.max_steps = None
     args.null_executor = False
     return _cmd_run(args)
@@ -352,6 +402,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--answer", help="answer to a pending ask_user question")
     run.add_argument("--retry", action="store_true", help="retry after a recoverable failure")
+    run.add_argument(
+        "--resubmit",
+        action="store_true",
+        help="authorize ONE more send of an ambiguous submission (same request id)",
+    )
     run.add_argument("--max-steps", type=int, default=None, help="stop after N phase steps")
     run.add_argument(
         "--null-executor",

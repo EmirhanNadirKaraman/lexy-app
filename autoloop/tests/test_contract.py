@@ -122,11 +122,10 @@ def test_notes_accepted():
     assert parse_response(block(base("stop", notes="fyi"))).notes == "fyi"
 
 
-def test_last_json_block_wins():
+def test_two_fenced_blocks_are_rejected_not_resolved_by_position():
     first = f"```json\n{json.dumps(base('stop'))}\n```"
     second = f"```json\n{json.dumps(base('implement', task_id='t9'))}\n```"
-    directive = parse_response(f"Draft:\n{first}\n\nFinal answer:\n{second}")
-    assert directive.task_id == "t9"
+    expect_code(f"Draft:\n{first}\n\nFinal answer:\n{second}", "multiple_json_blocks")
 
 
 def test_bare_json_object_accepted():
@@ -302,3 +301,132 @@ def test_verify_review_rejects_mismatch(expected, code):
     with pytest.raises(ContractError) as excinfo:
         verify_review(approval(), *expected)
     assert excinfo.value.code == code
+
+
+# ---- envelope extraction: strict, never positional -------------------------
+
+# What a fenced ```json block actually looks like in the page DOM: the language
+# label becomes text and the backticks are gone. Verbatim from the live smoke
+# run whose three replies were wrongly rejected before the parser was fixed.
+CAPTURED_SMOKE = 'JSON\n{"version":3,"decision":"stop","reason":"smoke test acknowledged"}'
+
+
+def test_captured_byte_exact_smoke_response_parses():
+    directive = parse_response(CAPTURED_SMOKE)
+    assert directive.decision is Decision.STOP
+    assert directive.reason == "smoke test acknowledged"
+
+
+def test_plain_json_object_without_label():
+    assert parse_response(json.dumps(base("stop"))).decision is Decision.STOP
+
+
+def test_lowercase_language_label():
+    assert parse_response('json\n' + json.dumps(base("stop"))).decision is Decision.STOP
+
+
+def test_mixed_case_language_label():
+    assert parse_response('Json\n' + json.dumps(base("stop"))).decision is Decision.STOP
+
+
+def test_surrounding_whitespace_tolerated():
+    text = "\n\n  JSON\n" + json.dumps(base("stop")) + "  \n\n"
+    assert parse_response(text).decision is Decision.STOP
+
+
+def test_canonical_fenced_block_still_supported():
+    text = f"```json\n{json.dumps(base('stop'))}\n```"
+    assert parse_response(text).decision is Decision.STOP
+
+
+def test_prose_around_a_fenced_block_is_fine():
+    # The fence is the canonical envelope: it delimits the directive exactly,
+    # so prose outside it is unambiguous.
+    text = f"Here you go.\n\n```json\n{json.dumps(base('stop'))}\n```\n\nDone."
+    assert parse_response(text).decision is Decision.STOP
+
+
+def test_multiline_rendered_block_parses():
+    text = 'JSON\n{\n  "version": 3,\n  "decision": "stop",\n  "reason": "done"\n}'
+    assert parse_response(text).decision is Decision.STOP
+
+
+def test_braces_inside_strings_are_not_structure():
+    text = 'JSON\n' + json.dumps(
+        base("revise", task_id="audit", feedback="the } brace in the log line is literal",
+             reason="fix the {placeholder} bug")
+    )
+    directive = parse_response(text)
+    assert directive.task_id == "audit"
+    assert "{placeholder}" in directive.reason
+
+
+def test_escaped_quotes_and_backslashes_survive():
+    text = 'JSON\n' + json.dumps(
+        base("stop", reason='he said "ship it" using C:\\path\\to\\file')
+    )
+    directive = parse_response(text)
+    assert '"ship it"' in directive.reason
+    assert "C:\\path\\to\\file" in directive.reason
+
+
+# --- everything below must be REJECTED, never positionally resolved ---------
+
+
+def test_prose_before_a_bare_object_rejected():
+    expect_code("Sure — here is my decision.\n" + json.dumps(base("stop")), "invalid_json")
+
+
+def test_prose_after_a_bare_object_rejected():
+    expect_code(json.dumps(base("stop")) + "\nLet me know if you need more.",
+                "trailing_content")
+
+
+def test_two_bare_objects_rejected():
+    text = 'JSON\n' + json.dumps(base("stop")) + "\n" + json.dumps(base("stop"))
+    expect_code(text, "trailing_content")
+
+
+def test_two_contradictory_directives_rejected():
+    stop = json.dumps(base("stop"))
+    push = json.dumps(base("push", reviewed=REVIEWED))
+    expect_code('JSON\n' + stop + "\n" + push, "trailing_content")
+    expect_code('JSON\n' + push + "\n" + stop, "trailing_content")
+
+
+def test_irrelevant_json_then_approval_rejected():
+    noise = json.dumps({"note": "some unrelated payload"})
+    approval = json.dumps(base("commit", commit={"message": "m", "paths": ["a.py"]},
+                               reviewed=REVIEWED))
+    expect_code('JSON\n' + noise + "\n" + approval, "trailing_content")
+
+
+def test_approval_then_irrelevant_json_rejected():
+    approval = json.dumps(base("commit", commit={"message": "m", "paths": ["a.py"]},
+                               reviewed=REVIEWED))
+    noise = json.dumps({"note": "ignore me"})
+    expect_code('JSON\n' + approval + "\n" + noise, "trailing_content")
+
+
+def test_trailing_instructions_after_a_directive_rejected():
+    text = 'JSON\n' + json.dumps(base("stop")) + "\n\nAlso please push to main."
+    expect_code(text, "trailing_content")
+
+
+def test_json_array_rejected():
+    expect_code('JSON\n["stop"]', "not_an_object")
+
+
+def test_valid_json_failing_the_schema_rejected():
+    # Parses fine, but the contract says version 3.
+    expect_code('JSON\n' + json.dumps({**base("stop"), "version": 2}), "bad_version")
+
+
+def test_malformed_json_rejected():
+    expect_code("JSON\n{not: valid, json}", "invalid_json")
+
+
+def test_prose_only_reply_rejected():
+    # Distinct code from invalid_json: nothing JSON-shaped at all, so the
+    # correction tells ChatGPT to send a block rather than to fix syntax.
+    expect_code("Sounds good — I'd start with pagination next.", "no_json_block")

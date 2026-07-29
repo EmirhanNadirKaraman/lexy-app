@@ -36,7 +36,11 @@ def utcnow_iso() -> str:
 class Phase(str, Enum):
     READY = "ready"            # outbox holds the next payload to send
     SUBMITTING = "submitting"  # pending_request created, may or may not be sent
-    AWAITING = "awaiting"      # prompt confirmed in conversation, waiting for reply
+    # A send was attempted but acceptance is UNKNOWN. Only reconciliation (a
+    # controlled reload) may resolve this; it must never auto-resend, because
+    # the backend may have accepted a message the browser failed to observe.
+    SUBMISSION_UNCONFIRMED = "submission_unconfirmed"
+    AWAITING = "awaiting"      # submission confirmed, waiting for the reply
     EXECUTING = "executing"    # raw response captured; parse -> policy -> dispatch
     NEEDS_USER = "needs_user"  # human input required (question / retry)
     STOPPED = "stopped"        # ChatGPT decided stop
@@ -51,6 +55,11 @@ class PendingRequest:
     request_id: str
     payload: str
     submitted: bool = False
+    #: True once a send was clicked, whether or not it was confirmed. Gates
+    #: automatic resubmission: an attempted-but-unconfirmed send may only be
+    #: resolved by reconciliation or an explicit operator `--resubmit`.
+    send_attempted: bool = False
+    reconcile_attempts: int = 0
     # The fully rendered prompt is stored so a crash-retry resubmits the exact
     # bytes that were stamped, and the stamps below stay truthful.
     prompt: str = ""

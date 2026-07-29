@@ -8,6 +8,9 @@ with a dedicated, already-logged-in profile:
 It never launches a browser, never touches the login flow, and never sees
 credentials. `close()` only disconnects — the user's browser stays open.
 
+It also deliberately exposes no cookie/storage accessor, so no code path
+(diagnostics included) can capture authentication material.
+
 Playwright is imported lazily inside `connect`, so nothing else in autoloop
 (including the whole test suite) needs the package installed.
 """
@@ -65,17 +68,46 @@ class PlaywrightSession:
     def goto(self, url: str) -> None:
         self._call(lambda: self._page.goto(url, wait_until="domcontentloaded"))
 
+    def reload(self) -> None:
+        self._call(lambda: self._page.reload(wait_until="domcontentloaded"))
+
     def url(self) -> str:
         return self._call(lambda: self._page.url)
 
     def exists(self, selector: str) -> bool:
         return self._call(lambda: self._page.locator(selector).count() > 0)
 
+    def is_enabled(self, selector: str) -> bool:
+        def _probe():
+            loc = self._page.locator(selector)
+            return loc.count() > 0 and loc.first.is_enabled()
+
+        return self._call(_probe)
+
     def click(self, selector: str) -> None:
         self._call(lambda: self._page.locator(selector).first.click())
 
-    def fill(self, selector: str, text: str) -> None:
-        self._call(lambda: self._page.locator(selector).first.fill(text))
+    def focus(self, selector: str) -> None:
+        # A real click, not .focus(): ProseMirror sets up its selection state
+        # from the pointer interaction the way it does for a person.
+        self._call(lambda: self._page.locator(selector).first.click())
+
+    def press(self, keys: str) -> None:
+        self._call(lambda: self._page.keyboard.press(keys))
+
+    def insert_text(self, text: str) -> None:
+        # keyboard.insert_text emits beforeinput/input (CDP Input.insertText),
+        # which is what the editor listens for — and unlike type() it does not
+        # cost one round-trip per character on a multi-thousand-char prompt.
+        # It emits no key events, so it can never trigger an accidental send.
+        self._call(lambda: self._page.keyboard.insert_text(text))
+
+    def inner_text(self, selector: str) -> str:
+        def _read():
+            loc = self._page.locator(selector)
+            return loc.first.inner_text() if loc.count() > 0 else ""
+
+        return self._call(_read)
 
     def elements(self, selector: str, attr: str) -> list[tuple[str, str]]:
         def _read():

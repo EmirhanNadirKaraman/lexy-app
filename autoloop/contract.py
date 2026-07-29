@@ -75,6 +75,40 @@ _TASK_SPEC_KEYS = {"id", "title", "description", "depends_on"}
 
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
+#: A rendered fenced block loses its backticks in `innerText` and leaves the
+#: language label as a standalone first line ("JSON"). Exactly one such leading
+#: label line is stripped, case-insensitively — nothing else.
+_LANG_LABEL = re.compile(r"\A(?:json)[ \t]*\r?\n", re.IGNORECASE)
+
+
+def _extract_envelope(text: str) -> str:
+    """Return the single JSON envelope in `text`, or raise ContractError.
+
+    Two accepted representations, both requiring the reply to contain exactly
+    one directive:
+
+    * **Canonical fenced** — one ```json block (raw markdown, other providers).
+      Prose outside the fence is ignored because the fence delimits the
+      directive unambiguously. Two or more blocks are rejected.
+    * **Rendered / plain** — the whole reply is the JSON value, optionally
+      preceded by one language-label line (what the browser DOM yields).
+
+    Deliberately NOT supported: picking one object out of several by position.
+    A reply that mixes prose with a bare object, or carries a second object or
+    trailing instructions, is rejected — with a directive that can authorize a
+    commit or push, "guess which one they meant" is not an acceptable rule.
+    """
+    fenced = _JSON_BLOCK.findall(text)
+    if len(fenced) > 1:
+        raise ContractError(
+            "multiple_json_blocks",
+            f"{len(fenced)} fenced json blocks found — send exactly one directive; "
+            "position is never used to choose between them",
+        )
+    if fenced:
+        return fenced[0].strip()
+    return _LANG_LABEL.sub("", text.strip(), count=1).strip()
+
 
 @dataclass(frozen=True)
 class TaskSpec:
@@ -114,9 +148,12 @@ class Directive:
 
 CONTRACT_INSTRUCTIONS = """\
 RESPONSE FORMAT — mandatory.
-Reply with exactly one fenced JSON code block (```json ... ```). Prose outside
-the block is ignored; only the LAST json block is read. The block must be a
-single object with these keys and no others:
+Your ENTIRE reply must be exactly one fenced JSON code block (```json ... ```)
+and nothing else — no sentence before it, no sentence after it. Two blocks, a
+second JSON object, or any trailing text is REJECTED rather than guessed at:
+a directive can authorize a commit or a push, so which object you meant is
+never inferred from position. The block must be a single object with these keys
+and no others:
 
   version    (required) always 3
   decision   (required) one of: audit | plan | implement | revise | commit |
@@ -230,18 +267,31 @@ def parse_response(text: str) -> Directive:
     if not isinstance(text, str) or not text.strip():
         raise ContractError("empty_response", "response text is empty")
 
-    blocks = _JSON_BLOCK.findall(text)
-    if blocks:
-        candidate = blocks[-1]
-    elif text.strip().startswith("{"):
-        candidate = text.strip()
-    else:
-        raise ContractError("no_json_block", "no fenced ```json block found in response")
-
+    envelope = _extract_envelope(text)
     try:
-        data = json.loads(candidate)
+        data = json.loads(envelope)
     except json.JSONDecodeError as exc:
-        raise ContractError("invalid_json", f"json block does not parse: {exc}") from exc
+        if exc.msg.startswith("Extra data"):
+            raise ContractError(
+                "trailing_content",
+                "content follows the JSON directive (a second object, another "
+                "decision, or trailing text). The reply must be exactly one "
+                "directive and nothing else — trailing content is never ignored "
+                f"and never resolved by position: {exc}",
+            ) from exc
+        if "{" not in envelope:
+            # Nothing JSON-shaped at all (usually a conversational reply). Say
+            # so plainly rather than complaining about JSON syntax.
+            raise ContractError(
+                "no_json_block",
+                "no JSON directive found — reply with exactly one fenced ```json "
+                "block and nothing else",
+            ) from exc
+        raise ContractError(
+            "invalid_json",
+            "the reply is not exactly one JSON value — send only the fenced "
+            f"```json block, with no prose around it: {exc}",
+        ) from exc
     if not isinstance(data, dict):
         raise ContractError("not_an_object", "top-level JSON value must be an object")
 
