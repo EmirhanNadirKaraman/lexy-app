@@ -134,8 +134,10 @@ P-numbers.
 >
 > What remains from this line of work is tracked separately, not here:
 > **#43 phase 4** (copy-to-my-lists, admin management of system lists), the
-> **POS enrichment schema decision** deferred by step 1, and the **453
-> ambiguous/unresolved entries** the seeding deliberately kept.
+> **511 inert entries** the seeding deliberately kept (453 ambiguous + 58
+> unresolved — see **N5b**, which the 2026-07-29 investigation showed to be
+> case-variant catalog duplication), and, on its own separate track, the
+> **POS enrichment schema decision** deferred by step 1.
 
 - **Not blocked, and not CEFR guesswork.** The earlier "unsafe pending
   licensing" classification was wrong — the owner holds distribution licences.
@@ -259,28 +261,86 @@ dependency. The existing `mixed → passive only` test in
 need rewriting; a homograph regression test (`"I war there"` must not grant
 active credit) is the one that protects the asymmetry above.
 
-### N5b — Ambiguous built-in-list entries + the POS decision — **code, investigate first**
-*Added 2026-07-29, as the largest thing N5a left behind.* Not a new idea —
-both halves are consequences already recorded in `docs/TODO.md` #43.
+### N5b — Case-variant catalog duplication — **code, ready to implement**
+*Added 2026-07-29, as the largest thing N5a left behind. **Rewritten the same
+day** after a read-only investigation disproved its own premise — see the
+correction box below.*
 
-- **453 seeded entries carry `item_id = NULL`** — 227 ambiguous + 29
+> **Corrections (2026-07-29 investigation).** This item was first written as
+> "ambiguous built-in-list entries + the POS decision", and both halves of
+> that framing were wrong:
+> - **The count was wrong.** It said "453 seeded entries carry `item_id =
+>   NULL`". 453 is the **ambiguous** count alone. The true inert total is
+>   **511** = **453 ambiguous + 58 unresolved**.
+> - **The POS entanglement was an inference, and the data contradicts it.**
+>   It claimed resolving ambiguity and enriching POS "are plausibly the same
+>   decision". Measured: **every ambiguous pair has identical `pos`**, and
+>   9,309 of 9,313 German rows hold `pos = ''` (the other 4 are test
+>   residue). Filling POS would not resolve a single ambiguous entry.
+> - **It is not a sense-disambiguation problem at all**, so the "UI picker vs
+>   schema change" option set it asked for was answering the wrong question.
+
+- **511 built-in entries carry `item_id = NULL`** — 227 ambiguous + 29
   unresolved in *Top German Words*, 226 + 29 in *German Verb & Phrase
   Patterns*. An entry with no `item_id` cannot be marked learning, cannot
   enter SRS, and cannot be reviewed.
-- **The ambiguous ones are the top of the language** — `ein`, `zu`, `im`,
-  `auf`, `ich`. So the most-used words in a "top words" list are exactly the
-  inert ones.
-- **The cheap fix is the forbidden one.** First-matching binds mastery to a
-  coin-flip sense; that is the W3 / Hole 2 rule, and it is why the seeder
-  keeps these rows rather than guessing. Any fix has to *disambiguate*.
-- **Entangled with POS.** N5a step 1 dropped POS enrichment because `pos` is
-  part of `word_table`'s `UNIQUE (word, language, pos)` and every existing row
-  has `pos = ''` — writing a real POS forks rows instead of enriching them,
-  which would turn currently-resolvable words ambiguous. Resolving ambiguity
-  by sense and enriching POS are plausibly the same decision.
-- **Investigate before implementing.** The output wanted is the option set and
-  its cost (a disambiguation picker in the UI? a POS-aware schema change? both?),
-  not a patch.
+- **The 453 ambiguous ones are 100% case-variant duplication.** Catalog-wide,
+  **417** German normalized keys have more than one row; **every group has
+  exactly 2**, and every one differs only by case — `haben`/`Haben`,
+  `ein`/`Ein`, `aber`/`Aber`. The scraper stores surface forms verbatim, so a
+  sentence-initial token became a second row. Zero groups differ by POS, zero
+  by phrase-vs-word, zero with three or more candidates.
+- **Both members are real.** In 399 of 400 sampled groups both rows are linked
+  in `word_to_sentence` (`aber` 76 sentences / `Aber` 63). These are not junk
+  rows to delete — `word_to_sentence` is `ON DELETE CASCADE`.
+- **Not all of them are the same word.** Catalog-wide the split is **269
+  same-lemma** (`haben`/`Haben`, safe to merge) and **148 different-lemma**,
+  which is a mixed bag: some are genuine German noun/verb pairs
+  (`leben`/`Leben`), others are lemmatizer noise on the capitalised token
+  (`alle`→`aller`). **Lemma difference is not a reliable proxy for meaning
+  difference**, so the 148 need review rather than a rule.
+- **This is not a list problem.** `resolve_word_ids('haben')` returns two ids,
+  so transcript lookup, learn-anyway, reading-selection resolution and
+  `/suggest` are all degraded by the same 417 pairs. Fixing the catalog fixes
+  every caller; fixing the list UI fixes one.
+- **It is cheapest right now.** Across the 834 duplicate rows: 15,013
+  `word_to_sentence`, 61 `word_usage_events`, 18 `srs_cards`, 10
+  `user_word_knowledge`, 0 `word_list_items` — and **zero groups where more
+  than one member already has user progress**. There is no progress to
+  reconcile today. That stops being true as people learn.
+- **The cheap fix is still the forbidden one.** First-matching binds mastery
+  to an arbitrary row; that is the W3 / Hole 2 rule and it does not change.
+  Merging two rows that are the *same word* is not first-matching — but the
+  148 different-lemma pairs must not be merged by rule.
+- **The 58 unresolved are a separate, smaller problem**: all are reflexive
+  `sich <verb>` headwords genuinely absent from both catalogs. Not a
+  normalization miss. `final_result.txt` column 0 lists bare reflexives while
+  the blueprint column seeds fully-specified valency frames
+  (`an jdn./etw. sich erinnern`), so the two shapes never meet. Only 21
+  `phrase_table` canonicals start with `sich `, one of them malformed
+  (`'sich (Akk) sich setzen'`).
+
+**Next step — a dry-run catalog dedupe audit. No `--apply`, no migration, no
+frontend.** `services/word_dedupe_service.py` + `scripts/dedupe_word_catalog.py`,
+following the dry-run pattern `backfill_word_catalog.py` and
+`seed_gloss_cache.py` already use. It classifies every duplicate group into
+`auto_mergeable` (case-only, same pos, same lemma), `needs_review` (case-only,
+differing lemma) and `unexpected` (anything else — empty today, and a hard
+error if it ever isn't), reports the blast radius per bucket, and writes
+nothing. The survivor rule (keep the higher `frequency`; tie → lowercase) is
+stated but not executed. Reviewing the 148 `needs_review` pairs is what
+decides whether an `--apply` phase is safe.
+
+**Also out of scope for that first step, and deliberately so:** the scraper
+insert path that creates the duplicates (without it a merge decays on the next
+run), and the reflexive gap above.
+
+**POS enrichment remains open — and is NOT on this critical path.** It is
+still a real question for its own reasons: `pos` is part of `word_table`'s
+`UNIQUE (word, language, pos)` and every row holds `pos = ''`, so writing a
+real POS forks rows instead of enriching them, which is why N5a step 1 seeds
+`pos = ''`. That is a catalog-modelling decision to make on its own merits;
+it neither causes nor fixes the ambiguity described above.
 
 ### N6 — Idle mini-game — **optional/fun**
 - Explicitly not core, blocks nothing, and has no design yet. Listed so it is not lost, not because it is queued.
@@ -1044,9 +1104,13 @@ a model server on the desktop and reach it over Tailscale. No code, no
 tests; the backend side already ships.
 
 **The best available *repo* work, in order:**
-1. **N5b** — investigate the 453 ambiguous/unresolved built-in-list entries
-   and the POS decision they are entangled with. Investigation first: the
-   output wanted is the option set and its cost, not a patch.
+1. **N5b** — build the dry-run catalog dedupe audit. **The investigation is
+   done** (2026-07-29): the 453 ambiguous entries are 100% case-variant
+   duplication (`haben`/`Haben`), not sense ambiguity, and the POS decision
+   is unrelated. Implementation-first now, but dry-run only — no `--apply`,
+   no migration, no frontend. It fixes lookup, reading and autocomplete
+   alongside lists, and it is cheapest today: zero duplicate groups currently
+   have user progress on more than one member.
 2. **T2.3** — the repo half of the deploy gate sweep. Small, and required
    before anything is deployed.
 3. **#43 phase 4** — copy-to-my-lists, so a learner can fork a built-in list
@@ -1117,34 +1181,53 @@ paste for N1; the checklist is:
    construct the provider.
 
 **If you want repo work now, paste this instead** — it does not depend on
-N1, and it is the largest thing N5a left behind:
+N1. *(Replaced 2026-07-29: the previous contents asked for the N5b
+investigation, which has since been done and disproved its own premise. The
+prompt below is the implementation it recommended.)*
 
 ```
-Investigate the ambiguous and unresolved entries in the built-in vocabulary
-lists, and the POS enrichment decision they are entangled with. Do not edit
-files. Do not modify the database.
+Implement Phase 1 of the catalog case-variant dedupe: a DRY-RUN audit only.
+Do not add an --apply mode. Do not add a migration. Do not change the
+frontend. Do not write to the database.
 
-Context:
-- Seeding kept 453 entries with item_id = NULL: 227 ambiguous + 29
-  unresolved in "Top German Words", 226 + 29 in the phrase-pattern list.
-- An entry with no item_id cannot be marked learning, cannot enter SRS and
-  cannot be reviewed. The ambiguous ones are the highest-frequency words in
-  the language (ein, zu, im, auf, ich).
-- First-matching them is forbidden: it binds mastery to a coin-flip sense.
-  That is the W3 / Hole 2 rule, and it is why catalog_resolver reports
-  `ambiguous` rather than picking.
-- N5a step 1 dropped POS enrichment because `pos` is part of word_table's
-  UNIQUE (word, language, pos) and every row has pos = ''. Writing a real
-  POS forks rows instead of enriching them, which would make currently
-  resolvable words ambiguous.
-- Read docs/TODO.md #43, services/catalog_resolver.py and
-  services/word_seed_service.py before starting.
+Context (measured 2026-07-29, read-only):
+- 417 German normalized keys in word_table have more than one row. Every
+  group has exactly 2, and every one differs only by case: haben/Haben,
+  ein/Ein, aber/Aber. The scraper stores surface forms verbatim, so a
+  sentence-initial token became a second row.
+- This is NOT sense ambiguity and NOT a POS problem. Every pair has
+  identical pos, and 9,309 of 9,313 German rows hold pos = ''.
+- It is not list-specific: resolve_word_ids('haben') returns two ids, so
+  transcript lookup, learn-anyway, reading selections and /suggest are all
+  degraded by the same pairs. It surfaces in the built-in lists as 453 of
+  the 511 inert entries.
+- Split: 269 groups same-lemma (haben/Haben — the same word), 148
+  different-lemma, which is mixed. Some are genuine noun/verb pairs
+  (leben/Leben); others are lemmatizer noise on the capitalised token
+  (alle -> aller). Lemma difference is NOT a reliable proxy for meaning.
+- Blast radius over the 834 duplicate rows: 15,013 word_to_sentence
+  (ON DELETE CASCADE), 61 word_usage_events, 18 srs_cards, 10
+  user_word_knowledge, 0 word_list_items — and ZERO groups where more than
+  one member already has user progress. 150 (word_norm, sentence_id) pairs
+  have both members on the same sentence, so any future re-point needs
+  conflict handling.
+- Read docs/ROADMAP.md N5b, services/catalog_resolver.py,
+  services/word_seed_service.py and scripts/backfill_word_catalog.py (the
+  dry-run pattern to follow) before starting.
 
-Produce: the option set with costs and risks. A UI disambiguation picker, a
-POS-aware schema change, both, or neither — and what each would do to the
-453 entries and to the words that resolve cleanly today. Say which entries
-are genuinely ambiguous senses versus artefacts of pos = '' duplication;
-that distinction decides whether this is a UX problem or a schema one.
+Build:
+- services/word_dedupe_service.py — classify every duplicate group into
+  auto_mergeable (case-only, same pos, same lemma), needs_review (case-only,
+  differing lemma), and unexpected (anything else; empty today and a hard
+  error if it ever isn't).
+- scripts/dedupe_word_catalog.py — dry-run by default and ONLY. Print
+  per-bucket counts, the full needs_review list with both lemmas, the blast
+  radius per bucket, and the colliding (word_norm, sentence_id) count.
+- State the survivor rule (keep the higher frequency; tie -> lowercase) but
+  do NOT execute it.
+
+Explicitly out of scope: the --apply half, the scraper insert path that
+creates the duplicates, and the 58 unresolved reflexive entries.
 ```
 
 Once a server answers, **N2** is the first repo task that depends on N1,
