@@ -1456,3 +1456,171 @@ async def test_two_users_capped_marking_stays_independent(
     assert a["marked"] == b["marked"] == MAX_LIST_WORDS
     assert a["remaining"] == b["remaining"] == 2, "B's own state is untouched by A"
     assert surfaces
+
+
+# ---------------------------------------------------------------------------
+# Optional limit/offset on the detail endpoint (phase 1)
+#
+# A built-in list is ~500 KB of JSON in full and ~22 KB for a 200-entry window.
+# The params page `entries` ONLY: `total` and `counts` stay whole-list, because
+# they drive the status badges and the mark-learning count, which describe the
+# list rather than the window.
+#
+# Omitting both params must reproduce the pre-pagination response exactly —
+# `create_list` and every test above depend on it.
+# ---------------------------------------------------------------------------
+
+
+async def _list_of(client, db_pool, tracked, n: int):
+    """A user list of `n` resolvable words, in a known order."""
+    surfaces = []
+    for _ in range(n):
+        wid, surface = await insert_owned_word(db_pool, word=f"Zzpage{uuid.uuid4().hex[:12]}")
+        tracked.append(wid)
+        surfaces.append(surface)
+    headers = await _registered_headers(client)
+    list_id = (await _create(client, headers, surfaces)).json()["list_id"]
+    return headers, list_id, surfaces
+
+
+async def test_no_params_returns_every_entry(client: AsyncClient, db_pool, tracked_words):
+    headers, list_id, surfaces = await _list_of(client, db_pool, tracked_words, 12)
+
+    body = (await client.get(f"{LISTS}/{list_id}", headers=headers)).json()
+
+    assert len(body["entries"]) == 12
+    assert body["total"] == 12
+    assert [e["surface"] for e in body["entries"]] == surfaces
+
+
+async def test_limit_returns_exactly_that_many(client: AsyncClient, db_pool, tracked_words):
+    headers, list_id, _ = await _list_of(client, db_pool, tracked_words, 12)
+
+    body = (await client.get(f"{LISTS}/{list_id}?limit=5", headers=headers)).json()
+
+    assert len(body["entries"]) == 5
+
+
+async def test_offset_walks_without_overlap_or_gaps(client: AsyncClient, db_pool, tracked_words):
+    headers, list_id, surfaces = await _list_of(client, db_pool, tracked_words, 12)
+
+    p1 = (await client.get(f"{LISTS}/{list_id}?limit=5&offset=0", headers=headers)).json()
+    p2 = (await client.get(f"{LISTS}/{list_id}?limit=5&offset=5", headers=headers)).json()
+    p3 = (await client.get(f"{LISTS}/{list_id}?limit=5&offset=10", headers=headers)).json()
+
+    walked = [e["surface"] for p in (p1, p2, p3) for e in p["entries"]]
+    assert walked == surfaces, "pages must reassemble into the whole list, in order"
+    assert len(p3["entries"]) == 2, "final partial page"
+
+
+async def test_offset_past_the_end_returns_an_empty_page(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    headers, list_id, _ = await _list_of(client, db_pool, tracked_words, 3)
+
+    resp = await client.get(f"{LISTS}/{list_id}?limit=5&offset=999", headers=headers)
+
+    assert resp.status_code == 200, "past the end is an empty page, not an error"
+    assert resp.json()["entries"] == []
+    assert resp.json()["total"] == 3
+
+
+async def test_total_and_counts_stay_whole_list_on_every_page(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """The property the whole design rests on.
+
+    `total` and `counts` drive the badges and the mark-learning count; if a
+    page reported its own size the UI would silently understate the list.
+    """
+    headers, list_id, _ = await _list_of(client, db_pool, tracked_words, 12)
+
+    full = (await client.get(f"{LISTS}/{list_id}", headers=headers)).json()
+    page = (await client.get(f"{LISTS}/{list_id}?limit=3&offset=6", headers=headers)).json()
+
+    assert page["total"] == full["total"] == 12
+    assert page["counts"] == full["counts"]
+    assert len(page["entries"]) == 3
+
+
+async def test_ambiguous_and_unresolved_paginate_in_place(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Paging is positional — it must not filter by status."""
+    ambiguous = f"Zzamb{uuid.uuid4().hex[:10]}"
+    await insert_owned_word(db_pool, word=ambiguous, pos="NOUN")
+    await insert_owned_word(db_pool, word=ambiguous, pos="VERB")
+    unresolved = f"Zzunres{uuid.uuid4().hex[:10]}"
+    _wid, resolved = await insert_owned_word(db_pool, word=f"Zzpage{uuid.uuid4().hex[:10]}")
+    headers = await _registered_headers(client)
+    list_id = (await _create(
+        client, headers, [resolved, ambiguous, unresolved])).json()["list_id"]
+
+    page = (await client.get(f"{LISTS}/{list_id}?limit=2&offset=1", headers=headers)).json()
+
+    assert [e["surface"] for e in page["entries"]] == [ambiguous, unresolved]
+    assert [e["status"] for e in page["entries"]] == ["ambiguous", "unresolved"]
+
+
+async def test_pagination_works_on_a_system_list(
+    client: AsyncClient, db_pool, make_system_list,
+):
+    list_id = await make_system_list(surfaces=[f"Zzsys{i}" for i in range(10)])
+    headers = await _registered_headers(client)
+
+    page = (await client.get(f"{LISTS}/{list_id}?limit=4&offset=4", headers=headers)).json()
+
+    assert len(page["entries"]) == 4
+    assert page["total"] == 10
+    assert page["is_system"] is True
+
+
+async def test_cross_user_private_list_is_still_404_with_params(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Ownership is resolved before the params are looked at.
+
+    A new query surface on an ownership-gated route is exactly where a leak
+    would hide, so this is pinned with the params present.
+    """
+    _headers_a, list_id, _ = await _list_of(client, db_pool, tracked_words, 3)
+    headers_b = await _registered_headers(client)
+
+    assert (await client.get(
+        f"{LISTS}/{list_id}?limit=1&offset=0", headers=headers_b)).status_code == 404
+    assert (await client.get(f"{LISTS}/{list_id}", headers=headers_b)).status_code == 404
+
+
+@pytest.mark.parametrize("qs", ["limit=0", "limit=-1", "limit=1001", "offset=-1"])
+async def test_invalid_pagination_params_are_rejected(
+    client: AsyncClient, db_pool, tracked_words, qs,
+):
+    headers, list_id, _ = await _list_of(client, db_pool, tracked_words, 3)
+
+    assert (await client.get(f"{LISTS}/{list_id}?{qs}", headers=headers)).status_code == 422
+
+
+async def test_export_is_unaffected_by_pagination(client: AsyncClient, db_pool, tracked_words):
+    """export_list reads surfaces straight from the table — params can't reach it."""
+    headers, list_id, surfaces = await _list_of(client, db_pool, tracked_words, 12)
+
+    plain = await client.get(f"{LISTS}/{list_id}/export", headers=headers)
+    with_params = await client.get(f"{LISTS}/{list_id}/export?limit=2&offset=0", headers=headers)
+
+    assert plain.text.splitlines() == surfaces
+    assert with_params.text.splitlines() == surfaces
+
+
+async def test_mark_learning_still_uses_the_whole_list(
+    client: AsyncClient, db_pool, tracked_words,
+):
+    """Marking runs server-side off the full entries, not a page."""
+    headers, list_id, surfaces = await _list_of(client, db_pool, tracked_words, 12)
+    await client.get(f"{LISTS}/{list_id}?limit=2&offset=0", headers=headers)
+
+    body = (await client.post(
+        f"{LISTS}/{list_id}/mark-unknown-learning", headers=headers)).json()
+
+    assert body["marked"] == 12, "a paged read must not shrink what marking sees"
+    assert body["remaining"] == 0 and body["capped"] is False
+    assert len(surfaces) == 12

@@ -274,15 +274,42 @@ def _counts(entries: list[dict]) -> dict[str, int]:
     return counts
 
 
-async def get_list(pool: asyncpg.Pool, user_id: str, list_id: int) -> dict | None:
-    """Full list with per-entry status. None when absent or owned by someone else."""
+async def get_list(
+    pool: asyncpg.Pool,
+    user_id: str,
+    list_id: int,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict | None:
+    """List with per-entry status. None when absent or owned by someone else.
+
+    `limit` selects a window of `entries`; omitting it returns every entry, so
+    a caller that does not paginate gets exactly the response this returned
+    before pagination existed. `create_list` relies on that.
+
+    **`total` and `counts` are always whole-list**, on every page. They drive
+    the status badges, the ambiguous explainer, and the mark-learning button's
+    unknown count — all of which describe the list, not the window. `entries`
+    is the only field pagination touches.
+
+    This shrinks the RESPONSE, not the query. The seeded system lists cost
+    ~33-36 ms in `_load_entries` (DB plus late re-resolution of unbound
+    surfaces) against ~3-4 ms to serialise, and counts need the full resolved
+    set anyway — so every page still does the whole load. What it buys is
+    wire size: 514 KB → ~22 KB for a 200-entry window. Do not expect a latency
+    win from paginating; if this ever needs to be faster, `_load_entries` and
+    `_counts` are where to look.
+    """
     row = await _load_list_row(pool, user_id, list_id)
     if row is None:
         return None
     entries = await _load_entries(pool, user_id, list_id, row["language"])
+    # Slice AFTER counting, so a page never reports its own size as the total.
+    page = entries[offset: offset + limit] if limit is not None else entries
     return {
         **row,
-        "entries": entries,
+        "entries": page,
         "total": len(entries),
         "counts": _counts(entries),
     }

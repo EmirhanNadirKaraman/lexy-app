@@ -756,6 +756,42 @@ was. Tracked in `docs/TODO.md`.
 `ruff check .` → All checks passed. Backend pytest not run — **no backend files
 changed**. Root pipeline suite not run — no root files changed.
 
+🆕 **2026-07-29 — Optional detail pagination, phase 1 (+14 backend)**
+
+`GET /word-lists/{id}` accepts optional `limit` (1–1000) and `offset` (≥0).
+They window **`entries` only** — `total` and `counts` stay whole-list on every
+page, because they drive the status badges and the mark-learning count, which
+describe the list rather than the window. 514 KB → ~22 KB for a 200-entry
+window.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_word_lists.py` | +14 | no params returns every entry in order (the back-compat regression); `limit` returns exactly that many; three offset pages reassemble into the whole list with no overlap or gaps, ending in a partial page; offset past the end is an **empty page, not an error**; **`total` and `counts` are identical on a page and on the full response**; ambiguous/unresolved paginate in place and are not filtered; pagination works on a system list; **cross-user private access is still 404 with the params present**; four invalid-param cases (`limit=0`, `limit=-1`, `limit=1001`, `offset=-1`) are 422; export is byte-identical with and without params; and mark-learning still marks all 12 after a paged read |
+
+**The whole-list guarantee is mutation-checked twice.** Computing
+`total`/`counts` from the page, and slicing before counting instead of after,
+both fail `test_total_and_counts_stay_whole_list_on_every_page` — the two ways
+that invariant could plausibly be broken by a later edit.
+
+**Back-compat is the load-bearing property.** All 80 pre-existing word-list
+tests passed unchanged before a single new test was written, which is the real
+evidence that omitting the params reproduces the old response — `create_list`
+returns `get_list(...)` and would have broken loudly otherwise.
+
+**Deliberately documented in the code:** this shrinks the response, not the
+query. `_load_entries` costs ~33–36 ms on the seeded lists against ~3–4 ms to
+serialise, and `_counts` needs the fully resolved set, so every page still does
+the whole load. Nobody should later expect a latency win that isn't there.
+
+**Phase 2 (frontend) not started.** It must switch the footer denominator from
+`detail.entries.length` to `detail.total`, or a paged response renders
+"Showing 200 of 200".
+
+**Validation:** backend `-n auto` → **1151 passed, 2 skipped** (1137 + 14);
+`ruff check .` → All checks passed; alembic unchanged at **037**. Frontend not
+run — no frontend files changed. Root pipeline suite not run — no root files
+changed.
+
 🆕 **2026-07-27 — vocabulary list upload/download (+39 tests / +2 files)**
 
 New feature: paste or upload a word list, see what you already know, mark the

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Path
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import PlainTextResponse
 
 from ..core.deps import get_current_user
@@ -58,11 +58,29 @@ async def get_word_lists(
 @router.get("/{list_id}", response_model=WordListDetail)
 async def get_word_list(
     list_id: int = Path(..., ge=1),
+    limit: int | None = Query(
+        None, ge=1, le=1000,
+        description="Return only this many entries. Omit for the whole list.",
+    ),
+    offset: int = Query(0, ge=0, description="Entries to skip, in list order."),
     pool=Depends(get_pool),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    One list with its entries.
+
+    `limit`/`offset` page the `entries` array only — a built-in list is ~500 KB
+    of JSON in full, ~22 KB for a 200-entry window. **`total` and `counts` stay
+    whole-list on every page**, so the status badges and the mark-learning
+    count still describe the list rather than the window. Omitting both params
+    returns the pre-pagination response unchanged.
+
+    Ownership is unaffected: the service resolves the row through
+    `_load_list_row` before it ever looks at the params, so another user's
+    private list is still a 404 with or without them.
+    """
     result = await word_list_service.get_list(
-        pool, str(current_user["user_id"]), list_id,
+        pool, str(current_user["user_id"]), list_id, limit=limit, offset=offset,
     )
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
