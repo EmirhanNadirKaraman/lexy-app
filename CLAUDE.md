@@ -45,7 +45,7 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 - **React 19** + **React Router 7** + **Vite 8** + **TypeScript** (strict)
 - **No state library** — `useOutletContext` + custom hooks + `localStorage` for token
 - **No CSS framework** — inline `React.CSSProperties` everywhere, dark mode via boolean prop
-- **Vitest** + jsdom (306 tests across 44 files)
+- **Vitest** + jsdom (322 tests across 44 files)
 - Dev proxy: `/api → http://localhost:8000`
 
 ### Data pipelines

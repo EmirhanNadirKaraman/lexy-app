@@ -70,22 +70,25 @@ const TYPE_BADGE: React.CSSProperties = {
 };
 
 /**
+ * Entries per page — both what is fetched and what is mounted.
+ *
+ * The seeded built-in lists hold 4,087 and 5,035 entries. Asking for all of
+ * them costs 406 KB / 514 KB of JSON and mounts thousands of DOM nodes
+ * synchronously, which is a visible freeze on a phone. Sending this as `limit`
+ * bounds both at once: the response is ~22 KB and only a page is ever
+ * rendered.
+ *
+ * Must stay within the backend's `limit` range (1–1000).
+ */
+const ENTRY_CHUNK = 200;
+
+/**
  * Confirm before marking more than this many words at once.
  *
  * Chosen well below the backend's 500-per-call cap so the dialog fires before
  * the cap ever does: a user who confirms should get their whole request, not a
  * surprise chunk. Small user lists never see it.
  */
-/**
- * How many detail entries to mount at once.
- *
- * The seeded built-in lists hold 4,087 and 5,035 entries, and `get_list`
- * returns all of them (406 KB / 514 KB). Rendering that in one flat `.map()`
- * mounts thousands of DOM nodes synchronously — a visible freeze on a phone.
- * The response is unchanged; this only bounds what is on screen.
- */
-const ENTRY_CHUNK = 200;
-
 const MARK_CONFIRM_THRESHOLD = 200;
 
 const SYSTEM_BADGE: React.CSSProperties = {
@@ -179,7 +182,8 @@ const errorStyle: React.CSSProperties = {
 export function WordListsPage({ token, language, onClose }: Props) {
     const [lists, setLists] = useState<WordListSummary[]>([]);
     const [detail, setDetail] = useState<WordListDetail | null>(null);
-    const [visibleCount, setVisibleCount] = useState(ENTRY_CHUNK);
+    const [loadingMore, setLoadingMore] = useState(false);
+    const [moreError, setMoreError] = useState<string | null>(null);
     const [name, setName] = useState('');
     const [text, setText] = useState('');
     const [creating, setCreating] = useState(false);
@@ -190,18 +194,51 @@ export function WordListsPage({ token, language, onClose }: Props) {
     const [notice, setNotice] = useState<string | null>(null);
 
     /**
-     * Swap the open list and reset how much of it is shown.
+     * Swap the open list and reset its paging state.
      *
-     * Every `setDetail` goes through here so the slice can never outlive the
-     * list it belongs to — opening another list, refreshing after
-     * mark-learning, and closing all reset together. Resetting at each call
-     * site instead would work until the next one forgets.
+     * Every `setDetail` that *replaces* a list goes through here, so a stale
+     * "loading" spinner or a failed-page error can never outlive the list it
+     * belongs to — opening another list, refreshing after mark-learning, and
+     * closing all reset together. Resetting at each call site instead would
+     * work until the next one forgets.
+     *
+     * `handleShowMore` is the one deliberate exception: it *extends* the open
+     * list rather than replacing it, so it updates `entries` in place and must
+     * not clear the state it is itself driving.
+     *
+     * `inFlightPagesRef` is deliberately NOT reset here — a request that is
+     * still running is still running, and dropping its key would let its exact
+     * duplicate be issued on the way back to this list. It drains itself.
      */
     function showDetail(next: WordListDetail | null) {
         setDetail(next);
-        setVisibleCount(ENTRY_CHUNK);
+        openListIdRef.current = next?.list_id ?? null;
+        setLoadingMore(false);
+        setMoreError(null);
     }
     const fileInputRef = useRef<HTMLInputElement>(null);
+    /**
+     * Which list is open right now, readable from an in-flight callback.
+     *
+     * `handleShowMore` awaits a fetch; by the time it settles the user may have
+     * opened a different list. The `detail` in its closure is the old one, so
+     * the ref is what tells a late response that its list is gone and it must
+     * not write loading/error state over the new list's.
+     */
+    const openListIdRef = useRef<number | null>(null);
+    /**
+     * Keys of the page requests currently in flight — see `handleShowMore`.
+     *
+     * A set rather than a single slot, and deliberately NOT cleared by
+     * `showDetail`. Both follow from the same requirement: block a duplicate
+     * request for the same list and offset, without ever blocking a *different*
+     * one. A single slot would be overwritten the moment a second list started
+     * paging, so switching away and back while the first request still hangs
+     * would let its exact duplicate through; clearing on list switch would do
+     * the same. Each request only ever removes its own key, so the set drains
+     * itself and every other pending page keeps its guard.
+     */
+    const inFlightPagesRef = useRef<Set<string>>(new Set());
 
     useEffect(() => {
         listWordLists(token)
@@ -272,9 +309,61 @@ export function WordListsPage({ token, language, onClose }: Props) {
         setActionError(null);
         setNotice(null);
         try {
-            showDetail(await getWordList(token, listId));
+            showDetail(await getWordList(token, listId, { limit: ENTRY_CHUNK, offset: 0 }));
         } catch (err: unknown) {
             setActionError(err instanceof Error ? err.message : 'Unknown error');
+        }
+    }
+
+    /**
+     * Fetch the next page of entries and append it.
+     *
+     * Offset is the number of entries already loaded, so pages line up with the
+     * backend's positional slice however many times this runs, and the slice
+     * being positional is why ambiguous and unresolved entries arrive in their
+     * place rather than being filtered out of a page.
+     *
+     * The response's own `total`/`counts` are ignored. They are whole-list on
+     * every page, so keeping the ones the list was opened with costs nothing
+     * and guarantees the badges never disagree with each other because two
+     * pages happened to observe different moments.
+     */
+    async function handleShowMore() {
+        if (!detail) return;
+        const listId = detail.list_id;
+        const offset = detail.entries.length;
+        // Keyed on what the request actually asks for, and held in a ref rather
+        // than in `loadingMore`: two clicks in one frame both read the
+        // pre-click render's closure, where that state is still false. The
+        // disabled attribute is what stops that in practice — this is the guard
+        // that holds if a commit lags behind the second click, and it is scoped
+        // so an unrelated list's pending page can never block this one.
+        const key = `${listId}:${offset}:${ENTRY_CHUNK}`;
+        if (inFlightPagesRef.current.has(key)) return;
+        inFlightPagesRef.current.add(key);
+        setLoadingMore(true);
+        setMoreError(null);
+        try {
+            const page = await getWordList(token, listId, { limit: ENTRY_CHUNK, offset });
+            setDetail(prev =>
+                // A page for a list the user has navigated away from must not
+                // be appended to whichever list is open now.
+                prev && prev.list_id === listId
+                    ? { ...prev, entries: [...prev.entries, ...page.entries] }
+                    : prev,
+            );
+        } catch (err: unknown) {
+            // Entries already loaded stay mounted — a failed page costs the
+            // user nothing they had, and the control stays available to retry.
+            if (openListIdRef.current === listId) {
+                setMoreError(err instanceof Error ? err.message : 'Unknown error');
+            }
+        } finally {
+            // Only ever this request's own key.
+            inFlightPagesRef.current.delete(key);
+            // A page for a list that is no longer open must not clear the
+            // spinner belonging to the list that is.
+            if (openListIdRef.current === listId) setLoadingMore(false);
         }
     }
 
@@ -295,7 +384,9 @@ export function WordListsPage({ token, language, onClose }: Props) {
         setNotice(null);
         try {
             const result = await markUnknownAsLearning(token, detail.list_id);
-            showDetail(await getWordList(token, detail.list_id));
+            // Back to the first page: statuses have changed list-wide, so
+            // re-reading only the pages already loaded would show a mix.
+            showDetail(await getWordList(token, detail.list_id, { limit: ENTRY_CHUNK, offset: 0 }));
             const skipped = result.skipped_unresolved + result.skipped_ambiguous;
             const remaining = result.remaining ?? 0;
             setNotice(
@@ -342,6 +433,11 @@ export function WordListsPage({ token, language, onClose }: Props) {
     }
 
     const unknownCount = detail?.counts.unknown ?? 0;
+
+    // `total` is whole-list on every page; `entries` is only what has been
+    // fetched. Comparing the two is what makes the footer say "200 of 5,035"
+    // instead of the "200 of 200" a paged response would otherwise produce.
+    const hasMore = detail !== null && detail.entries.length < detail.total;
 
     // Split on the backend's `is_system` flag. Hiding Delete for these is a
     // courtesy — the guarantee is server-side (a system list has no owner, so
@@ -656,7 +752,7 @@ export function WordListsPage({ token, language, onClose }: Props) {
                         listStyle: 'none', margin: '12px 0 0', padding: 0,
                         display: 'flex', flexWrap: 'wrap', gap: '8px',
                     }}>
-                        {detail.entries.slice(0, visibleCount).map(entry => (
+                        {detail.entries.map(entry => (
                             <li
                                 key={entry.id}
                                 data-testid={`word-list-entry-${entry.surface}`}
@@ -683,10 +779,12 @@ export function WordListsPage({ token, language, onClose }: Props) {
                         ))}
                     </ul>
 
-                    {/* Only when something is hidden. A short list shows no
-                        extra chrome at all. Deliberately no "Show all": that
-                        would put the freeze back one click away. */}
-                    {detail.entries.length > visibleCount && (
+                    {/* Only while entries remain unfetched. A list that fits in
+                        one page shows no extra chrome at all, and the control
+                        disappears once the last page lands. Deliberately no
+                        "Show all": that would put the whole 514 KB payload —
+                        and the freeze — one click away. */}
+                    {hasMore && (
                         <div
                             data-testid="word-list-more"
                             style={{
@@ -695,17 +793,27 @@ export function WordListsPage({ token, language, onClose }: Props) {
                             }}
                         >
                             <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>
-                                Showing {visibleCount.toLocaleString()} of{' '}
-                                {detail.entries.length.toLocaleString()} entries
+                                Showing {detail.entries.length.toLocaleString()} of{' '}
+                                {detail.total.toLocaleString()} entries
                             </span>
                             <button
                                 data-testid="word-list-show-more"
-                                onClick={() => setVisibleCount(c => c + ENTRY_CHUNK)}
+                                onClick={handleShowMore}
+                                disabled={loadingMore}
+                                aria-busy={loadingMore}
                                 style={buttonStyle}
                             >
-                                Show more
+                                {loadingMore ? 'Loading…' : 'Show more'}
                             </button>
                         </div>
+                    )}
+
+                    {/* Outside the block above so a failure is still readable if
+                        the last page is the one that failed. */}
+                    {moreError && (
+                        <p data-testid="word-list-more-error" role="alert" style={errorStyle}>
+                            {moreError}
+                        </p>
                     )}
                 </div>
             )}

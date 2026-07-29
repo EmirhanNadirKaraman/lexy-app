@@ -12,7 +12,7 @@
  *   - server errors surface inline
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import { WordListsPage } from './WordListsPage';
 import type { WordListDetail } from '../api/wordLists';
@@ -35,6 +35,19 @@ function jsonResponse(body: unknown, status = 200): Response {
         status,
         headers: { 'Content-Type': 'application/json' },
     });
+}
+
+/**
+ * A promise the test resolves by hand.
+ *
+ * Lets a fetch stay in flight across several `fireEvent.click`s, which is the
+ * only way to observe the in-flight window that the duplicate-request guard
+ * exists to close.
+ */
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(res => { resolve = res; });
+    return { promise, resolve };
 }
 
 function makeDetail(overrides: Partial<WordListDetail> = {}): WordListDetail {
@@ -652,14 +665,17 @@ describe('WordListsPage — bulk mark guard', () => {
 });
 
 /**
- * Large-list render guard.
+ * Large-list paged fetching (#43 phase 2).
  *
- * `get_list` returns every entry — 4,087 and 5,035 for the seeded built-in
- * lists — and the detail view used to mount all of them in one flat `.map()`.
- * The response is unchanged; only what is on screen is bounded. Counts,
- * export, and mark-learning all still work off the full response.
+ * The backend windows `entries` via `limit`/`offset` while keeping `total` and
+ * `counts` whole-list on every page. The page therefore holds only what it has
+ * fetched, and "Show more" is a request rather than a reveal.
+ *
+ * The stub below pages exactly the way `word_list_service.get_list` does —
+ * slice `entries`, leave `total`/`counts` alone — because the interesting
+ * failure is a component that reads the wrong one of those two.
  */
-describe('WordListsPage — large detail rendering', () => {
+describe('WordListsPage — paged detail fetching', () => {
     const CHUNK = 200;
 
     function bigDetail(n: number, overrides: Partial<WordListDetail> = {}): WordListDetail {
@@ -680,6 +696,22 @@ describe('WordListsPage — large detail rendering', () => {
         });
     }
 
+    /** Window `entries` per the URL's limit/offset; `total`/`counts` untouched. */
+    function pageOf(all: WordListDetail, url: string): WordListDetail {
+        const params = new URL(url, 'http://test.local').searchParams;
+        const rawLimit = params.get('limit');
+        const offset = Number(params.get('offset') ?? '0');
+        const limit = rawLimit === null ? all.entries.length : Number(rawLimit);
+        return { ...all, entries: all.entries.slice(offset, offset + limit) };
+    }
+
+    /** Query params of every list-detail GET, in call order. */
+    function detailQueries(): URLSearchParams[] {
+        return calls
+            .filter(c => /word-lists\/\d+(\?|$)/.test(c.url) && c.init?.method === undefined)
+            .map(c => new URL(c.url, 'http://test.local').searchParams);
+    }
+
     function installLists(listSummaries: unknown[], detailFor: (id: string) => WordListDetail,
                           markResult?: unknown) {
         installFetch((url, init) => {
@@ -693,7 +725,7 @@ describe('WordListsPage — large detail rendering', () => {
                 });
             }
             const id = url.match(/word-lists\/(\d+)/)?.[1] ?? '2';
-            return jsonResponse(detailFor(id));
+            return jsonResponse(pageOf(detailFor(id), url));
         });
     }
 
@@ -701,61 +733,91 @@ describe('WordListsPage — large detail rendering', () => {
         return screen.queryAllByTestId(/^word-list-entry-/);
     }
 
-    it('renders only the first chunk of a large list', async () => {
-        installLists([summary({ list_id: 2, name: 'Top German Words', is_system: true })],
-            () => bigDetail(5035));
+    async function openBig(n = 5035, lists?: unknown[]) {
+        installLists(
+            lists ?? [summary({ list_id: 2, name: 'Top German Words', is_system: true })],
+            id => bigDetail(n, { list_id: Number(id) }),
+        );
         renderPage();
-
         fireEvent.click(await screen.findByTestId('word-list-open-2'));
         await screen.findByTestId('word-list-detail');
+    }
+
+    it('asks for the first page only when a list is opened', async () => {
+        await openBig();
+
+        const [first] = detailQueries();
+        expect(first.get('limit')).toBe('200');
+        expect(first.get('offset')).toBe('0');
+    });
+
+    it('renders only the first page of a large list', async () => {
+        await openBig();
 
         expect(visibleEntries()).toHaveLength(CHUNK);
         expect(screen.getByTestId('word-list-entry-w0')).toBeInTheDocument();
         expect(screen.queryByTestId('word-list-entry-w200')).not.toBeInTheDocument();
     });
 
-    it('shows how many of the total are visible', async () => {
-        installLists([summary({ list_id: 2, name: 'Top German Words', is_system: true })],
-            () => bigDetail(5035));
-        renderPage();
+    it('counts the footer against the whole-list total, not the loaded page', async () => {
+        await openBig();
 
-        fireEvent.click(await screen.findByTestId('word-list-open-2'));
-
-        expect(await screen.findByTestId('word-list-more')).toHaveTextContent(
+        expect(screen.getByTestId('word-list-more')).toHaveTextContent(
             'Showing 200 of 5,035 entries',
         );
     });
 
-    it('reveals the next chunk on Show more', async () => {
-        installLists([summary({ list_id: 2, name: 'Top German Words', is_system: true })],
-            () => bigDetail(5035));
-        renderPage();
+    it('never reports the page size as the total', async () => {
+        // The regression this phase exists to prevent: reading the denominator
+        // off `entries.length` renders "Showing 200 of 200" the moment the
+        // response is paged, and hides Show more with 4,835 entries unseen.
+        await openBig();
 
-        fireEvent.click(await screen.findByTestId('word-list-open-2'));
-        await screen.findByTestId('word-list-detail');
+        const footer = screen.getByTestId('word-list-more');
+        expect(footer).not.toHaveTextContent('Showing 200 of 200 entries');
+        expect(screen.getByTestId('word-list-show-more')).toBeInTheDocument();
+    });
+
+    it('requests the next page by offset on Show more', async () => {
+        await openBig();
+
         fireEvent.click(screen.getByTestId('word-list-show-more'));
 
-        expect(visibleEntries()).toHaveLength(CHUNK * 2);
+        await waitFor(() => expect(detailQueries()).toHaveLength(2));
+        const second = detailQueries()[1];
+        expect(second.get('offset')).toBe('200');
+        expect(second.get('limit')).toBe('200');
+    });
+
+    it('appends the next page without duplicating what is already loaded', async () => {
+        await openBig();
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK * 2));
+        // Page 1 kept, page 2 added, and no surface rendered twice.
+        expect(screen.getByTestId('word-list-entry-w0')).toBeInTheDocument();
         expect(screen.getByTestId('word-list-entry-w200')).toBeInTheDocument();
+        expect(screen.queryAllByTestId('word-list-entry-w0')).toHaveLength(1);
+        expect(screen.getByTestId('word-list-more')).toHaveTextContent(
+            'Showing 400 of 5,035 entries',
+        );
     });
 
-    it('reaches the final partial chunk and then hides the control', async () => {
-        installLists([summary({ list_id: 2, name: 'Small system', is_system: true })],
-            () => bigDetail(450));
-        renderPage();
+    it('hides the control once the final partial page has loaded', async () => {
+        await openBig(450);
 
-        fireEvent.click(await screen.findByTestId('word-list-open-2'));
-        await screen.findByTestId('word-list-detail');
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        await waitFor(() => expect(visibleEntries()).toHaveLength(400));
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
 
-        fireEvent.click(screen.getByTestId('word-list-show-more'));   // 400
-        expect(visibleEntries()).toHaveLength(400);
-        fireEvent.click(screen.getByTestId('word-list-show-more'));   // 450, the remainder
-
-        expect(visibleEntries()).toHaveLength(450);
+        // Third page is the 50-entry remainder; nothing is left to fetch.
+        await waitFor(() => expect(visibleEntries()).toHaveLength(450));
         expect(screen.queryByTestId('word-list-more')).not.toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-show-more')).not.toBeInTheDocument();
     });
 
-    it('renders a small list in full with no extra controls', async () => {
+    it('renders a list that fits in one page with no extra controls', async () => {
         installLists([summary({ list_id: 1, is_system: false })], () => makeDetail({ list_id: 1 }));
         renderPage();
 
@@ -767,9 +829,8 @@ describe('WordListsPage — large detail rendering', () => {
         expect(screen.queryByTestId('word-list-show-more')).not.toBeInTheDocument();
     });
 
-    it('does not hide ambiguous or unresolved entries from the slice', async () => {
-        // They sort in with everything else — the slice is positional, never
-        // filtered by status.
+    it('does not filter ambiguous or unresolved entries out of a page', async () => {
+        // The window is positional, never filtered by status.
         const detail = bigDetail(3);
         detail.entries[1] = { id: 2, surface: 'Bank', item_id: null, item_type: 'word', status: 'ambiguous' };
         detail.entries[2] = { id: 3, surface: 'Blorptzk', item_id: null, item_type: 'word', status: 'unresolved' };
@@ -782,50 +843,165 @@ describe('WordListsPage — large detail rendering', () => {
         expect(screen.getByTestId('word-list-entry-Blorptzk')).toBeInTheDocument();
     });
 
-    it('resets the visible count when a different list is opened', async () => {
-        installLists(
-            [summary({ list_id: 2, name: 'Big', is_system: true }),
-             summary({ list_id: 3, name: 'Also big', is_system: true })],
-            id => bigDetail(5035, { list_id: Number(id) }),
-        );
+    it('disables Show more while a page is in flight and fires one request', async () => {
+        const all = bigDetail(5035);
+        const gate = deferred<Response>();
+        let detailCalls = 0;
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse([summary({ list_id: 2, is_system: true })]);
+            }
+            detailCalls += 1;
+            // First call is the open; the Show more that follows hangs until
+            // the test releases it, so the double-click window stays open.
+            return detailCalls === 1 ? jsonResponse(pageOf(all, url)) : gate.promise;
+        });
         renderPage();
-
         fireEvent.click(await screen.findByTestId('word-list-open-2'));
         await screen.findByTestId('word-list-detail');
+
         fireEvent.click(screen.getByTestId('word-list-show-more'));
-        expect(visibleEntries()).toHaveLength(CHUNK * 2);
+        await waitFor(() => expect(screen.getByTestId('word-list-show-more')).toBeDisabled());
+        expect(screen.getByTestId('word-list-show-more')).toHaveTextContent('Loading…');
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        expect(detailCalls).toBe(2);   // the open + exactly one page
+
+        gate.resolve(jsonResponse(pageOf(all, '/x?limit=200&offset=200')));
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK * 2));
+        expect(screen.getByTestId('word-list-show-more')).toBeEnabled();
+    });
+
+    it('keeps loaded entries and shows an inline error when a page fails', async () => {
+        const all = bigDetail(5035);
+        let detailCalls = 0;
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse([summary({ list_id: 2, is_system: true })]);
+            }
+            detailCalls += 1;
+            return detailCalls === 1
+                ? jsonResponse(pageOf(all, url))
+                : jsonResponse({ detail: 'Server exploded' }, 500);
+        });
+        renderPage();
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-detail');
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+
+        expect(await screen.findByTestId('word-list-more-error')).toHaveTextContent('Server exploded');
+        // Nothing already fetched is thrown away, and the control comes back.
+        expect(visibleEntries()).toHaveLength(CHUNK);
+        expect(screen.getByTestId('word-list-entry-w0')).toBeInTheDocument();
+        expect(screen.getByTestId('word-list-show-more')).toBeEnabled();
+    });
+
+    it('loads the next page on retry after a failure', async () => {
+        const all = bigDetail(5035);
+        let detailCalls = 0;
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse([summary({ list_id: 2, is_system: true })]);
+            }
+            detailCalls += 1;
+            // Only the first Show more fails.
+            return detailCalls === 2
+                ? jsonResponse({ detail: 'Server exploded' }, 500)
+                : jsonResponse(pageOf(all, url));
+        });
+        renderPage();
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-detail');
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        await screen.findByTestId('word-list-more-error');
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK * 2));
+        expect(screen.queryByTestId('word-list-more-error')).not.toBeInTheDocument();
+        // Retried the SAME offset — the failed page left no gap behind it.
+        expect(detailQueries()[2].get('offset')).toBe('200');
+    });
+
+    it('resets paging state when a different list is opened', async () => {
+        await openBig(5035, [
+            summary({ list_id: 2, name: 'Big', is_system: true }),
+            summary({ list_id: 3, name: 'Also big', is_system: true }),
+        ]);
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK * 2));
 
         fireEvent.click(screen.getByTestId('word-list-open-3'));
 
         await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK));
+        // The new list starts from the top, not from where the old one stopped.
+        expect(detailQueries().at(-1)!.get('offset')).toBe('0');
     });
 
-    it('resets the visible count after a mark-learning refresh', async () => {
-        installLists([summary({ list_id: 2, is_system: true })], () => bigDetail(5035));
-        vi.spyOn(window, 'confirm').mockReturnValue(true);
+    it('clears a page error when a different list is opened', async () => {
+        const all = bigDetail(5035);
+        let detailCalls = 0;
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse([
+                    summary({ list_id: 2, name: 'Big', is_system: true }),
+                    summary({ list_id: 3, name: 'Also big', is_system: true }),
+                ]);
+            }
+            detailCalls += 1;
+            return detailCalls === 2
+                ? jsonResponse({ detail: 'Server exploded' }, 500)
+                : jsonResponse(pageOf(all, url));
+        });
         renderPage();
-
         fireEvent.click(await screen.findByTestId('word-list-open-2'));
         await screen.findByTestId('word-list-detail');
+
         fireEvent.click(screen.getByTestId('word-list-show-more'));
-        expect(visibleEntries()).toHaveLength(CHUNK * 2);
+        await screen.findByTestId('word-list-more-error');
+
+        fireEvent.click(screen.getByTestId('word-list-open-3'));
+
+        await waitFor(() =>
+            expect(screen.queryByTestId('word-list-more-error')).not.toBeInTheDocument(),
+        );
+    });
+
+    it('resets to the first page after a mark-learning refresh', async () => {
+        await openBig();
+        vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK * 2));
 
         fireEvent.click(screen.getByTestId('word-list-mark-learning'));
 
         await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK));
+        expect(detailQueries().at(-1)!.get('offset')).toBe('0');
     });
 
-    it('keeps counts, export and mark-learning driven by the FULL response', async () => {
-        installLists([summary({ list_id: 2, is_system: true })], () => bigDetail(5035));
-        renderPage();
+    it('keeps counts, export and mark-learning driven by the WHOLE list', async () => {
+        await openBig();
 
-        fireEvent.click(await screen.findByTestId('word-list-open-2'));
-        await screen.findByTestId('word-list-detail');
-
-        // 5,035 unknown, though only 200 rows are mounted.
+        // 5,035 unknown, though only 200 rows have been fetched.
         expect(screen.getByTestId('word-list-count-unknown')).toHaveTextContent('5035');
         expect(screen.getByTestId('word-list-mark-learning')).toHaveTextContent('5035');
         expect(screen.getByTestId('word-list-download')).toBeInTheDocument();
+    });
+
+    it('keeps whole-list counts after a page is appended', async () => {
+        await openBig();
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK * 2));
+
+        // Appending entries must not let a page's own metadata overwrite these.
+        expect(screen.getByTestId('word-list-count-unknown')).toHaveTextContent('5035');
+        expect(screen.getByTestId('word-list-mark-learning')).toHaveTextContent('5035');
     });
 
     it('leaves the built-in badge and delete-hiding untouched', async () => {
@@ -838,5 +1014,224 @@ describe('WordListsPage — large detail rendering', () => {
 
         fireEvent.click(screen.getByTestId('word-list-open-2'));
         expect(await screen.findByTestId('word-list-detail-system-badge')).toBeInTheDocument();
+    });
+
+    /**
+     * Two lists whose surfaces are told apart by prefix, so a page appended to
+     * the wrong one is visible rather than merely miscounted.
+     */
+    function prefixed(listId: number, n: number, prefix: string): WordListDetail {
+        return makeDetail({
+            list_id: listId,
+            name: `List ${listId}`,
+            is_system: true,
+            total: n,
+            counts: { known: 0, learning: 0, unknown: n, unresolved: 0, ambiguous: 0 },
+            entries: Array.from({ length: n }, (_, i) => ({
+                id: i + 1,
+                surface: `${prefix}${i}`,
+                item_id: i + 1,
+                item_type: 'word' as const,
+                status: 'unknown' as const,
+            })),
+        });
+    }
+
+    /**
+     * List 2 (`a…`) and list 3 (`b…`), with list 2's *second* page held open by
+     * a gate the test resolves by hand. That is the window in which the user
+     * switches lists, which is what these three tests are about.
+     */
+    function installTwoListsWithGatedSecondPage() {
+        const a = prefixed(2, 5035, 'a');
+        const b = prefixed(3, 5035, 'b');
+        const gate = deferred<Response>();
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse([
+                    summary({ list_id: 2, name: 'List 2', is_system: true }),
+                    summary({ list_id: 3, name: 'List 3', is_system: true }),
+                ]);
+            }
+            const id = url.match(/word-lists\/(\d+)/)![1];
+            const offset = new URL(url, 'http://test.local').searchParams.get('offset');
+            if (id === '2' && offset === '200') return gate.promise;
+            return jsonResponse(pageOf(id === '2' ? a : b, url));
+        });
+        return { a, gate };
+    }
+
+    /** Open list 2, start its second page, leave it hanging, switch to list 3. */
+    async function stallListTwoThenOpenThree() {
+        const rig = installTwoListsWithGatedSecondPage();
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-entry-a0');
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        await waitFor(() => expect(screen.getByTestId('word-list-show-more')).toBeDisabled());
+
+        fireEvent.click(screen.getByTestId('word-list-open-3'));
+        await screen.findByTestId('word-list-entry-b0');
+        return rig;
+    }
+
+    it('does not let one list’s pending page block another list’s paging', async () => {
+        // The guard is keyed per list+offset, so list 3 asking for its own page
+        // is a different request, not a duplicate of the one still hanging.
+        await stallListTwoThenOpenThree();
+
+        expect(screen.getByTestId('word-list-show-more')).toBeEnabled();
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK * 2));
+        expect(screen.getByTestId('word-list-entry-b200')).toBeInTheDocument();
+        expect(detailQueries().at(-1)!.get('offset')).toBe('200');
+    });
+
+    it('still refuses a duplicate request for the same list and page', async () => {
+        // Same rig, but the click that repeats is list 2's own pending page.
+        const a = prefixed(2, 5035, 'a');
+        const gate = deferred<Response>();
+        let pageTwoRequests = 0;
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse([summary({ list_id: 2, name: 'List 2', is_system: true })]);
+            }
+            if (new URL(url, 'http://test.local').searchParams.get('offset') === '200') {
+                pageTwoRequests += 1;
+                return gate.promise;
+            }
+            return jsonResponse(pageOf(a, url));
+        });
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-entry-a0');
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        await waitFor(() => expect(screen.getByTestId('word-list-show-more')).toBeDisabled());
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+
+        expect(pageTwoRequests).toBe(1);
+
+        gate.resolve(jsonResponse(pageOf(a, '/x?limit=200&offset=200')));
+        await waitFor(() => expect(visibleEntries()).toHaveLength(CHUNK * 2));
+    });
+
+    it('still refuses a duplicate after navigating away and back', async () => {
+        // The case that rules out both a single-slot guard and clearing the
+        // guard in showDetail: either would forget list 2's pending page while
+        // the user is on list 3, and re-issue it on the way back.
+        const a = prefixed(2, 5035, 'a');
+        const b = prefixed(3, 5035, 'b');
+        const gate = deferred<Response>();
+        let pageTwoRequests = 0;
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse([
+                    summary({ list_id: 2, name: 'List 2', is_system: true }),
+                    summary({ list_id: 3, name: 'List 3', is_system: true }),
+                ]);
+            }
+            const id = url.match(/word-lists\/(\d+)/)![1];
+            const offset = new URL(url, 'http://test.local').searchParams.get('offset');
+            if (id === '2' && offset === '200') {
+                pageTwoRequests += 1;
+                return gate.promise;
+            }
+            return jsonResponse(pageOf(id === '2' ? a : b, url));
+        });
+        renderPage();
+
+        fireEvent.click(await screen.findByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-entry-a0');
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+        await waitFor(() => expect(screen.getByTestId('word-list-show-more')).toBeDisabled());
+
+        fireEvent.click(screen.getByTestId('word-list-open-3'));
+        await screen.findByTestId('word-list-entry-b0');
+        fireEvent.click(screen.getByTestId('word-list-open-2'));
+        await screen.findByTestId('word-list-entry-a0');
+
+        fireEvent.click(screen.getByTestId('word-list-show-more'));
+
+        expect(pageTwoRequests).toBe(1);
+    });
+
+    it('drops a late page from the list the user navigated away from', async () => {
+        const { a, gate } = await stallListTwoThenOpenThree();
+
+        await act(async () => {
+            gate.resolve(jsonResponse(pageOf(a, '/x?limit=200&offset=200')));
+        });
+
+        // List 3 keeps its own single page; list 2's entries never appear.
+        expect(visibleEntries()).toHaveLength(CHUNK);
+        expect(screen.getByTestId('word-list-entry-b0')).toBeInTheDocument();
+        expect(screen.queryByTestId('word-list-entry-a200')).not.toBeInTheDocument();
+    });
+
+    it('drops a late failure from the list the user navigated away from', async () => {
+        const { gate } = await stallListTwoThenOpenThree();
+
+        await act(async () => {
+            gate.resolve(jsonResponse({ detail: 'Server exploded' }, 500));
+        });
+
+        expect(screen.queryByTestId('word-list-more-error')).not.toBeInTheDocument();
+        expect(screen.getByTestId('word-list-show-more')).toBeEnabled();
+    });
+
+    it('shows no paging control for a freshly created list', async () => {
+        // POST is the one path that fills `detail` without going through the
+        // paged GET — it returns the whole list, capped at MAX_LIST_WORDS. If
+        // `hasMore` ever read something other than total-vs-loaded, this is
+        // where a Show more button would appear for a page that cannot exist.
+        const created = bigDetail(300, { list_id: 7, is_system: false });
+        installIndexThen(() => jsonResponse(created, 201));
+        renderPage();
+
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+
+        await screen.findByTestId('word-list-detail');
+        expect(visibleEntries()).toHaveLength(300);
+        expect(screen.queryByTestId('word-list-more')).not.toBeInTheDocument();
+    });
+
+    it('files a newly created list under Your lists, not the built-ins', async () => {
+        installFetch((url, init) => {
+            if (url.includes('/word-lists') && (!init || init.method === undefined) && !url.match(/word-lists\/\d/)) {
+                return jsonResponse([summary({ list_id: 2, name: 'Top German Words', is_system: true })]);
+            }
+            return jsonResponse(makeDetail({ list_id: 9, name: 'Fresh' }), 201);
+        });
+        renderPage();
+
+        await screen.findByTestId('word-list-system-section');
+        fireEvent.change(screen.getByTestId('word-list-input'), { target: { value: 'Haus' } });
+        fireEvent.click(screen.getByTestId('word-list-create'));
+
+        // Delete is offered, which only happens outside the built-in section.
+        expect(await screen.findByTestId('word-list-delete-9')).toBeInTheDocument();
+        expect(
+            screen.getByTestId('word-list-system-section').contains(screen.getByTestId('word-list-open-9')),
+        ).toBe(false);
+    });
+
+    it('leaves a user-created list working end to end', async () => {
+        installLists([summary({ list_id: 1, name: 'My list', is_system: false })],
+            () => makeDetail({ list_id: 1 }));
+        renderPage();
+
+        // Delete stays offered, the detail opens, and every entry renders.
+        expect(await screen.findByTestId('word-list-delete-1')).toBeInTheDocument();
+        fireEvent.click(screen.getByTestId('word-list-open-1'));
+        await screen.findByTestId('word-list-detail');
+
+        expect(screen.queryByTestId('word-list-detail-system-badge')).not.toBeInTheDocument();
+        expect(screen.getByTestId('word-list-entry-Haus')).toBeInTheDocument();
+        expect(screen.getByTestId('word-list-entry-Bank')).toBeInTheDocument();
+        expect(screen.getByTestId('word-list-download')).toBeInTheDocument();
     });
 });

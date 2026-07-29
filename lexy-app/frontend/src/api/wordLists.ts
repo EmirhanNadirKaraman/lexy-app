@@ -115,10 +115,39 @@ export async function listWordLists(token: string): Promise<WordListSummary[]> {
     return assertOkJson<WordListSummary[]>(res, 'Failed to load word lists');
 }
 
-export async function getWordList(token: string, listId: number): Promise<WordListDetail> {
-    const res = await fetch(apiUrl(`/api/v1/word-lists/${listId}`), {
-        headers: authHeaders(token),
-    });
+/** Page window for {@link getWordList}. Both fields are optional. */
+export interface WordListPageParams {
+    /** Entries to return. Backend accepts 1–1000. Omit for the whole list. */
+    limit?: number;
+    /** Entries to skip, in list order. */
+    offset?: number;
+}
+
+/**
+ * One list, optionally windowed.
+ *
+ * `limit`/`offset` page the `entries` array **only** — `total` and `counts`
+ * stay whole-list on every page, so a caller can walk the entries without the
+ * status badges or the mark-learning count drifting to describe the window.
+ *
+ * Omitting both sends no query string at all, which is the pre-pagination
+ * request byte for byte. That path is kept deliberately: the POST response and
+ * any caller that wants a whole list still get one without opting out of
+ * anything.
+ */
+export async function getWordList(
+    token: string,
+    listId: number,
+    params: WordListPageParams = {},
+): Promise<WordListDetail> {
+    const query = new URLSearchParams();
+    if (params.limit !== undefined) query.set('limit', String(params.limit));
+    if (params.offset !== undefined) query.set('offset', String(params.offset));
+    const suffix = query.toString();
+    const res = await fetch(
+        apiUrl(`/api/v1/word-lists/${listId}${suffix ? `?${suffix}` : ''}`),
+        { headers: authHeaders(token) },
+    );
     return assertOkJson<WordListDetail>(res, 'Failed to load word list');
 }
 

@@ -783,14 +783,60 @@ query. `_load_entries` costs ~33–36 ms on the seeded lists against ~3–4 ms t
 serialise, and `_counts` needs the fully resolved set, so every page still does
 the whole load. Nobody should later expect a latency win that isn't there.
 
-**Phase 2 (frontend) not started.** It must switch the footer denominator from
-`detail.entries.length` to `detail.total`, or a paged response renders
-"Showing 200 of 200".
+~~**Phase 2 (frontend) not started.**~~ **Shipped 2026-07-29** — see the entry
+directly below.
 
 **Validation:** backend `-n auto` → **1151 passed, 2 skipped** (1137 + 14);
 `ruff check .` → All checks passed; alembic unchanged at **037**. Frontend not
 run — no frontend files changed. Root pipeline suite not run — no root files
 changed.
+
+🆕 **2026-07-29 — Frontend paged fetching, phase 2 (+16 frontend)**
+
+`WordListsPage` now consumes the phase-1 params instead of slicing a full
+response client-side. Opening a list requests `limit=200&offset=0`; *Show more*
+requests `offset=<entries already loaded>` and **appends**. `visibleCount` is
+gone — there is one paging concept, not two.
+
+| File | Tests | Covers |
+|---|---|---|
+| `src/components/WordListsPage.test.tsx` | 10 → **26** in the (renamed) paged-fetching block | opening sends `limit=200&offset=0`; only the first page renders; **the footer counts against `total`, not the loaded page**; an explicit "never says 200 of 200" regression guard; *Show more* requests `offset=200&limit=200`; the page is appended with nothing duplicated; the final partial page hides the control; a one-page list shows no chrome; ambiguous/unresolved are not filtered out of a page; *Show more* is **disabled while in flight and fires exactly one request**; a failed page keeps loaded entries and shows an inline error with the control still enabled; **retry re-requests the same offset**, leaving no gap; opening another list resets entries *and* clears a page error; mark-learning refresh returns to `offset=0`; whole-list counts survive an append; **a freshly created list shows no paging control** (POST is the one path that fills `detail` without the paged GET) and files under *Your lists*, not the built-ins; built-in badge / delete-hiding and the user-list path unchanged |
+
+**The stub pages the way the backend does** — slice `entries`, leave
+`total`/`counts` alone. That matters: a stub returning the whole list would
+have let the old `entries.length` denominator keep passing.
+
+**Mutation-checked, including one that failed and changed the code.**
+Denominator → `entries.length`: **3 tests fail**. Append → overwrite: **7
+fail**. `hasMore` keyed on the page size (`>= ENTRY_CHUNK`) rather than on
+`total`: **2 fail**. Dropping `disabled={loadingMore}`: **1 fails**. But dropping the
+handler's `loadingMore` early-return: **0 fail** — correctly, because a
+disabled button never dispatches a click, *and* because two clicks in one frame
+would both read the pre-click closure where that state is still `false`. It was
+guarding a race it could not see. Replaced with the `inFlightPagesRef` key set
+described below, which holds regardless of commit timing. Its *same-page*
+behaviour is **not independently observable through the DOM** — `disabled` is
+what locks the double-click; the ref is the backstop. Its *cross-list*
+behaviour is fully observable and is tested.
+
+**Three ordering hazards are handled, each pinned by a test that fails when its
+guard is removed.** A page arriving after the user opened a different list is
+dropped (`prev.list_id === listId` inside the functional `setDetail`); a late
+failure cannot write its error over the new list (`openListIdRef`); and the
+duplicate-request guard is a **set of `listId:offset:limit` keys**, not a
+boolean. The key shape is load-bearing in both directions — dropping `listId`
+from it fails *"does not let one list's pending page block another list's
+paging"*, and clearing the set in `showDetail` fails *"still refuses a
+duplicate after navigating away and back"*. Each request deletes only its own
+key, so the set drains itself while every other pending page keeps its guard.
+Without all three, "reset on list switch" holds only until a slow request
+lands.
+
+**Validation:** frontend `npx vitest run` → **322 passed across 44 files**
+(306 + 16); `npx tsc --noEmit` clean; `npm run build` clean (474.86 kB JS /
+127.80 kB gzip). Backend pytest **not run — no backend files changed**; `ruff`
+**not run — no Python files changed**; root pipeline suite **not run — no root
+files changed**.
 
 🆕 **2026-07-27 — vocabulary list upload/download (+39 tests / +2 files)**
 
@@ -1689,8 +1735,8 @@ How the backend baseline got to 847, newest last:
 | 858 | word-list phrase support (+11), plus 14 provider byte-identity tests restored from skips — see below |
 | **894** | German catalog backfill (+36) |
 
-Frontend baseline: **278 passed across 44 files** (`npx vitest run` in
-`lexy-app/frontend`).
+Frontend baseline: **322 passed across 44 files** (`npx vitest run` in
+`lexy-app/frontend`), as of 2026-07-29.
 
 > **A sliding `HEAD~n` window silently disarmed 14 tests — fixed 2026-07-27.**
 > The `test_llm_provider.py` byte-identity checks read the pre-seam service
