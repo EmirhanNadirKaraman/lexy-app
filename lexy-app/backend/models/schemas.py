@@ -1001,3 +1001,40 @@ class WordListMarkLearningResult(BaseModel):
     #: True while `remaining > 0`. Defaulted so a client built against the
     #: pre-cap response still validates.
     capped: bool = False
+
+
+# ── Document-package import (roadmap A2) ─────────────────────────────────────
+
+
+class PackageImportRequest(BaseModel):
+    """Request to import a document package.
+
+    ``package_name`` is a *name*, never a path. It is joined under
+    ``PACKAGE_ROOT`` server-side and containment-checked there, so the API
+    surface cannot be used to reach an arbitrary file. Precedent: the S7 note
+    in ``routers/content_requests.py``.
+    """
+
+    package_name: str
+    #: Defaults to True. Real persistence needs migration 038 (roadmap A3);
+    #: until then a non-dry run is refused with a clear diagnostic rather than
+    #: writing rows a schema cannot hold.
+    dry_run: bool = True
+
+
+class PackageImportResponse(BaseModel):
+    import_schema_version: str
+    document_id: str
+    status: str
+    dry_run: bool
+    doc_id: str | None = None
+    source_sha256: str | None = None
+    package_schema_version: str | None = None
+    imported_at: str
+    counts: dict[str, int]
+    validation: dict[str, str]
+    skipped: list[dict]
+    warnings_promoted: list[dict]
+    errors: list[dict]
+    info: list[dict]
+    notes: list[str]

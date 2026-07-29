@@ -35,10 +35,12 @@ from ..models.schemas import (
     BookPageDetail,
     BookPageSummary,
     LLMRepairResponse,
+    PackageImportRequest,
+    PackageImportResponse,
     SentenceCountUpdate,
     StoredBlockToken,
 )
-from ..services import book_service, book_llm_service
+from ..services import book_import_service, book_service, book_llm_service
 
 router = APIRouter(tags=["books"])
 logger = logging.getLogger(__name__)
@@ -172,6 +174,42 @@ async def upload_book(
 
     row = await book_service.get_document(pool, doc_id, str(user["user_id"]))
     return _row_to_doc(row)
+
+
+# ── Document-package import (roadmap A2) ──────────────────────────────────────
+
+
+@router.get("/books/packages")
+async def list_packages(user=Depends(get_current_user)) -> list[str]:
+    """Package names available under ``PACKAGE_ROOT``."""
+    return book_import_service.list_packages()
+
+
+@router.post("/books/import", response_model=PackageImportResponse)
+async def import_package(
+    body: PackageImportRequest,
+    user=Depends(get_current_user),
+) -> PackageImportResponse:
+    """Validate and (eventually) import a document package.
+
+    Returns **200 with a rejected result** rather than an HTTP error when
+    validation fails: the body is the diagnostic, and a caller fixing a worker
+    bug needs every finding, not a status code. Only a genuinely unusable
+    request (a package name that is not a name) is a 4xx.
+
+    ``dry_run`` defaults to True. See ``services/document_package/persistence.py``
+    for why a real import is refused until roadmap A3.
+    """
+    name = (body.package_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="package_name is required")
+
+    result = await book_import_service.import_package(
+        name,
+        user_id=str(user["user_id"]),
+        dry_run=body.dry_run,
+    )
+    return PackageImportResponse(**result.as_dict())
 
 
 # ── Book list / detail ────────────────────────────────────────────────────────
