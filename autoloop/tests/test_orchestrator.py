@@ -1,0 +1,797 @@
+"""Orchestrator state machine with fake conversation / git / executor:
+audit flow, task-owned change manifests around commits, phase gating,
+review-integrity verification, terminal decisions, corrective re-prompts,
+budgets, crash recovery, duplicate-submission protection, pause."""
+
+import hashlib
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+from autoloop.config import AutoloopConfig, BrowserConfig
+from autoloop.contract import Decision
+from autoloop.errors import (
+    GitCommandError,
+    LoginExpiredError,
+    SessionLostError,
+    StateError,
+)
+from autoloop.executor import ExecutionOutcome
+from autoloop.manifest import ManifestStore
+from autoloop.orchestrator import Orchestrator
+from autoloop.policy import PolicyConfig, PolicyEngine
+from autoloop.state import (
+    LastResponse,
+    LoopState,
+    PendingRequest,
+    Phase,
+    StateStore,
+)
+from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
+from autoloop.transcript import TranscriptLogger
+
+URL = "https://chatgpt.com/c/test-conversation"
+
+
+def block(obj) -> str:
+    return f"Reasoning...\n```json\n{json.dumps(obj)}\n```"
+
+
+def plan_block(*ids):
+    tasks = [{"id": tid, "title": f"Title {tid}", "description": "desc"} for tid in ids]
+    return block({"version": 3, "decision": "plan", "reason": "roadmap", "tasks": tasks})
+
+
+def implement_block(task_id="t1"):
+    return block(
+        {"version": 3, "decision": "implement", "reason": "next", "task_id": task_id}
+    )
+
+
+def audit_block(scope=None):
+    data = {"version": 3, "decision": "audit", "reason": "orient"}
+    if scope:
+        data["scope"] = scope
+    return block(data)
+
+
+def revise_audit_block(feedback="dig deeper into migrations"):
+    return block(
+        {
+            "version": 3,
+            "decision": "revise",
+            "reason": "insufficient",
+            "task_id": "audit",
+            "feedback": feedback,
+        }
+    )
+
+
+def stop_block():
+    return block({"version": 3, "decision": "stop", "reason": "all done"})
+
+
+def ask_user_block(question="which DB?"):
+    return block(
+        {"version": 3, "decision": "ask_user", "reason": "unsure", "question": question}
+    )
+
+
+def extract_stamp(prompt: str) -> dict:
+    return {
+        "request_id": re.search(r"request_id: (\S+)", prompt).group(1),
+        "head_sha": re.search(r"head_sha: (\S+)", prompt).group(1),
+        "report_sha256": re.search(r"report_sha256: (\S+)", prompt).group(1),
+    }
+
+
+def approval(decision="commit", paths=("out.md",), task_id=None, message="docs: audit", stamp=None):
+    def responder(client):
+        data = {
+            "version": 3,
+            "decision": decision,
+            "reason": "approved",
+            "reviewed": stamp or extract_stamp(client.submitted[-1][1]),
+        }
+        if decision in ("commit", "commit_and_push"):
+            data["commit"] = {"message": message, "paths": list(paths)}
+            if task_id:
+                data["task_id"] = task_id
+        return block(data)
+
+    return responder
+
+
+class FakeClient:
+    def __init__(self, responses=()):
+        self.responses = list(responses)
+        self.submitted: list[tuple[str, str]] = []
+        self.already: set[str] = set()
+        self.open_calls = 0
+        self.closed = False
+        self.open_errors: list[Exception] = []
+        self.submit_errors: list[Exception] = []
+
+    def open(self):
+        self.open_calls += 1
+        if self.open_errors:
+            raise self.open_errors.pop(0)
+
+    def already_submitted(self, request_id):
+        return request_id in self.already
+
+    def submit(self, request_id, prompt):
+        if self.submit_errors:
+            raise self.submit_errors.pop(0)
+        self.submitted.append((request_id, prompt))
+        self.already.add(request_id)
+
+    def await_response(self, request_id):
+        if not self.responses:
+            raise AssertionError("test script exhausted: no response left")
+        entry = self.responses.pop(0)
+        return entry(self) if callable(entry) else entry
+
+    def close(self):
+        self.closed = True
+
+
+class FakeGit:
+    """Filesystem-backed fake: dirty_files reflects porcelain lines the test
+    (or the fake executor) appends; commit validates exact paths."""
+
+    def __init__(self, repo_root: Path, branch="feature/x"):
+        self.repo_root = Path(repo_root)
+        self.branch = branch
+        self.head = "a" * 40
+        self.dirty: list[str] = []
+        self.commits: list[tuple[str, tuple[str, ...]]] = []
+        self.pushes = 0
+        self.commit_error: Exception | None = None
+        self.push_error: Exception | None = None
+
+    def current_branch(self):
+        return self.branch
+
+    def head_sha(self):
+        return self.head
+
+    def dirty_files(self):
+        return list(self.dirty)
+
+    def commit(self, message, paths):
+        if self.commit_error:
+            raise self.commit_error
+        if not paths:
+            raise GitCommandError("commit requires an explicit non-empty path list")
+        self.commits.append((message, tuple(paths)))
+        self.head = "c" * 40
+        approved = set(paths)
+        self.dirty = [
+            line for line in self.dirty if line[3:].split(" -> ")[-1] not in approved
+        ]
+        return self.head, False, "1 file changed, 1 insertion(+)"
+
+    def push(self, remote="origin"):
+        if self.push_error:
+            raise self.push_error
+        self.pushes += 1
+        return "to origin"
+
+
+class FakeExecutor:
+    """Optionally creates files (like a real task would) so the manifest has
+    task-owned changes to approve."""
+
+    def __init__(self, status="ok", creates=None):
+        self.status = status
+        self.creates = dict(creates or {})
+        self.calls: list[tuple] = []
+        self.git: FakeGit | None = None
+
+    def execute(self, directive, task):
+        self.calls.append((directive, task))
+        for rel_path, content in self.creates.items():
+            target = self.git.repo_root / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            line = f"?? {rel_path}"
+            if line not in self.git.dirty:
+                self.git.dirty.append(line)
+        return ExecutionOutcome(
+            status=self.status,
+            summary="did it",
+            details="details here",
+            validation="ruff clean; 5 tests passed",
+        )
+
+
+def build(
+    tmp_path,
+    responses=(),
+    policy=None,
+    clients=None,
+    state=None,
+    tasks=(),
+    executor=None,
+    branch="feature/x",
+):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(exist_ok=True)
+    (repo_root / "x.py").write_text("pre-existing dirty content\n", encoding="utf-8")
+    git = FakeGit(repo_root, branch=branch)
+    git.dirty.append(" M x.py")
+
+    config = AutoloopConfig(
+        browser=BrowserConfig(conversation_url=URL),
+        policy=policy or PolicyConfig(),
+        state_dir=tmp_path / ".al",
+    )
+    store = StateStore(config.state_file)
+    if state is None:
+        state = LoopState.new(URL)
+        state.outbox = "kickoff report"
+    store.save(state)
+    registry = TaskRegistry(list(tasks))
+    task_store = TaskStore(config.tasks_file)
+    task_store.save(registry)
+    remaining = list(clients) if clients is not None else [FakeClient(responses)]
+    made = list(remaining)
+
+    def factory():
+        if not remaining:
+            raise AssertionError("client factory exhausted")
+        return remaining.pop(0)
+
+    executor = executor or FakeExecutor()
+    executor.git = git
+    manifest_store = ManifestStore(config.manifests_dir)
+    orch = Orchestrator(
+        config=config,
+        store=store,
+        state=state,
+        policy=PolicyEngine(config.policy),
+        git=git,
+        executor=executor,
+        transcript=TranscriptLogger(config.transcript_file),
+        client_factory=factory,
+        registry=registry,
+        task_store=task_store,
+        manifest_store=manifest_store,
+    )
+    return orch, store, git, executor, made, registry, manifest_store
+
+
+def ready_task(tid="t1"):
+    return Task(id=tid, title=f"Title {tid}", description="desc")
+
+
+IMPLEMENT_ON = PolicyConfig(implement_enabled=True)
+
+
+# ---- audit flow -------------------------------------------------------------
+
+
+def test_audit_decision_executes_and_reports(tmp_path):
+    executor = FakeExecutor(creates={"docs/AUDIT_2026-07-29.md": "# audit report"})
+    orch, _, _, executor, clients, _, manifest_store = build(
+        tmp_path, responses=[audit_block(scope="focus on SRS")], executor=executor
+    )
+    orch.run(max_steps=4)
+    directive, task = executor.calls[0]
+    assert directive.decision is Decision.AUDIT
+    assert task is None
+    assert "counterpart" in orch.state.outbox  # audit template wraps the report
+    # manifest recorded the report as task-created
+    manifest = manifest_store.load(orch.state.last_manifest_id)
+    assert manifest.created == ["docs/AUDIT_2026-07-29.md"]
+    assert manifest.task_id == "audit"
+
+
+def test_audit_revision_loop(tmp_path):
+    executor = FakeExecutor(creates={"docs/AUDIT_2026-07-29.md": "# v2 report"})
+    orch, _, _, executor, _, _, _ = build(
+        tmp_path,
+        responses=[audit_block(), revise_audit_block("check migrations"), stop_block()],
+        executor=executor,
+    )
+    assert orch.run() == Phase.STOPPED.value
+    decisions = [d.decision for d, _ in executor.calls]
+    assert decisions == [Decision.AUDIT, Decision.REVISE]
+    revise_directive, revise_task = executor.calls[1]
+    assert revise_task is None
+    assert revise_directive.feedback == "check migrations"
+
+
+def test_crash_recovery_during_audit_redispatches(tmp_path):
+    state = LoopState.new(URL)
+    state.iteration = 1
+    state.phase = Phase.EXECUTING.value
+    state.last_response = LastResponse(
+        request_id="alr-crash-0001",
+        raw=audit_block(),
+        received_at="t",
+        head_sha="a" * 40,
+        base_sha="(none)",
+        report_sha256="b" * 64,
+    )
+    orch, _, _, executor, _, _, _ = build(tmp_path, clients=[FakeClient()], state=state)
+    orch.run(max_steps=1)
+    assert len(executor.calls) == 1
+    assert orch.state.phase == Phase.READY.value
+
+
+# ---- phase gate -------------------------------------------------------------
+
+
+def test_implement_rejected_in_audit_phase(tmp_path):
+    orch, _, _, executor, clients, _, _ = build(
+        tmp_path,
+        responses=[implement_block("t1"), stop_block()],
+        tasks=[ready_task("t1")],
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert executor.calls == []
+    reprompt = clients[0].submitted[1][1]
+    assert "policy_denied" in reprompt
+    assert "audit review only" in reprompt
+
+
+def test_revise_of_registry_task_rejected_in_audit_phase(tmp_path):
+    raw = block(
+        {
+            "version": 3,
+            "decision": "revise",
+            "reason": "r",
+            "task_id": "t1",
+            "feedback": "f",
+        }
+    )
+    orch, _, _, executor, _, _, _ = build(
+        tmp_path, responses=[raw, stop_block()], tasks=[ready_task("t1")]
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert executor.calls == []
+
+
+def test_implement_works_when_phase_gate_lifted(tmp_path):
+    orch, _, _, executor, _, registry, _ = build(
+        tmp_path,
+        responses=[implement_block("t1")],
+        tasks=[ready_task("t1")],
+        policy=IMPLEMENT_ON,
+    )
+    orch.run(max_steps=4)
+    directive, task = executor.calls[0]
+    assert task.id == "t1"
+    assert registry.state_of("t1") is TaskState.IN_PROGRESS
+
+
+# ---- task flow (gate lifted) ------------------------------------------------
+
+
+def test_plan_then_implement_flow(tmp_path):
+    orch, _, _, executor, clients, registry, _ = build(
+        tmp_path,
+        responses=[plan_block("t1", "t2"), implement_block("t1")],
+        policy=IMPLEMENT_ON,
+    )
+    outcome = orch.run(max_steps=8)
+    assert outcome == Phase.READY.value
+    assert registry.state_of("t2") is TaskState.READY
+    directive, task = executor.calls[0]
+    assert directive.decision is Decision.IMPLEMENT
+    assert task.id == "t1"
+    assert "commit" in orch.state.outbox  # ok outcome -> commit_approval template
+    assert orch.state.last_validation == "ruff clean; 5 tests passed"
+
+
+def test_plan_rejected_keeps_registry_and_reports(tmp_path):
+    orch, _, _, _, clients, registry, _ = build(
+        tmp_path,
+        responses=[plan_block("t1"), stop_block()],
+        tasks=[ready_task("t1")],  # duplicate id -> rejected
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert len(registry.all_tasks()) == 1
+    assert "plan_rejected" in clients[0].submitted[1][1]
+
+
+# ---- change manifest + commit gate ------------------------------------------
+
+
+def audit_then_commit(tmp_path, commit_responder, executor=None, extra_responses=()):
+    executor = executor or FakeExecutor(creates={"out.md": "# report"})
+    return build(
+        tmp_path,
+        responses=[audit_block(), commit_responder, *extra_responses],
+        executor=executor,
+    )
+
+
+def test_commit_of_task_created_file_succeeds(tmp_path):
+    orch, _, git, _, clients, _, _ = audit_then_commit(
+        tmp_path, approval("commit", paths=("out.md",))
+    )
+    orch.run(max_steps=8)
+    assert git.commits == [("docs: audit", ("out.md",))]
+    assert orch.state.reviewed_commit == "c" * 40
+    assert "NOT yet pushed" in orch.state.outbox
+
+
+def test_commit_without_manifest_refused(tmp_path):
+    # First directive is a commit — no task ever executed, no manifest.
+    orch, _, git, _, clients, _, _ = build(
+        tmp_path,
+        responses=[approval("commit", paths=("x.py",)), stop_block()],
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []
+    assert "no change manifest recorded" in clients[0].submitted[1][1]
+
+
+def test_commit_of_preexisting_dirty_file_refused(tmp_path):
+    # x.py was dirty BEFORE the audit ran and the audit did not touch it.
+    orch, _, git, _, clients, _, _ = audit_then_commit(
+        tmp_path, approval("commit", paths=("x.py",)), extra_responses=[stop_block()]
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []
+    reprompt = clients[0].submitted[2][1]
+    assert "commit refused" in reprompt
+    assert "already modified before the task started" in reprompt
+
+
+def test_commit_of_untouched_file_refused(tmp_path):
+    orch, _, git, _, clients, _, _ = audit_then_commit(
+        tmp_path,
+        approval("commit", paths=("out.md", "never_touched.md")),
+        extra_responses=[stop_block()],
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []
+    assert "was not changed by task" in clients[0].submitted[2][1]
+
+
+def test_file_changed_during_task_on_top_of_baseline_is_committable(tmp_path):
+    # x.py is dirty at baseline AND the task edits it further -> task-modified.
+    executor = FakeExecutor(creates={"x.py": "content rewritten by the task\n"})
+    orch, _, git, _, _, _, manifest_store = audit_then_commit(
+        tmp_path, approval("commit", paths=("x.py",)), executor=executor
+    )
+    orch.run(max_steps=8)
+    manifest = manifest_store.load(orch.state.last_manifest_id)
+    assert manifest.modified == ["x.py"]
+    assert git.commits == [("docs: audit", ("x.py",))]
+
+
+def test_commit_and_push_flow(tmp_path):
+    orch, _, git, _, _, _, _ = audit_then_commit(
+        tmp_path, approval("commit_and_push", paths=("out.md",))
+    )
+    orch.run(max_steps=8)
+    assert len(git.commits) == 1
+    assert git.pushes == 1
+    assert "Git action completed" in orch.state.outbox
+
+
+def test_commit_completes_referenced_task(tmp_path):
+    executor = FakeExecutor(creates={"out.md": "# change"})
+    orch, _, git, _, _, registry, _ = build(
+        tmp_path,
+        responses=[implement_block("t1"), approval("commit", paths=("out.md",), task_id="t1")],
+        tasks=[ready_task("t1")],
+        policy=IMPLEMENT_ON,
+        executor=executor,
+    )
+    orch.run(max_steps=8)
+    assert registry.state_of("t1") is TaskState.COMPLETED
+    assert git.commits == [("docs: audit", ("out.md",))]
+
+
+# ---- review integrity -------------------------------------------------------
+
+
+def test_stale_stamp_rejected_and_nothing_committed(tmp_path):
+    stale = {"request_id": "alr-old-0001", "head_sha": "f" * 40, "report_sha256": "0" * 64}
+    orch, _, git, _, clients, _, _ = audit_then_commit(
+        tmp_path,
+        approval("commit", paths=("out.md",), stamp=stale),
+        extra_responses=[stop_block()],
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []
+    assert "review_mismatch:request_id" in clients[0].submitted[2][1]
+
+
+def test_head_moved_since_review_rejected(tmp_path):
+    executor = FakeExecutor(creates={"out.md": "# r"})
+    orch, _, git, _, made, _, _ = build(
+        tmp_path,
+        responses=[audit_block(), "PLACEHOLDER", stop_block()],
+        executor=executor,
+    )
+
+    def responder(client):
+        response = approval("commit", paths=("out.md",))(client)
+        git.head = "f" * 40  # tree changes after review, before execution
+        return response
+
+    made[0].responses[1] = responder
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []
+    assert "review_mismatch:head_moved" in made[0].submitted[2][1]
+
+
+def test_push_approval_stamps_new_head_after_commit(tmp_path):
+    orch, _, git, _, clients, _, _ = audit_then_commit(
+        tmp_path,
+        approval("commit", paths=("out.md",)),
+        extra_responses=[approval("push"), stop_block()],
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert git.pushes == 1
+    assert extract_stamp(clients[0].submitted[2][1])["head_sha"] == "c" * 40
+
+
+def test_recovery_reverifies_stamp_from_saved_response(tmp_path):
+    state = LoopState.new(URL)
+    state.iteration = 3
+    state.phase = Phase.EXECUTING.value
+    raw = block(
+        {
+            "version": 3,
+            "decision": "commit",
+            "reason": "approved",
+            "commit": {"message": "docs: audit", "paths": ["out.md"]},
+            "reviewed": {
+                "request_id": "alr-crash-0003",
+                "head_sha": "a" * 40,
+                "report_sha256": "b" * 64,
+            },
+        }
+    )
+    state.last_response = LastResponse(
+        request_id="alr-crash-0003",
+        raw=raw,
+        received_at="t",
+        head_sha="a" * 40,
+        base_sha="(none)",
+        report_sha256="b" * 64,
+    )
+    orch, _, git, _, _, _, manifest_store = build(
+        tmp_path, clients=[FakeClient()], state=state
+    )
+    # Recreate the pre-crash manifest: the audit had created out.md.
+    from autoloop.manifest import ChangeManifest
+
+    (git.repo_root / "out.md").write_text("# r", encoding="utf-8")
+    git.dirty.append("?? out.md")
+    manifest = ChangeManifest.begin("audit-i0003", "audit", git)
+    manifest.baseline = {"x.py": manifest.baseline["x.py"]}  # out.md is task-created
+    manifest.finish(
+        {
+            "x.py": manifest.baseline["x.py"],
+            "out.md": hashlib.sha256(b"# r").hexdigest(),
+        }
+    )
+    manifest_store.save(manifest)
+    orch.state.last_manifest_id = "audit-i0003"
+    orch.run(max_steps=1)
+    assert git.commits == [("docs: audit", ("out.md",))]
+
+
+# ---- context ----------------------------------------------------------------
+
+
+def test_prompt_carries_full_context_block(tmp_path):
+    orch, _, _, _, clients, _, _ = build(
+        tmp_path,
+        responses=[plan_block("t1"), stop_block()],
+        tasks=[ready_task("t0")],
+    )
+    orch.run()
+    first, second = clients[0].submitted[0][1], clients[0].submitted[1][1]
+    for label in (
+        "CONTEXT",
+        "request_id:",
+        "timestamp:",
+        "head_sha:",
+        "base_sha:",
+        "report_sha256:",
+        "branch: feature/x",
+        "changed_files: x.py",
+        "previous_decision: (none)",
+        "validation: (none)",
+        "roadmap:",
+    ):
+        assert label in first, label
+    assert "previous_decision: plan" in second
+    assert "next ready: t0" in second
+
+
+# ---- contract violations ----------------------------------------------------
+
+
+def test_malformed_response_triggers_corrective_reprompt(tmp_path):
+    orch, _, _, executor, clients, _, _ = build(
+        tmp_path, responses=["Sounds good.", audit_block()]
+    )
+    outcome = orch.run(max_steps=8)
+    assert outcome == Phase.READY.value
+    prompts = [p for _, p in clients[0].submitted]
+    assert "contract_violation" in prompts[1]
+    assert len(executor.calls) == 1
+    assert orch.state.parse_retries == 0
+
+
+def test_parse_budget_exhaustion_parks_loop(tmp_path):
+    orch, _, _, _, _, _, _ = build(
+        tmp_path,
+        responses=["not json", "still not json"],
+        policy=PolicyConfig(max_parse_retries=1),
+    )
+    assert orch.run() == Phase.NEEDS_USER.value
+    assert "malformed" in orch.state.question
+
+
+# ---- terminal decisions -----------------------------------------------------
+
+
+def test_stop_decision_ends_loop(tmp_path):
+    orch, _, _, executor, _, _, _ = build(tmp_path, responses=[stop_block()])
+    assert orch.run() == Phase.STOPPED.value
+    assert orch.state.stop_reason == "all done"
+    assert executor.calls == []
+
+
+def test_ask_user_parks_loop(tmp_path):
+    orch, _, _, _, _, _, _ = build(tmp_path, responses=[ask_user_block("which DB?")])
+    assert orch.run() == Phase.NEEDS_USER.value
+    assert orch.state.question == "which DB?"
+    assert orch.state.resume_phase is None
+
+
+# ---- policy + git failures --------------------------------------------------
+
+
+def test_denied_push_is_reported_not_executed(tmp_path):
+    orch, _, git, _, clients, _, _ = build(
+        tmp_path, responses=[approval("push"), stop_block()], branch="main"
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert git.pushes == 0
+    assert "policy_denied" in clients[0].submitted[1][1]
+
+
+def test_git_failure_reported_to_chatgpt(tmp_path):
+    orch, _, git, _, clients, _, _ = audit_then_commit(
+        tmp_path, approval("commit", paths=("out.md",)), extra_responses=[stop_block()]
+    )
+    git.commit_error = GitCommandError("index locked")
+    assert orch.run() == Phase.STOPPED.value
+    reprompt = clients[0].submitted[2][1]
+    assert "git_failure" in reprompt
+    assert "index locked" in reprompt
+
+
+def test_git_failure_in_ready_preserves_outbox(tmp_path):
+    orch, _, git, _, _, _, _ = build(tmp_path, clients=[FakeClient()])
+    git_error = GitCommandError("git binary missing")
+
+    def broken_head():
+        raise git_error
+
+    git.head_sha = broken_head
+    assert orch.run() == Phase.NEEDS_USER.value
+    assert orch.state.resume_phase == Phase.READY.value
+    assert orch.state.outbox == "kickoff report"
+
+
+# ---- browser failures -------------------------------------------------------
+
+
+def test_browser_failure_reconnects_and_retries(tmp_path):
+    first = FakeClient()
+    first.submit_errors = [SessionLostError("browser restarted")]
+    second = FakeClient(responses=[stop_block()])
+    orch, _, _, _, _, _, _ = build(tmp_path, clients=[first, second])
+    assert orch.run() == Phase.STOPPED.value
+    assert first.closed
+    assert len(second.submitted) == 1
+
+
+def test_browser_failure_budget_leads_to_failed(tmp_path):
+    clients = []
+    for _ in range(3):
+        c = FakeClient()
+        c.submit_errors = [SessionLostError("still down")]
+        clients.append(c)
+    orch, _, _, _, _, _, _ = build(
+        tmp_path, clients=clients, policy=PolicyConfig(max_consecutive_failures=1)
+    )
+    assert orch.run() == Phase.FAILED.value
+    assert orch.state.resume_phase == Phase.SUBMITTING.value
+
+
+def test_login_expiry_parks_with_resume_phase(tmp_path):
+    client = FakeClient()
+    client.open_errors = [LoginExpiredError("ChatGPT session is logged out")]
+    orch, _, _, _, _, _, _ = build(tmp_path, clients=[client])
+    assert orch.run() == Phase.NEEDS_USER.value
+    assert orch.state.resume_phase == Phase.SUBMITTING.value
+
+
+# ---- crash recovery ---------------------------------------------------------
+
+
+def test_recovery_never_resubmits_a_submitted_request(tmp_path):
+    state = LoopState.new(URL)
+    state.iteration = 1
+    state.phase = Phase.SUBMITTING.value
+    state.pending_request = PendingRequest(
+        request_id="alr-crash-0001", payload="payload", prompt="THE PROMPT", submitted=False
+    )
+    client = FakeClient(responses=[stop_block()])
+    client.already.add("alr-crash-0001")
+    orch, _, _, _, _, _, _ = build(tmp_path, clients=[client], state=state)
+    assert orch.run() == Phase.STOPPED.value
+    assert client.submitted == []
+
+
+def test_recovery_resubmits_stored_prompt_byte_identical(tmp_path):
+    state = LoopState.new(URL)
+    state.iteration = 1
+    state.phase = Phase.SUBMITTING.value
+    state.pending_request = PendingRequest(
+        request_id="alr-crash-0001",
+        payload="payload",
+        prompt="EXACT STORED PROMPT alr-crash-0001",
+        submitted=False,
+    )
+    client = FakeClient(responses=[stop_block()])
+    orch, _, _, _, _, _, _ = build(tmp_path, clients=[client], state=state)
+    orch.run()
+    assert client.submitted == [("alr-crash-0001", "EXACT STORED PROMPT alr-crash-0001")]
+
+
+# ---- budgets & control ------------------------------------------------------
+
+
+def test_iteration_budget_parks_loop_with_outbox_intact(tmp_path):
+    orch, _, _, _, _, _, _ = build(
+        tmp_path,
+        responses=[audit_block()],
+        policy=PolicyConfig(max_iterations=1),
+    )
+    assert orch.run() == Phase.NEEDS_USER.value
+    assert orch.state.resume_phase == Phase.READY.value
+    assert orch.state.outbox is not None
+    assert "iteration budget" in orch.state.question
+
+
+def test_pause_file_stops_before_next_step(tmp_path):
+    orch, _, _, _, _, _, _ = build(tmp_path, responses=[stop_block()])
+    orch._config.pause_file.parent.mkdir(parents=True, exist_ok=True)
+    orch._config.pause_file.touch()
+    assert orch.run() == "paused"
+    assert orch.state.phase == Phase.READY.value
+
+
+def test_ready_without_outbox_is_a_state_error(tmp_path):
+    state = LoopState.new(URL)
+    orch, _, _, _, _, _, _ = build(tmp_path, clients=[FakeClient()], state=state)
+    with pytest.raises(StateError):
+        orch.run(max_steps=1)
+
+
+def test_state_persists_across_reload(tmp_path):
+    orch, store, _, _, _, _, _ = build(tmp_path, responses=[audit_block()])
+    orch.run(max_steps=4)
+    reloaded = store.load()
+    assert reloaded.phase == Phase.READY.value
+    assert reloaded.iteration == 1
+    assert reloaded.last_decision == "audit"
+    assert reloaded.last_manifest_id == orch.state.last_manifest_id

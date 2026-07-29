@@ -1,0 +1,58 @@
+# Autoloop configuration template.
+# Copy to .autoloop/config.toml (the default path `python -m autoloop` reads)
+# and fill in browser.conversation_url. Unknown keys are rejected, not ignored.
+
+[browser]
+# The ONE persistent ChatGPT conversation the loop uses. Open the dedicated
+# profile, create a chat, copy its URL.
+conversation_url = "https://chatgpt.com/c/REPLACE-ME"
+# Chrome DevTools endpoint of the dedicated profile (see docs/AUTOLOOP.md for
+# the launch command).
+cdp_url = "http://127.0.0.1:9222"
+# How long to wait for ChatGPT to finish answering one prompt.
+response_timeout_seconds = 900.0
+# How long to wait for a submitted prompt to appear in the conversation.
+submit_timeout_seconds = 60.0
+poll_interval_seconds = 2.0
+# The answer must be unchanged this long (and generation stopped) to count.
+stability_seconds = 3.0
+
+[policy]
+max_iterations = 20
+max_consecutive_failures = 3
+max_parse_retries = 2
+max_policy_denials = 3
+allow_commit = true
+allow_push = true
+# Direct pushes to these branches are denied. This repo commits to `main`
+# today — either empty this list or set allow_protected_push = true once you
+# trust the loop; the safe default stays on.
+protected_branches = ["main", "master"]
+allow_protected_push = false
+# Note: force pushes and destructive git commands (reset/clean/rebase/...)
+# cannot be enabled by ANY setting — the git whitelist has no knob for them.
+
+[conversation]
+# Which LLMConversation adapter to use (see autoloop/conversation.py).
+# "browser_chatgpt" is the only built-in; future adapters (Claude.ai, Gemini)
+# register here without orchestrator changes.
+provider = "browser_chatgpt"
+
+[executor]
+# "audit" = the real Phase-3 audit executor (read-only claude-CLI subagents,
+# Markdown-only output). "null" = record directives without executing (dry run;
+# `run --null-executor` overrides per-invocation).
+kind = "audit"
+
+[audit]
+# How audit subagents are launched (the Claude Code CLI in headless mode).
+agent_command = ["claude"]
+agent_timeout_seconds = 900.0
+max_parallel_agents = 3
+# Safe validation commands run before the agents (argv lists; binaries are
+# restricted to ruff/pytest/python/npm/npx/tsc — nothing that mutates).
+validation_commands = [["ruff", "check", "."], ["python3", "-m", "pytest", "autoloop/tests", "-q"], ["python3", "-m", "pytest", "tests/", "-q"]]
+
+[paths]
+# Runtime state (state.json, tasks.json, transcript.jsonl, diagnostics/, PAUSE).
+state_dir = ".autoloop"

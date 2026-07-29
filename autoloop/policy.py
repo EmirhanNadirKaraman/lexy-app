@@ -1,0 +1,242 @@
+"""Deterministic policy / safety layer.
+
+Pure functions over configuration + state — no LLM involvement, no I/O. Every
+check returns a Verdict; the orchestrator and git gateway act on verdicts, and
+the git gateway re-validates every git invocation as defense in depth even
+though decisions were already authorized upstream.
+
+Hard rules with no configuration escape hatch:
+  * force pushes (any form) — the `push` whitelist admits zero flags
+  * history rewrites / destructive ops (reset, clean, rebase, checkout, ...)
+    — their subcommands are simply not on the whitelist
+Configurable rules:
+  * protected branches, commit/push enablement, iteration + retry budgets
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Sequence
+
+from .contract import (
+    AUDIT_TASK_ID,
+    COMMIT_DECISIONS,
+    PUSH_DECISIONS,
+    TASK_DECISIONS,
+    Decision,
+    Directive,
+)
+from .tasks import TaskRegistry, TaskState
+
+
+@dataclass(frozen=True)
+class Verdict:
+    allowed: bool
+    code: str
+    reason: str
+
+    @classmethod
+    def ok(cls) -> "Verdict":
+        return cls(True, "ok", "")
+
+    @classmethod
+    def deny(cls, code: str, reason: str) -> "Verdict":
+        return cls(False, code, reason)
+
+
+@dataclass(frozen=True)
+class PolicyConfig:
+    max_iterations: int = 20
+    max_consecutive_failures: int = 3
+    max_parse_retries: int = 2
+    max_policy_denials: int = 3
+    allow_commit: bool = True
+    allow_push: bool = True
+    protected_branches: tuple[str, ...] = ("main", "master")
+    allow_protected_push: bool = False
+    # Phase gate: while False (Phase 3 default), `implement` and `revise` of
+    # repository tasks are denied deterministically — only the audit-review
+    # cycle (audit / revise-of-audit / plan / stamped Markdown commits / push /
+    # ask_user / stop) is executable.
+    implement_enabled: bool = False
+
+
+# Whitelist, not blacklist: a git invocation is allowed only if its subcommand
+# appears here AND every flag it passes appears in that subcommand's set.
+# `push` admitting zero flags is what makes --force / --force-with-lease /
+# --delete / --mirror structurally impossible. reset / clean / rebase /
+# checkout / filter-branch are not listed, so they are denied regardless of
+# flags. `add` admits only `--` (explicit paths) — `git add -A` was removed in
+# Phase 3 and there is deliberately no flag or config that brings it back.
+# `restore` is admitted ONLY with `--staged` (index-only unstaging; see
+# _REQUIRED_GIT) — a worktree-touching `git restore <path>` stays impossible.
+_ALLOWED_GIT: dict[str, frozenset[str]] = {
+    "status": frozenset({"--porcelain"}),
+    "rev-parse": frozenset({"--abbrev-ref", "--verify", "--show-toplevel", "--short"}),
+    "log": frozenset({"-1", "--format=%H", "--format=%s", "--format=%B"}),
+    "diff": frozenset({"--stat", "--name-only", "--cached"}),
+    "show": frozenset({"--stat", "--format=%H"}),
+    "branch": frozenset({"--show-current"}),
+    "add": frozenset({"--"}),
+    "commit": frozenset({"-m"}),
+    "push": frozenset(),
+    "remote": frozenset({"-v"}),
+    "restore": frozenset({"--staged", "--"}),
+}
+
+# Flags that MUST be present for the subcommand to be allowed at all.
+_REQUIRED_GIT: dict[str, frozenset[str]] = {
+    "restore": frozenset({"--staged"}),
+    "add": frozenset({"--"}),
+}
+
+
+class PolicyEngine:
+    def __init__(self, config: PolicyConfig):
+        self.config = config
+
+    # ---- directive authorization -------------------------------------------
+
+    def authorize_directive(
+        self, directive: Directive, current_branch: str, registry: TaskRegistry
+    ) -> Verdict:
+        """Gate commit/push decisions and task references.
+
+        Commits and pushes happen ONLY via directives whose decision explicitly
+        approves them (enforced structurally: the orchestrator calls the git
+        gateway only from those branches); this check adds the configurable
+        layer on top. Task references (implement/revise, and the optional
+        completion id on commits) must point at a known task that is not
+        blocked and not already completed — deterministic graph state, never
+        ChatGPT's claim about it.
+        """
+        decision = directive.decision
+        if decision in TASK_DECISIONS:
+            if directive.task_id == AUDIT_TASK_ID:
+                # The audit pseudo-task: revise re-runs the audit with
+                # feedback; "implement audit" is meaningless.
+                if decision is Decision.IMPLEMENT:
+                    return Verdict.deny(
+                        "phase_gate", "'implement' cannot target the audit pseudo-task"
+                    )
+            else:
+                if not self.config.implement_enabled:
+                    return Verdict.deny(
+                        "phase_gate",
+                        "this phase supports audit review only — implement/revise "
+                        "of repository tasks is disabled "
+                        "(policy.implement_enabled=false). Available: revise the "
+                        "audit (task_id='audit'), plan, commit/push approved "
+                        "Markdown, ask_user, stop.",
+                    )
+                verdict = self._check_task_reference(directive.task_id, registry)
+                if not verdict.allowed:
+                    return verdict
+        elif decision in COMMIT_DECISIONS and directive.task_id is not None:
+            # Completing an already-completed task is an idempotent no-op
+            # (crash recovery re-dispatches the same approval), so it is
+            # allowed here and skipped in the git dispatch.
+            verdict = self._check_task_reference(
+                directive.task_id, registry, allow_completed=True
+            )
+            if not verdict.allowed:
+                return verdict
+        if decision in COMMIT_DECISIONS and not self.config.allow_commit:
+            return Verdict.deny(
+                "commit_disabled", "commits are disabled by policy (policy.allow_commit=false)"
+            )
+        if decision in PUSH_DECISIONS:
+            if not self.config.allow_push:
+                return Verdict.deny(
+                    "push_disabled", "pushes are disabled by policy (policy.allow_push=false)"
+                )
+            if (
+                current_branch in self.config.protected_branches
+                and not self.config.allow_protected_push
+            ):
+                return Verdict.deny(
+                    "protected_branch",
+                    f"direct push to protected branch '{current_branch}' is not allowed",
+                )
+        return Verdict.ok()
+
+    def _check_task_reference(
+        self, task_id: str | None, registry: TaskRegistry, allow_completed: bool = False
+    ) -> Verdict:
+        if not task_id or not registry.has(task_id):
+            return Verdict.deny(
+                "task_unknown",
+                f"task '{task_id}' is not in the registry — plan it first",
+            )
+        state = registry.state_of(task_id)
+        if state is TaskState.COMPLETED:
+            if allow_completed:
+                return Verdict.ok()
+            return Verdict.deny("task_completed", f"task '{task_id}' is already completed")
+        if state is TaskState.BLOCKED:
+            return Verdict.deny(
+                "task_blocked",
+                f"task '{task_id}' is blocked by incomplete dependencies",
+            )
+        return Verdict.ok()
+
+    # ---- git command validation (defense in depth) --------------------------
+
+    def validate_git_command(self, args: Sequence[str]) -> Verdict:
+        if not args:
+            return Verdict.deny("git_empty", "empty git command")
+        sub = args[0]
+        allowed_flags = _ALLOWED_GIT.get(sub)
+        if allowed_flags is None:
+            return Verdict.deny(
+                "git_subcommand_forbidden",
+                f"git subcommand '{sub}' is not on the whitelist",
+            )
+        for token in args[1:]:
+            if token.startswith("-") and token not in allowed_flags:
+                return Verdict.deny(
+                    "git_flag_forbidden", f"flag '{token}' is not allowed for 'git {sub}'"
+                )
+        required = _REQUIRED_GIT.get(sub)
+        if required and not required.issubset(args[1:]):
+            missing = sorted(required - set(args[1:]))
+            return Verdict.deny(
+                "git_flag_required",
+                f"'git {sub}' is only allowed with {missing} present",
+            )
+        return Verdict.ok()
+
+    # ---- budgets ------------------------------------------------------------
+
+    def check_iteration_budget(self, next_iteration: int) -> Verdict:
+        if next_iteration > self.config.max_iterations:
+            return Verdict.deny(
+                "iteration_budget",
+                f"iteration budget exhausted ({self.config.max_iterations}); "
+                "raise policy.max_iterations in the config to continue",
+            )
+        return Verdict.ok()
+
+    def check_failure_budget(self, consecutive_failures: int) -> Verdict:
+        if consecutive_failures > self.config.max_consecutive_failures:
+            return Verdict.deny(
+                "failure_budget",
+                f"more than {self.config.max_consecutive_failures} consecutive browser failures",
+            )
+        return Verdict.ok()
+
+    def check_parse_budget(self, parse_retries: int) -> Verdict:
+        if parse_retries > self.config.max_parse_retries:
+            return Verdict.deny(
+                "parse_budget",
+                f"more than {self.config.max_parse_retries} malformed responses in a row",
+            )
+        return Verdict.ok()
+
+    def check_denial_budget(self, policy_denials: int) -> Verdict:
+        if policy_denials > self.config.max_policy_denials:
+            return Verdict.deny(
+                "denial_budget",
+                f"more than {self.config.max_policy_denials} policy-denied directives in a row",
+            )
+        return Verdict.ok()

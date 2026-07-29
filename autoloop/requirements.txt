@@ -1,0 +1,4 @@
+# Runtime-only dependency of the live loop. The test suite runs without it
+# (the Playwright session is imported lazily and mocked in tests).
+# After installing, run once: playwright install chromium
+playwright==1.54.0
