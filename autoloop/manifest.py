@@ -1,5 +1,18 @@
 """Change manifests: what a commit approval is allowed to touch.
 
+**NON-PRODUCTION (2026-07-30, docs/SECURITY.md S21 / S22).** Both manifest
+kinds below, and every function in this module, are retired from the
+production dispatch path: `orchestrator.py`'s `_dispatch_git` (the only
+caller of `verify_commit` / `verify_tree_content` / `render_adoption_block`,
+and of `GitGateway.commit()` / `commit_adopted()`) was removed when the
+legacy authorize-then-produce commit path was replaced end to end by
+produce-then-review (`worktask.py`, `packet.py`, `_dispatch_task_postcommit`
+— audit included). `ChangeManifest.adopt` already had no production caller
+before that. This module is kept, unmodified otherwise, because it is still
+exercised directly by `test_manifest.py` (unit-level primitive tests, not
+integration through the orchestrator) — do not wire it back into
+`orchestrator.py` without a fresh design review.
+
 Two kinds, one gate.
 
 **`executor` (unchanged, the default).** Every executor run gets a content

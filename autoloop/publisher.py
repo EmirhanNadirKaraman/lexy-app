@@ -49,6 +49,8 @@ like every other write path in this codebase.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -57,6 +59,7 @@ from typing import Sequence
 from .errors import GitCommandError
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
+from .state import utcnow_iso
 
 #: Mirrors `git_gateway._SHA_RE` — a push/fetch source or want token must be
 #: a literal, already-resolved 40-hex commit id, never a ref, tag or HEAD.
@@ -72,6 +75,67 @@ def _run(args: list[str], cwd: Path) -> None:
         )
 
 
+# ---- publisher paths — single source of truth for `cli.py` / `doctor.py` --
+
+
+def publisher_repo_path(state_dir: Path) -> Path:
+    # Resolved for the same reason as WorkerRepoManager: these become
+    # subprocess cwd / `git init` targets, and the shipped state_dir is relative.
+    return Path(state_dir).resolve() / "publisher.git"
+
+
+def publisher_hooks_path(state_dir: Path) -> Path:
+    # Resolved for the same reason as WorkerRepoManager: these become
+    # subprocess cwd / `git init` targets, and the shipped state_dir is relative.
+    return Path(state_dir).resolve() / "publisher-hooks"
+
+
+def publisher_url_snapshot_path(state_dir: Path) -> Path:
+    # Resolved for the same reason as WorkerRepoManager: these become
+    # subprocess cwd / `git init` targets, and the shipped state_dir is relative.
+    return Path(state_dir).resolve() / "publisher_url.json"
+
+
+# ---- publisher URL policy (v1): a provision-time snapshot, never -----------
+# auto-updated from repository configuration -- see `provision_publisher_repo`
+# and `reprovision_publisher` below for the two functions that touch it.
+
+
+def read_publisher_url_snapshot(state_dir: Path) -> str | None:
+    """The persisted remote url snapshot, or `None` if never provisioned.
+
+    Raises `GitCommandError` if the file exists but cannot be parsed as the
+    expected shape — corruption here is exactly the kind of thing that must
+    surface loudly (a mismatch nobody can explain is worse than a missing
+    snapshot, which just means "provision first")."""
+    path = publisher_url_snapshot_path(state_dir)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise GitCommandError(f"publisher url snapshot {path} is corrupt: {exc}") from exc
+    url = data.get("remote_url") if isinstance(data, dict) else None
+    if not isinstance(url, str) or not url:
+        raise GitCommandError(f"publisher url snapshot {path} is malformed: {data!r}")
+    return url
+
+
+def _write_publisher_url_snapshot(state_dir: Path, remote: str, url: str) -> None:
+    path = publisher_url_snapshot_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(
+            {"remote": remote, "remote_url": url, "recorded_at": utcnow_iso()},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
 def provision_publisher_repo(
     state_dir: Path, source_git: GitGateway, remote: str = "origin"
 ) -> Path:
@@ -79,32 +143,80 @@ def provision_publisher_repo(
     `state_dir/publisher.git`, with `core.hooksPath` pointed at
     `state_dir/publisher-hooks` (created empty, never wiped if it already
     has content — an existing file there is left for `Publisher`'s own
-    construction-time check to refuse loudly, not silently cleaned up), and
-    `remote.<remote>.url` copied from `source_git`'s own configured url for
-    that remote name. Safe to call every run: re-copies the url (so a
-    changed real destination is picked up) and leaves an existing bare repo
-    and its objects alone.
+    construction-time check to refuse loudly, not silently cleaned up).
+
+    **URL policy (v1): a provision-time snapshot, never auto-updated.** The
+    FIRST call for a given `state_dir` reads `source_git`'s configured
+    `remote.<remote>.url`, persists it to `publisher_url_snapshot_path`
+    (`publisher_url.json`), and copies it into the publisher repo's config.
+    EVERY call after that re-asserts the PERSISTED SNAPSHOT's value — never a
+    fresh read of `source_git` — so a later change to the main checkout's own
+    `origin` is NEVER picked up silently. `reprovision_publisher` (below) is
+    the ONLY function that updates the snapshot after this first write;
+    `doctor` is what surfaces a drift between the snapshot and the main
+    checkout's current config, and `Orchestrator._dispatch_task_push` refuses
+    to publish while one exists (see its own docstring).
 
     Returns the publisher repo's path. Raises `GitCommandError` if
-    `source_git` has no `remote.<remote>.url` configured, or if the bare
-    repo already carries MULTIPLE values for that key (git refuses a plain
-    `config <key> <value>` write in that case — surfaced here rather than
-    silently picking one).
+    `source_git` has no `remote.<remote>.url` configured on first-ever
+    provisioning, or if the bare repo already carries MULTIPLE values for
+    that key (git refuses a plain `config <key> <value>` write in that case —
+    surfaced here rather than silently picking one).
     """
-    publisher_path = Path(state_dir) / "publisher.git"
-    hooks_dir = Path(state_dir) / "publisher-hooks"
+    publisher_path = publisher_repo_path(state_dir)
+    hooks_dir = publisher_hooks_path(state_dir)
     hooks_dir.mkdir(parents=True, exist_ok=True)
     if not publisher_path.exists():
-        _run(["git", "init", "-q", "--bare", str(publisher_path)], cwd=Path(state_dir))
+        _run(["git", "init", "-q", "--bare", str(publisher_path)], cwd=Path(state_dir).resolve())
     _run(["git", "config", "core.hooksPath", str(hooks_dir)], cwd=publisher_path)
+
+    snapshot_url = read_publisher_url_snapshot(state_dir)
+    if snapshot_url is None:
+        url = source_git.config_get(f"remote.{remote}.url")
+        if not url:
+            raise GitCommandError(
+                f"provision_publisher_repo refused: source repo has no "
+                f"remote.{remote}.url configured — nothing to snapshot"
+            )
+        _write_publisher_url_snapshot(state_dir, remote, url)
+        snapshot_url = url
+    _run(["git", "config", f"remote.{remote}.url", snapshot_url], cwd=publisher_path)
+    return publisher_path
+
+
+def reprovision_publisher(
+    state_dir: Path, source_git: GitGateway, remote: str = "origin", confirm: bool = False
+) -> str:
+    """The ONLY function that changes the publisher url snapshot after its
+    first write. `confirm` has no default that makes this callable by
+    accident: the sole caller anywhere in this codebase is `cli.py`'s
+    `reprovision-publisher --confirm` command, an explicit operator action —
+    nothing in `orchestrator.py`'s dispatch path, `authorize_directive`, or
+    any other directive-reachable code calls this function AT ALL (not
+    merely "with confirm=False"); see `test_v1_smoke.py` for the structural
+    assertion that a ChatGPT directive can never reach it.
+
+    Reads `source_git`'s CURRENT `remote.<remote>.url`, overwrites the
+    snapshot with it, and re-provisions the publisher repo to match. Returns
+    the newly-snapshotted url. Raises `GitCommandError` if `confirm` is not
+    `True`, or if `source_git` has no configured url for `remote`.
+    """
+    if not confirm:
+        raise GitCommandError(
+            "reprovision_publisher refused: confirm=True was not passed. This "
+            "is the ONLY way the publisher url snapshot changes after it is "
+            "first written — call it again with confirm=True once the new "
+            "destination has been verified by a human."
+        )
     url = source_git.config_get(f"remote.{remote}.url")
     if not url:
         raise GitCommandError(
-            f"provision_publisher_repo refused: source repo has no "
-            f"remote.{remote}.url configured — nothing to copy"
+            f"reprovision_publisher refused: source repo has no "
+            f"remote.{remote}.url configured — nothing to snapshot"
         )
-    _run(["git", "config", f"remote.{remote}.url", url], cwd=publisher_path)
-    return publisher_path
+    _write_publisher_url_snapshot(state_dir, remote, url)
+    provision_publisher_repo(state_dir, source_git, remote)
+    return url
 
 
 class Publisher:
@@ -284,14 +396,17 @@ class Publisher:
         return {
             "repo_root": str(self._git.repo_root),
             "remote": self.remote,
-            "remote_url_redacted": _redact_url(url),
+            "remote_url_redacted": redact_url(url),
             "hooks_dir": str(self._git.hooks_dir()),
         }
 
 
-def _redact_url(url: str) -> str:
+def redact_url(url: str) -> str:
     """Strip embedded userinfo (`user:token@`) from a url before it is ever
-    logged or returned as diagnostics. A bare local filesystem path (the
-    common case in tests, and possible in production too) has no userinfo
-    to strip and passes through unchanged."""
+    logged, returned as diagnostics, or put into a parked question. A bare
+    local filesystem path (the common case in tests, and possible in
+    production too) has no userinfo to strip and passes through unchanged.
+    Public (not `_redact_url`) because `orchestrator.py` and `doctor.py` both
+    need it for the publisher-url-drift messages — one redaction routine,
+    reused, rather than re-implemented per caller."""
     return re.sub(r"//[^/@]+@", "//", url)

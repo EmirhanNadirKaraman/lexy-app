@@ -8,26 +8,37 @@ cwd; command arguments are program-constructed except the commit message and
 optional staged paths, which come from a validated Directive and are passed as
 argv elements (no shell interpolation).
 
-Staging is EXACT (Phase 3): `commit` requires a non-empty path list, stages
-only those paths (`git add -- <paths>`), verifies the resulting index matches
-the approved set (unstaging any surprise via `git restore --staged`), captures
-the staged diff summary, and only then commits. `git add -A` no longer exists
-anywhere — the policy whitelist rejects `-A` and requires `--`, so it cannot
-be reintroduced without changing the whitelist itself.
-
-`commit` is idempotent for crash recovery: if no approved path differs from
-HEAD and HEAD's message equals the requested message, the commit already
-happened — return it.
+Staging is EXACT (Phase 3): every commit path stages only the approved paths
+(`git add -- <paths>`), verifies the resulting index matches the approved set
+(unstaging any surprise via `git restore --staged`), captures the staged diff
+summary, and only then commits. `git add -A` no longer exists anywhere — the
+policy whitelist rejects `-A` and requires `--`, so it cannot be reintroduced
+without changing the whitelist itself.
 
 There is no ambient `push()` — it pushed whatever the current branch tip
 happened to be at call time, exactly the race + wrong-destination class M1
 exists to close (removed 2026-07-30, pass 2b). Every push goes through
 `push_exact`, by an explicit, already-resolved `<sha>:<dest_ref>` refspec.
 
+**S21 retirement (2026-07-30).** The old authorize-then-produce/manifest
+`commit()` method — plain `git commit`, gated only on `ChangeManifest`
+provenance — is REMOVED. A `pre-commit` hook could rewrite an approved path's
+bytes, or stage an extra unapproved file, strictly AFTER that provenance check
+ran, and both would land in the commit (reproduced; see docs/SECURITY.md
+S21). Its only caller (`orchestrator.py`'s `_dispatch_git`) was removed in the
+same change — S21 is closed by retiring the vulnerable path, not by fixing
+it. `commit_adopted` (below) already closed the same hole a different way —
+build and verify an immutable tree, then `commit-tree` + `update-ref`
+compare-and-swap, refusing outright if any commit hook is active — but it
+ALSO has no production caller anymore (`ChangeManifest.adopt` likewise has
+none): see its own docstring and docs/SECURITY.md S22. It is kept for its
+unit-level tests only; do not wire it back into `orchestrator.py` without a
+fresh design review.
+
 **Produce-then-review path** (`commit_and_capture` / `push_exact`, alongside
-`worktask.py` and `environment.py`): the authorize-then-produce commit paths
-above verify BEFORE committing (`commit`'s manifest check, `commit_adopted`'s
-immutable-tree verification). This path instead commits first with hooks
+`worktask.py` and `environment.py` — the only commit/push path with a live
+production caller after the S21 retirement): unlike the two commit primitives
+above, which verify BEFORE committing, this path commits first with hooks
 enabled, reads the resulting sha honestly from `rev-parse HEAD` (never
 predicted), and leaves review to `range_diff`/`commit_range_paths` reading
 the immutable commit that already exists. `push_exact` then publishes ONLY an
@@ -360,56 +371,17 @@ class GitGateway:
         return commits
 
     # ---- write (only reachable from explicitly approved directives) ---------
-
-    def commit(
-        self, message: str, paths: tuple[str, ...], post_stage_check=None
-    ) -> tuple[str, bool, str]:
-        """Stage EXACTLY the approved paths and commit. Returns
-        (sha, already_committed, staged_diff_summary).
-
-        There is deliberately no all-paths mode: an empty/None path list is a
-        hard error, and staging is verified path-for-path before the commit
-        runs. Idempotent for crash recovery: if none of the approved paths
-        differ from HEAD and HEAD carries the requested message, the commit
-        already happened."""
-        if not paths:
-            raise GitCommandError("commit requires an explicit non-empty path list")
-        approved = {p.strip() for p in paths if p.strip()}
-        touchable = self.dirty_paths() | self.staged_paths()
-        if not (approved & touchable):
-            if self.head_message() == message.strip():
-                return self.head_sha(), True, ""
-            raise GitCommandError(
-                "nothing to commit: none of the approved paths differ from HEAD "
-                "and HEAD's message does not match the requested one"
-            )
-        self._git("add", "--", *sorted(approved))
-        staged = self.staged_paths()
-        extra = staged - approved
-        if extra:
-            # Something was already sitting in the index — undo and refuse.
-            self._git("restore", "--staged", "--", *sorted(extra))
-            raise GitCommandError(
-                f"refusing to commit: index contained unapproved paths {sorted(extra)} "
-                "(now unstaged)"
-            )
-        if not staged:
-            raise GitCommandError(
-                "refusing to commit: staging the approved paths produced an empty index"
-            )
-        if post_stage_check is not None:
-            # The index was built by `git add` above; a caller that binds
-            # content (adopted manifests) re-verifies here so nothing unreviewed
-            # can slip in between its first check and the staging call. On
-            # refusal the index is restored before the error propagates.
-            try:
-                post_stage_check()
-            except Exception:
-                self._git("restore", "--staged", "--", *sorted(staged))
-                raise
-        summary = self._out("diff", "--cached", "--stat")
-        self._git("commit", "-m", message)
-        return self.head_sha(), False, summary
+    #
+    # `commit()` — the legacy authorize-then-produce/manifest commit method,
+    # a plain `git commit` gated only on manifest provenance — was removed
+    # here 2026-07-30 (docs/SECURITY.md S21: closed by retirement, not by a
+    # fix; a `pre-commit` hook could rewrite an approved path's bytes or
+    # stage an extra unapproved file AFTER the manifest check ran, and both
+    # would land in the commit — reproduced, see S21's detail entry). Its
+    # only caller (`orchestrator.py`'s `_dispatch_git`) was removed in the
+    # same change. `commit_and_capture` (below) and `commit_adopted` (further
+    # down) are the two remaining commit primitives; neither has this hole —
+    # see their own docstrings.
 
     # ---- worktree lifecycle (produce-then-review: one worktree per task) ---
     #
@@ -925,6 +897,22 @@ class GitGateway:
         self, message: str, paths: tuple[str, ...], verify_tree
     ) -> tuple[str, str, list[str]]:
         """Commit approved paths via an immutable verified tree.
+
+        **NON-PRODUCTION / UNREACHABLE from any CLI route or dispatch path
+        (2026-07-30, docs/SECURITY.md S22).** This method's own design closed
+        S21 (a `pre-commit` hook rewriting content after verification) the
+        right way — build and verify an immutable tree, then `commit-tree` +
+        `update-ref` compare-and-swap, refusing outright if any commit hook
+        is active. But its only production caller was `orchestrator.py`'s
+        `_dispatch_git`, removed in the same change that retired the sibling
+        (vulnerable) `commit()` method above; `ChangeManifest.adopt`
+        (`manifest.py`), the thing that would produce an adopted manifest to
+        commit here, likewise has no production caller. Nothing in `cli.py`
+        or `orchestrator.py` constructs the inputs this method needs anymore.
+        It is kept, unmodified, because it is still exercised directly by
+        `test_git_gateway.py` / `test_manifest.py` (unit-level primitive
+        tests, not integration through the orchestrator) — do not repair or
+        re-wire it without a fresh design review; see S22.
 
         Sequence. No REF moves and no history is published before every check
         has passed. Note step 6 does write a commit object: a later failure (a

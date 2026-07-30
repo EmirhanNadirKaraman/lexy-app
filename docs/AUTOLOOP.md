@@ -4,56 +4,77 @@ Orchestration for a loop where an AI engineer (Fable) does the repository work
 and ChatGPT — used **through a real browser session, never the OpenAI API** —
 reviews each report and answers with the next machine-readable directive.
 
-State of the system after Phase 3: the loop can run its **first autonomous
-repository audit** — read-only Claude Code subagents per domain, reconciled
-findings, one dated Markdown report, a proposed task graph — and have browser
-ChatGPT review it. Implementation of repository tasks is **deliberately gated
-off** (`policy.implement_enabled = false`); an `implement` reply is denied with
-an explanation.
+**State of the system: Autoloop v1 (2026-07-30).** Every directive that does
+repository work — `audit`, `revise` (of the audit or of a registry task), and
+`implement` — runs through the **produce-then-review** commit path (§4b): its
+own isolated worker repository, an automatic commit once validation passes,
+and review from the immutable committed objects. This is now the **only**
+dispatch path; the older authorize-then-produce/change-manifest commit gate
+described in §4 was **retired**, not merely superseded — see
+`docs/SECURITY.md` S21 ("closed by retirement"). `policy.implement_enabled`
+still gates `implement`/`revise` of ordinary registry tasks (default `false`
+— no real code-editing executor is wired up yet, only the audit executor is
+production-ready), but `audit`/`revise("audit")` are never gated and always
+run.
+
+`cli.py`'s `_build_orchestrator` — what the plain `run` command always calls —
+unconditionally constructs the full produce-then-review collaborator set
+(`WorkerRepoManager`, `TaskExecutionStore`, `IntentStore`, a provisioned
+`Publisher`). There is no configuration that falls back to the retired path.
 
 Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 
 ---
 
-## 1. Architecture (after Phase 3)
+## 1. Architecture (Autoloop v1)
 
 | Component | File(s) | Owns |
 |---|---|---|
-| Orchestrator | `orchestrator.py` | Persisted state machine (ready → submitting → awaiting → executing), failure routing, budgets, review-integrity + manifest gates. |
+| Orchestrator | `orchestrator.py` | Persisted state machine (ready → submitting → awaiting → executing), failure routing, budgets, review-integrity gates, produce-then-review dispatch (`_dispatch_task_postcommit` — the only executor-dispatch path). |
 | Lock | `lock.py` | Single-instance lock per state dir (see §3). |
-| Change manifest | `manifest.py` | Task-owned change tracking + the commit gate (see §4). |
-| Worktrees / task execution | `worktree.py` (`WorktreeManager`), `worktask.py` (`TaskExecution`, `CommitIntent`, `reconcile_after_crash`) | Per-task linked worktree + branch lifecycle, and the crash-safe commit-intent/candidate-sha bookkeeping for produce-then-review (see §4b). |
+| Change manifest (retired, kept for its own unit tests) | `manifest.py` | The old task-owned change-manifest commit gate (see §4) — **no production caller since 2026-07-30** (docs/SECURITY.md S21/S22). |
+| Worktrees / task execution | `worktree.py` (`WorktreeManager`, unused in production — see §4c), `worktask.py` (`TaskExecution`, `CommitIntent`, `reconcile_after_crash`) | Per-task worktree/branch bookkeeping, and the crash-safe commit-intent/candidate-sha bookkeeping for produce-then-review (see §4b). |
 | Review packet | `packet.py` | Renders the post-commit review packet from immutable git objects (see §4b). |
-| Worker/publisher separation | `worker_env.py` (`worker_env`, `WorkerRepoManager`, `verify_worker_isolation`), `publisher.py` (`Publisher`, `provision_publisher_repo`) | Autoloop M2 (see §4c): a scrubbed environment + no-remote repo for worker-side git access, and a dedicated, hooks-controlled repository that is the only path through which a candidate commit is published. |
+| Worker/publisher separation | `worker_env.py` (`worker_env`, `WorkerRepoManager`, `verify_worker_isolation`), `publisher.py` (`Publisher`, `provision_publisher_repo`, `reprovision_publisher`) | Autoloop M2 (see §4c): a scrubbed environment + no-remote repo for worker-side git access — this is what production `_build_orchestrator` actually uses, not `WorktreeManager` — and a dedicated, hooks-controlled repository that is the only path through which a candidate commit is published, with a provision-time URL snapshot (§4d). |
 | Conversation | `conversation.py` (interface/registry), `browser/chatgpt.py` (`BrowserChatGPT`), `browser/playwright_session.py` (CDP, lazy), `browser/selectors.py` | One persistent reviewer conversation; duplicate/stale/streaming/login guards; provider-pluggable. |
 | Contract | `contract.py` | Response contract **v3** + strict parser + `verify_review`. |
 | Policy | `policy.py` | Deterministic gates: git whitelist (`add -A` and force pushes structurally impossible), task-reference checks, **phase gate**, budgets. |
-| Tasks | `tasks.py` | Task registry/graph (derived ready/blocked, cycles rejected, atomic persistence). |
+| Tasks | `tasks.py` | Task registry/graph (derived ready/blocked, cycles rejected, atomic persistence). `seed_tasks.json` (git-tracked, alongside `tasks.py`) seeds a fresh registry with `rt-01` when `.autoloop/tasks.json` does not exist yet (§9b). |
 | Context | `context.py` | Per-request CONTEXT block: integrity stamp + previous decision/task, roadmap, git summary, changed files, validation summary. |
 | Prompts | `prompts.py` | Strict template library (incl. `audit_kickoff`, `smoke_test`, `postcommit_review`). |
-| Git | `git_gateway.py` | Only git runner; exact-path staging; policy-validated per call; `push_exact` is the only way to publish anything (no ambient `push()`). |
-| Doctor | `doctor.py` | Non-destructive preflight (§6). |
-| Audit executor | `audit/` | The production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. |
+| Git | `git_gateway.py` | Only git runner; exact-path staging; policy-validated per call; `push_exact` is the only way to publish anything (no ambient `push()`); the legacy `commit()` method is **removed** (S21). |
+| Doctor | `doctor.py` | Non-destructive preflight (§6), including worker isolation, controlled hooks directories, publisher configuration, and publisher URL drift. |
+| Audit executor | `audit/` | The production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. Dispatched as a task-shaped unit of work (`Orchestrator._resolve_audit_task`), so it runs through §4b like any other task. |
 | State / transcript | `state.py`, `transcript.py` | Atomic crash-safe state; append-only JSONL audit log. |
-| CLI | `cli.py` | `run status tasks doctor smoke-browser pause resume unlock reset`. |
+| CLI | `cli.py` | `run [--continuous] status tasks next-task doctor smoke-browser pause resume unlock reset reprovision-publisher` (§8/§9). |
 
 ---
 
-## 2. Executor lifecycle
+## 2. Executor lifecycle (produce-then-review, unconditional)
 
-For every `audit` / `revise`(audit) / (future) `implement` directive:
+For **every** `audit` / `revise` (of the audit, or of a registry task) /
+`implement` directive, `_dispatch_executor` routes to
+`_dispatch_task_postcommit` — see §4b for the full sequence (worker repo →
+executor → automatic commit → structural + re-run validation → review
+packet). There is no other branch: the old manifest-begin/execute/
+manifest-finish/report cycle this section used to describe was the
+authorize-then-produce path, retired 2026-07-30 (docs/SECURITY.md S21).
 
-1. **Manifest begin** — content snapshot of the dirty tree, persisted to
-   `.autoloop/manifests/<task>-i<iteration>.json`, state saved (crash-safe:
-   redispatch reuses the same manifest id).
-2. **Execute** — the `TaskExecutor` runs (`AuditExecutor` in Phase 3;
-   `NullExecutor` via `run --null-executor` or `executor.kind = "null"` for
-   dry runs). Executors must tolerate redispatch after a crash.
-3. **Manifest finish** — second snapshot; the diff (created/modified/deleted,
-   by content hash, untracked-vs-tracked aware) is the task's owned change
-   set.
-4. **Report** — outcome (+ its `validation` summary) becomes the next review
-   request; the manifest id is recorded in state for the commit gate.
+The one thing specific to *which* directive is running: `_resolve_audit_task`
+gives the audit its own synthetic, per-run `Task` (`audit-<iteration>`, e.g.
+`audit-0007`) — distinct from the protocol-level pseudo-id `"audit"` ChatGPT
+uses in a `revise` directive — so it gets the same isolated-worker-repo
+treatment as a real task, and a `revise` of the audit resumes the SAME unit
+id rather than forking a new worker repo per round. `implement`/`revise` of
+an ordinary registry task use the task's own id directly.
+
+`NullExecutor` (via `run --null-executor` or `executor.kind = "null"`) still
+works: the worker repo is still created (there is nothing to route around),
+but the executor itself reports `status="not_implemented"` with no
+`changed_paths`, and `_dispatch_task_postcommit` checks `outcome.status`
+BEFORE attempting any commit — an `implementation_review` reporting the
+honest "not implemented" outcome is sent, and no `git commit` is ever
+called, rather than a fabricated success.
 
 ---
 
@@ -74,7 +95,19 @@ For every `audit` / `revise`(audit) / (future) `implement` directive:
 
 ---
 
-## 4. Task-owned change manifests (no `git add -A`, ever)
+## 4. Task-owned change manifests (RETIRED 2026-07-30 — kept for reference)
+
+> **This whole section describes the authorize-then-produce commit path,
+> which was RETIRED, not fixed — docs/SECURITY.md S21 ("closed by
+> retirement"). `orchestrator.py`'s `_dispatch_git` (the only caller of
+> `verify_commit`/`GitGateway.commit()`) is gone; produce-then-review (§4b)
+> is the only commit path left, for audit AND implement/revise alike.
+> `manifest.py` and `commit_adopted` (below) are kept, unmodified, because
+> `test_manifest.py`/`test_git_gateway.py` still exercise them directly as
+> standalone primitives — see docs/SECURITY.md S22. Do not read the
+> present-tense wording below as describing current dispatch behaviour; it
+> is preserved as documentation of code that still exists but has no
+> production caller.**
 
 A commit approval must name **exact paths**, and every approved path must be a
 file the last-executed task actually created, modified or deleted:
@@ -337,30 +370,24 @@ produce-then-review push evaluate against the wrong name (denying it
 whenever the main checkout happens to sit on `main`/`master`, the opposite
 of what `protected_branches` is meant to gate). `push_exact`'s OWN
 protected-ref check has no `allow_protected_push` escape hatch by design
-(see its docstring) — both push call sites (`_dispatch_task_push` and the
-legacy `_dispatch_git` push below) therefore pass an EMPTY protected-refs
-tuple to it when `allow_protected_push` is true, so that policy knob stays
-meaningful instead of `authorize_directive` approving a push that
-`push_exact` then silently refuses anyway.
+(see its docstring) — `_dispatch_task_push` therefore passes an EMPTY
+protected-refs tuple to it when `allow_protected_push` is true, so that
+policy knob stays meaningful instead of `authorize_directive` approving a
+push that `push_exact` then silently refuses anyway.
 
-**`commit`/`commit_and_push` are deliberately NOT routed to
-`_dispatch_task_push`** — there is nothing new to commit in this path (the
-commit already exists), so those decisions fall through to the §4
-`_dispatch_git` manifest gate, which refuses them with a clear "no change
-manifest recorded" error rather than silently reinterpreting them as a bare
-push. That same fallthrough is fail-closed against a subtler case: if
-`state.task_execution` shows a live candidate but the CURRENT response
-carries no postcommit binding (a parse-error re-prompt intervened, or the
-response answers an unrelated stale request), `_dispatch_git`'s own push
-branch refuses rather than publishing the main checkout's current branch —
-publishing "whatever the current branch is" is exactly what this whole path
-exists to prevent. That guard is scoped to a candidate still AWAITING
-publication: `_dispatch_task_push` clears `state.task_execution` the moment
-its own push actually lands, so a later, unrelated legacy push (an audit's
-`commit_and_push`, say) is never refused by a stale marker left over from an
-already-finished task — the alternative (never clearing it) would brick the
-legacy push path for the rest of every session that ever runs one
-produce-then-review task to completion.
+**`commit` and `commit_and_push` (and any `push` not bound to a
+produce-then-review candidate) are refused outright (2026-07-30).** There is
+nothing new to commit in this path — the commit already exists, made
+automatically once validation passed — so ChatGPT is never expected to send
+these decisions anymore, and if one arrives anyway it is denied through the
+same budget-capped `policy_denied` corrective-reprompt machinery as any
+other policy violation (`_dispatch`'s `legacy_git_path_retired` denial),
+never routed to an executor and never able to publish "whatever the current
+branch is". This supersedes what used to be a narrower, conditional guard
+inside the now-removed `_dispatch_git` (which only refused a *stale or
+unbound* response while a live candidate was on record) — the replacement is
+unconditional, so there is no longer a scenario where a legacy commit/push
+decision succeeds at all, regardless of what `state.task_execution` shows.
 
 **Revision rounds.** `revise` re-enters the same worktree, keeps the ORIGINAL
 `task_base_sha`, and produces a NEW commit on top of the current candidate —
@@ -493,34 +520,69 @@ CALLING process's own environment, defeating `verify_worker_isolation`
 entirely; `WorkerRepo.gateway(policy)` is the convenience that applies
 `worker_env()` correctly.
 
-**Wiring — narrower than the primitives above.** `Orchestrator` gained an
-optional `publisher: Publisher | None = None` constructor parameter,
-independently gated exactly like the `worktrees`/`execution_store`/
-`intent_store` triple (§4b): every existing caller and test passes `None`
-and `_dispatch_task_push` behaves exactly as before (`worktree_git.
-push_exact` straight from the task's worktree). When a `Publisher` IS
-supplied, `_dispatch_task_push` instead calls `Publisher.import_candidate`
-(sourcing from `execution.worktree_path`, the task's linked worktree) then
-`Publisher.publish` — the reviewed `binding.candidate_sha` stays the sole
-authority in both branches. **`cli.py` does not construct a `Publisher`
-yet** — same status as `worktrees`/`execution_store`/`intent_store` before
-it, primitives built and tested ahead of their wiring.
+**Wiring (2026-07-30 — production, unconditional).** `Orchestrator` takes
+`publisher: Publisher | None = None` and `worker_repos` alongside
+`worktrees`/`execution_store`/`intent_store`; `cli.py`'s `_build_orchestrator`
+— what the plain `run` command always calls — constructs ALL of them: a
+`WorkerRepoManager(config.workers_dir, config.worker_hooks_dir)`, a
+`TaskExecutionStore`/`IntentStore` under `config.executions_dir`/
+`config.intents_dir`, and a `Publisher` from `provision_publisher_repo
+(config.state_dir, git)`. `worker_repos is not None` takes precedence over
+`worktrees` in `_dispatch_task_postcommit` (§4b), and production never sets
+`worktrees` at all — every task, audit included, runs in a genuinely
+isolated `WorkerRepoManager` repo, and `_dispatch_task_push` always imports
+from it into the `Publisher` repo before publishing. There is no
+configuration under which the CLI falls back to a shared-`.git` linked
+worktree or a direct worktree-to-remote push.
 
-**What is, and is NOT, delivered by this pass.** `Publisher` genuinely
-guarantees that publication happens only through a separate, hooks-controlled
-repository — that part is wired end to end (`_dispatch_task_push` above).
-`WorkerRepoManager`/`worker_env` genuinely guarantee that a repo built by
-them has no remote and no ambient credential access — but **that is not yet
-the repository a task's implementation work runs in**. There is no
-repository task executor today (`executor.NullExecutor` is a stub,
-`policy.implement_enabled` defaults to `False`), so nothing currently spawns
-a worker subprocess to apply `worker_env()` to; `_dispatch_task_push` still
-imports from `execution.worktree_path`, a `WorktreeManager` linked worktree
-that shares `.git` with the main checkout. The guarantee this pass actually
-closes end to end is "publication happens only through the separate
-publisher repo, over an object it re-verifies by exact id" — not "the
-worker's own repository is isolated," which remains available-and-tested
-infrastructure for whenever a real executor lands.
+**What this closes end to end, now that it is wired:** a task's
+implementation work — real `implement`/`revise` once a code-editing executor
+exists, and the audit unconditionally today — runs in a repository with no
+configured remote and no ambient credential access (`worker_env`), and
+publication happens only through the separate, hooks-controlled `Publisher`
+repository, over an object it re-verifies by exact id, never a fresh lookup.
+`WorktreeManager` (the M1 linked-worktree lifecycle) remains in the codebase
+and is still directly tested, but is not what production `_build_orchestrator`
+constructs.
+
+---
+
+## 4d. Publisher URL policy (v1: a provision-time snapshot)
+
+`provision_publisher_repo(state_dir, source_git, remote="origin")` records
+`source_git`'s configured `remote.<remote>.url` into a persisted snapshot
+(`state_dir/publisher_url.json`, via `publisher.read_publisher_url_snapshot`
+/ the internal `_write_publisher_url_snapshot`) **only on the first-ever
+call** for a given `state_dir`. Every call after that re-asserts the
+SNAPSHOT's value into the publisher repo's own git config — never a fresh
+read of `source_git` — so a later change to the main checkout's own `origin`
+is **never picked up silently**.
+
+* **`Orchestrator._dispatch_task_push`** compares the main checkout's LIVE
+  `remote.<remote>.url` against the snapshot immediately, before doing
+  anything else. A mismatch parks (`needs_user`) naming the exact reprovision
+  command, rather than publishing to a destination nobody re-confirmed.
+  `Publisher.publish` is also given `expected_url=<snapshot>` as
+  belt-and-braces — `push_exact` re-checks it against the PUBLISHER repo's
+  own configured url immediately before pushing (catches the publisher
+  repo's config being tampered independently of the main checkout).
+* **`doctor`** (§6) reports the same comparison as the `publisher_url_drift`
+  check — `ok` when the snapshot matches the main checkout's current config,
+  `fail` (naming the reprovision command) on a mismatch, `warn` if no
+  snapshot exists yet (the preceding `publisher` check provisions one in the
+  same run).
+* **`python -m autoloop reprovision-publisher --confirm`** is the ONLY way
+  the snapshot changes after its first write (`publisher.
+  reprovision_publisher(state_dir, source_git, remote, confirm=True)` —
+  `confirm` has no default that makes it callable by accident). It re-reads
+  `source_git`'s CURRENT url, overwrites the snapshot, and re-provisions the
+  publisher repo to match. It takes the single-instance lock (§3), like
+  `run`/`reset`. Nothing in `orchestrator.py`'s dispatch path, or anywhere
+  reachable from a ChatGPT directive, calls this function — see
+  `autoloop/tests/test_v1_smoke.py`'s structural assertion.
+* Credentials are never exposed: any url containing embedded userinfo
+  (`https://user:token@host/...`) is redacted (`publisher.redact_url`) before
+  it reaches `status`, `doctor`, a parked question, or `Publisher.describe()`.
 
 ---
 
@@ -638,11 +700,22 @@ python -m autoloop smoke-browser  # submits exactly ONE harmless request
 ```
 
 `doctor` checks: config validity, state-dir writability, lock state, git
-identity, branch policy (warns when pushes would be denied), CDP endpoint
-reachability, Playwright presence, provider registration, conversation-URL
-shape, and — only when CDP+Playwright are actually available — that the
-conversation opens logged-in with the composer and message selectors
-resolving. Exit 0/1.
+identity, branch policy (warns when pushes would be denied), **worker
+isolation** (creates a throwaway probe worker repo via the real
+`WorkerRepoManager`, runs `verify_worker_isolation` against it, removes it),
+**controlled hooks directories** (every accumulated task's worker hooks dir,
+and the publisher's own, must be empty), **publisher configuration**
+(idempotently (re)provisions, then constructs a real `Publisher` — single
+url, no pushurl/mirror/followTags/insteadOf, empty hooks dir), **publisher
+URL drift** (§4d — the persisted snapshot vs. the main checkout's current
+`remote.origin.url`), CDP endpoint reachability, Playwright presence,
+provider registration, conversation-URL shape, and — only when CDP+Playwright
+are actually available — that the conversation opens logged-in with the
+composer and message selectors resolving. Exit 0/1. "Non-destructive" here
+means never irreversible and never touching the real conversation or the
+target repo's own history — the probe worker repo and publisher provisioning
+are both scoped entirely under `config.state_dir`, the same category of side
+effect as the pre-existing state-dir-writable probe file.
 
 `smoke-browser` runs the full normal machinery (request id, CONTEXT stamp,
 parser, transcript, diagnostics-on-failure) against an **isolated** smoke
@@ -666,9 +739,18 @@ running with `--remote-debugging-port=9222`, logged into chatgpt.com, and
 ## 7. The audit executor
 
 `audit`/`revise-of-audit` only — anything else returns an error outcome (and
-is policy-denied before that). Pipeline:
+is policy-denied before that). **Runs inside the audit's own isolated worker
+repo since 2026-07-30** (§2/§4b) — `AuditExecutor`'s constructor takes the
+STANDALONE `git`/`markdown`/`agent_runner` used directly whenever `task` is
+`None` (every direct-call test in `test_audit_executor.py`), plus optional
+`worker_repo_root_for`/`policy`/`agent_runner_factory`; `cli.py`'s
+`_build_executor` always supplies all three in production, so `execute()`
+re-roots onto `worker_repo_root_for(task.id)` — meaning steps 1–2 below read
+the WORKER repo's state (a frozen clone at `task_base_sha`; uncommitted work
+in the MAIN checkout is invisible to the audit), and subagents' `cwd` is that
+same worker repo, not the main checkout. Pipeline:
 
-1. Record git state (branch, HEAD, dirty count).
+1. Record git state (branch, HEAD, dirty count) — of the worker repo.
 2. Run configured **validation commands** (argv lists; binaries restricted to
    `ruff/pytest/python/python3/npm/npx/tsc` — refusal, not trust).
 3. Fan out **read-only subagents**, one per domain: architecture/structure,
@@ -738,48 +820,113 @@ python -m autoloop run --kickoff-audit
 ```
 
 `--kickoff-audit` opens the session by offering ChatGPT the audit; on its
-`audit` reply the executor runs (agents take minutes), the report goes back
-for review, and the loop continues until `stop`/`ask_user`/budget.
+`audit` reply the executor runs (agents take minutes), the commit happens
+automatically (§2/§4b), the review packet goes back for review, and the loop
+continues until `stop`/`ask_user`/budget.
 
-Ongoing control: `status`, `tasks`, `pause`/`resume`, `run --answer "..."`,
-`run --retry`, `run --resubmit` (§5b), `reset --yes`, `unlock`.
-`run --null-executor` dry-runs the loop without executing anything.
+Ongoing control: `status`, `tasks`, `next-task`, `pause`/`resume`,
+`run --answer "..."`, `run --retry`, `run --resubmit` (§5b), `reset --yes`,
+`unlock`. `run --null-executor` dry-runs the loop without executing anything.
+
+### 9a. Continuous mode
+
+```bash
+python -m autoloop run --continuous
+```
+
+Loops the existing phase machine indefinitely instead of running one session
+to a terminal phase and stopping: a saved session in a non-terminal phase is
+resumed via the ordinary `Orchestrator.run()` (this is what makes a
+killed-and-restarted `run --continuous` pick up the saved phase rather than
+starting over); at a clean boundary (no session yet, or the last one ended
+`stopped`), the selection policy decides what's next — a unique ready task
+(`TaskRegistry.next_ready()`, unmodified) starts a new round; otherwise a
+changed repository fingerprint (HEAD sha + a content digest of the dirty
+tree, `cli.repo_fingerprint`, persisted to
+`config.continuous_fingerprint_file`) permits exactly one audit round; an
+**unchanged** fingerprint with no ready task sleeps locally and makes **zero
+Claude and zero ChatGPT calls** — the fingerprint check runs before anything
+that would construct an Orchestrator, executor, or browser client. A session
+parked on `needs_user`/`failed` **stops** the continuous loop outright rather
+than spinning against it — resolve it with a plain `run --retry`/`--answer`
+(without `--continuous`), then restart `run --continuous`.
+`--kickoff`/`--kickoff-audit`/`--answer`/`--retry`/`--resubmit`/`--max-steps`
+are refused alongside `--continuous` — it manages session kickoff, resume
+and stepping itself.
+
+### 9b. Task selection: `rt-01` and `next-task`
+
+`autoloop/seed_tasks.json` (git-tracked, alongside `tasks.py`) seeds a fresh
+`TaskRegistry` with one entry — `rt-01`, "admin-gate GET /books/packages and
+POST /books/import" (`docs/AUDIT_2026-07-30.md` line ~378) — whenever
+`.autoloop/tasks.json` does not exist yet. `TaskStore.save` (called from the
+normal dispatch path the first time anything touches the task graph) is what
+actually creates `tasks.json` on disk; the seed is read-only and never
+written to.
+
+```bash
+python -m autoloop next-task   # read-only, no lock, never implements or commits
+# -> "rt-01 — admin-gate GET /books/packages and POST /books/import"
+```
+
+`next-task` prints exactly what continuous mode's selection policy
+(`next_ready()`) would pick right now, or "no ready task".
 
 ## 10. Recovery procedures
 
 | Situation | Do |
 |---|---|
-| Crash / Ctrl+C anywhere | Just `run` again — every phase is persisted; requests are never double-submitted; executing re-verifies from saved state. |
+| Crash / Ctrl+C anywhere | Just `run` (or `run --continuous`) again — every phase is persisted; requests are never double-submitted; executing re-verifies from saved state. |
 | `stale lock` error | Inspect `python -m autoloop status`, then `python -m autoloop unlock` (refuses live locks). |
 | Logged out mid-run (`needs_user`) | Log the profile back in, `run --retry`. |
 | Browser dead / CDP unreachable | Relaunch the profile (§8), `run --retry` (or just `run` if not parked). |
 | Repeated malformed replies / denials | Loop parks with the reason; talk to the conversation manually if needed, then `run --answer "..."`. |
 | **Ambiguous submission** (`needs_user`, "submission … is AMBIGUOUS") | Open the conversation and look. If the request is there, `run --retry` (reconciles and continues). If it is genuinely absent, `run --resubmit` authorizes exactly one more send of the same id. Autoloop will not decide this for you — see §5b. |
 | `send-not-ready` / `composer-not-synchronised` diagnostics | The editor never accepted the input, so **nothing was sent**: safe to `run --retry`. If it repeats, the composer selectors or the input method need attention (`browser/selectors.py`, `browser/chatgpt.py::_enter_prompt`). |
-| Crash mid-audit | `run` — the audit directive re-dispatches (a fresh agent fan-out; prior run's raw reports remain under `.autoloop/audit/`). |
-| Crash mid-commit | `run` — commit is idempotent (clean approved paths + matching HEAD message → recognized as done). |
+| Crash mid-audit | `run` — the audit directive re-dispatches (`_resolve_audit_task` resumes the SAME per-run worker repo/unit id when redispatching within the same iteration; prior run's raw reports remain under `.autoloop/audit/`). |
+| Crash mid-commit | `run` — `commit_and_capture` is crash-recoverable via `CommitIntent`/`reconcile_after_crash` (§4b), never a bare "message matches HEAD" idempotency shortcut. |
+| `doctor`'s `publisher_url_drift` check fails | The main checkout's `origin` changed since the publisher was last provisioned. Verify the NEW destination is actually correct, then `python -m autoloop reprovision-publisher --confirm` (§4d) — the only way the snapshot updates. Any push attempted before that is refused, not silently redirected. |
 
 ---
 
 ## 11. Known limitations
 
-* Implementation tasks are gated off — Phase 3 ships audit-review only.
+* There is no repository-editing task executor yet — `implement`/`revise` of
+  an ordinary registry task is policy-denied until `policy.implement_enabled
+  = true`, and even then the only production `TaskExecutor`
+  (`AuditExecutor`) reports an honest "unsupported decision" error rather
+  than editing code. `audit`/`revise("audit")` are unaffected by this gate
+  and always run.
 * The audit re-runs agents from scratch on `revise` (no incremental caching).
-* Manifest attribution is time-based: edits made by a human *during* an
-  executor run are indistinguishable from task work (§4).
-* **Produce-then-review (§4b) is not wired into `cli.py`.** `Orchestrator`
-  takes the path only when constructed with `worktrees`/`execution_store`/
-  `intent_store`; the production CLI (`_build_orchestrator`) does not pass
-  them, so every real run still takes the §4 manifest path today (moot in
-  practice while `implement_enabled=false` gates task work off entirely).
-  Exercised end-to-end in `autoloop/tests/test_postcommit_flow.py` and
-  `test_postcommit_review.py` by constructing `Orchestrator` directly.
+* The retired change-manifest attribution (§4) was time-based: edits made by
+  a human *during* an executor run were indistinguishable from task work.
+  Produce-then-review (§4b/§2) does not have this problem — a task's worker
+  repo starts from a clean checkout of `task_base_sha`, so path ownership is
+  `outcome.changed_paths`, not inferred from a before/after diff of a shared
+  tree.
 * Produce-then-review's two-round cap (§4b) is per-task and does not reset —
   a task that hits it stays parked; there is no `--revise-again` override,
   only the general `run --answer` / manual state edit escape hatches §10
   already documents for any park.
+* Worker/audit unit ids (`t1`, `audit-0007`, ...) are not scoped per session:
+  `.autoloop/workers/<id>` and the matching `TaskExecutionStore` record
+  persist across a `reset` (which only archives `state.json`/`tasks.json`).
+  A fresh session reusing the same id (rare — `reset` restarts iteration
+  counting, and audit ids are minted from `state.iteration`) would collide
+  with `WorkerRepoManager.create`'s "already exists" refusal rather than
+  silently reusing stale state. No production code path currently cleans up
+  a completed task's worker repo/hooks dir/execution record.
 * Subagent quality/latency depends on the local `claude` CLI; a failed agent
   is reported as a coverage gap, not retried automatically.
+* The publisher URL policy (§4d) is a provision-time snapshot by design — an
+  operator-changed `origin` is DETECTED (`doctor`, `_dispatch_task_push`) but
+  never auto-healed; `reprovision-publisher --confirm` is a manual step.
+* Every approved audit publishes its own `refs/heads/autoloop/audit-NNNN`
+  branch to the real remote (same as any task) — nothing prunes these.
+  Continuous mode (§9a) runs at most one audit per repository-fingerprint
+  change, but a long-lived deployment will still accumulate one remote
+  branch per approved audit round over time; branch cleanup on the remote is
+  an operator task today, not something autoloop does for you.
 * `doctor`'s live check and `smoke-browser` require the real dedicated
   browser; hermetic tests mock them, so "implemented" ≠ "live verified" until
   smoke-browser has actually passed on your machine.

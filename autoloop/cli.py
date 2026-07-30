@@ -2,24 +2,35 @@
 
     python -m autoloop run [--config PATH] [--kickoff FILE | --kickoff-audit |
                             --answer TEXT | --retry] [--null-executor]
-    python -m autoloop status | tasks | doctor      (read-only, no lock)
+                            [--continuous] [--max-steps N]
+    python -m autoloop status | tasks | doctor | next-task   (read-only, no lock)
     python -m autoloop smoke-browser [--config PATH]
     python -m autoloop pause | resume | unlock | reset --yes
+    python -m autoloop reprovision-publisher --confirm
 
 Locking: run / resume / reset / smoke-browser take the single-instance lock on
 the state directory (fail closed against a live process; `unlock` is the only
 stale-lock recovery, and it refuses live locks). status / tasks / doctor /
-pause stay available while locked.
+next-task / pause stay available while locked.
 
 Exit codes: 0 = clean end (stopped / paused / step budget), 2 = the loop parked
 itself (needs_user / failed) and wants operator attention, 1 = hard error.
+
+**Produce-then-review, unconditionally (2026-07-30).** `_build_orchestrator`
+always constructs the full collaborator set (`WorkerRepoManager`,
+`TaskExecutionStore`, `IntentStore`, a provisioned `Publisher`) — the plain
+`run` command has exactly one dispatch path now; see docs/SECURITY.md S21.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
+import json
+import os
 import sys
+import time
 from pathlib import Path
 
 from .audit.agents import ClaudeCliRunner
@@ -32,13 +43,22 @@ from .errors import AutoloopError, ConfigError, ExecutorError, StateError
 from .executor import NullExecutor
 from .git_gateway import GitGateway
 from .lock import LoopLock
-from .manifest import ManifestStore
+from .manifest import ManifestStore, snapshot as manifest_snapshot
 from .orchestrator import Orchestrator
-from .policy import PolicyEngine
+from .policy import PolicyConfig, PolicyEngine
 from .prompts import TEMPLATES, kickoff_payload, user_answer_payload
-from .state import LoopState, Phase, StateStore
-from .tasks import TaskRegistry, TaskStore
+from .publisher import (
+    Publisher,
+    provision_publisher_repo,
+    read_publisher_url_snapshot,
+    redact_url,
+    reprovision_publisher as _reprovision_publisher_snapshot,
+)
+from .state import TERMINAL_PHASES, LoopState, Phase, StateStore
+from .tasks import Task, TaskRegistry, TaskStore
 from .transcript import TranscriptLogger
+from .worker_env import WorkerRepoManager
+from .worktask import IntentStore, TaskExecutionStore
 
 DEFAULT_CONFIG = Path(".autoloop/config.toml")
 
@@ -59,11 +79,50 @@ def _load_tasks(config: AutoloopConfig) -> tuple[TaskStore, TaskRegistry]:
     task_store = TaskStore(config.tasks_file)
     registry = task_store.load()
     if registry is None:
-        registry = TaskRegistry()
+        registry = _seed_registry(config)
     return task_store, registry
 
 
-def _build_executor(config: AutoloopConfig, args, git: GitGateway, registry: TaskRegistry):
+def _seed_registry(config: AutoloopConfig) -> TaskRegistry:
+    """A fresh `TaskRegistry`, seeded from the git-tracked `seed_tasks.json`
+    when `.autoloop/tasks.json` has never been written (a brand-new
+    deployment, or right after `reset`). Read-only: `TaskStore.save` (called
+    from the normal dispatch path the first time anything touches the task
+    graph — `plan`, `mark_in_progress`, ...) is what actually creates
+    `tasks.json` on disk, exactly the "created on demand" semantics
+    `TaskStore`/`TaskRegistry` already have; this function never writes, so a
+    session that never touches the task graph leaves nothing behind, same as
+    an empty registry always did."""
+    registry = TaskRegistry()
+    seed_path = config.seed_tasks_file
+    if not seed_path.exists():
+        return registry
+    try:
+        specs = json.loads(seed_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"cannot parse seed tasks file {seed_path}: {exc}") from exc
+    registry.add_many(
+        [
+            Task(
+                id=spec["id"],
+                title=spec["title"],
+                description=spec["description"],
+                depends_on=tuple(spec.get("depends_on", ())),
+            )
+            for spec in specs
+        ]
+    )
+    return registry
+
+
+def _build_executor(
+    config: AutoloopConfig,
+    args,
+    git: GitGateway,
+    registry: TaskRegistry,
+    worker_repos: WorkerRepoManager,
+    policy: PolicyEngine,
+):
     if getattr(args, "null_executor", False) or config.executor.kind == "null":
         return NullExecutor()
     runner = ClaudeCliRunner(
@@ -79,31 +138,88 @@ def _build_executor(config: AutoloopConfig, args, git: GitGateway, registry: Tas
         run_dir_base=config.audit_dir,
         validation_commands=config.audit.validation_commands,
         max_parallel_agents=config.audit.max_parallel_agents,
+        # Re-root the audit onto its OWN worker repo per call (2026-07-30 —
+        # audit is task-shaped now, see orchestrator.py's
+        # `_resolve_audit_task`): `worker_repo_root_for` is `path_for`
+        # itself, `policy` is what the fresh worktree `GitGateway` is built
+        # with (running under the scrubbed `worker_env()`), and
+        # `agent_runner_factory` gives read-only subagents a `cwd` inside
+        # that same worker repo rather than the main checkout.
+        worker_repo_root_for=worker_repos.path_for,
+        policy=policy,
+        agent_runner_factory=lambda root: ClaudeCliRunner(
+            repo_root=root,
+            command=config.audit.agent_command,
+            timeout_seconds=config.audit.agent_timeout_seconds,
+        ),
     )
 
 
 def _build_orchestrator(config, args, store, state, task_store, registry) -> Orchestrator:
+    """Construct the full produce-then-review collaborator set. After this,
+    `run` (continuous or not) has exactly ONE dispatch path for
+    audit/implement/revise — see docs/SECURITY.md S21."""
     policy = PolicyEngine(config.policy)
     git = GitGateway(Path.cwd(), policy)
+    worker_repos = WorkerRepoManager(config.workers_dir, config.worker_hooks_dir)
+    execution_store = TaskExecutionStore(config.executions_dir)
+    intent_store = IntentStore(config.intents_dir)
+    publisher_path = provision_publisher_repo(config.state_dir, git)
+    publisher = Publisher(publisher_path, "origin", policy)
+    publisher_url_snapshot = read_publisher_url_snapshot(config.state_dir)
     return Orchestrator(
         config=config,
         store=store,
         state=state,
         policy=policy,
         git=git,
-        executor=_build_executor(config, args, git, registry),
+        executor=_build_executor(config, args, git, registry, worker_repos, policy),
         transcript=TranscriptLogger(config.transcript_file),
         client_factory=lambda: create_conversation(config.conversation.provider, config),
         registry=registry,
         task_store=task_store,
         manifest_store=ManifestStore(config.manifests_dir),
+        worker_repos=worker_repos,
+        execution_store=execution_store,
+        intent_store=intent_store,
+        publisher=publisher,
+        publisher_url_snapshot=publisher_url_snapshot,
     )
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     with LoopLock(config.state_dir):
+        if getattr(args, "continuous", False):
+            _validate_continuous_args(args)
+            return _run_continuous(args, config)
         return _run_locked(args, config)
+
+
+def _validate_continuous_args(args: argparse.Namespace) -> None:
+    """`--continuous` manages session kickoff, resume and the step budget
+    itself (see `_run_continuous`) — combining it with a flag that manually
+    drives ONE round is almost certainly not what was meant, so it is
+    refused outright rather than silently ignored."""
+    manual = [
+        name
+        for name, value in (
+            ("--kickoff", args.kickoff),
+            ("--kickoff-audit", args.kickoff_audit),
+            ("--answer", args.answer),
+            ("--retry", args.retry),
+            ("--resubmit", args.resubmit),
+            ("--max-steps", args.max_steps is not None),
+        )
+        if value
+    ]
+    if manual:
+        raise StateError(
+            "--continuous manages session kickoff, resume and stepping itself "
+            f"— {', '.join(manual)} is not valid alongside it. Resolve a park "
+            "with `run --retry`/`--answer` etc. WITHOUT --continuous first, "
+            "then restart `run --continuous`."
+        )
 
 
 def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
@@ -168,6 +284,134 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
     return 2 if outcome in (Phase.NEEDS_USER.value, Phase.FAILED.value) else 0
 
 
+#: How long `run --continuous` sleeps, locally, between selection-policy
+#: checks when there is genuinely nothing to do (no ready task, repository
+#: fingerprint unchanged since the last audit). Not configurable in v1 —
+#: keep the surface small.
+CONTINUOUS_POLL_SECONDS = 30.0
+
+
+def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
+    """`run --continuous`: loop the existing phase machine indefinitely.
+
+    Per outer iteration: a saved session in a NON-terminal phase (mid-flight
+    — ready/submitting/awaiting/executing/submission_unconfirmed) is resumed
+    via the ordinary, entirely unmodified `Orchestrator.run()` — this is what
+    makes a killed-and-restarted `run --continuous` pick up the saved phase
+    rather than re-deriving anything (item 13 of the v1 smoke checklist). At
+    a clean boundary (no session yet, or the last one ended STOPPED),
+    `_select_and_kickoff` runs the selection policy. A session parked on
+    NEEDS_USER/FAILED stops the continuous loop outright — an operator's
+    attention is required, and spinning against that would be busy-polling a
+    human, not a repository state (`--continuous` never auto-retries a park;
+    resolve it with a plain `run --retry`/`--answer`, then restart).
+    """
+    while True:
+        if config.pause_file.exists():
+            print("paused")
+            return 0
+        store, state = _load_state(config)
+        task_store, registry = _load_tasks(config)
+
+        if state is not None and Phase(state.phase) not in TERMINAL_PHASES:
+            orchestrator = _build_orchestrator(config, args, store, state, task_store, registry)
+            outcome = orchestrator.run()
+            if outcome == "paused":
+                return 0
+            if outcome in (Phase.NEEDS_USER.value, Phase.FAILED.value):
+                print(_summary(config, orchestrator.state, registry))
+                print(
+                    f"\ncontinuous mode stopped: {outcome} — resolve with `run "
+                    "--retry` / `--answer` (WITHOUT --continuous), then restart "
+                    "`run --continuous`."
+                )
+                return 2
+            continue  # STOPPED -> reassess at the top of the loop
+
+        if state is not None and Phase(state.phase) in (Phase.NEEDS_USER, Phase.FAILED):
+            print(_summary(config, state, registry))
+            print(
+                f"\ncontinuous mode stopped: {state.phase} — resolve with `run "
+                "--retry` / `--answer` (WITHOUT --continuous), then restart "
+                "`run --continuous`."
+            )
+            return 2
+
+        # Clean boundary: no session yet, or the last one ended STOPPED.
+        if not _select_and_kickoff(config, store, registry):
+            time.sleep(CONTINUOUS_POLL_SECONDS)
+
+
+def _select_and_kickoff(
+    config: AutoloopConfig, store: StateStore, registry: TaskRegistry
+) -> bool:
+    """The continuous-mode selection policy (`Do NOT build another
+    task-graph engine` — this reuses `TaskRegistry.next_ready()` exactly as
+    it is). Returns `True` if a new round was started (the caller should
+    reassess immediately), `False` if there is genuinely nothing to do (the
+    caller should sleep).
+
+    Order is load-bearing for the zero-calls guarantee: `registry.
+    next_ready()` and the fingerprint comparison are both pure local reads —
+    neither constructs an Orchestrator, a browser client, or an executor.
+    While a ready task exists OR the fingerprint is unchanged from the last
+    check, nothing here so much as imports a network-capable object; an
+    unchanged fingerprint with no ready task returns `False` having made
+    ZERO Claude and ZERO ChatGPT calls.
+    """
+    if registry.next_ready() is not None:
+        _start_new_session(config, store)
+        return True
+
+    fingerprint = repo_fingerprint(Path.cwd())
+    if fingerprint == _load_fingerprint(config):
+        return False  # unchanged since the last audit — sleep, make no calls
+    _save_fingerprint(config, fingerprint)
+    _start_new_session(config, store)
+    return True
+
+
+def _start_new_session(config: AutoloopConfig, store: StateStore) -> None:
+    state = LoopState.new(config.browser.conversation_url)
+    state.outbox = TEMPLATES["audit_kickoff"].render()
+    store.save(state)
+
+
+def repo_fingerprint(repo_root: Path) -> str:
+    """HEAD sha + a content digest of the dirty tree. Cheap enough to
+    compute on every continuous-mode iteration without ever needing a Claude
+    or ChatGPT call just to check "did anything change". Reuses
+    `manifest.snapshot`, which already content-hashes every dirty path (not
+    merely porcelain status), so the digest is sensitive to real edits, not
+    to touched mtimes or `git status`'s ordering."""
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    head = git.head_sha()
+    dirty = manifest_snapshot(git)
+    dirty_digest = hashlib.sha256(
+        "\n".join(f"{path}={value}" for path, value in sorted(dirty.items())).encode("utf-8")
+    ).hexdigest()
+    return f"{head}:{dirty_digest}"
+
+
+def _load_fingerprint(config: AutoloopConfig) -> str | None:
+    path = config.continuous_fingerprint_file
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None  # corrupt cache: treat as "unknown", not fatal
+    return data.get("fingerprint") if isinstance(data, dict) else None
+
+
+def _save_fingerprint(config: AutoloopConfig, fingerprint: str) -> None:
+    path = config.continuous_fingerprint_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"fingerprint": fingerprint}), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _authorize_resubmit(state: LoopState) -> None:
     """Operator override for an ambiguous submission — the ONLY way a send is
     repeated. Reuses the same request id on purpose: if the earlier attempt did
@@ -208,8 +452,32 @@ def _summary(config: AutoloopConfig, state: LoopState, registry: TaskRegistry) -
             f"current task {state.current_task.get('task_id') or '(audit)'}: "
             f"{(state.current_task.get('title') or '')[:120]}"
         )
-    if state.last_manifest_id:
-        lines.append(f"manifest     {state.last_manifest_id}")
+    # Produce-then-review record for whichever task/audit is currently
+    # running that path (see `worktask.TaskExecution`) — the ONE dispatch
+    # path since the S21 retirement, so this is the thing to look at for
+    # "what is the loop actually doing to the repository right now."
+    task_exec = state.task_execution
+    if task_exec:
+        candidate = task_exec.get("candidate_sha") or ""
+        lines.append(f"worker task  {task_exec.get('task_id')}")
+        lines.append(
+            f"worker repo  branch={task_exec.get('task_branch')} "
+            f"path={task_exec.get('worktree_path')}"
+        )
+        lines.append(f"base sha     {(task_exec.get('task_base_sha') or '')[:12] or '(none)'}")
+        lines.append(f"candidate    {candidate[:12] if candidate else '(none)'}")
+        lines.append(f"review round {task_exec.get('review_round')}")
+        if task_exec.get("intended_remote_ref"):
+            lines.append(
+                f"publish dest {task_exec.get('intended_remote')}/"
+                f"{task_exec.get('intended_remote_ref')}"
+            )
+    # Publisher target — never the raw url if it carries userinfo
+    # credentials (`https://user:token@host/...`); `redact_url` strips that
+    # unconditionally before anything reaches stdout.
+    publisher_snapshot = read_publisher_url_snapshot(config.state_dir)
+    if publisher_snapshot is not None:
+        lines.append(f"publisher    remote=origin url={redact_url(publisher_snapshot)}")
     if state.reviewed_commit:
         lines.append(f"reviewed     {state.reviewed_commit[:12]}")
     if state.question:
@@ -246,6 +514,40 @@ def _cmd_tasks(args: argparse.Namespace) -> int:
         deps = f" (after {', '.join(task.depends_on)})" if task.depends_on else ""
         print(f"[{state:11}] {task.id}: {task.title}{deps}")
     print(f"\n{registry.summary()}")
+    return 0
+
+
+def _cmd_next_task(args: argparse.Namespace) -> int:
+    """Dry-run selection — read-only, no lock, never implements or commits.
+    Prints exactly what continuous mode's selection policy would pick right
+    now (`TaskRegistry.next_ready()`, unmodified — see `_select_and_kickoff`)."""
+    config = load_config(args.config)
+    _, registry = _load_tasks(config)
+    task = registry.next_ready()
+    if task is None:
+        print("no ready task")
+        return 0
+    print(f"{task.id} — {task.title}")
+    return 0
+
+
+def _cmd_reprovision_publisher(args: argparse.Namespace) -> int:
+    """The ONLY way the publisher's remote-url snapshot changes after its
+    first write (`publisher.reprovision_publisher`) — an explicit, confirmed
+    operator action. Nothing in the directive-dispatch path can reach this;
+    it is not wired into `Orchestrator`/`authorize_directive` at all."""
+    config = load_config(args.config)
+    if not args.confirm:
+        print(
+            "reprovision-publisher re-snapshots the publisher's remote url "
+            "from the main checkout's CURRENT configuration. Pass --confirm "
+            "to do it — this is the ONLY way the snapshot changes."
+        )
+        return 1
+    with LoopLock(config.state_dir):
+        git = GitGateway(Path.cwd(), PolicyEngine(config.policy))
+        url = _reprovision_publisher_snapshot(config.state_dir, git, confirm=True)
+    print(f"publisher url snapshot updated: {redact_url(url)}")
     return 0
 
 
@@ -413,11 +715,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="dry run: record directives without executing them",
     )
+    run.add_argument(
+        "--continuous",
+        action="store_true",
+        help=(
+            "loop indefinitely: resume any in-flight session, otherwise "
+            "auto-select a ready task or run one audit per repository "
+            "fingerprint change, sleeping locally when there is nothing to "
+            "do (mutually exclusive with --kickoff/--kickoff-audit/--answer/"
+            "--retry/--resubmit/--max-steps, which it manages itself)"
+        ),
+    )
     run.set_defaults(func=_cmd_run)
 
     for name, func, help_text in (
         ("status", _cmd_status, "show session, lock and roadmap state (read-only)"),
         ("tasks", _cmd_tasks, "list the task graph with derived states (read-only)"),
+        (
+            "next-task",
+            _cmd_next_task,
+            "dry-run: print the task continuous mode would select next (read-only)",
+        ),
         ("doctor", _cmd_doctor, "non-destructive preflight checks (never submits)"),
         (
             "smoke-browser",
@@ -436,6 +754,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_config(reset)
     reset.add_argument("--yes", action="store_true")
     reset.set_defaults(func=_cmd_reset)
+
+    reprovision = sub.add_parser(
+        "reprovision-publisher",
+        help="re-snapshot the publisher's remote url from the main checkout (explicit, confirmed only)",
+    )
+    add_config(reprovision)
+    reprovision.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required — the ONLY way the publisher url snapshot changes",
+    )
+    reprovision.set_defaults(func=_cmd_reprovision_publisher)
     return parser
 
 

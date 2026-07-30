@@ -96,6 +96,48 @@ class AutoloopConfig:
     def pause_file(self) -> Path:
         return self.state_dir / "PAUSE"
 
+    # ---- produce-then-review collaborators (Autoloop v1 CLI wiring) --------
+    #
+    # All paths below live under `state_dir` (already gitignored). Publisher
+    # paths (bare repo, hooks dir, url snapshot) are NOT duplicated here —
+    # `publisher.py` is their single source of truth (`publisher_repo_path` /
+    # `publisher_hooks_path` / `publisher_url_snapshot_path`); import from
+    # there rather than re-deriving the same relative names in two places.
+
+    @property
+    def workers_dir(self) -> Path:
+        return self.state_dir / "workers"
+
+    @property
+    def worker_hooks_dir(self) -> Path:
+        return self.state_dir / "worker-hooks"
+
+    @property
+    def executions_dir(self) -> Path:
+        return self.state_dir / "executions"
+
+    @property
+    def intents_dir(self) -> Path:
+        return self.state_dir / "intents"
+
+    @property
+    def seed_tasks_file(self) -> Path:
+        """Git-tracked seed file (`autoloop/seed_tasks.json`, alongside this
+        module) — NOT under `state_dir`. `cli.py`'s `next-task` command loads
+        it directly into a fresh `TaskRegistry` when `.autoloop/tasks.json`
+        does not exist yet; it is never written to."""
+        return Path(__file__).resolve().parent / "seed_tasks.json"
+
+    @property
+    def continuous_fingerprint_file(self) -> Path:
+        """`run --continuous`'s "have I already looked at this exact
+        repository state" marker (HEAD sha + a content digest of the dirty
+        tree — see `cli.repo_fingerprint`). Deliberately OUTSIDE the
+        session/task lifecycle `reset` touches: it survives a `reset` on
+        purpose, so a reset does not force a redundant audit of an otherwise
+        unchanged repository."""
+        return self.state_dir / "continuous_fingerprint.json"
+
 
 _SECTIONS = {"browser", "policy", "paths", "conversation", "executor", "audit"}
 

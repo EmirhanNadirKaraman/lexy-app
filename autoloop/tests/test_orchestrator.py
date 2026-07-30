@@ -1,11 +1,24 @@
 """Orchestrator state machine with fake conversation / git / executor:
-audit flow, task-owned change manifests around commits, phase gating,
-review-integrity verification, terminal decisions, corrective re-prompts,
-budgets, crash recovery, duplicate-submission protection, pause."""
+audit flow, phase gating, review-integrity verification, terminal decisions,
+corrective re-prompts, budgets, crash recovery, duplicate-submission
+protection, pause.
+
+Two Orchestrator-construction styles:
+
+* `build()` — a pure in-memory `FakeGit` "main checkout". Used by every test
+  that never reaches `_dispatch_executor` (parsing, terminal decisions,
+  browser transport/submission machinery, budgets, most policy denials —
+  `FakeGit`'s directory is not a real git repository, so it cannot back the
+  real `WorkerRepoManager.create` the produce-then-review path needs).
+* `build_postcommit()` — a REAL throwaway git repo plus a real
+  `WorkerRepoManager`/`TaskExecutionStore`/`IntentStore`, for the smaller set
+  of tests that dispatch `audit`/`implement`/`revise` end to end (since
+  2026-07-30 the ONLY dispatch path — see docs/SECURITY.md S21)."""
 
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,6 +35,7 @@ from autoloop.errors import (
     SubmissionError,
 )
 from autoloop.executor import ExecutionOutcome
+from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
@@ -34,8 +48,25 @@ from autoloop.state import (
 )
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 from autoloop.transcript import TranscriptLogger
+from autoloop.worker_env import WorkerRepoManager
+from autoloop.worktask import IntentStore, TaskExecutionStore
 
 URL = "https://chatgpt.com/c/test-conversation"
+
+
+def run_git(cwd, *args):
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True
+    ).stdout
+
+
+def ok_validation(argv, **kwargs):
+    class Proc:
+        returncode = 0
+        stdout = "All checks passed!\n"
+        stderr = ""
+
+    return Proc()
 
 
 def block(obj) -> str:
@@ -394,38 +425,204 @@ def ready_task(tid="t1"):
 IMPLEMENT_ON = PolicyConfig(implement_enabled=True)
 
 
+class PostcommitExecutor:
+    """Test double standing in for the real TaskExecutor (`AuditExecutor` in
+    production) on the produce-then-review path: writes `files` into the
+    dispatched task's own worker repo — `workers_root / task.id`, the same
+    layout `WorkerRepoManager` uses — and reports success with those paths as
+    `changed_paths`. Mirrors `test_postcommit_flow.py`'s `WritingExecutor`.
+    `task` is never `None` here: the orchestrator resolves the audit to its
+    own synthetic `Task` before ever reaching an executor (`_resolve_audit_task`).
+
+    Each call's content carries a round marker so a `revise` round (writing
+    the SAME logical file again) produces a real diff rather than an empty,
+    refused commit.
+    """
+
+    def __init__(self, workers_root, files, status="ok"):
+        self.workers_root = Path(workers_root)
+        self.files = dict(files)
+        self.status = status
+        self.calls: list[tuple] = []
+
+    def execute(self, directive, task):
+        self.calls.append((directive, task))
+        wt = self.workers_root / task.id
+        for rel, content in self.files.items():
+            target = wt / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"{content}\n<!-- call {len(self.calls)} -->\n", encoding="utf-8")
+        return ExecutionOutcome(
+            status=self.status,
+            summary="did it",
+            details="details here",
+            validation="ruff clean; 5 tests passed",
+            changed_paths=tuple(self.files.keys()),
+        )
+
+
+def build_postcommit(
+    tmp_path,
+    responses=(),
+    policy=None,
+    clients=None,
+    state=None,
+    tasks=(),
+    executor_files=None,
+    executor_status="ok",
+):
+    """Real-git-backed Orchestrator construction for the smaller set of tests
+    that dispatch `audit`/`implement`/`revise` end to end. `build()`'s
+    `FakeGit` cannot back this: `WorkerRepoManager.create` runs a real `git
+    fetch <repo_root> <sha>`, which needs `repo_root` to be an actual
+    repository with that sha present."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(exist_ok=True)
+    run_git(repo_root, "init", "-q", "-b", "main")
+    run_git(repo_root, "config", "user.email", "test@example.com")
+    run_git(repo_root, "config", "user.name", "Test")
+    run_git(repo_root, "config", "commit.gpgsign", "false")
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run_git(repo_root, "add", "-A")
+    run_git(repo_root, "commit", "-q", "-m", "init")
+
+    policy_config = policy or PolicyConfig()
+    git = GitGateway(repo_root, PolicyEngine(policy_config))
+    workers_root = tmp_path / "workers"
+    worker_repos = WorkerRepoManager(workers_root, tmp_path / "worker-hooks")
+    execution_store = TaskExecutionStore(tmp_path / "executions")
+    intent_store = IntentStore(tmp_path / "intents")
+
+    config = AutoloopConfig(
+        browser=BrowserConfig(conversation_url=URL),
+        policy=policy_config,
+        state_dir=tmp_path / ".al",
+    )
+    store = StateStore(config.state_file)
+    if state is None:
+        state = LoopState.new(URL)
+        state.outbox = "kickoff report"
+    store.save(state)
+    registry = TaskRegistry(list(tasks))
+    task_store = TaskStore(config.tasks_file)
+    task_store.save(registry)
+    remaining = list(clients) if clients is not None else [FakeClient(responses)]
+    made = list(remaining)
+
+    def factory():
+        if not remaining:
+            raise AssertionError("client factory exhausted")
+        return remaining.pop(0)
+
+    executor = PostcommitExecutor(
+        workers_root,
+        executor_files
+        if executor_files is not None
+        else {"docs/AUDIT_2026-07-29.md": "# audit report"},
+        status=executor_status,
+    )
+    manifest_store = ManifestStore(config.manifests_dir)
+    orch = Orchestrator(
+        config=config,
+        store=store,
+        state=state,
+        policy=PolicyEngine(config.policy),
+        git=git,
+        executor=executor,
+        transcript=TranscriptLogger(config.transcript_file),
+        client_factory=factory,
+        registry=registry,
+        task_store=task_store,
+        manifest_store=manifest_store,
+        worker_repos=worker_repos,
+        execution_store=execution_store,
+        intent_store=intent_store,
+        validation_runner=ok_validation,
+    )
+    return orch, store, git, executor, made, registry, execution_store
+
+
 # ---- audit flow -------------------------------------------------------------
+#
+# Since 2026-07-30 (docs/SECURITY.md S21: legacy authorize-then-produce/
+# manifest path retired) the audit is dispatched as a task-shaped unit of
+# work through the SAME produce-then-review commit path as `implement`/
+# `revise` — its own isolated worker repo, committed automatically, reviewed
+# from the immutable commit via a `postcommit_review` packet. These tests use
+# `build_postcommit` (a real throwaway repo), not `build` (in-memory `FakeGit`
+# cannot back the real `WorkerRepoManager.create` this path needs).
 
 
 def test_audit_decision_executes_and_reports(tmp_path):
-    executor = FakeExecutor(creates={"docs/AUDIT_2026-07-29.md": "# audit report"})
-    orch, _, _, executor, clients, _, manifest_store = build(
-        tmp_path, responses=[audit_block(scope="focus on SRS")], executor=executor
+    orch, _, git, executor, clients, _, execution_store = build_postcommit(
+        tmp_path, responses=[audit_block(scope="focus on SRS")]
     )
     orch.run(max_steps=4)
     directive, task = executor.calls[0]
     assert directive.decision is Decision.AUDIT
-    assert task is None
-    assert "counterpart" in orch.state.outbox  # audit template wraps the report
-    # manifest recorded the report as task-created
-    manifest = manifest_store.load(orch.state.last_manifest_id)
-    assert manifest.created == ["docs/AUDIT_2026-07-29.md"]
-    assert manifest.task_id == "audit"
+    # a synthetic per-run unit id, not the literal "audit" pseudo-task id —
+    # see `Orchestrator._resolve_audit_task`.
+    assert task is not None and task.id.startswith("audit-")
+    assert "committed task" in orch.state.outbox  # postcommit_review template
+
+    execution = execution_store.load(task.id)
+    assert execution is not None
+    assert execution.candidate_sha != ""
+    assert execution.review_round == 1
 
 
 def test_audit_revision_loop(tmp_path):
-    executor = FakeExecutor(creates={"docs/AUDIT_2026-07-29.md": "# v2 report"})
-    orch, _, _, executor, _, _, _ = build(
+    orch, _, git, executor, _, _, execution_store = build_postcommit(
         tmp_path,
         responses=[audit_block(), revise_audit_block("check migrations"), stop_block()],
-        executor=executor,
     )
     assert orch.run() == Phase.STOPPED.value
     decisions = [d.decision for d, _ in executor.calls]
     assert decisions == [Decision.AUDIT, Decision.REVISE]
+    _, first_task = executor.calls[0]
     revise_directive, revise_task = executor.calls[1]
-    assert revise_task is None
+    # round 2 resumes round 1's own unit id — same worker repo, same branch,
+    # same TaskExecution — never forks a second one.
+    assert revise_task.id == first_task.id
     assert revise_directive.feedback == "check migrations"
+    execution = execution_store.load(first_task.id)
+    assert execution.review_round == 2
+
+
+def test_two_audits_in_one_session_get_distinct_worker_units(tmp_path):
+    """Continuous mode (scope item 4) drives audit -> push -> audit
+    repeatedly within one long-lived process. `_resolve_audit_task` mints a
+    fresh `audit-{iteration:04d}` unit id per AUDIT decision specifically to
+    avoid two audits colliding on the literal `"audit"` pseudo-task id — the
+    one case `test_audit_revision_loop` (REVISE, same unit id) does not
+    exercise. This proves the second audit gets its own unit id, its own
+    worker repo, and its own `TaskExecution` record rather than reusing or
+    clobbering the first."""
+    orch, _, git, executor, _, _, execution_store = build_postcommit(
+        tmp_path,
+        responses=[
+            audit_block(),
+            approval(decision="push"),
+            audit_block(),
+            stop_block(),
+        ],
+    )
+    assert orch.run() == Phase.STOPPED.value
+    decisions = [d.decision for d, _ in executor.calls]
+    assert decisions == [Decision.AUDIT, Decision.AUDIT]
+    _, first_task = executor.calls[0]
+    _, second_task = executor.calls[1]
+    assert first_task.id != second_task.id
+    assert first_task.id.startswith("audit-") and second_task.id.startswith("audit-")
+
+    first_execution = execution_store.load(first_task.id)
+    second_execution = execution_store.load(second_task.id)
+    assert first_execution is not None and second_execution is not None
+    assert first_execution.candidate_sha != second_execution.candidate_sha
+    # each unit got its own isolated worker repo on disk
+    workers_root = git.repo_root.parent / "workers"
+    assert (workers_root / first_task.id).is_dir()
+    assert (workers_root / second_task.id).is_dir()
 
 
 def test_crash_recovery_during_audit_redispatches(tmp_path):
@@ -440,10 +637,39 @@ def test_crash_recovery_during_audit_redispatches(tmp_path):
         base_sha="(none)",
         report_sha256="b" * 64,
     )
-    orch, _, _, executor, _, _, _ = build(tmp_path, clients=[FakeClient()], state=state)
+    orch, _, git, executor, _, _, execution_store = build_postcommit(
+        tmp_path, clients=[FakeClient()], state=state
+    )
     orch.run(max_steps=1)
     assert len(executor.calls) == 1
     assert orch.state.phase == Phase.READY.value
+    # iteration=1 at dispatch time -> minted unit id "audit-0001"
+    execution = execution_store.load("audit-0001")
+    assert execution is not None
+    assert execution.review_round == 1
+
+
+def test_review_requests_are_serialised_through_one_client(tmp_path):
+    """Item 5 of the v1 brief ("verify, do not expand"): review requests are
+    serialised through the single conversation. `_get_client` memoizes on
+    `self._client`, so a multi-round session (audit -> revise -> stop) never
+    constructs a second client — there is exactly one conversation, and
+    requests go through it strictly one at a time (the phase machine has no
+    concurrent in-flight-request state to even represent a second one)."""
+    client = FakeClient(responses=[audit_block(), revise_audit_block("x"), stop_block()])
+    orch, _, _, _, _, _, _ = build_postcommit(tmp_path, clients=[client])
+
+    calls = {"count": 0}
+    real_factory = orch._client_factory
+
+    def counting_factory():
+        calls["count"] += 1
+        return real_factory()
+
+    orch._client_factory = counting_factory
+    assert orch.run() == Phase.STOPPED.value
+    assert calls["count"] == 1
+    assert len(client.submitted) == 3  # three sequential rounds, one client
 
 
 # ---- phase gate -------------------------------------------------------------
@@ -480,7 +706,7 @@ def test_revise_of_registry_task_rejected_in_audit_phase(tmp_path):
 
 
 def test_implement_works_when_phase_gate_lifted(tmp_path):
-    orch, _, _, executor, _, registry, _ = build(
+    orch, _, git, executor, _, registry, _ = build_postcommit(
         tmp_path,
         responses=[implement_block("t1")],
         tasks=[ready_task("t1")],
@@ -496,7 +722,7 @@ def test_implement_works_when_phase_gate_lifted(tmp_path):
 
 
 def test_plan_then_implement_flow(tmp_path):
-    orch, _, _, executor, clients, registry, _ = build(
+    orch, _, git, executor, clients, registry, execution_store = build_postcommit(
         tmp_path,
         responses=[plan_block("t1", "t2"), implement_block("t1")],
         policy=IMPLEMENT_ON,
@@ -507,8 +733,11 @@ def test_plan_then_implement_flow(tmp_path):
     directive, task = executor.calls[0]
     assert directive.decision is Decision.IMPLEMENT
     assert task.id == "t1"
-    assert "commit" in orch.state.outbox  # ok outcome -> commit_approval template
-    assert orch.state.last_validation == "ruff clean; 5 tests passed"
+    assert "committed task" in orch.state.outbox  # postcommit_review template
+    # the re-run POST-commit validation summary (`_verify_committed`), not the
+    # executor's own outcome.validation — see `orchestrator.py`.
+    assert orch.state.last_validation == "ruff check .: PASS"
+    assert execution_store.load("t1").review_round == 1
 
 
 def test_plan_rejected_keeps_registry_and_reports(tmp_path):
@@ -522,188 +751,69 @@ def test_plan_rejected_keeps_registry_and_reports(tmp_path):
     assert "plan_rejected" in clients[0].submitted[1][1]
 
 
-# ---- change manifest + commit gate ------------------------------------------
-
-
-def audit_then_commit(tmp_path, commit_responder, executor=None, extra_responses=()):
-    executor = executor or FakeExecutor(creates={"out.md": "# report"})
-    return build(
-        tmp_path,
-        responses=[audit_block(), commit_responder, *extra_responses],
-        executor=executor,
-    )
-
-
-def test_commit_of_task_created_file_succeeds(tmp_path):
-    orch, _, git, _, clients, _, _ = audit_then_commit(
-        tmp_path, approval("commit", paths=("out.md",))
-    )
-    orch.run(max_steps=8)
-    assert git.commits == [("docs: audit", ("out.md",))]
-    assert orch.state.reviewed_commit == "c" * 40
-    assert "NOT yet pushed" in orch.state.outbox
-
-
-def test_commit_without_manifest_refused(tmp_path):
-    # First directive is a commit — no task ever executed, no manifest.
-    orch, _, git, _, clients, _, _ = build(
-        tmp_path,
-        responses=[approval("commit", paths=("x.py",)), stop_block()],
-    )
-    assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []
-    assert "no change manifest recorded" in clients[0].submitted[1][1]
-
-
-def test_commit_of_preexisting_dirty_file_refused(tmp_path):
-    # x.py was dirty BEFORE the audit ran and the audit did not touch it.
-    orch, _, git, _, clients, _, _ = audit_then_commit(
-        tmp_path, approval("commit", paths=("x.py",)), extra_responses=[stop_block()]
-    )
-    assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []
-    reprompt = clients[0].submitted[2][1]
-    assert "commit refused" in reprompt
-    assert "already modified before the task started" in reprompt
-
-
-def test_commit_of_untouched_file_refused(tmp_path):
-    orch, _, git, _, clients, _, _ = audit_then_commit(
-        tmp_path,
-        approval("commit", paths=("out.md", "never_touched.md")),
-        extra_responses=[stop_block()],
-    )
-    assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []
-    assert "was not changed by task" in clients[0].submitted[2][1]
-
-
-def test_file_changed_during_task_on_top_of_baseline_is_committable(tmp_path):
-    # x.py is dirty at baseline AND the task edits it further -> task-modified.
-    executor = FakeExecutor(creates={"x.py": "content rewritten by the task\n"})
-    orch, _, git, _, _, _, manifest_store = audit_then_commit(
-        tmp_path, approval("commit", paths=("x.py",)), executor=executor
-    )
-    orch.run(max_steps=8)
-    manifest = manifest_store.load(orch.state.last_manifest_id)
-    assert manifest.modified == ["x.py"]
-    assert git.commits == [("docs: audit", ("x.py",))]
-
-
-def test_commit_and_push_flow(tmp_path):
-    orch, _, git, _, _, _, _ = audit_then_commit(
-        tmp_path, approval("commit_and_push", paths=("out.md",))
-    )
-    orch.run(max_steps=8)
-    assert len(git.commits) == 1
-    assert git.pushes == 1
-    assert "Git action completed" in orch.state.outbox
-
-
-def test_commit_completes_referenced_task(tmp_path):
-    executor = FakeExecutor(creates={"out.md": "# change"})
-    orch, _, git, _, _, registry, _ = build(
-        tmp_path,
-        responses=[implement_block("t1"), approval("commit", paths=("out.md",), task_id="t1")],
-        tasks=[ready_task("t1")],
-        policy=IMPLEMENT_ON,
-        executor=executor,
-    )
-    orch.run(max_steps=8)
-    assert registry.state_of("t1") is TaskState.COMPLETED
-    assert git.commits == [("docs: audit", ("out.md",))]
+# ---- change manifest + commit gate -------------------------------------
+#
+# Retired 2026-07-30 (docs/SECURITY.md S21: closed by retirement, not a fix).
+# The authorize-then-produce/manifest commit gate this section tested
+# (`self._git.commit(...)` behind `ChangeManifest`/`verify_commit`, dispatched
+# by `_dispatch_git`'s COMMIT_DECISIONS branch) has no code left to test —
+# `_dispatch_git` was removed along with its only caller. A `commit` /
+# `commit_and_push` directive is now refused outright (see
+# `test_denied_push_is_reported_not_executed`-style coverage and
+# `_dispatch`'s `legacy_git_path_retired` denial); the produce-then-review
+# equivalent of "does the executor's own commit land and get reported" is
+# `test_audit_decision_executes_and_reports` / `test_plan_then_implement_flow`
+# above.
 
 
 # ---- review integrity -------------------------------------------------------
+#
+# The stamp/head checks below run in `_step_executing`, entirely BEFORE
+# `_dispatch()` — they fire (or don't) independently of whether anything
+# downstream would have handled the decision, so they still hold after S21's
+# retirement. `test_push_approval_stamps_new_head_after_commit` and
+# `test_recovery_reverifies_stamp_from_saved_response` (removed here) tested
+# the retired legacy commit->push_approval->bare-push cycle specifically and
+# have no equivalent left to adapt to.
 
 
 def test_stale_stamp_rejected_and_nothing_committed(tmp_path):
     stale = {"request_id": "alr-old-0001", "head_sha": "f" * 40, "report_sha256": "0" * 64}
-    orch, _, git, _, clients, _, _ = audit_then_commit(
+    orch, _, git, executor, clients, _, execution_store = build_postcommit(
         tmp_path,
-        approval("commit", paths=("out.md",), stamp=stale),
-        extra_responses=[stop_block()],
+        responses=[
+            audit_block(),
+            approval("commit", paths=("out.md",), stamp=stale),
+            stop_block(),
+        ],
     )
     assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []
     assert "review_mismatch:request_id" in clients[0].submitted[2][1]
+    # the stale-stamped commit approval never reached dispatch — the audit's
+    # own candidate is unaffected (still exactly one review round)
+    task_id = executor.calls[0][1].id
+    assert execution_store.load(task_id).review_round == 1
 
 
 def test_head_moved_since_review_rejected(tmp_path):
-    executor = FakeExecutor(creates={"out.md": "# r"})
-    orch, _, git, _, made, _, _ = build(
+    orch, _, git, executor, made, _, execution_store = build_postcommit(
         tmp_path,
         responses=[audit_block(), "PLACEHOLDER", stop_block()],
-        executor=executor,
     )
 
     def responder(client):
         response = approval("commit", paths=("out.md",))(client)
-        git.head = "f" * 40  # tree changes after review, before execution
+        # Tree changes on the MAIN checkout after review, before execution —
+        # `ctx.head_sha` (what the stamp echoes) is `self._git.head_sha()`,
+        # the main checkout's, never the worker branch's.
+        run_git(git.repo_root, "commit", "--allow-empty", "-q", "-m", "moved")
         return response
 
     made[0].responses[1] = responder
     assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []
     assert "review_mismatch:head_moved" in made[0].submitted[2][1]
-
-
-def test_push_approval_stamps_new_head_after_commit(tmp_path):
-    orch, _, git, _, clients, _, _ = audit_then_commit(
-        tmp_path,
-        approval("commit", paths=("out.md",)),
-        extra_responses=[approval("push"), stop_block()],
-    )
-    assert orch.run() == Phase.STOPPED.value
-    assert git.pushes == 1
-    assert extract_stamp(clients[0].submitted[2][1])["head_sha"] == "c" * 40
-
-
-def test_recovery_reverifies_stamp_from_saved_response(tmp_path):
-    state = LoopState.new(URL)
-    state.iteration = 3
-    state.phase = Phase.EXECUTING.value
-    raw = block(
-        {
-            "version": 3,
-            "decision": "commit",
-            "reason": "approved",
-            "commit": {"message": "docs: audit", "paths": ["out.md"]},
-            "reviewed": {
-                "request_id": "alr-crash-0003",
-                "head_sha": "a" * 40,
-                "report_sha256": "b" * 64,
-            },
-        }
-    )
-    state.last_response = LastResponse(
-        request_id="alr-crash-0003",
-        raw=raw,
-        received_at="t",
-        head_sha="a" * 40,
-        base_sha="(none)",
-        report_sha256="b" * 64,
-    )
-    orch, _, git, _, _, _, manifest_store = build(
-        tmp_path, clients=[FakeClient()], state=state
-    )
-    # Recreate the pre-crash manifest: the audit had created out.md.
-    from autoloop.manifest import ChangeManifest
-
-    (git.repo_root / "out.md").write_text("# r", encoding="utf-8")
-    git.dirty.append("?? out.md")
-    manifest = ChangeManifest.begin("audit-i0003", "audit", git)
-    manifest.baseline = {"x.py": manifest.baseline["x.py"]}  # out.md is task-created
-    manifest.finish(
-        {
-            "x.py": manifest.baseline["x.py"],
-            "out.md": hashlib.sha256(b"# r").hexdigest(),
-        }
-    )
-    manifest_store.save(manifest)
-    orch.state.last_manifest_id = "audit-i0003"
-    orch.run(max_steps=1)
-    assert git.commits == [("docs: audit", ("out.md",))]
+    task_id = executor.calls[0][1].id
+    assert execution_store.load(task_id).review_round == 1
 
 
 # ---- context ----------------------------------------------------------------
@@ -739,7 +849,7 @@ def test_prompt_carries_full_context_block(tmp_path):
 
 
 def test_malformed_response_triggers_corrective_reprompt(tmp_path):
-    orch, _, _, executor, clients, _, _ = build(
+    orch, _, _, executor, clients, _, _ = build_postcommit(
         tmp_path, responses=["Sounds good.", audit_block()]
     )
     outcome = orch.run(max_steps=8)
@@ -787,17 +897,6 @@ def test_denied_push_is_reported_not_executed(tmp_path):
     assert orch.run() == Phase.STOPPED.value
     assert git.pushes == 0
     assert "policy_denied" in clients[0].submitted[1][1]
-
-
-def test_git_failure_reported_to_chatgpt(tmp_path):
-    orch, _, git, _, clients, _, _ = audit_then_commit(
-        tmp_path, approval("commit", paths=("out.md",)), extra_responses=[stop_block()]
-    )
-    git.commit_error = GitCommandError("index locked")
-    assert orch.run() == Phase.STOPPED.value
-    reprompt = clients[0].submitted[2][1]
-    assert "git_failure" in reprompt
-    assert "index locked" in reprompt
 
 
 def test_git_failure_in_ready_preserves_outbox(tmp_path):
@@ -884,7 +983,7 @@ def test_recovery_resubmits_stored_prompt_byte_identical(tmp_path):
 
 
 def test_iteration_budget_parks_loop_with_outbox_intact(tmp_path):
-    orch, _, _, _, _, _, _ = build(
+    orch, _, _, _, _, _, _ = build_postcommit(
         tmp_path,
         responses=[audit_block()],
         policy=PolicyConfig(max_iterations=1),
@@ -911,13 +1010,20 @@ def test_ready_without_outbox_is_a_state_error(tmp_path):
 
 
 def test_state_persists_across_reload(tmp_path):
-    orch, store, _, _, _, _, _ = build(tmp_path, responses=[audit_block()])
+    orch, store, _, _, _, _, _ = build_postcommit(tmp_path, responses=[audit_block()])
     orch.run(max_steps=4)
     reloaded = store.load()
     assert reloaded.phase == Phase.READY.value
     assert reloaded.iteration == 1
     assert reloaded.last_decision == "audit"
-    assert reloaded.last_manifest_id == orch.state.last_manifest_id
+    # `last_manifest_id` belongs to the retired manifest path and is never
+    # set anymore; `task_execution` (the produce-then-review record) is the
+    # thing that must survive a reload now. (`allowed_paths` round-trips as a
+    # JSON list rather than a tuple — compare the fields that matter instead
+    # of the raw dicts.)
+    assert reloaded.task_execution["task_id"] == orch.state.task_execution["task_id"]
+    assert reloaded.task_execution["candidate_sha"] == orch.state.task_execution["candidate_sha"]
+    assert reloaded.task_execution["candidate_sha"] != ""
 
 
 # ---- submission confirmation & ambiguity (Phase 3.1 transport repair) -------
@@ -1143,184 +1249,46 @@ def test_await_timeout_exits_with_recoverable_state(tmp_path):
     assert saved.pending_request is not None  # request id + prompt preserved
 
 
-# ---- adopted manifests end to end ------------------------------------------
-
-
-def adopted_approval(paths=("out.md",), message="docs: adopted"):
-    """A stamped commit approval for an adopted manifest."""
-    def responder(client):
-        return block({
-            "version": 3,
-            "decision": "commit",
-            "reason": "approved",
-            "commit": {"message": message, "paths": list(paths)},
-            "reviewed": extract_stamp(client.submitted[-1][1]),
-        })
-    return responder
-
-
-def build_with_adoption(tmp_path, paths, responses, payload_includes_block=True,
-                        manifest_id="adopt-1"):
-    """Wire a session whose current manifest is an ADOPTED one, as the future
-    precommit-review workflow will."""
-    from autoloop.manifest import ChangeManifest, render_adoption_block
-
-    orch, store, git, executor, clients, registry, manifest_store = build(
-        tmp_path, responses=responses
-    )
-    for rel in paths:                      # make the paths genuinely dirty
-        target = git.repo_root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(f"content of {rel}\n", encoding="utf-8")
-        line = f"?? {rel}"
-        if line not in git.dirty:
-            git.dirty.append(line)
-    manifest = ChangeManifest.adopt(manifest_id, {p: "100644" for p in paths}, git)
-    manifest_store.save(manifest)
-    orch.state.last_manifest_id = manifest_id
-    block_text = render_adoption_block(manifest)
-    orch.state.outbox = (
-        "PRE-COMMIT REVIEW PACKET\n\n" + (block_text if payload_includes_block else "(table omitted)")
-    )
-    store.save(orch.state)
-    return orch, store, git, clients, manifest_store, manifest
-
-
-def test_adopted_manifest_commit_succeeds_when_content_matches(tmp_path):
-    orch, _, git, clients, store, manifest = build_with_adoption(
-        tmp_path, ["out.md"], responses=[adopted_approval()]
-    )
-    orch.run(max_steps=4)
-    assert git.commits == [("docs: adopted", ("out.md",))]
-    # the hash table was bound to the reviewed report
-    reloaded = store.load("adopt-1")
-    assert reloaded.presented_report_sha256 is not None
-    assert reloaded.presented_report_sha256 in clients[0].submitted[0][1]
-
-
-def test_payload_without_the_adoption_block_binds_nothing_and_cannot_commit(tmp_path):
-    """If the packet omits the hash table, report_sha256 does not cover it, so
-    the manifest is never bound and no approval answering that report can
-    commit. The request is still sent — refusing to send would deadlock error
-    reporting — but the commit gate refuses."""
-    orch, _, git, clients, store, _ = build_with_adoption(
-        tmp_path, ["out.md"],
-        responses=[adopted_approval(), stop_block()],
-        payload_includes_block=False,
-    )
-    assert orch.run() == Phase.STOPPED.value
-    assert len(clients[0].submitted) >= 1              # it WAS asked
-    assert store.load("adopt-1").presented_report_sha256 is None   # nothing bound
-    assert git.commits == []                           # and nothing committed
-    assert "never presented for review" in clients[0].submitted[1][1]
-
-
-def test_one_byte_change_after_approval_refuses_the_adopted_commit(tmp_path):
-    def approve_then_mutate(client):
-        response = adopted_approval()(client)
-        target = git_ref["git"].repo_root / "out.md"
-        target.write_text(target.read_text() + " ", encoding="utf-8")   # one byte
-        return response
-
-    git_ref = {}
-    orch, _, git, clients, _, _ = build_with_adoption(
-        tmp_path, ["out.md"], responses=[approve_then_mutate, stop_block()]
-    )
-    git_ref["git"] = git
-    assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []
-    reprompt = clients[0].submitted[1][1]
-    assert "changed after approval" in reprompt
-    assert "content of out.md" not in reprompt      # never echoes file content
-
-
-def test_unapproved_path_cannot_be_committed_from_an_adopted_manifest(tmp_path):
-    orch, _, git, clients, _, _ = build_with_adoption(
-        tmp_path, ["out.md"],
-        responses=[adopted_approval(paths=("out.md", "secret.md")), stop_block()],
-    )
-    assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []
-    assert "not in adopted manifest" in clients[0].submitted[1][1]
-
-
-def test_stale_approval_cannot_authorize_an_adoption(tmp_path):
-    """An approval bound to a different report must not commit this table."""
-    orch, _, git, clients, store, _ = build_with_adoption(
-        tmp_path, ["out.md"], responses=[adopted_approval(), stop_block()]
-    )
-    # after the request is sent, rebind the manifest to some other report
-    orch.run(max_steps=2)
-    manifest = store.load("adopt-1")
-    manifest.presented_report_sha256 = "a" * 64
-    store.save(manifest)
-    assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []
-    assert "stale approval" in clients[0].submitted[1][1]
-
-
-def test_tree_verification_aborts_before_the_commit_is_created(tmp_path):
-    """TOCTOU: content changing before staging must not be committed — the
-    candidate tree is verified before any commit object exists."""
-    orch, _, git, clients, _, _ = build_with_adoption(
-        tmp_path, ["out.md"], responses=[adopted_approval(), stop_block()]
-    )
-
-    real_commit = git.commit_adopted
-
-    def commit_with_mutation(message, paths, verify_tree):
-        target = git.repo_root / "out.md"
-        target.write_text("mutated between check and stage\n", encoding="utf-8")
-        return real_commit(message, paths, verify_tree)
-
-    git.commit_adopted = commit_with_mutation
-    assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []                       # no commit was created
-    assert "tree content does not match" in clients[0].submitted[1][1]
-
-
-def test_executor_manifest_flow_is_unaffected_by_adoption(tmp_path):
-    """The original provenance path still works, and never sees adoption."""
-    executor = FakeExecutor(creates={"out.md": "# report"})
-    orch, _, git, _, clients, _, store = build(
-        tmp_path, responses=[audit_block(), approval("commit", paths=("out.md",))],
-        executor=executor,
-    )
-    orch.run(max_steps=8)
-    assert git.commits == [("docs: audit", ("out.md",))]
-    manifest = store.load(orch.state.last_manifest_id)
-    assert not manifest.is_adopted()
-    assert manifest.presented_report_sha256 is None   # binding is adoption-only
-
-
-def test_adoption_grants_no_push_authorization(tmp_path):
-    """Adoption authorizes content, never publication."""
-    orch, _, git, clients, _, _ = build_with_adoption(
-        tmp_path, ["out.md"],
-        responses=[adopted_approval(), approval("push"), stop_block()],
-    )
-    orch._policy = PolicyEngine(PolicyConfig(allow_push=False))
-    assert orch.run() == Phase.STOPPED.value
-    assert len(git.commits) == 1
-    assert git.pushes == 0
-    assert "push_disabled" in clients[0].submitted[2][1] or "policy_denied" in clients[0].submitted[2][1]
-
-
-def test_wired_verification_reads_the_committed_tree_not_the_working_tree(tmp_path):
-    """End-to-end swap-and-restore through the orchestrator: the index receives
-    altered bytes, the working tree is restored before the hook runs, and the
-    commit must still be refused."""
-    orch, _, git, clients, _, _ = build_with_adoption(
-        tmp_path, ["out.md"], responses=[adopted_approval(), stop_block()]
-    )
-    target = git.repo_root / "out.md"
-    approved = target.read_text()
-    git.stage_hook = lambda: target.write_text("MALICIOUS PAYLOAD\n")
-    git.restore_hook = lambda: target.write_text(approved)
-
-    assert orch.run() == Phase.STOPPED.value
-    assert git.commits == []                       # nothing committed
-    assert target.read_text() == approved          # worktree looks innocent
-    reprompt = clients[0].submitted[1][1]
-    assert "tree content does not match" in reprompt
-    assert "MALICIOUS" not in reprompt             # digests only, never content
+# ---- adopted manifests -------------------------------------------------
+#
+# Removed 2026-07-30 (docs/SECURITY.md S21/S22). This section's 9 tests
+# dispatched a stamped "commit" approval through `_dispatch_git`'s adopted
+# branch (`ChangeManifest.adopt` + `GitGateway.commit_adopted`) end to end via
+# the orchestrator — that branch, and `_dispatch_git` itself, were removed
+# along with the legacy manifest commit gate. `commit_adopted` is sound (it
+# is what closed the hook-rewrite hole S21 documents) and is kept, but it now
+# has no production caller — see its own docstring in `git_gateway.py`.
+#
+# Coverage after removal: the unit-level content-binding behaviour these
+# tests exercised through the orchestrator is still directly covered in
+# `test_manifest.py` / `test_git_gateway.py`, which call `ChangeManifest.
+# adopt` / `verify_commit` / `verify_tree_content` / `commit_adopted`
+# themselves rather than through a live dispatch:
+#   test_adopted_manifest_commit_succeeds_when_content_matches
+#     -> test_manifest.py::test_exact_approved_content_and_mode_is_accepted
+#   test_payload_without_the_adoption_block_binds_nothing_and_cannot_commit
+#     -> no direct replacement; this was the ONLY test of the `_step_ready`
+#        adoption-stamping wiring, which was removed with `_dispatch_git`
+#        (nothing produces an adopted manifest to stamp anymore)
+#   test_one_byte_change_after_approval_refuses_the_adopted_commit
+#     -> test_manifest.py::test_tree_content_change_is_rejected
+#   test_unapproved_path_cannot_be_committed_from_an_adopted_manifest
+#     -> test_manifest.py::test_unapproved_path_cannot_be_added_to_an_adopted_commit
+#   test_stale_approval_cannot_authorize_an_adoption
+#     -> test_manifest.py::test_unpresented_adopted_manifest_is_refused
+#        (same "presented_report_sha256 must match" gate, unit-level)
+#   test_tree_verification_aborts_before_the_commit_is_created
+#     -> test_git_gateway.py::test_index_mutation_after_write_tree_cannot_alter_the_commit
+#   test_executor_manifest_flow_is_unaffected_by_adoption
+#     -> retired outright: it asserted the legacy executor-manifest commit
+#        (`self._git.commit(...)`) still worked, which is exactly what S21
+#        retired
+#   test_adoption_grants_no_push_authorization
+#     -> policy.allow_push / protected-branch denial is still covered by
+#        test_denied_push_is_reported_not_executed above; the "adoption
+#        authorizes content, never publication" framing has no path left to
+#        test now that adoption never reaches dispatch at all
+#   test_wired_verification_reads_the_committed_tree_not_the_working_tree
+#     -> test_git_gateway.py::test_index_mutation_after_write_tree_cannot_alter_the_commit
+#        (same swap-and-restore-through-a-hook attack, pinned at the
+#        GitGateway level instead of through the orchestrator)

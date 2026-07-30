@@ -804,32 +804,56 @@ def test_oversized_review_packet_parks_instead_of_raising(tmp_path):
 
 
 # =============================================================================
-# 16/17. legacy push fall-through must fail closed (review-flagged regressions)
+# 16/17/18. legacy push fall-through — RETIRED 2026-07-30 (docs/SECURITY.md
+# S21: `_dispatch_git` removed along with the authorize-then-produce/manifest
+# commit path it gated). The three tests that lived here
+# (`test_parse_error_reprompt_does_not_leak_postcommit_binding_to_legacy_push`,
+# `test_stale_audit_manifest_does_not_leak_postcommit_push_to_legacy_path`,
+# `test_successful_postcommit_push_does_not_block_a_later_unrelated_audit_push`)
+# each pinned a specific fail-closed guard INSIDE `_dispatch_git`'s
+# PUSH_DECISIONS branch (checking `state.task_execution` against the
+# response's postcommit binding before falling through to a bare
+# `push_exact`). None of that code exists anymore: `commit` /
+# `commit_and_push` / any `push` not bound to a produce-then-review
+# candidate are now refused UNCONDITIONALLY, by `_dispatch`'s own
+# `legacy_git_path_retired` policy denial, before any git write is even
+# attempted — a strictly stronger guarantee than "refused in this one
+# leak-shaped scenario". The audit-specific two of the three additionally
+# relied on the now-gone `ChangeManifest`/`last_manifest_id` bookkeeping for
+# `task is None` dispatch, which no longer exists at all (audit is
+# task-shaped now — see `orchestrator.py`'s `_resolve_audit_task`).
+#
+# The replacement below pins the STRONGER guarantee: a live, unpublished
+# postcommit candidate on record does not change the outcome — the legacy
+# decision is refused either way.
 # =============================================================================
 
 
-def test_parse_error_reprompt_does_not_leak_postcommit_binding_to_legacy_push(tmp_path):
-    """A malformed reply to the review packet triggers a corrective
-    re-prompt, whose payload carries none of the postcommit identifiers. If
-    ChatGPT then replies `push` with THAT request's stamp, the response has
-    no postcommit binding — `_dispatch` falls through to `_dispatch_git`,
-    which must refuse rather than publish the main checkout's current
-    branch."""
+def test_legacy_commit_and_push_is_always_refused_even_with_a_live_candidate(tmp_path):
+    """Supersedes the three retired leak-guard tests above (see the block
+    comment). A malformed reply to the review packet triggers a corrective
+    re-prompt (whose payload carries none of the postcommit identifiers); a
+    `push` approval answering THAT request therefore carries no postcommit
+    binding. Previously this fell through to `_dispatch_git`'s fail-closed
+    leak guard specifically because a live candidate was on record; now there
+    is no legacy git path left to fall through to at all — it is refused the
+    same way regardless of whether a candidate exists."""
     executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
-    # `allow_protected_push=True` so the main checkout being on "main" (the
-    # default policy's own protected branch) does not mask the guard under
-    # test behind an EARLIER, unrelated protected-branch denial — the point
-    # here is the fail-closed check inside `_dispatch_git` itself.
     orch, repo_root, worktrees, execution_store, intent_store, task, client = (
         build_postcommit_with_client(
             tmp_path,
             executor,
-            responses=["not a json directive at all", push_approval_from_last_submitted],
+            responses=[
+                "not a json directive at all",
+                push_approval_from_last_submitted,
+                stop_block(),
+            ],
             policy=PolicyConfig(implement_enabled=True, allow_protected_push=True),
         )
     )
     orch._dispatch_executor(implement(task.id))
     assert orch.state.phase == Phase.READY.value
+    assert orch.state.task_execution is not None  # a live, unpublished candidate IS on record
 
     def fail_if_called(*a, **kw):
         raise AssertionError("push_exact must not be called")
@@ -841,217 +865,8 @@ def test_parse_error_reprompt_does_not_leak_postcommit_binding_to_legacy_push(tm
     finally:
         GitGateway.push_exact = original
 
-    assert outcome == Phase.NEEDS_USER.value
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert "refusing to push through the legacy git path" in orch.state.question
-
-
-class DualExecutor:
-    """Behaves like an audit executor for `task is None` (writes into the
-    MAIN checkout so `ChangeManifest` sees a real change) and like a
-    postcommit task executor otherwise (writes into the task's worktree)."""
-
-    def __init__(self, repo_root, worktrees_root):
-        self.repo_root = Path(repo_root)
-        self.worktrees_root = Path(worktrees_root)
-        self.calls = 0
-
-    def execute(self, directive, task):
-        self.calls += 1
-        if task is None:
-            (self.repo_root / "docs").mkdir(exist_ok=True)
-            (self.repo_root / "docs" / "AUDIT.md").write_text("# stale audit\n", encoding="utf-8")
-            return ExecutionOutcome(status="ok", summary="audit done", details="", validation="ok")
-        wt = self.worktrees_root / task.id
-        (wt / "feature.py").write_text("print('hi')\n", encoding="utf-8")
-        return ExecutionOutcome(
-            status="ok", summary="did it", details="", validation="ok",
-            changed_paths=("feature.py",),
-        )
-
-
-def test_stale_audit_manifest_does_not_leak_postcommit_push_to_legacy_path(tmp_path):
-    """A `commit_and_push` reply that answers a STALE, unrelated audit
-    manifest must not be able to publish the main checkout just because a
-    produce-then-review task happens to have a live candidate on record."""
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    run_git(repo_root, "init", "-q", "-b", "main")
-    run_git(repo_root, "config", "user.email", "test@example.com")
-    run_git(repo_root, "config", "user.name", "Test")
-    run_git(repo_root, "config", "commit.gpgsign", "false")
-    (repo_root / "README.md").write_text("hello\n")
-    # `docs/` must already be a TRACKED directory before the audit manifest's
-    # baseline is taken — git porcelain reports a brand-new untracked
-    # directory as the directory path itself ("?? docs/"), not the file
-    # inside it, which would make the manifest record "docs/" rather than
-    # "docs/AUDIT.md" and defeat the point of this test.
-    (repo_root / "docs").mkdir()
-    (repo_root / "docs" / "placeholder.md").write_text("placeholder\n")
-    run_git(repo_root, "add", "-A")
-    run_git(repo_root, "commit", "-q", "-m", "init")
-
-    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
-    worktrees = WorktreeManager(git, tmp_path / "worktrees")
-    execution_store = TaskExecutionStore(tmp_path / "executions")
-    intent_store = IntentStore(tmp_path / "intents")
-    config = AutoloopConfig(
-        browser=BrowserConfig(conversation_url=URL),
-        policy=PolicyConfig(implement_enabled=True),
-        state_dir=tmp_path / ".al",
-    )
-    store = StateStore(config.state_file)
-    state = LoopState.new(URL)
-    store.save(state)
-    task = Task(id="t1", title="Title t1", description="desc")
-    registry = TaskRegistry([task])
-    task_store = TaskStore(config.tasks_file)
-    task_store.save(registry)
-    manifest_store = ManifestStore(config.manifests_dir)
-    executor = DualExecutor(repo_root, tmp_path / "worktrees")
-
-    def no_client():
-        raise AssertionError("no browser client expected in this test")
-
-    orch = Orchestrator(
-        config=config, store=store, state=state,
-        policy=PolicyEngine(config.policy), git=git, executor=executor,
-        transcript=TranscriptLogger(config.transcript_file), client_factory=no_client,
-        registry=registry, task_store=task_store, manifest_store=manifest_store,
-        worktrees=worktrees, execution_store=execution_store, intent_store=intent_store,
-        validation_runner=ok_validation,
-    )
-
-    audit_directive = Directive(decision=Decision.AUDIT, reason="orient")
-    orch._dispatch_executor(audit_directive)
-    stale_manifest_id = orch.state.last_manifest_id
-    assert stale_manifest_id is not None
-
-    orch._dispatch_executor(implement(task.id))
-    assert orch.state.last_manifest_id == stale_manifest_id  # untouched by the postcommit path
-    execution = execution_store.load(task.id)
-    assert execution.candidate_sha != ""
-
-    directive = Directive(
-        decision=Decision.COMMIT_AND_PUSH,
-        reason="approved",
-        commit_message="docs: audit",
-        commit_paths=("docs/AUDIT.md",),
-    )
-    orch.state.last_response = LastResponse(
-        request_id="r1", raw="{}", received_at="now", report_sha256="irrelevant-here",
-    )
-
-    def fail_if_called(*a, **kw):
-        raise AssertionError("push_exact must not be called")
-
-    original = GitGateway.push_exact
-    GitGateway.push_exact = fail_if_called
-    try:
-        orch._dispatch(directive)
-    finally:
-        GitGateway.push_exact = original
-
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert "refusing to push through the legacy git path" in orch.state.question
-    assert execution_store.load(task.id).candidate_sha == execution.candidate_sha  # unaffected
-
-
-# =============================================================================
-# 18. a SUCCESSFUL postcommit push must not brick every later legacy push
-# =============================================================================
-
-
-def test_successful_postcommit_push_does_not_block_a_later_unrelated_audit_push(tmp_path):
-    """Regression: the legacy-push guard (test 16/17 above) must only refuse
-    a candidate still AWAITING publication. Once `_dispatch_task_push` has
-    actually published it, `state.task_execution` is cleared — otherwise the
-    guard would refuse every later legacy push (e.g. an unrelated audit's
-    `commit_and_push`) for the rest of the session, because nothing else
-    ever clears that field."""
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    run_git(repo_root, "init", "-q", "-b", "main")
-    run_git(repo_root, "config", "user.email", "test@example.com")
-    run_git(repo_root, "config", "user.name", "Test")
-    run_git(repo_root, "config", "commit.gpgsign", "false")
-    (repo_root / "README.md").write_text("hello\n")
-    (repo_root / "docs").mkdir()
-    (repo_root / "docs" / "placeholder.md").write_text("placeholder\n")
-    run_git(repo_root, "add", "-A")
-    run_git(repo_root, "commit", "-q", "-m", "init")
-
-    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
-    worktrees = WorktreeManager(git, tmp_path / "worktrees")
-    execution_store = TaskExecutionStore(tmp_path / "executions")
-    intent_store = IntentStore(tmp_path / "intents")
-    config = AutoloopConfig(
-        browser=BrowserConfig(conversation_url=URL),
-        policy=PolicyConfig(implement_enabled=True, allow_protected_push=True),
-        state_dir=tmp_path / ".al",
-    )
-    store = StateStore(config.state_file)
-    state = LoopState.new(URL)
-    store.save(state)
-    task = Task(id="t1", title="Title t1", description="desc")
-    registry = TaskRegistry([task])
-    task_store = TaskStore(config.tasks_file)
-    task_store.save(registry)
-    manifest_store = ManifestStore(config.manifests_dir)
-    executor = DualExecutor(repo_root, tmp_path / "worktrees")
-
-    def no_client():
-        raise AssertionError("no browser client expected in this test")
-
-    orch = Orchestrator(
-        config=config, store=store, state=state,
-        policy=PolicyEngine(config.policy), git=git, executor=executor,
-        transcript=TranscriptLogger(config.transcript_file), client_factory=no_client,
-        registry=registry, task_store=task_store, manifest_store=manifest_store,
-        worktrees=worktrees, execution_store=execution_store, intent_store=intent_store,
-        validation_runner=ok_validation,
-    )
-
-    # 1. Run the produce-then-review task through to a successful, published push.
-    orch._dispatch_executor(implement(task.id))
-    orch._step_ready()
-    req = orch.state.pending_request
-    resp = LastResponse(
-        request_id=req.request_id, raw="{}", received_at="now",
-        head_sha=req.head_sha, base_sha=req.base_sha, report_sha256=req.report_sha256,
-        postcommit=req.postcommit,
-    )
-    # A linked worktree shares its remote CONFIGURATION with the main
-    # checkout (`.git/config` is shared), so one bare repo serves as "origin"
-    # for both the task branch push below and the main-branch push in step 2
-    # — they publish to different destination refs on the same remote.
-    bare = make_bare(tmp_path, "shared-bare.git")
-    run_git(repo_root, "remote", "add", "origin", str(bare))
-    orch._dispatch_task_push(Directive(decision=Decision.PUSH, reason="approved"), resp)
-    assert orch.state.phase == Phase.READY.value
-    assert orch.state.task_execution is None  # cleared — nothing left "awaiting publication"
-
-    # 2. An UNRELATED audit runs and its own commit_and_push must succeed —
-    # not be refused by a stale guard left over from step 1.
-    audit_directive = Directive(decision=Decision.AUDIT, reason="orient")
-    orch._dispatch_executor(audit_directive)
-    assert orch.state.task_execution is None  # audit dispatch does not touch it either
-
-    directive = Directive(
-        decision=Decision.COMMIT_AND_PUSH,
-        reason="approved",
-        commit_message="docs: audit",
-        commit_paths=("docs/AUDIT.md",),
-    )
-    orch.state.last_response = LastResponse(
-        request_id="r1", raw="{}", received_at="now", report_sha256="irrelevant-here",
-    )
-    orch._dispatch(directive)
-
-    assert orch.state.phase == Phase.READY.value  # NOT refused
-    assert "Git action completed" in orch.state.outbox
-    remote_head = subprocess.run(
-        ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/main"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    assert remote_head == git.head_sha()
+    assert outcome == Phase.STOPPED.value
+    prompts = [p for _, p in client.submitted]
+    assert any("policy_denied" in p and "no longer supported" in p for p in prompts)
+    # the live candidate is unaffected — nothing was published or lost
+    assert execution_store.load(task.id).candidate_sha != ""

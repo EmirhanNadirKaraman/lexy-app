@@ -86,12 +86,25 @@ def init_repo(path):
 
 
 def test_all_green(tmp_path):
+    import subprocess
+
     init_repo(tmp_path)
+    # A configured `origin` is what makes the publisher/worker-isolation
+    # checks (added 2026-07-30) able to report "ok" at all — a repo with no
+    # push destination legitimately fails `publisher` (nothing to snapshot).
+    origin = tmp_path.parent / f"{tmp_path.name}-origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin", str(origin)], check=True
+    )
     conversation = FakeConversation()
     results = run_doctor(make_config(tmp_path), tmp_path, probes(conversation))
     named = by_name(results)
-    for check in ("config", "state_dir", "lock", "cdp", "playwright", "provider",
-                  "conversation_url", "browser_live"):
+    for check in (
+        "config", "state_dir", "lock", "worker_isolation", "hooks_dirs",
+        "publisher", "publisher_url_drift", "cdp", "playwright", "provider",
+        "conversation_url", "browser_live",
+    ):
         assert named[check].status == "ok", (check, named[check].detail)
     assert exit_code(results) == 0
     # non-destructive: opened but NEVER submitted

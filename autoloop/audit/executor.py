@@ -9,10 +9,31 @@ fan-out, reconciliation, Markdown output and the task-graph proposal.
 Subagents (read-only `claude -p` invocations, see agents.py) only analyze and
 return structured findings — they cannot edit files or delegate further.
 
-Side effects per run, all captured by the task-owned change manifest:
+Side effects per run:
 * `.autoloop/audit/<run-id>/` — raw agent outputs, parsed findings,
-  reconciliation, proposed tasks (JSON; never committed — gitignored).
+  reconciliation, proposed tasks (JSON; never committed — gitignored). Always
+  rooted at the MAIN checkout's `run_dir_base`, never at a worker repo — see
+  the "produce-then-review" note below.
 * `docs/AUDIT_<date>.md` — the ONE new Markdown file (via MarkdownPolicy).
+
+**Produce-then-review (2026-07-30).** The audit is dispatched by the
+orchestrator as a task-shaped unit of work (`Orchestrator._dispatch_task_postcommit`
+with a synthetic `Task`, id like `audit-0007`), so it runs, writes its report,
+and commits inside its OWN isolated worker repo — never the main checkout —
+exactly like a real implementation task. `git` / `markdown` / `agent_runner`
+passed to `__init__` are the STANDALONE defaults (used by every existing
+direct-call test here, and whenever `task` is `None`); when the orchestrator
+also supplies `worker_repo_root_for` (+ `policy`, +, optionally,
+`agent_runner_factory`), `execute()` re-roots all three onto
+`worker_repo_root_for(task.id)` for that one call. `run_dir_base` is
+deliberately NEVER re-rooted — it must stay outside any worker repo's working
+tree, or its raw-output files would show up as untracked residue and fail the
+post-commit "worktree is clean" check.
+
+One consequence worth flagging: since the worker repo is a fresh clone of the
+main checkout's HEAD at `task_base_sha`, `dirty = len(git.dirty_files())` is
+always 0 there, and any uncommitted work sitting in the MAIN checkout is
+invisible to the audit — the audit only ever sees committed history.
 """
 
 from __future__ import annotations
@@ -24,12 +45,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from ..contract import AUDIT_TASK_ID, Decision, Directive
 from ..executor import ExecutionOutcome
 from ..git_gateway import GitGateway
+from ..policy import PolicyEngine
 from ..tasks import Task, TaskRegistry
 from ..validation import SAFE_VALIDATION_BINARIES
+from ..worker_env import worker_env
 from .agents import AgentResult, AgentRunner, AgentSpec
 from .findings import FINDINGS_SCHEMA_TEXT, parse_findings
 from .markdown import MarkdownPolicy
@@ -140,7 +164,29 @@ class AuditExecutor:
         max_parallel_agents: int = 3,
         domains: tuple[tuple[str, str, str], ...] = DEFAULT_DOMAINS,
         command_runner=None,
+        worker_repo_root_for: Callable[[str], Path] | None = None,
+        policy: PolicyEngine | None = None,
+        agent_runner_factory: Callable[[Path], AgentRunner] | None = None,
     ):
+        """`git` / `markdown` / `agent_runner` are the STANDALONE bindings —
+        used verbatim whenever `task` is `None` (every direct `execute()` call
+        in this module's own tests) or `worker_repo_root_for` is not supplied.
+
+        `worker_repo_root_for` (a `path_for`-shaped callable, e.g.
+        `WorkerRepoManager.path_for`) is how the orchestrator's produce-then-
+        review wiring re-roots a call onto the audit's own isolated worker
+        repo: when set AND `task` is not `None`, `execute()` builds a FRESH
+        `GitGateway`/`MarkdownPolicy` rooted at `worker_repo_root_for(task.id)`
+        for that one call — `policy` (required together with
+        `worker_repo_root_for`) is what that fresh `GitGateway` is
+        constructed with, running under the scrubbed `worker_env()` mapping
+        exactly like the orchestrator's own worktree gateway. `agent_runner_factory`,
+        if given, likewise builds a fresh `AgentRunner` rooted at the worker
+        repo (e.g. a `ClaudeCliRunner` whose `cwd` is the worker repo, so
+        read-only subagents inspect the audit's own frozen checkout, not the
+        main checkout); when omitted, the construction-time `agent_runner` is
+        reused as-is (its own `cwd`, whatever that is).
+        """
         self._git = git
         self._agent_runner = agent_runner
         self._markdown = markdown
@@ -150,6 +196,9 @@ class AuditExecutor:
         self._max_parallel = max(1, max_parallel_agents)
         self._domains = domains
         self._command_runner = command_runner or subprocess.run
+        self._worker_repo_root_for = worker_repo_root_for
+        self._policy = policy
+        self._agent_runner_factory = agent_runner_factory
 
     # ---- TaskExecutor -------------------------------------------------------
 
@@ -168,24 +217,51 @@ class AuditExecutor:
                 ),
                 validation="not run",
             )
+        git, markdown, agent_runner = self._bindings_for(task)
         return self._run_audit(
-            scope=directive.scope, feedback=directive.feedback if is_audit_revision else None
+            git,
+            markdown,
+            agent_runner,
+            scope=directive.scope,
+            feedback=directive.feedback if is_audit_revision else None,
         )
+
+    def _bindings_for(
+        self, task: Task | None
+    ) -> tuple[GitGateway, MarkdownPolicy, AgentRunner]:
+        if self._worker_repo_root_for is None or task is None:
+            return self._git, self._markdown, self._agent_runner
+        root = self._worker_repo_root_for(task.id)
+        git = GitGateway(root, self._policy, env=worker_env())
+        markdown = MarkdownPolicy(root)
+        agent_runner = (
+            self._agent_runner_factory(root)
+            if self._agent_runner_factory is not None
+            else self._agent_runner
+        )
+        return git, markdown, agent_runner
 
     # ---- audit pipeline -----------------------------------------------------
 
-    def _run_audit(self, scope: str | None, feedback: str | None) -> ExecutionOutcome:
+    def _run_audit(
+        self,
+        git: GitGateway,
+        markdown: MarkdownPolicy,
+        agent_runner: AgentRunner,
+        scope: str | None,
+        feedback: str | None,
+    ) -> ExecutionOutcome:
         now = datetime.now(timezone.utc)
         date = now.strftime("%Y-%m-%d")
         run_id = now.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
         run_dir = self._run_dir_base / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        branch = self._git.current_branch()
-        head = self._git.head_sha()
-        dirty = len(self._git.dirty_files())
+        branch = git.current_branch()
+        head = git.head_sha()
+        dirty = len(git.dirty_files())
 
-        validation_runs = [self._run_validation(cmd) for cmd in self._validation_commands]
+        validation_runs = [self._run_validation(git, cmd) for cmd in self._validation_commands]
 
         specs = [
             AgentSpec(
@@ -196,7 +272,7 @@ class AuditExecutor:
             )
             for slug, title, charter, model in self._domains
         ]
-        results = self._run_agents(specs, run_dir)
+        results = self._run_agents(agent_runner, specs, run_dir)
 
         findings, parse_rejects, agent_failures, covered = [], [], [], []
         for result in results:
@@ -254,7 +330,7 @@ class AuditExecutor:
             raw_reports_dir=str(run_dir),
         )
         report_path = f"docs/AUDIT_{date}.md"
-        self._markdown.write(report_path, report)
+        markdown.write(report_path, report)
 
         accepted = len(reconciled.accepted())
         validation_summary = "; ".join(
@@ -267,7 +343,7 @@ class AuditExecutor:
             f"across {len(self._domains)} domains "
             f"({len(agent_failures)} agent failures); {len(proposal.tasks)} tasks proposed. "
             f"Report written to {report_path} (the only file this audit changed — "
-            "approve that exact path if you commit)."
+            "committed automatically once validation passes)."
         )
         return ExecutionOutcome(
             status="ok" if not agent_failures else "error",
@@ -276,13 +352,19 @@ class AuditExecutor:
             else summary + " COVERAGE INCOMPLETE — see agent failures in the report.",
             details=report,
             validation=validation_summary,
+            # produce-then-review path: this is the ONE file the audit ever
+            # changes (`MarkdownPolicy` enforces at most one new report per
+            # run), so it is exactly `commit_and_capture`'s planned-paths set.
+            changed_paths=(report_path,),
         )
 
-    def _run_agents(self, specs: list[AgentSpec], run_dir: Path) -> list[AgentResult]:
+    def _run_agents(
+        self, agent_runner: AgentRunner, specs: list[AgentSpec], run_dir: Path
+    ) -> list[AgentResult]:
         raw_dir = run_dir / "raw"
         raw_dir.mkdir(exist_ok=True)
         with ThreadPoolExecutor(max_workers=self._max_parallel) as pool:
-            results = list(pool.map(self._agent_runner.run, specs))
+            results = list(pool.map(agent_runner.run, specs))
         for result in results:
             (raw_dir / f"{result.domain}.txt").write_text(
                 result.raw_text or f"(no output; error: {result.error})", encoding="utf-8"
@@ -302,7 +384,7 @@ class AuditExecutor:
             )
         return results
 
-    def _run_validation(self, argv: tuple[str, ...]) -> ValidationRun:
+    def _run_validation(self, git: GitGateway, argv: tuple[str, ...]) -> ValidationRun:
         command = " ".join(argv)
         binary = Path(argv[0]).name if argv else ""
         if binary not in SAFE_VALIDATION_BINARIES:
@@ -314,7 +396,7 @@ class AuditExecutor:
         try:
             proc = self._command_runner(
                 list(argv),
-                cwd=str(self._git.repo_root),
+                cwd=str(git.repo_root),
                 capture_output=True,
                 text=True,
                 timeout=1800,

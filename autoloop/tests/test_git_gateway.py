@@ -1,6 +1,12 @@
 """Git gateway against real throwaway repos: reads, EXACT-path staging (no
-`git add -A` anywhere), idempotent commits, pushes to a bare remote, and
-policy denial before subprocess."""
+`git add -A` anywhere), the immutable-tree `commit_adopted` path (hook
+refusal, tree verification, compare-and-swap), pushes to a bare remote, and
+policy denial before subprocess.
+
+The legacy `commit()` method (plain `git commit` gated only on
+`ChangeManifest` provenance) was removed 2026-07-30 — see docs/SECURITY.md
+S21 — along with its tests here; `commit_adopted` below closed the same hole
+a different way and is what the hook-attack tests pin."""
 
 import subprocess
 
@@ -43,82 +49,6 @@ def test_reads(repo):
     assert not gw.is_dirty()
 
 
-def test_commit_stages_exact_paths(repo):
-    gw = gateway(repo)
-    first_sha = gw.head_sha()
-    (repo / "a.txt").write_text("two\n")
-    sha, already, summary = gw.commit("update a", ("a.txt",))
-    assert not already
-    assert sha != first_sha
-    assert gw.head_message() == "update a"
-    assert "a.txt" in summary  # staged diff summary captured pre-commit
-    assert not gw.is_dirty()
-
-
-def test_commit_requires_paths(repo):
-    (repo / "a.txt").write_text("two\n")
-    with pytest.raises(GitCommandError):
-        gateway(repo).commit("update a", ())
-
-
-def test_commit_leaves_unapproved_dirty_files_alone(repo):
-    gw = gateway(repo)
-    (repo / "a.txt").write_text("two\n")
-    (repo / "unrelated.txt").write_text("human work in progress\n")
-    gw.commit("update a", ("a.txt",))
-    dirty = "".join(gw.dirty_files())
-    assert "unrelated.txt" in dirty
-    assert "a.txt" not in dirty
-
-
-def test_commit_refuses_preexisting_index_entries(repo):
-    gw = gateway(repo)
-    (repo / "a.txt").write_text("two\n")
-    (repo / "sneaky.txt").write_text("already staged by someone\n")
-    run_git(repo, "add", "sneaky.txt")  # index dirtied outside the loop
-    with pytest.raises(GitCommandError) as excinfo:
-        gw.commit("update a", ("a.txt",))
-    assert "sneaky.txt" in str(excinfo.value)
-    # the unapproved entry was unstaged again, nothing was committed
-    assert gw.head_message() == "init"
-    assert "sneaky.txt" not in gw.staged_paths()
-
-
-def test_commit_is_idempotent_after_crash(repo):
-    gw = gateway(repo)
-    (repo / "a.txt").write_text("two\n")
-    sha, _, _ = gw.commit("update a", ("a.txt",))
-    # Re-dispatch of the same directive after a crash — even with OTHER files
-    # still dirty in the tree.
-    (repo / "unrelated.txt").write_text("other work\n")
-    sha2, already, _ = gw.commit("update a", ("a.txt",))
-    assert already
-    assert sha2 == sha
-
-
-def test_commit_clean_tree_with_other_message_fails(repo):
-    with pytest.raises(GitCommandError):
-        gateway(repo).commit("something else entirely", ("a.txt",))
-
-
-def test_commit_handles_deletions_and_untracked(repo):
-    gw = gateway(repo)
-    (repo / "new.txt").write_text("brand new\n")
-    (repo / "a.txt").unlink()
-    sha, already, _ = gw.commit("replace a with new", ("a.txt", "new.txt"))
-    assert not already
-    assert not gw.is_dirty()
-    assert "new.txt" in run_git(repo, "show", "--stat", "--format=%H")
-
-
-def test_commit_handles_worktree_rename(repo):
-    gw = gateway(repo)
-    (repo / "a.txt").rename(repo / "b.txt")
-    sha, already, _ = gw.commit("rename a to b", ("a.txt", "b.txt"))
-    assert not already
-    assert not gw.is_dirty()
-
-
 def test_gateway_has_no_ambient_push_method(repo):
     """`push()` was removed 2026-07-30 (pass 2b) — it pushed whatever the
     current branch tip happened to be, exactly the wrong-destination race M1
@@ -154,46 +84,6 @@ def test_denied_command_never_reaches_subprocess(tmp_path):
     with pytest.raises(GitOperationDenied):
         gw._git("add", "-A")
     assert calls == []
-
-
-# ---- post-stage verification hook (adopted-manifest TOCTOU close) ----------
-
-
-def test_post_stage_check_runs_after_staging_and_before_commit(repo):
-    gw = gateway(repo)
-    (repo / "a.txt").write_text("two\n")
-    seen = {}
-
-    def check():
-        # The index already holds the change; the commit does not exist yet.
-        seen["staged"] = gw.staged_paths()
-        seen["head_message"] = gw.head_message()
-
-    gw.commit("update a", ("a.txt",), post_stage_check=check)
-    assert seen["staged"] == {"a.txt"}
-    assert seen["head_message"] == "init"       # commit had not happened yet
-    assert gw.head_message() == "update a"      # and then it did
-
-
-def test_post_stage_check_failure_aborts_and_unstages(repo):
-    gw = gateway(repo)
-    (repo / "a.txt").write_text("two\n")
-
-    def refuse():
-        raise GitCommandError("content changed after staging")
-
-    with pytest.raises(GitCommandError):
-        gw.commit("update a", ("a.txt",), post_stage_check=refuse)
-    assert gw.head_message() == "init"          # no commit was created
-    assert gw.staged_paths() == set()           # index restored
-    assert "a.txt" in "".join(gw.dirty_files())  # the change is preserved
-
-
-def test_commit_without_a_hook_is_unchanged(repo):
-    gw = gateway(repo)
-    (repo / "a.txt").write_text("two\n")
-    sha, already, summary = gw.commit("update a", ("a.txt",))
-    assert not already and sha and "a.txt" in summary
 
 
 # ---- immutable-tree commit path (adopted manifests) ------------------------

@@ -36,7 +36,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S13 | INFO | f-string SQL in a migration (pattern caution) | `migrations/versions/013_*.py` |
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
 | S18 | LOW | Self-hosted model server has no auth; `LLM_BASE_URL` egress is operator-controlled (opt-in, unset by default) | `services/llm_provider.py` |
-| S21 | HIGH | Commit hooks can rewrite an executor-manifest commit after verification (reproduced; adopted path fixed, executor path deliberately deferred) | `autoloop/git_gateway.py` `commit()` |
+| S22 | INFO | `commit_adopted` is sound but has no production call site (tracked, not a vulnerability) | `autoloop/git_gateway.py`, `autoloop/manifest.py` |
 
 ---
 
@@ -147,53 +147,33 @@ prefer `https://` when the tunnel supports it. If a shared/multi-tenant model
 server is ever used, revisit — prompt content would then leave the trust
 boundary.
 
-### S21 — Commit hooks can rewrite an executor-manifest commit after verification — HIGH — OPEN
+### S22 — `commit_adopted` is sound but has no production call site — INFO — OPEN (tracked, not a vulnerability)
 
-**What:** `autoloop`'s executor-manifest commit path uses `git commit`
-(`git_gateway.commit`). `git commit` runs `pre-commit` **after** any check the
-caller performed, and a pre-commit hook can `git add` arbitrary content. So a
-hook can change the bytes of an approved path and stage additional unapproved
-paths, and both land in the commit.
-
-**Reproduced 2026-07-30** while hardening the *adopted*-manifest path: an index
-check passed, a pre-commit hook rewrote the approved file to `HOOK-INJECTED
-PAYLOAD` and staged an extra `sneaked.txt`, and the created commit contained
-both. Verbatim:
-
-```
-index check at post_stage_check: PASS
-files in the commit : ['f.txt', 'sneaked.txt']
-committed f.txt     : 'HOOK-INJECTED PAYLOAD\n'
-```
-
-**Why it is not fixed here:** the adopted path was reworked to build and verify
-an immutable tree, then `commit-tree` + `update-ref` CAS, and it refuses when any
-commit hook is active. The **executor** path still uses `git commit` and was
-deliberately left alone to keep that changeset narrow — it verifies *provenance*
-(did the task produce this path?), not the committed bytes, so a hook could alter
-an executor commit today.
-
-**Current exposure:** low in practice — this repository has no active hooks
-(`.git/hooks` holds only `*.sample`, `core.hooksPath` unset), and a hook is
-operator-installed, not attacker-installed, so this needs local write access.
-Exposure rises the moment anyone adds a formatter hook.
-
-`file:line` — `autoloop/git_gateway.py` `commit()` (the `git commit` call at the
-end of the method).
-
+**What:** `GitGateway.commit_adopted` (the immutable-tree / `commit-tree` +
+`update-ref` CAS sequence that closed S21 — see *Resolved findings*) is
+correct and still directly exercised by `test_git_gateway.py` /
+`test_manifest.py`, but as of the 2026-07-30 S21 retirement it has **no
+production caller anywhere**: `orchestrator.py`'s `_dispatch_git` (its only
+caller) was removed along with the legacy authorize-then-produce commit path,
+and `ChangeManifest.adopt` (the only thing that would produce an adopted
+manifest to commit) already had no production caller before that. Tracked
+here so "why does this exist" has an answer, and so a future PR does not
+silently wire it back into `orchestrator.py` without a fresh design review —
+produce-then-review commits automatically now; there is no remaining
+authorize-then-produce step for `commit_adopted` to gate.
+**file:line** — `autoloop/git_gateway.py` `commit_adopted()`; `autoloop/manifest.py` (module-level, `ChangeManifest.adopt`).
 **Verification check:**
 ```bash
-# Expect: the executor path still shells out to `git commit`
-rg -n '"commit", "-m", message' autoloop/git_gateway.py
-# Expect: the adopted path does NOT, and refuses active hooks
-rg -n 'active_commit_hooks|commit-tree|update_ref_cas' autoloop/git_gateway.py
+# Expect: no match — the only historical caller is gone
+rg -n '\.commit_adopted\(' autoloop --glob '!**/tests/**'
+rg -n 'ChangeManifest\.adopt\(' autoloop --glob '!**/tests/**'
+# Expect: both modules' own docstrings say so
+rg -n 'NON-PRODUCTION' autoloop/git_gateway.py autoloop/manifest.py
 ```
-
-**Suggested fix:** route the executor path through the same
-`commit_adopted`-style sequence (verified tree → `commit-tree` → CAS) with the
-same fail-closed hook check, or bind executor commits to content hashes so the
-post-hook tree can be verified. Prefer sharing one commit implementation rather
-than maintaining two.
+**Suggested fix:** none needed — this is a tracking note, not a defect. If a
+future produce-then-review variant needs a pre-verified-content commit path
+again, reuse `commit_adopted` rather than reintroducing a second
+implementation.
 
 ---
 
@@ -228,6 +208,67 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 ---
 
 ## Resolved findings
+
+### S21 — Commit hooks can rewrite an executor-manifest commit after verification — HIGH — CLOSED BY RETIREMENT 2026-07-30
+
+**What it was:** `autoloop`'s executor-manifest commit path used plain `git
+commit` (`GitGateway.commit()`). `git commit` runs `pre-commit` **after** any
+check the caller performed, and a pre-commit hook could `git add` arbitrary
+content — so a hook could change the bytes of an approved path and stage
+additional unapproved paths, and both would land in the commit. Reproduced
+2026-07-30 (see the original finding text preserved below) while hardening
+the sibling *adopted*-manifest path, which closed the same hole a different
+way (immutable tree → `commit-tree` → `update-ref` CAS, refusing outright
+when any commit hook is active).
+
+**Closed by retirement, not by a fix.** The vulnerable path itself —
+`GitGateway.commit()`, and its only caller, `orchestrator.py`'s
+`_dispatch_git` (the authorize-then-produce/`ChangeManifest` commit gate) —
+was **removed** as part of replacing the whole authorize-then-produce commit
+model with produce-then-review end to end (`worktask.py` / `packet.py` /
+`Orchestrator._dispatch_task_postcommit`, now used for audit **and**
+implement/revise alike — see `_resolve_audit_task`). There is no more
+"approve, then commit" step for a hook to interpose itself in: the
+orchestrator commits automatically after implementation/audit work
+completes, with hooks enabled and unrestricted, and REVIEW happens
+afterward, reading the immutable committed objects — a hook cannot rewrite
+content between "was reviewed" and "was committed" because nothing is
+reviewed before it is committed anymore. `commit_adopted` (the fix that
+*did* patch the hole directly) is unaffected and still sound, but likewise
+lost its only caller in the same change — tracked separately as **S22**
+(non-production, kept for its own unit tests).
+
+**Verification check:**
+```bash
+# Expect: neither symbol exists anymore
+rg -n 'def commit\(' autoloop/git_gateway.py        # only commit_adopted/commit_and_capture/commit_tree remain
+rg -n '_dispatch_git' autoloop/orchestrator.py       # no match
+```
+
+**Original finding (preserved for history):**
+
+> **What:** `autoloop`'s executor-manifest commit path uses `git commit`
+> (`git_gateway.commit`). `git commit` runs `pre-commit` **after** any check the
+> caller performed, and a pre-commit hook can `git add` arbitrary content. So a
+> hook can change the bytes of an approved path and stage additional unapproved
+> paths, and both land in the commit.
+>
+> **Reproduced 2026-07-30** while hardening the *adopted*-manifest path: an index
+> check passed, a pre-commit hook rewrote the approved file to `HOOK-INJECTED
+> PAYLOAD` and staged an extra `sneaked.txt`, and the created commit contained
+> both. Verbatim:
+>
+> ```
+> index check at post_stage_check: PASS
+> files in the commit : ['f.txt', 'sneaked.txt']
+> committed f.txt     : 'HOOK-INJECTED PAYLOAD\n'
+> ```
+>
+> **Current exposure (at the time):** low in practice — this repository had no
+> active hooks (`.git/hooks` held only `*.sample`, `core.hooksPath` unset), and
+> a hook is operator-installed, not attacker-installed, so this needed local
+> write access. Exposure would have risen the moment anyone added a formatter
+> hook — which is exactly why the path was retired rather than left in place.
 
 ### S19 — Raw user input concatenated into a Postgres regex in corpus **search** — LOW — RESOLVED 2026-07-28
 **Was:** `search_service.PHRASE_WORD_QUERY` matched blueprints with a

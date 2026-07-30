@@ -56,69 +56,20 @@ def finish(manifest, root) -> ChangeManifest:
     return manifest
 
 
-# ---- snapshot diffing -------------------------------------------------------
-
-
-def test_task_created_file(repo):
-    manifest = begin(repo)
-    (repo / "new.txt").write_text("made by task\n")
-    finish(manifest, repo)
-    assert manifest.created == ["new.txt"]
-    assert manifest.modified == [] and manifest.deleted == []
-
-
-def test_task_modified_tracked_file(repo):
-    manifest = begin(repo)
-    (repo / "tracked.txt").write_text("v2 by task\n")
-    finish(manifest, repo)
-    assert manifest.modified == ["tracked.txt"]
-
-
-def test_task_deleted_tracked_file(repo):
-    manifest = begin(repo)
-    (repo / "tracked.txt").unlink()
-    finish(manifest, repo)
-    assert manifest.deleted == ["tracked.txt"]
-
-
-def test_preexisting_dirty_file_untouched_is_not_a_task_change(repo):
-    (repo / "human.txt").write_text("human work before the task\n")
-    manifest = begin(repo)
-    (repo / "new.txt").write_text("task output\n")
-    finish(manifest, repo)
-    assert manifest.created == ["new.txt"]
-    assert "human.txt" not in manifest.task_changed_paths()
-
-
-def test_unrelated_file_changed_during_task_is_recorded_as_task_change(repo):
-    # The manifest cannot attribute WHO edited during the window — anything
-    # that changed after baseline counts as task-changed and is therefore
-    # committable only with explicit approval. What matters for safety is the
-    # pre-existing-dirt exclusion, covered above.
-    (repo / "human.txt").write_text("human v1\n")
-    manifest = begin(repo)
-    (repo / "human.txt").write_text("edited during the task window\n")
-    finish(manifest, repo)
-    assert manifest.modified == ["human.txt"]
-
-
-def test_worktree_rename_is_delete_plus_create(repo):
-    manifest = begin(repo)
-    (repo / "tracked.txt").rename(repo / "renamed.txt")
-    finish(manifest, repo)
-    assert manifest.deleted == ["tracked.txt"]
-    assert manifest.created == ["renamed.txt"]
-
-
-def test_reverted_baseline_dirt_is_not_a_task_change(repo):
-    (repo / "tracked.txt").write_text("dirty before task\n")
-    manifest = begin(repo)
-    (repo / "tracked.txt").write_text("v1\n")  # back to HEAD content
-    finish(manifest, repo)
-    assert manifest.task_changed_paths() == set()
-
-
-# ---- verify_commit ----------------------------------------------------------
+# ---- snapshot diffing / verify_commit (executor gate) -----------------------
+#
+# Retired 2026-07-30 (docs/SECURITY.md S21: closed by retirement, not a fix).
+# `ChangeManifest.begin`/`.finish` (the ONLY thing that ever built or classified
+# an `executor`-kind manifest) and `verify_commit`'s executor-provenance branch
+# had exactly one caller, `orchestrator.py`'s `_dispatch_executor`/`_dispatch_git`
+# legacy branches — both removed. The tests that lived here (snapshot
+# created/modified/deleted classification, pre-existing-dirt exclusion, rename
+# handling, and `verify_commit`'s executor-path checks) tested that retired
+# call path specifically. `verify_commit`'s ADOPTED branch is still live and
+# still tested below (`verify_commit` dispatches on `manifest.is_adopted()`;
+# see e.g. `test_legacy_hash_only_manifest_is_refused`,
+# `test_unpresented_adopted_manifest_is_refused`,
+# `test_unapproved_path_cannot_be_added_to_an_adopted_commit`).
 
 
 def make_finished(repo, task_files=("new.txt",)) -> ChangeManifest:
@@ -126,43 +77,6 @@ def make_finished(repo, task_files=("new.txt",)) -> ChangeManifest:
     for name in task_files:
         (repo / name).write_text(f"task output {name}\n")
     return finish(manifest, repo)
-
-
-def test_verify_allows_exact_task_paths(repo):
-    manifest = make_finished(repo)
-    assert verify_commit(manifest, ("new.txt",)) == []
-
-
-def test_verify_refuses_empty_paths(repo):
-    manifest = make_finished(repo)
-    violations = verify_commit(manifest, ())
-    assert violations and "explicit path list" in violations[0]
-
-
-def test_verify_refuses_unfinished_manifest(repo):
-    manifest = begin(repo)
-    violations = verify_commit(manifest, ("new.txt",))
-    assert violations and "unfinished" in violations[0]
-
-
-def test_verify_refuses_preexisting_dirty_path(repo):
-    (repo / "human.txt").write_text("human work\n")
-    manifest = make_finished(repo)
-    violations = verify_commit(manifest, ("new.txt", "human.txt"))
-    assert any("already modified before the task" in v for v in violations)
-
-
-def test_verify_refuses_path_not_changed_by_task(repo):
-    manifest = make_finished(repo)
-    violations = verify_commit(manifest, ("new.txt", "ghost.txt"))
-    assert any("was not changed by task" in v for v in violations)
-
-
-def test_verify_allows_task_deletions(repo):
-    manifest = begin(repo)
-    (repo / "tracked.txt").unlink()
-    finish(manifest, repo)
-    assert verify_commit(manifest, ("tracked.txt",)) == []
 
 
 # ---- persistence ------------------------------------------------------------

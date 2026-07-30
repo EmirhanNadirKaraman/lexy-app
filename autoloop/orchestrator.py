@@ -74,26 +74,19 @@ from .contract import (
 from .errors import (
     BrowserError,
     ContractError,
+    ExecutorError,
     GitCommandError,
     GitError,
     LoginExpiredError,
-    ManifestViolation,
     StateError,
     TaskGraphError,
 )
-from .manifest import (
-    ChangeManifest,
-    ManifestStore,
-    render_adoption_block,
-    snapshot,
-    verify_commit,
-    verify_tree_content,
-)
+from .manifest import ManifestStore
 from .executor import TaskExecutor
 from .git_gateway import GitGateway
 from .packet import build_review_packet
-from .policy import PolicyEngine
-from .publisher import Publisher
+from .policy import PolicyEngine, Verdict
+from .publisher import Publisher, redact_url
 from .worker_env import verify_worker_isolation, worker_env
 from .prompts import (
     TEMPLATES,
@@ -155,6 +148,7 @@ class Orchestrator:
         validation_runner=None,
         publisher: Publisher | None = None,
         worker_repos=None,
+        publisher_url_snapshot: str | None = None,
     ):
         self._config = config
         self._store = store
@@ -166,13 +160,21 @@ class Orchestrator:
         self._client_factory = client_factory
         self._registry = registry
         self._task_store = task_store
+        #: Vestigial since the S21 retirement (2026-07-30, docs/SECURITY.md):
+        #: kept as a constructor parameter so every existing caller/test is
+        #: unaffected, but nothing in this class writes to it anymore — the
+        #: only writer was `_dispatch_executor`'s legacy manifest branch, and
+        #: the only reader was `_step_ready`'s adoption stamping, both removed.
         self._manifest_store = manifest_store
-        # Produce-then-review commit path (pass 2a). ALL THREE optional and
-        # gated together: when `worktrees` is None (every existing caller and
-        # test), `_dispatch_executor` takes the old authorize-then-produce/
-        # manifest branch unchanged for every decision, audit included. When
-        # set, a real (non-audit) task runs in its own worktree and commits
-        # automatically once validation passes — see `_dispatch_task_postcommit`.
+        # Produce-then-review commit path. `worktrees` / `worker_repos` are
+        # the two mutually-exclusive backends for where a task's own working
+        # repository lives (`worker_repos` wins if both are set — see
+        # `_dispatch_task_postcommit`); `execution_store` / `intent_store`
+        # are required alongside either one. Since the S21 retirement this is
+        # the ONLY dispatch path for audit/implement/revise — an Orchestrator
+        # built with none of these configured raises `ExecutorError` the
+        # first time it needs to dispatch, rather than silently doing
+        # nothing (see the guard at the top of `_dispatch_task_postcommit`).
         self._worktrees = worktrees
         self._execution_store = execution_store
         self._intent_store = intent_store
@@ -196,6 +198,16 @@ class Orchestrator:
         # therefore `origin` — with the main checkout. Gated like the rest:
         # `None` keeps the pre-M2 linked-worktree behaviour.
         self._worker_repos = worker_repos
+        #: The publisher's remote-url snapshot at the moment it was last
+        #: (re)provisioned (`publisher.read_publisher_url_snapshot`), passed
+        #: in by the caller rather than re-read here on every dispatch — so a
+        #: `reprovision-publisher` run mid-session by a DIFFERENT process is
+        #: picked up only on the next Orchestrator construction, never
+        #: silently mid-run. Only meaningful when `publisher` is set;
+        #: `_dispatch_task_push` compares it against the MAIN checkout's
+        #: LIVE `remote.<remote>.url` before every publish and refuses (never
+        #: auto-heals) on a mismatch — see that method's docstring.
+        self._publisher_url_snapshot = publisher_url_snapshot
         self._client = None
 
     # ---- main loop ----------------------------------------------------------
@@ -252,17 +264,6 @@ class Orchestrator:
         if state.outbox is None:
             raise StateError("phase=ready but outbox is empty — nothing to send")
         request_id = f"alr-{state.session_id[:8]}-{next_iteration:04d}"
-        adopted = self._current_adopted_manifest()
-        # Bind the hash table to the bytes being reviewed, but only when the
-        # payload actually carries it. Refusing to SEND otherwise would deadlock
-        # the loop: error re-prompts and other template payloads legitimately
-        # carry no adoption block, and the loop must still be able to report a
-        # refusal. The load-bearing check is at commit time — an approval that
-        # answers a report which did not carry the table is refused there,
-        # either as "never presented" or as a stale-report mismatch.
-        carries_block = (
-            adopted is not None and render_adoption_block(adopted) in state.outbox
-        )
         ctx = build_context(state, self._git, self._registry, request_id, state.outbox)
         prompt = build_prompt(request_id, next_iteration, render_context(ctx), state.outbox)
         postcommit = self._current_pending_postcommit(state.outbox, ctx.report_sha256)
@@ -277,17 +278,10 @@ class Orchestrator:
             timestamp=ctx.timestamp,
             postcommit=postcommit,
         )
-        if carries_block:
-            # Record WHICH reviewed report carried the table. A later approval
-            # must echo this same report_sha256, so an approval answering any
-            # other report can never authorize this adoption.
-            adopted.presented_report_sha256 = ctx.report_sha256
-            self._manifest_store.save(adopted)
         if postcommit is not None:
-            # Mirror the adoption stamp above, on the TaskExecution record
-            # instead of a ChangeManifest: bind the exact report this
-            # candidate was reviewed under, so a later approval answering a
-            # DIFFERENT report can never authorize publishing it.
+            # Bind the exact report this candidate was reviewed under, on the
+            # TaskExecution record, so a later approval answering a DIFFERENT
+            # report can never authorize publishing it.
             execution = self._execution_store.load(postcommit.task_id)
             if execution is not None:
                 execution.presented_report_sha256 = ctx.report_sha256
@@ -416,15 +410,6 @@ class Orchestrator:
             self._store.save(state)
             return
         self._park_ambiguous(req, reconciled=True)
-
-    def _current_adopted_manifest(self) -> ChangeManifest | None:
-        """The adopted manifest awaiting review, if the current one is adopted."""
-        if self.state.last_manifest_id is None:
-            return None
-        manifest = self._manifest_store.load(self.state.last_manifest_id)
-        if manifest is None or not manifest.is_adopted():
-            return None
-        return manifest
 
     def _current_pending_postcommit(
         self, payload: str, report_sha256: str
@@ -596,15 +581,30 @@ class Orchestrator:
             # A push answering a produce-then-review packet publishes via
             # `push_exact`, sourced entirely from the response's binding
             # (never from `directive` — see `_dispatch_task_push`'s
-            # docstring). `commit_and_push` deliberately does NOT take this
-            # branch: there is nothing new to commit here (the commit already
-            # exists), so a `commit_and_push` reply falls through to
-            # `_dispatch_git`, whose manifest gate refuses it with a clear
-            # "no change manifest recorded" error — a more honest response
-            # than silently reinterpreting it as a bare push.
+            # docstring).
             self._dispatch_task_push(directive, state.last_response)
         elif decision in COMMIT_DECISIONS or decision in PUSH_DECISIONS:
-            self._dispatch_git(directive)
+            # The legacy authorize-then-produce commit/push path (`commit`,
+            # `commit_and_push`, and any `push` NOT bound to a produce-then-
+            # review candidate — the bound case is handled above) was retired
+            # 2026-07-30 (docs/SECURITY.md S21: closed by retirement, not by
+            # a fix — see `_dispatch_task_postcommit`). Nothing in this
+            # codebase's own prompts ever asks ChatGPT for these anymore; if
+            # one arrives anyway (a stale habit, a hand-crafted directive), it
+            # is refused through the SAME budget-capped corrective-reprompt
+            # machinery as any other policy denial — never silently routed to
+            # the executor, which does not understand a git decision.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "legacy_git_path_retired",
+                    "direct commit/push is no longer supported — the orchestrator "
+                    "commits automatically after implementing (or auditing) a "
+                    "task in its own worker repo; the only valid approval is "
+                    "`push` with the `reviewed` stamp answering a postcommit "
+                    "review packet",
+                ),
+            )
         else:  # audit / implement / revise
             self._dispatch_executor(directive)
 
@@ -646,8 +646,17 @@ class Orchestrator:
         self._store.save(state)
 
     def _dispatch_executor(self, directive: Directive) -> None:
+        """`audit`/`implement`/`revise` all run through the SAME produce-
+        then-review commit path (`_dispatch_task_postcommit`) — the legacy
+        authorize-then-produce/change-manifest branch that used to live here
+        was retired 2026-07-30 (docs/SECURITY.md S21: closed by retirement,
+        not by a fix). The audit is dispatched as a task-shaped unit of work
+        too (`_resolve_audit_task`), so there is no more "task is None" fork:
+        every directive that reaches this method ends up in its own isolated
+        worker repo, committed automatically, reviewed from the immutable
+        commit, never from a pre-commit manifest.
+        """
         state = self.state
-        task = None
         is_audit = (
             directive.decision is Decision.AUDIT or directive.task_id == AUDIT_TASK_ID
         )
@@ -662,79 +671,55 @@ class Orchestrator:
                 "started_at": utcnow_iso(),
             }
         else:  # audit, or revise of the audit pseudo-task
-            state.current_task = {
-                "task_id": AUDIT_TASK_ID,
-                "title": "repository audit",
-                "decision": directive.decision.value,
-                "started_at": utcnow_iso(),
-            }
+            task = self._resolve_audit_task(directive, state)
+            if task is None:
+                return  # parked; _resolve_audit_task already reported why
 
-        if task is not None and (self._worktrees is not None or self._worker_repos is not None):
-            # Produce-then-review commit path. Audit never takes this branch
-            # (task is always None for it) — it keeps the manifest-based path
-            # below unconditionally, report content and all.
-            self._dispatch_task_postcommit(directive, task, state)
-            return
+        self._dispatch_task_postcommit(directive, task, state)
 
-        # Task-owned change manifest: snapshot the dirty tree BEFORE the task.
-        # The manifest id is stable across a crash-redispatch (same iteration),
-        # so recovery overwrites the same manifest instead of forking it.
-        manifest_id = f"{task.id if task else AUDIT_TASK_ID}-i{state.iteration:04d}"
-        manifest = ChangeManifest.begin(manifest_id, task.id if task else AUDIT_TASK_ID, self._git)
-        self._manifest_store.save(manifest)
-        state.current_task["manifest_id"] = manifest_id
-        # Save before executing: a crash mid-execution resumes in `executing`
-        # and re-dispatches the same directive (executors must tolerate that).
-        self._store.save(state)
-        outcome = self._executor.execute(directive, task)
-        manifest.finish(snapshot(self._git))
-        self._manifest_store.save(manifest)
-        state.last_manifest_id = manifest_id
-        self._log(
-            "manifest",
-            data={
-                "manifest_id": manifest_id,
-                "created": manifest.created,
-                "modified": manifest.modified,
-                "deleted": manifest.deleted,
-            },
-        )
-        state.last_validation = outcome.validation or "(none)"
-        self._log(
-            "executed",
-            data={
-                "decision": directive.decision.value,
-                "task_id": task.id if task else None,
-                "status": outcome.status,
-                "summary": outcome.summary,
-                "validation": outcome.validation,
-            },
-        )
-        if task is None:  # audit, or revise of the audit — both yield a report
-            report = outcome.summary + ("\n\n" + outcome.details if outcome.details else "")
-            state.outbox = TEMPLATES["audit"].render(report=report)
-        elif outcome.status == "ok":
-            state.outbox = TEMPLATES["commit_approval"].render(
-                task_id=task.id,
-                task_title=task.title,
-                summary=outcome.summary,
-                details=outcome.details,
-                validation=outcome.validation or "(none)",
-            )
+    def _resolve_audit_task(self, directive: Directive, state: LoopState) -> Task | None:
+        """The audit's own stable per-run identity, distinct from the
+        protocol-level pseudo-id `AUDIT_TASK_ID` ("audit" — what ChatGPT
+        always sends as `task_id` on a revise-of-audit directive, per the
+        contract). `WorkerRepoManager` keys one worker repo per id and
+        `TaskExecution.review_round`/`attempt_count` cap per id too, so if
+        every audit reused the literal "audit", a second audit in the same
+        session could never create its repo, and the first audit's round/
+        attempt counters would permanently cap every later one — continuous
+        mode's "one audit per changed fingerprint" selection policy (see
+        `cli.py`) depends on audits NOT sharing an id across runs.
+
+        A fresh `audit` decision mints a new id (`audit-<iteration>`, unique
+        per request since `state.iteration` only ever increases — and stable
+        across a crash-redispatch of the SAME request, exactly like the
+        retired manifest id was). A `revise` targeting the pseudo-id resumes
+        the id the immediately preceding audit/revise round in this arc
+        used — read from `state.current_task` BEFORE this call overwrites
+        it — so round 2 lands on the SAME worker repo, branch and
+        `TaskExecution` as round 1 instead of forking a new one and losing
+        round 1's commit. Returns `None` (having already parked) if a
+        revise arrives with no audit currently on record.
+        """
+        if directive.decision is Decision.AUDIT:
+            unit_id = f"audit-{state.iteration:04d}"
         else:
-            state.outbox = TEMPLATES["implementation_review"].render(
-                task_id=task.id if task else "(none)",
-                task_title=task.title if task else "(none)",
-                decision=directive.decision.value,
-                status=outcome.status,
-                summary=outcome.summary,
-                details=outcome.details,
-                validation=outcome.validation or "(none)",
-            )
-        state.last_response = None
-        state.consecutive_failures = 0
-        state.phase = Phase.READY.value
-        self._store.save(state)
+            prior = (state.current_task or {}).get("task_id") or ""
+            if not prior.startswith("audit-"):
+                state.last_response = None
+                self._to_needs_user(
+                    "revise of the audit pseudo-task has no audit currently on "
+                    "record for this session (state.current_task carries no audit "
+                    "unit id) — nothing was executed. Run `audit` first."
+                )
+                return None
+            unit_id = prior
+        state.current_task = {
+            "task_id": unit_id,
+            "title": "repository audit",
+            "decision": directive.decision.value,
+            "started_at": utcnow_iso(),
+        }
+        return Task(id=unit_id, title="repository audit", description="repository audit")
 
     # ---- produce-then-review commit path (pass 2a + 2b) ----------------------
     #
@@ -755,8 +740,30 @@ class Orchestrator:
     # or ChatGPT — `_park_round_cap` parks immediately with both the full
     # range diff and the latest round's own diff, plus the feedback that
     # triggered it.
+    #
+    # The audit runs through here too (2026-07-30): `_dispatch_executor`
+    # resolves it to a synthetic `Task` (`_resolve_audit_task`) with its own
+    # stable per-run id, so `task` below is never `None` — there is exactly
+    # ONE produce-then-review commit path, audit included.
 
     def _dispatch_task_postcommit(self, directive: Directive, task: Task, state: LoopState) -> None:
+        if (self._worktrees is None and self._worker_repos is None) or (
+            self._execution_store is None or self._intent_store is None
+        ):
+            # There is no other dispatch path left to fall back to (the
+            # legacy authorize-then-produce/manifest branch was retired
+            # 2026-07-30 — see docs/SECURITY.md S21). An Orchestrator built
+            # without a full worktrees-or-worker_repos / execution_store /
+            # intent_store set (e.g. `_cmd_smoke_browser`'s deliberately
+            # minimal construction) cannot execute ANY directive that reaches
+            # here — fail with a clear, catchable error rather than a raw
+            # AttributeError on the first `None.create(...)`/`None.load(...)`.
+            raise ExecutorError(
+                "this Orchestrator has no produce-then-review collaborators "
+                "configured (need worker_repos or worktrees, plus "
+                "execution_store and intent_store) — audit/implement/revise "
+                "cannot run"
+            )
         execution = self._execution_store.load(task.id)
         if execution is None:
             # First dispatch for this task: base sha is recorded BEFORE any
@@ -1128,9 +1135,40 @@ class Orchestrator:
         remains the ONLY source of what gets published in either branch; this
         method never reads a fresh "current" sha from anywhere once the
         binding checks above have passed.
+
+        **Publisher URL drift (v1 policy).** When `self._publisher` is set,
+        the main checkout's LIVE `remote.<remote>.url` is compared against
+        `self._publisher_url_snapshot` (captured at provisioning time, never
+        auto-updated — see `publisher.provision_publisher_repo`) BEFORE
+        anything else runs. A mismatch means the main checkout's origin
+        changed since the publisher was last (re)provisioned; this refuses
+        and parks rather than publishing to the stale snapshotted
+        destination, naming the exact operator command
+        (`reprovision-publisher --confirm`) that is the ONLY way to update
+        it. `Publisher.publish` is ALSO given `expected_url=` the same
+        snapshot as belt-and-braces (`push_exact` re-checks it against the
+        PUBLISHER repo's own config immediately before pushing), but that
+        second check cannot see the main-checkout-vs-snapshot drift this one
+        exists for — the publisher repo's own config only ever reflects the
+        snapshot itself (`provision_publisher_repo` re-asserts it on every
+        call), never the main checkout's current, possibly-drifted value.
         """
         state = self.state
         binding = resp.postcommit
+        if self._publisher is not None:
+            live_url = self._git.config_get(f"remote.{self._publisher.remote}.url")
+            if live_url != self._publisher_url_snapshot:
+                self._to_needs_user(
+                    f"task {binding.task_id}: push refused — the publisher's "
+                    f"remote url snapshot ({redact_url(self._publisher_url_snapshot or '')}) "
+                    "no longer matches the main checkout's configured "
+                    f"remote.{self._publisher.remote}.url "
+                    f"({redact_url(live_url)}). Autoloop never updates the "
+                    "snapshot automatically. Verify the new destination is "
+                    "correct, then run `python -m autoloop reprovision-publisher "
+                    "--confirm`. Nothing was published."
+                )
+                return
         execution = self._execution_store.load(binding.task_id)
         if execution is None or execution.candidate_sha != binding.candidate_sha:
             self._to_needs_user(
@@ -1206,7 +1244,10 @@ class Orchestrator:
                         execution.worktree_path, binding.candidate_sha
                     )
                     landed = self._publisher.publish(
-                        binding.candidate_sha, dest_ref, gateway_protected
+                        binding.candidate_sha,
+                        dest_ref,
+                        gateway_protected,
+                        expected_url=self._publisher_url_snapshot,
                     )
                 else:
                     landed = worktree_git.push_exact(
@@ -1227,15 +1268,12 @@ class Orchestrator:
         )
         self._execution_store.save(execution)
         # Clear `state.task_execution` now that the candidate is actually
-        # published — NOT just re-mirror it. `_dispatch_git`'s legacy-push
-        # guard refuses whenever `state.task_execution` shows a live
-        # `candidate_sha` with no matching binding on the current response;
-        # leaving the just-published candidate there would make that guard
-        # refuse EVERY later legacy push for the rest of the session (e.g. an
-        # unrelated audit's `commit_and_push`), forever, since nothing else
-        # ever clears it. The `TaskExecutionStore` record on disk is
-        # untouched — this only clears the in-memory "awaiting publication"
-        # marker other dispatch paths read.
+        # published — NOT just re-mirror it. It is display/tracking state
+        # only now (the S21 retirement removed the legacy-push guard that
+        # used to read it to decide whether a fall-through push was safe —
+        # see docs/SECURITY.md S21); clearing it keeps `status`/`_summary`
+        # honest about there being nothing left "awaiting publication". The
+        # `TaskExecutionStore` record on disk is untouched.
         state.task_execution = None
         self._log(
             "task_pushed",
@@ -1251,149 +1289,6 @@ class Orchestrator:
                 f"pushed {landed[:12]} to {remote}/{dest_ref} (task {binding.task_id})"
             )
         )
-        state.last_response = None
-        state.consecutive_failures = 0
-        state.phase = Phase.READY.value
-        self._store.save(state)
-
-    def _dispatch_git(self, directive: Directive) -> None:
-        state = self.state
-        actions: list[str] = []
-        commit_sha = None
-        if directive.decision in COMMIT_DECISIONS:
-            # Task-owned change-manifest gate: the approved paths must be
-            # exactly work the last executed task produced. Violations raise
-            # ManifestViolation (a GitError) and are reported back to ChatGPT.
-            if state.last_manifest_id is None:
-                raise ManifestViolation(
-                    "commit refused: no change manifest recorded — no task has "
-                    "produced changes in this session"
-                )
-            manifest = self._manifest_store.load(state.last_manifest_id)
-            if manifest is None:
-                raise ManifestViolation(
-                    f"commit refused: manifest {state.last_manifest_id} is missing"
-                )
-            if manifest.is_adopted():
-                # The approval must answer the very request that presented this
-                # adoption. Without this, an approval bound to an older report
-                # could authorize a table it never saw.
-                answered = state.last_response.report_sha256 if state.last_response else None
-                if manifest.presented_report_sha256 is None:
-                    raise ManifestViolation(
-                        f"commit refused: adopted manifest {manifest.manifest_id} was "
-                        "never presented for review — no report carried its hash table, "
-                        "so nothing about this content has been approved"
-                    )
-                if manifest.presented_report_sha256 != answered:
-                    raise ManifestViolation(
-                        "commit refused: adopted manifest "
-                        f"{manifest.manifest_id} was presented in report "
-                        f"{manifest.presented_report_sha256[:12]}… but the approval "
-                        f"answers report {(answered or '(none)')[:12]}… — a stale "
-                        "approval cannot authorize this adoption"
-                    )
-            violations = verify_commit(manifest, directive.commit_paths or (), self._git)
-            if violations:
-                raise ManifestViolation("commit refused: " + "; ".join(violations))
-
-            if manifest.is_adopted():
-                # Immutable-tree path. `git commit` is not used: its hooks can
-                # rewrite the index after any check, and a reproduced attack
-                # showed a pre-commit hook replacing approved bytes AND adding
-                # an unapproved file to the commit. The tree object verified
-                # here is the object committed.
-                def _verify_tree(tree: str, parent_tree: str) -> list[str]:
-                    return verify_tree_content(
-                        manifest, directive.commit_paths or (), self._git, tree, parent_tree
-                    )
-
-                commit_sha, staged_summary, residual = self._git.commit_adopted(
-                    directive.commit_message or "", directive.commit_paths, _verify_tree
-                )
-                already = False
-                if residual:
-                    self._log("residual_changes", data={"paths": residual})
-                    actions.append(
-                        "residual uncommitted changes remain (not reset): "
-                        + ", ".join(residual)
-                    )
-            else:
-                commit_sha, already, staged_summary = self._git.commit(
-                    directive.commit_message or "", directive.commit_paths
-                )
-            state.reviewed_commit = commit_sha
-            self._log(
-                "staged_diff",
-                data={"manifest_id": manifest.manifest_id, "summary": staged_summary},
-            )
-            actions.append(
-                f"commit {'already existed (recovered)' if already else 'created'}: "
-                f"{commit_sha}"
-                + (f"\nstaged diff:\n{staged_summary}" if staged_summary else "")
-            )
-            if directive.task_id:
-                try:
-                    self._registry.mark_completed(directive.task_id)
-                    self._task_store.save(self._registry)
-                    actions.append(f"task {directive.task_id} marked completed")
-                except TaskGraphError as exc:
-                    if exc.code != "task_completed":  # already done = crash recovery
-                        raise
-        if directive.decision in PUSH_DECISIONS:
-            # Fail closed rather than publish the wrong destination: a
-            # produce-then-review candidate is on record (state.task_execution
-            # carries a real candidate_sha) but THIS response carries no
-            # matching postcommit binding — either the packet that presented
-            # it was never sent (a parse-error/policy-denial re-prompt
-            # overwrote the outbox first) or this response answers a
-            # different, unrelated request entirely. Either way, pushing
-            # "whatever the main checkout's current branch is" here would
-            # publish the wrong branch. `_dispatch` already routes a
-            # postcommit-bound `push` to `_dispatch_task_push` before this
-            # method is ever reached, so reaching here WITH a live candidate
-            # and WITHOUT a binding is exactly the mismatch case.
-            task_exec = state.task_execution or {}
-            resp = state.last_response
-            if task_exec.get("candidate_sha") and not (
-                resp is not None and resp.postcommit is not None
-            ):
-                self._to_needs_user(
-                    "refusing to push through the legacy git path: a "
-                    f"produce-then-review candidate ({task_exec.get('candidate_sha', '')[:12]}"
-                    f" on task {task_exec.get('task_id')!r}) is on record but this "
-                    "response carries no matching review binding — publishing "
-                    "the main checkout's current branch here could be the wrong "
-                    "destination. Nothing was pushed."
-                )
-                return
-            push_sha = self._git.head_sha()
-            current_branch = self._git.current_branch()
-            if not current_branch:
-                raise GitCommandError("cannot push: detached HEAD")
-            dest_ref = f"refs/heads/{current_branch}"
-            # `authorize_directive` already gated protected-branch pushes on
-            # `allow_protected_push` before this point was ever reached, so
-            # `push_exact`'s OWN protected-ref check (which has no such
-            # escape hatch — see its docstring) must be told the same thing,
-            # or `allow_protected_push=True` would authorize the push at the
-            # policy layer and then have `push_exact` refuse it anyway,
-            # silently making that config knob inert for this path.
-            gateway_protected = (
-                () if self._policy.config.allow_protected_push
-                else self._policy.config.protected_branches
-            )
-            landed = self._git.push_exact("origin", push_sha, dest_ref, gateway_protected)
-            actions.append(f"pushed {landed[:12]} to origin/{dest_ref}")
-        summary = "; ".join(actions)
-        self._log("git_action", data={"decision": directive.decision.value, "summary": summary})
-        if directive.decision is Decision.COMMIT:
-            message_line = (directive.commit_message or "").splitlines()[0]
-            state.outbox = TEMPLATES["push_approval"].render(
-                commit_sha=(commit_sha or "")[:12], commit_message=message_line
-            )
-        else:
-            state.outbox = TEMPLATES["git_report"].render(summary_line=summary)
         state.last_response = None
         state.consecutive_failures = 0
         state.phase = Phase.READY.value

@@ -34,7 +34,11 @@ from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
-from autoloop.publisher import Publisher, provision_publisher_repo
+from autoloop.publisher import (
+    Publisher,
+    provision_publisher_repo,
+    read_publisher_url_snapshot,
+)
 from autoloop.state import LastResponse, LoopState, Phase, StateStore
 from autoloop.tasks import Task, TaskRegistry, TaskStore
 from autoloop.transcript import TranscriptLogger
@@ -780,8 +784,10 @@ def build_orchestrator_with_publisher(tmp_path, task_id="t1"):
     task_store.save(registry)
     manifest_store = ManifestStore(config.manifests_dir)
 
-    publisher_repo_path = provision_publisher_repo(tmp_path / "publisher-state", git, "origin")
+    publisher_state_dir = tmp_path / "publisher-state"
+    publisher_repo_path = provision_publisher_repo(publisher_state_dir, git, "origin")
     publisher = Publisher(publisher_repo_path, "origin", PolicyEngine(config.policy))
+    publisher_url_snapshot = read_publisher_url_snapshot(publisher_state_dir)
 
     def no_client():
         raise AssertionError("no browser client expected in this test")
@@ -805,6 +811,7 @@ def build_orchestrator_with_publisher(tmp_path, task_id="t1"):
         intent_store=intent_store,
         validation_runner=ok_validation,
         publisher=publisher,
+        publisher_url_snapshot=publisher_url_snapshot,
     )
     return orch, repo_root, upstream, execution_store, task, publisher
 

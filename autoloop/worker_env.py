@@ -201,8 +201,15 @@ class WorkerRepoManager:
     """
 
     def __init__(self, root_dir: Path, hooks_root_dir: Path):
-        self.root_dir = Path(root_dir)
-        self.hooks_root_dir = Path(hooks_root_dir)
+        # RESOLVED, deliberately. These paths are used as subprocess `cwd`
+        # values and as `git init` targets from a DIFFERENT working directory,
+        # so a relative path (the shipped config uses `state_dir = ".autoloop"`)
+        # would be re-interpreted against whatever cwd each call happens to use
+        # — `git init -q <rel>` run with `cwd=<rel>` nests the repo one level
+        # deeper and the next call's `cwd` then does not exist. Tests never saw
+        # it because they pass absolute `tmp_path` values.
+        self.root_dir = Path(root_dir).resolve()
+        self.hooks_root_dir = Path(hooks_root_dir).resolve()
 
     def path_for(self, task_id: str) -> Path:
         validate_task_id(task_id)
