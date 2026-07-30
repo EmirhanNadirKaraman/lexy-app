@@ -86,6 +86,132 @@ file the last-executed task actually created, modified or deleted:
 * The policy whitelist no longer contains `-A` and requires `--` for `add` —
   there is **no configuration escape hatch** that restores stage-everything.
 
+### Adopted manifests — committing work the loop did not create
+
+Work already in the tree (made by a human, or by the lead outside the loop) has
+no executor provenance, so the rule above can never pass for it. An **adopted**
+manifest binds such work by **content** instead:
+
+* the caller names **every** path explicitly — the list is never inferred from
+  the dirty tree, so an unrelated edit cannot be swept in;
+* each path is recorded with a SHA-256 of its approved content **and an
+  explicitly stated git mode** (`100644` or `100755`) — never inferred from the
+  working tree, because identical bytes can be committed either way and the
+  executable bit is a privilege change;
+* a commit succeeds only if every requested path is adopted **and** still
+  hashes to the approved value;
+* the commit is built from an **immutable verified tree**, never by
+  `git commit` (see "Why not `git commit`" below);
+* **symlinks are refused at adoption**, including paths under a symlinked
+  directory: reading a file follows the link while git stages the link itself
+  (mode `120000`, blob = the target path string), so the reviewed bytes would
+  not be the committed bytes. A symlink that somehow reached a manifest is
+  refused again by the staged-mode check;
+* clean paths, deletions, directories, duplicates, absolute paths and `..`
+  escapes are all refused at adoption time.
+
+This is stronger than the executor rule, not weaker. Provenance ("did the task
+create this?") is a proxy for what matters — reviewedness ("was *this content*
+approved?"). Adoption checks the real property: an executor-owned path is
+committable today even if its content changed after review; an adopted path is
+not.
+
+
+#### Why not `git commit`
+
+Three rounds of review each found the verification reading something mutable.
+The progression is worth keeping, because each fix looked sufficient:
+
+| verified | defeated by |
+|---|---|
+| working tree, before staging | swap after the check: `git add` stages other bytes |
+| working tree, after staging | *swap-and-restore*: stage altered bytes, put the approved bytes back on disk — the file looks untouched while the index holds the attacker's content |
+| the index, after staging | a **pre-commit hook**: `git commit` runs hooks *after* any check, and a hook can rewrite the index. Reproduced: the index check passed, the hook replaced the approved file's bytes **and** staged an extra file, and both landed in the commit |
+
+Only an object id names fixed bytes, so the adopted path commits a **tree**:
+
+1. refuse if any commit hook is active (never bypassed, never emulated);
+2. require a symbolic branch HEAD; record the branch ref and original HEAD;
+3. stage exactly the approved paths — the index must equal that set;
+4. `write-tree` → candidate tree;
+5. verify **that tree** entry by entry as a complete tuple — exact path,
+   expected mode, object type `blob`, and content hashing to the adopted
+   SHA-256 — plus a changed-path set versus the parent tree that is exactly the
+   approved set. Symlinks, submodules, trees and unknown modes are refused;
+6. `commit-tree` with the original HEAD as the single parent;
+7. read the commit object back: tree id, single parent, exact message bytes,
+   and a non-split author/committer identity;
+8. re-check the hook state (a hook installed, or `core.hooksPath` repointed,
+   after step 1 must not apply to this commit), then `update-ref`
+   **compare-and-swap** against the original HEAD — a branch that moved
+   meanwhile fails without overwriting it;
+9. confirm HEAD resolves to that commit and carries that exact tree.
+
+**No ref moves and no history is published before step 8.** Step 6 does write a
+commit object, so a failure after it — a lost CAS — leaves an *unreachable*
+commit in the object database, which `git gc` prunes. That is reported
+explicitly rather than described as "nothing irreversible", which would be
+inaccurate. Residual staged or working-tree changes are **reported, never
+reset** — discarding a human's work to tidy up would be worse than leaving it.
+
+**Path handling is NUL-delimited** (`-z` on `status`, `ls-tree`, `diff-tree`,
+`ls-files`, `diff --cached`). Without it git quotes and escapes paths containing
+spaces, tabs or non-ASCII, and a pathname-keyed security check would compare the
+wrong string.
+
+**Identity rule:** the created commit's author and committer must both be present
+and agree on their `Name <email>` part; timestamps may differ. `commit-tree`
+derives both from the same configuration, so a divergence means the environment
+overrode one. No signing is required or checked.
+
+**Guarantee boundary:** these checks are process-local. Arbitrary concurrent
+mutation of git configuration, hooks or the object database by an external
+hostile process is outside what they can promise.
+
+**Hook policy — fail closed, never bypass.** The effective hooks directory is
+resolved by git itself (`rev-parse --git-path hooks`, so `core.hooksPath` is
+honoured), and the four hooks an ordinary non-amend commit can invoke are
+checked: `pre-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit`. A hook
+counts as active when git would treat that exact path as executable (executable
+symlinks included). If any is active the adopted commit is **refused** with the
+hook names and directory — the hooks are neither run nor skipped. `*.sample`
+files never block, and a configured `core.hooksPath` with no active hooks is
+fine. The consequence is honest: in a repo with commit hooks, content-bound
+authorization is not achievable through this path, because a hook can rewrite
+the tree after it is approved.
+
+Amend, merge commits and detached HEAD are unsupported on the adopted path.
+
+**The integrity chain.** Hashes are deliberately **not** carried in the
+directive — a directive is model-authored text, and integrity values inside it
+could diverge from the reviewed report. Instead:
+
+```
+content → manifest.adopted[path] = sha256          (recorded at adopt time)
+        → render_adoption_block() inside the review payload
+        → report_sha256 = sha256(payload)          (covers the hash table)
+        → manifest.presented_report_sha256          (stamped only when the
+                                                     payload really carried it)
+        → the `reviewed` stamp must echo that report_sha256 (verify_review)
+        → commit: presented report == answered report, every path adopted,
+          every hash still matching — then re-verified on the immutable TREE
+```
+
+A stale approval cannot be replayed: it answers a different `report_sha256`, so
+the presented-report comparison fails. A payload that omits the block binds
+nothing, and any approval answering it is refused as "never presented".
+
+**Trust boundary.** The orchestrator does not refuse to *send* a payload lacking
+the block — doing so would deadlock error re-prompts, which legitimately carry
+no table. It simply never binds such a report, and the commit gate refuses. So
+the guarantee is: *no commit without an approval that answered a report which
+provably contained the exact hashes of the exact files being committed.*
+
+**Residual limitation.** Adoption authorizes content, never publication —
+`allow_push`, protected branches and remote behaviour are untouched. And nothing
+here creates an adopted manifest in production yet: `ChangeManifest.adopt(...)`
+is the API, and the `precommit-review` workflow that calls it lands separately.
+
 Files changed *during* the task window by someone else are indistinguishable
 from task work and therefore count as task-changed — they are still only
 committable if ChatGPT explicitly approves those paths. Don't edit the tree

@@ -75,7 +75,14 @@ from .errors import (
     StateError,
     TaskGraphError,
 )
-from .manifest import ChangeManifest, ManifestStore, snapshot, verify_commit
+from .manifest import (
+    ChangeManifest,
+    ManifestStore,
+    render_adoption_block,
+    snapshot,
+    verify_commit,
+    verify_tree_content,
+)
 from .executor import TaskExecutor
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
@@ -183,6 +190,17 @@ class Orchestrator:
         if state.outbox is None:
             raise StateError("phase=ready but outbox is empty — nothing to send")
         request_id = f"alr-{state.session_id[:8]}-{next_iteration:04d}"
+        adopted = self._current_adopted_manifest()
+        # Bind the hash table to the bytes being reviewed, but only when the
+        # payload actually carries it. Refusing to SEND otherwise would deadlock
+        # the loop: error re-prompts and other template payloads legitimately
+        # carry no adoption block, and the loop must still be able to report a
+        # refusal. The load-bearing check is at commit time — an approval that
+        # answers a report which did not carry the table is refused there,
+        # either as "never presented" or as a stale-report mismatch.
+        carries_block = (
+            adopted is not None and render_adoption_block(adopted) in state.outbox
+        )
         ctx = build_context(state, self._git, self._registry, request_id, state.outbox)
         prompt = build_prompt(request_id, next_iteration, render_context(ctx), state.outbox)
         state.pending_request = PendingRequest(
@@ -194,6 +212,12 @@ class Orchestrator:
             report_sha256=ctx.report_sha256,
             timestamp=ctx.timestamp,
         )
+        if carries_block:
+            # Record WHICH reviewed report carried the table. A later approval
+            # must echo this same report_sha256, so an approval answering any
+            # other report can never authorize this adoption.
+            adopted.presented_report_sha256 = ctx.report_sha256
+            self._manifest_store.save(adopted)
         state.outbox = None
         state.iteration = next_iteration
         state.phase = Phase.SUBMITTING.value
@@ -297,6 +321,15 @@ class Orchestrator:
             self._store.save(state)
             return
         self._park_ambiguous(req, reconciled=True)
+
+    def _current_adopted_manifest(self) -> ChangeManifest | None:
+        """The adopted manifest awaiting review, if the current one is adopted."""
+        if self.state.last_manifest_id is None:
+            return None
+        manifest = self._manifest_store.load(self.state.last_manifest_id)
+        if manifest is None or not manifest.is_adopted():
+            return None
+        return manifest
 
     def _park_ambiguous(self, req: PendingRequest, reconciled: bool) -> None:
         """Stop on an ambiguous submission. Never resends automatically."""
@@ -549,12 +582,54 @@ class Orchestrator:
                 raise ManifestViolation(
                     f"commit refused: manifest {state.last_manifest_id} is missing"
                 )
-            violations = verify_commit(manifest, directive.commit_paths or ())
+            if manifest.is_adopted():
+                # The approval must answer the very request that presented this
+                # adoption. Without this, an approval bound to an older report
+                # could authorize a table it never saw.
+                answered = state.last_response.report_sha256 if state.last_response else None
+                if manifest.presented_report_sha256 is None:
+                    raise ManifestViolation(
+                        f"commit refused: adopted manifest {manifest.manifest_id} was "
+                        "never presented for review — no report carried its hash table, "
+                        "so nothing about this content has been approved"
+                    )
+                if manifest.presented_report_sha256 != answered:
+                    raise ManifestViolation(
+                        "commit refused: adopted manifest "
+                        f"{manifest.manifest_id} was presented in report "
+                        f"{manifest.presented_report_sha256[:12]}… but the approval "
+                        f"answers report {(answered or '(none)')[:12]}… — a stale "
+                        "approval cannot authorize this adoption"
+                    )
+            violations = verify_commit(manifest, directive.commit_paths or (), self._git)
             if violations:
                 raise ManifestViolation("commit refused: " + "; ".join(violations))
-            commit_sha, already, staged_summary = self._git.commit(
-                directive.commit_message or "", directive.commit_paths
-            )
+
+            if manifest.is_adopted():
+                # Immutable-tree path. `git commit` is not used: its hooks can
+                # rewrite the index after any check, and a reproduced attack
+                # showed a pre-commit hook replacing approved bytes AND adding
+                # an unapproved file to the commit. The tree object verified
+                # here is the object committed.
+                def _verify_tree(tree: str, parent_tree: str) -> list[str]:
+                    return verify_tree_content(
+                        manifest, directive.commit_paths or (), self._git, tree, parent_tree
+                    )
+
+                commit_sha, staged_summary, residual = self._git.commit_adopted(
+                    directive.commit_message or "", directive.commit_paths, _verify_tree
+                )
+                already = False
+                if residual:
+                    self._log("residual_changes", data={"paths": residual})
+                    actions.append(
+                        "residual uncommitted changes remain (not reset): "
+                        + ", ".join(residual)
+                    )
+            else:
+                commit_sha, already, staged_summary = self._git.commit(
+                    directive.commit_message or "", directive.commit_paths
+                )
             state.reviewed_commit = commit_sha
             self._log(
                 "staged_diff",

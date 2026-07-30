@@ -71,10 +71,12 @@ class PolicyConfig:
 # `restore` is admitted ONLY with `--staged` (index-only unstaging; see
 # _REQUIRED_GIT) — a worktree-touching `git restore <path>` stays impossible.
 _ALLOWED_GIT: dict[str, frozenset[str]] = {
-    "status": frozenset({"--porcelain"}),
-    "rev-parse": frozenset({"--abbrev-ref", "--verify", "--show-toplevel", "--short"}),
+    "status": frozenset({"--porcelain", "-z"}),
+    "rev-parse": frozenset(
+        {"--abbrev-ref", "--verify", "--show-toplevel", "--short", "--git-path"}
+    ),
     "log": frozenset({"-1", "--format=%H", "--format=%s", "--format=%B"}),
-    "diff": frozenset({"--stat", "--name-only", "--cached"}),
+    "diff": frozenset({"--stat", "--name-only", "--cached", "-z"}),
     "show": frozenset({"--stat", "--format=%H"}),
     "branch": frozenset({"--show-current"}),
     "add": frozenset({"--"}),
@@ -82,6 +84,20 @@ _ALLOWED_GIT: dict[str, frozenset[str]] = {
     "push": frozenset(),
     "remote": frozenset({"-v"}),
     "restore": frozenset({"--staged", "--"}),
+    # Read-only index inspection, needed to verify what was actually STAGED
+    # rather than what the working tree currently shows (adopted manifests).
+    "cat-file": frozenset(),
+    "ls-files": frozenset({"-s", "-z", "--"}),
+    # Immutable-tree commit path (adopted manifests). `git commit` is NOT used
+    # there: it runs hooks that can rewrite the index between verification and
+    # commit creation. These build and verify a tree, create a commit object
+    # from it, and move the branch by compare-and-swap.
+    "write-tree": frozenset(),
+    "commit-tree": frozenset({"-p", "-m"}),
+    "update-ref": frozenset(),
+    "symbolic-ref": frozenset(),
+    "ls-tree": frozenset({"-r", "-z"}),
+    "diff-tree": frozenset({"-r", "--name-only", "-z"}),
 }
 
 # Flags that MUST be present for the subcommand to be allowed at all.

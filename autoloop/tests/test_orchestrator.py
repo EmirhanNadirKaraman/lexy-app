@@ -174,6 +174,73 @@ class FakeGit:
         self.pushes = 0
         self.commit_error: Exception | None = None
         self.push_error: Exception | None = None
+        self.index: dict[str, bytes] = {}
+        self.stage_hook = None
+        self.restore_hook = None
+        self.trees: dict[str, dict] = {"tree-parent": {}}
+        self.blobs: dict[str, bytes] = {}
+        self.head_tree = "tree-parent"
+        self.active_hooks: list[str] = []
+        self.detached = False
+
+    def staged_blob(self, path):
+        if path not in self.index:
+            raise GitCommandError(f"no staged content for {path}")
+        return self.index[path]
+
+    def staged_mode(self, path):
+        return "100644" if path in self.index else ""
+
+    # -- immutable-tree commit path -------------------------------------------
+    def tree_entries(self, tree):
+        return self.trees[tree]
+
+    def blob_bytes(self, oid):
+        return self.blobs[oid]
+
+    def changed_paths(self, tree_a, tree_b):
+        a, b = self.trees.get(tree_a, {}), self.trees.get(tree_b, {})
+        return {p for p in set(a) | set(b) if a.get(p) != b.get(p)}
+
+    def commit_adopted(self, message, paths, verify_tree):
+        """Model the real sequence: stage -> tree -> verify -> commit -> CAS."""
+        if self.active_hooks:
+            raise GitCommandError(
+                f"adopted commit refused: active commit hook(s) {self.active_hooks}"
+            )
+        if self.detached:
+            raise GitCommandError("adopted commit requires a symbolic branch HEAD")
+        if self.commit_error:
+            raise self.commit_error
+        if self.stage_hook is not None:
+            self.stage_hook()
+        for rel in paths:                      # `git add` snapshots the worktree
+            target = self.repo_root / rel
+            if target.exists():
+                self.index[rel] = target.read_bytes()
+        if self.restore_hook is not None:
+            self.restore_hook()
+        # write-tree: an immutable snapshot of the index
+        tree_id = f"tree-{len(self.trees)}"
+        entries = {}
+        for rel, data in self.index.items():
+            oid = hashlib.sha256(data).hexdigest()
+            self.blobs[oid] = data
+            entries[rel] = ("100644", "blob", oid)
+        self.trees[tree_id] = entries
+        violations = verify_tree(tree_id, self.head_tree)
+        if violations:
+            raise GitCommandError("adopted commit refused: " + "; ".join(violations))
+        self.commits.append((message, tuple(paths)))
+        self.head = "c" * 40
+        self.head_tree = tree_id
+        approved = set(paths)
+        self.dirty = [
+            line for line in self.dirty if line[3:].split(" -> ")[-1] not in approved
+        ]
+        return self.head, "1 file changed", sorted(
+            line[3:].split(" -> ")[-1] for line in self.dirty
+        )
 
     def current_branch(self):
         return self.branch
@@ -184,11 +251,33 @@ class FakeGit:
     def dirty_files(self):
         return list(self.dirty)
 
-    def commit(self, message, paths):
+    def dirty_entries(self):
+        """NUL-safe equivalent of the real gateway's parser."""
+        out = []
+        for line in self.dirty:
+            if len(line) > 3:
+                out.append((line[:2], line[3:].split(" -> ")[-1]))
+        return out
+
+    def commit(self, message, paths, post_stage_check=None):
         if self.commit_error:
             raise self.commit_error
         if not paths:
             raise GitCommandError("commit requires an explicit non-empty path list")
+        # Mirror the real gateway: `git add` snapshots the working tree into the
+        # index, THEN the hook runs, THEN the commit is created. Modelling the
+        # index is what lets a test prove the hook reads staged bytes rather
+        # than re-reading the file.
+        if self.stage_hook is not None:
+            self.stage_hook()                      # simulate a swap before `add`
+        for rel in paths:
+            target = self.repo_root / rel
+            if target.exists():
+                self.index[rel] = target.read_bytes()
+        if self.restore_hook is not None:
+            self.restore_hook()                    # worktree put back afterwards
+        if post_stage_check is not None:
+            post_stage_check()
         self.commits.append((message, tuple(paths)))
         self.head = "c" * 40
         approved = set(paths)
@@ -1041,3 +1130,186 @@ def test_await_timeout_exits_with_recoverable_state(tmp_path):
     assert saved.resume_phase == Phase.AWAITING.value  # recoverable via --retry
     assert "no assistant response" in saved.stop_reason
     assert saved.pending_request is not None  # request id + prompt preserved
+
+
+# ---- adopted manifests end to end ------------------------------------------
+
+
+def adopted_approval(paths=("out.md",), message="docs: adopted"):
+    """A stamped commit approval for an adopted manifest."""
+    def responder(client):
+        return block({
+            "version": 3,
+            "decision": "commit",
+            "reason": "approved",
+            "commit": {"message": message, "paths": list(paths)},
+            "reviewed": extract_stamp(client.submitted[-1][1]),
+        })
+    return responder
+
+
+def build_with_adoption(tmp_path, paths, responses, payload_includes_block=True,
+                        manifest_id="adopt-1"):
+    """Wire a session whose current manifest is an ADOPTED one, as the future
+    precommit-review workflow will."""
+    from autoloop.manifest import ChangeManifest, render_adoption_block
+
+    orch, store, git, executor, clients, registry, manifest_store = build(
+        tmp_path, responses=responses
+    )
+    for rel in paths:                      # make the paths genuinely dirty
+        target = git.repo_root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"content of {rel}\n", encoding="utf-8")
+        line = f"?? {rel}"
+        if line not in git.dirty:
+            git.dirty.append(line)
+    manifest = ChangeManifest.adopt(manifest_id, {p: "100644" for p in paths}, git)
+    manifest_store.save(manifest)
+    orch.state.last_manifest_id = manifest_id
+    block_text = render_adoption_block(manifest)
+    orch.state.outbox = (
+        "PRE-COMMIT REVIEW PACKET\n\n" + (block_text if payload_includes_block else "(table omitted)")
+    )
+    store.save(orch.state)
+    return orch, store, git, clients, manifest_store, manifest
+
+
+def test_adopted_manifest_commit_succeeds_when_content_matches(tmp_path):
+    orch, _, git, clients, store, manifest = build_with_adoption(
+        tmp_path, ["out.md"], responses=[adopted_approval()]
+    )
+    orch.run(max_steps=4)
+    assert git.commits == [("docs: adopted", ("out.md",))]
+    # the hash table was bound to the reviewed report
+    reloaded = store.load("adopt-1")
+    assert reloaded.presented_report_sha256 is not None
+    assert reloaded.presented_report_sha256 in clients[0].submitted[0][1]
+
+
+def test_payload_without_the_adoption_block_binds_nothing_and_cannot_commit(tmp_path):
+    """If the packet omits the hash table, report_sha256 does not cover it, so
+    the manifest is never bound and no approval answering that report can
+    commit. The request is still sent — refusing to send would deadlock error
+    reporting — but the commit gate refuses."""
+    orch, _, git, clients, store, _ = build_with_adoption(
+        tmp_path, ["out.md"],
+        responses=[adopted_approval(), stop_block()],
+        payload_includes_block=False,
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert len(clients[0].submitted) >= 1              # it WAS asked
+    assert store.load("adopt-1").presented_report_sha256 is None   # nothing bound
+    assert git.commits == []                           # and nothing committed
+    assert "never presented for review" in clients[0].submitted[1][1]
+
+
+def test_one_byte_change_after_approval_refuses_the_adopted_commit(tmp_path):
+    def approve_then_mutate(client):
+        response = adopted_approval()(client)
+        target = git_ref["git"].repo_root / "out.md"
+        target.write_text(target.read_text() + " ", encoding="utf-8")   # one byte
+        return response
+
+    git_ref = {}
+    orch, _, git, clients, _, _ = build_with_adoption(
+        tmp_path, ["out.md"], responses=[approve_then_mutate, stop_block()]
+    )
+    git_ref["git"] = git
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []
+    reprompt = clients[0].submitted[1][1]
+    assert "changed after approval" in reprompt
+    assert "content of out.md" not in reprompt      # never echoes file content
+
+
+def test_unapproved_path_cannot_be_committed_from_an_adopted_manifest(tmp_path):
+    orch, _, git, clients, _, _ = build_with_adoption(
+        tmp_path, ["out.md"],
+        responses=[adopted_approval(paths=("out.md", "secret.md")), stop_block()],
+    )
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []
+    assert "not in adopted manifest" in clients[0].submitted[1][1]
+
+
+def test_stale_approval_cannot_authorize_an_adoption(tmp_path):
+    """An approval bound to a different report must not commit this table."""
+    orch, _, git, clients, store, _ = build_with_adoption(
+        tmp_path, ["out.md"], responses=[adopted_approval(), stop_block()]
+    )
+    # after the request is sent, rebind the manifest to some other report
+    orch.run(max_steps=2)
+    manifest = store.load("adopt-1")
+    manifest.presented_report_sha256 = "a" * 64
+    store.save(manifest)
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []
+    assert "stale approval" in clients[0].submitted[1][1]
+
+
+def test_tree_verification_aborts_before_the_commit_is_created(tmp_path):
+    """TOCTOU: content changing before staging must not be committed — the
+    candidate tree is verified before any commit object exists."""
+    orch, _, git, clients, _, _ = build_with_adoption(
+        tmp_path, ["out.md"], responses=[adopted_approval(), stop_block()]
+    )
+
+    real_commit = git.commit_adopted
+
+    def commit_with_mutation(message, paths, verify_tree):
+        target = git.repo_root / "out.md"
+        target.write_text("mutated between check and stage\n", encoding="utf-8")
+        return real_commit(message, paths, verify_tree)
+
+    git.commit_adopted = commit_with_mutation
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []                       # no commit was created
+    assert "tree content does not match" in clients[0].submitted[1][1]
+
+
+def test_executor_manifest_flow_is_unaffected_by_adoption(tmp_path):
+    """The original provenance path still works, and never sees adoption."""
+    executor = FakeExecutor(creates={"out.md": "# report"})
+    orch, _, git, _, clients, _, store = build(
+        tmp_path, responses=[audit_block(), approval("commit", paths=("out.md",))],
+        executor=executor,
+    )
+    orch.run(max_steps=8)
+    assert git.commits == [("docs: audit", ("out.md",))]
+    manifest = store.load(orch.state.last_manifest_id)
+    assert not manifest.is_adopted()
+    assert manifest.presented_report_sha256 is None   # binding is adoption-only
+
+
+def test_adoption_grants_no_push_authorization(tmp_path):
+    """Adoption authorizes content, never publication."""
+    orch, _, git, clients, _, _ = build_with_adoption(
+        tmp_path, ["out.md"],
+        responses=[adopted_approval(), approval("push"), stop_block()],
+    )
+    orch._policy = PolicyEngine(PolicyConfig(allow_push=False))
+    assert orch.run() == Phase.STOPPED.value
+    assert len(git.commits) == 1
+    assert git.pushes == 0
+    assert "push_disabled" in clients[0].submitted[2][1] or "policy_denied" in clients[0].submitted[2][1]
+
+
+def test_wired_verification_reads_the_committed_tree_not_the_working_tree(tmp_path):
+    """End-to-end swap-and-restore through the orchestrator: the index receives
+    altered bytes, the working tree is restored before the hook runs, and the
+    commit must still be refused."""
+    orch, _, git, clients, _, _ = build_with_adoption(
+        tmp_path, ["out.md"], responses=[adopted_approval(), stop_block()]
+    )
+    target = git.repo_root / "out.md"
+    approved = target.read_text()
+    git.stage_hook = lambda: target.write_text("MALICIOUS PAYLOAD\n")
+    git.restore_hook = lambda: target.write_text(approved)
+
+    assert orch.run() == Phase.STOPPED.value
+    assert git.commits == []                       # nothing committed
+    assert target.read_text() == approved          # worktree looks innocent
+    reprompt = clients[0].submitted[1][1]
+    assert "tree content does not match" in reprompt
+    assert "MALICIOUS" not in reprompt             # digests only, never content

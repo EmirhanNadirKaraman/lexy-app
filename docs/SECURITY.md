@@ -36,6 +36,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S13 | INFO | f-string SQL in a migration (pattern caution) | `migrations/versions/013_*.py` |
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
 | S18 | LOW | Self-hosted model server has no auth; `LLM_BASE_URL` egress is operator-controlled (opt-in, unset by default) | `services/llm_provider.py` |
+| S21 | HIGH | Commit hooks can rewrite an executor-manifest commit after verification (reproduced; adopted path fixed, executor path deliberately deferred) | `autoloop/git_gateway.py` `commit()` |
 
 ---
 
@@ -145,6 +146,56 @@ on Tailscale or another authenticated tunnel, never on a public interface, and
 prefer `https://` when the tunnel supports it. If a shared/multi-tenant model
 server is ever used, revisit — prompt content would then leave the trust
 boundary.
+
+### S21 — Commit hooks can rewrite an executor-manifest commit after verification — HIGH — OPEN
+
+**What:** `autoloop`'s executor-manifest commit path uses `git commit`
+(`git_gateway.commit`). `git commit` runs `pre-commit` **after** any check the
+caller performed, and a pre-commit hook can `git add` arbitrary content. So a
+hook can change the bytes of an approved path and stage additional unapproved
+paths, and both land in the commit.
+
+**Reproduced 2026-07-30** while hardening the *adopted*-manifest path: an index
+check passed, a pre-commit hook rewrote the approved file to `HOOK-INJECTED
+PAYLOAD` and staged an extra `sneaked.txt`, and the created commit contained
+both. Verbatim:
+
+```
+index check at post_stage_check: PASS
+files in the commit : ['f.txt', 'sneaked.txt']
+committed f.txt     : 'HOOK-INJECTED PAYLOAD\n'
+```
+
+**Why it is not fixed here:** the adopted path was reworked to build and verify
+an immutable tree, then `commit-tree` + `update-ref` CAS, and it refuses when any
+commit hook is active. The **executor** path still uses `git commit` and was
+deliberately left alone to keep that changeset narrow — it verifies *provenance*
+(did the task produce this path?), not the committed bytes, so a hook could alter
+an executor commit today.
+
+**Current exposure:** low in practice — this repository has no active hooks
+(`.git/hooks` holds only `*.sample`, `core.hooksPath` unset), and a hook is
+operator-installed, not attacker-installed, so this needs local write access.
+Exposure rises the moment anyone adds a formatter hook.
+
+`file:line` — `autoloop/git_gateway.py` `commit()` (the `git commit` call at the
+end of the method).
+
+**Verification check:**
+```bash
+# Expect: the executor path still shells out to `git commit`
+rg -n '"commit", "-m", message' autoloop/git_gateway.py
+# Expect: the adopted path does NOT, and refuses active hooks
+rg -n 'active_commit_hooks|commit-tree|update_ref_cas' autoloop/git_gateway.py
+```
+
+**Suggested fix:** route the executor path through the same
+`commit_adopted`-style sequence (verified tree → `commit-tree` → CAS) with the
+same fail-closed hook check, or bind executor commits to content hashes so the
+post-hook tree can be verified. Prefer sharing one commit implementation rather
+than maintaining two.
+
+---
 
 ## Verified strengths (do not regress)
 
@@ -313,6 +364,8 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-07-30** — **Adopted-manifest content binding (new finding S21).** Autoloop gains a second manifest kind that authorizes commits by *content* (SHA-256 per explicitly named path) rather than executor provenance, so work the loop did not create can be reviewed and committed under an integrity-bound approval. Three review rounds each found the verification reading something mutable — working tree, then working tree after staging (swap-and-restore), then the index (rewritten by `pre-commit`) — so the final design commits an **immutable verified tree** via `commit-tree` + `update-ref` compare-and-swap and **refuses** when any commit hook is active (never bypassed, never emulated). Symlinks are refused at adoption and again on the tree. The same hook weakness in the *executor* commit path is recorded as **S21** and deliberately not fixed in that changeset.
 
 - **2026-07-29** — **Autoloop Phase 3 (no new findings; Verified Strength hardened again).** (1) **`git add -A` eliminated**: the policy whitelist now rejects `-A` and requires explicit `--` paths; commits demand a non-empty path list at the contract level AND must match the task-owned change manifest (content-hash snapshots before/after each executor run) — pre-existing human changes are unstageable by construction, with no config escape hatch. (2) **Single-instance locking** on the state dir (fail-closed, explicit `unlock` that refuses live locks). (3) **Audit subagents are read-only**: headless `claude -p` with `--allowedTools Read Grep Glob` and every editing/executing/delegating tool disallowed; the audit executor itself may write Markdown only (allowlist + at most one dated report). (4) **Phase gate**: `implement` is policy-denied until `policy.implement_enabled=true`. Verification: `pytest autoloop/tests` (329) — esp. `test_add_all_denied_at_the_gateway`, `test_commit_of_preexisting_dirty_file_refused`, `test_live_lock_from_separate_process_fails_closed`, `test_argv_is_read_only_headless`, `test_production_code_refused`.
 

@@ -286,15 +286,15 @@ design (`NullExecutor`).
 | `browser/session.py`, `browser/selectors.py` | Mockable session protocol; every DOM selector in one dataclass (UI-drift fix point). |
 | `contract.py` | Response contract **v3** (audit/plan/implement/revise/commit/push/commit_and_push/stop/ask_user; task-id work authorization; `reviewed` stamp on git approvals; **required non-empty `commit.paths`**) + strict single-envelope parser (one fenced block, or a rendered/plain object with an optional language label; a second object or trailing text is rejected, never resolved by position) + `verify_review` — coded rejects, never guesses. |
 | `lock.py` | Single-instance lock per state dir: atomic create, pid/host/start/run-id recorded, live-vs-stale distinction, fail-closed, `unlock`-only recovery (refuses live locks), run-id-guarded release. |
-| `manifest.py` | Task-owned change manifests: content-hash snapshots before/after each executor run; `verify_commit` refuses pre-existing or untouched paths — the mechanism that replaced `git add -A` (which the git whitelist now rejects outright). |
+| `manifest.py` | Task-owned change manifests: content-hash snapshots before/after each executor run; `verify_commit` refuses pre-existing or untouched paths — the mechanism that replaced `git add -A` (which the git whitelist now rejects outright). Two kinds: `executor` (provenance-bound, unchanged) and `adopted` (content-bound by SHA-256 for work the loop did not create, with the hash table bound to the reviewed report — see `docs/AUTOLOOP.md` §4). |
 | `doctor.py` | Non-destructive preflight: config, state dir, lock, git identity, branch policy, CDP, playwright, provider, conversation URL, live login/selector check. Never submits. |
 | `audit/` | Phase-3 audit executor: `findings` (strict agent contract), `agents` (read-only headless `claude -p` runner), `reconcile` (dedupe/classify/reject speculation+style), `taskgen` (`au-NNN` proposal graph), `markdown` (Markdown-only gate, one dated report), `report`, `executor`. |
 | `policy.py` | Deterministic safety layer: directive authorization (git gating + task-graph reference checks), git command whitelist (force push structurally impossible), iteration/failure/parse/denial budgets. |
-| `git_gateway.py` | The only git runner — argv subprocess (no shell), policy-validated per call, idempotent commit for crash recovery, explicit-refspec push. |
+| `git_gateway.py` | The only git runner — argv subprocess (no shell), policy-validated per call, idempotent commit, explicit-refspec push. Adopted commits use an **immutable-tree** path (`write-tree` → verify → `commit-tree` → `update-ref` CAS) and refuse when any commit hook is active, because `git commit` runs hooks that can rewrite the index after verification (see S21). |
 | `state.py`, `transcript.py` | Atomic crash-safe JSON state (schema v2, stamped requests); append-only JSONL audit log. |
 | `executor.py` | `TaskExecutor` seam (`execute(directive, task)` → outcome incl. validation summary); `NullExecutor` reports honestly today. |
 | `prompts.py`, `config.py`, `cli.py` | Strict `PromptTemplate` library (+ `audit_kickoff`, `smoke_test`); strict TOML config (`[executor]`, `[audit]` sections); `run/status/tasks/doctor/smoke-browser/pause/resume/unlock/reset` CLI with locking on mutating commands. |
-| `tests/` | 396 hermetic tests — no network, no playwright, no live claude CLI (see `docs/TESTS.md`). |
+| `tests/` | 487 hermetic tests — no network, no playwright, no live claude CLI (see `docs/TESTS.md`). |
 
 ---
 
