@@ -126,6 +126,13 @@ from .worktask import (
 from .worktree import WorktreeManager
 
 
+#: Independent ceiling on commit/packet attempts for one task, including those
+#: that never produced a review. `review_round` counts only dispatched reviews,
+#: so on its own it would let repeated structural refusals churn locally
+#: without bound.
+MAX_TASK_ATTEMPTS = 5
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -788,6 +795,15 @@ class Orchestrator:
             # Clear the stale intent and fall through to attempt it fresh.
             self._intent_store.clear(task.id)
 
+        if execution.attempt_count >= MAX_TASK_ATTEMPTS:
+            self._to_needs_user(
+                f"task {task.id}: {execution.attempt_count} commit attempts on "
+                f"{execution.task_branch} without reaching an approved review "
+                f"(cap {MAX_TASK_ATTEMPTS}). A structural refusal consumes an "
+                "attempt but not a review round, so this ceiling is what stops "
+                "unbounded local churn. Nothing was rolled back or pushed."
+            )
+            return
         if execution.review_round >= 2:
             self._park_round_cap(execution, worktree_git, directive, state, task)
             return
@@ -969,6 +985,7 @@ class Orchestrator:
         state: LoopState,
         task: Task,
     ) -> None:
+        execution.attempt_count += 1
         failures, validation_summary = self._verify_committed(execution, worktree_git)
         state.last_validation = validation_summary
         # `review_round` counts REVIEWS, not commit attempts. It is incremented

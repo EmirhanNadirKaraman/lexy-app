@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import os
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -106,6 +107,11 @@ class TaskExecution:
     candidate_sha: str = ""  # read from HEAD only AFTER git commit returns
     candidate_commit_count: int = 0
     review_round: int = 0
+    #: Every commit/packet attempt for this task, INCLUDING ones that never
+    #: produced a review. `review_round` deliberately counts only dispatched
+    #: reviews, so on its own it would let structural refusals churn locally
+    #: without bound. This is the independent ceiling on that.
+    attempt_count: int = 0
     presented_report_sha256: str = ""
     review_request_id: str = ""
     intended_remote: str = ""
@@ -130,7 +136,21 @@ class CommitIntent:
     planned_paths: tuple[str, ...]
     planned_paths_digest: str
     message_sha256: str
+    #: Random per-attempt token, generated BEFORE `git commit` and written into
+    #: the commit message as a trailer. Parent linkage plus a planned-path
+    #: subset cannot establish PROVENANCE — a human commit with the same parent
+    #: touching only planned paths is indistinguishable. A 128-bit token that
+    #: exists only in this record and in the resulting commit is the difference
+    #: between "looks like ours" and "is ours".
+    nonce: str = ""
     created_at: str = field(default_factory=utcnow_iso)
+
+    @staticmethod
+    def new_nonce() -> str:
+        return secrets.token_hex(16)
+
+    def trailer(self) -> str:
+        return f"Autoloop-Intent: {self.nonce}"
 
     @classmethod
     def create(
@@ -155,6 +175,7 @@ class CommitIntent:
             planned_paths=paths,
             planned_paths_digest=_sha256_hex("\n".join(paths).encode("utf-8")),
             message_sha256=_sha256_hex(message.encode("utf-8")),
+            nonce=cls.new_nonce(),
         )
 
 
@@ -273,6 +294,16 @@ def reconcile_after_crash(
         # including a merge commit whose FIRST parent happens to match — is
         # not what `commit_and_capture` produces.
         return Reconciliation.AMBIGUOUS
+    # PROVENANCE. Parent linkage and a path subset prove shape, not authorship:
+    # a human commit with the same parent touching only planned paths matches
+    # both. The nonce was generated before `git commit` and exists only in this
+    # record and in the message of the commit it produced, so requiring it is
+    # what turns "looks like ours" into "is ours". Its absence is AMBIGUOUS —
+    # parked for a human — not a rejection of the commit itself.
+    if intent.nonce:
+        message = git.read_commit(branch_head).get("message", "")
+        if intent.trailer() not in message:
+            return Reconciliation.AMBIGUOUS
     changed = git.commit_range_paths(expected, branch_head)
     planned = set(intent.planned_paths)
     if not changed or not changed.issubset(planned):

@@ -195,6 +195,16 @@ class GitGateway:
         proc = self._git("config", "--get", key, check=False)
         return proc.stdout.strip() if proc.returncode == 0 else ""
 
+    def config_get_all(self, key: str) -> list[str]:
+        """EVERY value for a multi-valued config key. `config --get` returns
+        only the LAST value, which is why `remote.<n>.url` needed this: git
+        pushes to ALL configured urls, so reading one and calling it "the"
+        destination misses an exfiltration remote entirely."""
+        proc = self._git("config", "--get-all", key, check=False)
+        if proc.returncode != 0:
+            return []
+        return [line for line in proc.stdout.splitlines() if line.strip()]
+
     def config_get_regexp(self, pattern: str) -> str:
         """`git config --get-regexp <pattern>`, or "" if nothing matches.
 
@@ -482,9 +492,30 @@ class GitGateway:
         intent_store.save(intent)
         self._git("add", "--", *sorted(approved))
         summary = self._out("diff", "--cached", "--stat")
-        self._git("commit", "-m", message)
+        # The intent nonce goes INTO the commit message so crash recovery can
+        # establish provenance rather than inferring it from shape.
+        full_message = message
+        if getattr(intent, "nonce", ""):
+            full_message = f"{message}\n\n{intent.trailer()}"
+        self._git("commit", "-m", full_message)
         candidate_sha = self._out("rev-parse", "HEAD")
         return candidate_sha, summary
+
+    def _remote_ref_map(self, remote: str) -> dict:
+        """Every ref the remote advertises, as {refname: oid}. Used to prove a
+        push changed exactly one ref and published no tag or extra branch."""
+        out = {}
+        proc = self._git("ls-remote", remote, check=False)
+        if proc.returncode != 0:
+            return out
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t")
+            # Only real refs. `HEAD` is a symref that resolves as soon as a
+            # bare repo gains its first branch, so comparing it would flag a
+            # normal first push as an unexpected extra ref.
+            if len(parts) == 2 and parts[1].startswith("refs/"):
+                out[parts[1]] = parts[0]
+        return out
 
     def remote_ref_sha(self, remote: str, dest_ref: str) -> str:
         """The sha `dest_ref` currently points to on `remote`, or "" if the
@@ -610,6 +641,35 @@ class GitGateway:
                 "push and was reproduced publishing an unreviewed commit to a "
                 "protected branch. It was NOT executed and NOT bypassed."
             )
+        # `push.followTags` publishes ANNOTATED tags alongside an explicit sha
+        # refspec — verified: a `v1` tag landed on the remote from a
+        # `<sha>:refs/heads/x` push. A tag is an unreviewed ref, so this is
+        # publication outside the reviewed operation.
+        follow_tags = self.config_get("push.followTags").strip().lower()
+        if follow_tags in ("true", "1", "yes", "on"):
+            raise GitCommandError(
+                "push_exact refuses: push.followTags is enabled, which publishes "
+                "annotated tags alongside the explicit refspec — refs nobody "
+                "reviewed. Unset it for this repository."
+            )
+        # `remote.<n>.mirror` makes git refuse refspecs outright today, but
+        # refusing here keeps the failure legible rather than a raw git fatal.
+        if self.config_get(f"remote.{remote}.mirror").strip().lower() in ("true", "1", "yes", "on"):
+            raise GitCommandError(
+                f"push_exact refuses: remote.{remote}.mirror is enabled — mirror "
+                "semantics publish the whole ref namespace, not one reviewed commit."
+            )
+        # A remote may carry MORE THAN ONE url, and git pushes to every one of
+        # them — verified: two configured urls both received the commit while
+        # `config --get` reported only one. Reading a single url and calling it
+        # "the destination" would miss an added exfiltration remote entirely.
+        all_urls = self.config_get_all(f"remote.{remote}.url")
+        if len(all_urls) > 1:
+            raise GitCommandError(
+                f"push_exact refuses: remote {remote!r} has {len(all_urls)} "
+                f"configured urls ({all_urls}) and git pushes to ALL of them. "
+                "Exactly one destination must be configured."
+            )
         configured_url = self.config_get(f"remote.{remote}.url")
         if not configured_url:
             raise GitCommandError(f"push_exact refuses: remote {remote!r} has no configured url")
@@ -618,6 +678,12 @@ class GitGateway:
                 f"push_exact refuses: remote.{remote}.url is {configured_url!r}, "
                 f"caller expected {expected_url!r}"
             )
+
+        # Snapshot the remote's ref namespace so anything that appears beyond
+        # the one approved ref is detectable. Post-hoc, but publication of an
+        # extra ref is exactly what the checks above are trying to prevent, and
+        # a residual surprise must not pass silently.
+        refs_before = self._remote_ref_map(remote)
 
         self._git("push", remote, refspec)
 
@@ -631,6 +697,18 @@ class GitGateway:
             raise GitCommandError(
                 "push_exact: push destination config changed during the push — "
                 "the post-push confirmation cannot be trusted"
+            )
+        refs_after = self._remote_ref_map(remote)
+        unexpected = {
+            name: oid
+            for name, oid in refs_after.items()
+            if name != dest_ref and refs_before.get(name) != oid
+        }
+        if unexpected:
+            raise GitCommandError(
+                f"push_exact: the push changed refs beyond {dest_ref} on {remote}: "
+                f"{sorted(unexpected)}. Nothing here can un-publish them — "
+                "investigate the repository's push configuration and hooks."
             )
         landed = self.remote_ref_sha(remote, dest_ref)
         if landed != sha:

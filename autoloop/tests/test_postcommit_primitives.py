@@ -716,3 +716,80 @@ def test_snapshot_records_push_hooks_and_verify_flags_a_new_one(repo):
     install_hook(repo, "pre-push", "#!/bin/sh\nexit 0\n")
     violations = environment.verify_unchanged(before, gw_)
     assert any("push hook set changed" in v for v in violations)
+
+
+# ---- ChatGPT review round: side-effect publication vectors -----------------
+
+
+def test_push_exact_refuses_push_followtags(tmp_path, repo):
+    """`push.followTags` publishes ANNOTATED tags alongside an explicit sha
+    refspec — verified against real git. A tag is a ref nobody reviewed."""
+    gw_ = gateway(repo)
+    bare = make_bare(tmp_path)
+    run_git(repo, "remote", "add", "origin", str(bare))
+    (repo / "a.txt").write_text("work\n", encoding="utf-8")
+    run_git(repo, "add", "a.txt")
+    run_git(repo, "commit", "-q", "-m", "feat: a")
+    run_git(repo, "tag", "-a", "v1", "-m", "annotated")
+    run_git(repo, "config", "push.followTags", "true")
+    sha = gw_.head_sha()
+
+    with pytest.raises(GitCommandError, match="followTags"):
+        gw_.push_exact("origin", sha, "refs/heads/feat", ("main", "master"))
+    assert gw_.remote_ref_sha("origin", "refs/heads/feat") == ""
+
+
+def test_push_exact_refuses_multiple_remote_urls(tmp_path, repo):
+    """A remote may carry several urls and git pushes to EVERY one — verified:
+    both bare repos received the commit while `config --get` reported one."""
+    gw_ = gateway(repo)
+    first, second = make_bare(tmp_path, "one.git"), make_bare(tmp_path, "two.git")
+    run_git(repo, "remote", "add", "origin", str(first))
+    run_git(repo, "config", "--add", "remote.origin.url", str(second))
+    (repo / "a.txt").write_text("work\n", encoding="utf-8")
+    run_git(repo, "add", "a.txt")
+    run_git(repo, "commit", "-q", "-m", "feat: a")
+    sha = gw_.head_sha()
+
+    with pytest.raises(GitCommandError, match="configured urls"):
+        gw_.push_exact("origin", sha, "refs/heads/feat", ("main", "master"))
+    assert gw_.remote_ref_sha("origin", "refs/heads/feat") == ""
+
+
+def test_push_exact_refuses_remote_mirror(tmp_path, repo):
+    gw_ = gateway(repo)
+    bare = make_bare(tmp_path)
+    run_git(repo, "remote", "add", "origin", str(bare))
+    run_git(repo, "config", "remote.origin.mirror", "true")
+    (repo / "a.txt").write_text("work\n", encoding="utf-8")
+    run_git(repo, "add", "a.txt")
+    run_git(repo, "commit", "-q", "-m", "feat: a")
+
+    with pytest.raises(GitCommandError, match="mirror"):
+        gw_.push_exact("origin", gw_.head_sha(), "refs/heads/feat", ("main", "master"))
+
+
+def test_reconcile_requires_the_intent_nonce_for_provenance(tmp_path, repo):
+    """Parent linkage plus a planned-path subset proves SHAPE, not authorship.
+    A human commit matching both must not be adopted as this task's candidate."""
+    gw_ = gateway(repo)
+    intents = IntentStore(tmp_path / "intents")
+    base = gw_.head_sha()
+    (repo / "a.txt").write_text("work\n", encoding="utf-8")
+    intent = make_intent(gw_, "t1", base, ("a.txt",), "feat: a")
+
+    # A human commits the same path, same parent, same message convention —
+    # everything except the nonce that only our intent knows.
+    run_git(repo, "add", "a.txt")
+    run_git(repo, "commit", "-q", "-m", "feat: a")
+
+    assert intent.nonce  # generated before any commit
+    assert reconcile_after_crash(intent, gw_.head_sha(), base, gw_) is (
+        Reconciliation.AMBIGUOUS
+    )
+
+    # Our own commit carries the trailer and IS recognised.
+    run_git(repo, "reset", "-q", "--hard", base)
+    (repo / "a.txt").write_text("work\n", encoding="utf-8")
+    sha, _ = gw_.commit_and_capture("feat: a", ("a.txt",), intents, intent)
+    assert reconcile_after_crash(intent, sha, base, gw_) is Reconciliation.RECOVERABLE
