@@ -346,9 +346,14 @@ def test_happy_path_commits_and_passes_review(tmp_path):
     assert touched == {"feature.py"}
     assert wt_git.dirty_entries() == []
 
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert "passed post-commit review" in orch.state.question
-    assert execution.candidate_sha[:12] in orch.state.question
+    # Pass 2b: a clean pass builds the review packet and re-enters `ready` to
+    # send it, rather than parking with a placeholder message (pass 2a).
+    assert orch.state.phase == Phase.READY.value
+    assert "POST-COMMIT REVIEW PACKET" in orch.state.outbox
+    assert execution.task_id in orch.state.outbox
+    assert execution.task_branch in orch.state.outbox
+    assert execution.task_base_sha in orch.state.outbox
+    assert execution.candidate_sha in orch.state.outbox
     # state mirrors the execution record
     assert orch.state.task_execution["candidate_sha"] == execution.candidate_sha
 
@@ -409,8 +414,9 @@ def test_hook_modifying_approved_file_is_allowed_and_visible_in_diff(tmp_path):
     # the path is still exactly what was planned — no path-ownership failure —
     # so this passes post-commit review (hook content changes are NOT caught
     # by the path check; that's what range_diff/post-commit validation are for)
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert "passed post-commit review" in orch.state.question
+    assert orch.state.phase == Phase.READY.value
+    assert "POST-COMMIT REVIEW PACKET" in orch.state.outbox
+    assert "HOOK PAYLOAD" in orch.state.outbox  # the packet's own diff, not just wt_git's
 
 
 # ---- 8. residual dirty worktree after commit -> refused ------------------------
@@ -577,8 +583,8 @@ def test_crash_after_commit_before_persisting_is_recoverable_no_second_commit(tm
     # the executor was never invoked — RECOVERABLE adopts, it does not re-run
     assert orch._executor.calls == 0
 
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert "passed post-commit review" in orch.state.question
+    assert orch.state.phase == Phase.READY.value
+    assert "POST-COMMIT REVIEW PACKET" in orch.state.outbox
 
 
 def test_crash_with_branch_head_outside_the_plan_is_ambiguous_and_parks(tmp_path):

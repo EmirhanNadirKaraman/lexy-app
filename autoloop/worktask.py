@@ -110,6 +110,16 @@ class TaskExecution:
     review_request_id: str = ""
     intended_remote: str = ""
     intended_remote_ref: str = ""
+    #: Union of `changed_paths` across every round committed so far (pass 1's
+    #: round produces the first set; each `revise` round adds its own on top).
+    #: The post-commit path-ownership check (`Orchestrator._verify_committed`)
+    #: compares this — not a single round's `changed_paths` — against
+    #: everything `commit_range_paths(task_base_sha, candidate_sha)` reports,
+    #: because that range spans EVERY round once round > 0. Comparing against
+    #: only the latest round's paths would wrongly flag round 1's legitimate
+    #: paths as "outside" on round 2's review. Stored sorted for a stable,
+    #: deterministic on-disk representation.
+    allowed_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -176,7 +186,9 @@ class TaskExecutionStore:
         return self.directory / f"{task_id}.json"
 
     def save(self, execution: TaskExecution) -> None:
-        _atomic_write_json(self._path(execution.task_id), asdict(execution))
+        data = asdict(execution)
+        data["allowed_paths"] = sorted(execution.allowed_paths)
+        _atomic_write_json(self._path(execution.task_id), data)
 
     def load(self, task_id: str) -> TaskExecution | None:
         path = self._path(task_id)
@@ -184,6 +196,7 @@ class TaskExecutionStore:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            data["allowed_paths"] = tuple(data.get("allowed_paths", ()))
             return TaskExecution(**data)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise StateCorruptError(

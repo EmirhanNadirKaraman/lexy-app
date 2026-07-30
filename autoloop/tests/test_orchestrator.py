@@ -172,6 +172,7 @@ class FakeGit:
         self.dirty: list[str] = []
         self.commits: list[tuple[str, tuple[str, ...]]] = []
         self.pushes = 0
+        self.push_exact_calls: list[tuple[str, str, str]] = []
         self.commit_error: Exception | None = None
         self.push_error: Exception | None = None
         self.index: dict[str, bytes] = {}
@@ -286,11 +287,21 @@ class FakeGit:
         ]
         return self.head, False, "1 file changed, 1 insertion(+)"
 
-    def push(self, remote="origin"):
+    def push_exact(self, remote, sha, dest_ref, protected_refs, expected_url=None, env_snapshot=None):
         if self.push_error:
             raise self.push_error
+        branch = dest_ref[len("refs/heads/"):] if dest_ref.startswith("refs/heads/") else dest_ref
+        if branch in set(protected_refs) or dest_ref in set(protected_refs):
+            raise GitCommandError(f"push_exact refuses protected ref {dest_ref!r}")
         self.pushes += 1
-        return "to origin"
+        self.push_exact_calls.append((remote, sha, dest_ref))
+        return sha
+
+    def remote_ref_sha(self, remote, dest_ref):
+        # No remote state is modelled beyond `push_exact_calls`; treat
+        # nothing as ever already landed so callers that pre-check idempotency
+        # always fall through to `push_exact` in these tests.
+        return ""
 
 
 class FakeExecutor:

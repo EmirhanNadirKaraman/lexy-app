@@ -52,6 +52,7 @@ Failure routing:
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict
 from pathlib import Path
 
@@ -90,6 +91,7 @@ from .manifest import (
 )
 from .executor import TaskExecutor
 from .git_gateway import GitGateway
+from .packet import build_review_packet
 from .policy import PolicyEngine
 from .prompts import (
     TEMPLATES,
@@ -106,6 +108,7 @@ from .state import (
     LoopState,
     PendingRequest,
     Phase,
+    PostcommitBinding,
     StateStore,
     utcnow_iso,
 )
@@ -235,14 +238,17 @@ class Orchestrator:
         )
         ctx = build_context(state, self._git, self._registry, request_id, state.outbox)
         prompt = build_prompt(request_id, next_iteration, render_context(ctx), state.outbox)
+        postcommit = self._current_pending_postcommit(state.outbox, ctx.report_sha256)
         state.pending_request = PendingRequest(
             request_id=request_id,
             payload=state.outbox,
             prompt=prompt,
+            prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             head_sha=ctx.head_sha,
             base_sha=ctx.base_sha,
             report_sha256=ctx.report_sha256,
             timestamp=ctx.timestamp,
+            postcommit=postcommit,
         )
         if carries_block:
             # Record WHICH reviewed report carried the table. A later approval
@@ -250,6 +256,16 @@ class Orchestrator:
             # other report can never authorize this adoption.
             adopted.presented_report_sha256 = ctx.report_sha256
             self._manifest_store.save(adopted)
+        if postcommit is not None:
+            # Mirror the adoption stamp above, on the TaskExecution record
+            # instead of a ChangeManifest: bind the exact report this
+            # candidate was reviewed under, so a later approval answering a
+            # DIFFERENT report can never authorize publishing it.
+            execution = self._execution_store.load(postcommit.task_id)
+            if execution is not None:
+                execution.presented_report_sha256 = ctx.report_sha256
+                execution.review_request_id = request_id
+                self._execution_store.save(execution)
         state.outbox = None
         state.iteration = next_iteration
         state.phase = Phase.SUBMITTING.value
@@ -290,6 +306,26 @@ class Orchestrator:
             # operator decision (`run --resubmit`): the backend may have
             # accepted a message the browser never observed.
             self._park_ambiguous(req, reconciled=True)
+            return
+
+        # Defensive integrity check: `req.prompt` is set once in `ready` and
+        # never recomputed before a resend, so this should never fire in
+        # normal operation. It exists to catch on-disk corruption or manual
+        # state-file tampering between a crash and a retry — sending a prompt
+        # nobody actually reviewed the stamps for is worse than parking.
+        # `prompt_sha256 == ""` means it was never stamped (a hand-built
+        # `PendingRequest`, or a state file from before this field existed —
+        # SCHEMA_VERSION was deliberately not bumped for it) rather than a
+        # mismatch, so that case is skipped, not treated as corruption.
+        actual_prompt_sha256 = hashlib.sha256(req.prompt.encode("utf-8")).hexdigest()
+        if req.prompt_sha256 and actual_prompt_sha256 != req.prompt_sha256:
+            self._to_needs_user(
+                f"pending request {req.request_id}'s prompt does not match its "
+                "recorded prompt_sha256 — the state file may be corrupted or "
+                "was edited by hand. Refusing to send a prompt that was never "
+                "reviewed. Inspect .autoloop/state.json before retrying.",
+                resume_phase=Phase.SUBMITTING.value,
+            )
             return
 
         # Mark PESSIMISTICALLY and durably before handing control to the
@@ -363,6 +399,49 @@ class Orchestrator:
             return None
         return manifest
 
+    def _current_pending_postcommit(
+        self, payload: str, report_sha256: str
+    ) -> PostcommitBinding | None:
+        """Bind `payload` to a produce-then-review candidate, but only if
+        `payload` actually carries that candidate's identifiers as literal
+        text — mirroring `carries_block`'s adoption-block check above. A
+        corrective re-prompt or any other payload legitimately carries none
+        of this, and must bind nothing: an approval answering THAT request
+        must never be treated as if it reviewed a candidate it never showed.
+
+        `state.task_execution` (not `last_manifest_id` — deliberately a
+        separate field, see `state.py`) is refreshed by `_finish_postcommit`
+        every time a round finishes, success or failure, so it always
+        reflects the most recently produced candidate. Requiring all four
+        identifiers (task_id, branch, base_sha, candidate_sha — the latter
+        two 40-hex shas) as substrings makes an accidental match on ordinary
+        prose effectively impossible without needing an exact-block compare.
+        """
+        task_exec = self.state.task_execution
+        if not task_exec or not task_exec.get("candidate_sha"):
+            return None
+        task_id = task_exec.get("task_id", "")
+        task_branch = task_exec.get("task_branch", "")
+        base_sha = task_exec.get("task_base_sha", "")
+        candidate_sha = task_exec.get("candidate_sha", "")
+        if not all(
+            value and value in payload for value in (task_id, task_branch, base_sha, candidate_sha)
+        ):
+            return None
+        execution = self._execution_store.load(task_id)
+        if execution is None or execution.candidate_sha != candidate_sha:
+            return None
+        worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
+        candidate_tree_sha = worktree_git.tree_of(candidate_sha)
+        return PostcommitBinding(
+            task_id=task_id,
+            task_branch=task_branch,
+            base_sha=base_sha,
+            candidate_sha=candidate_sha,
+            candidate_tree_sha=candidate_tree_sha,
+            packet_sha256=report_sha256,
+        )
+
     def _park_ambiguous(self, req: PendingRequest, reconciled: bool) -> None:
         """Stop on an ambiguous submission. Never resends automatically."""
         self._log(
@@ -398,6 +477,7 @@ class Orchestrator:
             head_sha=req.head_sha,
             base_sha=req.base_sha,
             report_sha256=req.report_sha256,
+            postcommit=req.postcommit,
         )
         state.pending_request = None
         state.consecutive_failures = 0
@@ -429,9 +509,21 @@ class Orchestrator:
                 "question": directive.question,
             },
         )
-        verdict = self._policy.authorize_directive(
-            directive, self._git.current_branch(), self._registry
+        # A postcommit-bound push publishes `resp.postcommit.task_branch`, an
+        # entirely different ref than whatever the main checkout has current
+        # (usually the branch the orchestrator itself runs from, e.g. "main").
+        # `authorize_directive`'s protected-branch gate must judge THAT
+        # destination, not the main checkout's — otherwise every
+        # produce-then-review push would be evaluated against the wrong
+        # branch name (denying it whenever the main checkout sits on
+        # "main"/"master", the exact opposite of what protected_branches is
+        # meant to gate).
+        destination_branch = (
+            resp.postcommit.task_branch
+            if resp.postcommit is not None and directive.decision in PUSH_DECISIONS
+            else self._git.current_branch()
         )
+        verdict = self._policy.authorize_directive(directive, destination_branch, self._registry)
         if not verdict.allowed:
             self._handle_policy_denial(directive, verdict)
             return
@@ -471,6 +563,19 @@ class Orchestrator:
             self._to_needs_user(directive.question or "(no question given)")
         elif decision is Decision.PLAN:
             self._dispatch_plan(directive)
+        elif decision is Decision.PUSH and state.last_response is not None and (
+            state.last_response.postcommit is not None
+        ):
+            # A push answering a produce-then-review packet publishes via
+            # `push_exact`, sourced entirely from the response's binding
+            # (never from `directive` — see `_dispatch_task_push`'s
+            # docstring). `commit_and_push` deliberately does NOT take this
+            # branch: there is nothing new to commit here (the commit already
+            # exists), so a `commit_and_push` reply falls through to
+            # `_dispatch_git`, whose manifest gate refuses it with a clear
+            # "no change manifest recorded" error — a more honest response
+            # than silently reinterpreting it as a bare push.
+            self._dispatch_task_push(directive, state.last_response)
         elif decision in COMMIT_DECISIONS or decision in PUSH_DECISIONS:
             self._dispatch_git(directive)
         else:  # audit / implement / revise
@@ -604,7 +709,7 @@ class Orchestrator:
         state.phase = Phase.READY.value
         self._store.save(state)
 
-    # ---- produce-then-review commit path (pass 2a) --------------------------
+    # ---- produce-then-review commit path (pass 2a + 2b) ----------------------
     #
     # A real task runs in its own worktree/branch (`WorktreeManager`) and
     # commits immediately after the executor reports success and the commit
@@ -612,12 +717,17 @@ class Orchestrator:
     # chat approval, because none exists for this path. On ANY check failure
     # the commit is left exactly where it is: nothing here can roll it back
     # (reset/checkout/clean are not on the git command whitelist), so refusal
-    # means "park and report", never "undo". Building the actual review
-    # packet (the message that shows ChatGPT the diff and lets it request a
-    # revision) is explicitly OUT of scope for this pass — see the module
-    # docstring in `worktree.py`/`worktask.py`. A clean pass therefore also
-    # parks today, with an honest "awaiting review, not wired yet" message,
-    # rather than inventing that content early.
+    # means "park and report", never "undo". A clean pass builds the review
+    # packet (`packet.build_review_packet`) and sends it for review — success
+    # re-enters `ready`, it does not park (pass 2b; pass 2a parked here with
+    # an "awaiting review, not wired yet" placeholder).
+    #
+    # Maximum two review rounds per task (`execution.review_round`): round 1
+    # is the initial `implement`, round 2 is one `revise`. A THIRD round
+    # (another `revise` once `review_round == 2`) never reaches the executor
+    # or ChatGPT — `_park_round_cap` parks immediately with both the full
+    # range diff and the latest round's own diff, plus the feedback that
+    # triggered it.
 
     def _dispatch_task_postcommit(self, directive: Directive, task: Task, state: LoopState) -> None:
         execution = self._execution_store.load(task.id)
@@ -661,18 +771,26 @@ class Orchestrator:
                 return
             if recon is Reconciliation.RECOVERABLE:
                 # The commit DID happen; only persisting candidate_sha was
-                # lost. Adopt the branch head — do NOT commit again.
-                allowed_paths = set(pending_intent.planned_paths)
+                # lost. Adopt the branch head — do NOT commit again. Union the
+                # recovered round's planned paths into the accumulated
+                # ownership set (see `TaskExecution.allowed_paths`).
+                execution.allowed_paths = tuple(
+                    sorted(set(execution.allowed_paths) | set(pending_intent.planned_paths))
+                )
                 execution.candidate_sha = worktree_git.head_sha()
                 self._execution_store.save(execution)
                 self._intent_store.clear(task.id)
                 state.task_execution = asdict(execution)
                 self._store.save(state)
-                self._finish_postcommit(execution, worktree_git, allowed_paths, state, task)
+                self._finish_postcommit(execution, worktree_git, state, task)
                 return
             # NO_COMMIT: the commit this intent describes never happened.
             # Clear the stale intent and fall through to attempt it fresh.
             self._intent_store.clear(task.id)
+
+        if execution.review_round >= 2:
+            self._park_round_cap(execution, worktree_git, directive, state, task)
+            return
 
         # Snapshot the environment (hooks / push destination) BEFORE the
         # executor runs, so a hook installed mid-task (e.g. by a dependency
@@ -740,6 +858,9 @@ class Orchestrator:
         # -> clear the intent -> THEN verify. If the process dies during
         # verification the commit is already both real and recorded, which is
         # the honest state (the commit exists either way).
+        execution.allowed_paths = tuple(
+            sorted(set(execution.allowed_paths) | set(outcome.changed_paths))
+        )
         execution.candidate_sha = candidate_sha
         self._execution_store.save(execution)
         self._intent_store.clear(task.id)
@@ -748,25 +869,57 @@ class Orchestrator:
         self._log(
             "staged_diff", data={"task_id": task.id, "candidate_sha": candidate_sha, "summary": staged_summary}
         )
-        self._finish_postcommit(execution, worktree_git, set(outcome.changed_paths), state, task)
+        self._finish_postcommit(execution, worktree_git, state, task)
+
+    def _park_round_cap(
+        self,
+        execution: TaskExecution,
+        worktree_git: GitGateway,
+        directive: Directive,
+        state: LoopState,
+        task: Task,
+    ) -> None:
+        """Round 3 never reaches the executor or ChatGPT. Presents BOTH the
+        full accumulated diff and the latest round's own diff (parent =
+        the previous round's tip, derived from `commit_list` rather than a
+        separately persisted field, since each round is exactly one commit),
+        so a human can see the whole arc and the most recent change without
+        re-deriving either by hand."""
+        state.last_response = None
+        base, candidate = execution.task_base_sha, execution.candidate_sha
+        commits = worktree_git.commit_list(base, candidate)
+        previous_tip = commits[-2]["sha"] if len(commits) >= 2 else base
+        try:
+            full_diff = worktree_git.range_diff(base, candidate)
+        except GitCommandError as exc:
+            full_diff = f"(unavailable: {exc})"
+        try:
+            latest_diff = worktree_git.range_diff(previous_tip, candidate)
+        except GitCommandError as exc:
+            latest_diff = f"(unavailable: {exc})"
+        self._to_needs_user(
+            f"task {task.id}: review round cap (2) reached on branch "
+            f"{execution.task_branch} at candidate {candidate[:12]} — a third "
+            "revision round is never sent to ChatGPT. Latest feedback: "
+            f"{directive.feedback or '(none — last directive was not revise)'}"
+            f"\n\n--- full diff {base[:12]}..{candidate[:12]} ---\n{full_diff}"
+            f"\n\n--- latest round diff {previous_tip[:12]}..{candidate[:12]} ---"
+            f"\n{latest_diff}"
+        )
 
     def _verify_committed(
-        self, execution: TaskExecution, worktree_git: GitGateway, allowed_paths: set[str]
+        self, execution: TaskExecution, worktree_git: GitGateway
     ) -> tuple[list[str], str]:
         """The post-commit review gate for `execution.candidate_sha`. Returns
         `(failures, validation_summary)`; `failures` empty means the commit
         passes every check.
 
-        NOTE — round > 0 (a revision on top of an already-reviewed commit) is
-        not handled correctly here: `commit_range_paths(task_base_sha,
-        candidate_sha)` spans the WHOLE base..candidate range, so on a second
-        round it would also include the FIRST round's paths, not just this
-        round's. The ownership set would need to be a union across rounds (or
-        a diff from the round's own parent) to be correct there. Revision
-        rounds are the review loop and are explicitly out of scope for this
-        pass — round 0 (every scenario this method is exercised against here)
-        is unaffected because `task_base_sha` and `execution.candidate_sha`'s
-        only parent are the same commit.
+        Path ownership is checked against `execution.allowed_paths` — the
+        UNION of every round's `changed_paths` committed so far, not just the
+        latest round's. `commit_range_paths(task_base_sha, candidate_sha)`
+        spans the WHOLE range once `review_round > 0`, so comparing it against
+        only the latest round's paths would wrongly flag an earlier round's
+        legitimate paths as "outside" on a second review.
         """
         failures: list[str] = []
         candidate = execution.candidate_sha
@@ -778,7 +931,7 @@ class Orchestrator:
         touched = worktree_git.commit_range_paths(execution.task_base_sha, candidate)
         if not touched:
             failures.append("commit range is empty — nothing was actually committed")
-        outside = touched - allowed_paths
+        outside = touched - set(execution.allowed_paths)
         if outside:
             failures.append(
                 "commit touched path(s) outside what the task was allowed to "
@@ -813,13 +966,19 @@ class Orchestrator:
         self,
         execution: TaskExecution,
         worktree_git: GitGateway,
-        allowed_paths: set[str],
         state: LoopState,
         task: Task,
     ) -> None:
-        failures, validation_summary = self._verify_committed(execution, worktree_git, allowed_paths)
+        failures, validation_summary = self._verify_committed(execution, worktree_git)
         state.last_validation = validation_summary
-        execution.review_round += 1
+        # `review_round` counts REVIEWS, not commit attempts. It is incremented
+        # only where a packet is actually sent (below), never here: a structural
+        # refusal (residual dirty file, failing post-commit validation, a hook
+        # that added a path) parks without any packet reaching ChatGPT, so
+        # charging it against a two-round review budget would exhaust that
+        # budget without a single review having happened — and would report the
+        # confusing "out of review rounds" when nothing was ever reviewed. A
+        # structural refusal is already fail-closed on its own.
         execution.candidate_commit_count = len(
             worktree_git.commit_list(execution.task_base_sha, execution.candidate_sha)
         )
@@ -845,13 +1004,162 @@ class Orchestrator:
                 f"reachable through this gateway. Reasons: {'; '.join(failures)}"
             )
             return
-        self._to_needs_user(
-            f"task {task.id}: commit {execution.candidate_sha[:12]} on "
-            f"{execution.task_branch} (round {execution.review_round}) passed "
-            "post-commit review. Awaiting a review packet for ChatGPT to see "
-            "the diff — that construction is not implemented yet; park here "
-            "for the operator in the meantime."
+        # A packet that exceeds `range_diff`'s byte cap (or any other git
+        # failure while rendering it) parks here, not via the generic
+        # GitError/budget path: the commit already exists, nothing here can
+        # roll it back, and no amount of re-prompting ChatGPT changes that —
+        # the same "park and report, never undo" rule as every other refusal
+        # in this method.
+        try:
+            packet_text = build_review_packet(execution, worktree_git, task)
+        except GitCommandError as exc:
+            self._to_needs_user(
+                f"task {task.id}: commit {execution.candidate_sha[:12]} on "
+                f"{execution.task_branch} (round {execution.review_round + 1}) "
+                "passed post-commit review, but the review packet could not be "
+                f"built — {exc}. The commit is NOT rolled back and NOT pushed; "
+                "nothing was sent to ChatGPT."
+            )
+            return
+        # Only here — a packet exists and is about to become `outbox`. A packet
+        # that could not be built consumed no review round either.
+        execution.review_round += 1
+        self._execution_store.save(execution)
+        state.task_execution = asdict(execution)
+        state.outbox = TEMPLATES["postcommit_review"].render(
+            task_id=task.id, task_title=task.title, packet=packet_text
         )
+        state.consecutive_failures = 0
+        state.phase = Phase.READY.value
+        self._store.save(state)
+
+    def _dispatch_task_push(self, directive: Directive, resp: LastResponse) -> None:
+        """Publish a produce-then-review candidate via `push_exact`.
+
+        `directive` is used ONLY for logging/reason text — never for identity.
+        A `push` directive cannot carry a task_id at all (`contract._forbid`
+        rejects it at parse time), so `resp.postcommit` — the binding
+        captured the moment THIS packet was sent, not a fresh
+        `TaskExecutionStore` lookup — is the only source of which task and
+        which candidate sha this approval concerns. That is what makes
+        swapping the candidate underneath an approval a REFUSAL rather than a
+        silent wrong-commit publish: if `TaskExecutionStore` now disagrees
+        with the binding, or the recorded candidate no longer resolves, or
+        its tree no longer matches what was reviewed, nothing is pushed.
+
+        No `env_snapshot` is passed to `push_exact` here — pass 2a/2b persist
+        no environment snapshot across the review round-trip (only within a
+        single `commit_and_capture` call), so there is nothing honest to
+        compare against. `push_exact`'s own unconditional checks (active
+        push hooks, `insteadOf`/`pushurl` presence) still run regardless.
+        """
+        state = self.state
+        binding = resp.postcommit
+        execution = self._execution_store.load(binding.task_id)
+        if execution is None or execution.candidate_sha != binding.candidate_sha:
+            self._to_needs_user(
+                f"task {binding.task_id}: push refused — the reviewed candidate "
+                f"{binding.candidate_sha[:12]} is no longer this task's current "
+                "candidate (a later round advanced it, or the execution record "
+                "is gone). Nothing was pushed; re-review the current state "
+                "before approving again."
+            )
+            return
+        worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
+        if not worktree_git.is_descendant(binding.candidate_sha, execution.task_base_sha):
+            self._to_needs_user(
+                f"task {binding.task_id}: push refused — candidate "
+                f"{binding.candidate_sha[:12]} is not a descendant of task base "
+                f"{execution.task_base_sha[:12]}. Nothing was pushed."
+            )
+            return
+        try:
+            info = worktree_git.read_commit(binding.candidate_sha)
+        except GitCommandError as exc:
+            self._to_needs_user(
+                f"task {binding.task_id}: push refused — the reviewed candidate "
+                f"{binding.candidate_sha[:12]} no longer resolves: {exc}. Nothing "
+                "was pushed."
+            )
+            return
+        if info.get("tree") != binding.candidate_tree_sha:
+            self._to_needs_user(
+                f"task {binding.task_id}: push refused — candidate "
+                f"{binding.candidate_sha[:12]}'s tree changed since it was "
+                f"reviewed (was {binding.candidate_tree_sha[:12]}, now "
+                f"{info.get('tree', '?')[:12]}). Nothing was pushed."
+            )
+            return
+
+        remote = execution.intended_remote or "origin"
+        dest_ref = f"refs/heads/{binding.task_branch}"
+        # Durable push intent, recorded BEFORE the network call — mirrors
+        # `CommitIntent`'s "write before the risky operation" pattern, so a
+        # crash between a successful `git push` and this method returning is
+        # recoverable from the remote ref alone rather than re-pushed.
+        execution.intended_remote = remote
+        execution.intended_remote_ref = dest_ref
+        self._execution_store.save(execution)
+
+        landed = worktree_git.remote_ref_sha(remote, dest_ref)
+        if landed != binding.candidate_sha:
+            # Same `allow_protected_push` gating as the legacy path below —
+            # `authorize_directive` already decided whether
+            # `resp.postcommit.task_branch` being in `protected_branches` is
+            # allowed (using that same flag); `push_exact`'s own protected-ref
+            # check must agree, or `allow_protected_push=True` would silently
+            # be inert for this path too.
+            gateway_protected = (
+                () if self._policy.config.allow_protected_push
+                else self._policy.config.protected_branches
+            )
+            try:
+                landed = worktree_git.push_exact(
+                    remote,
+                    binding.candidate_sha,
+                    dest_ref,
+                    gateway_protected,
+                )
+            except GitCommandError as exc:
+                self._to_needs_user(
+                    f"task {binding.task_id}: push of {binding.candidate_sha[:12]} "
+                    f"to {remote}/{dest_ref} was REFUSED — {exc}. Nothing was "
+                    "pushed; the commit itself is unaffected."
+                )
+                return
+        execution.candidate_commit_count = len(
+            worktree_git.commit_list(execution.task_base_sha, execution.candidate_sha)
+        )
+        self._execution_store.save(execution)
+        # Clear `state.task_execution` now that the candidate is actually
+        # published — NOT just re-mirror it. `_dispatch_git`'s legacy-push
+        # guard refuses whenever `state.task_execution` shows a live
+        # `candidate_sha` with no matching binding on the current response;
+        # leaving the just-published candidate there would make that guard
+        # refuse EVERY later legacy push for the rest of the session (e.g. an
+        # unrelated audit's `commit_and_push`), forever, since nothing else
+        # ever clears it. The `TaskExecutionStore` record on disk is
+        # untouched — this only clears the in-memory "awaiting publication"
+        # marker other dispatch paths read.
+        state.task_execution = None
+        self._log(
+            "task_pushed",
+            data={
+                "task_id": binding.task_id,
+                "candidate_sha": binding.candidate_sha,
+                "remote": remote,
+                "dest_ref": dest_ref,
+            },
+        )
+        state.outbox = TEMPLATES["git_report"].render(
+            summary_line=(
+                f"pushed {landed[:12]} to {remote}/{dest_ref} (task {binding.task_id})"
+            )
+        )
+        state.last_response = None
+        state.consecutive_failures = 0
+        state.phase = Phase.READY.value
+        self._store.save(state)
 
     def _dispatch_git(self, directive: Directive) -> None:
         state = self.state
@@ -938,8 +1246,50 @@ class Orchestrator:
                     if exc.code != "task_completed":  # already done = crash recovery
                         raise
         if directive.decision in PUSH_DECISIONS:
-            output = self._git.push()
-            actions.append("pushed current branch" + (f": {output}" if output else ""))
+            # Fail closed rather than publish the wrong destination: a
+            # produce-then-review candidate is on record (state.task_execution
+            # carries a real candidate_sha) but THIS response carries no
+            # matching postcommit binding — either the packet that presented
+            # it was never sent (a parse-error/policy-denial re-prompt
+            # overwrote the outbox first) or this response answers a
+            # different, unrelated request entirely. Either way, pushing
+            # "whatever the main checkout's current branch is" here would
+            # publish the wrong branch. `_dispatch` already routes a
+            # postcommit-bound `push` to `_dispatch_task_push` before this
+            # method is ever reached, so reaching here WITH a live candidate
+            # and WITHOUT a binding is exactly the mismatch case.
+            task_exec = state.task_execution or {}
+            resp = state.last_response
+            if task_exec.get("candidate_sha") and not (
+                resp is not None and resp.postcommit is not None
+            ):
+                self._to_needs_user(
+                    "refusing to push through the legacy git path: a "
+                    f"produce-then-review candidate ({task_exec.get('candidate_sha', '')[:12]}"
+                    f" on task {task_exec.get('task_id')!r}) is on record but this "
+                    "response carries no matching review binding — publishing "
+                    "the main checkout's current branch here could be the wrong "
+                    "destination. Nothing was pushed."
+                )
+                return
+            push_sha = self._git.head_sha()
+            current_branch = self._git.current_branch()
+            if not current_branch:
+                raise GitCommandError("cannot push: detached HEAD")
+            dest_ref = f"refs/heads/{current_branch}"
+            # `authorize_directive` already gated protected-branch pushes on
+            # `allow_protected_push` before this point was ever reached, so
+            # `push_exact`'s OWN protected-ref check (which has no such
+            # escape hatch — see its docstring) must be told the same thing,
+            # or `allow_protected_push=True` would authorize the push at the
+            # policy layer and then have `push_exact` refuse it anyway,
+            # silently making that config knob inert for this path.
+            gateway_protected = (
+                () if self._policy.config.allow_protected_push
+                else self._policy.config.protected_branches
+            )
+            landed = self._git.push_exact("origin", push_sha, dest_ref, gateway_protected)
+            actions.append(f"pushed {landed[:12]} to origin/{dest_ref}")
         summary = "; ".join(actions)
         self._log("git_action", data={"decision": directive.decision.value, "summary": summary})
         if directive.decision is Decision.COMMIT:

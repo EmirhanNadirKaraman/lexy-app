@@ -17,8 +17,12 @@ be reintroduced without changing the whitelist itself.
 
 `commit` is idempotent for crash recovery: if no approved path differs from
 HEAD and HEAD's message equals the requested message, the commit already
-happened — return it. `push` always pushes the current branch by explicit
-refspec, never a bare `git push`.
+happened — return it.
+
+There is no ambient `push()` — it pushed whatever the current branch tip
+happened to be at call time, exactly the race + wrong-destination class M1
+exists to close (removed 2026-07-30, pass 2b). Every push goes through
+`push_exact`, by an explicit, already-resolved `<sha>:<dest_ref>` refspec.
 
 **Produce-then-review path** (`commit_and_capture` / `push_exact`, alongside
 `worktask.py` and `environment.py`): the authorize-then-produce commit paths
@@ -481,13 +485,6 @@ class GitGateway:
         self._git("commit", "-m", message)
         candidate_sha = self._out("rev-parse", "HEAD")
         return candidate_sha, summary
-
-    def push(self, remote: str = "origin") -> str:
-        branch = self.current_branch()
-        if not branch:
-            raise GitCommandError("cannot push: detached HEAD")
-        proc = self._git("push", remote, branch)
-        return (proc.stdout + proc.stderr).strip()
 
     def remote_ref_sha(self, remote: str, dest_ref: str) -> str:
         """The sha `dest_ref` currently points to on `remote`, or "" if the

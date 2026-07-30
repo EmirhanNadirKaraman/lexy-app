@@ -119,25 +119,14 @@ def test_commit_handles_worktree_rename(repo):
     assert not gw.is_dirty()
 
 
-def test_push_to_bare_remote(repo, tmp_path):
-    bare = tmp_path / "bare.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
-    run_git(repo, "remote", "add", "origin", str(bare))
-    gw = gateway(repo)
-    gw.push()
-    remote_head = subprocess.run(
-        ["git", "--git-dir", str(bare), "rev-parse", "main"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert remote_head == gw.head_sha()
-
-
-def test_push_from_detached_head_fails(repo):
-    run_git(repo, "checkout", "-q", "--detach")
-    with pytest.raises(GitCommandError):
-        gateway(repo).push()
+def test_gateway_has_no_ambient_push_method(repo):
+    """`push()` was removed 2026-07-30 (pass 2b) — it pushed whatever the
+    current branch tip happened to be, exactly the wrong-destination race M1
+    exists to close. Publishing goes ONLY through `push_exact`'s explicit
+    `<sha>:<dest_ref>` refspec now; see `test_postcommit_primitives.py` for
+    its dedicated coverage (bare-remote publish, idempotency, protected-ref
+    and non-fast-forward refusals, and more)."""
+    assert not hasattr(GitGateway, "push")
 
 
 def test_force_push_denied(repo):

@@ -135,6 +135,23 @@ TEMPLATES: dict[str, PromptTemplate] = {
             ),
         ),
         PromptTemplate(
+            name="postcommit_review",
+            body=(
+                "The executor committed task {task_id} ({task_title}) directly to "
+                "its own branch, and the commit passed structural post-commit "
+                "review (ancestry from the task base, path ownership, a clean "
+                "worktree, and a re-run of validation against the committed tree). "
+                "Nothing has been pushed. The packet below is rendered ONLY from "
+                "the immutable committed git objects — not from what the executor "
+                "claimed to have done.\n\n{packet}\n\nIf you approve, reply `push` "
+                "with the `reviewed` stamp copied from CONTEXT — this publishes "
+                "exactly the candidate commit above to its own task branch, "
+                "nothing else. If not, reply `revise` with this task_id and "
+                "feedback describing what must change (at most one further "
+                "revision round is allowed for this task)."
+            ),
+        ),
+        PromptTemplate(
             name="smoke_test",
             body=(
                 "AUTOLOOP SMOKE TEST — this verifies the browser automation "

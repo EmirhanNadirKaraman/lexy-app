@@ -22,13 +22,15 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Orchestrator | `orchestrator.py` | Persisted state machine (ready → submitting → awaiting → executing), failure routing, budgets, review-integrity + manifest gates. |
 | Lock | `lock.py` | Single-instance lock per state dir (see §3). |
 | Change manifest | `manifest.py` | Task-owned change tracking + the commit gate (see §4). |
+| Worktrees / task execution | `worktree.py` (`WorktreeManager`), `worktask.py` (`TaskExecution`, `CommitIntent`, `reconcile_after_crash`) | Per-task linked worktree + branch lifecycle, and the crash-safe commit-intent/candidate-sha bookkeeping for produce-then-review (see §4b). |
+| Review packet | `packet.py` | Renders the post-commit review packet from immutable git objects (see §4b). |
 | Conversation | `conversation.py` (interface/registry), `browser/chatgpt.py` (`BrowserChatGPT`), `browser/playwright_session.py` (CDP, lazy), `browser/selectors.py` | One persistent reviewer conversation; duplicate/stale/streaming/login guards; provider-pluggable. |
 | Contract | `contract.py` | Response contract **v3** + strict parser + `verify_review`. |
 | Policy | `policy.py` | Deterministic gates: git whitelist (`add -A` and force pushes structurally impossible), task-reference checks, **phase gate**, budgets. |
 | Tasks | `tasks.py` | Task registry/graph (derived ready/blocked, cycles rejected, atomic persistence). |
 | Context | `context.py` | Per-request CONTEXT block: integrity stamp + previous decision/task, roadmap, git summary, changed files, validation summary. |
-| Prompts | `prompts.py` | Strict template library (incl. `audit_kickoff`, `smoke_test`). |
-| Git | `git_gateway.py` | Only git runner; exact-path staging; policy-validated per call. |
+| Prompts | `prompts.py` | Strict template library (incl. `audit_kickoff`, `smoke_test`, `postcommit_review`). |
+| Git | `git_gateway.py` | Only git runner; exact-path staging; policy-validated per call; `push_exact` is the only way to publish anything (no ambient `push()`). |
 | Doctor | `doctor.py` | Non-destructive preflight (§6). |
 | Audit executor | `audit/` | The production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. |
 | State / transcript | `state.py`, `transcript.py` | Atomic crash-safe state; append-only JSONL audit log. |
@@ -209,13 +211,167 @@ provably contained the exact hashes of the exact files being committed.*
 
 **Residual limitation.** Adoption authorizes content, never publication —
 `allow_push`, protected branches and remote behaviour are untouched. And nothing
-here creates an adopted manifest in production yet: `ChangeManifest.adopt(...)`
-is the API, and the `precommit-review` workflow that calls it lands separately.
+creates an adopted manifest in production yet: `ChangeManifest.adopt(...)` is the
+API, but no caller in this repo invokes it — it stays available for whatever
+adopts pre-existing human/lead work later. This is a *different* mechanism from
+produce-then-review (§4b below): adoption binds work the loop did not create by
+content hash; produce-then-review is for work a task's own executor produced,
+verified from the immutable commit it made. Do not confuse the two, and do not
+resurrect an archived "precommit-review" design under either name — that design
+predates produce-then-review and was superseded by it, not merged into it.
 
 Files changed *during* the task window by someone else are indistinguishable
 from task work and therefore count as task-changed — they are still only
 committable if ChatGPT explicitly approves those paths. Don't edit the tree
 while an executor task is running.
+
+---
+
+## 4b. Produce-then-review: per-task worktrees and the post-commit review packet
+
+A second, structurally different commit path for real (non-audit) tasks —
+implemented across three passes (2026-07-30): pass 1 (`git_gateway.py`,
+`worktask.py`) the honest-sha commit primitive and `push_exact`; pass 2a
+(`worktree.py`, `orchestrator.py`) per-task worktrees and the structural
+post-commit verification gate; pass 2b (`packet.py`, this section) the review
+packet, the request/response binding that pins a push to the candidate it
+reviewed, and push routing. Gated behind an optional
+`worktrees`/`execution_store`/`intent_store` constructor triple on
+`Orchestrator` — every existing caller (including `cli.py`, unchanged) takes
+the §4 manifest path unaffected. Not wired into `cli.py` yet.
+
+**Why a second path at all.** §4's manifest gate authorizes a commit BEFORE it
+exists, from a snapshot diff ChatGPT approved sight-unseen of the real diff.
+Produce-then-review inverts that: the executor commits immediately to its own
+branch in its own linked worktree (`WorktreeManager`, one branch
+`autoloop/<task_id>` and one directory per task — git itself refuses to check
+the same branch out twice, so two attempts at the same task can't race), a
+structural gate re-verifies the resulting IMMUTABLE commit, and only then is
+it shown to ChatGPT as a real diff for a real, already-existing commit.
+Nothing here can roll a bad commit back — `reset`/`checkout`/`clean` are not
+on the git whitelist — so every refusal in this path means "park and report",
+never "undo".
+
+**Sequence per task (`Orchestrator._dispatch_task_postcommit`).**
+
+1. First dispatch: `task_base_sha` = the MAIN checkout's HEAD, worktree +
+   branch created off it (`TaskExecution`, `worktask.py`).
+2. A pending `CommitIntent` from a previous crash is reconciled FIRST
+   (`reconcile_after_crash`, F8 — see `worktask.py`'s module docstring) —
+   `RECOVERABLE` adopts the branch tip without re-committing, `AMBIGUOUS`
+   parks for a human, `NO_COMMIT` clears the stale intent and proceeds fresh.
+3. Round cap: `execution.review_round >= 2` refuses a third round outright —
+   see below.
+4. Environment snapshot (`environment.snapshot`) BEFORE the executor runs, so
+   a hook installed mid-task (e.g. a dependency postinstall script) is
+   caught, not silently trusted.
+5. The executor runs; a non-`ok` outcome never reaches the commit step.
+6. `commit_and_capture` writes the `CommitIntent` durably, stages exactly the
+   reported `changed_paths`, runs a NORMAL `git commit` (hooks enabled — the
+   diff a hook produces is what gets reviewed, not what was staged before it
+   ran), and reads the candidate sha from `rev-parse HEAD` — never predicted.
+7. `_verify_committed` (the structural gate): candidate is a descendant of
+   `task_base_sha`; the commit range is non-empty; every touched path is in
+   `execution.allowed_paths` (the UNION of `changed_paths` across every round
+   so far — comparing against only the LATEST round's paths would wrongly
+   flag an earlier round's legitimate paths as "outside" once
+   `review_round > 0`, since `commit_range_paths(task_base_sha,
+   candidate_sha)` spans every round); the worktree is clean after commit;
+   `config.audit.validation_commands` re-run against the committed tree
+   (pre-commit validation is not enough — a hook can change committed
+   content after the executor last saw it).
+8. On success: `packet.build_review_packet` renders the packet and it is sent
+   for review (state re-enters `ready`, it does not park). On failure: parks
+   in `needs_user` with every reason; the commit is not rolled back.
+
+**The review packet (`packet.py`).** Rendered ONLY from immutable git objects
+in `task_base_sha..candidate_sha`: the commit list (sha/subject/parents),
+every changed path with its mode and object type on each side of the range
+(read from the two trees directly, not inferred from the diff), the diff
+stat, and the full diff (`range_diff` — plumbing-rendered, no external diff
+driver or textconv filter, refuses above a byte cap rather than truncating).
+`task_id`, `branch`, `base_sha` and `candidate_sha` are stamped into the
+returned text as literal lines — load-bearing, not decoration: that string
+becomes `state.outbox`, and `context.report_sha256` hashes exactly those
+bytes. Two different commits can produce byte-identical diff TEXT, so a
+digest over the diff alone would not pin which commit was reviewed; the four
+identifiers inside the hashed body are what make an approval of candidate A
+structurally unable to authorize publishing a swapped-in candidate B.
+
+**Request/response binding (`state.PostcommitBinding`).** A dedicated field
+on `PendingRequest`/`LastResponse` — never `last_manifest_id`, which belongs
+to the §4 manifest path and means something different — captured once, when
+the packet is actually sent, and carried through response handling
+unmodified: `task_id`, `task_branch`, `base_sha`, `candidate_sha`,
+`candidate_tree_sha` (the candidate's tree object id, for a push-time
+tamper check) and `packet_sha256`. `Orchestrator._current_pending_postcommit`
+binds a request ONLY when its payload actually carries all four identifiers
+as literal substrings (mirroring the §4 adoption block's own carries-check) —
+a corrective re-prompt or any other payload legitimately carries none of
+this and must bind nothing. Everything downstream (push routing) reads the
+candidate sha from this binding alone — never from a fresh
+`TaskExecutionStore` lookup ("latest" state can have moved on to a new round
+by the time an approval arrives) and never from the directive (a `push`
+directive cannot even carry a task_id — see `contract._forbid`).
+
+**Push routing (`Orchestrator._dispatch_task_push`, `GitGateway.push_exact`).**
+There is no ambient `push()` anymore (removed 2026-07-30 — it pushed
+whatever the current branch tip happened to be, exactly the
+wrong-destination race this path exists to close). A `push` decision bound to
+a postcommit review routes to `_dispatch_task_push`, which: refuses unless
+the FRESH `TaskExecutionStore` record still shows the SAME candidate as the
+binding (a later round having advanced it is a refusal, not "push the old
+one anyway"); refuses unless the candidate is still a descendant of
+`task_base_sha`, still resolves, and its tree still matches
+`candidate_tree_sha`; then publishes via `push_exact` to
+`refs/heads/<task_branch>` on `execution.intended_remote` (default
+`"origin"`) — an explicit, already-resolved `<sha>:<dest_ref>` refspec, never
+a bare branch push, rejected outright if `dest_ref` is protected. Before
+pushing, `remote_ref_sha` is checked first: if the remote already has this
+exact candidate (a push that landed before a crash, or an ordinary retry),
+nothing is re-pushed. `authorize_directive`'s protected-branch check is
+evaluated against `resp.postcommit.task_branch` for a postcommit-bound push —
+NOT the main checkout's current branch, which would otherwise make every
+produce-then-review push evaluate against the wrong name (denying it
+whenever the main checkout happens to sit on `main`/`master`, the opposite
+of what `protected_branches` is meant to gate). `push_exact`'s OWN
+protected-ref check has no `allow_protected_push` escape hatch by design
+(see its docstring) — both push call sites (`_dispatch_task_push` and the
+legacy `_dispatch_git` push below) therefore pass an EMPTY protected-refs
+tuple to it when `allow_protected_push` is true, so that policy knob stays
+meaningful instead of `authorize_directive` approving a push that
+`push_exact` then silently refuses anyway.
+
+**`commit`/`commit_and_push` are deliberately NOT routed to
+`_dispatch_task_push`** — there is nothing new to commit in this path (the
+commit already exists), so those decisions fall through to the §4
+`_dispatch_git` manifest gate, which refuses them with a clear "no change
+manifest recorded" error rather than silently reinterpreting them as a bare
+push. That same fallthrough is fail-closed against a subtler case: if
+`state.task_execution` shows a live candidate but the CURRENT response
+carries no postcommit binding (a parse-error re-prompt intervened, or the
+response answers an unrelated stale request), `_dispatch_git`'s own push
+branch refuses rather than publishing the main checkout's current branch —
+publishing "whatever the current branch is" is exactly what this whole path
+exists to prevent. That guard is scoped to a candidate still AWAITING
+publication: `_dispatch_task_push` clears `state.task_execution` the moment
+its own push actually lands, so a later, unrelated legacy push (an audit's
+`commit_and_push`, say) is never refused by a stale marker left over from an
+already-finished task — the alternative (never clearing it) would brick the
+legacy push path for the rest of every session that ever runs one
+produce-then-review task to completion.
+
+**Revision rounds.** `revise` re-enters the same worktree, keeps the ORIGINAL
+`task_base_sha`, and produces a NEW commit on top of the current candidate —
+`review_round` increments each time `_finish_postcommit` runs, success or
+failure. Maximum two rounds: round 1 is the initial `implement`, round 2 is
+one `revise`. A third round (`review_round >= 2` at the top of
+`_dispatch_task_postcommit`) never reaches the executor or ChatGPT —
+`_park_round_cap` parks immediately in `needs_user` with BOTH the full
+accumulated diff (`task_base_sha..candidate_sha`) and the latest round's own
+diff (the previous round's tip, derived from `commit_list` since each round
+is exactly one commit — not a separately persisted field), plus the feedback
+that triggered the third attempt.
 
 ---
 
@@ -462,6 +618,17 @@ Ongoing control: `status`, `tasks`, `pause`/`resume`, `run --answer "..."`,
 * The audit re-runs agents from scratch on `revise` (no incremental caching).
 * Manifest attribution is time-based: edits made by a human *during* an
   executor run are indistinguishable from task work (§4).
+* **Produce-then-review (§4b) is not wired into `cli.py`.** `Orchestrator`
+  takes the path only when constructed with `worktrees`/`execution_store`/
+  `intent_store`; the production CLI (`_build_orchestrator`) does not pass
+  them, so every real run still takes the §4 manifest path today (moot in
+  practice while `implement_enabled=false` gates task work off entirely).
+  Exercised end-to-end in `autoloop/tests/test_postcommit_flow.py` and
+  `test_postcommit_review.py` by constructing `Orchestrator` directly.
+* Produce-then-review's two-round cap (§4b) is per-task and does not reset —
+  a task that hits it stays parked; there is no `--revise-again` override,
+  only the general `run --answer` / manual state edit escape hatches §10
+  already documents for any park.
 * Subagent quality/latency depends on the local `claude` CLI; a failed agent
   is reported as a coverage gap, not retried automatically.
 * `doctor`'s live check and `smoke-browser` require the real dedicated

@@ -31,6 +31,14 @@ from .errors import StateCorruptError, StateError
 # (worktree path/branch, base/candidate sha, review round). Breaking on
 # purpose, same as v1->v2: a v2 session has no worktree/candidate-sha
 # provenance to backfill, so it must be reset rather than guessed at.
+#
+# NOT bumped for the pass-2b additions below (`PendingRequest.prompt_sha256`,
+# `PendingRequest.postcommit` / `LastResponse.postcommit`): both are new
+# dataclass fields with defaults, so `PendingRequest(**data)` /
+# `LastResponse(**data)` tolerate an old on-disk dict that lacks the keys —
+# there is nothing to backfill because a session with no in-flight postcommit
+# review simply has `postcommit = None`, which is exactly the correct value
+# for it.
 SCHEMA_VERSION = 3
 
 
@@ -56,6 +64,37 @@ TERMINAL_PHASES = frozenset({Phase.NEEDS_USER, Phase.STOPPED, Phase.FAILED})
 
 
 @dataclass
+class PostcommitBinding:
+    """Which produce-then-review candidate a single request/response pair
+    concerns — captured ONCE, when the review packet is sent, and never
+    recomputed from a later "latest state" lookup.
+
+    `packet_sha256` duplicates `PendingRequest.report_sha256` /
+    `LastResponse.report_sha256` on purpose: those fields are generic (every
+    request carries one, postcommit or not), so a reader who only has a
+    `PostcommitBinding` in hand (e.g. `_dispatch_task_push`) does not have to
+    reach into the surrounding request to know what report this binding
+    belongs to.
+
+    `candidate_tree_sha` is the candidate commit's tree object id, captured
+    at the SAME moment as `candidate_sha`. Because git objects are content
+    addressed, re-deriving `tree_of(candidate_sha)` at push time and
+    comparing it to this value only fails if something replaced the object
+    (`git replace`) or the object database itself is inconsistent — the kind
+    of tamper `report_sha256` alone cannot see, since that hash covers the
+    rendered packet TEXT, not a fresh read of the object right before
+    publishing it.
+    """
+
+    task_id: str
+    task_branch: str
+    base_sha: str
+    candidate_sha: str
+    candidate_tree_sha: str
+    packet_sha256: str
+
+
+@dataclass
 class PendingRequest:
     request_id: str
     payload: str
@@ -68,11 +107,23 @@ class PendingRequest:
     # The fully rendered prompt is stored so a crash-retry resubmits the exact
     # bytes that were stamped, and the stamps below stay truthful.
     prompt: str = ""
+    #: sha256 of `prompt`, stamped when `prompt` is built and re-checked
+    #: immediately before `client.submit` is called. `prompt` is never
+    #: recomputed between those two points in normal operation, so this
+    #: should never fail — it exists to catch on-disk corruption or manual
+    #: state-file tampering between a crash and a `--retry` sending a prompt
+    #: nobody actually reviewed the stamps for.
+    prompt_sha256: str = ""
     template: str = ""
     head_sha: str = ""
     base_sha: str = ""
     report_sha256: str = ""
     timestamp: str = ""
+    #: Set only when this request's payload is a produce-then-review packet
+    #: (`packet.build_review_packet`, wrapped by the `postcommit_review`
+    #: template). `None` for every other kind of request — audit reports,
+    #: corrective re-prompts, ordinary commit approvals, and so on.
+    postcommit: PostcommitBinding | None = None
 
 
 @dataclass
@@ -85,6 +136,34 @@ class LastResponse:
     head_sha: str = ""
     base_sha: str = ""
     report_sha256: str = ""
+    #: Carried over from the `PendingRequest` this response answers. The
+    #: orchestrator's push dispatch reads the candidate sha ONLY from here —
+    #: never from a fresh `TaskExecutionStore` lookup, and never from
+    #: anything in the directive itself (a `push` directive cannot even
+    #: carry a task_id — see `contract._forbid`). That is what makes an
+    #: approval of candidate A structurally unable to publish a swapped-in
+    #: candidate B.
+    postcommit: PostcommitBinding | None = None
+
+
+def _load_postcommit(raw: dict | None) -> PostcommitBinding | None:
+    return PostcommitBinding(**raw) if raw else None
+
+
+def _load_pending_request(raw: dict | None) -> PendingRequest | None:
+    if not raw:
+        return None
+    data = dict(raw)
+    data["postcommit"] = _load_postcommit(data.get("postcommit"))
+    return PendingRequest(**data)
+
+
+def _load_last_response(raw: dict | None) -> LastResponse | None:
+    if not raw:
+        return None
+    data = dict(raw)
+    data["postcommit"] = _load_postcommit(data.get("postcommit"))
+    return LastResponse(**data)
 
 
 @dataclass
@@ -131,8 +210,8 @@ class LoopState:
             pending = data.get("pending_request")
             last = data.get("last_response")
             kwargs = dict(data)
-            kwargs["pending_request"] = PendingRequest(**pending) if pending else None
-            kwargs["last_response"] = LastResponse(**last) if last else None
+            kwargs["pending_request"] = _load_pending_request(pending)
+            kwargs["last_response"] = _load_last_response(last)
             return cls(**kwargs)
         except (KeyError, TypeError) as exc:
             raise StateCorruptError(f"state file has an unexpected shape: {exc}") from exc
