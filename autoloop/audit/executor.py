@@ -42,15 +42,21 @@ SAFE_VALIDATION_BINARIES = frozenset(
     {"ruff", "pytest", "python", "python3", "npm", "npx", "tsc"}
 )
 
-DEFAULT_DOMAINS: tuple[tuple[str, str, str], ...] = (
+# (slug, title, charter, model). Order IS the wave order: with
+# max_parallel_agents=3 the first three run concurrently, then the rest — so
+# wave 1 is the two Haiku inventory domains plus one Sonnet reader, wave 2 is
+# the three Sonnet judgement domains. Models are per domain on purpose:
+# mechanical inventory (docs drift, test/CI/command inventory) does not need an
+# expensive model, and nothing here runs on the lead's model.
+DEFAULT_DOMAINS: tuple[tuple[str, str, str, str], ...] = (
     (
-        "repo_structure",
-        "Architecture & repository structure",
-        "Map the actual architecture against what CLAUDE.md and docs/SUMMARY.md "
-        "claim. Look for: dead or orphaned modules, duplicated responsibilities, "
-        "layering violations (routers writing state directly, services importing "
-        "routers), the two-backend split (lexy-app/backend vs root pipeline "
-        "modules), and import-time side effects.",
+        "docs_drift",
+        "Documentation drift",
+        "Compare CLAUDE.md, docs/SUMMARY.md, docs/TESTS.md, docs/ROADMAP.md and "
+        "docs/TODO.md against the code. Report claims that are demonstrably "
+        "stale (files that moved/died, counts that changed, commands that no "
+        "longer work). Cite the exact doc line and the contradicting code.",
+        "haiku",
     ),
     (
         "tests_ci",
@@ -59,6 +65,17 @@ DEFAULT_DOMAINS: tuple[tuple[str, str, str], ...] = (
         "not run by any documented command, tests that can never fail, xdist "
         "isolation hazards, the pytest-vs-python-m-pytest sys.path trap, ruff "
         "scope gaps, CI workflows that don't run what the docs claim.",
+        "haiku",
+    ),
+    (
+        "repo_structure",
+        "Architecture & repository structure",
+        "Map the actual architecture against what CLAUDE.md and docs/SUMMARY.md "
+        "claim. Look for: dead or orphaned modules, duplicated responsibilities, "
+        "layering violations (routers writing state directly, services importing "
+        "routers), the two-backend split (lexy-app/backend vs root pipeline "
+        "modules), and import-time side effects.",
+        "sonnet",
     ),
     (
         "security_paths",
@@ -68,6 +85,7 @@ DEFAULT_DOMAINS: tuple[tuple[str, str, str], ...] = (
         "uploads/document packages, subprocess call sites, auth/ownership "
         "filters on routers with path params, JSONB settings whitelist, LLM "
         "prompt-injection surfaces.",
+        "sonnet",
     ),
     (
         "db_migrations",
@@ -76,14 +94,7 @@ DEFAULT_DOMAINS: tuple[tuple[str, str, str], ...] = (
         "destructive operations without guards, drift between models/schemas.py "
         "and the migration chain, missing indexes implied by hot queries, and "
         "irreversible data transformations.",
-    ),
-    (
-        "docs_drift",
-        "Documentation drift",
-        "Compare CLAUDE.md, docs/SUMMARY.md, docs/TESTS.md, docs/ROADMAP.md and "
-        "docs/TODO.md against the code. Report claims that are demonstrably "
-        "stale (files that moved/died, counts that changed, commands that no "
-        "longer work). Cite the exact doc line and the contradicting code.",
+        "sonnet",
     ),
     (
         "ingestion_pipeline",
@@ -93,6 +104,7 @@ DEFAULT_DOMAINS: tuple[tuple[str, str, str], ...] = (
         "contract mismatches between the offline worker design and the import "
         "path, coordinate-space errors, validation gaps, and the import-path "
         "convention issue in test_document_package.py.",
+        "sonnet",
     ),
 )
 
@@ -176,12 +188,17 @@ class AuditExecutor:
         validation_runs = [self._run_validation(cmd) for cmd in self._validation_commands]
 
         specs = [
-            AgentSpec(domain=slug, title=title, prompt=_agent_prompt(title, charter, scope, feedback))
-            for slug, title, charter in self._domains
+            AgentSpec(
+                domain=slug,
+                title=title,
+                prompt=_agent_prompt(title, charter, scope, feedback),
+                model=model,
+            )
+            for slug, title, charter, model in self._domains
         ]
         results = self._run_agents(specs, run_dir)
 
-        findings, parse_rejects, agent_failures = [], [], []
+        findings, parse_rejects, agent_failures, covered = [], [], [], []
         for result in results:
             if not result.ok:
                 agent_failures.append(
@@ -189,8 +206,17 @@ class AuditExecutor:
                 )
                 continue
             outcome = parse_findings(result.raw_text, result.domain)
-            findings.extend(outcome.findings)
             parse_rejects.extend(outcome.rejected)
+            if not outcome.usable:
+                # The agent exited 0 but its output could not be read at all —
+                # the domain is UNCOVERED. Reporting this as "0 findings" while
+                # claiming no agent failures is exactly how a whole security
+                # review once vanished from a clean-looking summary.
+                reason = outcome.rejected[0].reason if outcome.rejected else "unusable output"
+                agent_failures.append(f"{result.domain}: output unusable — {reason}")
+                continue
+            findings.extend(outcome.findings)
+            covered.append(result.domain)
 
         reconciled = reconcile(findings, parse_rejects)
         proposal = generate_tasks(reconciled, self._registry)
@@ -223,6 +249,8 @@ class AuditExecutor:
             reconciled=reconciled,
             proposal=proposal,
             agent_failures=agent_failures,
+            covered_domains=tuple(covered),
+            all_domains=tuple(slug for slug, *_ in self._domains),
             raw_reports_dir=str(run_dir),
         )
         report_path = f"docs/AUDIT_{date}.md"

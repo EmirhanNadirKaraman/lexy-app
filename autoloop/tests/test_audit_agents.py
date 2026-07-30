@@ -78,3 +78,27 @@ def test_nonzero_exit_captures_stderr(tmp_path):
     result = ClaudeCliRunner(tmp_path, runner=stub).run(SPEC)
     assert not result.ok
     assert "rate limited" in result.error
+
+
+# ---- per-domain model routing ----------------------------------------------
+
+
+def test_model_flag_passed_when_a_domain_names_one(tmp_path):
+    spec = AgentSpec(domain="docs_drift", title="t", prompt="p", model="haiku")
+    argv = ClaudeCliRunner(tmp_path).build_argv(spec)
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "haiku"
+
+
+def test_model_flag_omitted_when_unset(tmp_path):
+    argv = ClaudeCliRunner(tmp_path).build_argv(SPEC)  # model defaults to ""
+    assert "--model" not in argv
+
+
+def test_model_routing_does_not_weaken_read_only_flags(tmp_path):
+    spec = AgentSpec(domain="d", title="t", prompt="p", model="sonnet")
+    argv = ClaudeCliRunner(tmp_path).build_argv(spec)
+    for tool in READ_ONLY_ALLOWED_TOOLS:
+        assert tool in argv
+    for tool in DISALLOWED_TOOLS:
+        assert tool in argv[argv.index("--disallowedTools"):]

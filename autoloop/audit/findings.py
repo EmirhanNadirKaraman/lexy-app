@@ -102,6 +102,12 @@ class RejectedItem:
 class ParseOutcome:
     findings: list[Finding] = field(default_factory=list)
     rejected: list[RejectedItem] = field(default_factory=list)
+    #: False when the agent's output as a WHOLE was unusable (empty, not JSON,
+    #: wrong top-level shape). That is a coverage GAP for the domain, not a
+    #: per-item rejection: the agent may have found real problems we never got
+    #: to see. Callers must report it as a failure rather than as "0 findings",
+    #: or an entire domain vanishes behind a clean-looking summary.
+    usable: bool = True
 
 
 def _str_list(value: object, name: str, allow_empty: bool) -> tuple[str, ...]:
@@ -157,6 +163,7 @@ def parse_findings(text: str, domain: str) -> ParseOutcome:
     outcome = ParseOutcome()
     if not isinstance(text, str) or not text.strip():
         outcome.rejected.append(RejectedItem("empty agent output", raw="", domain=domain))
+        outcome.usable = False
         return outcome
     blocks = _JSON_BLOCK.findall(text)
     candidate = blocks[-1] if blocks else text.strip()
@@ -166,6 +173,7 @@ def parse_findings(text: str, domain: str) -> ParseOutcome:
         outcome.rejected.append(
             RejectedItem(f"agent output is not valid JSON: {exc}", raw=text[:2000], domain=domain)
         )
+        outcome.usable = False
         return outcome
     if isinstance(data, dict):
         if set(data) != {"findings"}:
@@ -176,6 +184,7 @@ def parse_findings(text: str, domain: str) -> ParseOutcome:
                     domain=domain,
                 )
             )
+            outcome.usable = False
             return outcome
         items = data["findings"]
     else:
@@ -184,6 +193,7 @@ def parse_findings(text: str, domain: str) -> ParseOutcome:
         outcome.rejected.append(
             RejectedItem("'findings' must be a list", raw=candidate[:2000], domain=domain)
         )
+        outcome.usable = False
         return outcome
     seen_ids: set[str] = set()
     for i, item in enumerate(items):

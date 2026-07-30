@@ -40,6 +40,11 @@ class AgentSpec:
     domain: str  # slug, e.g. "security_paths"
     title: str
     prompt: str
+    #: Model alias for this domain ("haiku" / "sonnet" / "opus"). Empty means
+    #: "whatever the CLI defaults to". Routing is per domain so mechanical
+    #: inventory work does not run on an expensive model — see the allocation
+    #: in `executor.DEFAULT_DOMAINS`.
+    model: str = ""
 
 
 @dataclass(frozen=True)
@@ -74,10 +79,12 @@ class ClaudeCliRunner:
         self._runner = runner or subprocess.run
 
     def build_argv(self, spec: AgentSpec) -> list[str]:
+        model_flag = ["--model", spec.model] if spec.model else []
         return [
             *self._command,
             "-p",
             spec.prompt,
+            *model_flag,
             "--output-format",
             "json",
             "--permission-mode",

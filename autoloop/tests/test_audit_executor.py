@@ -171,3 +171,122 @@ def test_unsafe_validation_command_refused(repo, tmp_path):
     outcome = executor.execute(audit_directive(), None)
     assert "FAIL" in outcome.validation
     assert "not a safe validation binary" in outcome.details
+
+
+# ---- model allocation (operator Decision 2) --------------------------------
+
+
+def test_domain_allocation_is_two_haiku_inventory_then_four_sonnet():
+    from autoloop.audit.executor import DEFAULT_DOMAINS
+
+    assert len(DEFAULT_DOMAINS) == 6
+    slugs = [d[0] for d in DEFAULT_DOMAINS]
+    models = [d[3] for d in DEFAULT_DOMAINS]
+    # Order is wave order: wave 1 = first three (max_parallel_agents=3).
+    assert slugs[:3] == ["docs_drift", "tests_ci", "repo_structure"]
+    assert models[:3] == ["haiku", "haiku", "sonnet"]
+    assert models[3:] == ["sonnet", "sonnet", "sonnet"]
+    # Mechanical inventory never runs on an expensive model, and the lead's
+    # model is never delegated to.
+    assert dict(zip(slugs, models))["docs_drift"] == "haiku"
+    assert dict(zip(slugs, models))["tests_ci"] == "haiku"
+    assert "opus" not in models
+    assert "fable" not in models
+
+
+def test_executor_routes_each_domain_to_its_model(repo, tmp_path):
+    runner = FakeRunner()
+    build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+    routed = {spec.domain: spec.model for spec in runner.specs}
+    assert routed == {
+        "docs_drift": "haiku",
+        "tests_ci": "haiku",
+        "repo_structure": "sonnet",
+        "security_paths": "sonnet",
+        "db_migrations": "sonnet",
+        "ingestion_pipeline": "sonnet",
+    }
+
+
+def test_parallelism_is_capped_at_the_configured_worker_count(repo, tmp_path):
+    """Six domains, cap of three: never more than three agents in flight."""
+    import threading
+
+    live = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+    gate = threading.Barrier(3, timeout=5)
+
+    class CountingRunner(FakeRunner):
+        def run(self, spec):
+            with lock:
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            try:
+                # Force three to be genuinely concurrent, so a serial
+                # implementation would deadlock the barrier instead of passing.
+                gate.wait()
+                return super().run(spec)
+            finally:
+                with lock:
+                    live["now"] -= 1
+
+    executor = AuditExecutor(
+        git=GitGateway(repo, PolicyEngine(PolicyConfig())),
+        agent_runner=CountingRunner(),
+        markdown=MarkdownPolicy(repo),
+        registry=TaskRegistry(),
+        run_dir_base=tmp_path / "runs",
+        validation_commands=(),
+        max_parallel_agents=3,
+        command_runner=ok_command,
+    )
+    executor.execute(audit_directive(), None)
+    assert live["peak"] == 3  # exactly the cap, excluding the lead
+
+
+def test_shipped_config_caps_workers_at_three():
+    from autoloop.config import AuditConfig
+
+    assert AuditConfig().max_parallel_agents == 3
+
+
+# ---- coverage honesty (the defect ChatGPT caught) --------------------------
+
+
+def test_unusable_agent_output_is_reported_as_a_coverage_failure(repo, tmp_path):
+    """The live regression: security_paths returned truncated JSON, contributed
+    zero findings, and the report still claimed '0 agent failures'."""
+    truncated = '{"findings": [{"id": "sec-01", "evidence": "unterminated'
+    runner = FakeRunner(outputs={"security_paths": truncated})
+    outcome = build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+    assert outcome.status == "error"
+    assert "COVERAGE INCOMPLETE" in outcome.summary
+    assert "security_paths" in outcome.details
+    assert "output unusable" in outcome.details
+
+
+def test_report_shows_per_domain_coverage_and_names_the_missing_domain(repo, tmp_path):
+    truncated = '{"findings": [{"id": "sec-01"'
+    runner = FakeRunner(outputs={"security_paths": truncated})
+    outcome = build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+    assert "## Domain coverage — 5/6 domains reported usable output" in outcome.details
+    assert "| `security_paths` | **NO** | 0 |" in outcome.details
+    assert "treat their areas as unaudited, not as clean" in outcome.details
+
+
+def test_full_coverage_reports_six_of_six(repo, tmp_path):
+    outcome = build_executor(repo, tmp_path, FakeRunner()).execute(audit_directive(), None)
+    assert "## Domain coverage — 6/6 domains reported usable output" in outcome.details
+    assert "COVERAGE INCOMPLETE" not in outcome.details
+    assert outcome.status == "ok"
+
+
+def test_one_bad_finding_does_not_mark_a_domain_uncovered(repo, tmp_path):
+    """A single rejected item is not a coverage gap — the domain still reported."""
+    mixed = json.dumps(
+        {"findings": [json.loads(good_findings())["findings"][0], {"id": "broken"}]}
+    )
+    runner = FakeRunner(outputs={"db_migrations": mixed})
+    outcome = build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+    assert outcome.status == "ok"
+    assert "## Domain coverage — 6/6 domains reported usable output" in outcome.details

@@ -3,6 +3,8 @@ reasons, tolerance of prose around the JSON block."""
 
 import json
 
+import pytest
+
 from autoloop.audit.findings import Finding, parse_findings
 
 
@@ -112,3 +114,45 @@ def test_wrong_top_level_shape_rejected():
 def test_empty_output_rejected():
     outcome = parse_findings("", domain="d")
     assert "empty agent output" in outcome.rejected[0].reason
+
+
+# ---- whole-output failure is a COVERAGE GAP, not a per-item rejection -------
+
+
+def test_unusable_output_is_flagged_unusable():
+    """A truncated reply lost an entire security review once while the summary
+    claimed zero agent failures. Whole-output failures must be distinguishable."""
+    truncated = '{"findings": [{"id": "sec-01", "evidence": "unterminated string'
+    outcome = parse_findings(truncated, domain="security_paths")
+    assert outcome.usable is False
+    assert outcome.findings == []
+    assert "not valid JSON" in outcome.rejected[0].reason
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "   ",
+        "I could not complete the audit.",
+        json.dumps({"results": []}),
+        json.dumps({"findings": "not a list"}),
+    ],
+)
+def test_whole_output_failures_are_unusable(text):
+    assert parse_findings(text, domain="d").usable is False
+
+
+def test_per_item_rejection_keeps_the_batch_usable():
+    """One malformed finding must NOT mark the domain uncovered — the rest of
+    the agent's work is still real."""
+    outcome = parse_findings(
+        wrap(finding_dict(), finding_dict(id="bad", severity="catastrophic")), domain="d"
+    )
+    assert outcome.usable is True
+    assert len(outcome.findings) == 1
+    assert len(outcome.rejected) == 1
+
+
+def test_empty_findings_from_a_clean_domain_is_usable():
+    assert parse_findings(wrap(), domain="d").usable is True

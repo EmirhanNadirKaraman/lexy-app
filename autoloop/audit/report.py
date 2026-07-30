@@ -64,6 +64,8 @@ def render_report(
     proposal: TaskGraphProposal,
     agent_failures: list[str],
     raw_reports_dir: str,
+    covered_domains: tuple[str, ...] = (),
+    all_domains: tuple[str, ...] = (),
 ) -> str:
     parts: list[str] = [
         f"# Repository audit — {date}",
@@ -79,6 +81,34 @@ def render_report(
     if feedback:
         parts.append(f"- revision feedback incorporated: {feedback}")
     parts.append("")
+
+    # Coverage FIRST: a reader must not have to reach the bottom of a 100 KB
+    # report to learn that a whole domain produced nothing usable.
+    if all_domains:
+        covered = set(covered_domains)
+        missing = [d for d in all_domains if d not in covered]
+        parts.append(
+            f"## Domain coverage — {len(covered)}/{len(all_domains)} domains reported usable output"
+        )
+        if missing:
+            parts.append("")
+            parts.append(
+                f"> **COVERAGE INCOMPLETE.** No usable findings from: "
+                f"{', '.join(f'`{d}`' for d in missing)}. Anything those domains "
+                "would have found is ABSENT from this report — treat their areas "
+                "as unaudited, not as clean."
+            )
+        parts.append("")
+        parts.append("| domain | usable output | findings |")
+        parts.append("|---|---|---|")
+        counts = {}
+        for bucket in BUCKETS:
+            for finding in reconciled.buckets[bucket]:
+                counts[finding.domain] = counts.get(finding.domain, 0) + 1
+        for domain in all_domains:
+            ok = "yes" if domain in covered else "**NO**"
+            parts.append(f"| `{domain}` | {ok} | {counts.get(domain, 0)} |")
+        parts.append("")
 
     parts.append("## Validation baseline")
     if validation_runs:
