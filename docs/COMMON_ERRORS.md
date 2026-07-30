@@ -264,6 +264,32 @@ time. Fixing only the count would have left the pointless re-inserts.
 
 ## 2. Test suite
 
+### Backend suite: hundreds of `asyncpg` errors, or one unreproducible failure
+**Symptom:** `python3 -m pytest -n auto` in `lexy-app/backend` reports something
+like `1260 errors` with tracebacks bottoming out in
+`pool = await asyncpg.create_pool(...)`, or a single odd failure such as
+`test_repeated_calls_drain_to_zero`. Re-running alone passes clean at the
+expected `1258 passed, 2 skipped`.
+
+**Cause:** two backend suites running against the SAME Postgres database at the
+same time. Easy to do by accident — start one in the background to save time,
+then start another in the foreground while it is still going. The per-worker
+`PYTEST_XDIST_WORKER` tagging (CLAUDE.md §11) isolates workers *within* one run;
+it does nothing between two independent runs, which trample each other's rows
+and exhaust the pool.
+
+**Why it's dangerous:** the output looks like a catastrophic regression in code
+that was never touched, which invites debugging the wrong thing entirely. The
+single-failure variant is worse — it reads as a real flake worth chasing.
+
+**Fix:** run the backend suite once at a time. Before believing any backend
+failure, confirm nothing else is running against the DB and re-run it alone:
+```bash
+cd lexy-app/backend && python3 -m pytest -n auto -q   # expect 1258 passed, 2 skipped
+```
+If a background run is already in flight, wait for its notification rather than
+starting a second one.
+
 ### `ModuleNotFoundError: No module named 'services'` — only `test_document_package.py` fails collection
 **Symptom:** Backend suite reports `1151 passed, 2 skipped, 1 error` — the
 error is an ImportError collecting `tests/test_document_package.py`. The A2
