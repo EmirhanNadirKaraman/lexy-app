@@ -19,16 +19,42 @@ be reintroduced without changing the whitelist itself.
 HEAD and HEAD's message equals the requested message, the commit already
 happened — return it. `push` always pushes the current branch by explicit
 refspec, never a bare `git push`.
+
+**Produce-then-review path** (`commit_and_capture` / `push_exact`, alongside
+`worktask.py` and `environment.py`): the authorize-then-produce commit paths
+above verify BEFORE committing (`commit`'s manifest check, `commit_adopted`'s
+immutable-tree verification). This path instead commits first with hooks
+enabled, reads the resulting sha honestly from `rev-parse HEAD` (never
+predicted), and leaves review to `range_diff`/`commit_range_paths` reading
+the immutable commit that already exists. `push_exact` then publishes ONLY an
+explicit, already-resolved `<sha>:<dest_ref>` refspec — never a branch name —
+with `+`-prefix and non-hex-source refspecs refused at both this layer and
+the policy layer (F2), and any `url.*.insteadOf` rule refused outright before
+any network access (F5). See `worktask.py` for the crash-recovery story
+(`CommitIntent` / `reconcile_after_crash`, F8) and `environment.py` for
+detecting a hook or push destination that changed mid-task.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
+from typing import Sequence
 
 from .errors import GitCommandError, GitOperationDenied
 from .policy import PolicyEngine
+from .worktask import CommitIntent, IntentStore
+
+#: A push refspec's source must be a literal, already-resolved 40-hex commit
+#: id — never a branch name, tag, or `HEAD`, any of which can move between
+#: review and push.
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+#: `refs/heads/<name>`, matching the policy layer's shape. The character
+#: class deliberately excludes `+` and does not by itself exclude `..` (a
+#: name like `refs/heads/a/../b` matches it), so `..` is checked separately.
+_BRANCH_REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9._/-]+$")
 
 
 class GitGateway:
@@ -149,6 +175,135 @@ class GitGateway:
         )
         return {p for p in raw.split("\0") if p}
 
+    def config_get(self, key: str) -> str:
+        """`git config --get <key>`, or "" if unset.
+
+        `git config --get` exits 1 when the key is not set — that is a
+        normal "not configured" outcome, not a command failure, so this
+        calls `_git` with `check=False` rather than letting the default
+        `check=True` raise on it.
+        """
+        proc = self._git("config", "--get", key, check=False)
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    def config_get_regexp(self, pattern: str) -> str:
+        """`git config --get-regexp <pattern>`, or "" if nothing matches.
+
+        Used instead of `git remote -v` / `git remote get-url` wherever a
+        check needs the LITERAL configured value: both of those commands
+        report the value AFTER a `url.*.insteadOf` rewrite is applied, which
+        is exactly the thing F5 needs to detect rather than transparently
+        reflect.
+        """
+        proc = self._git("config", "--get-regexp", pattern, check=False)
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    def commit_range_paths(self, base_sha: str, candidate_sha: str) -> set[str]:
+        """Every path that differs between two commits, diffing their trees
+        DIRECTLY (same plumbing as `changed_paths`) rather than walking
+        history — so a path touched only by an intermediate commit between
+        `base_sha` and `candidate_sha` (e.g. one a hook created) is never
+        missed just because it isn't the final state of some other path.
+
+        NUL-delimited (`-z`): without it, `diff-tree`'s default output quotes
+        and escapes paths containing tabs or double quotes, and a caller
+        keying a security decision on the pathname would compare the wrong
+        string.
+        """
+        return self.changed_paths(base_sha, candidate_sha)
+
+    def is_descendant(self, candidate: str, base: str) -> bool:
+        """True if `base` is `candidate` itself or an ancestor of it.
+
+        `git merge-base --is-ancestor` exits 0 for "yes" and 1 for "no" —
+        both are normal outcomes of asking the question, not command
+        failures — so this treats only those two codes specially. Any other
+        exit code (e.g. an unresolvable object) is a genuine error and is
+        raised rather than silently reported as "not a descendant".
+        """
+        proc = self._git("merge-base", "--is-ancestor", base, candidate, check=False)
+        if proc.returncode == 0:
+            return True
+        if proc.returncode == 1:
+            return False
+        raise GitCommandError(
+            f"git merge-base --is-ancestor {base} {candidate} failed "
+            f"(rc={proc.returncode}): {(proc.stderr or proc.stdout).strip()}"
+        )
+
+    #: Above this many bytes, `range_diff`/`range_diff_stat` refuse outright
+    #: rather than truncate. A truncated diff can hide exactly the change a
+    #: reviewer needs to see, which would be worse than an explicit refusal.
+    RANGE_DIFF_MAX_BYTES = 400_000
+
+    #: Flags common to `range_diff` and `range_diff_stat`: no external diff
+    #: driver, no textconv filter, no ANSI color in the reviewed text, and a
+    #: rename always shown as delete+add rather than hidden behind a rename
+    #: heuristic.
+    _RANGE_DIFF_SAFETY_FLAGS = (
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--no-renames",
+    )
+
+    def range_diff(self, base_sha: str, candidate_sha: str) -> str:
+        """The full patch text between two commits, plumbing-rendered so no
+        external diff driver or textconv filter can execute and no rename
+        heuristic can hide a path's real diff.
+
+        Refuses (raises `GitCommandError`) above `RANGE_DIFF_MAX_BYTES`
+        rather than truncating.
+        """
+        raw = self._git_bytes(
+            "diff-tree", "-r", "-p", *self._RANGE_DIFF_SAFETY_FLAGS, base_sha, candidate_sha
+        )
+        if len(raw) > self.RANGE_DIFF_MAX_BYTES:
+            raise GitCommandError(
+                f"range diff {base_sha[:12]}..{candidate_sha[:12]} is {len(raw)} "
+                f"bytes, over the {self.RANGE_DIFF_MAX_BYTES}-byte cap — refusing "
+                "rather than truncating a diff a reviewer must see in full"
+            )
+        return raw.decode("utf-8", "replace")
+
+    def range_diff_stat(self, base_sha: str, candidate_sha: str) -> str:
+        """Like `range_diff` but the `--stat` summary only, same safety
+        flags and the same refuse-rather-than-truncate cap."""
+        raw = self._git_bytes(
+            "diff-tree", "-r", "--stat", *self._RANGE_DIFF_SAFETY_FLAGS, base_sha, candidate_sha
+        )
+        if len(raw) > self.RANGE_DIFF_MAX_BYTES:
+            raise GitCommandError(
+                f"range diff stat {base_sha[:12]}..{candidate_sha[:12]} is "
+                f"{len(raw)} bytes, over the {self.RANGE_DIFF_MAX_BYTES}-byte cap "
+                "— refusing rather than truncating"
+            )
+        return raw.decode("utf-8", "replace")
+
+    def commit_list(self, base_sha: str, candidate_sha: str) -> list[dict]:
+        """Commits strictly after `base_sha` up to and including
+        `candidate_sha`, oldest first, each as `{"sha", "subject", "parents"}`.
+
+        `rev-list` alone fixes the exact ordered commit set (newest first, so
+        reversed here for an oldest-first report); metadata for each comes
+        from `read_commit` (already-tested `cat-file commit` parsing) rather
+        than a `--format=%H %P %s` line, which is only unambiguous when the
+        subject never starts with a token that itself looks like a 40-hex
+        parent sha — not a guarantee this can make. No `log`-specific flags
+        are needed as a result.
+        """
+        raw_shas = self._out("rev-list", f"{base_sha}..{candidate_sha}")
+        shas = [s for s in raw_shas.splitlines() if s]
+        shas.reverse()  # rev-list is newest-first; report oldest-first
+        commits = []
+        for sha in shas:
+            info = self.read_commit(sha)
+            message = info.get("message", "")
+            lines = message.splitlines()
+            subject = lines[0] if lines else ""
+            commits.append({"sha": sha, "subject": subject, "parents": info.get("parents", [])})
+        return commits
+
     # ---- write (only reachable from explicitly approved directives) ---------
 
     def commit(
@@ -201,12 +356,202 @@ class GitGateway:
         self._git("commit", "-m", message)
         return self.head_sha(), False, summary
 
+    # ---- produce-then-review commit path ------------------------------------
+    #
+    # Unlike `commit_adopted`, hooks are expected to run here — the artifact
+    # under review is the resulting commit's diff (`range_diff`), read from
+    # immutable git objects AFTER the commit exists, not a pre-verified tree.
+    # This is the "produce" half of produce-then-review: nothing here decides
+    # whether the commit is good, only that the intent survives a crash and
+    # the sha is read honestly.
+
+    def commit_and_capture(
+        self, message: str, paths: tuple[str, ...], intent_store: IntentStore, intent: CommitIntent
+    ) -> tuple[str, str]:
+        """Write `intent` durably, stage exactly `paths`, run a NORMAL
+        `git commit` (hooks enabled, never `--no-verify`), then read the
+        candidate sha from `rev-parse HEAD` only after the commit call
+        returns. Returns `(candidate_sha, staged_diff_summary)`.
+
+        Sequence, in order: (1) `intent_store.save(intent)` — durable BEFORE
+        anything else runs; (2) `git add -- <paths>`; (3) `git commit -m
+        <message>`; (4) `rev-parse HEAD`. The sha is never predicted or
+        precomputed — step 4 is the only source of truth for what was
+        actually committed, because a hook can change the tree between steps
+        2 and 3 in ways nothing upstream of `rev-parse HEAD` could know about.
+
+        Paths are NOT stripped: a leading/trailing space or tab in a filename
+        is part of its identity (unlike `commit`, which strips — this method
+        deliberately does not inherit that). Only fully empty/whitespace-only
+        entries are dropped as invalid.
+
+        Deliberately does NOT inherit `commit`'s message-equality idempotency
+        shortcut ("nothing to commit, but HEAD's message already matches" ->
+        treat as already done): F8 exists precisely because message + parent
+        + author identity cannot distinguish this task's commit from an
+        unrelated one, so that shortcut would reintroduce the exact ambiguity
+        `reconcile_after_crash` (`worktask.py`) is built to resolve instead.
+        Crash recovery for this path goes through `reconcile_after_crash`,
+        never through a message match.
+        """
+        approved = tuple(p for p in paths if p and p.strip())
+        if not approved:
+            raise GitCommandError(
+                "commit_and_capture requires an explicit non-empty path list"
+            )
+        head = self.head_sha()
+        if head != intent.expected_parent_sha:
+            # The intent was built against a different HEAD than the one we are
+            # about to commit onto. Refusing here beats committing and letting
+            # `reconcile_after_crash` sort it out afterwards: that would classify
+            # the result AMBIGUOUS (correct, but only discoverable after a crash),
+            # whereas the mismatch is knowable right now, before anything is
+            # staged or any hook runs.
+            raise GitCommandError(
+                f"commit_and_capture refuses: HEAD is {head[:12]} but the commit "
+                f"intent expects parent {intent.expected_parent_sha[:12]}. The "
+                "branch moved after the intent was recorded — rebuild the intent "
+                "against the current HEAD rather than committing onto a base "
+                "nobody planned for."
+            )
+        intent_store.save(intent)
+        self._git("add", "--", *sorted(approved))
+        summary = self._out("diff", "--cached", "--stat")
+        self._git("commit", "-m", message)
+        candidate_sha = self._out("rev-parse", "HEAD")
+        return candidate_sha, summary
+
     def push(self, remote: str = "origin") -> str:
         branch = self.current_branch()
         if not branch:
             raise GitCommandError("cannot push: detached HEAD")
         proc = self._git("push", remote, branch)
         return (proc.stdout + proc.stderr).strip()
+
+    def remote_ref_sha(self, remote: str, dest_ref: str) -> str:
+        """The sha `dest_ref` currently points to on `remote`, or "" if the
+        ref does not exist there. Always a fresh `ls-remote` round-trip —
+        never a previous push's captured output — which is exactly the
+        distinction `push_exact` relies on to confirm what actually landed."""
+        raw = self._out("ls-remote", "--heads", remote, dest_ref)
+        if not raw:
+            return ""
+        first_line = raw.splitlines()[0]
+        sha, _, _ref = first_line.partition("\t")
+        return sha.strip()
+
+    def push_exact(
+        self,
+        remote: str,
+        sha: str,
+        dest_ref: str,
+        protected_refs: Sequence[str],
+        expected_url: str | None = None,
+    ) -> str:
+        """Push exactly one already-existing commit to exactly one ref, by an
+        explicit `<sha>:<dest_ref>` refspec — never a bare branch push (which
+        pushes whatever the current branch happens to be) and never able to
+        force anything, because the refspec is built ONLY by concatenating
+        the two values this method itself validates below.
+
+        Every check runs BEFORE any network access:
+
+          * `sha` must be a literal 40-hex commit id — a branch name, tag or
+            `HEAD` can move between review and push, so only an
+            already-resolved id may be pinned into the refspec;
+          * `dest_ref` must match `refs/heads/<name>`, contain no `..`
+            (checked separately from the regex: a name like
+            `refs/heads/a/../b` matches the character class but is not a
+            single flat name), and its branch part must not be in
+            `protected_refs` — checked against BOTH the bare name and the
+            full ref, so a caller cannot dodge the check by passing whichever
+            form it happens to skip;
+          * no `+` may appear anywhere in the constructed refspec (F2). Given
+            the two regexes above, neither half can actually contain `+`, so
+            this is unreachable today — kept anyway as an independent check
+            that still stands between a force-push refspec and the network
+            if either regex is ever loosened later;
+          * no `url.*.insteadOf` rule may be configured ANYWHERE in the
+            repository's git config (F5). This refuses on the rule's mere
+            PRESENCE rather than trying to reason about whether a specific
+            rule would rewrite this specific remote — `git remote -v` /
+            `git remote get-url` reflect the rewritten destination, not the
+            configured one, so presence is the only signal that does not
+            depend on reproducing git's own URL-matching logic;
+          * `remote.<remote>.pushurl` must NOT be configured. When set, git
+            pushes there INSTEAD of `remote.<remote>.url` — verified
+            empirically: pointing `url` at one bare repo and `pushurl` at a
+            second sends the commit to the second while `git config --get
+            remote.<remote>.url` (and this method's own url check below)
+            keeps reporting the first, unchanged. Refusing on presence,
+            exactly like the `insteadOf` check, is the only response that
+            does not depend on reasoning about which URL git will actually
+            use in a given git version;
+          * `remote.<remote>.url` is read directly via `config --get` (never
+            `get-url`, same reason) and must be non-empty; if the caller
+            supplies `expected_url`, it must match exactly.
+
+        After the push, `ls-remote --heads <remote> <dest_ref>` — a fresh
+        network round-trip, never the push command's own captured output —
+        must report exactly `sha`; anything else raises. Returns that
+        confirmed sha.
+        """
+        if not _SHA_RE.match(sha or ""):
+            raise GitCommandError(f"push_exact refuses a non-40-hex sha: {sha!r}")
+        if ".." in (dest_ref or "") or not _BRANCH_REF_RE.match(dest_ref or ""):
+            raise GitCommandError(
+                f"push_exact refuses dest_ref {dest_ref!r}: must match "
+                "'refs/heads/<name>' with no '..'"
+            )
+        branch_name = dest_ref[len("refs/heads/"):]
+        protected = set(protected_refs)
+        if branch_name in protected or dest_ref in protected:
+            raise GitCommandError(
+                f"push_exact refuses protected ref {dest_ref!r} (branch {branch_name!r})"
+            )
+        refspec = f"{sha}:{dest_ref}"
+        if "+" in refspec:
+            raise GitCommandError(
+                f"push_exact refuses a '+' anywhere in the refspec: {refspec!r}"
+            )
+
+        instead_of = self.config_get_regexp(r"^url\..*\.insteadof$")
+        if instead_of:
+            raise GitCommandError(
+                "push_exact refuses: url.*.insteadOf rule(s) are configured "
+                f"({instead_of!r}). These silently redirect a push to another "
+                "host, and `git remote -v`/`git remote get-url` would show the "
+                "REWRITTEN destination rather than the configured one — so the "
+                "only response that does not depend on reasoning about which "
+                "rule 'would' apply is refusing on their mere presence."
+            )
+
+        pushurl = self.config_get(f"remote.{remote}.pushurl")
+        if pushurl:
+            raise GitCommandError(
+                f"push_exact refuses: remote.{remote}.pushurl is configured "
+                f"({pushurl!r}) — git would push there INSTEAD of "
+                f"remote.{remote}.url, silently bypassing the url check below"
+            )
+
+        configured_url = self.config_get(f"remote.{remote}.url")
+        if not configured_url:
+            raise GitCommandError(f"push_exact refuses: remote {remote!r} has no configured url")
+        if expected_url is not None and configured_url != expected_url:
+            raise GitCommandError(
+                f"push_exact refuses: remote.{remote}.url is {configured_url!r}, "
+                f"caller expected {expected_url!r}"
+            )
+
+        self._git("push", remote, refspec)
+
+        landed = self.remote_ref_sha(remote, dest_ref)
+        if landed != sha:
+            raise GitCommandError(
+                f"push_exact: after pushing, {remote}'s {dest_ref} is {landed!r}, "
+                f"expected {sha!r}"
+            )
+        return landed
 
     # ---- immutable-tree commit path (adopted manifests) --------------------
     #

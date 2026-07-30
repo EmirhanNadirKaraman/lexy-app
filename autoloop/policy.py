@@ -15,6 +15,7 @@ Configurable rules:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -97,7 +98,44 @@ _ALLOWED_GIT: dict[str, frozenset[str]] = {
     "update-ref": frozenset(),
     "symbolic-ref": frozenset(),
     "ls-tree": frozenset({"-r", "-z"}),
-    "diff-tree": frozenset({"-r", "--name-only", "-z"}),
+    # `-p`/`--stat` + the four `--no-*` safety flags are for the post-commit
+    # review path (`range_diff` / `range_diff_stat`): plumbing `diff-tree`
+    # honours `diff.external` and textconv filters unless told not to, so
+    # rendering a reviewed diff without `--no-ext-diff --no-textconv
+    # --no-color --no-renames` could run attacker-configured code or hide a
+    # rename behind a heuristic.
+    "diff-tree": frozenset(
+        {
+            "-r",
+            "--name-only",
+            "-z",
+            "-p",
+            "--stat",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-renames",
+        }
+    ),
+    # Post-commit primitives (produce-then-review): confirming ancestry,
+    # listing commits in a range, reading config without trusting
+    # `remote -v`/`get-url` (which can reflect an `insteadOf` rewrite rather
+    # than the literal configured value — F5), and confirming what actually
+    # landed on the remote.
+    "merge-base": frozenset({"--is-ancestor"}),
+    "rev-list": frozenset(),
+    "ls-remote": frozenset({"--heads"}),
+    "config": frozenset({"--get", "--get-regexp", "--get-all"}),
+    # Not yet called by any gateway method in this pass (no worktree-per-task
+    # wiring exists yet) — whitelisted ahead of that so policy.py does not
+    # need to change again when it lands. NOTE: "add"/"remove"/"list"/"prune"
+    # are the git-worktree action words, not flags, so — like every other
+    # subcommand here — they are NOT structurally checked against this set;
+    # `validate_git_command` only validates tokens starting with "-". That is
+    # the same class of gap F2 closed for `push` specifically, left open here
+    # because nothing in this repo invokes `git worktree` yet. Flag this
+    # before wiring worktree usage.
+    "worktree": frozenset({"add", "remove", "list", "prune", "-b", "--force", "--porcelain"}),
 }
 
 # Flags that MUST be present for the subcommand to be allowed at all.
@@ -105,6 +143,13 @@ _REQUIRED_GIT: dict[str, frozenset[str]] = {
     "restore": frozenset({"--staged"}),
     "add": frozenset({"--"}),
 }
+
+#: A `push` refspec's source (the part before ":") must be a literal,
+#: already-resolved 40-hex commit id — never a branch name, tag, or `HEAD`,
+#: all of which can move between review and push. Matched against the whole
+#: token, so `+<40hex>:...` fails this too (belt-and-braces with the
+#: `+`-prefix check below, which fires first).
+_HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
 
 class PolicyEngine:
@@ -213,6 +258,32 @@ class PolicyEngine:
                 return Verdict.deny(
                     "git_flag_forbidden", f"flag '{token}' is not allowed for 'git {sub}'"
                 )
+        # F2, closed here in addition to `push`'s empty flag set: the flag
+        # loop above only inspects tokens starting with "-", so a refspec
+        # like `+<sha>:refs/heads/x` (no leading "-") sailed through
+        # untouched and force-pushed with zero flags — reproduced as a real
+        # forced update. Both checks below apply to EVERY non-flag `push`
+        # token, deliberately not just ones that look like refspecs.
+        if sub == "push":
+            for token in args[1:]:
+                if token.startswith("+"):
+                    return Verdict.deny(
+                        "git_push_force_prefix",
+                        f"push argv token '{token}' starts with '+' — a "
+                        "force-update refspec prefix is refused unconditionally, "
+                        "regardless of the flag whitelist (F2)",
+                    )
+                if ":" in token:
+                    source = token.split(":", 1)[0]
+                    if not _HEX40.match(source):
+                        return Verdict.deny(
+                            "git_push_refspec_source",
+                            f"push refspec '{token}' has a source that is not a "
+                            "literal 40-hex commit id — only an already-created, "
+                            "already-resolved commit may be pushed by refspec "
+                            "through this gateway (F2); a branch name, tag or "
+                            "'HEAD' can move between review and push",
+                        )
         required = _REQUIRED_GIT.get(sub)
         if required and not required.issubset(args[1:]):
             missing = sorted(required - set(args[1:]))
