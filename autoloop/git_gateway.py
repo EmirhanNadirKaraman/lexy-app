@@ -366,7 +366,12 @@ class GitGateway:
     # the sha is read honestly.
 
     def commit_and_capture(
-        self, message: str, paths: tuple[str, ...], intent_store: IntentStore, intent: CommitIntent
+        self,
+        message: str,
+        paths: tuple[str, ...],
+        intent_store: IntentStore,
+        intent: CommitIntent,
+        env_snapshot=None,
     ) -> tuple[str, str]:
         """Write `intent` durably, stage exactly `paths`, run a NORMAL
         `git commit` (hooks enabled, never `--no-verify`), then read the
@@ -399,6 +404,18 @@ class GitGateway:
             raise GitCommandError(
                 "commit_and_capture requires an explicit non-empty path list"
             )
+        if env_snapshot is not None:
+            # A hook installed since the task started would run during the
+            # `git commit` below. Detecting it afterwards is too late: the
+            # commit already exists and the hook has already run.
+            from .environment import verify_unchanged
+
+            drift = verify_unchanged(env_snapshot, self)
+            if drift:
+                raise GitCommandError(
+                    "commit_and_capture refuses: the git environment changed "
+                    "since this task started — " + "; ".join(drift)
+                )
         head = self.head_sha()
         if head != intent.expected_parent_sha:
             # The intent was built against a different HEAD than the one we are
@@ -447,6 +464,7 @@ class GitGateway:
         dest_ref: str,
         protected_refs: Sequence[str],
         expected_url: str | None = None,
+        env_snapshot=None,
     ) -> str:
         """Push exactly one already-existing commit to exactly one ref, by an
         explicit `<sha>:<dest_ref>` refspec — never a bare branch push (which
@@ -534,6 +552,23 @@ class GitGateway:
                 f"remote.{remote}.url, silently bypassing the url check below"
             )
 
+        if env_snapshot is not None:
+            from .environment import verify_unchanged
+
+            drift = verify_unchanged(env_snapshot, self)
+            if drift:
+                raise GitCommandError(
+                    "push_exact refuses: the git environment changed since this "
+                    "task started — " + "; ".join(drift)
+                )
+        _hookdir, push_hooks = self.active_push_hooks()
+        if push_hooks:
+            raise GitCommandError(
+                f"push_exact refuses: active push hook(s) {push_hooks} in "
+                f"{_hookdir}. A pre-push hook runs arbitrary code during this "
+                "push and was reproduced publishing an unreviewed commit to a "
+                "protected branch. It was NOT executed and NOT bypassed."
+            )
         configured_url = self.config_get(f"remote.{remote}.url")
         if not configured_url:
             raise GitCommandError(f"push_exact refuses: remote {remote!r} has no configured url")
@@ -545,6 +580,17 @@ class GitGateway:
 
         self._git("push", remote, refspec)
 
+        # Re-assert the redirection config BEFORE trusting the confirmation
+        # below: `ls-remote` follows the FETCH url, so a rule added between the
+        # pre-push checks and this point would confirm against a different
+        # repository than the push actually reached.
+        if self.config_get_regexp(r"^url\..*\.insteadof$") or self.config_get(
+            f"remote.{remote}.pushurl"
+        ):
+            raise GitCommandError(
+                "push_exact: push destination config changed during the push — "
+                "the post-push confirmation cannot be trusted"
+            )
         landed = self.remote_ref_sha(remote, dest_ref)
         if landed != sha:
             raise GitCommandError(
@@ -566,11 +612,34 @@ class GitGateway:
     #: The hooks an ordinary (non-amend) `git commit` can invoke.
     COMMIT_HOOKS = ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit")
 
+    #: The hook `git push` can invoke. Tracked separately because it fires
+    #: inside `push_exact`'s own push, not at commit time: a `pre-push` hook
+    #: running `git push origin HEAD:refs/heads/main` was reproduced publishing
+    #: an unreviewed commit to a protected branch as a side effect of an
+    #: otherwise correct exact-refspec push.
+    PUSH_HOOKS = ("pre-push",)
+
     def hooks_dir(self) -> Path:
         """Effective hooks directory as GIT resolves it (honours core.hooksPath)."""
         raw = self._out("rev-parse", "--git-path", "hooks")
         path = Path(raw)
         return path if path.is_absolute() else self._repo_root / path
+
+    def active_hooks(self, names: "tuple[str, ...]") -> tuple[Path, list[str]]:
+        """(effective hooks dir, active hooks among `names`). See
+        `active_commit_hooks` for what "active" means."""
+        directory = self.hooks_dir()
+        active = [
+            name
+            for name in names
+            if os.access(directory / name, os.X_OK) and (directory / name).is_file()
+        ]
+        return directory, active
+
+    def active_push_hooks(self) -> tuple[Path, list[str]]:
+        """(effective hooks dir, active push hooks). Checked immediately before
+        `git push`, because a hook can be installed after the task snapshot."""
+        return self.active_hooks(self.PUSH_HOOKS)
 
     def active_commit_hooks(self) -> tuple[Path, list[str]]:
         """(effective hooks dir, names of active commit hooks).

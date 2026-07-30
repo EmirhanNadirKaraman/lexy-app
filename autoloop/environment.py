@@ -30,6 +30,10 @@ _INSTEAD_OF_KEY_RE_GROUP = r"^url\..*\.insteadof$"
 class EnvSnapshot:
     hooks_dir: str
     active_hooks: tuple[str, ...]
+    #: Active `pre-push` hooks. Separate from `active_hooks` (commit hooks)
+    #: because it fires inside `push_exact`'s own `git push`, so it must be
+    #: re-checked immediately before pushing, not only at task start.
+    active_push_hooks: tuple[str, ...]
     core_hooks_path: str  # raw config value; "" if unset
     #: Every `url.<base>.insteadOf` rule as (config key, value), sorted.
     instead_of_rules: tuple[tuple[str, str], ...]
@@ -79,10 +83,12 @@ def snapshot(git) -> EnvSnapshot:
     """Capture the current hook set, hooks directory, `core.hooksPath`,
     every `insteadOf` rule, and every remote's url / pushurl / push refspec."""
     hooks_dir, active = git.active_commit_hooks()
+    _pushdir, active_push = git.active_push_hooks()
     names = _remote_names(git)
     return EnvSnapshot(
         hooks_dir=str(hooks_dir),
         active_hooks=tuple(active),
+        active_push_hooks=tuple(active_push),
         core_hooks_path=git.config_get("core.hooksPath"),
         instead_of_rules=_instead_of_rules(git),
         remote_urls=tuple(sorted((name, git.config_get(f"remote.{name}.url")) for name in names)),
@@ -101,6 +107,11 @@ def verify_unchanged(before: EnvSnapshot, git) -> list[str]:
     after = snapshot(git)
     violations: list[str] = []
 
+    if after.active_push_hooks != before.active_push_hooks:
+        violations.append(
+            f"push hook set changed: {list(before.active_push_hooks)} -> "
+            f"{list(after.active_push_hooks)}"
+        )
     if after.hooks_dir != before.hooks_dir:
         violations.append(
             f"hooks directory changed: {before.hooks_dir!r} -> {after.hooks_dir!r}"

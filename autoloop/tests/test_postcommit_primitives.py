@@ -638,3 +638,81 @@ def test_commit_and_capture_refuses_when_head_moved_after_the_intent(tmp_path, r
     # Nothing was staged and no commit was created.
     assert "a.txt" not in gw_.staged_paths()
     assert gw_.head_message().strip() == "unrelated"
+
+
+# ---- environment enforcement is WIRED, not merely available ----------------
+
+
+def test_commit_refuses_when_a_hook_appears_after_the_task_snapshot(tmp_path, repo):
+    """`npm install` running a dependency postinstall script was shown to
+    install a pre-commit hook mid-task. The snapshot must catch that."""
+    gw_ = gateway(repo)
+    before = environment.snapshot(gw_)
+    intents = IntentStore(tmp_path / "intents")
+    (repo / "a.txt").write_text("work\n", encoding="utf-8")
+    intent = make_intent(gw_, "t1", gw_.head_sha(), ("a.txt",), "feat: a")
+
+    install_hook(repo, "pre-commit", "#!/bin/sh\nexit 0\n")
+
+    with pytest.raises(GitCommandError, match="git environment changed"):
+        gw_.commit_and_capture("feat: a", ("a.txt",), intents, intent, env_snapshot=before)
+    assert "a.txt" not in gw_.staged_paths()
+
+
+def test_commit_proceeds_when_the_environment_is_unchanged(tmp_path, repo):
+    gw_ = gateway(repo)
+    before = environment.snapshot(gw_)
+    intents = IntentStore(tmp_path / "intents")
+    (repo / "a.txt").write_text("work\n", encoding="utf-8")
+    intent = make_intent(gw_, "t1", gw_.head_sha(), ("a.txt",), "feat: a")
+
+    sha, _ = gw_.commit_and_capture(
+        "feat: a", ("a.txt",), intents, intent, env_snapshot=before
+    )
+    assert sha == gw_.head_sha()
+
+
+def test_push_exact_refuses_an_active_pre_push_hook(tmp_path, repo):
+    """A pre-push hook runs arbitrary code during our own push — reproduced
+    publishing an unreviewed commit to a protected branch."""
+    gw_ = gateway(repo)
+    bare = make_bare(tmp_path)
+    run_git(repo, "remote", "add", "origin", str(bare))
+    (repo / "a.txt").write_text("work\n", encoding="utf-8")
+    run_git(repo, "add", "a.txt")
+    run_git(repo, "commit", "-q", "-m", "feat: a")
+    sha = gw_.head_sha()
+
+    install_hook(repo, "pre-push", "#!/bin/sh\nexit 0\n")
+
+    with pytest.raises(GitCommandError, match="active push hook"):
+        gw_.push_exact("origin", sha, "refs/heads/feat", ("main", "master"))
+    assert gw_.remote_ref_sha("origin", "refs/heads/feat") == ""
+
+
+def test_push_exact_refuses_when_the_environment_changed_since_task_start(tmp_path, repo):
+    gw_ = gateway(repo)
+    bare = make_bare(tmp_path)
+    run_git(repo, "remote", "add", "origin", str(bare))
+    before = environment.snapshot(gw_)
+    (repo / "a.txt").write_text("work\n", encoding="utf-8")
+    run_git(repo, "add", "a.txt")
+    run_git(repo, "commit", "-q", "-m", "feat: a")
+    sha = gw_.head_sha()
+
+    run_git(repo, "config", "core.hooksPath", str(tmp_path / "elsewhere"))
+
+    with pytest.raises(GitCommandError, match="git environment changed"):
+        gw_.push_exact(
+            "origin", sha, "refs/heads/feat", ("main", "master"), env_snapshot=before
+        )
+    assert gw_.remote_ref_sha("origin", "refs/heads/feat") == ""
+
+
+def test_snapshot_records_push_hooks_and_verify_flags_a_new_one(repo):
+    gw_ = gateway(repo)
+    before = environment.snapshot(gw_)
+    assert before.active_push_hooks == ()
+    install_hook(repo, "pre-push", "#!/bin/sh\nexit 0\n")
+    violations = environment.verify_unchanged(before, gw_)
+    assert any("push hook set changed" in v for v in violations)
