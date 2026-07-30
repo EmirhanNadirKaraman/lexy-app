@@ -29,6 +29,7 @@ from ..contract import AUDIT_TASK_ID, Decision, Directive
 from ..executor import ExecutionOutcome
 from ..git_gateway import GitGateway
 from ..tasks import Task, TaskRegistry
+from ..validation import SAFE_VALIDATION_BINARIES
 from .agents import AgentResult, AgentRunner, AgentSpec
 from .findings import FINDINGS_SCHEMA_TEXT, parse_findings
 from .markdown import MarkdownPolicy
@@ -36,11 +37,10 @@ from .reconcile import reconcile
 from .report import ValidationRun, render_report
 from .taskgen import generate_tasks
 
-# Validation commands may only start with these binaries — the audit runs
-# repo checks, never repo mutations.
-SAFE_VALIDATION_BINARIES = frozenset(
-    {"ruff", "pytest", "python", "python3", "npm", "npx", "tsc"}
-)
+# SAFE_VALIDATION_BINARIES lives in `..validation` now — shared with the
+# produce-then-review post-commit validation check in `orchestrator.py`, so
+# the two call sites can't drift apart on what's safe to launch. The audit
+# runs repo checks, never repo mutations.
 
 # (slug, title, charter, model). Order IS the wave order: with
 # max_parallel_agents=3 the first three run concurrently, then the rest — so

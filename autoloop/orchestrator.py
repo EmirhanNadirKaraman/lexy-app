@@ -52,6 +52,10 @@ Failure routing:
 
 from __future__ import annotations
 
+from dataclasses import asdict
+from pathlib import Path
+
+from . import environment
 from .browser.chatgpt import SubmitResult
 from .config import AutoloopConfig
 from .context import build_context, render_context
@@ -69,6 +73,7 @@ from .contract import (
 from .errors import (
     BrowserError,
     ContractError,
+    GitCommandError,
     GitError,
     LoginExpiredError,
     ManifestViolation,
@@ -106,6 +111,16 @@ from .state import (
 )
 from .tasks import Task, TaskRegistry, TaskStore
 from .transcript import TranscriptLogger
+from .validation import run_validation_commands
+from .worktask import (
+    CommitIntent,
+    IntentStore,
+    Reconciliation,
+    TaskExecution,
+    TaskExecutionStore,
+    reconcile_after_crash,
+)
+from .worktree import WorktreeManager
 
 
 class Orchestrator:
@@ -122,6 +137,10 @@ class Orchestrator:
         registry: TaskRegistry,
         task_store: TaskStore,
         manifest_store: ManifestStore,
+        worktrees: WorktreeManager | None = None,
+        execution_store: TaskExecutionStore | None = None,
+        intent_store: IntentStore | None = None,
+        validation_runner=None,
     ):
         self._config = config
         self._store = store
@@ -134,6 +153,19 @@ class Orchestrator:
         self._registry = registry
         self._task_store = task_store
         self._manifest_store = manifest_store
+        # Produce-then-review commit path (pass 2a). ALL THREE optional and
+        # gated together: when `worktrees` is None (every existing caller and
+        # test), `_dispatch_executor` takes the old authorize-then-produce/
+        # manifest branch unchanged for every decision, audit included. When
+        # set, a real (non-audit) task runs in its own worktree and commits
+        # automatically once validation passes — see `_dispatch_task_postcommit`.
+        self._worktrees = worktrees
+        self._execution_store = execution_store
+        self._intent_store = intent_store
+        #: Injected `subprocess.run`-compatible callable for post-commit
+        #: validation, mirroring `AuditExecutor`'s `command_runner` — lets
+        #: tests avoid depending on a real `ruff`/`pytest` install.
+        self._validation_runner = validation_runner
         self._client = None
 
     # ---- main loop ----------------------------------------------------------
@@ -504,6 +536,14 @@ class Orchestrator:
                 "decision": directive.decision.value,
                 "started_at": utcnow_iso(),
             }
+
+        if task is not None and self._worktrees is not None:
+            # Produce-then-review commit path. Audit never takes this branch
+            # (task is always None for it) — it keeps the manifest-based path
+            # below unconditionally, report content and all.
+            self._dispatch_task_postcommit(directive, task, state)
+            return
+
         # Task-owned change manifest: snapshot the dirty tree BEFORE the task.
         # The manifest id is stable across a crash-redispatch (same iteration),
         # so recovery overwrites the same manifest instead of forking it.
@@ -563,6 +603,255 @@ class Orchestrator:
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
+
+    # ---- produce-then-review commit path (pass 2a) --------------------------
+    #
+    # A real task runs in its own worktree/branch (`WorktreeManager`) and
+    # commits immediately after the executor reports success and the commit
+    # passes structural + re-run-validation checks — never gated on a prior
+    # chat approval, because none exists for this path. On ANY check failure
+    # the commit is left exactly where it is: nothing here can roll it back
+    # (reset/checkout/clean are not on the git command whitelist), so refusal
+    # means "park and report", never "undo". Building the actual review
+    # packet (the message that shows ChatGPT the diff and lets it request a
+    # revision) is explicitly OUT of scope for this pass — see the module
+    # docstring in `worktree.py`/`worktask.py`. A clean pass therefore also
+    # parks today, with an honest "awaiting review, not wired yet" message,
+    # rather than inventing that content early.
+
+    def _dispatch_task_postcommit(self, directive: Directive, task: Task, state: LoopState) -> None:
+        execution = self._execution_store.load(task.id)
+        if execution is None:
+            # First dispatch for this task: base sha is recorded BEFORE any
+            # implementation work starts, from the MAIN checkout's HEAD (the
+            # commit the task's branch forks from).
+            base_sha = self._git.head_sha()
+            execution = self._worktrees.create(task.id, base_sha)
+            self._execution_store.save(execution)
+        state.task_execution = asdict(execution)
+        self._store.save(state)
+
+        worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
+
+        pending_intent = self._intent_store.load(task.id)
+        if pending_intent is not None:
+            # A previous attempt at this task wrote an intent and then the
+            # process died somewhere around the `git commit` it describes.
+            # Classify BEFORE doing anything else — see `worktask.py` (F8).
+            recon = reconcile_after_crash(
+                pending_intent, worktree_git.head_sha(), execution.task_base_sha, worktree_git
+            )
+            if recon is Reconciliation.AMBIGUOUS:
+                # Deliberately do NOT clear the intent: it is the only durable
+                # record of what this task's commit attempt was expecting, and
+                # leaving it in place means a later re-dispatch reconciles to
+                # the SAME AMBIGUOUS verdict rather than silently treating an
+                # unresolved situation as a fresh start. Only an operator
+                # (inspecting `execution.worktree_path` by hand, then clearing
+                # the intent file directly) resolves this.
+                state.last_response = None
+                self._to_needs_user(
+                    f"task {task.id}: crash reconciliation for branch "
+                    f"{execution.task_branch} is AMBIGUOUS — the branch tip "
+                    "cannot be safely attributed to this task's own commit "
+                    "attempt. Nothing was rolled back or overwritten; inspect "
+                    f"{execution.worktree_path} by hand, then clear the "
+                    "commit intent once resolved."
+                )
+                return
+            if recon is Reconciliation.RECOVERABLE:
+                # The commit DID happen; only persisting candidate_sha was
+                # lost. Adopt the branch head — do NOT commit again.
+                allowed_paths = set(pending_intent.planned_paths)
+                execution.candidate_sha = worktree_git.head_sha()
+                self._execution_store.save(execution)
+                self._intent_store.clear(task.id)
+                state.task_execution = asdict(execution)
+                self._store.save(state)
+                self._finish_postcommit(execution, worktree_git, allowed_paths, state, task)
+                return
+            # NO_COMMIT: the commit this intent describes never happened.
+            # Clear the stale intent and fall through to attempt it fresh.
+            self._intent_store.clear(task.id)
+
+        # Snapshot the environment (hooks / push destination) BEFORE the
+        # executor runs, so a hook installed mid-task (e.g. by a dependency
+        # postinstall script) is caught rather than silently trusted.
+        env_snapshot = environment.snapshot(worktree_git)
+        # Save before executing: a crash mid-execution resumes in `executing`
+        # and re-dispatches the same directive (executors must tolerate that;
+        # re-entering here re-loads the same `execution` record above).
+        self._store.save(state)
+        outcome = self._executor.execute(directive, task)
+        state.last_validation = outcome.validation or "(none)"
+        self._log(
+            "executed",
+            data={
+                "decision": directive.decision.value,
+                "task_id": task.id,
+                "status": outcome.status,
+                "summary": outcome.summary,
+                "validation": outcome.validation,
+            },
+        )
+        if outcome.status != "ok":
+            state.outbox = TEMPLATES["implementation_review"].render(
+                task_id=task.id,
+                task_title=task.title,
+                decision=directive.decision.value,
+                status=outcome.status,
+                summary=outcome.summary,
+                details=outcome.details,
+                validation=outcome.validation or "(none)",
+            )
+            state.last_response = None
+            state.consecutive_failures = 0
+            state.phase = Phase.READY.value
+            self._store.save(state)
+            return
+
+        message = f"{task.title}\n\n{outcome.summary}".strip()
+        parent = worktree_git.head_sha()
+        intent = CommitIntent.create(
+            task.id, execution.task_branch, parent, outcome.changed_paths, message
+        )
+        try:
+            candidate_sha, staged_summary = worktree_git.commit_and_capture(
+                message,
+                outcome.changed_paths,
+                self._intent_store,
+                intent,
+                env_snapshot=env_snapshot,
+            )
+        except GitCommandError as exc:
+            # Environment drift (a hook installed mid-task), HEAD drift, or an
+            # empty path list. Every OTHER refusal in this path parks for the
+            # operator, so this one does too rather than escaping as a raw
+            # error: the commit did not happen, nothing was rolled back, and a
+            # human needs to look at why the task's environment moved.
+            self._intent_store.clear(task.id)
+            state.last_response = None
+            self._to_needs_user(
+                f"task {task.id}: the commit was refused before it happened — "
+                f"{exc}. Nothing was committed and nothing was rolled back."
+            )
+            return
+        # Ordering matters for crash safety: commit -> persist candidate_sha
+        # -> clear the intent -> THEN verify. If the process dies during
+        # verification the commit is already both real and recorded, which is
+        # the honest state (the commit exists either way).
+        execution.candidate_sha = candidate_sha
+        self._execution_store.save(execution)
+        self._intent_store.clear(task.id)
+        state.task_execution = asdict(execution)
+        self._store.save(state)
+        self._log(
+            "staged_diff", data={"task_id": task.id, "candidate_sha": candidate_sha, "summary": staged_summary}
+        )
+        self._finish_postcommit(execution, worktree_git, set(outcome.changed_paths), state, task)
+
+    def _verify_committed(
+        self, execution: TaskExecution, worktree_git: GitGateway, allowed_paths: set[str]
+    ) -> tuple[list[str], str]:
+        """The post-commit review gate for `execution.candidate_sha`. Returns
+        `(failures, validation_summary)`; `failures` empty means the commit
+        passes every check.
+
+        NOTE — round > 0 (a revision on top of an already-reviewed commit) is
+        not handled correctly here: `commit_range_paths(task_base_sha,
+        candidate_sha)` spans the WHOLE base..candidate range, so on a second
+        round it would also include the FIRST round's paths, not just this
+        round's. The ownership set would need to be a union across rounds (or
+        a diff from the round's own parent) to be correct there. Revision
+        rounds are the review loop and are explicitly out of scope for this
+        pass — round 0 (every scenario this method is exercised against here)
+        is unaffected because `task_base_sha` and `execution.candidate_sha`'s
+        only parent are the same commit.
+        """
+        failures: list[str] = []
+        candidate = execution.candidate_sha
+        if not worktree_git.is_descendant(candidate, execution.task_base_sha):
+            failures.append(
+                f"candidate {candidate[:12]} is not a descendant of task base "
+                f"{execution.task_base_sha[:12]}"
+            )
+        touched = worktree_git.commit_range_paths(execution.task_base_sha, candidate)
+        if not touched:
+            failures.append("commit range is empty — nothing was actually committed")
+        outside = touched - allowed_paths
+        if outside:
+            failures.append(
+                "commit touched path(s) outside what the task was allowed to "
+                f"touch: {sorted(outside)}"
+            )
+        residual = worktree_git.dirty_entries()
+        if residual:
+            failures.append(
+                "worktree is not clean after commit — residual change(s): "
+                + ", ".join(f"{status} {path}" for status, path in residual)
+            )
+        validation_ok, validation_summary = self._run_post_commit_validation(
+            execution.worktree_path
+        )
+        if not validation_ok:
+            failures.append(f"post-commit validation failed: {validation_summary}")
+        return failures, validation_summary
+
+    def _run_post_commit_validation(self, worktree_path: str) -> tuple[bool, str]:
+        """Re-run the SAME validation commands the audit executor uses
+        (`config.audit.validation_commands`), against the task's own worktree,
+        AFTER the commit exists. Pre-commit validation (`outcome.validation`,
+        whatever the executor itself reports) is not sufficient: a commit
+        hook can change committed content in ways the executor never saw."""
+        return run_validation_commands(
+            self._config.audit.validation_commands,
+            Path(worktree_path),
+            command_runner=self._validation_runner,
+        )
+
+    def _finish_postcommit(
+        self,
+        execution: TaskExecution,
+        worktree_git: GitGateway,
+        allowed_paths: set[str],
+        state: LoopState,
+        task: Task,
+    ) -> None:
+        failures, validation_summary = self._verify_committed(execution, worktree_git, allowed_paths)
+        state.last_validation = validation_summary
+        execution.review_round += 1
+        execution.candidate_commit_count = len(
+            worktree_git.commit_list(execution.task_base_sha, execution.candidate_sha)
+        )
+        self._execution_store.save(execution)
+        state.task_execution = asdict(execution)
+        self._log(
+            "postcommit_review",
+            data={
+                "task_id": task.id,
+                "candidate_sha": execution.candidate_sha,
+                "review_round": execution.review_round,
+                "candidate_commit_count": execution.candidate_commit_count,
+                "failures": failures,
+            },
+        )
+        state.last_response = None
+        if failures:
+            self._to_needs_user(
+                f"task {task.id}: commit {execution.candidate_sha[:12]} on "
+                f"{execution.task_branch} (round {execution.review_round}) was "
+                "created but REFUSED at post-commit review. The commit is NOT "
+                "rolled back and NOT pushed — reset/checkout/clean are not "
+                f"reachable through this gateway. Reasons: {'; '.join(failures)}"
+            )
+            return
+        self._to_needs_user(
+            f"task {task.id}: commit {execution.candidate_sha[:12]} on "
+            f"{execution.task_branch} (round {execution.review_round}) passed "
+            "post-commit review. Awaiting a review packet for ChatGPT to see "
+            "the diff — that construction is not implemented yet; park here "
+            "for the operator in the meantime."
+        )
 
     def _dispatch_git(self, directive: Directive) -> None:
         state = self.state

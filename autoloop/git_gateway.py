@@ -32,7 +32,12 @@ with `+`-prefix and non-hex-source refspecs refused at both this layer and
 the policy layer (F2), and any `url.*.insteadOf` rule refused outright before
 any network access (F5). See `worktask.py` for the crash-recovery story
 (`CommitIntent` / `reconcile_after_crash`, F8) and `environment.py` for
-detecting a hook or push destination that changed mid-task.
+detecting a hook or push destination that changed mid-task. `worktree_add` /
+`worktree_remove` / `worktree_prune` / `worktree_list_porcelain` /
+`branch_exists` give each task its own linked worktree and branch (see
+`worktree.py`'s `WorktreeManager`); the commit/verify sequence for a task's
+changes then runs through a SEPARATE `GitGateway` rooted at that worktree's
+path, not this one.
 """
 
 from __future__ import annotations
@@ -280,6 +285,17 @@ class GitGateway:
             )
         return raw.decode("utf-8", "replace")
 
+    def branch_exists(self, branch: str) -> bool:
+        """True if `refs/heads/<branch>` resolves. Used by `WorktreeManager`
+        to refuse creating a worktree on a branch name that is already taken,
+        BEFORE `git worktree add -b` fails with its own (less specific)
+        error."""
+        proc = self._git("rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+        return proc.returncode == 0
+
+    def worktree_list_porcelain(self) -> str:
+        return self._out("worktree", "list", "--porcelain")
+
     def commit_list(self, base_sha: str, candidate_sha: str) -> list[dict]:
         """Commits strictly after `base_sha` up to and including
         `candidate_sha`, oldest first, each as `{"sha", "subject", "parents"}`.
@@ -355,6 +371,34 @@ class GitGateway:
         summary = self._out("diff", "--cached", "--stat")
         self._git("commit", "-m", message)
         return self.head_sha(), False, summary
+
+    # ---- worktree lifecycle (produce-then-review: one worktree per task) ---
+    #
+    # Run from the MAIN checkout's gateway, never from inside a worktree being
+    # managed — `WorktreeManager` is constructed with the main repo's
+    # GitGateway. The commit/verify sequence for a task's own changes then
+    # runs through a SEPARATE GitGateway rooted at `worktree_path`.
+
+    def worktree_add(self, path: str, branch: str, base_sha: str) -> None:
+        """`git worktree add -b <branch> <path> <base_sha>` — always creates a
+        NEW branch (never attaches an existing one), so the only way this can
+        collide with another worktree is the pre-checks in `WorktreeManager`.
+        Git itself still refuses to check the same branch out twice in two
+        worktrees; that refusal is relied on as defense in depth here, not
+        reimplemented."""
+        self._git("worktree", "add", "-b", branch, path, base_sha)
+
+    def worktree_remove(self, path: str, force: bool = False) -> None:
+        """`git worktree remove [--force] <path>`. Never deletes the branch —
+        the branch (and its commits) survive worktree removal."""
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(path)
+        self._git(*args)
+
+    def worktree_prune(self) -> None:
+        self._git("worktree", "prune")
 
     # ---- produce-then-review commit path ------------------------------------
     #

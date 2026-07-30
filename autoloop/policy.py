@@ -126,16 +126,25 @@ _ALLOWED_GIT: dict[str, frozenset[str]] = {
     "rev-list": frozenset(),
     "ls-remote": frozenset({"--heads"}),
     "config": frozenset({"--get", "--get-regexp", "--get-all"}),
-    # Not yet called by any gateway method in this pass (no worktree-per-task
-    # wiring exists yet) — whitelisted ahead of that so policy.py does not
-    # need to change again when it lands. NOTE: "add"/"remove"/"list"/"prune"
-    # are the git-worktree action words, not flags, so — like every other
-    # subcommand here — they are NOT structurally checked against this set;
-    # `validate_git_command` only validates tokens starting with "-". That is
-    # the same class of gap F2 closed for `push` specifically, left open here
-    # because nothing in this repo invokes `git worktree` yet. Flag this
-    # before wiring worktree usage.
-    "worktree": frozenset({"add", "remove", "list", "prune", "-b", "--force", "--porcelain"}),
+    # Per-task worktree lifecycle (`worktree.py`'s WorktreeManager). Only the
+    # real FLAGS live here — the action verb (add/remove/list/prune) is
+    # checked separately below via `_ALLOWED_GIT_VERBS`, because the flag loop
+    # in `validate_git_command` only inspects tokens starting with "-" and
+    # would otherwise let an unlisted verb like `git worktree lock` through
+    # with zero flags to trip on (the same class of gap F2 closed for `push`'s
+    # refspec source).
+    "worktree": frozenset({"-b", "--force", "--porcelain"}),
+}
+
+# Subcommands whose first positional argument (`args[1]`) is an action VERB,
+# not a free-form value (a path, a branch name, a sha, ...). The per-flag loop
+# above only inspects tokens starting with "-", so without this a verb outside
+# the set here would sail through as long as its own flags happened to be
+# whitelisted — `git worktree lock <path>` takes no flags at all and would
+# otherwise pass silently. `validate_git_command` denies both a missing verb
+# (bare `git worktree`) and a verb not in this set.
+_ALLOWED_GIT_VERBS: dict[str, frozenset[str]] = {
+    "worktree": frozenset({"add", "remove", "list", "prune"}),
 }
 
 # Flags that MUST be present for the subcommand to be allowed at all.
@@ -253,6 +262,20 @@ class PolicyEngine:
                 "git_subcommand_forbidden",
                 f"git subcommand '{sub}' is not on the whitelist",
             )
+        verbs = _ALLOWED_GIT_VERBS.get(sub)
+        if verbs is not None:
+            if len(args) < 2:
+                return Verdict.deny(
+                    "git_verb_required",
+                    f"'git {sub}' requires an action verb (one of {sorted(verbs)})",
+                )
+            verb = args[1]
+            if verb not in verbs:
+                return Verdict.deny(
+                    "git_verb_forbidden",
+                    f"'git {sub} {verb}' is not allowed — allowed actions for "
+                    f"'git {sub}' are {sorted(verbs)}",
+                )
         for token in args[1:]:
             if token.startswith("-") and token not in allowed_flags:
                 return Verdict.deny(

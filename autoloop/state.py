@@ -26,7 +26,12 @@ from .errors import StateCorruptError, StateError
 # v2 (2026-07-29): review-integrity stamps on PendingRequest/LastResponse,
 # last_decision / last_validation for the review context. Breaking on purpose —
 # v1 sessions predate contract v2 and must be reset, not migrated mid-flight.
-SCHEMA_VERSION = 2
+# v3 (2026-07-30): `task_execution` — the serialised `worktask.TaskExecution`
+# for whichever task is currently running the produce-then-review commit path
+# (worktree path/branch, base/candidate sha, review round). Breaking on
+# purpose, same as v1->v2: a v2 session has no worktree/candidate-sha
+# provenance to backfill, so it must be reset rather than guessed at.
+SCHEMA_VERSION = 3
 
 
 def utcnow_iso() -> str:
@@ -99,6 +104,13 @@ class LoopState:
     last_decision: str | None = None
     last_validation: str | None = None
     last_manifest_id: str | None = None
+    #: Serialised `worktask.TaskExecution` (a plain dict — `dataclasses.
+    #: asdict(execution)`, never a reconstructed dataclass instance here) for
+    #: the task currently running the produce-then-review commit path.
+    #: Deliberately separate from `last_manifest_id`, which belongs to the
+    #: OLD authorize-then-produce/manifest path and means something different
+    #: (a `ChangeManifest` id against the main checkout, not a worktree).
+    task_execution: dict | None = None
     question: str | None = None
     resume_phase: str | None = None
     stop_reason: str | None = None
