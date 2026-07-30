@@ -67,10 +67,32 @@ _BRANCH_REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9._/-]+$")
 
 
 class GitGateway:
-    def __init__(self, repo_root: Path, policy: PolicyEngine, runner=None):
+    def __init__(self, repo_root: Path, policy: PolicyEngine, runner=None, env: dict | None = None):
+        """`env`, when given, is passed to every subprocess invocation this
+        gateway makes (`subprocess.run(..., env=env)`), REPLACING the
+        inherited process environment rather than layering on top of it —
+        exactly `subprocess.run`'s own `env=` semantics. `None` (the
+        default) means "inherit the current process environment", identical
+        to every caller before this parameter existed — zero behavior change
+        for any existing construction site.
+
+        This is how a `GitGateway` rooted at a worker repo is made to
+        actually SEE the scrubbed environment `worker_env.worker_env()`
+        builds: without an explicit `env`, every git subprocess this class
+        runs would inherit whatever ambient credential helper / system
+        config the CALLING process happens to have, regardless of how
+        isolated the worker repo's own on-disk git config is — verified:
+        constructing a plain `GitGateway` (no `env`) against a freshly
+        created no-remote worker repo and reading `credential.helper`
+        through it still reported the CALLING process's ambient
+        `osxkeychain` helper, because `git config --get-regexp` walks the
+        system/global config layers of whatever environment the subprocess
+        itself runs under, not the repo's local config alone.
+        """
         self._repo_root = Path(repo_root)
         self._policy = policy
         self._runner = runner or subprocess.run
+        self._env = env
 
     @property
     def repo_root(self) -> Path:
@@ -85,6 +107,7 @@ class GitGateway:
             cwd=str(self._repo_root),
             capture_output=True,
             text=True,
+            env=self._env,
         )
         if check and proc.returncode != 0:
             raise GitCommandError(
@@ -106,7 +129,9 @@ class GitGateway:
         verdict = self._policy.validate_git_command(args)
         if not verdict.allowed:
             raise GitOperationDenied(f"{verdict.code}: {verdict.reason}")
-        proc = self._runner(["git", *args], cwd=str(self._repo_root), capture_output=True)
+        proc = self._runner(
+            ["git", *args], cwd=str(self._repo_root), capture_output=True, env=self._env
+        )
         if proc.returncode != 0:
             detail = proc.stderr or proc.stdout or b""
             if isinstance(detail, bytes):
@@ -528,6 +553,43 @@ class GitGateway:
         first_line = raw.splitlines()[0]
         sha, _, _ref = first_line.partition("\t")
         return sha.strip()
+
+    def fetch_object(self, source_path: str, want_sha: str) -> None:
+        """`git fetch <source_path> <want_sha>` — pull exactly one
+        already-existing object, by its literal 40-hex id, from a LOCAL
+        filesystem path. Used by `publisher.py`'s `Publisher.import_candidate`
+        to bring a worker's candidate commit into the publisher's object
+        database without ever configuring a remote for the worker.
+
+        No refspec destination is given, so this never creates or moves a ref
+        in THIS repository — the object becomes reachable in the object
+        database and is anchored only via `FETCH_HEAD`, which is all a
+        caller needs: every later reference to the object (verification,
+        `push_exact`) is by its literal sha, never by a ref. Repeating the
+        fetch is harmless — fetching an object already present is a normal,
+        side-effect-free no-op (verified against a real repo).
+
+        The policy layer (F2-style, `policy.py`) independently enforces that
+        `want_sha` is a literal 40-hex id with no ':' or '+' and that
+        `source_path` is an absolute filesystem path with no URL scheme —
+        this method does not re-derive those checks, it relies on
+        `validate_git_command` refusing before any subprocess runs.
+
+        This does NOT verify the fetched object's type or identity — that is
+        the caller's job (`Publisher.import_candidate` calls `read_commit`
+        immediately afterward, which raises on anything that is not a valid
+        commit object).
+
+        No `-c credential.helper=` belt-and-braces here (unlike
+        `WorkerRepoManager`'s own `fetch` call in `worker_env.py`, which adds
+        it): `source_path` is already policy-verified to be an absolute
+        local filesystem path with no URL scheme, so credential resolution
+        cannot fire for it regardless; adding a global `-c` override would
+        require teaching `validate_git_command` to recognize and strip a
+        `-c key=value` PREFIX before its subcommand check, which is a
+        policy-layer change wider than this method needs.
+        """
+        self._git("fetch", source_path, want_sha)
 
     def push_exact(
         self,

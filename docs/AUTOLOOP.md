@@ -24,6 +24,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Change manifest | `manifest.py` | Task-owned change tracking + the commit gate (see §4). |
 | Worktrees / task execution | `worktree.py` (`WorktreeManager`), `worktask.py` (`TaskExecution`, `CommitIntent`, `reconcile_after_crash`) | Per-task linked worktree + branch lifecycle, and the crash-safe commit-intent/candidate-sha bookkeeping for produce-then-review (see §4b). |
 | Review packet | `packet.py` | Renders the post-commit review packet from immutable git objects (see §4b). |
+| Worker/publisher separation | `worker_env.py` (`worker_env`, `WorkerRepoManager`, `verify_worker_isolation`), `publisher.py` (`Publisher`, `provision_publisher_repo`) | Autoloop M2 (see §4c): a scrubbed environment + no-remote repo for worker-side git access, and a dedicated, hooks-controlled repository that is the only path through which a candidate commit is published. |
 | Conversation | `conversation.py` (interface/registry), `browser/chatgpt.py` (`BrowserChatGPT`), `browser/playwright_session.py` (CDP, lazy), `browser/selectors.py` | One persistent reviewer conversation; duplicate/stale/streaming/login guards; provider-pluggable. |
 | Contract | `contract.py` | Response contract **v3** + strict parser + `verify_review`. |
 | Policy | `policy.py` | Deterministic gates: git whitelist (`add -A` and force pushes structurally impossible), task-reference checks, **phase gate**, budgets. |
@@ -372,6 +373,154 @@ accumulated diff (`task_base_sha..candidate_sha`) and the latest round's own
 diff (the previous round's tip, derived from `commit_list` since each round
 is exactly one commit — not a separately persisted field), plus the feedback
 that triggered the third attempt.
+
+---
+
+## 4c. Worker/publisher separation (Autoloop M2)
+
+`worker_env.py` + `publisher.py`, 2026-07-30. M1's produce-then-review path
+(§4b) closed the "review before publish" race but left a structural gap a
+review flagged: a task's own linked worktree (`WorktreeManager`, §4b) SHARES
+its `.git` directory — every remote, every hook, every credential-relevant
+config key — with the main checkout it was created from. Code running inside
+that worktree therefore has the SAME ordinary git access to the real origin
+as the checkout it was linked from, regardless of what the produce-then-review
+gate does afterward. M2 closes this STRUCTURALLY by separating two concerns
+that M1 left conflated: the environment a worker's own git commands run
+under, and the repository that actually publishes.
+
+**THREAT MODEL — read this before trusting any claim below.** Git and the OS
+are TRUSTED; the process sandbox is the boundary these modules defend.
+Arbitrary sandbox escape, direct credential theft (reading an unencrypted SSH
+key off disk), or a worker simply running arbitrary shell code that does
+whatever it likes are OUT OF SCOPE and are not claimed to be closed. What IS
+guaranteed: a worker using git NORMALLY — inheriting whatever a naive
+`subprocess.run` would hand it — cannot discover or use a push destination,
+credential helper, or hook through ORDINARY (inherited/ambient) git
+configuration. See the module docstrings in `worker_env.py` and
+`publisher.py` for the full statement; both restate it, deliberately, so
+neither can be read in isolation and overclaim.
+
+**The worker side (`worker_env.py`).**
+
+- `worker_env(base_env=None) -> dict` — the environment mapping a worker's
+  git subprocesses should run under. Removes `SSH_AUTH_SOCK`, `SSH_ASKPASS`,
+  `GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`, and every OTHER `GIT_CONFIG*`
+  var the parent had, then forces `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`. **Platform trap,
+  verified empirically (Apple Git 2.39.5, macOS 26.2):**
+  `GIT_CONFIG_SYSTEM=/dev/null` does NOT suppress Apple's second,
+  compiled-in system gitconfig
+  (`/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig`, which
+  sets `credential.helper=osxkeychain`) — only `GIT_CONFIG_NOSYSTEM=1` does.
+  `HOME` is never repurposed (the brief this shipped against called that out
+  explicitly as a scoped-controls-only boundary).
+- `WorkerRepoManager` — creates one isolated, no-remote repository PER TASK
+  (`git init`, never `git worktree add`), seeded with the task's base commit
+  via a ONE-TIME local-path `git fetch <source-path> <base-sha>` — never a
+  persistent configured remote — with `core.hooksPath` pointed at a
+  dedicated, empty, controlled directory it creates. This is why it is a
+  genuinely separate repository rather than a `WorktreeManager` linked
+  worktree: a linked worktree cannot be given its own remotes or hooks
+  independent of the checkout it was linked from; a fresh `git init` can.
+- `verify_worker_isolation(git, expected_hooks_dir=None) -> list[str]` —
+  violations (empty = clean) for: any configured remote/pushurl,
+  `url.*.insteadOf`, `push.followTags`, `remote.*.mirror`, any credential
+  helper, `core.hooksPath` not pointed at the expected controlled directory,
+  or any ACTIVE (executable) file anywhere in the EFFECTIVE hooks directory
+  — enumerated directly, not limited to git's named hook set, because a
+  `WorkerRepoManager` repo's controlled hooks directory is created EMPTY, so
+  the correct state is zero files, named or not. **`git` MUST be
+  constructed with `env=worker_env()` (or via `WorkerRepo.gateway(policy)`)
+  for this to mean what it claims** — verified: a `GitGateway` with no
+  explicit `env` reports the CALLING process's ambient config, not the
+  worker repo's isolation, because `git config --get-regexp` resolves
+  whatever environment the subprocess itself runs under.
+- `describe_policy(worker=None) -> dict` — diagnostics of the APPLIED policy
+  (forced env vars, removed patterns), never a dump of an actual environment
+  or config file, so there is nothing secret to redact.
+
+**The publisher side (`publisher.py`).**
+
+- `provision_publisher_repo(state_dir, source_git, remote="origin") -> Path`
+  — idempotently creates a BARE repo at `state_dir/publisher.git` with
+  `core.hooksPath` pointed at `state_dir/publisher-hooks` (created empty,
+  never wiped if it already has content — left for `Publisher`'s own
+  construction check to refuse loudly) and `remote.<remote>.url` copied from
+  `source_git`'s own configured url. Uses direct `subprocess.run` for
+  `init --bare` / config writes — these are parent-process provisioning
+  steps, never directive-driven, so routing them through the policy
+  whitelist (which exists to gate what a MODEL-AUTHORED directive can reach)
+  would be pointless.
+- `Publisher(repo_root, remote, policy, runner=None)` — construction runs
+  the same structural pre-flight `push_exact` runs at push time (single url,
+  no pushurl, no mirror, no followTags, no insteadOf) plus a
+  hooks-directory-emptiness check, and refuses to construct if any fail.
+  These are belt-and-braces, not what actually closes them —
+  `GitGateway.push_exact` (§4b) is, unconditionally, on every call.
+  - `import_candidate(worker_repo_path, candidate_sha) -> str` — fetches
+    `candidate_sha` (a literal 40-hex id, never a ref) from a LOCAL
+    filesystem path via the new `GitGateway.fetch_object`, then verifies via
+    `read_commit` that the imported object is exactly that id and IS a
+    commit (`read_commit` runs `cat-file commit <oid>`, which itself fails
+    on anything else — no separate `cat-file -t` step, since `cat-file` is
+    policy-whitelisted with an empty flag set). No local ref is created;
+    the object is anchored only via `FETCH_HEAD`. Repeating the import is
+    harmless (verified against a real repo). A later worker HEAD moving on
+    does not affect a candidate already imported by exact sha.
+  - `publish(candidate_sha, dest_ref, protected_refs, expected_url=None) ->
+    str` — never substitutes worker HEAD, publisher HEAD, a branch name, or
+    a fresh lookup for `candidate_sha`; the caller (the orchestrator) is
+    responsible for sourcing it from the reviewed request binding. Calls
+    `GitGateway.push_exact` — reused, not reimplemented.
+  - `remote_ref_sha(dest_ref) -> str` — a fresh `ls-remote` round-trip, used
+    to reconcile after a crash (a push that landed but whose confirmation
+    was never seen) without re-pushing, and to check idempotency before
+    calling `publish` again.
+  - `describe() -> dict` — diagnostics with userinfo (`user:token@host`)
+    stripped from any url before it is ever returned.
+
+**New `GitGateway` surface this required.** `fetch_object(source_path,
+want_sha)` — `git fetch <source_path> <want_sha>`, policy-whitelisted
+(`policy.py`'s new `"fetch"` entry) with F2-style checks: `want_sha` must be
+a literal 40-hex id with no `':'`/`'+'`, `source_path` must be an absolute
+local filesystem path with no URL scheme or scp-like `user@host:path`
+syntax. `GitGateway.__init__` also gained an optional `env: dict | None`
+parameter (default `None` = inherit the current process environment,
+identical to every construction site that predates this) — without it, a
+`GitGateway` rooted at a worker repo would run its subprocesses under the
+CALLING process's own environment, defeating `verify_worker_isolation`
+entirely; `WorkerRepo.gateway(policy)` is the convenience that applies
+`worker_env()` correctly.
+
+**Wiring — narrower than the primitives above.** `Orchestrator` gained an
+optional `publisher: Publisher | None = None` constructor parameter,
+independently gated exactly like the `worktrees`/`execution_store`/
+`intent_store` triple (§4b): every existing caller and test passes `None`
+and `_dispatch_task_push` behaves exactly as before (`worktree_git.
+push_exact` straight from the task's worktree). When a `Publisher` IS
+supplied, `_dispatch_task_push` instead calls `Publisher.import_candidate`
+(sourcing from `execution.worktree_path`, the task's linked worktree) then
+`Publisher.publish` — the reviewed `binding.candidate_sha` stays the sole
+authority in both branches. **`cli.py` does not construct a `Publisher`
+yet** — same status as `worktrees`/`execution_store`/`intent_store` before
+it, primitives built and tested ahead of their wiring.
+
+**What is, and is NOT, delivered by this pass.** `Publisher` genuinely
+guarantees that publication happens only through a separate, hooks-controlled
+repository — that part is wired end to end (`_dispatch_task_push` above).
+`WorkerRepoManager`/`worker_env` genuinely guarantee that a repo built by
+them has no remote and no ambient credential access — but **that is not yet
+the repository a task's implementation work runs in**. There is no
+repository task executor today (`executor.NullExecutor` is a stub,
+`policy.implement_enabled` defaults to `False`), so nothing currently spawns
+a worker subprocess to apply `worker_env()` to; `_dispatch_task_push` still
+imports from `execution.worktree_path`, a `WorktreeManager` linked worktree
+that shares `.git` with the main checkout. The guarantee this pass actually
+closes end to end is "publication happens only through the separate
+publisher repo, over an object it re-verifies by exact id" — not "the
+worker's own repository is isolated," which remains available-and-tested
+infrastructure for whenever a real executor lands.
 
 ---
 

@@ -444,6 +444,51 @@ the model sends.
 
 ---
 
+## 7. Autoloop worker/publisher separation (M2)
+
+### zsh silently eats a character out of `"$VAR:literal"` — a refspec with the wrong ref name, no error
+**Symptom:** `git push origin "${CANDIDATE}:refs/heads/task/t1"` worked from a
+shell one-liner, but an EARLIER attempt written as `"$CANDIDATE:refs/heads/task/t1"`
+(no braces) failed with `error: src refspec fdfc398...efs/heads/task/t1 does not
+match any` — note `efs` where `refs` should be. This happened identically on two
+separate ad hoc verification commands before the pattern was recognized.
+**Cause:** zsh applies history-style modifiers (`:t`, `:h`, `:r`, `:e`, ...) to a
+**bare** `$name` expansion — including inside double quotes — when a `:`
+immediately follows it. `$CANDIDATE:refs/...` parses as `$CANDIDATE` with
+modifier `r` (bash-style "remove one word" semantics don't apply; zsh's own `:r`
+strips a trailing suffix) applied, silently eating the leading `r` of the literal
+text that followed. `${CANDIDATE}:refs/...` (braced) is immune — the modifier
+syntax only fires on the unbraced form.
+**Fix:** nothing repo-side (this only affects ad hoc shell commands, never the
+Python code, which builds refspecs via plain f-string concatenation with no
+shell involved). **Always brace a variable that is followed by a literal `:`
+in a zsh command** — `"${VAR}:literal"`, never `"$VAR:literal"` — when
+constructing a git refspec (or anything else `name:value`-shaped) by hand at a
+shell prompt.
+
+### `verify_worker_isolation` reports an ambient system credential helper even against a freshly created, genuinely no-remote worker repo
+**Symptom:** `GitGateway(worker.path, policy)` (no `env=`) run against a brand
+new `WorkerRepoManager`-created repo (verified to have zero remotes, zero
+hooks) still reported `credential.helper=osxkeychain` as a violation.
+**Cause:** `GitGateway` had no way to control the environment its subprocess
+calls ran under — every `git` invocation inherited the CALLING process's own
+environment, ambient system/global config included. `git config --get-regexp`
+resolves whatever environment the subprocess itself runs under, not "the
+repo's local config in isolation" — so a check built purely on `GitGateway`
+reflects the CALLER's isolation, not the repo's, unless the caller explicitly
+scrubs the subprocess environment too.
+**Fix:** `GitGateway.__init__` gained an optional `env: dict | None = None`
+parameter (default `None` = prior behavior, inherit the current process
+environment — zero change for any of the 579 pre-M2 construction sites),
+threaded into every `subprocess.run(..., env=self._env)` call. `worker_env.
+WorkerRepo.gateway(policy)` is the convenience that constructs a `GitGateway`
+with `env=worker_env()` correctly; anything checking worker isolation MUST use
+it (or the equivalent explicit `env=`) rather than a bare `GitGateway(path,
+policy)` — see `verify_worker_isolation`'s own docstring, which states this
+requirement explicitly so it cannot be missed a second time.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found

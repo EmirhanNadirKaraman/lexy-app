@@ -93,6 +93,8 @@ from .executor import TaskExecutor
 from .git_gateway import GitGateway
 from .packet import build_review_packet
 from .policy import PolicyEngine
+from .publisher import Publisher
+from .worker_env import verify_worker_isolation, worker_env
 from .prompts import (
     TEMPLATES,
     build_prompt,
@@ -151,6 +153,8 @@ class Orchestrator:
         execution_store: TaskExecutionStore | None = None,
         intent_store: IntentStore | None = None,
         validation_runner=None,
+        publisher: Publisher | None = None,
+        worker_repos=None,
     ):
         self._config = config
         self._store = store
@@ -176,6 +180,22 @@ class Orchestrator:
         #: validation, mirroring `AuditExecutor`'s `command_runner` — lets
         #: tests avoid depending on a real `ruff`/`pytest` install.
         self._validation_runner = validation_runner
+        # Autoloop M2 (`publisher.py`). Optional and independently gated from
+        # the `worktrees`/`execution_store`/`intent_store` triple above: when
+        # `None` (every existing caller and test), `_dispatch_task_push`
+        # publishes exactly as before — `worktree_git.push_exact` straight
+        # from the task's own linked worktree. When set, publication routes
+        # through the dedicated `Publisher` repo instead: the reviewed
+        # candidate is imported by exact object id from the worktree, then
+        # published from the SEPARATE publisher repo, never from the
+        # worktree's own (main-checkout-shared) git configuration.
+        self._publisher = publisher
+        # Autoloop M2 worker side. When set, a task's working repository is a
+        # SEPARATE local repo (no remote, no credentials, controlled empty
+        # hooks dir) instead of a linked worktree that shares `.git` — and
+        # therefore `origin` — with the main checkout. Gated like the rest:
+        # `None` keeps the pre-M2 linked-worktree behaviour.
+        self._worker_repos = worker_repos
         self._client = None
 
     # ---- main loop ----------------------------------------------------------
@@ -649,7 +669,7 @@ class Orchestrator:
                 "started_at": utcnow_iso(),
             }
 
-        if task is not None and self._worktrees is not None:
+        if task is not None and (self._worktrees is not None or self._worker_repos is not None):
             # Produce-then-review commit path. Audit never takes this branch
             # (task is always None for it) — it keeps the manifest-based path
             # below unconditionally, report content and all.
@@ -743,12 +763,38 @@ class Orchestrator:
             # implementation work starts, from the MAIN checkout's HEAD (the
             # commit the task's branch forks from).
             base_sha = self._git.head_sha()
-            execution = self._worktrees.create(task.id, base_sha)
+            if self._worker_repos is not None:
+                repo = self._worker_repos.create(task.id, self._git.repo_root, base_sha)
+                execution = TaskExecution(
+                    task_id=task.id,
+                    task_branch=repo.branch,
+                    worktree_path=str(repo.path),
+                    task_base_sha=base_sha,
+                )
+            else:
+                execution = self._worktrees.create(task.id, base_sha)
             self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         self._store.save(state)
 
-        worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
+        if self._worker_repos is not None:
+            # The scrubbed env is not decoration: a GitGateway with no explicit
+            # env inherits the CALLING process's credential helper and system
+            # config regardless of how isolated the repo's own on-disk config
+            # is, so an isolation check run without it inspects the wrong thing.
+            worktree_git = GitGateway(
+                Path(execution.worktree_path), self._policy, env=worker_env()
+            )
+            violations = verify_worker_isolation(worktree_git)
+            if violations:
+                self._to_needs_user(
+                    f"task {task.id}: the worker repository is not isolated — "
+                    + "; ".join(violations)
+                    + ". Nothing was executed or committed."
+                )
+                return
+        else:
+            worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
 
         pending_intent = self._intent_store.load(task.id)
         if pending_intent is not None:
@@ -1069,6 +1115,19 @@ class Orchestrator:
         single `commit_and_capture` call), so there is nothing honest to
         compare against. `push_exact`'s own unconditional checks (active
         push hooks, `insteadOf`/`pushurl` presence) still run regardless.
+
+        **Autoloop M2 routing.** When `self._publisher` is set, publication
+        goes through it instead of pushing directly from the task's own
+        worktree: `Publisher.import_candidate` fetches `binding.candidate_sha`
+        (and ONLY that literal object id — never worktree HEAD, never a ref)
+        from `execution.worktree_path` into the publisher's own,
+        SEPARATE repository, verifies the imported object id and type, and
+        `Publisher.publish` then calls the exact same `GitGateway.push_exact`
+        the worktree branch below calls — reused, not reimplemented — rooted
+        at the publisher repo instead of the worktree. `binding.candidate_sha`
+        remains the ONLY source of what gets published in either branch; this
+        method never reads a fresh "current" sha from anywhere once the
+        binding checks above have passed.
         """
         state = self.state
         binding = resp.postcommit
@@ -1108,7 +1167,9 @@ class Orchestrator:
             )
             return
 
-        remote = execution.intended_remote or "origin"
+        remote = self._publisher.remote if self._publisher is not None else (
+            execution.intended_remote or "origin"
+        )
         dest_ref = f"refs/heads/{binding.task_branch}"
         # Durable push intent, recorded BEFORE the network call — mirrors
         # `CommitIntent`'s "write before the risky operation" pattern, so a
@@ -1118,7 +1179,11 @@ class Orchestrator:
         execution.intended_remote_ref = dest_ref
         self._execution_store.save(execution)
 
-        landed = worktree_git.remote_ref_sha(remote, dest_ref)
+        landed = (
+            self._publisher.remote_ref_sha(dest_ref)
+            if self._publisher is not None
+            else worktree_git.remote_ref_sha(remote, dest_ref)
+        )
         if landed != binding.candidate_sha:
             # Same `allow_protected_push` gating as the legacy path below —
             # `authorize_directive` already decided whether
@@ -1131,12 +1196,25 @@ class Orchestrator:
                 else self._policy.config.protected_branches
             )
             try:
-                landed = worktree_git.push_exact(
-                    remote,
-                    binding.candidate_sha,
-                    dest_ref,
-                    gateway_protected,
-                )
+                if self._publisher is not None:
+                    # Import first: bring the EXACT reviewed object into the
+                    # publisher's own, separate object database from the
+                    # worker's worktree, by literal sha — never a ref, never
+                    # worker HEAD. `import_candidate` itself re-verifies the
+                    # imported object id and that it is a commit.
+                    self._publisher.import_candidate(
+                        execution.worktree_path, binding.candidate_sha
+                    )
+                    landed = self._publisher.publish(
+                        binding.candidate_sha, dest_ref, gateway_protected
+                    )
+                else:
+                    landed = worktree_git.push_exact(
+                        remote,
+                        binding.candidate_sha,
+                        dest_ref,
+                        gateway_protected,
+                    )
             except GitCommandError as exc:
                 self._to_needs_user(
                     f"task {binding.task_id}: push of {binding.candidate_sha[:12]} "

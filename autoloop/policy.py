@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 from .contract import (
@@ -126,6 +127,13 @@ _ALLOWED_GIT: dict[str, frozenset[str]] = {
     "rev-list": frozenset(),
     "ls-remote": frozenset({"--heads"}),
     "config": frozenset({"--get", "--get-regexp", "--get-all"}),
+    # Autoloop M2 (`publisher.py`'s `import_candidate` / `worker_env.py`'s
+    # `WorkerRepo`): fetching a SINGLE already-existing object by its literal
+    # 40-hex id from a LOCAL filesystem path, with no destination ref and no
+    # wildcard. Zero flags admitted, mirroring `push`'s own empty set — the
+    # want-token and source-path shape checks below (F2-style) are what keep
+    # this from becoming an arbitrary-refspec fetch.
+    "fetch": frozenset(),
     # Per-task worktree lifecycle (`worktree.py`'s WorktreeManager). Only the
     # real FLAGS live here — the action verb (add/remove/list/prune) is
     # checked separately below via `_ALLOWED_GIT_VERBS`, because the flag loop
@@ -307,6 +315,44 @@ class PolicyEngine:
                             "through this gateway (F2); a branch name, tag or "
                             "'HEAD' can move between review and push",
                         )
+        if sub == "fetch":
+            # Autoloop M2: `git fetch <source> <want>` — exactly two
+            # positional arguments, no refspec, no wildcard, no remote name.
+            # `source` must be an absolute filesystem path (never a URL
+            # scheme like `https://`/`ssh://`, never `user@host:path`
+            # scp-syntax, never a relative path) — cheap insurance since the
+            # caller (`GitGateway.fetch_object`) always constructs it itself
+            # rather than taking it from a directive. `want` must be a
+            # literal, already-resolved 40-hex object id, exactly like
+            # `push`'s refspec source (F2): a branch name or tag could
+            # pull in history nobody asked for.
+            positionals = args[1:]
+            if len(positionals) != 2:
+                return Verdict.deny(
+                    "git_fetch_shape",
+                    "'git fetch' is only allowed as 'fetch <source> <want>' "
+                    f"(got {len(positionals)} argument(s))",
+                )
+            source, want = positionals
+            if "+" in want or ":" in want or not _HEX40.match(want):
+                return Verdict.deny(
+                    "git_fetch_want",
+                    f"fetch want-token {want!r} must be a literal 40-hex object "
+                    "id with no ':' (refspec) or '+' (force) — a branch name, "
+                    "tag or wildcard is refused",
+                )
+            if "://" in source or not Path(source).is_absolute():
+                # `Path(...).is_absolute()` alone already rejects a leading
+                # '-' (flag injection) and scp-like 'user@host:path' syntax —
+                # neither starts with '/' — so the '://' check is the only
+                # thing doing independent work here; kept as an explicit,
+                # named case rather than relying on that being obvious.
+                return Verdict.deny(
+                    "git_fetch_source",
+                    f"fetch source {source!r} must be an absolute local "
+                    "filesystem path — no URL scheme, no scp-like "
+                    "'user@host:path' syntax, no relative path",
+                )
         required = _REQUIRED_GIT.get(sub)
         if required and not required.issubset(args[1:]):
             missing = sorted(required - set(args[1:]))
