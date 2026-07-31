@@ -734,9 +734,9 @@ the same request id so a message that did land is still detected. Sessions
 without the observation capability (every non-Playwright adapter) never produce
 `REJECTED` and behave exactly as they did before.
 
-**Rotation is the last resort, not the reflex.** A second confirmed rejection, or
-a `ConversationUnusableError`, may abandon the chat for a fresh one in the
-configured project:
+**Rotation is the last resort, not the reflex.** A second confirmed rejection, a
+`ConversationUnusableError`, or a confirmed **silent conversation** (below) may
+abandon the chat for a fresh one in the configured project:
 
 * `browser.project_url` must be set **explicitly**. It is never derived from
   `conversation_url` — a guessed project opens chats somewhere you did not
@@ -750,9 +750,67 @@ configured project:
   budget — rotating for a network blip would spend the one rotation and leave
   none for the real thing. The two budgets are also kept separate: a rotation
   attempt does not also increment `consecutive_failures`.
-* Never rotates for: generation already started, a slow answer, an ordinary
-  response timeout, login expiry, rate limits, capacity, a malformed reply, or a
-  policy denial.
+* Never rotates for: generation already started, a slow answer, a single or
+  merely occasional response-start timeout, login expiry, rate limits,
+  capacity, a malformed reply, or a policy denial.
+
+**A silent conversation — send confirmed, model never starts — is the third
+trigger.** Added 2026-07-31, after this exact shape recurred three times: the
+send is CONFIRMED and persisted (§5b/§5c above already rule out ambiguity and a
+disproven send), and the model simply never begins generating, producing
+repeated `ResponseTimeoutError`s that used to just spend the ordinary failure
+budget down to `failed`. `BrowserChatGPT.await_response` now tags each timeout
+with a `stage` — `"start"` (nothing began within `response_start_timeout_seconds`)
+or `"complete"` (a response began and merely did not settle) — and rotation may
+consider only `"start"`. All three of the following must hold, checked in this
+order, before autoloop will call the chat unusable:
+
+1. **Three consecutive `stage="start"` timeouts for the SAME request**, with no
+   resubmission in between. This holds by construction, not by an extra guard:
+   `awaiting` has no transition back to `submitting` except through a completed
+   rotation, which resets the count — so three in a row can only mean three
+   timeouts in one conversation, for one submission, nothing resent between
+   them.
+2. **A total measured wait of at least 3× `response_start_timeout_seconds`**
+   (the default 120s → a 360s floor), computed from the configured value —
+   never hardcoded — and checked against the ACTUAL elapsed time each timeout
+   measured (`ResponseTimeoutError.elapsed`), not merely assumed from config.
+   This is a soft gate, not an invariant to crash on: the floor is computed
+   from the CURRENT config, while each `elapsed` was measured against
+   whatever was configured at the time, so raising
+   `response_start_timeout_seconds` between processes (the third trigger's
+   own restart path can land exactly here) can leave a true, honestly
+   measured wait below a floor computed from the new value. That is
+   insufficient evidence, not corruption — the loop logs
+   `response_silence_wait_below_floor` and keeps retrying ordinarily rather
+   than raising.
+3. **One FINAL reconciliation of the (still-current) conversation confirms no
+   assistant turn has started** — `BrowserChatGPT.reconcile_no_response`, an
+   explicit reload followed by the same "has the assistant begun answering our
+   turn" check `await_response` itself uses, so a reply that landed between the
+   third timeout and this check is not missed. A reply appearing here
+   **cancels** the rotation attempt entirely: the streak resets to 0, exactly
+   as if the timeouts had never happened, because the conversation was never
+   actually silent — it was just slow.
+
+Only once all three hold does the loop retire the old conversation, open
+exactly one replacement in the configured project, resend the same request id
+(the ordinary rotation continuation prompt — see below), and bind to it. It is
+bounded by the SAME `policy.max_conversation_rotations` budget as the other two
+triggers, not a separate allowance — a replacement chat that is also silent
+parks `loop_fatal` on the second attempt, same as any other rotation-cap
+refusal. Every occurrence, first through third, is still charged to the
+ordinary failure budget too (`_handle_browser_failure` runs first, every time);
+the silent-conversation check is layered on top of it, never a bypass. A
+completed rotation resets `consecutive_failures` to 0 alongside the silence
+count, exactly like an ordinary successful `awaiting` step already does — the
+replacement conversation does not inherit the retired one's fault count. This
+is what makes the "replacement chat is also silent" case above reachable at
+all: without the reset, a single timeout in the replacement chat would push
+`consecutive_failures` straight past `max_consecutive_failures` (already at
+its ceiling from the three timeouts that earned the first rotation) and fail
+the loop before a second rotation attempt — and its cap refusal — is ever
+reached.
 
 **Rotation proves before it binds.** ChatGPT does not mint a `/c/<id>` until a
 chat has its first turn, so the order is forced: retarget to the project page,

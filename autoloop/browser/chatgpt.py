@@ -199,6 +199,36 @@ class BrowserChatGPT:
                 return False
             self._sleep(self._poll_interval)
 
+    def reconcile_no_response(self, request_id: str) -> bool:
+        """Explicit reload, then report whether the assistant has NOT yet
+        begun answering `request_id`, per PERSISTED history.
+
+        `reconcile()`'s counterpart for a confirmed, persisted send whose
+        assistant turn never started: `reconcile()` only proves OUR turn
+        persisted, which is already known true in that situation, so it
+        cannot answer "has the model started replying?" This can — and it
+        answers from a FRESH reload rather than the live page
+        `await_response` was already polling, because a dropped
+        subscription can leave the live DOM stale even where a reload would
+        show the truth. This is the orchestrator's "silent conversation"
+        rotation entry condition's final check (see
+        `orchestrator._attempt_silence_rotation`); an optional capability
+        like `retarget`/`current_url`, probed the same way.
+
+        Returns True while the conversation still shows no assistant turn
+        for this request (the conversation may still be a rotation
+        candidate); False the moment any evidence of a started response
+        appears, which cancels rotation.
+        """
+        if self._on_conversation():
+            self._session.reload()
+        else:
+            self._session.goto(self._conversation_url)
+        self._reconciled = True
+        self._await_composer("reconcile-no-response", request_id=request_id)
+        self._check_logged_in(request_id=request_id, stage="reconcile-no-response")
+        return not self._response_started(self.messages(), request_id)
+
     def close(self) -> None:
         self._session.close()
 
@@ -345,7 +375,8 @@ class BrowserChatGPT:
         `response_start_timeout` and *complete* within `response_timeout`.
         Polls the live page — no navigation, no reload.
         """
-        start_deadline = self._monotonic() + self._response_start_timeout
+        wait_start = self._monotonic()
+        start_deadline = wait_start + self._response_start_timeout
         started = False
         stable_text: str | None = None
         stable_since = 0.0
@@ -373,7 +404,9 @@ class BrowserChatGPT:
                     )
                     raise ResponseTimeoutError(
                         f"no assistant response to {request_id} began within "
-                        f"{self._response_start_timeout}s"
+                        f"{self._response_start_timeout}s",
+                        stage="start",
+                        elapsed=self._monotonic() - wait_start,
                     )
 
             if started:
@@ -400,7 +433,8 @@ class BrowserChatGPT:
                     )
                     raise ResponseTimeoutError(
                         f"assistant response to {request_id} did not complete within "
-                        f"{self._response_timeout}s"
+                        f"{self._response_timeout}s",
+                        stage="complete",
                     )
             self._sleep(self._poll_interval)
 

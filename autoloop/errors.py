@@ -67,7 +67,28 @@ class ConversationUnusableError(BrowserError):
 
 
 class ResponseTimeoutError(BrowserError):
-    """No completed assistant response appeared within the timeout."""
+    """No completed assistant response appeared within the timeout.
+
+    `stage` distinguishes which of `BrowserChatGPT.await_response`'s two
+    bounds fired: `"start"` means no assistant turn began generating at all
+    within `response_start_timeout` — the one shape of this error that is a
+    candidate for the "silent conversation" rotation entry condition (see
+    `orchestrator._handle_response_start_timeout` and `docs/AUTOLOOP.md`
+    §5c). `"complete"` (the default, for every other raise site) means a
+    response visibly started but did not settle in time — the conversation
+    is plainly alive, so this is never grounds to rotate.
+
+    `elapsed` is the ACTUAL measured wait in monotonic seconds, not the
+    configured timeout value — so a caller proving a minimum total wait was
+    really observed (rather than assumed from config) has real evidence to
+    sum, not just a repeated constant. `None` for an instance that never
+    measured it (e.g. hand-constructed in a test).
+    """
+
+    def __init__(self, message: str, *, stage: str = "complete", elapsed: float | None = None):
+        self.stage = stage
+        self.elapsed = elapsed
+        super().__init__(message)
 
 
 class GitError(AutoloopError):

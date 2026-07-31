@@ -78,6 +78,7 @@ class RotatingFakeClient:
         send_outcomes=None,
         attach_errors=(),
         new_url=NEW_CONV_URL,
+        no_response_results=(True,),
     ):
         self.conversation_url = conversation_url
         self.responses = list(responses)
@@ -97,6 +98,12 @@ class RotatingFakeClient:
         self.send_attempted = False
         self.send_outcome = SendOutcome.UNKNOWN
         self.send_observations: list[SendObservation] = []
+        # Queue consumed one entry per `reconcile_no_response()` call (tail
+        # repeats, same convention as `submit_results`). True = "still no
+        # assistant turn for this request" (a rotation candidate); False =
+        # "a reply appeared" (cancels it).
+        self.no_response_results = list(no_response_results)
+        self.no_response_calls: list[tuple[str, str]] = []  # (url, request_id)
 
     # -- test helpers ------------------------------------------------------
     def seed(self, url, request_id):
@@ -121,6 +128,15 @@ class RotatingFakeClient:
     def reconcile(self, request_id):
         self.reconciled.append((self.conversation_url, request_id))
         return self.has_request(request_id)
+
+    def reconcile_no_response(self, request_id):
+        self.no_response_calls.append((self.conversation_url, request_id))
+        result = (
+            self.no_response_results.pop(0)
+            if len(self.no_response_results) > 1
+            else self.no_response_results[0]
+        )
+        return result
 
     def submit(self, request_id, prompt):
         result = (
@@ -863,6 +879,285 @@ def test_new_chat_prompt_is_the_original_plus_one_continuation_line(tmp_path):
     assert orch.state.pending_request.prompt_sha256 == (
         hashlib.sha256(rotated_prompt.encode("utf-8")).hexdigest()
     )
+
+
+# ---- 16. the silent-conversation rotation entry condition -------------------
+#
+# A CONFIRMED, persisted send whose assistant turn never starts is a THIRD,
+# distinct rotation trigger (`docs/AUTOLOOP.md` §5c): the send is known good,
+# the model simply never begins. Unlike the other two triggers, its own
+# disproof (three `ResponseTimeoutError(stage="start")`s, an accumulated wait
+# past the configured floor, and one final reconciliation) has to be earned
+# here rather than handed over by the transport.
+
+
+def _start_timeout(elapsed=125.0):
+    """A `responses` queue entry that raises the response-START timeout (never
+    the response-COMPLETE one) `_handle_response_start_timeout` watches for.
+    `elapsed` is the ACTUAL measured wait the exception reports, kept above
+    the 120s configured start timeout `build()` uses — what a real timeout
+    would measure.
+    """
+
+    def _raise(client):
+        raise ResponseTimeoutError(
+            "no assistant response began within 120.0s", stage="start", elapsed=elapsed
+        )
+
+    return _raise
+
+
+def test_two_start_timeouts_do_not_rotate(tmp_path):
+    """The entry condition requires a THIRD consecutive timeout; two is an
+    ordinary retry on the failure budget, exactly as before this change."""
+    client = RotatingFakeClient(responses=[_start_timeout(), _start_timeout()])
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.AWAITING.value
+    state.pending_request = pending(submitted=True)
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=2)
+
+    assert orch.state.pending_request.start_timeouts == 2
+    assert orch.state.phase == Phase.AWAITING.value  # retried, not parked
+    assert orch.state.rotations == 0
+    assert client.no_response_calls == []  # never reached the final check
+    assert transcript_entries(config, "conversation_rotated") == []
+
+
+def test_third_start_timeout_with_confirmed_silence_rotates(tmp_path):
+    """Three consecutive response-START timeouts, an accumulated wait past
+    the floor, and a final reconciliation that still finds no assistant turn
+    — together are what authorizes the one rotation."""
+    client = RotatingFakeClient(
+        responses=[_start_timeout(), _start_timeout(), _start_timeout()],
+        no_response_results=[True],
+    )
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.AWAITING.value
+    state.pending_request = pending(submitted=True)
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=3)  # stops at the rotation, before the reply is consumed
+
+    assert orch.state.rotations == 1
+    assert orch.state.conversation_url == NEW_CONV_URL
+    assert orch.state.conversation_epoch == 1
+    assert orch.state.pending_request.conversation_url == NEW_CONV_URL
+    assert orch.state.pending_request.start_timeouts == 0  # reset by the rotation
+    assert orch.state.phase == Phase.AWAITING.value
+    # The final check reconciled the OLD (still-current-at-the-time) chat.
+    assert client.no_response_calls == [(CONV_URL, "alr-test-0001")]
+    rotated = transcript_entries(config, "conversation_rotated")
+    assert len(rotated) == 1
+    assert rotated[0]["data"]["old_url"] == CONV_URL
+    assert rotated[0]["data"]["new_url"] == NEW_CONV_URL
+    assert rotated[0]["data"]["reason"] == "response_start_silence"
+    confirmed = transcript_entries(config, "response_silence_confirmed")
+    assert confirmed and confirmed[0]["data"]["start_timeouts"] == 3
+
+
+def test_response_appearing_during_final_reconciliation_cancels_rotation(tmp_path):
+    """A reply that shows up between the third timeout and the final
+    reconciliation means the conversation was never silent: no rotation, and
+    the stale streak must not survive to threaten a future timeout."""
+    client = RotatingFakeClient(
+        responses=[_start_timeout(), _start_timeout(), _start_timeout()],
+        no_response_results=[False],
+    )
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.AWAITING.value
+    state.pending_request = pending(submitted=True)
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=3)
+
+    assert orch.state.rotations == 0
+    assert orch.state.conversation_url == CONV_URL  # never rotated
+    assert orch.state.phase == Phase.AWAITING.value  # still retryable
+    assert orch.state.pending_request.start_timeouts == 0  # streak reset
+    assert orch.state.pending_request.start_timeout_wait_seconds == 0.0
+    cancelled = transcript_entries(config, "response_silence_check_cancelled")
+    assert cancelled and cancelled[0]["data"]["start_timeouts"] == 3
+    assert transcript_entries(config, "conversation_rotated") == []
+
+
+def test_no_duplicate_send_during_timeout_retries(tmp_path):
+    """`awaiting` never resends on its own account; the only send across the
+    whole sequence is the ONE the eventual rotation makes into the
+    replacement chat."""
+    client = RotatingFakeClient(
+        responses=[_start_timeout(), _start_timeout(), _start_timeout()],
+        no_response_results=[True],
+    )
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.AWAITING.value
+    state.pending_request = pending(submitted=True)
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=2)
+    assert client.submitted == []  # nothing sent across the first two timeouts
+
+    orch.run(max_steps=1)  # the third timeout, confirmed silence, rotation
+    assert len(client.submitted) == 1
+    assert client.submitted[0][0] == PROJECT_URL  # the one send: into the replacement
+    assert client.submitted[0][1] == "alr-test-0001"
+
+
+def test_delayed_reply_in_the_retired_conversation_is_ignored(tmp_path):
+    """After the silence rotation the request is bound to the replacement
+    chat; every read from that point on follows the request's OWN
+    conversation, so a reply that later shows up in the retired one is never
+    even looked at."""
+    client = RotatingFakeClient(
+        responses=[
+            _start_timeout(),
+            _start_timeout(),
+            _start_timeout(),
+            stop_block("from the replacement chat"),
+        ],
+        no_response_results=[True],
+    )
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.AWAITING.value
+    state.pending_request = pending(submitted=True)
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=4)
+
+    assert orch.state.rotations == 1
+    assert client.awaited, "the loop never awaited a response"
+    # The three pre-rotation timeouts were read from the original chat; the
+    # reply that actually got consumed came from the replacement.
+    assert client.awaited[:3] == [(CONV_URL, "alr-test-0001")] * 3
+    assert client.awaited[-1] == (NEW_CONV_URL, "alr-test-0001")
+    assert orch.state.last_response is not None
+    assert orch.state.last_response.conversation_url == NEW_CONV_URL
+
+
+def test_replacement_chat_reuses_the_same_request_id(tmp_path):
+    client = RotatingFakeClient(
+        responses=[_start_timeout(), _start_timeout(), _start_timeout()],
+        no_response_results=[True],
+    )
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.AWAITING.value
+    original = pending(submitted=True)
+    state.pending_request = original
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=3)
+
+    assert len(client.submitted) == 1
+    rotated_url, rotated_rid, rotated_prompt = client.submitted[0]
+    assert rotated_url == PROJECT_URL  # sent into the project's new chat
+    assert rotated_rid == original.request_id == "alr-test-0001"
+    assert orch.state.pending_request.request_id == original.request_id
+    assert CONTINUATION_NOTE in rotated_prompt
+
+
+def test_second_silence_rotation_is_refused_and_parks(tmp_path):
+    """The FULL sequence, not a pre-seeded budget: three timeouts rotate once
+    (this is what resets `consecutive_failures` alongside `start_timeouts` —
+    without that reset, a first timeout in the replacement chat would exceed
+    the ordinary failure budget and reach `failed` before the rotation cap
+    is ever consulted, making this scenario unreachable). Three MORE timeouts
+    in the replacement chat, confirmed silent again, attempt a second
+    rotation — refused by `policy.max_conversation_rotations` (default 1),
+    parking `loop_fatal` exactly like the other two triggers' cap refusals.
+    """
+    client = RotatingFakeClient(
+        responses=[
+            _start_timeout(),
+            _start_timeout(),
+            _start_timeout(),
+            _start_timeout(),
+            _start_timeout(),
+            _start_timeout(),
+        ],
+        no_response_results=[True, True],
+    )
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.AWAITING.value
+    state.pending_request = pending(submitted=True)
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=6)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert orch.state.rotations == 1  # the first rotation, not a second
+    declined = transcript_entries(config, "rotation_declined")
+    assert declined and declined[-1]["data"]["reason_code"] == "rotation_cap_reached"
+    # Exactly one rotation happened — the first sequence's, into the chat
+    # that then ALSO went silent.
+    rotated = transcript_entries(config, "conversation_rotated")
+    assert len(rotated) == 1
+    assert rotated[0]["data"]["new_url"] == NEW_CONV_URL
+    # The final silence check ran BOTH times (evidence gathering happens
+    # unconditionally): once against the original chat, once against the
+    # replacement — it is only the second ROTATION that the budget refuses.
+    assert client.no_response_calls == [
+        (CONV_URL, "alr-test-0001"),
+        (NEW_CONV_URL, "alr-test-0001"),
+    ]
+
+
+def test_restart_preserves_timeout_count_and_completes_the_rotation(tmp_path):
+    """A crash after two response-start timeouts loses nothing: a fresh
+    process resumes the count (and the still-retired epoch/binding) from
+    disk, and the third timeout — now against a fresh client — still
+    completes the same rotation a live run would have."""
+    client = RotatingFakeClient(responses=[_start_timeout(), _start_timeout()])
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.AWAITING.value
+    state.pending_request = pending(submitted=True)
+    orch, store, config = build(tmp_path, client, state=state)
+    orch.run(max_steps=2)
+    assert orch.state.pending_request.start_timeouts == 2
+
+    reloaded = StateStore(config.state_file).load()
+    assert reloaded.pending_request.start_timeouts == 2
+    assert reloaded.pending_request.start_timeout_wait_seconds == pytest.approx(250.0)
+    assert reloaded.phase == Phase.AWAITING.value
+    assert reloaded.rotations == 0
+    assert reloaded.conversation_epoch == 0  # nothing retired yet
+    assert reloaded.pending_request.conversation_url == CONV_URL
+    # Captured now, not read again after `orch2.run()` below: `build()` binds
+    # the orchestrator directly to the `reloaded` object (by reference, not a
+    # copy), so a second run mutates it in place — the SAME trap
+    # `test_rejected_outcome_survives_a_restart` avoids by never re-reading
+    # `reloaded` after constructing `orch2`.
+    epoch_before_restart = reloaded.conversation_epoch
+
+    # Fresh process, fresh client: the count picks up where it left off.
+    resumed_client = RotatingFakeClient(
+        responses=[_start_timeout()], no_response_results=[True]
+    )
+    second = tmp_path / "second"
+    second.mkdir()
+    orch2, _, config2 = build(second, resumed_client, state=reloaded)
+    orch2.run(max_steps=1)
+
+    assert orch2.state.rotations == 1
+    assert orch2.state.conversation_url == NEW_CONV_URL
+    assert orch2.state.conversation_epoch == 1
+    assert orch2.state.pending_request.conversation_url == NEW_CONV_URL
+    assert orch2.state.pending_request.start_timeouts == 0  # reset by the rotation
+
+    reloaded2 = StateStore(config2.state_file).load()
+    assert reloaded2.rotations == 1
+    assert reloaded2.conversation_epoch == 1
+    assert reloaded2.pending_request.conversation_url == NEW_CONV_URL
+    assert reloaded2.last_rotation["old_url"] == CONV_URL
+    assert reloaded2.last_rotation["reason"] == "response_start_silence"
+    # `RotationRecord` carries no separate `old_epoch` field — the retired
+    # epoch is recorded only implicitly, as `epoch - 1`. That is exactly
+    # `epoch_before_restart` captured above, from BEFORE the restart: epoch 0
+    # is what got retired, epoch 1 (asserted here) is what replaced it, and
+    # the restart lost neither number.
+    assert reloaded2.last_rotation["epoch"] == 1
+    assert reloaded2.last_rotation["epoch"] - 1 == epoch_before_restart
 
 
 # ---- classification unit tests ---------------------------------------------

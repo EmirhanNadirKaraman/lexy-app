@@ -53,6 +53,17 @@ Transport-recovery additions (this change):
   `conversation_epoch`. Submitting, awaiting and reconciling all follow the
   request's URL, never the loop's current one, so a late reply in an abandoned
   chat cannot authorize anything.
+* A CONFIRMED, persisted send whose assistant turn never begins generating
+  (`ResponseTimeoutError` with `stage="start"`, repeated) is a THIRD, distinct
+  rotation trigger — the "silent conversation" — layered on top of the
+  ordinary failure budget rather than routed around it. Three consecutive
+  such timeouts for the same request, an accumulated measured wait of at
+  least 3x `response_start_timeout_seconds`, and a FINAL reconciliation that
+  still finds no assistant turn started, together authorize exactly one
+  rotation (`_handle_response_start_timeout` / `_attempt_silence_rotation`).
+  A response that already started and is merely slow (`stage="complete"`)
+  never qualifies, and a reply that appears during that final reconciliation
+  cancels the attempt.
 
 Note for the merge with the blocker/quarantine work (commit 5346551, branch
 `feat/autoloop-postcommit-review`): every park site added here goes through the
@@ -65,6 +76,9 @@ code — no new taxonomy is invented here.
 Failure routing:
 
 * LoginExpiredError            → needs_user, resume_phase preserved (--retry)
+* ResponseTimeoutError(start)  → ordinary budget as below, PLUS: 3rd
+                                 consecutive one for the same request may
+                                 rotate (see "silent conversation" above)
 * other BrowserError           → drop conversation, retry same phase; failure
                                  budget exhausted → failed (resume via --retry)
 * GitError                     → reported back to ChatGPT (budget-capped);
@@ -127,6 +141,7 @@ from .errors import (
     GitCommandError,
     GitError,
     LoginExpiredError,
+    ResponseTimeoutError,
     StateError,
     TaskGraphError,
 )
@@ -321,6 +336,13 @@ class Orchestrator:
                 )
             except ConversationUnusableError as exc:
                 self._handle_conversation_unusable(phase, exc)
+            except ResponseTimeoutError as exc:
+                # Caught BEFORE the generic BrowserError below (it is one),
+                # so a repeated, confirmed-silent response-START timeout can
+                # be routed to the rotation entry condition instead of only
+                # ever retrying on the ordinary failure budget. See
+                # `_handle_response_start_timeout`.
+                self._handle_response_start_timeout(phase, exc)
             except BrowserError as exc:
                 self._handle_browser_failure(phase, exc)
             except GitError as exc:
@@ -630,6 +652,83 @@ class Orchestrator:
         # phase. Assigning it here too would just be overwritten.
         self._attempt_rotation(req, reason="conversation_unusable")
 
+    def _handle_response_start_timeout(
+        self, phase: Phase, exc: ResponseTimeoutError
+    ) -> None:
+        """A confirmed, persisted send whose assistant turn never starts —
+        the "silent conversation" fault distinct from every other rotation
+        trigger, where a send was disproven or the chat itself was broken.
+        Here the send is known good; the model simply never begins.
+
+        Every occurrence still goes through `_handle_browser_failure` FIRST,
+        exactly like `_handle_conversation_unusable` layers rotation ON TOP
+        of (never instead of) the ordinary failure budget for a wedged chat.
+        Only on the THIRD consecutive `stage="start"` timeout for the SAME
+        request — with that budget still allowing a retry — does this
+        attempt the additional proof rotation requires (see
+        `_attempt_silence_rotation`). A `stage="complete"` timeout (a
+        response that already started and is merely slow or stalled) is
+        never a candidate and is routed through unconditionally.
+
+        "No resubmission happened between these windows" holds by
+        construction, not by an extra guard here: `awaiting` has no
+        transition back to `submitting` except through a completed
+        rotation, which resets `start_timeouts` to 0 — so a nonzero count
+        can only describe consecutive timeouts in one conversation, for one
+        submission, with nothing resent in between.
+        """
+        if phase is not Phase.AWAITING or exc.stage != "start":
+            self._handle_browser_failure(phase, exc)
+            return
+
+        state = self.state
+        req = state.pending_request
+        if req is None:  # pragma: no cover - defensive; awaiting always has one
+            self._handle_browser_failure(phase, exc)
+            return
+
+        req.start_timeouts += 1
+        req.start_timeout_wait_seconds += (
+            exc.elapsed
+            if exc.elapsed is not None
+            else self._config.browser.response_start_timeout_seconds
+        )
+        # Persists the incremented, still-ordinary-failure counters durably
+        # (via `_handle_browser_failure`'s own save) before anything below
+        # risks a further network call — a crash here must resume with the
+        # timeout count intact, not lose it back to 0.
+        self._handle_browser_failure(phase, exc)
+        if state.phase != Phase.AWAITING.value or req.start_timeouts < 3:
+            # Either the ordinary budget already parked/failed the loop, or
+            # this is only the first or second such timeout — an ordinary
+            # retry, not yet a rotation candidate.
+            return
+
+        floor = 3 * self._config.browser.response_start_timeout_seconds
+        if req.start_timeout_wait_seconds < floor:
+            # Computed from the CURRENT config, not a literal 360 — and
+            # deliberately NOT an assertion. `elapsed` on each of the three
+            # timeouts was measured against whatever
+            # `response_start_timeout_seconds` was configured AT THE TIME;
+            # an operator raising that value between processes (this trigger
+            # is exactly the kind of fault a restart can land in the middle
+            # of) can leave a true, honestly-measured accumulated wait below
+            # a floor computed from the NEW value. That is insufficient
+            # evidence, not corruption — the correct response is to keep
+            # retrying ordinarily, never to crash the loop over it.
+            self._log(
+                "response_silence_wait_below_floor",
+                request_id=req.request_id,
+                data={
+                    "reason_code": "response_silence_wait_below_floor",
+                    "start_timeouts": req.start_timeouts,
+                    "accumulated_wait_seconds": req.start_timeout_wait_seconds,
+                    "floor_seconds": floor,
+                },
+            )
+            return
+        self._attempt_silence_rotation(req)
+
     # ---- conversation rotation ---------------------------------------------
 
     def _attempt_rotation(self, req: PendingRequest, reason: str) -> None:
@@ -717,6 +816,23 @@ class Orchestrator:
         req.submitted = True
         req.send_attempted = True
         req.last_send_outcome = SendOutcome.ACCEPTED.value
+        # Fresh conversation, fresh silence clock: whatever `start_timeouts`
+        # counted described the RETIRED conversation, which this request no
+        # longer belongs to. Carrying it forward would let a future timeout
+        # in the new chat inherit a count it did not earn.
+        req.start_timeouts = 0
+        req.start_timeout_wait_seconds = 0.0
+        # A completed rotation is itself a successful transport action — a
+        # send AND a reconciliation both just succeeded against the new
+        # conversation — exactly the evidence `_step_awaiting`'s own success
+        # path resets this counter on. Not resetting it here would leave the
+        # replacement chat starting from whatever count the RETIRED one had
+        # accrued, which for the silent-conversation trigger specifically
+        # means a single further timeout in the brand-new chat could exceed
+        # `max_consecutive_failures` and fail the loop before the rotation
+        # cap even gets a chance to refuse a second rotation. Cannot loop:
+        # `max_conversation_rotations` bounds rotations, not this reset.
+        state.consecutive_failures = 0
         state.phase = Phase.AWAITING.value
         state.resume_phase = None
         self._log(
@@ -726,6 +842,102 @@ class Orchestrator:
         )
         self._store.save(state)
         self._heal_config_url(new_url)
+
+    def _attempt_silence_rotation(self, req: PendingRequest) -> None:
+        """The third consecutive response-START timeout for `req`, with the
+        ordinary failure budget still allowing another try. One thing
+        remains before rotation may fire: proof, not assumption, that the
+        conversation is STILL silent right now — a reply could have landed
+        in the gap between the third timeout and this check, or across a
+        restart.
+
+        This is the ONLY extra step the "silent conversation" trigger needs:
+        past this point it reuses `_attempt_rotation` for everything else
+        (the project_url precondition, the rotation budget,
+        `_rotate_conversation`, and the persisted `RotationRecord`) exactly
+        like `_handle_conversation_unusable` and `_step_submission_rejected`
+        do — their own disproof already came from the transport itself, so
+        neither needs this call.
+
+        `LoginExpiredError` is parked HERE, not re-raised: this method is
+        itself called from inside `run()`'s `except ResponseTimeoutError`
+        handler, so a raise here would leave the try/except entirely (a
+        sibling `except LoginExpiredError` on the SAME try never catches an
+        exception raised from within another branch of it) and crash the
+        process instead of parking. `_attempt_rotation`'s own re-raise is
+        safe only for its OTHER caller, `_step_submission_rejected`, which
+        runs inside that same try — never rotate for login expiry, but never
+        let discovering that take the whole loop down either.
+        """
+        try:
+            client = self._client_for_request(req)
+            client.attach()
+            still_silent = self._reconcile_no_response(client, req.request_id)
+        except LoginExpiredError as exc:
+            self._log("login_expired", data={"error": str(exc), "context": "silence_check"})
+            self._drop_client()
+            self._to_needs_user(
+                str(exc),
+                resume_phase=Phase.AWAITING.value,
+                kind="loop_fatal",
+                code="login_expired",
+            )
+            return
+        except (BrowserError, AutoloopError) as exc:
+            # The check itself could not complete. This is NOT evidence the
+            # conversation is silent — it is an ordinary transport hiccup on
+            # the confirmation step, so it changes nothing further: the
+            # ordinary failure budget already decided (in
+            # `_handle_response_start_timeout`) that the loop retries
+            # `awaiting` with a fresh client, and that decision is left
+            # standing.
+            self._log(
+                "response_silence_check_failed",
+                request_id=req.request_id,
+                data={"reason_code": "response_silence_check_failed", "error": str(exc)},
+            )
+            self._drop_client()
+            return
+        if not still_silent:
+            # A reply appeared between the third timeout and this reload.
+            # The conversation was never broken — just slow — so the streak
+            # is stale and must not survive to threaten a future timeout.
+            self._log(
+                "response_silence_check_cancelled",
+                request_id=req.request_id,
+                data={
+                    "reason_code": "response_started_during_reconciliation",
+                    "start_timeouts": req.start_timeouts,
+                },
+            )
+            req.start_timeouts = 0
+            req.start_timeout_wait_seconds = 0.0
+            self._store.save(self.state)
+            return
+        self._log(
+            "response_silence_confirmed",
+            request_id=req.request_id,
+            data={
+                "reason_code": "response_start_silence",
+                "start_timeouts": req.start_timeouts,
+                "start_timeout_wait_seconds": req.start_timeout_wait_seconds,
+            },
+        )
+        self._attempt_rotation(req, reason="response_start_silence")
+
+    @staticmethod
+    def _reconcile_no_response(client, request_id: str) -> bool:
+        """Probe the optional final-silence-check capability the same way
+        `_client_for_request` probes `retarget`/`current_url`: a provider
+        without it (every non-Playwright adapter today) cannot PROVE the
+        conversation silent by reconciliation — only the live polling
+        `await_response` already did — so this fails closed. No capability,
+        no rotation on this trigger.
+        """
+        check = getattr(client, "reconcile_no_response", None)
+        if check is None:
+            return False
+        return check(request_id)
 
     def _rotate_conversation(
         self, req: PendingRequest, project_url: str

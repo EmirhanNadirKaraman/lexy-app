@@ -51,6 +51,13 @@ from .errors import StateCorruptError, StateError
 # `rotations == 0` — before any rotation the global URL *is* every request's
 # URL — and after it the request carries its own, so a later rotation cannot
 # retroactively re-point an old request at the new chat.
+#
+# NOT bumped for the "silent conversation" rotation entry condition either
+# (`PendingRequest.start_timeouts` / `start_timeout_wait_seconds`). Same
+# reasoning again: both are new fields with defaults of 0, and 0 is exactly
+# correct for a request loaded from a state file written before this existed
+# — it has no recorded response-start timeouts to backfill, and treating it
+# as having none is the truth, not a guess.
 SCHEMA_VERSION = 3
 
 
@@ -164,6 +171,27 @@ class PendingRequest:
     #: after a crash resumes from the same evidence the live run had, rather
     #: than downgrading to "unknown" and parking a human unnecessarily.
     last_send_outcome: str = ""
+    #: Consecutive response-START timeouts (`ResponseTimeoutError` with
+    #: `stage="start"`) observed for this request while `awaiting`, in the
+    #: SAME conversation. Only ever incremented by
+    #: `orchestrator._handle_response_start_timeout`, and only for that
+    #: stage — a response that already started and merely took too long
+    #: never touches this. Reset to 0 by a completed rotation (a fresh
+    #: conversation gets a fresh silence clock) and by a reconciliation that
+    #: finds the conversation is no longer silent. At 3, with the ordinary
+    #: failure budget still allowing a retry, the loop performs ONE final
+    #: reconciliation of the current conversation; confirmed continued
+    #: silence there is what may authorize a rotation (see
+    #: `docs/AUTOLOOP.md` §5c).
+    start_timeouts: int = 0
+    #: Accumulated ACTUAL wait (`ResponseTimeoutError.elapsed`, monotonic
+    #: seconds — not the configured timeout value) behind `start_timeouts`.
+    #: Checked against a floor computed from
+    #: `config.browser.response_start_timeout_seconds` (3x it) before a
+    #: rotation may fire, so the loop is acting on a total wait it actually
+    #: measured, not merely assumed from configuration. Reset alongside
+    #: `start_timeouts`.
+    start_timeout_wait_seconds: float = 0.0
 
 
 @dataclass
