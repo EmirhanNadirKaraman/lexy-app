@@ -73,6 +73,23 @@ Failure routing:
 * ContractError (parse)        → corrective re-prompt; budget-capped
 * review-integrity mismatch    → failure_recovery re-prompt; denial budget
 * policy denial / plan reject  → failure_recovery re-prompt; denial budget
+
+Blocker classification (continuous mode, see `docs/AUTOLOOP.md`'s blockers
+section for the full table):
+
+* Every `_to_needs_user` call site is classified `kind="task_fatal"` (one
+  task's own unit of work cannot proceed — `cli.py`'s `run --continuous`
+  quarantines that task via `TaskRegistry.block` and keeps working whatever
+  else is READY) or `kind="loop_fatal"` (the environment or the operator is
+  the problem — the whole loop stops, exactly as every park did before this
+  classification existed). The default is `kind="loop_fatal"`: an
+  unclassified or newly added park site fails closed, never silently
+  quarantining a task on a park nobody has reasoned about.
+* Every park, of either kind, is persisted as a `blockers.Blocker` (when a
+  `BlockerStore` is configured — always true in production; `None` in tests
+  that construct a minimal `Orchestrator`) carrying the exact question text
+  the operator would have seen, so `python -m autoloop blockers`/`answer`
+  can list and resolve it even after the session that recorded it is gone.
 """
 
 from __future__ import annotations
@@ -83,6 +100,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import environment
+from .blockers import NO_TASK, Blocker, BlockerStore
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
 from .config import AutoloopConfig
@@ -189,6 +207,7 @@ class Orchestrator:
         worktrees: WorktreeManager | None = None,
         execution_store: TaskExecutionStore | None = None,
         intent_store: IntentStore | None = None,
+        blocker_store: BlockerStore | None = None,
         validation_runner=None,
         publisher: Publisher | None = None,
         worker_repos=None,
@@ -223,6 +242,14 @@ class Orchestrator:
         self._worktrees = worktrees
         self._execution_store = execution_store
         self._intent_store = intent_store
+        #: Persisted operator-facing blocker records (`blockers.py`).
+        #: Optional, like every other produce-then-review collaborator:
+        #: `None` (many existing tests that hand-build a minimal
+        #: Orchestrator) means `_to_needs_user` still classifies and logs
+        #: every park exactly as before, it just does not ALSO persist a
+        #: `Blocker` — see that method. `_build_orchestrator` (production)
+        #: always wires a real one.
+        self._blocker_store = blocker_store
         #: Injected `subprocess.run`-compatible callable for post-commit
         #: validation, mirroring `AuditExecutor`'s `command_runner` — lets
         #: tests avoid depending on a real `ruff`/`pytest` install.
@@ -285,7 +312,12 @@ class Orchestrator:
                 # rotation on a login prompt.
                 self._log("login_expired", data={"error": str(exc)})
                 self._drop_client()
-                self._to_needs_user(str(exc), resume_phase=phase.value)
+                self._to_needs_user(
+                    str(exc),
+                    resume_phase=phase.value,
+                    kind="loop_fatal",
+                    code="login_expired",
+                )
             except ConversationUnusableError as exc:
                 self._handle_conversation_unusable(phase, exc)
             except BrowserError as exc:
@@ -318,7 +350,12 @@ class Orchestrator:
         if not verdict.allowed:
             # Checked BEFORE consuming outbox, so --retry after raising the
             # limit re-enters ready with the payload intact.
-            self._to_needs_user(verdict.reason, resume_phase=Phase.READY.value)
+            self._to_needs_user(
+                verdict.reason,
+                resume_phase=Phase.READY.value,
+                kind="loop_fatal",
+                code="iteration_budget_exhausted",
+            )
             return
         if state.outbox is None:
             raise StateError("phase=ready but outbox is empty — nothing to send")
@@ -415,6 +452,9 @@ class Orchestrator:
                 "was edited by hand. Refusing to send a prompt that was never "
                 "reviewed. Inspect .autoloop/state.json before retrying.",
                 resume_phase=Phase.SUBMITTING.value,
+                kind="loop_fatal",
+                code="prompt_integrity_mismatch",
+                detail=f"request_id={req.request_id}",
             )
             return
 
@@ -850,6 +890,9 @@ class Orchestrator:
             "or `run --resubmit` (send this same request id once more; if it did "
             "land, it is detected and not duplicated).",
             resume_phase=Phase.SUBMISSION_UNCONFIRMED.value,
+            kind="loop_fatal",
+            code="submission_ambiguous",
+            detail=f"request_id={req.request_id} reconcile_attempts={req.reconcile_attempts}",
         )
 
     def _step_awaiting(self) -> None:
@@ -958,7 +1001,11 @@ class Orchestrator:
             self._store.save(state)
         elif decision is Decision.ASK_USER:
             state.last_response = None
-            self._to_needs_user(directive.question or "(no question given)")
+            self._to_needs_user(
+                directive.question or "(no question given)",
+                kind="loop_fatal",
+                code="ask_user",
+            )
         elif decision is Decision.PLAN:
             self._dispatch_plan(directive)
         elif decision is Decision.PUSH and state.last_response is not None and (
@@ -1015,7 +1062,12 @@ class Orchestrator:
             budget = self._policy.check_denial_budget(state.policy_denials)
             state.last_response = None
             if not budget.allowed:
-                self._to_needs_user(f"{budget.reason} — last plan rejection: {exc}")
+                self._to_needs_user(
+                    f"{budget.reason} — last plan rejection: {exc}",
+                    kind="loop_fatal",
+                    code="plan_denial_budget_exhausted",
+                    detail=f"task_graph_error={exc.code}: {exc}",
+                )
                 return
             state.outbox = plan_rejected_payload(exc.code, str(exc))
             state.phase = Phase.READY.value
@@ -1095,7 +1147,9 @@ class Orchestrator:
                 self._to_needs_user(
                     "revise of the audit pseudo-task has no audit currently on "
                     "record for this session (state.current_task carries no audit "
-                    "unit id) — nothing was executed. Run `audit` first."
+                    "unit id) — nothing was executed. Run `audit` first.",
+                    kind="loop_fatal",
+                    code="audit_revise_no_record",
                 )
                 return None
             unit_id = prior
@@ -1180,10 +1234,23 @@ class Orchestrator:
             )
             violations = verify_worker_isolation(worktree_git)
             if violations:
+                # loop_fatal, not task_fatal: isolation is provided by
+                # WorkerRepoManager/worker_env() for EVERY task, not
+                # something specific to this one — a violation here means
+                # the isolation mechanism itself may be compromised (a
+                # credential/config leak), which would very likely recur on
+                # the next task too. That is an environment-shaped problem,
+                # not "this one unit of work can't proceed" — quarantining
+                # just this task and churning on to the next would silently
+                # repeat a security-relevant failure rather than surfacing it.
                 self._to_needs_user(
                     f"task {task.id}: the worker repository is not isolated — "
                     + "; ".join(violations)
-                    + ". Nothing was executed or committed."
+                    + ". Nothing was executed or committed.",
+                    kind="loop_fatal",
+                    code="worker_isolation_violation",
+                    task_id=task.id,
+                    detail="; ".join(violations),
                 )
                 return
         else:
@@ -1212,7 +1279,11 @@ class Orchestrator:
                     "cannot be safely attributed to this task's own commit "
                     "attempt. Nothing was rolled back or overwritten; inspect "
                     f"{execution.worktree_path} by hand, then clear the "
-                    "commit intent once resolved."
+                    "commit intent once resolved.",
+                    kind="task_fatal",
+                    code="crash_reconciliation_ambiguous",
+                    task_id=task.id,
+                    detail=f"branch={execution.task_branch} worktree={execution.worktree_path}",
                 )
                 return
             if recon is Reconciliation.RECOVERABLE:
@@ -1240,7 +1311,14 @@ class Orchestrator:
                 f"{execution.task_branch} without reaching an approved review "
                 f"(cap {MAX_TASK_ATTEMPTS}). A structural refusal consumes an "
                 "attempt but not a review round, so this ceiling is what stops "
-                "unbounded local churn. Nothing was rolled back or pushed."
+                "unbounded local churn. Nothing was rolled back or pushed.",
+                kind="task_fatal",
+                code="attempt_count_ceiling",
+                task_id=task.id,
+                detail=(
+                    f"attempt_count={execution.attempt_count} cap={MAX_TASK_ATTEMPTS} "
+                    f"branch={execution.task_branch}"
+                ),
             )
             return
         if execution.review_round >= 2:
@@ -1306,7 +1384,11 @@ class Orchestrator:
             state.last_response = None
             self._to_needs_user(
                 f"task {task.id}: the commit was refused before it happened — "
-                f"{exc}. Nothing was committed and nothing was rolled back."
+                f"{exc}. Nothing was committed and nothing was rolled back.",
+                kind="task_fatal",
+                code="commit_refused",
+                task_id=task.id,
+                detail=str(exc),
             )
             return
         # Ordering matters for crash safety: commit -> persist candidate_sha
@@ -1359,7 +1441,11 @@ class Orchestrator:
             f"{directive.feedback or '(none — last directive was not revise)'}"
             f"\n\n--- full diff {base[:12]}..{candidate[:12]} ---\n{full_diff}"
             f"\n\n--- latest round diff {previous_tip[:12]}..{candidate[:12]} ---"
-            f"\n{latest_diff}"
+            f"\n{latest_diff}",
+            kind="task_fatal",
+            code="review_round_cap",
+            task_id=task.id,
+            detail=f"branch={execution.task_branch} candidate={candidate}",
         )
 
     def _verify_committed(
@@ -1457,7 +1543,11 @@ class Orchestrator:
                 f"{execution.task_branch} (round {execution.review_round}) was "
                 "created but REFUSED at post-commit review. The commit is NOT "
                 "rolled back and NOT pushed — reset/checkout/clean are not "
-                f"reachable through this gateway. Reasons: {'; '.join(failures)}"
+                f"reachable through this gateway. Reasons: {'; '.join(failures)}",
+                kind="task_fatal",
+                code="post_commit_verification_failed",
+                task_id=task.id,
+                detail="; ".join(failures),
             )
             return
         # A packet that exceeds `range_diff`'s byte cap (or any other git
@@ -1474,7 +1564,11 @@ class Orchestrator:
                 f"{execution.task_branch} (round {execution.review_round + 1}) "
                 "passed post-commit review, but the review packet could not be "
                 f"built — {exc}. The commit is NOT rolled back and NOT pushed; "
-                "nothing was sent to ChatGPT."
+                "nothing was sent to ChatGPT.",
+                kind="task_fatal",
+                code="review_packet_build_failed",
+                task_id=task.id,
+                detail=str(exc),
             )
             return
         # Only here — a packet exists and is about to become `outbox`. A packet
@@ -1552,7 +1646,14 @@ class Orchestrator:
                     f"({redact_url(live_url)}). Autoloop never updates the "
                     "snapshot automatically. Verify the new destination is "
                     "correct, then run `python -m autoloop reprovision-publisher "
-                    "--confirm`. Nothing was published."
+                    "--confirm`. Nothing was published.",
+                    kind="loop_fatal",
+                    code="publisher_url_drift",
+                    task_id=binding.task_id,
+                    detail=(
+                        f"snapshot={redact_url(self._publisher_url_snapshot or '')} "
+                        f"live={redact_url(live_url)}"
+                    ),
                 )
                 return
         execution = self._execution_store.load(binding.task_id)
@@ -1562,7 +1663,11 @@ class Orchestrator:
                 f"{binding.candidate_sha[:12]} is no longer this task's current "
                 "candidate (a later round advanced it, or the execution record "
                 "is gone). Nothing was pushed; re-review the current state "
-                "before approving again."
+                "before approving again.",
+                kind="loop_fatal",
+                code="push_candidate_stale",
+                task_id=binding.task_id,
+                detail=f"approved={binding.candidate_sha}",
             )
             return
         worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
@@ -1570,7 +1675,11 @@ class Orchestrator:
             self._to_needs_user(
                 f"task {binding.task_id}: push refused — candidate "
                 f"{binding.candidate_sha[:12]} is not a descendant of task base "
-                f"{execution.task_base_sha[:12]}. Nothing was pushed."
+                f"{execution.task_base_sha[:12]}. Nothing was pushed.",
+                kind="loop_fatal",
+                code="push_not_descendant",
+                task_id=binding.task_id,
+                detail=f"candidate={binding.candidate_sha} base={execution.task_base_sha}",
             )
             return
         try:
@@ -1579,7 +1688,11 @@ class Orchestrator:
             self._to_needs_user(
                 f"task {binding.task_id}: push refused — the reviewed candidate "
                 f"{binding.candidate_sha[:12]} no longer resolves: {exc}. Nothing "
-                "was pushed."
+                "was pushed.",
+                kind="loop_fatal",
+                code="push_candidate_unresolvable",
+                task_id=binding.task_id,
+                detail=str(exc),
             )
             return
         if info.get("tree") != binding.candidate_tree_sha:
@@ -1587,7 +1700,11 @@ class Orchestrator:
                 f"task {binding.task_id}: push refused — candidate "
                 f"{binding.candidate_sha[:12]}'s tree changed since it was "
                 f"reviewed (was {binding.candidate_tree_sha[:12]}, now "
-                f"{info.get('tree', '?')[:12]}). Nothing was pushed."
+                f"{info.get('tree', '?')[:12]}). Nothing was pushed.",
+                kind="loop_fatal",
+                code="push_tree_mismatch",
+                task_id=binding.task_id,
+                detail=f"reviewed_tree={binding.candidate_tree_sha} now={info.get('tree', '?')}",
             )
             return
 
@@ -1646,7 +1763,11 @@ class Orchestrator:
                 self._to_needs_user(
                     f"task {binding.task_id}: push of {binding.candidate_sha[:12]} "
                     f"to {remote}/{dest_ref} was REFUSED — {exc}. Nothing was "
-                    "pushed; the commit itself is unaffected."
+                    "pushed; the commit itself is unaffected.",
+                    kind="loop_fatal",
+                    code="push_refused",
+                    task_id=binding.task_id,
+                    detail=f"remote={remote} dest_ref={dest_ref} error={exc}",
                 )
                 return
         execution.candidate_commit_count = len(
@@ -1691,7 +1812,10 @@ class Orchestrator:
             state.last_response = None
             self._to_needs_user(
                 f"{verdict.reason} — last error: {exc}. Inspect the conversation, "
-                "then answer with `run --answer '<message to ChatGPT>'`."
+                "then answer with `run --answer '<message to ChatGPT>'`.",
+                kind="loop_fatal",
+                code="parse_budget_exhausted",
+                detail=str(exc),
             )
             return
         state.outbox = parse_error_payload(exc.code, str(exc))
@@ -1713,7 +1837,13 @@ class Orchestrator:
         budget = self._policy.check_denial_budget(state.policy_denials)
         if not budget.allowed:
             state.last_response = None
-            self._to_needs_user(f"{budget.reason} — last denial: {verdict.reason}")
+            self._to_needs_user(
+                f"{budget.reason} — last denial: {verdict.reason}",
+                kind="loop_fatal",
+                code="policy_denial_budget_exhausted",
+                task_id=directive.task_id,
+                detail=f"decision={directive.decision.value} verdict_code={verdict.code}",
+            )
             return
         state.outbox = policy_denied_payload(directive.decision.value, verdict.reason)
         state.last_response = None
@@ -1727,7 +1857,12 @@ class Orchestrator:
         budget = self._policy.check_denial_budget(state.policy_denials)
         if not budget.allowed:
             state.last_response = None
-            self._to_needs_user(f"{budget.reason} — last review mismatch: {exc}")
+            self._to_needs_user(
+                f"{budget.reason} — last review mismatch: {exc}",
+                kind="loop_fatal",
+                code="review_mismatch_budget_exhausted",
+                detail=str(exc),
+            )
             return
         state.outbox = review_mismatch_payload(exc.code, str(exc))
         state.last_response = None
@@ -1759,6 +1894,9 @@ class Orchestrator:
             self._to_needs_user(
                 f"git unavailable while preparing the request: {exc}",
                 resume_phase=Phase.READY.value,
+                kind="loop_fatal",
+                code="git_unavailable_in_ready",
+                detail=str(exc),
             )
             return
         state.consecutive_failures += 1
@@ -1771,7 +1909,12 @@ class Orchestrator:
         verdict = self._policy.check_failure_budget(state.consecutive_failures)
         if not verdict.allowed:
             state.last_response = None
-            self._to_needs_user(f"repeated git failures — last error: {exc}")
+            self._to_needs_user(
+                f"repeated git failures — last error: {exc}",
+                kind="loop_fatal",
+                code="git_failure_budget_exhausted",
+                detail=str(exc),
+            )
             return
         state.outbox = git_error_payload(decision, str(exc))
         state.last_response = None
@@ -1780,12 +1923,63 @@ class Orchestrator:
 
     # ---- helpers ------------------------------------------------------------
 
-    def _to_needs_user(self, question: str, resume_phase: str | None = None) -> None:
+    def _to_needs_user(
+        self,
+        question: str,
+        resume_phase: str | None = None,
+        *,
+        kind: str = "loop_fatal",
+        code: str = "unclassified",
+        task_id: str | None = None,
+        detail: str = "",
+    ) -> None:
+        """Park the loop on `needs_user`, classified `kind` (see the module
+        docstring's "Blocker classification" section). `kind` and `code`
+        deliberately default to the fail-closed values (`"loop_fatal"`,
+        `"unclassified"`) so a park site nobody has explicitly reasoned
+        about — today's or a future one — stops the whole loop rather than
+        silently being treated as safe to quarantine and churn past.
+
+        Every call — classified or not — is persisted as a `blockers.
+        Blocker` when `self._blocker_store` is configured, carrying the
+        EXACT `question` text, so `python -m autoloop blockers`/`answer`
+        can show the operator precisely what they would have seen here.
+        `task_id` is descriptive metadata on the record either way; only
+        `cli.py`'s continuous-mode handling treats it as actionable, and
+        only for `kind="task_fatal"`.
+        """
         state = self.state
+        originating_phase = state.phase
         state.question = question
         state.resume_phase = resume_phase
         state.phase = Phase.NEEDS_USER.value
-        self._log("needs_user", data={"question": question, "resume_phase": resume_phase})
+        state.park_kind = kind
+        state.park_task_id = task_id
+        state.park_blocker_id = None
+        self._log(
+            "needs_user",
+            data={
+                "question": question,
+                "resume_phase": resume_phase,
+                "kind": kind,
+                "code": code,
+                "task_id": task_id,
+            },
+        )
+        if self._blocker_store is not None:
+            blocker_task_id = task_id or NO_TASK
+            blocker = Blocker(
+                id=self._blocker_store.next_id(blocker_task_id),
+                task_id=blocker_task_id,
+                kind=kind,
+                code=code,
+                question=question,
+                detail=detail,
+                phase=originating_phase,
+                created_at=utcnow_iso(),
+            )
+            self._blocker_store.save(blocker)
+            state.park_blocker_id = blocker.id
         self._store.save(state)
 
     def _get_client(self):

@@ -654,8 +654,13 @@ class GitGateway:
         if pushurl:
             raise GitCommandError(
                 f"push_exact refuses: remote.{remote}.pushurl is configured "
-                f"({pushurl!r}) — git would push there INSTEAD of "
-                f"remote.{remote}.url, silently bypassing the url check below"
+                "— git would push THERE instead of remote."
+                f"{remote}.url, silently bypassing the url check below. The "
+                "value is deliberately not shown: a pushurl can carry embedded "
+                "credentials (https://user:token@host), and this message reaches "
+                "the parked question, the transcript and the persisted blocker "
+                "record. Inspect it locally with "
+                f"`git config --get remote.{remote}.pushurl`."
             )
 
         if env_snapshot is not None:

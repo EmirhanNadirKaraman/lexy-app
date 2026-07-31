@@ -3,15 +3,25 @@
     python -m autoloop run [--config PATH] [--kickoff FILE | --kickoff-audit |
                             --answer TEXT | --retry] [--null-executor]
                             [--continuous] [--max-steps N]
-    python -m autoloop status | tasks | doctor | next-task   (read-only, no lock)
+    python -m autoloop status | tasks | doctor | next-task | blockers [--all]
+                                                               (read-only, no lock)
+    python -m autoloop answer <blocker-id> "<text>"
     python -m autoloop smoke-browser [--config PATH]
     python -m autoloop pause | resume | unlock | reset --yes
     python -m autoloop reprovision-publisher --confirm
 
-Locking: run / resume / reset / smoke-browser take the single-instance lock on
-the state directory (fail closed against a live process; `unlock` is the only
-stale-lock recovery, and it refuses live locks). status / tasks / doctor /
-next-task / pause stay available while locked.
+Locking: run / resume / reset / smoke-browser / answer take the single-
+instance lock on the state directory (fail closed against a live process;
+`unlock` is the only stale-lock recovery, and it refuses live locks). status /
+tasks / doctor / next-task / blockers / pause stay available while locked.
+
+**Blockers (`blockers.py`).** `run --continuous` no longer stops on every
+park: a `task_fatal` one (see `orchestrator._to_needs_user`'s classification)
+quarantines just that task and keeps working whatever else is READY; a
+`loop_fatal` one still stops the loop. Either way the operator-facing
+question is durably recorded as a `Blocker` — `blockers` lists open ones,
+`answer <id> "<text>"` resolves one and, for a `task_fatal` blocker, makes
+its task READY again. See `docs/AUTOLOOP.md`'s blockers section.
 
 Exit codes: 0 = clean end (stopped / paused / step budget), 2 = the loop parked
 itself (needs_user / failed) and wants operator attention, 1 = hard error.
@@ -31,15 +41,24 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .audit.agents import ClaudeCliRunner
 from .audit.executor import AuditExecutor
 from .audit.markdown import MarkdownPolicy
+from .blockers import NO_TASK, Blocker, BlockerStore
 from .config import AutoloopConfig, load_config
 from .conversation import create_conversation
 from .doctor import DoctorProbes, exit_code, run_doctor
-from .errors import AutoloopError, ConfigError, ExecutorError, StateError
+from .errors import (
+    AutoloopError,
+    ConfigError,
+    ExecutorError,
+    StateCorruptError,
+    StateError,
+    TaskGraphError,
+)
 from .executor import NullExecutor
 from .git_gateway import GitGateway
 from .lock import LoopLock
@@ -190,6 +209,7 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
     worker_repos = WorkerRepoManager(config.workers_dir, config.worker_hooks_dir)
     execution_store = TaskExecutionStore(config.executions_dir)
     intent_store = IntentStore(config.intents_dir)
+    blocker_store = BlockerStore(config.blockers_dir)
     publisher_path = provision_publisher_repo(config.state_dir, git)
     publisher = Publisher(publisher_path, "origin", policy)
     publisher_url_snapshot = read_publisher_url_snapshot(config.state_dir)
@@ -208,6 +228,7 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         worker_repos=worker_repos,
         execution_store=execution_store,
         intent_store=intent_store,
+        blocker_store=blocker_store,
         publisher=publisher,
         publisher_url_snapshot=publisher_url_snapshot,
         # `--config` can put the file anywhere, so pass the path actually
@@ -323,7 +344,8 @@ CONTINUOUS_POLL_SECONDS = 30.0
 
 
 def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
-    """`run --continuous`: loop the existing phase machine indefinitely.
+    """`run --continuous`: loop the existing phase machine indefinitely,
+    working around task-scoped blockers instead of halting on them.
 
     Per outer iteration: a saved session in a NON-terminal phase (mid-flight
     — ready/submitting/awaiting/executing/submission_unconfirmed) is resumed
@@ -331,12 +353,34 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
     makes a killed-and-restarted `run --continuous` pick up the saved phase
     rather than re-deriving anything (item 13 of the v1 smoke checklist). At
     a clean boundary (no session yet, or the last one ended STOPPED),
-    `_select_and_kickoff` runs the selection policy. A session parked on
-    NEEDS_USER/FAILED stops the continuous loop outright — an operator's
-    attention is required, and spinning against that would be busy-polling a
-    human, not a repository state (`--continuous` never auto-retries a park;
-    resolve it with a plain `run --retry`/`--answer`, then restart).
+    `_select_and_kickoff` runs the selection policy.
+
+    **A session parked on `needs_user` is split by classification**
+    (`orchestrator._to_needs_user`'s `kind`, persisted as `state.park_kind`
+    — see `_handle_parked_task`): `task_fatal` quarantines the ONE task at
+    fault (`TaskRegistry.block`) and clears the session, so the very next
+    iteration starts a clean round on whatever else is READY; `loop_fatal`
+    (including a missing/unrecognised classification — fail-closed) stops
+    the continuous loop outright, exactly as every park did before this
+    split existed. `failed` (budget-exhausted browser/git failures — a
+    separate phase, never routed through `_to_needs_user`, so never
+    classified) always stops the loop too — resolve either with a plain
+    `run --retry`/`--answer` (WITHOUT `--continuous`), then restart.
+
+    **EXHAUSTION.** Once a clean boundary finds no READY task AND the
+    repository fingerprint is unchanged, that used to always mean "sleep and
+    poll again" — and still does, UNLESS there is at least one OPEN blocker
+    at that point. With one, "nothing ready + nothing new to audit +
+    something is still waiting on a human" is "nothing can proceed
+    autonomously": every open blocker (id, task, question) is printed and
+    the process exits 0 — a clean end, not an error — rather than sleeping
+    forever next to unresolved questions nobody asked to see. Zero open
+    blockers is still the ordinary idle steady state, unchanged from before
+    (and untouched here — the check runs strictly AFTER
+    `_select_and_kickoff` returns `False`, so the zero-Claude/zero-ChatGPT
+    guarantee that function provides is exactly as before).
     """
+    blocker_store = BlockerStore(config.blockers_dir)
     while True:
         if config.pause_file.exists():
             print("paused")
@@ -349,28 +393,122 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
             outcome = orchestrator.run()
             if outcome == "paused":
                 return 0
-            if outcome in (Phase.NEEDS_USER.value, Phase.FAILED.value):
+            if outcome == Phase.NEEDS_USER.value:
+                if _handle_parked_task(config, store, task_store, registry, orchestrator.state) == "task_fatal":
+                    continue
+                return 2
+            if outcome == Phase.FAILED.value:
                 print(_summary(config, orchestrator.state, registry))
                 print(
                     f"\ncontinuous mode stopped: {outcome} — resolve with `run "
-                    "--retry` / `--answer` (WITHOUT --continuous), then restart "
-                    "`run --continuous`."
+                    "--retry` (WITHOUT --continuous), then restart `run --continuous`."
                 )
                 return 2
             continue  # STOPPED -> reassess at the top of the loop
 
-        if state is not None and Phase(state.phase) in (Phase.NEEDS_USER, Phase.FAILED):
+        if state is not None and Phase(state.phase) is Phase.NEEDS_USER:
+            # Found already-parked at the top of an iteration (e.g. a
+            # restart after an earlier process was killed). Same
+            # classification split as the freshly-parked case above —
+            # `state.park_kind` was persisted at park time, so a plain
+            # `store.load()` here sees exactly what `orchestrator.state`
+            # would have.
+            if _handle_parked_task(config, store, task_store, registry, state) == "task_fatal":
+                continue
+            return 2
+
+        if state is not None and Phase(state.phase) is Phase.FAILED:
             print(_summary(config, state, registry))
             print(
                 f"\ncontinuous mode stopped: {state.phase} — resolve with `run "
-                "--retry` / `--answer` (WITHOUT --continuous), then restart "
-                "`run --continuous`."
+                "--retry` (WITHOUT --continuous), then restart `run --continuous`."
             )
             return 2
 
         # Clean boundary: no session yet, or the last one ended STOPPED.
-        if not _select_and_kickoff(config, store, registry):
-            time.sleep(CONTINUOUS_POLL_SECONDS)
+        if _select_and_kickoff(config, store, registry):
+            continue
+        open_blockers = blocker_store.open_blockers()
+        if open_blockers:
+            _print_blocker_summary(open_blockers)
+            return 0
+        time.sleep(CONTINUOUS_POLL_SECONDS)
+
+
+def _handle_parked_task(
+    config: AutoloopConfig,
+    store: StateStore,
+    task_store: TaskStore,
+    registry: TaskRegistry,
+    state: LoopState,
+) -> str:
+    """A session just parked on `needs_user`. Returns `"task_fatal"` (the
+    caller should `continue` — the one task at fault has been quarantined
+    and the session state file is already removed here, so the next
+    iteration starts fresh) or `"loop_fatal"` (the caller should print and
+    exit 2).
+
+    Fail-closed: only the EXACT string `"task_fatal"`, together with a
+    `park_task_id` that actually resolves to a blockable task, is treated as
+    task_fatal. `"loop_fatal"`, `None` (a state file written before this
+    classification existed, or a hand-built one in a test), or a
+    `park_task_id` that `TaskRegistry.block` refuses (unknown id, already
+    completed) all fall through to loop_fatal. A `blockers.Blocker` record
+    was already written by `orchestrator._to_needs_user` regardless of
+    kind — this function only decides what the LOOP does next, never
+    whether a blocker exists.
+
+    `task_store.save(registry)` is load-bearing, not decoration: the caller
+    reloads `tasks.json` fresh from disk on every outer iteration
+    (`_load_tasks`), so an unpersisted `block()` would be invisible on the
+    very next pass and the task would come back READY — silently undoing
+    the quarantine and burning a fresh Claude/ChatGPT round on the same
+    failure.
+    """
+    if state.park_kind == "task_fatal" and state.park_task_id:
+        reason = state.question or "(no reason recorded)"
+        try:
+            registry.block(state.park_task_id, reason)
+        except TaskGraphError as exc:
+            print(
+                f"blocker for task {state.park_task_id!r} is classified task_fatal, "
+                f"but the task could not be quarantined ({exc}) — treating this park "
+                "as loop_fatal instead of silently dropping it."
+            )
+        else:
+            task_store.save(registry)
+            # NOT `store.archive()`: archiving would leave one
+            # `state.json.bak-<timestamp>` behind per task_fatal park, and a
+            # long continuous run can hit many of these — unbounded litter
+            # for a file whose entire content (question/detail/phase/task)
+            # already survives durably in the just-written `Blocker` record.
+            store.path.unlink(missing_ok=True)
+            print(
+                f"task {state.park_task_id} blocked (task_fatal): {reason}\n"
+                "continuous mode continues with other ready tasks — see "
+                "`python -m autoloop blockers`."
+            )
+            return "task_fatal"
+    print(_summary(config, state, registry))
+    print(
+        "\ncontinuous mode stopped: needs_user (loop_fatal) — resolve with "
+        "`run --retry` / `--answer` (WITHOUT --continuous), then restart "
+        "`run --continuous`."
+    )
+    return "loop_fatal"
+
+
+def _print_blocker_summary(blockers: list[Blocker]) -> None:
+    print(
+        f"continuous mode: exhausted — no ready task, the repository fingerprint "
+        f"is unchanged, and {len(blockers)} blocker(s) are still open:"
+    )
+    for b in sorted(blockers, key=lambda b: b.created_at):
+        print(f"  {b.id}  task={b.task_id}  code={b.code}  {b.question}")
+    print(
+        "\nResolve with `python -m autoloop answer <blocker-id> \"<text>\"`, then "
+        "restart `run --continuous`."
+    )
 
 
 def _select_and_kickoff(
@@ -464,6 +602,19 @@ def _authorize_resubmit(state: LoopState) -> None:
     state.consecutive_failures = 0
 
 
+def _open_blocker_count_display(config: AutoloopConfig) -> str:
+    """Open-blocker count for `_summary` — a single corrupt blocker record
+    must not take `status` (or every continuous-mode park message, which
+    also calls `_summary`) down with it. Unlike `blockers`, whose entire job
+    is surfacing that corruption loudly (`_cmd_blockers` lets it propagate),
+    this is a status LINE among many; failing the whole summary over one bad
+    file would hide the rest of the operator-relevant state too."""
+    try:
+        return str(len(BlockerStore(config.blockers_dir).open_blockers()))
+    except StateCorruptError:
+        return "? (unreadable — see `python -m autoloop blockers`)"
+
+
 def _summary(config: AutoloopConfig, state: LoopState, registry: TaskRegistry) -> str:
     lines = [
         f"session      {state.session_id}",
@@ -475,6 +626,7 @@ def _summary(config: AutoloopConfig, state: LoopState, registry: TaskRegistry) -
         f"executor     {config.executor.kind}",
         f"roadmap      {registry.summary()}",
         f"paused flag  {'yes' if config.pause_file.exists() else 'no'}",
+        f"open blockers{_open_blocker_count_display(config)}",
     ]
     if state.last_decision:
         lines.append(f"last decision {state.last_decision}")
@@ -559,6 +711,74 @@ def _cmd_next_task(args: argparse.Namespace) -> int:
         print("no ready task")
         return 0
     print(f"{task.id} — {task.title}")
+    return 0
+
+
+def _age(created_at: str) -> str:
+    """Human-readable elapsed time since `created_at` (an ISO-8601
+    timestamp, always UTC — see `state.utcnow_iso`). Falls back to the raw
+    string on anything unparseable rather than raising: this is a display
+    helper for `blockers`, not a place where a malformed timestamp should
+    take the whole command down."""
+    try:
+        then = datetime.fromisoformat(created_at)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - then
+    except ValueError:
+        return created_at
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        seconds = 0
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def _cmd_blockers(args: argparse.Namespace) -> int:
+    """Read-only, no lock — like `status`/`tasks`/`doctor`/`next-task`.
+    Lists open blockers by default; `--all` also shows resolved ones."""
+    config = load_config(args.config)
+    store = BlockerStore(config.blockers_dir)
+    blockers = store.all_blockers() if args.all else store.open_blockers()
+    if not blockers:
+        print("no blockers recorded" if args.all else "no open blockers")
+        return 0
+    for b in sorted(blockers, key=lambda b: b.created_at):
+        status = "open" if b.resolved_at is None else f"resolved ({b.resolved_at})"
+        print(f"[{status}] {b.id}  task={b.task_id}  kind={b.kind}  code={b.code}  age={_age(b.created_at)}")
+        print(f"    {b.question}")
+        if b.answer is not None:
+            print(f"    answer: {b.answer}")
+    return 0
+
+
+def _cmd_answer(args: argparse.Namespace) -> int:
+    """Resolve a blocker with the operator's answer and, for a `task_fatal`
+    blocker, unblock the task it quarantined so it becomes READY again.
+    Takes the lock (like `run`/`reset`) — it mutates `tasks.json`, and must
+    not race a live `run --continuous`."""
+    config = load_config(args.config)
+    with LoopLock(config.state_dir):
+        blocker_store = BlockerStore(config.blockers_dir)
+        blocker = blocker_store.resolve(args.blocker_id, args.text)  # raises on unknown/resolved
+        print(f"blocker {blocker.id} resolved.")
+        if blocker.kind != "task_fatal" or blocker.task_id == NO_TASK:
+            print("(not tied to a quarantined task — nothing else to do.)")
+            return 0
+        task_store, registry = _load_tasks(config)
+        try:
+            registry.unblock(blocker.task_id)
+        except TaskGraphError as exc:
+            print(
+                f"task {blocker.task_id!r} could not be unblocked ({exc}) — the "
+                "blocker itself is still resolved."
+            )
+            return 0
+        task_store.save(registry)
+        print(f"task {blocker.task_id} is ready again.")
     return 0
 
 
@@ -780,6 +1000,24 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         add_config(p)
         p.set_defaults(func=func)
+
+    blockers = sub.add_parser(
+        "blockers", help="list open operator-facing blockers (read-only, no lock)"
+    )
+    add_config(blockers)
+    blockers.add_argument(
+        "--all", action="store_true", help="also show resolved blockers"
+    )
+    blockers.set_defaults(func=_cmd_blockers)
+
+    answer = sub.add_parser(
+        "answer",
+        help="resolve a blocker and, if task_fatal, make its task READY again",
+    )
+    add_config(answer)
+    answer.add_argument("blocker_id", help="the blocker id, e.g. blk-t1-001")
+    answer.add_argument("text", help="the operator's answer/decision")
+    answer.set_defaults(func=_cmd_answer)
 
     reset = sub.add_parser("reset", help="archive the session state")
     add_config(reset)

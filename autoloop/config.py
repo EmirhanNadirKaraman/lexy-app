@@ -129,6 +129,14 @@ class AutoloopConfig:
         return self.state_dir / "intents"
 
     @property
+    def blockers_dir(self) -> Path:
+        """Durable operator-facing blocker records (`blockers.BlockerStore`)
+        — survives a `task_fatal` park clearing `state.json`, and survives
+        `reset` too (like `continuous_fingerprint_file`, `reset` only
+        archives `state.json`/`tasks.json`)."""
+        return self.state_dir / "blockers"
+
+    @property
     def seed_tasks_file(self) -> Path:
         """Git-tracked seed file (`autoloop/seed_tasks.json`, alongside this
         module) — NOT under `state_dir`. `cli.py`'s `next-task` command loads

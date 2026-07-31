@@ -545,6 +545,37 @@ it (or the equivalent explicit `env=`) rather than a bare `GitGateway(path,
 policy)` — see `verify_worker_isolation`'s own docstring, which states this
 requirement explicitly so it cannot be missed a second time.
 
+### A test writes a REAL `.al`/`.autoloop` directory into the repo root instead of `tmp_path`
+**Symptom:** after running `autoloop/tests/test_blockers.py`, `git status`
+showed an untracked `.al/` at the repo root (with `blockers/` and
+`tasks.json` inside) — and a later test in the same file failed with
+`blocker 'blk-t1-001' is already resolved`, even though that test's own
+`tmp_path` had never seen that id before.
+**Cause:** a test wrote a `config.toml` with `[paths] state_dir = ".al"` (a
+RELATIVE path, copied from `test_v1_smoke.py`'s `write_config_toml`, which
+deliberately uses a relative path to test that real-world shape) and then
+called a CLI command function (`_cmd_blockers`/`_cmd_answer`) that reads it
+via `load_config` — without ever `monkeypatch.chdir`-ing into `tmp_path`
+first. `config.state_dir` stayed the literal relative `Path(".al")`, so
+every `config.blockers_dir`/`config.tasks_file` access resolved against
+whatever directory `pytest` was actually invoked from (the repo root), not
+`tmp_path`. Every test in the file that used the same pattern wrote into
+that SAME real, never-cleaned directory, so state leaked from one test into
+the next entirely outside of `tmp_path`'s isolation.
+**Fix:** if a test needs `load_config`'s file-reading path (rather than
+building an in-memory `AutoloopConfig` directly) AND does not also need a
+real relative-cwd scenario, write the config with an ABSOLUTE `state_dir`
+(`str(tmp_path / ".al")`) instead of a bare name — see `test_blockers.py`'s
+`write_config_toml`. If the test genuinely needs to exercise a *relative*
+`state_dir` (as `test_v1_smoke.py`'s does, on purpose, for
+`test_relative_state_dir_still_provisions_worker_and_publisher`), keep it
+relative but `monkeypatch.chdir(repo_root)` into a `tmp_path`-rooted
+directory BEFORE anything reads the config, exactly as that test already
+does. Either way: `rm -rf .al` at the repo root if a test run leaves stray
+state behind — `.al` (the state-dir name these tests use) is NOT
+gitignored (only the real `.autoloop/` is), so `git status` is the tell,
+not a build failure.
+
 ---
 
 ## Adding an entry

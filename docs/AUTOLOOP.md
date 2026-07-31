@@ -39,14 +39,15 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Conversation | `conversation.py` (interface/registry), `browser/chatgpt.py` (`BrowserChatGPT`), `browser/playwright_session.py` (CDP, lazy), `browser/selectors.py` | One persistent reviewer conversation; duplicate/stale/streaming/login guards; provider-pluggable. |
 | Contract | `contract.py` | Response contract **v3** + strict parser + `verify_review`. |
 | Policy | `policy.py` | Deterministic gates: git whitelist (`add -A` and force pushes structurally impossible), task-reference checks, **phase gate**, budgets. |
-| Tasks | `tasks.py` | Task registry/graph (derived ready/blocked, cycles rejected, atomic persistence). `seed_tasks.json` (git-tracked, alongside `tasks.py`) seeds a fresh registry with `rt-01` when `.autoloop/tasks.json` does not exist yet (§9b). |
+| Tasks | `tasks.py` | Task registry/graph (derived ready/blocked, cycles rejected, atomic persistence). `seed_tasks.json` (git-tracked, alongside `tasks.py`) seeds a fresh registry with `rt-01` when `.autoloop/tasks.json` does not exist yet (§9b). `block`/`unblock` quarantine a task after a `task_fatal` park (§9c) via a dedicated `blocked` status/`TaskState.BLOCKED_BY_OPERATOR`, distinct from the dependency-derived `blocked` state. |
+| Blockers | `blockers.py` | Persisted operator-facing `Blocker` records (one JSON file per blocker, `.autoloop/blockers/`) for every park, `task_fatal` or `loop_fatal` (§9c) — `python -m autoloop blockers`/`answer`. |
 | Context | `context.py` | Per-request CONTEXT block: integrity stamp + previous decision/task, roadmap, git summary, changed files, validation summary. |
 | Prompts | `prompts.py` | Strict template library (incl. `audit_kickoff`, `smoke_test`, `postcommit_review`). |
 | Git | `git_gateway.py` | Only git runner; exact-path staging; policy-validated per call; `push_exact` is the only way to publish anything (no ambient `push()`); the legacy `commit()` method is **removed** (S21). |
 | Doctor | `doctor.py` | Non-destructive preflight (§6), including worker isolation, controlled hooks directories, publisher configuration, and publisher URL drift. |
 | Audit executor | `audit/` | The production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. Dispatched as a task-shaped unit of work (`Orchestrator._resolve_audit_task`), so it runs through §4b like any other task. |
 | State / transcript | `state.py`, `transcript.py` | Atomic crash-safe state; append-only JSONL audit log. |
-| CLI | `cli.py` | `run [--continuous] status tasks next-task doctor smoke-browser pause resume unlock reset reprovision-publisher` (§8/§9). |
+| CLI | `cli.py` | `run [--continuous] status tasks next-task blockers answer doctor smoke-browser pause resume unlock reset reprovision-publisher` (§8/§9). |
 
 ---
 
@@ -948,10 +949,15 @@ tree, `cli.repo_fingerprint`, persisted to
 `config.continuous_fingerprint_file`) permits exactly one audit round; an
 **unchanged** fingerprint with no ready task sleeps locally and makes **zero
 Claude and zero ChatGPT calls** — the fingerprint check runs before anything
-that would construct an Orchestrator, executor, or browser client. A session
-parked on `needs_user`/`failed` **stops** the continuous loop outright rather
-than spinning against it — resolve it with a plain `run --retry`/`--answer`
-(without `--continuous`), then restart `run --continuous`.
+that would construct an Orchestrator, executor, or browser client.
+
+A session parked on `failed` (a budget-exhausted browser/git failure — never
+routed through the classification below) **always stops** the continuous
+loop outright — resolve it with a plain `run --retry` (without
+`--continuous`), then restart. A session parked on `needs_user` is **split
+by classification** — see §9c: a `task_fatal` park quarantines just the one
+task at fault and the loop keeps going; a `loop_fatal` park stops the loop
+exactly like `failed` does.
 `--kickoff`/`--kickoff-audit`/`--answer`/`--retry`/`--resubmit`/`--max-steps`
 are refused alongside `--continuous` — it manages session kickoff, resume
 and stepping itself.
@@ -974,6 +980,74 @@ python -m autoloop next-task   # read-only, no lock, never implements or commits
 `next-task` prints exactly what continuous mode's selection policy
 (`next_ready()`) would pick right now, or "no ready task".
 
+### 9c. Blockers: `task_fatal` vs `loop_fatal`, and the fail-closed default
+
+Before this, `run --continuous` was single-track: ANY park (any of
+`orchestrator.py`'s ~25 `_to_needs_user` call sites) stopped the whole loop,
+even when the failure concerned exactly one task and every other ready task
+could have kept going. Every park is now classified with a `kind`:
+
+* **`task_fatal`** — the problem is about ONE unit of work: post-commit
+  verification failures (unexpected path from a hook, path outside task
+  ownership, empty commit range, residual dirty worktree, failed re-run
+  validation), the review-round cap, the attempt-count ceiling, an
+  AMBIGUOUS crash reconciliation for that task, a review packet that could
+  not be built (e.g. an oversized diff), or a commit refused before it
+  happened (environment/HEAD drift for that task). Continuous mode
+  quarantines the task (`TaskRegistry.block` — a NEW `blocked` status,
+  distinct from the dependency-derived `blocked` `TaskState`, so it never
+  auto-resolves) and clears the session, so the very next pass starts a
+  clean round on whatever else is READY. **Enforced, not advisory:**
+  `policy._check_task_reference` denies any `implement`/`revise` directive
+  that names a quarantined task id directly (`task_blocked_by_operator`) —
+  `next_ready()` skipping it is not the only thing standing between
+  ChatGPT and re-triggering the same failure; `TaskRegistry.mark_in_progress`
+  refuses it too, defense in depth for any dispatch path that bypasses
+  policy.
+* **`loop_fatal`** — the problem is about the ENVIRONMENT or the operator:
+  browser/login failures, response timeouts, submission ambiguity,
+  publisher URL drift, a protected-branch refusal / `allow_push` disabled,
+  a policy-denial or parse/iteration budget exhausted, ChatGPT's own
+  `ask_user` (literally a question for a human), or anything not
+  confidently classifiable. The whole loop stops, exactly as every park did
+  before this split existed.
+* **The default is `loop_fatal`.** `orchestrator._to_needs_user(question,
+  ..., kind="loop_fatal", code="unclassified")` — an unclassified or newly
+  added park site fails closed: it stops the loop rather than silently
+  being treated as safe to quarantine and churn past. Widening a park to
+  `task_fatal` is a deliberate per-site decision, never an accident of
+  omission.
+
+**Every park, of either kind, is persisted** as a `blockers.Blocker`
+(`autoloop/blockers.py`) — one JSON file per blocker under
+`.autoloop/blockers/`, carrying the exact operator-facing question text,
+extra `detail` (paths/shas/reasons), the loop phase it happened in, and a
+stable id (`blk-<task_id>-<NNN>`, or `blk-(loop)-<NNN>` for a park not tied
+to any task). This is independent of continuous mode — a plain `run` also
+writes one on every park, so `blockers`/`answer` work either way. A corrupt
+blocker record raises rather than being read as absent, same rule as every
+other store in this package.
+
+```bash
+python -m autoloop blockers            # open blockers: id, task, code, question, age
+python -m autoloop blockers --all      # + resolved ones
+python -m autoloop answer <id> "<text>"  # resolve + (if task_fatal) unblock the task
+```
+
+**Exhaustion.** At a clean boundary, "no ready task and the fingerprint is
+unchanged" used to always mean "sleep and poll again" — and still does,
+UNLESS there is at least one OPEN blocker at that point. With one, "nothing
+ready, nothing new to audit, and something is still waiting on a human" is
+genuinely "nothing can proceed autonomously": every open blocker (id, task,
+question) is printed and the process exits `0` — a clean end, not an error.
+Zero open blockers is still the ordinary idle steady state, unchanged.
+
+`reset` archives `state.json`/`tasks.json` but never touches
+`.autoloop/blockers/` — a blocker recorded against a task that a later
+`reset` + fresh plan no longer has will fail to `unblock` (there is nothing
+to unblock), but `answer` still resolves the blocker record itself; the CLI
+reports this rather than raising.
+
 ## 10. Recovery procedures
 
 | Situation | Do |
@@ -988,6 +1062,8 @@ python -m autoloop next-task   # read-only, no lock, never implements or commits
 | Crash mid-audit | `run` — the audit directive re-dispatches (`_resolve_audit_task` resumes the SAME per-run worker repo/unit id when redispatching within the same iteration; prior run's raw reports remain under `.autoloop/audit/`). |
 | Crash mid-commit | `run` — `commit_and_capture` is crash-recoverable via `CommitIntent`/`reconcile_after_crash` (§4b), never a bare "message matches HEAD" idempotency shortcut. |
 | `doctor`'s `publisher_url_drift` check fails | The main checkout's `origin` changed since the publisher was last provisioned. Verify the NEW destination is actually correct, then `python -m autoloop reprovision-publisher --confirm` (§4d) — the only way the snapshot updates. Any push attempted before that is refused, not silently redirected. |
+| `run --continuous` exited 0 with "continuous mode: exhausted" | Nothing autonomous is left to do — every ready task is done/blocked and the repository fingerprint hasn't changed. `python -m autoloop blockers` lists what's waiting; `answer <id> "..."` each one (unblocking any `task_fatal` task), then restart `run --continuous`. |
+| `run --continuous` exited 2 | A `loop_fatal` park (§9c) — the environment or the operator is the problem, not one task. `python -m autoloop blockers` shows the question (also in `status`); resolve it (fix the environment, or `answer` it if that's enough), then `run --retry`/`--answer` (WITHOUT `--continuous`) before restarting `run --continuous`. |
 
 ---
 

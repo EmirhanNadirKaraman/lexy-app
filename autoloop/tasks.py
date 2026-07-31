@@ -35,6 +35,15 @@ class TaskState(str, Enum):
     BLOCKED = "blocked"        # pending, at least one dependency incomplete
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
+    #: Quarantined by the orchestrator after a `task_fatal` park (see
+    #: `orchestrator._to_needs_user` / `docs/AUTOLOOP.md`'s blockers
+    #: section) — deliberately a DIFFERENT value than `BLOCKED`, which means
+    #: "waiting on an incomplete dependency" and resolves itself once that
+    #: dependency completes. A quarantined task never resolves itself; it
+    #: stays out of `ready_tasks()`/`next_ready()` until an operator answers
+    #: the recorded blocker (`python -m autoloop answer`), which calls
+    #: `unblock()` below.
+    BLOCKED_BY_OPERATOR = "blocked_by_operator"
 
 
 @dataclass
@@ -43,9 +52,16 @@ class Task:
     title: str
     description: str
     depends_on: tuple[str, ...] = ()
-    status: str = "pending"  # pending | in_progress | completed
+    status: str = "pending"  # pending | in_progress | completed | blocked
     created_at: str = field(default_factory=utcnow_iso)
     completed_at: str | None = None
+    #: Operator-facing reason, set by `TaskRegistry.block` and cleared by
+    #: `unblock`. Empty for every task that has never been quarantined.
+    #: New field with a default — an old `tasks.json` written before this
+    #: existed loads fine (`Task(**raw)` falls back to the default), see
+    #: `TaskRegistry.from_dict` below and `test_blockers.py`'s backward-
+    #: compatibility test.
+    blocked_reason: str = ""
 
 
 class TaskRegistry:
@@ -101,6 +117,18 @@ class TaskRegistry:
                 "task_blocked",
                 f"task '{task_id}' is blocked by incomplete dependencies",
             )
+        if state is TaskState.BLOCKED_BY_OPERATOR:
+            # Defense in depth alongside `policy._check_task_reference` (the
+            # primary gate every TASK_DECISIONS directive passes through
+            # before dispatch reaches here): without this, a caller that
+            # bypasses policy (a test, a future dispatch path) could
+            # silently overwrite `status="blocked"` with `"in_progress"`,
+            # un-quarantining a task no operator ever answered.
+            raise TaskGraphError(
+                "task_blocked_by_operator",
+                f"task '{task_id}' is quarantined — answer its blocker first "
+                "(`python -m autoloop answer`)",
+            )
         task.status = "in_progress"
         return task
 
@@ -116,6 +144,37 @@ class TaskRegistry:
             )
         task.status = "completed"
         task.completed_at = utcnow_iso()
+        return task
+
+    def block(self, task_id: str, reason: str) -> Task:
+        """Quarantine `task_id` after a `task_fatal` park: set it aside so
+        `ready_tasks()`/`next_ready()` skip it (via `state_of` below,
+        without either of those methods needing to change) while continuous
+        mode keeps working whatever else is READY. Idempotent — blocking an
+        already-blocked task just refreshes the reason, since a task can in
+        principle hit a second `task_fatal` park before an operator answers
+        the first (e.g. re-dispatched after a crash). Refuses only a
+        completed task, which can never legitimately need quarantining."""
+        task = self.get(task_id)
+        if task.status == "completed":
+            raise TaskGraphError(
+                "task_completed", f"task '{task_id}' is already completed — cannot block it"
+            )
+        task.status = "blocked"
+        task.blocked_reason = reason
+        return task
+
+    def unblock(self, task_id: str) -> Task:
+        """Reverse of `block`: back to `pending`, i.e. READY again once its
+        dependencies are still satisfied (`state_of` re-derives that from
+        `depends_on` exactly as for any other pending task). Called by
+        `python -m autoloop answer` once the operator resolves the blocker
+        that quarantined it."""
+        task = self.get(task_id)
+        if task.status != "blocked":
+            raise TaskGraphError("task_not_blocked", f"task '{task_id}' is not blocked")
+        task.status = "pending"
+        task.blocked_reason = ""
         return task
 
     # ---- lookup -------------------------------------------------------------
@@ -136,6 +195,8 @@ class TaskRegistry:
         task = self.get(task_id)
         if task.status == "completed":
             return TaskState.COMPLETED
+        if task.status == "blocked":
+            return TaskState.BLOCKED_BY_OPERATOR
         if any(self._tasks[dep].status != "completed" for dep in task.depends_on):
             return TaskState.BLOCKED
         if task.status == "in_progress":
@@ -160,7 +221,8 @@ class TaskRegistry:
         parts = (
             f"{len(self._tasks)} tasks: {counts[TaskState.COMPLETED]} completed, "
             f"{counts[TaskState.IN_PROGRESS]} in progress, "
-            f"{counts[TaskState.READY]} ready, {counts[TaskState.BLOCKED]} blocked"
+            f"{counts[TaskState.READY]} ready, {counts[TaskState.BLOCKED]} blocked, "
+            f"{counts[TaskState.BLOCKED_BY_OPERATOR]} quarantined"
         )
         if nxt is not None:
             parts += f"; next ready: {nxt.id} — {nxt.title}"

@@ -270,6 +270,21 @@ class LoopState:
     question: str | None = None
     resume_phase: str | None = None
     stop_reason: str | None = None
+    #: Classification of the CURRENT `needs_user` park (see
+    #: `orchestrator._to_needs_user`'s `kind` parameter and
+    #: `docs/AUTOLOOP.md`'s blockers section): `"task_fatal"` (one task was
+    #: set aside; `park_task_id` names it) or `"loop_fatal"` (the whole loop
+    #: stops). `None` outside `needs_user`, or for a state file written
+    #: before this existed — `cli.py`'s continuous-mode handling treats a
+    #: missing/unrecognised value as `loop_fatal` (fail-closed), never as
+    #: task_fatal. New fields with defaults — nothing to backfill on an old
+    #: state file, same reasoning as the pass-2b additions above.
+    park_kind: str | None = None
+    park_task_id: str | None = None
+    #: The `blockers.Blocker.id` this park was recorded under, if a
+    #: `BlockerStore` was configured (always true in production; `None` in
+    #: tests/tools that construct a minimal `Orchestrator`).
+    park_blocker_id: str | None = None
     created_at: str = field(default_factory=utcnow_iso)
     updated_at: str = field(default_factory=utcnow_iso)
     schema_version: int = SCHEMA_VERSION

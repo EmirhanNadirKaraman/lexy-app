@@ -262,6 +262,19 @@ class PolicyEngine:
                 "task_blocked",
                 f"task '{task_id}' is blocked by incomplete dependencies",
             )
+        if state is TaskState.BLOCKED_BY_OPERATOR:
+            # Quarantined after a `task_fatal` park (see orchestrator.py's
+            # blocker classification, docs/AUTOLOOP.md §9c) — enforcement,
+            # not just advisory: without this, `next_ready()` keeping the
+            # task off the roadmap summary would be the ONLY thing stopping
+            # a directive that names the task id directly, and this is the
+            # gate every TASK_DECISIONS dispatch passes through before
+            # `_dispatch_executor` ever calls `mark_in_progress`.
+            return Verdict.deny(
+                "task_blocked_by_operator",
+                f"task '{task_id}' is quarantined pending an operator answer "
+                "(see `python -m autoloop blockers`)",
+            )
         return Verdict.ok()
 
     # ---- git command validation (defense in depth) --------------------------
