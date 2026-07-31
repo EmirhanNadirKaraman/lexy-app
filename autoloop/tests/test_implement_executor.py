@@ -315,3 +315,107 @@ def test_worker_repo_root_for_requires_policy_together(main_repo):
             worker_repo_root_for=None,
             policy=policy,
         )
+
+
+# ---- per-task validation (the vacuous-validation bug) ----------------------
+
+
+def _writing_stub(argv, **kwargs):
+    (Path(kwargs["cwd"]) / "feature.py").write_text("x = 1\n")
+
+    class Proc:
+        returncode = 0
+        stdout = json.dumps({"result": "done"})
+        stderr = ""
+
+    return Proc()
+
+
+def test_task_declared_validation_overrides_the_configured_default(main_repo, worker_repo):
+    """The configured default is ruff + the autoloop and root suites, none of
+    which touch `lexy-app/backend`. Without a per-task override, rt-01's change
+    would pass validation with NOTHING exercising it — including the test the
+    agent just wrote."""
+    (worker_repo / "lexy-app" / "backend").mkdir(parents=True, exist_ok=True)
+    ran = []
+
+    def command_runner(argv, cwd=None, **kw):
+        ran.append((tuple(argv), str(cwd)))
+
+        class Proc:
+            returncode = 0
+            stdout = "ok\n"
+            stderr = ""
+
+        return Proc()
+
+    executor = build_executor(
+        main_repo, worker_repo,
+        lambda root: implement_agent_runner(root, runner=_writing_stub),
+        validation=(("ruff", "check", "."),),
+        command_runner=command_runner,
+    )
+    task = Task(
+        id="rt-01", title="admin-gate", description="d",
+        validation=(("python3", "-m", "pytest", "-n", "auto", "-q"),),
+        validation_cwd="lexy-app/backend",
+    )
+    outcome = executor.execute(implement_directive(), task)
+
+    assert outcome.status == "ok"
+    argvs = [a for a, _ in ran]
+    assert ("python3", "-m", "pytest", "-n", "auto", "-q") in argvs
+    assert ("ruff", "check", ".") not in argvs, "the configured default must be REPLACED"
+    assert all(c.endswith("lexy-app/backend") for _, c in ran), (
+        "must run from the declared cwd — `python -m` needs it on sys.path"
+    )
+
+
+def test_empty_task_validation_keeps_the_configured_default(main_repo, worker_repo):
+    ran = []
+
+    def command_runner(argv, cwd=None, **kw):
+        ran.append(tuple(argv))
+
+        class Proc:
+            returncode = 0
+            stdout = "ok\n"
+            stderr = ""
+
+        return Proc()
+
+    executor = build_executor(
+        main_repo, worker_repo,
+        lambda root: implement_agent_runner(root, runner=_writing_stub),
+        validation=(("ruff", "check", "."),),
+        command_runner=command_runner,
+    )
+    executor.execute(implement_directive(), make_task())
+    assert ("ruff", "check", ".") in ran
+
+
+def test_missing_validation_cwd_is_an_honest_error_not_a_silent_pass(main_repo, worker_repo):
+    """A declared directory that does not exist must not fall back to the repo
+    root and report success — that is the vacuous pass all over again."""
+    def command_runner(argv, cwd=None, **kw):
+        class Proc:
+            returncode = 0
+            stdout = "ok\n"
+            stderr = ""
+
+        return Proc()
+
+    executor = build_executor(
+        main_repo, worker_repo,
+        lambda root: implement_agent_runner(root, runner=_writing_stub),
+        validation=(("ruff", "check", "."),),
+        command_runner=command_runner,
+    )
+    task = Task(
+        id="t1", title="t", description="d",
+        validation=(("ruff", "check", "."),),
+        validation_cwd="does/not/exist",
+    )
+    outcome = executor.execute(implement_directive(), task)
+    assert outcome.status == "error"
+    assert "validation_cwd" in outcome.summary

@@ -255,8 +255,30 @@ class ImplementExecutor:
                 validation="not run",
             )
 
+        # A task may declare its own validation. Without this the configured
+        # default (ruff + the autoloop and root-pipeline suites) runs for every
+        # task regardless of what it touched — so a change under
+        # `lexy-app/backend` would pass validation with nothing exercising it,
+        # including the test the agent just wrote. An empty `task.validation`
+        # keeps the configured default, which is right for tasks the default
+        # does cover.
+        commands = tuple(task.validation) or self._validation_commands
+        validation_cwd = git.repo_root
+        if task.validation_cwd:
+            validation_cwd = git.repo_root / task.validation_cwd
+            if not validation_cwd.is_dir():
+                return ExecutionOutcome(
+                    status="error",
+                    summary=(
+                        f"task '{task.id}': declared validation_cwd "
+                        f"{task.validation_cwd!r} does not exist in the worker repo"
+                    ),
+                    details=result.raw_text,
+                    validation="not run",
+                    changed_paths=tuple(sorted(changed)),
+                )
         passed, validation_summary = run_validation_commands(
-            self._validation_commands, git.repo_root, command_runner=self._command_runner
+            commands, validation_cwd, command_runner=self._command_runner
         )
         if not passed:
             return ExecutionOutcome(

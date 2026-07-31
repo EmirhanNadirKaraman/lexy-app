@@ -3,6 +3,22 @@
     "id": "rt-01",
     "title": "admin-gate GET /books/packages and POST /books/import",
     "description": "docs/AUDIT_2026-07-30.md line ~378 (rt-01, P1): GET /books/packages and POST /books/import in lexy-app/backend/routers/books.py are auth-gated but not admin-gated, so any authenticated user can enumerate server-side package names and trigger import validation. Apply the existing require_admin pattern (see POST /phrases/seed and /admin/lemma-corrections/*) to both endpoints. New test: lexy-app/backend/tests/test_books_import_admin.py (non-admin -> 403, admin -> unchanged behavior). rt-09 (book CRUD/import endpoint tests) depends on this.",
-    "depends_on": []
+    "depends_on": [],
+    "validation": [
+      [
+        "ruff",
+        "check",
+        "."
+      ],
+      [
+        "python3",
+        "-m",
+        "pytest",
+        "-n",
+        "auto",
+        "-q"
+      ]
+    ],
+    "validation_cwd": "lexy-app/backend"
   }
 ]

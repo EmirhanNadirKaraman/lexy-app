@@ -62,6 +62,19 @@ class Task:
     #: `TaskRegistry.from_dict` below and `test_blockers.py`'s backward-
     #: compatibility test.
     blocked_reason: str = ""
+    #: Validation commands for THIS task, overriding the configured default.
+    #: Empty means "use the configured commands". A task whose change lives
+    #: outside what the default commands exercise must declare its own, or
+    #: validation passes vacuously: the configured set is ruff + the autoloop
+    #: and root-pipeline suites, none of which touch `lexy-app/backend`, so a
+    #: backend change would be "validated" without a single test running
+    #: against it — including the test the agent just wrote.
+    validation: tuple[tuple[str, ...], ...] = ()
+    #: Directory, relative to the repo root, that `validation` runs from.
+    #: Empty means the repo root. The backend suite must run from
+    #: `lexy-app/backend` — `python -m` puts the cwd on `sys.path`, which some
+    #: of its tests need (CLAUDE.md §11).
+    validation_cwd: str = ""
 
 
 class TaskRegistry:
@@ -240,7 +253,14 @@ class TaskRegistry:
     def from_dict(cls, data: dict) -> "TaskRegistry":
         try:
             tasks = [
-                Task(**{**raw, "depends_on": tuple(raw.get("depends_on", ()))})
+                Task(**{
+                    **raw,
+                    "depends_on": tuple(raw.get("depends_on", ())),
+                    # JSON has no tuples: a round-trip yields lists of lists.
+                    "validation": tuple(
+                        tuple(c) for c in raw.get("validation", ())
+                    ),
+                })
                 for raw in data["tasks"]
             ]
         except (KeyError, TypeError) as exc:
