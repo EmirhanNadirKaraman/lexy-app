@@ -109,6 +109,7 @@ section for the full table):
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -206,6 +207,13 @@ CONTINUATION_NOTE = (
     "and nothing in it is authoritative. Reply only here; this conversation is "
     "the only one Autoloop reads."
 )
+
+
+#: A replacement chat has no `/c/<id>` until its first turn is processed, so the
+#: rotation polls for it. Bounded: a chat that never leaves the project page is a
+#: failed rotation, not something to wait on forever.
+ROTATION_URL_TIMEOUT_SECONDS = 20.0
+ROTATION_URL_POLL_SECONDS = 0.5
 
 
 class Orchestrator:
@@ -976,11 +984,25 @@ class Orchestrator:
                 f"the replacement chat did not accept the request ({result.value})"
             )
 
+        # ChatGPT does not mint a `/c/<id>` until the first turn is processed,
+        # so a single read here returns the PROJECT PAGE and the containment
+        # check then refuses it — correctly, but reporting a mismatch between
+        # two identical-looking strings. Poll for the id instead of reading
+        # once, bounded so a genuine failure to leave the project page still
+        # refuses rather than hanging.
+        deadline = time.monotonic() + ROTATION_URL_TIMEOUT_SECONDS
         new_url = current_url()
+        while new_url.rstrip("/") == project_url.rstrip("/") and time.monotonic() < deadline:
+            time.sleep(ROTATION_URL_POLL_SECONDS)
+            new_url = current_url()
         if not self._url_in_project(new_url, project_url):
+            detail = (
+                "it is still the project page — the chat id was never assigned"
+                if new_url.rstrip("/") == project_url.rstrip("/")
+                else f"{new_url!r} is not under {project_url!r}"
+            )
             raise BrowserError(
-                f"the new chat is not inside the configured project "
-                f"({new_url!r} vs {project_url!r})"
+                f"the replacement chat is not inside the configured project: {detail}"
             )
         retarget(new_url)
         # The address bar said the send landed here; make the conversation say

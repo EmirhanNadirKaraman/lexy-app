@@ -1194,3 +1194,45 @@ def _raiser(exc):
         raise exc
 
     return _raise
+
+
+def test_rotation_waits_for_the_chat_id_instead_of_reading_the_project_page(tmp_path):
+    """ChatGPT assigns a `/c/<id>` only once the first turn is processed.
+
+    Reading `current_url()` once, right after the submit, returned the PROJECT
+    PAGE, and the containment check refused it while printing a mismatch
+    between two identical-looking strings:
+
+        the replacement chat is not inside the configured project
+        ('.../g-p-.../project' vs '.../g-p-.../project')
+
+    That spent the single rotation budget and parked the loop on a conversation
+    it had correctly identified as wedged. This fake withholds the id on the
+    first read after submitting, exactly as the browser did.
+    """
+    client = RotatingFakeClient(
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
+        responses=[stop_block()],
+    )
+    real_current_url = client.current_url
+    seen = {"n": 0}
+
+    def delayed_current_url():
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return PROJECT_URL          # id not minted yet
+        return real_current_url()
+
+    client.current_url = delayed_current_url
+
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.SUBMITTING.value
+    state.pending_request = pending()
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=4)
+
+    assert orch.state.rotations == 1, "a delayed id must not burn the rotation"
+    assert orch.state.conversation_url == NEW_CONV_URL, "must bind the CHAT, not the project page"
+    assert transcript_entries(config, "conversation_rotated"), "rotation must be recorded"
+    assert seen["n"] > 1, "the first read returned the project page — it must poll again"
