@@ -869,6 +869,101 @@ this section's own history shows.
 
 ---
 
+## 4f. Operator-changeset review (publishing a hand-authored commit)
+
+`changeset_review.py`, 2026-07-31. Everything above this section reviews and
+publishes work THIS LOOP produced in its own task worker repo
+(`PostcommitBinding`, §4b/§4c). It has no path for a changeset an operator
+authored directly on the branch autoloop itself runs from — before this,
+`push`'s only two outcomes were "answers a live `PostcommitBinding`" or
+`legacy_git_path_retired` (§4c's `_dispatch` — the retired direct-push route
+stays retired), so every infrastructure commit had to be pushed by hand.
+
+**`ChangesetBinding`** (`changeset_review.py`) mirrors `PostcommitBinding`'s
+shape and field naming (`base_sha`, `candidate_sha`, `candidate_tree_sha`,
+`packet_sha256`) but is a distinct type: there is no task, no
+`TaskExecutionStore`, and no separate worktree behind it — the candidate
+lives directly in the checkout the orchestrator itself runs from. It carries
+`branch`/`dest_ref` explicitly rather than deriving them at push time.
+
+**CLI: `python -m autoloop review-changeset --base <sha> --candidate <sha>
+[--packet FILE]`** (`cli._cmd_review_changeset`). Refuses (before touching
+any session) unless both shas are literal 40-hex and resolve to commit
+objects, `--candidate` is a descendant of `--base`, and the checked-out
+branch is not protected — `changeset_review.build_changeset_binding`.
+Requires no existing session (same rule as `run --kickoff`). On success it
+renders the review packet — `changeset_review.build_changeset_packet`,
+reusing `packet.py`'s commit-list/changed-paths/diffstat/`range_diff`
+machinery — records the binding on `state.changeset`, and queues it as
+`state.outbox`; a later `run` sends it. `--packet FILE` replaces only the
+diff BODY with the file's text; the `branch`/`dest_ref`/`base_sha`/
+`candidate_sha` header is always stamped from git, never from the file —
+`report_sha256` (hashed over the whole rendered request, which embeds this
+packet verbatim) is what stops an approval of one commit validating against
+another, so those four identifiers must always be literal text in the
+hashed body regardless of where the rest of the packet text came from.
+
+**Dispatch.** `Orchestrator._dispatch` routes a `push` directive whose
+response carries `resp.changeset` to `_dispatch_changeset_push` — checked
+before the `resp.postcommit` branch (the two are mutually exclusive in
+practice; the order carries no meaning) and before the
+`legacy_git_path_retired` fallback, so a `push` with no changeset binding
+still refuses exactly as before (§4c). `_dispatch_changeset_push` mirrors
+`_dispatch_task_push`: `resp.changeset.candidate_sha` is the ONLY source of
+what publishes (never `directive`, never a fresh lookup); it re-verifies
+descendant-of-base, that the candidate still resolves, and that its tree
+still matches `candidate_tree_sha`, then imports the object by literal id
+from `self._git.repo_root` into the Publisher and calls `publish` — the
+same `push_exact` underneath, unconditionally. **A Publisher is required**
+for this path — there is no direct-push fallback (unlike
+`_dispatch_task_push`'s no-publisher branch): pushing straight from the
+orchestrator's own checkout would be the retired legacy direct-push shape
+this feature exists to replace, not reintroduce. Its absence parks with the
+new `changeset_publisher_required` — mapped in `cli._RESOLUTION_PRECONDITIONS`
+to the existing `_precondition_publisher_url` recheck (and added to
+`test_m1_hardening.py`'s curated `security_and_environment_codes` set) in
+the SAME change that introduced it, per §4e's rule: an environmental
+`loop_fatal` code with no precondition at all is exactly the gap that bit
+twice before (S25/S26) — the forward-only exhaustiveness test cannot catch
+a missing key, only the curated reverse test can.
+
+**Why the generic HEAD-moved staleness check is skipped for this path.**
+Every other reviewed decision stamps `head_sha` from `context.build_context`
+— the RUNNING checkout's `git rev-parse HEAD` at request-send time — and
+`_step_executing` refuses if that checkout's HEAD has since moved
+(`review_mismatch:head_moved`). That check is sound where the checkout
+legitimately should not move while a request is outstanding (the
+orchestrator's own repo during a produce-then-review task round, which
+happens in a separate worktree). For a changeset review the checkout IS the
+branch under review, and the whole feature exists to let the operator keep
+committing to it after a packet is sent — the reviewed candidate, not
+whatever HEAD has since become, is what must publish. `_step_executing`
+skips the HEAD-moved check specifically when the decision is `push` AND
+`resp.changeset is not None` — narrower than "any changeset-bound
+response", since `resp.changeset` is only ever meant to answer a `push`
+(a stray `commit`/`commit_and_push` reply somehow carrying one still gets
+the ordinary check, and separately lands in `legacy_git_path_retired`
+either way);
+identity is instead carried entirely by `resp.changeset.candidate_sha` plus
+the `report_sha256` digest `verify_review` already checked. Proved directly:
+a later, unreviewed commit lands on the branch after the packet is queued,
+and the stamped approval still publishes the earlier, recorded candidate —
+never the later one (`test_changeset_review.py`).
+
+**Protected-branch destination.** `_step_executing`'s `destination_branch`
+computation (used by `authorize_directive`'s protected-branch gate) reads
+`resp.changeset.branch` — the value pinned at binding time — rather than a
+fresh `self._git.current_branch()`, for the same reason `_dispatch_task_push`
+reads `resp.postcommit.task_branch`: judging the CURRENT checkout branch
+would be wrong (and, for a changeset review specifically, would let a
+`protected_branches` config change or a branch switch between review and
+dispatch retroactively make a still-protected destination look clear).
+`_dispatch_changeset_push`'s own `push_exact` call re-checks the same
+protected set independently, belt-and-braces, exactly like the
+produce-then-review path.
+
+---
+
 ## 5. Response contract (v3)
 
 As v2 (task-id-based work authorization, `plan`, `reviewed` integrity stamps —

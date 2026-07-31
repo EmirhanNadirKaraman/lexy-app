@@ -20,8 +20,15 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .errors import StateCorruptError, StateError
+
+if TYPE_CHECKING:
+    # Type-checking / static-analysis only — see `_load_changeset`'s
+    # docstring for why the REAL import stays local to that function rather
+    # than living at module level.
+    from .changeset_review import ChangesetBinding
 
 # v2 (2026-07-29): review-integrity stamps on PendingRequest/LastResponse,
 # last_decision / last_validation for the review context. Breaking on purpose —
@@ -58,6 +65,13 @@ from .errors import StateCorruptError, StateError
 # correct for a request loaded from a state file written before this existed
 # — it has no recorded response-start timeouts to backfill, and treating it
 # as having none is the truth, not a guess.
+#
+# NOT bumped for the operator-changeset review additions either
+# (`PendingRequest.changeset` / `LastResponse.changeset` / `LoopState.
+# changeset` — see `changeset_review.ChangesetBinding`). Same reasoning as
+# `postcommit` above: all three are new fields with a `None` default, and a
+# session written before this existed has no in-flight changeset review to
+# backfill — `None` is exactly correct for it.
 SCHEMA_VERSION = 3
 
 
@@ -150,6 +164,14 @@ class PendingRequest:
     #: template). `None` for every other kind of request — audit reports,
     #: corrective re-prompts, ordinary commit approvals, and so on.
     postcommit: PostcommitBinding | None = None
+    #: Set only when this request's payload is an operator-changeset review
+    #: packet (`changeset_review.build_changeset_packet`, wrapped by the
+    #: `changeset_review` template). Mutually exclusive with `postcommit` in
+    #: practice (each is bound from a distinct `state` field —
+    #: `task_execution` vs `changeset` — and only one is normally set at a
+    #: time), but nothing enforces that structurally; both are simply `None`
+    #: for every other kind of request.
+    changeset: ChangesetBinding | None = None
     #: THE authoritative conversation for this request. Every submit, await and
     #: reconcile for it targets this URL — never `LoopState.conversation_url`,
     #: which moves when a rotation happens. That is what makes a late reply in
@@ -212,6 +234,11 @@ class LastResponse:
     #: approval of candidate A structurally unable to publish a swapped-in
     #: candidate B.
     postcommit: PostcommitBinding | None = None
+    #: Carried over from the `PendingRequest` this response answers, exactly
+    #: like `postcommit` above but for an operator-changeset review — see
+    #: `changeset_review.ChangesetBinding` and
+    #: `Orchestrator._dispatch_changeset_push`.
+    changeset: ChangesetBinding | None = None
     #: Which conversation this reply was actually read from, copied from the
     #: request it answers. Recorded so "only a response captured from the
     #: request's bound conversation may authorize action" is auditable after
@@ -225,11 +252,30 @@ def _load_postcommit(raw: dict | None) -> PostcommitBinding | None:
     return PostcommitBinding(**raw) if raw else None
 
 
+def _load_changeset(raw: dict | None) -> ChangesetBinding | None:
+    if not raw:
+        return None
+    # Local (call-time) import, deliberately not hoisted to module level:
+    # `PostcommitBinding` avoids this entirely by living IN this module, but
+    # `ChangesetBinding` lives in `changeset_review.py` per the brief for
+    # this feature. `changeset_review.py` has legitimate reasons to import
+    # FROM `state.py` in the future (session/`PendingRequest` construction
+    # for the CLI's `review-changeset` command lives right next to it) — a
+    # module-level `from .changeset_review import ChangesetBinding` here
+    # would make that a real import cycle the moment it happened. This
+    # function is the only place the real class is ever needed at runtime,
+    # so it is the only place that imports it.
+    from .changeset_review import ChangesetBinding
+
+    return ChangesetBinding(**raw)
+
+
 def _load_pending_request(raw: dict | None) -> PendingRequest | None:
     if not raw:
         return None
     data = dict(raw)
     data["postcommit"] = _load_postcommit(data.get("postcommit"))
+    data["changeset"] = _load_changeset(data.get("changeset"))
     return PendingRequest(**data)
 
 
@@ -238,6 +284,7 @@ def _load_last_response(raw: dict | None) -> LastResponse | None:
         return None
     data = dict(raw)
     data["postcommit"] = _load_postcommit(data.get("postcommit"))
+    data["changeset"] = _load_changeset(data.get("changeset"))
     return LastResponse(**data)
 
 
@@ -283,6 +330,16 @@ class LoopState:
     #: OLD authorize-then-produce/manifest path and means something different
     #: (a `ChangeManifest` id against the main checkout, not a worktree).
     task_execution: dict | None = None
+    #: Serialised `changeset_review.ChangesetBinding` (a plain dict —
+    #: `dataclasses.asdict(binding)`, never a reconstructed dataclass
+    #: instance here — same convention as `task_execution` above) for an
+    #: operator changeset queued by `python -m autoloop review-changeset`
+    #: and not yet published. Deliberately separate from `task_execution`:
+    #: there is no task, no worktree, and no `TaskExecutionStore` record
+    #: behind it — the candidate lives directly in THIS checkout. Cleared
+    #: (`None`) once `Orchestrator._dispatch_changeset_push` actually
+    #: publishes it.
+    changeset: dict | None = None
     #: Current conversation generation. Requests are stamped with it, so a
     #: response captured under an older epoch can be recognised and ignored.
     conversation_epoch: int = 0

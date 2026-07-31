@@ -1361,6 +1361,11 @@ def test_security_and_environment_codes_all_have_a_precondition():
         "push_refused_protected",
         "primary_checkout_dirty",
         "checkout_escape_detected",
+        # Operator-changeset review (`changeset_review.py`,
+        # `Orchestrator._dispatch_changeset_push`, 2026-07-31): "no publisher
+        # configured" is an environmental fact, not something an operator's
+        # answer text can fix.
+        "changeset_publisher_required",
     }
     missing = security_and_environment_codes - set(_RESOLUTION_PRECONDITIONS)
     assert not missing, f"security/environment codes with no precondition at all: {sorted(missing)}"

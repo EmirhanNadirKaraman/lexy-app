@@ -118,6 +118,7 @@ from . import escape_detector
 from .blockers import NO_TASK, BlockerStore
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
+from .changeset_review import ChangesetBinding
 from .config import AutoloopConfig
 from .config_writer import update_conversation_url
 from .context import build_context, render_context
@@ -387,6 +388,7 @@ class Orchestrator:
         ctx = build_context(state, self._git, self._registry, request_id, state.outbox)
         prompt = build_prompt(request_id, next_iteration, render_context(ctx), state.outbox)
         postcommit = self._current_pending_postcommit(state.outbox, ctx.report_sha256)
+        changeset = self._current_pending_changeset(state.outbox, ctx.report_sha256)
         state.pending_request = PendingRequest(
             request_id=request_id,
             payload=state.outbox,
@@ -397,6 +399,7 @@ class Orchestrator:
             report_sha256=ctx.report_sha256,
             timestamp=ctx.timestamp,
             postcommit=postcommit,
+            changeset=changeset,
         )
         if postcommit is not None:
             # Bind the exact report this candidate was reviewed under, on the
@@ -1098,6 +1101,42 @@ class Orchestrator:
             packet_sha256=report_sha256,
         )
 
+    def _current_pending_changeset(
+        self, payload: str, report_sha256: str
+    ) -> ChangesetBinding | None:
+        """Bind `payload` to an operator-authored changeset, exactly like
+        `_current_pending_postcommit` above binds one to a produce-then-review
+        candidate — see that method's docstring for the "why literal
+        substrings" reasoning, which applies identically here.
+
+        `state.changeset` (set by `python -m autoloop review-changeset`, see
+        `changeset_review.build_changeset_binding`) is the ONLY source: there
+        is no `TaskExecutionStore` to cross-check against, because there is
+        no task and no separate worktree — the candidate lives directly in
+        THIS checkout (`self._git`), which is exactly why `candidate_tree_sha`
+        is re-derived from `self._git` rather than a worktree gateway.
+        """
+        raw = self.state.changeset
+        if not raw or not raw.get("candidate_sha"):
+            return None
+        base_sha = raw.get("base_sha", "")
+        candidate_sha = raw.get("candidate_sha", "")
+        branch = raw.get("branch", "")
+        dest_ref = raw.get("dest_ref", "")
+        if not all(
+            value and value in payload for value in (base_sha, candidate_sha, branch, dest_ref)
+        ):
+            return None
+        candidate_tree_sha = self._git.tree_of(candidate_sha)
+        return ChangesetBinding(
+            base_sha=base_sha,
+            candidate_sha=candidate_sha,
+            candidate_tree_sha=candidate_tree_sha,
+            branch=branch,
+            dest_ref=dest_ref,
+            packet_sha256=report_sha256,
+        )
+
     def _park_ambiguous(self, req: PendingRequest, reconciled: bool) -> None:
         """Stop on an ambiguous submission. Never resends automatically."""
         self._log(
@@ -1177,17 +1216,27 @@ class Orchestrator:
         # A postcommit-bound push publishes `resp.postcommit.task_branch`, an
         # entirely different ref than whatever the main checkout has current
         # (usually the branch the orchestrator itself runs from, e.g. "main").
-        # `authorize_directive`'s protected-branch gate must judge THAT
-        # destination, not the main checkout's — otherwise every
-        # produce-then-review push would be evaluated against the wrong
-        # branch name (denying it whenever the main checkout sits on
-        # "main"/"master", the exact opposite of what protected_branches is
-        # meant to gate).
-        destination_branch = (
-            resp.postcommit.task_branch
-            if resp.postcommit is not None and directive.decision in PUSH_DECISIONS
-            else self._git.current_branch()
-        )
+        # A changeset-bound push (`resp.changeset`) similarly targets its own
+        # recorded `branch`, not necessarily whatever this checkout happens
+        # to be on by the time the approval is dispatched — the checkout
+        # normally still IS that branch (the whole point of a changeset
+        # review), but `resp.changeset.branch` is the pinned value from
+        # binding time, and using it rather than a fresh lookup means a
+        # config change to `protected_branches`, or an operator switching
+        # branches, between review and dispatch cannot retroactively make a
+        # protected destination look unprotected. `authorize_directive`'s
+        # protected-branch gate must judge the ACTUAL push destination in
+        # either case, not the main checkout's current branch — otherwise a
+        # produce-then-review or changeset push would be evaluated against
+        # the wrong branch name (denying it whenever the main checkout sits
+        # on "main"/"master", the exact opposite of what protected_branches
+        # is meant to gate).
+        if resp.postcommit is not None and directive.decision in PUSH_DECISIONS:
+            destination_branch = resp.postcommit.task_branch
+        elif resp.changeset is not None and directive.decision in PUSH_DECISIONS:
+            destination_branch = resp.changeset.branch
+        else:
+            destination_branch = self._git.current_branch()
         verdict = self._policy.authorize_directive(directive, destination_branch, self._registry)
         if not verdict.allowed:
             self._handle_policy_denial(directive, verdict)
@@ -1198,17 +1247,36 @@ class Orchestrator:
             except ContractError as exc:
                 self._handle_review_mismatch(exc)
                 return
-            current_head = self._git.head_sha()
-            if current_head != directive.reviewed.head_sha:
-                self._handle_review_mismatch(
-                    ContractError(
-                        "review_mismatch:head_moved",
-                        f"repository HEAD is {current_head[:12]} but the approval "
-                        f"references {directive.reviewed.head_sha[:12]} — the tree "
-                        "changed since the review",
+            # The generic "repository HEAD must still equal the reviewed
+            # head_sha" staleness check below does not apply to a
+            # changeset-bound PUSH: `head_sha` there is THIS checkout's HEAD
+            # at packet-render time, and this checkout IS the branch the
+            # operator keeps committing to — advancing it after the review
+            # was sent is the expected, legitimate case a changeset review
+            # exists to handle (publish the reviewed candidate, not
+            # whatever HEAD has since become). See `changeset_review`'s
+            # module docstring for the full reasoning. Identity for this
+            # path is carried entirely by `resp.changeset.candidate_sha`
+            # plus the `report_sha256` digest just verified above. Narrowed
+            # to `decision is PUSH` (not every REVIEWED_DECISIONS member):
+            # `resp.changeset` is only ever meant to answer a `push` (see
+            # `PendingRequest.changeset`'s docstring) — a `commit`/
+            # `commit_and_push` reply somehow carrying one still gets the
+            # ordinary staleness check, and separately lands in
+            # `legacy_git_path_retired` either way (`_dispatch`'s changeset
+            # branch only fires for `Decision.PUSH`).
+            if directive.decision is not Decision.PUSH or resp.changeset is None:
+                current_head = self._git.head_sha()
+                if current_head != directive.reviewed.head_sha:
+                    self._handle_review_mismatch(
+                        ContractError(
+                            "review_mismatch:head_moved",
+                            f"repository HEAD is {current_head[:12]} but the approval "
+                            f"references {directive.reviewed.head_sha[:12]} — the tree "
+                            "changed since the review",
+                        )
                     )
-                )
-                return
+                    return
         state.policy_denials = 0
         self._dispatch(directive)
 
@@ -1233,6 +1301,18 @@ class Orchestrator:
         elif decision is Decision.PLAN:
             self._dispatch_plan(directive)
         elif decision is Decision.PUSH and state.last_response is not None and (
+            state.last_response.changeset is not None
+        ):
+            # A push answering an operator-changeset review packet publishes
+            # via the Publisher, sourced entirely from the response's binding
+            # (never from `directive`, and never a fallback to the legacy
+            # path below) — see `_dispatch_changeset_push`'s docstring.
+            # Checked BEFORE the postcommit branch below only because both
+            # conditions can never be true at once in practice (see
+            # `state.PendingRequest.changeset`'s docstring); the order itself
+            # carries no meaning.
+            self._dispatch_changeset_push(directive, state.last_response)
+        elif decision is Decision.PUSH and state.last_response is not None and (
             state.last_response.postcommit is not None
         ):
             # A push answering a produce-then-review packet publishes via
@@ -1243,8 +1323,9 @@ class Orchestrator:
         elif decision in COMMIT_DECISIONS or decision in PUSH_DECISIONS:
             # The legacy authorize-then-produce commit/push path (`commit`,
             # `commit_and_push`, and any `push` NOT bound to a produce-then-
-            # review candidate — the bound case is handled above) was retired
-            # 2026-07-30 (docs/SECURITY.md S21: closed by retirement, not by
+            # review candidate or an operator-changeset review (the bound
+            # cases are handled above) was retired 2026-07-30
+            # (docs/SECURITY.md S21: closed by retirement, not by
             # a fix — see `_dispatch_task_postcommit`). Nothing in this
             # codebase's own prompts ever asks ChatGPT for these anymore; if
             # one arrives anyway (a stale habit, a hand-crafted directive), it
@@ -1258,8 +1339,8 @@ class Orchestrator:
                     "direct commit/push is no longer supported — the orchestrator "
                     "commits automatically after implementing (or auditing) a "
                     "task in its own worker repo; the only valid approval is "
-                    "`push` with the `reviewed` stamp answering a postcommit "
-                    "review packet",
+                    "`push` with the `reviewed` stamp answering a postcommit or "
+                    "operator-changeset review packet",
                 ),
             )
         else:  # audit / implement / revise
@@ -2362,6 +2443,156 @@ class Orchestrator:
         state.outbox = TEMPLATES["git_report"].render(
             summary_line=(
                 f"pushed {landed[:12]} to {remote}/{dest_ref} (task {binding.task_id})"
+            )
+        )
+        state.last_response = None
+        state.consecutive_failures = 0
+        state.phase = Phase.READY.value
+        self._store.save(state)
+
+    def _dispatch_changeset_push(self, directive: Directive, resp: LastResponse) -> None:
+        """Publish an operator-authored changeset via the Publisher —
+        `_dispatch_task_push`'s sibling for the case where there is no task,
+        no `TaskExecutionStore` record, and no separate worktree: the
+        reviewed candidate lives directly in the checkout this orchestrator
+        itself runs from (`self._git`), because the operator committed it
+        there directly (see `changeset_review.py`'s module docstring for the
+        full "why" and why the generic HEAD-moved staleness check does not
+        gate this path — `_step_executing` skips it for exactly this
+        method).
+
+        `directive` is used ONLY for logging/reason text — never for
+        identity, same discipline as `_dispatch_task_push`: `resp.changeset`
+        — the binding captured the moment THIS packet was sent — is the only
+        source of which candidate this approval concerns. If the candidate
+        no longer resolves, is no longer a descendant of the reviewed base,
+        or its tree no longer matches what was reviewed, nothing is pushed.
+
+        **A Publisher is REQUIRED here — there is no direct-push fallback**
+        like `_dispatch_task_push`'s no-publisher branch. A direct push from
+        `self._git` would push straight from the SAME checkout this
+        orchestrator runs from, using its ordinary (non-scrubbed, non-
+        firewalled) git configuration — exactly the retired legacy
+        direct-push shape (docs/SECURITY.md S21) this feature exists to
+        replace, not reintroduce. `import_candidate` instead fetches
+        `resp.changeset.candidate_sha` — by literal object id, from
+        `self._git.repo_root` as a local filesystem source — into the
+        Publisher's own, separate repository, and `publish` pushes from
+        there.
+        """
+        state = self.state
+        binding = resp.changeset
+        if self._publisher is None:
+            self._to_needs_user(
+                f"changeset push refused — candidate {binding.candidate_sha[:12]}: "
+                "no publisher is configured. An operator-changeset review can "
+                "only be published through the Publisher (see "
+                "`cli._build_orchestrator`); there is no direct-push fallback "
+                "for this path. Nothing was pushed.",
+                kind="loop_fatal",
+                code="changeset_publisher_required",
+                detail=f"candidate={binding.candidate_sha}",
+            )
+            return
+        live_url = self._git.config_get(f"remote.{self._publisher.remote}.url")
+        if live_url != self._publisher_url_snapshot:
+            self._to_needs_user(
+                f"changeset push refused — the publisher's remote url snapshot "
+                f"({redact_url(self._publisher_url_snapshot or '')}) no longer "
+                f"matches the main checkout's configured "
+                f"remote.{self._publisher.remote}.url ({redact_url(live_url)}). "
+                "Autoloop never updates the snapshot automatically. Verify the "
+                "new destination is correct, then run `python -m autoloop "
+                "reprovision-publisher --confirm`. Nothing was published.",
+                kind="loop_fatal",
+                code="publisher_url_drift",
+                detail=(
+                    f"snapshot={redact_url(self._publisher_url_snapshot or '')} "
+                    f"live={redact_url(live_url)}"
+                ),
+            )
+            return
+        if not self._git.is_descendant(binding.candidate_sha, binding.base_sha):
+            self._to_needs_user(
+                f"changeset push refused — candidate {binding.candidate_sha[:12]} "
+                f"is not a descendant of the reviewed base {binding.base_sha[:12]}. "
+                "Nothing was pushed.",
+                kind="loop_fatal",
+                code="push_not_descendant",
+                detail=f"candidate={binding.candidate_sha} base={binding.base_sha}",
+            )
+            return
+        try:
+            info = self._git.read_commit(binding.candidate_sha)
+        except GitCommandError as exc:
+            self._to_needs_user(
+                f"changeset push refused — the reviewed candidate "
+                f"{binding.candidate_sha[:12]} no longer resolves: {exc}. Nothing "
+                "was pushed.",
+                kind="loop_fatal",
+                code="push_candidate_unresolvable",
+                detail=str(exc),
+            )
+            return
+        if info.get("tree") != binding.candidate_tree_sha:
+            self._to_needs_user(
+                f"changeset push refused — candidate {binding.candidate_sha[:12]}'s "
+                f"tree changed since it was reviewed (was "
+                f"{binding.candidate_tree_sha[:12]}, now {info.get('tree', '?')[:12]}). "
+                "Nothing was pushed.",
+                kind="loop_fatal",
+                code="push_tree_mismatch",
+                detail=f"reviewed_tree={binding.candidate_tree_sha} now={info.get('tree', '?')}",
+            )
+            return
+        gateway_protected = (
+            () if self._policy.config.allow_protected_push
+            else self._policy.config.protected_branches
+        )
+        try:
+            # Import first: bring the EXACT reviewed object into the
+            # publisher's own, separate object database from THIS checkout,
+            # by literal sha — never a ref, never this checkout's own HEAD.
+            self._publisher.import_candidate(self._git.repo_root, binding.candidate_sha)
+            landed = self._publisher.publish(
+                binding.candidate_sha,
+                binding.dest_ref,
+                gateway_protected,
+                expected_url=self._publisher_url_snapshot,
+            )
+        except GitCommandError as exc:
+            branch_name = (
+                binding.dest_ref[len("refs/heads/"):]
+                if binding.dest_ref.startswith("refs/heads/")
+                else binding.dest_ref
+            )
+            is_protected_refusal = bool(gateway_protected) and (
+                branch_name in gateway_protected or binding.dest_ref in gateway_protected
+            )
+            self._to_needs_user(
+                f"changeset push of {binding.candidate_sha[:12]} to "
+                f"{self._publisher.remote}/{binding.dest_ref} was REFUSED — {exc}. "
+                "Nothing was pushed; the commit itself is unaffected.",
+                kind="loop_fatal",
+                code="push_refused_protected" if is_protected_refusal else "push_refused",
+                detail=f"dest_ref={binding.dest_ref} error={exc}",
+            )
+            return
+        # Cleared now that the candidate is actually published — mirrors
+        # `_dispatch_task_push` clearing `state.task_execution`.
+        state.changeset = None
+        self._log(
+            "changeset_pushed",
+            data={
+                "candidate_sha": binding.candidate_sha,
+                "remote": self._publisher.remote,
+                "dest_ref": binding.dest_ref,
+            },
+        )
+        state.outbox = TEMPLATES["git_report"].render(
+            summary_line=(
+                f"pushed {landed[:12]} to {self._publisher.remote}/{binding.dest_ref} "
+                "(operator changeset)"
             )
         )
         state.last_response = None

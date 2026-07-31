@@ -9,6 +9,7 @@
     python -m autoloop smoke-browser [--config PATH]
     python -m autoloop pause | resume | unlock | reset --yes
     python -m autoloop reprovision-publisher --confirm
+    python -m autoloop review-changeset --base <sha> --candidate <sha> [--packet FILE]
 
 Locking: run / resume / reset / smoke-browser / answer take the single-
 instance lock on the state directory (fail closed against a live process;
@@ -48,6 +49,7 @@ from .audit.agents import ClaudeCliRunner
 from .audit.executor import AuditExecutor
 from .audit.markdown import MarkdownPolicy
 from .blockers import NO_TASK, Blocker, BlockerStore
+from .changeset_review import build_changeset_binding, build_changeset_packet
 from .config import AutoloopConfig, load_config
 from .contract import AUDIT_TASK_ID, Decision, Directive
 from .conversation import create_conversation
@@ -973,6 +975,15 @@ _RESOLUTION_PRECONDITIONS = {
     "submission_ambiguous": _precondition_browser,
     "git_failure_budget_exhausted": _precondition_browser,
     "publisher_url_drift": _precondition_publisher_url,
+    # `changeset_publisher_required` (`Orchestrator._dispatch_changeset_push`)
+    # fires when `self._publisher is None` — unreachable through
+    # `cli._build_orchestrator`, which always provisions one, but a genuinely
+    # environmental condition wherever it IS reachable (a hand-built
+    # Orchestrator). Reuses `_precondition_publisher_url` rather than a new
+    # function: that check already refuses to clear on text alone unless a
+    # real publisher url snapshot exists and matches the live remote — the
+    # closest existing recheck to "a publisher is actually configured".
+    "changeset_publisher_required": _precondition_publisher_url,
     "worker_environment_drift": _precondition_worker_environment_drift,
     "worker_isolation_violation": _precondition_worker_environment_drift,
     "push_refused_protected": _precondition_protected,
@@ -1038,6 +1049,47 @@ def _cmd_reprovision_publisher(args: argparse.Namespace) -> int:
         git = GitGateway(Path.cwd(), PolicyEngine(config.policy))
         url = _reprovision_publisher_snapshot(config.state_dir, git, confirm=True)
     print(f"publisher url snapshot updated: {redact_url(url)}")
+    return 0
+
+
+def _cmd_review_changeset(args: argparse.Namespace) -> int:
+    """Queue an operator-authored changeset (already committed directly on
+    this checkout's branch — never produced by this loop's own executor) for
+    ChatGPT review, bound to an exact base/candidate sha pair. A later
+    `run` sends the queued packet; a stamped `push` approval that echoes it
+    publishes `--candidate` (and only `--candidate`) through the Publisher —
+    see `changeset_review.py` and `Orchestrator._dispatch_changeset_push`.
+
+    Refuses (via `build_changeset_binding`, before any session is touched)
+    if either sha is not literal 40-hex, does not resolve to a commit,
+    `--candidate` is not a descendant of `--base`, or the checked-out branch
+    is protected. Requires no EXISTING session — exactly like `run
+    --kickoff` — so this never silently merges into or clobbers unrelated
+    in-flight state; `reset` (or resolve the existing session) first.
+    """
+    config = load_config(args.config)
+    with LoopLock(config.state_dir):
+        store, state = _load_state(config)
+        if state is not None:
+            raise StateError(
+                "a session already exists — resolve it (`run --retry`/"
+                "`--answer`) or `reset` it before queuing a changeset review"
+            )
+        policy = PolicyEngine(config.policy)
+        git = GitGateway(Path.cwd(), policy)
+        binding = build_changeset_binding(git, policy, args.base, args.candidate)
+        body = Path(args.packet).read_text(encoding="utf-8") if args.packet else None
+        packet_text = build_changeset_packet(git, binding, body=body)
+        state = LoopState.new(config.browser.conversation_url)
+        state.changeset = dataclasses.asdict(binding)
+        state.outbox = TEMPLATES["changeset_review"].render(
+            branch=binding.branch, dest_ref=binding.dest_ref, packet=packet_text
+        )
+        store.save(state)
+    print(
+        f"changeset review queued: {binding.candidate_sha[:12]} -> "
+        f"{binding.dest_ref}. Run `python -m autoloop run` to send it."
+    )
     return 0
 
 
@@ -1274,6 +1326,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="required — the ONLY way the publisher url snapshot changes",
     )
     reprovision.set_defaults(func=_cmd_reprovision_publisher)
+
+    review_changeset = sub.add_parser(
+        "review-changeset",
+        help=(
+            "queue an operator-authored changeset already committed on this "
+            "branch for ChatGPT review, bound to an exact base/candidate sha"
+        ),
+    )
+    add_config(review_changeset)
+    review_changeset.add_argument("--base", required=True, help="base commit sha (40-hex)")
+    review_changeset.add_argument(
+        "--candidate", required=True, help="candidate commit sha (40-hex)"
+    )
+    review_changeset.add_argument(
+        "--packet",
+        default=None,
+        help=(
+            "use this file's text as the packet body instead of the "
+            "git-rendered diff (the branch/dest_ref/base_sha/candidate_sha "
+            "header always comes from git, never from this file)"
+        ),
+    )
+    review_changeset.set_defaults(func=_cmd_review_changeset)
     return parser
 
 

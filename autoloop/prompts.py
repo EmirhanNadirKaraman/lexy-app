@@ -152,6 +152,20 @@ TEMPLATES: dict[str, PromptTemplate] = {
             ),
         ),
         PromptTemplate(
+            name="changeset_review",
+            body=(
+                "An operator authored a changeset directly on branch {branch} — "
+                "not produced by this loop's own executor. The packet below is "
+                "rendered ONLY from immutable git objects between base_sha and "
+                "candidate_sha; nothing here is claimed, everything is "
+                "read.\n\n{packet}\n\nIf you approve, reply `push` with the "
+                "`reviewed` stamp copied from CONTEXT — this publishes exactly "
+                "the candidate commit above to {dest_ref}, nothing else. This "
+                "review path has no revise loop; if you do not approve, reply "
+                "`ask_user` describing what must change."
+            ),
+        ),
+        PromptTemplate(
             name="smoke_test",
             body=(
                 "AUTOLOOP SMOKE TEST — this verifies the browser automation "
