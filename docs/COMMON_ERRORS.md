@@ -616,9 +616,16 @@ On the dev database row 1 happens to be a real German word/phrase, so both pass
 and the dependency stays invisible. `_get_word`'s own comment shows this was
 already patched once (for digit/underscore fixture pollution); the language
 dimension was missed.
-**Fix:** constrain the pick — filter `_get_word` by the same language the test
-asserts against, and give `_get_phrase` an `ORDER BY` plus an exclusion of
-`_testphrase%` fixture rows. This is the same failure class as the xdist
+**Fix (landed 2026-08-01, `test_free_chat_progression.py`):** `_get_word` takes
+an optional `language` and pins the pick to it — the failing call site passes
+the phrase's language, which is what the match actually runs in; the default
+`None` leaves the other three call sites byte-identical. `_get_phrase` gained
+`ORDER BY phrase_id` and `canonical !~ '^_testphrase'`. Verified it FIXES
+rather than mutes: with no German word the test now skips with a clear reason,
+and with one German word present it PASSES — a skip alone would have proven
+nothing. The equivalent helpers in the other ~13 test files were left alone;
+they carry the same latent risk and are worth the same treatment. This is the
+same failure class as the xdist
 isolation cluster in `docs/TESTS.md`: **any `… FROM <shared catalog> LIMIT 1`
 without an ORDER BY and without a filter that pins what you actually need is a
 latent bug**, whether the disturbance is a parallel worker or a different

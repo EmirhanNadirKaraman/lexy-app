@@ -51,7 +51,7 @@ async def _register_and_login(client: AsyncClient, db_pool, email: str) -> tuple
     return await register_and_login(client, db_pool, email)
 
 
-async def _get_word(db_pool) -> tuple[int, str, str]:
+async def _get_word(db_pool, language: str | None = None) -> tuple[int, str, str]:
     # Exclude test-fixture pollution: other suites (e.g. test_words.py's
     # "learn anyway" path) insert synthetic surfaces like 'ζtest_<hex>' /
     # 'Bnk_<hex>' into the un-user-scoped word_table and the autouse cleanup
@@ -59,12 +59,32 @@ async def _get_word(db_pool) -> tuple[int, str, str]:
     # digits/underscores, which real corpus words never do — and they can't
     # round-trip the message tokenizer, so a LIMIT-1 grab of one silently
     # breaks every match-based test. Pick a plain word and stay deterministic.
-    row = await db_pool.fetchrow(
-        "SELECT word_id, word, language FROM word_table "
-        "WHERE word !~ '[0-9_]' ORDER BY word_id LIMIT 1"
-    )
+    #
+    # `language` pins the pick to the language the CALLER matches against.
+    # Without it this returned "the first plain word in the table" regardless
+    # of language, which is only accidentally right: on the dev database
+    # word_id 1 is German, so a caller matching against 'de' passed. On any
+    # other database — a dedicated validation database whose only rows were
+    # Spanish fixtures — it returned 'hola' and the match could never
+    # succeed. Same failure class as the unordered catalog picks in
+    # docs/TESTS.md; see docs/COMMON_ERRORS.md.
+    if language is None:
+        row = await db_pool.fetchrow(
+            "SELECT word_id, word, language FROM word_table "
+            "WHERE word !~ '[0-9_]' ORDER BY word_id LIMIT 1"
+        )
+    else:
+        row = await db_pool.fetchrow(
+            "SELECT word_id, word, language FROM word_table "
+            "WHERE word !~ '[0-9_]' AND language = $1 ORDER BY word_id LIMIT 1",
+            language,
+        )
     if row is None:
-        pytest.skip("word_table has no plain word — run the subtitle pipeline first")
+        pytest.skip(
+            "word_table has no plain word"
+            + (f" in {language!r}" if language else "")
+            + " — run the subtitle pipeline first"
+        )
     return row["word_id"], row["word"], row["language"]
 
 
@@ -217,10 +237,19 @@ async def test_match_deduplicates_repeated_word(client: AsyncClient, db_pool):
 # ---------------------------------------------------------------------------
 
 async def _get_phrase(db_pool, language: str = "de") -> tuple[int, str, str, str] | None:
-    """Return (phrase_id, canonical, surface_form, language) for any seeded phrase."""
+    """Return (phrase_id, canonical, surface_form, language) for any seeded phrase.
+
+    ORDER BY + a fixture exclusion, for the same reason `_get_word` above pins
+    its language. `phrase_table` is not user-scoped, so the autouse cleanup
+    (which reaps by test user) cannot remove `_testphrase_<hex>` rows other
+    tests leave behind — and on a freshly built database those leaked rows are
+    the FIRST ones physically, so an unordered LIMIT 1 picks a synthetic
+    surface the spaCy matcher can never match.
+    """
     row = await db_pool.fetchrow(
         "SELECT phrase_id, canonical, surface_form, language FROM phrase_table "
-        "WHERE language = $1 LIMIT 1",
+        "WHERE language = $1 AND canonical !~ '^_testphrase' "
+        "ORDER BY phrase_id LIMIT 1",
         language,
     )
     return (row["phrase_id"], row["canonical"], row["surface_form"], row["language"]) if row else None
@@ -298,9 +327,11 @@ async def test_match_word_and_phrase_returned_together(client: AsyncClient, db_p
         pytest.skip("phrase_table empty")
     phrase_id, _, surface_form, language = info
 
-    word_id, word, _ = await _get_word(db_pool)
     if language != "de":
         pytest.skip("test assumes de word + de phrase")
+    # The word must be in the SAME language the match runs in — `language`
+    # here comes from the phrase, and passing it is the whole fix.
+    word_id, word, _ = await _get_word(db_pool, language)
 
     headers, uid = await _register_and_login(client, db_pool, _email())
     await _mark_learning(db_pool, uid, word_id)

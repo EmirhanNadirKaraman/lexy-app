@@ -1071,11 +1071,13 @@ built from one that already works. What actually worked, in order:
    exists in no migration — it predates Alembic), plus `video_category` seeded
    from migration 013's own `CATEGORIES` list.
 
-Result: **1203 passed, 1 failed, 56 skipped**. The single failure is a
-pre-existing latent test bug that a non-dev database exposes rather than
-causes — an unconstrained catalog pick; see `docs/COMMON_ERRORS.md`. Divergence
-worth knowing: this database has exactly the 18 categories migration 013
-defines, and PG16 vs production's PG14.8.
+Result: **1206 passed, 0 failed, 54 skipped**. Getting there surfaced two
+pre-existing latent test bugs that a non-dev database exposes rather than
+causes — unconstrained catalog picks in `test_free_chat_progression.py`, now
+fixed (`docs/COMMON_ERRORS.md`). Divergences worth knowing: this database has
+exactly the 18 categories migration 013 defines, one hand-added German word
+(`Haus` — without at least one, five match tests skip rather than run), and
+PG16 against production's PG14.8.
 
 **Allowlist deviation, stated plainly.** The brief that specified this
 boundary named `JWT_SECRET_KEY`. This repository reads `SECRET_KEY`
