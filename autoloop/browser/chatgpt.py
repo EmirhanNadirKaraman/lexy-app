@@ -24,6 +24,16 @@ Anything weaker yields `SubmitResult.UNCONFIRMED`, which is an *ambiguous*
 outcome, never an implicit retry: the backend may have accepted the message
 while the browser failed to observe it, so re-sending could double-post.
 
+**A positive rejection is different from ambiguity.** When the optional
+send-observation capability is present (`observation.py`), the browser's own
+request to the conversation endpoint can *disprove* acceptance: a 4xx/5xx, or a
+request that never completed, means the turn was refused. That yields
+`SubmitResult.REJECTED` — still not a licence to resend on its own, but a
+verdict the orchestrator can confirm by reconciliation and then act on, instead
+of parking a human on every dropped send. Absent the capability, or on any mixed
+or missing evidence, the result stays UNCONFIRMED and nothing about the old
+behaviour changes.
+
 **Navigation is explicit.** `attach()` navigates only when there is no page on
 the conversation URL; `reconcile()` is the only reload. Ordinary awaiting polls
 the live page so a streaming answer is never interrupted.
@@ -46,10 +56,12 @@ from urllib.parse import urlsplit
 
 from ..errors import (
     BrowserError,
+    ConversationUnusableError,
     LoginExpiredError,
     ResponseTimeoutError,
     SubmissionError,
 )
+from .observation import SendObservation, SendOutcome, classify_submission
 from .selectors import ChatGPTSelectors
 from .session import BrowserSession, Message
 
@@ -62,6 +74,12 @@ class SubmitResult(str, Enum):
     #: A send was attempted, but acceptance could not be established. The
     #: caller must reconcile; it must NOT resend on its own.
     UNCONFIRMED = "unconfirmed"
+    #: A send was attempted and the browser's own request to the conversation
+    #: endpoint demonstrably failed. Acceptance is DISPROVEN, not merely
+    #: unknown. Still not self-authorizing: the caller confirms absence by
+    #: reconciliation before it may resend. Only ever produced when the
+    #: session implements the optional send-observation capability.
+    REJECTED = "rejected"
 
 
 @dataclass(frozen=True)
@@ -87,6 +105,13 @@ class TransportDiagnostics:
     reconciled: bool
     retry_prohibited: bool
     note: str = ""
+    #: Verdict from the optional network observation ("unknown" when the
+    #: session does not implement it) and the raw observations behind it.
+    #: Each observation is a path + status + coarse failure string; there is
+    #: nowhere in `SendObservation` to put a header, cookie or body, so this
+    #: field cannot leak credentials into a diagnostics dump.
+    send_outcome: str = SendOutcome.UNKNOWN.value
+    send_observations: tuple[dict, ...] = ()
 
 
 class BrowserChatGPT:
@@ -105,6 +130,7 @@ class BrowserChatGPT:
         reconcile_timeout: float = 30.0,
         poll_interval: float = 2.0,
         stability_seconds: float = 3.0,
+        rejection_grace_seconds: float | None = None,
         diagnostics_dir: Path | None = None,
         sleep=time.sleep,
         monotonic=time.monotonic,
@@ -121,12 +147,21 @@ class BrowserChatGPT:
         self._reconcile_timeout = reconcile_timeout
         self._poll_interval = poll_interval
         self._stability_seconds = stability_seconds
+        # After the first observed send response arrives, wait this long before
+        # ruling on it. The web client can retry a failed request behind our
+        # back, and a window holding both a failure and a success must classify
+        # as UNKNOWN rather than as whichever landed first.
+        self._rejection_grace_seconds = (
+            rejection_grace_seconds if rejection_grace_seconds is not None else poll_interval * 2
+        )
         self._diagnostics_dir = diagnostics_dir
         self._sleep = sleep
         self._monotonic = monotonic
         # Diagnostic bookkeeping for the current request.
         self._send_attempted = False
         self._reconciled = False
+        self._observations: list[SendObservation] = []
+        self._send_outcome = SendOutcome.UNKNOWN
 
     # ---- lifecycle ----------------------------------------------------------
 
@@ -168,6 +203,38 @@ class BrowserChatGPT:
         self._session.close()
 
     @property
+    def conversation_url(self) -> str:
+        """The conversation this client currently considers authoritative."""
+        return self._conversation_url
+
+    def retarget(self, url: str) -> None:
+        """Point the client at a different conversation.
+
+        Used only by rotation, in two steps: first at the project page (where a
+        new chat has no `/c/<id>` yet), then at the captured conversation URL
+        once the first turn has created it. Every page-identity check
+        (`attach`, `_require_on_conversation`, `reconcile`) follows this value,
+        so retargeting is what stops a post-rotation await from reading the
+        abandoned chat.
+        """
+        self._conversation_url = url
+
+    def current_url(self) -> str:
+        """The page's live URL. Used by rotation to learn the id the server
+        assigned to a new chat; never trusted on its own — the caller
+        reconciles against it before binding anything to it."""
+        return self._session.url()
+
+    @property
+    def send_outcome(self) -> SendOutcome:
+        """Network verdict for the most recent `submit()` call."""
+        return self._send_outcome
+
+    @property
+    def send_observations(self) -> list[SendObservation]:
+        return list(self._observations)
+
+    @property
     def send_attempted(self) -> bool:
         """True once Send was clicked for the current request.
 
@@ -204,33 +271,71 @@ class BrowserChatGPT:
         or UNCONFIRMED (send attempted, acceptance unknown → reconcile).
         """
         self._send_attempted = False
+        self._observations = []
+        self._send_outcome = SendOutcome.UNKNOWN
         if self.has_request(request_id):
             # Only trustworthy because callers attach/reconcile first.
             return SubmitResult.ALREADY_PERSISTED
         self._wait_not_generating(request_id)
         self._enter_prompt(request_id, prompt)
         self._await_send_ready(request_id)
+        # Open the observation window immediately before the click, so nothing
+        # the page did earlier can be attributed to this turn.
+        self._start_observation()
         self._session.click(self._sel.send_button)
         self._send_attempted = True
 
         deadline = self._monotonic() + self._submit_timeout
+        first_observation_at: float | None = None
         while True:
             self._check_logged_in(request_id=request_id, stage="submit-confirm")
+            self._collect_observations()
+            if first_observation_at is None and self._observations:
+                first_observation_at = self._monotonic()
+            # Persisted history beats the network: an assistant turn for our
+            # request is direct evidence of acceptance, whatever the transport
+            # thought it saw.
             if self._response_started(self.messages(), request_id):
+                self._send_outcome = SendOutcome.ACCEPTED
                 return SubmitResult.CONFIRMED
-            if self._monotonic() >= deadline:
-                self.save_diagnostics(
-                    "submit-unconfirmed",
-                    request_id=request_id,
-                    stage="submit-confirm",
-                    retry_prohibited=True,
-                    note=(
-                        f"send was clicked but no assistant turn began within "
-                        f"{self._submit_timeout}s; acceptance unknown — "
-                        "reconcile before any resend"
-                    ),
-                )
-                return SubmitResult.UNCONFIRMED
+
+            grace_expired = (
+                first_observation_at is not None
+                and self._monotonic() - first_observation_at >= self._rejection_grace_seconds
+            )
+            timed_out = self._monotonic() >= deadline
+            if grace_expired or timed_out:
+                self._send_outcome = classify_submission(self._observations)
+                if self._send_outcome is SendOutcome.REJECTED:
+                    self.save_diagnostics(
+                        "submit-rejected",
+                        request_id=request_id,
+                        stage="submit-confirm",
+                        retry_prohibited=False,
+                        note=(
+                            "the browser's own send request failed — acceptance "
+                            "is disproven, not unknown; confirm by reconciliation "
+                            "before resending"
+                        ),
+                    )
+                    return SubmitResult.REJECTED
+                if timed_out:
+                    self.save_diagnostics(
+                        "submit-unconfirmed",
+                        request_id=request_id,
+                        stage="submit-confirm",
+                        retry_prohibited=True,
+                        note=(
+                            f"send was clicked but no assistant turn began within "
+                            f"{self._submit_timeout}s; acceptance unknown — "
+                            "reconcile before any resend"
+                        ),
+                    )
+                    return SubmitResult.UNCONFIRMED
+                # Observed something non-rejecting (a 2xx, or a mixed window).
+                # Neither proves our turn is live, so keep waiting for history
+                # until the submit deadline rules.
+                first_observation_at = None
             self._sleep(self._poll_interval)
 
     def await_response(self, request_id: str) -> str:
@@ -298,6 +403,35 @@ class BrowserChatGPT:
                         f"{self._response_timeout}s"
                     )
             self._sleep(self._poll_interval)
+
+    # ---- network observation (optional capability) --------------------------
+
+    def _start_observation(self) -> None:
+        """Open an observation window if the session can provide one.
+
+        Probed with `getattr`, exactly like `send_attempted` is probed in the
+        orchestrator: a session without the capability (every in-memory fake, a
+        future non-Playwright adapter) simply never contributes observations,
+        so `classify_submission` returns UNKNOWN and the transport behaves
+        precisely as it did before this capability existed.
+        """
+        start = getattr(self._session, "start_send_observation", None)
+        if start is None:
+            return
+        try:
+            start()
+        except Exception:
+            # Observation must never be able to fail a send.
+            pass
+
+    def _collect_observations(self) -> None:
+        take = getattr(self._session, "take_send_observations", None)
+        if take is None:
+            return
+        try:
+            self._observations.extend(take())
+        except Exception:
+            pass
 
     # ---- turn matching ------------------------------------------------------
 
@@ -441,9 +575,31 @@ class BrowserChatGPT:
         deadline = self._monotonic() + self._composer_timeout
         while True:
             self._check_logged_in(request_id=request_id, stage=stage)
+            if any(
+                self._session.exists(marker) for marker in self._sel.conversation_error_markers
+            ):
+                self.save_diagnostics(
+                    "conversation-unusable",
+                    request_id=request_id,
+                    stage=stage,
+                    retry_prohibited=False,
+                    note="the conversation reports itself unavailable",
+                )
+                raise ConversationUnusableError(
+                    "the configured conversation reports itself unavailable "
+                    "(deleted, or its history failed to load)"
+                )
             if self._session.exists(self._sel.composer):
                 return
             if self._monotonic() >= deadline:
+                # Distinguish "this chat is wedged" from "the browser is
+                # unhappy". Only the former authorizes a rotation, and a run
+                # gets one — spending it on a slow page load would leave none
+                # for the real thing. `_on_conversation()` is what separates
+                # them: it means the page demonstrably reached the configured
+                # conversation (and `_check_logged_in` above has already ruled
+                # out an auth redirect) yet still has no composer.
+                on_conversation = self._on_conversation()
                 self.save_diagnostics(
                     "composer-not-found",
                     request_id=request_id,
@@ -454,6 +610,11 @@ class BrowserChatGPT:
                         "ChatGPT UI changed (see autoloop/browser/selectors.py)"
                     ),
                 )
+                if on_conversation:
+                    raise ConversationUnusableError(
+                        "the configured conversation loaded but never produced a "
+                        "composer — this chat appears wedged"
+                    )
                 raise BrowserError(
                     "composer not found — page did not load, or the ChatGPT UI "
                     "changed (see autoloop/browser/selectors.py)"
@@ -526,6 +687,8 @@ class BrowserChatGPT:
             reconciled=self._reconciled,
             retry_prohibited=retry_prohibited,
             note=note,
+            send_outcome=self._send_outcome.value,
+            send_observations=tuple(asdict(obs) for obs in self._observations),
         )
 
     def save_diagnostics(self, tag: str, **kwargs) -> Path | None:

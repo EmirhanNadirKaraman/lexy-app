@@ -11,6 +11,13 @@ credentials. `close()` only disconnects — the user's browser stays open.
 It also deliberately exposes no cookie/storage accessor, so no code path
 (diagnostics included) can capture authentication material.
 
+It additionally implements the optional send-observation capability
+(`start_send_observation` / `take_send_observations`): a passive
+`page.on("response")` / `page.on("requestfailed")` listener that records an HTTP
+status and a URL path for the conversation-send endpoint and nothing else. It
+never issues a request of its own — see `observation.py` for why the vocabulary
+is that narrow.
+
 Playwright is imported lazily inside `connect`, so nothing else in autoloop
 (including the whole test suite) needs the package installed.
 """
@@ -20,6 +27,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..errors import BrowserError, SessionLostError
+from .observation import SendObservation, is_send_path, scrub_path
 
 
 class PlaywrightSession:
@@ -27,6 +35,8 @@ class PlaywrightSession:
         self._page = page
         self._playwright = playwright
         self._error_cls = error_cls
+        self._observations: list[SendObservation] = []
+        self._listening = False
 
     @classmethod
     def connect(cls, cdp_url: str, match_url_substring: str = "chatgpt.com") -> "PlaywrightSession":
@@ -125,6 +135,59 @@ class PlaywrightSession:
 
     def html(self) -> str:
         return self._call(lambda: self._page.content())
+
+    # ---- optional send-observation capability -------------------------------
+
+    def start_send_observation(self) -> None:
+        """Attach the passive listener once and clear any prior window.
+
+        Attaching is idempotent (the handlers stay for the life of the page);
+        each call opens a fresh window by dropping what the previous one saw,
+        so an observation can never be attributed to a later send.
+        """
+        self._observations = []
+        if self._listening:
+            return
+
+        def _on_response(response):
+            try:
+                if is_send_path(response.url):
+                    # Status and path ONLY. Reading `response.body()` or any
+                    # header here would put credentials and message content
+                    # into a diagnostics dump — see observation.py.
+                    self._observations.append(
+                        SendObservation(path=scrub_path(response.url), status=response.status)
+                    )
+            except Exception:
+                pass
+
+        def _on_request_failed(request):
+            try:
+                if is_send_path(request.url):
+                    self._observations.append(
+                        SendObservation(
+                            path=scrub_path(request.url),
+                            status=None,
+                            failure=str(request.failure or "request failed")[:120],
+                        )
+                    )
+            except Exception:
+                pass
+
+        try:
+            self._page.on("response", _on_response)
+            self._page.on("requestfailed", _on_request_failed)
+        except self._error_cls:
+            # A page that cannot take listeners is a dead page; the caller
+            # discovers that on its next real operation. Observation is an
+            # optimisation, never a precondition.
+            return
+        self._listening = True
+
+    def take_send_observations(self) -> list[SendObservation]:
+        """Drain the current window. Draining leaves the listener attached."""
+        observations, self._observations = self._observations, []
+        return observations
 
     def close(self) -> None:
         try:

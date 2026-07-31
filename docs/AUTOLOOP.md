@@ -692,6 +692,108 @@ opening `Understood.`) can never satisfy a later request.
 
 ---
 
+## 5c. Transport recovery: disproving a send, resending once, rotating once
+
+Added 2026-07-31. §5b made ambiguity safe; this section makes it **rarer**,
+without weakening the rule that ambiguity never retries.
+
+**The problem.** In one real run, two of sixteen sends simply did not persist
+(see `docs/COMMON_ERRORS.md` §6). Every field the loop could see was a DOM
+reading, and "the server refused it" and "the browser never issued it" render
+identically. Unable to distinguish them, the loop parked a human on each — the
+correct call on that evidence, and an expensive one.
+
+**The missing fact is one layer down.** `browser/observation.py` attaches a
+passive listener to the page's own traffic on the conversation-send endpoint. It
+records a **status and a path, nothing else** — there is no field on
+`SendObservation` for a header, a cookie or a body, and query strings are
+stripped, so this cannot leak credentials into a diagnostic. It issues no
+requests: it is an observer, never a second transport.
+
+Verdicts, in the order they outrank each other:
+
+| Evidence | Result | What it licenses |
+|---|---|---|
+| Our request id is in persisted history | `CONFIRMED` / accepted | proceed to `awaiting` |
+| Send request returned 4xx/5xx, or never completed | `REJECTED` | reconcile, then **one** same-chat resend |
+| No observation, or a mixed window (a failure *and* a success) | `UNCONFIRMED` | nothing — park, exactly as before |
+
+**History outranks the network in both directions.** A rejecting status on a
+request that turns out to be in the conversation resolves to *accepted* — the
+status code is a proxy, history is direct evidence. And a 2xx **never** confirms
+on its own: `_response_started` still requires the request id to be present, so
+a 200 on a stream that then dies falls through to the ordinary response-start
+timeout instead of masquerading as a reply. Do not remove that check on the
+strength of a status code.
+
+**One resend, after confirmation, never on the verdict alone.** `REJECTED`
+routes to phase `submission_rejected`, which reconciles first. Only *confirmed
+absence* — nothing in the conversation — licenses a resend, and only one, reusing
+the same request id so a message that did land is still detected. Sessions
+without the observation capability (every non-Playwright adapter) never produce
+`REJECTED` and behave exactly as they did before.
+
+**Rotation is the last resort, not the reflex.** A second confirmed rejection, or
+a `ConversationUnusableError`, may abandon the chat for a fresh one in the
+configured project:
+
+* `browser.project_url` must be set **explicitly**. It is never derived from
+  `conversation_url` — a guessed project opens chats somewhere you did not
+  choose. Unset means the loop parks instead of rotating.
+* `policy.max_conversation_rotations` (default **1**) caps it per run. A second
+  rotation in one run usually means the fault is not the chat.
+* `ConversationUnusableError` is deliberately narrow: the page demonstrably
+  reached the conversation URL, is not an auth page, and still has no composer
+  (or shows an explicit unavailable marker). A page that never loaded, a dropped
+  CDP connection and a logged-out profile stay ordinary failures on the normal
+  budget — rotating for a network blip would spend the one rotation and leave
+  none for the real thing. The two budgets are also kept separate: a rotation
+  attempt does not also increment `consecutive_failures`.
+* Never rotates for: generation already started, a slow answer, an ordinary
+  response timeout, login expiry, rate limits, capacity, a malformed reply, or a
+  policy denial.
+
+**Rotation proves before it binds.** ChatGPT does not mint a `/c/<id>` until a
+chat has its first turn, so the order is forced: retarget to the project page,
+submit there, read the URL the server assigned, check it is inside the configured
+project — and then **reconcile against it**. Until the new conversation itself
+confirms it holds the request, nothing is bound and the rotation has not
+happened. Trusting the address bar would be the same class of mistake as
+trusting an optimistic bubble.
+
+**A failed rotation still costs its budget, and changes nothing else.** The
+budget is consumed *before* the send, durably — a rotation posts a message, and
+if the process dies between that send and the binding, recovery must not be able
+to open a second chat and post again. Same pessimism as `send_attempted`, for
+the same reason. Everything else is left exactly as it was: the request keeps
+its old conversation binding and, crucially, its **original prompt**. Rewriting
+the prompt before the send succeeded would leave a failed rotation holding text
+that announces the conversation is abandoned — sitting in the request that
+`--resubmit` would send into the conversation that was never abandoned.
+
+**Every request owns its conversation.** `PendingRequest.conversation_url` and
+`conversation_epoch` are the authority for submitting, awaiting and reconciling
+that request — never `LoopState.conversation_url`, which moves. That is what makes
+a late reply in an abandoned chat structurally unable to authorize anything: it is
+not in the conversation the request is bound to, so it is never read. A request
+written before this field existed is adopted onto the loop's URL on first touch,
+which is only correct while `rotations == 0`; afterwards an unbound request raises
+rather than being guessed at.
+
+**The config follows the state.** A completed rotation rewrites
+`[browser].conversation_url` so the next session does not walk back into the chat
+the loop just escaped. The write is line-surgical (comments and every other key
+survive), atomic, and **refuses a git-tracked path** — the config lives under the
+gitignored state dir, and a loop that can quietly edit tracked files while
+recovering from a browser fault is a worse problem than a failed heal. If the
+heal fails, the CLI's drift guard recognises the recorded rotation (state moved,
+config did not) and continues; any *other* disagreement still refuses to start.
+
+`doctor` reports which conversation is actually live, how much rotation budget is
+left, and whether `project_url` looks like a project.
+
+---
+
 ## 6. Preflight: `doctor` and the live smoke test
 
 ```bash

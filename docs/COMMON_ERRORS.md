@@ -468,6 +468,38 @@ Regression tests use the byte-exact captured text.
 test it against bytes captured from the real page, not against what you believe
 the model sends.
 
+### `submission of alr-… is AMBIGUOUS` on a send that simply never landed
+**Symptom:** roughly one turn in eight parked for a human. `.autoloop/state.json`
+sat in `awaiting`; the diagnostics snapshot said `send_attempted: true`,
+`reconciled: true`, `matching_user_messages: 0`, `composer_chars: 0`,
+`send_button_enabled: false` — and the conversation contained no such message.
+Two of sixteen requests in one run (`alr-b58c9a33-0001`, `alr-fe650dbd-0001`).
+**Not** length-related: 104k- and 113k-character prompts landed, and the
+byte-identical resend of the 13,265-character failure landed on the next try.
+**Cause (partly diagnosed, and that is the point):** the send genuinely did not
+persist. *Why* it did not persist was unknowable, because every field in the
+snapshot is a DOM reading, and "the server refused it" and "the browser never
+issued it" produce identical DOM. Unable to tell those apart, the loop correctly
+refused to resend — resending an accepted-but-unobserved message double-posts —
+and parked. The cost was a human per dropped send.
+**Fix:** `autoloop/browser/observation.py` (2026-07-31). A passive
+`page.on("response")` listener on the conversation-send endpoint supplies the one
+fact the DOM cannot: whether the browser's own request succeeded. A 4xx/5xx or a
+request that never completed **disproves** acceptance → `SubmitResult.REJECTED` →
+reconcile to confirm absence → exactly one same-chat resend. Missing or mixed
+evidence still classifies as UNKNOWN and still parks.
+**Do not** use a 2xx as proof of persistence, and do not remove the "is our
+request id in the conversation" check on the strength of one: a 200 on a stream
+that then dies must fall through to the response-start timeout, not be read as a
+reply. Persisted history outranks the status code in both directions — a
+rejecting status on a request that IS in history resolves to accepted.
+**Related trap while diagnosing this:** a long user turn can render as a
+`Pasted markdown(N).md` attachment chip rather than inline text (offset 227680 of
+the captured `page.html`). `innerText` then contains none of it, so
+`has_request()` cannot see a request id that is genuinely there. Loop-sent
+prompts do not hit this — `keyboard.insert_text` fires no paste event — but a
+human paste into the same conversation does.
+
 ---
 
 ## 7. Autoloop worker/publisher separation (M2)

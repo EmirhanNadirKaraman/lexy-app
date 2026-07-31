@@ -12,6 +12,12 @@ Two deliberate omissions:
   `focus` + `press` + `insert_text` instead.
 * **No cookie / storage accessors.** Diagnostics must never be able to capture
   authentication material, so the protocol simply cannot reach it.
+
+Send observation (`start_send_observation` / `take_send_observations`) is an
+**optional** capability, not part of this Protocol: `BrowserChatGPT` probes for
+it with `getattr` and behaves exactly as it did before when it is absent. That
+keeps the in-memory fakes and any future provider adapter valid without
+implementing a network listener. See `observation.py`.
 """
 
 from __future__ import annotations

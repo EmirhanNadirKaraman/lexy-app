@@ -22,6 +22,17 @@ Contract every implementation must honor:
   never a stale one, never a partial one — and never navigates.
 * Errors raise the shared BrowserError hierarchy (`errors.py`) so the
   orchestrator's failure routing stays provider-agnostic.
+
+Two capabilities are OPTIONAL and probed with `getattr`, so an adapter that
+implements only the protocol above stays valid:
+
+* **Send observation** — `submit` may return `SubmitResult.REJECTED` when the
+  provider can positively disprove acceptance (see `browser/observation.py`). An
+  adapter that cannot returns UNCONFIRMED for the same situation, which is the
+  historical behaviour: ambiguity, park for a human.
+* **Rotation** — `retarget(url)` + `current_url()` let the orchestrator move an
+  in-flight request to a replacement conversation. Without them, a wedged
+  conversation parks instead of rotating.
 """
 
 from __future__ import annotations

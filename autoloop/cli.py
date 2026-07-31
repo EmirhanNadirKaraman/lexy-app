@@ -67,12 +67,38 @@ def _load_state(config: AutoloopConfig) -> tuple[StateStore, LoopState | None]:
     store = StateStore(config.state_file)
     state = store.load()
     if state is not None and state.conversation_url != config.browser.conversation_url:
-        raise ConfigError(
-            "browser.conversation_url in the config differs from the one this "
-            "session started with. Restore the config value or `reset` the state "
-            "to begin a new session."
-        )
+        if not _drift_is_recorded_rotation(state, config):
+            raise ConfigError(
+                "browser.conversation_url in the config differs from the one this "
+                "session started with. Restore the config value or `reset` the state "
+                "to begin a new session."
+            )
     return store, state
+
+
+def _drift_is_recorded_rotation(state: LoopState, config: AutoloopConfig) -> bool:
+    """Is this drift the loop's own rotation rather than an edited config?
+
+    A completed rotation writes the new URL to state and then heals the config.
+    If the process died between those two steps — or the heal was refused — the
+    config still names the chat the loop deliberately abandoned, and refusing to
+    start would strand the session on exactly the fault it just recovered from.
+
+    Narrow on purpose. The state must carry a rotation record whose `new_url` is
+    where the state now points AND whose `old_url` is what the config still
+    says: precisely the "we moved, the file did not" shape. Any other
+    disagreement — an operator pointing the config somewhere new, a stale state
+    file, a rotation record that matches neither side — still refuses, because
+    those are the cases where continuing would silently run against a
+    conversation nobody chose.
+    """
+    record = state.last_rotation
+    if not record or not state.rotations:
+        return False
+    return (
+        record.get("new_url") == state.conversation_url
+        and record.get("old_url") == config.browser.conversation_url
+    )
 
 
 def _load_tasks(config: AutoloopConfig) -> tuple[TaskStore, TaskRegistry]:
@@ -184,6 +210,11 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         intent_store=intent_store,
         publisher=publisher,
         publisher_url_snapshot=publisher_url_snapshot,
+        # `--config` can put the file anywhere, so pass the path actually
+        # loaded rather than re-deriving the conventional one. Callers that
+        # build an args namespace without it (tests, embedders) fall back to
+        # the default, which is where `DEFAULT_CONFIG` points.
+        config_path=Path(getattr(args, "config", None) or DEFAULT_CONFIG),
     )
 
 

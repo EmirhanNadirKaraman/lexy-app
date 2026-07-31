@@ -18,6 +18,7 @@ from autoloop.browser.chatgpt import BrowserChatGPT, SubmitResult
 from autoloop.browser.selectors import ChatGPTSelectors
 from autoloop.errors import (
     BrowserError,
+    ConversationUnusableError,
     LoginExpiredError,
     ResponseTimeoutError,
     SubmissionError,
@@ -581,3 +582,167 @@ def test_reconcile_navigates_once_when_off_conversation(tmp_path):
     client = make_client(session, clock, tmp_path)
     assert client.reconcile(RID) is True
     assert session.navigations == [f"goto:{CONV_URL}"]
+
+
+# ---- send observation: the transport can now DISPROVE acceptance ------------
+#
+# `FakeSession` deliberately does NOT implement the observation capability, so
+# every test above exercises the no-capability path and must keep behaving
+# exactly as it did before this feature existed. `ObservingSession` adds it.
+
+
+class ObservingSession(FakeSession):
+    """FakeSession plus the optional send-observation capability.
+
+    `scripted` is the list of observations the "network" reports for the next
+    send; `windows` records each time a window was opened, so a test can prove
+    an observation is never attributed to an earlier turn.
+    """
+
+    def __init__(self, *args, scripted=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scripted = list(scripted)
+        self.windows = 0
+        self._pending: list = []
+
+    def start_send_observation(self):
+        self.windows += 1
+        self._pending = []
+
+    def click(self, selector):
+        super().click(selector)
+        if selector == SEL.send_button:
+            self._pending = list(self.scripted)
+
+    def take_send_observations(self):
+        out, self._pending = self._pending, []
+        return out
+
+
+def observation(status=None, failure=""):
+    from autoloop.browser.observation import SendObservation
+
+    return SendObservation(path="/backend-api/conversation", status=status, failure=failure)
+
+
+def test_failed_send_request_is_reported_as_rejected_not_unconfirmed(tmp_path):
+    """The whole point: a send the browser itself reports as failed is
+    DISPROVEN, so the orchestrator may confirm and resend rather than park."""
+    session = ObservingSession(send_mode="optimistic_only", scripted=[observation(status=500)])
+    clock = FakeClock()
+    session.seed(OLD_TURN)
+    client = make_client(session, clock, tmp_path)
+    assert client.submit(RID, PROMPT) is SubmitResult.REJECTED
+    assert client.send_attempted is True
+    assert session.windows == 1  # the window opened for exactly this send
+
+
+def test_a_request_that_never_completed_is_rejected(tmp_path):
+    session = ObservingSession(
+        send_mode="optimistic_only",
+        scripted=[observation(status=None, failure="net::ERR_INTERNET_DISCONNECTED")],
+    )
+    clock = FakeClock()
+    session.seed(OLD_TURN)
+    assert make_client(session, clock, tmp_path).submit(RID, PROMPT) is SubmitResult.REJECTED
+
+
+def test_a_mixed_window_stays_unconfirmed(tmp_path):
+    """A failure followed by a success is precisely where a resend could
+    double-post, so it must not resolve to either verdict."""
+    session = ObservingSession(
+        send_mode="optimistic_only",
+        scripted=[observation(status=500), observation(status=200)],
+    )
+    clock = FakeClock()
+    session.seed(OLD_TURN)
+    assert make_client(session, clock, tmp_path).submit(RID, PROMPT) is SubmitResult.UNCONFIRMED
+
+
+def test_a_successful_status_alone_does_not_confirm(tmp_path):
+    """200 is not persistence. Without an assistant turn for our request the
+    result stays UNCONFIRMED — the history check is load-bearing."""
+    session = ObservingSession(send_mode="optimistic_only", scripted=[observation(status=200)])
+    clock = FakeClock()
+    session.seed(OLD_TURN)
+    assert make_client(session, clock, tmp_path).submit(RID, PROMPT) is SubmitResult.UNCONFIRMED
+
+
+def test_history_outranks_a_rejecting_status(tmp_path):
+    """If the turn is demonstrably live, a discouraging status code loses."""
+    session = ObservingSession(send_mode="persist", scripted=[observation(status=500)])
+    clock = FakeClock()
+    session.seed(OLD_TURN)
+    clock.events[1] = lambda: session.dom.append(("assistant", "answering now"))
+    client = make_client(session, clock, tmp_path)
+    assert client.submit(RID, PROMPT) is SubmitResult.CONFIRMED
+
+
+def test_a_session_without_the_capability_behaves_exactly_as_before(tmp_path):
+    session, clock = FakeSession(send_mode="optimistic_only"), FakeClock()
+    session.seed(OLD_TURN)
+    client = make_client(session, clock, tmp_path)
+    assert client.submit(RID, PROMPT) is SubmitResult.UNCONFIRMED
+    assert client.send_outcome.value == "unknown"
+
+
+def test_rejection_diagnostics_carry_the_observations_and_no_secrets(tmp_path):
+    session = ObservingSession(send_mode="optimistic_only", scripted=[observation(status=403)])
+    clock = FakeClock()
+    session.seed(OLD_TURN)
+    make_client(session, clock, tmp_path).submit(RID, PROMPT)
+    folders = diagnostics(tmp_path)
+    assert folders
+    meta = read_meta(folders[-1])
+    assert meta["send_outcome"] == "rejected"
+    assert meta["send_observations"] == [
+        {"path": "/backend-api/conversation", "status": 403, "failure": ""}
+    ]
+    blob = (folders[-1] / "meta.json").read_text().lower()
+    for forbidden in ("cookie", "authorization", "bearer"):
+        assert forbidden not in blob
+
+
+# ---- conversation-unusable: the narrow rotation trigger ---------------------
+
+
+def test_a_loaded_conversation_without_a_composer_is_unusable(tmp_path):
+    """On the conversation URL, logged in, no composer: THIS chat is wedged."""
+    session, clock = FakeSession(), FakeClock()
+    session.present = set()  # loaded, but no composer ever appears
+    with pytest.raises(ConversationUnusableError):
+        make_client(session, clock, tmp_path, composer_timeout=3.0).attach()
+
+
+def test_a_page_that_never_reached_the_conversation_is_only_a_browser_error(tmp_path):
+    """A page stuck elsewhere is a transport fault on the ordinary failure
+    budget — rotating for it would spend the run's one rotation on a blip."""
+    session, clock = FakeSession(), FakeClock()
+    session.present = set()
+    session.current_url = "https://chatgpt.com/c/somewhere-else"
+
+    def stay_put(url):
+        session.navigations.append(f"goto:{url}")  # navigation does not take
+
+    session.goto = stay_put
+    with pytest.raises(BrowserError) as exc:
+        make_client(session, clock, tmp_path, composer_timeout=3.0).attach()
+    assert not isinstance(exc.value, ConversationUnusableError)
+
+
+def test_an_explicit_unavailable_marker_is_unusable(tmp_path):
+    session, clock = FakeSession(), FakeClock()
+    session.present = {SEL.conversation_error_markers[0]}
+    with pytest.raises(ConversationUnusableError):
+        make_client(session, clock, tmp_path).attach()
+
+
+def test_retarget_moves_every_page_identity_check(tmp_path):
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    client = make_client(session, clock, tmp_path)
+    other = "https://chatgpt.com/g/g-p-proj/c/replacement"
+    client.retarget(other)
+    assert client.conversation_url == other
+    client.attach()  # now considers the old URL "elsewhere" and navigates
+    assert session.navigations == [f"goto:{other}"]

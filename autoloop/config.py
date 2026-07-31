@@ -21,6 +21,14 @@ from .policy import PolicyConfig
 class BrowserConfig:
     conversation_url: str
     cdp_url: str = "http://127.0.0.1:9222"
+    #: The ChatGPT *project* the conversation belongs to, e.g.
+    #: "https://chatgpt.com/g/g-p-<id>-<slug>/project". Required for conversation
+    #: rotation and for nothing else — a rotation opens a new chat here.
+    #: Configured EXPLICITLY rather than sliced out of `conversation_url`:
+    #: deriving it would mean guessing which URL shapes are project-scoped, and
+    #: a wrong guess opens a chat somewhere the operator never chose. Unset
+    #: means rotation is unavailable and the loop parks instead.
+    project_url: str = ""
     #: Every wait below is bounded separately, so a stuck channel fails fast
     #: with a specific diagnosis instead of hanging on one giant timeout.
     composer_timeout_seconds: float = 30.0

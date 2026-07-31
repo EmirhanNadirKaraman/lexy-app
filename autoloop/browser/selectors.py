@@ -26,3 +26,14 @@ class ChatGPTSelectors:
         "/auth/login",
         "chatgpt.com/auth",
     )
+    #: Markers that mean THIS conversation is broken (deleted, unavailable,
+    #: failed to load its history) as opposed to the browser being unhappy in
+    #: general. Only these — plus a loaded-but-composerless conversation page —
+    #: authorize a rotation, so keep the list specific to the conversation.
+    conversation_error_markers: tuple[str, ...] = (
+        '[data-testid="conversation-not-found"]',
+        '[data-testid="conversation-unavailable"]',
+    )
+    #: Composer of a not-yet-created chat inside a project. Present on the
+    #: project page before any turn exists, which is where a rotation starts.
+    new_chat_composer: str = "#prompt-textarea"

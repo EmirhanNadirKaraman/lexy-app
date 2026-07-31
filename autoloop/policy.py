@@ -61,6 +61,12 @@ class PolicyConfig:
     # cycle (audit / revise-of-audit / plan / stamped Markdown commits / push /
     # ask_user / stop) is executable.
     implement_enabled: bool = False
+    #: How many times one run may abandon a wedged conversation for a fresh one
+    #: in the same project. One is the deliberate default: rotation exists to
+    #: escape a broken chat, and a loop that keeps opening new ones on a
+    #: systemic outage would fan out a chat per iteration while looking like it
+    #: is making progress.
+    max_conversation_rotations: int = 1
 
 
 # Whitelist, not blacklist: a git invocation is allowed only if its subcommand
@@ -386,6 +392,22 @@ class PolicyEngine:
             return Verdict.deny(
                 "parse_budget",
                 f"more than {self.config.max_parse_retries} malformed responses in a row",
+            )
+        return Verdict.ok()
+
+    def check_rotation_budget(self, rotations_used: int) -> Verdict:
+        """May this run abandon a wedged conversation for a fresh one?
+
+        `rotations_used` is how many rotations this run has ALREADY performed,
+        so the check is `>=`, not `>` like the other budgets: those count
+        attempts that have happened and ask whether to keep going, this one
+        asks permission before the fact.
+        """
+        if rotations_used >= self.config.max_conversation_rotations:
+            return Verdict.deny(
+                "rotation_budget",
+                f"conversation rotation budget exhausted "
+                f"({self.config.max_conversation_rotations} per run)",
             )
         return Verdict.ok()
 

@@ -39,6 +39,18 @@ from .errors import StateCorruptError, StateError
 # there is nothing to backfill because a session with no in-flight postcommit
 # review simply has `postcommit = None`, which is exactly the correct value
 # for it.
+#
+# NOT bumped for the transport-recovery additions either
+# (`PendingRequest.conversation_url` / `conversation_epoch` / `resends_used` /
+# `last_send_outcome`, `LoopState.conversation_epoch` / `rotations` /
+# `last_rotation`). Same reasoning, and the one field that could be
+# misinterpreted is handled explicitly rather than by default: an on-disk
+# request predating this change carries `conversation_url = ""`, which the
+# orchestrator binds to `state.conversation_url` the first time it touches the
+# request. That binding is correct because it can only happen while
+# `rotations == 0` — before any rotation the global URL *is* every request's
+# URL — and after it the request carries its own, so a later rotation cannot
+# retroactively re-point an old request at the new chat.
 SCHEMA_VERSION = 3
 
 
@@ -53,6 +65,13 @@ class Phase(str, Enum):
     # controlled reload) may resolve this; it must never auto-resend, because
     # the backend may have accepted a message the browser failed to observe.
     SUBMISSION_UNCONFIRMED = "submission_unconfirmed"
+    # A send was attempted and the transport POSITIVELY DISPROVED acceptance
+    # (the browser's own send request failed — see browser/observation.py).
+    # Distinct from SUBMISSION_UNCONFIRMED because the recovery differs: here
+    # reconciliation can confirm absence, and confirmed absence licenses
+    # exactly one same-chat resend of the same request id. Unknown acceptance
+    # never earns that.
+    SUBMISSION_REJECTED = "submission_rejected"
     AWAITING = "awaiting"      # submission confirmed, waiting for the reply
     EXECUTING = "executing"    # raw response captured; parse -> policy -> dispatch
     NEEDS_USER = "needs_user"  # human input required (question / retry)
@@ -124,6 +143,27 @@ class PendingRequest:
     #: template). `None` for every other kind of request — audit reports,
     #: corrective re-prompts, ordinary commit approvals, and so on.
     postcommit: PostcommitBinding | None = None
+    #: THE authoritative conversation for this request. Every submit, await and
+    #: reconcile for it targets this URL — never `LoopState.conversation_url`,
+    #: which moves when a rotation happens. That is what makes a late reply in
+    #: an abandoned chat structurally unable to authorize anything: it is not
+    #: in the conversation this request is bound to, so it is never read.
+    #: Empty only on a request written before this field existed; see the
+    #: SCHEMA_VERSION note above for why binding it lazily is sound.
+    conversation_url: str = ""
+    #: Which conversation generation the binding above belongs to. Incremented
+    #: by every rotation. Carried alongside the URL rather than derived from it
+    #: so two chats that somehow share a URL still cannot be confused, and so
+    #: the transcript can say plainly which generation a turn happened in.
+    conversation_epoch: int = 0
+    #: Same-chat resends performed for this request id. Capped at one, and only
+    #: ever spent after reconciliation has CONFIRMED the request is absent.
+    resends_used: int = 0
+    #: The transport's last verdict for this request ("accepted" / "rejected" /
+    #: "unknown" — `browser.observation.SendOutcome`). Persisted so recovery
+    #: after a crash resumes from the same evidence the live run had, rather
+    #: than downgrading to "unknown" and parking a human unnecessarily.
+    last_send_outcome: str = ""
 
 
 @dataclass
@@ -144,6 +184,13 @@ class LastResponse:
     #: approval of candidate A structurally unable to publish a swapped-in
     #: candidate B.
     postcommit: PostcommitBinding | None = None
+    #: Which conversation this reply was actually read from, copied from the
+    #: request it answers. Recorded so "only a response captured from the
+    #: request's bound conversation may authorize action" is auditable after
+    #: the fact, not merely enforced in the moment by whichever client the
+    #: awaiting phase happened to hold.
+    conversation_url: str = ""
+    conversation_epoch: int = 0
 
 
 def _load_postcommit(raw: dict | None) -> PostcommitBinding | None:
@@ -164,6 +211,24 @@ def _load_last_response(raw: dict | None) -> LastResponse | None:
     data = dict(raw)
     data["postcommit"] = _load_postcommit(data.get("postcommit"))
     return LastResponse(**data)
+
+
+@dataclass
+class RotationRecord:
+    """One completed conversation rotation. Written only after the new chat has
+    been proven usable AND the request reconciled against it, so its presence
+    means the move finished — not that it was attempted.
+
+    Carries no credentials and no message text; `reason` is a stable code
+    (`conversation_unusable`, `send_rejected_twice`), not free prose.
+    """
+
+    old_url: str
+    new_url: str
+    request_id: str
+    reason: str
+    epoch: int
+    at: str = field(default_factory=lambda: utcnow_iso())
 
 
 @dataclass
@@ -190,6 +255,18 @@ class LoopState:
     #: OLD authorize-then-produce/manifest path and means something different
     #: (a `ChangeManifest` id against the main checkout, not a worktree).
     task_execution: dict | None = None
+    #: Current conversation generation. Requests are stamped with it, so a
+    #: response captured under an older epoch can be recognised and ignored.
+    conversation_epoch: int = 0
+    #: Completed rotations this run. Checked against
+    #: `PolicyConfig.max_conversation_rotations` BEFORE each rotation.
+    rotations: int = 0
+    #: The most recent completed rotation, as a plain dict (`asdict` of a
+    #: `RotationRecord`). Read by the CLI's config-drift guard: after a
+    #: rotation the state legitimately points somewhere the config does not
+    #: yet, and this record is what distinguishes that from an operator
+    #: editing the config out from under a live session.
+    last_rotation: dict | None = None
     question: str | None = None
     resume_phase: str | None = None
     stop_reason: str | None = None

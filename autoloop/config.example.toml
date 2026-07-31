@@ -6,6 +6,14 @@
 # The ONE persistent ChatGPT conversation the loop uses. Open the dedicated
 # profile, create a chat, copy its URL.
 conversation_url = "https://chatgpt.com/c/REPLACE-ME"
+# The ChatGPT project that conversation belongs to. Required ONLY for
+# conversation rotation: when a chat becomes unusable, or two sends in a row are
+# positively disproven, the loop opens ONE replacement chat here and rebinds the
+# in-flight request to it. Leave empty to disable rotation entirely (the loop
+# then parks for you instead). Set explicitly rather than derived from
+# conversation_url — a guessed project URL opens chats somewhere you did not
+# choose.
+project_url = ""
 # Chrome DevTools endpoint of the dedicated profile (see docs/AUTOLOOP.md for
 # the launch command).
 cdp_url = "http://127.0.0.1:9222"
@@ -25,6 +33,10 @@ stability_seconds = 3.0
 [policy]
 max_iterations = 20
 max_consecutive_failures = 3
+# How many times ONE run may abandon a wedged conversation for a fresh chat in
+# browser.project_url. A second rotation in one run usually means the fault is
+# not the chat, so the default stops and asks instead of fanning out chats.
+max_conversation_rotations = 1
 max_parse_retries = 2
 max_policy_denials = 3
 allow_commit = true

@@ -33,6 +33,7 @@ from .errors import AutoloopError, BrowserError, LoginExpiredError
 from .git_gateway import GitGateway
 from .lock import LoopLock
 from .policy import PolicyEngine
+from .state import StateStore
 from .publisher import (
     Publisher,
     provision_publisher_repo,
@@ -49,6 +50,26 @@ from .worker_env import WorkerRepoManager, verify_worker_isolation
 _CHATGPT_URL = re.compile(
     r"^https://chatgpt\.com(?:/g/[A-Za-z0-9_-]+)?/c/[A-Za-z0-9_-]+/?(?:[?#].*)?$"
 )
+
+# A project URL, the rotation target: the `/g/<slug>` prefix on its own or with
+# chatgpt.com's `/project` landing suffix. Deliberately NOT allowed to match a
+# `/c/<id>` conversation — rotating "into" an existing chat is not a rotation.
+_CHATGPT_PROJECT_URL = re.compile(
+    r"^https://chatgpt\.com/g/[A-Za-z0-9_-]+(?:/project)?/?(?:[?#].*)?$"
+)
+
+
+def _read_state_quietly(config: AutoloopConfig):
+    """The session state, or None if there is none or it cannot be read.
+
+    `doctor` is the command you run when things are already broken, so a
+    corrupt or unreadable state file must not stop it from reporting everything
+    else — the other checks are exactly what diagnoses that corruption.
+    """
+    try:
+        return StateStore(config.state_file).load()
+    except (AutoloopError, OSError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -273,6 +294,48 @@ def run_doctor(
                 f"'{config.browser.conversation_url}' does not look like "
                 "https://chatgpt.com/c/<id> or "
                 "https://chatgpt.com/g/<project>/c/<id>",
+            )
+
+        # 13b. which conversation is ACTUALLY live, and how much rotation
+        # budget is left. The config is only the starting point: after a
+        # rotation the state is authoritative, and an operator debugging a run
+        # needs to know which chat to open.
+        state = _read_state_quietly(config)
+        if state is None:
+            add("conversation_active", "ok", "no session state yet — the config URL will be used")
+        else:
+            drifted = state.conversation_url != config.browser.conversation_url
+            add(
+                "conversation_active",
+                "warn" if drifted else "ok",
+                f"{state.conversation_url}"
+                + (" (state has moved past the config — a rotation was recorded)" if drifted else ""),
+            )
+            cap = config.policy.max_conversation_rotations
+            add(
+                "conversation_rotations",
+                "warn" if state.rotations >= cap else "ok",
+                f"{state.rotations}/{cap} used this run"
+                + (" — the next unusable conversation will park, not rotate"
+                   if state.rotations >= cap else ""),
+            )
+
+        # 13c. rotation target
+        project_url = config.browser.project_url
+        if not project_url:
+            add(
+                "project_url",
+                "warn",
+                "unset — conversation rotation is disabled; a wedged chat will "
+                "park for you instead of moving to a fresh one",
+            )
+        elif _CHATGPT_PROJECT_URL.match(project_url):
+            add("project_url", "ok", project_url)
+        else:
+            add(
+                "project_url",
+                "fail",
+                f"'{project_url}' does not look like https://chatgpt.com/g/<project>[/project]",
             )
 
     # 14. live browser: login + conversation + selectors. Never submits.

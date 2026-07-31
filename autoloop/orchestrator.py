@@ -37,6 +37,31 @@ Phase 3.1 (browser-transport repair) additions:
   more send of the same request id).
 * `awaiting` performs no navigation at all, so a streaming answer survives.
 
+Transport-recovery additions (this change):
+
+* A send whose acceptance is POSITIVELY DISPROVEN by the browser's own network
+  activity lands in `submission_rejected`, not `submission_unconfirmed`. That
+  phase reconciles for confirmation and, on confirmed absence, permits exactly
+  ONE same-chat resend of the same request id. Unknown acceptance still never
+  earns a resend — the whole point of the distinction.
+* A second confirmed rejection, or a conversation that is structurally unusable,
+  may `rotate`: open one fresh chat in the configured project, prove it usable,
+  and rebind the in-flight request to it. Bounded by
+  `policy.max_conversation_rotations` (default 1 per run); no project URL
+  configured means no rotation, ever — the loop parks instead.
+* Every request carries its OWN authoritative `conversation_url` and
+  `conversation_epoch`. Submitting, awaiting and reconciling all follow the
+  request's URL, never the loop's current one, so a late reply in an abandoned
+  chat cannot authorize anything.
+
+Note for the merge with the blocker/quarantine work (commit 5346551, branch
+`feat/autoloop-postcommit-review`): every park site added here goes through the
+existing two-argument `_to_needs_user` and emits a stable `reason_code` in its
+transcript event (`submission_unknown`, `rotation_unavailable`,
+`rotation_cap_reached`, `rotation_failed`, `conversation_unusable`). When the two
+lines meet, classifying them is a matter of passing the kind that matches each
+code — no new taxonomy is invented here.
+
 Failure routing:
 
 * LoginExpiredError            → needs_user, resume_phase preserved (--retry)
@@ -55,10 +80,13 @@ from __future__ import annotations
 import hashlib
 from dataclasses import asdict
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import environment
 from .browser.chatgpt import SubmitResult
+from .browser.observation import SendOutcome
 from .config import AutoloopConfig
+from .config_writer import update_conversation_url
 from .context import build_context, render_context
 from .contract import (
     AUDIT_TASK_ID,
@@ -72,8 +100,10 @@ from .contract import (
     verify_review,
 )
 from .errors import (
+    AutoloopError,
     BrowserError,
     ContractError,
+    ConversationUnusableError,
     ExecutorError,
     GitCommandError,
     GitError,
@@ -104,6 +134,7 @@ from .state import (
     PendingRequest,
     Phase,
     PostcommitBinding,
+    RotationRecord,
     StateStore,
     utcnow_iso,
 )
@@ -127,6 +158,19 @@ from .worktree import WorktreeManager
 #: without bound.
 MAX_TASK_ATTEMPTS = 5
 
+#: Appended to a request that is being re-sent into a replacement conversation.
+#: One line, because the payload it follows is already self-contained — every
+#: turn carries its own CONTEXT block and the full response contract. It says
+#: which conversation is authoritative and nothing else; replaying the
+#: abandoned chat's history by hand would be reconstructing evidence rather
+#: than continuing work.
+CONTINUATION_NOTE = (
+    "[autoloop transport note] This request continues an Autoloop session after "
+    "a conversation-transport recovery. The previous conversation is abandoned "
+    "and nothing in it is authoritative. Reply only here; this conversation is "
+    "the only one Autoloop reads."
+)
+
 
 class Orchestrator:
     def __init__(
@@ -149,6 +193,7 @@ class Orchestrator:
         publisher: Publisher | None = None,
         worker_repos=None,
         publisher_url_snapshot: str | None = None,
+        config_path: Path | None = None,
     ):
         self._config = config
         self._store = store
@@ -208,6 +253,12 @@ class Orchestrator:
         #: LIVE `remote.<remote>.url` before every publish and refuses (never
         #: auto-heals) on a mismatch — see that method's docstring.
         self._publisher_url_snapshot = publisher_url_snapshot
+        #: Where the config file lives, so a completed rotation can point it at
+        #: the replacement conversation. Defaults to the conventional location
+        #: under `state_dir`; the CLI passes the path it actually loaded, since
+        #: `--config` can put it anywhere. Only ever written through
+        #: `config_writer`, which refuses git-tracked paths.
+        self._config_path = Path(config_path) if config_path else config.state_dir / "config.toml"
         self._client = None
 
     # ---- main loop ----------------------------------------------------------
@@ -228,9 +279,15 @@ class Orchestrator:
             try:
                 self._step(phase)
             except LoginExpiredError as exc:
+                # Deliberately caught BEFORE ConversationUnusableError: a
+                # logged-out profile is an account problem, and opening a new
+                # chat cannot fix it. Rotating here would spend the run's one
+                # rotation on a login prompt.
                 self._log("login_expired", data={"error": str(exc)})
                 self._drop_client()
                 self._to_needs_user(str(exc), resume_phase=phase.value)
+            except ConversationUnusableError as exc:
+                self._handle_conversation_unusable(phase, exc)
             except BrowserError as exc:
                 self._handle_browser_failure(phase, exc)
             except GitError as exc:
@@ -243,6 +300,8 @@ class Orchestrator:
             self._step_submitting()
         elif phase is Phase.SUBMISSION_UNCONFIRMED:
             self._step_submission_unconfirmed()
+        elif phase is Phase.SUBMISSION_REJECTED:
+            self._step_submission_rejected()
         elif phase is Phase.AWAITING:
             self._step_awaiting()
         elif phase is Phase.EXECUTING:
@@ -308,7 +367,7 @@ class Orchestrator:
         req = state.pending_request
         if req is None:
             raise StateError("phase=submitting but no pending request")
-        client = self._get_client()
+        client = self._client_for_request(req)
         client.attach()
         # One controlled reload BEFORE sending, so the duplicate check reads
         # persisted history rather than whatever the DOM happens to show (a
@@ -323,9 +382,19 @@ class Orchestrator:
 
         if req.send_attempted:
             # A send was already attempted for this id and reconciliation says
-            # it did not persist. Resending is forbidden without an explicit
-            # operator decision (`run --resubmit`): the backend may have
-            # accepted a message the browser never observed.
+            # it did not persist. What that licenses depends entirely on WHY:
+            #
+            #  * the transport disproved acceptance -> `submission_rejected`
+            #    owns the decision (it may spend one same-chat resend, or
+            #    rotate). Routing there rather than deciding here is what makes
+            #    a crash mid-recovery resume from the same evidence the live
+            #    run had, instead of silently downgrading to "ambiguous".
+            #  * anything else -> genuinely ambiguous, park. The backend may
+            #    have accepted a message the browser never observed.
+            if req.last_send_outcome == SendOutcome.REJECTED.value:
+                state.phase = Phase.SUBMISSION_REJECTED.value
+                self._store.save(state)
+                return
             self._park_ambiguous(req, reconciled=True)
             return
 
@@ -368,6 +437,26 @@ class Orchestrator:
                 req.send_attempted = False
                 self._store.save(state)
             raise
+        # Persist the transport's verdict before acting on it, so a crash
+        # between here and the next step cannot lose the distinction between
+        # "disproven" and "unknown".
+        req.last_send_outcome = self._client_send_outcome(client)
+        if result is SubmitResult.REJECTED:
+            # The browser's own send request failed: acceptance is disproven,
+            # not merely unobserved. Still not self-authorizing — the dedicated
+            # phase reconciles for confirmation before anything is resent.
+            req.last_send_outcome = SendOutcome.REJECTED.value
+            state.phase = Phase.SUBMISSION_REJECTED.value
+            self._log(
+                "submission_rejected",
+                request_id=req.request_id,
+                data={
+                    "note": "the browser's own send request failed — confirming by reconciliation",
+                    "observations": self._observation_summary(client),
+                },
+            )
+            self._store.save(state)
+            return
         if result is SubmitResult.UNCONFIRMED:
             # Ambiguous: the send was clicked but acceptance is unknown. Park in
             # a dedicated phase — resending here could double-post.
@@ -395,7 +484,7 @@ class Orchestrator:
         req = state.pending_request
         if req is None:
             raise StateError("phase=submission_unconfirmed but no pending request")
-        client = self._get_client()
+        client = self._client_for_request(req)
         client.attach()
         req.reconcile_attempts += 1
         persisted = client.reconcile(req.request_id)
@@ -410,6 +499,297 @@ class Orchestrator:
             self._store.save(state)
             return
         self._park_ambiguous(req, reconciled=True)
+
+    def _step_submission_rejected(self) -> None:
+        """Resolve a DISPROVEN send.
+
+        Reconciliation is still the authority — persisted history outranks the
+        network every time, so a request that turns out to be there simply
+        proceeds. Only confirmed absence unlocks anything, and what it unlocks
+        is bounded: one same-chat resend of the same request id, then (on a
+        second confirmed rejection) at most one rotation.
+        """
+        state = self.state
+        req = state.pending_request
+        if req is None:
+            raise StateError("phase=submission_rejected but no pending request")
+        client = self._client_for_request(req)
+        client.attach()
+        req.reconcile_attempts += 1
+        persisted = client.reconcile(req.request_id)
+        self._log(
+            "reconciled",
+            request_id=req.request_id,
+            data={
+                "persisted": persisted,
+                "attempts": req.reconcile_attempts,
+                "after": "rejected_send",
+            },
+        )
+        if persisted:
+            # The network said the send failed and history says it is there.
+            # History wins: it is the direct evidence, the status code is a
+            # proxy. Resending now would be the double-post this whole phase
+            # exists to prevent.
+            req.submitted = True
+            req.last_send_outcome = SendOutcome.ACCEPTED.value
+            state.phase = Phase.AWAITING.value
+            self._store.save(state)
+            return
+
+        if req.resends_used < 1:
+            # Confirmed absent, once. Nothing is in the conversation, so
+            # sending the same request id again cannot duplicate anything.
+            req.resends_used += 1
+            req.send_attempted = False
+            req.last_send_outcome = ""
+            state.phase = Phase.SUBMITTING.value
+            self._log(
+                "resend_authorized",
+                request_id=req.request_id,
+                data={
+                    "reason_code": "send_rejected_confirmed_absent",
+                    "resends_used": req.resends_used,
+                    "conversation_epoch": req.conversation_epoch,
+                },
+            )
+            self._store.save(state)
+            return
+
+        # Confirmed absent twice, in the same chat, with the transport
+        # disproving both sends. The chat itself is the suspect now.
+        self._attempt_rotation(req, reason="send_rejected_twice")
+
+    def _handle_conversation_unusable(
+        self, phase: Phase, exc: ConversationUnusableError
+    ) -> None:
+        """The configured conversation loaded and is broken.
+
+        Distinct from `_handle_browser_failure`: that one counts consecutive
+        failures and retries the same phase with a fresh client, which for a
+        wedged chat just re-runs the same failure until the budget is spent.
+        Accounting is deliberately NOT shared — a rotation attempt does not
+        also increment `consecutive_failures`, or one fault would be charged to
+        two budgets and the loop would fail earlier than either one describes.
+        """
+        state = self.state
+        self._log(
+            "conversation_unusable",
+            data={"phase": phase.value, "error": str(exc), "reason_code": "conversation_unusable"},
+        )
+        self._drop_client()
+        req = state.pending_request
+        if req is None:
+            # Nothing in flight to rebind; treat as an ordinary browser fault
+            # so the failure budget still governs a dead conversation at rest.
+            self._handle_browser_failure(phase, exc)
+            return
+        # `resume_phase` is not set here: every park below routes through
+        # `_park_rotation` -> `_to_needs_user`, which sets it from the live
+        # phase. Assigning it here too would just be overwritten.
+        self._attempt_rotation(req, reason="conversation_unusable")
+
+    # ---- conversation rotation ---------------------------------------------
+
+    def _attempt_rotation(self, req: PendingRequest, reason: str) -> None:
+        """Move the in-flight request to a fresh chat in the same project.
+
+        Parks — never proceeds — unless every precondition holds. The sequence
+        is deliberately "prove, then bind": the new chat's URL is only written
+        anywhere after the request has been reconciled against it, because the
+        address bar is exactly the kind of evidence this changeset exists to
+        stop trusting.
+        """
+        state = self.state
+        project_url = self._config.browser.project_url
+        if not project_url:
+            self._park_rotation(
+                req,
+                "rotation_unavailable",
+                "the conversation cannot be used and no browser.project_url is "
+                "configured, so autoloop cannot open a replacement chat. `run "
+                "--retry` alone will not clear this. Set browser.project_url to "
+                "the ChatGPT project this conversation belongs to and then retry, "
+                "or move the loop to a healthy conversation by hand.",
+            )
+            return
+        verdict = self._policy.check_rotation_budget(state.rotations)
+        if not verdict.allowed:
+            self._park_rotation(
+                req,
+                "rotation_cap_reached",
+                f"the conversation is unusable and {verdict.reason}. `run --retry` "
+                "alone will not clear this — it will park here again with the same "
+                "reason. A second rotation in one run usually means the fault is "
+                "not the chat, so inspect the project first; raise "
+                "policy.max_conversation_rotations only if you have established "
+                "otherwise.",
+            )
+            return
+
+        old_url = req.conversation_url or state.conversation_url
+        # Consume the budget BEFORE the attempt, durably. A rotation SENDS a
+        # message; if the process dies between that send and the binding below,
+        # recovery must not be able to open a second chat and post again. Same
+        # pessimism as `send_attempted`, for the same reason — and it is why a
+        # failed attempt still costs a rotation.
+        state.rotations += 1
+        self._store.save(state)
+        try:
+            new_url, sent_prompt = self._rotate_conversation(req, project_url)
+        except LoginExpiredError:
+            raise
+        except (BrowserError, AutoloopError) as exc:
+            self._log(
+                "rotation_failed",
+                request_id=req.request_id,
+                data={"reason_code": "rotation_failed", "error": str(exc)},
+            )
+            self._drop_client()
+            self._park_rotation(
+                req,
+                "rotation_failed",
+                f"the conversation is unusable and opening a replacement chat "
+                f"failed: {exc}. The rotation attempt is spent — it may have "
+                "posted before failing, so autoloop will not try again on its own.",
+            )
+            return
+
+        # Only now is the request's prompt the one that was actually sent. Doing
+        # this before the send would leave a failed rotation holding a prompt
+        # that announces the conversation is abandoned, in the conversation that
+        # was never abandoned — which is exactly where `--resubmit` would send it.
+        req.prompt = sent_prompt
+        req.prompt_sha256 = hashlib.sha256(sent_prompt.encode("utf-8")).hexdigest()
+        record = RotationRecord(
+            old_url=old_url,
+            new_url=new_url,
+            request_id=req.request_id,
+            reason=reason,
+            epoch=state.conversation_epoch + 1,
+        )
+        state.conversation_epoch = record.epoch
+        state.conversation_url = new_url
+        state.last_rotation = asdict(record)
+        req.conversation_url = new_url
+        req.conversation_epoch = record.epoch
+        req.submitted = True
+        req.send_attempted = True
+        req.last_send_outcome = SendOutcome.ACCEPTED.value
+        state.phase = Phase.AWAITING.value
+        state.resume_phase = None
+        self._log(
+            "conversation_rotated",
+            request_id=req.request_id,
+            data=asdict(record) | {"rotations": state.rotations},
+        )
+        self._store.save(state)
+        self._heal_config_url(new_url)
+
+    def _rotate_conversation(
+        self, req: PendingRequest, project_url: str
+    ) -> tuple[str, str]:
+        """Open one new chat in the project and land `req` in it.
+
+        Returns `(new_conversation_url, prompt_actually_sent)` — both already
+        verified. Mutates nothing on `req`: a rotation that fails partway must
+        leave the request exactly as it was, still bound to the old
+        conversation, so the caller commits the new prompt only on success.
+
+        ChatGPT does not mint a `/c/<id>` until a chat has its first turn, so
+        the order is forced: retarget to the project page, submit there, and
+        only then read the id the server assigned. Every step after the submit
+        is verification.
+        """
+        client = self._get_client()
+        retarget = getattr(client, "retarget", None)
+        current_url = getattr(client, "current_url", None)
+        if retarget is None or current_url is None:
+            raise BrowserError(
+                "the configured conversation provider does not support rotation "
+                "(no retarget/current_url); rotate by hand"
+            )
+        retarget(project_url)
+        client.attach()
+
+        prompt = self._continuation_prompt(req)
+        result = client.submit(req.request_id, prompt)
+        if result not in (SubmitResult.CONFIRMED, SubmitResult.ALREADY_PERSISTED):
+            raise BrowserError(
+                f"the replacement chat did not accept the request ({result.value})"
+            )
+
+        new_url = current_url()
+        if not self._url_in_project(new_url, project_url):
+            raise BrowserError(
+                f"the new chat is not inside the configured project "
+                f"({new_url!r} vs {project_url!r})"
+            )
+        retarget(new_url)
+        # The address bar said the send landed here; make the conversation say
+        # it. Until this returns True the rotation has not happened and nothing
+        # is bound to the new URL.
+        if not client.reconcile(req.request_id):
+            raise BrowserError(
+                "the replacement chat does not contain the request after "
+                "reconciliation — refusing to bind to it"
+            )
+        return new_url, prompt
+
+    @staticmethod
+    def _url_in_project(candidate: str, project_url: str) -> bool:
+        """True when `candidate` is a conversation under `project_url`.
+
+        Compares the project path prefix, so a chat that opened outside the
+        project (a stray navigation, a redirect to the plain composer) is
+        refused rather than silently adopted.
+        """
+        if not candidate:
+            return False
+        want, have = urlsplit(project_url), urlsplit(candidate)
+        if want.netloc != have.netloc:
+            return False
+        project_path = want.path.rstrip("/")
+        # ".../project" is the project landing page; conversations live at
+        # ".../c/<id>" directly under the same /g/<slug> prefix.
+        base = project_path.rsplit("/", 1)[0] if project_path.endswith("/project") else project_path
+        return have.path.startswith(base + "/c/")
+
+    def _continuation_prompt(self, req: PendingRequest) -> str:
+        """The same request, plus one line saying the transport moved.
+
+        The payload is already self-contained (`prompts.build_prompt` re-sends
+        the CONTEXT block and the full contract every turn), so the new chat is
+        contract-complete without replaying any history. The note exists so the
+        reviewer knows which conversation is authoritative — not to reconstruct
+        what the abandoned one said.
+        """
+        return req.prompt.rstrip("\n") + "\n\n" + CONTINUATION_NOTE
+
+    def _heal_config_url(self, new_url: str) -> None:
+        """Point the config file at the new conversation.
+
+        Best-effort by design: the rotation itself is already committed to
+        state, and state is what this run follows. A failure here only means
+        the NEXT session would start from the old URL, which the CLI's
+        drift guard detects and reports — a worse outcome than a healed config,
+        but far better than unwinding a rotation that already succeeded.
+        """
+        try:
+            update_conversation_url(self._config_path, new_url, Path.cwd())
+        except (AutoloopError, OSError) as exc:
+            self._log(
+                "config_heal_failed",
+                data={"reason_code": "config_heal_failed", "error": str(exc)},
+            )
+
+    def _park_rotation(self, req: PendingRequest, reason_code: str, question: str) -> None:
+        self._log(
+            "rotation_declined",
+            request_id=req.request_id,
+            data={"reason_code": reason_code, "rotations": self.state.rotations},
+        )
+        self._to_needs_user(question, resume_phase=self.state.phase)
 
     def _current_pending_postcommit(
         self, payload: str, report_sha256: str
@@ -477,7 +857,11 @@ class Orchestrator:
         req = state.pending_request
         if req is None:
             raise StateError("phase=awaiting but no pending request")
-        client = self._get_client()
+        # Aimed at the request's OWN conversation. After a rotation the loop's
+        # current conversation and this request's are the same, but a request
+        # that predates the rotation keeps its old binding — so a reply that
+        # arrives late in an abandoned chat is never the one that gets read.
+        client = self._client_for_request(req)
         # attach() navigates only when the page is absent or elsewhere — never a
         # reload here, or a streaming answer would be destroyed mid-flight.
         client.attach()
@@ -490,6 +874,8 @@ class Orchestrator:
             base_sha=req.base_sha,
             report_sha256=req.report_sha256,
             postcommit=req.postcommit,
+            conversation_url=req.conversation_url,
+            conversation_epoch=req.conversation_epoch,
         )
         state.pending_request = None
         state.consecutive_failures = 0
@@ -1406,6 +1792,65 @@ class Orchestrator:
         if self._client is None:
             self._client = self._client_factory()
         return self._client
+
+    def _client_for_request(self, req: PendingRequest):
+        """A client aimed at THIS request's conversation, not the loop's.
+
+        Every phase that touches a pending request goes through here, so
+        "reconcile a historical request against the URL it was sent to" is a
+        property of the code path rather than a rule each site remembers. After
+        a rotation the two differ, and using the current URL to reconcile an
+        older request would ask the wrong chat whether it holds a message it
+        never received.
+        """
+        self._bind_request_conversation(req)
+        client = self._get_client()
+        retarget = getattr(client, "retarget", None)
+        aimed_at = getattr(client, "conversation_url", None)
+        if retarget is not None and aimed_at != req.conversation_url:
+            retarget(req.conversation_url)
+        return client
+
+    def _bind_request_conversation(self, req: PendingRequest) -> None:
+        """Give a request its authoritative conversation if it has none.
+
+        Only reachable for requests written before this field existed, and only
+        ever correct because it cannot happen after a rotation: the binding is
+        taken on first touch, every request created since carries its own, and
+        `rotations == 0` means the loop URL *is* this request's URL. Guarded
+        rather than assumed — an unbound request surfacing after a rotation
+        would be a real inconsistency, and silently pointing it at the new chat
+        is exactly the wrong repair.
+        """
+        if req.conversation_url:
+            return
+        if self.state.rotations:
+            raise StateError(
+                f"request {req.request_id} has no conversation binding but this run "
+                f"has already rotated {self.state.rotations} time(s); it cannot be "
+                "attributed to a conversation. Inspect .autoloop/state.json."
+            )
+        req.conversation_url = self.state.conversation_url
+        req.conversation_epoch = self.state.conversation_epoch
+        self._store.save(self.state)
+
+    @staticmethod
+    def _client_send_outcome(client) -> str:
+        """The transport's verdict, or "unknown" from a provider without the
+        optional observation capability — which is every provider today except
+        the Playwright one, and must stay behaviourally identical to before."""
+        outcome = getattr(client, "send_outcome", None)
+        if outcome is None:
+            return SendOutcome.UNKNOWN.value
+        return getattr(outcome, "value", str(outcome))
+
+    @staticmethod
+    def _observation_summary(client) -> list[dict]:
+        """Observations as plain dicts for the transcript: path, status and a
+        coarse failure string. `SendObservation` has nowhere to put a header,
+        cookie or body, so this cannot carry credentials into the log."""
+        observations = getattr(client, "send_observations", None) or []
+        return [asdict(obs) for obs in observations]
 
     def _drop_client(self) -> None:
         if self._client is not None:

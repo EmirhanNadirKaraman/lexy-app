@@ -51,6 +51,21 @@ class SubmissionError(BrowserError):
     """A prompt could not be submitted or its submission was never confirmed."""
 
 
+class ConversationUnusableError(BrowserError):
+    """The configured conversation loaded but cannot be used at all.
+
+    Narrow on purpose: this is the one browser failure that authorizes
+    rotating to a fresh conversation, and a run gets a single rotation. It
+    means the page demonstrably reached the conversation URL, is not an auth
+    page, and still has no composer (or shows an explicit conversation-error
+    marker) — i.e. *this chat* is wedged. A page that never loaded, a dropped
+    CDP connection, or a logged-out profile are ordinary `BrowserError` /
+    `SessionLostError` / `LoginExpiredError` on the normal failure budget:
+    rotating for those would spend the one rotation on a network blip and
+    leave none for the real thing.
+    """
+
+
 class ResponseTimeoutError(BrowserError):
     """No completed assistant response appeared within the timeout."""
 
