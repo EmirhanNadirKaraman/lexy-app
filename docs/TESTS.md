@@ -1929,7 +1929,7 @@ Run all three. The lint step is not optional.
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
 | Backend | `cd lexy-app/backend && python3 -m pytest -n auto` | 1258 passed, 2 skipped |
 | Root pipeline | `pytest tests/` *(repo root)* | 368 passed |
-| Autoloop | `pytest autoloop/tests` *(repo root; only when touching `autoloop/`)* | 629 passed |
+| Autoloop | `pytest autoloop/tests` *(repo root; only when touching `autoloop/`)* | 647 passed |
 
 > **Backend command reconciled 2026-07-29:** it must be `python3 -m pytest`,
 > NOT the bare `pytest` entrypoint. `python -m` puts the cwd on `sys.path`,

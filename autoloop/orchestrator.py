@@ -830,7 +830,17 @@ class Orchestrator:
             request_id=req.request_id,
             data={"reason_code": reason_code, "rotations": self.state.rotations},
         )
-        self._to_needs_user(question, resume_phase=self.state.phase)
+        # Every rotation refusal is loop_fatal: the conversation channel itself
+        # is unusable or exhausted, which no other task can route around. The
+        # fail-closed default would already give loop_fatal — passing it
+        # explicitly, with the caller's own reason_code, is what makes the
+        # persisted blocker say WHICH refusal it was instead of "unclassified".
+        self._to_needs_user(
+            question,
+            resume_phase=self.state.phase,
+            kind="loop_fatal",
+            code=reason_code,
+        )
 
     def _current_pending_postcommit(
         self, payload: str, report_sha256: str
