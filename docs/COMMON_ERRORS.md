@@ -597,6 +597,37 @@ line rather than the error. The tail is a pointer, never the diagnosis.
 command by hand in the worker repo rather than reading the tail — the tail
 told us "benchmark warning" for a credentials problem.
 
+### `relation "video" does not exist` on a fresh `alembic upgrade head` — and the schema cannot be rebuilt any other way either
+**Symptom:** building a clean database and running `alembic upgrade head` dies
+at migration 006 (`ALTER TABLE video ADD COLUMN … channel_id`). The chain
+creates 23 tables and never creates the content core — `video`, `word_table`,
+`sentence`, `language_table`, `word_to_sentence`, `video_category`,
+`phrase_blueprint`.
+**Cause:** there are TWO schema sources and neither is complete.
+  1. **Migrations** build the app half (users, srs_cards, llm_cache, book_*,
+     chat_*, notification, …) and *alter* content tables they never create.
+  2. A **`table.sql`** at the repo root built the content half. It was deleted
+     in `25a194d`; recover it with `git show <sha-before>:table.sql`.
+They cannot simply be composed. `table.sql` is a LATE snapshot — its `video`
+already has `channel_id` and `fk_video_channel → channel(id)`, i.e. the state
+*after* the 013–022 channel surrogate-key refactor — so replaying the chain
+over it fails with `constraint "fk_video_category" for relation "video"
+already exists`. And there is no single revision to `alembic stamp` past,
+because the chain interleaves content-table alterations with app-table
+creation, so any stamp that skips the conflicts also skips tables you need.
+**Fix:** for a throwaway/CI/test database, copy the schema from a database
+that already works — it is the only source that is provably current:
+```bash
+pg_dump -h <host> -p <port> -U <user> -d <live-db> \
+  --schema-only --no-owner --no-privileges | psql -d <new-db>
+```
+**Worth fixing properly:** a baseline migration that creates the content core,
+so the chain is self-sufficient. Until then every fresh deploy, CI database and
+new-contributor setup hits this wall. `docs/AUDIT_2026-07-30.md` proposed
+exactly this experiment as a validation step; running it confirmed the finding
+and showed it is worse than "migrations are incomplete" — the two halves have
+drifted into each other.
+
 ### `assert b'validation_user' in b'\x00\x00\x00\x08\x04\xd2\x16/'` — a test listener sees 8 bytes instead of a Postgres startup packet
 **Symptom:** a test that opens a loopback listener and asserts the Postgres
 startup packet carries the expected user/database receives only
