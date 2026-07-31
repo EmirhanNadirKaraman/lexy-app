@@ -778,7 +778,8 @@ def build_orchestrator_with_publisher(tmp_path, task_id="t1"):
     state = LoopState.new(URL)
     store.save(state)
 
-    task = Task(id=task_id, title=f"Title {task_id}", description="desc")
+    # Matches `WritingExecutor(tmp_path / "worktrees", {"a.py": ...})` below.
+    task = Task(id=task_id, title=f"Title {task_id}", description="desc", approved_paths=("a.py",))
     registry = TaskRegistry([task])
     task_store = TaskStore(config.tasks_file)
     task_store.save(registry)
@@ -954,7 +955,8 @@ def test_orchestrator_task_repo_is_an_isolated_worker_repo(tmp_path):
     store = StateStore(config.state_file)
     state = LoopState.new(config.browser.conversation_url)
     store.save(state)
-    task = Task(id="t1", title="T", description="d")
+    # Matches `Writer.execute`'s own `feature.py` write below.
+    task = Task(id="t1", title="T", description="d", approved_paths=("feature.py",))
     registry = TaskRegistry([task])
     task_store = TaskStore(config.tasks_file)
     task_store.save(registry)

@@ -19,6 +19,11 @@
         "-q"
       ]
     ],
-    "validation_cwd": "lexy-app/backend"
+    "validation_cwd": "lexy-app/backend",
+    "approved_paths": [
+      "lexy-app/backend/routers/books.py",
+      "lexy-app/backend/tests/test_books_import_admin.py",
+      "docs/SECURITY.md"
+    ]
   }
 ]

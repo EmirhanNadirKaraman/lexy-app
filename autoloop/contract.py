@@ -71,7 +71,7 @@ _TOP_LEVEL_KEYS = {
 }
 _COMMIT_KEYS = {"message", "paths"}
 _REVIEWED_KEYS = {"request_id", "head_sha", "report_sha256"}
-_TASK_SPEC_KEYS = {"id", "title", "description", "depends_on"}
+_TASK_SPEC_KEYS = {"id", "title", "description", "depends_on", "approved_paths"}
 
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -118,6 +118,18 @@ class TaskSpec:
     title: str
     description: str
     depends_on: tuple[str, ...] = ()
+    #: The task's write-scope authorization — see `tasks.Task.approved_paths`.
+    #: Accepted here (type/shape only: a list of non-empty strings) but NOT
+    #: required at the protocol level — making it required would be a
+    #: breaking wire change to every existing `plan` (PROTOCOL_VERSION stays
+    #: 3). The real enforcement is downstream and fail-closed instead:
+    #: `tasks.TaskRegistry.add_many` validates each path is an exact,
+    #: repo-relative, non-glob, non-'..' pathspec, and
+    #: `orchestrator._dispatch_task_postcommit` refuses to dispatch a
+    #: write-capable implement/revise for a task whose `approved_paths` is
+    #: still empty — so an omitted scope makes a task permanently
+    #: undispatchable rather than silently unscoped.
+    approved_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,9 +173,14 @@ and no others:
   reason     (required) one short sentence explaining the decision
   scope      (audit only, optional) what the audit should focus on
   tasks      (required for plan) list of task definitions:
-               {id, title, description, depends_on?}
+               {id, title, description, depends_on?, approved_paths?}
              id: a stable slug ([A-Za-z0-9._-], max 64). depends_on lists ids
-             of existing tasks or tasks in this same batch.
+             of existing tasks or tasks in this same batch. approved_paths is
+             the EXACT list of repository-relative files this task may touch
+             (no globs, no "..", no absolute paths) — name new files
+             explicitly. A task cannot be implemented until it has at least
+             one approved path, so give every task you intend to implement
+             one.
   task_id    (required for implement/revise; optional for commit /
              commit_and_push, where it marks that task completed)
   feedback   (required for revise) what is wrong and must change
@@ -241,7 +258,30 @@ def _parse_task_specs(raw: object) -> tuple[TaskSpec, ...]:
                     f"'{where}.depends_on' must be a list of non-empty strings",
                 )
             deps = tuple(d.strip() for d in deps_raw)
-        specs.append(TaskSpec(id=task_id, title=title, description=description, depends_on=deps))
+        paths_raw = item.get("approved_paths")
+        approved_paths: tuple[str, ...] = ()
+        if paths_raw is not None:
+            if not isinstance(paths_raw, list) or not all(
+                isinstance(p, str) and p.strip() for p in paths_raw
+            ):
+                raise ContractError(
+                    f"bad_type:{where}.approved_paths",
+                    f"'{where}.approved_paths' must be a list of non-empty strings",
+                )
+            # Deliberately NOT stripped/normalized here: the exact string is
+            # what `tasks._validate_approved_path` and the later dispatch-time
+            # comparison both see, so silently trimming whitespace here would
+            # let a path differ from what actually gets validated/compared.
+            approved_paths = tuple(paths_raw)
+        specs.append(
+            TaskSpec(
+                id=task_id,
+                title=title,
+                description=description,
+                depends_on=deps,
+                approved_paths=approved_paths,
+            )
+        )
     return tuple(specs)
 
 

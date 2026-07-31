@@ -152,6 +152,36 @@ def _agent_prompt(title: str, charter: str, scope: str | None, feedback: str | N
     return "\n\n".join(parts)
 
 
+#: The audit report goes to ChatGPT as the `details` of a review payload, and
+#: `report_sha256` is computed over exactly those bytes. A real report is ~70 kB,
+#: which produced 104k/113k/122k-character messages — roughly three quarters of
+#: everything this loop ever sent, and the load that wedged a conversation into
+#: accepting messages and never generating a reply. The full text is on disk and
+#: in the reviewed commit, whose diff the post-commit packet already carries, so
+#: inlining it again bought nothing.
+MAX_REPORT_DETAILS_CHARS = 8_000
+
+
+def cap_report_details(report: str, report_path: str) -> str:
+    """A bounded excerpt of `report` for the review payload.
+
+    Keeps the HEAD of the report — the coverage table and findings summary lead
+    it, which is what a reviewer needs to judge whether the audit is sound.
+    Truncation is announced rather than silent: a reviewer must never believe
+    they read the whole thing, and the path to the full text is named.
+    """
+    if len(report) <= MAX_REPORT_DETAILS_CHARS:
+        return report
+    kept = report[:MAX_REPORT_DETAILS_CHARS]
+    omitted = len(report) - len(kept)
+    return (
+        kept
+        + f"\n\n[... {omitted:,} characters omitted. This is an EXCERPT, not the "
+        f"report. The full text is committed at {report_path} and appears in "
+        "full in this candidate's diff. ...]"
+    )
+
+
 class AuditExecutor:
     def __init__(
         self,
@@ -350,7 +380,7 @@ class AuditExecutor:
             summary=summary
             if not agent_failures
             else summary + " COVERAGE INCOMPLETE — see agent failures in the report.",
-            details=report,
+            details=cap_report_details(report, report_path),
             validation=validation_summary,
             # produce-then-review path: this is the ONE file the audit ever
             # changes (`MarkdownPolicy` enforces at most one new report per

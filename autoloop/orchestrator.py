@@ -114,6 +114,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import environment
+from . import escape_detector
 from .blockers import NO_TASK, BlockerStore
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
@@ -146,7 +147,7 @@ from .errors import (
     TaskGraphError,
 )
 from .manifest import ManifestStore
-from .executor import TaskExecutor
+from .executor import ExecutionOutcome, TaskExecutor
 from .git_gateway import GitGateway
 from .packet import build_review_packet
 from .policy import PolicyEngine, Verdict
@@ -1275,6 +1276,7 @@ class Orchestrator:
                         title=s.title,
                         description=s.description,
                         depends_on=s.depends_on,
+                        approved_paths=s.approved_paths,
                     )
                     for s in specs
                 ]
@@ -1427,12 +1429,53 @@ class Orchestrator:
                 "execution_store and intent_store) — audit/implement/revise "
                 "cannot run"
             )
+        # Matches `_dispatch_executor`'s own `is_audit` computation EXACTLY
+        # (deliberately duplicated, not shared — see that method's docstring
+        # and `cli._DispatchingExecutor`, which makes the identical decision
+        # a third time to route to the read-only vs write-capable executor).
+        # The audit's write surface is already bounded by a DIFFERENT,
+        # non-agent-controlled mechanism (`MarkdownPolicy` — at most one new
+        # `docs/AUDIT_<date>.md`), so it is deliberately exempt from the
+        # `approved_paths` gate below: that gate exists because an
+        # `implement`/`revise` agent's own report was the ONLY thing
+        # authorizing its scope (Autoloop M1 finding #2/#3), which was never
+        # true for the audit.
+        is_audit = directive.decision is Decision.AUDIT or directive.task_id == AUDIT_TASK_ID
+
+        if not is_audit and not task.approved_paths:
+            # Fail-closed gate for M1 finding #2 (circular task ownership):
+            # `approved_paths` is the task's machine-checkable authorization
+            # scope, set BEFORE the writer ever starts (a `plan` directive's
+            # `TaskSpec.approved_paths`, or `seed_tasks.json`). A task with
+            # none is not "unscoped" — it is simply never dispatchable, so an
+            # omitted scope cannot silently fall back to "whatever the agent
+            # touched" (which is exactly the circularity being closed: the
+            # agent's own report must never be allowed to EXPAND its own
+            # authorization).
+            self._to_needs_user(
+                f"task {task.id}: has no `approved_paths` — a write-capable "
+                "implement/revise cannot be dispatched without an explicit, "
+                "pre-authorized set of repository-relative paths it may "
+                "touch. Add `approved_paths` to the task (via `plan` or "
+                "seed_tasks.json) and try again. Nothing was executed.",
+                kind="task_fatal",
+                code="approved_paths_missing",
+                task_id=task.id,
+            )
+            return
+
         execution = self._execution_store.load(task.id)
         if execution is None:
             # First dispatch for this task: base sha is recorded BEFORE any
             # implementation work starts, from the MAIN checkout's HEAD (the
-            # commit the task's branch forks from).
+            # commit the task's branch forks from). `allowed_paths` is seeded
+            # from `task.approved_paths` — fixed for the task's whole
+            # lifetime, never from anything the executor reports — EXCEPT for
+            # the audit, whose scope is bounded by `MarkdownPolicy` instead
+            # (see the `is_audit` comment above) and keeps the pre-M1
+            # accumulate-from-`changed_paths` behaviour, unchanged.
             base_sha = self._git.head_sha()
+            allowed_paths = () if is_audit else tuple(sorted(task.approved_paths))
             if self._worker_repos is not None:
                 repo = self._worker_repos.create(task.id, self._git.repo_root, base_sha)
                 execution = TaskExecution(
@@ -1440,9 +1483,22 @@ class Orchestrator:
                     task_branch=repo.branch,
                     worktree_path=str(repo.path),
                     task_base_sha=base_sha,
+                    allowed_paths=allowed_paths,
                 )
             else:
                 execution = self._worktrees.create(task.id, base_sha)
+                execution.allowed_paths = allowed_paths
+            self._execution_store.save(execution)
+        elif not is_audit and execution.allowed_paths != tuple(sorted(task.approved_paths)):
+            # Re-sync on every LOADED (not freshly created) execution too —
+            # covers a resumed task whose `TaskExecution` record predates
+            # this field (an old `.autoloop/executions/<id>.json`) as well as
+            # a record created by test/embedder code that built the
+            # `TaskExecution` directly rather than through this method.
+            # `task.approved_paths` is the single source of truth for a
+            # real task's authorization; it is never derived from
+            # `execution` state, only ever written INTO it.
+            execution.allowed_paths = tuple(sorted(task.approved_paths))
             self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         self._store.save(state)
@@ -1511,12 +1567,20 @@ class Orchestrator:
                 return
             if recon is Reconciliation.RECOVERABLE:
                 # The commit DID happen; only persisting candidate_sha was
-                # lost. Adopt the branch head — do NOT commit again. Union the
-                # recovered round's planned paths into the accumulated
-                # ownership set (see `TaskExecution.allowed_paths`).
-                execution.allowed_paths = tuple(
-                    sorted(set(execution.allowed_paths) | set(pending_intent.planned_paths))
-                )
+                # lost. Adopt the branch head — do NOT commit again. For the
+                # AUDIT only (see `is_audit` above), union the recovered
+                # round's planned paths into the accumulated ownership set
+                # (see `TaskExecution.allowed_paths`) exactly as before M1;
+                # for a real task, `allowed_paths` is already the fixed
+                # `task.approved_paths` set from creation and must NOT be
+                # widened by anything the executor (or a crash-recovered
+                # intent, which is itself just a recording of what the
+                # executor reported) claims it touched — that self-widening
+                # is the exact circularity M1 finding #2/#3 closes.
+                if is_audit:
+                    execution.allowed_paths = tuple(
+                        sorted(set(execution.allowed_paths) | set(pending_intent.planned_paths))
+                    )
                 execution.candidate_sha = worktree_git.head_sha()
                 self._execution_store.save(execution)
                 self._intent_store.clear(task.id)
@@ -1548,6 +1612,28 @@ class Orchestrator:
             self._park_round_cap(execution, worktree_git, directive, state, task)
             return
 
+        # M1 finding #3 (failed-round isolation): a write-capable attempt
+        # never starts from a dirty primary checkout, and never resumes a
+        # worker repo left dirty by a previous attempt that crashed or failed
+        # validation without committing. Audit-exempt (see `is_audit` above)
+        # and worktrees-fallback-exempt (see `_prepare_write_capable_worker`'s
+        # own docstring) — scoped to the path production actually uses.
+        if self._worker_repos is not None and not is_audit:
+            refreshed = self._prepare_write_capable_worker(task, execution, worktree_git)
+            if refreshed is None:
+                return  # already parked
+            worktree_git = refreshed
+
+        # M1 finding #3 (bounded attempts): incremented and PERSISTED before
+        # the executor ever runs, not after a commit — so a crash, a restart,
+        # or a validation failure that never reaches `commit_and_capture` all
+        # consume an attempt exactly like a successful one does. (The
+        # corresponding increment used to live in `_finish_postcommit`,
+        # reached only after a commit; it is gone from there now — see that
+        # method.)
+        execution.attempt_count += 1
+        self._execution_store.save(execution)
+
         # Snapshot the environment (hooks / push destination) BEFORE the
         # executor runs, so a hook installed mid-task (e.g. by a dependency
         # postinstall script) is caught rather than silently trusted.
@@ -1556,7 +1642,17 @@ class Orchestrator:
         # and re-dispatches the same directive (executors must tolerate that;
         # re-entering here re-loads the same `execution` record above).
         self._store.save(state)
-        outcome = self._executor.execute(directive, task)
+        if self._worker_repos is not None and not is_audit:
+            # M1 finding #1 (escape detection): bracket the write-capable
+            # call with a filesystem snapshot of the PRIMARY checkout. See
+            # `escape_detector.py`'s module docstring for the full threat
+            # model and why this is detection, checked before commit/review,
+            # never prevention.
+            outcome = self._execute_with_escape_detection(directive, task)
+            if outcome is None:
+                return  # escape detected, already parked
+        else:
+            outcome = self._executor.execute(directive, task)
         state.last_validation = outcome.validation or "(none)"
         self._log(
             "executed",
@@ -1583,6 +1679,34 @@ class Orchestrator:
             state.phase = Phase.READY.value
             self._store.save(state)
             return
+
+        if not is_audit:
+            # M1 finding #2/#3: the pre-commit gate. `outcome.changed_paths`
+            # is the executor's own report — it may never EXPAND what gets
+            # committed beyond `task.approved_paths`. Checked HERE, before
+            # `commit_and_capture` runs at all, because once a commit exists
+            # nothing in this codebase can roll it back (see the module
+            # docstring above `_dispatch_task_postcommit`) — refusing after
+            # the fact would still leave an out-of-scope commit sitting on
+            # the branch. `_verify_committed`'s post-commit path-ownership
+            # check (against `execution.allowed_paths`, itself seeded from
+            # `task.approved_paths`) remains as defense in depth for the
+            # residual case this CANNOT catch: a commit hook adding a path
+            # strictly AFTER this check ran (see
+            # `test_hook_adding_unexpected_path_is_refused`).
+            outside = set(outcome.changed_paths) - set(task.approved_paths)
+            if outside:
+                self._to_needs_user(
+                    f"task {task.id}: the executor reported changed path(s) "
+                    f"outside the task's approved scope: {sorted(outside)} — "
+                    f"approved: {sorted(task.approved_paths)}. Refused BEFORE "
+                    "committing; nothing was committed.",
+                    kind="task_fatal",
+                    code="changed_paths_outside_approved",
+                    task_id=task.id,
+                    detail=f"outside={sorted(outside)} approved={sorted(task.approved_paths)}",
+                )
+                return
 
         message = f"{task.title}\n\n{outcome.summary}".strip()
         parent = worktree_git.head_sha()
@@ -1638,9 +1762,15 @@ class Orchestrator:
         # -> clear the intent -> THEN verify. If the process dies during
         # verification the commit is already both real and recorded, which is
         # the honest state (the commit exists either way).
-        execution.allowed_paths = tuple(
-            sorted(set(execution.allowed_paths) | set(outcome.changed_paths))
-        )
+        if is_audit:
+            # Audit only — see the `is_audit` comment near the top of this
+            # method for why a real task's `allowed_paths` must NOT be
+            # widened here (that is exactly the circularity M1 finding #2/#3
+            # closes; the pre-commit gate above already refused before this
+            # point if `outcome.changed_paths` ever left `approved_paths`).
+            execution.allowed_paths = tuple(
+                sorted(set(execution.allowed_paths) | set(outcome.changed_paths))
+            )
         execution.candidate_sha = candidate_sha
         self._execution_store.save(execution)
         self._intent_store.clear(task.id)
@@ -1650,6 +1780,177 @@ class Orchestrator:
             "staged_diff", data={"task_id": task.id, "candidate_sha": candidate_sha, "summary": staged_summary}
         )
         self._finish_postcommit(execution, worktree_git, state, task)
+
+    def _prepare_write_capable_worker(
+        self, task: Task, execution: TaskExecution, worktree_git: GitGateway
+    ) -> GitGateway | None:
+        """Preflight for a write-capable (non-audit) dispatch through
+        `self._worker_repos`, run once the pending-intent crash check in
+        `_dispatch_task_postcommit` has already ruled out a recoverable
+        in-flight commit for this exact worktree. Two independent
+        fail-closed gates (Autoloop M1 finding #3, failed-round isolation):
+
+          * the PRIMARY checkout (index + working tree) must be clean —
+            refused outright (loop_fatal: this is an environmental
+            precondition that affects every task, not just this one) rather
+            than trusted as a baseline for the escape detector's snapshot
+            (`_execute_with_escape_detection`);
+          * the WORKER repo must have no uncommitted residue. Any dispatch
+            that reaches here without having committed (a crashed agent, a
+            validation failure that returned `status="error"` before
+            `commit_and_capture` ever ran) leaves files on disk in the SAME
+            worker repo `execution.worktree_path` always points at; reusing
+            that dirty worktree for the next attempt would let content that
+            failed its OWN validation ride along into a LATER round's
+            commit — the exact bug reported. Residue is QUARANTINED (moved
+            out of `workers_root` via `WorkerRepoManager.quarantine`, never
+            deleted — preserved on disk for diagnosis, but no longer
+            reachable by any future `create()` for this task id) and a
+            fresh worker repo is created from `execution.candidate_sha` (a
+            round already committed — a later `revise` still builds on that
+            committed work) or `execution.task_base_sha` (nothing has
+            committed yet). The fetch SOURCE differs accordingly:
+            `candidate_sha` exists only inside the object database we just
+            quarantined, so that recreation fetches from the quarantined
+            path, not the primary checkout; `task_base_sha` always exists in
+            the primary checkout, so that recreation fetches from there as
+            usual.
+
+        Returns the `GitGateway` to actually use — `worktree_git` unchanged
+        when it was already clean, or a fresh one rooted at the recreated
+        repo — or `None` if this already parked (`_to_needs_user` was
+        called); the caller must return immediately without dispatching the
+        executor.
+        """
+        if self._git.is_dirty():
+            self._to_needs_user(
+                f"task {task.id}: the primary checkout is not clean (staged "
+                "or unstaged changes present) — refusing to start a "
+                "write-capable agent. A dirty primary checkout cannot be "
+                "used as a trustworthy baseline for detecting whether the "
+                "agent wrote outside its worker repository, and this "
+                "affects every task, not just this one.",
+                kind="loop_fatal",
+                code="primary_checkout_dirty",
+                task_id=task.id,
+                detail=f"dirty={self._git.dirty_files()}",
+            )
+            return None
+
+        if worktree_git.dirty_entries_all():
+            label = f"attempt{execution.attempt_count + 1}-{utcnow_iso().replace(':', '')}"
+            quarantined_at = self._worker_repos.quarantine(task.id, label)
+            self._log(
+                "worker_quarantined",
+                data={
+                    "task_id": task.id,
+                    "quarantined_at": str(quarantined_at),
+                    "reason": "residual uncommitted state from a prior attempt",
+                },
+            )
+            # `candidate_sha`, if set, names a commit made INSIDE the worker
+            # repo we just quarantined — its own local git object database,
+            # never pushed or fetched anywhere else. The primary checkout
+            # does not have that object, so fetching it from
+            # `self._git.repo_root` fails outright. Fetch from the
+            # quarantined copy instead (still a real, valid git repo on
+            # disk — `quarantine()` moves it, never deletes it — so the
+            # object is reachable there). Only `task_base_sha` — which by
+            # construction always exists in the primary checkout — uses the
+            # primary checkout as the fetch source.
+            if execution.candidate_sha:
+                resume_sha = execution.candidate_sha
+                fetch_source = quarantined_at
+            else:
+                resume_sha = execution.task_base_sha
+                fetch_source = self._git.repo_root
+            repo = self._worker_repos.create(task.id, fetch_source, resume_sha)
+            worktree_git = GitGateway(repo.path, self._policy, env=worker_env())
+            violations = verify_worker_isolation(worktree_git)
+            if violations:
+                self._to_needs_user(
+                    f"task {task.id}: the freshly recreated worker repository "
+                    "is not isolated — " + "; ".join(violations) + ". Nothing "
+                    "was executed.",
+                    kind="loop_fatal",
+                    code="worker_isolation_violation",
+                    task_id=task.id,
+                    detail="; ".join(violations),
+                )
+                return None
+
+        # v1 task-scope hardening: `task.approved_paths` is validated as a
+        # STRING by `tasks._validate_approved_path` (no globs, no '..', not
+        # absolute) when the task was planned/seeded, but that check has no
+        # filesystem awareness by design. Re-checked HERE, against the
+        # worker repo's actual on-disk content, immediately before a
+        # write-capable agent runs: a path that looks like an ordinary
+        # relative file can still traverse a symlink that already exists at
+        # or above it, writing through to somewhere outside the repository
+        # entirely.
+        symlink_violations = escape_detector.find_symlink_traversal(
+            worktree_git.repo_root, task.approved_paths
+        )
+        if symlink_violations:
+            self._to_needs_user(
+                f"task {task.id}: approved path(s) traverse a symlink — "
+                + "; ".join(symlink_violations)
+                + ". Nothing was executed.",
+                kind="task_fatal",
+                code="approved_path_symlink_traversal",
+                task_id=task.id,
+                detail="; ".join(symlink_violations),
+            )
+            return None
+        return worktree_git
+
+    def _execute_with_escape_detection(
+        self, directive: Directive, task: Task
+    ) -> ExecutionOutcome | None:
+        """Wraps a write-capable executor call with the Autoloop M1 escape
+        DETECTOR — a deterministic filesystem snapshot of the PRIMARY
+        checkout taken immediately before and immediately after the call,
+        nothing wider. See `escape_detector.py`'s module docstring for the
+        full threat model (detection, not prevention) and for why bracketing
+        exactly this call — rather than the whole task dispatch — is what
+        makes an explicit exclusion list for Autoloop's own volatile files
+        (state.json, the blocker/execution/intent stores, ...) unnecessary:
+        nothing in this orchestrator writes any of them between the two
+        snapshots below.
+
+        Returns the outcome, or `None` if an escape was detected — already
+        parked (loop_fatal: the isolation mechanism itself may be
+        compromised) — in which case the caller must return immediately
+        without committing anything.
+        """
+        paths_before = escape_detector.enumerate_checkout_paths(self._git)
+        before = escape_detector.snapshot_checkout(self._git.repo_root, paths_before)
+        outcome = self._executor.execute(directive, task)
+        # Re-enumerate rather than re-snapshotting the SAME path list: a
+        # brand-new file the agent created would not appear in
+        # `paths_before` at all, so "created outside the worker repo" could
+        # never be detected without a fresh enumeration here too.
+        paths_after = escape_detector.enumerate_checkout_paths(self._git)
+        after = escape_detector.snapshot_checkout(
+            self._git.repo_root, sorted(set(paths_before) | set(paths_after))
+        )
+        violations = escape_detector.diff_snapshots(before, after)
+        if violations:
+            self._to_needs_user(
+                f"task {task.id}: the write-capable agent changed the "
+                "PRIMARY checkout outside its worker repository — "
+                + "; ".join(violations)
+                + ". This is LOOP-FATAL: the isolation mechanism itself may "
+                "be compromised. Nothing was committed. This is DETECTION, "
+                "not prevention — the change already happened and is NOT "
+                "reverted automatically; inspect and resolve it by hand.",
+                kind="loop_fatal",
+                code="checkout_escape_detected",
+                task_id=task.id,
+                detail="; ".join(violations),
+            )
+            return None
+        return outcome
 
     def _park_round_cap(
         self,
@@ -1753,7 +2054,15 @@ class Orchestrator:
         state: LoopState,
         task: Task,
     ) -> None:
-        execution.attempt_count += 1
+        # `attempt_count` is NOT incremented here (M1 finding #3) — it is
+        # incremented and persisted BEFORE the executor ever runs (see
+        # `_dispatch_task_postcommit`), so a validation failure or a crash
+        # that never reaches this method still consumes an attempt. This
+        # method is reached either right after a fresh commit (that
+        # increment already happened earlier in the SAME call) or via
+        # crash-recovery adoption (the increment happened in the EARLIER,
+        # crashed process, before ITS executor call) — either way the count
+        # on disk is already correct and must not be bumped again here.
         failures, validation_summary = self._verify_committed(execution, worktree_git)
         state.last_validation = validation_summary
         # `review_round` counts REVIEWS, not commit attempts. It is incremented
@@ -2003,12 +2312,28 @@ class Orchestrator:
                         gateway_protected,
                     )
             except GitCommandError as exc:
+                # Distinguish a PROTECTED-branch refusal from every other
+                # push refusal (remote unreachable, non-fast-forward, ...) —
+                # computed the SAME way `push_exact` itself decides it
+                # (bare branch name OR the full ref, against the SAME
+                # `gateway_protected` set already computed above, which
+                # already accounts for `allow_protected_push`), never by
+                # sniffing the exception text. This is what makes
+                # `push_refused_protected` (Autoloop M1 finding #7) a real,
+                # emitted code instead of a dead key in
+                # `cli._RESOLUTION_PRECONDITIONS` — `_precondition_protected`
+                # there refuses to let ANY answer text clear it, which only
+                # matters if the code is ever actually produced.
+                branch_name = dest_ref[len("refs/heads/"):] if dest_ref.startswith("refs/heads/") else dest_ref
+                is_protected_refusal = bool(gateway_protected) and (
+                    branch_name in gateway_protected or dest_ref in gateway_protected
+                )
                 self._to_needs_user(
                     f"task {binding.task_id}: push of {binding.candidate_sha[:12]} "
                     f"to {remote}/{dest_ref} was REFUSED — {exc}. Nothing was "
                     "pushed; the commit itself is unaffected.",
                     kind="loop_fatal",
-                    code="push_refused",
+                    code="push_refused_protected" if is_protected_refusal else "push_refused",
                     task_id=binding.task_id,
                     detail=f"remote={remote} dest_ref={dest_ref} error={exc}",
                 )

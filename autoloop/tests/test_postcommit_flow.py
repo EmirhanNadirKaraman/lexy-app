@@ -260,7 +260,9 @@ class WritingExecutor:
         )
 
 
-def build_postcommit(tmp_path, executor, task_id="t1", validation_runner=ok_validation):
+def build_postcommit(
+    tmp_path, executor, task_id="t1", validation_runner=ok_validation, approved_paths=None
+):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     run_git(repo_root, "init", "-q", "-b", "main")
@@ -285,7 +287,18 @@ def build_postcommit(tmp_path, executor, task_id="t1", validation_runner=ok_vali
     state = LoopState.new(URL)
     store.save(state)
 
-    task = Task(id=task_id, title=f"Title {task_id}", description="desc")
+    # `approved_paths` defaults to every path the executor is ever going to
+    # report as changed (across every round, for `per_round_files`-shaped
+    # doubles) — computed HERE, before the task ever dispatches, mirroring
+    # what a real `plan`/`seed_tasks.json` scope declaration looks like. A
+    # test that specifically wants to exercise an out-of-scope path passes
+    # `approved_paths` explicitly instead.
+    if approved_paths is None:
+        derived = set(getattr(executor, "files", {}) or {})
+        for round_files in getattr(executor, "per_round_files", None) or ():
+            derived |= set(round_files)
+        approved_paths = tuple(sorted(derived))
+    task = Task(id=task_id, title=f"Title {task_id}", description="desc", approved_paths=tuple(approved_paths))
     registry = TaskRegistry([task])
     task_store = TaskStore(config.tasks_file)
     task_store.save(registry)
@@ -540,7 +553,7 @@ def precommit_a_crash(tmp_path, executor_files, install=None):
     'commit exited 0' and 'the sha was saved' leaves behind."""
     executor = WritingExecutor(tmp_path / "worktrees", {})  # never actually called
     orch, repo_root, worktrees, execution_store, intent_store, task = build_postcommit(
-        tmp_path, executor
+        tmp_path, executor, approved_paths=tuple(executor_files.keys())
     )
     if install is not None:
         install(repo_root)

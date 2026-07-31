@@ -290,3 +290,25 @@ def test_one_bad_finding_does_not_mark_a_domain_uncovered(repo, tmp_path):
     outcome = build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
     assert outcome.status == "ok"
     assert "## Domain coverage — 6/6 domains reported usable output" in outcome.details
+
+
+def test_report_details_are_capped_for_the_review_payload():
+    """A ~70 kB report inlined into `details` produced 104k/113k/122k-character
+    messages — most of everything this loop ever sent, and the load that wedged
+    a conversation into accepting messages and never replying."""
+    from autoloop.audit.executor import MAX_REPORT_DETAILS_CHARS, cap_report_details
+
+    report = "COVERAGE TABLE\n" + ("finding line\n" * 8000)
+    assert len(report) > 70_000
+    capped = cap_report_details(report, "docs/AUDIT_2026-07-31.md")
+
+    assert len(capped) < MAX_REPORT_DETAILS_CHARS + 500
+    assert capped.startswith("COVERAGE TABLE"), "the head is what a reviewer needs"
+    assert "EXCERPT" in capped, "truncation must be announced, never silent"
+    assert "docs/AUDIT_2026-07-31.md" in capped, "must name where the full text is"
+
+
+def test_a_short_report_is_not_truncated():
+    from autoloop.audit.executor import cap_report_details
+
+    assert cap_report_details("a short report", "p.md") == "a short report"

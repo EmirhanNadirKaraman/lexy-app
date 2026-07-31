@@ -1135,6 +1135,129 @@ two bonus tests for the audit/`None`-task refusal branches and the
 constructor's `worker_repo_root_for`/`policy` pairing contract). **668
 tests.**
 
+**Worker-isolation hardening (2026-07-31; `docs/AUTOLOOP.md` §4e,
+`docs/SECURITY.md` S23-S26).** An adversarial review of the M2 worker
+isolation (above) found four gaps: the worker repo lived at
+`config.workers_dir` (`state_dir/"workers"`), INSIDE the checkout, invisible
+to every git-based verification primitive scoped to it; the write-capable
+agent's confinement was a sentence in the prompt with no filesystem-escape
+detector; a task's post-commit path-ownership check was validated against
+the executor's OWN report (`outcome.changed_paths`), never against anything
+authorized independently, so an agent could never be "caught" widening its
+own scope; a failed round's uncommitted files stayed in the worker repo for
+the NEXT round to pick up, and the attempt-count ceiling only incremented
+after a commit, so a validation failure never consumed an attempt. All four
+closed (the third partially — see S24): `config.workers_root`, a required
+absolute config value validated by the new `worker_env.validate_workers_root`
+(refuses relative/nested-under-checkout/`.git`/state-dir/publisher-dir,
+including a linked worktree's real gitdir behind its `.git` pointer file) —
+replaces `config.workers_dir` everywhere a `WorkerRepoManager` is
+constructed for real dispatch; new `escape_detector.py` — a deterministic
+before/after filesystem snapshot (content sha256/symlink target/executable
+bit over tracked+untracked+ignored paths) of the PRIMARY checkout bracketing
+every write-capable executor call, non-audit only; new `Task.approved_paths`
+— the ONLY thing a non-audit task's post-commit path-ownership check is
+validated against now, fixed before the writer starts and never widened by
+`outcome.changed_paths`/a recovered `CommitIntent.planned_paths` again (the
+audit keeps its pre-existing accumulate behaviour — its scope is already
+bounded by `MarkdownPolicy`, a different, non-agent-controlled mechanism); a
+pre-commit gate refuses to commit at all if `outcome.changed_paths` leaves
+`approved_paths`; `WorkerRepoManager.quarantine` moves (never deletes) a
+dirty worker repo aside before a fresh attempt, so failed-round residue can
+never ride into a later commit; `attempt_count` now increments and persists
+BEFORE the executor runs, not in `_finish_postcommit`. Two dead/mismapped
+`cli._RESOLUTION_PRECONDITIONS` keys fixed
+(`git_failure_budget`→`git_failure_budget_exhausted`;
+`worker_environment_drift` now a dedicated `verify_worker_isolation`-based
+recheck instead of the unrelated browser/login probes) and one previously
+dead code made real (`push_refused_protected`, now actually emitted by
+`Orchestrator._dispatch_task_push` when a push is refused specifically for
+targeting a protected branch). New `test_m1_hardening.py` (52 tests):
+`workers_root` relative/missing/nested-under-checkout/`.git`/linked-worktree-
+gitdir/state-dir/publisher-dir refusal and the positive external-path
+acceptance case, `escape_detector` unit tests for each of
+creation/deletion/tracked-content/ignored-content/symlink-target/
+executable-bit changes, end-to-end orchestrator dispatch tests proving an
+agent writing outside its worker repo (including tampering with
+`.autoloop/state.json` and a blocker record specifically) is caught and the
+audit path is NOT wrapped, `Task.approved_paths` structural-violation
+parametrization (absolute/`..`/glob/empty/padded/backslash — 14 cases) plus
+symlink-traversal, an agent-reported extra path refused before commit, an
+unexpected commit path from a crash-recovered prior process refused after
+adoption (hooks are proven categorically impossible for `worker_repos`, so
+this is the realistic mechanism, not an evasion of an easier hook-based
+test), a task with no `approved_paths` refused before a worker repo is even
+created, failed-attempt residue proven absent from the next candidate (with
+the quarantine directory and its preserved evidence asserted directly), the
+attempt budget proven to survive a simulated process restart (a fresh
+`Orchestrator` per attempt, nothing carried over but disk state), the
+`worker_environment_drift` precondition proven to be the dedicated recheck
+(not the browser one) by exercising both a still-broken and a genuinely-
+fixed config, `answer` end-to-end refusing a worker-drift blocker on
+arbitrary text, and an AST-based (not regex, not hand-maintained)
+exhaustiveness check that every `_RESOLUTION_PRECONDITIONS` key matches a
+real `code=` literal `orchestrator.py` actually emits (including one built
+from a conditional expression). **723 tests initially; +6 across two
+rounds of same-day follow-up below.**
+
+**Same-day follow-up, round 1 (5 tests) — two real gaps an external review
+found in the pass above, neither caught by its own suite passing:** (1)
+three new `loop_fatal` codes the pass introduced
+(`primary_checkout_dirty`/`checkout_escape_detected`/
+`worker_isolation_violation`) had no `_RESOLUTION_PRECONDITIONS` entry at
+all — the exact S26 failure mode, reopened by S26's own fix, since the
+forward-only AST exhaustiveness test cannot detect a missing key, only a
+stale one. Mapped `worker_isolation_violation` to the existing
+`_precondition_worker_environment_drift`, `primary_checkout_dirty` to a
+new `_precondition_checkout_clean` (re-runs `GitGateway.is_dirty()`), and
+— at this point incorrectly, see round 2 below —
+`checkout_escape_detected` to that SAME function; plus three dedicated
+tests and one new CURATED (not AST-derived) reverse test,
+`test_security_and_environment_codes_all_have_a_precondition`, pinning the
+full set of codes that must never resolve on text alone. (2) The
+vacuous-by-construction original `test_audit_dispatch_is_not_wrapped_by_
+the_escape_detector` (its assertion was a disjunction satisfied by ANY
+unrelated loop_fatal park, and it dispatched a task id the audit path
+never actually uses) rewritten under the same name with a positive spy on
+`_execute_with_escape_detection` itself. A separate, non-test bug found and
+fixed in the same round (one new test, no new file):
+`_prepare_write_capable_worker`'s quarantine-and-recreate branch always
+fetched from the primary checkout even when resuming
+`execution.candidate_sha`, which exists only inside the worker repo just
+quarantined — see `test_quarantine_recreate_resumes_from_a_candidate_sha_
+that_only_exists_in_the_quarantined_repo` and `docs/COMMON_ERRORS.md` §8.
+
+**Same-day follow-up, round 2 (1 more test; 1 existing test rewritten, no
+count change from it) — a second external review found the round-1 fix for
+`checkout_escape_detected` was itself wrong.** Sharing
+`_precondition_checkout_clean` with `primary_checkout_dirty` means the
+recheck is `GitGateway.is_dirty()`, which only sees tracked + working-tree
+changes — but `escape_detector`'s own snapshot deliberately covers a
+SUPERSET (tracked + untracked + IGNORED paths; this file's own
+`test_escape_detector_detects_ignored_content_change` proves
+`git.dirty_files() == []` even while the detector correctly flags
+ignored-path tampering). Autoloop's own state directory is gitignored in
+production, so the canonical "agent forged its own records" escape is
+EXACTLY the case an `is_dirty()` recheck cannot see — that blocker would
+have cleared on a check that verified nothing. Fixed:
+`checkout_escape_detected` now has its own
+`_precondition_checkout_escape_detected`, which refuses UNCONDITIONALLY
+(mirroring `_precondition_protected`'s shape) rather than attempting any
+automated recheck.
+`test_checkout_escape_detected_precondition_refuses_until_checkout_is_clean`
+(round 1's test, which asserted the WRONG "clears once clean" behaviour)
+is replaced by
+`test_checkout_escape_detected_precondition_never_resolves_by_answer_text`
+(dirty AND clean both refuse) plus one new end-to-end test,
+`test_checkout_escape_detected_blocker_cannot_be_cleared_even_when_only_an_ignored_path_was_touched`,
+which reproduces the exact ignored-path scenario through
+`python -m autoloop answer`. The audit-dispatch negative-control test from
+round 1 was also strengthened in this round (no count change): asserting
+only that the escape-detector spy saw zero calls could pass vacuously if
+the audit dispatch parked for an unrelated reason before ever reaching the
+executor — `executor.calls` is now asserted directly too, proving the
+audit executor actually ran. **729 tests.**
+
 **584 tests (pre-blockers baseline), fully hermetic** — no network, no ChatGPT, no playwright import,
 no live `claude` CLI (agent runner stubbed), no app DB. `test_git_gateway.py`,
 `test_manifest.py`, `test_audit_executor.py`, `test_postcommit_primitives.py`,
@@ -1187,6 +1310,7 @@ Run: `pytest autoloop/tests` from the repo root. **Not included in bare
 | `test_postcommit_review.py` | 17 | Autoloop M1 pass 2b, real git: `task_id`/`task_branch`/`base_sha`/`candidate_sha` are literal substrings of `PendingRequest.payload`, and `sha256(payload) == report_sha256` recomputed independently (not just asserted against `build_review_packet`'s return value); the packet is byte-identical after an unrelated later local commit; **approving candidate A cannot push candidate B** (the response's frozen `PostcommitBinding` disagrees with a fresh `TaskExecutionStore` lookup — refused); `revise` keeps `task_base_sha` and advances `candidate_sha`; **the round>0 path-ownership union fix**, regression-tested (round 2 touching a NEW path is not flagged as "outside" the plan); a third review round never reaches the executor or ChatGPT, parking with both the full diff and the latest round's own diff plus the feedback; `push_exact` through the orchestrator excludes a later local commit, is idempotent on a same-sha retry, refuses a non-fast-forward remote (a sibling commit pushed first), and is refused twice over for a protected destination (the policy layer, proving `authorize_directive` is judged against `resp.postcommit.task_branch` not the main checkout's branch, AND `push_exact`'s own independent check); `allow_push=false` refuses without pushing; a same-candidate retry after a simulated crash never calls `push_exact` again (`remote_ref_sha` pre-check); a tampered `PendingRequest.prompt` with a stale `prompt_sha256` is refused before `client.submit` is ever called; no `.push(` caller of the removed method remains anywhere in `autoloop/` (grep-style, source-scanned); an oversized packet (`RANGE_DIFF_MAX_BYTES` forced tiny) parks with a clear message instead of propagating as a budget-cycled git error. **RETIRED 2026-07-30 (S21): 3 legacy-push-guard tests deleted, replaced by 1 stronger test.** The three (`test_parse_error_reprompt_does_not_leak_postcommit_binding_to_legacy_push`, `test_stale_audit_manifest_does_not_leak_postcommit_push_to_legacy_path`, `test_successful_postcommit_push_does_not_block_a_later_unrelated_audit_push`) each pinned a conditional fail-closed guard INSIDE the now-removed `_dispatch_git`. The replacement, `test_legacy_commit_and_push_is_always_refused_even_with_a_live_candidate`, proves the STRICTLY STRONGER successor: `commit`/`commit_and_push`/an unbound `push` are refused UNCONDITIONALLY now (`_dispatch`'s `legacy_git_path_retired` policy denial), whether or not a live candidate is on record — there is no more leak-shaped scenario to test. |
 | `test_worker_publisher.py` | 32 | Autoloop M2, real git throughout: worker repo has no remotes (config-gated AND raw `.git/config` read); `worker_env()` neutralizes a poisoned global `HOME` (`insteadOf` + credential helper both invisible under it); an active hook in the worker's controlled hooks dir is reported by `verify_worker_isolation`, `WorkerRepoManager.create` refuses a pre-populated hooks dir outright, and a real commit proves a hook in the DEFAULT (non-redirected) `.git/hooks` never fires; **the live platform-trap negative control** — `GIT_CONFIG_SYSTEM=/dev/null` genuinely leaks the ambient system `credential.helper` via a real subprocess, `worker_env()` (via `GIT_CONFIG_NOSYSTEM=1`) does not; `SSH_AUTH_SOCK`/`GIT_SSH*`/`GIT_ASKPASS`/any other `GIT_CONFIG*` stripped, forced vars asserted by name; `describe_policy` carries no secret substring; a worker-planted ref/object in the publisher does not change what `publish()` sends (candidate_sha stays authoritative) and, with a DECOY remote planted first so the check has non-empty text to search (an empty config would make path-absence vacuous), the worker's own config carries no path reference to the publisher; `Publisher.import_candidate` imports exactly the candidate object (idempotent), refuses an absent object, a non-commit object (a real blob sha — via `read_commit`'s `cat-file commit` failing, not a separate `cat-file -t`), and a malformed sha; a later worker HEAD moving on does not affect a candidate already imported (the publisher never even fetches the later commit); `Publisher` refuses construction on multiple configured urls / `pushurl` / `mirror` / `push.followTags` / an `insteadOf` rewrite; a hook in the publisher's DEFAULT (non-effective) `.git/hooks` never fires a real push (canary proven absent) while a hook in the EFFECTIVE (redirected) dir refuses construction outright; `publish` refuses a protected branch and a force-shaped refspec (`+`-prefix, `..`); repeated identical `publish` is idempotent; a divergent remote refuses non-fast-forward without ever forcing; crash recovery reads `remote_ref_sha` and never re-pushes (`push_exact` monkeypatched to fail if called); `Publisher.describe()` redacts embedded url userinfo. **Orchestrator wiring:** `_dispatch_task_push` with a `publisher=` supplied imports the candidate into the SEPARATE publisher repo before publishing (asserted via direct object-presence in the publisher's own repo — the discriminating fact between this path and the no-publisher one, verified to actually fail if the routing is removed); with `publisher=None` (a supported non-CLI mode; production `cli._build_orchestrator` always sets one now — see `test_v1_smoke.py`) `worktree_git.push_exact` runs directly from the task's own worktree and the publisher repo never receives the object. |
 | `test_v1_smoke.py` | 14 | **New 2026-07-30 — Autoloop v1 wiring, end to end through `cli.py`'s real entry points, real git throughout.** `_build_orchestrator` constructs the full collaborator set and `audit`/`implement` dispatch actually reaches `_dispatch_task_postcommit`; the legacy `_dispatch_git`/`GitGateway.commit()` are structurally gone (`hasattr` + source-scan); `next-task` prints `rt-01`'s exact line from the git-tracked `seed_tasks.json`; a CLI-built worker repo is isolated (`verify_worker_isolation`); the persisted candidate sha matches an independent, freshly-read `git rev-parse HEAD` and the review packet embeds it literally; `revise` retains `task_base_sha` while advancing `candidate_sha`; an approved push calls `push_exact` ONLY on the `Publisher`'s own repo, never the worker's; a drifted publisher url snapshot (main checkout's `origin` changed since provisioning) refuses the push and names `reprovision-publisher --confirm`; `reprovision_publisher` refuses without `confirm=True`, updates the snapshot only with it, and no directive-reachable module calls it (source-scanned); a protected task branch refuses the push; an idle, unchanged repository fingerprint makes the selection policy return `False` having made ZERO Claude/ChatGPT calls (counting fakes that raise if invoked); a session parked mid-flight (`EXECUTING`) is resumed by `run --continuous` to completion via the ordinary `Orchestrator.run()`, never re-derived; `doctor` reports `worker_isolation`/`hooks_dirs`/`publisher`/`publisher_url_drift` all `ok` against a fully-configured repo. |
+| `test_m1_hardening.py` | 58 | **New 2026-07-31 — worker-isolation hardening (`docs/AUTOLOOP.md` §4e, `docs/SECURITY.md` S23-S26); +6 across two rounds of same-day follow-up (S25/S26 addenda).** See the narrative entry above this table for the full description; self-contained, real git throughout, no shared fixtures imported from other test files. |
 | `test_blockers.py` | 15 | **New 2026-07-31 — continuous-mode blockers (`docs/AUTOLOOP.md` §9c).** A `task_fatal` park (review-round cap, driven directly through `_dispatch_executor` — real git, `WorktreeManager`-backed) quarantines only that task (`TaskRegistry.block`, `TaskState.BLOCKED_BY_OPERATOR`) and the NEXT ready task (`next_ready()`, asserted by id) is what `_select_and_kickoff` picks up; the block survives a fresh `TaskStore` reload (proving `_handle_parked_task`'s `task_store.save` isn't decorative). A `loop_fatal` park (pre-seeded `needs_user` state) stops `_run_continuous` (`rc == 2`) and leaves every task's status untouched. `_to_needs_user`'s default (`kind` unset) persists as `loop_fatal`/`unclassified`; a `None`/unrecognised `park_kind` on a pre-existing state file is treated as `loop_fatal` by `_handle_parked_task`, never task_fatal. `Blocker` round-trips through `BlockerStore` with the full question text; a corrupt record raises (`load`/`open_blockers`/`all_blockers` all propagate, never silently skip) EXCEPT inside `_summary`, which degrades to a `?` display rather than taking `status`/every park message down with it. `blockers`/`answer` CLI commands: listing shows id/task/question, `answer` resolves + unblocks a `task_fatal` blocker's task, refuses an unknown id and an already-resolved one (second answer never overwrites the first). Exhaustion (no ready task, unchanged fingerprint, >=1 open blocker) prints every open blocker and exits 0; with zero open blockers and everything blocked, `_run_continuous` still makes zero Claude/zero ChatGPT calls (counting fakes). `next_ready()`/`ready_tasks()` skip every blocked task with no changes to either method. A pre-existing `tasks.json` with no `blocked_reason` key loads, defaults to `""`, and supports `block()` immediately. Round-trip: block → `answer` → task READY → selected by `_select_and_kickoff` on the next pass. **Enforcement:** a quarantined task's id cannot be dispatched around — `policy.authorize_directive` denies `implement`/`revise` naming it directly (`task_blocked_by_operator`), and `TaskRegistry.mark_in_progress` refuses it too, defense in depth for any dispatch path that bypasses policy. |
 
 Fakes live in the test files themselves; `conftest.py` only inserts the repo
@@ -1967,7 +2091,7 @@ Run all three. The lint step is not optional.
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
 | Backend | `cd lexy-app/backend && python3 -m pytest -n auto` | 1258 passed, 2 skipped |
 | Root pipeline | `pytest tests/` *(repo root)* | 368 passed |
-| Autoloop | `pytest autoloop/tests` *(repo root; only when touching `autoloop/`)* | 668 passed |
+| Autoloop | `pytest autoloop/tests` *(repo root; only when touching `autoloop/`)* | 729 passed |
 
 > **Backend command reconciled 2026-07-29:** it must be `python3 -m pytest`,
 > NOT the bare `pytest` entrypoint. `python -m` puts the cwd on `sys.path`,

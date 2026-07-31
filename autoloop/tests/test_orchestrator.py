@@ -73,8 +73,20 @@ def block(obj) -> str:
     return f"Reasoning...\n```json\n{json.dumps(obj)}\n```"
 
 
-def plan_block(*ids):
-    tasks = [{"id": tid, "title": f"Title {tid}", "description": "desc"} for tid in ids]
+def plan_block(*ids, approved_paths=("docs/AUDIT_2026-07-29.md",)):
+    # `approved_paths` defaults to match `build_postcommit`'s default
+    # `executor_files` — every task in the batch gets the same declared
+    # scope, which is harmless for ids that are never actually implemented
+    # in a given test and correct for the one (usually "t1") that is.
+    tasks = [
+        {
+            "id": tid,
+            "title": f"Title {tid}",
+            "description": "desc",
+            "approved_paths": list(approved_paths),
+        }
+        for tid in ids
+    ]
     return block({"version": 3, "decision": "plan", "reason": "roadmap", "tasks": tasks})
 
 
@@ -418,8 +430,10 @@ def build(
     return orch, store, git, executor, made, registry, manifest_store
 
 
-def ready_task(tid="t1"):
-    return Task(id=tid, title=f"Title {tid}", description="desc")
+def ready_task(tid="t1", approved_paths=("docs/AUDIT_2026-07-29.md",)):
+    # Default matches `build_postcommit`'s own default `executor_files` below
+    # — most callers here never override either, so the pair stays in sync.
+    return Task(id=tid, title=f"Title {tid}", description="desc", approved_paths=tuple(approved_paths))
 
 
 IMPLEMENT_ON = PolicyConfig(implement_enabled=True)

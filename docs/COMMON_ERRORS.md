@@ -578,6 +578,118 @@ not a build failure.
 
 ---
 
+## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
+
+### A blocker's "recheck the condition" precondition is narrower than what actually fired the park, so it clears on nothing
+**Symptom:** `cli._RESOLUTION_PRECONDITIONS["checkout_escape_detected"]` was
+first fixed by pointing it at the SAME function already used for
+`primary_checkout_dirty` (`_precondition_checkout_clean`, which re-runs
+`GitGateway.is_dirty()`) — plausible, since both parks are about the
+primary checkout's state, and the fix passed every test written for it at
+the time. A second review caught that this clears the blocker for the
+exact scenario the detector exists to catch: an agent tampering with
+`.autoloop/state.json` (gitignored in production) leaves `is_dirty()`
+reporting a clean tree throughout.
+**Cause:** the park (`escape_detector`'s before/after snapshot) and the
+recheck (`is_dirty()`) were built on DIFFERENT path enumerations —
+`enumerate_checkout_paths` deliberately covers tracked + untracked +
+IGNORED paths (see finding #2's own design and
+`test_escape_detector_detects_ignored_content_change`, which asserts
+`git.dirty_files() == []` even while the detector correctly flags ignored-
+path tampering — that assertion was sitting in the same test file the
+whole time and named the exact mismatch). A precondition that reuses an
+existing recheck function without checking whether that function's
+COVERAGE matches the condition that fired the specific park will pass
+trivially whenever the two diverge, and "the checkout looks clean" is a
+condition an agent tampering with a gitignored path can satisfy by doing
+nothing at all.
+**Fix:** `checkout_escape_detected` now has its own
+`_precondition_checkout_escape_detected`, which refuses UNCONDITIONALLY —
+mirroring `_precondition_protected`'s shape — rather than attempting any
+automated recheck. Lesson for the next one of these: before pointing a new
+precondition at an EXISTING recheck function, verify the function's
+coverage actually matches what can trigger the park, not just that both
+happen to mention "the checkout." When a detector's whole design point is
+seeing MORE than an ordinary git status/diff would (as `escape_detector`'s
+is), no git-status-shaped recheck can be trusted to re-verify it — refusing
+unconditionally is the honest fallback, not a lesser fix.
+
+### End-to-end orchestrator test fails with `primary_checkout_dirty` for a reason that has nothing to do with what the test checks
+**Symptom:** every end-to-end `test_m1_hardening.py` test built around a real
+git repo parked `loop_fatal` / `primary_checkout_dirty` (or, in one case,
+`park_kind == "loop_fatal"` where the test expected `"task_fatal"`) the moment
+`orch._dispatch_executor(...)` ran — before the scenario under test (escape
+detection, path-ownership, quarantine, ...) ever got a chance to fire.
+**Cause:** this pass added a precondition that the PRIMARY checkout must be
+clean before any write-capable agent invocation (`_prepare_write_capable_
+worker`, M1 finding #2). `Orchestrator.__init__`/`StateStore.save(state)`
+writes `.al/state.json` into the repo root as its very first act; the real
+production repo's `.gitignore` excludes `.autoloop/` (and this test suite's
+`state_dir` is set to `.al`, not `.autoloop`), but the test helper's
+throwaway `real_repo()` fixture never replicated any gitignore rule at all —
+so that write showed up as an untracked, dirty path and tripped the new
+precondition for every single test, regardless of what it was trying to
+exercise.
+**Fix:** `_build_worker_repos_orchestrator` (the shared fixture for this
+test file) commits a `.gitignore` containing `.al/\n` as its first step,
+before constructing anything. Any new end-to-end orchestrator test built on
+a real git repo needs the same line — grep `_build_worker_repos_orchestrator`
+for the exact pattern rather than re-deriving it.
+
+### A test tries to prove path-ownership enforcement via a commit `pre-commit` hook and gets refused before the scenario even starts
+**Symptom:** installing a `pre-commit` hook into a `WorkerRepoManager`
+worker's controlled hooks directory, then dispatching, refused immediately
+with `worker_isolation_violation` — the hook-based scenario the test was
+trying to model (an unexpected path landing in a commit via a hook) never
+ran at all.
+**Cause:** `verify_worker_isolation` refuses ANY active hook found in a
+worker's hooks directory, unconditionally, as a blanket isolation
+guarantee — it does not distinguish "a malicious hook" from "a test fixture
+installing one on purpose." `WorkerRepoManager.create` separately refuses
+outright if the hooks directory is non-empty at creation time, so a hook
+cannot even be pre-staged before the worker repo exists.
+**Fix:** hooks are categorically impossible to exercise on the
+`worker_repos` path — this is intentional, not a gap (see
+`test_worker_isolation_refuses_any_active_hook_before_anything_else_runs`,
+which asserts exactly this as a positive control). To model "an unexpected
+path lands in a real commit some OTHER way", use the crash-recovery path
+instead: commit both an approved and unapproved path directly via
+`worker_git.commit_and_capture(...)`, leave `candidate_sha` unpersisted
+(simulating a crash), and let the orchestrator's crash-recovery
+(`reconcile_after_crash` / `CommitIntent`) adopt the commit as `RECOVERABLE`
+— the post-commit path-ownership check still refuses it from there. See
+`test_unexpected_commit_path_from_a_prior_process_is_rejected`.
+
+### `WorkerRepoManager.create()` raises `GitCommandError` fetching a `candidate_sha` after quarantine-and-recreate, even though the sha is real and was committed moments earlier
+**Symptom:** a round that already committed successfully (`candidate_sha`
+set), followed by a LATER round that fails validation and leaves residue in
+the same worker repo, then a THIRD round whose dispatch quarantines that
+dirty repo and tries to recreate — the recreate's `git fetch -q <source>
+<candidate_sha>` fails with `src refspec <sha> does not match any`, even
+though `candidate_sha` is a real commit that genuinely exists on disk.
+**Cause:** `_prepare_write_capable_worker`'s quarantine-and-recreate branch
+always passed `self._git.repo_root` (the PRIMARY checkout) as the fetch
+source, regardless of whether it was resuming from `execution.task_base_sha`
+(which the primary checkout always has) or `execution.candidate_sha` (a
+commit made INSIDE the worker repo's own, separate git object database —
+`WorkerRepoManager` creates a real, standalone `git init` repo per task,
+never a linked worktree, so nothing about that commit is ever pushed or
+otherwise made visible to the primary checkout). Fetching an object the
+source repo never had was always going to fail; `test_failed_attempt_
+residue_absent_from_the_next_candidate` didn't catch this because its
+quarantine happens BEFORE any commit, so it only ever exercised the
+`task_base_sha` branch.
+**Fix:** the fetch source now depends on which sha is being resumed —
+`execution.candidate_sha` (when set) fetches from the just-quarantined
+directory (`WorkerRepoManager.quarantine` MOVES the repo, never deletes it,
+so the object is still there and reachable via a local-path fetch);
+`execution.task_base_sha` still fetches from `self._git.repo_root` as
+before. See `orchestrator.py`'s `_prepare_write_capable_worker` and the
+regression test `test_quarantine_recreate_resumes_from_a_candidate_sha_
+that_only_exists_in_the_quarantined_repo`.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found

@@ -101,7 +101,13 @@ _ALLOWED_GIT: dict[str, frozenset[str]] = {
     # Read-only index inspection, needed to verify what was actually STAGED
     # rather than what the working tree currently shows (adopted manifests).
     "cat-file": frozenset(),
-    "ls-files": frozenset({"-s", "-z", "--"}),
+    # `-s`/`--` are the pre-existing staged-index-inspection flags (`staged_mode`).
+    # `--others`/`--ignored`/`--exclude-standard` are read-only enumeration
+    # flags added for the M1 escape detector (`escape_detector.py`), which
+    # needs the literal tracked/untracked/ignored path lists `git status`
+    # cannot give it without collapsing directories or omitting unchanged
+    # tracked files — see `GitGateway.list_tracked_paths` and friends.
+    "ls-files": frozenset({"-s", "-z", "--", "--others", "--ignored", "--exclude-standard"}),
     # Immutable-tree commit path (adopted manifests). `git commit` is NOT used
     # there: it runs hooks that can rewrite the index between verification and
     # commit creation. These build and verify a tree, create a commit object

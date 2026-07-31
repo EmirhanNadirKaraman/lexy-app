@@ -178,6 +178,93 @@ def _run(args: list[str], cwd: Path, env: dict) -> None:
         )
 
 
+def _is_nested(candidate: Path, boundary: Path) -> bool:
+    """True when `candidate` equals `boundary` or is anywhere underneath
+    it — both already-resolved absolute paths."""
+    try:
+        candidate.relative_to(boundary)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_workers_root(
+    workers_root: Path | None, repo_root: Path, state_dir: Path
+) -> list[str]:
+    """Human-readable violations in `workers_root` as an EXTERNAL worker
+    location (Autoloop M1 finding #1). Empty means it is safe to use.
+
+    Refuses (never silently falls back to the old `state_dir/workers`
+    default — that IS finding #1, a worker repo nested inside the tree the
+    verification primitives are scoped to):
+
+      * unset (`None` — the config key was never provided);
+      * relative (nothing here can make a relative path unambiguous across
+        the different cwds `WorkerRepoManager`'s subprocesses run from — see
+        that class's own docstring on why it resolves eagerly);
+      * nested beneath the primary checkout, beneath its `.git` (both the
+        literal `<repo_root>/.git` entry AND, if that entry is a linked
+        worktree's gitdir POINTER FILE, the real git-common-dir it resolves
+        to — a worktree's `.git` is a text file, not a directory, so a
+        naive path-prefix check alone would miss a `workers_root` pointed at
+        the actual shared git directory a worktree redirects to), beneath
+        the state dir, or beneath either publisher path.
+
+    Called from `doctor.py` (a `fail` check) and from the same place
+    `WorkerRepoManager` gets constructed for real dispatch (`cli.py`) — both
+    must refuse identically; see each call site's own comment for why
+    duplicating the call (rather than only doctor) is what actually stops
+    an unsafe config from ever driving a real task.
+    """
+    if workers_root is None:
+        return [
+            "workers_root is not configured — set an absolute [paths].workers_root "
+            "in config.toml (see config.example.toml); there is no default"
+        ]
+    workers_root = Path(workers_root)
+    if not workers_root.is_absolute():
+        return [f"workers_root must be an absolute path, got {workers_root}"]
+
+    resolved = workers_root.resolve()
+    repo_resolved = Path(repo_root).resolve()
+    boundaries: list[tuple[str, Path]] = [
+        ("the primary checkout", repo_resolved),
+        ("the primary checkout's .git", repo_resolved / ".git"),
+        ("the state directory", Path(state_dir).resolve()),
+    ]
+    try:
+        from .publisher import publisher_hooks_path, publisher_repo_path
+
+        boundaries.append(("the publisher repo", publisher_repo_path(state_dir)))
+        boundaries.append(("the publisher hooks dir", publisher_hooks_path(state_dir)))
+    except Exception:  # pragma: no cover - publisher.py always importable in practice
+        pass
+
+    git_pointer = repo_resolved / ".git"
+    if git_pointer.is_file():
+        try:
+            text = git_pointer.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            text = ""
+        if text.startswith("gitdir:"):
+            target = text[len("gitdir:"):].strip()
+            target_path = Path(target)
+            if not target_path.is_absolute():
+                target_path = repo_resolved / target_path
+            boundaries.append(
+                ("the checkout's real git directory (linked worktree gitdir)", target_path.resolve())
+            )
+
+    violations = []
+    for label, boundary in boundaries:
+        if _is_nested(resolved, boundary):
+            violations.append(
+                f"workers_root ({resolved}) is nested beneath {label} ({boundary}) "
+                "— it must live entirely outside every one of these"
+            )
+    return violations
+
+
 class WorkerRepoManager:
     """Creates one isolated, no-remote repository per task.
 
@@ -284,6 +371,45 @@ class WorkerRepoManager:
         `WorktreeManager.remove`, which must run `git worktree remove`)."""
         shutil.rmtree(self.path_for(task_id), ignore_errors=True)
         shutil.rmtree(self.hooks_dir_for(task_id), ignore_errors=True)
+
+    def quarantine(self, task_id: str, label: str) -> Path:
+        """MOVE (never delete) the worker repo for `task_id` out of
+        `root_dir` into a sibling `quarantine/<task_id>-<label>` directory
+        (Autoloop M1 finding #3: failed-round isolation).
+
+        Content that failed its own validation, or was left behind by a
+        crashed agent, must never be reachable by a LATER `create()` call for
+        the same task id — `create()` already refuses if anything exists at
+        `path_for(task_id)`, so simply moving the old directory away and
+        letting the caller `create()` a fresh one there is sufficient; there
+        is no separate "is it really gone" check needed. Evidence is
+        preserved on disk (never `shutil.rmtree`d) so a human can inspect
+        what a failed attempt actually wrote, but it is intentionally no
+        longer under `root_dir`, so nothing here or in `WorkerRepoManager`
+        will ever look inside it again on its own.
+
+        `label` should be unique per call (e.g. an attempt number plus a
+        timestamp) — this method does not deduplicate or overwrite; a
+        colliding destination raises rather than silently clobbering an
+        earlier quarantined attempt's evidence.
+        """
+        validate_task_id(task_id)
+        src = self.path_for(task_id)
+        quarantine_root = self.root_dir.parent / "quarantine"
+        quarantine_root.mkdir(parents=True, exist_ok=True)
+        dest = quarantine_root / f"{task_id}-{label}"
+        if dest.exists():
+            raise GitCommandError(
+                f"quarantine destination {dest} already exists — 'label' must "
+                "be unique per call"
+            )
+        shutil.move(str(src), str(dest))
+        # The hooks dir is orchestrator-controlled and always created empty
+        # (`create()` refuses otherwise) — it is not evidence of what the
+        # agent wrote, so it is removed rather than quarantined alongside the
+        # repo, freeing the task id's hooks dir for the next `create()`.
+        shutil.rmtree(self.hooks_dir_for(task_id), ignore_errors=True)
+        return dest
 
 
 def verify_worker_isolation(git: GitGateway, expected_hooks_dir: Path | None = None) -> list[str]:

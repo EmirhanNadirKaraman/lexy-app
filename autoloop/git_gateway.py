@@ -267,6 +267,45 @@ class GitGateway:
         )
         return {p for p in raw.split("\0") if p}
 
+    # ---- checkout enumeration (M1 escape detector) ---------------------------
+    #
+    # `git status` (even with `-uall`) only reports what CHANGED against the
+    # index, and by default collapses an ignored directory to one entry for
+    # the directory itself — neither is what a filesystem snapshot needs: it
+    # must cover every tracked path regardless of whether it currently
+    # matches the index (so a working-tree-only edit to an untouched tracked
+    # file is comparable byte-for-byte across two snapshots), and every
+    # ignored path individually (so a write inside an ignored directory is
+    # not hidden behind a single collapsed directory entry). `git ls-files`
+    # does neither collapsing.
+
+    def list_tracked_paths(self) -> list[str]:
+        """Every tracked path (`git ls-files -z`) — independent of whether
+        the working tree currently matches the index, unlike `dirty_*`,
+        which only reports what CHANGED."""
+        raw = self._git_bytes("ls-files", "-z").decode("utf-8", "surrogateescape")
+        return [p for p in raw.split("\0") if p]
+
+    def list_untracked_paths(self) -> list[str]:
+        """Untracked, non-ignored paths, one per file — `.gitignore`d
+        content is excluded here and reported separately by
+        `list_ignored_paths` instead."""
+        raw = self._git_bytes("ls-files", "-z", "--others", "--exclude-standard").decode(
+            "utf-8", "surrogateescape"
+        )
+        return [p for p in raw.split("\0") if p]
+
+    def list_ignored_paths(self) -> list[str]:
+        """Ignored paths, one per file where git can see individual files —
+        a nested git repository (a real `.git` boundary git will not cross,
+        e.g. a stale pre-external-workers-root worker repo left on disk under
+        the checkout) is reported as ONE entry for its own root instead, since
+        git itself refuses to enumerate inside a repository boundary."""
+        raw = self._git_bytes(
+            "ls-files", "-z", "--others", "--ignored", "--exclude-standard"
+        ).decode("utf-8", "surrogateescape")
+        return [p for p in raw.split("\0") if p]
+
     def config_get(self, key: str) -> str:
         """`git config --get <key>`, or "" if unset.
 

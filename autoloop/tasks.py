@@ -29,6 +29,59 @@ TASKS_SCHEMA_VERSION = 1
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+#: A single path SEGMENT (between '/'s) for `Task.approved_paths` — v1 is
+#: deliberately restrictive: no glob metacharacters (`*?[]{}`), no
+#: whitespace, no leading '-' (a flag-injection habit elsewhere in this
+#: package). This is checked per-segment, not on the whole string, so a
+#: multi-directory path like `lexy-app/backend/routers/books.py` is built
+#: from segments this regex accepts individually.
+_APPROVED_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_approved_path(path: object) -> None:
+    """Raise `TaskGraphError` unless `path` is an EXACT, repository-relative
+    path safe to use as a git pathspec and a filesystem path: a non-empty
+    string, no leading/trailing whitespace, no leading '/' or '~' (not
+    absolute, not home-relative), no '\\\\' (Windows separator confusion), no
+    '.' or '..' segment, and every segment restricted to
+    `_APPROVED_PATH_SEGMENT_RE` — which by construction excludes every glob
+    metacharacter. This is intentionally a strict ALLOWLIST rather than a
+    blocklist of bad characters: v1 accepts exact paths only, so anything
+    that is not obviously a plain relative file path is refused rather than
+    guessed at. Symlink-traversal (whether an existing ancestor component on
+    disk is a symlink) cannot be checked here — this module has no
+    filesystem/repo-root awareness by design (see the module docstring) — so
+    that check is re-run at dispatch time instead, immediately before a
+    write-capable agent runs (`orchestrator.py`)."""
+    if not isinstance(path, str) or not path or path != path.strip():
+        raise TaskGraphError(
+            "bad_approved_path", f"approved path {path!r} must be a non-empty string with no padding"
+        )
+    if path.startswith("/") or path.startswith("~"):
+        raise TaskGraphError(
+            "bad_approved_path",
+            f"approved path {path!r} must be repository-relative — absolute paths "
+            "and '~' are refused",
+        )
+    if "\\" in path:
+        raise TaskGraphError(
+            "bad_approved_path", f"approved path {path!r} must use '/' separators, not '\\\\'"
+        )
+    segments = path.split("/")
+    if any(seg in ("", ".", "..") for seg in segments):
+        raise TaskGraphError(
+            "bad_approved_path",
+            f"approved path {path!r} must not contain '..', '.', or an empty "
+            "segment (no '//' or leading/trailing '/')",
+        )
+    for seg in segments:
+        if not _APPROVED_PATH_SEGMENT_RE.match(seg):
+            raise TaskGraphError(
+                "bad_approved_path",
+                f"approved path {path!r} has an invalid segment {seg!r} — only "
+                "[A-Za-z0-9._-] is allowed (no globs, no whitespace, no leading '-')",
+            )
+
 
 class TaskState(str, Enum):
     READY = "ready"            # pending, all dependencies completed
@@ -75,6 +128,21 @@ class Task:
     #: `lexy-app/backend` — `python -m` puts the cwd on `sys.path`, which some
     #: of its tests need (CLAUDE.md §11).
     validation_cwd: str = ""
+    #: The machine-checkable authorization scope for a write-capable
+    #: (`implement`/`revise`) dispatch of this task — EXACT repository-
+    #: relative paths, validated by `_validate_approved_path` on the way in
+    #: (`TaskRegistry.add_many`, so both a ChatGPT `plan` and
+    #: `seed_tasks.json` go through the same gate). Empty means "no scope has
+    #: been authorized yet"; `orchestrator._dispatch_task_postcommit` refuses
+    #: to dispatch a non-audit implement/revise for a task whose
+    #: `approved_paths` is empty (see docs/SECURITY.md finding #2/circular
+    #: ownership) rather than letting the executor's own report define its
+    #: authorization. New files must be named explicitly up front — there is
+    #: no "anything the agent happens to touch" default. New field with a
+    #: default — an old `tasks.json` written before this existed loads fine
+    #: (`Task(**raw)` falls back to `()`), same backward-compatible pattern as
+    #: `blocked_reason`/`validation` above.
+    approved_paths: tuple[str, ...] = ()
 
 
 class TaskRegistry:
@@ -102,6 +170,15 @@ class TaskRegistry:
                 raise TaskGraphError(
                     "empty_task_field", f"task '{task.id}' needs a title and a description"
                 )
+            seen_paths: set[str] = set()
+            for approved in task.approved_paths:
+                _validate_approved_path(approved)
+                if approved in seen_paths:
+                    raise TaskGraphError(
+                        "duplicate_approved_path",
+                        f"task '{task.id}' lists approved path {approved!r} more than once",
+                    )
+                seen_paths.add(approved)
             candidate[task.id] = task
         for task in tasks:
             for dep in task.depends_on:
@@ -260,6 +337,7 @@ class TaskRegistry:
                     "validation": tuple(
                         tuple(c) for c in raw.get("validation", ())
                     ),
+                    "approved_paths": tuple(raw.get("approved_paths", ())),
                 })
                 for raw in data["tasks"]
             ]

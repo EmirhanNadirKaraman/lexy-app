@@ -68,6 +68,19 @@ class AutoloopConfig:
     browser: BrowserConfig
     policy: PolicyConfig
     state_dir: Path
+    #: EXTERNAL worker-repo location (Autoloop M1 finding #1) — `None` is a
+    #: valid dataclass value (every direct `AutoloopConfig(...)` construction
+    #: across the test suite predates this field and does not set it) but is
+    #: NOT a usable one: `load_config` below requires an absolute value in
+    #: `[paths].workers_root` and raises `ConfigError` otherwise, and the two
+    #: places that actually construct a `WorkerRepoManager` for real dispatch
+    #: (`cli._build_orchestrator`, `doctor.run_doctor`) both call
+    #: `worker_env.validate_workers_root` and refuse before doing so — see
+    #: those call sites. There is deliberately NO fallback to the old
+    #: `state_dir / "workers"` default (`workers_dir` below, kept only for
+    #: locating pre-existing/legacy worker repos to report on, never as a
+    #: place new ones are created).
+    workers_root: Path | None = None
     conversation: ConversationConfig = ConversationConfig()
     executor: ExecutorConfig = ExecutorConfig()
     audit: AuditConfig = AuditConfig()
@@ -114,6 +127,14 @@ class AutoloopConfig:
 
     @property
     def workers_dir(self) -> Path:
+        """The OLD, pre-M1-fix worker location (`state_dir / "workers"`,
+        nested inside the checkout by construction). No production code
+        creates NEW worker repos here anymore — real dispatch uses
+        `workers_root` instead (validated externally; see that field's
+        docstring). Kept only so `doctor.py` / the CLI can find and report on
+        worker repos a pre-fix deployment left behind here (finding #1's
+        "migrate or safely abandon existing disposable workers" — reported,
+        never moved)."""
         return self.state_dir / "workers"
 
     @property
@@ -201,8 +222,33 @@ def load_config(path: Path) -> AutoloopConfig:
     policy = PolicyConfig(**policy_data)
 
     paths_data = data.get("paths", {})
-    _check_keys("paths", paths_data, {"state_dir"})
+    _check_keys("paths", paths_data, {"state_dir", "workers_root"})
     state_dir = Path(paths_data.get("state_dir", ".autoloop"))
+
+    # `workers_root` (Autoloop M1 finding #1): required, absolute, no
+    # default — NEVER silently falls back to `state_dir / "workers"`. This
+    # catches "missing" and "relative" at load time, cheaply, without needing
+    # a repo root; "nested beneath the checkout / its .git / the state dir /
+    # the publisher dir" needs that context and is checked separately by
+    # `worker_env.validate_workers_root` at the two places a `WorkerRepoManager`
+    # actually gets constructed for real dispatch (`cli.py`, `doctor.py`).
+    workers_root_raw = paths_data.get("workers_root")
+    if not workers_root_raw or not str(workers_root_raw).strip():
+        raise ConfigError(
+            "paths.workers_root is required — an ABSOLUTE path outside this "
+            "checkout where task worker repositories live (e.g. "
+            "\"~/.autoloop/workers\"). There is no default; see "
+            "config.example.toml. (Autoloop M1: a worker repo nested inside "
+            "the checkout is invisible to every git-based verification "
+            "primitive scoped to the checkout.)"
+        )
+    workers_root = Path(str(workers_root_raw)).expanduser()
+    if not workers_root.is_absolute():
+        raise ConfigError(
+            f"paths.workers_root must be an absolute path, got {workers_root_raw!r} "
+            "(after expanding '~') — a relative path is ambiguous across the "
+            "different working directories worker-repo subprocesses run from"
+        )
 
     conversation_data = data.get("conversation", {})
     conversation_fields = {f.name for f in dataclasses.fields(ConversationConfig)}
@@ -238,6 +284,7 @@ def load_config(path: Path) -> AutoloopConfig:
         browser=browser,
         policy=policy,
         state_dir=state_dir,
+        workers_root=workers_root,
         conversation=conversation,
         executor=executor,
         audit=audit,

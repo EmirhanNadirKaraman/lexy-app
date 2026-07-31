@@ -47,10 +47,15 @@ class FakeConversation:
 
 
 def make_config(tmp_path, **policy) -> AutoloopConfig:
+    # `tmp_path` doubles as `repo_root` in every `run_doctor(...)` call in
+    # this file, so `workers_root` must be a SIBLING of it (never a child) —
+    # matching the pattern `test_full_healthy_run` already uses for the
+    # `origin` bare repo below.
     return AutoloopConfig(
         browser=BrowserConfig(conversation_url=URL),
         policy=PolicyConfig(**policy),
         state_dir=tmp_path / ".al",
+        workers_root=tmp_path.parent / f"{tmp_path.name}-workers_root",
     )
 
 
@@ -101,7 +106,7 @@ def test_all_green(tmp_path):
     results = run_doctor(make_config(tmp_path), tmp_path, probes(conversation))
     named = by_name(results)
     for check in (
-        "config", "state_dir", "lock", "worker_isolation", "hooks_dirs",
+        "config", "state_dir", "lock", "workers_root", "worker_isolation", "hooks_dirs",
         "publisher", "publisher_url_drift", "cdp", "playwright", "provider",
         "conversation_url", "browser_live",
     ):

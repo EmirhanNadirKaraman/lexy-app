@@ -97,17 +97,22 @@ def make_config(tmp_path: Path, policy: PolicyConfig | None = None) -> AutoloopC
         browser=BrowserConfig(conversation_url=URL),
         policy=policy or PolicyConfig(implement_enabled=True),
         state_dir=tmp_path / ".al",
+        workers_root=tmp_path / "workers_root",
     )
 
 
 def write_config_toml(tmp_path: Path, state_dir_name: str = ".al") -> Path:
     """A real `.toml` config file — only needed by tests that go through
     `load_config` (the CLI entry points read a file, not an in-memory
-    `AutoloopConfig`)."""
+    `AutoloopConfig`). `workers_root` is always absolute (`tmp_path /
+    "workers_root"`) regardless of `state_dir_name`'s shape — a RELATIVE
+    `workers_root` is refused unconditionally by `load_config`, so it cannot
+    share `state_dir_name`'s "test the relative-path shape" purpose."""
     path = tmp_path / "config.toml"
+    workers_root_value = str(tmp_path / "workers_root")
     path.write_text(
         f'[browser]\nconversation_url = "{URL}"\n\n'
-        f'[paths]\nstate_dir = "{state_dir_name}"\n\n'
+        f'[paths]\nstate_dir = "{state_dir_name}"\nworkers_root = "{workers_root_value}"\n\n'
         "[policy]\nimplement_enabled = true\n",
         encoding="utf-8",
     )
@@ -253,14 +258,23 @@ def build_v1_orchestrator(
     state = LoopState.new(URL)
     state.outbox = "kickoff report"
     store.save(state)
-    registry = TaskRegistry(list(tasks) or [Task(id=task_id, title=f"Title {task_id}", description="desc")])
+    files = executor_files if executor_files is not None else {"feature.py": "print('hi')\n"}
+    registry = TaskRegistry(
+        list(tasks)
+        or [
+            Task(
+                id=task_id,
+                title=f"Title {task_id}",
+                description="desc",
+                approved_paths=tuple(files.keys()),
+            )
+        ]
+    )
     task_store = TaskStore(config.tasks_file)
     task_store.save(registry)
 
     orch = cli._build_orchestrator(config, args, store, state, task_store, registry)
-    orch._executor = WritingExecutor(
-        config.workers_dir, executor_files if executor_files is not None else {"feature.py": "print('hi')\n"}
-    )
+    orch._executor = WritingExecutor(config.workers_root, files)
     # `_build_orchestrator` (production) wires NO fake validation runner —
     # post-commit validation really runs `ruff check .`. These tests are not
     # about validation content, so swap in the same deterministic-pass fake

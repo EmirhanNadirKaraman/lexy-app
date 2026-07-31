@@ -73,3 +73,13 @@ validation_commands = [["ruff", "check", "."], ["python3", "-m", "pytest", "auto
 [paths]
 # Runtime state (state.json, tasks.json, transcript.jsonl, diagnostics/, PAUSE).
 state_dir = ".autoloop"
+# REQUIRED, no default. Where each task's isolated worker repository lives.
+# MUST be an absolute path OUTSIDE this checkout, its .git (including the
+# real git-common-dir a linked worktree's .git file points at), the state
+# dir above, and the publisher repo/hooks dirs — `doctor` and every real run
+# refuse otherwise, and never silently fall back to the old
+# `<state_dir>/workers` location. `~` is expanded. See docs/SECURITY.md
+# (Autoloop M1 finding #1): a worker repo nested inside the checkout is
+# invisible to every git-based verification primitive scoped to it, so a
+# write outside the worker repo but inside the checkout would go undetected.
+workers_root = "~/.autoloop/workers"

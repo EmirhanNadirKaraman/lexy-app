@@ -71,6 +71,7 @@ def make_config(tmp_path: Path, policy: PolicyConfig | None = None) -> AutoloopC
         browser=BrowserConfig(conversation_url=URL),
         policy=policy or PolicyConfig(implement_enabled=True),
         state_dir=tmp_path / ".al",
+        workers_root=tmp_path / "workers_root",
     )
 
 
@@ -84,12 +85,17 @@ def write_config_toml(tmp_path: Path, state_dir_name: str = ".al") -> Path:
     resolve against the pytest process's actual cwd (not `tmp_path`), which
     is not just wrong for the test but writes real, un-isolated files into
     whatever directory pytest happened to be invoked from — see
-    `docs/COMMON_ERRORS.md`."""
+    `docs/COMMON_ERRORS.md`. `workers_root` is a SIBLING of `state_dir`
+    (`tmp_path / "workers_root"`), i.e. absolute and outside whatever repo a
+    given test later creates under `tmp_path` — satisfies
+    `worker_env.validate_workers_root` without needing repo-root context
+    here."""
     path = tmp_path / "config.toml"
     state_dir_value = str(tmp_path / state_dir_name)
+    workers_root_value = str(tmp_path / "workers_root")
     path.write_text(
         f'[browser]\nconversation_url = "{URL}"\n\n'
-        f'[paths]\nstate_dir = "{state_dir_value}"\n\n'
+        f'[paths]\nstate_dir = "{state_dir_value}"\nworkers_root = "{workers_root_value}"\n\n'
         "[policy]\nimplement_enabled = true\n",
         encoding="utf-8",
     )
@@ -105,8 +111,9 @@ def ok_validation(argv, **kwargs):
     return Proc()
 
 
-def ready_task(tid="t1") -> Task:
-    return Task(id=tid, title=f"Title {tid}", description="desc")
+def ready_task(tid="t1", approved_paths=("a.py",)) -> Task:
+    # Default matches `WritingExecutor`'s own default file — see below.
+    return Task(id=tid, title=f"Title {tid}", description="desc", approved_paths=tuple(approved_paths))
 
 
 def implement(task_id="t1") -> Directive:
@@ -844,7 +851,14 @@ def test_environment_drift_is_loop_fatal_not_a_task_refusal():
 
 
 def test_answer_cannot_clear_an_environmental_invariant_by_text(tmp_path, monkeypatch, capsys):
-    """`allow_push` is false: no answer text may resolve a push refusal."""
+    """A protected-branch push refusal can NEVER be cleared by answer text.
+
+    Previously this asserted on `push_refused`, whose precondition only rechecked
+    `allow_push` — a flag necessarily already true for the push to have reached
+    the gateway at all, so the check was a no-op for every real failure. The
+    orchestrator now emits `push_refused_protected`, which maps to an
+    unconditional refusal: a protected destination is not something an operator
+    can assert their way past."""
     from autoloop.blockers import Blocker, BlockerStore
     from autoloop.cli import main
 
@@ -857,18 +871,22 @@ def test_answer_cannot_clear_an_environmental_invariant_by_text(tmp_path, monkey
     run_git(repo, "add", "f.txt")
     run_git(repo, "commit", "-q", "-m", "init")
     cfg = repo / "config.toml"
+    workers_root_value = str(tmp_path / "workers_root")
     cfg.write_text(
         '[browser]\nconversation_url = "https://chatgpt.com/c/abc"\n\n'
-        '[policy]\nallow_push = false\n\n[paths]\nstate_dir = ".al"\n', encoding="utf-8")
+        '[policy]\nallow_push = false\n\n'
+        f'[paths]\nstate_dir = ".al"\nworkers_root = "{workers_root_value}"\n',
+        encoding="utf-8")
     monkeypatch.chdir(repo)
 
     store = BlockerStore(repo / ".al" / "blockers")
     store.save(Blocker(id="blk-(loop)-001", task_id="(loop)", kind="loop_fatal",
-                       code="push_refused", question="enable pushing?", detail="",
+                       code="push_refused_protected", question="push to main?", detail="",
                        phase="executing", created_at="2026-07-31T00:00:00+00:00"))
 
     code = main(["answer", "blk-(loop)-001", "I enabled it, honest", "--config", str(cfg)])
     out = capsys.readouterr().out
     assert code == 1
-    assert "NOT resolved" in out and "allow_push is still false" in out
+    assert "NOT resolved" in out
+    assert "cannot be cleared by an answer" in out
     assert store.load("blk-(loop)-001").resolved_at is None, "must stay open"

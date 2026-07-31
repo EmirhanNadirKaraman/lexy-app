@@ -41,7 +41,7 @@ from .publisher import (
     read_publisher_url_snapshot,
     redact_url,
 )
-from .worker_env import WorkerRepoManager, verify_worker_isolation
+from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
 
 # A conversation URL is either a plain `/c/<id>` or a project- / GPT-scoped
 # `/g/<slug>/c/<id>` (chatgpt.com Projects put the conversation under the
@@ -133,6 +133,47 @@ def run_doctor(
             f"stale lock ({info.describe()}) — recover with `python -m autoloop unlock`",
         )
 
+    # 3b. workers_root — Autoloop M1 finding #1. MUST be absolute and
+    # entirely outside the checkout/.git/state dir/publisher dirs; refuses
+    # (never falls back to the old `config.workers_dir`) if not. This gates
+    # check 6 below: creating even a THROWAWAY probe repo at an unsafe
+    # location would be doing exactly the unsafe thing being diagnosed.
+    workers_root_violations = validate_workers_root(config.workers_root, repo_root, config.state_dir)
+    if workers_root_violations:
+        add("workers_root", "fail", "; ".join(workers_root_violations))
+    else:
+        add("workers_root", "ok", str(Path(config.workers_root).resolve()))
+
+    # 3c. legacy workers — pre-M1-fix deployments created worker repos under
+    # `config.workers_dir` (`state_dir / "workers"`, nested inside the
+    # checkout). This never MOVES anything (moving repository changes
+    # implicitly is explicitly refused by the brief this closes) — it only
+    # reports what is there so an operator can migrate or discard it by
+    # hand. `warn`, never `fail`: mere presence is not itself unsafe once
+    # `workers_root` (above) is the location new work actually uses.
+    legacy_root = config.workers_dir
+    if legacy_root.is_dir():
+        stray = []
+        for task_dir in sorted(p for p in legacy_root.iterdir() if p.is_dir()):
+            try:
+                legacy_git = GitGateway(task_dir, PolicyEngine(config.policy))
+                state_desc = "dirty working tree" if legacy_git.dirty_files() else "clean working tree"
+                stray.append(f"{task_dir.name} ({state_desc}, head={legacy_git.head_sha()[:12]})")
+            except AutoloopError:
+                stray.append(f"{task_dir.name} (not a readable git repo)")
+        if stray:
+            add(
+                "legacy_workers",
+                "warn",
+                f"{len(stray)} pre-M1 worker repo(s) still at {legacy_root} — "
+                "never moved automatically, inspect and migrate/discard by hand: "
+                + "; ".join(stray),
+            )
+        else:
+            add("legacy_workers", "ok", f"{legacy_root} exists but holds no task directories")
+    else:
+        add("legacy_workers", "ok", f"{legacy_root} does not exist — nothing to migrate")
+
     # 4./5. git identity + branch policy
     git = GitGateway(repo_root, PolicyEngine(config.policy))
     try:
@@ -151,29 +192,34 @@ def run_doctor(
     except AutoloopError as exc:
         add("git", "fail", str(exc))
 
-    # 6. worker isolation — create a throwaway probe worker repo, verify it
-    # with the SAME `verify_worker_isolation` production code uses, remove
-    # it. Proves the WorkerRepoManager pipeline actually isolates today, not
-    # just that the code reads correctly.
-    probe_id = "doctor-probe"
-    worker_repos = WorkerRepoManager(config.workers_dir, config.worker_hooks_dir)
-    worker_repos.remove(probe_id)  # clear any stale probe from a crashed prior run
-    try:
-        head = GitGateway(repo_root, PolicyEngine(config.policy)).head_sha()
-        worker = worker_repos.create(probe_id, repo_root, head)
+    # 6. worker isolation — create a throwaway probe worker repo at the
+    # (validated, external) `workers_root`, verify it with the SAME
+    # `verify_worker_isolation` production code uses, remove it. Proves the
+    # WorkerRepoManager pipeline actually isolates today, not just that the
+    # code reads correctly. Skipped (not "fail" — already reported by check
+    # 3b) if `workers_root` itself is not safe to use.
+    if workers_root_violations:
+        add("worker_isolation", "skip", "workers_root is not valid — see the 'workers_root' check above")
+    else:
+        probe_id = "doctor-probe"
+        worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+        worker_repos.remove(probe_id)  # clear any stale probe from a crashed prior run
         try:
-            probe_git = worker.gateway(PolicyEngine(config.policy))
-            violations = verify_worker_isolation(
-                probe_git, expected_hooks_dir=worker_repos.hooks_dir_for(probe_id)
-            )
-            if violations:
-                add("worker_isolation", "fail", "; ".join(violations))
-            else:
-                add("worker_isolation", "ok", f"probe repo at {worker.path} is isolated")
-        finally:
-            worker_repos.remove(probe_id)
-    except AutoloopError as exc:
-        add("worker_isolation", "fail", str(exc))
+            head = GitGateway(repo_root, PolicyEngine(config.policy)).head_sha()
+            worker = worker_repos.create(probe_id, repo_root, head)
+            try:
+                probe_git = worker.gateway(PolicyEngine(config.policy))
+                violations = verify_worker_isolation(
+                    probe_git, expected_hooks_dir=worker_repos.hooks_dir_for(probe_id)
+                )
+                if violations:
+                    add("worker_isolation", "fail", "; ".join(violations))
+                else:
+                    add("worker_isolation", "ok", f"probe repo at {worker.path} is isolated")
+            finally:
+                worker_repos.remove(probe_id)
+        except AutoloopError as exc:
+            add("worker_isolation", "fail", str(exc))
 
     # 7. controlled hooks directories — every accumulated task's worker hooks
     # dir, and the publisher's own, must be empty. Broader than check 6: that

@@ -53,7 +53,8 @@ def write_config(tmp_path, provider):
         "[conversation]\n"
         f'provider = "{provider}"\n'
         "[paths]\n"
-        f'state_dir = "{tmp_path / ".al"}"\n',
+        f'state_dir = "{tmp_path / ".al"}"\n'
+        f'workers_root = "{tmp_path / "workers_root"}"\n',
         encoding="utf-8",
     )
     return config

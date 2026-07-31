@@ -98,7 +98,14 @@ def worktree_git_for(worktrees: WorktreeManager, task_id: str) -> GitGateway:
     return GitGateway(worktrees.path_for(task_id), PolicyEngine(PolicyConfig()))
 
 
-def build_postcommit(tmp_path, executor, task_id="t1", validation_runner=ok_validation, policy=None):
+def build_postcommit(
+    tmp_path,
+    executor,
+    task_id="t1",
+    validation_runner=ok_validation,
+    policy=None,
+    approved_paths=None,
+):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     run_git(repo_root, "init", "-q", "-b", "main")
@@ -123,7 +130,14 @@ def build_postcommit(tmp_path, executor, task_id="t1", validation_runner=ok_vali
     state = LoopState.new(URL)
     store.save(state)
 
-    task = Task(id=task_id, title=f"Title {task_id}", description="desc")
+    # See `test_postcommit_flow.py`'s `build_postcommit` for why this is
+    # derived from the executor's own known files rather than left empty.
+    if approved_paths is None:
+        derived = set(getattr(executor, "files", {}) or {})
+        for round_files in getattr(executor, "per_round_files", None) or ():
+            derived |= set(round_files)
+        approved_paths = tuple(sorted(derived))
+    task = Task(id=task_id, title=f"Title {task_id}", description="desc", approved_paths=tuple(approved_paths))
     registry = TaskRegistry([task])
     task_store = TaskStore(config.tasks_file)
     task_store.save(registry)

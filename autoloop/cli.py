@@ -78,7 +78,7 @@ from .publisher import (
 from .state import TERMINAL_PHASES, LoopState, Phase, StateStore
 from .tasks import Task, TaskRegistry, TaskStore
 from .transcript import TranscriptLogger
-from .worker_env import WorkerRepoManager
+from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
 from .worktask import IntentStore, TaskExecutionStore
 
 DEFAULT_CONFIG = Path(".autoloop/config.toml")
@@ -155,6 +155,9 @@ def _seed_registry(config: AutoloopConfig) -> TaskRegistry:
                 title=spec["title"],
                 description=spec["description"],
                 depends_on=tuple(spec.get("depends_on", ())),
+                validation=tuple(tuple(c) for c in spec.get("validation", ())),
+                validation_cwd=spec.get("validation_cwd", ""),
+                approved_paths=tuple(spec.get("approved_paths", ())),
             )
             for spec in specs
         ]
@@ -262,7 +265,17 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
     audit/implement/revise — see docs/SECURITY.md S21."""
     policy = PolicyEngine(config.policy)
     git = GitGateway(Path.cwd(), policy)
-    worker_repos = WorkerRepoManager(config.workers_dir, config.worker_hooks_dir)
+    # Autoloop M1 finding #1: refuse — never silently fall back to the old
+    # `config.workers_dir` (nested inside the checkout) — before a
+    # `WorkerRepoManager` capable of running real tasks is ever constructed.
+    # `doctor` runs the identical check (`validate_workers_root`) as a
+    # non-fatal report; this is the one that actually stops a run.
+    workers_root_violations = validate_workers_root(config.workers_root, git.repo_root, config.state_dir)
+    if workers_root_violations:
+        raise ConfigError(
+            "paths.workers_root is not safe to use: " + "; ".join(workers_root_violations)
+        )
+    worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
     execution_store = TaskExecutionStore(config.executions_dir)
     intent_store = IntentStore(config.intents_dir)
     blocker_store = BlockerStore(config.blockers_dir)
@@ -845,11 +858,6 @@ def _precondition_publisher_url(config) -> str:
     return ""
 
 
-def _precondition_allow_push(config) -> str:
-    if not config.policy.allow_push:
-        return "policy.allow_push is still false — enable it in the config first"
-    return ""
-
 
 def _precondition_protected(config) -> str:
     return (
@@ -859,16 +867,117 @@ def _precondition_protected(config) -> str:
     )
 
 
+def _precondition_worker_environment_drift(config) -> str:
+    """Dedicated recheck for `worker_environment_drift` — previously
+    mismapped to `_precondition_browser` (Autoloop M1 finding #7), whose
+    doctor probes (cdp/playwright/provider/conversation_url/browser_live)
+    never look at git hooks or worker isolation at all, so ANY answer text
+    resolved this blocker regardless of whether the environment it describes
+    was still broken. Reuses the SAME primitives `doctor.py`'s
+    `worker_isolation` check and `orchestrator.py`'s own environment-drift
+    detection are built on (`worker_env.validate_workers_root` /
+    `verify_worker_isolation`) — a throwaway probe worker repo is created
+    and verified exactly like `doctor`'s check 6, proving the
+    WorkerRepoManager pipeline itself is currently isolated, not just that
+    the code that builds it reads correctly."""
+    root_violations = validate_workers_root(config.workers_root, Path.cwd(), config.state_dir)
+    if root_violations:
+        return "workers_root is not safe to use: " + "; ".join(root_violations)
+    probe_id = "precondition-drift-probe"
+    worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+    worker_repos.remove(probe_id)  # clear any stale probe from a crashed prior check
+    try:
+        policy = PolicyEngine(config.policy)
+        git = GitGateway(Path.cwd(), policy)
+        worker = worker_repos.create(probe_id, git.repo_root, git.head_sha())
+        try:
+            probe_git = worker.gateway(PolicyEngine(config.policy))
+            violations = verify_worker_isolation(
+                probe_git, expected_hooks_dir=worker_repos.hooks_dir_for(probe_id)
+            )
+            if violations:
+                return "worker environment still not isolated: " + "; ".join(violations)
+        finally:
+            worker_repos.remove(probe_id)
+    except AutoloopError as exc:
+        return f"could not verify the worker environment: {exc}"
+    return ""
+
+
+def _precondition_checkout_clean(config) -> str:
+    """Dedicated recheck for `primary_checkout_dirty` — re-runs the exact
+    `is_dirty()` check the orchestrator itself used to park in the first
+    place, so an operator's answer text alone cannot clear a checkout that
+    is still genuinely dirty.
+
+    Deliberately NOT reused for `checkout_escape_detected` (an earlier
+    version of this fix did, and that was wrong — see
+    `_precondition_checkout_escape_detected` below for why `is_dirty()` is
+    not a sufficient recheck for a detected escape)."""
+    from .git_gateway import GitGateway
+    from .policy import PolicyEngine
+
+    git = GitGateway(Path.cwd(), PolicyEngine(config.policy))
+    if git.is_dirty():
+        return "the primary checkout still has staged or unstaged changes: " + ", ".join(
+            git.dirty_files()
+        )
+    return ""
+
+
+def _precondition_checkout_escape_detected(config) -> str:
+    """`checkout_escape_detected` (a write-capable agent wrote something
+    outside its own worker repo — `escape_detector.py`, Autoloop M1 finding
+    #2) can NEVER be cleared by an `answer`, unconditionally — mirrors
+    `_precondition_protected`'s unconditional-refusal shape, for the same
+    reason: some conditions are not "recheck and see", they need a human to
+    actually look.
+
+    Why NOT a dirty-checkout recheck (an earlier version of this fix used
+    one, shared with `primary_checkout_dirty`, and it was wrong): the escape
+    detector's snapshot deliberately covers a SUPERSET of what `GitGateway.
+    is_dirty()` can ever see — tracked *and* untracked *and* IGNORED paths
+    (`escape_detector.enumerate_checkout_paths`; see that module's docstring
+    and `test_escape_detector_detects_ignored_content_change`, which proves
+    `git.dirty_files() == []` even while the detector correctly flags the
+    tampering). Autoloop's own state directory is gitignored in production,
+    so the canonical scenario this detector exists to catch — an agent
+    forging `.autoloop/state.json` or a blocker record to cover its tracks —
+    is EXACTLY a case where the working tree stays clean throughout. A
+    dirty-checkout recheck would clear that blocker on nothing. The loop is
+    already stopped (`loop_fatal`) either way, so refusing the text path
+    unconditionally costs nothing and is the honest posture for a
+    security-shaped detection: the reported paths need a human to actually
+    read them, not an automated recheck to wave through."""
+    return (
+        "a detected filesystem escape cannot be cleared by an answer — the "
+        "paths `escape_detector` reported were left exactly as the agent "
+        "wrote them (nothing here reverts anything) and must be inspected "
+        "directly. Once satisfied, reset or archive this session rather "
+        "than answering it — see docs/SECURITY.md S24."
+    )
+
+
 #: code -> precondition. Anything NOT listed resolves by answer text alone
 #: (ask_user and every task_fatal code), which is the intended behaviour.
+#: KEEP EVERY KEY HERE MATCHED TO A REAL, EMITTED `code=` LITERAL —
+#: `test_m1_hardening.py::test_every_precondition_key_matches_a_real_emitted_code`
+#: AST-walks `orchestrator.py` for every `code=` argument passed to
+#: `_to_needs_user` (including inside a ternary, like the one below) and
+#: fails if a key here has no match, so this cannot silently drift back to a
+#: dead mapping the way `git_failure_budget` (real code:
+#: `git_failure_budget_exhausted`) and `push_refused_protected` (previously
+#: never emitted at all) did.
 _RESOLUTION_PRECONDITIONS = {
     "login_expired": _precondition_browser,
     "submission_ambiguous": _precondition_browser,
-    "git_failure_budget": _precondition_browser,
+    "git_failure_budget_exhausted": _precondition_browser,
     "publisher_url_drift": _precondition_publisher_url,
-    "worker_environment_drift": _precondition_browser,
-    "push_refused": _precondition_allow_push,
+    "worker_environment_drift": _precondition_worker_environment_drift,
+    "worker_isolation_violation": _precondition_worker_environment_drift,
     "push_refused_protected": _precondition_protected,
+    "primary_checkout_dirty": _precondition_checkout_clean,
+    "checkout_escape_detected": _precondition_checkout_escape_detected,
 }
 
 
