@@ -1071,13 +1071,34 @@ built from one that already works. What actually worked, in order:
    exists in no migration — it predates Alembic), plus `video_category` seeded
    from migration 013's own `CATEGORIES` list.
 
-Result: **1206 passed, 0 failed, 54 skipped**. Getting there surfaced two
-pre-existing latent test bugs that a non-dev database exposes rather than
-causes — unconstrained catalog picks in `test_free_chat_progression.py`, now
-fixed (`docs/COMMON_ERRORS.md`). Divergences worth knowing: this database has
-exactly the 18 categories migration 013 defines, one hand-added German word
-(`Haus` — without at least one, five match tests skip rather than run), and
-PG16 against production's PG14.8.
+5. Corpus, via `python3 scripts/seed_validation_db.py` — deterministic,
+   idempotent, and entirely INVENTED (no row is copied from any real
+   database). Without it ~55 tests skip themselves rather than fail
+   ("run the subtitle pipeline first"), and a skipping test grades nothing.
+   Two videos, five sentences, five words and their `word_to_sentence` links,
+   chosen to satisfy specific guards: a lemma with two surface forms in one
+   video, a word whose lemma differs from its surface, a non-ASCII surface,
+   and a `word_id` that collides with a real `phrase_id`. It refuses to run
+   against the database name `.env.example` declares, reusing
+   `validation_env.repo_declared_db_name`. `--verify` re-checks every guard
+   without writing.
+
+Result: **1259 passed, 1 skipped, 0 failed** — against a documented baseline of
+1258 passed / 2 skipped, so one MORE test runs than on the dev database.
+Getting there surfaced two pre-existing latent test bugs a non-dev database
+exposes rather than causes — unconstrained catalog picks in
+`test_free_chat_progression.py`, now fixed (`docs/COMMON_ERRORS.md`).
+
+The one remaining skip is `test_match_inflected_phrase_matches_canonical`, and
+it is **inert by construction, not by configuration**: it skips unless
+`sich freuen auf` is in `phrase_table`, but the phrase extractor never
+produces that canonical — measured, `match_sentence("ich freue mich auf die
+Reise", "de")` returns `['ich', 'jdn. (Akk) freuen']`. Seeding the phrase makes
+the test RUN and FAIL, so the seeder deliberately does not (see its `PHRASE`
+comment). Whether the extractor or the test is wrong is an app-level question.
+
+Divergences worth knowing: exactly the 18 categories migration 013 defines,
+the synthetic corpus above, and PG16 against production's PG14.8.
 
 **Allowlist deviation, stated plainly.** The brief that specified this
 boundary named `JWT_SECRET_KEY`. This repository reads `SECRET_KEY`

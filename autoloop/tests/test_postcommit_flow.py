@@ -261,8 +261,19 @@ class WritingExecutor:
 
 
 def build_postcommit(
-    tmp_path, executor, task_id="t1", validation_runner=ok_validation, approved_paths=None
+    tmp_path,
+    executor,
+    task_id="t1",
+    validation_runner=ok_validation,
+    approved_paths=None,
+    task_validation=(),
+    task_validation_cwd="",
+    executor_factory=None,
 ):
+    """`executor_factory`, when given, is called with the `WorktreeManager`
+    once it exists and its result replaces `executor`. Needed by the B4b test,
+    which uses a REAL `ImplementExecutor` — that has to be rooted at the
+    task's worktree, which does not exist until this function builds it."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     run_git(repo_root, "init", "-q", "-b", "main")
@@ -298,7 +309,16 @@ def build_postcommit(
         for round_files in getattr(executor, "per_round_files", None) or ():
             derived |= set(round_files)
         approved_paths = tuple(sorted(derived))
-    task = Task(id=task_id, title=f"Title {task_id}", description="desc", approved_paths=tuple(approved_paths))
+    task = Task(
+        id=task_id,
+        title=f"Title {task_id}",
+        description="desc",
+        approved_paths=tuple(approved_paths),
+        validation=tuple(task_validation),
+        validation_cwd=task_validation_cwd,
+    )
+    if executor_factory is not None:
+        executor = executor_factory(worktrees)
     registry = TaskRegistry([task])
     task_store = TaskStore(config.tasks_file)
     task_store.save(registry)
@@ -641,3 +661,119 @@ def test_state_schema_v2_refuses_to_load(tmp_path):
 
     with pytest.raises(StateError):
         StateStore(path).load()
+
+
+# ---- B4b: post-commit re-runs the TASK's validation, not the audit's ---------
+
+
+class _WritingAgent:
+    """Minimal write-capable agent double: drops one file into the worker repo
+    so `dirty_paths_all()` has something real to report."""
+
+    def __init__(self, root_for, task_id, rel_path):
+        self._root_for, self._task_id, self._rel = root_for, task_id, rel_path
+
+    def run(self, spec):
+        from autoloop.audit.agents import AgentResult
+
+        target = Path(self._root_for(self._task_id)) / self._rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("changed by the agent\n", encoding="utf-8")
+        return AgentResult(domain=spec.domain, raw_text="wrote it", returncode=0,
+                           duration_seconds=0.0, command=("claude",))
+
+
+def test_post_commit_reruns_the_tasks_own_validation_not_the_audit_set(tmp_path):
+    """B4b. The declared commands must run BEFORE the commit (executor) and
+    AGAIN AFTER it (orchestrator) — otherwise the reviewed commit is graded by
+    the generic audit set, and produce-then-review's whole premise (a hook can
+    change committed content after the executor looked) is not actually
+    checked for any task that declares its own validation.
+
+    Recorded through ONE runner shared by both ends, so "the same commands"
+    is observed rather than asserted twice against two separate doubles.
+    """
+    from autoloop.implement_executor import ImplementExecutor
+
+    DECLARED = (("pytest", "-q", "tests/test_thing.py"),)
+    AUDIT_DEFAULT = (("ruff", "check", "."),)
+    calls: list[tuple[tuple[str, ...], str]] = []
+
+    def recorder(argv, **kwargs):
+        calls.append((tuple(argv), str(kwargs.get("cwd", ""))))
+
+        class Proc:
+            returncode = 0
+            stdout = "ok\n"
+            stderr = ""
+
+        return Proc()
+
+    def make_executor(worktrees):
+        return ImplementExecutor(
+            git=GitGateway(tmp_path / "repo", PolicyEngine(PolicyConfig())),
+            agent_runner=_WritingAgent(worktrees.path_for, "t1", "src/thing.py"),
+            # The executor's OWN default is the audit set; the task's declared
+            # validation must win over it at both ends.
+            validation_commands=AUDIT_DEFAULT,
+            command_runner=recorder,
+            worker_repo_root_for=worktrees.path_for,
+            policy=PolicyEngine(PolicyConfig()),
+            agent_runner_factory=lambda root: _WritingAgent(
+                lambda _t: root, "t1", "src/thing.py"
+            ),
+        )
+
+    orch, repo_root, worktrees, execution_store, _intents, _task = build_postcommit(
+        tmp_path,
+        executor=None,
+        validation_runner=recorder,
+        approved_paths=("src/thing.py",),
+        task_validation=DECLARED,
+        executor_factory=make_executor,
+    )
+
+    orch._dispatch(implement())
+
+    ran = [argv for argv, _cwd in calls]
+    assert ran.count(DECLARED[0]) == 2, (
+        f"expected the declared command before AND after the commit, saw {ran}"
+    )
+    assert AUDIT_DEFAULT[0] not in ran, (
+        f"the audit default was substituted for the task's declared validation: {ran}"
+    )
+    # ...and the persisted record is what carried it across, so a crash-resumed
+    # task re-runs the same thing rather than falling back.
+    execution = execution_store.load("t1")
+    assert execution.validation_commands == DECLARED
+
+
+def test_post_commit_validation_honours_the_declared_cwd(tmp_path):
+    """A declared `validation_cwd` must apply to the post-commit re-run too —
+    the right commands from the wrong directory check nothing."""
+    calls: list[str] = []
+
+    def recorder(argv, **kwargs):
+        calls.append(str(kwargs.get("cwd", "")))
+
+        class Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Proc()
+
+    executor = WritingExecutor(tmp_path / "worktrees", {"sub/app/f.py": "x\n"})
+    orch, _repo, worktrees, _store, _intents, _task = build_postcommit(
+        tmp_path,
+        executor,
+        validation_runner=recorder,
+        approved_paths=("sub/app/f.py",),
+        task_validation=(("pytest", "-q"),),
+        task_validation_cwd="sub/app",
+    )
+    orch._dispatch(implement())
+
+    expected = str(Path(worktrees.path_for("t1")) / "sub" / "app")
+    assert calls, "post-commit validation never ran"
+    assert calls[-1] == expected, f"ran from {calls[-1]}, expected {expected}"

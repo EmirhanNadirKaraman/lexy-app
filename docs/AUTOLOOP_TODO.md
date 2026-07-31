@@ -74,20 +74,31 @@ diffstat — and include the full patch only below a smaller threshold. The four
 identifiers must stay in the body at any size, since `report_sha256` covers
 exactly those bytes.
 
-### B4b. Post-commit validation ignores the task's declared validation
-`_run_post_commit_validation` re-runs `config.audit.validation_commands`, not
+### ~~B4b. Post-commit validation ignores the task's declared validation~~ — RESOLVED 2026-08-01
+`_run_post_commit_validation` re-ran `config.audit.validation_commands`, not
 `task.validation`. So a task like `rt-01`, which declares the backend suite
-precisely because the configured default does not cover what it changes, has
-its *reviewed commit* checked by the default only — the declared validation
-runs once, in `ImplementExecutor`, against the pre-commit tree. That is a
-weaker guarantee than §4b claims for the produce-then-review path, whose whole
-point is that a commit hook can change committed content in ways pre-commit
+precisely because the configured default does not cover what it changes, had
+its *reviewed commit* checked by the default only — the declared validation ran
+once, in `ImplementExecutor`, against the pre-commit tree. That was a weaker
+guarantee than §4b claims for the produce-then-review path, whose whole point
+is that a commit hook can change committed content in ways pre-commit
 validation never saw.
 
-Found while wiring the validation-environment boundary (§4g), deliberately not
-fixed there — out of that brief's scope. The fix is small (thread the task
-through `_verify_committed` and prefer `task.validation`) but it changes what
-gets refused, so it wants its own changeset and its own test.
+**Fixed:** `TaskExecution` now persists `validation_commands` +
+`validation_cwd`, captured from the `Task` at dispatch (and re-synced onto a
+loaded record, so a pre-existing execution file does not silently fall back).
+`_run_post_commit_validation` takes the execution rather than a bare path and
+runs those commands from that cwd, falling back to the configured default only
+when the task declared none — the same `tuple(task.validation) or default`
+rule `ImplementExecutor` already used, so the two ends now agree by
+construction. A declared `validation_cwd` missing from the committed tree is a
+refusal, not a silent run from the repo root.
+
+Regression: `test_post_commit_reruns_the_tasks_own_validation_not_the_audit_set`
+drives a REAL `ImplementExecutor` and the orchestrator through ONE recording
+runner, so "the same commands before and after" is observed rather than
+asserted twice against separate doubles. Verified to fail when the fix is
+reverted — it then records `[declared, ruff-check]`, which is the bug exactly.
 
 ### B5. Fail-closed check for unmapped blocker codes
 Three times now a new `loop_fatal` code shipped without a

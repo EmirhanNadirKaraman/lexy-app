@@ -126,6 +126,27 @@ class TaskExecution:
     #: paths as "outside" on round 2's review. Stored sorted for a stable,
     #: deterministic on-disk representation.
     allowed_paths: tuple[str, ...] = ()
+    #: The validation the TASK declared, persisted at dispatch so the
+    #: post-commit re-run checks the same thing the executor checked.
+    #:
+    #: Without this the post-commit re-run fell back to
+    #: `config.audit.validation_commands` — the generic repo-health set — so a
+    #: task that declared its own validation precisely because the default does
+    #: not cover what it changes had its REVIEWED COMMIT graded by the default
+    #: anyway. The declared suite ran once, pre-commit, against a tree that a
+    #: commit hook could still change. That is the exact gap produce-then-review
+    #: exists to close, so the commands travel with the execution record rather
+    #: than being re-derived from config (or from a `Task` the crash-recovery
+    #: path may not have in hand).
+    #:
+    #: Empty means "the task declared none" — the caller then uses the
+    #: configured default, matching `ImplementExecutor`'s own
+    #: `tuple(task.validation) or self._validation_commands`.
+    validation_commands: tuple[tuple[str, ...], ...] = ()
+    #: Directory the validation runs from, relative to the worker repo root
+    #: (`Task.validation_cwd`). Persisted for the same reason: running the
+    #: right commands from the wrong directory checks nothing.
+    validation_cwd: str = ""
 
 
 @dataclass
@@ -209,6 +230,7 @@ class TaskExecutionStore:
     def save(self, execution: TaskExecution) -> None:
         data = asdict(execution)
         data["allowed_paths"] = sorted(execution.allowed_paths)
+        data["validation_commands"] = [list(c) for c in execution.validation_commands]
         _atomic_write_json(self._path(execution.task_id), data)
 
     def load(self, task_id: str) -> TaskExecution | None:
@@ -218,6 +240,13 @@ class TaskExecutionStore:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             data["allowed_paths"] = tuple(data.get("allowed_paths", ()))
+            # JSON has no tuples: a record written before this field existed
+            # has no key at all, and one written after has lists-of-lists.
+            # Both normalise to the same shape, so an older record loads as
+            # "declared none" rather than raising.
+            data["validation_commands"] = tuple(
+                tuple(c) for c in data.get("validation_commands", ())
+            )
             return TaskExecution(**data)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise StateCorruptError(

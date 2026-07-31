@@ -1575,6 +1575,17 @@ class Orchestrator:
             )
             return
 
+        # Computed BEFORE the create/load split, because every branch below
+        # needs it: a freshly created record persists it, and a LOADED record
+        # is re-synced against it (a record written before this field existed
+        # loads as "declared none", which would silently fall back to the audit
+        # set on a resumed task — B4b). The audit declares no validation of its
+        # own and keeps the configured default.
+        declared_validation = (
+            () if is_audit else tuple(tuple(c) for c in task.validation)
+        )
+        declared_validation_cwd = "" if is_audit else (task.validation_cwd or "")
+
         execution = self._execution_store.load(task.id)
         if execution is None:
             # First dispatch for this task: base sha is recorded BEFORE any
@@ -1595,10 +1606,14 @@ class Orchestrator:
                     worktree_path=str(repo.path),
                     task_base_sha=base_sha,
                     allowed_paths=allowed_paths,
+                    validation_commands=declared_validation,
+                    validation_cwd=declared_validation_cwd,
                 )
             else:
                 execution = self._worktrees.create(task.id, base_sha)
                 execution.allowed_paths = allowed_paths
+                execution.validation_commands = declared_validation
+                execution.validation_cwd = declared_validation_cwd
             self._execution_store.save(execution)
         elif not is_audit and execution.allowed_paths != tuple(sorted(task.approved_paths)):
             # Re-sync on every LOADED (not freshly created) execution too —
@@ -1610,6 +1625,20 @@ class Orchestrator:
             # real task's authorization; it is never derived from
             # `execution` state, only ever written INTO it.
             execution.allowed_paths = tuple(sorted(task.approved_paths))
+            execution.validation_commands = declared_validation
+            execution.validation_cwd = declared_validation_cwd
+            self._execution_store.save(execution)
+        elif not is_audit and (
+            execution.validation_commands != declared_validation
+            or execution.validation_cwd != declared_validation_cwd
+        ):
+            # Same re-sync, for the case where only the VALIDATION drifted:
+            # a record written before this field existed loads as "declared
+            # none", which would silently fall back to the audit set on a
+            # resumed task. The Task is the source of truth here exactly as
+            # it is for `approved_paths` above.
+            execution.validation_commands = declared_validation
+            execution.validation_cwd = declared_validation_cwd
             self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         self._store.save(state)
@@ -2139,22 +2168,47 @@ class Orchestrator:
                 "worktree is not clean after commit — residual change(s): "
                 + ", ".join(f"{status} {path}" for status, path in residual)
             )
-        validation_ok, validation_summary = self._run_post_commit_validation(
-            execution.worktree_path
-        )
+        validation_ok, validation_summary = self._run_post_commit_validation(execution)
         if not validation_ok:
             failures.append(f"post-commit validation failed: {validation_summary}")
         return failures, validation_summary
 
-    def _run_post_commit_validation(self, worktree_path: str) -> tuple[bool, str]:
-        """Re-run the SAME validation commands the audit executor uses
-        (`config.audit.validation_commands`), against the task's own worktree,
-        AFTER the commit exists. Pre-commit validation (`outcome.validation`,
-        whatever the executor itself reports) is not sufficient: a commit
-        hook can change committed content in ways the executor never saw."""
+    def _run_post_commit_validation(self, execution: TaskExecution) -> tuple[bool, str]:
+        """Re-run the task's OWN declared validation against its worktree,
+        AFTER the commit exists.
+
+        Pre-commit validation (`outcome.validation`, whatever the executor
+        itself reports) is not sufficient: a commit hook can change committed
+        content in ways the executor never saw. That is only a real check if
+        it re-runs the SAME commands — which is what
+        `execution.validation_commands` (persisted at dispatch from
+        `Task.validation`) provides. It previously re-ran
+        `config.audit.validation_commands` instead, so a task that declared
+        its own validation precisely because the default does not cover its
+        change had the reviewed commit graded by the default anyway
+        (`docs/AUTOLOOP_TODO.md` B4b).
+
+        Falls back to the configured default only when the task declared
+        nothing — identical to `ImplementExecutor`'s own
+        `tuple(task.validation) or self._validation_commands`, so the two ends
+        of the check agree by construction rather than by coincidence. The
+        audit path declares none and therefore still runs the default.
+        """
+        commands = execution.validation_commands or self._config.audit.validation_commands
+        cwd = Path(execution.worktree_path)
+        if execution.validation_cwd:
+            cwd = cwd / execution.validation_cwd
+            if not cwd.is_dir():
+                # Refuse rather than silently validating the repo root: the
+                # declared directory not existing in the COMMITTED tree is
+                # itself a failure of the change under review.
+                return False, (
+                    f"declared validation_cwd {execution.validation_cwd!r} does not "
+                    "exist in the committed worker repo"
+                )
         return run_validation_commands(
-            self._config.audit.validation_commands,
-            Path(worktree_path),
+            commands,
+            cwd,
             command_runner=self._validation_runner,
             validation_env=self._validation_env,
         )
