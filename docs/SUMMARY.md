@@ -343,6 +343,7 @@ sandbox — recorded as open finding S24, on purpose.
 | `README.md` | Repo-root readme. |
 | `CLAUDE.md` | This project's master guide (read first). |
 | `docs/TODO.md` | Bugs + tasks, ordered by blocking dependency. |
+| `docs/AUTOLOOP_TODO.md` | Open work on the loop itself — the live-progress gap during agent fan-out, the unexplained changeset-publish refusal, execution records stranded by a `workers_root` move, and the self-hosting rollback design. App tasks stay in `docs/TODO.md`; security findings stay in `docs/SECURITY.md`, referenced by id. |
 | `docs/WORKFLOW_AUDIT.md` | Full word-learning trace with numbered holes. |
 | `services/book_import_service.py` | **Document-package import orchestration (roadmap A2).** `verify → validate → dry-run → persist`, no DB mutation before every gate passes. `list_packages`, `validate_package`, `import_package`, `dry_run_package`. Scope is narrow by design: no reconstruction (A4), segmentation (A5), AI review (A8) or worker invocation (A10). |
 | `services/document_package/` | The A2 internals. `contract.py` (versions, element enum, coordinate space — no logic), `issues.py` (fatal/warning/info collector), `loader.py` (discovery, checksums, **path-containment chokepoint**), `validators.py` (individually testable structural validators), `coordinates.py` (the single Docling↔fitz flip), `persistence.py` (`PersistenceBackend` seam + dry-run + the A3 placeholder), `result.py` (`import_result.json`). Imports nothing from `nlp_histo`/Docling/Torch — asserted by a test. |
