@@ -31,7 +31,39 @@ from pathlib import Path
 
 #: Reserved status roles (dataviz palette). Never reused for anything else, and
 #: every use in the page ships an icon + label so state is never colour-alone.
+#: Fixed, never themed — the same four steps clear 3:1 on the dark surface.
 STATUS = {"good": "#0ca30c", "warning": "#fab219", "serious": "#ec835a", "critical": "#d03b3b"}
+
+#: The pipeline's mark colours, and WHY they are these.
+#:
+#: A stage is not a category — the six stages are an ordered progression, and
+#: what varies is how far along each one is. So exactly one stage carries a hue
+#: (the one running now, categorical slot 1); finished stages recede to
+#: secondary ink because history should not compete with the present; idle
+#: stages sit on the axis neutral. `blocked` is the only state that is genuinely
+#: a health verdict, so it is the only one allowed a status colour.
+#:
+#: The previous version painted `active` with status-good green, which is the
+#: "status colour used for a non-status series" anti-pattern: "running" is not a
+#: verdict about health, and reusing the good/bad channel for progress leaves
+#: nothing to say with when something IS wrong.
+#:
+#: VALIDATED, not eyeballed — `scripts/validate_palette.js` from the dataviz
+#: skill, against the surface the marks actually sit on (the node fill, not the
+#: page):
+#:   light  "#2a78d6,#d03b3b" --surface #f4f3f0  → ALL CHECKS PASS
+#:          (CVD ΔE 23.8 protan / 33.5 tritan, normal 31.6, both >= 3:1)
+#:   dark   "#3987e5,#d03b3b" --surface #2a2a27  → ALL CHECKS PASS, one WARN:
+#:          critical sits at exactly 3.0:1, which obligates relief. Both reliefs
+#:          are shipped — every mark carries an icon + word, and the stage table
+#:          below the diagram repeats all of it as text.
+#: A first attempt used sequential ramp steps for `done` and FAILED both modes
+#: (light `#86b6ef` below the chroma floor and 1.9:1; dark `#184f95` outside the
+#: lightness band) — recorded so nobody re-derives it.
+MARKS = {
+    "light": {"active": "#2a78d6", "done": "#52514e", "idle": "#c3c2b7"},
+    "dark": {"active": "#3987e5", "done": "#c3c2b7", "idle": "#383835"},
+}
 
 _DOMAIN = re.compile(r"Your domain:\s*(.+?)\.")
 _REMOTE_CACHE: dict = {"at": 0.0, "refs": []}
@@ -261,9 +293,25 @@ PAGE = """<!doctype html>
 <meta charset="utf-8"><title>Autoloop — live</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--surface:#fcfcfb;--card:#fff;--ink:#0b0b0b;--ink2:#52514e;--line:#e5e4e0;--soft:#f4f3f0;
+/* Roles, not raw hex, so light/dark swap in one place. Surfaces are the
+   reference palette's: page plane, chart surface, and the node fill the marks
+   were validated against. Status colours are FIXED — never themed. */
+:root{color-scheme:light;
+      --surface:#f9f9f7;--card:#fcfcfb;--soft:#f4f3f0;
+      --ink:#0b0b0b;--ink2:#52514e;--muted:#898781;--line:#e1e0d9;--axis:#c3c2b7;
+      --mark-active:#2a78d6;--mark-done:#52514e;--mark-idle:#c3c2b7;
       --good:#0ca30c;--warning:#fab219;--serious:#ec835a;--critical:#d03b3b}
-@media (prefers-color-scheme:dark){:root{--surface:#1a1a19;--card:#222220;--ink:#fff;--ink2:#c3c2b7;--line:#34332f;--soft:#2a2a27}}
+/* Dark is SELECTED, not flipped: its own steps, validated against #2a2a27.
+   Declared under both scopes so the toggle wins either way — the :not() guard
+   lets an explicit light stamp beat OS-dark. */
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;
+      --surface:#0d0d0d;--card:#1a1a19;--soft:#2a2a27;
+      --ink:#fff;--ink2:#c3c2b7;--muted:#898781;--line:#2c2c2a;--axis:#383835;
+      --mark-active:#3987e5;--mark-done:#c3c2b7;--mark-idle:#383835}}
+:root[data-theme="dark"]{color-scheme:dark;
+      --surface:#0d0d0d;--card:#1a1a19;--soft:#2a2a27;
+      --ink:#fff;--ink2:#c3c2b7;--muted:#898781;--line:#2c2c2a;--axis:#383835;
+      --mark-active:#3987e5;--mark-done:#c3c2b7;--mark-idle:#383835}
 *{box-sizing:border-box}
 body{margin:0;background:var(--surface);color:var(--ink);font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",sans-serif}
 .wrap{max-width:1180px;margin:0 auto;padding:22px 20px 72px}
@@ -276,23 +324,44 @@ section{background:var(--card);border:1px solid var(--line);border-radius:10px;p
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
 .tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:11px 13px}
 .k{font-size:11px;color:var(--ink2);text-transform:uppercase;letter-spacing:.06em}
-.v{font-size:18px;margin-top:2px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+/* Proportional figures on standalone values — tabular-nums makes `121` look
+   loose at display sizes. It belongs on columns that align vertically, which is
+   `code` in the tables below, not here. */
+.v{font-size:18px;margin-top:2px;overflow-wrap:anywhere}
 table{width:100%;border-collapse:collapse;font-size:13px}
 td,th{text-align:left;padding:5px 8px 5px 0;border-bottom:1px solid var(--line);vertical-align:top}
 th{font-size:11px;color:var(--ink2);font-weight:500;text-transform:uppercase;letter-spacing:.05em}
 tr:last-child td{border-bottom:0}
-code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);overflow-wrap:anywhere}
+code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);
+     font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .muted{color:var(--ink2)}.empty{color:var(--ink2);font-style:italic;font-size:13px}
 .scroll{overflow-x:auto}
 /* pipeline */
-#flow{width:100%;height:132px;display:block}
+/* height:auto, not a fixed px: the viewBox owns the aspect ratio, so the
+   container is sized to its content instead of letterboxing ~48px of dead
+   space under the nodes. */
+#flow{width:100%;height:auto;display:block}
 .node rect{fill:var(--soft);stroke:var(--line);stroke-width:1;rx:8;cursor:pointer}
 .node.sel rect{stroke:var(--ink2);stroke-width:2}
+.node:focus{outline:none}
+.node:focus rect{stroke:var(--ink);stroke-width:2}
 .node text{font-size:11.5px;fill:var(--ink);pointer-events:none}
 .node .sub{font-size:10px;fill:var(--ink2)}
+/* Solid hairlines, one shade off the surface — never dashed. */
 .edge{stroke:var(--line);stroke-width:2;fill:none;marker-end:url(#ar)}
-.edge.on{stroke:var(--ink2)}
+.edge.on{stroke:var(--axis)}
 .badge{font-size:10px;fill:var(--ink2)}
+/* Legend: identity is never colour-alone, so each key is swatch + icon + word.
+   Present because the diagram carries four distinct states. */
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;font-size:12px;color:var(--ink2)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:10px;height:10px;border-radius:50%;display:inline-block;font-style:normal}
+details{margin-top:10px}
+summary{font-size:12px;color:var(--ink2);cursor:pointer}
+summary:hover{color:var(--ink)}
+.themetog{margin-left:auto;font-size:12px;background:var(--card);color:var(--ink2);
+          border:1px solid var(--line);border-radius:999px;padding:4px 11px;cursor:pointer}
+.themetog:hover{color:var(--ink)}
 #tip{position:fixed;pointer-events:none;opacity:0;transition:opacity .12s;background:var(--card);
      border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12.5px;max-width:330px;
      box-shadow:0 6px 22px rgba(0,0,0,.13);z-index:9}
@@ -303,18 +372,25 @@ code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);ove
     <h1>AUTOLOOP</h1>
     <span class="pill"><span class="dot" id="hdot"></span><span id="hlabel">…</span></span>
     <span class="muted" style="font-size:12px" id="served"></span>
+    <button class="themetog" id="themetog" type="button">◐ theme</button>
   </header>
 
   <div class="grid" id="tiles"></div>
 
   <section>
-    <h2>Pipeline — hover for detail, click to inspect</h2>
-    <svg id="flow" viewBox="0 0 1140 132" preserveAspectRatio="xMidYMid meet">
+    <h2>Pipeline — hover or focus for detail, click to inspect</h2>
+    <svg id="flow" viewBox="0 0 1140 74" preserveAspectRatio="xMidYMid meet">
       <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
         <path d="M0,0 L10,5 L0,10 z" fill="var(--line)"/></marker></defs>
       <g id="edges"></g><g id="nodes"></g>
     </svg>
     <div id="detail" class="muted" style="font-size:12.5px;margin-top:6px"></div>
+    <div class="legend" id="legend"></div>
+    <!-- The table view is the WCAG-clean twin: every stage's full detail as
+         text, so a tooltip is never the only way to read a value, and the
+         dark-mode contrast WARN on `critical` has its required relief. -->
+    <details><summary>Table view — all stages as text</summary>
+      <div id="flowtable" class="scroll"></div></details>
   </section>
 
   <section><h2>Language-app tasks</h2><div id="apptasks" class="scroll"></div></section>
@@ -326,10 +402,17 @@ code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);ove
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const rows = (head, body) => body ? `<table><tr>${head.map(h=>`<th>${h}</th>`).join("")}</tr>${body}</table>` : `<p class="empty">none</p>`;
-// state -> icon + word. Colour never carries meaning on its own.
+// state -> icon + word. Colour never carries meaning on its own: every mark
+// ships both, and the table view below repeats all of it as text.
 const MARK = {active:["▶","running"],done:["✓","done"],blocked:["■","blocked"],idle:["·","idle"]};
-const FILL = {active:"var(--good)",done:"var(--ink2)",blocked:"var(--critical)",idle:"var(--line)"};
-let SEL = null, LAST = null;
+// One hue for the stage running NOW (categorical slot 1, validated); finished
+// stages recede to secondary ink; idle sits on the axis neutral. `blocked` is
+// the only genuine health verdict, so it is the only status colour here — see
+// the MARKS comment in dashboard.py for the validator runs behind these.
+const FILL = {active:"var(--mark-active)",done:"var(--mark-done)",
+              blocked:"var(--critical)",idle:"var(--mark-idle)"};
+const ORDER = ["active","done","blocked","idle"];
+let SEL = null, LAST = null, LASTJSON = null;
 
 const tip = document.getElementById("tip");
 function showTip(e, html){ tip.innerHTML = html; tip.style.opacity = 1;
@@ -338,41 +421,76 @@ function showTip(e, html){ tip.innerHTML = html; tip.style.opacity = 1;
 function hideTip(){ tip.style.opacity = 0; }
 
 function drawFlow(d){
-  const N = d.pipeline, W = 1140, w = 158, h = 54, gap = (W - N.length*w) / (N.length - 1), y = 30;
+  const N = d.pipeline, W = 1140, w = 158, h = 54, gap = (W - N.length*w) / (N.length - 1), y = 8;
   const edges = [], nodes = [];
   N.forEach((n, i) => {
     const x = i * (w + gap);
     if (i) { const px = (i-1)*(w+gap)+w, on = N[i-1].state==="done" || N[i-1].state==="active";
       edges.push(`<path class="edge${on?" on":""}" d="M${px+4},${y+h/2} L${x-6},${y+h/2}"/>`); }
     const [ic, word] = MARK[n.state] || MARK.idle;
-    nodes.push(`<g class="node${SEL===n.key?" sel":""}" data-k="${esc(n.key)}" transform="translate(${x},${y})">
+    // Only ever render a label that fits: ~24 chars at 10px inside a 158px
+    // box, with an ellipsis so truncation is visible rather than silent.
+    const det = (n.detail || ""), shown = det.length > 24 ? det.slice(0,23) + "…" : det;
+    // tabindex/role: keyboard focus must reveal exactly what hover reveals.
+    nodes.push(`<g class="node${SEL===n.key?" sel":""}" data-k="${esc(n.key)}" tabindex="0"
+      role="button" aria-label="${esc(n.label)} — ${esc(word)}. ${esc(det)}"
+      transform="translate(${x},${y})">
       <rect width="${w}" height="${h}"/>
-      <circle cx="13" cy="15" r="4" fill="${FILL[n.state]}"/>
-      <text x="24" y="19">${esc(n.label)}</text>
+      <circle cx="13" cy="15" r="5" fill="${FILL[n.state]}"/>
+      <text x="26" y="19">${esc(n.label)}</text>
       <text class="sub" x="11" y="36">${esc(ic)} ${esc(word)}</text>
-      <text class="sub" x="11" y="49">${esc((n.detail||"").slice(0,24))}</text></g>`);
+      <text class="sub" x="11" y="49">${esc(shown)}</text></g>`);
   });
   document.getElementById("edges").innerHTML = edges.join("");
   document.getElementById("nodes").innerHTML = nodes.join("");
   document.querySelectorAll("#nodes .node").forEach(g => {
     const n = N.find(x => x.key === g.dataset.k);
-    g.addEventListener("mousemove", e => showTip(e,
-      `<b>${esc(n.label)}</b> — ${esc((MARK[n.state]||MARK.idle)[1])}<br><span class="muted">${esc(n.detail)}</span>`));
+    const body = `<b>${esc(n.label)}</b> — ${esc((MARK[n.state]||MARK.idle)[1])}`
+               + `<br><span class="muted">${esc(n.detail)}</span>`;
+    g.addEventListener("mousemove", e => showTip(e, body));
     g.addEventListener("mouseleave", hideTip);
-    g.addEventListener("click", () => { SEL = SEL === n.key ? null : n.key; render(LAST); });
+    // Keyboard parity: focus anchors the same tooltip to the node's own box.
+    g.addEventListener("focus", () => {
+      const r = g.getBoundingClientRect();
+      showTip({clientX: r.left, clientY: r.bottom - 8}, body);
+    });
+    g.addEventListener("blur", hideTip);
+    const pick = () => { SEL = SEL === n.key ? null : n.key; render(LAST, true); };
+    g.addEventListener("click", pick);
+    g.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); }
+    });
   });
+
+  document.getElementById("legend").innerHTML = ORDER.map(s =>
+    `<span><i style="background:${FILL[s]}"></i>${esc(MARK[s][0])} ${esc(MARK[s][1])}</span>`).join("");
+
+  document.getElementById("flowtable").innerHTML = rows(["stage","state","detail"],
+    N.map(n => `<tr><td>${esc(n.label)}</td><td>${esc(MARK[n.state][0])} ${esc(MARK[n.state][1])}</td>
+      <td class="muted">${esc(n.detail || "—")}</td></tr>`).join(""));
+
   document.getElementById("detail").textContent = SEL
     ? `${SEL}: ${(N.find(x=>x.key===SEL)||{}).detail || ""}`
     : "no stage selected";
 }
 
-function render(d){
-  if (!d) return; LAST = d;
+function render(d, force){
+  if (!d) return;
+  // No skeleton flash on refetch: a 2s poll that rebuilt identical DOM threw
+  // away hover state and any text selection for nothing. Re-render only when
+  // the payload actually changed (or a click forced it). `served_at` is
+  // excluded from the signature on purpose — it ticks every poll, so leaving
+  // it in would make the guard never fire; its own line is updated below
+  // regardless, so "updated HH:MM:SS" still moves.
+  const {served_at, ...rest} = d;
+  const sig = JSON.stringify(rest);
+  document.getElementById("served").textContent = `updated ${esc(served_at)}`;
+  if (!force && sig === LASTJSON) return;
+  LASTJSON = sig; LAST = d;
   document.getElementById("hdot").style.background = `var(--${d.health.role})`;
   const hi = {good:"●",warning:"◐",serious:"◑",critical:"■"}[d.health.role] || "●";
   document.getElementById("hlabel").textContent =
     `${hi} ${d.health.label}` + (d.health.pids.length ? ` · pid ${d.health.pids.join(", ")}` : "");
-  document.getElementById("served").textContent = `updated ${esc(d.served_at)}`;
 
   const t = d.task;
   document.getElementById("tiles").innerHTML = [
@@ -414,6 +532,22 @@ function render(d){
     [`<tr><td>local <code>${esc(d.git.branch)}</code>${d.git.dirty?` · <span class="muted">${d.git.dirty} dirty</span>`:""}</td><td><code>${esc(d.git.head)}</code></td></tr>`]
       .concat((d.git.remote||[]).map(r=>`<tr><td>origin/${esc(r.ref)}</td><td><code>${esc(r.sha)}</code></td></tr>`)).join(""));
 }
+
+// Theme toggle. The stamp goes on <html>, which both dark scopes key off, so
+// an explicit choice beats the OS setting in BOTH directions.
+const tog = document.getElementById("themetog");
+const applyTheme = t => {
+  if (t) document.documentElement.setAttribute("data-theme", t);
+  else document.documentElement.removeAttribute("data-theme");
+  tog.textContent = t === "dark" ? "◑ dark" : t === "light" ? "◐ light" : "◐ theme";
+};
+applyTheme(localStorage.getItem("al-theme"));
+tog.addEventListener("click", () => {
+  const now = document.documentElement.getAttribute("data-theme");
+  const next = now === "dark" ? "light" : now === "light" ? "" : "dark";
+  next ? localStorage.setItem("al-theme", next) : localStorage.removeItem("al-theme");
+  applyTheme(next);
+});
 
 async function tick(){ try { render(await (await fetch("/api/state")).json()); } catch {} }
 tick(); setInterval(tick, 2000);

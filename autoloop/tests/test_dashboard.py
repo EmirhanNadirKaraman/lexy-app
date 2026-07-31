@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import subprocess
 
-from autoloop.dashboard import app_tasks, collect, pipeline
+from autoloop.dashboard import MARKS, PAGE, STATUS, app_tasks, collect, pipeline
 
 
 def run_git(cwd, *args):
@@ -79,3 +79,73 @@ def test_pipeline_marks_blocked_when_the_loop_is_parked():
     assert stages[0]["state"] == "blocked"
     idle_or_blocked = {s["state"] for s in stages}
     assert "active" not in idle_or_blocked, "a parked loop has nothing running"
+
+
+# ---- visual encoding (dataviz method) ---------------------------------------
+#
+# The page's colours are a correctness property, not taste: an earlier version
+# painted the "running" stage with the reserved status-good green, which spends
+# the good/bad channel on progress and leaves nothing to say with when something
+# is actually wrong. These pin the rules that fix cost real debugging to find.
+
+
+def test_status_colours_are_never_used_for_a_non_status_state():
+    """`blocked` is the only pipeline state that is a health verdict, so it is
+    the only one allowed a status colour. `active`/`done`/`idle` describe
+    progress and must draw from the mark roles instead."""
+    fill = PAGE.split("const FILL = {", 1)[1].split("};", 1)[0]
+    compact = "".join(fill.split())
+    assert 'active:"var(--mark-active)"' in compact
+    assert 'done:"var(--mark-done)"' in compact
+    assert 'idle:"var(--mark-idle)"' in compact
+    for role in ("--good", "--warning", "--serious"):
+        assert role not in fill, f"{role} is a reserved status colour, not a progress mark"
+    assert "--critical" in fill, "blocked must still use the status critical role"
+
+
+def test_every_pipeline_state_ships_an_icon_and_a_word():
+    """Colour never carries meaning alone — required because two marks sit
+    below 3:1 on their surface, and because CVD readers get no hue at all."""
+    states = {"active", "done", "blocked", "idle"}
+    mark = PAGE.split("const MARK = {", 1)[1].split("};", 1)[0]
+    for s in states:
+        assert f"{s}:[" in mark.replace(" ", ""), f"state {s} has no icon+word pair"
+
+
+def test_pipeline_only_emits_states_the_page_can_draw():
+    """A state the page has no mark for would render as an undefined fill —
+    invisible, and silently so."""
+    drawable = {"active", "done", "blocked", "idle"}
+    scenarios = [
+        ({"phase": "executing", "task_execution": {"task_id": "t"}}, [], []),
+        ({"phase": "needs_user"}, [], [{"id": "b"}]),
+        ({"phase": "awaiting", "task_execution": {"task_id": "t", "candidate_sha": "a" * 40},
+          "last_decision": "push"}, [{"domain": "d"}], []),
+        ({}, [], []),
+    ]
+    for state, agents, blockers in scenarios:
+        stages = pipeline(state, agents, blockers)
+        emitted = {s["state"] for s in stages}
+        assert emitted <= drawable, f"undrawable state(s) {emitted - drawable}"
+
+
+def test_validated_mark_hexes_are_the_ones_the_page_ships():
+    """The hexes in MARKS are the ones `validate_palette.js` passed against the
+    node surface (see dashboard.py's MARKS comment). If someone edits the CSS
+    without re-running the validator, this catches the drift."""
+    for mode in ("light", "dark"):
+        for role, hexv in MARKS[mode].items():
+            assert f"--mark-{role}:{hexv}" in PAGE, f"{mode}/{role} drifted from {hexv}"
+    for role, hexv in STATUS.items():
+        assert f"--{role}:{hexv}" in PAGE
+    # Status colours are fixed, never themed: exactly one declaration each.
+    assert PAGE.count("--critical:#d03b3b") == 1
+
+
+def test_stat_tile_values_use_proportional_figures():
+    """`tabular-nums` on a large standalone number makes it look loose; it
+    belongs on columns that align vertically, which here is `code`."""
+    tile_rule = PAGE.split(".v{", 1)[1].split("}", 1)[0]
+    assert "tabular-nums" not in tile_rule
+    code_rule = PAGE.split("code{", 1)[1].split("}", 1)[0]
+    assert "tabular-nums" in code_rule
