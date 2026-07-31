@@ -1229,6 +1229,17 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the read-only tracker. Takes NO lock and writes nothing — it may
+    run alongside a live `run --continuous`, which is the only time it is
+    useful. Touching the working tree would make the loop's escape detector
+    refuse its next write-capable task."""
+    from .dashboard import main as dashboard_main
+
+    repo = args.repo or Path.cwd()
+    return dashboard_main(["--repo", str(repo), "--port", str(args.port)])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="autoloop")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1309,6 +1320,17 @@ def build_parser() -> argparse.ArgumentParser:
     answer.add_argument("blocker_id", help="the blocker id, e.g. blk-t1-001")
     answer.add_argument("text", help="the operator's answer/decision")
     answer.set_defaults(func=_cmd_answer)
+
+    dash = sub.add_parser(
+        "dashboard", help="serve a read-only live tracker on localhost (no lock)"
+    )
+    add_config(dash)
+    dash.add_argument("--port", type=int, default=8787)
+    dash.add_argument(
+        "--repo", type=Path, default=None,
+        help="checkout whose .autoloop/ to read (default: cwd)",
+    )
+    dash.set_defaults(func=_cmd_dashboard)
 
     reset = sub.add_parser("reset", help="archive the session state")
     add_config(reset)
