@@ -41,6 +41,7 @@ from .publisher import (
     read_publisher_url_snapshot,
     redact_url,
 )
+from .validation_env import load_validation_env, validate_validation_env_path
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
 
 # A conversation URL is either a plain `/c/<id>` or a project- / GPT-scoped
@@ -143,6 +144,44 @@ def run_doctor(
         add("workers_root", "fail", "; ".join(workers_root_violations))
     else:
         add("workers_root", "ok", str(Path(config.workers_root).resolve()))
+
+    # 3b-bis. validation environment (the credential boundary). Reports the
+    # SAME checks `cli._load_validation_env` enforces, so doctor can never
+    # come back clean on a configuration a real run would refuse. Names and
+    # paths only — `ValidationEnv` has no accessor that yields a value, and
+    # its `describe()` says so explicitly.
+    if config.validation_env_file is None:
+        add(
+            "validation_env",
+            "skip",
+            "no paths.validation_env_file configured — post-writer validation "
+            "runs with no database credentials (correct unless a task's declared "
+            "validation needs one)",
+        )
+    else:
+        location_violations = validate_validation_env_path(
+            config.validation_env_file, repo_root, config.state_dir, config.workers_root
+        )
+        if location_violations:
+            add("validation_env", "fail", "; ".join(location_violations))
+        else:
+            try:
+                loaded = load_validation_env(
+                    config.validation_env_file,
+                    repo_root=repo_root,
+                    state_dir=config.state_dir,
+                    workers_root=config.workers_root,
+                )
+            except AutoloopError as exc:
+                add("validation_env", "fail", str(exc))
+            else:
+                add(
+                    "validation_env",
+                    "ok",
+                    f"{loaded.path} defines {', '.join(loaded.keys())} "
+                    "(values redacted; delivered only to the post-writer "
+                    "validation subprocess, stripped from the agent subprocess)",
+                )
 
     # 3c. legacy workers — pre-M1-fix deployments created worker repos under
     # `config.workers_dir` (`state_dir / "workers"`, nested inside the

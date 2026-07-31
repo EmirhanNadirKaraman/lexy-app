@@ -74,6 +74,21 @@ diffstat — and include the full patch only below a smaller threshold. The four
 identifiers must stay in the body at any size, since `report_sha256` covers
 exactly those bytes.
 
+### B4b. Post-commit validation ignores the task's declared validation
+`_run_post_commit_validation` re-runs `config.audit.validation_commands`, not
+`task.validation`. So a task like `rt-01`, which declares the backend suite
+precisely because the configured default does not cover what it changes, has
+its *reviewed commit* checked by the default only — the declared validation
+runs once, in `ImplementExecutor`, against the pre-commit tree. That is a
+weaker guarantee than §4b claims for the produce-then-review path, whose whole
+point is that a commit hook can change committed content in ways pre-commit
+validation never saw.
+
+Found while wiring the validation-environment boundary (§4g), deliberately not
+fixed there — out of that brief's scope. The fix is small (thread the task
+through `_verify_committed` and prefer `task.validation`) but it changes what
+gets refused, so it wants its own changeset and its own test.
+
 ### B5. Fail-closed check for unmapped blocker codes
 Three times now a new `loop_fatal` code shipped without a
 `_RESOLUTION_PRECONDITIONS` entry, meaning an environmental blocker could be

@@ -65,6 +65,7 @@ from pathlib import Path
 from .errors import GitCommandError
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
+from .validation_env import VALIDATION_ENV_ALLOWLIST, strip_validation_vars
 from .worktree import validate_task_id
 
 #: Removed unconditionally: an ambient ssh-agent socket or askpass/ssh
@@ -99,7 +100,10 @@ _FORCED_GIT_CONFIG_ENV = {
 def worker_env(base_env: dict | None = None) -> dict:
     """The environment mapping a worker's git subprocesses run under.
 
-    Starts from `base_env` (a copy of `os.environ` if omitted), removes every
+    Starts from `base_env` (a copy of `os.environ` if omitted) with the
+    VALIDATION credentials already removed (`strip_validation_vars` — see
+    `validation_env.py`; those belong to the post-writer validation
+    subprocess and to nothing else on the worker side), removes every
     var in `_SCRUB_VARS`, removes every OTHER `GIT_CONFIG*` var the parent
     process might have set (so a parent-supplied override cannot survive),
     then forces `_FORCED_GIT_CONFIG_ENV` on top. `HOME` is never touched —
@@ -107,7 +111,7 @@ def worker_env(base_env: dict | None = None) -> dict:
     and `GIT_CONFIG_GLOBAL=/dev/null` already suppresses the global config
     file that `HOME` would otherwise point at.
     """
-    env = dict(base_env if base_env is not None else os.environ)
+    env = strip_validation_vars(base_env if base_env is not None else os.environ)
     for key in _SCRUB_VARS:
         env.pop(key, None)
     for key in list(env):
@@ -134,6 +138,9 @@ def describe_policy(worker: "WorkerRepo | None" = None) -> dict:
         "forced_env": dict(_FORCED_GIT_CONFIG_ENV),
         "removed_env_vars": sorted(_SCRUB_VARS),
         "removed_env_var_pattern": "GIT_CONFIG* other than the forced two above",
+        # Names only — `validation_env.py` never exposes the values, and this
+        # dict is printed by `doctor`.
+        "removed_validation_env_vars": sorted(VALIDATION_ENV_ALLOWLIST),
         "home_repurposed_by_policy": False,
         "remotes_permitted_by_policy": False,
         "hooks_dir_policy": "controlled, empty, enumerated (not limited to named hooks)",

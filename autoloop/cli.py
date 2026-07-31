@@ -80,6 +80,7 @@ from .publisher import (
 from .state import TERMINAL_PHASES, LoopState, Phase, StateStore
 from .tasks import Task, TaskRegistry, TaskStore
 from .transcript import TranscriptLogger
+from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
 from .worktask import IntentStore, TaskExecutionStore
 
@@ -201,6 +202,25 @@ class _DispatchingExecutor:
         return executor.execute(directive, task)
 
 
+def _load_validation_env(config: AutoloopConfig, repo_root: Path):
+    """The configured `ValidationEnv`, or None when no file is configured.
+
+    Raises `ConfigError` (refusing the whole run) when a file IS configured
+    but is unsafe or unparseable — never falls back to "no credentials",
+    because a task whose declared validation needs a database would then
+    report a failure that looks like a code problem instead of a
+    configuration one.
+    """
+    if config.validation_env_file is None:
+        return None
+    return load_validation_env(
+        config.validation_env_file,
+        repo_root=repo_root,
+        state_dir=config.state_dir,
+        workers_root=config.workers_root,
+    )
+
+
 def _build_executor(
     config: AutoloopConfig,
     args,
@@ -208,6 +228,7 @@ def _build_executor(
     registry: TaskRegistry,
     worker_repos: WorkerRepoManager,
     policy: PolicyEngine,
+    validation_env=None,
 ) -> TaskExecutor:
     if getattr(args, "null_executor", False) or config.executor.kind == "null":
         return NullExecutor()
@@ -250,6 +271,10 @@ def _build_executor(
         # there is no separate `[implement]` config section (kept minimal;
         # add one if the two ever need to diverge).
         validation_commands=config.audit.validation_commands,
+        # ONLY the implement executor gets the credentials — the audit
+        # executor above deliberately does not (read-only agents, no writer,
+        # no reason for a database).
+        validation_env=validation_env,
         worker_repo_root_for=worker_repos.path_for,
         policy=policy,
         agent_runner_factory=lambda root: implement_agent_runner(
@@ -278,6 +303,14 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
             "paths.workers_root is not safe to use: " + "; ".join(workers_root_violations)
         )
     worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+    # The validation-environment boundary. Loaded ONCE, here, and handed only
+    # to the two post-writer validation sites (the ImplementExecutor's own run
+    # and the orchestrator's post-commit re-run). A bad file refuses the run
+    # rather than degrading to "validation without a database", which would
+    # look like a pass while proving nothing — the same fail-closed shape as
+    # `validate_workers_root` directly above. `doctor` reports the identical
+    # checks non-fatally.
+    validation_env = _load_validation_env(config, git.repo_root)
     execution_store = TaskExecutionStore(config.executions_dir)
     intent_store = IntentStore(config.intents_dir)
     blocker_store = BlockerStore(config.blockers_dir)
@@ -290,7 +323,9 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         state=state,
         policy=policy,
         git=git,
-        executor=_build_executor(config, args, git, registry, worker_repos, policy),
+        executor=_build_executor(
+            config, args, git, registry, worker_repos, policy, validation_env
+        ),
         transcript=TranscriptLogger(config.transcript_file),
         client_factory=lambda: create_conversation(config.conversation.provider, config),
         registry=registry,
@@ -302,6 +337,7 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         blocker_store=blocker_store,
         publisher=publisher,
         publisher_url_snapshot=publisher_url_snapshot,
+        validation_env=validation_env,
         # `--config` can put the file anywhere, so pass the path actually
         # loaded rather than re-deriving the conventional one. Callers that
         # build an args namespace without it (tests, embedders) fall back to

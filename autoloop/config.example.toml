@@ -83,3 +83,30 @@ state_dir = ".autoloop"
 # invisible to every git-based verification primitive scoped to it, so a
 # write outside the worker repo but inside the checkout would go undetected.
 workers_root = "~/.autoloop/workers"
+# OPTIONAL. Absolute path to a file holding the DEDICATED TEST database
+# credentials that post-writer validation runs under. Set this only when a
+# task's declared validation needs a database (e.g. the backend suite); leave
+# it unset and validation runs with no credentials at all.
+#
+# The file must define EXACTLY these six names and nothing else:
+#
+#   DB_HOST=127.0.0.1
+#   DB_PORT=5432
+#   DB_NAME=REPLACE_WITH_A_DEDICATED_TEST_DATABASE
+#   DB_USER=REPLACE_ME
+#   DB_PASSWORD=REPLACE_ME_MIN_8_CHARS
+#   SECRET_KEY=REPLACE_ME_MIN_8_CHARS_JWT_SIGNING_KEY
+#
+# Refused, deliberately: any other key (so this can never become a channel
+# for ANTHROPIC_API_KEY or another provider credential), a duplicate key, a
+# missing key, a malformed line, an empty value, a symlink, a file not owned
+# by you, any group/world permission bit (`chmod 600`), a path inside this
+# checkout / the state dir / workers_root / the publisher dirs, and a DB_NAME
+# equal to the application database name this repo declares in `.env.example`.
+#
+# The database is created, written to and deleted from by the test suite. Use
+# a throwaway database, NOT the one the app runs on, and do NOT point this at
+# your real `.env` — it holds provider keys this boundary exists to keep out.
+# The write-capable agent subprocess has these variables explicitly removed
+# from its environment and never learns this path.
+# validation_env_file = "~/.autoloop/validation.env"

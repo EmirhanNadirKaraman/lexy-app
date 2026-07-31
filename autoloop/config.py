@@ -81,6 +81,16 @@ class AutoloopConfig:
     #: locating pre-existing/legacy worker repos to report on, never as a
     #: place new ones are created).
     workers_root: Path | None = None
+    #: Absolute path to the operator-authored file holding the DEDICATED TEST
+    #: database credentials the post-writer validation subprocess runs under
+    #: (`validation_env.py`). Optional: `None` means validation runs with no
+    #: database credentials at all, which is correct for tasks whose declared
+    #: validation does not need one. Like `workers_root`, only the cheap
+    #: checks (absolute, expandable) happen at load time — location,
+    #: permissions, ownership and content are checked by
+    #: `validation_env.validate_validation_env_path` / `load_validation_env`
+    #: at the two places that need a repo root (`cli.py`, `doctor.py`).
+    validation_env_file: Path | None = None
     conversation: ConversationConfig = ConversationConfig()
     executor: ExecutorConfig = ExecutorConfig()
     audit: AuditConfig = AuditConfig()
@@ -222,7 +232,7 @@ def load_config(path: Path) -> AutoloopConfig:
     policy = PolicyConfig(**policy_data)
 
     paths_data = data.get("paths", {})
-    _check_keys("paths", paths_data, {"state_dir", "workers_root"})
+    _check_keys("paths", paths_data, {"state_dir", "workers_root", "validation_env_file"})
     state_dir = Path(paths_data.get("state_dir", ".autoloop"))
 
     # `workers_root` (Autoloop M1 finding #1): required, absolute, no
@@ -249,6 +259,24 @@ def load_config(path: Path) -> AutoloopConfig:
             "(after expanding '~') — a relative path is ambiguous across the "
             "different working directories worker-repo subprocesses run from"
         )
+
+    # `validation_env_file` (the validation-environment boundary): OPTIONAL,
+    # but absolute when present. Same split as `workers_root` above — "unset"
+    # and "relative" are cheap and checked here; "outside the checkout /
+    # workers root / publisher / state dir", "not group-readable", "owned by
+    # me", "parses under the allowlist" all need a repo root and live in
+    # `validation_env.py`, called from `cli.py` AND `doctor.py` (both, so
+    # doctor cannot silently skip a check a real run enforces).
+    validation_env_raw = paths_data.get("validation_env_file")
+    validation_env_file: Path | None = None
+    if validation_env_raw is not None and str(validation_env_raw).strip():
+        validation_env_file = Path(str(validation_env_raw)).expanduser()
+        if not validation_env_file.is_absolute():
+            raise ConfigError(
+                "paths.validation_env_file must be an absolute path, got "
+                f"{validation_env_raw!r} (after expanding '~') — it is read from "
+                "several different working directories"
+            )
 
     conversation_data = data.get("conversation", {})
     conversation_fields = {f.name for f in dataclasses.fields(ConversationConfig)}
@@ -285,6 +313,7 @@ def load_config(path: Path) -> AutoloopConfig:
         policy=policy,
         state_dir=state_dir,
         workers_root=workers_root,
+        validation_env_file=validation_env_file,
         conversation=conversation,
         executor=executor,
         audit=audit,

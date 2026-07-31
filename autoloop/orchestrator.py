@@ -235,6 +235,7 @@ class Orchestrator:
         intent_store: IntentStore | None = None,
         blocker_store: BlockerStore | None = None,
         validation_runner=None,
+        validation_env=None,
         publisher: Publisher | None = None,
         worker_repos=None,
         publisher_url_snapshot: str | None = None,
@@ -280,6 +281,13 @@ class Orchestrator:
         #: validation, mirroring `AuditExecutor`'s `command_runner` — lets
         #: tests avoid depending on a real `ruff`/`pytest` install.
         self._validation_runner = validation_runner
+        #: Dedicated TEST database credentials for the POST-COMMIT validation
+        #: re-run (`validation_env.py`). `None` = that re-run gets none, which
+        #: is the pre-existing behaviour and correct for validation commands
+        #: that never touch a database. Same object the `ImplementExecutor`
+        #: holds; both are post-writer validation, and the writer subprocess
+        #: itself is explicitly stripped of these variables.
+        self._validation_env = validation_env
         # Autoloop M2 (`publisher.py`). Optional and independently gated from
         # the `worktrees`/`execution_store`/`intent_store` triple above: when
         # `None` (every existing caller and test), `_dispatch_task_push`
@@ -2148,6 +2156,7 @@ class Orchestrator:
             self._config.audit.validation_commands,
             Path(worktree_path),
             command_runner=self._validation_runner,
+            validation_env=self._validation_env,
         )
 
     def _finish_postcommit(

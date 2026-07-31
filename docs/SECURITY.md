@@ -205,6 +205,12 @@ reviewed — not prevention. Residual, explicitly still open:
     write from happening, only from being silently trusted afterward. A
     write that is made and reverted before the "after" snapshot runs is not
     caught by this or by anything else in this codebase.
+  * the validation-environment boundary (S27, resolved 2026-07-31,
+    `docs/AUTOLOOP.md` §4g) does NOT close this. It removes the six
+    validation credentials from the agent's own environment, which is how
+    every library and config loader in this repository finds credentials —
+    but an agent that can already run arbitrary code can still read the
+    credential file off disk. Process separation, not confinement.
   * the detector does not inspect the primary checkout's `.git/` internals
     (hooks, config, refs) — scoped to the three `git status` categories
     (tracked/untracked/ignored) over the WORKING TREE only. A write to
@@ -486,6 +492,55 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 
 ## Resolved findings
 
+### S27 — Database credentials for validation had no delivery path that excluded the writer — MEDIUM — RESOLVED 2026-07-31
+
+**What it was:** a task whose declared validation needs a database (`rt-01`
+runs the backend suite) could not validate honestly in a worker repo, because
+a worker is a fresh clone and `.env` is gitignored. Every workaround available
+before this changeset was a security regression: copying `.env` into worker
+repos puts the production DB password, the JWT signing key and the Anthropic
+API key on disk in every worker; exporting the variables into the loop's shell
+hands them to the write-capable `claude` subprocess through ordinary
+inheritance (`ClaudeCliRunner.run` passed no `env=`, so the agent inherited
+everything the loop had); narrowing the declared validation reintroduces the
+vacuous-validation weakness closed by `7616b18`.
+
+**Fix (`autoloop/validation_env.py`, new):** an explicit
+`[paths].validation_env_file` — absolute, outside the checkout / state dir /
+`workers_root` / both publisher paths, `chmod 600`, owned by the running user,
+never a symlink — parsed under a six-name allowlist (`DB_HOST`, `DB_PORT`,
+`DB_NAME`, `DB_USER`, `DB_PASSWORD`, `SECRET_KEY`) that rejects unknown keys,
+duplicates, malformed lines, empty values, missing keys, and secrets under 8
+characters. Delivery is explicit at both ends: `run_validation_commands`
+always passes `strip_validation_vars(os.environ)` and overlays the file's
+values only for post-writer validation, while `ClaudeCliRunner.run` and
+`worker_env()` explicitly REMOVE the same six names. Values are redacted from
+every validation summary — that string becomes `state.last_validation`, which
+reaches `state.json`, the transcript, blocker records and the review packet
+sent to the reviewer. Design and rationale: `docs/AUTOLOOP.md` §4g.
+
+**Deviation from the brief, recorded deliberately:** the brief named
+`JWT_SECRET_KEY`; this repository reads `SECRET_KEY` (`core/security.py:11`).
+Verified in a clean clone: six test modules fail to import until `SECRET_KEY`
+is set, after which all 1260 tests collect with nothing else supplied.
+`JWT_SECRET_KEY` is not accepted as an alias.
+
+**Scope — this does NOT close S24.** It separates credentials from the writer
+PROCESS. It is not an OS sandbox and does not stop a process that can already
+run arbitrary code from reading the file. The write-capable agent still has no
+path jail.
+
+- `file:line` — `autoloop/validation_env.py:1`, `autoloop/validation.py:60`,
+  `autoloop/audit/agents.py:128`, `autoloop/worker_env.py:110`
+- severity — MEDIUM (credential exposure to a write-capable subprocess)
+- verification check —
+  `rg -n 'env=strip_validation_vars' autoloop/audit/agents.py` (writer strips),
+  `rg -n 'validation_env.apply|strip_validation_vars()' autoloop/validation.py`
+  (validator's env is always explicit), and
+  `python3 -m pytest autoloop/tests/test_validation_env.py -q` (39 pass, 1
+  skipped pending operator test credentials)
+- fix — shipped; see above
+
 ### S21 — Commit hooks can rewrite an executor-manifest commit after verification — HIGH — CLOSED BY RETIREMENT 2026-07-30
 
 **What it was:** `autoloop`'s executor-manifest commit path used plain `git
@@ -683,6 +738,7 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 
 ## Changelog
 
+- **2026-07-31** — **Validation-environment boundary (new resolved finding S27; S24 unchanged).** A task whose declared validation needs a database could not validate honestly in a worker repo, and every available workaround leaked credentials to the write-capable agent. `autoloop/validation_env.py` gives the six DB/JWT variables a one-directional delivery path: an allowlisted, permission-checked, location-checked operator file → the post-writer validation subprocess only, with the same names explicitly REMOVED from the agent subprocess and from every worker git subprocess. `run_validation_commands` no longer lets any validation subprocess inherit `os.environ`, so "no file configured" means "no credentials" rather than "whatever the operator exported" — a shell that sourced `.env` cannot silently change what validation connects to. Values are redacted from validation summaries because that string reaches `state.json`, the transcript, blocker records and the review packet. One exact production marker is refused (the `DB_NAME` this repo declares in `.env.example`); no name heuristics and deliberately no host refusal, since `localhost` is where a legitimate test database lives. **S24 stays OPEN** — this is process separation, not an OS sandbox. 780 hermetic autoloop tests (was 741), plus 1 skipped pending operator-supplied test credentials.
 - **2026-07-31** — **Autonomous publication of operator-authored changesets, and one review-integrity check deliberately relaxed.** A changeset written directly on the branch could be reviewed by the loop but never published by it: `_dispatch_git` was retired with S21, and the review stamp's `head_sha` binds the RUNNING checkout rather than the reviewed candidate, so the two coincided only when the branch had already been fast-forwarded. Every infrastructure change therefore needed a manual Publisher run — which is not autonomy, it is a human standing in for a missing component. `changeset_review.py` records `base_sha`/`candidate_sha`/`branch`/`dest_ref`/packet digest in the request binding, the same shape the produce-then-review path already used, and a stamped approval publishes that exact SHA through the Publisher. **The relaxation:** for a changeset-bound `push`, the `head_sha` staleness check is skipped, because the reviewed branch is expected to keep advancing while the packet is out. This is not a weakening: identity moves to the pinned `candidate_sha`, which is more specific than HEAD, and the dispatch independently re-verifies that the candidate still resolves, is still a descendant of the reviewed base, and still carries the reviewed tree — plus `verify_review` against stored request values, the publisher URL snapshot, protected-ref refusal, and post-push `ls-remote` confirmation. A Publisher is REQUIRED on this path with no direct-push fallback, so the retired legacy shape is not reopened. Proven by test: a later, unreviewed commit landing on the branch after the packet is queued does not publish — the recorded candidate does.
 
 

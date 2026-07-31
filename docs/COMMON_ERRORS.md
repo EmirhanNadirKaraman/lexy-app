@@ -580,6 +580,49 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### Validation reports a `pytest` failure whose tail is a warning, and the real error is `InvalidPasswordError`
+**Symptom:** a task parked four times with
+`ruff check .: PASS; python3 -m pytest -n auto -q: FAIL (warner(PytestBenchmarkWarning(text)))`.
+The same command passes in the primary checkout (`1258 passed, 2 skipped`).
+Inside the worker repo it produced **1197 errors**, all
+`asyncpg.exceptions.InvalidPasswordError: password authentication failed`.
+**Cause:** two separate things. (1) A worker repo is a fresh clone and `.env`
+is gitignored, so `DB_*`/`SECRET_KEY` are absent and every DB-backed test
+fails to authenticate — the boundary in §4g of `docs/AUTOLOOP.md` exists for
+exactly this. (2) `run_validation_commands` summarises a failure with the
+**last line** of combined output, which for pytest is often a warnings-summary
+line rather than the error. The tail is a pointer, never the diagnosis.
+**Fix:** configure `[paths].validation_env_file` (see
+`autoloop/config.example.toml`). When triaging any validation FAIL, re-run the
+command by hand in the worker repo rather than reading the tail — the tail
+told us "benchmark warning" for a credentials problem.
+
+### `assert b'validation_user' in b'\x00\x00\x00\x08\x04\xd2\x16/'` — a test listener sees 8 bytes instead of a Postgres startup packet
+**Symptom:** a test that opens a loopback listener and asserts the Postgres
+startup packet carries the expected user/database receives only
+`b"\x00\x00\x00\x08\x04\xd2\x16\x2f"`.
+**Cause:** that IS the whole first message — asyncpg sends an **SSLRequest**
+(length 8, body 80877103 = `0x04d2162f`) and waits for a single-byte reply
+before sending the startup packet that actually contains `user`/`database`. A
+listener that reads once and closes never sees the credentials.
+**Fix:** answer the SSLRequest with `b"N"` (TLS declined), then `recv` again.
+Applied in `autoloop/tests/test_validation_env.py`
+(`test_validation_subprocess_delivers_credentials_to_a_real_db_client`), with
+the byte constant named and commented so it is not mistaken for junk.
+
+### `RuntimeError: SECRET_KEY is not set in .env` during `pytest --collect-only` in a clean clone
+**Symptom:** six backend test modules ERROR at collection in a fresh clone;
+`1141 tests collected, 6 errors`. Adding a dummy `SECRET_KEY` alone collects
+all 1260.
+**Cause:** `core/security.py:11` reads `SECRET_KEY` at **import** and raises
+when unset. Useful as a tool, not just a trap: it is the cheapest way to
+enumerate exactly which environment variables the suite needs, without a
+database and without reading `.env`.
+**Fix / note:** the variable is `SECRET_KEY`, **not** `JWT_SECRET_KEY`. A
+brief, a doc, or a memory that says `JWT_SECRET_KEY` is wrong — check
+`core/security.py` before propagating either name. The autoloop validation
+allowlist deliberately does not accept an alias.
+
 ### A blocker's "recheck the condition" precondition is narrower than what actually fired the park, so it clears on nothing
 **Symptom:** `cli._RESOLUTION_PRECONDITIONS["checkout_escape_detected"]` was
 first fixed by pointing it at the SAME function already used for

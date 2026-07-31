@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from ..validation_env import strip_validation_vars
+
 READ_ONLY_ALLOWED_TOOLS = ("Read", "Grep", "Glob")
 DISALLOWED_TOOLS = (
     "Edit",
@@ -119,6 +121,15 @@ class ClaudeCliRunner:
     def run(self, spec: AgentSpec) -> AgentResult:
         argv = self.build_argv(spec)
         started = time.monotonic()
+        # EXPLICIT removal, not merely a failure to add: a subagent inherits
+        # the loop's environment by construction, so the validation database
+        # credentials have to be taken back out for the boundary in
+        # `validation_env.py` to mean anything. Applied to BOTH tool sets —
+        # the write-capable implement runner is the one the brief names, but
+        # a read-only audit subagent has no business seeing them either, and
+        # one unconditional strip cannot be forgotten at a future call site.
+        # `strip_validation_vars` also drops any `*VALIDATION_ENV_FILE*`
+        # variable, so the agent never learns where the file lives.
         try:
             proc = self._runner(
                 argv,
@@ -126,6 +137,7 @@ class ClaudeCliRunner:
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
+                env=strip_validation_vars(),
             )
         except subprocess.TimeoutExpired:
             return AgentResult(

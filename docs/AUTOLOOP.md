@@ -964,6 +964,95 @@ produce-then-review path.
 
 ---
 
+## 4g. The validation-environment boundary (test DB credentials)
+
+**The problem.** A task may declare validation that needs a database — `rt-01`
+declares `ruff check .` plus `python3 -m pytest -n auto -q` under
+`lexy-app/backend`, and that suite reads `DB_HOST`/`DB_PORT`/`DB_NAME`/
+`DB_USER`/`DB_PASSWORD` plus `SECRET_KEY` from the environment
+(`database.py:70-73`, `core/security.py:11`, `tests/conftest.py:37-42`). A
+worker repo is a fresh clone and `.env` is gitignored, so in a worker those
+variables are absent and every DB-backed test fails authentication. Observed
+directly: rt-01 burned four attempts, each reporting a `pytest` failure that
+was really `asyncpg.exceptions.InvalidPasswordError` ×1197.
+
+The three obvious fixes are all wrong. Copying `.env` into worker repos puts
+the production DB password, the JWT signing key and the Anthropic API key on
+disk in every worker, undoing M2's containment. Sourcing `.env` into the
+loop's shell hands all of it to the write-capable agent through ordinary
+inheritance. Narrowing the declared validation makes the check vacuous — the
+exact weakness `7616b18` fixed.
+
+**The boundary.** `autoloop/validation_env.py`. One operator-authored file,
+`[paths].validation_env_file` (absolute, optional), holding ONLY six names:
+
+    DB_HOST  DB_PORT  DB_NAME  DB_USER  DB_PASSWORD  SECRET_KEY
+
+Delivery is one-directional and explicit at both ends:
+
+* **Validator gets them.** `run_validation_commands` never lets a subprocess
+  inherit `os.environ`. It always passes `strip_validation_vars(os.environ)`
+  — the parent environment MINUS those six names — and overlays the file's
+  values when a `ValidationEnv` is configured. The file is therefore the ONLY
+  channel; an operator who sources `.env` into the loop's shell does not
+  silently change what validation connects to, and an unconfigured loop runs
+  validation with no credentials rather than ambient ones.
+* **Writer explicitly loses them.** `ClaudeCliRunner.run` passes
+  `env=strip_validation_vars()` for BOTH tool sets (write-capable implement
+  and read-only audit), and `worker_env()` strips them from every worker git
+  subprocess. Removal, not omission — the agent inherits the loop's
+  environment by construction, so they have to be taken back out.
+* The file's **path** never enters any environment, and
+  `strip_validation_vars` additionally drops any `*VALIDATION_ENV_FILE*`
+  variable, so the property holds even if a future caller passes one through.
+
+Only the two POST-WRITER validation sites receive the credentials: the
+`ImplementExecutor`'s own validation run and the orchestrator's post-commit
+re-run. The audit executor deliberately gets none — read-only agents, no
+writer, no database.
+
+**Refusals** (all fail closed, and no message ever contains a value):
+relative path, missing file, non-regular file, symlink (checked BEFORE
+`resolve()`, so a link into the real `.env` is caught as a link rather than
+followed), a file not owned by the running user, any group/world permission
+bit, a path inside the checkout / state dir / `workers_root` / either
+publisher path, an unknown key, a duplicate key, a malformed line (including
+an `export ` prefix), an empty value, a missing required key, a `DB_PASSWORD`
+or `SECRET_KEY` under 8 characters, and a `DB_NAME` equal to the application
+database name this repository declares in `.env.example`.
+
+That last one is the only production marker the repo actually defines. It is
+one exact string, **not** a test-vs-production discriminator and **not** a
+name heuristic — supplying a dedicated throwaway database stays the
+operator's responsibility. There is deliberately no host refusal:
+`.env.example`'s `DB_HOST` is `localhost`, which is exactly where a
+legitimate test database lives.
+
+**Redaction.** Every value is replaced with `[redacted <NAME>]` in the
+validation summary, longest value first. That matters beyond logging: the
+summary becomes `state.last_validation`, which reaches `state.json`, the
+transcript, blocker records **and the review packet sent to ChatGPT**.
+Short secrets are refused at load time rather than handled by a length
+threshold at redaction time, so redaction can never be defeated by a value
+too short to match safely.
+
+**What this is NOT.** It separates credentials from the writer PROCESS. It is
+not an OS sandbox, and it does not stop a process that can already run
+arbitrary code from reading the file itself. **S24 remains OPEN** — the
+write-capable agent still has no path jail; escape is detected after the
+fact, not prevented.
+
+**Allowlist deviation, stated plainly.** The brief that specified this
+boundary named `JWT_SECRET_KEY`. This repository reads `SECRET_KEY`
+(`core/security.py:11`, which raises at import when it is unset). Verified in
+a fresh clone with no `.env`: six test modules fail to import until
+`SECRET_KEY` is set, after which all 1260 tests collect with no other
+variable supplied — so the six above are exactly sufficient and exactly
+necessary. `JWT_SECRET_KEY` is not accepted as an alias; implementing the
+brief literally would have rejected the real name as unknown.
+
+---
+
 ## 5. Response contract (v3)
 
 As v2 (task-id-based work authorization, `plan`, `reviewed` integrity stamps —

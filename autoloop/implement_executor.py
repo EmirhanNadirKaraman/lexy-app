@@ -57,6 +57,7 @@ from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .tasks import Task
 from .validation import run_validation_commands
+from .validation_env import ValidationEnv
 from .worker_env import worker_env
 
 #: Read/Grep/Glob for context, Edit/Write to make the change. `Bash` and
@@ -132,6 +133,7 @@ class ImplementExecutor:
         worker_repo_root_for: Callable[[str], Path] | None = None,
         policy: PolicyEngine | None = None,
         agent_runner_factory: Callable[[Path], AgentRunner] | None = None,
+        validation_env: ValidationEnv | None = None,
     ):
         """`git` / `agent_runner` are the STANDALONE bindings — used verbatim
         whenever `worker_repo_root_for` is not supplied (every direct
@@ -163,6 +165,12 @@ class ImplementExecutor:
         self._worker_repo_root_for = worker_repo_root_for
         self._policy = policy
         self._agent_runner_factory = agent_runner_factory
+        # The dedicated TEST database credentials the validation subprocess
+        # runs under, or None for "validation gets no credentials". Held here
+        # and passed ONLY to `run_validation_commands` below — never to the
+        # agent runner, which runs under `strip_validation_vars()` (see
+        # `audit/agents.py`) precisely so the writer cannot read them.
+        self._validation_env = validation_env
 
     # ---- TaskExecutor -------------------------------------------------------
 
@@ -278,7 +286,10 @@ class ImplementExecutor:
                     changed_paths=tuple(sorted(changed)),
                 )
         passed, validation_summary = run_validation_commands(
-            commands, validation_cwd, command_runner=self._command_runner
+            commands,
+            validation_cwd,
+            command_runner=self._command_runner,
+            validation_env=self._validation_env,
         )
         if not passed:
             return ExecutionOutcome(
