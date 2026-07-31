@@ -79,7 +79,13 @@ class PolicyConfig:
 # `restore` is admitted ONLY with `--staged` (index-only unstaging; see
 # _REQUIRED_GIT) — a worktree-touching `git restore <path>` stays impossible.
 _ALLOWED_GIT: dict[str, frozenset[str]] = {
-    "status": frozenset({"--porcelain", "-z"}),
+    # `-uall` (`--untracked-files=all`) is admitted alongside the plain form:
+    # `GitGateway.dirty_entries_all` needs it so a caller that turns the
+    # result into an exact path set (`ImplementExecutor.changed_paths`) sees
+    # literal file paths, not a collapsed new-directory entry — see that
+    # method's docstring. Read-only either way, so admitting it widens
+    # nothing security-relevant.
+    "status": frozenset({"--porcelain", "-z", "-uall"}),
     "rev-parse": frozenset(
         {"--abbrev-ref", "--verify", "--show-toplevel", "--short", "--git-path"}
     ),

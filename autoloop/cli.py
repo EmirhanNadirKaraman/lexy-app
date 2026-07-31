@@ -49,6 +49,7 @@ from .audit.executor import AuditExecutor
 from .audit.markdown import MarkdownPolicy
 from .blockers import NO_TASK, Blocker, BlockerStore
 from .config import AutoloopConfig, load_config
+from .contract import AUDIT_TASK_ID, Decision, Directive
 from .conversation import create_conversation
 from .doctor import DoctorProbes, exit_code, run_doctor
 from .errors import (
@@ -59,8 +60,9 @@ from .errors import (
     StateError,
     TaskGraphError,
 )
-from .executor import NullExecutor
+from .executor import ExecutionOutcome, NullExecutor, TaskExecutor
 from .git_gateway import GitGateway
+from .implement_executor import ImplementExecutor, implement_agent_runner
 from .lock import LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
 from .orchestrator import Orchestrator
@@ -160,6 +162,40 @@ def _seed_registry(config: AutoloopConfig) -> TaskRegistry:
     return registry
 
 
+class _DispatchingExecutor:
+    """Routes a directive to the read-only audit executor or the
+    write-capable implement executor.
+
+    The orchestrator holds exactly ONE `TaskExecutor` (`self._executor`,
+    constructed once in `_build_orchestrator` and called from a single site,
+    `orchestrator.py`'s `_dispatch_task_postcommit`) — teaching it about two
+    executors would mean widening the `TaskExecutor` protocol or the
+    orchestrator's own dispatch method, which is more than this needs. A
+    small dispatcher built here, in the CLI's wiring layer, keeps both real
+    executors constructible in the same process without touching
+    `orchestrator.py` or `executor.py` at all.
+
+    Routing matches `orchestrator._dispatch_executor`'s own `is_audit`
+    computation EXACTLY (`directive.decision is Decision.AUDIT or
+    directive.task_id == AUDIT_TASK_ID`), so a revise-of-audit directive
+    (`decision=REVISE`, `task_id="audit"`) still reaches `AuditExecutor`
+    rather than `ImplementExecutor` — the same condition, duplicated
+    deliberately rather than imported as a shared helper, since the two call
+    sites making the same decision independently is exactly the "policy
+    denies it upstream, the executor refuses it downstream" defense-in-depth
+    shape both executors already rely on (see each one's own refusal branch).
+    """
+
+    def __init__(self, audit_executor: AuditExecutor, implement_executor: ImplementExecutor):
+        self._audit = audit_executor
+        self._implement = implement_executor
+
+    def execute(self, directive: Directive, task: Task | None) -> ExecutionOutcome:
+        is_audit = directive.decision is Decision.AUDIT or directive.task_id == AUDIT_TASK_ID
+        executor = self._audit if is_audit else self._implement
+        return executor.execute(directive, task)
+
+
 def _build_executor(
     config: AutoloopConfig,
     args,
@@ -167,17 +203,17 @@ def _build_executor(
     registry: TaskRegistry,
     worker_repos: WorkerRepoManager,
     policy: PolicyEngine,
-):
+) -> TaskExecutor:
     if getattr(args, "null_executor", False) or config.executor.kind == "null":
         return NullExecutor()
-    runner = ClaudeCliRunner(
+    audit_runner = ClaudeCliRunner(
         repo_root=git.repo_root,
         command=config.audit.agent_command,
         timeout_seconds=config.audit.agent_timeout_seconds,
     )
-    return AuditExecutor(
+    audit_executor = AuditExecutor(
         git=git,
-        agent_runner=runner,
+        agent_runner=audit_runner,
         markdown=MarkdownPolicy(git.repo_root),
         registry=registry,
         run_dir_base=config.audit_dir,
@@ -198,6 +234,26 @@ def _build_executor(
             timeout_seconds=config.audit.agent_timeout_seconds,
         ),
     )
+    implement_executor = ImplementExecutor(
+        git=git,
+        agent_runner=implement_agent_runner(
+            git.repo_root,
+            command=config.audit.agent_command,
+            timeout_seconds=config.audit.agent_timeout_seconds,
+        ),
+        # Same validation commands and agent CLI settings as the audit —
+        # there is no separate `[implement]` config section (kept minimal;
+        # add one if the two ever need to diverge).
+        validation_commands=config.audit.validation_commands,
+        worker_repo_root_for=worker_repos.path_for,
+        policy=policy,
+        agent_runner_factory=lambda root: implement_agent_runner(
+            root,
+            command=config.audit.agent_command,
+            timeout_seconds=config.audit.agent_timeout_seconds,
+        ),
+    )
+    return _DispatchingExecutor(audit_executor, implement_executor)
 
 
 def _build_orchestrator(config, args, store, state, task_store, registry) -> Orchestrator:

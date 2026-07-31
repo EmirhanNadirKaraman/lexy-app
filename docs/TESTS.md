@@ -1098,6 +1098,43 @@ this, `next_ready()` skipping the task would have been merely advisory: a
 directive naming it directly would have sailed through. See
 `docs/AUTOLOOP.md` §9c. New: `test_blockers.py` (15 tests). **600 tests.**
 
+**Implement executor (2026-07-31).** `implement`/`revise` of a real registry
+task had nowhere write-capable to go — `AuditExecutor`'s subagents are
+read-only by construction and refuse anything but audit/revise-of-audit;
+`NullExecutor` only records intent. New `autoloop/implement_executor.py`:
+`ImplementExecutor` runs ONE `Edit`/`Write`-capable `claude -p` subagent (via
+the audit's own `audit.agents.ClaudeCliRunner`, whose tool set is now a
+constructor parameter — `allowed_tools`/`disallowed_tools` default to the
+read-only set, so `AuditExecutor` and every existing `test_audit_agents.py`
+test build the exact same argv as before this became configurable) against
+the task's own isolated worker repo, then re-runs validation. `Bash`/
+`Task`/`Agent` stay disallowed; no `--model` flag is ever passed (automatic
+selection — deliberately no model table). `changed_paths` is derived from
+the worker repo's OWN `git status --porcelain -z -uall`
+(`GitGateway.dirty_entries_all`/`dirty_paths_all`, new; `policy.py`'s
+`status` whitelist now additionally admits `-uall`) — NEVER the agent's own
+claim about what it did — specifically because the plain `-z` form
+collapses a new file inside a brand-new directory to just the directory
+entry (`?? d/`), which would go on to fail the post-commit structural check
+(it compares literal file paths). `cli._build_executor` now constructs BOTH
+`AuditExecutor` and `ImplementExecutor` and wraps them in a small
+`_DispatchingExecutor` (new, in `cli.py`) that routes each directive by the
+same `is_audit` test the orchestrator's own `_dispatch_executor` uses;
+`orchestrator.py` and the `TaskExecutor` protocol (`executor.py`) are
+untouched. `policy.implement_enabled`'s default (`false`) is unchanged by
+this work — flipping it is a separate operator decision. New
+`test_implement_executor.py` (13 tests): write-capable argv (`Edit`/`Write`
+allowed, `Bash`/`Task` disallowed), no `--model` flag, subagent `cwd` is the
+task's worker repo not the main checkout, `changed_paths` ignores a false
+agent claim, a filename with both a space AND a tab round-trips, agent
+failure / no-files-changed / validation failure each report
+`status="error"` without raising, success reports `status="ok"` with
+`changed_paths`/`validation` populated, and nothing is written outside the
+worker repo (main checkout and `.autoloop/` both provably untouched, plus
+two bonus tests for the audit/`None`-task refusal branches and the
+constructor's `worker_repo_root_for`/`policy` pairing contract). **668
+tests.**
+
 **584 tests (pre-blockers baseline), fully hermetic** — no network, no ChatGPT, no playwright import,
 no live `claude` CLI (agent runner stubbed), no app DB. `test_git_gateway.py`,
 `test_manifest.py`, `test_audit_executor.py`, `test_postcommit_primitives.py`,
@@ -1135,7 +1172,8 @@ Run: `pytest autoloop/tests` from the repo root. **Not included in bare
 | `test_audit_taskgen.py` | 8 | Priority ordering per the mandated ranking, `au-NNN` ids skipping registry collisions (never A1-style ids), finding→task dependency mapping (incl. deps on existing roadmap tasks; unresolved deps noted, not invented), human decisions skipped, full task structure. |
 | `test_audit_executor.py` | 6 | End-to-end with fake agents + stubbed validation: 6-domain fan-out with scope/feedback threading, raw reports persisted separately, one dated Markdown report as the only repo write, proposal JSON, agent failure → honest "COVERAGE INCOMPLETE", non-audit decisions refused, unsafe validation binaries refused. |
 | `test_markdown_policy.py` | 7 | Markdown-only gate: canonical files ok, ONE dated report max, production code / non-canonical md / traversal / absolute paths refused. |
-| `test_audit_agents.py` | 6 | ClaudeCliRunner with stubbed subprocess: read-only headless argv (allow Read/Grep/Glob, disallow Edit/Write/Bash/Task/…), result-JSON unwrap, timeout / missing binary / non-zero exit reported not raised. |
+| `test_audit_agents.py` | 6 | ClaudeCliRunner with stubbed subprocess: read-only headless argv (allow Read/Grep/Glob, disallow Edit/Write/Bash/Task/…), result-JSON unwrap, timeout / missing binary / non-zero exit reported not raised. Tool set is now a constructor parameter (`allowed_tools`/`disallowed_tools`, defaulting to the read-only pair asserted here); `test_implement_executor.py` is the other construction site, via `implement_agent_runner`. |
+| `test_implement_executor.py` | 13 | `ImplementExecutor` with fake/stubbed agents: write-capable argv (Edit/Write allowed, Bash/Task disallowed), no `--model` flag (automatic selection), subagent `cwd` is the task's own worker repo not the main checkout, `changed_paths` derived from the worker repo's real `git status` and NOT from the agent's own claim (a fake agent claims a file it never touched — ignored), a filename with both a space AND a tab round-trips (`-uall`/`-z` NUL-safety), agent failure / no-files-changed / validation failure each `status="error"` without raising, success is `status="ok"` with `changed_paths`/`validation` populated, and nothing is written outside the worker repo (main checkout + `.autoloop/` marker both provably untouched); plus the audit/`None`-task defense-in-depth refusals and the `worker_repo_root_for`/`policy` constructor pairing contract. |
 | `test_prompts.py` | 23 | Template library incl. `audit_kickoff`, `smoke_test`, `postcommit_review`; strict rendering; payload helpers. |
 | `test_context.py` | 8 | Review context: stamp values, porcelain parsing, previous decision/task, validation + roadmap summaries, truncation. |
 | `test_conversation.py` | 5 | Provider registry + interface conformance without playwright. |
@@ -1929,7 +1967,7 @@ Run all three. The lint step is not optional.
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
 | Backend | `cd lexy-app/backend && python3 -m pytest -n auto` | 1258 passed, 2 skipped |
 | Root pipeline | `pytest tests/` *(repo root)* | 368 passed |
-| Autoloop | `pytest autoloop/tests` *(repo root; only when touching `autoloop/`)* | 655 passed |
+| Autoloop | `pytest autoloop/tests` *(repo root; only when touching `autoloop/`)* | 668 passed |
 
 > **Backend command reconciled 2026-07-29:** it must be `python3 -m pytest`,
 > NOT the bare `pytest` entrypoint. `python -m` puts the cwd on `sys.path`,

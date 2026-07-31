@@ -167,15 +167,11 @@ class GitGateway:
         record = raw.split("\0", 1)[0]
         return record.split(" ", 1)[0] if record else ""
 
-    def dirty_entries(self) -> list[tuple[str, str]]:
-        """(XY status, path) for every pending change, NUL-parsed.
-
-        `git status --porcelain` without `-z` QUOTES and escapes paths holding
-        spaces, tabs or non-ASCII (`?? "has\\ttab.txt"`), so line splitting
-        yields a string that matches no real path. Every security decision that
-        depends on a pathname uses this NUL-delimited form instead.
-        """
-        raw = self._git_bytes("status", "--porcelain", "-z").decode("utf-8", "surrogateescape")
+    @staticmethod
+    def _parse_status_porcelain_z(raw: str) -> list[tuple[str, str]]:
+        """Shared NUL-record parser for `git status --porcelain -z` output,
+        with or without `-uall`. Rename/copy entries carry the ORIGINAL path
+        as a second record, consumed here so callers never see it."""
         records = [r for r in raw.split("\0") if r]
         entries: list[tuple[str, str]] = []
         index = 0
@@ -185,11 +181,56 @@ class GitGateway:
             if len(record) < 4:
                 continue
             status, path = record[:2], record[3:]
-            # Rename/copy entries carry the ORIGINAL path as a second record.
             if status and status[0] in ("R", "C"):
                 index += 1
             entries.append((status, path))
         return entries
+
+    def dirty_entries(self) -> list[tuple[str, str]]:
+        """(XY status, path) for every pending change, NUL-parsed.
+
+        `git status --porcelain` without `-z` QUOTES and escapes paths holding
+        spaces, tabs or non-ASCII (`?? "has\\ttab.txt"`), so line splitting
+        yields a string that matches no real path. Every security decision that
+        depends on a pathname uses this NUL-delimited form instead.
+
+        Untracked files use git's default collapsed reporting: a brand-new
+        directory shows as one entry for the directory itself (`?? d/`), not
+        one per file inside it. Every existing caller of this method only
+        ever needs "is anything dirty" / "what top-level things changed", so
+        that collapsing is harmless here. `dirty_entries_all` below is the
+        one to use when a caller needs the LITERAL file paths.
+        """
+        raw = self._git_bytes("status", "--porcelain", "-z").decode("utf-8", "surrogateescape")
+        return self._parse_status_porcelain_z(raw)
+
+    def dirty_entries_all(self) -> list[tuple[str, str]]:
+        """Like `dirty_entries`, but with `-uall`
+        (`--untracked-files=all`): a new file inside a brand-new directory is
+        reported as its OWN full path (`?? d/f.py`) rather than collapsed to
+        the directory (`?? d/`) — verified empirically (`git status
+        --porcelain -z` vs `-z -uall` against a freshly created `d/f.py`).
+
+        This matters wherever the result is turned into an exact path set
+        that must literally match what git itself will diff, e.g.
+        `ImplementExecutor`'s `changed_paths`: that set becomes both
+        `commit_and_capture`'s staged-paths argument (`git add --
+        <paths>`, which stages a directory recursively and would "work") AND
+        the post-commit structural check's expected-paths set, which compares
+        against `commit_range_paths` — LITERAL file paths. `services/new/`
+        is not a superset match for `services/new/foo.py`, so a collapsed
+        directory entry there is a reproducible false structural refusal for
+        the ordinary case of an agent creating a new package directory.
+
+        Kept as a SEPARATE method rather than changing `dirty_entries`'s
+        default: every other caller of `dirty_entries` only needs "is
+        anything dirty", and `-uall` is a materially more expensive stat walk
+        that nothing else here should pay for.
+        """
+        raw = self._git_bytes("status", "--porcelain", "-z", "-uall").decode(
+            "utf-8", "surrogateescape"
+        )
+        return self._parse_status_porcelain_z(raw)
 
     # ---- read-only ----------------------------------------------------------
 
@@ -213,6 +254,12 @@ class GitGateway:
 
     def dirty_paths(self) -> set[str]:
         return {path for _status, path in self.dirty_entries()}
+
+    def dirty_paths_all(self) -> set[str]:
+        """`dirty_paths`, but backed by `dirty_entries_all` — see that
+        method's docstring for why a caller needing literal file paths
+        (rather than "is anything dirty") must use this instead."""
+        return {path for _status, path in self.dirty_entries_all()}
 
     def staged_paths(self) -> set[str]:
         raw = self._git_bytes("diff", "--cached", "--name-only", "-z").decode(

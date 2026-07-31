@@ -1,16 +1,28 @@
-"""Audit subagent invocation via the Claude Code CLI.
+"""Subagent invocation via the Claude Code CLI — shared by the audit and the
+implement executors.
 
 The environment's real delegation facility is the `claude` CLI in headless
 mode (`claude -p <prompt> --output-format json`) — no model API is used.
-Agents are READ-ONLY by construction: `--allowedTools Read Grep Glob` plus an
-explicit disallow of every editing/executing tool, and `--permission-mode
-dontAsk` denies anything that would prompt in headless mode. Agents therefore
-cannot edit files or spawn nested agents (Task/Agent is disallowed), which is
-what "no uncontrolled nested delegation" means mechanically.
+`--permission-mode dontAsk` denies anything that would prompt in headless
+mode.
 
-Tests never invoke the real CLI — AgentRunner is a protocol; the executor is
-exercised with fakes, and ClaudeCliRunner itself is tested with a stubbed
-subprocess runner.
+**Tool set is a constructor parameter, not a fixed constant (since the
+implement executor landed).** `ClaudeCliRunner.__init__` takes
+`allowed_tools`/`disallowed_tools`, defaulting to `READ_ONLY_ALLOWED_TOOLS`
+(Read/Grep/Glob) / `DISALLOWED_TOOLS` (every editing/executing tool) — every
+existing caller (the audit executor, `test_audit_agents.py`) omits both and
+gets the exact same read-only argv as before this became configurable.
+`autoloop/implement_executor.py`'s `implement_agent_runner` is the OTHER
+construction site: it passes a write-capable set (Read/Grep/Glob/Edit/Write)
+so its subagent can produce a change. `Bash` and `Task`/`Agent` stay
+disallowed on BOTH paths — the executor (not the agent) runs validation and
+commits, and a subagent spawning nested agents is out of scope for either
+phase; that is what "no uncontrolled nested delegation" means mechanically,
+independent of which tool set is otherwise in force.
+
+Tests never invoke the real CLI — AgentRunner is a protocol; the executors
+are exercised with fakes, and ClaudeCliRunner itself is tested with a
+stubbed subprocess runner.
 """
 
 from __future__ import annotations
@@ -72,11 +84,20 @@ class ClaudeCliRunner:
         command: tuple[str, ...] = ("claude",),
         timeout_seconds: float = 900.0,
         runner=None,
+        allowed_tools: tuple[str, ...] = READ_ONLY_ALLOWED_TOOLS,
+        disallowed_tools: tuple[str, ...] = DISALLOWED_TOOLS,
     ):
+        """`allowed_tools`/`disallowed_tools` default to the read-only audit
+        set — every caller that does not pass them (every existing one)
+        builds the exact same argv as before these became parameters. Pass a
+        different pair (see `implement_executor.implement_agent_runner`) to
+        run a write-capable subagent instead."""
         self._repo_root = Path(repo_root)
         self._command = tuple(command)
         self._timeout = timeout_seconds
         self._runner = runner or subprocess.run
+        self._allowed_tools = tuple(allowed_tools)
+        self._disallowed_tools = tuple(disallowed_tools)
 
     def build_argv(self, spec: AgentSpec) -> list[str]:
         model_flag = ["--model", spec.model] if spec.model else []
@@ -90,9 +111,9 @@ class ClaudeCliRunner:
             "--permission-mode",
             "dontAsk",
             "--allowedTools",
-            *READ_ONLY_ALLOWED_TOOLS,
+            *self._allowed_tools,
             "--disallowedTools",
-            *DISALLOWED_TOOLS,
+            *self._disallowed_tools,
         ]
 
     def run(self, spec: AgentSpec) -> AgentResult:

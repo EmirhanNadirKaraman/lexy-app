@@ -13,9 +13,23 @@ dispatch path; the older authorize-then-produce/change-manifest commit gate
 described in §4 was **retired**, not merely superseded — see
 `docs/SECURITY.md` S21 ("closed by retirement"). `policy.implement_enabled`
 still gates `implement`/`revise` of ordinary registry tasks (default `false`
-— no real code-editing executor is wired up yet, only the audit executor is
-production-ready), but `audit`/`revise("audit")` are never gated and always
-run.
+as of this writing — the phase gate is an operator decision, independent of
+whether an executor exists behind it), but `audit`/`revise("audit")` are
+never gated and always run.
+
+**Two production executors as of the implement executor (below).**
+`cli._build_executor` now constructs both `AuditExecutor` (read-only
+subagents; §7) and `ImplementExecutor` (write-capable subagent; §7b) and
+wraps them in a small `_DispatchingExecutor` that routes each directive by
+the same `is_audit` test `orchestrator._dispatch_executor` itself uses
+(`decision is AUDIT or task_id == "audit"` → audit executor, everything else
+→ implement executor). The orchestrator's own `self._executor` field and the
+`TaskExecutor` protocol are untouched — the dispatcher lives entirely in
+`cli.py`'s wiring layer. `implement`/`revise` of a real registry task still
+reaches `ImplementExecutor` only once `policy.implement_enabled = true`; the
+phase gate is enforced by `policy.py` before dispatch, and `ImplementExecutor`
+itself refuses (defense in depth) anything that is not an `implement`/
+`revise` of a real task.
 
 `cli.py`'s `_build_orchestrator` — what the plain `run` command always calls —
 unconditionally constructs the full produce-then-review collaborator set
@@ -45,7 +59,8 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Prompts | `prompts.py` | Strict template library (incl. `audit_kickoff`, `smoke_test`, `postcommit_review`). |
 | Git | `git_gateway.py` | Only git runner; exact-path staging; policy-validated per call; `push_exact` is the only way to publish anything (no ambient `push()`); the legacy `commit()` method is **removed** (S21). |
 | Doctor | `doctor.py` | Non-destructive preflight (§6), including worker isolation, controlled hooks directories, publisher configuration, and publisher URL drift. |
-| Audit executor | `audit/` | The production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. Dispatched as a task-shaped unit of work (`Orchestrator._resolve_audit_task`), so it runs through §4b like any other task. |
+| Audit executor | `audit/` | The read-only production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner, tool set now a constructor param — see §7b), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. Dispatched as a task-shaped unit of work (`Orchestrator._resolve_audit_task`), so it runs through §4b like any other task. |
+| Implement executor | `implement_executor.py` | The write-capable production executor (§7b): `ImplementExecutor` runs ONE `Edit`/`Write`-capable subagent (`implement_agent_runner`, built on the SAME `audit.agents.ClaudeCliRunner` the audit uses, configured with a different tool set) against a task's own worker repo, derives `changed_paths` from the worker repo's real `git status`, then re-runs validation. `cli._build_executor`'s `_DispatchingExecutor` routes `implement`/`revise`-of-a-real-task here; `audit`/`revise("audit")` still go to `AuditExecutor`. |
 | State / transcript | `state.py`, `transcript.py` | Atomic crash-safe state; append-only JSONL audit log. |
 | CLI | `cli.py` | `run [--continuous] status tasks next-task blockers answer doctor smoke-browser pause resume unlock reset reprovision-publisher` (§8/§9). |
 
@@ -76,6 +91,11 @@ but the executor itself reports `status="not_implemented"` with no
 BEFORE attempting any commit — an `implementation_review` reporting the
 honest "not implemented" outcome is sent, and no `git commit` is ever
 called, rather than a fabricated success.
+
+When a real executor is in play (i.e. `executor.kind != "null"`), `_executor`
+is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
+`AuditExecutor` and `ImplementExecutor` and picks per call — see the
+"Two production executors" note above (state-of-the-system intro) and §7b.
 
 ---
 
@@ -957,6 +977,62 @@ writes land in the change manifest.
 
 ---
 
+## 7b. The implement executor
+
+`implement`/`revise` of a REAL registry task (never the audit pseudo-task,
+never `audit` itself — those stay `AuditExecutor`'s, routed by
+`cli._build_executor`'s `_DispatchingExecutor`, §2). Gated upstream by
+`policy.implement_enabled` (default `false`); `ImplementExecutor.execute`
+refuses anything else as defense in depth, mirroring `AuditExecutor`'s own
+refusal branch. Runs inside the task's own isolated worker repo, exactly
+like the audit (`worker_repo_root_for`/`policy`/`agent_runner_factory` —
+same constructor shape as `AuditExecutor`, same re-rooting behaviour).
+Pipeline (`implement_executor.py`):
+
+1. Build a prompt carrying the task's id, title and description (plus
+   revision feedback, if this is a `revise` round), telling the agent it may
+   only touch files inside its own working directory and must not run `git`
+   or any other command.
+2. Run exactly ONE subagent via `implement_agent_runner` — the same
+   `audit.agents.ClaudeCliRunner` the audit uses, headless (`claude -p ...
+   --output-format json --permission-mode dontAsk`), but configured with a
+   WRITE-capable tool set: `--allowedTools Read Grep Glob Edit Write
+   --disallowedTools NotebookEdit Bash Task Agent WebFetch WebSearch`. `Bash`
+   and `Task`/`Agent` stay disallowed on both executors — the executor (not
+   the agent) runs validation and owns the commit, and nested delegation is
+   out of scope. No `--model` flag is ever passed (`AgentSpec.model` stays
+   `""`), so model selection is whatever the `claude` CLI defaults to — there
+   is no per-task model table.
+3. **Never trust the agent's own account of what it changed.** After the
+   agent returns, `changed_paths` is read from the worker repo's OWN `git
+   status --porcelain -z -uall` (`GitGateway.dirty_paths_all`) — `-uall`
+   (`--untracked-files=all`) specifically, because the plain form collapses a
+   new file inside a brand-new directory to just the directory entry (`??
+   d/`), which would go on to fail the post-commit structural check (it
+   compares literal file paths, and `d/` does not match `d/f.py`). An empty
+   result is `status="error"` ("changed no files") rather than an empty
+   success.
+4. Re-run the configured **validation commands** (same allowlisted binaries
+   and `validation.py` helper as the audit) in the worker repo. Failure is
+   `status="error"` carrying the validation summary; the changed files are
+   still reported (nothing is rolled back — produce-then-review never rolls
+   anything back, §4b).
+5. `status="ok"` only when the agent succeeded AND at least one path changed
+   AND validation passed. Every other outcome is `status="error"` with an
+   honest summary — this executor never raises for an ordinary failure; the
+   orchestrator's park/quarantine machinery (§9c) handles it exactly like an
+   `AuditExecutor` failure.
+
+**Side effects are confined to the worker repo.** Unlike the audit, this
+executor writes no Markdown report, keeps no `run_dir_base`, and never
+touches `.autoloop/` — the only durable artifact of a run is whatever the
+agent wrote inside its own worker repo, surfaced back as
+`ExecutionOutcome.changed_paths`. `cli.py`'s `_DispatchingExecutor` is the
+only new wiring in the orchestrator's executor slot; `orchestrator.py` and
+the `TaskExecutor` protocol (`executor.py`) are unchanged.
+
+---
+
 ## 8. Setup
 
 ```bash
@@ -969,8 +1045,8 @@ mkdir -p .autoloop && cp autoloop/config.example.toml .autoloop/config.toml
 # edit .autoloop/config.toml: browser.conversation_url, review [policy]/[audit]
 ```
 
-The test suite needs none of this. The audit executor additionally needs the
-`claude` CLI on PATH (it is, in this environment).
+The test suite needs none of this. The audit and implement executors
+additionally need the `claude` CLI on PATH (it is, in this environment).
 
 ## 9. First-run procedure
 
@@ -1127,12 +1203,17 @@ reports this rather than raising.
 
 ## 11. Known limitations
 
-* There is no repository-editing task executor yet — `implement`/`revise` of
-  an ordinary registry task is policy-denied until `policy.implement_enabled
-  = true`, and even then the only production `TaskExecutor`
-  (`AuditExecutor`) reports an honest "unsupported decision" error rather
-  than editing code. `audit`/`revise("audit")` are unaffected by this gate
-  and always run.
+* `implement`/`revise` of an ordinary registry task is still policy-denied
+  until `policy.implement_enabled = true` (default `false` as of this
+  writing — an operator decision, made separately from this doc). Once
+  flipped, `ImplementExecutor` (§7b) is wired up and write-capable — this is
+  no longer "no executor exists". `audit`/`revise("audit")` are unaffected by
+  this gate and always run.
+* `ImplementExecutor` runs exactly ONE subagent per `implement`/`revise`
+  call — no fan-out, no self-review, no second opinion. Quality depends
+  entirely on that one pass plus the configured validation commands and the
+  two-round revise cap (§4b); there is no retry-with-different-prompt on a
+  weak first attempt.
 * The audit re-runs agents from scratch on `revise` (no incremental caching).
 * The retired change-manifest attribution (§4) was time-based: edits made by
   a human *during* an executor run were indistinguishable from task work.
