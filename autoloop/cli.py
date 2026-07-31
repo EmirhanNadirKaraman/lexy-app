@@ -755,6 +755,67 @@ def _cmd_blockers(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Blocker codes whose condition lives in the ENVIRONMENT, not in an answer.
+#: Text alone must never clear these: the operator saying "fixed it" is not
+#: evidence that it is fixed, and resolving on a promise would send the loop
+#: straight back into the same wall — this time with the blocker marked
+#: resolved, so the queue would understate what is actually wrong.
+#: Each maps to a precondition that is RE-CHECKED at answer time.
+def _precondition_browser(config) -> str:
+    from .doctor import DoctorProbes, run_doctor
+    results = run_doctor(config, Path.cwd(), probes=DoctorProbes())
+    bad = [r for r in results if r.status != "ok" and r.name in
+           ("cdp", "playwright", "provider", "conversation_url", "browser_live")]
+    if bad:
+        return "browser/login checks still failing: " + ", ".join(
+            f"{r.name} ({r.detail})" for r in bad)
+    return ""
+
+
+def _precondition_publisher_url(config) -> str:
+    from .publisher import publisher_url_snapshot_path, read_publisher_url_snapshot, redact_url
+    from .git_gateway import GitGateway
+    from .policy import PolicyEngine
+    snap = read_publisher_url_snapshot(config.state_dir)
+    live = GitGateway(Path.cwd(), PolicyEngine(config.policy)).config_get("remote.origin.url")
+    if not snap:
+        return f"no publisher url snapshot at {publisher_url_snapshot_path(config.state_dir)}"
+    if snap != live:
+        return (
+            f"publisher snapshot ({redact_url(snap)}) still differs from the "
+            f"configured remote ({redact_url(live)}) — run "
+            "`python -m autoloop reprovision-publisher --confirm` first"
+        )
+    return ""
+
+
+def _precondition_allow_push(config) -> str:
+    if not config.policy.allow_push:
+        return "policy.allow_push is still false — enable it in the config first"
+    return ""
+
+
+def _precondition_protected(config) -> str:
+    return (
+        "a protected destination cannot be cleared by an answer — the target "
+        "must be corrected to a non-protected branch, or protected_branches "
+        f"changed deliberately (currently {list(config.policy.protected_branches)})"
+    )
+
+
+#: code -> precondition. Anything NOT listed resolves by answer text alone
+#: (ask_user and every task_fatal code), which is the intended behaviour.
+_RESOLUTION_PRECONDITIONS = {
+    "login_expired": _precondition_browser,
+    "submission_ambiguous": _precondition_browser,
+    "git_failure_budget": _precondition_browser,
+    "publisher_url_drift": _precondition_publisher_url,
+    "worker_environment_drift": _precondition_browser,
+    "push_refused": _precondition_allow_push,
+    "push_refused_protected": _precondition_protected,
+}
+
+
 def _cmd_answer(args: argparse.Namespace) -> int:
     """Resolve a blocker with the operator's answer and, for a `task_fatal`
     blocker, unblock the task it quarantined so it becomes READY again.
@@ -763,6 +824,19 @@ def _cmd_answer(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     with LoopLock(config.state_dir):
         blocker_store = BlockerStore(config.blockers_dir)
+        pending = blocker_store.load(args.blocker_id)
+        if pending is not None and pending.resolved_at is None:
+            check = _RESOLUTION_PRECONDITIONS.get(pending.code)
+            if check is not None:
+                problem = check(config)
+                if problem:
+                    print(
+                        f"blocker {pending.id} ({pending.code}) NOT resolved — its "
+                        f"condition is environmental and is still present:\n  {problem}\n"
+                        "Fix the condition, then run `answer` again. An answer alone "
+                        "cannot clear it."
+                    )
+                    return 1
         blocker = blocker_store.resolve(args.blocker_id, args.text)  # raises on unknown/resolved
         print(f"blocker {blocker.id} resolved.")
         if blocker.kind != "task_fatal" or blocker.task_id == NO_TASK:

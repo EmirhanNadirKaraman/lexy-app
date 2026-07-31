@@ -786,3 +786,89 @@ def test_summary_survives_a_corrupt_blocker_record(tmp_path):
     # that IS its job (test 5 pins the store-level behaviour this relies on).
     with pytest.raises(StateCorruptError):
         BlockerStore(config.blockers_dir).open_blockers()
+
+
+# ---- acceptance-check regressions (Phase 1 gaps) ---------------------------
+
+
+def test_reparking_the_same_condition_updates_one_blocker(tmp_path):
+    """A restart/retry against the same wall must not fill the queue with
+    duplicates of one problem — the operator has to be able to see how many
+    DISTINCT things are wrong."""
+    from autoloop.blockers import BlockerStore
+
+    store = BlockerStore(tmp_path / "blockers")
+    for i in range(4):
+        store.record(
+            task_id="t1", kind="task_fatal", code="post_commit_verification_failed",
+            question="q", detail="d", phase="executing",
+            now=f"2026-07-31T00:0{i}:00+00:00",
+        )
+    assert len(store.all_blockers()) == 1
+    assert store.all_blockers()[0].recurrences == 4
+
+    # A genuinely different condition is its own record.
+    store.record(task_id="t1", kind="task_fatal", code="review_round_cap",
+                 question="q2", detail="d", phase="executing",
+                 now="2026-07-31T00:09:00+00:00")
+    assert len(store.all_blockers()) == 2
+
+    # A resolved blocker is not matched — the condition returning after an
+    # answer is genuinely new.
+    store.resolve("blk-t1-001", "handled")
+    store.record(task_id="t1", kind="task_fatal", code="post_commit_verification_failed",
+                 question="q", detail="d", phase="executing",
+                 now="2026-07-31T00:10:00+00:00")
+    assert len(store.all_blockers()) == 3
+
+
+def test_environment_drift_is_loop_fatal_not_a_task_refusal():
+    """A hook appearing mid-task affects EVERY task. If it were task_fatal the
+    loop would march through the backlog blocking each task in turn while the
+    hook stayed installed."""
+    import inspect
+    from autoloop import orchestrator
+    from autoloop.errors import EnvironmentDriftError, GitCommandError
+
+    assert issubclass(EnvironmentDriftError, GitCommandError)
+    src = inspect.getsource(orchestrator.Orchestrator._dispatch_task_postcommit)
+    drift = src.index("except EnvironmentDriftError")
+    generic = src.index("except GitCommandError")
+    assert drift < generic, "drift must be caught BEFORE the generic handler"
+    assert 'code="worker_environment_drift"' in src
+    assert 'kind="loop_fatal"' in src[drift:generic]
+    # And the task-scoped handler must not claim to cover environment drift.
+    tail = src[generic:generic + 1200]
+    assert 'code="commit_refused"' in tail
+    assert 'kind="task_fatal"' in tail
+
+
+def test_answer_cannot_clear_an_environmental_invariant_by_text(tmp_path, monkeypatch, capsys):
+    """`allow_push` is false: no answer text may resolve a push refusal."""
+    from autoloop.blockers import Blocker, BlockerStore
+    from autoloop.cli import main
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git(repo, "init", "-q", "-b", "main")
+    run_git(repo, "config", "user.email", "t@e.com")
+    run_git(repo, "config", "user.name", "T")
+    (repo / "f.txt").write_text("x\n")
+    run_git(repo, "add", "f.txt")
+    run_git(repo, "commit", "-q", "-m", "init")
+    cfg = repo / "config.toml"
+    cfg.write_text(
+        '[browser]\nconversation_url = "https://chatgpt.com/c/abc"\n\n'
+        '[policy]\nallow_push = false\n\n[paths]\nstate_dir = ".al"\n', encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    store = BlockerStore(repo / ".al" / "blockers")
+    store.save(Blocker(id="blk-(loop)-001", task_id="(loop)", kind="loop_fatal",
+                       code="push_refused", question="enable pushing?", detail="",
+                       phase="executing", created_at="2026-07-31T00:00:00+00:00"))
+
+    code = main(["answer", "blk-(loop)-001", "I enabled it, honest", "--config", str(cfg)])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "NOT resolved" in out and "allow_push is still false" in out
+    assert store.load("blk-(loop)-001").resolved_at is None, "must stay open"

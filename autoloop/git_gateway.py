@@ -63,7 +63,7 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
-from .errors import GitCommandError, GitOperationDenied
+from .errors import EnvironmentDriftError, GitCommandError, GitOperationDenied
 from .policy import PolicyEngine
 from .worktask import CommitIntent, IntentStore
 
@@ -467,7 +467,7 @@ class GitGateway:
 
             drift = verify_unchanged(env_snapshot, self)
             if drift:
-                raise GitCommandError(
+                raise EnvironmentDriftError(
                     "commit_and_capture refuses: the git environment changed "
                     "since this task started — " + "; ".join(drift)
                 )
@@ -668,7 +668,7 @@ class GitGateway:
 
             drift = verify_unchanged(env_snapshot, self)
             if drift:
-                raise GitCommandError(
+                raise EnvironmentDriftError(
                     "push_exact refuses: the git environment changed since this "
                     "task started — " + "; ".join(drift)
                 )

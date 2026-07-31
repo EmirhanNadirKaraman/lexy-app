@@ -56,6 +56,13 @@ class Blocker:
     created_at: str
     resolved_at: str | None = None
     answer: str | None = None
+    #: How many times this exact condition has re-parked. A restart or retry
+    #: that hits the same wall must UPDATE this record, never mint a second
+    #: one — otherwise a crash-retry loop silently fills the queue with
+    #: duplicates of one problem and the operator cannot see how many
+    #: distinct things are actually wrong.
+    recurrences: int = 1
+    last_seen_at: str = ""
 
 
 class BlockerStore:
@@ -104,6 +111,42 @@ class BlockerStore:
                 if suffix.isdigit():
                     n = max(n, int(suffix))
         return f"{prefix}{n + 1:03d}"
+
+    def find_open(self, task_id: str, code: str, phase: str) -> "Blocker | None":
+        """An OPEN blocker for the same (task, code, phase), or None.
+
+        Identity is the CONDITION, not the occurrence: the same task hitting
+        the same failure in the same phase is one blocker seen repeatedly,
+        which is what the operator needs to answer once. A resolved blocker
+        is deliberately not matched — if the condition returns after being
+        answered, that is genuinely new and deserves its own record."""
+        for existing in self.open_blockers():
+            if (existing.task_id, existing.code, existing.phase) == (task_id, code, phase):
+                return existing
+        return None
+
+    def record(self, *, task_id, kind, code, question, detail, phase, now) -> "Blocker":
+        """Idempotent upsert. Returns the existing open blocker for this
+        condition with its recurrence count bumped, or a new one."""
+        existing = self.find_open(task_id, code, phase)
+        if existing is not None:
+            from dataclasses import replace
+            bumped = replace(
+                existing,
+                recurrences=existing.recurrences + 1,
+                last_seen_at=now,
+                question=question,
+                detail=detail,
+            )
+            self.save(bumped)
+            return bumped
+        fresh = Blocker(
+            id=self.next_id(task_id), task_id=task_id, kind=kind, code=code,
+            question=question, detail=detail, phase=phase, created_at=now,
+            last_seen_at=now,
+        )
+        self.save(fresh)
+        return fresh
 
     def all_blockers(self) -> list[Blocker]:
         """Every blocker on disk, open or resolved, oldest id first per

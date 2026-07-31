@@ -100,7 +100,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import environment
-from .blockers import NO_TASK, Blocker, BlockerStore
+from .blockers import NO_TASK, BlockerStore
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
 from .config import AutoloopConfig
@@ -123,6 +123,7 @@ from .errors import (
     ContractError,
     ConversationUnusableError,
     ExecutorError,
+    EnvironmentDriftError,
     GitCommandError,
     GitError,
     LoginExpiredError,
@@ -1374,9 +1375,29 @@ class Orchestrator:
                 intent,
                 env_snapshot=env_snapshot,
             )
+        except EnvironmentDriftError as exc:
+            # A hook appeared, core.hooksPath moved, or a url rewrite was added
+            # WHILE this task ran. The cause is the shared environment, not this
+            # unit of work: quarantining just this task would leave the same
+            # condition in place for every task after it, and the loop would
+            # march through the whole backlog blocking each one in turn. So this
+            # is loop_fatal even though it surfaced inside a task.
+            self._intent_store.clear(task.id)
+            state.last_response = None
+            self._to_needs_user(
+                f"task {task.id}: the git environment changed under this task — "
+                f"{exc}. Nothing was committed. This affects every task, not "
+                "just this one, so the loop is stopping rather than moving on.",
+                kind="loop_fatal",
+                code="worker_environment_drift",
+                task_id=task.id,
+                detail=str(exc),
+            )
+            return
         except GitCommandError as exc:
-            # Environment drift (a hook installed mid-task), HEAD drift, or an
-            # empty path list. Every OTHER refusal in this path parks for the
+            # HEAD drift or an empty path list — genuinely scoped to this unit
+            # of work. Environment drift is caught above and is NOT task_fatal.
+            # Every OTHER refusal in this path parks for the
             # operator, so this one does too rather than escaping as a raw
             # error: the commit did not happen, nothing was rolled back, and a
             # human needs to look at why the task's environment moved.
@@ -1968,17 +1989,18 @@ class Orchestrator:
         )
         if self._blocker_store is not None:
             blocker_task_id = task_id or NO_TASK
-            blocker = Blocker(
-                id=self._blocker_store.next_id(blocker_task_id),
+            # Idempotent: re-parking on the same (task, code, phase) updates
+            # the existing open record instead of minting a duplicate, so a
+            # restart/retry against the same wall does not fill the queue.
+            blocker = self._blocker_store.record(
                 task_id=blocker_task_id,
                 kind=kind,
                 code=code,
                 question=question,
                 detail=detail,
                 phase=originating_phase,
-                created_at=utcnow_iso(),
+                now=utcnow_iso(),
             )
-            self._blocker_store.save(blocker)
             state.park_blocker_id = blocker.id
         self._store.save(state)
 

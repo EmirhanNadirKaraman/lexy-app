@@ -116,3 +116,17 @@ class ManifestViolation(GitError):
 
 class AuditError(AutoloopError):
     """The audit executor failed in a way it could not report as an outcome."""
+
+
+class EnvironmentDriftError(GitCommandError):
+    """The git execution environment changed under a running task — a hook
+    appeared, `core.hooksPath` moved, or an `insteadOf`/pushurl rule was
+    added.
+
+    Distinct from an ordinary `GitCommandError` because the cause is the
+    SHARED environment, not this unit of work. Quarantining one task and
+    moving to the next would leave the same condition in place for every
+    task after it, so this is classified `loop_fatal` while an ordinary
+    task-owned path/content refusal stays `task_fatal`. Subclasses
+    GitCommandError so existing `except GitCommandError` handlers still
+    catch it."""
