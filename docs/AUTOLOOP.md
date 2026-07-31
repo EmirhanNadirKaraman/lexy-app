@@ -1042,6 +1042,41 @@ arbitrary code from reading the file itself. **S24 remains OPEN** — the
 write-capable agent still has no path jail; escape is detected after the
 fact, not prevented.
 
+**Building the validation database (done 2026-08-01, reproducible).** The repo
+cannot rebuild its own schema (see `docs/COMMON_ERRORS.md`), so the database is
+built from one that already works. What actually worked, in order:
+
+1. A dedicated server, so the credentials in the env file reach nothing else.
+   The unused Homebrew `postgresql@16` cluster started on port **5433** with
+   `pg_ctl -D /opt/homebrew/var/postgresql@16 -o "-p 5433" start`; its
+   `pg_hba.conf` is `trust`, so no superuser password is needed. (The
+   `postgresql@14` cluster, which would have matched production's major
+   version, is a broken install — missing timezone data AND `libpq`.)
+2. `CREATE ROLE lexy_validation LOGIN PASSWORD …` + `CREATE DATABASE
+   lexy_validation_test OWNER lexy_validation TEMPLATE template0 ENCODING
+   'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'`, then `CREATE EXTENSION pgcrypto` as
+   superuser — migration 001 needs pgcrypto and the plain role cannot install
+   it. Do NOT make the role a superuser: it would then reach the real database
+   too, which is the whole thing this boundary exists to prevent.
+3. Schema from the working database, read-only:
+   `pg_dump --schema-only --no-owner --no-privileges | psql -p 5433 …`, then
+   `alembic stamp head` — NOT `upgrade head`. `--schema-only` copies the
+   `alembic_version` TABLE but not its ROW, so the chain would otherwise
+   replay against a schema that already has everything. Stamping is only
+   correct because the source is genuinely at head, which was verified
+   structurally first (037's `word_lists.is_system` and nullable `user_id`,
+   036's `word_norm`, 034's table all present).
+4. Reference DATA, which stamping necessarily skips: `pg_dump --data-only -t
+   language_table -t lemma_override` from the working database (the German row
+   exists in no migration — it predates Alembic), plus `video_category` seeded
+   from migration 013's own `CATEGORIES` list.
+
+Result: **1203 passed, 1 failed, 56 skipped**. The single failure is a
+pre-existing latent test bug that a non-dev database exposes rather than
+causes — an unconstrained catalog pick; see `docs/COMMON_ERRORS.md`. Divergence
+worth knowing: this database has exactly the 18 categories migration 013
+defines, and PG16 vs production's PG14.8.
+
 **Allowlist deviation, stated plainly.** The brief that specified this
 boundary named `JWT_SECRET_KEY`. This repository reads `SECRET_KEY`
 (`core/security.py:11`, which raises at import when it is unset). Verified in

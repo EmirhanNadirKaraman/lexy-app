@@ -597,6 +597,37 @@ line rather than the error. The tail is a pointer, never the diagnosis.
 command by hand in the worker repo rather than reading the tail — the tail
 told us "benchmark warning" for a credentials problem.
 
+### Backend tests that pass on the dev database fail on a fresh one: `assert 'word' in {'phrase'}`, `assert False` in the match tests
+**Symptom:** on a newly built database the suite is green except a handful of
+`match_learning_words` tests. Seen: `test_match_word_and_phrase_returned_together`
+(`assert 'word' in {'phrase'}`), `test_match_returns_learning_phrase_by_surface`
+and `test_match_learning_words_matches_phrases` (`assert False`).
+**Cause:** the helpers pick an arbitrary row out of a SHARED catalog table and
+the pick is only accidentally correct on the dev database.
+  * `_get_phrase` does `SELECT … FROM phrase_table WHERE language=$1 LIMIT 1`
+    with **no ORDER BY**, so it takes whatever is physically first. On a fresh
+    database that was a leaked `_testphrase_<hex>` row from an earlier run —
+    a synthetic surface the spaCy matcher can never match.
+  * `_get_word` does `ORDER BY word_id LIMIT 1` filtered only by
+    `word !~ '[0-9_]'` — **no language filter** — while the test then matches
+    against the PHRASE's language (`de`). On a fresh database the only rows
+    were Spanish (`hola`, `gato`), so the word could never match.
+On the dev database row 1 happens to be a real German word/phrase, so both pass
+and the dependency stays invisible. `_get_word`'s own comment shows this was
+already patched once (for digit/underscore fixture pollution); the language
+dimension was missed.
+**Fix:** constrain the pick — filter `_get_word` by the same language the test
+asserts against, and give `_get_phrase` an `ORDER BY` plus an exclusion of
+`_testphrase%` fixture rows. This is the same failure class as the xdist
+isolation cluster in `docs/TESTS.md`: **any `… FROM <shared catalog> LIMIT 1`
+without an ORDER BY and without a filter that pins what you actually need is a
+latent bug**, whether the disturbance is a parallel worker or a different
+database.
+**Note:** leaked fixture rows are the other half of this. `phrase_table` /
+`word_table` are not user-scoped, so the autouse cleanup (which reaps by test
+user) cannot reap them, and they accumulate. On a fresh database they are the
+FIRST rows, which is why they dominate an unordered pick.
+
 ### `relation "video" does not exist` on a fresh `alembic upgrade head` — and the schema cannot be rebuilt any other way either
 **Symptom:** building a clean database and running `alembic upgrade head` dies
 at migration 006 (`ALTER TABLE video ADD COLUMN … channel_id`). The chain
