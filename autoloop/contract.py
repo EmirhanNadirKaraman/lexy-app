@@ -161,60 +161,50 @@ class Directive:
 CONTRACT_INSTRUCTIONS = """\
 RESPONSE FORMAT — mandatory.
 Your ENTIRE reply must be exactly one fenced JSON code block (```json ... ```)
-and nothing else — no sentence before it, no sentence after it. Two blocks, a
-second JSON object, or any trailing text is REJECTED rather than guessed at:
-a directive can authorize a commit or a push, so which object you meant is
-never inferred from position. The block must be a single object with these keys
-and no others:
+and nothing else: no sentence before it, no sentence after it. Two blocks, a
+second object, or trailing text is REJECTED, never guessed at. The block is one
+object with these keys and no others:
 
   version    (required) always 3
   decision   (required) one of: audit | plan | implement | revise | commit |
              push | commit_and_push | stop | ask_user
   reason     (required) one short sentence explaining the decision
   scope      (audit only, optional) what the audit should focus on
-  tasks      (required for plan) list of task definitions:
-               {id, title, description, depends_on?, approved_paths?}
-             id: a stable slug ([A-Za-z0-9._-], max 64). depends_on lists ids
-             of existing tasks or tasks in this same batch. approved_paths is
-             the EXACT list of repository-relative files this task may touch
-             (no globs, no "..", no absolute paths) — name new files
-             explicitly. A task cannot be implemented until it has at least
-             one approved path, so give every task you intend to implement
-             one.
+  tasks      (required for plan) list of {id, title, description, depends_on?,
+             approved_paths?}. id: a stable slug ([A-Za-z0-9._-], max 64).
+             depends_on: ids of existing tasks or tasks in this same batch.
+             approved_paths: the EXACT repo-relative files this task may touch
+             — no globs, no "..", no absolute paths; name new files
+             explicitly. A task with no approved path cannot be implemented.
   task_id    (required for implement/revise; optional for commit /
              commit_and_push, where it marks that task completed)
   feedback   (required for revise) what is wrong and must change
   commit     (required for commit/commit_and_push) an object:
                message (required) the full commit message
                paths   (required) NON-EMPTY list of repo-relative paths to
-                       stage. There is no "stage everything" — every approved
-                       path must be a file the task actually changed.
+                       stage. There is no "stage everything"; every path must
+                       be one the task actually changed.
   reviewed   (required for commit/push/commit_and_push) an object:
                {request_id, head_sha, report_sha256}
-             Copy the three values EXACTLY from the CONTEXT block of the
-             request you are answering. An approval whose stamp does not match
-             the reviewed state is rejected — never approve from memory.
+             Copy all three EXACTLY from the CONTEXT block of the request you
+             are answering; never approve from memory. A stamp that does not
+             match the reviewed state is rejected.
   question   (required for ask_user) the question for the human operator
   notes      (optional) anything else worth recording
 
-Decision semantics:
+Decisions:
   audit — the executor audits the repository and reports back.
-  plan — add tasks to the roadmap. Work is authorized ONLY by task id, so
-    plan before you implement. Nothing is executed by plan itself.
-  implement — the executor performs the referenced READY task and reports
-    back with validation results. No free-form instructions — use plan first
-    if the roadmap lacks the task.
-  revise — send the referenced task back to the executor with feedback. Use
-    task_id "audit" to send the AUDIT itself back for another pass.
-  commit — commit the reviewed work. No push. Add task_id to mark the task
-    completed.
-  push — push the current branch (the reviewed commit). No new commit.
+  plan — add tasks to the roadmap; nothing is executed by plan itself. Work is
+    authorized ONLY by task id, so plan before you implement.
+  implement — the executor performs the referenced READY task and reports back
+    with validation results. No free-form instructions.
+  revise — send the referenced task back to the executor with feedback.
+    task_id "audit" sends the AUDIT itself back for another pass.
+  commit — commit the reviewed work; no push. task_id marks the task completed.
+  push — push the current branch (the reviewed commit); no new commit.
   commit_and_push — commit, then push.
   stop — end the loop.
-  ask_user — pause the loop and surface `question` to the human operator.
-
-Malformed replies are rejected with an error code and echoed back for
-correction — they are never guessed at."""
+  ask_user — pause the loop and surface `question` to the human operator."""
 
 
 def _require_str(field: str, value: object) -> str:

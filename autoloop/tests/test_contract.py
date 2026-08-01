@@ -6,7 +6,12 @@ import json
 
 import pytest
 
-from autoloop.contract import Decision, parse_response, verify_review
+from autoloop.contract import (
+    CONTRACT_INSTRUCTIONS,
+    Decision,
+    parse_response,
+    verify_review,
+)
 from autoloop.errors import ContractError
 
 REVIEWED = {"request_id": "alr-x-0003", "head_sha": "a" * 40, "report_sha256": "b" * 64}
@@ -430,3 +435,104 @@ def test_prose_only_reply_rejected():
     # Distinct code from invalid_json: nothing JSON-shaped at all, so the
     # correction tells ChatGPT to send a block rather than to fix syntax.
     expect_code("Sounds good — I'd start with pagination next.", "no_json_block")
+
+
+# ---- the contract TEXT states every normative requirement ------------------
+#
+# `CONTRACT_INSTRUCTIONS` is a prompt, not parser code: trimming its prose
+# cannot make `parse_response` accept or reject anything new — the 60-odd tests
+# above cover that, including the byte-exact rendered-page capture from
+# docs/COMMON_ERRORS.md §6. What a trim CAN silently do is drop a rule the model
+# is expected to follow, and no parser test would notice, because the loss shows
+# up as a malformed reply from a live model days later.
+#
+# So these tests pin the CONTENT of the instructions. They were written before
+# the 2026-08-01 trim (3,307 -> 2,812 chars) and passed against the untrimmed
+# text first, so they describe the contract rather than the edit.
+
+
+def test_contract_states_the_single_envelope_rule():
+    text = CONTRACT_INSTRUCTIONS.lower()
+    assert "```json" in CONTRACT_INSTRUCTIONS
+    # One block, nothing around it, and rejection rather than a guess.
+    assert "nothing else" in text
+    assert "rejected" in text
+    for forbidden in ("before", "after"):
+        assert forbidden in text
+
+
+@pytest.mark.parametrize("decision", [d.value for d in Decision])
+def test_contract_names_every_decision(decision):
+    """A decision the parser accepts but the instructions never mention is
+    unreachable in practice."""
+    assert decision in CONTRACT_INSTRUCTIONS
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "version", "decision", "reason", "scope", "tasks", "task_id",
+        "feedback", "commit", "reviewed", "question", "notes",
+    ],
+)
+def test_contract_documents_every_top_level_field(field):
+    assert field in CONTRACT_INSTRUCTIONS
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        "version",        # always 3
+        "request_id",     # the review-integrity stamp, all three parts
+        "head_sha",
+        "report_sha256",
+        "approved_paths",
+        "depends_on",
+        "message",        # commit.message
+        "paths",          # commit.paths
+    ],
+)
+def test_contract_documents_every_nested_binding(requirement):
+    assert requirement in CONTRACT_INSTRUCTIONS
+
+
+def test_contract_states_the_integrity_binding_is_copied_not_remembered():
+    """The stamp is what makes an approval un-replayable; 'copy it exactly'
+    must survive any trim."""
+    text = CONTRACT_INSTRUCTIONS.lower()
+    assert "exactly" in text
+    assert "context" in text
+
+
+def test_contract_states_the_path_restrictions():
+    """approved_paths and commit.paths carry the only limits on what a task may
+    touch — losing these loses the containment, not just some prose."""
+    text = CONTRACT_INSTRUCTIONS
+    assert "no globs" in text.lower()
+    assert ".." in text
+    assert "absolute" in text.lower()
+    assert "non-empty" in text.lower() or "NON-EMPTY" in text
+
+
+def test_contract_states_that_work_is_authorized_by_task_id():
+    text = CONTRACT_INSTRUCTIONS.lower()
+    assert "task id" in text or "task_id" in text
+    assert "plan" in text
+
+
+def test_contract_says_version_is_three():
+    assert "3" in CONTRACT_INSTRUCTIONS
+
+
+def test_contract_stays_within_its_budget():
+    """A ceiling, not a target. The instructions are re-sent on EVERY turn, so
+    they are a per-turn tax on a metered allowance.
+
+    2,850 is set just above the 2,812 the 2026-08-01 trim actually achieved,
+    NOT at a number chosen in advance. The pre-work estimate was ~1,800, which
+    turned out to be wrong: the remaining text is field definitions, decision
+    semantics and path restrictions — rules, not prose — and reaching a lower
+    figure would have meant deleting requirements to hit a guess. Raising this
+    ceiling is fine when a genuine new requirement lands; raising it to make
+    room for explanation is not."""
+    assert len(CONTRACT_INSTRUCTIONS) <= 2850
