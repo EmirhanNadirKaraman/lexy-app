@@ -357,6 +357,25 @@ class TaskRegistry:
     def ready_tasks(self) -> list[Task]:
         return [t for t in self._tasks.values() if self.state_of(t.id) is TaskState.READY]
 
+    def set_priority(self, task_id: str, priority: int) -> Task:
+        """Re-prioritise an existing task.
+
+        Deliberately the ONLY mutation an operator can make from outside the
+        normal `plan`/`seed_tasks.json` route (see `inbox.KIND_PRIORITY`).
+        Priority changes what runs next; it cannot change what a task is
+        allowed to touch, so it is safe to expose on a form in a way
+        `approved_paths` would not be.
+        """
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise TaskGraphError("unknown_task", f"no task with id '{task_id}'")
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            raise TaskGraphError(
+                "bad_priority", f"priority must be an integer, got {priority!r}"
+            )
+        task.priority = priority
+        return task
+
     def next_ready(self) -> Task | None:
         """Highest-priority ready task; ties broken by id.
 

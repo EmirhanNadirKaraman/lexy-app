@@ -1045,6 +1045,25 @@ or replayed forever; a request the registry refuses (duplicate id, unknown
 dependency, bad approved path) is reported and dropped. One typo never stops a
 running loop.
 
+**Editing priorities from the tracker.** The dashboard's roadmap section shows
+each task's priority in a number input with a Save button. Saving POSTs to
+`/api/priority`, which writes a `kind: "priority"` request to the SAME inbox —
+the page's only write path, and it touches neither the repository nor the state
+dir, so the read-only property everything else in that file depends on is
+unchanged and a save is safe while an agent is running. The change is queued,
+not applied: the loop applies it on its next run, and the page says so rather
+than showing a value that is not yet true.
+
+A priority request carries an id and a number, and nothing else — submitting
+one with `approved_paths` is refused. That is deliberate: priority decides what
+runs next, `approved_paths` decides what an agent may touch, and only the first
+belongs on a form. The endpoint has no authentication (the server binds
+127.0.0.1), so it requires an `X-Autoloop` header a cross-origin form post
+cannot set without a preflight this server never approves, and refuses a
+non-local `Origin`. Both are cheap mitigations against a local page in the same
+browser, not claimed to be more; the blast radius is bounded by what the
+endpoint can express.
+
 **Priorities.** `Task.priority` is an ascending integer — 1 outranks 2, the
 default 100 sorts last, ties break on id so selection stays deterministic.
 `next_ready()` orders by it instead of insertion order, which is the point: an

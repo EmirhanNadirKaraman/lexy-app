@@ -40,6 +40,7 @@ from pathlib import Path
 #: ignores has almost certainly not done what its author intended.
 ALLOWED_FIELDS = frozenset(
     {
+        "kind",
         "id",
         "title",
         "description",
@@ -51,6 +52,17 @@ ALLOWED_FIELDS = frozenset(
     }
 )
 REQUIRED_FIELDS = ("id", "title", "description")
+
+#: Request kinds. `task` creates a new task (the original shape; a request
+#: with no `kind` is treated as one, so files written before this existed
+#: still drain). `priority` re-prioritises an EXISTING task and carries only
+#: an id and a number — deliberately NOT a general "edit a task" request:
+#: description and, above all, `approved_paths` are authorization surface, and
+#: an operator changing those should go through `plan`/`seed_tasks.json` where
+#: it is reviewable, not through a form on a localhost page.
+KIND_TASK = "task"
+KIND_PRIORITY = "priority"
+KINDS = (KIND_TASK, KIND_PRIORITY)
 
 
 class InboxError(Exception):
@@ -79,11 +91,25 @@ class TaskInbox:
             raise InboxError(
                 f"unknown field(s) {sorted(unknown)}; allowed: {sorted(ALLOWED_FIELDS)}"
             )
-        missing = [f for f in REQUIRED_FIELDS if not str(spec.get(f, "")).strip()]
-        if missing:
-            raise InboxError(f"missing required field(s): {', '.join(missing)}")
+        kind = spec.get("kind", KIND_TASK)
+        if kind not in KINDS:
+            raise InboxError(f"unknown kind {kind!r}; expected one of {list(KINDS)}")
         if "priority" in spec and not isinstance(spec["priority"], int):
             raise InboxError("priority must be an integer (ascending; 1 outranks 2)")
+        if kind == KIND_PRIORITY:
+            if not str(spec.get("id", "")).strip():
+                raise InboxError("a priority request needs the task 'id'")
+            if not isinstance(spec.get("priority"), int):
+                raise InboxError("a priority request needs an integer 'priority'")
+            extra = set(spec) - {"kind", "id", "priority"}
+            if extra:
+                raise InboxError(
+                    f"a priority request carries only id + priority; got {sorted(extra)}"
+                )
+        else:
+            missing = [f for f in REQUIRED_FIELDS if not str(spec.get(f, "")).strip()]
+            if missing:
+                raise InboxError(f"missing required field(s): {', '.join(missing)}")
 
         self.directory.mkdir(parents=True, exist_ok=True)
         # Lexicographic filename order MUST equal submission order — `drain`
@@ -101,6 +127,11 @@ class TaskInbox:
         tmp.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
         return path
+
+    def submit_priority(self, task_id: str, priority: int) -> Path:
+        """Re-prioritise an existing task. Same safety as `submit`: outside the
+        checkout, no lock, safe mid-run."""
+        return self.submit({"kind": KIND_PRIORITY, "id": task_id, "priority": priority})
 
     # ---- loop side ----------------------------------------------------------
 

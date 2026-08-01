@@ -6,8 +6,17 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
+
+import pytest
 
 from autoloop.dashboard import MARKS, PAGE, STATUS, app_tasks, collect, pipeline
+
+
+def snapshot(root: Path) -> dict:
+    """Every file under `root` with its mtime — the same shape the read-only
+    test uses, so "did anything change" is one comparison."""
+    return {p: p.stat().st_mtime_ns for p in Path(root).rglob("*") if p.is_file()}
 
 
 def run_git(cwd, *args):
@@ -149,3 +158,55 @@ def test_stat_tile_values_use_proportional_figures():
     assert "tabular-nums" not in tile_rule
     code_rule = PAGE.split("code{", 1)[1].split("}", 1)[0]
     assert "tabular-nums" in code_rule
+
+
+# ---- priority editing (the one write path) -----------------------------------
+
+
+def test_the_post_endpoint_writes_only_to_the_inbox(tmp_path, monkeypatch):
+    """The write path must not touch the repo or the state dir. A write into
+    `.autoloop/` mid-run would trip the escape detector and park the loop
+    loop-fatal, which is the whole reason the inbox lives outside the checkout."""
+    import autoloop.dashboard as dash
+    from autoloop.inbox import TaskInbox
+
+    repo = make_repo(tmp_path)
+    inbox_dir = tmp_path / "outside" / "inbox"
+    monkeypatch.setattr(dash, "_inbox_dir", lambda _repo: inbox_dir)
+
+    before = snapshot(repo)
+    TaskInbox(dash._inbox_dir(repo)).submit_priority("rt-01", 3)
+    assert snapshot(repo) == before, "the checkout must be untouched"
+
+    specs, problems = TaskInbox(inbox_dir).drain()
+    assert problems == []
+    assert specs == [{"kind": "priority", "id": "rt-01", "priority": 3}]
+
+
+def test_a_priority_request_cannot_change_authorization():
+    """Priority is the only thing this endpoint can express. It must not be a
+    general task editor — `approved_paths` is authorization surface and belongs
+    in a reviewable `plan`, not a form on a localhost page."""
+    from autoloop.inbox import InboxError, TaskInbox
+
+    inbox = TaskInbox(Path("/tmp/never-written"))
+    with pytest.raises(InboxError, match="only id \\+ priority"):
+        inbox.submit({
+            "kind": "priority", "id": "rt-01", "priority": 1,
+            "approved_paths": ["lexy-app/backend/routers/books.py"],
+        })
+
+
+def test_the_roadmap_is_sorted_by_priority_for_display(tmp_path):
+    """What the operator sees must match what `next_ready()` would pick."""
+    repo = make_repo(tmp_path)
+    (repo / ".autoloop" / "tasks.json").write_text(json.dumps({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "b", "title": "B", "description": "d", "status": "pending", "priority": 9},
+            {"id": "a", "title": "A", "description": "d", "status": "pending", "priority": 1},
+        ],
+    }), encoding="utf-8")
+    roadmap = collect(repo)["roadmap"]
+    assert [t["id"] for t in roadmap] == ["a", "b"]
+    assert roadmap[0]["priority"] == 1

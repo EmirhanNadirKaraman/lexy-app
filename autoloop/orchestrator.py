@@ -3132,8 +3132,21 @@ class Orchestrator:
             self._log("task_inbox_rejected", data={"reason": problem})
         if not specs:
             return
-        added, refused = [], []
+        added, refused, reprioritised = [], [], []
         for spec in specs:
+            if spec.get("kind") == "priority":
+                # Re-prioritise an existing task. Separate from task creation
+                # because it must NOT be able to change authorization — only
+                # what runs next.
+                try:
+                    task = self._registry.set_priority(
+                        str(spec.get("id", "")), int(spec.get("priority", 100))
+                    )
+                except (TaskGraphError, ValueError, TypeError) as exc:
+                    refused.append(f"{spec.get('id')}: {exc}")
+                else:
+                    reprioritised.append(f"{task.id} -> {task.priority}")
+                continue
             task = Task(
                 id=str(spec.get("id", "")),
                 title=str(spec.get("title", "")),
@@ -3152,11 +3165,11 @@ class Orchestrator:
                 refused.append(f"{task.id}: {exc}")
             else:
                 added.append(f"{task.id} (priority {task.priority})")
-        if added:
+        if added or reprioritised:
             self._task_store.save(self._registry)
         self._log(
             "task_inbox_drained",
-            data={"added": added, "refused": refused},
+            data={"added": added, "reprioritised": reprioritised, "refused": refused},
         )
 
     def _get_client(self):

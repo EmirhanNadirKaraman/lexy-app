@@ -143,6 +143,40 @@ def app_tasks(repo: Path, limit: int = 40) -> list[dict]:
     return out
 
 
+
+def _inbox_dir(repo: Path) -> Path:
+    """Where task requests go. Resolved through the loop's own config so the
+    dashboard and `add-task` always agree, with the documented default as the
+    fallback for a dashboard pointed at a checkout that has no config yet."""
+    try:
+        import tomllib
+
+        data = tomllib.loads((repo / ".autoloop" / "config.toml").read_text(encoding="utf-8"))
+        workers_root = (data.get("paths") or {}).get("workers_root")
+        if workers_root:
+            return Path(workers_root).expanduser().parent / "inbox"
+    except (OSError, ValueError, KeyError):
+        pass
+    return Path.home() / ".autoloop" / "inbox"
+
+
+def _pending_inbox(repo: Path) -> list[dict]:
+    """Queued requests, so a submit is visibly recorded rather than vanishing
+    until the loop next runs."""
+    out = []
+    for path in sorted(_inbox_dir(repo).glob("*.json")):
+        spec = _json(path)
+        if not isinstance(spec, dict):
+            continue
+        out.append({
+            "kind": spec.get("kind", "task"),
+            "id": spec.get("id"),
+            "priority": spec.get("priority"),
+            "title": spec.get("title") or "",
+        })
+    return out
+
+
 def pipeline(state: dict, agents: list, blockers: list) -> list[dict]:
     """The loop's stages, each with a state the page can render.
 
@@ -227,7 +261,10 @@ def collect(repo: Path) -> dict:
         roadmap.append({
             "id": t.get("id"), "title": t.get("title"),
             "status": t.get("status") or "pending", "reason": (t.get("blocked_reason") or "")[:200],
+            # Ascending: 1 outranks 2, default 100 sorts last (tasks.Task.priority).
+            "priority": t.get("priority", 100),
         })
+    roadmap.sort(key=lambda r: (r.get("priority", 100), r.get("id") or ""))
 
     # --- recent events --------------------------------------------------
     events = []
@@ -282,6 +319,7 @@ def collect(repo: Path) -> dict:
         "events": events,
         "blockers": blockers,
         "roadmap": roadmap,
+        "inbox": _pending_inbox(repo),
         "app_tasks": app_tasks(repo),
         "pipeline": pipeline(state, live_agents_cache, blockers),
         "git": {"branch": branch, "head": head[:12], "dirty": dirty, "remote": _REMOTE_CACHE["refs"]},
@@ -366,6 +404,13 @@ summary:hover{color:var(--ink)}
      border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12.5px;max-width:330px;
      box-shadow:0 6px 22px rgba(0,0,0,.13);z-index:9}
 .row-active{background:var(--soft)}
+input.pri{width:64px;font:inherit;padding:3px 6px;border:1px solid var(--line);
+  border-radius:6px;background:var(--card);color:var(--ink);font-variant-numeric:tabular-nums}
+button.save{font:inherit;font-size:12px;padding:3px 10px;border:1px solid var(--line);
+  border-radius:6px;background:var(--card);color:var(--ink2);cursor:pointer}
+button.save:hover{color:var(--ink)}
+button.save[disabled]{opacity:.5;cursor:default}
+.saved{color:var(--good)}.savefail{color:var(--critical)}
 </style>
 <div class="wrap">
   <header>
@@ -393,6 +438,11 @@ summary:hover{color:var(--ink)}
       <div id="flowtable" class="scroll"></div></details>
   </section>
 
+  <section>
+    <h2>Roadmap — set priority, then Save</h2>
+    <div id="roadmap" class="scroll"></div>
+    <div id="queued" class="muted" style="font-size:12px;margin-top:9px"></div>
+  </section>
   <section><h2>Language-app tasks</h2><div id="apptasks" class="scroll"></div></section>
   <section><h2>Blockers</h2><div id="blockers"></div></section>
   <section><h2>Recent events</h2><div id="events" class="scroll"></div></section>
@@ -501,6 +551,55 @@ function render(d, force){
 
   drawFlow(d);
 
+  // ---- roadmap priority editor ------------------------------------------
+  // Writes go to the task INBOX, never to tasks.json: the loop is the only
+  // registry writer, and a write into .autoloop/ mid-run would trip the
+  // escape detector. So a Save is "queued", applied on the loop's next run.
+  const RS = {completed:["\u2713","done"],in_progress:["\u25b6","in progress"],
+              blocked:["\u25a0","blocked"],blocked_by_operator:["\u25a0","quarantined"],
+              pending:["\u25cb","queued"]};
+  document.getElementById("roadmap").innerHTML = rows(["task","priority","state","title"],
+    (d.roadmap||[]).map(t => {
+      const [ic,word] = RS[t.status] || RS.pending;
+      return `<tr><td><code>${esc(t.id)}</code></td>
+        <td><input class="pri" type="number" step="1" value="${esc(t.priority)}"
+             data-id="${esc(t.id)}" aria-label="priority for ${esc(t.id)}">
+            <button class="save" data-id="${esc(t.id)}">Save</button>
+            <span class="note" data-id="${esc(t.id)}"></span></td>
+        <td>${esc(ic)} ${esc(word)}</td>
+        <td>${esc((t.title||"").slice(0,80))}</td></tr>`;
+    }).join(""))
+    + `<p class="muted" style="font-size:12px;margin:9px 0 0">Lower number runs first; 100 is the default. Saved changes queue in the inbox and apply on the loop's next run.</p>`;
+
+  document.querySelectorAll("button.save").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id;
+      const input = document.querySelector(`input.pri[data-id="${CSS.escape(id)}"]`);
+      const note = document.querySelector(`span.note[data-id="${CSS.escape(id)}"]`);
+      const value = parseInt(input.value, 10);
+      if (!Number.isInteger(value)) { note.className = "note savefail"; note.textContent = " ✗ not a number"; return; }
+      btn.disabled = true; note.className = "note"; note.textContent = " …";
+      try {
+        const r = await fetch("/api/priority", {
+          method: "POST",
+          headers: {"Content-Type": "application/json", "X-Autoloop": "1"},
+          body: JSON.stringify({id, priority: value}),
+        });
+        const body = await r.json();
+        if (r.ok) { note.className = "note saved"; note.textContent = " ✓ queued"; }
+        else { note.className = "note savefail"; note.textContent = " ✗ " + (body.error || r.status); }
+      } catch (e) {
+        note.className = "note savefail"; note.textContent = " ✗ " + e;
+      } finally { btn.disabled = false; LASTJSON = null; }
+    });
+  });
+
+  const q = d.inbox || [];
+  document.getElementById("queued").textContent = q.length
+    ? `${q.length} queued request(s) awaiting the loop: ` +
+      q.map(r => r.kind === "priority" ? `${r.id} → priority ${r.priority}` : `new task ${r.id}`).join(", ")
+    : "no queued requests";
+
   // which app task is actually being worked
   const activeId = t.id;
   const inRoadmap = new Set((d.roadmap||[]).map(r => r.id));
@@ -557,6 +656,65 @@ tick(); setInterval(tick, 2000);
 
 class Handler(BaseHTTPRequestHandler):
     repo = Path(".")
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        """The ONE write path, and it writes only to the task inbox.
+
+        The inbox lives OUTSIDE the checkout, so this does not touch the repo,
+        `.autoloop/`, or git — the read-only property the rest of this file
+        depends on is unchanged, and a submit is safe while an agent is running
+        (a write into the state dir would trip the escape detector and park the
+        loop loop-fatal).
+
+        The page has no authentication and binds 127.0.0.1 only, so the residual
+        risk is a *local* page in the same browser posting here. Two cheap
+        mitigations, neither claimed to be more than that: a custom header,
+        which a cross-origin form post cannot set without a CORS preflight this
+        server never approves; and an Origin check when one is present. The
+        blast radius is bounded by what the endpoint can express — a task
+        priority. It cannot change `approved_paths`, so it cannot widen what any
+        agent may touch.
+        """
+        if self.headers.get("X-Autoloop") != "1":
+            return self._json_response(403, {"error": "missing X-Autoloop header"})
+        origin = self.headers.get("Origin")
+        if origin and not origin.startswith(("http://127.0.0.1", "http://localhost")):
+            return self._json_response(403, {"error": "cross-origin refused"})
+        if not self.path.startswith("/api/priority"):
+            return self._json_response(404, {"error": "unknown endpoint"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+            task_id = str(body["id"])
+            priority = int(body["priority"])
+        except (ValueError, KeyError, TypeError) as exc:
+            return self._json_response(400, {"error": f"bad request: {exc}"})
+
+        from .inbox import InboxError, TaskInbox
+
+        try:
+            path = TaskInbox(_inbox_dir(self.repo)).submit_priority(task_id, priority)
+        except InboxError as exc:
+            return self._json_response(400, {"error": str(exc)})
+        except OSError as exc:
+            return self._json_response(500, {"error": f"could not queue: {exc}"})
+        return self._json_response(
+            200,
+            {
+                "queued": task_id,
+                "priority": priority,
+                "file": path.name,
+                "note": "applied by the loop on its next run",
+            },
+        )
+
+    def _json_response(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path.startswith("/api/state"):
