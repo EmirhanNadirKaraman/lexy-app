@@ -922,13 +922,11 @@ class TestImportFlow:
 
     async def test_api_reports_checksum_failure_without_raising(self, client, db_pool, tmp_path, monkeypatch):
         """API, dry-run and direct-service callers must agree."""
-        from tests._auth_helper import register_and_login
-        from tests._email_helper import make_test_email
-
         write_package(tmp_path, name="nochecks", checksums=False)
         monkeypatch.setenv("PACKAGE_ROOT", str(tmp_path))
 
-        headers, _ = await register_and_login(client, db_pool, make_test_email())
+        # Admin: the endpoint is operator-only (rt-01, see test_books_import_admin).
+        headers = await _admin_headers(client, db_pool)
         r = await client.post(
             "/api/v1/books/import",
             json={"package_name": "nochecks"},
@@ -981,18 +979,40 @@ assert WARNING and FATAL  # imported for readability in assertions above
 # ---------------------------------------------------------------------------
 
 
+async def _admin_headers(client, db_pool) -> dict:
+    """Bearer headers for a fresh admin user.
+
+    Both package routes are admin-only since rt-01 (2026-08-01), so every
+    authenticated case below needs one. `is_admin` is planted with direct SQL
+    because the settings API filters writes to `settings_service.DEFAULTS` and
+    cannot set it — that un-self-grantability is the control the gate rests on.
+    """
+    from tests._auth_helper import register_and_login
+    from tests._email_helper import make_test_email
+
+    headers, uid = await register_and_login(client, db_pool, make_test_email())
+    await db_pool.execute(
+        "UPDATE users SET settings = COALESCE(settings::jsonb, '{}'::jsonb) "
+        "|| '{\"is_admin\": true}'::jsonb WHERE user_id = $1::uuid",
+        uid,
+    )
+    return headers
+
+
 class TestImportEndpoint:
-    """The API takes a package *name*, never a path."""
+    """The API takes a package *name*, never a path.
+
+    Every authenticated case here uses an **admin** token: the endpoint is
+    operator-only (rt-01). Who may call it is pinned in
+    `test_books_import_admin.py`; what it answers is pinned here.
+    """
 
     async def test_requires_auth(self, client):
         r = await client.post("/api/v1/books/import", json={"package_name": "pkg"})
         assert r.status_code in (401, 403)
 
     async def test_blank_name_is_422(self, client, db_pool):
-        from tests._auth_helper import register_and_login
-        from tests._email_helper import make_test_email
-
-        headers, _ = await register_and_login(client, db_pool, make_test_email())
+        headers = await _admin_headers(client, db_pool)
         r = await client.post(
             "/api/v1/books/import", json={"package_name": "   "}, headers=headers
         )
@@ -1003,10 +1023,7 @@ class TestImportEndpoint:
     ):
         """The body is the diagnostic. A caller fixing a worker bug needs the
         findings, not just a status code."""
-        from tests._auth_helper import register_and_login
-        from tests._email_helper import make_test_email
-
-        headers, _ = await register_and_login(client, db_pool, make_test_email())
+        headers = await _admin_headers(client, db_pool)
         r = await client.post(
             "/api/v1/books/import",
             json={"package_name": "does-not-exist"},
@@ -1018,10 +1035,11 @@ class TestImportEndpoint:
         assert payload["errors"][0]["code"] == "package_unreadable"
 
     async def test_traversal_in_package_name_is_refused(self, client, db_pool):
-        from tests._auth_helper import register_and_login
-        from tests._email_helper import make_test_email
-
-        headers, _ = await register_and_login(client, db_pool, make_test_email())
+        """Containment is checked for the caller who *can* reach it — an admin.
+        Admin-gating (rt-01) narrows who reaches this code; it is not itself the
+        traversal defence, so the defence is still asserted directly.
+        """
+        headers = await _admin_headers(client, db_pool)
         r = await client.post(
             "/api/v1/books/import",
             json={"package_name": "../../etc"},

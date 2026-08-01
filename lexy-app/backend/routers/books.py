@@ -13,6 +13,8 @@ Endpoints:
   PATCH /api/v1/books/{doc_id}/blocks/{block_id}       — update block
   POST  /api/v1/books/{doc_id}/blocks/{block_id}/llm-repair   — trigger LLM repair
   POST  /api/v1/books/{doc_id}/pages/{page_number}/batch-llm-repair — repair low-conf blocks
+  GET   /api/v1/books/packages                         — list importable packages (admin)
+  POST  /api/v1/books/import                           — validate/import a package (admin)
 """
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from ..core.deps import get_current_user, rate_limit_llm
+from ..core.deps import get_current_user, rate_limit_llm, require_admin
 from ..database import get_pool
 from ..models.schemas import (
     BlockPatchRequest,
@@ -180,17 +182,31 @@ async def upload_book(
 
 
 @router.get("/books/packages")
-async def list_packages(user=Depends(get_current_user)) -> list[str]:
-    """Package names available under ``PACKAGE_ROOT``."""
+async def list_packages(user=Depends(require_admin)) -> list[str]:
+    """Package names available under ``PACKAGE_ROOT``. **Admin-only.**
+
+    The listing is server-side operator inventory, not user content: package
+    names are not scoped to any user, so an authenticated learner reading them
+    is enumerating what the operator curated. Gated on `require_admin` like the
+    other operator routes (403 `admin_required` for non-admins).
+    """
     return book_import_service.list_packages()
 
 
 @router.post("/books/import", response_model=PackageImportResponse)
 async def import_package(
     body: PackageImportRequest,
-    user=Depends(get_current_user),
+    user=Depends(require_admin),
 ) -> PackageImportResponse:
-    """Validate and (eventually) import a document package.
+    """Validate and (eventually) import a document package. **Admin-only.**
+
+    This is the operator ingestion path (`docs/INGESTION_PIPELINE.md` §5), not
+    an end-user feature: the caller names a package the operator put on the
+    server, and the server then loads, checksums and structurally validates it.
+    Left open to any authenticated user that is an information-disclosure plus
+    compute-cost surface today, and a write path into `book_blocks` once
+    roadmap A3 activates a real persistence backend — so it is gated on
+    `require_admin` (403 `admin_required` for non-admins).
 
     Returns **200 with a rejected result** rather than an HTTP error when
     validation fails: the body is the diagnostic, and a caller fixing a worker
