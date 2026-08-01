@@ -276,7 +276,6 @@ def _build_executor(
         # executor above deliberately does not (read-only agents, no writer,
         # no reason for a database).
         validation_env=validation_env,
-        task_inbox=TaskInbox(inbox_dir_for(config.workers_root, config.state_dir)),
         worker_repo_root_for=worker_repos.path_for,
         policy=policy,
         agent_runner_factory=lambda root: implement_agent_runner(
@@ -342,6 +341,7 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         blocker_store=blocker_store,
         publisher=publisher,
         publisher_url_snapshot=publisher_url_snapshot,
+        task_inbox=TaskInbox(inbox_dir_for(config.workers_root, config.state_dir)),
         validation_env=validation_env,
         # `--config` can put the file anywhere, so pass the path actually
         # loaded rather than re-deriving the conventional one. Callers that

@@ -186,3 +186,64 @@ def test_a_refused_batch_never_raises():
     ])
     assert [a.split(" ")[0] for a in added] == ["ok"]
     assert len(refused) == 1
+
+
+def test_the_cli_actually_builds_an_orchestrator(tmp_path, monkeypatch):
+    """The gap that let a broken `run` ship: every other test constructs the
+    Orchestrator directly, so nothing exercised `_build_orchestrator` /
+    `_build_executor`. A keyword landing on the wrong constructor (task_inbox
+    was passed to ImplementExecutor) type-errors only at real startup.
+
+    Builds the real collaborator set against a throwaway repo — no browser, no
+    agent, no network: construction is the whole assertion.
+    """
+    import subprocess
+
+    from autoloop import cli
+    from autoloop.config import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (("init", "-q", "-b", "work"), ("config", "user.email", "t@e.com"),
+                 ("config", "user.name", "T")):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    (repo / "f.txt").write_text("x\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True, capture_output=True)
+
+    # `_build_orchestrator` provisions the publisher repo, which needs a real
+    # remote to snapshot a url from.
+    upstream = tmp_path / "upstream.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(upstream)], cwd=repo,
+                   check=True, capture_output=True)
+
+    (repo / ".autoloop").mkdir()
+    (repo / ".autoloop" / "config.toml").write_text(
+        '[browser]\nconversation_url = "https://chatgpt.com/c/abc"\n\n'
+        f'[paths]\nworkers_root = "{tmp_path / "outside" / "workers"}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+    config = load_config(repo / ".autoloop" / "config.toml")
+    store, state = cli._load_state(config)
+    if state is None:
+        from autoloop.state import LoopState, StateStore
+
+        state = LoopState.new(config.browser.conversation_url)
+        store = StateStore(config.state_file)
+        store.save(state)
+    task_store, registry = cli._load_tasks(config)
+
+    orch = cli._build_orchestrator(
+        config, argparse_ns(config), store, state, task_store, registry
+    )
+    assert orch._task_inbox is not None, "the inbox must reach the Orchestrator"
+    assert orch._task_inbox.directory.is_absolute()
+
+
+def argparse_ns(config):
+    import argparse
+
+    return argparse.Namespace(config=config.state_dir / "config.toml", null_executor=True)

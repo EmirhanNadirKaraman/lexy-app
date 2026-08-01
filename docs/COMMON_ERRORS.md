@@ -580,6 +580,24 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### `TypeError: ImplementExecutor.__init__() got an unexpected keyword argument 'task_inbox'` at `run` startup
+**Symptom:** every unit test passes, `ruff` is clean, and `python -m autoloop
+run` dies immediately in `cli._build_executor`.
+**Cause:** a new keyword was inserted by matching an anchor line that is NOT
+unique. `validation_env=validation_env,` appears in BOTH the `ImplementExecutor`
+and the `Orchestrator` construction in `cli.py`, so a "insert after the first
+occurrence" edit landed the argument on the wrong constructor.
+**Why nothing caught it:** every orchestrator test builds `Orchestrator(...)`
+directly with its own collaborators. Nothing exercised `_build_orchestrator` /
+`_build_executor`, so the real startup wiring had no coverage at all — a whole
+seam only production ran.
+**Fix:** `test_task_inbox.py::test_the_cli_actually_builds_an_orchestrator`
+builds the real collaborator set against a throwaway repo (with an `origin`,
+which the publisher provisioning needs). No browser, no agent, no network —
+construction is the whole assertion, and that is enough to catch a misplaced
+keyword. **When patching by anchor, assert the anchor is unique** (`s.count(a)
+== 1`) before replacing; a non-unique anchor silently edits the wrong place.
+
 ### The loop asks you to unset `ANTHROPIC_API_KEY` — a variable that is not set anywhere
 **Symptom:** a task parks with `ask_user`: *"Please unset ANTHROPIC_API_KEY and
 any other external Claude authentication variables in the executor
