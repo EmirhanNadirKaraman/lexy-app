@@ -65,6 +65,7 @@ from .errors import (
 from .executor import ExecutionOutcome, NullExecutor, TaskExecutor
 from .git_gateway import GitGateway
 from .implement_executor import ImplementExecutor, implement_agent_runner
+from .inbox import InboxError, TaskInbox, inbox_dir_for
 from .lock import LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
 from .orchestrator import Orchestrator
@@ -275,6 +276,7 @@ def _build_executor(
         # executor above deliberately does not (read-only agents, no writer,
         # no reason for a database).
         validation_env=validation_env,
+        task_inbox=TaskInbox(inbox_dir_for(config.workers_root, config.state_dir)),
         worker_repo_root_for=worker_repos.path_for,
         policy=policy,
         agent_runner_factory=lambda root: implement_agent_runner(
@@ -847,6 +849,41 @@ def _age(created_at: str) -> str:
     return f"{seconds // 86400}d"
 
 
+def _cmd_add_task(args: argparse.Namespace) -> int:
+    """Submit a task request to the inbox. Deliberately takes NO lock and
+    touches neither the repository nor the state dir, so it is safe to run at
+    any moment — including while a write-capable agent is mid-run. The running
+    loop merges it between steps; if no loop is running, the next one drains it
+    on startup."""
+    config = load_config(args.config)
+    inbox = TaskInbox(inbox_dir_for(config.workers_root, config.state_dir))
+    spec = {
+        "id": args.id,
+        "title": args.title,
+        "description": args.description,
+        "priority": args.priority,
+    }
+    if args.depends_on:
+        spec["depends_on"] = list(args.depends_on)
+    if args.approved_path:
+        spec["approved_paths"] = list(args.approved_path)
+    if args.validation_cwd:
+        spec["validation_cwd"] = args.validation_cwd
+    if args.validation:
+        spec["validation"] = [v.split() for v in args.validation]
+    try:
+        path = inbox.submit(spec)
+    except InboxError as exc:
+        print(f"error: {exc}")
+        return 1
+    print(
+        f"queued task '{args.id}' (priority {args.priority}) -> {path}\n"
+        "The running loop picks it up between steps; the task graph is validated "
+        "on merge, so a duplicate id or unknown dependency is reported there."
+    )
+    return 0
+
+
 def _cmd_blockers(args: argparse.Namespace) -> int:
     """Read-only, no lock — like `status`/`tasks`/`doctor`/`next-task`.
     Lists open blockers by default; `--all` also shows resolved ones."""
@@ -1358,6 +1395,27 @@ def build_parser() -> argparse.ArgumentParser:
             )
         p.set_defaults(func=func)
 
+    add_task = sub.add_parser(
+        "add-task",
+        help="queue a new task for the loop (safe at any time, even mid-run)",
+    )
+    add_config(add_task)
+    add_task.add_argument("--id", required=True, help="stable slug id")
+    add_task.add_argument("--title", required=True)
+    add_task.add_argument("--description", required=True)
+    add_task.add_argument(
+        "--priority", type=int, default=100,
+        help="ascending: 1 outranks 2; default 100 sorts last",
+    )
+    add_task.add_argument("--depends-on", action="append", default=[])
+    add_task.add_argument(
+        "--approved-path", action="append", default=[],
+        help="repeatable; the exact paths this task may touch",
+    )
+    add_task.add_argument("--validation", action="append", default=[],
+                          help='repeatable, e.g. --validation "ruff check ."')
+    add_task.add_argument("--validation-cwd", default="")
+
     blockers = sub.add_parser(
         "blockers", help="list open operator-facing blockers (read-only, no lock)"
     )
@@ -1365,6 +1423,7 @@ def build_parser() -> argparse.ArgumentParser:
     blockers.add_argument(
         "--all", action="store_true", help="also show resolved blockers"
     )
+    add_task.set_defaults(func=_cmd_add_task)
     blockers.set_defaults(func=_cmd_blockers)
 
     answer = sub.add_parser(

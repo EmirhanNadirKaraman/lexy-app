@@ -105,6 +105,13 @@ class Task:
     title: str
     description: str
     depends_on: tuple[str, ...] = ()
+    #: Scheduling order for `next_ready()`. ASCENDING — 1 outranks 2, and
+    #: the default sorts last, so an existing roadmap keeps its insertion
+    #: order until someone actually assigns priorities. Matches the P0/P1/P2
+    #: vocabulary the audit reports already use. Ties break on id, so the
+    #: selection stays deterministic (a non-deterministic `next_ready` would
+    #: make "which task ran" depend on dict ordering).
+    priority: int = 100
     status: str = "pending"  # pending | in_progress | completed | blocked
     created_at: str = field(default_factory=utcnow_iso)
     completed_at: str | None = None
@@ -351,9 +358,16 @@ class TaskRegistry:
         return [t for t in self._tasks.values() if self.state_of(t.id) is TaskState.READY]
 
     def next_ready(self) -> Task | None:
-        """First ready task in insertion order — deterministic."""
+        """Highest-priority ready task; ties broken by id.
+
+        Was insertion order. Ordering by `priority` first is what lets an
+        operator steer a running loop — otherwise a task added later can
+        never overtake one already queued, no matter how urgent.
+        """
         ready = self.ready_tasks()
-        return ready[0] if ready else None
+        if not ready:
+            return None
+        return sorted(ready, key=lambda t: (t.priority, t.id))[0]
 
     def summary(self) -> str:
         if not self._tasks:

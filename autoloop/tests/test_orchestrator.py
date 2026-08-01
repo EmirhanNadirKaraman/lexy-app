@@ -1306,3 +1306,68 @@ def test_await_timeout_exits_with_recoverable_state(tmp_path):
 #     -> test_git_gateway.py::test_index_mutation_after_write_tree_cannot_alter_the_commit
 #        (same swap-and-restore-through-a-hook attack, pinned at the
 #        GitGateway level instead of through the orchestrator)
+
+
+# ---- operator task inbox, merged between steps -------------------------------
+
+
+def test_orchestrator_drains_the_task_inbox_into_the_registry(tmp_path):
+    """The integration point: a request submitted from outside the checkout
+    becomes a real registry task, written by the LOOP (the only writer of
+    tasks.json), not by whoever submitted it."""
+    from autoloop.inbox import TaskInbox
+
+    inbox = TaskInbox(tmp_path / "outside" / "inbox")
+    inbox.submit({
+        "id": "new-1",
+        "title": "queued while running",
+        "description": "d",
+        "priority": 1,
+        "approved_paths": ["docs/SECURITY.md"],
+    })
+
+    orch, _, _, _, _, _, _ = build(tmp_path)
+    orch._task_inbox = inbox
+    orch._drain_task_inbox()
+
+    task = orch._registry.get("new-1")
+    assert task is not None and task.priority == 1
+    assert task.approved_paths == ("docs/SECURITY.md",)
+    assert inbox.pending() == [], "drained requests must not replay"
+
+
+def test_a_refused_request_does_not_stop_the_loop(tmp_path):
+    """A duplicate id (or any graph violation) is reported and dropped. The
+    registry gate is the single validation authority — the inbox deliberately
+    has no second copy of it — and one bad request must never break a run."""
+    from autoloop.inbox import TaskInbox
+
+    inbox = TaskInbox(tmp_path / "outside" / "inbox")
+    orch, _, _, _, _, _, _ = build(
+        tmp_path, tasks=(Task(id="dupe", title="T", description="d"),)
+    )
+    orch._task_inbox = inbox
+
+    inbox.submit({"id": "dupe", "title": "again", "description": "d"})
+    inbox.submit({"id": "fresh", "title": "ok", "description": "d", "priority": 2})
+    orch._drain_task_inbox()   # must not raise
+
+    assert orch._registry.get("fresh") is not None, "the good one still landed"
+    assert orch._registry.get("dupe").title == "T", "the original is untouched"
+
+
+def test_inbox_priority_decides_what_runs_next(tmp_path):
+    """End of the chain: submitting a priority-1 task while a lower-priority
+    one is already queued changes what `next_ready()` returns."""
+    from autoloop.inbox import TaskInbox
+
+    inbox = TaskInbox(tmp_path / "outside" / "inbox")
+    orch, _, _, _, _, _, _ = build(
+        tmp_path, tasks=(Task(id="slow", title="S", description="d", priority=50),)
+    )
+    orch._task_inbox = inbox
+    assert orch._registry.next_ready().id == "slow"
+
+    inbox.submit({"id": "urgent", "title": "U", "description": "d", "priority": 1})
+    orch._drain_task_inbox()
+    assert orch._registry.next_ready().id == "urgent"

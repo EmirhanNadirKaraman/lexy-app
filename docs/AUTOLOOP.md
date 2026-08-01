@@ -1007,6 +1007,50 @@ tracker, so an agent can now edit the record of a finding without that being
 named in its task. It is documentation, not a control — but a weakened finding
 misleads a later reader, and it is why this list stays four entries long.
 
+## 4f-ter. Operator task inbox and priorities
+
+Adding a task while the loop runs used to be impossible without breaking
+something. Two independent reasons, both real:
+
+1. **The escape detector snapshots the state dir.**
+   `enumerate_checkout_paths` covers tracked, untracked AND ignored paths, so
+   `.autoloop/tasks.json` sits inside the before/after snapshot taken around
+   every write-capable agent call. An operator edit landing mid-execute is
+   indistinguishable from an agent writing outside its worker repo and parks
+   the loop LOOP-FATAL. **That coverage is not the bug and must not be
+   "fixed":** `tasks.json` holds `approved_paths`, so an agent able to edit it
+   undetected could widen its own authorization — the circular ownership
+   finding #2 closes.
+2. **Lost updates.** The running orchestrator holds the registry in memory and
+   saves it on task-graph changes, so an external edit can be overwritten by
+   the next save. The single-instance lock exists to prevent exactly this.
+
+`inbox.py` resolves both without weakening either. Requests go to a directory
+BESIDE `workers_root` — already required to be absolute and outside the
+checkout, its `.git`, the state dir and the publisher paths — so submission
+touches nothing the detector watches and needs no lock. The loop drains it
+between steps (`run`, never inside one), validates through
+`TaskRegistry.add_many` — the same gate a ChatGPT `plan` goes through, so
+there is no second implementation to drift — and writes `tasks.json` itself.
+**The loop remains the only writer of the registry.**
+
+    python -m autoloop add-task --id dash-02 --priority 1 \
+        --title "..." --description "..." \
+        --approved-path autoloop/dashboard.py \
+        --validation "ruff check ."
+
+Safe at any instant, including mid-execute. A malformed request is refused at
+submit; an unparseable file is moved to `inbox/rejected/` rather than deleted
+or replayed forever; a request the registry refuses (duplicate id, unknown
+dependency, bad approved path) is reported and dropped. One typo never stops a
+running loop.
+
+**Priorities.** `Task.priority` is an ascending integer — 1 outranks 2, the
+default 100 sorts last, ties break on id so selection stays deterministic.
+`next_ready()` orders by it instead of insertion order, which is the point: an
+operator has to be able to steer a running loop, and under insertion order a
+task added later could never overtake one already queued however urgent.
+
 ## 4g. The validation-environment boundary (test DB credentials)
 
 **The problem.** A task may declare validation that needs a database — `rt-01`

@@ -238,6 +238,7 @@ class Orchestrator:
         blocker_store: BlockerStore | None = None,
         validation_runner=None,
         validation_env=None,
+        task_inbox=None,
         publisher: Publisher | None = None,
         worker_repos=None,
         publisher_url_snapshot: str | None = None,
@@ -298,6 +299,10 @@ class Orchestrator:
         #: holds; both are post-writer validation, and the writer subprocess
         #: itself is explicitly stripped of these variables.
         self._validation_env = validation_env
+        #: Operator task requests submitted from outside the checkout
+        #: (`inbox.TaskInbox`). Optional: `None` (most tests) simply means
+        #: nothing is drained, exactly as before this existed.
+        self._task_inbox = task_inbox
         # Autoloop M2 (`publisher.py`). Optional and independently gated from
         # the `worktrees`/`execution_store`/`intent_store` triple above: when
         # `None` (every existing caller and test), `_dispatch_task_push`
@@ -341,6 +346,13 @@ class Orchestrator:
             if self._config.pause_file.exists():
                 self._log("paused")
                 return "paused"
+            # Between steps, never inside one. The inbox lives outside the
+            # checkout, so an operator may submit at any instant — including
+            # while a write-capable agent is running — but the MERGE has to
+            # happen where no execute window is open and the registry is not
+            # being written by anything else. Here the loop holds its own lock
+            # and owns the registry, so it stays the only writer of tasks.json.
+            self._drain_task_inbox()
             phase = Phase(self.state.phase)
             if phase in TERMINAL_PHASES:
                 return phase.value
@@ -3098,6 +3110,54 @@ class Orchestrator:
         exhaust it again.
         """
         return self.state.active_provider or self._config.conversation.provider
+
+    def _drain_task_inbox(self) -> None:
+        """Merge any operator-submitted task requests into the registry.
+
+        Called between steps (see `run`). Never raises: an inbox problem is an
+        operator's typo, and a typo must not stop a loop that is mid-task. A
+        request the registry refuses (duplicate id, unknown dependency, bad
+        approved path) is reported and dropped — `TaskRegistry.add_many` is the
+        single validation gate, the same one a ChatGPT `plan` goes through, so
+        there is no second implementation here to drift from it.
+        """
+        if self._task_inbox is None:
+            return
+        try:
+            specs, problems = self._task_inbox.drain()
+        except OSError as exc:  # pragma: no cover - unreadable inbox directory
+            self._log("task_inbox_error", data={"error": str(exc)})
+            return
+        for problem in problems:
+            self._log("task_inbox_rejected", data={"reason": problem})
+        if not specs:
+            return
+        added, refused = [], []
+        for spec in specs:
+            task = Task(
+                id=str(spec.get("id", "")),
+                title=str(spec.get("title", "")),
+                description=str(spec.get("description", "")),
+                depends_on=tuple(spec.get("depends_on", ()) or ()),
+                priority=int(spec.get("priority", 100)),
+                validation=tuple(tuple(c) for c in spec.get("validation", ()) or ()),
+                validation_cwd=str(spec.get("validation_cwd", "") or ""),
+                approved_paths=tuple(spec.get("approved_paths", ()) or ()),
+            )
+            try:
+                # One at a time: `add_many` is atomic per call, so a single bad
+                # request would otherwise reject the whole batch alongside it.
+                self._registry.add_many([task])
+            except (TaskGraphError, ValueError, TypeError) as exc:
+                refused.append(f"{task.id}: {exc}")
+            else:
+                added.append(f"{task.id} (priority {task.priority})")
+        if added:
+            self._task_store.save(self._registry)
+        self._log(
+            "task_inbox_drained",
+            data={"added": added, "refused": refused},
+        )
 
     def _get_client(self):
         if self._client is None:
