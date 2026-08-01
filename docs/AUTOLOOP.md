@@ -1549,10 +1549,23 @@ folded text to its original id, takes the stronger severity/confidence, and
 takes the **cautious** answer on `safe_to_parallelize` so one agent's optimism
 cannot override another's caution.
 
-That is what makes the widened candidate test safe: file **and** symbol overlap
-now marks two findings as duplicate candidates, which would be reckless under a
-keep-the-winner rule — two genuinely distinct defects routinely live in the same
-function — and costs nothing when everything from both survives.
+**Location is a prefilter, never a verdict.** A first version of this widened
+the candidate test to "file and symbol overlap" on the reasoning that merging
+preserves content so over-merging is harmless. That was wrong, and worth
+recording: `generate_tasks` promotes one finding to one task, so folding two
+distinct defects yields a single task whose identity, severity, dependencies and
+remediation belong to neither — and keeping both texts inside it does not repair
+that. An off-by-one and an unchecked return in the same function are two
+problems.
+
+So a fold requires location overlap **and** a substance signal (a high Jaccard
+overlap of the impact and proposed-action wording, deliberately excluding
+evidence — two agents citing the same `file:line` is location agreement wearing
+a different hat). The threshold is set high because the failure directions are
+not symmetric: failing to merge two reports of one defect costs a duplicated
+block, visible to any reader; merging two defects costs a defect, silently.
+Deduplication is expected to fire rarely, and that is correct — compaction comes
+from the structural bounds, which is where the measured win actually was.
 
 **The task graph renders once.** It was emitted as a Markdown table *and* a JSON
 block carrying identical fields. The JSON is the representation that does work

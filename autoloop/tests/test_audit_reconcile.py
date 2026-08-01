@@ -6,7 +6,8 @@ from autoloop.audit.reconcile import reconcile
 
 
 def finding(fid="f1", domain="d1", category="defect", severity="high",
-            confidence="confirmed", files=("a.py",), deps=()):
+            confidence="confirmed", files=("a.py",), deps=(),
+            impact="bad", proposed_action="fix it"):
     return Finding(
         id=fid,
         category=category,
@@ -15,8 +16,8 @@ def finding(fid="f1", domain="d1", category="defect", severity="high",
         affected_files=tuple(files),
         symbols=(),
         evidence="saw it",
-        impact="bad",
-        proposed_action="fix it",
+        impact=impact,
+        proposed_action=proposed_action,
         dependencies=tuple(deps),
         acceptance_criteria=("fixed",),
         validation_commands=("ruff check .",),
@@ -59,13 +60,32 @@ def test_style_rejected_not_bucketed():
     assert "stylistic" in result.rejected[0].reason
 
 
-def test_cross_agent_duplicate_keeps_higher_quality():
-    weaker = finding("a1", domain="agent_a", confidence="probable", severity="medium")
-    stronger = finding("b1", domain="agent_b", confidence="confirmed", severity="high")
+def test_cross_agent_duplicate_folds_and_keeps_the_stronger_identity():
+    """Semantics changed 2026-08-01: a fold MERGES rather than discarding the
+    weaker instance, and needs a substance signal — the default helper text has
+    no distinctive tokens, so the two must actually describe one defect."""
+    same = dict(
+        impact="authorization tokens leak into the request log",
+        proposed_action="redact authorization tokens from the request log",
+    )
+    weaker = finding("a1", domain="agent_a", confidence="probable", severity="medium",
+                     **same)
+    stronger = finding("b1", domain="agent_b", confidence="confirmed", severity="high",
+                       **same)
     result = reconcile([weaker, stronger])
     [kept] = result.buckets["confirmed_defects"]
     assert kept.qualified_id == "agent_b:b1"
+    assert (kept.severity, kept.confidence) == ("high", "confirmed")
     assert ("agent_a:a1", "agent_b:b1") in result.duplicates
+
+
+def test_two_defects_sharing_a_file_are_not_folded():
+    """Location is a prefilter, not a verdict — see reconcile._is_duplicate_candidate."""
+    a = finding("a1", impact="loop reads past the end of the buffer",
+                proposed_action="clamp the loop bound")
+    b = finding("b1", impact="the write() return value is ignored",
+                proposed_action="raise on a short write")
+    assert len(reconcile([a, b]).buckets["confirmed_defects"]) == 2
 
 
 def test_different_files_are_not_duplicates():

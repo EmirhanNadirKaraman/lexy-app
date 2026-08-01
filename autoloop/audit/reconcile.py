@@ -7,6 +7,7 @@ items stay visible in the report (with reasons); they are just never promoted.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .findings import Finding, RejectedItem
@@ -66,23 +67,85 @@ def _quality(finding: Finding) -> tuple:
     )
 
 
-def _is_duplicate_candidate(a: Finding, b: Finding) -> bool:
-    """Do these two look like the same underlying issue?
+#: How much of the two findings' substance must coincide before they are
+#: treated as the same defect. High on purpose — see `_is_duplicate_candidate`
+#: for why the failure directions are not symmetric.
+MERGE_SIMILARITY = 0.7
 
-    Same category, plus either an identical file set (the original rule) or an
-    overlap in BOTH files and symbols. Overlap is deliberately only a
-    *candidate* test, never proof: two genuinely distinct defects routinely
-    live in the same function. That is safe here only because merging keeps
-    everything from both — see `_merge`. If merging ever became "keep the
-    better one", this predicate would have to become much stricter.
+_TOKEN = re.compile(r"[a-z0-9_]+")
+#: Words that say nothing about WHICH defect this is, so they must not push two
+#: unrelated findings over the similarity threshold.
+_STOPWORDS = frozenset(
+    {
+        "that", "this", "with", "from", "when", "will", "would", "should",
+        "have", "which", "there", "their", "then", "than", "into", "code",
+        "file", "files", "line", "lines", "function", "method", "class",
+        "value", "values", "return", "returns", "check", "checks", "fix",
+        "fixes", "test", "tests", "user", "users", "does", "make", "makes",
+        "used", "uses", "using", "instead", "rather", "before", "after",
+    }
+)
+
+
+def _substance_tokens(finding: Finding) -> set[str]:
+    """Distinctive words describing WHAT is wrong and what to do about it.
+
+    Deliberately excludes `evidence`: two agents citing the same file:line
+    would score as similar on location alone, which is the very thing that
+    must not be sufficient.
+    """
+    text = f"{finding.impact} {finding.proposed_action}".lower()
+    return {t for t in _TOKEN.findall(text) if len(t) > 3 and t not in _STOPWORDS}
+
+
+def _describes_same_defect(a: Finding, b: Finding) -> bool:
+    """Jaccard overlap of the two findings' substance, above the threshold.
+
+    A blunt instrument, and knowingly so: deciding whether two prose
+    descriptions denote the same defect is a semantic judgement no
+    deterministic rule settles. It is used only to make folding RARER than
+    location matching would, never to justify a fold on its own.
+
+    Empty token sets return False: no evidence of sameness is not evidence of
+    sameness.
+    """
+    ta, tb = _substance_tokens(a), _substance_tokens(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / len(ta | tb) >= MERGE_SIMILARITY
+
+
+def _is_duplicate_candidate(a: Finding, b: Finding) -> bool:
+    """Are these two the SAME defect, reported twice?
+
+    Location is a prefilter, never a verdict. Two genuinely distinct defects
+    routinely live in the same file and the same function — an off-by-one and
+    an unchecked return in `mod.f` are two problems, two severities, two
+    remediations and two tasks. Folding them produces one task whose identity
+    belongs to neither, and preserving both texts inside it does not repair
+    that: `generate_tasks` promotes one finding to one task.
+
+    So a fold requires location overlap AND a substance signal
+    (`_describes_same_defect`). The two failure directions are not symmetric,
+    and the rule is tuned accordingly:
+
+      * failing to merge two reports of one defect costs a duplicated block —
+        bytes, and a reader who sees the same thing twice;
+      * merging two defects into one costs a defect, silently, with its
+        severity and remediation absorbed into another's.
+
+    The first is cheap and visible, the second is expensive and invisible, so
+    this errs hard toward leaving findings apart. Compaction is not what this
+    predicate is for — that comes from the structural bounds in `findings.py`,
+    which is where the measured win actually was. Deduplication is for
+    correctness of the report, and it is expected to fire rarely.
     """
     if a.category != b.category:
         return False
-    if frozenset(a.affected_files) == frozenset(b.affected_files):
-        return True
     files_overlap = bool(set(a.affected_files) & set(b.affected_files))
-    symbols_overlap = bool(set(a.symbols) & set(b.symbols))
-    return files_overlap and symbols_overlap
+    if not files_overlap:
+        return False
+    return _describes_same_defect(a, b)
 
 
 def _merge_text(primary: str, other: str, other_id: str) -> str:

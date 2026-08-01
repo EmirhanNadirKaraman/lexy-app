@@ -127,30 +127,32 @@ def test_oversize_check_runs_after_validation_not_instead_of_it():
 
 def test_duplicates_are_merged_not_discarded():
     """The pre-2026-08-01 behaviour kept the better instance and threw the other
-    away, losing impacts and acceptance criteria nothing else carried."""
-    a = finding(id="a", evidence="a.py:10 leaks", impact="tokens leak",
-                acceptance_criteria=["no token in logs"], confidence="confirmed")
-    b = finding(id="b", evidence="a.py:44 also leaks", impact="and headers leak",
-                acceptance_criteria=["no header in logs"], confidence="probable")
+    away, losing evidence and acceptance criteria nothing else carried. These
+    two describe the SAME defect — that is what licenses the fold at all."""
+    a = finding(id="a", evidence="a.py:10 logs the header",
+                acceptance_criteria=["no token in logs"], confidence="confirmed",
+                impact="authorization tokens leak into the request log",
+                proposed_action="redact authorization tokens from the request log")
+    b = finding(id="b", evidence="a.py:44 logs it again",
+                acceptance_criteria=["no header in logs"], confidence="probable",
+                impact="authorization tokens leak into the request log",
+                proposed_action="redact authorization tokens from the request log")
 
     result = reconcile([a, b])
     kept = result.accepted()
 
-    assert len(kept) == 1  # one block, not two
+    assert len(kept) == 1
     merged = kept[0]
     # Every unique statement from BOTH survives.
-    assert "a.py:10 leaks" in merged.evidence
-    assert "a.py:44 also leaks" in merged.evidence
-    assert "tokens leak" in merged.impact
-    assert "and headers leak" in merged.impact
+    assert "a.py:10 logs the header" in merged.evidence
+    assert "a.py:44 logs it again" in merged.evidence
     assert set(merged.acceptance_criteria) == {"no token in logs", "no header in logs"}
-    # And the fold is recorded, so a reader can see what happened.
     assert result.duplicates == [("dom:b", "dom:a")]
 
 
 def test_a_merge_attributes_the_folded_finding():
-    a = finding(id="a", impact="one")
-    b = finding(id="b", impact="two")
+    a = finding(id="a", impact="tokens leak into logs", proposed_action="redact tokens")
+    b = finding(id="b", impact="tokens leak into logs badly", proposed_action="redact tokens")
     merged = reconcile([a, b]).accepted()[0]
     assert "dom:b" in merged.impact  # attribution, not anonymous concatenation
 
@@ -162,24 +164,78 @@ def test_identical_text_is_not_duplicated_into_the_merged_finding():
     assert merged.impact.count("same impact") == 1
 
 
-def test_file_and_symbol_overlap_merges_rather_than_picking_a_winner():
-    """Overlap is only a CANDIDATE test — safe precisely because merging keeps
-    both. Two distinct defects in one function lose nothing by being folded."""
-    a = finding(id="a", affected_files=["a.py", "b.py"], symbols=["mod.f"],
-                impact="off-by-one")
-    b = finding(id="b", affected_files=["a.py", "c.py"], symbols=["mod.f", "mod.g"],
-                impact="unchecked return")
+def test_distinct_defects_in_the_same_symbol_stay_separate():
+    """The guarantee this whole predicate exists for. An off-by-one and an
+    unchecked return in `mod.f` are two problems — two severities, two
+    remediations, two tasks. Folding them yields one task whose identity
+    belongs to neither, and preserving both texts inside it does NOT repair
+    that, because one finding becomes one task.
 
-    merged = reconcile([a, b]).accepted()[0]
+    An earlier version of this file asserted the opposite and pinned the bug.
+    """
+    a = finding(id="a", affected_files=["a.py"], symbols=["mod.f"],
+                impact="loop reads one element past the end of the buffer",
+                proposed_action="clamp the loop bound to len(buffer)")
+    b = finding(id="b", affected_files=["a.py"], symbols=["mod.f"],
+                impact="the return value of write() is ignored so partial writes vanish",
+                proposed_action="raise when write() reports fewer bytes than requested")
 
-    assert set(merged.affected_files) == {"a.py", "b.py", "c.py"}
-    assert set(merged.symbols) == {"mod.f", "mod.g"}
-    assert "off-by-one" in merged.impact and "unchecked return" in merged.impact
+    kept = reconcile([a, b]).accepted()
+
+    assert len(kept) == 2, "two distinct defects must not become one task"
+    assert {f.id for f in kept} == {"a", "b"}
 
 
-def test_file_overlap_without_symbol_overlap_stays_separate():
-    a = finding(id="a", affected_files=["a.py", "b.py"], symbols=["mod.f"])
-    b = finding(id="b", affected_files=["a.py", "c.py"], symbols=["mod.z"])
+def test_location_overlap_alone_never_folds():
+    """Same file, same symbol, same category — and nothing else in common.
+    Location is a prefilter, never a verdict."""
+    a = finding(id="a", affected_files=["a.py"], symbols=["mod.f"],
+                impact="timestamps are stored without a timezone",
+                proposed_action="store aware datetimes in UTC")
+    b = finding(id="b", affected_files=["a.py"], symbols=["mod.f"],
+                impact="the retry budget is never reset between sessions",
+                proposed_action="zero the counter when a session starts")
+
+    assert len(reconcile([a, b]).accepted()) == 2
+
+
+def test_a_fold_requires_the_substance_signal_not_just_the_location():
+    """Two agents reporting the SAME defect in near-identical terms do fold —
+    otherwise deduplication would never fire at all."""
+    shared = dict(
+        affected_files=["a.py"],
+        symbols=["mod.f"],
+        impact="authorization tokens leak into the request log",
+        proposed_action="redact authorization tokens from the request log",
+    )
+    a = finding(id="a", confidence="confirmed", **shared)
+    b = finding(id="b", confidence="probable", **shared)
+
+    result = reconcile([a, b])
+
+    assert len(result.accepted()) == 1
+    assert result.duplicates == [("dom:b", "dom:a")]
+
+
+def test_evidence_alone_cannot_make_two_findings_look_the_same():
+    """Two agents citing the same file:line is location agreement wearing a
+    different hat — it must not push distinct defects over the threshold."""
+    cited = "a.py:10-20 — see the block quoted here verbatim in both reports"
+    a = finding(id="a", evidence=cited, impact="unbounded memory growth",
+                proposed_action="cap the cache size")
+    b = finding(id="b", evidence=cited, impact="password printed on stderr",
+                proposed_action="remove the debug print")
+
+    assert len(reconcile([a, b]).accepted()) == 2
+
+
+def test_findings_in_different_files_never_fold():
+    """Location overlap is the prefilter; without it nothing is even
+    considered, however similar the wording."""
+    a = finding(id="a", affected_files=["a.py"], impact="authorization tokens leak into the request log",
+                proposed_action="redact authorization tokens from the request log")
+    b = finding(id="b", affected_files=["b.py"], impact="authorization tokens leak into the request log",
+                proposed_action="redact authorization tokens from the request log")
     assert len(reconcile([a, b]).accepted()) == 2
 
 
@@ -204,23 +260,29 @@ def test_a_merge_takes_the_cautious_parallelism_answer():
 
 
 def test_merging_is_order_independent_in_what_it_preserves():
-    a = finding(id="a", impact="alpha", acceptance_criteria=["ac-a"])
-    b = finding(id="b", impact="beta", acceptance_criteria=["ac-b"])
+    a = finding(id="a", acceptance_criteria=["ac-a"], evidence="a.py:1 alpha",
+                impact="authorization tokens leak into the request log",
+                proposed_action="redact authorization tokens from the request log")
+    b = finding(id="b", acceptance_criteria=["ac-b"], evidence="a.py:2 beta",
+                impact="authorization tokens leak into the request log",
+                proposed_action="redact authorization tokens from the request log")
     forward = reconcile([a, b]).accepted()[0]
     backward = reconcile([b, a]).accepted()[0]
     for merged in (forward, backward):
-        assert "alpha" in merged.impact and "beta" in merged.impact
         assert set(merged.acceptance_criteria) == {"ac-a", "ac-b"}
+        assert "alpha" in merged.evidence and "beta" in merged.evidence
 
 
-def test_three_way_overlap_collapses_without_losing_any_of_the_three():
-    a = finding(id="a", affected_files=["x.py"], symbols=["m.f"], impact="one")
-    b = finding(id="b", affected_files=["x.py"], symbols=["m.f"], impact="two")
-    c = finding(id="c", affected_files=["x.py"], symbols=["m.f"], impact="three")
+def test_three_reports_of_one_defect_collapse_without_losing_any_of_them():
+    a = finding(id="a", acceptance_criteria=["one"], impact="authorization tokens leak into the request log",
+                proposed_action="redact authorization tokens from the request log")
+    b = finding(id="b", acceptance_criteria=["two"], impact="authorization tokens leak into the request log",
+                proposed_action="redact authorization tokens from the request log")
+    c = finding(id="c", acceptance_criteria=["three"], impact="authorization tokens leak into the request log",
+                proposed_action="redact authorization tokens from the request log")
     merged = reconcile([a, b, c]).accepted()
     assert len(merged) == 1
-    for text in ("one", "two", "three"):
-        assert text in merged[0].impact
+    assert set(merged[0].acceptance_criteria) == {"one", "two", "three"}
 
 
 # ---- the report renders the task graph once --------------------------------
@@ -371,3 +433,30 @@ def test_a_reshape_returning_nothing_parks_instead_of_silently_losing_it(repo, t
 
     with pytest.raises(AuditError):
         executor.execute(audit_directive(), task=None)
+
+
+def test_a_held_finding_blocks_completion_even_though_its_domain_is_covered(repo, tmp_path):
+    """The two halves must hold together, which is why they are asserted as a
+    pair rather than in two separate tests.
+
+    "Covered" and "complete" answer different questions. A domain whose only
+    finding was held DID produce usable output — calling it uncovered would
+    hide a real finding behind a coverage warning. But the run must NOT finish
+    while that finding is unresolved, or the report ships silently missing it.
+    Getting either half wrong loses the finding; getting them backwards loses
+    it twice over.
+    """
+    runner = ReshapeRunner(reshaped=json.dumps({"findings": []}))
+    executor = build_executor(repo, tmp_path, runner=runner)
+
+    with pytest.raises(AuditError) as exc:
+        executor.execute(audit_directive(), task=None)
+
+    # No report was written: completion is genuinely blocked, not merely warned.
+    assert not list((repo / "docs").glob("AUDIT_*.md"))
+    assert "lost, not shortened" in str(exc.value)
+    # And the domain that produced it was never marked unusable.
+    first_pass = parse_findings(
+        payload(item(id="big", category="doc_drift", evidence="x" * 5000)), "docs_drift"
+    )
+    assert first_pass.usable is True and first_pass.oversized
