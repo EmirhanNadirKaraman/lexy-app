@@ -222,3 +222,57 @@ def test_store_archive(tmp_path):
     backup = store.archive()
     assert backup is not None and backup.exists()
     assert store.load() is None
+
+
+# ---- always-approved repository trackers ------------------------------------
+
+
+def test_tracker_paths_are_exactly_the_four_claude_md_mandates():
+    """Pinned as a set. CLAUDE.md makes updating these a CONDITION of the work
+    (§12 SUMMARY/TESTS/COMMON_ERRORS, §14 SECURITY), which is why they are
+    implicitly approved. Anything ADDED here widens the scope of every task in
+    the repository, so it must be a deliberate diff, not an accident."""
+    from autoloop.tasks import TRACKER_PATHS
+
+    assert set(TRACKER_PATHS) == {
+        "docs/COMMON_ERRORS.md",
+        "docs/SECURITY.md",
+        "docs/SUMMARY.md",
+        "docs/TESTS.md",
+    }
+    # Markdown trackers only: nothing executable, nothing that changes behaviour.
+    assert all(p.startswith("docs/") and p.endswith(".md") for p in TRACKER_PATHS)
+
+
+def test_a_scoped_task_gains_the_trackers():
+    from autoloop.tasks import TRACKER_PATHS, effective_approved_paths
+
+    effective = effective_approved_paths(("lexy-app/backend/routers/books.py",))
+    assert "lexy-app/backend/routers/books.py" in effective
+    assert set(TRACKER_PATHS) <= set(effective)
+    assert list(effective) == sorted(effective), "must be sorted for a stable record"
+
+
+def test_an_UNSCOPED_task_stays_unscoped():
+    """The property that must not regress: empty `approved_paths` means "no
+    scope authorized yet" and must keep refusing dispatch (docs/SECURITY.md
+    finding #2, circular ownership). Returning just the trackers would quietly
+    turn an unscoped task into a dispatchable one."""
+    from autoloop.tasks import effective_approved_paths
+
+    assert effective_approved_paths(()) == ()
+
+
+def test_trackers_do_not_authorize_code_outside_the_task_scope():
+    """The widening is documentation-only. A source file the task did not name
+    is still outside its authorization."""
+    from autoloop.tasks import effective_approved_paths
+
+    effective = set(effective_approved_paths(("docs/SECURITY.md",)))
+    for outside in (
+        "lexy-app/backend/routers/books.py",
+        "autoloop/policy.py",
+        "docs/AUTOLOOP.md",   # a doc, but NOT one of the four trackers
+        "CLAUDE.md",
+    ):
+        assert outside not in effective

@@ -1012,3 +1012,45 @@ def test_validation_that_leaves_the_tree_unchanged_is_accepted(tmp_path):
     assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
     assert execution_store.load(task.id).candidate_sha != ""
     assert "POST-COMMIT REVIEW PACKET" in (orch.state.outbox or "")
+
+
+# ---- always-approved trackers, end to end -----------------------------------
+
+
+def test_a_tracker_edit_outside_approved_paths_no_longer_refuses(tmp_path):
+    """rt-01's actual failure, twice: the agent updated `docs/SUMMARY.md`
+    because CLAUDE.md §12 requires it when a file is added, and the commit was
+    refused for a path the repo's own rules obliged it to touch."""
+    executor = WritingExecutor(
+        tmp_path / "worktrees",
+        {"src/thing.py": "x\n", "docs/SUMMARY.md": "index\n"},
+    )
+    orch, _repo, _wt, execution_store, _intents, task = build_postcommit(
+        tmp_path,
+        executor,
+        approved_paths=("src/thing.py",),   # SUMMARY.md deliberately NOT named
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
+    assert execution_store.load(task.id).candidate_sha != "", "should have committed"
+
+
+def test_a_NON_tracker_path_outside_approved_paths_still_refuses(tmp_path):
+    """The guard that makes the widening narrow: only the four trackers are
+    implicit. Any other unnamed path is still an authorization failure."""
+    executor = WritingExecutor(
+        tmp_path / "worktrees",
+        {"src/thing.py": "x\n", "src/sneaky.py": "y\n"},
+    )
+    orch, _repo, _wt, execution_store, _intents, task = build_postcommit(
+        tmp_path,
+        executor,
+        approved_paths=("src/thing.py",),
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert "outside the task's approved scope" in orch.state.question
+    assert "src/sneaky.py" in orch.state.question
+    assert execution_store.load(task.id).candidate_sha == "", "must not commit"

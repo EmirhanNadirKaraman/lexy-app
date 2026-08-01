@@ -177,7 +177,7 @@ from .state import (
     StateStore,
     utcnow_iso,
 )
-from .tasks import Task, TaskRegistry, TaskStore
+from .tasks import Task, TaskRegistry, TaskStore, effective_approved_paths
 from .transcript import TranscriptLogger
 from .validation import run_validation_commands
 from .worktask import (
@@ -1792,7 +1792,9 @@ class Orchestrator:
             # (see the `is_audit` comment above) and keeps the pre-M1
             # accumulate-from-`changed_paths` behaviour, unchanged.
             base_sha = self._git.head_sha()
-            allowed_paths = () if is_audit else tuple(sorted(task.approved_paths))
+            allowed_paths = (
+                () if is_audit else effective_approved_paths(task.approved_paths)
+            )
             if self._worker_repos is not None:
                 repo = self._worker_repos.create(task.id, self._git.repo_root, base_sha)
                 execution = TaskExecution(
@@ -1812,11 +1814,11 @@ class Orchestrator:
             self._execution_store.save(execution)
         elif not is_audit:
             dirty = False
-            if execution.allowed_paths != tuple(sorted(task.approved_paths)):
+            if execution.allowed_paths != effective_approved_paths(task.approved_paths):
                 # Re-synced every dispatch: `task.approved_paths` is the single
                 # source of truth for a real task's authorization, and is never
                 # derived from `execution` state, only ever written INTO it.
-                execution.allowed_paths = tuple(sorted(task.approved_paths))
+                execution.allowed_paths = effective_approved_paths(task.approved_paths)
                 dirty = True
             if not execution.validation_commands and declared_validation:
                 # Backfill ONLY — an unbound record adopts the Task's value
@@ -2022,7 +2024,15 @@ class Orchestrator:
             # residual case this CANNOT catch: a commit hook adding a path
             # strictly AFTER this check ran (see
             # `test_hook_adding_unexpected_path_is_refused`).
-            outside = set(outcome.changed_paths) - set(task.approved_paths)
+            # `effective_approved_paths`, not `task.approved_paths`: the
+            # always-allowed trackers are part of a task's authorization, and
+            # this PRE-commit gate has to agree with the post-commit one that
+            # compares against `execution.allowed_paths`. Using the raw field
+            # here refused a tracker edit before the commit while the later
+            # check would have allowed it — two gates, two answers.
+            outside = set(outcome.changed_paths) - set(
+                effective_approved_paths(task.approved_paths)
+            )
             if outside:
                 self._to_needs_user(
                     f"task {task.id}: the executor reported changed path(s) "

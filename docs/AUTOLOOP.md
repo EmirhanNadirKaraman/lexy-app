@@ -964,6 +964,49 @@ produce-then-review path.
 
 ---
 
+## 4f-bis. Always-approved repository trackers
+
+`Task.approved_paths` is the machine-checkable authorization scope, and it is
+deliberately not self-widening (§4e). But this repository's own rules make
+updating four documents a **condition of doing the work**: `CLAUDE.md` §12
+requires `docs/SUMMARY.md` whenever a file is added, removed or changes
+responsibility, and `docs/TESTS.md` whenever a test is added, removed or
+renamed; §14 requires `docs/SECURITY.md` in the same change as a
+security-relevant edit; §12 requires `docs/COMMON_ERRORS.md` when something new
+breaks.
+
+So a task that adds a file and does not list `SUMMARY.md` **cannot be completed
+while obeying the repo's rules** — the agent must violate `CLAUDE.md` or violate
+its path scope. rt-01 hit exactly that twice: after the first refusal the scope
+was widened by four paths, and the next attempt was refused again for
+`docs/SUMMARY.md`. Enumerating obligations by hand per task does not converge.
+
+`tasks.TRACKER_PATHS` is therefore implicitly approved for every scoped task,
+combined in exactly one place (`effective_approved_paths`) so the dispatch-time
+seed, the every-dispatch re-sync, the PRE-commit gate and the POST-commit
+path-ownership check cannot disagree. That last one is not hypothetical: the
+first version of this change patched three of the four sites, and the
+pre-commit gate then refused a tracker edit the post-commit check would have
+allowed.
+
+Bounded on purpose:
+
+* **Fixed constant, not configurable.** Widening every task's scope must be a
+  reviewed diff, never a TOML edit.
+* **Markdown trackers only** — no code, no config, no test file, nothing
+  executable.
+* **An unscoped task stays unscoped.** Empty `approved_paths` still means "no
+  scope authorized yet" and still refuses dispatch (`docs/SECURITY.md` finding
+  #2); it does not become a task that may write documentation.
+* **Visibility is unchanged.** Tracker edits still appear in
+  `commit_range_paths` and in the review packet — this removes a refusal, not
+  the reviewer's sight of it.
+
+Residual risk, stated rather than hidden: `docs/SECURITY.md` is the security
+tracker, so an agent can now edit the record of a finding without that being
+named in its task. It is documentation, not a control — but a weakened finding
+misleads a later reader, and it is why this list stays four entries long.
+
 ## 4g. The validation-environment boundary (test DB credentials)
 
 **The problem.** A task may declare validation that needs a database — `rt-01`

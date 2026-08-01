@@ -145,6 +145,60 @@ class Task:
     approved_paths: tuple[str, ...] = ()
 
 
+#: Repository trackers every task may update, WITHOUT naming them in its own
+#: `approved_paths`.
+#:
+#: Not a convenience. `CLAUDE.md` makes updating these a CONDITION of doing the
+#: work: §12 requires `docs/SUMMARY.md` whenever a file is added, removed or
+#: changes responsibility, and `docs/TESTS.md` whenever a test is added,
+#: removed or renamed; §14 requires `docs/SECURITY.md` in the same change as a
+#: security-relevant edit; §12 requires `docs/COMMON_ERRORS.md` when something
+#: new breaks. So a task that adds a file and does not list `SUMMARY.md`
+#: cannot be completed while obeying the repo's own rules — the agent must
+#: violate one or the other. rt-01 hit exactly that twice: the scope was
+#: widened by four paths after the first refusal and STILL missed
+#: `docs/SUMMARY.md`, because enumerating obligations by hand per task does
+#: not converge.
+#:
+#: Why this is a narrow widening and not a hole:
+#:   * Fixed constant, deliberately NOT configurable — widening the scope of
+#:     every task must be a diff someone reviews, not a TOML edit.
+#:   * Markdown trackers only. No code, no config, no test file, nothing
+#:     executable, nothing that changes behaviour.
+#:   * The paths still appear in `commit_range_paths` and in the review
+#:     packet, so a reviewer sees every tracker edit; this removes a REFUSAL,
+#:     not visibility.
+#:
+#: The residual risk, stated rather than hidden: `docs/SECURITY.md` is the
+#: security tracker, so an agent can now edit the record of a finding without
+#: that being named in its task. It is documentation and not a control — the
+#: controls are in code — but a weakened finding is a real (if modest) way to
+#: mislead a later reader, and it is the reason this list stays this short.
+TRACKER_PATHS: tuple[str, ...] = (
+    "docs/COMMON_ERRORS.md",
+    "docs/SECURITY.md",
+    "docs/SUMMARY.md",
+    "docs/TESTS.md",
+)
+
+
+def effective_approved_paths(approved: tuple[str, ...]) -> tuple[str, ...]:
+    """A task's authorized paths PLUS the always-allowed trackers, sorted.
+
+    The single place the two are combined, so the dispatch-time seed and the
+    every-dispatch re-sync cannot disagree — if only one of them applied the
+    trackers, the other would silently narrow the scope back on the next round.
+
+    An EMPTY `approved` stays empty. "No scope authorized yet" must keep
+    refusing dispatch (`docs/SECURITY.md` finding #2, circular ownership);
+    returning just the trackers would turn an unscoped task into a dispatchable
+    one that may write documentation, which is not what "unscoped" means.
+    """
+    if not approved:
+        return ()
+    return tuple(sorted(set(approved) | set(TRACKER_PATHS)))
+
+
 class TaskRegistry:
     def __init__(self, tasks: list[Task] | None = None):
         self._tasks: dict[str, Task] = {}
