@@ -113,6 +113,35 @@ runner, so "the same commands before and after" is observed rather than
 asserted twice against separate doubles. Verified to fail when the fix is
 reverted — it then records `[declared, ruff-check]`, which is the bug exactly.
 
+### B7. The protected-branch check is vacuous on a detached HEAD
+Running `doctor` from a detached-HEAD worktree reports:
+
+    [ok] branch_policy   pushes to '' are permitted by policy
+
+The current-branch lookup returns an empty string, and `''` is not in
+`protected_branches`, so the check passes by default. Nothing was at risk when
+this was found (publication was disabled, and `push_exact` re-checks the
+protected set independently at push time), but a gate whose answer is
+"permitted" for a branch name that does not exist is the wrong shape: it
+should refuse an empty/undeterminable branch rather than treat it as unlisted.
+
+Found while standing up a clean runner worktree so the loop could dispatch
+write-capable work while the primary checkout held unrelated uncommitted
+changes (see B8).
+
+### B8. `state_dir` is relative, so a second checkout cannot share a session
+A dirty primary checkout parks `primary_checkout_dirty` (loop-fatal) before any
+write-capable agent starts — correct, since a dirty checkout cannot be a
+trustworthy baseline for escape detection. But when the dirt is unrelated work
+in progress, the loop is stuck until someone commits or stashes it.
+
+The workaround is a second, clean worktree — which only works because
+`state_dir` can be given an ABSOLUTE path, so the runner shares the original
+session, blockers, tasks, publisher and transcript. That is B3 in reverse: the
+relative default resolves against cwd and would have silently created a second,
+empty session instead. Worth making first-class: a documented "runner checkout"
+mode, rather than something each operator rediscovers under pressure.
+
 ### B6. A repeating ENVIRONMENTAL validation failure burns the attempt budget
 rt-01 consumed five attempts on 2026-07-31. Rounds 1–3 (20:34, 20:46, 20:59)
 failed **identically**: `validation failed after implementation — ruff check .:

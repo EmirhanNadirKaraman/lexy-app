@@ -22,6 +22,7 @@ agent is on, parsed from the process table. Agent prompts carry
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -66,6 +67,22 @@ MARKS = {
 }
 
 _DOMAIN = re.compile(r"Your domain:\s*(.+?)\.")
+
+#: This module's content hash, frozen at IMPORT. `PAGE` is a module-level
+#: string, so a process started before an edit serves the old HTML for as long
+#: as it lives — a stale tracker is indistinguishable from a missing feature,
+#: which cost a real round-trip ("why can't I see it?"). Comparing this against
+#: the file's CURRENT hash at request time is the only way the page can know it
+#: is out of date, because everything else it reads comes from the same stale
+#: process.
+def _source_stamp() -> str:
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+_IMPORT_STAMP = _source_stamp()
 _REMOTE_CACHE: dict = {"at": 0.0, "refs": []}
 
 
@@ -324,6 +341,10 @@ def collect(repo: Path) -> dict:
         "pipeline": pipeline(state, live_agents_cache, blockers),
         "git": {"branch": branch, "head": head[:12], "dirty": dirty, "remote": _REMOTE_CACHE["refs"]},
         "served_at": time.strftime("%H:%M:%S"),
+        # `stale` means the file on disk has changed since this process
+        # imported it — restart the dashboard to pick the change up.
+        "build": {"running": _IMPORT_STAMP, "on_disk": _source_stamp(),
+                  "stale": _IMPORT_STAMP != _source_stamp()},
     }
 
 
@@ -420,6 +441,8 @@ button.save[disabled]{opacity:.5;cursor:default}
     <button class="themetog" id="themetog" type="button">◐ theme</button>
   </header>
 
+  <div id="stale" style="display:none;border:1px solid var(--warning);border-radius:8px;
+       padding:9px 12px;margin-bottom:14px;font-size:13px"></div>
   <div class="grid" id="tiles"></div>
 
   <section>
@@ -535,6 +558,15 @@ function render(d, force){
   const {served_at, ...rest} = d;
   const sig = JSON.stringify(rest);
   document.getElementById("served").textContent = `updated ${esc(served_at)}`;
+  // A stale process serves the old PAGE forever, which looks exactly like a
+  // missing feature. Say so instead of letting someone wonder.
+  const stale = document.getElementById("stale");
+  if (d.build && d.build.stale) {
+    stale.style.display = "block";
+    stale.textContent = `\u26a0 This page is STALE — dashboard.py changed on disk `
+      + `(running ${d.build.running}, on disk ${d.build.on_disk}). `
+      + `Restart the dashboard to load it.`;
+  } else { stale.style.display = "none"; }
   if (!force && sig === LASTJSON) return;
   LASTJSON = sig; LAST = d;
   document.getElementById("hdot").style.background = `var(--${d.health.role})`;

@@ -210,3 +210,20 @@ def test_the_roadmap_is_sorted_by_priority_for_display(tmp_path):
     roadmap = collect(repo)["roadmap"]
     assert [t["id"] for t in roadmap] == ["a", "b"]
     assert roadmap[0]["priority"] == 1
+
+
+def test_a_stale_process_reports_itself(tmp_path, monkeypatch):
+    """`PAGE` is baked in at import, so a process started before an edit serves
+    the old HTML for as long as it lives — indistinguishable from a feature that
+    never shipped, which is exactly how it was hit. The payload compares the
+    import-time source hash against the file's current one."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    assert collect(repo)["build"]["stale"] is False, "unchanged source is not stale"
+
+    monkeypatch.setattr(dash, "_IMPORT_STAMP", "0000deadbeef")
+    build = collect(repo)["build"]
+    assert build["stale"] is True
+    assert build["running"] == "0000deadbeef"
+    assert build["on_disk"] != build["running"]
