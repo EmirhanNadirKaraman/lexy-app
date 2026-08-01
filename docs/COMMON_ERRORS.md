@@ -580,6 +580,31 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### The loop asks you to unset `ANTHROPIC_API_KEY` — a variable that is not set anywhere
+**Symptom:** a task parks with `ask_user`: *"Please unset ANTHROPIC_API_KEY and
+any other external Claude authentication variables in the executor
+environment."* Checking finds it unset in the environment, absent from every
+shell profile, and absent from `~/.claude/settings.json`.
+**Cause:** the loop's subagents run NESTED inside a Claude Code session, so
+they inherit its auth context (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, …). The
+CLI decides "another auth source" is present, disables claude.ai **connectors**
+(an advisory — authentication itself is fine), and prints that banner to
+stderr *first*. `ClaudeCliRunner.run` then captured `stderr[:2000]` — the
+HEAD — so on any non-zero exit the banner became the entire reported cause. It
+propagated into the executor summary, the review packet, and back out as a
+directive to fix a variable that was never set, while the real failure was
+never shown at all.
+**Fix:** `agents.summarize_failure` (2026-08-01) drops advisory lines
+(`BENIGN_STDERR_MARKERS`) from the reported cause, keeps BOTH head and tail of
+long output (a traceback puts its cause LAST; a banner puts itself first), and
+when the output is *only* advisory says `non-zero exit (N) with NO diagnostic
+output` rather than presenting a warning as the cause.
+**The general trap:** this is the second time a warning at the edge of captured
+output masqueraded as a failure — once as a TAIL (the validation summary
+below), once as a HEAD. When output is truncated for a summary, the truncation
+itself decides what looks like the cause. Keep both ends, and never let a
+warning be the whole answer.
+
 ### Validation reports a `pytest` failure whose tail is a warning, and the real error is `InvalidPasswordError`
 **Symptom:** a task parked four times with
 `ruff check .: PASS; python3 -m pytest -n auto -q: FAIL (warner(PytestBenchmarkWarning(text)))`.

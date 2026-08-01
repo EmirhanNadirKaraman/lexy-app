@@ -102,3 +102,85 @@ def test_model_routing_does_not_weaken_read_only_flags(tmp_path):
         assert tool in argv
     for tool in DISALLOWED_TOOLS:
         assert tool in argv[argv.index("--disallowedTools"):]
+
+
+# ---- failure summarisation: advisory banners are not causes ------------------
+#
+# The CLI prints a connectors notice to stderr BEFORE anything else when the
+# subagent runs nested inside a Claude Code session. The old capture took
+# `stderr[:2000]` — the head — so that banner became the whole reported cause
+# of every non-zero exit, travelled into the review packet, and came back as a
+# directive asking an operator to unset a variable that was not set anywhere.
+
+CONNECTORS_BANNER = (
+    "⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another "
+    "auth source is set and takes precedence over your claude.ai login · "
+    "Unset it to load your organization's connectors"
+)
+
+
+def test_a_leading_advisory_banner_is_not_reported_as_the_cause():
+    """The regression. The real error follows the banner; it must be what the
+    summary leads with."""
+    from autoloop.audit.agents import summarize_failure
+
+    stderr = f"{CONNECTORS_BANNER}\nTypeError: cannot read property 'x' of undefined\n"
+    summary = summarize_failure(stderr, "", 1)
+
+    assert summary.startswith("TypeError: cannot read property")
+    assert "connectors are disabled" not in summary.split("(advisory")[0]
+
+
+def test_banner_only_stderr_says_there_was_no_diagnostic_output():
+    """The case that actually happened: nothing but the banner. Reporting it
+    as the cause sends someone to fix a variable that is not set — so say
+    plainly that there was no diagnosis, and mark the notice as not the
+    cause."""
+    from autoloop.audit.agents import summarize_failure
+
+    summary = summarize_failure(CONNECTORS_BANNER + "\n", "", 1)
+
+    assert "NO diagnostic output" in summary
+    assert "not the cause" in summary
+    assert "unset" not in summary.lower().split("advisory notice")[0]
+
+
+def test_a_long_traceback_keeps_its_TAIL_where_the_cause_lives():
+    """A head-only excerpt loses the exception line: tracebacks put the cause
+    last. Both ends are kept."""
+    from autoloop.audit.agents import summarize_failure
+
+    stderr = "\n".join(f"  File \"mod{i}.py\", line {i}, in f" for i in range(400))
+    stderr += "\nValueError: the actual cause\n"
+    summary = summarize_failure(stderr, "", 1)
+
+    assert "ValueError: the actual cause" in summary
+    assert "elided" in summary
+
+
+def test_plain_failures_are_unchanged_and_stdout_is_the_fallback():
+    from autoloop.audit.agents import summarize_failure
+
+    assert "boom" in summarize_failure("boom\n", "", 2)
+    # stderr empty -> stdout is used, as before
+    assert "from stdout" in summarize_failure("", "from stdout\n", 2)
+    # nothing at all -> honest, and names the exit code
+    assert "no output" in summarize_failure("", "", 3)
+
+
+def test_runner_reports_the_real_cause_end_to_end(tmp_path):
+    """Through `ClaudeCliRunner.run`, not just the helper."""
+    import subprocess as _sp
+
+    from autoloop.audit.agents import AgentSpec, ClaudeCliRunner
+
+    def fake_run(argv, **kwargs):
+        return _sp.CompletedProcess(
+            argv, 1, stdout="", stderr=f"{CONNECTORS_BANNER}\nOSError: disk full\n"
+        )
+
+    result = ClaudeCliRunner(repo_root=tmp_path, runner=fake_run).run(
+        AgentSpec(domain="d", title="t", prompt="p")
+    )
+    assert not result.ok
+    assert result.error.startswith("OSError: disk full")

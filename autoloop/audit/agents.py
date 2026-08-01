@@ -160,7 +160,7 @@ class ClaudeCliRunner:
         text = _extract_result_text(proc.stdout or "")
         error = ""
         if proc.returncode != 0:
-            error = (proc.stderr or proc.stdout or "").strip()[:2000] or "non-zero exit"
+            error = summarize_failure(proc.stderr, proc.stdout, proc.returncode)
         return AgentResult(
             domain=spec.domain,
             raw_text=text,
@@ -169,6 +169,77 @@ class ClaudeCliRunner:
             command=tuple(argv),
             error=error,
         )
+
+
+#: stderr lines the CLI prints that are ADVISORY, never a cause of failure.
+#:
+#: The connectors notice is the one that cost real time: the loop's subagents
+#: run nested inside a Claude Code session, so they inherit its auth context,
+#: the CLI decides "another auth source" is present and disables claude.ai
+#: connectors, and it prints that to stderr BEFORE anything else. The old
+#: capture took `stderr[:2000]` — the HEAD — so this banner became the entire
+#: reported cause of every non-zero exit. It travelled into the executor
+#: summary, into the review packet, and out as a directive asking an operator
+#: to unset `ANTHROPIC_API_KEY` — a variable that was not set anywhere, while
+#: the actual failure was never shown at all.
+#:
+#: Matched as substrings against stripped lines, case-insensitively. Keep this
+#: list SHORT and specific: anything matched here is dropped from the reported
+#: cause, so a pattern that is too broad hides real failures — the exact bug
+#: this exists to fix.
+BENIGN_STDERR_MARKERS: tuple[str, ...] = (
+    "claude.ai connectors are disabled",
+    "unset it to load your organization's connectors",
+)
+
+#: Head and tail kept when output is long. Both ends, because a traceback puts
+#: its cause LAST while a banner puts itself first — keeping only one end loses
+#: whichever the failure happens to be.
+_EXCERPT_SIDE = 900
+
+
+def _is_benign(line: str) -> bool:
+    lowered = line.strip().lower().lstrip("⚠! ").strip()
+    return any(marker in lowered for marker in BENIGN_STDERR_MARKERS)
+
+
+def _excerpt(text: str) -> str:
+    text = text.strip()
+    if len(text) <= _EXCERPT_SIDE * 2:
+        return text
+    dropped = len(text) - _EXCERPT_SIDE * 2
+    return f"{text[:_EXCERPT_SIDE]}\n… [{dropped} chars elided] …\n{text[-_EXCERPT_SIDE:]}"
+
+
+def summarize_failure(stderr: str | None, stdout: str | None, returncode: int) -> str:
+    """What actually went wrong, with advisory banners demoted rather than
+    reported as the cause.
+
+    Returns the substantive output when there is any. When the output is
+    NOTHING BUT advisory notices, it says so explicitly instead of presenting
+    a warning as the failure — "exited N with no diagnostic output" is a
+    worse-sounding but far more honest answer, and it is the one that sends
+    someone looking in the right place.
+    """
+    raw = (stderr or "").strip() or (stdout or "").strip()
+    if not raw:
+        return f"non-zero exit ({returncode}) with no output on stderr or stdout"
+
+    lines = raw.splitlines()
+    substantive = [ln for ln in lines if ln.strip() and not _is_benign(ln)]
+    advisory = [ln.strip() for ln in lines if ln.strip() and _is_benign(ln)]
+
+    if substantive:
+        summary = _excerpt("\n".join(substantive))
+        if advisory:
+            # Kept, but clearly separated from the cause and never first.
+            summary += f"\n(advisory, not the cause: {advisory[0][:160]})"
+        return summary
+
+    return (
+        f"non-zero exit ({returncode}) with NO diagnostic output — stderr held "
+        f"only advisory notice(s), which are not the cause: {advisory[0][:200]}"
+    )
 
 
 def _extract_result_text(stdout: str) -> str:
