@@ -1154,6 +1154,7 @@ class _SmokeNeverExecutor:
 
 def _cmd_smoke_browser(args: argparse.Namespace) -> int:
     config = load_config(args.config)
+    smoke_provider = getattr(args, "provider", None) or "browser_chatgpt"
     with LoopLock(config.state_dir):
         store = StateStore(config.smoke_dir / "state.json")
         store.archive()  # every smoke run starts fresh
@@ -1193,13 +1194,12 @@ def _cmd_smoke_browser(args: argparse.Namespace) -> int:
             git=GitGateway(Path.cwd(), policy),
             executor=_SmokeNeverExecutor(),
             transcript=TranscriptLogger(config.transcript_file),
-            # Pinned to the browser provider, NOT `conversation.provider`.
-            # Smoke-testing the browser transport is this command's entire
-            # purpose; reading the configured provider would silently stop
-            # exercising it the moment the primary became something else, and
-            # the browser is exactly the transport you need proven before you
-            # depend on it as a fallback.
-            client_factory=lambda: create_conversation("browser_chatgpt", smoke_config),
+            # `--provider`, which defaults to the browser rather than to
+            # `conversation.provider` — see the parser. Smoke-testing the
+            # browser is this command's purpose, and since Codex became the
+            # primary reviewer the configured provider is no longer the one
+            # that needs proving.
+            client_factory=lambda: create_conversation(smoke_provider, smoke_config),
             registry=TaskRegistry(),
             task_store=TaskStore(config.smoke_dir / "tasks.json"),
             manifest_store=ManifestStore(config.smoke_dir / "manifests"),
@@ -1344,6 +1344,18 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         p = sub.add_parser(name, help=help_text)
         add_config(p)
+        if name == "smoke-browser":
+            # Defaults to the browser REGARDLESS of `conversation.provider`.
+            # Since Codex became the primary reviewer, reading the configured
+            # provider here would silently stop exercising the transport this
+            # command exists for — and the browser is the fallback, so it is
+            # precisely the one that must be proven before it is needed.
+            # Explicit rather than hard-coded, so any provider can be smoked.
+            p.add_argument(
+                "--provider",
+                default="browser_chatgpt",
+                help="conversation provider to smoke (default: browser_chatgpt)",
+            )
         p.set_defaults(func=func)
 
     blockers = sub.add_parser(

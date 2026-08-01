@@ -154,15 +154,12 @@ def render_report(
 
     parts.append(f"## Proposed task graph ({len(proposal.tasks)} tasks)")
     if proposal.tasks:
-        parts.append("| id | P | title | depends on | parallel |")
-        parts.append("|---|---|---|---|---|")
-        for task in proposal.tasks:
-            deps = ", ".join(task.depends_on) or "—"
-            parts.append(
-                f"| {task.id} | {task.priority} | {task.title} | {deps} | "
-                f"{'yes' if task.parallelizable else 'no'} |"
-            )
-        parts.append("")
+        # Rendered ONCE, as JSON. There used to be a Markdown table above this
+        # carrying the same id/priority/title/depends_on/parallel fields — the
+        # identical data twice, for human convenience. The JSON is the
+        # representation that does work (a `plan` decision is adopted from it),
+        # so the table is what goes. On a real audit the two together were the
+        # single largest section of the report.
         parts.append(
             "To adopt this graph, reply with a `plan` decision containing the "
             "tasks below (edit freely — this is a proposal):"

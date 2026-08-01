@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..contract import AUDIT_TASK_ID, Decision, Directive
+from ..errors import AuditError
 from ..executor import ExecutionOutcome
 from ..git_gateway import GitGateway
 from ..policy import PolicyEngine
@@ -58,8 +59,42 @@ from .agents import AgentResult, AgentRunner, AgentSpec
 from .findings import FINDINGS_SCHEMA_TEXT, parse_findings
 from .markdown import MarkdownPolicy
 from .reconcile import reconcile
+
+
 from .report import ValidationRun, render_report
 from .taskgen import generate_tasks
+
+
+def _reshape_prompt(items) -> str:
+    """Ask an agent to re-express its own oversized findings.
+
+    Carries the original items verbatim, so the agent is compressing its own
+    words rather than re-deriving the finding from scratch — a re-derivation
+    could quietly come back as a different, weaker finding.
+    """
+    blocks = []
+    for item in items:
+        blocks.append(
+            f"Finding '{item.finding_id}' exceeds the structural bounds:\n"
+            + "\n".join(f"  - {reason}" for reason in item.reasons)
+            + "\nOriginal:\n```json\n"
+            + json.dumps(item.item, indent=2, ensure_ascii=False)
+            + "\n```"
+        )
+    return (
+        "You previously reported findings that are too long to include in the "
+        "audit report. Re-express EVERY finding below within the limits, "
+        "preserving its substance: the same defect, the same impact, the same "
+        "acceptance criteria. Cite locations as `path:line` instead of quoting "
+        "code. If a finding covers several genuinely separate problems, split "
+        "it into several findings — that is the intended fix, and ids may gain "
+        "a suffix (e.g. 'sec-01a', 'sec-01b').\n\n"
+        "Do NOT drop a finding, and do not soften its severity or confidence "
+        "to make it shorter.\n\n"
+        + "\n\n".join(blocks)
+        + "\n\n"
+        + FINDINGS_SCHEMA_TEXT
+    )
 
 # SAFE_VALIDATION_BINARIES lives in `..validation` now — shared with the
 # produce-then-review post-commit validation check in `orchestrator.py`, so
@@ -305,6 +340,7 @@ class AuditExecutor:
         results = self._run_agents(agent_runner, specs, run_dir)
 
         findings, parse_rejects, agent_failures, covered = [], [], [], []
+        oversized = []
         for result in results:
             if not result.ok:
                 agent_failures.append(
@@ -322,7 +358,13 @@ class AuditExecutor:
                 agent_failures.append(f"{result.domain}: output unusable — {reason}")
                 continue
             findings.extend(outcome.findings)
+            oversized.extend(outcome.oversized)
             covered.append(result.domain)
+
+        if oversized:
+            findings.extend(
+                self._reshape_oversized(agent_runner, oversized, run_dir)
+            )
 
         reconciled = reconcile(findings, parse_rejects)
         proposal = generate_tasks(reconciled, self._registry)
@@ -387,6 +429,94 @@ class AuditExecutor:
             # run), so it is exactly `commit_and_capture`'s planned-paths set.
             changed_paths=(report_path,),
         )
+
+    def _reshape_oversized(self, agent_runner, oversized, run_dir) -> list:
+        """One bounded re-expression round for findings that blew the
+        structural bounds. Returns the reshaped findings.
+
+        Exactly one attempt, by design. A finding that is still oversized after
+        being told precisely what was wrong is not going to converge by being
+        asked again, and the three tempting alternatives are all worse than
+        stopping: looping burns the agent budget on one stubborn item, silently
+        accepting it puts the outlier back in the report the bounds exist to
+        keep out, and dropping or truncating it destroys a finding nobody has
+        read yet. So this parks, with the finding preserved on disk.
+        """
+        from .findings import oversize_reasons, parse_findings
+
+        by_domain: dict[str, list] = {}
+        for item in oversized:
+            by_domain.setdefault(item.domain, []).append(item)
+
+        specs = [
+            AgentSpec(
+                domain=f"{domain}-reshape",
+                title=f"{domain} (re-express oversized findings)",
+                prompt=_reshape_prompt(items),
+                model="",
+            )
+            for domain, items in by_domain.items()
+        ]
+        # Its own subdirectory so the reshape round's raw output sits beside
+        # the first pass's rather than overwriting it — both are evidence.
+        reshape_dir = run_dir / "reshape"
+        reshape_dir.mkdir(parents=True, exist_ok=True)
+        results = self._run_agents(agent_runner, specs, reshape_dir)
+
+        reshaped: list = []
+        still_oversized: list[str] = []
+        produced: dict[str, int] = {domain: 0 for domain in by_domain}
+        for result in results:
+            domain = result.domain.removesuffix("-reshape")
+            if not result.ok:
+                still_oversized.append(
+                    f"{domain}: reshape agent failed ({result.error or result.returncode})"
+                )
+                continue
+            outcome = parse_findings(result.raw_text, domain)
+            for finding in outcome.findings:
+                if oversize_reasons(finding):  # defensive; parse_findings filters these
+                    still_oversized.append(f"{domain}:{finding.id} still oversized")
+                else:
+                    reshaped.append(finding)
+                    produced[domain] = produced.get(domain, 0) + 1
+            for item in outcome.oversized:
+                still_oversized.append(
+                    f"{domain}:{item.finding_id} still oversized — {item.reasons[0]}"
+                )
+
+        # COUNT the findings back. A reshape is allowed to SPLIT one oversized
+        # finding into several (that is the intended fix, so ids legitimately
+        # change), which rules out matching by id — but it is never allowed to
+        # return FEWER than it was given. Without this, an agent replying
+        # `{"findings": []}` would look like a clean success while the finding
+        # it was asked about disappeared: the quietest of the three losses this
+        # method exists to prevent, and the one a reader could never detect.
+        for domain, items in by_domain.items():
+            if produced.get(domain, 0) < len(items):
+                still_oversized.append(
+                    f"{domain}: reshape returned {produced.get(domain, 0)} findings for "
+                    f"{len(items)} oversized one(s) — findings were lost, not shortened"
+                )
+
+        if still_oversized:
+            preserved = run_dir / "oversized_findings.json"
+            try:
+                preserved.parent.mkdir(parents=True, exist_ok=True)
+                preserved.write_text(
+                    json.dumps([asdict(o) for o in oversized], indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            raise AuditError(
+                "audit findings could not be brought within the structural bounds "
+                f"after one reshape round: {'; '.join(still_oversized)}. The "
+                f"findings are preserved verbatim at {preserved} — nothing was "
+                "truncated or discarded. Review them by hand, or split them into "
+                "separate findings, before re-running the audit."
+            )
+        return reshaped
 
     def _run_agents(
         self, agent_runner: AgentRunner, specs: list[AgentSpec], run_dir: Path

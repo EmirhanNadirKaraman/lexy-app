@@ -1499,6 +1499,67 @@ reason — exercising that transport is its whole purpose.
 
 ---
 
+## 5e. Report compaction: smaller reports, nothing lost
+
+Added 2026-08-01, to cut what the reviewer must read per turn — the packet is
+the loop's dominant token cost, and a smaller allowance goes further.
+
+**Measured first.** In a real run, 7 review packets were 71% of all prompt
+bytes, and 96% of the largest was the full diff of a generated audit report. In
+that report, 28 finding blocks had a median of 1,464 characters and **one had
+21,022** — 32% of all finding bytes in a single item. That outlier was not a
+verbose finding; it was prose written into `evidence`, a field specified as
+"cite code/doc lines".
+
+**Truncating the reviewer's input is not on the table.** The reviewer returns a
+`reviewed{report_sha256}` stamp that authorizes a commit. Show it a shortened
+artifact and it is stamping bytes it never read, which voids the review
+integrity §5b and §5c exist to establish. So the report is made smaller at the
+source, and the reviewer always sees 100% of what exists.
+
+**Structural bounds hold findings; they never shorten them.** `findings.py`
+bounds the free-text fields (evidence 700, impact 400, action 300, per-criterion
+200, whole-finding 2,200 — set well above the median so they catch that one
+shape and nothing else). A finding over a bound is neither accepted nor
+rejected: it is held as `OversizedFinding` with its item dict byte-for-byte
+intact. The domain still counts as covered — a held finding is a real finding,
+and marking its domain unusable would hide it.
+
+**One reshape round, then park.** The executor asks that agent to re-express its
+own findings within the limits, carrying the originals verbatim so it compresses
+its own words rather than re-deriving a possibly weaker finding. Splitting one
+finding into several is the intended fix, so ids may gain suffixes. Exactly one
+attempt: a finding that is still oversized after being told precisely what was
+wrong will not converge by being asked again, and every alternative is worse —
+looping burns the agent budget on one item, accepting puts the outlier back, and
+dropping or truncating destroys a finding nobody has read.
+
+The park fires on any of: still oversized, reshape agent failed, or **fewer
+findings returned than were sent**. That last check matters most — an agent
+replying `{"findings": []}` would otherwise look like a clean success while the
+finding vanished, the one loss a report's reader could never detect. Originals
+are written to `oversized_findings.json` before the park.
+
+**Deduplication merges; it does not discard.** The old rule kept the
+higher-quality instance and dropped the other, recording only a `(dropped, kept)`
+id pair — throwing away impacts, acceptance criteria and evidence that nothing
+else carried. Now a fold unions every unique evidence reference, impact,
+acceptance criterion, symbol, dependency and validation command, attributes the
+folded text to its original id, takes the stronger severity/confidence, and
+takes the **cautious** answer on `safe_to_parallelize` so one agent's optimism
+cannot override another's caution.
+
+That is what makes the widened candidate test safe: file **and** symbol overlap
+now marks two findings as duplicate candidates, which would be reckless under a
+keep-the-winner rule — two genuinely distinct defects routinely live in the same
+function — and costs nothing when everything from both survives.
+
+**The task graph renders once.** It was emitted as a Markdown table *and* a JSON
+block carrying identical fields. The JSON is the representation that does work
+(a `plan` decision is adopted from it), so the table went.
+
+---
+
 ## 6. Preflight: `doctor` and the live smoke test
 
 ```bash

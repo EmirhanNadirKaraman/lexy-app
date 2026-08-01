@@ -65,7 +65,12 @@ def run_smoke(tmp_path, conversation):
     register_provider(provider, lambda config: conversation)
     try:
         config = write_config(tmp_path, provider)
-        return cli.main(["smoke-browser", "--config", str(config)])
+        # `--provider` is explicit since 2026-08-01: smoke-browser defaults to
+        # the browser rather than to `conversation.provider`, so the fake has
+        # to be named here rather than only in the config.
+        return cli.main(
+            ["smoke-browser", "--config", str(config), "--provider", provider]
+        )
     finally:
         conversation_module._PROVIDERS.pop(provider, None)
 

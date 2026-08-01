@@ -44,6 +44,26 @@ _FINDING_KEYS = {
 
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
+# Structural bounds on the free-text fields. These are NOT truncation limits:
+# nothing is ever shortened here. A finding that exceeds one is held as
+# `OversizedFinding` and sent back to its agent to be re-expressed within the
+# schema it was already given — see `ParseOutcome.oversized` and the executor's
+# single bounded reshape round.
+#
+# The numbers come from measuring a real audit report (2026-07-30): 28 finding
+# blocks, median 1,464 characters, and ONE block at 21,022 — 32% of all finding
+# bytes in a single item. That outlier is not a verbose finding, it is prose
+# written into a field specified as "quote code/doc lines". These bounds are set
+# well above the median so they catch that shape and nothing else; a normal
+# finding never comes near them.
+MAX_EVIDENCE_CHARS = 700
+MAX_IMPACT_CHARS = 400
+MAX_PROPOSED_ACTION_CHARS = 300
+MAX_ACCEPTANCE_ITEM_CHARS = 200
+#: Whole-finding budget across the free-text fields, so a report cannot be
+#: inflated by many individually-legal fields.
+MAX_FINDING_CHARS = 2200
+
 FINDINGS_SCHEMA_TEXT = """\
 Return EXACTLY one JSON object (fenced in ```json ... ``` or bare):
 {"findings": [
@@ -54,9 +74,9 @@ Return EXACTLY one JSON object (fenced in ```json ... ``` or bare):
     "confidence": "confirmed (you verified it in the code) | probable | speculative",
     "affected_files": ["repo-relative paths"],
     "symbols": ["function/class or file:line-range, e.g. progression_service.apply_progression:178-210"],
-    "evidence": "what you actually saw — quote code/doc lines, not impressions",
-    "impact": "what goes wrong and for whom",
-    "proposed_action": "one concrete, scoped change",
+    "evidence": "file:line references to what you saw, plus AT MOST one sentence — cite, do not transcribe (max 700 chars)",
+    "impact": "one sentence: what breaks and for whom (max 400 chars)",
+    "proposed_action": "one concrete, scoped change (max 300 chars)",
     "dependencies": ["ids of findings that must be fixed first, usually []"],
     "acceptance_criteria": ["observable outcomes that prove the fix"],
     "validation_commands": ["exact commands that verify, e.g. 'ruff check .'"],
@@ -66,7 +86,13 @@ Return EXACTLY one JSON object (fenced in ```json ... ``` or bare):
 Rules: every field is required. Do not report style opinions as defects — use
 category "style" and they will not become tasks. Use confidence "speculative"
 honestly; speculation is recorded but never promoted. An empty {"findings": []}
-is a valid answer for a clean domain."""
+is a valid answer for a clean domain.
+
+Be concise per finding. `evidence` cites locations — `path:line` — it does not
+reproduce the code; the reviewer can open the file. If one finding needs more
+than a few hundred characters of prose, it is almost always several findings
+that belong apart, so split it. An over-long finding is not discarded: it is
+sent back to you once to re-express, which costs a whole extra agent run."""
 
 
 @dataclass(frozen=True)
@@ -98,10 +124,70 @@ class RejectedItem:
     domain: str = ""
 
 
+@dataclass(frozen=True)
+class OversizedFinding:
+    """A VALID finding whose free-text fields exceed the structural bounds.
+
+    Deliberately neither accepted nor rejected: it is held, with its original
+    item dict intact, so the agent can re-express it. Nothing about it is
+    shortened, dropped, or silently let through — the three outcomes this class
+    exists to prevent.
+    """
+
+    item: dict
+    reasons: tuple[str, ...]
+    finding_id: str
+    domain: str = ""
+
+
+def oversize_reasons(finding: "Finding") -> tuple[str, ...]:
+    """Which structural bounds this finding exceeds (empty when it is fine)."""
+    reasons = []
+    if len(finding.evidence) > MAX_EVIDENCE_CHARS:
+        reasons.append(
+            f"evidence is {len(finding.evidence)} chars (max {MAX_EVIDENCE_CHARS}) — "
+            "cite file:line references, do not transcribe the code"
+        )
+    if len(finding.impact) > MAX_IMPACT_CHARS:
+        reasons.append(
+            f"impact is {len(finding.impact)} chars (max {MAX_IMPACT_CHARS}) — "
+            "one sentence on what breaks and for whom"
+        )
+    if len(finding.proposed_action) > MAX_PROPOSED_ACTION_CHARS:
+        reasons.append(
+            f"proposed_action is {len(finding.proposed_action)} chars "
+            f"(max {MAX_PROPOSED_ACTION_CHARS}) — one concrete scoped change"
+        )
+    for criterion in finding.acceptance_criteria:
+        if len(criterion) > MAX_ACCEPTANCE_ITEM_CHARS:
+            reasons.append(
+                f"an acceptance criterion is {len(criterion)} chars "
+                f"(max {MAX_ACCEPTANCE_ITEM_CHARS}) — state one observable outcome"
+            )
+            break
+    total = (
+        len(finding.evidence)
+        + len(finding.impact)
+        + len(finding.proposed_action)
+        + sum(len(c) for c in finding.acceptance_criteria)
+    )
+    if total > MAX_FINDING_CHARS:
+        reasons.append(
+            f"the finding's free text totals {total} chars (max {MAX_FINDING_CHARS}) — "
+            "split genuinely separate problems into separate findings"
+        )
+    return tuple(reasons)
+
+
 @dataclass
 class ParseOutcome:
     findings: list[Finding] = field(default_factory=list)
     rejected: list[RejectedItem] = field(default_factory=list)
+    #: Valid findings held back for ONE reshape round because their free text
+    #: exceeds the structural bounds. Never dropped and never truncated: the
+    #: executor either gets a compact re-expression or parks with the finding
+    #: intact.
+    oversized: list[OversizedFinding] = field(default_factory=list)
     #: False when the agent's output as a WHOLE was unusable (empty, not JSON,
     #: wrong top-level shape). That is a coverage GAP for the domain, not a
     #: per-item rejection: the agent may have found real problems we never got
@@ -221,5 +307,13 @@ def parse_findings(text: str, domain: str) -> ParseOutcome:
             )
             continue
         seen_ids.add(finding.id)
+        reasons = oversize_reasons(finding)
+        if reasons:
+            outcome.oversized.append(
+                OversizedFinding(
+                    item=item, reasons=reasons, finding_id=finding.id, domain=domain
+                )
+            )
+            continue
         outcome.findings.append(finding)
     return outcome

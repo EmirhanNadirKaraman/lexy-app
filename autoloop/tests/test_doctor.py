@@ -108,7 +108,7 @@ def test_all_green(tmp_path):
     for check in (
         "config", "state_dir", "lock", "workers_root", "worker_isolation", "hooks_dirs",
         "publisher", "publisher_url_drift", "cdp", "playwright", "provider",
-        "conversation_url", "browser_live",
+        "conversation_url", "primary_live",
     ):
         assert named[check].status == "ok", (check, named[check].detail)
     assert exit_code(results) == 0
@@ -135,7 +135,9 @@ def test_cdp_unreachable_fails_and_skips_live(tmp_path):
     results = run_doctor(make_config(tmp_path), tmp_path, probes(cdp_ok=False))
     named = by_name(results)
     assert named["cdp"].status == "fail"
-    assert named["browser_live"].status == "skip"
+    # Renamed 2026-08-01: the single `browser_live` check became per-seat
+    # (`primary_live` / `fallback_live`), so an unverified fallback is visible.
+    assert named["primary_live"].status == "skip"
     assert exit_code(results) == 1
 
 
@@ -148,8 +150,8 @@ def test_logged_out_browser_fails(tmp_path):
     conversation = FakeConversation(login_expired=True)
     results = run_doctor(make_config(tmp_path), tmp_path, probes(conversation))
     named = by_name(results)
-    assert named["browser_live"].status == "fail"
-    assert "logged out" in named["browser_live"].detail
+    assert named["primary_live"].status == "fail"
+    assert "logged out" in named["primary_live"].detail
     assert conversation.closed
 
 
