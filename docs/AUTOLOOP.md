@@ -1069,6 +1069,21 @@ AGENT to edit a path, never validation to mutate one. Messages name PATHS
 ONLY, so a park message is safe even when what was written was a credential;
 the mutated files stay on disk uncommitted, as evidence.
 
+**What the mutation guard is NOT** (reviewer's wording, kept because it is
+exactly right): it detects **persistent net changes** to the snapshotted worker
+tree and index. It is defence in depth, not an exfiltration or
+write-prevention boundary. Three things it cannot see, by construction:
+
+* validation that **transmits** a credential (a POST leaves no trace on disk);
+* validation that writes **outside** the snapshotted scope — the snapshot is
+  the worker repo, so anything elsewhere on the filesystem is invisible to it;
+* validation that writes and then **restores** the content before the second
+  snapshot — only the net difference is compared, so a transient write is
+  indistinguishable from no write at all.
+
+It raises the cost of an accidental leak landing in a reviewed commit. It does
+not stop deliberate exfiltration, and must not be described as if it did.
+
 **Building the validation database (done 2026-08-01, reproducible).** The repo
 cannot rebuild its own schema (see `docs/COMMON_ERRORS.md`), so the database is
 built from one that already works. What actually worked, in order:
