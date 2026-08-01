@@ -63,6 +63,17 @@ class Blocker:
     #: distinct things are actually wrong.
     recurrences: int = 1
     last_seen_at: str = ""
+    #: The loop session that parked this. Recorded so "does this blocker
+    #: belong to a session that has since been retired?" is a machine question
+    #: rather than a timestamp inference — the only way to answer it before
+    #: this field existed was to match `created_at` against a transcript line,
+    #: by hand. Empty on records written before this field.
+    session_id: str = ""
+    #: Set ONLY by `archive_stale`. Distinct from `answer` on purpose: `answer`
+    #: means "an operator responded to this question", and writing text there
+    #: to clear a dead blocker would forge exactly the operator confirmation
+    #: `_RESOLUTION_PRECONDITIONS` exists to require.
+    archived_reason: str = ""
 
 
 class BlockerStore:
@@ -125,7 +136,8 @@ class BlockerStore:
                 return existing
         return None
 
-    def record(self, *, task_id, kind, code, question, detail, phase, now) -> "Blocker":
+    def record(self, *, task_id, kind, code, question, detail, phase, now,
+               session_id: str = "") -> "Blocker":
         """Idempotent upsert. Returns the existing open blocker for this
         condition with its recurrence count bumped, or a new one."""
         existing = self.find_open(task_id, code, phase)
@@ -143,10 +155,36 @@ class BlockerStore:
         fresh = Blocker(
             id=self.next_id(task_id), task_id=task_id, kind=kind, code=code,
             question=question, detail=detail, phase=phase, created_at=now,
-            last_seen_at=now,
+            last_seen_at=now, session_id=session_id,
         )
         self.save(fresh)
         return fresh
+
+    def archive_stale(self, blocker_id: str, reason: str) -> "Blocker":
+        """Close a blocker that belongs to a RETIRED session, recording a
+        machine reason rather than an operator answer.
+
+        Deliberately not `resolve()`: that writes `answer`, which means "the
+        operator responded to this question", and using it to clear a dead
+        blocker would fabricate exactly the confirmation
+        `cli._RESOLUTION_PRECONDITIONS` exists to demand. A blocker whose
+        session no longer exists was never answered — it was abandoned, and
+        the record should say so. `reason` is required and non-empty so an
+        archival can never be a silent delete.
+        """
+        if not reason.strip():
+            raise StateError("archive_stale requires a non-empty machine reason")
+        blocker = self.load(blocker_id)
+        if blocker is None:
+            raise StateError(f"no blocker with id '{blocker_id}'")
+        if blocker.resolved_at is not None:
+            raise StateError(
+                f"blocker '{blocker_id}' is already closed (at {blocker.resolved_at})"
+            )
+        blocker.resolved_at = utcnow_iso()
+        blocker.archived_reason = reason
+        self.save(blocker)
+        return blocker
 
     def all_blockers(self) -> list[Blocker]:
         """Every blocker on disk, open or resolved, oldest id first per

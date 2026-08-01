@@ -525,10 +525,35 @@ Verified in a clean clone: six test modules fail to import until `SECRET_KEY`
 is set, after which all 1260 tests collect with nothing else supplied.
 `JWT_SECRET_KEY` is not accepted as an alias.
 
-**Scope — this does NOT close S24.** It separates credentials from the writer
-PROCESS. It is not an OS sandbox and does not stop a process that can already
-run arbitrary code from reading the file. The write-capable agent still has no
-path jail.
+**Scope — what this is NOT, stated plainly (revised 2026-08-01).**
+
+**Candidate validation code CAN observe the test credentials.** That is the
+accepted v1 posture, not an oversight: the validation subprocess is handed
+`DB_*` and `SECRET_KEY` so the backend suite can run, and any test, conftest,
+plugin or imported module in that process can read `os.environ`, print it,
+encode it, or write it to a file. Output redaction removes the values from
+summaries the loop produces; it does not and cannot stop candidate code from
+exfiltrating what it was deliberately given. **This is not secrecy from
+candidate code, and must not be described as if it were.**
+
+What the protection actually is, in order of how much it carries:
+
+1. **Least privilege** — a dedicated role on a dedicated throwaway database,
+   with no access to application data.
+2. **Local-only scope** — the validation server is a separate local cluster;
+   the credentials authenticate to nothing reachable off this machine.
+3. **Separation from production** — production credentials are FORBIDDEN here,
+   enforced by refusing the `DB_NAME` this repo declares in `.env.example`.
+4. **Publication gating** — a candidate that mutates the tree during validation
+   is refused and never published (see the mutation guard, §4g).
+5. **Non-inheritance** — the writer subprocess has these variables explicitly
+   removed, so an agent that never runs validation never sees them.
+
+**It does NOT close S24.** It separates credentials from the writer PROCESS.
+It is not an OS sandbox, does not stop a process that can already run
+arbitrary code from reading the credential file off disk, and the
+write-capable agent still has no path jail. Per-run ephemeral databases and a
+real sandbox are the next steps and are deliberately NOT in this changeset.
 
 - `file:line` — `autoloop/validation_env.py:1`, `autoloop/validation.py:60`,
   `autoloop/audit/agents.py:128`, `autoloop/worker_env.py:110`

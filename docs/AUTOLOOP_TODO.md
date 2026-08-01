@@ -19,19 +19,32 @@ Fix: emit a transcript event when each agent **starts**, not only on completion,
 and surface per-domain state in `status`. Cheap, and it removes the single worst
 feedback gap in normal operation.
 
-### A2. Operator-authored changesets still cannot be published by the loop
-`review-changeset` binds correctly and ChatGPT approves, but dispatch refuses
-with `legacy_git_path_retired`. Root cause **unknown** — an early diagnosis
-(binding dropped in `_step_awaiting`) was disproved by reverting the supposed
-fix and observing the binding survive anyway. Do not re-apply that fix without
-new evidence.
+### ~~A2. Operator-authored changesets still cannot be published by the loop~~ — RESOLVED 2026-08-01
+`review-changeset` bound correctly and ChatGPT approved, but dispatch refused
+with `legacy_git_path_retired`.
 
-Next diagnostic: run with `--max-steps 3` so the loop stops after the response
-and before dispatch, then inspect `last_response.changeset` at that exact point.
-That separates "never bound" from "bound but not routed" in one shot.
+**Root cause: `orchestrator.py`'s `_step_awaiting` built `LastResponse` with
+`postcommit=req.postcommit` and simply never copied `changeset=req.changeset`.**
+It is the only production construction of `LastResponse`, so a binding that was
+built, submitted and awaited perfectly intact was dropped at the moment the
+response was persisted — reaching dispatch as `None`, where the changeset
+branch is skipped and the retired legacy path is all that is left to refuse.
 
-Until then, publication of infrastructure changes goes through `Publisher`
-directly, which is how `b743567`, `5303926` and `da0c41e` all shipped.
+The earlier note here said this diagnosis was "disproved". It was not: the
+original check inspected `last_response` AFTER `orch.run()` returned, and
+`_step_executing` consumes `last_response` — so that probe reads `None` whether
+the bug is present or not. The measurement was wrong, not the hypothesis. The
+regression now probes AT `_dispatch_changeset_push`, and is confirmed to fail
+when the one-line copy is removed.
+
+Every existing changeset test hand-built a `LastResponse` that already carried
+the binding, so none of them ever exercised the construction that lost it —
+that is why 6 passing tests coexisted with a completely broken feature.
+
+Also closed alongside it: a queued changeset whose packet lacks the four
+identifiers now parks `changeset_binding_missing` BEFORE the packet is sent,
+instead of spending a full review round to discover the approval cannot
+publish anything. No fallback to an unbound send.
 
 ### A3. Stale `TaskExecution` records strand when `workers_root` changes
 The orchestrator recomputes a worker path from the current `workers_root`

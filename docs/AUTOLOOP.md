@@ -1036,11 +1036,38 @@ Short secrets are refused at load time rather than handled by a length
 threshold at redaction time, so redaction can never be defeated by a value
 too short to match safely.
 
-**What this is NOT.** It separates credentials from the writer PROCESS. It is
-not an OS sandbox, and it does not stop a process that can already run
-arbitrary code from reading the file itself. **S24 remains OPEN** — the
-write-capable agent still has no path jail; escape is detected after the
-fact, not prevented.
+**What this is NOT — read this before describing the boundary to anyone.**
+
+**Candidate validation code can observe the test credentials.** The validation
+subprocess is handed them on purpose so the backend suite can run; any test,
+conftest or imported module in that process can read `os.environ` and do what
+it likes with the values. Redaction scrubs the loop's own summaries — it
+cannot stop candidate code from exfiltrating what it was deliberately given.
+The protection is **least privilege** (a dedicated role on a throwaway
+database), **local-only scope** (a separate local cluster, reachable from
+nowhere else), **separation from production** (production credentials are
+forbidden and the declared application `DB_NAME` is refused), and
+**publication gating** (a candidate that mutates the tree during validation is
+refused — see the mutation guard below). It is NOT secrecy from candidate
+code.
+
+**S24 remains OPEN** — the write-capable agent still has no path jail; escape
+is detected after the fact, not prevented. Per-run ephemeral databases and a
+real sandbox are the next steps, deliberately not attempted here.
+
+**Validation mutation guard (2026-08-01).** Validation reads; it must never
+write. `_verify_committed` brackets the post-commit validation run with
+`escape_detector.snapshot_worker_tree` and refuses the candidate on any
+difference: content, creation, deletion, symlink target, executable bit —
+over tracked, untracked AND ignored paths — plus the `.git/index` bytes, since
+staging a change mutates the index while leaving every file identical. The
+pre-existing residual-dirty check cannot cover this: it runs BEFORE validation
+and is a `git status` check, so an ignored path (exactly where a test dumping
+its config would land) is invisible to it. The refusal holds even when the
+mutated file is one the task was approved to touch — approval authorises the
+AGENT to edit a path, never validation to mutate one. Messages name PATHS
+ONLY, so a park message is safe even when what was written was a credential;
+the mutated files stay on disk uncommitted, as evidence.
 
 **Building the validation database (done 2026-08-01, reproducible).** The repo
 cannot rebuild its own schema (see `docs/COMMON_ERRORS.md`), so the database is

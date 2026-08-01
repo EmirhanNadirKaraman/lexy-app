@@ -225,3 +225,77 @@ def find_symlink_traversal(repo_root: Path, paths: list[str]) -> list[str]:
                 )
                 break
     return violations
+
+
+# ---- validation mutation guard ----------------------------------------------
+#
+# Validation is supposed to READ a tree and report on it. Nothing stops a test
+# from writing, and the accepted v1 posture hands validation real (test-only)
+# database credentials — so "a test wrote a credential into the tree" is a
+# concrete way a secret leaves the process, whether by accident (a fixture
+# dumping its config) or otherwise. The existing residual-dirty check in
+# `_verify_committed` cannot see it: that runs BEFORE validation, and it is a
+# `git status` check, so it is blind to ignored paths entirely.
+#
+# This compares the worker tree either side of the validation run. It reuses
+# the same primitives as the checkout escape detector — content sha256,
+# symlink target, executable bit, over tracked + untracked + ignored paths —
+# and adds the index, because staging a change mutates `.git/index` without
+# touching any working-tree file.
+
+
+@dataclass(frozen=True)
+class WorkerTreeState:
+    files: CheckoutSnapshot
+    #: sha256 of `.git/index` bytes. Compared literally: the brief asks for
+    #: byte-for-byte, and a hash of the file is exactly that claim.
+    index_sha256: str
+
+
+def _index_path(repo_root: Path) -> Path:
+    """`.git/index`, resolving the linked-worktree case where `.git` is a
+    POINTER FILE rather than a directory (`WorktreeManager`'s repos) as well
+    as the ordinary directory case (`WorkerRepoManager`'s `git init` repos)."""
+    dot_git = Path(repo_root) / ".git"
+    if dot_git.is_file():
+        text = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+        if text.startswith("gitdir:"):
+            target = Path(text[len("gitdir:"):].strip())
+            if not target.is_absolute():
+                target = Path(repo_root) / target
+            return target / "index"
+    return dot_git / "index"
+
+
+def snapshot_worker_tree(git: GitGateway) -> WorkerTreeState:
+    """Complete state of the worker tree, for comparison across a validation
+    run.
+
+    The index is hashed FIRST, before any git command this function issues:
+    enumeration refreshes git's view and can rewrite `.git/index` as a side
+    effect (the same trap that made a "read-only" dashboard write to the repo
+    it observed — see `dashboard._run`). Hashing first means both snapshots
+    measure the index as validation found it, not as this function left it.
+    """
+    index = _index_path(git.repo_root)
+    index_sha = _hash_file(index) if index.is_file() else ""
+    paths = enumerate_checkout_paths(git)
+    return WorkerTreeState(
+        files=snapshot_checkout(git.repo_root, paths), index_sha256=index_sha
+    )
+
+
+def diff_worker_tree(before: WorkerTreeState, after: WorkerTreeState) -> list[str]:
+    """Human-readable mutations between two `snapshot_worker_tree` calls.
+
+    PATHS ONLY, never contents — `diff_snapshots` guarantees that, and it is
+    the property that makes this safe to put in a parked question or a blocker
+    record when the thing validation wrote was a credential.
+    """
+    violations = list(diff_snapshots(before.files, after.files))
+    if before.index_sha256 != after.index_sha256:
+        violations.append(
+            "git index changed during validation (a change was staged) — "
+            "the working tree may look clean while the index does not"
+        )
+    return violations

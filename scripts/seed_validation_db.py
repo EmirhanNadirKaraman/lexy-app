@@ -104,19 +104,17 @@ LINKS = [
     (_BASE + 104, _BASE + 5),
 ]
 
-#: DELIBERATELY NOT SEEDED: `sich freuen auf`.
+#: Seeded ON PURPOSE, even though the test that uses it cannot pass.
 #:
-#: `test_match_inflected_phrase_matches_canonical` skips unless that canonical
-#: is in `phrase_table`, so seeding it looks like it would recover a test. It
-#: does the opposite — the test then RUNS and FAILS, because the phrase
-#: extractor never produces that canonical in the first place. Measured
-#: directly: `match_sentence("ich freue mich auf die Reise", "de")` returns
-#: `['ich', 'jdn. (Akk) freuen']`. The assertion is about the extractor's
-#: dictionary, not about the database, so no amount of seeding can satisfy it
-#: and its skip is the honest outcome. (That the extractor disagrees with the
-#: test's premise is an app-level question — see docs/TESTS.md — not something
-#: a validation database should paper over.)
-PHRASE = None
+#: `test_match_inflected_phrase_matches_canonical` is now
+#: `xfail(strict=True)` against a known extractor defect: `match_sentence("ich
+#: freue mich auf die Reise", "de")` returns `['ich', 'jdn. (Akk) freuen']`,
+#: never the canonical the test names. Strict xfail only means anything if the
+#: test actually RUNS — a `pytest.skip` inside an xfail test reports as
+#: skipped, so the fixture has to exist for the expected failure to be
+#: observed. Seeding it converts a data-dependent skip (which proves nothing)
+#: into a strict xfail (which fails loudly the day the extractor is fixed).
+PHRASE = ("sich freuen auf", "sich freuen auf", "verb_pattern", LANGUAGE)
 
 
 def connect():
@@ -236,6 +234,8 @@ CHECKS = [
      "WHERE wt.language = pt.language LIMIT 1"),
     ("non-ASCII word (test_search_unicode)",
      r"SELECT 1 FROM word_table WHERE word ~ '[^\x01-\x7F]' LIMIT 1"),
+    ("phrase 'sich freuen auf' for the strict-xfail inflection case",
+     "SELECT 1 FROM phrase_table WHERE canonical = 'sich freuen auf' AND language = 'de'"),
 ]
 
 

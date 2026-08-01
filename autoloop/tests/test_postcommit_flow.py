@@ -269,6 +269,7 @@ def build_postcommit(
     task_validation=(),
     task_validation_cwd="",
     executor_factory=None,
+    validation_env=None,
 ):
     """`executor_factory`, when given, is called with the `WorktreeManager`
     once it exists and its result replaces `executor`. Needed by the B4b test,
@@ -343,6 +344,7 @@ def build_postcommit(
         execution_store=execution_store,
         intent_store=intent_store,
         validation_runner=validation_runner,
+        validation_env=validation_env,
     )
     return orch, repo_root, worktrees, execution_store, intent_store, task
 
@@ -777,3 +779,236 @@ def test_post_commit_validation_honours_the_declared_cwd(tmp_path):
     expected = str(Path(worktrees.path_for("t1")) / "sub" / "app")
     assert calls, "post-commit validation never ran"
     assert calls[-1] == expected, f"ran from {calls[-1]}, expected {expected}"
+
+
+# ---- validation-binding integrity (frozen at dispatch) ----------------------
+
+
+def _dispatch_once(tmp_path, declared, files=None, task_id="t1"):
+    """One full dispatch, returning the harness so a second round can run
+    against the SAME on-disk execution record."""
+    executor = WritingExecutor(tmp_path / "worktrees", files or {"src/a.py": "x\n"})
+    return build_postcommit(
+        tmp_path,
+        executor,
+        task_id=task_id,
+        approved_paths=tuple(files or {"src/a.py": "x\n"}),
+        task_validation=declared,
+    )
+
+
+def test_recovery_uses_the_persisted_binding_not_the_current_task_file(tmp_path):
+    """A later edit to the task file must NOT change what a resumed round
+    validates. The binding is authorization-adjacent: if `tasks.json` could
+    widen it mid-task, an approved review would be re-graded against commands
+    nobody reviewed."""
+    DISPATCHED = (("pytest", "-q", "declared/at/dispatch.py"),)
+    WIDENED = (("pytest", "-q", "--co"),)
+
+    orch, _repo, _wt, execution_store, _intents, _task = _dispatch_once(tmp_path, DISPATCHED)
+    orch._dispatch(implement())
+    assert execution_store.load("t1").validation_commands == DISPATCHED
+
+    # The operator (or an agent, or a ChatGPT `plan`) rewrites the task's
+    # validation between rounds, then the task is dispatched again.
+    registry = orch._registry
+    registry.get("t1").validation = WIDENED
+    orch._registry.get("t1").validation_cwd = "somewhere/else"
+    orch._dispatch(implement())
+
+    persisted = execution_store.load("t1")
+    assert persisted.validation_commands == DISPATCHED, (
+        "a task-file edit replaced the binding the round was dispatched under"
+    )
+    assert persisted.validation_cwd == ""
+
+
+def test_an_unbound_legacy_record_adopts_the_task_binding_once(tmp_path):
+    """The one permitted write: a record from before the field existed has no
+    binding at all, so adopting the Task's value cannot WIDEN anything — and
+    is strictly better than silently falling back to the audit default."""
+    DECLARED = (("pytest", "-q", "x.py"),)
+    orch, _repo, _wt, execution_store, _intents, _task = _dispatch_once(tmp_path, DECLARED)
+    orch._dispatch(implement())
+
+    # Simulate the legacy on-disk shape: binding stripped, everything else kept.
+    execution = execution_store.load("t1")
+    execution.validation_commands = ()
+    execution.validation_cwd = ""
+    execution_store.save(execution)
+
+    orch._dispatch(implement())
+    assert execution_store.load("t1").validation_commands == DECLARED
+
+
+def test_binding_survives_a_restart_with_a_fresh_orchestrator(tmp_path):
+    """Restart/recovery: a NEW Orchestrator reading the same state dir must
+    validate against the persisted binding, not re-derive it."""
+    DISPATCHED = (("pytest", "-q", "round/one.py"),)
+    orch, _repo, _wt, execution_store, _intents, _task = _dispatch_once(tmp_path, DISPATCHED)
+    orch._dispatch(implement())
+
+    reloaded = TaskExecutionStore(tmp_path / "executions").load("t1")
+    assert reloaded.validation_commands == DISPATCHED
+    assert reloaded.task_base_sha and reloaded.candidate_sha, "round did not commit"
+
+
+# ---- validation mutation guard ----------------------------------------------
+#
+# Accepted v1 posture: validation code RECEIVES real (test-only) DB
+# credentials. That is not a secrecy boundary, so the thing worth enforcing is
+# that validation cannot write — including into a path the task was approved
+# to touch, because approval authorises the AGENT to edit a path, never
+# validation to mutate one.
+
+MUTATION_SECRET = "sup3r-secret-db-password"
+
+
+def _validation_env_with_secret(tmp_path):
+    from autoloop.validation_env import ValidationEnv
+
+    return ValidationEnv(
+        tmp_path / "validation.env",
+        {
+            "DB_HOST": "127.0.0.1",
+            "DB_PORT": "5433",
+            "DB_NAME": "zzz_validation_test",
+            "DB_USER": "zzz_validation_user",
+            "DB_PASSWORD": MUTATION_SECRET,
+            "SECRET_KEY": "zzz-signing-key-for-tests",
+        },
+    )
+
+
+def _mutating_validation(mutate):
+    """A validation runner that succeeds but performs `mutate(cwd)` — the
+    real shape of the risk: the commands PASS, so nothing else in the gate
+    would notice."""
+
+    def runner(argv, **kwargs):
+        mutate(Path(kwargs["cwd"]))
+
+        class Proc:
+            returncode = 0
+            stdout = "All checks passed!\n"
+            stderr = ""
+
+        return Proc()
+
+    return runner
+
+
+def _run_with_mutation(tmp_path, mutate, files=None, approved=None):
+    files = files or {"feature.py": "print('hi')\n"}
+    executor = WritingExecutor(tmp_path / "worktrees", files)
+    orch, _repo, worktrees, execution_store, _intents, task = build_postcommit(
+        tmp_path,
+        executor,
+        validation_runner=_mutating_validation(mutate),
+        approved_paths=approved if approved is not None else tuple(files),
+        validation_env=_validation_env_with_secret(tmp_path),
+    )
+    orch._dispatch_executor(implement(task.id))
+    return orch, worktrees, execution_store, task
+
+
+def test_validation_writing_the_password_into_an_APPROVED_path_is_refused(tmp_path):
+    """The case the brief singles out: the file is one the task was allowed to
+    change, so path-ownership passes and only the mutation guard catches it."""
+    orch, worktrees, execution_store, task = _run_with_mutation(
+        tmp_path,
+        lambda cwd: (cwd / "feature.py").write_text(f"LEAKED = {MUTATION_SECRET!r}\n"),
+    )
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert "MUTATED" in orch.state.question
+    assert "feature.py" in orch.state.question
+    assert MUTATION_SECRET not in orch.state.question, "the secret reached the park message"
+    # Evidence preserved, uncommitted: the file on disk holds the write, the
+    # committed tree does not.
+    wt = Path(worktrees.path_for(task.id))
+    assert MUTATION_SECRET in (wt / "feature.py").read_text()
+    committed = run_git(wt, "show", f"{execution_store.load(task.id).candidate_sha}:feature.py")
+    assert MUTATION_SECRET not in committed
+
+
+def test_validation_writing_the_password_into_an_UNAPPROVED_path_is_refused(tmp_path):
+    orch, worktrees, _store, task = _run_with_mutation(
+        tmp_path,
+        lambda cwd: (cwd / "not_approved.txt").write_text(f"{MUTATION_SECRET}\n"),
+    )
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert "MUTATED" in orch.state.question
+    assert "not_approved.txt" in orch.state.question
+    assert MUTATION_SECRET not in orch.state.question
+
+
+def test_validation_writing_into_a_GITIGNORED_path_is_refused(tmp_path):
+    """The gap the pre-existing residual-dirty check cannot close: it is a
+    `git status` check, so an ignored path is invisible to it entirely."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, repo_root, _wt, _store, _intents, task = build_postcommit(
+        tmp_path,
+        executor,
+        validation_runner=_mutating_validation(
+            lambda cwd: (cwd / "secrets.log").write_text(f"{MUTATION_SECRET}\n")
+        ),
+        approved_paths=("feature.py",),
+        validation_env=_validation_env_with_secret(tmp_path),
+    )
+    # `.gitignore` goes in the BASE commit, not the approved set: a leading
+    # dot is not a legal approved-path segment, and the point here is that the
+    # ignored file is invisible to `git status` — which is what the pre-existing
+    # residual-dirty check relies on.
+    (repo_root / ".gitignore").write_text("secrets.log\n")
+    run_git(repo_root, "add", ".gitignore")
+    run_git(repo_root, "commit", "-q", "-m", "ignore secrets.log")
+
+    orch._dispatch_executor(implement(task.id))
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert "MUTATED" in orch.state.question
+    assert "secrets.log" in orch.state.question
+    assert MUTATION_SECRET not in orch.state.question
+
+
+def test_validation_changing_an_executable_mode_is_refused(tmp_path):
+    orch, _wt, _store, _task = _run_with_mutation(
+        tmp_path, lambda cwd: (cwd / "feature.py").chmod(0o755)
+    )
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert "MUTATED" in orch.state.question
+    assert "executable" in orch.state.question.lower()
+
+
+def test_validation_replacing_a_file_with_a_symlink_is_refused(tmp_path):
+    def mutate(cwd):
+        target = cwd / "feature.py"
+        target.unlink()
+        target.symlink_to("/etc/passwd")
+
+    orch, _wt, _store, _task = _run_with_mutation(tmp_path, mutate)
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert "MUTATED" in orch.state.question
+    assert "feature.py" in orch.state.question
+
+
+def test_validation_staging_a_change_is_refused_even_with_a_clean_worktree(tmp_path):
+    """Index-only mutation: `git add` of already-tracked content leaves every
+    working-tree file byte-identical, so only the index hash catches it."""
+    def mutate(cwd):
+        (cwd / "feature.py").write_text("print('hi')\nstaged = 1\n")
+        run_git(cwd, "add", "feature.py")
+        (cwd / "feature.py").write_text("print('hi')\n")  # restore the worktree
+
+    orch, _wt, _store, _task = _run_with_mutation(tmp_path, mutate)
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert "MUTATED" in orch.state.question
+    assert "index" in orch.state.question.lower()
+
+
+def test_validation_that_leaves_the_tree_unchanged_is_accepted(tmp_path):
+    """The negative control — without it the guard could be refusing
+    everything and every test above would still pass."""
+    orch, _wt, execution_store, task = _run_with_mutation(tmp_path, lambda cwd: None)
+    assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
+    assert execution_store.load(task.id).candidate_sha != ""
+    assert "POST-COMMIT REVIEW PACKET" in (orch.state.outbox or "")

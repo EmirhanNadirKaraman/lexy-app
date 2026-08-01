@@ -275,6 +275,36 @@ async def test_match_returns_learning_phrase_by_surface(client: AsyncClient, db_
     assert any(m["item_id"] == phrase_id and m["item_type"] == "phrase" for m in matches)
 
 
+async def test_inflection_fixture_is_seeded(db_pool):
+    """The data precondition for the strict-xfail test below, asserted on its
+    own so a missing fixture reports as ITS OWN failure rather than being
+    absorbed into that test's expected failure. Without this split, deleting
+    the phrase would keep the suite green (a missing row makes the xfail test
+    fail, which is what it is marked to do) and the extractor defect would
+    stop being what is actually observed."""
+    row = await db_pool.fetchrow(
+        "SELECT phrase_id FROM phrase_table WHERE canonical = $1 AND language = 'de'",
+        "sich freuen auf",
+    )
+    assert row is not None, (
+        "phrase 'sich freuen auf' is not seeded — run scripts/seed_validation_db.py"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "KNOWN EXTRACTOR DEFECT (app-level, tracked as rt-05): the phrase "
+        "extractor never yields the canonical 'sich freuen auf'. Measured: "
+        "match_sentence('ich freue mich auf die Reise', 'de') returns "
+        "['ich', 'jdn. (Akk) freuen'], so the reflexive+preposition pattern "
+        "is reduced to a bare accusative verb frame and the canonical this "
+        "test names is unreachable. strict=True on purpose: the day the "
+        "extractor is fixed this test PASSES and pytest reports XPASS as a "
+        "failure, forcing the mark to be removed rather than quietly "
+        "outliving the bug."
+    ),
+)
 async def test_match_inflected_phrase_matches_canonical(client: AsyncClient, db_pool):
     """Inflected production (e.g. 'ich freue mich auf die Reise') must match the
     canonical 'sich freuen auf' via the spaCy-based phrase_finder."""
@@ -282,8 +312,15 @@ async def test_match_inflected_phrase_matches_canonical(client: AsyncClient, db_
         "SELECT phrase_id FROM phrase_table WHERE canonical = $1 AND language = 'de'",
         "sich freuen auf",
     )
-    if row is None:
-        pytest.skip("phrase 'sich freuen auf' not seeded — skip inflection test")
+    # NOT a skip. A `pytest.skip` inside an `xfail(strict=True)` test reports
+    # as skipped, so the expected failure would never be observed and the mark
+    # would silently mean nothing. The fixture is seeded by
+    # `scripts/seed_validation_db.py`; its absence is a setup error worth
+    # failing on, and `test_inflection_fixture_is_seeded` below reports that
+    # cause on its own, outside the xfail.
+    assert row is not None, (
+        "phrase 'sich freuen auf' is not seeded — run scripts/seed_validation_db.py"
+    )
     phrase_id = row["phrase_id"]
 
     headers, uid = await _register_and_login(client, db_pool, _email())

@@ -405,6 +405,33 @@ class Orchestrator:
         prompt = build_prompt(request_id, next_iteration, render_context(ctx), state.outbox)
         postcommit = self._current_pending_postcommit(state.outbox, ctx.report_sha256)
         changeset = self._current_pending_changeset(state.outbox, ctx.report_sha256)
+        if state.changeset and (state.changeset or {}).get("candidate_sha") and changeset is None:
+            # A changeset review was queued but the payload does not carry all
+            # four identifiers, so nothing could bind it. Refuse HERE, before
+            # the packet is sent: otherwise a full review round is spent and
+            # the approval that comes back cannot publish anything (that is
+            # how A2 was found — after the round, not before it). There is
+            # deliberately no fallback to an unbound send.
+            queued = state.changeset or {}
+            missing = [
+                name
+                for name in ("base_sha", "candidate_sha", "branch", "dest_ref")
+                if not queued.get(name) or queued.get(name) not in (state.outbox or "")
+            ]
+            self._to_needs_user(
+                "a changeset review is queued but its packet does not contain "
+                f"{', '.join(missing)} as literal text, so the approval could "
+                "never be bound to the candidate. Nothing was sent. Re-queue "
+                "with `review-changeset` (its default rendering always includes "
+                "the four identifiers) or add them to your --packet body.",
+                kind="loop_fatal",
+                code="changeset_binding_missing",
+                detail=(
+                    f"candidate={queued.get('candidate_sha', '')[:12]} "
+                    f"missing={','.join(missing)}"
+                ),
+            )
+            return
         state.pending_request = PendingRequest(
             request_id=request_id,
             payload=state.outbox,
@@ -1210,6 +1237,14 @@ class Orchestrator:
             base_sha=req.base_sha,
             report_sha256=req.report_sha256,
             postcommit=req.postcommit,
+            changeset=req.changeset,
+            # THE changeset-binding bug (docs/AUTOLOOP_TODO.md A2). This is the
+            # only production construction of `LastResponse`, and it carried
+            # `postcommit` but silently dropped `changeset` — so an operator
+            # changeset bound correctly at request time arrived at dispatch
+            # unbound, and `_dispatch_changeset_push` refused a push it should
+            # have published. The binding was never "lost in transit": it was
+            # built, submitted and awaited intact, then not copied here.
             conversation_url=req.conversation_url,
             conversation_epoch=req.conversation_epoch,
         )
@@ -1575,12 +1610,23 @@ class Orchestrator:
             )
             return
 
-        # Computed BEFORE the create/load split, because every branch below
-        # needs it: a freshly created record persists it, and a LOADED record
-        # is re-synced against it (a record written before this field existed
-        # loads as "declared none", which would silently fall back to the audit
-        # set on a resumed task — B4b). The audit declares no validation of its
-        # own and keeps the configured default.
+        # Bound from the Task HERE — before the writer runs, on the first
+        # dispatch only — and then FROZEN on the execution record (B4b).
+        #
+        # `allowed_paths` below is deliberately re-synced from the Task on
+        # every dispatch, because the Task is its authorization source. The
+        # validation binding is the opposite: once written it is never
+        # re-derived, so nothing downstream of the first dispatch can replace
+        # or widen what the reviewed commit is checked against — not an agent
+        # result, not a later edit to `seed_tasks.json`/`tasks.json`, not a
+        # ChatGPT response. A resumed or crash-recovered round re-runs exactly
+        # the commands the round was dispatched under.
+        #
+        # The ONE exception is a record with no binding at all (written before
+        # this field existed, or hand-built by a test/embedder): adopting the
+        # Task's value once is strictly better than falling back to the
+        # generic audit set, and it cannot widen anything, because there was
+        # nothing there to widen.
         declared_validation = (
             () if is_audit else tuple(tuple(c) for c in task.validation)
         )
@@ -1615,31 +1661,24 @@ class Orchestrator:
                 execution.validation_commands = declared_validation
                 execution.validation_cwd = declared_validation_cwd
             self._execution_store.save(execution)
-        elif not is_audit and execution.allowed_paths != tuple(sorted(task.approved_paths)):
-            # Re-sync on every LOADED (not freshly created) execution too —
-            # covers a resumed task whose `TaskExecution` record predates
-            # this field (an old `.autoloop/executions/<id>.json`) as well as
-            # a record created by test/embedder code that built the
-            # `TaskExecution` directly rather than through this method.
-            # `task.approved_paths` is the single source of truth for a
-            # real task's authorization; it is never derived from
-            # `execution` state, only ever written INTO it.
-            execution.allowed_paths = tuple(sorted(task.approved_paths))
-            execution.validation_commands = declared_validation
-            execution.validation_cwd = declared_validation_cwd
-            self._execution_store.save(execution)
-        elif not is_audit and (
-            execution.validation_commands != declared_validation
-            or execution.validation_cwd != declared_validation_cwd
-        ):
-            # Same re-sync, for the case where only the VALIDATION drifted:
-            # a record written before this field existed loads as "declared
-            # none", which would silently fall back to the audit set on a
-            # resumed task. The Task is the source of truth here exactly as
-            # it is for `approved_paths` above.
-            execution.validation_commands = declared_validation
-            execution.validation_cwd = declared_validation_cwd
-            self._execution_store.save(execution)
+        elif not is_audit:
+            dirty = False
+            if execution.allowed_paths != tuple(sorted(task.approved_paths)):
+                # Re-synced every dispatch: `task.approved_paths` is the single
+                # source of truth for a real task's authorization, and is never
+                # derived from `execution` state, only ever written INTO it.
+                execution.allowed_paths = tuple(sorted(task.approved_paths))
+                dirty = True
+            if not execution.validation_commands and declared_validation:
+                # Backfill ONLY — an unbound record adopts the Task's value
+                # once. A record that already carries a binding is left alone
+                # even when the Task now says something different: that
+                # difference is exactly the widening this must not honour.
+                execution.validation_commands = declared_validation
+                execution.validation_cwd = declared_validation_cwd
+                dirty = True
+            if dirty:
+                self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         self._store.save(state)
 
@@ -2168,9 +2207,31 @@ class Orchestrator:
                 "worktree is not clean after commit — residual change(s): "
                 + ", ".join(f"{status} {path}" for status, path in residual)
             )
+        # Bracket the validation run. The residual-dirty check above cannot
+        # cover this: it runs BEFORE validation, and it is a `git status`
+        # check, so it is blind to ignored paths — exactly where a test that
+        # dumped its configuration would land. Validation now receives real
+        # (test-only) database credentials, so "a test wrote a credential into
+        # the tree" is a concrete leak path, and it stays a refusal even when
+        # the file it wrote is one the task was approved to touch: approval
+        # authorises the AGENT to edit a path, never validation to mutate one.
+        tree_before = escape_detector.snapshot_worker_tree(worktree_git)
         validation_ok, validation_summary = self._run_post_commit_validation(execution)
+        mutations = escape_detector.diff_worker_tree(
+            tree_before, escape_detector.snapshot_worker_tree(worktree_git)
+        )
         if not validation_ok:
             failures.append(f"post-commit validation failed: {validation_summary}")
+        if mutations:
+            # Paths only — `diff_worker_tree` never reports contents, so this
+            # is safe to park with even when what was written was a secret.
+            # The mutated files are left on disk, uncommitted: the candidate is
+            # refused, and the worker repo is the evidence.
+            failures.append(
+                "validation MUTATED the worker tree (validation must read, "
+                "never write; the candidate is refused and the worker repo is "
+                "preserved uncommitted as evidence): " + "; ".join(sorted(mutations))
+            )
         return failures, validation_summary
 
     def _run_post_commit_validation(self, execution: TaskExecution) -> tuple[bool, str]:
@@ -2863,6 +2924,9 @@ class Orchestrator:
                 detail=detail,
                 phase=originating_phase,
                 now=utcnow_iso(),
+                # Attribution, so a later run can tell a live blocker from one
+                # abandoned by a session that has since been reset.
+                session_id=state.session_id or "",
             )
             state.park_blocker_id = blocker.id
         self._store.save(state)
