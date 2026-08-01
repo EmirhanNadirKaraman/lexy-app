@@ -65,7 +65,7 @@ from .errors import (
 from .executor import ExecutionOutcome, NullExecutor, TaskExecutor
 from .git_gateway import GitGateway
 from .implement_executor import ImplementExecutor, implement_agent_runner
-from .inbox import InboxError, TaskInbox, inbox_dir_for
+from .inbox import InboxError, TaskInbox, apply_requests, inbox_dir_for
 from .lock import LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
 from .orchestrator import Orchestrator
@@ -884,6 +884,44 @@ def _cmd_add_task(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_drain_inbox(args: argparse.Namespace) -> int:
+    """Merge queued task requests into the registry WITHOUT stepping the phase
+    machine.
+
+    `run` drains between steps, but that also dispatches whatever the current
+    phase is — so with a review packet waiting in the outbox there was no way
+    to apply queued requests without also sending it. This separates the two.
+
+    Takes the single-instance lock, because it writes `tasks.json`: the loop
+    must stay the only writer, and "the loop" here means "whoever holds the
+    lock". Refuses rather than racing a live run.
+    """
+    config = load_config(args.config)
+    with LoopLock(config.state_dir):
+        task_store, registry = _load_tasks(config)
+        inbox = TaskInbox(inbox_dir_for(config.workers_root, config.state_dir))
+        specs, problems = inbox.drain()
+        for problem in problems:
+            print(f"  unreadable: {problem}")
+        if not specs:
+            print("no queued task requests")
+            return 0
+        added, reprioritised, refused = apply_requests(registry, specs)
+        if added or reprioritised:
+            task_store.save(registry)
+        for line in added:
+            print(f"  added        {line}")
+        for line in reprioritised:
+            print(f"  reprioritised {line}")
+        for line in refused:
+            print(f"  REFUSED      {line}")
+        print(
+            f"{len(added)} added, {len(reprioritised)} reprioritised, "
+            f"{len(refused)} refused"
+        )
+    return 2 if refused else 0
+
+
 def _cmd_blockers(args: argparse.Namespace) -> int:
     """Read-only, no lock — like `status`/`tasks`/`doctor`/`next-task`.
     Lists open blockers by default; `--all` also shows resolved ones."""
@@ -1423,6 +1461,13 @@ def build_parser() -> argparse.ArgumentParser:
     blockers.add_argument(
         "--all", action="store_true", help="also show resolved blockers"
     )
+    drain = sub.add_parser(
+        "drain-inbox",
+        help="merge queued task requests into the roadmap without running a step",
+    )
+    add_config(drain)
+    drain.set_defaults(func=_cmd_drain_inbox)
+
     add_task.set_defaults(func=_cmd_add_task)
     blockers.set_defaults(func=_cmd_blockers)
 

@@ -134,3 +134,55 @@ def test_an_old_tasks_file_without_priority_still_loads(tmp_path):
         "tasks": [{"id": "old", "title": "O", "description": "d", "status": "pending"}],
     }), encoding="utf-8")
     assert TaskStore(path).load().get("old").priority == 100
+
+
+# ---- the shared merge (one implementation, two callers) ----------------------
+
+
+def test_apply_requests_is_the_single_merge_used_by_both_callers():
+    """`Orchestrator._drain_task_inbox` and `python -m autoloop drain-inbox`
+    must apply a request identically. Two copies would drift, and a drift means
+    the same request behaves differently depending on who applied it."""
+    import inspect
+
+    from autoloop import cli, orchestrator
+    from autoloop.inbox import apply_requests
+
+    assert "apply_requests(" in inspect.getsource(orchestrator.Orchestrator._drain_task_inbox)
+    assert "apply_requests(" in inspect.getsource(cli._cmd_drain_inbox)
+    assert callable(apply_requests)
+
+
+def test_apply_requests_adds_reprioritises_and_refuses_in_one_pass():
+    from autoloop.inbox import apply_requests
+
+    registry = TaskRegistry()
+    registry.add_many([Task(id="existing", title="E", description="d", priority=9)])
+
+    added, reprioritised, refused = apply_requests(registry, [
+        {"id": "brand-new", "title": "N", "description": "d", "priority": 2},
+        {"kind": "priority", "id": "existing", "priority": 1},
+        {"id": "existing", "title": "dupe", "description": "d"},      # duplicate id
+        {"kind": "priority", "id": "ghost", "priority": 1},           # unknown task
+    ])
+
+    assert len(added) == 1 and "brand-new" in added[0]
+    assert len(reprioritised) == 1 and "existing -> 1" in reprioritised[0]
+    assert len(refused) == 2, refused
+    # The good ones landed despite the bad ones queued alongside.
+    assert registry.get("brand-new").priority == 2
+    assert registry.get("existing").priority == 1
+    assert registry.get("existing").title == "E", "the original is untouched"
+
+
+def test_a_refused_batch_never_raises():
+    """One typo must not discard the good requests queued behind it."""
+    from autoloop.inbox import apply_requests
+
+    registry = TaskRegistry()
+    added, reprioritised, refused = apply_requests(registry, [
+        {"id": "", "title": "", "description": ""},
+        {"id": "ok", "title": "T", "description": "d"},
+    ])
+    assert [a.split(" ")[0] for a in added] == ["ok"]
+    assert len(refused) == 1

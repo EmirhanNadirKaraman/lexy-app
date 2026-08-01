@@ -1045,6 +1045,19 @@ or replayed forever; a request the registry refuses (duplicate id, unknown
 dependency, bad approved path) is reported and dropped. One typo never stops a
 running loop.
 
+**Applying queued requests on demand.** `run` drains between steps, but that
+also dispatches whatever the current phase is — so with a review packet waiting
+in the outbox there was no way to apply queued requests without also sending
+it. `python -m autoloop drain-inbox` merges and exits without stepping the
+phase machine. It takes the single-instance lock, because it writes
+`tasks.json` and the loop must stay the only writer — "the loop" meaning
+"whoever holds the lock" — so it refuses rather than racing a live run.
+
+Both callers share ONE merge (`inbox.apply_requests`). Two copies would drift,
+and a drift means the same request behaves differently depending on who applied
+it — the same reasoning as `tasks.effective_approved_paths`, and a test pins
+that both call sites use it.
+
 **Editing priorities from the tracker.** The dashboard's roadmap section shows
 each task's priority in a number input with a Save button. Saving POSTs to
 `/api/priority`, which writes a `kind: "priority"` request to the SAME inbox —

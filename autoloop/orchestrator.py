@@ -177,6 +177,7 @@ from .state import (
     StateStore,
     utcnow_iso,
 )
+from .inbox import apply_requests
 from .tasks import Task, TaskRegistry, TaskStore, effective_approved_paths
 from .transcript import TranscriptLogger
 from .validation import run_validation_commands
@@ -3132,39 +3133,7 @@ class Orchestrator:
             self._log("task_inbox_rejected", data={"reason": problem})
         if not specs:
             return
-        added, refused, reprioritised = [], [], []
-        for spec in specs:
-            if spec.get("kind") == "priority":
-                # Re-prioritise an existing task. Separate from task creation
-                # because it must NOT be able to change authorization — only
-                # what runs next.
-                try:
-                    task = self._registry.set_priority(
-                        str(spec.get("id", "")), int(spec.get("priority", 100))
-                    )
-                except (TaskGraphError, ValueError, TypeError) as exc:
-                    refused.append(f"{spec.get('id')}: {exc}")
-                else:
-                    reprioritised.append(f"{task.id} -> {task.priority}")
-                continue
-            task = Task(
-                id=str(spec.get("id", "")),
-                title=str(spec.get("title", "")),
-                description=str(spec.get("description", "")),
-                depends_on=tuple(spec.get("depends_on", ()) or ()),
-                priority=int(spec.get("priority", 100)),
-                validation=tuple(tuple(c) for c in spec.get("validation", ()) or ()),
-                validation_cwd=str(spec.get("validation_cwd", "") or ""),
-                approved_paths=tuple(spec.get("approved_paths", ()) or ()),
-            )
-            try:
-                # One at a time: `add_many` is atomic per call, so a single bad
-                # request would otherwise reject the whole batch alongside it.
-                self._registry.add_many([task])
-            except (TaskGraphError, ValueError, TypeError) as exc:
-                refused.append(f"{task.id}: {exc}")
-            else:
-                added.append(f"{task.id} (priority {task.priority})")
+        added, reprioritised, refused = apply_requests(self._registry, specs)
         if added or reprioritised:
             self._task_store.save(self._registry)
         self._log(

@@ -187,3 +187,56 @@ def inbox_dir_for(workers_root: Path | None, state_dir: Path) -> Path:
     if workers_root is not None:
         return Path(workers_root).expanduser().parent / "inbox"
     return Path(state_dir) / "inbox"
+
+
+def apply_requests(registry, specs: list[dict]) -> tuple[list[str], list[str], list[str]]:
+    """Merge drained requests into `registry`. Returns
+    `(added, reprioritised, refused)`, all human-readable.
+
+    THE single merge implementation, shared by the running loop
+    (`Orchestrator._drain_task_inbox`) and the on-demand
+    `python -m autoloop drain-inbox`. Two copies would drift, and a drift here
+    means the same request behaves differently depending on who applied it —
+    the same reasoning as `tasks.effective_approved_paths`.
+
+    Never raises. `TaskRegistry.add_many` is the only validation authority, so
+    a refused request is reported and dropped rather than aborting the batch:
+    one operator typo must not stop a running loop, nor discard the fifteen
+    good requests queued behind it.
+    """
+    from .errors import TaskGraphError
+    from .tasks import Task
+
+    added: list[str] = []
+    reprioritised: list[str] = []
+    refused: list[str] = []
+    for spec in specs:
+        if spec.get("kind") == KIND_PRIORITY:
+            try:
+                task = registry.set_priority(
+                    str(spec.get("id", "")), int(spec.get("priority", 100))
+                )
+            except (TaskGraphError, ValueError, TypeError) as exc:
+                refused.append(f"{spec.get('id')}: {exc}")
+            else:
+                reprioritised.append(f"{task.id} -> {task.priority}")
+            continue
+        try:
+            task = Task(
+                id=str(spec.get("id", "")),
+                title=str(spec.get("title", "")),
+                description=str(spec.get("description", "")),
+                depends_on=tuple(spec.get("depends_on", ()) or ()),
+                priority=int(spec.get("priority", 100)),
+                validation=tuple(tuple(c) for c in spec.get("validation", ()) or ()),
+                validation_cwd=str(spec.get("validation_cwd", "") or ""),
+                approved_paths=tuple(spec.get("approved_paths", ()) or ()),
+            )
+            # One at a time: `add_many` is atomic per call, so batching would let
+            # one bad request reject every good one queued alongside it.
+            registry.add_many([task])
+        except (TaskGraphError, ValueError, TypeError) as exc:
+            refused.append(f"{spec.get('id')}: {exc}")
+        else:
+            added.append(f"{task.id} (priority {task.priority})")
+    return added, reprioritised, refused
