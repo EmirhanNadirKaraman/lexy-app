@@ -294,7 +294,7 @@ async def test_inflection_fixture_is_seeded(db_pool):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "KNOWN EXTRACTOR DEFECT (app-level, tracked as rt-05): the phrase "
+        "KNOWN EXTRACTOR DEFECT (app-level, tracked as ext-01): the phrase "
         "extractor never yields the canonical 'sich freuen auf'. Measured: "
         "match_sentence('ich freue mich auf die Reise', 'de') returns "
         "['ich', 'jdn. (Akk) freuen'], so the reflexive+preposition pattern "

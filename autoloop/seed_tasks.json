@@ -27,7 +27,7 @@
     ]
   },
   {
-    "id": "rt-05",
+    "id": "ext-01",
     "title": "phrase extractor drops the reflexive+preposition frame ('sich freuen auf')",
     "description": "Known defect, pinned by a strict xfail. lexy-app/backend/tests/test_free_chat_progression.py::test_match_inflected_phrase_matches_canonical is marked xfail(strict=True) because the extractor never yields the canonical 'sich freuen auf'. Measured directly: match_sentence('ich freue mich auf die Reise', 'de') returns ['ich', 'jdn. (Akk) freuen'] \u2014 the reflexive pronoun and the governed preposition are dropped, so a reflexive verb pattern collapses to a bare accusative frame and can never match its phrase_table canonical. Fix the extraction in subtitle-scraper/phrase_finder.py so a reflexive+preposition verb pattern produces its full canonical, then REMOVE the xfail mark \u2014 strict=True means the suite fails with XPASS once this works, which is the intended signal, not a regression.",
     "depends_on": [],
