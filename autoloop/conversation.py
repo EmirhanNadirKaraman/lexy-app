@@ -37,6 +37,7 @@ implements only the protocol above stays valid:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Protocol
 
 from .browser.chatgpt import SubmitResult
@@ -100,8 +101,28 @@ def _browser_chatgpt_factory(config: "AutoloopConfig") -> LLMConversation:
     )
 
 
+def _codex_cli_factory(config: "AutoloopConfig") -> LLMConversation:
+    # Lazy import for symmetry with the browser factory — nothing here depends
+    # on the codex binary existing until a run actually selects this provider.
+    from .codex.conversation import CodexConversation, SubprocessCodexRunner
+    from .codex.quota import DEFAULT_QUOTA_PATTERNS
+
+    codex = config.codex
+    runner = SubprocessCodexRunner(
+        command=codex.command,
+        sandbox_args=codex.sandbox_args,
+        timeout_seconds=codex.timeout_seconds,
+        cwd=Path(codex.working_dir) if codex.working_dir else None,
+    )
+    return CodexConversation(
+        runner,
+        quota_patterns=codex.quota_patterns or DEFAULT_QUOTA_PATTERNS,
+    )
+
+
 _PROVIDERS: dict[str, ConversationFactory] = {
     "browser_chatgpt": _browser_chatgpt_factory,
+    "codex_cli": _codex_cli_factory,
 }
 
 

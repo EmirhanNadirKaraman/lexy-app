@@ -144,6 +144,7 @@ from .errors import (
     GitCommandError,
     GitError,
     LoginExpiredError,
+    QuotaExhaustedError,
     ResponseTimeoutError,
     StateError,
     TaskGraphError,
@@ -171,6 +172,7 @@ from .state import (
     PendingRequest,
     Phase,
     PostcommitBinding,
+    ProviderSwitch,
     RotationRecord,
     StateStore,
     utcnow_iso,
@@ -240,6 +242,7 @@ class Orchestrator:
         worker_repos=None,
         publisher_url_snapshot: str | None = None,
         config_path: Path | None = None,
+        provider_factory=None,
     ):
         self._config = config
         self._store = store
@@ -249,6 +252,13 @@ class Orchestrator:
         self._executor = executor
         self._transcript = transcript
         self._client_factory = client_factory
+        #: Optional provider-aware factory (`provider_name -> LLMConversation`).
+        #: Additive on purpose: when it is absent the zero-argument
+        #: `client_factory` is used exactly as before, so every existing caller
+        #: and test is unaffected and single-provider runs stay single-provider.
+        #: `cli._build_orchestrator` passes one, which is what makes failover
+        #: reachable in production.
+        self._provider_factory = provider_factory
         self._registry = registry
         self._task_store = task_store
         #: Vestigial since the S21 retirement (2026-07-30, docs/SECURITY.md):
@@ -352,6 +362,12 @@ class Orchestrator:
                     kind="loop_fatal",
                     code="login_expired",
                 )
+            except QuotaExhaustedError as exc:
+                # Not a BrowserError, and caught explicitly: an exhausted plan
+                # allowance is an account condition. Routed through the failure
+                # budget it would spend three retries in seconds and land in
+                # `failed`, describing neither the cause nor the remedy.
+                self._handle_quota_exhausted(phase, exc)
             except ConversationUnusableError as exc:
                 self._handle_conversation_unusable(phase, exc)
             except ResponseTimeoutError as exc:
@@ -498,12 +514,34 @@ class Orchestrator:
             #    run had, instead of silently downgrading to "ambiguous".
             #  * anything else -> genuinely ambiguous, park. The backend may
             #    have accepted a message the browser never observed.
+            #  * the provider declares `idempotent_submit` -> there is no
+            #    ambiguity to park on. A transport whose failed send appended
+            #    nothing to any durable conversation cannot double-post on a
+            #    retry, so the rule below — written for a shared, persistent
+            #    chat thread — describes nothing. Probed as a capability rather
+            #    than inferred, so the provider states the property and this
+            #    code stays the one place that reasons about it.
             if req.last_send_outcome == SendOutcome.REJECTED.value:
                 state.phase = Phase.SUBMISSION_REJECTED.value
                 self._store.save(state)
                 return
-            self._park_ambiguous(req, reconciled=True)
-            return
+            if getattr(client, "idempotent_submit", False):
+                req.send_attempted = False
+                self._log(
+                    "resend_authorized",
+                    request_id=req.request_id,
+                    data={
+                        "reason_code": "idempotent_transport",
+                        "provider": self.active_provider(),
+                    },
+                )
+                self._store.save(state)
+                # Deliberately fall THROUGH to the ordinary send path below
+                # rather than parking: with nothing left behind by the failed
+                # attempt, re-issuing is the correct action, not a compromise.
+            else:
+                self._park_ambiguous(req, reconciled=True)
+                return
 
         # Defensive integrity check: `req.prompt` is set once in `ready` and
         # never recomputed before a resend, so this should never fire in
@@ -537,6 +575,11 @@ class Orchestrator:
         # during confirmation, a dying page, or SIGKILL — and the next run
         # would happily post a duplicate.)
         req.send_attempted = True
+        # Stamped with the send, not the preparation: a request prepared under
+        # one provider and handed to another must name the one that actually
+        # answered it, or the `reviewed` stamp it comes back with is
+        # unattributable.
+        req.provider = self.active_provider()
         self._store.save(state)
         try:
             result = client.submit(req.request_id, req.prompt)
@@ -669,6 +712,111 @@ class Orchestrator:
         # Confirmed absent twice, in the same chat, with the transport
         # disproving both sends. The chat itself is the suspect now.
         self._attempt_rotation(req, reason="send_rejected_twice")
+
+    def _handle_quota_exhausted(self, phase: Phase, exc: QuotaExhaustedError) -> None:
+        """Hand the reviewer role to the fallback provider, or park saying why.
+
+        The handover is safe here for a reason worth stating: the request has
+        no captured reply, so nothing was authorized under the exhausted
+        provider, and the fallback is a transport that has never seen this
+        request. It is *recorded* for a different reason — the reviewer grants
+        authority, so an approval must stay attributable to the transport that
+        produced it. A silent swap would leave a `reviewed` stamp with no
+        answer to "reviewed by whom".
+        """
+        state = self.state
+        from_provider = self.active_provider()
+        self._log(
+            "quota_exhausted",
+            data={
+                "phase": phase.value,
+                "provider": from_provider,
+                "error": str(exc),
+                "reason_code": "quota_exhausted",
+            },
+        )
+        self._drop_client()
+        req = state.pending_request
+        fallback = self._config.conversation.fallback_provider
+
+        def park(code: str, extra: str) -> None:
+            self._to_needs_user(
+                f"{exc} {extra}",
+                resume_phase=phase.value,
+                kind="loop_fatal",
+                code=code,
+            )
+
+        if not fallback or fallback == from_provider:
+            park(
+                "quota_exhausted",
+                "No usable conversation.fallback_provider is configured, so the "
+                "loop cannot hand over. Wait for the allowance window to reset, "
+                "buy credits, or set conversation.fallback_provider (the browser "
+                "provider draws on a separate quota).",
+            )
+            return
+        if req is None:
+            # Nothing in flight to re-issue. Switching would still be safe, but
+            # it would be a change nobody can attribute to a request, so leave
+            # the decision with the operator.
+            park(
+                "quota_exhausted",
+                "No request was in flight, so there is nothing to hand over. "
+                f"Set conversation.provider to '{fallback}' and retry.",
+            )
+            return
+        if state.last_response is not None:
+            # Belt to the phase machine's braces: quota can only bite while a
+            # request is unanswered. A captured reply here would mean the
+            # handover was about to straddle an answered turn, which is the one
+            # shape that could put two reviewers inside one round.
+            park(
+                "quota_exhausted",
+                "A captured reply is still pending execution, so the reviewer "
+                "cannot be handed over mid-turn. Resolve the pending response "
+                "first.",
+            )
+            return
+        verdict = self._policy.check_provider_switch_budget(state.provider_switches)
+        if not verdict.allowed:
+            park(
+                "provider_switch_budget",
+                f"{verdict.reason}. Both configured providers have now reported "
+                "an exhausted allowance in this run — waiting for a reset is the "
+                "only remedy that does not cost money.",
+            )
+            return
+
+        record = ProviderSwitch(
+            from_provider=from_provider,
+            to_provider=fallback,
+            request_id=req.request_id,
+            reason="quota_exhausted",
+        )
+        state.active_provider = fallback
+        state.provider_switches += 1
+        state.last_provider_switch = asdict(record)
+        req.provider = fallback
+        # The fallback is a DIFFERENT transport that has never seen this
+        # request, so the transport-level marks left by the exhausted one
+        # describe nothing here. Clearing them is what lets `submitting`
+        # re-issue instead of parking on `submission_ambiguous` — and it is
+        # only sound because those marks are per-transport facts, not claims
+        # about the request itself.
+        req.send_attempted = False
+        req.last_send_outcome = ""
+        req.resends_used = 0
+        req.submitted = False
+        req.conversation_url = state.conversation_url
+        req.conversation_epoch = state.conversation_epoch
+        state.phase = Phase.SUBMITTING.value
+        self._log(
+            "provider_switched",
+            request_id=req.request_id,
+            data=asdict(record) | {"provider_switches": state.provider_switches},
+        )
+        self._store.save(state)
 
     def _handle_conversation_unusable(
         self, phase: Phase, exc: ConversationUnusableError
@@ -1247,6 +1395,7 @@ class Orchestrator:
             # built, submitted and awaited intact, then not copied here.
             conversation_url=req.conversation_url,
             conversation_epoch=req.conversation_epoch,
+            provider=req.provider or self.active_provider(),
         )
         state.pending_request = None
         state.consecutive_failures = 0
@@ -2931,9 +3080,29 @@ class Orchestrator:
             state.park_blocker_id = blocker.id
         self._store.save(state)
 
+    def active_provider(self) -> str:
+        """The provider currently holding the reviewer role.
+
+        State wins over config once a failover has happened, so a resumed run
+        does not silently return to a transport whose allowance is spent and
+        exhaust it again.
+        """
+        return self.state.active_provider or self._config.conversation.provider
+
     def _get_client(self):
         if self._client is None:
-            self._client = self._client_factory()
+            provider = self.active_provider()
+            # `client_factory` stays the way the CONFIGURED provider is built,
+            # and `provider_factory` is consulted only once a failover has
+            # actually moved the active provider away from it. Preferring the
+            # provider-aware one unconditionally would silently bypass every
+            # caller that injects its conversation through `client_factory` —
+            # which is how the whole test suite does it, and how a run with no
+            # failover in sight should keep behaving.
+            if self._provider_factory is not None and provider != self._config.conversation.provider:
+                self._client = self._provider_factory(provider)
+            else:
+                self._client = self._client_factory()
         return self._client
 
     def _client_for_request(self, req: PendingRequest):

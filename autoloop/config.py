@@ -48,6 +48,40 @@ class BrowserConfig:
 @dataclass(frozen=True)
 class ConversationConfig:
     provider: str = "browser_chatgpt"
+    #: Where to go when `provider` reports its allowance exhausted. Empty
+    #: disables failover — the loop parks instead. The pairing that motivates
+    #: this is codex_cli -> browser_chatgpt: Codex draws on the ChatGPT plan's
+    #: AGENTIC allowance (shared with ChatGPT Work and ChatGPT for Excel),
+    #: while ordinary ChatGPT conversations draw on a separate quota, so the
+    #: browser really does still work once Codex is spent. Two transports AND
+    #: two budgets — which is the only reason automatic failover buys anything.
+    fallback_provider: str = ""
+
+
+@dataclass(frozen=True)
+class CodexConfig:
+    """The Codex CLI reviewer. Only consulted when a codex provider is used."""
+
+    #: Base invocation. Split from `sandbox_args` so the two can be reasoned
+    #: about separately — this is "how do I run it", that is "what may it do".
+    command: tuple[str, ...] = ("codex", "exec")
+    #: Flags that confine the reviewer. Deliberately NOT given a permissive
+    #: default: the flag names cannot be verified from this repository, and
+    #: guessing them would produce a setting that looks like a control and is
+    #: not one. `doctor` warns while this is empty. The reviewer is confined
+    #: regardless by running outside the checkout (see `working_dir`).
+    sandbox_args: tuple[str, ...] = ()
+    timeout_seconds: float = 900.0
+    #: Where the CLI runs. Empty means the user's home directory — anywhere but
+    #: the repository. The prompt is self-contained, so the reviewer needs no
+    #: filesystem access, and this containment holds without depending on a
+    #: sandbox flag's name.
+    working_dir: str = ""
+    #: Substrings that identify an exhausted allowance in a FAILED invocation.
+    #: Empty uses `codex.quota.DEFAULT_QUOTA_PATTERNS`. Overridable because the
+    #: real wording cannot be confirmed here and will change; every non-zero
+    #: exit logs its stderr tail so the first real exhaustion shows what to add.
+    quota_patterns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -92,6 +126,7 @@ class AutoloopConfig:
     #: at the two places that need a repo root (`cli.py`, `doctor.py`).
     validation_env_file: Path | None = None
     conversation: ConversationConfig = ConversationConfig()
+    codex: CodexConfig = CodexConfig()
     executor: ExecutorConfig = ExecutorConfig()
     audit: AuditConfig = AuditConfig()
 
@@ -186,7 +221,7 @@ class AutoloopConfig:
         return self.state_dir / "continuous_fingerprint.json"
 
 
-_SECTIONS = {"browser", "policy", "paths", "conversation", "executor", "audit"}
+_SECTIONS = {"browser", "policy", "paths", "conversation", "codex", "executor", "audit"}
 
 
 def _check_keys(section: str, data: dict, allowed: set[str]) -> None:
@@ -283,6 +318,19 @@ def load_config(path: Path) -> AutoloopConfig:
     _check_keys("conversation", conversation_data, conversation_fields)
     conversation = ConversationConfig(**conversation_data)
 
+    codex_data = dict(data.get("codex", {}))
+    _check_keys("codex", codex_data, {f.name for f in dataclasses.fields(CodexConfig)})
+    for key in ("command", "sandbox_args", "quota_patterns"):
+        if key not in codex_data:
+            continue
+        value = codex_data[key]
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ConfigError(f"codex.{key} must be a list of strings")
+        if key == "command" and not value:
+            raise ConfigError("codex.command must not be empty")
+        codex_data[key] = tuple(value)
+    codex = CodexConfig(**codex_data)
+
     executor_data = data.get("executor", {})
     _check_keys("executor", executor_data, {f.name for f in dataclasses.fields(ExecutorConfig)})
     executor = ExecutorConfig(**executor_data)
@@ -315,6 +363,7 @@ def load_config(path: Path) -> AutoloopConfig:
         workers_root=workers_root,
         validation_env_file=validation_env_file,
         conversation=conversation,
+        codex=codex,
         executor=executor,
         audit=audit,
     )

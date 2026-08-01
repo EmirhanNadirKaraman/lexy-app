@@ -59,6 +59,14 @@ if TYPE_CHECKING:
 # URL — and after it the request carries its own, so a later rotation cannot
 # retroactively re-point an old request at the new chat.
 #
+# NOT bumped for the provider-failover additions either
+# (`PendingRequest.provider`, `LastResponse.provider`,
+# `LoopState.active_provider` / `provider_switches` / `last_provider_switch`).
+# All defaulted, and the defaults are the truth rather than a guess: a session
+# written before this existed ran on whatever `conversation.provider` said and
+# had no way to switch, so "" (meaning "ask the config") and 0 describe it
+# exactly.
+#
 # NOT bumped for the "silent conversation" rotation entry condition either
 # (`PendingRequest.start_timeouts` / `start_timeout_wait_seconds`). Same
 # reasoning again: both are new fields with defaults of 0, and 0 is exactly
@@ -193,6 +201,12 @@ class PendingRequest:
     #: after a crash resumes from the same evidence the live run had, rather
     #: than downgrading to "unknown" and parking a human unnecessarily.
     last_send_outcome: str = ""
+    #: Which conversation provider this request was last SENT through. Recorded
+    #: because the reviewer grants authority: an approval carrying a `reviewed`
+    #: stamp must be attributable to the transport (and therefore the model)
+    #: that produced it. Empty on a request written before this field existed,
+    #: which is honest — those predate any possibility of a switch.
+    provider: str = ""
     #: Consecutive response-START timeouts (`ResponseTimeoutError` with
     #: `stage="start"`) observed for this request while `awaiting`, in the
     #: SAME conversation. Only ever incremented by
@@ -246,6 +260,11 @@ class LastResponse:
     #: awaiting phase happened to hold.
     conversation_url: str = ""
     conversation_epoch: int = 0
+    #: Which provider produced this reply, copied from the request it answers.
+    #: This is the field that makes "who authorized this commit" answerable
+    #: after a failover — without it the transcript says a directive was
+    #: reviewed but not by which reviewer.
+    provider: str = ""
 
 
 def _load_postcommit(raw: dict | None) -> PostcommitBinding | None:
@@ -286,6 +305,22 @@ def _load_last_response(raw: dict | None) -> LastResponse | None:
     data["postcommit"] = _load_postcommit(data.get("postcommit"))
     data["changeset"] = _load_changeset(data.get("changeset"))
     return LastResponse(**data)
+
+
+@dataclass
+class ProviderSwitch:
+    """One completed handover of the reviewer role to the fallback provider.
+
+    Written only after the switch is committed, so its presence means the
+    handover happened. Carries no credentials and no message text; `reason` is
+    a stable code (`quota_exhausted`), not free prose.
+    """
+
+    from_provider: str
+    to_provider: str
+    request_id: str
+    reason: str
+    at: str = field(default_factory=lambda: utcnow_iso())
 
 
 @dataclass
@@ -352,6 +387,19 @@ class LoopState:
     #: yet, and this record is what distinguishes that from an operator
     #: editing the config out from under a live session.
     last_rotation: dict | None = None
+    #: The conversation provider currently holding the reviewer role. Empty
+    #: means "whatever `conversation.provider` says" — the state only starts
+    #: carrying a value once something has reason to disagree with the config,
+    #: which is exactly a failover. Kept in state rather than read from config
+    #: on every step so a handover survives a restart: a run that switched
+    #: because Codex was spent must not quietly switch back on resume and
+    #: exhaust the same allowance again.
+    active_provider: str = ""
+    #: Completed provider handovers this run, checked against
+    #: `PolicyConfig.max_provider_switches` BEFORE each one.
+    provider_switches: int = 0
+    #: The most recent completed handover (`asdict` of a `ProviderSwitch`).
+    last_provider_switch: dict | None = None
     question: str | None = None
     resume_phase: str | None = None
     stop_reason: str | None = None

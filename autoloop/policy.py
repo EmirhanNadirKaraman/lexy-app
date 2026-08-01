@@ -67,6 +67,12 @@ class PolicyConfig:
     #: systemic outage would fan out a chat per iteration while looking like it
     #: is making progress.
     max_conversation_rotations: int = 1
+    #: How many times one run may hand the reviewer role to the configured
+    #: fallback provider after an exhausted allowance. One is the deliberate
+    #: default: the useful move is primary -> fallback, and switching back
+    #: would require a quota window to have reset, which does not happen inside
+    #: a single run.
+    max_provider_switches: int = 1
 
 
 # Whitelist, not blacklist: a git invocation is allowed only if its subcommand
@@ -433,6 +439,20 @@ class PolicyEngine:
                 "rotation_budget",
                 f"conversation rotation budget exhausted "
                 f"({self.config.max_conversation_rotations} per run)",
+            )
+        return Verdict.ok()
+
+    def check_provider_switch_budget(self, switches_used: int) -> Verdict:
+        """May this run hand the reviewer role to the fallback provider?
+
+        `>=` like `check_rotation_budget` and for the same reason: it asks
+        permission before the fact, rather than judging attempts already made.
+        """
+        if switches_used >= self.config.max_provider_switches:
+            return Verdict.deny(
+                "provider_switch_budget",
+                f"conversation provider-switch budget exhausted "
+                f"({self.config.max_provider_switches} per run)",
             )
         return Verdict.ok()
 

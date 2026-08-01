@@ -1419,6 +1419,86 @@ left, and whether `project_url` looks like a project.
 
 ---
 
+## 5d. Two reviewers: Codex primary, browser fallback
+
+Added 2026-08-01. The reviewer seat now has two occupants, and the default is
+the CLI.
+
+**Why Codex is primary.** Everything §5b and §5c describe is machinery for not
+knowing whether a message was delivered — a property of reading a DOM, not of
+the reviewer role. A subprocess returns an exit code. So `codex_cli` collapses
+the interface honestly: `submit` runs the CLI and stashes the reply, returning
+CONFIRMED or REJECTED and **never** UNCONFIRMED; `await_response` returns the
+stash; `reconcile` is authoritative because the transport is synchronous. It
+declares `idempotent_submit`, which is what tells the orchestrator that a failed
+send appended nothing to any durable conversation and can simply be re-issued —
+without it, every failed invocation would park a human on `submission_ambiguous`,
+a rule written for a shared chat thread that means nothing here.
+
+Rotation is unreachable rather than disabled: the adapter omits
+`retarget`/`current_url`, and every rotation trigger describes a browser
+conversation.
+
+**Why the browser stays.** Codex draws on your ChatGPT plan's **agentic**
+allowance (shared with ChatGPT Work and ChatGPT for Excel). Ordinary ChatGPT
+conversations draw on a **separate** quota. So the browser is not a second door
+onto the same budget — it genuinely still works once Codex is spent. That, and
+only that, is what makes automatic failover worth its complexity.
+
+**Failover is bounded, gated and recorded.** On `QuotaExhaustedError` the loop
+hands the reviewer role to `conversation.fallback_provider`:
+
+* Bounded by `policy.max_provider_switches` (default 1). The useful move is
+  primary → fallback; switching back would need a quota window to have reset,
+  which does not happen inside one run.
+* Gated on `state.last_response is None`. Quota can only bite while a request is
+  unanswered, but the guard is asserted rather than inferred from the phase
+  machine: a handover straddling an answered turn is the one shape that could
+  put two reviewers inside a single review round.
+* Recorded on the request and the response (`provider`), plus a
+  `ProviderSwitch` record and a `provider_switched` transcript entry. The
+  reviewer grants authority — an approval carrying a `reviewed` stamp must stay
+  attributable to the transport that produced it. A silent swap would leave the
+  audit trail saying a directive was reviewed with no answer to *by whom*.
+* State beats config afterwards (`active_provider`), so a resumed run does not
+  quietly return to the exhausted provider and spend the same allowance again.
+
+When the handover happens the request keeps its id and its bytes, but the
+exhausted transport's per-transport marks (`send_attempted`, `last_send_outcome`,
+`resends_used`) are cleared — the fallback has never seen this request, so those
+marks describe nothing here. Without that, `submitting` would park on
+`submission_ambiguous` and the failover would be dead on arrival.
+
+With no fallback configured, a fallback equal to the primary, no request in
+flight, or the budget spent, the loop parks `loop_fatal` and says which.
+
+**Quota detection is honest about what it cannot verify.** `codex/quota.py` is a
+pure function over `(returncode, stdout, stderr)` with an overridable pattern
+list, because the exact exhaustion wording could not be confirmed when this was
+written and will change. A `returncode == 0` is never exhaustion whatever the
+text says — OpenAI's documented behaviour is a soft stop, so a turn in flight
+finishes and that reply should be used. Every non-zero exit logs its return code
+and a bounded stderr tail, so the first real exhaustion shows exactly what to add
+to `codex.quota_patterns`. A missed pattern degrades to an ordinary failure:
+noisy, never unsafe — an unrecognised failure authorizes nothing, and re-running
+a stateless call cannot double-post.
+
+**The reviewer gets no repository access.** It runs with `cwd` outside the
+checkout. The prompt is self-contained (every turn carries its own CONTEXT block
+and the full contract), so the reviewer needs no filesystem at all, and
+containment that does not depend on a sandbox flag's name still holds when the
+flag is renamed. `codex.sandbox_args` is deliberately **empty** by default rather
+than carrying a guessed flag that would look like a control without being one;
+`doctor` warns while it is unset and fails if `working_dir` is inside the repo.
+
+**`doctor` probes both seats.** `primary_live` and `fallback_live` are separate
+checks. An unverified fallback is not a fallback: checking only the configured
+primary means the browser profile's login is first tested at the moment the
+allowance runs out. `smoke-browser` is pinned to `browser_chatgpt` for the same
+reason — exercising that transport is its whole purpose.
+
+---
+
 ## 6. Preflight: `doctor` and the live smoke test
 
 ```bash

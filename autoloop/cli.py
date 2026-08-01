@@ -328,6 +328,9 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         ),
         transcript=TranscriptLogger(config.transcript_file),
         client_factory=lambda: create_conversation(config.conversation.provider, config),
+        # Provider-aware factory: this is what makes a quota failover reachable.
+        # The zero-argument one above stays for callers that never switch.
+        provider_factory=lambda provider: create_conversation(provider, config),
         registry=registry,
         task_store=task_store,
         manifest_store=ManifestStore(config.manifests_dir),
@@ -1190,9 +1193,13 @@ def _cmd_smoke_browser(args: argparse.Namespace) -> int:
             git=GitGateway(Path.cwd(), policy),
             executor=_SmokeNeverExecutor(),
             transcript=TranscriptLogger(config.transcript_file),
-            client_factory=lambda: create_conversation(
-                smoke_config.conversation.provider, smoke_config
-            ),
+            # Pinned to the browser provider, NOT `conversation.provider`.
+            # Smoke-testing the browser transport is this command's entire
+            # purpose; reading the configured provider would silently stop
+            # exercising it the moment the primary became something else, and
+            # the browser is exactly the transport you need proven before you
+            # depend on it as a fallback.
+            client_factory=lambda: create_conversation("browser_chatgpt", smoke_config),
             registry=TaskRegistry(),
             task_store=TaskStore(config.smoke_dir / "tasks.json"),
             manifest_store=ManifestStore(config.smoke_dir / "manifests"),

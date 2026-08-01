@@ -37,6 +37,11 @@ max_consecutive_failures = 3
 # browser.project_url. A second rotation in one run usually means the fault is
 # not the chat, so the default stops and asks instead of fanning out chats.
 max_conversation_rotations = 1
+# How many times ONE run may hand the reviewer role to
+# conversation.fallback_provider after an exhausted allowance. One is enough:
+# the useful move is primary -> fallback, and switching back would need a quota
+# window to have reset, which does not happen inside a single run.
+max_provider_switches = 1
 max_parse_retries = 2
 max_policy_denials = 3
 allow_commit = true
@@ -49,11 +54,47 @@ allow_protected_push = false
 # Note: force pushes and destructive git commands (reset/clean/rebase/...)
 # cannot be enabled by ANY setting — the git whitelist has no knob for them.
 
+[codex]
+# The Codex CLI reviewer. Only read when a codex provider is selected above.
+# Codex signs in with your ChatGPT plan (`codex login`) — no API key.
+command = ["codex", "exec"]
+# Flags that confine the reviewer, e.g. a read-only sandbox. Left EMPTY on
+# purpose: the flag names could not be verified when this was written, and a
+# guessed value would look like a control without being one. `doctor` warns
+# while this is empty. Fill it in once you have checked `codex exec --help`.
+sandbox_args = []
+timeout_seconds = 900.0
+# Where the CLI runs. Empty = your home directory. Never point this at the
+# repository: the prompt is self-contained, so the reviewer needs no filesystem
+# access, and running outside the checkout is a containment that holds no
+# matter what the sandbox flags are called. `doctor` fails if it is inside.
+working_dir = ""
+# Substrings that mark an exhausted allowance in a FAILED invocation. Empty
+# uses the built-in list. Every non-zero exit logs its return code and a
+# stderr tail to the transcript, so the first real exhaustion shows you exactly
+# what to add here — it is a config edit, not a code change.
+quota_patterns = []
+
 [conversation]
-# Which LLMConversation adapter to use (see autoloop/conversation.py).
-# "browser_chatgpt" is the only built-in; future adapters (Claude.ai, Gemini)
+# Which LLMConversation adapter holds the reviewer role (see
+# autoloop/conversation.py). Built in: "codex_cli" (Codex CLI, one process per
+# turn — no DOM, so none of the browser transport's ambiguity machinery is even
+# reachable) and "browser_chatgpt" (Playwright over CDP). Further adapters
 # register here without orchestrator changes.
-provider = "browser_chatgpt"
+provider = "codex_cli"
+# Where the reviewer role goes when `provider` reports its allowance exhausted.
+# Empty disables failover and the loop parks instead.
+#
+# This pairing is worth the complexity for one specific reason: Codex draws on
+# your ChatGPT plan's AGENTIC allowance (shared with ChatGPT Work and ChatGPT
+# for Excel), while ordinary ChatGPT conversations draw on a SEPARATE quota. So
+# the browser genuinely still works after Codex is spent — two transports and
+# two budgets, not two doors onto the same one.
+#
+# The handover is bounded (policy.max_provider_switches), only happens with no
+# captured reply in flight, and is recorded on the request and the response, so
+# a `reviewed` stamp always says which reviewer produced it.
+fallback_provider = "browser_chatgpt"
 
 [executor]
 # "audit" = the real Phase-3 audit executor (read-only claude-CLI subagents,

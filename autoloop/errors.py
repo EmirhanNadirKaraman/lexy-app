@@ -91,6 +91,18 @@ class ResponseTimeoutError(BrowserError):
         super().__init__(message)
 
 
+class QuotaExhaustedError(AutoloopError):
+    """The reviewer's plan allowance is spent — an account condition, not a
+    transport fault.
+
+    Deliberately NOT a `BrowserError`: routing it through the ordinary failure
+    budget would burn `max_consecutive_failures` in seconds and land the loop in
+    `failed`, which describes neither the cause nor the remedy. It parks
+    explicitly, or hands over to the configured fallback provider, and says
+    which. Either provider may raise it — ChatGPT's web UI rate-limits too.
+    """
+
+
 class GitError(AutoloopError):
     """Base class for git-gateway failures."""
 

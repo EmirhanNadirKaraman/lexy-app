@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,6 +59,67 @@ _CHATGPT_URL = re.compile(
 _CHATGPT_PROJECT_URL = re.compile(
     r"^https://chatgpt\.com/g/[A-Za-z0-9_-]+(?:/project)?/?(?:[?#].*)?$"
 )
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    """True when `candidate` resolves inside `root`.
+
+    Resolves both sides first, so a symlink pointing into the checkout is
+    caught rather than passing a string comparison.
+    """
+    try:
+        Path(candidate).expanduser().resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _probe_live(add, name, provider_name, config, probes, cdp_ok, playwright_ok):
+    """Open one provider's conversation read-only and report what resolved.
+
+    Never submits. Skips rather than fails when a provider's prerequisites are
+    unavailable, so a missing codex binary does not mask a healthy browser (or
+    the reverse) — the point of probing both is to learn about each one
+    independently.
+    """
+    factory = probes.conversation_factory
+    if factory is None:
+        if provider_name == "browser_chatgpt" and not (cdp_ok and playwright_ok):
+            add(name, "skip", f"{provider_name}: skipped — CDP or playwright unavailable")
+            return
+
+        def factory():
+            return create_conversation(provider_name, config)
+
+    conversation = None
+    try:
+        conversation = factory()
+        # attach() navigates only if the page is elsewhere, then waits for the
+        # composer and checks login. It never types and never submits. For a
+        # CLI provider it is an honest no-op, so this reports reachability of
+        # the adapter, not of the binary — see the `codex_command` check.
+        conversation.attach()
+        messages = getattr(conversation, "messages", None)
+        if callable(messages):
+            count = len(messages())
+            add(
+                name,
+                "ok",
+                f"{provider_name}: logged in; conversation open; composer + "
+                f"message selectors resolve ({count} messages visible)",
+            )
+        else:
+            add(name, "ok", f"{provider_name}: constructed (no message probe exposed)")
+    except LoginExpiredError as exc:
+        add(name, "fail", f"{provider_name}: logged out: {exc}")
+    except (BrowserError, AutoloopError) as exc:
+        add(name, "fail", f"{provider_name}: {exc}")
+    finally:
+        if conversation is not None:
+            try:
+                conversation.close()
+            except Exception:
+                pass
 
 
 def _read_state_quietly(config: AutoloopConfig):
@@ -423,43 +485,74 @@ def run_doctor(
                 f"'{project_url}' does not look like https://chatgpt.com/g/<project>[/project]",
             )
 
-    # 14. live browser: login + conversation + selectors. Never submits.
-    factory = probes.conversation_factory
-    if factory is None:
-        if not (cdp_ok and playwright_ok):
-            add("browser_live", "skip", "skipped — CDP or playwright unavailable")
-            return results
-
-        def factory():
-            return create_conversation(provider, config)
-
-    conversation = None
-    try:
-        conversation = factory()
-        # attach() navigates only if the page is elsewhere, then waits for the
-        # composer and checks login. It never types and never submits.
-        conversation.attach()
-        messages = getattr(conversation, "messages", None)
-        if callable(messages):
-            count = len(messages())
+    # 13d. Codex reviewer, when either seat uses it. The live probe below
+    # constructs the adapter but cannot prove the binary works without spending
+    # quota, so what is checkable here is checked here: is it on PATH, and is
+    # it confined.
+    codex_seats = {provider, config.conversation.fallback_provider} & {"codex_cli"}
+    if codex_seats:
+        binary = config.codex.command[0] if config.codex.command else ""
+        found = shutil.which(binary) if binary else None
+        if found:
+            add("codex_command", "ok", f"{binary} -> {found}")
+        else:
             add(
-                "browser_live",
-                "ok",
-                f"logged in; conversation open; composer + message selectors "
-                f"resolve ({count} messages visible)",
+                "codex_command",
+                "fail",
+                f"'{binary}' is not on PATH — install the Codex CLI and sign in "
+                "with `codex login`, or change codex.command",
+            )
+        workdir = config.codex.working_dir or str(Path.home())
+        inside_repo = _is_within(Path(workdir), repo_root)
+        add(
+            "codex_workdir",
+            "fail" if inside_repo else "ok",
+            f"{workdir}"
+            + (
+                " — INSIDE the repository. The reviewer's prompt is "
+                "self-contained and it must not be able to read the checkout; "
+                "set codex.working_dir outside it."
+                if inside_repo
+                else " (outside the repository)"
+            ),
+        )
+        if not config.codex.sandbox_args:
+            add(
+                "codex_sandbox",
+                "warn",
+                "codex.sandbox_args is empty — the reviewer is confined only by "
+                "running outside the repository. Add the CLI's read-only "
+                "sandbox flags once you have confirmed their names.",
             )
         else:
-            add("browser_live", "ok", "conversation opened (provider exposes no message probe)")
-    except LoginExpiredError as exc:
-        add("browser_live", "fail", f"logged out: {exc}")
-    except (BrowserError, AutoloopError) as exc:
-        add("browser_live", "fail", str(exc))
-    finally:
-        if conversation is not None:
-            try:
-                conversation.close()
-            except Exception:
-                pass
+            add("codex_sandbox", "ok", " ".join(config.codex.sandbox_args))
+
+    # 14. live conversation checks: login + conversation + selectors. Never
+    # submits.
+    #
+    # BOTH providers are probed, not just the configured primary. An
+    # unverified fallback is not a fallback: with Codex primary, checking only
+    # `conversation.provider` means the browser profile's login is first tested
+    # at the moment the allowance runs out — the worst possible time to learn
+    # it expired three days ago.
+    fallback = config.conversation.fallback_provider
+    _probe_live(add, "primary_live", provider, config, probes, cdp_ok, playwright_ok)
+    if fallback and fallback != provider:
+        _probe_live(add, "fallback_live", fallback, config, probes, cdp_ok, playwright_ok)
+    elif fallback == provider and fallback:
+        add(
+            "fallback_live",
+            "warn",
+            f"conversation.fallback_provider is also '{provider}' — a quota "
+            "failover would have nowhere to go",
+        )
+    else:
+        add(
+            "fallback_live",
+            "warn",
+            "no conversation.fallback_provider configured — an exhausted "
+            "allowance parks the loop instead of handing over",
+        )
     return results
 
 
