@@ -113,6 +113,27 @@ runner, so "the same commands before and after" is observed rather than
 asserted twice against separate doubles. Verified to fail when the fix is
 reverted — it then records `[declared, ruff-check]`, which is the bug exactly.
 
+### B6. A repeating ENVIRONMENTAL validation failure burns the attempt budget
+rt-01 consumed five attempts on 2026-07-31. Rounds 1–3 (20:34, 20:46, 20:59)
+failed **identically**: `validation failed after implementation — ruff check .:
+PASS; python3 -m pytest -n auto -q: FAIL`. The agent implemented the task
+correctly every time (the quarantined worker for attempt 5 still holds a
+modified `routers/books.py`, a new `test_books_import_admin.py` and the doc
+updates); validation failed because the worker had no database credentials,
+which is environmental and could not be fixed by retrying.
+
+Each failure left the worker dirty, so the next round quarantined it as
+"residual uncommitted state from a prior attempt" and started over — correct
+per M1 finding #3, but it means the loop redid the same work three times and
+spent three of its attempts on a condition no amount of retrying could clear.
+
+The blocker taxonomy already distinguishes `task_fatal` from `loop_fatal`, but
+a validation failure is always charged to the task. **Fix:** when N
+consecutive rounds fail with a byte-identical validation summary, stop
+retrying and park as environmental — a retry that cannot change its own
+outcome is not a retry. The credential cause is fixed (§4g), so this is about
+the next environmental failure, not this one.
+
 ### B5. Fail-closed check for unmapped blocker codes
 Three times now a new `loop_fatal` code shipped without a
 `_RESOLUTION_PRECONDITIONS` entry, meaning an environmental blocker could be
