@@ -7,7 +7,7 @@
                                                                (read-only, no lock)
     python -m autoloop answer <blocker-id> "<text>"
     python -m autoloop smoke-browser [--config PATH]
-    python -m autoloop pause | resume | unlock | reset --yes
+    python -m autoloop pause | resume | unlock | reset --yes [--tasks]
     python -m autoloop reprovision-publisher --confirm
     python -m autoloop review-changeset --base <sha> --candidate <sha> [--packet FILE]
 
@@ -357,9 +357,48 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
     )
 
 
+def _reset_run_scoped_budgets(config: AutoloopConfig) -> None:
+    """Start every run with the budgets that are documented as per-run.
+
+    `state.rotations` is checked against `policy.max_conversation_rotations`,
+    described everywhere as "per run" — but it lives in the state file, which
+    outlives the process. So it was really per SESSION, and one transport
+    failure (a dropped network, a browser that died mid-navigation) spent the
+    budget permanently: every later `run --retry` re-read the same count and
+    parked with the same reason. The escapes the park message offered were
+    both wrong — raise a policy cap for a rotation that was never needed, or
+    `reset`, which used to take the task registry with it.
+
+    Resetting here rather than in `_build_orchestrator` is load-bearing:
+    `_run_continuous` rebuilds the orchestrator on EVERY iteration
+    (`cli.py`'s while loop), so resetting there would refill the budget
+    between rotations and remove the cap entirely. This runs once per
+    process, which is what "per run" has always claimed to mean.
+
+    A rotation still costs its budget the moment it is attempted, and a
+    failed attempt is still not refunded — within one run the cap is exactly
+    as strict as before. What changes is that a deliberate operator restart,
+    like `--retry` itself, is treated as a new run.
+    """
+    store, state = _load_state(config)
+    if state is None or not state.rotations:
+        return
+    spent = state.rotations
+    state.rotations = 0
+    store.save(state)
+    TranscriptLogger(config.transcript_file).append(
+        "rotation_budget_reset",
+        data={
+            "rotations_spent_in_previous_run": spent,
+            "note": "per-run budget; a new run starts fresh",
+        },
+    )
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     with LoopLock(config.state_dir):
+        _reset_run_scoped_budgets(config)
         if getattr(args, "continuous", False):
             _validate_continuous_args(args)
             return _run_continuous(args, config)
@@ -1335,20 +1374,40 @@ def _cmd_resume(args: argparse.Namespace) -> int:
 
 
 def _cmd_reset(args: argparse.Namespace) -> int:
+    """Archive the SESSION. The roadmap survives unless asked for explicitly.
+
+    `reset` used to archive `tasks.json` alongside the state, unprompted. The
+    two have nothing to do with each other: the session is one conversation
+    and its in-flight request, while the registry is the accumulated roadmap
+    — imported audit findings, operator-set priorities, quarantine decisions.
+    Reaching for `reset` to clear a wedged session therefore discarded work
+    that had no bearing on the problem, and the only sign was one line of
+    output after it had already happened.
+
+    `--tasks` is the opt-in for the rare case that genuinely means it. Both
+    archives are moves, not deletions, so a mistake is recoverable from the
+    printed `.bak-<stamp>` path either way.
+    """
     config = load_config(args.config)
     if not args.yes:
-        print("reset archives the current session state; pass --yes to confirm")
+        target = "the current session state and the TASK REGISTRY" if args.tasks else (
+            "the current session state (the task registry is kept — pass --tasks "
+            "to archive it too)"
+        )
+        print(f"reset archives {target}; pass --yes to confirm")
         return 1
+    stores = [("state", StateStore(config.state_file))]
+    if args.tasks:
+        stores.append(("tasks", TaskStore(config.tasks_file)))
     with LoopLock(config.state_dir):
-        for label, store in (
-            ("state", StateStore(config.state_file)),
-            ("tasks", TaskStore(config.tasks_file)),
-        ):
+        for label, store in stores:
             backup = store.archive()
             if backup is None:
                 print(f"no {label} to reset")
             else:
                 print(f"{label} archived to {backup}")
+    if not args.tasks:
+        print("task registry kept (--tasks archives it too)")
     print("transcript, manifests and audit runs kept as-is")
     return 0
 
@@ -1497,9 +1556,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dash.set_defaults(func=_cmd_dashboard)
 
-    reset = sub.add_parser("reset", help="archive the session state")
+    reset = sub.add_parser(
+        "reset", help="archive the session state (keeps the task registry)"
+    )
     add_config(reset)
     reset.add_argument("--yes", action="store_true")
+    reset.add_argument(
+        "--tasks",
+        action="store_true",
+        help="ALSO archive the task registry (the roadmap: imported findings, "
+        "priorities, quarantine decisions). Off by default — a wedged session "
+        "is not a reason to discard the roadmap.",
+    )
     reset.set_defaults(func=_cmd_reset)
 
     reprovision = sub.add_parser(

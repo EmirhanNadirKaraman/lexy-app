@@ -975,12 +975,18 @@ class Orchestrator:
             self._park_rotation(
                 req,
                 "rotation_cap_reached",
-                f"the conversation is unusable and {verdict.reason}. `run --retry` "
-                "alone will not clear this — it will park here again with the same "
-                "reason. A second rotation in one run usually means the fault is "
-                "not the chat, so inspect the project first; raise "
-                "policy.max_conversation_rotations only if you have established "
-                "otherwise.",
+                f"this run could not reach the conversation and {verdict.reason}. "
+                "The budget is per RUN: starting a new run (`run --retry`, or "
+                "`run --continuous` again) begins with a fresh one, so if the "
+                "cause was transport — a dropped network, a browser that died "
+                "mid-navigation — fix that and start a new run. A spent rotation "
+                "is NOT evidence the chat itself is broken; open the conversation "
+                "by hand before concluding it is. Raise "
+                "policy.max_conversation_rotations only to allow more rotations "
+                "WITHIN one run, which is rarely the actual problem. If a new run "
+                "reaches the chat but no reply ever starts, check whether the "
+                "request was ever posted — the loop resumes into `awaiting` and "
+                "will wait for a response to a message that never landed.",
             )
             return
 

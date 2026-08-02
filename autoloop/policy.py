@@ -438,7 +438,10 @@ class PolicyEngine:
     def check_rotation_budget(self, rotations_used: int) -> Verdict:
         """May this run abandon a wedged conversation for a fresh one?
 
-        `rotations_used` is how many rotations this run has ALREADY performed,
+        `rotations_used` is how many rotations this run has ALREADY performed
+        — genuinely this run: `cli._reset_run_scoped_budgets` zeroes it once
+        per process, so the cap bounds autonomous churn WITHIN a run and a
+        deliberate operator restart begins with a fresh budget.
         so the check is `>=`, not `>` like the other budgets: those count
         attempts that have happened and ask whether to keep going, this one
         asks permission before the fact.

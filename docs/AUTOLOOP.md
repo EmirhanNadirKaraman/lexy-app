@@ -1520,6 +1520,20 @@ abandon the chat for a fresh one in the configured project:
   choose. Unset means the loop parks instead of rotating.
 * `policy.max_conversation_rotations` (default **1**) caps it per run. A second
   rotation in one run usually means the fault is not the chat.
+* **"Per run" means per process**, and it took a real incident to make that
+  true. `state.rotations` lives in the state file, which outlives the process,
+  so the budget was really per *session*: a dropped network on 2026-08-02 spent
+  the one rotation, and every later `run --retry` re-read the same count and
+  parked with the same reason. Neither escape the park message offered was
+  right — raise a policy cap for a rotation that was never needed, or `reset`,
+  which back then also took the task registry. `cli._reset_run_scoped_budgets`
+  now zeroes it once per process, logging `rotation_budget_reset` with the
+  forgiven count so genuine churn stays visible.
+  The reset lives in `_cmd_run`, **not** `_build_orchestrator`: `_run_continuous`
+  rebuilds the orchestrator every iteration, so resetting there would refill the
+  budget between rotations and delete the cap. Within one run the cap is exactly
+  as strict as before — a rotation still costs its budget the moment it is
+  attempted, and a failed attempt is still not refunded.
 * `ConversationUnusableError` is deliberately narrow: the page demonstrably
   reached the conversation URL, is not an auth page, and still has no composer
   (or shows an explicit unavailable marker). A page that never loaded, a dropped
@@ -1975,6 +1989,15 @@ continues until `stop`/`ask_user`/budget.
 Ongoing control: `status`, `tasks`, `next-task`, `pause`/`resume`,
 `run --answer "..."`, `run --retry`, `run --resubmit` (§5b), `reset --yes`,
 `unlock`. `run --null-executor` dry-runs the loop without executing anything.
+
+**`reset --yes` archives the SESSION only; the task registry survives.** It
+used to archive `tasks.json` too, unprompted. The two are unrelated — a session
+is one conversation plus its in-flight request, while the registry is the
+accumulated roadmap (imported audit findings, operator-set priorities,
+quarantine decisions) — so reaching for `reset` to clear a wedged conversation
+discarded work that had no bearing on the wedge, announced by one line of
+output after the fact. `--tasks` is the opt-in for the rare case that means it.
+Both are moves to a printed `.bak-<stamp>` path, never deletions.
 
 ### 9a. Continuous mode
 

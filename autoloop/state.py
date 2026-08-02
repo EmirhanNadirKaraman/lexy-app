@@ -394,8 +394,13 @@ class LoopState:
     #: Current conversation generation. Requests are stamped with it, so a
     #: response captured under an older epoch can be recognised and ignored.
     conversation_epoch: int = 0
-    #: Completed rotations this run. Checked against
-    #: `PolicyConfig.max_conversation_rotations` BEFORE each rotation.
+    #: Completed rotations THIS RUN. Checked against
+    #: `PolicyConfig.max_conversation_rotations` BEFORE each rotation, and
+    #: zeroed once per process by `cli._reset_run_scoped_budgets`. It lives
+    #: in the state file only so a crash mid-rotation cannot refund the
+    #: budget it already spent — not to accumulate across runs. Before that
+    #: reset existed the field was really per-SESSION, so a single dropped
+    #: network spent it permanently and no `run --retry` could recover.
     rotations: int = 0
     #: The most recent completed rotation, as a plain dict (`asdict` of a
     #: `RotationRecord`). Read by the CLI's config-drift guard: after a

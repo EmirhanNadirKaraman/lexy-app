@@ -580,6 +580,47 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### `the conversation is unusable and conversation rotation budget exhausted (1 per run)` — and `run --retry` never clears it
+**Symptom:** the loop parks `loop_fatal` with `rotation_cap_reached`. Every
+`run --retry` parks again with the identical message, quoting the same stale
+error. Opening the conversation URL by hand works fine.
+**Cause:** two separate things, and the message named neither.
+1. `state.rotations` is checked against a cap described everywhere as "per
+   run", but it lives in the state file, which outlives the process — so it
+   was really per *session*. One transport failure (a dropped network, a
+   browser that died mid-navigation) spent it permanently.
+2. The park text blamed the chat and suggested raising
+   `policy.max_conversation_rotations`. Both wrong: the chat was fine, and no
+   rotation was needed at all.
+**How to tell what actually happened:** read the transcript, not the park
+message — `python3 -c "…"` over `.autoloop/transcript.jsonl`, last ~10 rows.
+In the 2026-08-02 incident the fresh error was `no assistant response to
+alr-…-0004 began within 120.0s`, i.e. the loop was **waiting for a reply to a
+request that was never posted** (confirmed by reading the conversation: it
+contained only `-0002`). `--retry` resumes into `awaiting`, so it waits another
+120 s and parks forever.
+**Fix:** applied repo-side — `cli._reset_run_scoped_budgets` zeroes the budget
+once per process, and the park message now says so and warns about the
+never-posted-request case. **Do not move that reset into `_build_orchestrator`**:
+`_run_continuous` rebuilds the orchestrator every iteration, so it would refill
+the budget between rotations and remove the cap entirely.
+**If you are stuck on a build that predates the fix:** archive the session
+state ONLY — `StateStore(config.state_file).archive()` — and start a new run.
+Do **not** use `reset --yes` on such a build; see the next entry.
+
+### `reset --yes` silently archived the whole task registry
+**Symptom:** you ran `reset --yes` to clear a wedged session and the roadmap
+came back with only the seed task. Imported audit findings, operator-set
+priorities and quarantine decisions all gone.
+**Cause:** `_cmd_reset` archived `tasks.json` alongside `state.json`,
+unprompted, announced by one line of output after it had already happened. The
+confirmation prompt said "archives the current session state" and did not
+mention the registry at all.
+**Fix:** applied repo-side — the default now archives the session only and
+prints `task registry kept`; `--tasks` is the opt-in. **Recovery either way:**
+both are moves, never deletions. `ls .autoloop/tasks.json.bak-*` and rename the
+newest back into place.
+
 ### `refusing to remove a LIVE lock (pid=… )` from `unlock`, after a reboot
 **Symptom:** the machine was restarted (or power-cut) while `run --continuous`
 was going. `python -m autoloop run` reports the state dir is locked; the
