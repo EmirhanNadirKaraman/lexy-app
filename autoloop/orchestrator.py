@@ -1795,6 +1795,10 @@ class Orchestrator:
         declared_validation_cwd = "" if is_audit else (task.validation_cwd or "")
 
         execution = self._execution_store.load(task.id)
+        if execution is not None and self._worker_repos is not None:
+            execution = self._rebase_execution_if_stale(execution, task)
+            if execution is None:
+                return          # parked; _rebase_execution_if_stale explained why
         if execution is None:
             # First dispatch for this task: base sha is recorded BEFORE any
             # implementation work starts, from the MAIN checkout's HEAD (the
@@ -3111,6 +3115,82 @@ class Orchestrator:
         exhaust it again.
         """
         return self.state.active_provider or self._config.conversation.provider
+
+    def _rebase_execution_if_stale(self, execution: TaskExecution, task: Task):
+        """Re-point a retry at the CURRENT branch head when its pinned base has
+        been left behind (docs/AUTOLOOP_TODO.md B9).
+
+        task_base_sha is recorded once, at first dispatch. Without this, a task
+        that failed for a reason since FIXED on the branch rebuilds its worker
+        at the old base and fails identically -- forever. Observed 2026-08-02:
+        audit-0001 was refused for two failing tests, those tests were fixed one
+        commit later, and the retry failed with the same two because its base
+        predated the fix. The tell was the worker suite reporting 929 passed
+        against the checkout's 931.
+
+        Returns the execution to use, or None when it parked instead.
+
+        Two cases, deliberately different:
+
+        * Nothing reviewed yet (review_round == 0) -- re-base. The worker is
+          QUARANTINED rather than deleted, so a refused candidate stays on disk
+          as evidence, and attempt_count is PRESERVED: a moving base must not
+          silently refill the retry budget, or a task could churn forever by
+          re-basing.
+        * A review already happened -- refuse, naming both shas. Discarding a
+          candidate a reviewer has seen is not a decision to make quietly.
+        """
+        head = self._git.head_sha()
+        base = execution.task_base_sha
+        if not base or base == head:
+            return execution
+        # Strictly BEHIND the branch, not merely different: a base that is not
+        # an ancestor means something unusual (a rewritten branch), and
+        # silently re-pointing that is worse than stopping.
+        if not self._git.is_descendant(head, base):
+            return execution
+
+        if execution.review_round > 0:
+            self._to_needs_user(
+                f"task {task.id}: its recorded base {base[:12]} is behind the "
+                f"branch head {head[:12]}, but a review round has already run "
+                f"against candidate {(execution.candidate_sha or '(none)')[:12]}. "
+                "Re-basing would discard work a reviewer has already seen, so "
+                "nothing was changed. Either publish or abandon that candidate, "
+                f"or archive .autoloop/executions/{task.id}.json to start fresh "
+                "at the current head.",
+                kind="task_fatal",
+                code="task_base_behind_head",
+                task_id=task.id,
+                detail=f"base={base} head={head} review_round={execution.review_round}",
+            )
+            return None
+
+        stamp = utcnow_iso().replace(":", "").replace("-", "")
+        try:
+            quarantined = self._worker_repos.quarantine(
+                task.id, f"stalebase-{base[:12]}-{stamp}"
+            )
+        except (GitError, OSError):
+            quarantined = None      # nothing on disk yet; recreation is enough
+        repo = self._worker_repos.create(task.id, self._git.repo_root, head)
+        execution.task_base_sha = head
+        execution.task_branch = repo.branch
+        execution.worktree_path = str(repo.path)
+        execution.candidate_sha = ""      # belonged to the old base
+        execution.candidate_commit_count = 0
+        self._execution_store.save(execution)
+        self._log(
+            "execution_rebased",
+            data={
+                "task_id": task.id,
+                "old_base": base,
+                "new_base": head,
+                "quarantined": str(quarantined) if quarantined else None,
+                "attempt_count": execution.attempt_count,
+            },
+        )
+        return execution
 
     def _drain_task_inbox(self) -> None:
         """Merge any operator-submitted task requests into the registry.
