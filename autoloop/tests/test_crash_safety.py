@@ -5,6 +5,7 @@ a lock whose pid was reassigned by a reboot, a state file whose rename
 outlived its data, and a SIGTERM that skipped the release.
 """
 
+import contextlib
 import json
 import os
 import signal
@@ -219,19 +220,63 @@ def _spawn_holder(state_dir: Path) -> subprocess.Popen:
     return proc
 
 
+@contextlib.contextmanager
+def holder(state_dir: Path):
+    """A lock-holding subprocess that is always reaped.
+
+    Without the `finally`, a test that fails leaves a child holding a lock
+    and sleeping for a minute — which then competes for CPU with everything
+    after it. A flaky test that leaks processes makes its neighbours flaky
+    too, which is the harder failure to trace back.
+    """
+    proc = _spawn_holder(state_dir)
+    try:
+        yield proc
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:  # pragma: no cover - kill is reliable
+            pass
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+
+def _await_lock_release(lock_path: Path, timeout: float = 60.0) -> bool:
+    """Poll for the lock to disappear.
+
+    Deliberately NOT `proc.wait(timeout=...)` followed by an instant check.
+    That asserts something stricter than the guarantee: it requires the whole
+    interpreter to have finished shutting down by a fixed deadline, and on a
+    loaded machine it does not. Caught by this suite's own flake hunt —
+    `proc.wait(timeout=30)` raised TimeoutExpired inside a full-suite run
+    while passing 25/25 in isolation, and it refused three of the loop's
+    commits before it was tracked down.
+
+    The property under test is that the lock is RELEASED, and the release
+    happens before the process exits, so polling the artefact tests the real
+    behaviour with no timing assumption about interpreter teardown.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not lock_path.exists():
+            return True
+        time.sleep(0.05)
+    return not lock_path.exists()
+
+
 @pytest.mark.parametrize("signame", ["SIGTERM", "SIGHUP"])
 def test_termination_signal_releases_the_lock(tmp_path, signame):
     """Without a handler, Python's default action for both signals is to die
     without unwinding — so the ordinary way to stop a run left a lock that
     the next start refused to take."""
-    proc = _spawn_holder(tmp_path)
     lock_path = tmp_path / "LOCK"
-    assert lock_path.exists()
+    with holder(tmp_path) as proc:
+        assert lock_path.exists()
+        proc.send_signal(getattr(signal, signame))
+        assert _await_lock_release(lock_path), f"{signame} left a lock behind"
 
-    proc.send_signal(getattr(signal, signame))
-    proc.wait(timeout=30)
-
-    assert not lock_path.exists(), f"{signame} left a lock behind"
     # And the next run can start without operator recovery.
     with LoopLock(tmp_path):
         pass
@@ -292,18 +337,18 @@ def test_lock_is_released_before_unwinding_not_by_it(tmp_path):
 
 
 def test_sigint_release_is_unchanged(tmp_path):
-    proc = _spawn_holder(tmp_path)
-    proc.send_signal(signal.SIGINT)
-    proc.wait(timeout=30)
-    assert not (tmp_path / "LOCK").exists()
+    lock_path = tmp_path / "LOCK"
+    with holder(tmp_path) as proc:
+        proc.send_signal(signal.SIGINT)
+        assert _await_lock_release(lock_path), "SIGINT left a lock behind"
 
 
 def test_sigkill_still_leaves_a_lock_that_recovery_can_clear(tmp_path):
     """No handler can run for SIGKILL — the honest guarantee is that what it
     leaves behind is recoverable, not that it leaves nothing."""
-    proc = _spawn_holder(tmp_path)
-    proc.kill()
-    proc.wait(timeout=30)
+    with holder(tmp_path) as proc:
+        proc.kill()
+        proc.wait(timeout=30)
 
     lock_path = tmp_path / "LOCK"
     assert lock_path.exists()

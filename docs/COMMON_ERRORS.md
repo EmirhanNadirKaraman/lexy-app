@@ -580,6 +580,30 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### An autoloop commit is refused by a test that passes when you re-run it
+**Symptom:** post-commit validation refuses a commit with exactly one failing
+test out of ~1000. Re-running the identical worker tree passes. Happened three
+times before it was tracked down.
+**Cause:** `test_crash_safety.py::test_sigint_release_is_unchanged` asserted
+`proc.wait(timeout=30)` — that a signalled child had fully exited within a
+fixed deadline. On a loaded machine (validation runs while six agents work) it
+does not. The lock code was never at fault.
+**Why it resisted diagnosis:** it passed 25/25 in isolation and 12/12 as a
+whole file. It only failed inside a full-suite run, so any hunt that narrowed
+to the file first found nothing.
+**Fix:** applied repo-side — the signal tests poll for the LOCK FILE to
+disappear (`_await_lock_release`) instead of timing interpreter teardown. The
+release happens before the process exits, so polling the artefact tests the
+real property with no timing assumption. Both mutations (handler that does not
+release; no handler installed) still fail, so the test kept its teeth.
+Subprocess holders now also go through a `holder()` context manager that always
+reaps the child: **a test that leaks a sleeping process makes its NEIGHBOURS
+flaky**, which is the harder failure to trace.
+**Hunting a flake like this:** run the full suite in a loop under CPU load and
+capture with `--color=no`. pytest's `FAILED` lines begin with an ANSI escape,
+so `grep '^FAILED'` silently matches nothing — the same trap that made the
+validation gate report a count with no name.
+
 ### A commit was REFUSED at post-commit review and the blocker does not say which test failed
 **Symptom:** a blocker reads `post-commit validation failed: ... pytest ...:
 FAIL (1 failed, 992 passed, 1 skipped)` — a count and nothing else, often
