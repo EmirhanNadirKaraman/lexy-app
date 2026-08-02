@@ -244,3 +244,39 @@ def test_check_only_never_launches_the_loop(wired, monkeypatch, capsys):
     assert cli._cmd_start(_args(check_only=False)) == 0
     assert len(launched) == 1
     assert launched[0].continuous is True
+
+
+# --- a failed audit must not take the loop down ------------------------------
+
+
+def test_a_synthetic_audit_unit_is_registered_so_it_can_be_quarantined(config):
+    """Audit units are minted per run and never planned, so `block` refused
+    them as task_unknown and `_handle_parked_task` escalated the park to
+    loop_fatal — every audit that failed its own post-commit validation
+    stopped the whole loop. Observed 2026-08-02 with `audit-0003`, refused on
+    a flaky test."""
+    from autoloop.tasks import TaskRegistry
+
+    registry = TaskRegistry([])
+    cli._register_synthetic_audit_unit(registry, "audit-0003")
+
+    assert registry.has("audit-0003")
+    registry.block("audit-0003", "failed its own validation")  # must not raise
+    assert registry.get("audit-0003").status == "blocked"
+
+
+def test_registering_is_narrow_and_idempotent(config):
+    """Only minted audit ids, only when unknown. A real planned task that
+    `block` refuses must still escalate exactly as before."""
+    from autoloop.tasks import Task, TaskRegistry
+
+    registry = TaskRegistry([Task(id="real-1", title="t", description="d")])
+
+    for not_an_audit in ("real-1", "audit", "audit-x", "auditing-0001", "t-0001"):
+        cli._register_synthetic_audit_unit(registry, not_an_audit)
+    assert {t.id for t in registry.all_tasks()} == {"real-1"}
+
+    cli._register_synthetic_audit_unit(registry, "audit-0007")
+    registry.block("audit-0007", "first")
+    cli._register_synthetic_audit_unit(registry, "audit-0007")  # already known
+    assert registry.get("audit-0007").status == "blocked"

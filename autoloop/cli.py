@@ -39,6 +39,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import re
 import os
 import subprocess
 import sys
@@ -593,6 +594,46 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
         time.sleep(CONTINUOUS_POLL_SECONDS)
 
 
+#: Ids minted by `Orchestrator._resolve_audit_task` (`audit-<iteration>`).
+_AUDIT_UNIT_RE = re.compile(r"^audit-\d{4,}$")
+
+
+def _register_synthetic_audit_unit(registry: TaskRegistry, task_id: str) -> None:
+    """Make an audit unit quarantinable by adding it to the registry first.
+
+    Audit units are minted per run (`audit-<iteration>`, see
+    `Orchestrator._resolve_audit_task`), never planned, so the registry has
+    normally never heard of one. `TaskRegistry.block` then refuses it as
+    `task_unknown`, and `_handle_parked_task`'s fail-closed branch escalates
+    the park to loop_fatal — which meant EVERY audit that failed its own
+    post-commit validation stopped the whole loop, when the intent was to
+    quarantine that one unit and carry on. Observed 2026-08-02: `audit-0003`
+    was refused on a flaky test and took continuous mode down with it.
+
+    Registering it makes the quarantine real and durable, which a second
+    mechanism depends on: `_audit_unit_quarantined` reads the registry to
+    decide whether re-minting the same id would re-dispatch a dead unit. If
+    the block never lands, that guard sees nothing and the churn it exists to
+    stop comes back.
+
+    Deliberately narrow — only ids that match a minted audit unit, and only
+    when the registry does not already know one. A real planned task that
+    `block` refuses still escalates exactly as before.
+    """
+    if not _AUDIT_UNIT_RE.match(task_id) or registry.has(task_id):
+        return
+    registry.add(
+        Task(
+            id=task_id,
+            title="repository audit",
+            description=(
+                "synthetic audit unit, registered so its failed round can be "
+                "quarantined rather than stopping the loop"
+            ),
+        )
+    )
+
+
 def _handle_parked_task(
     config: AutoloopConfig,
     store: StateStore,
@@ -625,6 +666,7 @@ def _handle_parked_task(
     """
     if state.park_kind == "task_fatal" and state.park_task_id:
         reason = state.question or "(no reason recorded)"
+        _register_synthetic_audit_unit(registry, state.park_task_id)
         try:
             registry.block(state.park_task_id, reason)
         except TaskGraphError as exc:
