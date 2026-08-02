@@ -29,13 +29,19 @@ TASKS_SCHEMA_VERSION = 1
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
-#: A single path SEGMENT (between '/'s) for `Task.approved_paths` — v1 is
-#: deliberately restrictive: no glob metacharacters (`*?[]{}`), no
-#: whitespace, no leading '-' (a flag-injection habit elsewhere in this
-#: package). This is checked per-segment, not on the whole string, so a
-#: multi-directory path like `lexy-app/backend/routers/books.py` is built
-#: from segments this regex accepts individually.
-_APPROVED_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+#: A single path SEGMENT (between '/'s) for `Task.approved_paths`: no glob
+#: metacharacters (`*?[]{}`), no whitespace, and no leading '-' (a
+#: flag-injection habit elsewhere in this package). Checked per-segment, not on
+#: the whole string, so `lexy-app/backend/routers/books.py` is built from
+#: segments this regex accepts individually.
+#:
+#: A leading '.' or '_' IS allowed. The original pattern required an
+#: alphanumeric first character, which made ordinary repository files
+#: unrepresentable — `lexy-app/backend/tests/_auth_helper.py` and `.gitignore`
+#: were both refused while the error message claimed '_' was legal. That is a
+#: scope-authoring failure, not a safety property: '.' and '..' segments are
+#: refused separately below, which is the check that actually matters.
+_APPROVED_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")
 
 
 def _validate_approved_path(path: object) -> None:
@@ -67,7 +73,10 @@ def _validate_approved_path(path: object) -> None:
         raise TaskGraphError(
             "bad_approved_path", f"approved path {path!r} must use '/' separators, not '\\\\'"
         )
-    segments = path.split("/")
+    # A trailing '/' marks a DIRECTORY PREFIX ("everything under here").
+    # Stripped before segment checks so the empty final segment it produces is
+    # not mistaken for the '//' case refused below.
+    segments = path.rstrip("/").split("/")
     if any(seg in ("", ".", "..") for seg in segments):
         raise TaskGraphError(
             "bad_approved_path",
@@ -82,6 +91,34 @@ def _validate_approved_path(path: object) -> None:
                 "[A-Za-z0-9._-] is allowed (no globs, no whitespace, no leading '-')",
             )
 
+
+
+def is_directory_prefix(approved: str) -> bool:
+    """A trailing '/' means "this directory and everything under it"."""
+    return approved.endswith("/")
+
+
+def unauthorized_paths(changed, approved) -> set[str]:
+    """Which of `changed` no entry in `approved` authorizes.
+
+    THE single matcher, used by both the pre-commit gate and the post-commit
+    ownership check. Two implementations would drift, and a drift here means a
+    path refused before the commit but accepted after (or worse, the reverse) —
+    the same reasoning as `effective_approved_paths`.
+
+    An entry is either an exact repository-relative file path, or a directory
+    prefix ending in '/'. Prefix matching is on SEGMENT boundaries, which the
+    trailing slash gives for free: `lexy-app/backend/routers/` authorizes
+    `.../routers/books.py` but never `.../routers_backup/secret.py`. Exact
+    entries never match by prefix, so naming a file authorizes that file alone.
+    """
+    exact = {a for a in approved if not is_directory_prefix(a)}
+    prefixes = tuple(a for a in approved if is_directory_prefix(a))
+    return {
+        path
+        for path in changed
+        if path not in exact and not any(path.startswith(pre) for pre in prefixes)
+    }
 
 class TaskState(str, Enum):
     READY = "ready"            # pending, all dependencies completed

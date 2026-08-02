@@ -179,7 +179,13 @@ from .state import (
     utcnow_iso,
 )
 from .inbox import apply_requests
-from .tasks import Task, TaskRegistry, TaskStore, effective_approved_paths
+from .tasks import (
+    Task,
+    TaskRegistry,
+    TaskStore,
+    effective_approved_paths,
+    unauthorized_paths,
+)
 from .transcript import TranscriptLogger
 from .validation import run_validation_commands
 from .worktask import (
@@ -2064,8 +2070,8 @@ class Orchestrator:
             # compares against `execution.allowed_paths`. Using the raw field
             # here refused a tracker edit before the commit while the later
             # check would have allowed it — two gates, two answers.
-            outside = set(outcome.changed_paths) - set(
-                effective_approved_paths(task.approved_paths)
+            outside = unauthorized_paths(
+                outcome.changed_paths, effective_approved_paths(task.approved_paths)
             )
             if outside:
                 self._to_needs_user(
@@ -2417,7 +2423,10 @@ class Orchestrator:
         touched = worktree_git.commit_range_paths(execution.task_base_sha, candidate)
         if not touched:
             failures.append("commit range is empty — nothing was actually committed")
-        outside = touched - set(execution.allowed_paths)
+        # Same matcher as the pre-commit gate, so a directory prefix means the
+        # same thing at both ends. Set subtraction here would have refused
+        # after the commit what was accepted before it.
+        outside = unauthorized_paths(touched, execution.allowed_paths)
         if outside:
             failures.append(
                 "commit touched path(s) outside what the task was allowed to "

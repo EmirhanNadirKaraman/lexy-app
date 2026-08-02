@@ -1083,6 +1083,46 @@ default 100 sorts last, ties break on id so selection stays deterministic.
 operator has to be able to steer a running loop, and under insertion order a
 task added later could never overtake one already queued however urgent.
 
+## 4f-quater. Directory prefixes in `approved_paths`
+
+Scope was exact paths only, and authoring it became the loop's main source of
+friction: rt-01 was refused twice for files it genuinely had to touch, and every
+imported audit task arrived unscoped. The answer is to relax how scope is
+EXPRESSED, not what is enforced.
+
+An entry is now either an exact repository-relative file, or a **directory
+prefix ending in `/`**:
+
+    approved_paths = [
+      "lexy-app/backend/routers/",          # this directory and everything under it
+      "docs/SECURITY.md",                   # this file, and only this file
+    ]
+
+Matching is on segment boundaries, which the trailing slash gives for free:
+`lexy-app/backend/routers/` authorizes `.../routers/books.py` but never
+`.../routers_backup/secret.py`. An exact entry never matches by prefix, so
+naming a file authorizes that file alone.
+
+`tasks.unauthorized_paths` is the single matcher, used by BOTH the pre-commit
+gate and the post-commit ownership check. Two implementations would drift, and
+a drift means a path refused before the commit but accepted after — the same
+reasoning as `effective_approved_paths`, and the same bug that was caught
+there when only three of four call sites were updated.
+
+**What did not change.** Everything a prefix must survive: no `..`, no glob
+metacharacters, no whitespace, no leading `-`, nothing absolute or
+home-relative. The executor's own report still never defines its own
+authorization (`docs/SECURITY.md` finding #2). A prefix is broader than a file,
+so it is worth choosing the narrowest one that covers the work — but it is
+still a scope the OPERATOR declared up front and the reviewer sees in the
+packet.
+
+Also fixed here: the segment pattern required an alphanumeric first character,
+which made ordinary files unrepresentable — `tests/_auth_helper.py` and
+`.gitignore` were both refused while the error text claimed `_` was legal.
+A leading `.` or `_` is now accepted; `.` and `..` segments are refused
+separately, which is the check that actually matters.
+
 ## 4g. The validation-environment boundary (test DB credentials)
 
 **The problem.** A task may declare validation that needs a database — `rt-01`
