@@ -1555,6 +1555,83 @@ def _cmd_start(args: argparse.Namespace) -> int:
     return _cmd_run(args)
 
 
+def _cmd_release(args: argparse.Namespace) -> int:
+    """Return a task stranded IN-PROGRESS to pending, and clear its worker.
+
+    A `loop_fatal` park mid-round leaves the task marked in-progress with
+    nothing to finish it, so it is never picked again. Both halves are
+    needed: the STATUS keeps it out of `next_ready`, and the stale WORKER
+    REPO would make the next dispatch refuse, since `create()` will not
+    write into an existing directory. Fixing only the status swaps one dead
+    end for another.
+
+    The worker is MOVED to quarantine, never deleted — an interrupted round
+    usually has real work in it (`dash-02` had a half-finished dashboard
+    change), and the operator may want to read it.
+    """
+    config = load_config(args.config)
+    with LoopLock(config.state_dir):
+        task_store, registry = _load_tasks(config)
+        try:
+            task = registry.release(args.task_id)
+        except TaskGraphError as exc:
+            print(f"error: {exc}")
+            return 1
+        task_store.save(registry)
+        print(f"task {task.id} released: in_progress -> pending")
+
+        worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+        if worker_repos.path_for(args.task_id).exists():
+            moved = worker_repos.quarantine(args.task_id, "released-by-operator")
+            print(f"worker repo moved to {moved} (kept, not deleted — it may hold work)")
+        else:
+            print("no worker repo to clear")
+    return 0
+
+
+def _cmd_archive_blocker(args: argparse.Namespace) -> int:
+    """Close a blocker whose session is gone, recording a machine reason.
+
+    Some blockers cannot be answered at all — `checkout_escape_detected`
+    refuses every answer by design, because a text reply would fabricate
+    exactly the human confirmation it exists to demand. Its own message says
+    to archive the session instead. But archiving the session left the
+    blocker RECORD open, `start` refuses to run with an open blocker, and
+    nothing on the CLI could close it: the only way out was to call
+    `BlockerStore.archive_stale` from a Python one-liner. Hit for real on
+    2026-08-02.
+
+    Not a backdoor for answering. It writes `archived_reason`, never
+    `answer`, and it REFUSES a blocker belonging to the session that is
+    still live — otherwise it would become the "clear the escape detection"
+    button that `_RESOLUTION_PRECONDITIONS` deliberately withholds.
+    """
+    config = load_config(args.config)
+    store = BlockerStore(config.blockers_dir)
+    blocker = store.load(args.blocker_id)
+    if blocker is None:
+        print(f"error: no blocker with id {args.blocker_id!r}")
+        return 1
+
+    _, state = _load_state(config)
+    if state is not None and blocker.session_id and blocker.session_id == state.session_id:
+        print(
+            f"error: blocker {blocker.id} belongs to the CURRENT session "
+            f"({state.session_id}), which is still live. Archiving is for a "
+            "blocker whose session has been retired — resolve it, or archive "
+            "the session first (`reset --yes` keeps the task registry)."
+        )
+        return 1
+    try:
+        archived = store.archive_stale(args.blocker_id, args.reason)
+    except StateError as exc:
+        print(f"error: {exc}")
+        return 1
+    print(f"blocker {archived.id} archived at {archived.resolved_at}")
+    print("recorded as a machine reason, NOT as an operator answer")
+    return 0
+
+
 def _cmd_pause(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     config.pause_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1671,6 +1748,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.set_defaults(func=_cmd_run)
+
+    release = sub.add_parser(
+        "release",
+        help=(
+            "return a task stranded IN-PROGRESS by an interrupted round to "
+            "pending, and move its stale worker repo to quarantine"
+        ),
+    )
+    add_config(release)
+    release.add_argument("task_id")
+    release.set_defaults(func=_cmd_release)
+
+    archive_blocker = sub.add_parser(
+        "archive-blocker",
+        help=(
+            "close a blocker whose session has been retired, recording a "
+            "machine reason (never an operator answer)"
+        ),
+    )
+    add_config(archive_blocker)
+    archive_blocker.add_argument("blocker_id")
+    archive_blocker.add_argument(
+        "--reason",
+        required=True,
+        help="why this blocker is dead — required, so an archival is never a silent delete",
+    )
+    archive_blocker.set_defaults(func=_cmd_archive_blocker)
 
     start = sub.add_parser(
         "start",

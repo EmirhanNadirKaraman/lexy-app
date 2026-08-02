@@ -365,6 +365,37 @@ class TaskRegistry:
         task.blocked_reason = ""
         return task
 
+    def release(self, task_id: str) -> Task:
+        """Return an IN-PROGRESS task to pending, so it can be picked again.
+
+        A task is marked in-progress at dispatch and cleared when the round
+        finishes. A `loop_fatal` park in between finishes nothing, so the
+        task stays in-progress forever: `state_of` reports IN_PROGRESS,
+        `next_ready` skips it, and no command could move it. `unblock` is not
+        that command — it refuses anything that is not `blocked`, correctly,
+        since a quarantine and an interrupted round are different situations
+        with different evidence behind them.
+
+        Observed 2026-08-02: `dash-02` was interrupted mid-round by an escape
+        detection whose cause turned out to be operator activity, and the
+        only way to get it back was to edit `tasks.json` by hand.
+
+        Narrow on purpose. Refuses a task that is not in progress, so it
+        cannot quietly un-complete finished work or launder a quarantine
+        (`blocked` still goes through `unblock`, which is what the blocker
+        record is tied to).
+        """
+        task = self.get(task_id)
+        if self.state_of(task_id) is not TaskState.IN_PROGRESS:
+            raise TaskGraphError(
+                "task_not_in_progress",
+                f"task '{task_id}' is not in progress (status {task.status!r}) — "
+                "`release` only returns an interrupted round to pending; use "
+                "`unblock` for a quarantined task",
+            )
+        task.status = "pending"
+        return task
+
     # ---- lookup -------------------------------------------------------------
 
     def get(self, task_id: str) -> Task:

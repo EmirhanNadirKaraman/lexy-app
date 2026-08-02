@@ -126,6 +126,34 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   unparseable or timezone-naive, the pid probe decides exactly as before —
   the check can only ever make MORE locks recoverable, never fewer.
 
+### 3c. Two recovery commands for interrupted work
+
+```bash
+python -m autoloop release <task-id>                     # in-progress -> pending
+python -m autoloop archive-blocker <id> --reason "..."   # close a dead blocker
+```
+
+**`release`** returns a task stranded IN-PROGRESS to pending. A task is marked
+in-progress at dispatch and cleared when the round finishes; a `loop_fatal`
+park in between finishes nothing, so `state_of` reports IN_PROGRESS,
+`next_ready` skips it forever, and no command could move it — `unblock`
+correctly refuses anything that is not `blocked`. It clears both halves: the
+status AND the stale worker repo, which would otherwise make the next dispatch
+refuse. The worker is moved to quarantine, never deleted, because an
+interrupted round usually holds real work.
+
+**`archive-blocker`** closes a blocker whose session has been retired. Some
+blockers cannot be answered at all — `checkout_escape_detected` refuses every
+answer by design, since a text reply would fabricate exactly the human
+confirmation it exists to demand, and its message says to archive the session
+instead. But that left the blocker RECORD open, `start` refuses to run with an
+open blocker, and nothing on the CLI could close it. It writes
+`archived_reason`, never `answer`, and it REFUSES a blocker belonging to the
+session that is still live — otherwise it would become the "clear the escape
+detection" button the precondition table deliberately withholds.
+
+---
+
 ### 3b. `start` — the one command to come back to
 
 ```bash
