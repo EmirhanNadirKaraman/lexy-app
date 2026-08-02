@@ -606,9 +606,12 @@ leaves `.autoloop/LOCK` behind and the next `run` refuses to start.
 `KeyboardInterrupt`, which unwinds and runs `LoopLock`'s context-manager exit.
 Python's default action for **SIGTERM and SIGHUP is to die without running
 `finally`**, so the orderly-looking ways to stop skipped the release entirely.
-**Fix:** applied repo-side — `cli._release_lock_on_termination` installs
-handlers for both. The release happens **inside the handler**, before
-unwinding, and that placement is load-bearing: a SIGTERM mid-fan-out unwinds
+**Fix:** applied repo-side — `LoopLock.acquire` installs handlers for both and
+`release` restores them, so **every** lock holder gets it (`run` is the long
+one, but `smoke-browser` drives a browser and `review-changeset` waits on a
+reviewer; a per-command wrapper would only cover whichever ones somebody
+remembered). The release happens **inside the handler**, before unwinding, and
+that placement is load-bearing: a SIGTERM mid-fan-out unwinds
 into `ThreadPoolExecutor.shutdown(wait=True)`, which waits on agents that run
 for minutes, while a shutdown's grace period is seconds. A version that only
 raised `SystemExit` and let the `with` block release looks identical in a quick

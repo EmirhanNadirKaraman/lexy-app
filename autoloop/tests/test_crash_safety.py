@@ -193,12 +193,11 @@ def test_state_save_leaves_no_temp_file_behind(tmp_path):
 SIGNAL_RUN_SCRIPT = """
 import sys, time
 sys.path.insert(0, {repo_root!r})
-from autoloop.cli import _release_lock_on_termination
 from autoloop.lock import LoopLock
 
 lock = LoopLock({state_dir!r})
 try:
-    with lock, _release_lock_on_termination(lock):
+    with lock:
         print("HELD", flush=True)
         time.sleep(60)
 except SystemExit as exc:
@@ -247,11 +246,9 @@ def test_termination_signal_releases_the_lock(tmp_path, signame):
 BLOCKED_CLEANUP_SCRIPT = """
 import sys, time
 sys.path.insert(0, {repo_root!r})
-from autoloop.cli import _release_lock_on_termination
 from autoloop.lock import LoopLock
 
-lock = LoopLock({state_dir!r})
-with lock, _release_lock_on_termination(lock):
+with LoopLock({state_dir!r}):
     try:
         print("HELD", flush=True)
         time.sleep(120)

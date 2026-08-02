@@ -138,6 +138,12 @@ arriving mid-fan-out unwinds into `ThreadPoolExecutor.shutdown(wait=True)`,
 which waits on agents that run for minutes, and a shutdown's grace period
 is seconds. Child agents are deliberately left to exit on their own.
 
+This lives on `LoopLock` (installed by `acquire`, restored by `release`),
+not at one call site, so it covers every holder listed above rather than
+whichever ones a wrapper was remembered on — `smoke-browser` drives a real
+browser and `review-changeset` waits on a reviewer, both long enough to be
+running when a machine goes down.
+
 What each way of stopping costs:
 
 | How it stops | Lock | State | In-flight work |

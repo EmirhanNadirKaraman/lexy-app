@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -135,6 +136,7 @@ class LoopLock:
         self.path = self.state_dir / LOCK_FILENAME
         self.run_id = uuid.uuid4().hex
         self._owned = False
+        self._prev_handlers: list[tuple[int, object]] = []
 
     # ---- inspection ---------------------------------------------------------
 
@@ -176,6 +178,48 @@ class LoopLock:
 
     # ---- lifecycle ----------------------------------------------------------
 
+    # ---- termination handling ----------------------------------------------
+    #
+    # Ctrl-C already unwinds cleanly: KeyboardInterrupt runs `__exit__`.
+    # Python's default action for SIGTERM and SIGHUP is to die WITHOUT running
+    # `finally`, so the orderly-looking ways to stop (a shutdown, a logout,
+    # plain `kill`) were the ones that left a lock behind. This lives on the
+    # lock rather than at one call site because every holder needs it — `run`
+    # is the long one, but `smoke-browser` drives a real browser and
+    # `review-changeset` waits on a reviewer, and a per-command wrapper would
+    # protect whichever ones somebody remembered.
+    #
+    # The release happens INSIDE the handler, before unwinding, and that is
+    # the point rather than a detail: a SIGTERM mid-fan-out unwinds into
+    # `ThreadPoolExecutor.shutdown(wait=True)`, which waits on agents that run
+    # for minutes, while a shutdown's grace period is seconds. Nothing else is
+    # written here — state is consistent at every instant (atomic saves), and
+    # touching the pause flag would silently gag the NEXT run.
+
+    def _install_termination_handlers(self) -> None:
+        def _terminate(signum, _frame):
+            self.release()
+            raise SystemExit(128 + signum)
+
+        for name in ("SIGTERM", "SIGHUP"):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                self._prev_handlers.append((signum, signal.signal(signum, _terminate)))
+            except ValueError:
+                # Not the main thread (embedded or test use). The caller's own
+                # cleanup still applies; we simply cannot add to it here.
+                pass
+
+    def _restore_termination_handlers(self) -> None:
+        while self._prev_handlers:
+            signum, previous = self._prev_handlers.pop()
+            try:
+                signal.signal(signum, previous)
+            except ValueError:
+                pass
+
     def acquire(self) -> "LoopLock":
         self.state_dir.mkdir(parents=True, exist_ok=True)
         info = LockInfo(
@@ -208,6 +252,7 @@ class LoopLock:
         finally:
             os.close(fd)
         self._owned = True
+        self._install_termination_handlers()
         return self
 
     def release(self) -> None:
@@ -220,6 +265,7 @@ class LoopLock:
             except FileNotFoundError:
                 pass
         self._owned = False
+        self._restore_termination_handlers()
 
     def __enter__(self) -> "LoopLock":
         return self.acquire()
