@@ -50,7 +50,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Worktrees / task execution | `worktree.py` (`WorktreeManager`, unused in production — see §4c), `worktask.py` (`TaskExecution`, `CommitIntent`, `reconcile_after_crash`) | Per-task worktree/branch bookkeeping, and the crash-safe commit-intent/candidate-sha bookkeeping for produce-then-review (see §4b). |
 | Review packet | `packet.py` | Renders the post-commit review packet from immutable git objects (see §4b). |
 | Worker/publisher separation | `worker_env.py` (`worker_env`, `WorkerRepoManager`, `verify_worker_isolation`), `publisher.py` (`Publisher`, `provision_publisher_repo`, `reprovision_publisher`) | Autoloop M2 (see §4c): a scrubbed environment + no-remote repo for worker-side git access — this is what production `_build_orchestrator` actually uses, not `WorktreeManager` — and a dedicated, hooks-controlled repository that is the only path through which a candidate commit is published, with a provision-time URL snapshot (§4d). |
-| Conversation | `conversation.py` (interface/registry), `browser/chatgpt.py` (`BrowserChatGPT`), `browser/playwright_session.py` (CDP, lazy), `browser/selectors.py` | One persistent reviewer conversation; duplicate/stale/streaming/login guards; provider-pluggable. |
+| Conversation | `conversation.py` (interface/registry), `browser/chatgpt.py` (`BrowserChatGPT`), `browser/playwright_session.py` (CDP, lazy, **one driver per process** — see below), `browser/selectors.py` | One persistent reviewer conversation; duplicate/stale/streaming/login guards; provider-pluggable. |
 | Contract | `contract.py` | Response contract **v3** + strict parser + `verify_review`. |
 | Policy | `policy.py` | Deterministic gates: git whitelist (`add -A` and force pushes structurally impossible), task-reference checks, **phase gate**, budgets. |
 | Tasks | `tasks.py` | Task registry/graph (derived ready/blocked, cycles rejected, atomic persistence). `seed_tasks.json` (git-tracked, alongside `tasks.py`) seeds a fresh registry with `rt-01` when `.autoloop/tasks.json` does not exist yet (§9b). `block`/`unblock` quarantine a task after a `task_fatal` park (§9c) via a dedicated `blocked` status/`TaskState.BLOCKED_BY_OPERATOR`, distinct from the dependency-derived `blocked` state. |
@@ -1544,6 +1544,25 @@ abandon the chat for a fresh one in the configured project:
 * Never rotates for: generation already started, a slow answer, a single or
   merely occasional response-start timeout, login expiry, rate limits,
   capacity, a malformed reply, or a policy denial.
+
+**One Playwright driver per process.** `sync_playwright().start()` raises
+"Playwright Sync API inside the asyncio loop" when another driver is already
+RUNNING in the thread — the sync API drives an event loop of its own, so a
+second start lands inside the first. Stop-then-start is fine; alive-then-start
+is not. That made a *leaked* driver fatal rather than merely wasteful, and
+leaking one was easy: `PlaywrightSession.close()` swallowed a failed `stop()`,
+and `Orchestrator._drop_client` swallows a failed `close()` and drops the
+reference regardless — so tearing down a session whose connection had already
+broken (what happens after any browser error) left a live driver with nothing
+pointing at it, and the next `connect()` killed the process. It presented as a
+browser fault, but restarting Chrome never helped.
+
+`playwright_session._driver()` now holds one driver for the process, started
+lazily and never stopped; `close()` drops only the CDP connection. Closing a
+CDP-connected browser leaves the human's Chrome running (same pid, CDP still
+answering — verified). Sharing the driver makes the failure unreachable
+regardless of which teardown path forgets what, rather than depending on all
+of them being correct.
 
 **A silent conversation — send confirmed, model never starts — is the third
 trigger.** Added 2026-07-31, after this exact shape recurred three times: the

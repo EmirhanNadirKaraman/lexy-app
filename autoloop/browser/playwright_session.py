@@ -8,6 +8,10 @@ with a dedicated, already-logged-in profile:
 It never launches a browser, never touches the login flow, and never sees
 credentials. `close()` only disconnects — the user's browser stays open.
 
+The Playwright driver itself is a per-process singleton (`_driver`): starting
+a second one while the first is alive is a hard error, so sessions share one
+and `close()` drops only the CDP connection.
+
 It also deliberately exposes no cookie/storage accessor, so no code path
 (diagnostics included) can capture authentication material.
 
@@ -30,11 +34,47 @@ from ..errors import BrowserError, SessionLostError
 from .observation import SendObservation, is_send_path, scrub_path
 
 
+#: The one Playwright driver for this process, started lazily and never
+#: stopped while the process lives. See `_driver` for why it is a singleton.
+_DRIVER = None
+
+
+def _driver():
+    """The process's single Playwright driver.
+
+    `sync_playwright().start()` raises "Playwright Sync API inside the asyncio
+    loop" if another driver is ALREADY RUNNING in this thread — the sync API
+    drives an event loop of its own, so a second start lands inside the first
+    one. Stop-then-start is fine; alive-then-start is not. (Verified both ways
+    against a live Chrome before this was written.)
+
+    That made a leaked driver fatal rather than merely wasteful, and leaking
+    one was easy: `close()` swallowed a failed `stop()`, and
+    `Orchestrator._drop_client` swallows a failed `close()` and drops the
+    reference regardless. So tearing down a session whose connection had
+    already broken — exactly what happens after a browser error — could leave
+    a live driver with nothing pointing at it, and the next `connect()` would
+    take the whole loop down with it. Reusing one driver makes that
+    unreachable no matter who forgets to close what, instead of relying on
+    every teardown path being perfect.
+
+    Never stopped: a `stop()` here would strand every session still holding a
+    browser off this driver, and the process is about to exit anyway.
+    """
+    global _DRIVER
+    if _DRIVER is None:
+        from playwright.sync_api import sync_playwright
+
+        _DRIVER = sync_playwright().start()
+    return _DRIVER
+
+
 class PlaywrightSession:
-    def __init__(self, page, playwright, error_cls):
+    def __init__(self, page, playwright, error_cls, browser=None):
         self._page = page
         self._playwright = playwright
         self._error_cls = error_cls
+        self._browser = browser
         self._observations: list[SendObservation] = []
         self._listening = False
 
@@ -42,17 +82,17 @@ class PlaywrightSession:
     def connect(cls, cdp_url: str, match_url_substring: str = "chatgpt.com") -> "PlaywrightSession":
         try:
             from playwright.sync_api import Error as PlaywrightError
-            from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise BrowserError(
                 "playwright is not installed — run: pip install -r autoloop/requirements.txt "
                 "&& playwright install chromium"
             ) from exc
-        pw = sync_playwright().start()
+        pw = _driver()
         try:
             browser = pw.chromium.connect_over_cdp(cdp_url)
         except PlaywrightError as exc:
-            pw.stop()
+            # Deliberately NOT stopping the driver: it is shared, and a failed
+            # connect is the case most likely to be retried.
             raise SessionLostError(
                 f"cannot connect to Chrome DevTools at {cdp_url} — is the dedicated "
                 f"profile running with --remote-debugging-port? ({exc})"
@@ -65,7 +105,7 @@ class PlaywrightSession:
                 break
         if page is None:
             page = context.new_page()
-        return cls(page, pw, PlaywrightError)
+        return cls(page, pw, PlaywrightError, browser)
 
     def _call(self, fn):
         try:
@@ -190,7 +230,19 @@ class PlaywrightSession:
         return observations
 
     def close(self) -> None:
+        """Drop THIS session's CDP connection. The driver stays up.
+
+        Stopping the shared driver here would break every other session and
+        make the next `connect()` start a second one — the failure this class
+        exists to avoid. Closing a CDP-connected browser only ends the
+        connection: the human's Chrome keeps running, verified against a live
+        profile (same pid, CDP still answering, afterwards).
+        """
+        if self._browser is None:
+            return
         try:
-            self._playwright.stop()
+            self._browser.close()
         except Exception:
             pass
+        finally:
+            self._browser = None

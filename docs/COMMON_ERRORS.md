@@ -580,6 +580,32 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### `Error: It looks like you are using Playwright Sync API inside the asyncio loop.` — `run --continuous` dies after a park
+**Symptom:** the loop runs fine, parks or hits a browser error, prepares the
+next request, and the whole process dies with this traceback ending at
+`playwright_session.py` → `sync_playwright().start()`. Deterministic: it
+happens on the SECOND browser client the process builds.
+**Cause:** not asyncio in autoloop — there is none. Playwright's sync API
+drives an event loop of its own, and `sync_playwright().start()` refuses when
+another driver is **already running in the thread**. Stop-then-start is fine;
+alive-then-start is not (both verified against a live Chrome). So a *leaked*
+driver was fatal, and leaking one was easy: `PlaywrightSession.close()`
+swallowed a failed `stop()`, and `Orchestrator._drop_client` swallows a failed
+`close()` and drops the reference anyway. Tearing down a session whose
+connection had already broken — precisely what happens after a browser error —
+left a live driver with nothing pointing at it, and the next `connect()` took
+the loop down.
+**Why it reads as a browser problem:** it is not. Restarting Chrome does not
+help, the CDP endpoint is healthy, and the conversation loads by hand.
+**Fix:** applied repo-side — `playwright_session._driver()` holds ONE driver
+per process, started lazily and never stopped, and `close()` drops only the
+CDP connection (`browser.close()`, which leaves the human's Chrome running:
+same pid, CDP still answering). **Do not "tidy" `close()` back into stopping
+the driver** — that recreates the bug for every session that follows.
+**Reproducing it, if you need to:** start a driver, connect, then call
+`sync_playwright().start()` again WITHOUT stopping the first. A probe that
+stops before starting will not reproduce it and will mislead you.
+
 ### `the conversation is unusable and conversation rotation budget exhausted (1 per run)` — and `run --retry` never clears it
 **Symptom:** the loop parks `loop_fatal` with `rotation_cap_reached`. Every
 `run --retry` parks again with the identical message, quoting the same stale
