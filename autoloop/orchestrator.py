@@ -353,7 +353,13 @@ class Orchestrator:
         """Run until a terminal phase, a pause request, or max_steps."""
         steps = 0
         while True:
-            if self._config.pause_file.exists():
+            # BOTH locations: the flag moved outside the checkout (see
+            # `AutoloopConfig.pause_file`), and one written by an older
+            # build must still stop the loop rather than be ignored.
+            if (
+                self._config.pause_file.exists()
+                or self._config.legacy_pause_file.exists()
+            ):
                 self._log("paused")
                 return "paused"
             # Between steps, never inside one. The inbox lives outside the

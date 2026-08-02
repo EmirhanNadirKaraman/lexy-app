@@ -541,7 +541,7 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
     """
     blocker_store = BlockerStore(config.blockers_dir)
     while True:
-        if config.pause_file.exists():
+        if pause_requested(config):
             print("paused")
             return 0
         store, state = _load_state(config)
@@ -825,7 +825,7 @@ def _summary(config: AutoloopConfig, state: LoopState, registry: TaskRegistry) -
         f"provider     {config.conversation.provider}",
         f"executor     {config.executor.kind}",
         f"roadmap      {registry.summary()}",
-        f"paused flag  {'yes' if config.pause_file.exists() else 'no'}",
+        f"paused flag  {'yes' if pause_requested(config) else 'no'}",
         f"open blockers{_open_blocker_count_display(config)}",
     ]
     if state.last_decision:
@@ -1524,8 +1524,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
         print(line)
         ok = ok and healthy
 
-    if config.pause_file.exists():
-        config.pause_file.unlink()
+    if clear_pause(config):
         print("pause        flag cleared (start is an explicit request to run)")
     else:
         print("pause        not set")
@@ -1632,6 +1631,27 @@ def _cmd_archive_blocker(args: argparse.Namespace) -> int:
     return 0
 
 
+def pause_requested(config: AutoloopConfig) -> bool:
+    """Is a pause in effect? Reads BOTH locations.
+
+    `pause_file` moved outside the checkout (see its docstring), but a flag
+    written by an older build sits at `legacy_pause_file`. Ignoring that one
+    would leave the operator with a loop that keeps running after they asked
+    it to stop — the failure mode a pause flag exists to prevent.
+    """
+    return config.pause_file.exists() or config.legacy_pause_file.exists()
+
+
+def clear_pause(config: AutoloopConfig) -> bool:
+    """Remove the flag from both locations. True if either existed."""
+    cleared = False
+    for path in (config.pause_file, config.legacy_pause_file):
+        if path.exists():
+            path.unlink()
+            cleared = True
+    return cleared
+
+
 def _cmd_pause(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     config.pause_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1645,8 +1665,7 @@ def _cmd_pause(args: argparse.Namespace) -> int:
 
 def _cmd_resume(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    if config.pause_file.exists():
-        config.pause_file.unlink()
+    if clear_pause(config):
         print("pause flag cleared")
     args.kickoff = None
     args.kickoff_audit = False

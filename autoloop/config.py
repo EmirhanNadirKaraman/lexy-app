@@ -173,6 +173,39 @@ class AutoloopConfig:
 
     @property
     def pause_file(self) -> Path:
+        """The pause flag, deliberately OUTSIDE the checkout.
+
+        It used to live at `state_dir / "PAUSE"`, and `state_dir` is inside
+        the tree `escape_detector` snapshots around every write-capable agent
+        call — it enumerates ignored paths on purpose, since `.autoloop/` is
+        gitignored in production and an agent forging state there is exactly
+        what the detector exists to catch. So running `pause` while a task
+        was dispatched created a file the detector then reported as an escape,
+        and parked the loop `loop_fatal`. The documented way to stop the loop
+        broke it.
+
+        Placed beside `workers_root` for the same reason `inbox.inbox_dir_for`
+        is: that path is already required to be absolute and outside the
+        checkout, its `.git`, the state dir and the publisher paths
+        (`worker_env.validate_workers_root`). Operator-writable things belong
+        outside the snapshotted tree — the inbox learned this first.
+
+        Exempting the path inside the detector was the alternative and is
+        worse: it would carve a permanent hole in a security-shaped check so
+        that one operator convenience can write into the watched tree.
+        """
+        if self.workers_root is not None:
+            return Path(self.workers_root).expanduser().parent / "PAUSE"
+        return self.state_dir / "PAUSE"
+
+    @property
+    def legacy_pause_file(self) -> Path:
+        """The pre-2026-08-02 location, still honoured on read.
+
+        A flag left here by an older build must not be silently ignored:
+        the operator asked for a pause and would otherwise get a loop that
+        keeps running. Read from both, write only to `pause_file`, clear both.
+        """
         return self.state_dir / "PAUSE"
 
     # ---- produce-then-review collaborators (Autoloop v1 CLI wiring) --------

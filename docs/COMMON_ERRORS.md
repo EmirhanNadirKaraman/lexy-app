@@ -623,6 +623,28 @@ message does not reach the summary.
 passes, the refusal was a flake; the commit is untouched on its branch, since
 this gateway cannot reset or roll back.
 
+### `autoloop pause` parks the loop with `checkout_escape_detected`
+**Symptom:** you run `python -m autoloop pause` while a task is running, and
+instead of stopping cleanly the loop parks `loop_fatal` with
+`created outside the worker repo: .autoloop/PAUSE (file)`. The supported way to
+stop the loop breaks it.
+**Cause:** the pause flag lived at `state_dir/PAUSE`, i.e. INSIDE the tree
+`escape_detector` snapshots around every write-capable agent call. That
+enumeration deliberately covers ignored paths — `.autoloop/` is gitignored in
+production, and an agent forging `state.json` or a blocker record there is
+precisely what the detector exists to catch — so it cannot distinguish the
+operator's pause file from an agent's write.
+**Fix:** applied repo-side — the flag moved beside `workers_root`, outside the
+checkout, the same placement and the same reasoning as `inbox.inbox_dir_for`.
+Operator-writable things belong outside the snapshotted tree. **Not** fixed by
+exempting the path inside the detector: that would carve a permanent hole in a
+security-shaped check for one convenience. A flag left at the old location by
+an older build is still honoured on read and cleared by `resume`.
+**If you hit it on an older build:** the detection is real but harmless here —
+inspect the reported paths, confirm `.autoloop/PAUSE` is the only one, then
+archive the session (`reset --yes` keeps the task registry) and close the
+record with `archive-blocker <id> --reason "..."`.
+
 ### The loop runs forever without progressing — same `audit` decision, same park, every cycle
 **Symptom:** `run --continuous` is alive and healthy (no crash, no blocker you
 can act on), but the transcript repeats one cycle: `directive {"decision":
