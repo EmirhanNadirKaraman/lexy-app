@@ -187,6 +187,39 @@ def test_a_parked_session_is_reported_never_auto_answered(wired, capsys):
     assert StateStore(wired.state_file).load().phase == Phase.NEEDS_USER.value
 
 
+def test_a_task_fatal_park_with_no_blocker_does_not_stop_start(wired, capsys):
+    """Not every park needs a human. `_handle_parked_task` quarantines a
+    task_fatal park's task and keeps going on the rest of the roadmap — that
+    is the task_fatal/loop_fatal split. Refusing on every `needs_user` would
+    send the operator off to resolve something the loop handles itself."""
+    StateStore(wired.state_file).save(
+        _a_state(
+            phase=Phase.NEEDS_USER.value,
+            park_kind="task_fatal",
+            question="task t-9 failed its own validation",
+        )
+    )
+
+    assert cli._cmd_start(_args()) == 0
+
+    out = capsys.readouterr().out
+    assert "quarantines that task and continues" in out
+    assert "all clear" in out
+
+
+def test_a_loop_fatal_park_still_stops_start(wired, capsys):
+    StateStore(wired.state_file).save(
+        _a_state(
+            phase=Phase.NEEDS_USER.value,
+            park_kind="loop_fatal",
+            question="the conversation is unusable",
+        )
+    )
+
+    assert cli._cmd_start(_args()) == 2
+    assert "PARKED at needs_user" in capsys.readouterr().out
+
+
 def test_a_failed_session_is_reported_with_its_recovery(wired, capsys):
     StateStore(wired.state_file).save(_a_state(phase=Phase.FAILED.value))
 

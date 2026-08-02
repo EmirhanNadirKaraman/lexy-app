@@ -1422,10 +1422,24 @@ def _report_blockers_and_phase(config) -> tuple[list[str], bool]:
         return lines, ok
     phase = Phase(state.phase)
     if phase is Phase.NEEDS_USER:
-        ok = False
-        lines.append("session      PARKED at needs_user — continuous mode will stop immediately")
-        lines.append(f"               {(state.question or '(no question recorded)')[:160]}")
-        lines.append('               resolve: python -m autoloop run --answer "..."  (or --retry)')
+        # Not every park needs a human. `_handle_parked_task` quarantines a
+        # `task_fatal` park's task and keeps going on the rest of the roadmap
+        # — that is the whole point of the task_fatal/loop_fatal split. Only
+        # a loop_fatal park (or an unresolved question) actually stops
+        # continuous mode, so refusing on every `needs_user` would send you
+        # off to resolve something the loop was about to handle itself.
+        if state.park_kind == "task_fatal" and not open_blockers:
+            lines.append(
+                "session      parked task_fatal, no open blocker — continuous mode "
+                "quarantines that task and continues"
+            )
+        else:
+            ok = False
+            lines.append(
+                "session      PARKED at needs_user — continuous mode will stop immediately"
+            )
+            lines.append(f"               {(state.question or '(no question recorded)')[:160]}")
+            lines.append('               resolve: python -m autoloop run --answer "..."  (or --retry)')
     elif phase is Phase.FAILED:
         ok = False
         lines.append("session      FAILED — continuous mode will stop immediately")

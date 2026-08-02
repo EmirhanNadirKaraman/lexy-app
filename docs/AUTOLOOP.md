@@ -150,7 +150,8 @@ It repairs only what is decidable from evidence, and reports the rest:
 | CDP silent, no restart command configured | refuses — never infers which Chrome to kill |
 | Pause flag set | clears it: `start` is an explicit request to run |
 | Open blockers | prints each with its exact `answer` command, and stops |
-| Session parked at `needs_user` / `failed` | prints the question and its recovery command, and stops |
+| Session parked `task_fatal`, no open blocker | starts — continuous mode quarantines that task and carries on by itself |
+| Session parked `loop_fatal`, or `failed` | prints the question and its recovery command, and stops |
 
 **What it will never do**, and the reason the list is short: archiving an
 execution record discards the link to a reviewed candidate, quarantining a
