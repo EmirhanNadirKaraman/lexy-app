@@ -107,6 +107,12 @@ class TaskExecution:
     candidate_sha: str = ""  # read from HEAD only AFTER git commit returns
     candidate_commit_count: int = 0
     review_round: int = 0
+    #: Normalised text of the most recent `revise` feedback. Compared
+    #: against the next one: identical feedback twice means the reviewer
+    #: is asking for something the executor did not change, so another
+    #: round cannot change its own outcome. This is what makes an
+    #: unlimited round budget safe.
+    last_revise_feedback: str = ""
     #: Every commit/packet attempt for this task, INCLUDING ones that never
     #: produced a review. `review_round` deliberately counts only dispatched
     #: reviews, so on its own it would let structural refusals churn locally

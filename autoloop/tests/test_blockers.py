@@ -252,7 +252,10 @@ def test_task_fatal_park_blocks_only_that_task_and_loop_selects_next_ready(tmp_p
     )
     blocker_store = BlockerStore(tmp_path / ".al" / "blockers")
     orch, config, store, task_store, registry, execution_store = build_postcommit(
-        tmp_path, executor, task_ids=("t1", "t2"), blocker_store=blocker_store
+        # Pins the cap this test depends on: it reaches its task_fatal park
+        # BY exhausting review rounds, which no longer happens by default.
+        tmp_path, executor, task_ids=("t1", "t2"), blocker_store=blocker_store,
+        policy=PolicyConfig(implement_enabled=True, max_review_rounds=2),
     )
 
     # Drive t1 through 3 rounds directly (bypassing the browser entirely —
@@ -710,7 +713,11 @@ def test_round_trip_block_answer_unblock_selected_next_pass(tmp_path):
     )
     blocker_store = BlockerStore(tmp_path / ".al" / "blockers")
     orch, config, store, task_store, registry, _execution_store = build_postcommit(
-        tmp_path, executor, task_ids=("t1",), blocker_store=blocker_store
+        # Pins the cap: this test reaches its task_fatal park BY exhausting
+        # review rounds, and the cap now defaults to unlimited. Its feedback
+        # differs per round, so the convergence guard correctly does not fire.
+        tmp_path, executor, task_ids=("t1",), blocker_store=blocker_store,
+        policy=PolicyConfig(implement_enabled=True, max_review_rounds=2)
     )
     config_path = write_config_toml(tmp_path)  # same state_dir (".al"), for the CLI commands
 

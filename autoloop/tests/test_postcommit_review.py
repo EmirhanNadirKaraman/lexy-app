@@ -448,7 +448,12 @@ def test_third_review_round_parks_and_never_submits(tmp_path):
         per_round_files=[{"a.py": "one\n"}, {"a.py": "two\n"}, {"a.py": "three\n"}],
     )
     orch, repo_root, worktrees, execution_store, intent_store, task = build_postcommit(
-        tmp_path, executor
+        # The cap is configurable now and defaults to UNLIMITED, so this
+        # test pins the value it is actually about. What it verifies is
+        # unchanged: with a cap of 2, a third round never reaches the
+        # executor.
+        tmp_path, executor,
+        policy=PolicyConfig(implement_enabled=True, max_review_rounds=2),
     )
     orch._dispatch_executor(implement(task.id))
     orch.state.phase = Phase.READY.value

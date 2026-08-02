@@ -52,6 +52,15 @@ class PolicyConfig:
     max_consecutive_failures: int = 3
     max_parse_retries: int = 2
     max_policy_denials: int = 3
+    #: Review rounds allowed per task. 0 means UNLIMITED, which is the
+    #: default: a hard cap of 2 abandoned work that was still converging,
+    #: and the operator, not this file, should decide when to give up.
+    #: Unlimited is only safe because a SEPARATE guard stops the real
+    #: runaway case — identical revise feedback twice in a row means the
+    #: round cannot change its own outcome (see
+    #: `_revise_feedback_is_unchanged`). Bound this only if you want a
+    #: hard ceiling on top of that.
+    max_review_rounds: int = 0
     allow_commit: bool = True
     allow_push: bool = True
     protected_branches: tuple[str, ...] = ("main", "master")

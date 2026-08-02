@@ -109,6 +109,7 @@ section for the full table):
 from __future__ import annotations
 
 import hashlib
+import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -304,6 +305,8 @@ class Orchestrator:
         #: (`inbox.TaskInbox`). Optional: `None` (most tests) simply means
         #: nothing is drained, exactly as before this existed.
         self._task_inbox = task_inbox
+        #: monotonic timestamp of the last browser restart, for the cooldown.
+        self._last_browser_restart = None
         # Autoloop M2 (`publisher.py`). Optional and independently gated from
         # the `worktrees`/`execution_store`/`intent_store` triple above: when
         # `None` (every existing caller and test), `_dispatch_task_push`
@@ -1955,8 +1958,16 @@ class Orchestrator:
                 ),
             )
             return
-        if execution.review_round >= 2:
+        cap = self._policy.config.max_review_rounds
+        if cap and execution.review_round >= cap:
             self._park_round_cap(execution, worktree_git, directive, state, task)
+            return
+        # Unlimited rounds are only safe with this: a reviewer repeating itself
+        # verbatim means the executor did not change what was asked, so another
+        # round cannot change its own outcome. Same principle as B6 — a retry
+        # that cannot alter its result is not a retry.
+        if self._revise_feedback_is_unchanged(execution, directive):
+            self._park_unchanged_feedback(execution, directive, task)
             return
 
         # M1 finding #3 (failed-round isolation): a write-capable attempt
@@ -1979,6 +1990,12 @@ class Orchestrator:
         # reached only after a commit; it is gone from there now — see that
         # method.)
         execution.attempt_count += 1
+        # Remember what this round was asked to change, so the NEXT round can
+        # tell "the reviewer wants something new" from "the reviewer is
+        # repeating itself". Recorded HERE, at the point the round is actually
+        # dispatched, so a round refused before this never poisons the memory.
+        if directive.decision is Decision.REVISE and (directive.feedback or "").strip():
+            execution.last_revise_feedback = self._normalise_feedback(directive.feedback)
         self._execution_store.save(execution)
 
         # Snapshot the environment (hooks / push destination) BEFORE the
@@ -2345,6 +2362,35 @@ class Orchestrator:
             code="review_round_cap",
             task_id=task.id,
             detail=f"branch={execution.task_branch} candidate={candidate}",
+        )
+
+    @staticmethod
+    def _normalise_feedback(text: str) -> str:
+        """Collapse whitespace and case so trivial re-wording does not read as
+        a different request. Deliberately NOT fuzzy: two genuinely different
+        complaints should always be allowed to run another round."""
+        return " ".join((text or "").split()).strip().lower()
+
+    def _revise_feedback_is_unchanged(self, execution: TaskExecution, directive: Directive) -> bool:
+        if directive.decision is not Decision.REVISE:
+            return False
+        current = self._normalise_feedback(directive.feedback or "")
+        if not current:
+            return False
+        return current == execution.last_revise_feedback
+
+    def _park_unchanged_feedback(self, execution: TaskExecution, directive: Directive, task: Task) -> None:
+        self._to_needs_user(
+            f"task {task.id}: the reviewer asked for the same change twice in a "
+            f"row (round {execution.review_round}) — the executor did not alter "
+            "what was asked, so a further round cannot change the outcome. "
+            "Nothing was dispatched. Read the feedback and either scope the task "
+            "differently or fix it by hand.\n\nRepeated feedback: "
+            f"{directive.feedback}",
+            kind="task_fatal",
+            code="review_feedback_unchanged",
+            task_id=task.id,
+            detail=f"round={execution.review_round} candidate={execution.candidate_sha}",
         )
 
     def _verify_committed(
@@ -2990,14 +3036,70 @@ class Orchestrator:
         state.phase = Phase.READY.value
         self._store.save(state)
 
+    def _attempt_browser_restart(self) -> bool:
+        """Restart the browser via the operator-declared command, at most once
+        per cooldown. Returns True when a restart actually ran.
+
+        Declared rather than inferred: the loop knows a `cdp_url`, not which
+        Chrome owns it, and pattern-matching process lists to decide what to
+        kill is how an automation takes down someone's everyday browser. The
+        shipped `scripts/restart_autoloop_chrome.sh` targets one profile by its
+        `--user-data-dir` and reports CDP readiness before returning.
+
+        The cooldown matters as much as the restart: without it a genuinely
+        dead transport becomes a restart loop, thrashing the browser instead of
+        surfacing the fault.
+        """
+        command = self._config.browser.restart_command
+        if not command:
+            return False
+        now = time.monotonic()
+        cooldown = self._config.browser.restart_cooldown_seconds
+        if self._last_browser_restart is not None and (
+            now - self._last_browser_restart
+        ) < cooldown:
+            self._log("browser_restart_skipped", data={"reason": "within cooldown"})
+            return False
+        self._last_browser_restart = now
+        try:
+            proc = subprocess.run(
+                list(command), capture_output=True, text=True, timeout=120
+            )
+        except (OSError, subprocess.SubprocessError) as restart_exc:
+            self._log("browser_restart_failed", data={"error": str(restart_exc)})
+            return False
+        ok = proc.returncode == 0
+        self._log(
+            "browser_restarted" if ok else "browser_restart_failed",
+            data={
+                "returncode": proc.returncode,
+                "output": (proc.stdout or proc.stderr or "").strip()[-400:],
+            },
+        )
+        return ok
+
     def _handle_browser_failure(self, phase: Phase, exc: BrowserError) -> None:
         state = self.state
+        # Try a restart BEFORE charging the failure budget. A stalled browser is
+        # the fault this recovers from, so spending the budget on it means three
+        # stalls end the run even when every one was recoverable — which is what
+        # happened three times in one session before this existed. A restart
+        # that actually runs makes this attempt free; one that is skipped or
+        # fails counts exactly as before.
+        self._drop_client()
+        if self._attempt_browser_restart():
+            self._log(
+                "browser_error",
+                data={"phase": phase.value, "error": str(exc),
+                      "kind": type(exc).__name__, "recovered": "restarted"},
+            )
+            self._store.save(state)
+            return
         state.consecutive_failures += 1
         self._log(
             "browser_error",
             data={"phase": phase.value, "error": str(exc), "kind": type(exc).__name__},
         )
-        self._drop_client()
         verdict = self._policy.check_failure_budget(state.consecutive_failures)
         if not verdict.allowed:
             state.resume_phase = phase.value

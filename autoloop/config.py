@@ -43,6 +43,19 @@ class BrowserConfig:
     reconcile_timeout_seconds: float = 30.0
     poll_interval_seconds: float = 2.0
     stability_seconds: float = 3.0
+    #: Command run to restart the browser after a session loss. Empty
+    #: disables auto-restart, which is the pre-existing behaviour.
+    #:
+    #: Declared by the operator rather than inferred: the loop knows only
+    #: a `cdp_url`, not which Chrome process owns it, and a loop that
+    #: pattern-matched process lists could kill the wrong browser. An
+    #: explicit command also makes the blast radius reviewable — see
+    #: scripts/restart_autoloop_chrome.sh, which targets one profile by
+    #: its --user-data-dir and nothing else.
+    restart_command: tuple[str, ...] = ()
+    #: Minimum seconds between restart attempts. Without it a genuinely
+    #: dead transport becomes a restart loop.
+    restart_cooldown_seconds: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -254,6 +267,14 @@ def load_config(path: Path) -> AutoloopConfig:
             "browser.conversation_url is required — the URL of the one persistent "
             "ChatGPT conversation the loop uses (https://chatgpt.com/c/...)"
         )
+    if "restart_command" in browser_data:
+        cmd = browser_data["restart_command"]
+        if not isinstance(cmd, list) or not all(isinstance(c, str) for c in cmd):
+            raise ConfigError(
+                "browser.restart_command must be a list of strings, e.g. "
+                '["bash", "scripts/restart_autoloop_chrome.sh"]'
+            )
+        browser_data["restart_command"] = tuple(cmd)
     browser = BrowserConfig(**browser_data)
 
     policy_data = dict(data.get("policy", {}))
