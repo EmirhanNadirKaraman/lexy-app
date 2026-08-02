@@ -126,6 +126,41 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   unparseable or timezone-naive, the pid probe decides exactly as before —
   the check can only ever make MORE locks recoverable, never fewer.
 
+### 3b. `start` — the one command to come back to
+
+```bash
+python -m autoloop start              # repair, report, then run continuously
+python -m autoloop start --check-only # repair and report, do not run
+```
+
+**A start-time command, deliberately not a pre-stop one.** Stopping is already
+clean (§3a): SIGTERM and SIGHUP release the lock, `pause` finishes the current
+phase, every state write is atomic and fsynced. And a pre-stop repair would be
+unreliable by construction — the cases it exists for (a power cut, a crash, a
+panic) are exactly the ones that never give you the chance to run it. Recovery
+has to work from evidence left behind, not from cooperation before the fact.
+
+It repairs only what is decidable from evidence, and reports the rest:
+
+| Condition | What `start` does |
+|---|---|
+| Lock held by a LIVE process | says "already running" and exits 0 — not a fault, and it touches nothing else |
+| Lock whose owner is provably dead | removes it (boot-aware, §3) |
+| CDP not answering | runs `browser.restart_command`, then re-probes |
+| CDP silent, no restart command configured | refuses — never infers which Chrome to kill |
+| Pause flag set | clears it: `start` is an explicit request to run |
+| Open blockers | prints each with its exact `answer` command, and stops |
+| Session parked at `needs_user` / `failed` | prints the question and its recovery command, and stops |
+
+**What it will never do**, and the reason the list is short: archiving an
+execution record discards the link to a reviewed candidate, quarantining a
+worker repo moves the only copy of a branch, and "resolving" a blocker means
+answering a question nobody has read. Those need a judgement, and a repair
+command that guesses at them is worse than none — because it looks like it
+worked. Everything above the line is decidable; everything below it is yours.
+
+---
+
 ### 3a. Stopping the loop, and losing the machine
 
 `SIGTERM` and `SIGHUP` release the lock **inside the signal handler**,

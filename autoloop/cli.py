@@ -40,6 +40,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -53,7 +54,7 @@ from .changeset_review import build_changeset_binding, build_changeset_packet
 from .config import AutoloopConfig, load_config
 from .contract import AUDIT_TASK_ID, Decision, Directive
 from .conversation import create_conversation
-from .doctor import DoctorProbes, exit_code, run_doctor
+from .doctor import DoctorProbes, _default_probe_cdp, exit_code, run_doctor
 from .errors import (
     AutoloopError,
     ConfigError,
@@ -1347,6 +1348,157 @@ def _cmd_unlock(args: argparse.Namespace) -> int:
     return 0
 
 
+#: What `start` may repair on its own, and what it must only report.
+#:
+#: The split is not conservatism for its own sake. Everything on the safe side
+#: is decidable from evidence the machine already has — a lock whose owner is
+#: provably dead, a CDP port that does not answer. Everything on the other side
+#: needs a judgement that would destroy work if guessed wrong: archiving an
+#: execution record discards the link to a reviewed candidate, quarantining a
+#: worker repo moves the only copy of a branch, and "resolving" a blocker means
+#: answering a question nobody has read. A repair command that guesses at those
+#: is worse than none, because it looks like it worked.
+def _repair_stale_lock(config) -> tuple[str, bool]:
+    """Clear a lock whose owner is provably dead. Never one that is alive."""
+    lock = LoopLock(config.state_dir)
+    info = lock.read()
+    if info is None:
+        return ("lock         none held", True)
+    if LoopLock.is_live(info):
+        return (f"lock         HELD by a LIVE process ({info.describe()})", False)
+    lock.break_stale()
+    return (f"lock         stale lock removed ({info.describe()})", True)
+
+
+def _repair_browser(config) -> tuple[str, bool]:
+    """Restart the browser only if CDP does not answer, and only via the
+    operator-declared command — the loop knows a `cdp_url`, not which Chrome
+    owns it, and pattern-matching process lists is how an automation takes
+    down someone's everyday browser."""
+    try:
+        _default_probe_cdp(f"{config.browser.cdp_url}/json/version")
+        return ("browser      CDP answering", True)
+    except Exception:
+        pass
+    if not config.browser.restart_command:
+        return (
+            "browser      CDP silent and no browser.restart_command configured "
+            "— start the dedicated profile by hand",
+            False,
+        )
+    result = subprocess.run(
+        list(config.browser.restart_command),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        return (f"browser      restart FAILED: {result.stderr.strip()[:200]}", False)
+    try:
+        _default_probe_cdp(f"{config.browser.cdp_url}/json/version")
+    except Exception as exc:
+        return (f"browser      restarted but CDP still silent ({exc})", False)
+    return ("browser      restarted, CDP answering", True)
+
+
+def _report_blockers_and_phase(config) -> tuple[list[str], bool]:
+    """Report what needs a human. Never resolve it."""
+    lines: list[str] = []
+    ok = True
+    open_blockers = BlockerStore(config.blockers_dir).open_blockers()
+    if open_blockers:
+        ok = False
+        lines.append(f"blockers     {len(open_blockers)} OPEN — each needs a decision:")
+        for blocker in open_blockers:
+            lines.append(f"               {blocker.id} ({blocker.kind}/{blocker.code})")
+            lines.append(f"               {blocker.question[:160]}")
+            lines.append(f'               resolve: python -m autoloop answer {blocker.id} "..."')
+    else:
+        lines.append("blockers     none open")
+
+    _, state = _load_state(config)
+    if state is None:
+        lines.append("session      none yet — a fresh one will be selected")
+        return lines, ok
+    phase = Phase(state.phase)
+    if phase is Phase.NEEDS_USER:
+        ok = False
+        lines.append("session      PARKED at needs_user — continuous mode will stop immediately")
+        lines.append(f"               {(state.question or '(no question recorded)')[:160]}")
+        lines.append('               resolve: python -m autoloop run --answer "..."  (or --retry)')
+    elif phase is Phase.FAILED:
+        ok = False
+        lines.append("session      FAILED — continuous mode will stop immediately")
+        lines.append("               resolve: python -m autoloop run --retry")
+    else:
+        lines.append(f"session      phase={phase.value} iteration={state.iteration}")
+    return lines, ok
+
+
+def _cmd_start(args: argparse.Namespace) -> int:
+    """Repair what is provably safe, report what is not, then run.
+
+    This is a START-time command, and deliberately not a pre-stop one.
+    Stopping is already clean — SIGTERM and SIGHUP release the lock, `pause`
+    finishes the current phase, and every state write is atomic and fsynced.
+    More to the point, a pre-stop repair is unreliable by construction: the
+    cases it would exist for (a power cut, a crash, a kernel panic) are
+    exactly the ones that never give you the chance to run it. Recovery has
+    to work from evidence left behind, not from cooperation before the fact.
+    """
+    config = load_config(args.config)
+    print("autoloop start — repairing what is safe, reporting what is not\n")
+
+    # A LIVE lock is the healthy already-running case, not a fault, and
+    # pressing start twice must not read as "something needs a decision".
+    # Checked before anything else because every repair below would be acting
+    # underneath a working process: restarting its browser mid-request is a
+    # real way to break a run that was fine.
+    held = LoopLock(config.state_dir).read()
+    if held is not None and LoopLock.is_live(held):
+        print(f"lock         HELD by a live process ({held.describe()})")
+        print("\nalready running — nothing to do.")
+        print("  watch it:  python -m autoloop status")
+        print("  stop it:   python -m autoloop pause")
+        return 0
+
+    ok = True
+    for repair in (_repair_stale_lock, _repair_browser):
+        line, healthy = repair(config)
+        print(line)
+        ok = ok and healthy
+
+    if config.pause_file.exists():
+        config.pause_file.unlink()
+        print("pause        flag cleared (start is an explicit request to run)")
+    else:
+        print("pause        not set")
+
+    lines, healthy = _report_blockers_and_phase(config)
+    for line in lines:
+        print(line)
+    ok = ok and healthy
+
+    if not ok:
+        print(
+            "\nNOT started — the items above need a decision, and guessing at them "
+            "would discard work. Resolve them with the commands shown, then run "
+            "`start` again."
+        )
+        return 2
+    if args.check_only:
+        print("\nall clear (--check-only, not starting)")
+        return 0
+    print("\nall clear — starting continuous mode")
+    args.continuous = True
+    for name in ("kickoff", "answer"):
+        setattr(args, name, None)
+    for name in ("kickoff_audit", "retry", "resubmit"):
+        setattr(args, name, False)
+    args.max_steps = None
+    return _cmd_run(args)
+
+
 def _cmd_pause(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     config.pause_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1463,6 +1615,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.set_defaults(func=_cmd_run)
+
+    start = sub.add_parser(
+        "start",
+        help=(
+            "repair what is provably safe (stale lock, dead browser, pause "
+            "flag), report what needs a decision, then run continuously"
+        ),
+    )
+    add_config(start)
+    start.add_argument(
+        "--check-only",
+        action="store_true",
+        help="repair and report, but do not start the loop",
+    )
+    start.set_defaults(func=_cmd_start)
 
     for name, func, help_text in (
         ("status", _cmd_status, "show session, lock and roadmap state (read-only)"),
