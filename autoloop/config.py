@@ -208,6 +208,28 @@ class AutoloopConfig:
         """
         return self.state_dir / "PAUSE"
 
+    @property
+    def heartbeat_file(self) -> Path:
+        """Where the loop publishes its liveness, OUTSIDE the checkout.
+
+        Two independent reasons, either sufficient:
+
+        * `escape_detector` snapshots the checkout around every write-capable
+          agent call, ignored paths included. A heartbeat written inside it
+          mid-round would be reported as an escape — the bug the pause flag
+          had.
+        * macOS TCC blocks a launchd agent from reading `~/Documents` at all
+          (`getcwd: Operation not permitted`, exit 126 — hit on 2026-08-02
+          scheduling the health check). A monitor that never touches a
+          protected path needs no Full Disk Access grant, so the durable job
+          works with no security change.
+
+        Beside `workers_root`, like the inbox and the pause flag.
+        """
+        if self.workers_root is not None:
+            return Path(self.workers_root).expanduser().parent / "heartbeat.json"
+        return self.state_dir / "heartbeat.json"
+
     # ---- produce-then-review collaborators (Autoloop v1 CLI wiring) --------
     #
     # All paths below live under `state_dir` (already gitignored). Publisher

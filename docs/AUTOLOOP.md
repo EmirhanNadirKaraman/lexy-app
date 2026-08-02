@@ -126,6 +126,40 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   unparseable or timezone-naive, the pid probe decides exactly as before —
   the check can only ever make MORE locks recoverable, never fewer.
 
+### 3e. Heartbeat + the durable monitor
+
+```bash
+bash scripts/install_health_monitor.sh     # one-time; launchd, every 10 min
+```
+
+`health` (§3d) is the better check, but it reads the state dir, blockers and
+transcript — all inside `~/Documents` here, which **macOS TCC puts out of
+reach of a launchd agent** (`getcwd: Operation not permitted`, exit 126, hit
+on 2026-08-02). Granting Full Disk Access to `/bin/bash` would fix it and is a
+bad trade.
+
+So the loop PUBLISHES and the monitor JUDGES. `heartbeat.json` is written
+beside `workers_root` — outside the checkout, like the inbox and the pause
+flag — once per phase step, plus `stopped` on a clean exit. The installer
+copies a **stdlib-only** checker to `~/.autoloop/` and points launchd at that,
+so the agent never touches a protected path and no permission grant is needed.
+
+The split is deliberate:
+
+* **Staleness is the monitor's call.** A loop that hung, crashed or was killed
+  cannot report "I am stuck" — it stops writing. Threshold defaults to 45 min,
+  because a single-threaded loop is blocked inside an audit fan-out for
+  fifteen-plus and cannot beat during one.
+* **Everything the loop knows goes in the file.** Blockers, a park, a pause —
+  it is alive and aware in each case, and inferring them from silence would be
+  slower and wrong (a pause is not a fault).
+* **`stopped` is why a clean stop does not page you.** It is judged before
+  staleness; otherwise every deliberate stop would look identical to a crash.
+
+Uninstall: `launchctl bootout gui/$(id -u)/com.autoloop.health && rm ~/Library/LaunchAgents/com.autoloop.health.plist`
+
+---
+
 ### 3d. `health` — is it working, or stuck?
 
 ```bash

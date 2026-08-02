@@ -152,6 +152,7 @@ from .errors import (
 )
 from .manifest import ManifestStore
 from .executor import ExecutionOutcome, TaskExecutor
+from . import heartbeat
 from .git_gateway import GitGateway
 from .packet import build_review_packet
 from .policy import PolicyEngine, Verdict
@@ -361,7 +362,13 @@ class Orchestrator:
                 or self._config.legacy_pause_file.exists()
             ):
                 self._log("paused")
+                heartbeat.publish(self._config, self.state, heartbeat.PAUSED)
                 return "paused"
+            # One per phase step. That is as often as a single-threaded loop
+            # can report: it is blocked inside an agent call for minutes at a
+            # time, which is exactly why the monitor's staleness threshold is
+            # generous rather than tight.
+            heartbeat.publish(self._config, self.state)
             # Between steps, never inside one. The inbox lives outside the
             # checkout, so an operator may submit at any instant — including
             # while a write-capable agent is running — but the MERGE has to

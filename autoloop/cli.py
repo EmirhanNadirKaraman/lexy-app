@@ -55,7 +55,7 @@ from .changeset_review import build_changeset_binding, build_changeset_packet
 from .config import AutoloopConfig, load_config
 from .contract import AUDIT_TASK_ID, Decision, Directive
 from .conversation import create_conversation
-from . import health
+from . import health, heartbeat
 from .doctor import DoctorProbes, _default_probe_cdp, exit_code, run_doctor
 from .errors import (
     AutoloopError,
@@ -402,10 +402,22 @@ def _cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     with LoopLock(config.state_dir):
         _reset_run_scoped_budgets(config)
-        if getattr(args, "continuous", False):
-            _validate_continuous_args(args)
-            return _run_continuous(args, config)
-        return _run_locked(args, config)
+        try:
+            if getattr(args, "continuous", False):
+                _validate_continuous_args(args)
+                return _run_continuous(args, config)
+            return _run_locked(args, config)
+        finally:
+            # A CLEAN exit publishes `stopped`, which is how the monitor tells
+            # "you stopped it" from "it died". Without this both look identical
+            # — a heartbeat that simply stopped arriving — and every deliberate
+            # stop would raise an alarm. Reached on the SIGTERM path too, whose
+            # SystemExit unwinds through here (the lock is already released by
+            # then, inside the handler).
+            _, final_state = _load_state(config)
+            heartbeat.publish(
+                config, final_state, heartbeat.STOPPED, detail="run exited"
+            )
 
 
 def _validate_continuous_args(args: argparse.Namespace) -> None:
