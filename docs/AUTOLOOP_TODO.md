@@ -142,6 +142,31 @@ relative default resolves against cwd and would have silently created a second,
 empty session instead. Worth making first-class: a documented "runner checkout"
 mode, rather than something each operator rediscovers under pressure.
 
+### B9. A task's base sha is pinned at first dispatch, so an upstream fix never reaches a retry
+`TaskExecution.task_base_sha` is recorded once, when the record is created, and
+never revisited. Every later attempt recreates the worker at that same base. So
+when a task fails for a reason that is fixed ON THE BRANCH afterwards, the
+retry rebuilds the worker at the OLD base and fails identically — forever.
+
+Observed 2026-08-02: `audit-0001` was refused because post-commit validation
+found 2 failing autoloop tests. Those were pre-existing defects on the branch,
+fixed in `7a207f2`. The retry still failed with the same two, because the
+record's base was `39cedcf` — one commit earlier. The worker suite reported
+929 passed against the checkout's 931, which is the tell: a two-test gap
+between worker and checkout means the worker is not at the base you fixed.
+
+This compounds B6. There, a repeated environmental failure burns the attempt
+budget; here, the retry cannot possibly succeed, so every one of those attempts
+is spent on a base known to be broken.
+
+**Fix:** when a task is retried after a `task_fatal` park and its base is an
+ancestor of the current branch head, re-base the record — record the new base
+and recreate the worker there — or refuse with a message naming both shas
+instead of silently retrying at the stale one. Never silently reuse a base the
+branch has moved past. Workaround until then: archive
+`.autoloop/executions/<task>.json` so a fresh record is created at current
+HEAD (the same manual step A3 already needs).
+
 ### B6. A repeating ENVIRONMENTAL validation failure burns the attempt budget
 rt-01 consumed five attempts on 2026-07-31. Rounds 1–3 (20:34, 20:46, 20:59)
 failed **identically**: `validation failed after implementation — ruff check .:
