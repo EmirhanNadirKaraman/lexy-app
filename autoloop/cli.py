@@ -55,6 +55,7 @@ from .changeset_review import build_changeset_binding, build_changeset_packet
 from .config import AutoloopConfig, load_config
 from .contract import AUDIT_TASK_ID, Decision, Directive
 from .conversation import create_conversation
+from . import health
 from .doctor import DoctorProbes, _default_probe_cdp, exit_code, run_doctor
 from .errors import (
     AutoloopError,
@@ -1652,6 +1653,24 @@ def clear_pause(config: AutoloopConfig) -> bool:
     return cleared
 
 
+def _cmd_health(args: argparse.Namespace) -> int:
+    """Judge the loop and exit 0 (fine) or 1 (needs you).
+
+    Read-only and lock-free, so a scheduler may run it at any moment,
+    including mid-round. The exit code is the contract: a cron wrapper only
+    has to test it, and `--json` carries the reason for anything richer.
+    """
+    config = load_config(args.config)
+    verdict = health.check(config, silence_minutes=args.silence_minutes)
+    if args.json:
+        print(verdict.to_json())
+    else:
+        print(verdict.summary)
+        if verdict.detail:
+            print(f"  {verdict.detail}")
+    return 1 if verdict.needs_attention else 0
+
+
 def _cmd_pause(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     config.pause_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1794,6 +1813,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="why this blocker is dead — required, so an archival is never a silent delete",
     )
     archive_blocker.set_defaults(func=_cmd_archive_blocker)
+
+    healthp = sub.add_parser(
+        "health",
+        help=(
+            "is the loop working or stuck? read-only, no lock; exit 0 = fine, "
+            "1 = needs attention (for cron/launchd)"
+        ),
+    )
+    add_config(healthp)
+    healthp.add_argument("--json", action="store_true", help="machine-readable verdict")
+    healthp.add_argument(
+        "--silence-minutes",
+        type=float,
+        default=health.DEFAULT_SILENCE_MINUTES,
+        help=(
+            "how long a live loop may write nothing before it counts as stuck "
+            f"(default {health.DEFAULT_SILENCE_MINUTES:.0f}; an audit fan-out is "
+            "legitimately quiet for 15+ minutes)"
+        ),
+    )
+    healthp.set_defaults(func=_cmd_health)
 
     start = sub.add_parser(
         "start",

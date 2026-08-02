@@ -126,6 +126,37 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   unparseable or timezone-naive, the pid probe decides exactly as before —
   the check can only ever make MORE locks recoverable, never fewer.
 
+### 3d. `health` — is it working, or stuck?
+
+```bash
+python -m autoloop health              # exit 0 = fine, 1 = needs you
+python -m autoloop health --json       # machine-readable verdict
+```
+
+Read-only and lock-free, so a scheduler may run it at any moment including
+mid-round. The exit code is the contract.
+
+Three signals, each chosen against a mistake that was actually made here:
+
+* **The lock, not a process name.** `LoopLock.is_live` is boot-aware and
+  authoritative. The loop runs as `autoloop start` OR `autoloop run`, and
+  `pgrep -fc` counts PATTERNS rather than processes — both produced confident
+  wrong answers on 2026-08-02.
+* **Transcript age, not `state.json` mtime.** State is written at phase
+  TRANSITIONS, so a healthy loop mid-`executing` leaves it untouched for
+  twenty minutes; its mtime reports a working loop as dead.
+* **A live agent suppresses the silence alarm.** An audit fan-out runs six
+  subagents for fifteen-plus minutes writing nothing. That is the likeliest
+  false alarm, so a live agent counts as proof of work.
+
+`scripts/autoloop_health_notify.sh` wraps it for launchd/cron. It `cd`s to the
+repo first — `state_dir` is relative, and launchd inherits `/` — and notifies
+only on a CHANGE of verdict, so a loop blocked since breakfast does not
+produce forty identical alerts. A check that itself fails still notifies:
+a monitor that goes quiet when it breaks is the worst kind.
+
+---
+
 ### 3c. Two recovery commands for interrupted work
 
 ```bash
