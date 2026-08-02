@@ -126,6 +126,43 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   unparseable or timezone-naive, the pid probe decides exactly as before —
   the check can only ever make MORE locks recoverable, never fewer.
 
+### 3g. Detecting a task's scope (propose, never authorize)
+
+The dashboard's new-task form has a **Detect paths** button. It reads the
+title and description and fills `approved_paths` with what the task probably
+touches, each line carrying the reason it was proposed:
+
+```
+autoloop/validation.py    # defines run_validation_commands
+autoloop/tests/           # directory named in the description
+```
+
+The operator reads the list, deletes what does not belong, and submits. The
+comments are stripped on submit — a path is what the registry validates.
+
+**Why it stops there.** `approved_paths` is what a write-capable agent may
+write, and `docs/SECURITY.md` finding #2 exists because the executor's own
+report must never define its own scope. Deriving the scope automatically at
+merge or dispatch time would rebuild that circularity with extra steps: the
+task would arrive carrying its own permission slip. So detection runs at
+AUTHORING time, into a field a human reads, and `/api/suggest-paths` queues
+nothing at all.
+
+**Deliberately not an LLM.** Every suggestion is a mechanical consequence of
+text the operator wrote plus files that exist, so each one is explainable in a
+phrase — and a suggestion you cannot explain is one you cannot check. Three
+sources, most trustworthy first: a path the text names; a bare filename that
+resolves to exactly ONE tracked file; an identifier DEFINED in exactly one
+file. Ambiguity resolves to nothing rather than a guess, because offering the
+wrong `models.py` is worse than offering none — it looks considered.
+
+Identifiers are matched by SHAPE (snake_case or CamelCase), not by a
+blocklist. A bare lowercase word like `report` is prose that happens to
+collide with a function name; the first version matched it and produced one
+confident, wrong suggestion.
+
+---
+
 ### 3f. `merge-window` — do not strand the loop's own work
 
 ```bash

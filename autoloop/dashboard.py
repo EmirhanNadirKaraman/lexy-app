@@ -513,6 +513,7 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
         <textarea name="approved_paths" rows="4" required
           placeholder="autoloop/dashboard.py"></textarea></label>
       <div class="actions"><button class="save" type="submit">Queue task</button>
+        <button class="save" type="button" id="ntdetect">Detect paths</button>
         <span id="ntnote"></span></div>
     </form>
     <p class="muted" style="font-size:12px;margin:9px 0 0">
@@ -745,6 +746,39 @@ function render(d, force){
 // would drift from it and start refusing paths the registry accepts.
 const ntform = document.getElementById("newtask");
 const ntnote = document.getElementById("ntnote");
+
+// "Detect paths" FILLS the field; it never submits. Every suggestion arrives
+// with the reason it was proposed, appended as a trailing comment so the
+// operator can judge each line rather than trusting the list — and so a line
+// whose reason does not fit the task is the obvious one to delete. The
+// comments are stripped again on submit, since a path is what the registry
+// validates.
+document.getElementById("ntdetect").addEventListener("click", async () => {
+  const el = ntform.elements["approved_paths"];
+  ntnote.className = ""; ntnote.textContent = " scanning…";
+  try {
+    const r = await fetch("/api/suggest-paths", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Autoloop": "1"},
+      body: JSON.stringify({title: ntform.elements["title"].value,
+                            description: ntform.elements["description"].value}),
+    });
+    const body = await r.json();
+    if (!r.ok) { ntnote.className = "savefail"; ntnote.textContent = " \u2717 " + (body.error || r.status); return; }
+    const found = body.suggestions || [];
+    if (!found.length) {
+      ntnote.className = "savefail";
+      ntnote.textContent = " \u2717 nothing detected \u2014 name a file, folder or function in the description";
+      return;
+    }
+    const existing = el.value.split("\n").map(s => s.split("#")[0].trim()).filter(Boolean);
+    const merged = existing.concat(
+      found.filter(s => !existing.includes(s.path)).map(s => `${s.path}  # ${s.reason}`));
+    el.value = merged.join("\n");
+    ntnote.className = "saved";
+    ntnote.textContent = ` \u2713 ${found.length} suggested \u2014 check each line, then queue`;
+  } catch (err) { ntnote.className = "savefail"; ntnote.textContent = " \u2717 " + err; }
+});
 ntform.addEventListener("submit", async e => {
   e.preventDefault();
   const val = n => String(ntform.elements[n].value || "");
@@ -753,7 +787,10 @@ ntform.addEventListener("submit", async e => {
   // trailing whitespace, with an error pointing at an invisible character.
   // (The escape is doubled because PAGE is a plain Python string, not a raw
   // one — a single one would be decoded here and break the JS literal.)
-  const paths = val("approved_paths").split("\\n").map(s => s.trim()).filter(Boolean);
+  // Split off any "  # reason" the detector appended: the operator reads those,
+  // the registry validates paths.
+  const paths = val("approved_paths").split("\\n")
+    .map(s => s.split("#")[0].trim()).filter(Boolean);
   const priority = parseInt(val("priority"), 10);
   const fail = msg => { ntnote.className = "savefail"; ntnote.textContent = " ✗ " + msg; };
   if (!Number.isInteger(priority)) return fail("priority must be a whole number");
@@ -873,9 +910,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._json_response(400, {"error": f"bad request: {exc}"})
         if self.path.startswith("/api/priority"):
             return self._submit_priority(body)
+        if self.path.startswith("/api/suggest-paths"):
+            return self._suggest_paths(body)
         if self.path.startswith("/api/task"):
             return self._submit_task(body)
         return self._json_response(404, {"error": "unknown endpoint"})
+
+    def _suggest_paths(self, body: dict) -> None:
+        """Propose the paths a task probably touches. READ-ONLY.
+
+        It queues nothing, and that is the point rather than an omission.
+        `approved_paths` is authorization, and `docs/SECURITY.md` finding #2
+        exists because the executor's own report must never define its own
+        scope — so this fills a form field the operator then reads and
+        submits, and the submit is still the only thing that queues anything.
+        A suggestion the operator does not send has authorized nothing.
+        """
+        from .path_suggest import suggest
+
+        text = " ".join(
+            str(body.get(k) or "") for k in ("title", "description")
+        ).strip()
+        if not text:
+            return self._json_response(400, {"error": "nothing to read: title/description empty"})
+        try:
+            found = suggest(text, self.repo)
+        except OSError as exc:
+            return self._json_response(500, {"error": f"could not scan the repo: {exc}"})
+        return self._json_response(200, {"suggestions": [s.as_dict() for s in found]})
 
     def _submit_priority(self, body: dict) -> None:
         try:
