@@ -4,8 +4,13 @@ tracker that touched the working tree would stop the thing it observes."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
+import threading
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -210,6 +215,175 @@ def test_the_roadmap_is_sorted_by_priority_for_display(tmp_path):
     roadmap = collect(repo)["roadmap"]
     assert [t["id"] for t in roadmap] == ["a", "b"]
     assert roadmap[0]["priority"] == 1
+
+
+# ---- task creation (the second write path) -----------------------------------
+#
+# These drive the REAL handler over a real socket, not `TaskInbox` directly: the
+# thing worth pinning is routing + field handling + what reaches the inbox file,
+# and a test that calls `TaskInbox.submit` itself would pass with the endpoint
+# deleted.
+
+
+@contextlib.contextmanager
+def serving(repo, inbox_dir, monkeypatch):
+    """The dashboard on an ephemeral port, with its inbox redirected outside the
+    checkout — the placement the whole design rests on."""
+    import autoloop.dashboard as dash
+
+    monkeypatch.setattr(dash, "_inbox_dir", lambda _repo: inbox_dir)
+    monkeypatch.setattr(dash.Handler, "repo", repo)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), dash.Handler)
+    srv.daemon_threads = True
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
+
+
+def post(base, path, payload, headers=None):
+    """POST JSON, returning `(status, body)` for refusals as well as successes.
+    Every call carries a timeout: a hung request here would stall the suite
+    rather than fail it."""
+    req = urllib.request.Request(
+        base + path,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json",
+                 **({"X-Autoloop": "1"} if headers is None else headers)},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}")
+
+
+def test_the_task_endpoint_queues_exactly_what_was_typed(tmp_path, monkeypatch):
+    """`approved_paths` is authorization surface, so the request that lands in
+    the inbox must carry the operator's paths verbatim and in order — nothing
+    inferred from the title, nothing defaulted, no wildcard. And the checkout
+    must be byte-identical across the request: a write into `.autoloop/` while
+    an agent is running trips the escape detector and parks the loop loop-fatal,
+    which is why the inbox lives outside the checkout in the first place."""
+    from autoloop.inbox import TaskInbox
+
+    repo = make_repo(tmp_path)
+    inbox_dir = tmp_path / "outside" / "inbox"
+    paths = ["autoloop/dashboard.py", "autoloop/tests/test_dashboard.py", "docs/"]
+
+    with serving(repo, inbox_dir, monkeypatch) as base:
+        before = snapshot(repo)
+        status, body = post(base, "/api/task", {
+            "id": "dash-03", "title": "Author tasks", "description": "form on the page",
+            "priority": 4, "approved_paths": paths,
+        })
+        assert snapshot(repo) == before, "the observed checkout must be untouched"
+
+    assert status == 200, body
+    assert body["queued"] == "dash-03"
+    specs, problems = TaskInbox(inbox_dir).drain()
+    assert problems == []
+    assert specs == [{
+        "kind": "task", "id": "dash-03", "title": "Author tasks",
+        "description": "form on the page", "priority": 4, "approved_paths": paths,
+    }]
+
+
+def test_a_task_with_no_approved_paths_is_refused_rather_than_queued(tmp_path, monkeypatch):
+    """The registry accepts an empty scope and `effective_approved_paths` keeps
+    returning (), so the orchestrator then refuses to dispatch that task for
+    ever. Queuing one is a trap, not a task — say so at submit."""
+    from autoloop.inbox import TaskInbox
+
+    repo = make_repo(tmp_path)
+    inbox_dir = tmp_path / "outside" / "inbox"
+    with serving(repo, inbox_dir, monkeypatch) as base:
+        status, body = post(base, "/api/task", {
+            "id": "dash-03", "title": "T", "description": "d", "approved_paths": ["  ", ""],
+        })
+    assert status == 400
+    assert "approved_paths" in body["error"]
+    assert TaskInbox(inbox_dir).pending() == [], "a refused request must queue nothing"
+
+
+def test_the_task_endpoint_refuses_a_field_the_form_cannot_produce(tmp_path, monkeypatch):
+    """Narrower than `inbox.ALLOWED_FIELDS` on purpose: `validation` decides
+    which commands grade the task and `depends_on` reorders the graph, and
+    neither is on this form — so a request carrying one did not come from this
+    page. Refused, not silently dropped."""
+    repo = make_repo(tmp_path)
+    inbox_dir = tmp_path / "outside" / "inbox"
+    with serving(repo, inbox_dir, monkeypatch) as base:
+        status, body = post(base, "/api/task", {
+            "id": "dash-03", "title": "T", "description": "d",
+            "approved_paths": ["autoloop/dashboard.py"],
+            "validation": [["echo", "ok"]],
+        })
+    assert status == 400
+    assert "validation" in body["error"]
+
+
+def test_the_write_path_keeps_its_routing_guards(tmp_path, monkeypatch):
+    """The page has no authentication. The custom header is what a cross-origin
+    form post cannot set without a preflight this server never approves — it
+    must gate the new endpoint too, not just `/api/priority`."""
+    from autoloop.inbox import TaskInbox
+
+    repo = make_repo(tmp_path)
+    inbox_dir = tmp_path / "outside" / "inbox"
+    good = {"id": "dash-03", "title": "T", "description": "d",
+            "approved_paths": ["autoloop/dashboard.py"]}
+    with serving(repo, inbox_dir, monkeypatch) as base:
+        no_header, _ = post(base, "/api/task", good, headers={})
+        cross, _ = post(base, "/api/task", good,
+                        headers={"X-Autoloop": "1", "Origin": "http://evil.example"})
+        unknown, _ = post(base, "/api/anything", good)
+    assert (no_header, cross, unknown) == (403, 403, 404)
+    assert TaskInbox(inbox_dir).pending() == [], "no refusal may reach the inbox"
+
+
+def test_pending_authorization_is_shown_as_text_before_the_loop_merges_it(tmp_path, monkeypatch):
+    """The loop applies a queued creation request without asking again, so the
+    window between submit and merge is the only chance to notice a scope nobody
+    meant to grant. A count would not do — the paths themselves must be on the
+    page."""
+    import autoloop.dashboard as dash
+    from autoloop.inbox import TaskInbox
+
+    repo = make_repo(tmp_path)
+    inbox_dir = tmp_path / "outside" / "inbox"
+    monkeypatch.setattr(dash, "_inbox_dir", lambda _repo: inbox_dir)
+    TaskInbox(inbox_dir).submit({
+        "kind": "task", "id": "dash-03", "title": "T", "description": "d",
+        "approved_paths": ["autoloop/dashboard.py"],
+    })
+    queued = collect(repo)["inbox"]
+    assert queued == [{"kind": "task", "id": "dash-03", "priority": None, "title": "T",
+                       "approved_paths": ["autoloop/dashboard.py"]}]
+    # …and the page renders that field rather than counting the requests.
+    assert "r.approved_paths" in PAGE
+
+
+def test_the_creation_form_is_static_markup_with_one_listener():
+    """`render()` rebuilds a section's innerHTML on every 2s poll. A form built
+    by JS would lose half-typed text on the next tick and rebind its submit
+    listener each time, so a later submit would fire twice — one queued task per
+    accumulated listener."""
+    static_markup, script = PAGE.split("<script>", 1)
+    assert '<form class="newtask" id="newtask"' in static_markup
+    assert "<form" not in script, "no form markup may be generated by a re-render"
+    assert script.count("ntform.addEventListener") == 1, "exactly one listener, bound at load"
+    # The form's button shares the `save` class for styling, so the roadmap's
+    # per-render binding must be scoped — unscoped, it hands the STATIC button
+    # one extra click listener per poll, each of which looks up an
+    # `input.pri[data-id="undefined"]` that does not exist and throws.
+    assert 'querySelectorAll("#roadmap button.save")' in script, \
+        "the per-render binding must not reach the static form's submit button"
 
 
 def test_a_stale_process_reports_itself(tmp_path, monkeypatch):

@@ -38,6 +38,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S18 | LOW | Self-hosted model server has no auth; `LLM_BASE_URL` egress is operator-controlled (opt-in, unset by default) | `services/llm_provider.py` |
 | S22 | INFO | `commit_adopted` is sound but has no production call site (tracked, not a vulnerability) | `autoloop/git_gateway.py`, `autoloop/manifest.py` |
 | S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
+| S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
 
 ---
 
@@ -274,6 +275,62 @@ reminder that something was never actually resolved, surfaced only when
 there is otherwise nothing productive to report, rather than a hard block
 on all future work. Does not change anything above: the OS-sandbox
 gap is unaffected either way.
+
+### S28 — The dashboard's localhost POST can now queue authorization, not just a priority — MEDIUM — OPEN (bounded, accepted)
+
+**What:** `autoloop/dashboard.py` serves an unauthenticated page on
+`127.0.0.1` and, since 2026-08-01, accepts `POST /api/priority`. That endpoint
+takes a task id and an integer, and nothing else — the finding it could not
+raise was authorization, because a priority request carries no
+`approved_paths` (refused at `inbox.TaskInbox.submit`).
+
+`POST /api/task` (2026-08-02) changes that. A creation request carries
+`approved_paths`, which is the scope a write-capable agent is later authorized
+against, and the loop drains the inbox between steps without asking the
+operator again. So **any local process that can reach the port can queue a
+task naming paths the operator never typed**, and the next drain merges it.
+This is not a browser-origin bug that a header fixes: the header + Origin
+checks stop a *cross-origin page* in the operator's browser, not a local
+process that speaks HTTP.
+
+What bounds it, stated rather than assumed:
+- **Well-formedness, not intent.** `TaskRegistry.add_many` →
+  `_validate_approved_path` refuses globs, `..`, absolute and `~` paths, and
+  backslashes; `escape_detector.find_symlink_traversal` re-checks symlink
+  traversal at dispatch. None of that asks whether the path was *wanted*.
+- **It creates, never widens.** There is deliberately no request kind that
+  edits an existing task's `approved_paths` — `inbox.KINDS` is
+  `("task", "priority")` and the priority branch refuses every other field.
+- **Visible before it runs.** `_pending_inbox` carries the paths and the page
+  prints them per queued request, and the loop's drain reports each merge.
+- **Same trust boundary as the rest.** Anything that can post here can also
+  run `python -m autoloop add-task`, or edit the inbox directory directly.
+  The endpoint adds convenience to an existing local-user capability; it does
+  not cross a boundary that was previously closed.
+
+**file:line** — `autoloop/dashboard.py` `Handler.do_POST` / `Handler._submit_task`
+(routing + creation), `Handler._queue` (the only write), `_pending_inbox`
+(the visibility mitigation).
+**Severity:** MEDIUM — requires local code execution as the operator, which
+already implies broader access; the concrete gain is a *plausible-looking*
+scope that a hurried operator may not re-read before the loop drains it.
+**Verification check:**
+```bash
+# Expect: the ONLY writes are inbox submits — no repo/state-dir path is written
+rg -n 'write_text|mkdir|open\(|subprocess\.run' autoloop/dashboard.py
+# Expect: no second path validator here — add_many stays the single authority
+rg -n '_validate_approved_path|APPROVED_PATH|glob|fnmatch' autoloop/dashboard.py
+# Expect: creation cannot smuggle validation commands or dependencies
+rg -n 'TASK_REQUEST_FIELDS' autoloop/dashboard.py
+# Expect: no request kind edits an existing task's scope
+rg -n 'KINDS = ' autoloop/inbox.py
+```
+**Suggested fix (if the page ever leaves a single-operator machine):** require
+a per-process token printed by `main()` and sent as a header — cheap, and it
+distinguishes "the operator's tab" from "a local process". Do NOT fix it by
+validating paths inside `dashboard.py`: a second rule set would drift from
+`add_many`, which is the failure S25 closed. Binding anything other than
+`127.0.0.1` must stay out of the question.
 
 ### S25 — Circular task-scope authorization, failed-round residue, and unbounded pre-commit retries — HIGH — RESOLVED 2026-07-31
 
@@ -764,6 +821,8 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-08-02** — **The dashboard can author tasks, so its POST endpoint now touches authorization (new finding S28).** The read-only tracker's one write path used to express a priority number and nothing else; it now also queues task CREATION requests, which carry `approved_paths`. Recorded as S28 (MEDIUM, open, bounded) rather than folded in silently, because the mitigations are honest but partial: the custom header + Origin check stop a cross-origin page, not a local process; `TaskRegistry.add_many` proves paths are well-formed, not that anyone wanted them. What did NOT change: the endpoint still writes only to the inbox OUTSIDE the checkout (a write into `.autoloop/` mid-run trips the escape detector and parks the loop loop-fatal), there is still no request kind that edits an EXISTING task's scope, no path is inferred or defaulted, no wildcard is representable, and `dashboard.py` deliberately contains no path validator of its own — a second rule set would drift from the one S25 made authoritative. New: queued requests print their paths on the page, so pending authorization is readable before the loop merges it. 19 dashboard tests (was 13), including the endpoint driven over a real socket.
 
 - **2026-08-01** — **Four repository trackers are now implicitly approved for every scoped task (authorization widening, deliberate).** `CLAUDE.md` makes updating `docs/SUMMARY.md`, `docs/TESTS.md`, `docs/SECURITY.md` and `docs/COMMON_ERRORS.md` a CONDITION of doing the work, so a task that adds a file but does not name `SUMMARY.md` cannot be completed while obeying the repo's own rules — the agent must violate one or the other. rt-01 was refused twice for exactly this, the second time after its scope had already been widened by four paths. `tasks.TRACKER_PATHS` + `effective_approved_paths` make the four implicit, combined in ONE place so the dispatch seed, the re-sync, the pre-commit gate and the post-commit path-ownership check cannot disagree (the first cut of the change patched three of the four, and the pre-commit gate then refused what the post-commit check allowed). Bounded: fixed constant rather than configuration, markdown trackers only, an unscoped task stays unscoped and still refuses dispatch (finding #2 unchanged), and tracker edits remain visible in `commit_range_paths` and the review packet — this removes a refusal, not visibility. **Residual risk, recorded not hidden:** `docs/SECURITY.md` is this tracker, so an agent may now edit a finding's record without that being named in its task. It is documentation and not a control, but a weakened finding misleads a later reader — which is why the list is four entries and fixed. See `docs/AUTOLOOP.md` §4f-bis.
 

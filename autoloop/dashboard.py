@@ -8,11 +8,18 @@ a wedged loop look identical — an empty `raw/` directory and a silent stdout.
 This reads the state the loop already writes, plus the process table, and shows
 what is happening now.
 
-**It never writes.** Not to `.autoloop/`, not to the repo, not to git. That is
-not politeness: the loop's escape detector requires the primary checkout to be
-clean before every write-capable agent invocation, so a tracker that touched the
-working tree would make the next task refuse. Everything here is `read_text`,
-`glob`, and `ps`.
+**It never writes to what it observes.** Not to `.autoloop/`, not to the repo,
+not to git. That is not politeness: the loop's escape detector requires the
+primary checkout to be clean before every write-capable agent invocation, so a
+tracker that touched the working tree would make the next task refuse. Reading
+is `read_text`, `glob`, and `ps`.
+
+There IS one write path, and it deliberately points elsewhere: `Handler.do_POST`
+queues operator requests — a task priority, or a new task — into the `TaskInbox`
+directory OUTSIDE the checkout, which the loop drains between steps. So a submit
+is safe at any instant, including mid-agent, and the loop stays the only writer
+of `tasks.json`. A new task carries `approved_paths`; read `do_POST`'s docstring
+and `docs/SECURITY.md` S28 before widening what that endpoint accepts.
 
 The one thing it learns that is not already on disk: which domain each in-flight
 agent is on, parsed from the process table. Agent prompts carry
@@ -179,7 +186,14 @@ def _inbox_dir(repo: Path) -> Path:
 
 def _pending_inbox(repo: Path) -> list[dict]:
     """Queued requests, so a submit is visibly recorded rather than vanishing
-    until the loop next runs."""
+    until the loop next runs.
+
+    `approved_paths` is carried through deliberately. A creation request is the
+    only thing this page can queue that touches authorization, and the loop
+    applies it without a second operator confirmation — so the paths must be
+    readable as text between the submit and the merge, or the only record of
+    what scope is pending is a JSON file nobody is looking at.
+    """
     out = []
     for path in sorted(_inbox_dir(repo).glob("*.json")):
         spec = _json(path)
@@ -190,6 +204,7 @@ def _pending_inbox(repo: Path) -> list[dict]:
             "id": spec.get("id"),
             "priority": spec.get("priority"),
             "title": spec.get("title") or "",
+            "approved_paths": list(spec.get("approved_paths") or ()),
         })
     return out
 
@@ -432,6 +447,18 @@ button.save{font:inherit;font-size:12px;padding:3px 10px;border:1px solid var(--
 button.save:hover{color:var(--ink)}
 button.save[disabled]{opacity:.5;cursor:default}
 .saved{color:var(--good)}.savefail{color:var(--critical)}
+/* New-task form. No new hexes — feedback reuses .saved/.savefail above, and
+   the fields sit on the same card/line roles as everything else. */
+form.newtask{display:grid;gap:9px;max-width:760px}
+form.newtask label{display:block;font-size:11px;color:var(--ink2);
+  text-transform:uppercase;letter-spacing:.05em}
+form.newtask input,form.newtask textarea{display:block;width:100%;margin-top:3px;
+  font:13px/1.45 ui-sans-serif,-apple-system,"Segoe UI",sans-serif;padding:5px 7px;
+  border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);
+  text-transform:none;letter-spacing:normal}
+form.newtask textarea[name="approved_paths"]{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+form.newtask .two{display:grid;grid-template-columns:2fr 1fr;gap:9px}
+form.newtask .actions{display:flex;align-items:center;gap:8px}
 </style>
 <div class="wrap">
   <header>
@@ -465,6 +492,38 @@ button.save[disabled]{opacity:.5;cursor:default}
     <h2>Roadmap — set priority, then Save</h2>
     <div id="roadmap" class="scroll"></div>
     <div id="queued" class="muted" style="font-size:12px;margin-top:9px"></div>
+  </section>
+
+  <!-- STATIC markup, outside anything `render()` rewrites. The roadmap table is
+       rebuilt from scratch on every payload change (2s poll), so a form living
+       inside it would erase half-typed text and rebind its listener each time.
+       Its listener is attached once, at script load. -->
+  <section>
+    <h2>New task — queued to the inbox, merged by the loop</h2>
+    <form class="newtask" id="newtask" autocomplete="off">
+      <div class="two">
+        <label>task id<input name="id" required placeholder="dash-03"></label>
+        <label>priority<input name="priority" type="number" step="1" value="100"></label>
+      </div>
+      <label>title<input name="title" required placeholder="what the task delivers"></label>
+      <label>description
+        <textarea name="description" rows="4" required
+          placeholder="what to build, and the constraints that are load-bearing"></textarea></label>
+      <label>approved paths — one per line, each typed in full
+        <textarea name="approved_paths" rows="4" required
+          placeholder="autoloop/dashboard.py"></textarea></label>
+      <div class="actions"><button class="save" type="submit">Queue task</button>
+        <span id="ntnote"></span></div>
+    </form>
+    <p class="muted" style="font-size:12px;margin:9px 0 0">
+      Approved paths are the task's authorization: an agent may write these and
+      nothing else. Nothing is inferred from the title and there is no wildcard —
+      list every file, or a directory with a trailing <code>/</code>. Each one is
+      validated by the registry on merge, so a bad path is refused there and
+      reported, not silently accepted here. The doc trackers
+      (<code>docs/SUMMARY.md</code>, <code>docs/TESTS.md</code>,
+      <code>docs/SECURITY.md</code>, <code>docs/COMMON_ERRORS.md</code>) are
+      always allowed and need not be listed.</p>
   </section>
   <section><h2>Language-app tasks</h2><div id="apptasks" class="scroll"></div></section>
   <section><h2>Blockers</h2><div id="blockers"></div></section>
@@ -603,7 +662,12 @@ function render(d, force){
     }).join(""))
     + `<p class="muted" style="font-size:12px;margin:9px 0 0">Lower number runs first; 100 is the default. Saved changes queue in the inbox and apply on the loop's next run.</p>`;
 
-  document.querySelectorAll("button.save").forEach(btn => {
+  // SCOPED to #roadmap on purpose. These rows are rebuilt as fresh DOM on every
+  // render, so rebinding them each time is free — but the new-task form's
+  // button shares the `save` class for styling and is STATIC, so an unscoped
+  // `button.save` would hand it one extra click listener per poll, each looking
+  // up an `input.pri[data-id="undefined"]` that does not exist.
+  document.querySelectorAll("#roadmap button.save").forEach(btn => {
     btn.addEventListener("click", async () => {
       const id = btn.dataset.id;
       const input = document.querySelector(`input.pri[data-id="${CSS.escape(id)}"]`);
@@ -626,10 +690,16 @@ function render(d, force){
     });
   });
 
+  // A queued creation request carries approved_paths, and the loop merges it
+  // without asking again — so the paths are spelled out here rather than
+  // counted. Visibility between submit and merge is the mitigation.
   const q = d.inbox || [];
   document.getElementById("queued").textContent = q.length
     ? `${q.length} queued request(s) awaiting the loop: ` +
-      q.map(r => r.kind === "priority" ? `${r.id} → priority ${r.priority}` : `new task ${r.id}`).join(", ")
+      q.map(r => r.kind === "priority"
+        ? `${r.id} → priority ${r.priority}`
+        : `new task ${r.id} (priority ${r.priority ?? 100}) may write: `
+          + ((r.approved_paths || []).join(", ") || "nothing — undispatchable")).join(" · ")
     : "no queued requests";
 
   // which app task is actually being worked
@@ -664,6 +734,53 @@ function render(d, force){
       .concat((d.git.remote||[]).map(r=>`<tr><td>origin/${esc(r.ref)}</td><td><code>${esc(r.sha)}</code></td></tr>`)).join(""));
 }
 
+// ---- new-task form -----------------------------------------------------
+// Bound ONCE, here, because the form is static markup. Inside `render()` it
+// would gain a duplicate listener on every 2s poll and double-submit.
+//
+// Nothing about a path is guessed: the textarea is split on lines, each line
+// trimmed, blanks dropped, and what remains is sent verbatim. There is no
+// client-side path validator on purpose — `TaskRegistry.add_many` is the single
+// authority (`inbox.py`'s docstring commits to that), and a second rule set here
+// would drift from it and start refusing paths the registry accepts.
+const ntform = document.getElementById("newtask");
+const ntnote = document.getElementById("ntnote");
+ntform.addEventListener("submit", async e => {
+  e.preventDefault();
+  const val = n => String(ntform.elements[n].value || "");
+  // One path per line, then trim each: a textarea entry can arrive CRLF
+  // terminated, and a stray carriage return would be refused by the registry as
+  // trailing whitespace, with an error pointing at an invisible character.
+  // (The escape is doubled because PAGE is a plain Python string, not a raw
+  // one — a single one would be decoded here and break the JS literal.)
+  const paths = val("approved_paths").split("\\n").map(s => s.trim()).filter(Boolean);
+  const priority = parseInt(val("priority"), 10);
+  const fail = msg => { ntnote.className = "savefail"; ntnote.textContent = " ✗ " + msg; };
+  if (!Number.isInteger(priority)) return fail("priority must be a whole number");
+  // A UI precondition, not validation: a task with no approved paths merges
+  // fine and can then never be dispatched, because an empty scope is how
+  // "nothing authorized yet" is spelled.
+  if (!paths.length) return fail("name at least one approved path");
+  const btn = ntform.querySelector("button[type=submit]");
+  btn.disabled = true; ntnote.className = ""; ntnote.textContent = " …";
+  try {
+    const r = await fetch("/api/task", {
+      method: "POST",
+      headers: {"Content-Type": "application/json", "X-Autoloop": "1"},
+      body: JSON.stringify({id: val("id").trim(), title: val("title").trim(),
+                            description: val("description").trim(),
+                            priority, approved_paths: paths}),
+    });
+    const body = await r.json();
+    if (r.ok) {
+      ntnote.className = "saved";
+      ntnote.textContent = ` ✓ queued ${body.queued} — ${paths.length} approved path(s)`;
+      ntform.reset();
+    } else { fail(body.error || r.status); }
+  } catch (err) { fail(err); }
+  finally { btn.disabled = false; LASTJSON = null; }
+});
+
 // Theme toggle. The stamp goes on <html>, which both dark scopes key off, so
 // an explicit choice beats the OS setting in BOTH directions.
 const tog = document.getElementById("themetog");
@@ -686,6 +803,14 @@ tick(); setInterval(tick, 2000);
 """
 
 
+#: Fields `/api/task` accepts. Deliberately NARROWER than the inbox's own
+#: `ALLOWED_FIELDS`: `depends_on`, `validation` and `validation_cwd` are not on
+#: the form, so a request carrying one did not come from this page. Refused
+#: rather than dropped, for the reason `inbox.ALLOWED_FIELDS` gives — a request
+#: naming a field the receiver ignores has not done what its author intended.
+TASK_REQUEST_FIELDS = frozenset({"id", "title", "description", "priority", "approved_paths"})
+
+
 class Handler(BaseHTTPRequestHandler):
     repo = Path(".")
 
@@ -702,42 +827,128 @@ class Handler(BaseHTTPRequestHandler):
         risk is a *local* page in the same browser posting here. Two cheap
         mitigations, neither claimed to be more than that: a custom header,
         which a cross-origin form post cannot set without a CORS preflight this
-        server never approves; and an Origin check when one is present. The
-        blast radius is bounded by what the endpoint can express — a task
-        priority. It cannot change `approved_paths`, so it cannot widen what any
-        agent may touch.
+        server never approves; and an Origin check when one is present.
+
+        **The blast radius is no longer just a priority.** `/api/priority` still
+        cannot express anything but a number against an existing id. But
+        `/api/task` queues a CREATION request, and a new task carries
+        `approved_paths` — the scope a write-capable agent is later authorized
+        against. So a local page that can reach this port can queue a task
+        naming paths nobody typed, and the loop merges the inbox without asking
+        again. What bounds it, honestly stated:
+
+          * `TaskRegistry.add_many` validates every path on merge (exact
+            repository-relative paths, no globs, no '..', no absolute paths),
+            and `orchestrator` re-checks symlink traversal at dispatch — so the
+            paths are well-formed, not that they are *wanted*.
+          * A queued request is visible as text on this page (`_pending_inbox`
+            carries the paths) and in the loop's drain output before anything
+            runs against it.
+          * It creates a task; it cannot widen an EXISTING one. There is
+            deliberately no "edit approved_paths" request kind.
+
+        That is a real widening over the read-only tracker, and it is recorded
+        as such in `docs/SECURITY.md` rather than left implied.
         """
+        # Drain the body BEFORE any refusal. Each response closes the
+        # connection, and closing one with unread data still in the receive
+        # buffer makes the OS send an RST — which can discard the 403 that was
+        # just written, so the caller sees a connection error instead of the
+        # reason it was refused.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length)
+        except (ValueError, OSError) as exc:
+            return self._json_response(400, {"error": f"bad request: {exc}"})
         if self.headers.get("X-Autoloop") != "1":
             return self._json_response(403, {"error": "missing X-Autoloop header"})
         origin = self.headers.get("Origin")
         if origin and not origin.startswith(("http://127.0.0.1", "http://localhost")):
             return self._json_response(403, {"error": "cross-origin refused"})
-        if not self.path.startswith("/api/priority"):
-            return self._json_response(404, {"error": "unknown endpoint"})
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(raw or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+        except ValueError as exc:
+            return self._json_response(400, {"error": f"bad request: {exc}"})
+        if self.path.startswith("/api/priority"):
+            return self._submit_priority(body)
+        if self.path.startswith("/api/task"):
+            return self._submit_task(body)
+        return self._json_response(404, {"error": "unknown endpoint"})
+
+    def _submit_priority(self, body: dict) -> None:
+        try:
             task_id = str(body["id"])
             priority = int(body["priority"])
         except (ValueError, KeyError, TypeError) as exc:
             return self._json_response(400, {"error": f"bad request: {exc}"})
+        return self._queue(
+            lambda inbox: inbox.submit_priority(task_id, priority),
+            {"queued": task_id, "priority": priority},
+        )
 
+    def _submit_task(self, body: dict) -> None:
+        """Queue a new task through the same inbox `add-task` uses.
+
+        No field is invented here. `approved_paths` arrives as the operator
+        typed it — split into lines and stripped by the page, forwarded
+        verbatim — and this deliberately runs NO path validator of its own:
+        `TaskRegistry.add_many` is the single authority on merge (the same gate
+        a ChatGPT `plan` passes), and a second rule set here would drift from it
+        and start refusing paths the registry accepts, or worse, accepting ones
+        it does not.
+        """
+        unknown = sorted(set(body) - TASK_REQUEST_FIELDS)
+        if unknown:
+            return self._json_response(
+                400,
+                {"error": f"unknown field(s) {unknown}; allowed: {sorted(TASK_REQUEST_FIELDS)}"},
+            )
+        try:
+            raw_paths = body.get("approved_paths") or []
+            if not isinstance(raw_paths, list):
+                raise TypeError("approved_paths must be a list of strings")
+            paths = [p for p in (str(x).strip() for x in raw_paths) if p]
+            spec = {
+                "kind": "task",
+                "id": str(body["id"]).strip(),
+                "title": str(body["title"]).strip(),
+                "description": str(body["description"]).strip(),
+                "priority": int(body.get("priority", 100)),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            return self._json_response(400, {"error": f"bad request: {exc}"})
+        if not paths:
+            # A UI precondition rather than validation: the registry accepts an
+            # empty scope, and `effective_approved_paths` then keeps returning
+            # (), so the orchestrator refuses to dispatch the task forever. A
+            # form that queues an undispatchable task is a trap, so say it here.
+            return self._json_response(
+                400,
+                {"error": "approved_paths: name at least one path — a task with no "
+                          "authorized scope can never be dispatched"},
+            )
+        spec["approved_paths"] = paths
+        return self._queue(
+            lambda inbox: inbox.submit(spec),
+            {"queued": spec["id"], "priority": spec["priority"], "approved_paths": paths},
+        )
+
+    def _queue(self, submit, payload: dict) -> None:
+        """Run one inbox submit and turn its failures into responses. Shared so
+        both endpoints report a refusal identically."""
         from .inbox import InboxError, TaskInbox
 
         try:
-            path = TaskInbox(_inbox_dir(self.repo)).submit_priority(task_id, priority)
+            path = submit(TaskInbox(_inbox_dir(self.repo)))
         except InboxError as exc:
             return self._json_response(400, {"error": str(exc)})
         except OSError as exc:
             return self._json_response(500, {"error": f"could not queue: {exc}"})
         return self._json_response(
             200,
-            {
-                "queued": task_id,
-                "priority": priority,
-                "file": path.name,
-                "note": "applied by the loop on its next run",
-            },
+            {**payload, "file": path.name, "note": "applied by the loop on its next run"},
         )
 
     def _json_response(self, code: int, payload: dict) -> None:
