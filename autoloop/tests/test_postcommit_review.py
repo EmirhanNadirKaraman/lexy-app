@@ -25,7 +25,7 @@ from autoloop.orchestrator import Orchestrator
 from autoloop.packet import build_review_packet
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import LastResponse, LoopState, Phase, StateStore
-from autoloop.tasks import Task, TaskRegistry, TaskStore
+from autoloop.tasks import TRACKER_PATHS, Task, TaskRegistry, TaskStore
 from autoloop.transcript import TranscriptLogger
 from autoloop.worktask import IntentStore, TaskExecutionStore
 from autoloop.worktree import WorktreeManager
@@ -425,7 +425,13 @@ def test_round_two_touching_a_different_path_is_not_wrongly_refused(tmp_path):
     assert "POST-COMMIT REVIEW PACKET" in orch.state.outbox
 
     execution = execution_store.load(task.id)
-    assert set(execution.allowed_paths) == {"a.py", "b.py"}
+    # The task's own scope PLUS the always-approved trackers: updating
+    # docs/SUMMARY.md, TESTS.md, SECURITY.md and COMMON_ERRORS.md is a
+    # CONDITION of doing the work (CLAUDE.md 12/14), so they are implicit
+    # for every scoped task — see tasks.TRACKER_PATHS and AUTOLOOP.md 4f-bis.
+    # Asserted against the constant rather than six literals, so widening
+    # that list cannot silently drift from what this test expects.
+    assert set(execution.allowed_paths) == {"a.py", "b.py"} | set(TRACKER_PATHS)
     wt_git = worktree_git_for(worktrees, task.id)
     touched = wt_git.commit_range_paths(execution.task_base_sha, execution.candidate_sha)
     assert touched == {"a.py", "b.py"}

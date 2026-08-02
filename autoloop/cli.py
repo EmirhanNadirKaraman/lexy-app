@@ -159,6 +159,12 @@ def _seed_registry(config: AutoloopConfig) -> TaskRegistry:
                 title=spec["title"],
                 description=spec["description"],
                 depends_on=tuple(spec.get("depends_on", ())),
+                # Threaded explicitly: a field the seed declares and this
+                # function forgets is silently dropped, which is how
+                # `validation`/`validation_cwd` were lost before. A dropped
+                # priority is worse than useless — it looks set in the file
+                # while `next_ready` falls back to the id tie-break.
+                priority=int(spec.get("priority", 100)),
                 validation=tuple(tuple(c) for c in spec.get("validation", ())),
                 validation_cwd=spec.get("validation_cwd", ""),
                 approved_paths=tuple(spec.get("approved_paths", ())),

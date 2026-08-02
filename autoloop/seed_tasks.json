@@ -24,7 +24,8 @@
       "lexy-app/backend/routers/books.py",
       "lexy-app/backend/tests/test_books_import_admin.py",
       "docs/SECURITY.md"
-    ]
+    ],
+    "priority": 1
   },
   {
     "id": "ext-01",
@@ -50,6 +51,7 @@
     "approved_paths": [
       "subtitle-scraper/phrase_finder.py",
       "lexy-app/backend/tests/test_free_chat_progression.py"
-    ]
+    ],
+    "priority": 3
   }
 ]
