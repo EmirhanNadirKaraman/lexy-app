@@ -36,10 +36,12 @@ always constructs the full collaborator set (`WorkerRepoManager`,
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import json
 import os
+import signal
 import sys
 import time
 from datetime import datetime, timezone
@@ -357,9 +359,55 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
     )
 
 
+@contextlib.contextmanager
+def _release_lock_on_termination(lock: LoopLock):
+    """Release the instance lock when the OS asks us to stop.
+
+    Ctrl-C already unwinds cleanly: KeyboardInterrupt runs `LoopLock`'s
+    context-manager exit. SIGTERM and SIGHUP do not — Python's default
+    action for both is to die without unwinding — so the tidy-looking way
+    to stop a run (a shutdown, a logout, plain `kill`) was the one that
+    left a lock behind, and the abrupt way was clean. This inverts that.
+
+    The release happens inside the handler, before unwinding, so the lock
+    is gone even if the shutdown's grace period expires and we are SIGKILLed
+    on the way out. Nothing else is written here: the state file is already
+    consistent at every instant (atomic saves), and touching the pause flag
+    would silently gag the NEXT run.
+
+    Child agents are deliberately left to their own exit. They are separately
+    contained, their in-flight output is discarded on resume anyway, and
+    signalling a process group from a handler risks hitting the wrong one.
+    """
+    installed: list[tuple[int, object]] = []
+
+    def _terminate(signum, _frame):
+        lock.release()
+        raise SystemExit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            installed.append((signum, signal.signal(signum, _terminate)))
+        except ValueError:
+            # Not the main thread (embedded/test use) — the caller's own
+            # cleanup still applies; we simply cannot add to it here.
+            pass
+    try:
+        yield
+    finally:
+        for signum, previous in installed:
+            try:
+                signal.signal(signum, previous)
+            except ValueError:
+                pass
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    with LoopLock(config.state_dir):
+    with LoopLock(config.state_dir) as lock, _release_lock_on_termination(lock):
         if getattr(args, "continuous", False):
             _validate_continuous_args(args)
             return _run_continuous(args, config)

@@ -83,6 +83,22 @@ if TYPE_CHECKING:
 SCHEMA_VERSION = 3
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Make a rename inside `directory` durable. Best-effort by design: not
+    every filesystem allows opening a directory for fsync, and a save that
+    succeeded is not worth failing over a platform that cannot confirm it."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -471,10 +487,20 @@ class StateStore:
         state.updated_at = utcnow_iso()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(
-            json.dumps(state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        payload = json.dumps(state.to_dict(), ensure_ascii=False, indent=2)
+        # Temp-file + rename alone is atomic against a killed PROCESS but not
+        # against a killed MACHINE: without these fsyncs the rename can reach
+        # the disk while the data blocks it points at have not, leaving a
+        # state file that is empty or truncated after a power cut. Both are
+        # needed — the first makes the contents durable, the second makes the
+        # rename durable. A filesystem that refuses to fsync a directory
+        # (some network mounts) is not a reason to fail the save.
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, self.path)
+        _fsync_dir(self.path.parent)
 
     def archive(self) -> Path | None:
         """Move the current state file aside (used by `reset`). Returns the backup path."""

@@ -113,6 +113,52 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   have written it) and stays on disk for diagnosis until `unlock`.
 * Clean exit releases; release is run-id-guarded, so a zombie can never
   remove a successor's lock.
+* **A lock written before the machine's current boot is stale whatever its
+  pid says**, and the boot check runs BEFORE the pid probe. Pids are
+  reassigned across a reboot, so a lock left by a power-off can name a pid
+  that some unrelated process now holds; `os.kill(pid, 0)` then reports it
+  live and `unlock` refuses with "stop that process instead" — pointing the
+  operator at an innocent process with no way forward. Boot time comes from
+  `kern.boottime` (darwin) or `/proc/stat`'s `btime` (linux), never from a
+  monotonic clock: macOS's stops during sleep, so uptime-minus-now on a
+  laptop that has slept would date boot too recently and could declare a
+  LIVE lock stale. When boot time is unreadable, or the stamp is
+  unparseable or timezone-naive, the pid probe decides exactly as before —
+  the check can only ever make MORE locks recoverable, never fewer.
+
+### 3a. Stopping the loop, and losing the machine
+
+`SIGTERM` and `SIGHUP` release the lock **inside the signal handler**,
+before unwinding. Python's default action for both is to die without
+running `finally`, so before this the tidy-looking way to stop a run (a
+shutdown, a logout, plain `kill`) was the one that left a lock behind,
+while Ctrl-C — which raises `KeyboardInterrupt` and unwinds — was clean.
+The release must happen in the handler rather than by unwinding: a SIGTERM
+arriving mid-fan-out unwinds into `ThreadPoolExecutor.shutdown(wait=True)`,
+which waits on agents that run for minutes, and a shutdown's grace period
+is seconds. Child agents are deliberately left to exit on their own.
+
+What each way of stopping costs:
+
+| How it stops | Lock | State | In-flight work |
+|---|---|---|---|
+| `pause` | released | consistent | none — finishes the current phase first |
+| Ctrl-C / SIGTERM / SIGHUP | released | consistent | the current step |
+| SIGKILL / power cut | left behind, `unlock` clears it | consistent | the current step |
+
+"State consistent" is not a hope: `StateStore.save` writes a temp file,
+**fsyncs it**, renames, then fsyncs the directory. Temp-file + rename alone
+is atomic against a killed process but not against a killed machine — the
+rename can reach disk while the data blocks it points at have not, leaving
+a truncated state file after a power cut. Directory fsync is best-effort
+(some network mounts refuse it) and never fails a save that otherwise
+succeeded.
+
+"In-flight work" is a whole step, not a partial one. The audit fan-out
+writes each domain's raw output only after **all** agents return
+(`executor.py:_run_agents`), so losing a run mid-fan-out loses all six
+domains, not the one in progress. Nothing is corrupted; the step is
+re-dispatched on resume.
 
 ---
 

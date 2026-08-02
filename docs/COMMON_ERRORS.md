@@ -580,6 +580,41 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### `refusing to remove a LIVE lock (pid=… )` from `unlock`, after a reboot
+**Symptom:** the machine was restarted (or power-cut) while `run --continuous`
+was going. `python -m autoloop run` reports the state dir is locked; the
+documented recovery, `python -m autoloop unlock`, then refuses — "refusing to
+remove a LIVE lock. Stop that process instead." There is no process to stop:
+the pid belongs to something unrelated that booted afterwards.
+**Cause:** `LoopLock.is_live` decided staleness purely by `os.kill(pid, 0)`.
+**Pids are reassigned across a reboot**, so the recorded pid can be handed to
+any other process, and the probe then says "alive". Both commands were behaving
+correctly on false evidence, which is why it reads as a dead end.
+**Fix:** applied repo-side — `lock.py` compares the lock's `started_at` against
+the machine's boot time (`kern.boottime` / `/proc/stat` `btime`) BEFORE probing
+the pid; anything written before this boot is stale regardless. **Do not
+"simplify" that to a monotonic clock**: macOS's `CLOCK_MONOTONIC` stops during
+sleep, so a slept laptop would compute a boot time far too recent and could
+declare a LIVE lock stale — the one direction this must never fail in. If you
+hit this on a build that predates the fix, delete `.autoloop/LOCK` by hand
+after confirming with `pgrep -f 'autoloop run'` that nothing is running.
+
+### The loop leaves a stale lock on shutdown but NOT on Ctrl-C
+**Symptom:** stopping with Ctrl-C is clean; a reboot, logout, or plain `kill`
+leaves `.autoloop/LOCK` behind and the next `run` refuses to start.
+**Cause:** it is backwards from how it looks. Ctrl-C raises
+`KeyboardInterrupt`, which unwinds and runs `LoopLock`'s context-manager exit.
+Python's default action for **SIGTERM and SIGHUP is to die without running
+`finally`**, so the orderly-looking ways to stop skipped the release entirely.
+**Fix:** applied repo-side — `cli._release_lock_on_termination` installs
+handlers for both. The release happens **inside the handler**, before
+unwinding, and that placement is load-bearing: a SIGTERM mid-fan-out unwinds
+into `ThreadPoolExecutor.shutdown(wait=True)`, which waits on agents that run
+for minutes, while a shutdown's grace period is seconds. A version that only
+raised `SystemExit` and let the `with` block release looks identical in a quick
+test and fails exactly when it matters — see
+`test_lock_is_released_before_unwinding_not_by_it`.
+
 ### `TypeError: ImplementExecutor.__init__() got an unexpected keyword argument 'task_inbox'` at `run` startup
 **Symptom:** every unit test passes, `ruff` is clean, and `python -m autoloop
 run` dies immediately in `cli._build_executor`.
