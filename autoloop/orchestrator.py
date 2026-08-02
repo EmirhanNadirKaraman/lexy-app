@@ -1663,6 +1663,19 @@ class Orchestrator:
 
         self._dispatch_task_postcommit(directive, task, state)
 
+    def _audit_unit_quarantined(self, unit_id: str) -> bool:
+        """Has the operator quarantined this exact audit unit?
+
+        Audit units are synthetic — minted here, never planned — so most of
+        the time the registry has never heard of one. That is the ordinary
+        case (a fresh audit), not an error: only a unit that previously
+        parked task_fatal is in the registry at all, put there by
+        `TaskRegistry.block`. Anything unknown is therefore dispatchable.
+        """
+        if not self._registry.has(unit_id):
+            return False
+        return self._registry.get(unit_id).status == "blocked"
+
     def _resolve_audit_task(self, directive: Directive, state: LoopState) -> Task | None:
         """The audit's own stable per-run identity, distinct from the
         protocol-level pseudo-id `AUDIT_TASK_ID` ("audit" — what ChatGPT
@@ -1688,6 +1701,39 @@ class Orchestrator:
         """
         if directive.decision is Decision.AUDIT:
             unit_id = f"audit-{state.iteration:04d}"
+            # The audit pseudo-task skips `authorize_directive`'s
+            # `_check_task_reference`, so nothing else asks whether the id
+            # about to be dispatched is one the operator already quarantined.
+            # It matters because the id is NOT unique per attempt: it is
+            # `audit-<iteration>`, and an audit that parks before completing
+            # its iteration re-mints the SAME id next time. Observed
+            # 2026-08-02: a quarantined `audit-0001` was re-dispatched four
+            # times in a row, each costing a full ChatGPT round trip, each
+            # parking on the same stale execution record — the loop looked
+            # alive while making no progress at all.
+            #
+            # Denying rather than parking is the point. A park here would
+            # re-quarantine an already-quarantined task and leave ChatGPT
+            # none the wiser, which is precisely the cycle that churned.
+            # A denial re-prompts with the reason and is bounded by
+            # `check_denial_budget`, so ChatGPT can pick a real task and a
+            # genuinely stuck loop still stops instead of spinning.
+            if self._audit_unit_quarantined(unit_id):
+                self._handle_policy_denial(
+                    directive,
+                    Verdict.deny(
+                        "audit_unit_quarantined",
+                        f"the audit unit {unit_id} is quarantined "
+                        "(blocked_by_operator) and re-running `audit` would "
+                        "re-dispatch that same unit, not a fresh one — the id is "
+                        "derived from the loop iteration, which a parked audit "
+                        "does not advance. Choose a different ready task, or ask "
+                        "the operator to clear the quarantine (`autoloop "
+                        f"blockers` / `answer`) and archive "
+                        f".autoloop/executions/{unit_id}.json.",
+                    ),
+                )
+                return None
         else:
             prior = (state.current_task or {}).get("task_id") or ""
             if not prior.startswith("audit-"):

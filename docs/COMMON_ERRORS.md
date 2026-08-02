@@ -580,6 +580,31 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### The loop runs forever without progressing — same `audit` decision, same park, every cycle
+**Symptom:** `run --continuous` is alive and healthy (no crash, no blocker you
+can act on), but the transcript repeats one cycle: `directive {"decision":
+"audit"}` → `needs_user {"task_id": "audit-00NN"}` → `request_prepared` →
+`request_submitted`. Every pass costs a full ChatGPT round trip. `iteration`
+never advances.
+**Cause:** two things compounding.
+1. The audit unit id is `audit-<iteration>`, **not unique per attempt** — and
+   an audit that parks never advances the iteration, so each retry re-mints
+   the *same* id and finds the same stale `.autoloop/executions/<id>.json`.
+2. `decision=audit` skips `authorize_directive`'s `_check_task_reference` (it
+   is a pseudo-task, not a registry entry), so nothing asked whether that id
+   was already quarantined. The park re-quarantined an already-quarantined
+   unit and told ChatGPT nothing, so it chose `audit` again.
+**Fix:** applied repo-side — `_resolve_audit_task` refuses a quarantined unit
+via `_handle_policy_denial` rather than parking. A denial re-prompts with the
+reason (so the next directive can name a real task) and is bounded by
+`check_denial_budget`, so a genuinely stuck loop stops instead of spinning.
+**Clearing one that is already stuck:** stop the loop, archive
+`.autoloop/executions/<unit-id>.json` (a move, keep the `.bak-`), then
+`autoloop answer <blocker-id> "..."` to release the quarantine. Check first
+that the reviewed candidate survives — `git -C ~/.autoloop/workers/<unit-id>
+branch --contains <candidate-sha>` — since archiving the record does not touch
+the branch, and that branch is the only copy.
+
 ### `Error: It looks like you are using Playwright Sync API inside the asyncio loop.` — `run --continuous` dies after a park
 **Symptom:** the loop runs fine, parks or hits a browser error, prepares the
 next request, and the whole process dies with this traceback ending at

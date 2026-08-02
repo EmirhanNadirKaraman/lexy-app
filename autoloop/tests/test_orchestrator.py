@@ -25,7 +25,7 @@ import pytest
 
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.browser.chatgpt import SubmitResult
-from autoloop.contract import Decision
+from autoloop.contract import Decision, Directive
 from autoloop.errors import (
     GitCommandError,
     LoginExpiredError,
@@ -1371,3 +1371,60 @@ def test_inbox_priority_decides_what_runs_next(tmp_path):
     inbox.submit({"id": "urgent", "title": "U", "description": "d", "priority": 1})
     orch._drain_task_inbox()
     assert orch._registry.next_ready().id == "urgent"
+
+
+def test_audit_on_a_quarantined_unit_is_denied_not_re_dispatched(tmp_path):
+    """The churn observed 2026-08-02: a quarantined `audit-0001` was
+    re-dispatched four times running, each costing a full ChatGPT round trip
+    and each parking on the same stale execution record. The loop looked
+    alive while making no progress.
+
+    The audit pseudo-task skips `authorize_directive`'s
+    `_check_task_reference`, so nothing asked whether the unit about to be
+    dispatched was already quarantined — and the id is NOT unique per
+    attempt (`audit-<iteration>`, and a parked audit never advances the
+    iteration), so every retry re-minted the same one.
+
+    Denying rather than parking is the fix: a park would re-quarantine an
+    already-quarantined unit and tell ChatGPT nothing, which is the cycle
+    itself. A denial re-prompts with the reason, so the next directive can
+    name a real task.
+
+    Driven at `_resolve_audit_task` directly: the unit id is derived from
+    `state.iteration`, which advances DURING `run()`, so an end-to-end test
+    cannot name the id it needs to quarantine without racing the loop.
+    """
+    orch, _, _, executor, _, _, _ = build_postcommit(
+        tmp_path, responses=[audit_block(), stop_block()]
+    )
+    orch.state.iteration = 7
+    unit_id = "audit-0007"
+    orch._registry.add(
+        Task(id=unit_id, title="repository audit", description="repository audit")
+    )
+    orch._registry.block(unit_id, "stale execution record")
+
+    directive = Directive(decision=Decision.AUDIT, reason="orient")
+    assert orch._resolve_audit_task(directive, orch.state) is None
+
+    # Denied, not parked: the loop stays runnable and ChatGPT is told why.
+    assert orch.state.policy_denials == 1
+    assert orch.state.phase == Phase.READY.value
+    assert unit_id in (orch.state.outbox or "")
+    assert executor.calls == []
+
+
+def test_a_fresh_audit_unit_is_never_treated_as_quarantined(tmp_path):
+    """Audit units are synthetic and usually absent from the registry
+    entirely. 'Unknown' must mean dispatchable, or the deny above would
+    block every audit that ever runs."""
+    orch, _, _, executor, _, _, _ = build_postcommit(
+        tmp_path, responses=[audit_block(), approval(decision="push"), stop_block()]
+    )
+    unit_id = f"audit-{orch.state.iteration:04d}"
+    assert not orch._registry.has(unit_id)
+
+    assert orch.run() == Phase.STOPPED.value
+
+    assert [d.decision for d, _ in executor.calls] == [Decision.AUDIT]
+    assert orch.state.policy_denials == 0
