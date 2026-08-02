@@ -126,6 +126,41 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   unparseable or timezone-naive, the pid probe decides exactly as before —
   the check can only ever make MORE locks recoverable, never fewer.
 
+### 3f. `merge-window` — do not strand the loop's own work
+
+```bash
+python -m autoloop merge-window            # exit 0 = safe to merge
+python -m autoloop merge-window --wait     # block until it opens
+```
+
+The operator and the loop share one branch, so every merge into it while a
+task holds a candidate invalidates that task: `task_base_sha` is pinned, the
+loop refuses to rebase (a reviewer has already seen the candidate, and
+re-basing would discard reviewed work), and it parks. This happened **four
+times on 2026-08-02**, every time because "no agent is running right now"
+looked like "safe to merge".
+
+The real condition is not the phase — it is whether any
+`.autoloop/executions/*.json` carries a `candidate_sha`. A dispatched task
+that has not committed yet holds nothing reviewed, so it does not close the
+window; an executing phase does.
+
+The intended workflow:
+
+```bash
+git switch -c fix/whatever && ...work...
+python -m autoloop merge-window --wait \
+  && git switch audit/initial-autoloop-audit \
+  && git merge --ff-only fix/whatever
+```
+
+Working in a `git worktree` is the companion habit: `git ls-files` never lists
+`.git/` internals, so a worktree outside the checkout is invisible to the
+escape detector, and editing the primary checkout while a write-capable task
+is dispatched is what trips it (§3e).
+
+---
+
 ### 3e. Heartbeat + the durable monitor
 
 ```bash

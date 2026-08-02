@@ -683,6 +683,26 @@ def _handle_parked_task(
         try:
             registry.block(state.park_task_id, reason)
         except TaskGraphError as exc:
+            if exc.code == "task_completed":
+                # The park is stale: its task finished after the park was
+                # written — typically the operator published the candidate the
+                # park was complaining about and marked the task done. There is
+                # nothing to quarantine, and `block` refuses a completed task
+                # precisely because quarantining finished work is meaningless.
+                #
+                # Escalating here (as the generic branch does) made resolving a
+                # park BY COMPLETING ITS TASK produce a session that could never
+                # be recovered, only archived — hit twice on 2026-08-02, once
+                # per published candidate. Same shape as the `in_progress` gap
+                # `release` closed: a state the fail-closed branch cannot tell
+                # apart from a real fault.
+                print(
+                    f"task {state.park_task_id} is already completed — its park is "
+                    "stale and there is nothing to quarantine.\n"
+                    "continuous mode continues with other ready tasks."
+                )
+                store.path.unlink(missing_ok=True)
+                return "task_fatal"
             print(
                 f"blocker for task {state.park_task_id!r} is classified task_fatal, "
                 f"but the task could not be quarantined ({exc}) — treating this park "
@@ -1683,6 +1703,70 @@ def _cmd_health(args: argparse.Namespace) -> int:
     return 1 if verdict.needs_attention else 0
 
 
+def _merge_window_blockers(config) -> list[str]:
+    """Why merging into the loop's base is unsafe right now, or []."""
+    reasons: list[str] = []
+
+    # An execution record with a candidate is the REAL hazard, and the one a
+    # phase check misses. It pins `task_base_sha`; moving the branch head under
+    # it strands the task, because a review has already seen that candidate and
+    # re-basing would discard reviewed work. Four tasks were stranded this way
+    # on 2026-08-02, every one of them by a merge that looked safe because no
+    # agent happened to be running at that instant.
+    executions = sorted(config.state_dir.glob("executions/*.json"))
+    for path in executions:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if record.get("candidate_sha"):
+            reasons.append(
+                f"task {record.get('task_id', path.stem)} has a candidate "
+                f"({str(record.get('candidate_sha'))[:12]}) bound to base "
+                f"{str(record.get('task_base_sha'))[:12]} — merging would strand it"
+            )
+
+    _, state = _load_state(config)
+    if state is not None and Phase(state.phase) is Phase.EXECUTING:
+        reasons.append("a phase is executing — an agent may be mid-write")
+
+    return reasons
+
+
+def _cmd_merge_window(args: argparse.Namespace) -> int:
+    """Is it safe to merge into the branch the loop builds against?
+
+    Exists because the operator and the loop share one branch, and every
+    merge into it while a task holds a candidate invalidates that task. The
+    loop then refuses to rebase — correctly, since a reviewer has already seen
+    the candidate — and parks. That happened four times in one day, each time
+    because "no agent is running" was mistaken for "safe".
+
+    Exit 0 = safe, 1 = not. With `--wait` it blocks until safe or the timeout
+    expires, so the intended use is:
+
+        git switch -c fix/whatever && ...work...
+        python -m autoloop merge-window --wait && git switch <base> && git merge --ff-only fix/whatever
+    """
+    config = load_config(args.config)
+    deadline = time.monotonic() + args.timeout
+    while True:
+        reasons = _merge_window_blockers(config)
+        if not reasons:
+            print("merge window OPEN — no in-flight candidate, no executing phase")
+            return 0
+        if not args.wait or time.monotonic() > deadline:
+            print("merge window CLOSED:")
+            for reason in reasons:
+                print(f"  - {reason}")
+            if not args.wait:
+                print("\n`--wait` blocks until it opens.")
+            else:
+                print(f"\ngave up after {args.timeout:.0f}s.")
+            return 1
+        time.sleep(args.poll)
+
+
 def _cmd_pause(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     config.pause_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1825,6 +1909,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="why this blocker is dead — required, so an archival is never a silent delete",
     )
     archive_blocker.set_defaults(func=_cmd_archive_blocker)
+
+    window = sub.add_parser(
+        "merge-window",
+        help=(
+            "is it safe to merge into the loop's branch? exit 0 = yes. A merge "
+            "while a task holds a candidate strands that task"
+        ),
+    )
+    add_config(window)
+    window.add_argument("--wait", action="store_true", help="block until the window opens")
+    window.add_argument("--timeout", type=float, default=7200, help="give up after N seconds")
+    window.add_argument("--poll", type=float, default=15, help="seconds between checks")
+    window.set_defaults(func=_cmd_merge_window)
 
     healthp = sub.add_parser(
         "health",
