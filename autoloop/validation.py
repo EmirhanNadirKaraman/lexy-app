@@ -38,6 +38,7 @@ second env policy there.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -48,6 +49,59 @@ from .validation_env import ValidationEnv, redact_with, strip_validation_vars
 SAFE_VALIDATION_BINARIES = frozenset(
     {"ruff", "pytest", "python", "python3", "npm", "npx", "tsc"}
 )
+
+
+#: Lines that NAME what failed, as opposed to counting it. pytest prints
+#: these in its short summary; unittest and ruff use the same leading words.
+_FAILURE_LINE_RE = re.compile(r"^(FAILED|ERROR)\b")
+
+#: Terminal colour codes. pytest emits them even under `-q` when it thinks it
+#: has a tty, and they survive `capture_output` into blocker text and park
+#: messages, where they render as literal `\x1b[31m` noise.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+#: Bounds on the digest. Generous enough to name a dozen failing tests,
+#: bounded so a catastrophic run cannot flood a park message or a review
+#: packet with tool output.
+_DIGEST_MAX_LINES = 12
+_DIGEST_MAX_CHARS = 700
+
+
+def failure_digest(
+    output: str,
+    max_lines: int = _DIGEST_MAX_LINES,
+    max_chars: int = _DIGEST_MAX_CHARS,
+) -> str:
+    """What actually failed, not just how many things did.
+
+    This used to be `splitlines()[-1]` — the LAST line of output. For pytest
+    that is the count line ("1 failed, 992 passed"), which discards the
+    `FAILED <file>::<test>` lines printed immediately above it. The effect
+    was that a refused commit could not be diagnosed from its own blocker
+    record: on 2026-08-02 an audit was refused on a single failing test and
+    the only way to learn which one was to re-run the tree by hand. A flaky
+    gate is bad; a flaky gate that does not say what flaked is worse.
+
+    Keeps the naming lines AND the final count line, since the count is what
+    tells you whether one test failed or four hundred did.
+    """
+    text = _ANSI_RE.sub("", output).strip()
+    if not text:
+        return "(no output)"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    named = [line for line in lines if _FAILURE_LINE_RE.match(line)]
+    picked = named[:max_lines]
+    if len(named) > max_lines:
+        picked.append(f"(+{len(named) - max_lines} more)")
+    # The last line is the count/summary for every runner we use. Include it
+    # unless it is already one of the named lines (a run whose only output
+    # IS a FAILED line).
+    if lines[-1] not in picked:
+        picked.append(lines[-1])
+    digest = "; ".join(picked)
+    if len(digest) > max_chars:
+        digest = digest[: max_chars - 3].rstrip() + "..."
+    return digest
 
 
 def run_validation_commands(
@@ -111,12 +165,8 @@ def run_validation_commands(
         if ok:
             parts.append(f"{command}: PASS")
         else:
-            # A short tail of the combined output on failure — enough for a
-            # park message or a log line to be actionable without echoing an
-            # unbounded amount of tool output.
             output = (proc.stdout or "") + (proc.stderr or "")
-            tail = output.strip().splitlines()[-1].strip() if output.strip() else "(no output)"
-            parts.append(f"{command}: FAIL ({tail[:200]})")
+            parts.append(f"{command}: FAIL ({failure_digest(output)})")
     if not parts:
         return True, "(no validation commands configured)"
     # Redacted LAST, over the assembled summary, so every branch above is

@@ -580,6 +580,25 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### A commit was REFUSED at post-commit review and the blocker does not say which test failed
+**Symptom:** a blocker reads `post-commit validation failed: ... pytest ...:
+FAIL (1 failed, 992 passed, 1 skipped)` — a count and nothing else, often
+wrapped in literal `\x1b[31m` escape codes. There is no way to tell which test
+failed, so there is no way to tell a real regression from a flake.
+**Cause:** the validation summary kept `output.splitlines()[-1]` — the LAST
+line. For pytest that is the count line, and the `FAILED <file>::<test>` lines
+sit immediately ABOVE it in the short summary.
+**Fix:** applied repo-side — `validation.failure_digest` keeps the naming lines
+AND the count, strips ANSI, and bounds the result (visibly, so truncation never
+reads as "only 12 failed"). It is redacted through `ValidationEnv` exactly as
+before; the digest is wider than the old one-line tail, so that redaction
+matters more, not less — there is a test pinning that a password in a failure
+message does not reach the summary.
+**Diagnosing one on an older build:** re-run the exact tree by hand —
+`cd ~/.autoloop/workers/<unit-id> && python3 -m pytest autoloop/tests -q`. If it
+passes, the refusal was a flake; the commit is untouched on its branch, since
+this gateway cannot reset or roll back.
+
 ### The loop runs forever without progressing — same `audit` decision, same park, every cycle
 **Symptom:** `run --continuous` is alive and healthy (no crash, no blocker you
 can act on), but the transcript repeats one cycle: `directive {"decision":
