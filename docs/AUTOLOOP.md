@@ -141,7 +141,10 @@ times on 2026-08-02**, every time because "no agent is running right now"
 looked like "safe to merge".
 
 The real condition is not the phase — it is whether any
-`.autoloop/executions/*.json` carries a `candidate_sha`. A dispatched task
+`.autoloop/executions/*.json` carries a `candidate_sha` **for a task that could
+still be dispatched or reviewed**. Records outlive the work they describe
+(nothing archives one when a candidate is published), so a completed or
+quarantined task's record is skipped; an unknown id is not. A dispatched task
 that has not committed yet holds nothing reviewed, so it does not close the
 window; an executing phase does.
 

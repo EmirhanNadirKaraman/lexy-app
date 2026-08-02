@@ -107,6 +107,48 @@ def test_an_execution_record_without_a_candidate_does_not_close_it(wired):
     assert cli._cmd_merge_window(_args()) == 0
 
 
+def test_a_record_for_finished_work_does_not_close_the_window(wired):
+    """Records outlive the work they describe — nothing archives one when a
+    candidate is published or its task is quarantined. Counting those would
+    close the window permanently on work that can no longer be stranded.
+    Found by running this command against the real repo the moment it was
+    written: it reported a completed task and a quarantined one."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="done-1")
+    _execution(wired, task_id="quarantined-1")
+
+    store = TaskStore(wired.tasks_file)
+    registry = TaskRegistry([
+        Task(id="done-1", title="t", description="d"),
+        Task(id="quarantined-1", title="t", description="d"),
+    ])
+    registry.mark_completed("done-1")
+    registry.block("quarantined-1", "failed its own validation")
+    store.save(registry)
+
+    assert cli._cmd_merge_window(_args()) == 0
+
+
+def test_a_record_for_a_LIVE_task_still_closes_it(wired, capsys):
+    """The guard must not swallow the case the command exists for."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="live-1")
+    TaskStore(wired.tasks_file).save(
+        TaskRegistry([Task(id="live-1", title="t", description="d")])
+    )
+
+    assert cli._cmd_merge_window(_args()) == 1
+    assert "would strand it" in capsys.readouterr().out
+
+
+def test_a_record_whose_task_is_unknown_still_closes_it(wired):
+    """An id the registry has never heard of is not evidence of safety."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="ghost-1")
+
+    assert cli._cmd_merge_window(_args()) == 1
+
+
 def test_no_session_at_all_is_safe(wired):
     assert cli._cmd_merge_window(_args()) == 0
 

@@ -82,7 +82,7 @@ from .publisher import (
     reprovision_publisher as _reprovision_publisher_snapshot,
 )
 from .state import TERMINAL_PHASES, LoopState, Phase, StateStore
-from .tasks import Task, TaskRegistry, TaskStore
+from .tasks import Task, TaskRegistry, TaskState, TaskStore
 from .transcript import TranscriptLogger
 from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
@@ -1713,12 +1713,24 @@ def _merge_window_blockers(config) -> list[str]:
     # re-basing would discard reviewed work. Four tasks were stranded this way
     # on 2026-08-02, every one of them by a merge that looked safe because no
     # agent happened to be running at that instant.
+    # Records outlive the work they describe: nothing archives one when a
+    # candidate is published or its task is quarantined. Counting those would
+    # close the window permanently on finished work — dogfooding this command
+    # reported two such records the moment it was written — and a tool that
+    # cries wolf gets ignored, which is the failure it exists to prevent.
+    # Only a task that could still be dispatched or reviewed can be stranded.
+    _, registry = _load_tasks(config)
     executions = sorted(config.state_dir.glob("executions/*.json"))
     for path in executions:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        task_id = record.get("task_id") or path.stem
+        if registry.has(task_id):
+            state = registry.state_of(task_id)
+            if state in (TaskState.COMPLETED, TaskState.BLOCKED_BY_OPERATOR):
+                continue
         if record.get("candidate_sha"):
             reasons.append(
                 f"task {record.get('task_id', path.stem)} has a candidate "
