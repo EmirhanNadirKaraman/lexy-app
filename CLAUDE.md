@@ -253,10 +253,27 @@ instead of bare `'test+%@example.com'` — see `test_words.py` / `test_recommend
 `zztest-model-{worker}` model, and the autouse cleanup reaps that pattern.
 Never clean it by `prompt_key` — `item_gloss` is a real production key.
 
-### Root-pipeline tests
+### Root tests — what a bare `pytest` actually covers
 ```bash
-pytest tests/                       # tests for root pipeline modules
+pytest                              # root pipeline modules + autoloop (testpaths)
+pytest tests/                       # just the root pipeline modules
+pytest autoloop/tests               # just the autoloop loop harness
 ```
+Root `pytest.ini` sets `testpaths = tests autoloop/tests`, so a bare `pytest`
+at the repo root runs **both** trees. Expect minutes, not seconds — the
+autoloop suite shells out to real `git` and spawns real subprocesses. It is
+still hermetic (no database, no network, no real `claude` CLI) and derives
+every state dir, worker root and lock path from `tmp_path`, so running it
+cannot disturb a live loop's `~/.autoloop`.
+
+**The two suites a bare root `pytest` does NOT run**, because each needs its
+own runner and environment:
+- `lexy-app/backend/tests` — own `pytest.ini` (asyncio settings) + a live
+  Postgres. Run `cd lexy-app/backend && python3 -m pytest -n auto`.
+- `lexy-app/frontend` — vitest. Run `npx vitest run`.
+
+So "a Python change is validated" means three commands, not one: `ruff check .`,
+a bare root `pytest`, and the backend suite. Full table in `docs/TESTS.md`.
 
 ### Env (`.env` at repo root, also read by backend)
 ```

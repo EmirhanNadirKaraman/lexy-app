@@ -1329,8 +1329,24 @@ files, e.g. `test_orchestrator.py`, `test_audit_executor.py`,
 table. Not re-audited here — out of scope for this change — but flagged so
 it isn't mistaken for a claim that every row below is current.
 
-Run: `pytest autoloop/tests` from the repo root. **Not included in bare
-`pytest`** — root `testpaths` still points at `tests/` only.
+Run: `pytest autoloop/tests` from the repo root to run only this tree.
+
+**Included in a bare `pytest` since 2026-08-04 (rt-05).** Root `testpaths` is
+now `tests autoloop/tests`, so a bare root run collects both trees. It
+previously pointed at `tests/` alone, which meant a bare `pytest` reported a
+green root suite while this entire suite had silently not been collected — the
+default surface said nothing about what it was skipping, so nobody had to
+choose the exclusion for it to hold.
+
+Two properties made merging safe, and both are worth re-checking before adding
+any third tree: this suite imports only `pytest` and the stdlib (`playwright`
+is imported lazily inside functions and faked in tests, so a machine without it
+still collects), and it derives every state dir, worker root and lock path from
+`tmp_path` — including `test_v1_smoke.py`'s deliberately RELATIVE `.autoloop`,
+which runs under `monkeypatch.chdir`. Nothing here can reach the real
+`~/.autoloop`, so a bare `pytest` cannot disturb a loop that is mid-round.
+The cost is wall-clock: real `git` and real subprocesses make a bare root run
+take minutes.
 
 As of 2026-08-01 this suite is **790 passed, 1 skipped** (~2m26s serial). The
 one skip is `test_real_db_validation_command_succeeds`, which needs an
@@ -2176,8 +2192,23 @@ Run all three. The lint step is not optional.
 |---|---|---|
 | Lint | `ruff check .` *(repo root)* | `All checks passed!` |
 | Backend | `cd lexy-app/backend && python3 -m pytest -n auto` | 1258 passed, 2 skipped |
-| Root pipeline | `pytest tests/` *(repo root)* | 368 passed |
-| Autoloop | `pytest autoloop/tests` *(repo root; only when touching `autoloop/`)* | 869 passed, 1 skipped |
+| Root (pipeline + autoloop) | `pytest` *(repo root)* | re-measure — see below |
+| ↳ pipeline only | `pytest tests/` *(repo root)* | 368 passed |
+| ↳ autoloop only | `pytest autoloop/tests` *(repo root)* | 869 passed, 1 skipped |
+
+> **The root command is now a bare `pytest`, not `pytest tests/` (rt-05,
+> 2026-08-04).** `testpaths = tests autoloop/tests`, so one command covers both
+> trees and the autoloop suite is no longer conditional on "only when touching
+> `autoloop/`" — that qualifier is what let a loop-harness regression ship
+> unnoticed by anyone who did not think to run it. The two split rows are kept
+> for narrowing a failure, not for validating a change.
+>
+> The combined expected count is deliberately left unmeasured rather than
+> guessed. The three figures on record disagree — the audit that filed this task
+> said 415, this file said 790 at 2026-08-01 and 869 in the row above — because
+> each was measured on a different date, and the change that merged the trees
+> was made without a shell to run them in. Record what a real run reports; do
+> not sum the rows above (the same idiom as the autoloop section's own note).
 
 > **Backend command reconciled 2026-07-29:** it must be `python3 -m pytest`,
 > NOT the bare `pytest` entrypoint. `python -m` puts the cwd on `sys.path`,
