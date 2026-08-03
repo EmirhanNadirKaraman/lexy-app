@@ -136,6 +136,17 @@ def live_agents() -> list[dict]:
     return agents
 
 
+#: A finding heading in the audit report: `#### <domain>:<id> — <title>`.
+#: The previous pattern expected a markdown TABLE row (`| rt-01 | P1 | … |`),
+#: a format the auditor stopped emitting — so this panel had been silently
+#: empty for both of the reports on disk, not merely the newest one. An
+#: em dash or a plain hyphen may separate id from title.
+_FINDING = re.compile(
+    r"^#{2,4}\s+([a-z_]+):([a-z]+-\d+)\s*[—-]\s*(.+?)\s*$", re.M
+)
+#: Severity line beneath a finding, used as the priority stand-in.
+_SEVERITY = re.compile(r"severity\s+\*{0,2}(critical|high|medium|low)\*{0,2}", re.I)
+#: The retired table form, still honoured so an older report keeps rendering.
 _RT_ROW = re.compile(r"^\|\s*\*{0,2}(rt-\d+|hb-\d+)\*{0,2}\s*\|\s*\*{0,2}(P\d)\*{0,2}\s*\|\s*(.+?)\s*\|", re.M)
 
 
@@ -153,14 +164,35 @@ def app_tasks(repo: Path, limit: int = 40) -> list[dict]:
         text = reports[0].read_text()
     except OSError:
         return []
+    def _clean(value: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[*`]", "", value)).strip()
+
     out, seen = [], set()
+
+    # Current format: one heading per finding, severity on the line below.
+    for match in _FINDING.finditer(text):
+        domain, short, title = match.groups()
+        tid = f"{domain}:{short}"
+        if tid in seen:
+            continue
+        seen.add(tid)
+        tail = text[match.end(): match.end() + 400]
+        sev = _SEVERITY.search(tail)
+        out.append({
+            "id": tid,
+            "priority": (sev.group(1).lower() if sev else ""),
+            "title": _clean(title)[:180],
+            "source": reports[0].name,
+        })
+        if len(out) >= limit:
+            return out
+
+    # Retired table form, so an older report still renders.
     for tid, prio, title in _RT_ROW.findall(text):
         if tid in seen:
             continue
         seen.add(tid)
-        clean = re.sub(r"[*`]", "", title)
-        clean = re.sub(r"\s+", " ", clean).strip()
-        out.append({"id": tid, "priority": prio, "title": clean[:180],
+        out.append({"id": tid, "priority": prio, "title": _clean(title)[:180],
                     "source": reports[0].name})
         if len(out) >= limit:
             break
@@ -259,14 +291,33 @@ def collect(repo: Path) -> dict:
             tasks = {"tasks": seeded}
 
     # --- loop liveness -------------------------------------------------
-    pids = [p for p in _run(["pgrep", "-f", "autoloop run --continuous"]).split() if p]
-    lock = _json(sd / "lock.json") or {}
-    lock_pid = str(lock.get("pid", "")) if lock else ""
-    lock_alive = bool(lock_pid) and bool(_run(["ps", "-p", lock_pid]))
+    # Read the LOCK, which is the authority, rather than matching a process
+    # name. Two bugs lived here: the file was read as "lock.json" when it is
+    # named LOCK, so lock_pid was always empty; and the process pattern was
+    # "autoloop run --continuous", which never matches a loop started with
+    # `autoloop start` — that command calls the run path IN-PROCESS, so the
+    # argv still says "start". Together they reported "stopped" while the loop
+    # was demonstrably executing (2026-08-03).
+    #
+    # `LoopLock` is now the single source: it is boot-aware, so a lock left by
+    # a power cut whose pid has since been reused reads as stale rather than
+    # live — a distinction a bare `ps -p` cannot make.
+    from .lock import LoopLock
 
-    if pids:
+    lock_info = LoopLock(sd).read()
+    lock_alive = lock_info is not None and LoopLock.is_live(lock_info)
+    lock_pid = str(lock_info.pid) if lock_info else ""
+    # Kept for display only. Never the authority: it is the check that was
+    # wrong before, and both spellings of the command are matched now.
+    pids = [
+        p
+        for p in _run(["pgrep", "-f", "autoloop (start|run)"]).split()
+        if p
+    ]
+
+    if lock_alive:
         health = ("good", "running")
-    elif lock and not lock_alive:
+    elif lock_info is not None:
         health = ("critical", "stopped — stale lock")
     else:
         health = ("warning", "stopped")

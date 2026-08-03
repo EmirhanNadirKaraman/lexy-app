@@ -623,6 +623,31 @@ message does not reach the summary.
 passes, the refusal was a flake; the commit is untouched on its branch, since
 this gateway cannot reset or roll back.
 
+### The dashboard says "stopped" while the loop is running, and its task panel is empty
+**Symptom:** the header reads `stopped`, the agents list is empty, and the
+"Language-app tasks" section shows nothing — all while `autoloop health`
+reports EXIT 0 and the loop is demonstrably executing.
+**Cause:** three independent bugs in `dashboard.py`, every one of which
+reported an ABSENCE rather than an error, which is the worst shape because
+nothing looks broken.
+1. Liveness matched `pgrep -f "autoloop run --continuous"`. A loop started
+   with `autoloop start` never matches: that command calls the run path
+   IN-PROCESS, so argv still says `start`.
+2. The lock was read as `lock.json`. The file is named `LOCK`, so `lock_pid`
+   was always empty and `lock_alive` always false.
+3. `app_tasks` parsed a markdown TABLE row (`| rt-01 | P1 | … |`). The auditor
+   emits `#### <domain>:<id> — <title>` with severity beneath, so the panel had
+   been empty for EVERY report on disk, not merely the newest.
+**Fix:** applied repo-side — liveness now reads the LOCK through `LoopLock`,
+the same authority `autoloop health` uses, which is also boot-aware (a lock
+left by a power cut whose pid has been reused reads stale, not live). `pgrep`
+is kept for display only and matches both spellings. The parser handles the
+current heading format and still honours the retired table form so an older
+report keeps rendering.
+**The general lesson:** there were two implementations of "is the loop
+running" and the older one was wrong. When a check exists in a command, the
+UI should call it rather than keep a private copy.
+
 ### `page left the configured conversation while awaiting <request-id>`
 **Symptom:** mid-await the loop reports that its page navigated away, often
 followed by `Execution context was destroyed` and then repeated

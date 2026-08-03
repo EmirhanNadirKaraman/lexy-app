@@ -401,3 +401,97 @@ def test_a_stale_process_reports_itself(tmp_path, monkeypatch):
     assert build["stale"] is True
     assert build["running"] == "0000deadbeef"
     assert build["on_disk"] != build["running"]
+
+
+# ---- liveness and the audit-report parser (2026-08-03) -----------------------
+#
+# The header said "stopped" while the loop was executing, and the app-task
+# panel was empty. Three separate bugs, all of which reported an absence rather
+# than an error — the worst shape, because nothing looks broken.
+
+
+def test_liveness_reads_the_LOCK_not_a_process_name(tmp_path, monkeypatch):
+    """The file is named LOCK; the old code read "lock.json" and so always saw
+    no lock. And it matched `pgrep -f "autoloop run --continuous"`, which never
+    matches a loop started via `autoloop start` — that command calls the run
+    path IN-PROCESS, so argv still says start."""
+    import os
+
+    from autoloop.dashboard import collect
+    from autoloop.lock import LoopLock
+
+    repo = make_repo(tmp_path)
+    state = repo / ".autoloop"
+    state.mkdir(exist_ok=True)
+
+    # No lock at all -> stopped.
+    assert collect(repo)["health"]["label"] == "stopped"
+
+    # A lock held by THIS process is live, whatever any process name says.
+    with LoopLock(state):
+        health = collect(repo)["health"]
+    assert health["label"] == "running"
+    assert health["lock_alive"] is True
+    assert health["lock_pid"] == str(os.getpid())
+
+
+def test_a_lock_whose_owner_is_gone_reads_as_stale_not_running(tmp_path):
+    """Distinct from both other states: the loop died holding the lock, and
+    saying "running" there would hide a crash."""
+    import json as _json
+
+    from autoloop.dashboard import collect
+    from autoloop.lock import LoopLock
+
+    repo = make_repo(tmp_path)
+    state = repo / ".autoloop"
+    state.mkdir(exist_ok=True)
+    lock = LoopLock(state)
+    lock.acquire()
+    lock._owned = False  # leave the file behind
+    data = _json.loads(lock.path.read_text(encoding="utf-8"))
+    data["pid"] = 999_999_999
+    lock.path.write_text(_json.dumps(data), encoding="utf-8")
+
+    health = collect(repo)["health"]
+    assert health["label"] == "stopped — stale lock"
+    assert health["role"] == "critical"
+
+
+def test_app_tasks_parses_the_format_the_auditor_actually_emits(tmp_path):
+    """The parser expected a markdown TABLE row. The auditor emits
+    `#### <domain>:<id> — <title>` with severity on the following line, so the
+    panel had been silently empty for every report on disk — not just the
+    newest one."""
+    from autoloop.dashboard import app_tasks
+
+    repo = make_repo(tmp_path)
+    (repo / "docs").mkdir(exist_ok=True)
+    (repo / "docs" / "AUDIT_2026-08-03.md").write_text(
+        "## Confirmed defects (2)\n"
+        "#### security_paths:ing-01 — Add a structural validator for bbox pages\n"
+        "- severity **medium**, confidence **confirmed**\n"
+        "#### db_migrations:db-02 — Comment the downgrade reconstruction\n"
+        "- severity **low**, confidence **confirmed**\n",
+        encoding="utf-8",
+    )
+
+    found = app_tasks(repo)
+    assert [t["id"] for t in found] == ["security_paths:ing-01", "db_migrations:db-02"]
+    assert found[0]["priority"] == "medium"
+    assert "structural validator" in found[0]["title"]
+
+
+def test_the_retired_table_format_still_renders(tmp_path):
+    """An older report on disk must not go blank because the format moved on."""
+    from autoloop.dashboard import app_tasks
+
+    repo = make_repo(tmp_path)
+    (repo / "docs").mkdir(exist_ok=True)
+    (repo / "docs" / "AUDIT_2026-01-01.md").write_text(
+        "| rt-01 | P1 | Guard the destructive downgrade |\n", encoding="utf-8"
+    )
+
+    found = app_tasks(repo)
+    assert found[0]["id"] == "rt-01"
+    assert found[0]["priority"] == "P1"
