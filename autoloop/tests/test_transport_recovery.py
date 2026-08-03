@@ -251,6 +251,80 @@ def transcript_entries(config, entry_type=None):
 # ---- 1. a persisted send is never resent and never rotates ------------------
 
 
+SLUG_PROJECT_URL = "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77/project"
+
+
+def in_project(candidate, project=SLUG_PROJECT_URL):
+    from autoloop.orchestrator import Orchestrator
+
+    return Orchestrator._url_in_project(candidate, project)
+
+
+def test_a_chat_url_carrying_the_project_slug_is_inside_the_project():
+    """The bug that stranded the loop on 2026-08-03. ChatGPT writes the project
+    LANDING page as `/g/g-p-<id>/project` but its conversations as
+    `/g/g-p-<id>-<slugified-name>/c/<id>`, so a plain prefix compare rejects a
+    chat that really is in the project. A rotation created a chat, posted the
+    request into it, then refused its own successful result on this check."""
+    assert in_project(
+        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77"
+        "-learn-german-by-speaking/c/6a7069f5-a370-83ed-85c8-0693cd484b86"
+    )
+
+
+def test_the_check_accepted_the_conversation_already_in_use():
+    """What proves the old check was not discriminating good from bad: it
+    rejected the conversation the loop had been working in all day."""
+    assert in_project(
+        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77"
+        "-learn-german-by-speaking/c/6a6d0342-5ddc-83ed-bbf1-6f8a78371671"
+    )
+
+
+def test_a_chat_with_no_slug_suffix_is_still_inside():
+    assert in_project(
+        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77/c/abc123"
+    )
+
+
+def test_a_longer_id_is_not_the_same_project():
+    """The segment-boundary trap: `g-p-abc` may match `g-p-abc-x` but never
+    `g-p-abcdef`. Same class of bug as bare string prefixes in approved_paths."""
+    assert not in_project(
+        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77EXTRA/c/abc"
+    )
+
+
+def test_a_different_project_is_refused():
+    assert not in_project("https://chatgpt.com/g/g-p-someotherproject/c/abc")
+
+
+def test_a_chat_outside_any_project_is_refused():
+    """A redirect to the plain composer must not be silently adopted."""
+    assert not in_project("https://chatgpt.com/c/abc123")
+
+
+def test_the_project_landing_page_is_not_a_conversation():
+    assert not in_project(SLUG_PROJECT_URL)
+    assert not in_project(SLUG_PROJECT_URL.rstrip("/") + "/")
+
+
+def test_a_foreign_host_is_refused():
+    assert not in_project(
+        "https://evil.example/g/g-p-6918cd65611881918e54c50bef4aee77-x/c/abc"
+    )
+
+
+def test_an_empty_or_missing_c_segment_is_refused():
+    assert not in_project("")
+    assert not in_project(
+        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77-x/c/"
+    )
+    assert not in_project(
+        "https://chatgpt.com/g/g-p-6918cd65611881918e54c50bef4aee77-x/settings/abc"
+    )
+
+
 def test_persisted_send_never_resends_or_rotates(tmp_path):
     """Reconciliation finds the request already there: nothing may be sent."""
     client = RotatingFakeClient(responses=[stop_block()])

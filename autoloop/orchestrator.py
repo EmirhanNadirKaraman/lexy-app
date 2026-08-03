@@ -1254,9 +1254,32 @@ class Orchestrator:
             return False
         project_path = want.path.rstrip("/")
         # ".../project" is the project landing page; conversations live at
-        # ".../c/<id>" directly under the same /g/<slug> prefix.
+        # ".../c/<id>" under the same /g/<...> prefix.
         base = project_path.rsplit("/", 1)[0] if project_path.endswith("/project") else project_path
-        return have.path.startswith(base + "/c/")
+
+        # Compare SEGMENTS, and allow the last one to carry a slug suffix.
+        # ChatGPT writes the project landing page as `/g/g-p-<id>/project` but
+        # its conversations as `/g/g-p-<id>-<slugified-project-name>/c/<id>`,
+        # so a plain `startswith(base + "/c/")` rejects a chat that really is
+        # inside the project. On 2026-08-03 a rotation created a chat, posted
+        # the request into it, and then refused its own successful result on
+        # this check — and the SAME check rejected the conversation the loop
+        # had been using all day, which is what proves it was never
+        # discriminating good from bad.
+        #
+        # The suffix must be `-<something>`: `g-p-abc` may match `g-p-abc-x`
+        # but never `g-p-abcdef`, the segment-boundary trap that `approved_
+        # paths` prefixes hit too.
+        want_segs = [seg for seg in base.split("/") if seg]
+        have_segs = [seg for seg in have.path.split("/") if seg]
+        if len(have_segs) < len(want_segs) + 2:
+            return False
+        for index, wanted in enumerate(want_segs):
+            got = have_segs[index]
+            last = index == len(want_segs) - 1
+            if got != wanted and not (last and got.startswith(wanted + "-")):
+                return False
+        return have_segs[len(want_segs)] == "c" and bool(have_segs[len(want_segs) + 1])
 
     def _continuation_prompt(self, req: PendingRequest) -> str:
         """The same request, plus one line saying the transport moved.

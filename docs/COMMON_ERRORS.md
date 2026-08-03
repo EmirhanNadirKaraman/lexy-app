@@ -623,6 +623,29 @@ message does not reach the summary.
 passes, the refusal was a flake; the commit is untouched on its branch, since
 this gateway cannot reset or roll back.
 
+### `the replacement chat is not inside the configured project` — but it plainly is
+**Symptom:** a rotation parks `loop_fatal` reporting that the chat it just
+opened is outside the project, quoting a URL that visibly contains the project
+id. Recovering by hand then fails the same way, because the loop is refusing a
+chat that is genuinely in the project.
+**Cause:** ChatGPT writes the project LANDING page as `/g/g-p-<id>/project`
+but its conversations as `/g/g-p-<id>-<slugified-project-name>/c/<chat-id>`.
+`Orchestrator._url_in_project` compared `startswith(base + "/c/")`, and the
+slug suffix breaks that prefix — so a good chat reads as foreign. The tell
+that it was never discriminating good from bad: the SAME check rejected the
+conversation the loop had been working in successfully all day.
+**What it costs:** the rotation has already created the chat AND posted the
+request into it before the check runs, so each failure leaves an orphan chat
+holding a live request. Look for those before creating another.
+**Fix:** applied repo-side — the check compares path SEGMENTS and allows the
+final one to carry a `-<slug>` suffix. The suffix must begin with `-`:
+`g-p-abc` may match `g-p-abc-x` but never `g-p-abcdef`, the same
+segment-boundary trap bare string prefixes hit in `approved_paths`.
+**If you hit it on an older build:** the orphan chat is usable. Point
+`browser.conversation_url` at it — it is in the project, it already carries
+the request, and being new it also renders far faster than the thread that
+triggered the rotation.
+
 ### `autoloop pause` parks the loop with `checkout_escape_detected`
 **Symptom:** you run `python -m autoloop pause` while a task is running, and
 instead of stopping cleanly the loop parks `loop_fatal` with
