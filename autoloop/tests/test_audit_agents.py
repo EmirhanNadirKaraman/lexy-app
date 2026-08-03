@@ -304,6 +304,45 @@ def test_a_failure_after_the_process_exits_is_caught_too(tmp_path):
     assert "pipe read failed" in result.error
 
 
+def test_a_failure_building_the_argv_is_reported_not_raised(tmp_path):
+    """Argv construction is inside the guard too — it is the part of `run`
+    that executes BEFORE the spawn, so an exception there escaped even after
+    the subprocess call was wrapped, and cost the same whole fan-out.
+
+    Driven through the REAL `build_argv` (a spec stand-in whose `model` raises,
+    since `run` is duck-typed over the spec) rather than an overridden method:
+    an override would only prove the guard catches an override. The result
+    still has to name the command, which is why `argv` is bound to the base
+    command before the try — a failure path that raises `NameError` while
+    reporting a failure is not a failure path at all."""
+    spawned = []
+
+    class ExplodingSpec:
+        domain = "docs_drift"
+        prompt = "audit the docs"
+
+        @property
+        def model(self):
+            raise RuntimeError("model routing lookup failed")
+
+    def stub(argv, **kwargs):
+        spawned.append(argv)
+        return Proc(stdout='{"findings": []}')
+
+    result = ClaudeCliRunner(tmp_path, command=("claude",), runner=stub).run(ExplodingSpec())
+
+    assert not result.ok
+    assert result.returncode == -1
+    assert result.raw_text == ""
+    assert result.domain == "docs_drift"
+    assert "RuntimeError" in result.error
+    assert "model routing lookup failed" in result.error
+    # The record still says WHAT was being run, and the CLI was never spawned:
+    # the failure is upstream of the process, not inside it.
+    assert result.command == ("claude",)
+    assert spawned == []
+
+
 def test_one_domain_blowing_up_does_not_discard_its_siblings(tmp_path):
     """The acceptance criterion, driven through the exact call shape
     `AuditExecutor._run_agents` uses. `list(pool.map(...))` re-raises the first

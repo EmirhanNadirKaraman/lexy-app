@@ -127,11 +127,19 @@ class ClaudeCliRunner:
         that already finished. One agent falling over is a single coverage
         gap (the executor turns `not result.ok` into an `agent_failures`
         entry); it is not a reason to lose an audit run. The whole body is
-        guarded, not just the subprocess call — reading `proc.stdout` /
-        `proc.returncode` and decoding the output are part of the same
-        failure surface."""
-        argv = self.build_argv(spec)
+        guarded, not just the subprocess call — building the argv, reading
+        `proc.stdout` / `proc.returncode` and decoding the output are all part
+        of the same failure surface."""
         started = time.monotonic()
+        # Bound BEFORE the try, so reporting a failure can never itself fail.
+        # `build_argv` reads `spec.model` and the configured tool tuples and is
+        # therefore inside the guard — but `_failed` puts `argv` in the result,
+        # so an unbound name there would turn a caught exception back into an
+        # escaping one, in the exact handler that exists to stop that. The
+        # fallback is the base command: enough to say WHAT was being run.
+        # (`spec.domain` is read the same way and is not similarly guarded —
+        # whatever it were captured into would need a guard of its own.)
+        argv: list[str] = list(self._command)
         # EXPLICIT removal, not merely a failure to add: a subagent inherits
         # the loop's environment by construction, so the validation database
         # credentials have to be taken back out for the boundary in
@@ -142,6 +150,7 @@ class ClaudeCliRunner:
         # `strip_validation_vars` also drops any `*VALIDATION_ENV_FILE*`
         # variable, so the agent never learns where the file lives.
         try:
+            argv = self.build_argv(spec)
             proc = self._runner(
                 argv,
                 cwd=str(self._repo_root),
