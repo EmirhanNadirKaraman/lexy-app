@@ -243,7 +243,7 @@ paths off), so import can *refuse* a package produced with the biomedical profil
   "level": 2,
   "text": "…",
   "bbox": {"x1": 72.0, "y1": 186.0, "x2": 521.0, "y2": 141.0,
-           "page": 12, "coordinate_space": "pdf_points_bottom_left"},
+           "page": 11, "coordinate_space": "pdf_points_bottom_left"},
   "reading_order": 42,
   "parent_id": "p0011",
   "paragraph_id": "para-0031",
@@ -259,7 +259,19 @@ paths off), so import can *refuse* a package produced with the biomedical profil
   `docling_label`. `nlp-histo` stringifies labels defensively in four places precisely because
   they are version-fragile; the contract must not inherit that fragility.
 - **`bbox` carries `page` explicitly.** `BoundingBox.to_dict()` drops it today and callers pass it
-  as a sibling key — an easy source of mismatch. Pages are **1-based**.
+  as a sibling key — an easy source of mismatch. Pages are **1-based**, and `bbox.page` is the
+  *same* number as `page_index`, not a second numbering: everything page-bearing counts from 1
+  (`page_index`, `bbox.page`, `page_dims` keys, the `p{page:04d}` id prefix, and
+  `page_images.path_template`). Pinned as `contract.PAGE_INDEX_BASE`.
+
+  A disagreement is therefore **fatal** (`bbox_page_mismatch`), not a convention to reconcile:
+  `build_plan` looks the page height up by `page_index` and `to_fitz` subtracts y from it, so a
+  bbox that genuinely belongs to another page lands off by the height difference — misplaced
+  content (§2b). Which field is wrong is unknowable at import, so we refuse rather than pick. An
+  **omitted** `bbox.page` is accepted silently, because the worker drops it today and `page_index`
+  alone is unambiguous. (Until 2026-08-04 the example above carried a `bbox.page` one greater than
+  its own `page_index` — the mismatch this bullet warns about, sitting in the reference document.
+  It was a typo, never a zero-based convention.)
 - **`confidence` is an object with nullable members.** Classification confidence is largely absent
   and text confidence does not exist; honest nulls beat fabricated `1.0`s.
 - **No internal Python objects are serialized.** No pickles, no dataclass dumps.
@@ -348,7 +360,8 @@ These are real traps, verified in `runner.py`:
    note in `routers/content_requests.py` (validate at the boundary before anything reaches the
    filesystem or a subprocess). **`docs/SECURITY.md` must be updated in the same PR.**
 4. Structural: unique element IDs, `reading_order` a permutation without gaps or duplicates, every
-   `parent_id` resolvable, bboxes within page dimensions, `page_index` contiguous.
+   `parent_id` resolvable, bboxes within page dimensions, `bbox.page` agreeing with `page_index`
+   (§4 — one 1-based number written twice), `page_index` contiguous.
 5. Profile check: refuse a package whose `extractor.profile` is not a German-fiction profile.
 
 **Checksums are mandatory (tightened 2026-07-29).** `CHECKSUMS.txt` is a required

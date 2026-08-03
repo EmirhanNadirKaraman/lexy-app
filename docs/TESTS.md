@@ -973,7 +973,7 @@ Three groups worth knowing before changing `services/document_package/`:
 - **Severity pins.** Several tests assert a defect is a *warning* rather than
   fatal (unknown element type, reading-order gaps, inverted y, malformed
   confidence, missing provenance) and vice-versa (duplicate reading order,
-  coordinate-space mismatch, bbox off-page). That split is the
+  coordinate-space mismatch, bbox off-page, `bbox_page_mismatch`). That split is the
   information-preservation principle (§2b) expressed as tests: losing content is
   irreversible, so only misplacement/loss is allowed to block an import.
   Flipping one of these is a design change, not a test fix.
@@ -981,6 +981,28 @@ Three groups worth knowing before changing `services/document_package/`:
 `test_real_persistence_refuses_until_a3` and
 `test_real_import_refuses_and_reports_rather_than_raising` are the pins that
 flip when **A3** lands.
+
+🆕 **2026-08-04 — `bbox.page` / `page_index` consistency (+11 backend, same file)**
+
+Eight test functions in `TestStructuralValidators`, 11 collected (one is
+parametrized over four values), covering
+`validators.validate_bbox_page_consistency`. The question the audit raised first
+was whether `page_index` is zero-based while `bbox.page` is one-based — it is
+not: §4 of `docs/INGESTION_PIPELINE.md` states one 1-based numbering, now pinned
+as `contract.PAGE_INDEX_BASE` and asserted by
+`test_page_numbering_is_one_based_throughout`. The 11/12 pair in that doc's
+example was a typo, and is fixed.
+
+Three of the eight are not about the happy path and should survive refactors:
+
+- `test_bbox_page_mismatch_is_caught_by_full_validation` is a **registration
+  pin**. Most tests here call a validator function directly, so one missing from
+  `STRUCTURAL_VALIDATORS` would pass every unit test and run on no import.
+- `test_non_integer_bbox_page_is_fatal` parametrizes `True`, which equals `1` in
+  Python and would otherwise pass on page 1.
+- `test_bbox_page_not_reported_when_page_index_is_unusable` pins the
+  no-double-report rule: a bad `page_index` belongs to `validate_page_indices`
+  alone.
 
 🆕 **2026-07-29 — Document-ingestion evaluation harness (+147 root / +6 files)**
 

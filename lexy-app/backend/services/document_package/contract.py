@@ -37,6 +37,23 @@ boundary (§6), which is why a mismatch here is fatal rather than a warning:
 silently accepting the wrong space would misplace every bbox in the reader.
 """
 
+PAGE_INDEX_BASE = 1
+"""Pages are **1-based** everywhere in the package — there is no zero-based half.
+
+Every page-bearing field counts from 1 and they must all agree:
+
+* ``element.page_index``
+* ``bbox.page`` — a redundant copy of ``page_index``, not a second numbering
+* ``manifest.page_dims`` keys (``"1"``, ``"2"``, …)
+* the element-id prefix ``p{page:04d}`` and ``parent_id`` page containers
+* ``manifest.page_images.path_template`` (``pages/{page_index:04d}.png``)
+
+Stated as a constant because the alternative was folklore. ``bbox.page``
+duplicating ``page_index`` looks like it *could* be a different coordinate
+convention — it is not, and a reader who assumes otherwise would "fix" a real
+mismatch by adding an off-by-one. See :func:`validators.validate_bbox_page_consistency`.
+"""
+
 ELEMENT_TYPES = frozenset(
     {
         "paragraph",

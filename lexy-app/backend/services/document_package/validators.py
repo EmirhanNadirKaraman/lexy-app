@@ -7,7 +7,8 @@ element must not hide the twelve after it.
 
 Severity follows the preservation principle (``docs/INGESTION_PIPELINE.md``
 §2b). Anything that would make the app **misplace or lose** content is fatal
-(duplicate ids, bad coordinate space, bboxes off the page). Anything that is
+(duplicate ids, bad coordinate space, bboxes off the page, a ``bbox.page`` that
+disagrees with its element's ``page_index``). Anything that is
 merely *unproven* — an unknown element type, a missing confidence object — is a
 warning, because dropping the element would be the irreversible choice and the
 downstream reviewer can still resolve it.
@@ -108,11 +109,16 @@ def validate_page_indices(pkg: LoadedPackage, issues: IssueCollector) -> None:
         page = element.get("page_index")
         if page is None:
             continue
-        if not isinstance(page, int) or isinstance(page, bool) or page < 1:
+        if (
+            not isinstance(page, int)
+            or isinstance(page, bool)
+            or page < contract.PAGE_INDEX_BASE
+        ):
             issues.add(
                 "invalid_page_index",
                 f"element {element.get('id')!r} has page_index {page!r}; "
-                "expected a 1-based integer",
+                f"expected an integer ≥ {contract.PAGE_INDEX_BASE} "
+                "(pages are 1-based)",
                 stage="structural",
                 element_id=element.get("id") if isinstance(element.get("id"), str) else None,
             )
@@ -372,6 +378,61 @@ def validate_bboxes(pkg: LoadedPackage, issues: IssueCollector) -> None:
             )
 
 
+def validate_bbox_page_consistency(pkg: LoadedPackage, issues: IssueCollector) -> None:
+    """``bbox.page`` must equal ``element.page_index``.
+
+    The two are **one numbering, written twice** — both 1-based
+    (``contract.PAGE_INDEX_BASE``), the bbox copy being redundant rather than a
+    second coordinate convention. §4 of ``docs/INGESTION_PIPELINE.md`` says so
+    explicitly, and it warns that carrying the page as a sibling key is "an easy
+    source of mismatch"; the example directly beneath that sentence carried
+    ``page_index: 11`` with ``bbox.page: 12`` until 2026-08-04, which is exactly
+    the confusion this validator exists to make impossible.
+
+    Fatal, and not on a hypothetical: ``persistence.build_plan`` looks the page
+    height up by ``page_index`` (``persistence.py:151``) and feeds it to
+    :func:`coordinates.to_fitz`, which subtracts y from that height. If the bbox
+    truly belongs to a different page, every y is off by the height difference —
+    misplaced content, which §2b makes fatal. Which of the two fields is the
+    wrong one is unknowable from here, so we refuse rather than pick.
+
+    Two deliberate non-findings:
+
+    * **Absent ``bbox.page``** is accepted silently. ``BoundingBox.to_dict()``
+      drops it in the worker today (§4), so warning would fire on every real
+      package while proving nothing — ``page_index`` alone is unambiguous.
+    * **A missing or invalid ``page_index``** is skipped, because
+      :func:`validate_page_indices` already reports it and there is nothing
+      trustworthy left to compare against.
+    """
+    for element in pkg.elements:
+        if not isinstance(element, dict):
+            continue
+        bbox = element.get("bbox")
+        if not isinstance(bbox, dict) or "page" not in bbox:
+            continue
+        page_index = element.get("page_index")
+        if not isinstance(page_index, int) or isinstance(page_index, bool):
+            continue
+
+        bbox_page = bbox.get("page")
+        # ``True == 1`` in Python, so a bool must be rejected rather than
+        # compared — same guard the numeric validators use.
+        if isinstance(bbox_page, int) and not isinstance(bbox_page, bool):
+            if bbox_page == page_index:
+                continue
+        issues.add(
+            "bbox_page_mismatch",
+            f"element {element.get('id')!r} has page_index {page_index} but "
+            f"bbox.page {bbox_page!r}; expected exactly the integer "
+            f"{page_index} — the two are one 1-based page number written twice",
+            stage="structural",
+            element_id=element.get("id") if isinstance(element.get("id"), str) else None,
+            page_index=page_index,
+            bbox_page=bbox_page if isinstance(bbox_page, (int, str)) else str(bbox_page),
+        )
+
+
 def validate_confidence(pkg: LoadedPackage, issues: IssueCollector) -> None:
     """Confidence must be an object of nullable numbers in ``[0, 1]``.
 
@@ -458,6 +519,7 @@ STRUCTURAL_VALIDATORS = (
     validate_reading_order,
     validate_coordinate_space,
     validate_bboxes,
+    validate_bbox_page_consistency,
     validate_confidence,
     validate_provenance,
 )
