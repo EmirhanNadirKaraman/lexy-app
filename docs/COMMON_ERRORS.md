@@ -1154,6 +1154,30 @@ before. See `orchestrator.py`'s `_prepare_write_capable_worker` and the
 regression test `test_quarantine_recreate_resumes_from_a_candidate_sha_
 that_only_exists_in_the_quarantined_repo`.
 
+### A test for a "generic exception" handler passes against code that has no generic handler
+**Symptom:** a test written to prove `except Exception` was added — a stub
+raising `OSError(errno.ENOENT, "no such file")` — asserts the new generic
+error wording and fails, reporting `agent command not found: [Errno 2] …`
+instead. Deleting the new handler does not change the result: the case never
+reached it. (Hit on `ClaudeCliRunner.run`, `autoloop/audit/agents.py`.)
+**Cause:** `OSError.__new__` dispatches on errno at CONSTRUCTION time. The
+two-or-more-argument form returns an errno-specific subclass, not an
+`OSError` — so `OSError(errno.ENOENT, …)` *is* a `FileNotFoundError` and is
+caught by the pre-existing dedicated branch above the broad one. The
+single-argument form (`OSError("boom")`) is never specialized, and other
+errnos map elsewhere (`EACCES` → `PermissionError`).
+**Fix:** build generic cases as single-argument `OSError`, or with an errno
+that maps to something other than the type already handled. Then pin it: add
+a control assertion that the *dedicated* message is absent from the result
+(`assert "command not found" not in result.error`) so a case that silently
+specializes fails loudly instead of passing for the wrong reason, plus one
+test asserting the specialization itself — see
+`test_every_generic_case_really_misses_the_dedicated_branch` in
+`autoloop/tests/test_audit_agents.py`. The same trap applies to any
+`except`-ordering test: `FileNotFoundError`, `PermissionError`,
+`IsADirectoryError` and friends are all `OSError` subclasses, so a broad
+clause placed above them swallows the specific one.
+
 ---
 
 ## Adding an entry

@@ -119,6 +119,17 @@ class ClaudeCliRunner:
         ]
 
     def run(self, spec: AgentSpec) -> AgentResult:
+        """Never raises. Every failure — expected or not — comes back as an
+        `AgentResult` carrying the cause.
+
+        `_run_agents` fans these out through `list(pool.map(...))`, so ONE
+        escaping exception discards the whole batch, including the domains
+        that already finished. One agent falling over is a single coverage
+        gap (the executor turns `not result.ok` into an `agent_failures`
+        entry); it is not a reason to lose an audit run. The whole body is
+        guarded, not just the subprocess call — reading `proc.stdout` /
+        `proc.returncode` and decoding the output are part of the same
+        failure surface."""
         argv = self.build_argv(spec)
         started = time.monotonic()
         # EXPLICIT removal, not merely a failure to add: a subagent inherits
@@ -139,32 +150,43 @@ class ClaudeCliRunner:
                 timeout=self._timeout,
                 env=strip_validation_vars(),
             )
+            text = _extract_result_text(proc.stdout or "")
+            error = ""
+            if proc.returncode != 0:
+                error = summarize_failure(proc.stderr, proc.stdout, proc.returncode)
+            return AgentResult(
+                domain=spec.domain,
+                raw_text=text,
+                returncode=proc.returncode,
+                duration_seconds=time.monotonic() - started,
+                command=tuple(argv),
+                error=error,
+            )
         except subprocess.TimeoutExpired:
-            return AgentResult(
-                domain=spec.domain,
-                raw_text="",
-                returncode=-1,
-                duration_seconds=time.monotonic() - started,
-                command=tuple(argv),
-                error=f"agent timed out after {self._timeout}s",
-            )
+            return self._failed(spec, argv, started, f"agent timed out after {self._timeout}s")
+        # BEFORE the broad clause below, and it must stay there:
+        # FileNotFoundError is an OSError subclass, so a broad `except
+        # Exception` placed above would swallow the one message that tells an
+        # operator the `claude` binary is missing rather than misbehaving.
         except FileNotFoundError as exc:
-            return AgentResult(
-                domain=spec.domain,
-                raw_text="",
-                returncode=-1,
-                duration_seconds=time.monotonic() - started,
-                command=tuple(argv),
-                error=f"agent command not found: {exc}",
-            )
-        text = _extract_result_text(proc.stdout or "")
-        error = ""
-        if proc.returncode != 0:
-            error = summarize_failure(proc.stderr, proc.stdout, proc.returncode)
+            return self._failed(spec, argv, started, f"agent command not found: {exc}")
+        except Exception as exc:  # noqa: BLE001 — deliberately total; see the docstring
+            # The TYPE NAME is not decoration. `str(exc)` is empty for a bare
+            # `MemoryError`/`RuntimeError()`, and an AgentResult whose `error`
+            # is "" reads as `ok` (see `AgentResult.ok`) — a domain that blew
+            # up would be counted as covered with zero findings. The message
+            # is non-empty unconditionally.
+            detail = str(exc).strip()
+            described = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+            return self._failed(spec, argv, started, f"agent raised {described}")
+
+    def _failed(
+        self, spec: AgentSpec, argv: list[str], started: float, error: str
+    ) -> AgentResult:
         return AgentResult(
             domain=spec.domain,
-            raw_text=text,
-            returncode=proc.returncode,
+            raw_text="",
+            returncode=-1,
             duration_seconds=time.monotonic() - started,
             command=tuple(argv),
             error=error,
