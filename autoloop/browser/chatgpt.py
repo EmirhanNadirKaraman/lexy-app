@@ -52,7 +52,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from ..errors import (
     BrowserError,
@@ -288,6 +288,49 @@ class BrowserChatGPT:
         on its own to confirm a send — that is the bug this module documents.
         """
         return any(m.role == "user" and request_id in m.text for m in self.messages())
+
+    def find_conversation_with(
+        self, request_id: str, project_url: str, limit: int = 6
+    ) -> str | None:
+        """The conversation holding `request_id`, found by CONTENT.
+
+        The address bar is a poor witness for a chat that was just created:
+        ChatGPT mints `/c/<id>` some time after accepting the first message,
+        and on a slow account that is longer than any polling window worth
+        having. Rotation used to give up at 20 seconds and report "the chat id
+        was never assigned" — while the chat existed, held the request, and sat
+        in the project list (2026-08-03, three times, each leaving an orphan
+        chat with a live request nobody read).
+
+        The request id is already in the message, so it identifies the chat
+        without help from the URL. This reads the project's list newest-first
+        and returns the first conversation whose PERSISTED history carries the
+        id, or None.
+
+        Bounded by `limit`: a project accumulates chats, and walking all of
+        them costs a page load each. The one we want was just created, so it is
+        at the top or nowhere.
+        """
+        self._session.goto(project_url)
+        self._await_composer("find_conversation", request_id=request_id)
+        hrefs: list[str] = []
+        for _text, href in self._session.elements(
+            self._sel.conversation_link, "href"
+        ):
+            if not href or "/c/" not in href:
+                continue
+            full = urljoin(project_url, href)
+            if full not in hrefs:
+                hrefs.append(full)
+            if len(hrefs) >= limit:
+                break
+
+        for candidate in hrefs:
+            self._session.goto(candidate)
+            self._await_composer("find_conversation", request_id=request_id)
+            if self.has_request(request_id):
+                return candidate
+        return None
 
     def is_generating(self) -> bool:
         return self._session.exists(self._sel.stop_button)

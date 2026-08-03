@@ -223,7 +223,13 @@ CONTINUATION_NOTE = (
 #: A replacement chat has no `/c/<id>` until its first turn is processed, so the
 #: rotation polls for it. Bounded: a chat that never leaves the project page is a
 #: failed rotation, not something to wait on forever.
-ROTATION_URL_TIMEOUT_SECONDS = 20.0
+#: How long to wait for the address bar to show `/c/<id>` after a rotation
+#: posts. Only the FAST PATH now — when it expires, the chat is found by
+#: the request id it contains (`find_conversation_with`), so this being
+#: short costs a few page loads rather than the whole rotation. It used
+#: to be the only witness, and 20s against an account whose composer
+#: needs 180s failed three rotations that had actually succeeded.
+ROTATION_URL_TIMEOUT_SECONDS = 30.0
 ROTATION_URL_POLL_SECONDS = 0.5
 
 
@@ -1250,14 +1256,40 @@ class Orchestrator:
             time.sleep(ROTATION_URL_POLL_SECONDS)
             new_url = current_url()
         if not self._url_in_project(new_url, project_url):
-            detail = (
-                "it is still the project page — the chat id was never assigned"
-                if new_url.rstrip("/") == project_url.rstrip("/")
-                else f"{new_url!r} is not under {project_url!r}"
-            )
-            raise BrowserError(
-                f"the replacement chat is not inside the configured project: {detail}"
-            )
+            # The address bar is a poor witness for a chat that was just
+            # created: ChatGPT mints `/c/<id>` some time after accepting the
+            # first message, and on a slow account that outlasts any polling
+            # window worth having. So ask the CONTENT instead — the request id
+            # is in the message and identifies the chat without the URL.
+            #
+            # This is not a nicety. Three rotations failed on the timeout while
+            # the chat existed and held the request, each leaving an orphan
+            # nobody read, and each reporting "the chat id was never assigned"
+            # about a chat that plainly had one (2026-08-03).
+            by_content = getattr(client, "find_conversation_with", None)
+            found = None
+            if by_content is not None:
+                try:
+                    found = by_content(req.request_id, project_url)
+                except (BrowserError, AutoloopError):
+                    found = None
+            if found:
+                self._log(
+                    "rotation_found_by_content",
+                    request_id=req.request_id,
+                    data={"url": found, "note": "address bar had not caught up"},
+                )
+                new_url = found
+            else:
+                detail = (
+                    "it is still the project page and no chat in the project "
+                    "carries this request"
+                    if new_url.rstrip("/") == project_url.rstrip("/")
+                    else f"{new_url!r} is not under {project_url!r}"
+                )
+                raise BrowserError(
+                    f"the replacement chat is not inside the configured project: {detail}"
+                )
         retarget(new_url)
         # The address bar said the send landed here; make the conversation say
         # it. Until this returns True the rotation has not happened and nothing

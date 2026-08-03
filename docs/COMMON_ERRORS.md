@@ -623,6 +623,28 @@ message does not reach the summary.
 passes, the refusal was a flake; the commit is untouched on its branch, since
 this gateway cannot reset or roll back.
 
+### `the replacement chat is not inside the configured project: it is still the project page`
+**Symptom:** a rotation parks `loop_fatal` claiming the chat id was never
+assigned. Open the project afterwards and the chat is right there, holding the
+request — one orphan per failure, each with a live request nobody read.
+**Cause:** ChatGPT mints `/c/<id>` some time AFTER accepting the first message.
+The rotation polled the address bar for `ROTATION_URL_TIMEOUT_SECONDS` (20s)
+and treated expiry as proof the chat did not exist. On an account whose
+composer needs 180s and whose replies routinely miss a 120s start timeout, 20s
+is not a wait — it is a coin toss. Hit three times on 2026-08-03.
+**Fix:** applied repo-side — the address bar is now only the FAST path. When
+it lags, `BrowserChatGPT.find_conversation_with` reads the project's chat list
+newest-first and returns the conversation whose persisted history carries the
+request id. The id is in the message, so it identifies the chat without the
+URL. The window was also raised to 30s, but that is incidental: what matters
+is that expiry is no longer a verdict.
+**The guard still holds:** if no chat carries the request, the rotation still
+refuses rather than adopting an unrelated one — the same reasoning that makes
+an unbound request refuse to guess.
+**Diagnosing an older build:** open the project and look for a chat containing
+the request id from the park message. If it exists, the rotation worked and
+only the detection failed; point `browser.conversation_url` at that chat.
+
 ### The loop vanishes mid-run leaving NO blocker, no park and no heartbeat
 **Symptom:** `autoloop health` reports `not_running` with `open_blockers: 0`
 and a phase that was healthy moments earlier. Unlike every other stop, nothing

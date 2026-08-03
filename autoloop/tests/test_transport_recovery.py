@@ -104,10 +104,28 @@ class RotatingFakeClient:
         # "a reply appeared" (cancels it).
         self.no_response_results = list(no_response_results)
         self.no_response_calls: list[tuple[str, str]] = []  # (url, request_id)
+        self.find_calls: list[tuple[str, str]] = []
+        self._stranded_at = None
+        self.find_finds_nothing = False
 
     # -- test helpers ------------------------------------------------------
     def seed(self, url, request_id):
         self.persisted.setdefault(url, set()).add(request_id)
+
+    def strand_the_address_bar(self, project_url):
+        """Model the real failure: the chat is created and holds the request,
+        but the SPA leaves the URL on the project page for good."""
+        self._stranded_at = project_url
+
+    def find_conversation_with(self, request_id, project_url, limit=6):
+        """Find the chat by CONTENT, as the real client does."""
+        self.find_calls.append((request_id, project_url))
+        if self.find_finds_nothing:
+            return None
+        for url, ids in self.persisted.items():
+            if request_id in ids and url != project_url:
+                return url
+        return None
 
     # -- LLMConversation surface -------------------------------------------
     def attach(self):
@@ -120,6 +138,10 @@ class RotatingFakeClient:
         self.conversation_url = url
 
     def current_url(self):
+        # When stranded, the address bar stays on whatever it was before the
+        # submit — the project page — no matter how long the loop polls.
+        if self._stranded_at is not None:
+            return self._stranded_at
         return self.page_url
 
     def has_request(self, request_id):
@@ -1317,3 +1339,60 @@ def test_rotation_waits_for_the_chat_id_instead_of_reading_the_project_page(tmp_
     assert orch.state.conversation_url == NEW_CONV_URL, "must bind the CHAT, not the project page"
     assert transcript_entries(config, "conversation_rotated"), "rotation must be recorded"
     assert seen["n"] > 1, "the first read returned the project page — it must poll again"
+
+
+# ---- a rotation is identified by CONTENT when the URL lags (2026-08-03) ------
+
+
+def test_a_rotation_is_found_by_request_id_when_the_address_bar_lags(tmp_path):
+    """The failure that stopped the loop three times. ChatGPT mints `/c/<id>`
+    some time after accepting the first message; on a slow account that is
+    longer than any polling window worth having. The rotation gave up and
+    reported "the chat id was never assigned" — about a chat that existed, held
+    the request, and sat in the project list. The request id is IN the message,
+    so it identifies the chat without the URL."""
+    client = RotatingFakeClient(
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
+        responses=[stop_block()],
+    )
+    client.strand_the_address_bar(PROJECT_URL)
+    client.seed(NEW_CONV_URL, "alr-x-0001")  # the chat exists and holds it
+
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.SUBMITTING.value
+    state.pending_request = pending("alr-x-0001")
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=4)
+
+    assert client.find_calls, "must ask the CONTENT once the URL will not move"
+    assert orch.state.conversation_url == NEW_CONV_URL, "must bind the chat it created"
+    assert orch.state.phase != Phase.NEEDS_USER.value, "a lagging URL must not park it"
+
+
+def test_a_rotation_still_refuses_when_no_chat_carries_the_request(tmp_path):
+    """The guard must survive. If the content search finds nothing either, the
+    send did not land anywhere and adopting some other chat is the wrong
+    repair — the same reasoning that makes an unbound request refuse to guess."""
+    client = RotatingFakeClient(
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
+        responses=[stop_block()],
+    )
+    client.strand_the_address_bar(PROJECT_URL)
+    # The search itself comes up empty — the send landed nowhere. Forced
+    # explicitly, because this fake persists a CONFIRMED submit into the chat
+    # it rotated to, so "seed nothing" does NOT model an empty project (the
+    # first draft of this test assumed it did, and passed for the wrong
+    # reason: the rotation legitimately SUCCEEDED).
+    client.find_finds_nothing = True
+
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.SUBMITTING.value
+    state.pending_request = pending("alr-x-0002")
+    orch, store, config = build(tmp_path, client, state=state)
+
+    orch.run(max_steps=4)
+
+    assert client.find_calls, "it must have looked"
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert "no chat in the project carries this request" in (orch.state.question or "")

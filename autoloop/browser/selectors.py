@@ -16,6 +16,10 @@ class ChatGPTSelectors:
     send_button: str = '[data-testid="send-button"]'
     stop_button: str = '[data-testid="stop-button"]'
     message: str = "[data-message-author-role]"
+    #: Links to conversations in a project's chat list. Used to find a
+    #: chat by the request it contains when the address bar has not yet
+    #: caught up — see `BrowserChatGPT.find_conversation_with`.
+    conversation_link: str = 'a[href*="/c/"]'
     role_attr: str = "data-message-author-role"
     login_markers: tuple[str, ...] = (
         '[data-testid="login-button"]',
