@@ -623,6 +623,32 @@ message does not reach the summary.
 passes, the refusal was a flake; the commit is untouched on its branch, since
 this gateway cannot reset or roll back.
 
+### The loop vanishes mid-run leaving NO blocker, no park and no heartbeat
+**Symptom:** `autoloop health` reports `not_running` with `open_blockers: 0`
+and a phase that was healthy moments earlier. Unlike every other stop, nothing
+explains itself — no park, no blocker record, and the heartbeat's last status
+is whatever the loop was doing rather than `stopped`. Happened twice on
+2026-08-03.
+**Cause:** a `StateError` propagating out of `Orchestrator.run()`. The one
+seen was `request <id> has no conversation binding but this run has already
+rotated N time(s)` — raised by `_bind_request_conversation`, which refuses to
+attribute an unbound request after a rotation (correctly: pointing it at the
+NEW chat would be the wrong repair). But its premise was false. The
+`PendingRequest(...)` constructor call omitted `conversation_url`, so every
+request was born UNBOUND and only became attributable when something touched
+it; a rotation inside that window made the guard fire on a minutes-old
+request.
+**Where to look:** the run log — `tail ~/.autoloop/start-*.log`. A hard error
+prints there and nowhere else, which is exactly why the loop appeared to
+vanish. `.autoloop/state.json` then shows `rotations >= 1` alongside a
+`pending_request` whose `conversation_url` is empty.
+**Fix:** applied repo-side, in two parts. Requests are bound at creation, so
+the invariant holds by construction rather than by timing. And a `StateError`
+escaping a step now PARKS `loop_fatal` with a durable blocker (`code=
+state_inconsistent`) instead of killing the process — a system whose design is
+"park with a record so a human can see it" had one path that died without a
+trace, and it was the one that bit.
+
 ### The dashboard says "stopped" while the loop is running, and its task panel is empty
 **Symptom:** the header reads `stopped`, the agents list is empty, and the
 "Language-app tasks" section shows nothing — all while `autoloop health`

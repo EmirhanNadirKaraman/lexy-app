@@ -665,9 +665,16 @@ def test_unbound_request_after_a_rotation_refuses_to_guess(tmp_path):
     state.pending_request = pending("alr-legacy-0001", url="")
     orch, store, config = build(tmp_path, client, state=state)
 
-    with pytest.raises(Exception) as exc:
-        orch.run(max_steps=1)
-    assert "cannot be attributed" in str(exc.value)
+    # The refusal is unchanged — what changed (2026-08-03) is that it PARKS
+    # with a durable blocker instead of propagating out of the process. The
+    # property this test exists for is that nothing is guessed, so it is
+    # asserted on the recorded reason rather than on an exception.
+    outcome = orch.run(max_steps=1)
+
+    assert outcome == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert "cannot be attributed" in (orch.state.question or "")
+    assert orch.state.pending_request.conversation_url == "", "must not be guessed"
 
 
 def test_legacy_request_binds_to_the_loop_url_before_any_rotation(tmp_path):

@@ -416,6 +416,25 @@ class Orchestrator:
                 self._handle_browser_failure(phase, exc)
             except GitError as exc:
                 self._handle_git_failure(phase, exc)
+            except StateError as exc:
+                # LAST in the chain, so every specific handler above still
+                # wins, and safe to add because StateError parents only
+                # StateCorruptError — neither is caught elsewhere here.
+                #
+                # A state inconsistency genuinely needs a human. What it must
+                # NOT do is leave by propagating out of the process: this loop
+                # explains itself on the way down everywhere else, and this one
+                # path did not, so two runs vanished leaving no blocker, no
+                # park and no heartbeat — indistinguishable from being killed,
+                # and invisible to the monitor whose whole job is noticing
+                # (2026-08-03, twice). Park instead, with a durable record.
+                self._log("state_error", data={"error": str(exc)})
+                self._to_needs_user(
+                    str(exc),
+                    resume_phase=phase.value,
+                    kind="loop_fatal",
+                    code="state_inconsistent",
+                )
 
     def _step(self, phase: Phase) -> None:
         if phase is Phase.READY:
@@ -494,6 +513,17 @@ class Orchestrator:
             timestamp=ctx.timestamp,
             postcommit=postcommit,
             changeset=changeset,
+            # Bound HERE, at birth, not lazily on first touch.
+            # `_bind_request_conversation` refuses to bind after a rotation —
+            # correctly, since an unbound request cannot be attributed and
+            # pointing it at the NEW chat would be the wrong repair. But its
+            # premise, that every request created since carries its own
+            # binding, was false: this call omitted the field, so a request was
+            # born unbound and only became attributable when something touched
+            # it. A rotation in that window made the guard fire on a request
+            # minutes old and killed the run (2026-08-03, twice).
+            conversation_url=state.conversation_url,
+            conversation_epoch=state.conversation_epoch,
         )
         if postcommit is not None:
             # Bind the exact report this candidate was reviewed under, on the

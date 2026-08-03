@@ -21,7 +21,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import pytest
 
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.browser.chatgpt import SubmitResult
@@ -1017,10 +1016,22 @@ def test_pause_file_stops_before_next_step(tmp_path):
 
 
 def test_ready_without_outbox_is_a_state_error(tmp_path):
+    """Still an error, now PARKED rather than raised out of the process.
+
+    Changed deliberately on 2026-08-03, not muted: the property this pins is
+    that a missing outbox is treated as a fault instead of silently ignored,
+    and a loop_fatal park with a durable blocker asserts that more strongly
+    than an exception which left no record. Two runs died that way with no
+    blocker, no park and no heartbeat.
+    """
     state = LoopState.new(URL)
     orch, _, _, _, _, _, _ = build(tmp_path, clients=[FakeClient()], state=state)
-    with pytest.raises(StateError):
-        orch.run(max_steps=1)
+
+    outcome = orch.run(max_steps=1)
+
+    assert outcome == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert orch.state.question
 
 
 def test_state_persists_across_reload(tmp_path):
@@ -1428,3 +1439,55 @@ def test_a_fresh_audit_unit_is_never_treated_as_quarantined(tmp_path):
 
     assert [d.decision for d, _ in executor.calls] == [Decision.AUDIT]
     assert orch.state.policy_denials == 0
+
+
+# ---- a request is bound at birth, and a state error PARKS (2026-08-03) -------
+
+
+def test_a_new_request_carries_its_conversation_binding(tmp_path):
+    """`_bind_request_conversation` refuses to bind after a rotation — rightly,
+    since an unbound request cannot be attributed and pointing it at the NEW
+    chat would be the wrong repair. But its premise, that every request created
+    since carries its own binding, was false: the constructor call omitted the
+    field, so a request was born unbound and only became attributable when
+    something touched it. A rotation inside that window made the guard fire on
+    a minutes-old request and killed the run, twice, with no blocker."""
+    orch, *_ = build(tmp_path, responses=[stop_block()])
+    orch.state.conversation_url = "https://chatgpt.com/c/bound-at-birth"
+    orch.state.conversation_epoch = 3
+    orch.state.phase = Phase.READY.value
+    orch.state.outbox = "payload"
+
+    orch._step_ready()
+
+    req = orch.state.pending_request
+    assert req is not None, "the step under test must actually create a request"
+    assert req.conversation_url == "https://chatgpt.com/c/bound-at-birth"
+    assert req.conversation_epoch == 3
+
+    # And the lazy binder is now only ever reached by genuinely legacy state:
+    # with a binding present it is a no-op even after a rotation, which is the
+    # case that used to raise and kill the run.
+    orch.state.rotations = 1
+    orch._bind_request_conversation(req)  # must not raise
+    assert req.conversation_url == "https://chatgpt.com/c/bound-at-birth"
+
+
+def test_a_state_error_parks_with_a_blocker_instead_of_killing_the_run(tmp_path):
+    """The failure that made two runs vanish. Everything else in this loop
+    explains itself on the way down; a StateError propagated out of the
+    process, leaving no park, no blocker and no heartbeat — indistinguishable
+    from being killed, and invisible to the monitor whose job is noticing."""
+    orch, *_ = build(tmp_path, responses=[stop_block()])
+
+    def boom(_phase):
+        raise StateError("request alr-x has no conversation binding")
+
+    orch._step = boom
+
+    outcome = orch.run()  # must NOT raise
+
+    assert outcome == Phase.NEEDS_USER.value
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert "no conversation binding" in (orch.state.question or "")
