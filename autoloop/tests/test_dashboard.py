@@ -495,3 +495,42 @@ def test_the_retired_table_format_still_renders(tmp_path):
     found = app_tasks(repo)
     assert found[0]["id"] == "rt-01"
     assert found[0]["priority"] == "P1"
+
+
+def test_the_served_javascript_actually_parses():
+    """One syntax error kills the WHOLE script.
+
+    `PAGE` is a plain Python string, so a single `\\n` written inside a JS
+    literal is decoded here and splits that literal across two physical lines.
+    The browser then throws `SyntaxError: Invalid or unexpected token`, no
+    dynamic section renders, and the page shows only its static markup — which
+    reads as a dead dashboard rather than a typo. That shipped on 2026-08-04
+    and survived every check I ran, because serving valid HTML and a correct
+    JSON payload says nothing about whether the script parses.
+
+    So this asks a JS engine instead of inspecting strings.
+    """
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+
+    from autoloop.dashboard import PAGE
+
+    node = shutil.which("node")
+    if node is None:  # pragma: no cover - environment without node
+        pytest.skip("node is required to syntax-check the served script")
+
+    scripts = re.findall(r"<script>(.*?)</script>", PAGE, re.S)
+    assert scripts, "the page must carry a script block"
+
+    for index, body in enumerate(scripts):
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(body)
+            path = handle.name
+        result = subprocess.run(
+            [node, "--check", path], capture_output=True, text=True, timeout=60
+        )
+        assert result.returncode == 0, (
+            f"script block {index} does not parse:\n{result.stderr[:600]}"
+        )

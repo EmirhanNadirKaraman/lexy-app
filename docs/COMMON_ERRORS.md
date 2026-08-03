@@ -671,6 +671,25 @@ state_inconsistent`) instead of killing the process — a system whose design is
 "park with a record so a human can see it" had one path that died without a
 trace, and it was the one that bit.
 
+### The dashboard renders only its static markup — pipeline and roadmap are blank
+**Symptom:** the page loads, headings and the new-task form show, but every
+section built by JavaScript is empty. The API returns correct data, so the
+server looks fine and the page looks dead.
+**Cause:** a JS syntax error. `PAGE` is a plain (non-raw) Python string, so a
+single `\n` written inside a JS string literal is decoded by PYTHON and splits
+that literal across two physical lines. The browser reports
+`SyntaxError: Invalid or unexpected token`, and one syntax error kills the
+WHOLE script — so nothing dynamic renders while static markup still does.
+**Diagnosing it:** read the browser console, or
+`curl -s localhost:8787/ > /tmp/p.html` and look at the reported line. Checking
+the API payload proves nothing: it is served by a different code path and was
+correct throughout.
+**Fix:** applied repo-side — escapes inside the PAGE script must be DOUBLED
+(`split("\\n")`), which the file already documented next to a correct example.
+`test_the_served_javascript_actually_parses` now extracts every `<script>`
+block and runs `node --check` on it, so this class of bug fails a test instead
+of shipping. It found a second broken escape the moment it was written.
+
 ### The dashboard says "stopped" while the loop is running, and its task panel is empty
 **Symptom:** the header reads `stopped`, the agents list is empty, and the
 "Language-app tasks" section shows nothing — all while `autoloop health`

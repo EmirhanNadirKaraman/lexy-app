@@ -822,10 +822,16 @@ document.getElementById("ntdetect").addEventListener("click", async () => {
       ntnote.textContent = " \u2717 nothing detected \u2014 name a file, folder or function in the description";
       return;
     }
-    const existing = el.value.split("\n").map(s => s.split("#")[0].trim()).filter(Boolean);
+    // Doubled, per the rule this file documents a few lines below: PAGE is a
+    // plain Python string, so a single escape is decoded HERE and splits the
+    // JS literal across two physical lines. That is a SyntaxError, and one
+    // syntax error kills the whole script — every dynamic section then renders
+    // empty while the static markup still shows, which looks like a dead
+    // dashboard rather than a typo (2026-08-04).
+    const existing = el.value.split("\\n").map(s => s.split("#")[0].trim()).filter(Boolean);
     const merged = existing.concat(
       found.filter(s => !existing.includes(s.path)).map(s => `${s.path}  # ${s.reason}`));
-    el.value = merged.join("\n");
+    el.value = merged.join("\\n");
     ntnote.className = "saved";
     ntnote.textContent = ` \u2713 ${found.length} suggested \u2014 check each line, then queue`;
   } catch (err) { ntnote.className = "savefail"; ntnote.textContent = " \u2717 " + err; }
