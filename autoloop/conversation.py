@@ -84,7 +84,13 @@ def _browser_chatgpt_factory(config: "AutoloopConfig") -> LLMConversation:
     from .browser.chatgpt import BrowserChatGPT
     from .browser.playwright_session import PlaywrightSession
 
-    session = PlaywrightSession.connect(config.browser.cdp_url)
+    # Pass the conversation so the session binds to THAT tab rather than
+    # whatever ChatGPT page is open first — the profile collects strays
+    # (a chat a failed rotation left behind), and adopting one attaches
+    # the loop to the wrong conversation.
+    session = PlaywrightSession.connect(
+        config.browser.cdp_url, conversation_url=config.browser.conversation_url
+    )
     return BrowserChatGPT(
         session,
         config.browser.conversation_url,

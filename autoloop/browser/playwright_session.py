@@ -70,16 +70,37 @@ def _driver():
 
 
 class PlaywrightSession:
-    def __init__(self, page, playwright, error_cls, browser=None):
+    def __init__(self, page, playwright, error_cls, browser=None, opened_page=False):
         self._page = page
         self._playwright = playwright
         self._error_cls = error_cls
         self._browser = browser
+        #: True when `connect` opened this tab rather than adopting one. Only
+        #: then may `close` close it — closing a tab the operator opened would
+        #: be the mirror of the bug this fixes.
+        self._opened_page = opened_page
         self._observations: list[SendObservation] = []
         self._listening = False
 
+    @staticmethod
+    def _same_conversation(a: str, b: str) -> bool:
+        """Same conversation, ignoring query, fragment and a trailing slash."""
+        from urllib.parse import urlsplit
+
+        pa, pb = urlsplit(a or ""), urlsplit(b or "")
+        return (
+            bool(pa.netloc)
+            and pa.netloc == pb.netloc
+            and pa.path.rstrip("/") == pb.path.rstrip("/")
+        )
+
     @classmethod
-    def connect(cls, cdp_url: str, match_url_substring: str = "chatgpt.com") -> "PlaywrightSession":
+    def connect(
+        cls,
+        cdp_url: str,
+        match_url_substring: str = "chatgpt.com",
+        conversation_url: str | None = None,
+    ) -> "PlaywrightSession":
         try:
             from playwright.sync_api import Error as PlaywrightError
         except ImportError as exc:
@@ -98,14 +119,37 @@ class PlaywrightSession:
                 f"profile running with --remote-debugging-port? ({exc})"
             ) from exc
         context = browser.contexts[0] if browser.contexts else browser.new_context()
+
+        # Bind to the CONFIGURED conversation, never to whatever ChatGPT tab
+        # happens to be open first. The profile accumulates strays — a chat a
+        # failed rotation created, something left open by hand — and adopting
+        # one silently attaches the loop to the wrong conversation. It then
+        # reports "page left the configured conversation while awaiting <id>",
+        # which reads as the page navigating away when really it was never on
+        # the right page (observed 2026-08-03; the loop's Chrome was sitting on
+        # a third chat while the config named another).
+        #
+        # With no conversation given, the old substring match still applies —
+        # `doctor` and the smoke test connect without one.
         page = None
-        for p in context.pages:
-            if match_url_substring in p.url:
-                page = p
-                break
-        if page is None:
+        if conversation_url:
+            for candidate in context.pages:
+                if cls._same_conversation(conversation_url, candidate.url):
+                    page = candidate
+                    break
+        else:
+            for candidate in context.pages:
+                if match_url_substring in candidate.url:
+                    page = candidate
+                    break
+
+        # No match means open our own rather than adopt a stranger's: a new tab
+        # in this profile is logged in exactly the same, and the caller
+        # navigates to the conversation anyway.
+        opened_here = page is None
+        if opened_here:
             page = context.new_page()
-        return cls(page, pw, PlaywrightError, browser)
+        return cls(page, pw, PlaywrightError, browser, opened_page=opened_here)
 
     def _call(self, fn):
         try:
@@ -240,6 +284,14 @@ class PlaywrightSession:
         """
         if self._browser is None:
             return
+        if self._opened_page and self._page is not None:
+            # Ours to clean up. Without this a long run leaks one tab per
+            # client rebuild, and a profile full of ChatGPT tabs is exactly
+            # what made tab selection ambiguous in the first place.
+            try:
+                self._page.close()
+            except Exception:
+                pass
         try:
             self._browser.close()
         except Exception:

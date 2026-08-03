@@ -623,6 +623,26 @@ message does not reach the summary.
 passes, the refusal was a flake; the commit is untouched on its branch, since
 this gateway cannot reset or roll back.
 
+### `page left the configured conversation while awaiting <request-id>`
+**Symptom:** mid-await the loop reports that its page navigated away, often
+followed by `Execution context was destroyed` and then repeated
+`no assistant response ... within 120.0s`. Nothing visibly navigated anything.
+**Cause:** `PlaywrightSession.connect` bound to the FIRST tab whose URL merely
+contained `chatgpt.com`. The dedicated profile accumulates strays — a chat a
+failed rotation created, something left open by hand — so the loop could
+attach to the wrong conversation from the start. The message then describes a
+page "leaving" a conversation it was never on. Seen 2026-08-03 with the loop's
+Chrome sitting on a third chat while the config named another.
+**Fix:** applied repo-side — `connect` takes the configured `conversation_url`
+and binds to THAT tab, comparing host+path so a query string or trailing slash
+does not defeat the match. With no match it opens its own tab rather than
+adopting a stranger's (a new tab in that profile is logged in identically, and
+the caller navigates to the conversation anyway), and closes only tabs it
+opened — closing one the operator opened would be the mirror of this bug.
+**Diagnosing it:** list the profile's pages and compare against the config —
+`curl -s localhost:9222/json | python3 -c "…"` versus
+`grep ^conversation_url .autoloop/config.toml`. If they differ, this is it.
+
 ### `the replacement chat is not inside the configured project` — but it plainly is
 **Symptom:** a rotation parks `loop_fatal` reporting that the chat it just
 opened is outside the project, quoting a URL that visibly contains the project

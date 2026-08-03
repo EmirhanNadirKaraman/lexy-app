@@ -38,15 +38,20 @@ class FakeBrowser:
 
 
 class FakePage:
-    url = "https://chatgpt.com/c/abc"
+    def __init__(self, url="https://chatgpt.com/c/abc"):
+        self.url = url
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
 
 class FakeContext:
-    def __init__(self):
-        self.pages = [FakePage()]
+    def __init__(self, urls=("https://chatgpt.com/c/abc",)):
+        self.pages = [FakePage(u) for u in urls]
 
     def new_page(self):
-        page = FakePage()
+        page = FakePage("about:blank")
         self.pages.append(page)
         return page
 
@@ -182,3 +187,119 @@ def test_a_missing_playwright_still_says_how_to_install_it(monkeypatch):
     with pytest.raises(BrowserError, match="playwright is not installed"):
         ps.PlaywrightSession.connect("http://localhost:9222")
     ps._DRIVER = None
+
+
+# ---- binding to the CONFIGURED conversation ---------------------------------
+#
+# `connect` used to take the first tab whose URL merely contained
+# "chatgpt.com". The dedicated profile accumulates strays — a chat a failed
+# rotation created, something left open by hand — so the loop could attach to
+# the wrong conversation and then report "page left the configured
+# conversation while awaiting <id>", which reads as the page navigating away
+# when it was never on the right page. Observed 2026-08-03: the loop's Chrome
+# sat on a third chat while the config named another.
+
+WANTED = "https://chatgpt.com/g/g-p-abc-demo/c/wanted-chat"
+STRAY = "https://chatgpt.com/g/g-p-abc-demo/c/some-other-chat"
+
+
+def test_it_binds_to_the_configured_conversation_not_the_first_chatgpt_tab(fake_playwright):
+    """The bug. A stray ChatGPT tab must not be adopted when the conversation
+    this session is for is open in another one."""
+    import autoloop.browser.playwright_session as ps
+
+    original = FakeChromium.connect_over_cdp
+
+    def with_pages(self, url):
+        self._driver.connects += 1
+        browser = FakeBrowser(self._driver)
+        browser.contexts = [FakeContext((STRAY, WANTED))]
+        return browser
+
+    FakeChromium.connect_over_cdp = with_pages
+    try:
+        session = ps.PlaywrightSession.connect("http://cdp", conversation_url=WANTED)
+        assert session._page.url == WANTED
+    finally:
+        FakeChromium.connect_over_cdp = original
+
+
+def test_no_matching_tab_opens_its_own_rather_than_adopting_a_stranger(fake_playwright):
+    """A new tab in this profile is logged in identically, and the caller
+    navigates to the conversation anyway — so adopting an unrelated chat buys
+    nothing and costs correctness."""
+    import autoloop.browser.playwright_session as ps
+
+    original = FakeChromium.connect_over_cdp
+
+    def only_stray(self, url):
+        self._driver.connects += 1
+        browser = FakeBrowser(self._driver)
+        browser.contexts = [FakeContext((STRAY,))]
+        return browser
+
+    FakeChromium.connect_over_cdp = only_stray
+    try:
+        session = ps.PlaywrightSession.connect("http://cdp", conversation_url=WANTED)
+        assert session._page.url == "about:blank", "must not adopt the stray"
+        assert session._opened_page is True
+    finally:
+        FakeChromium.connect_over_cdp = original
+
+
+def test_a_tab_we_opened_is_closed_again_but_a_borrowed_one_is_not(fake_playwright):
+    """Closing a tab the operator opened would be the mirror of this bug; not
+    closing ours leaks one per client rebuild, and a profile full of ChatGPT
+    tabs is what made selection ambiguous to begin with."""
+    import autoloop.browser.playwright_session as ps
+
+    original = FakeChromium.connect_over_cdp
+
+    def only_stray(self, url):
+        self._driver.connects += 1
+        browser = FakeBrowser(self._driver)
+        browser.contexts = [FakeContext((STRAY,))]
+        return browser
+
+    FakeChromium.connect_over_cdp = only_stray
+    try:
+        ours = ps.PlaywrightSession.connect("http://cdp", conversation_url=WANTED)
+        page = ours._page
+        ours.close()
+        assert page.closed is True
+    finally:
+        FakeChromium.connect_over_cdp = original
+
+    def has_wanted(self, url):
+        self._driver.connects += 1
+        browser = FakeBrowser(self._driver)
+        browser.contexts = [FakeContext((WANTED,))]
+        return browser
+
+    FakeChromium.connect_over_cdp = has_wanted
+    try:
+        borrowed = ps.PlaywrightSession.connect("http://cdp", conversation_url=WANTED)
+        page = borrowed._page
+        borrowed.close()
+        assert page.closed is False, "a tab we did not open is not ours to close"
+    finally:
+        FakeChromium.connect_over_cdp = original
+
+
+def test_query_and_trailing_slash_do_not_defeat_the_match(fake_playwright):
+    import autoloop.browser.playwright_session as ps
+
+    same = ps.PlaywrightSession._same_conversation
+    assert same(WANTED, WANTED + "/")
+    assert same(WANTED, WANTED + "?model=gpt-5")
+    assert not same(WANTED, STRAY)
+    assert not same(WANTED, "https://evil.example/g/g-p-abc-demo/c/wanted-chat")
+    assert not same(WANTED, "")
+
+
+def test_without_a_conversation_the_old_substring_match_still_applies(fake_playwright):
+    """`doctor` and the smoke test connect with no conversation in hand."""
+    import autoloop.browser.playwright_session as ps
+
+    session = ps.PlaywrightSession.connect("http://cdp")
+    assert "chatgpt.com" in session._page.url
