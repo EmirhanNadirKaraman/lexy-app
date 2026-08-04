@@ -336,6 +336,7 @@ def test_lock_is_released_before_unwinding_not_by_it(tmp_path):
         proc.wait(timeout=30)
 
 
+@pytest.mark.isolated
 def test_sigint_release_is_unchanged(tmp_path):
     lock_path = tmp_path / "LOCK"
     with holder(tmp_path) as proc:
@@ -356,3 +357,41 @@ def test_sigkill_still_leaves_a_lock_that_recovery_can_clear(tmp_path):
     assert LoopLock.is_live(lock.read()) is False
     lock.break_stale()
     assert not lock_path.exists()
+
+
+def test_the_isolated_marker_is_registered_and_actually_used():
+    """Isolation must not decay into deletion.
+
+    An `isolated` test runs in its own process and nowhere else, so if the
+    marker were dropped, mistyped, or the dedicated command removed, the test
+    would stop running and every suite would stay green — silent coverage
+    loss, which is worse than the flake it replaces.
+
+    Asks CONFIGPARSER and PYTEST rather than grepping the files. The first
+    version of this test grepped, and two of its three assertions matched
+    their own text: `-m "not isolated"` appears in the explanatory comment,
+    and `@pytest.mark.isolated` appears in the assertion line itself. Both
+    mutations passed. A guard that reads its own source proves nothing.
+    """
+    import configparser
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[2]
+
+    parser = configparser.ConfigParser()
+    parser.read(root / "pytest.ini")
+    addopts = parser.get("pytest", "addopts", fallback="")
+    markers = parser.get("pytest", "markers", fallback="")
+    assert "not isolated" in addopts, f"default run must exclude it; addopts={addopts!r}"
+    assert "isolated" in markers, "the marker must be declared, or pytest ignores typos"
+
+    # Authoritative: ask pytest which tests carry the marker.
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "autoloop/tests/test_crash_safety.py",
+         "-m", "isolated", "--collect-only", "-q", "-p", "no:cacheprovider"],
+        cwd=str(root), capture_output=True, text=True, timeout=120,
+    ).stdout
+    assert "test_sigint_release_is_unchanged" in collected, (
+        "the flaky test must actually carry the marker, not merely mention it"
+    )
