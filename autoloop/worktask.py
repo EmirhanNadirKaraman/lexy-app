@@ -153,6 +153,24 @@ class TaskExecution:
     #: (`Task.validation_cwd`). Persisted for the same reason: running the
     #: right commands from the wrong directory checks nothing.
     validation_cwd: str = ""
+    #: What the executor SAID it did — `ExecutionOutcome.summary`/`.details`
+    #: from the round that produced `candidate_sha`.
+    #:
+    #: Persisted rather than passed along, because `_finish_postcommit` is also
+    #: reached by crash-recovery adoption, where the executor ran in an earlier
+    #: process and no `ExecutionOutcome` exists in this one. Only the summary
+    #: reaches the commit message today (`title\n\nsummary`); the details were
+    #: discarded entirely on the success path.
+    #:
+    #: These are CLAIMS, and the packet labels them as such. Everything else in
+    #: a review packet is read from immutable git objects; this is the one
+    #: section the executor authors. It exists so the reviewer can judge intent
+    #: — "is this the right change?" — which a raw diff answers badly. It must
+    #: never become the basis of an authorization decision: `allowed_paths`
+    #: above is the scope, and the post-commit ownership check compares git's
+    #: own `commit_range_paths` against THAT, never against this.
+    report_summary: str = ""
+    report_details: str = ""
 
 
 @dataclass
