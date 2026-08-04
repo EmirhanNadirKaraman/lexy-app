@@ -19,9 +19,19 @@ different `report_sha256`.
 
 from __future__ import annotations
 
+import textwrap
+
 from .git_gateway import GitGateway
 from .tasks import Task
 from .worktask import TaskExecution
+
+#: How much patch text a packet may carry. Deliberately far below
+#: `GitGateway.RANGE_DIFF_MAX_BYTES` (400 KB): that cap bounds what git is
+#: asked to RENDER, this one bounds what a chat message can actually DELIVER.
+#: See `_format_diff_section` for the failure that set it — a 38 KB diff was
+#: accepted by the composer, failed generation server-side, and left no
+#: message in the conversation at all.
+DIFF_INCLUDE_MAX_CHARS = 8_000
 
 
 def _format_commit_list(commits: list[dict]) -> str:
@@ -90,8 +100,9 @@ def build_review_packet(execution: TaskExecution, worktree_git: GitGateway, task
 
     return "\n".join(
         [
-            "POST-COMMIT REVIEW PACKET — rendered only from immutable git",
-            "objects in the range below; nothing here is claimed, everything is read.",
+            "POST-COMMIT REVIEW PACKET — every section below is READ from",
+            "immutable git objects in the range shown, except the one section",
+            "explicitly labelled as the executor's own claims.",
             f"task_id: {task.id}",
             f"task_title: {task.title}",
             f"branch: {execution.task_branch}",
@@ -108,7 +119,81 @@ def build_review_packet(execution: TaskExecution, worktree_git: GitGateway, task
             "Diff stat:",
             stat.strip() or "  (empty)",
             "",
-            "Full diff:",
-            diff,
+            _format_executor_report(execution),
+            "",
+            _format_diff_section(diff),
         ]
+    )
+
+
+def _format_executor_report(execution: TaskExecution) -> str:
+    """The executor's own account of the round — the ONLY unread section.
+
+    Labelled loudly on purpose. The packet's value has always been that a
+    reviewer reads git rather than a self-description; folding the executor's
+    words back in reintroduces exactly the voice that `docs/SECURITY.md`
+    finding #2 removed from AUTHORIZATION. It is safe here, and only here,
+    because nothing downstream consumes it: path ownership is checked against
+    `commit_range_paths` vs `allowed_paths`, ancestry against the real graph,
+    and validation by re-running it on the committed tree. A false report can
+    mislead the reviewer's JUDGEMENT — it cannot widen scope, fake a passing
+    suite, or authorize a push.
+
+    Empty for any record written before these fields existed (a candidate
+    committed by an older build, or crash-recovery adoption of one). Saying so
+    is better than an unexplained blank: an absent report is not a silent one.
+    """
+    summary = (execution.report_summary or "").strip()
+    details = (execution.report_details or "").strip()
+    if not summary and not details:
+        return (
+            "Executor report (CLAIMED by the executor, not read from git):\n"
+            "  (none recorded — this candidate predates report capture, or was\n"
+            "   adopted after a crash. Judge from the git-read sections above.)"
+        )
+    body = "\n".join(part for part in (summary, details) if part)
+    return (
+        "Executor report (CLAIMED by the executor, not read from git — every\n"
+        "other section is read. Treat this as intent, and check it against the\n"
+        "changed paths and diff stat above rather than trusting it):\n"
+        + textwrap.indent(body, "  ")
+    )
+
+
+def _format_diff_section(diff: str) -> str:
+    """The full patch when it is small enough to send, an honest omission
+    notice when it is not.
+
+    `GitGateway.RANGE_DIFF_MAX_BYTES` (400 KB) is a safety cap on what git is
+    asked to render; it is not a limit on what the REVIEWER can receive. On
+    2026-08-04 rt-09 produced a 38 KB diff — legal by that cap — and ChatGPT
+    could not process the message at all: the composer accepted it and
+    rendered optimistically (so the loop logged `request_submitted:
+    confirmed`), generation then failed server-side, and the whole turn was
+    never persisted. Reloading the conversation showed no user message. The
+    loop waited 486s for a reply to a message that did not exist, restarted
+    Chrome between attempts, and finally tried to rotate to a fresh chat —
+    which failed identically, because the same oversized payload could not
+    land there either. Three separate blockers, one cause.
+
+    Truncating silently would be worse than omitting loudly: a reviewer who
+    cannot see that the patch was cut will read a partial diff as the whole
+    change. So the notice states the real size, names what IS still authorative
+    (paths + stat, both read from git), and says how to read the rest.
+    """
+    diff = diff.strip()
+    if not diff:
+        return "Full diff:\n  (empty)"
+    if len(diff) <= DIFF_INCLUDE_MAX_CHARS:
+        return "Full diff:\n" + diff
+    return (
+        f"Full diff: OMITTED — {len(diff)} characters, over the "
+        f"{DIFF_INCLUDE_MAX_CHARS}-character send limit.\n"
+        "  Nothing was truncated: the patch is absent, not shortened, so no\n"
+        "  section above is a partial view of it. The changed-path list and\n"
+        "  diff stat ARE complete and are read from git.\n"
+        "  To read the patch itself:\n"
+        f"    git diff-tree -r -p <base_sha> <candidate_sha>\n"
+        "  If you cannot review the change without it, reply `revise` asking\n"
+        "  for a smaller commit rather than approving unseen."
     )

@@ -895,3 +895,128 @@ def test_legacy_commit_and_push_is_always_refused_even_with_a_live_candidate(tmp
     assert any("policy_denied" in p and "no longer supported" in p for p in prompts)
     # the live candidate is unaffected — nothing was published or lost
     assert execution_store.load(task.id).candidate_sha != ""
+
+
+# =============================================================================
+# Report-first packets (2026-08-04)
+#
+# The packet carried the entire patch, and on rt-09 that was 38 KB of new test
+# code. ChatGPT could not process the message: the composer accepted it and
+# rendered optimistically (so the loop logged `request_submitted: confirmed`),
+# generation failed server-side, and the turn was never persisted — reloading
+# the conversation showed no user message at all. The loop then waited 486s for
+# a reply that could not come, restarted Chrome between attempts, and tried to
+# rotate to a fresh chat, which failed for the same reason. Three blockers, one
+# cause: a message too big to send.
+#
+# The fix carries the executor's own report (so the reviewer can judge intent)
+# and omits an oversized diff LOUDLY rather than truncating it silently.
+
+
+def test_the_packet_carries_what_the_executor_said_it_did(tmp_path):
+    """The point of the change: a reviewer gets the executor's account, which
+    a raw patch answers badly."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, _wt, execution_store, _intent, task = build_postcommit(tmp_path, executor)
+
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+
+    payload = orch.state.pending_request.payload
+    assert "round 1" in payload, "the executor's summary must reach the reviewer"
+    assert "details" in payload
+    execution = execution_store.load(task.id)
+    assert execution.report_summary == "round 1"
+    assert execution.report_details == "details"
+
+
+def test_the_report_is_labelled_as_claimed_not_read(tmp_path):
+    """Load-bearing. Every other section is read from git; folding the
+    executor's voice back in without saying so is what SECURITY.md finding #2
+    removed from authorization. The label is the whole safety margin."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, _wt, _store, _intent, task = build_postcommit(tmp_path, executor)
+
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+
+    payload = orch.state.pending_request.payload
+    assert "CLAIMED by the executor, not read from git" in payload
+
+
+def test_an_oversized_diff_is_OMITTED_not_truncated(tmp_path):
+    """Silent truncation is worse than omission: a reviewer who cannot see
+    that the patch was cut reads a partial diff as the whole change."""
+    from autoloop import packet as packet_mod
+
+    big = "\n".join(f"line {i} of a large generated file" for i in range(4000)) + "\n"
+    executor = WritingExecutor(tmp_path / "worktrees", {"big.py": big})
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+
+    payload = orch.state.pending_request.payload
+    assert "Full diff: OMITTED" in payload
+    assert "Nothing was truncated" in payload
+    assert "line 3999 of a large generated file" not in payload, "no patch body"
+    # The git-read facts are still complete — that is what makes the omission
+    # honest rather than a hole.
+    assert "big.py" in payload
+    assert "Diff stat:" in payload
+    assert len(payload) < packet_mod.DIFF_INCLUDE_MAX_CHARS + 4_000
+
+
+def test_a_small_diff_is_still_sent_in_full(tmp_path):
+    """The cap must not cost fidelity on the changes where fidelity is cheap."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, _wt, _store, _intent, task = build_postcommit(tmp_path, executor)
+
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+
+    payload = orch.state.pending_request.payload
+    assert "Full diff:" in payload
+    assert "OMITTED" not in payload
+    assert "print('hi')" in payload
+
+
+def test_a_record_with_no_report_says_so_rather_than_going_blank(tmp_path):
+    """Candidates committed by an older build, and crash-recovery adoptions,
+    have no report. An absent report must not read as a silent one."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+    execution = execution_store.load(task.id)
+    execution.report_summary = ""
+    execution.report_details = ""
+
+    text = build_review_packet(execution, worktree_git_for(worktrees, task.id), task)
+
+    assert "(none recorded" in text
+    assert "predates report capture" in text
+
+
+def test_the_report_never_widens_scope(tmp_path):
+    """The guarantee that makes including it safe at all: path ownership is
+    checked against git's own range, never against what the executor wrote.
+    A report naming a file it did not touch changes nothing."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    execution = execution_store.load(task.id)
+    execution.report_summary = "also rewrote /etc/passwd and docs/SECURITY.md"
+    execution_store.save(execution)
+    text = build_review_packet(execution, worktree_git_for(worktrees, task.id), task)
+
+    assert "also rewrote" in text                      # it is shown, as a claim
+    assert "docs/SECURITY.md" not in text.split("Executor report")[0], (
+        "the claim must not appear among the git-read changed paths"
+    )
+    assert execution.allowed_paths == ("feature.py",) or "feature.py" in text

@@ -2236,6 +2236,16 @@ class Orchestrator:
                 )
                 return
 
+        # Captured BEFORE the commit, while the outcome is still in hand: this
+        # is the executor's own account of the round, and `_finish_postcommit`
+        # (which renders the packet) is also reachable by crash-recovery
+        # adoption, where no `ExecutionOutcome` exists in this process. Only
+        # `summary` survives in the commit message; `details` had nowhere to go
+        # at all on the success path.
+        execution.report_summary = outcome.summary or ""
+        execution.report_details = outcome.details or ""
+        self._execution_store.save(execution)
+
         message = f"{task.title}\n\n{outcome.summary}".strip()
         parent = worktree_git.head_sha()
         intent = CommitIntent.create(
