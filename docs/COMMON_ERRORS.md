@@ -90,6 +90,33 @@ calls issued in parallel in the same message.
 result depends on location — especially when several suites share a directory
 name. Add `pwd` to the command when the output will be quoted in a report.
 
+### An autoloop CLI run from a sibling worktree reports on an EMPTY state dir
+**Symptom:** `python -m autoloop merge-window`, run from a second worktree
+against the live config, printed `merge window OPEN` while the same command in
+the primary checkout listed four blocking candidates. Nothing had changed
+between the two runs.
+**Cause:** `state_dir` is **relative** in the shipped config (`.autoloop`), so it
+resolves against the caller's cwd — not against the config file's location and
+not against the repo. From the worktree it pointed at a directory that does not
+exist, every `glob("executions/*.json")` came back empty, and "found no records"
+was indistinguishable from "there are no records". Same family as the cwd trap
+above, and as AUTOLOOP_TODO B8.
+**Fix:** pass an absolute `state_dir`, or run the CLI with the checkout as cwd.
+To exercise a *worktree's* code against the *live* state, set cwd to the live
+checkout and import the worktree explicitly — cwd would otherwise win on
+`sys.path`:
+
+```bash
+cd /path/to/live-checkout
+PYTHONSAFEPATH=1 PYTHONPATH=/path/to/worktree python3 -m autoloop.cli merge-window
+# confirm which copy actually loaded:
+PYTHONSAFEPATH=1 PYTHONPATH=/path/to/worktree python3 -c "import autoloop; print(autoloop.__file__)"
+```
+
+`merge-window` itself now refuses to answer when its `state_dir` is missing
+(2026-08-04) — an unreadable directory is not evidence of safety. Any other
+command reading `state_dir` still has this shape.
+
 ### `ImportError: cannot import name 'markcoroutinefunction'` from a partially initialized `inspect`
 **Symptom:** A throwaway script that only does `import asyncio, asyncpg` dies with
 a traceback that ends inside `asyncpg/compat.py`:
