@@ -65,6 +65,7 @@ line.
 | `test_grammar_rules_srs.py` | grammar rule via `/words/{type}/{id}/status`; status_marked_learning currently creates passive only (grammar_rule guard added in this session) |
 | `test_llm_cache.py` | cache key generation, hit/miss, TTL |
 | `test_matcher.py` | phrase matching via `/sentences/match` (🆕 auth-gated, S16): 403 unauth / 200 auth / 422 over-length cap; German + Spanish (es-model) extraction; unknown-language → []. |
+| `test_migration_025_downgrade.py` | 🆕 db-02 downgrade guard for migration 025: `_tokenize` id instability, refuse-before-DDL when `reading_selections` anchors exist, proceed at zero dependents, and the counting SQL against the live schema (token_id counts, legacy/null/empty don't). **Never runs `alembic downgrade`** — see the caveat below the table. |
 | `test_client_errors.py` | W7 crash-sink coverage; 🆕 extended with S6 per-IP throttle tests (429 after limit, authed below-limit still 204) |
 | `test_playlist.py` | playlist generation from target words |
 | `test_prioritization.py` | get_prioritized_items signal weights |
@@ -1032,6 +1033,50 @@ Three new cases in `TestChecksumGate` plus one in `TestImportFlow`:
 
 Counts in the summary table below were not re-measured for this change (no
 execution in the worker role that made it); the delta is +5 backend cases.
+
+🆕 **2026-08-05 — Migration 025 downgrade guard (+9 backend / +1 file)**
+
+Audit `tests_ci:db-02` (rt-02). `025_block_token_ids.downgrade()` was a bare
+`DROP COLUMN tokens`. `reading_selections.anchors` holds `{block_id, token_id,
+surface}` pointing into that column with **no FK**, and `_tokenize` mints fresh
+`uuid4()`s on every run — so downgrade + re-upgrade silently reassigns every id
+and orphans every anchor. No error, no warning; the selections survive but stop
+resolving to any text. `downgrade()` now counts dependent rows and raises
+before touching the schema.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_migration_025_downgrade.py` (NEW) | 9 | `_tokenize` id instability across runs (the reason the loss is unrecoverable); refusal with the row count + the DELETE that constitutes explicit consent; **no DDL executed on the refusal path**; proceed at zero dependents and on a `None` scalar; no env-var force flag; and the counting SQL run against the live schema — a token_id anchor counts, pre-025 legacy anchors / JSON-null token_id / empty anchors do not, and a 3-anchor selection counts once |
+
+**No force flag, deliberately.** Nothing else in this repo gates destruction on
+an env var (022 raises flatly, 035 deletes only rows it created), and the
+escape hatch already exists and is better: the operator deletes the dependent
+`reading_selections` rows, which makes the loss explicit and auditable. The
+refusal message hands them that exact statement.
+
+**The load-bearing test is `test_dependent_anchors_sql_counts_only_token_id_anchors`.**
+Anchors written before 025 have no `token_id` key at all — that's why
+`routers/reading.py:64` falls back to `"legacy"`. A guard that counted every
+`reading_selections` row would block the downgrade on deployments that never
+depended on the column, which is a bug in the opposite direction. The scoped
+count pins both halves on one user's fixtures.
+
+**This suite never runs `alembic downgrade`** — the tests share the dev
+database, and a real downgrade would drop `book_blocks.tokens` out from under
+every other suite. The SQL constant is executed directly through asyncpg
+instead, and `downgrade()` is driven with a fake `op` that only records what it
+was handed. The two live tests scope their count by *appending* to
+`mig._DEPENDENT_ANCHORS_SQL` rather than copying the predicate, so the string
+under test is the one that ships and the count stays deterministic under xdist.
+
+Note this edits a migration that has already been applied (CLAUDE.md §12,
+append-only). Only `downgrade()` and the prose changed — `upgrade()`,
+`_tokenize` and the revision ids are byte-for-byte unchanged, so no deployment
+can diverge. The docstring says so, to save the next reader the diff.
+
+Counts in the summary table below were not re-measured for this change (no
+execution in the worker role that made it); the delta is +9 backend cases,
+counted from the file rather than from a run.
 
 🆕 **2026-07-29 — Document-ingestion evaluation harness (+147 root / +6 files)**
 
