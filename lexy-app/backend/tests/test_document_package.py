@@ -407,6 +407,66 @@ class TestChecksumGate:
         assert not issues.ok
         assert "empty_checksums" in issues.codes()
 
+    # -- what the gate CLAIMS, not just what it rejects ---------------------
+
+    def test_a_clean_gate_reports_what_it_verified(self, tmp_path):
+        write_package(tmp_path)
+        issues = issues_for(tmp_path)
+        claims = [i.message for i in issues.infos if i.code == "checksums_verified"]
+        # The count is the substantive part; the prose around it is free to
+        # change (issues.py — codes are the contract, messages are not).
+        assert len(claims) == 1 and claims[0].startswith("verified 2 file(s)")
+        assert "checksums_checked" not in issues.codes()
+
+    @pytest.mark.parametrize(
+        "damage",
+        [
+            "mismatch",  # a digest in the loop does not match
+            "uncovered_required_file",  # every entry verifies, coverage does not
+            "malformed_line",  # parse defect, raised before the loop runs
+        ],
+    )
+    def test_a_failed_gate_never_claims_verification(self, tmp_path, damage):
+        """The report said "verified 2 file(s)" next to the mismatch that
+        refuted it (audit ``ingestion_pipeline:ing-06``).
+
+        Two of these three cases fail *outside* the digest loop — a package can
+        have every listed digest match and still be unverifiable, because the
+        inventory is malformed or does not cover the files that define the
+        package. So the claim is gated on the whole gate being clean, not on the
+        loop alone.
+        """
+        directory = write_package(tmp_path)
+        if damage == "mismatch":
+            (directory / contract.DOCUMENT_FILENAME).write_text(
+                json.dumps({"elements": [element()]}) + " ", encoding="utf-8"
+            )
+        elif damage == "uncovered_required_file":
+            digest = hashlib.sha256(
+                (directory / contract.DOCUMENT_FILENAME).read_bytes()
+            ).hexdigest()
+            (directory / contract.CHECKSUMS_FILENAME).write_text(
+                f"{digest}  {contract.DOCUMENT_FILENAME}\n", encoding="utf-8"
+            )
+        else:
+            with (directory / contract.CHECKSUMS_FILENAME).open("a", encoding="utf-8") as fh:
+                fh.write("this-line-has-no-path\n")
+
+        issues = issues_for(tmp_path)
+        assert not issues.ok
+        assert "checksums_verified" not in issues.codes()
+        # Still says how much was walked — honest, and useful when the failure
+        # is one bad entry in a large inventory.
+        assert "checksums_checked" in issues.codes()
+
+    def test_an_absent_inventory_claims_nothing_either_way(self, tmp_path):
+        """Nothing was hashed, so neither line belongs in the report."""
+        write_package(tmp_path, checksums=False)
+        assert not issues_for(tmp_path).codes() & {
+            "checksums_verified",
+            "checksums_checked",
+        }
+
     def test_parse_ignores_comments_and_blanks_but_reports_garbage(self):
         parsed = parse_checksums(f"# comment\n\n{'a' * 64}  manifest.json\ngarbage\n")
         assert parsed.entries == {"manifest.json": "a" * 64}
@@ -895,6 +955,18 @@ class TestImportFlow:
         )
         assert result.status == contract.STATUS_REJECTED
         assert "missing_checksums" in {e["code"] for e in result.errors}
+
+    async def test_a_rejected_result_carries_no_verification_claim(self, tmp_path):
+        """The info list is part of the import report (§4), so a success claim
+        there is read by whoever triages the rejection."""
+        directory = write_package(tmp_path)
+        (directory / contract.DOCUMENT_FILENAME).write_text(
+            json.dumps({"elements": [element()]}) + " ", encoding="utf-8"
+        )
+        result = await book_import_service.dry_run_package("pkg", user_id="u", root=tmp_path)
+        assert result.status == contract.STATUS_REJECTED
+        assert "checksum_mismatch" in {e["code"] for e in result.errors}
+        assert "checksums_verified" not in {i["code"] for i in result.info}
 
     async def test_persistence_is_not_called_after_a_checksum_failure(self, tmp_path):
         """The gate must stop the pipeline, not merely annotate it."""

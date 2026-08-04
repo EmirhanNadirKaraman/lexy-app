@@ -982,6 +982,36 @@ Three groups worth knowing before changing `services/document_package/`:
 `test_real_import_refuses_and_reports_rather_than_raising` are the pins that
 flip when **A3** lands.
 
+🆕 **2026-08-04 — The checksum gate may not claim what it did not verify (+6 collected in `test_document_package.py`; 4 new test functions, the failure case parametrized ×3; no new file)**
+
+Audit `ingestion_pipeline:ing-06` (rt-06; duplicate of `ing-05` /
+`ingest-defect-01`). `verify_checksums` closed with an unconditional INFO
+"verified N file(s) against CHECKSUMS.txt", so a rejected package's report
+carried a success claim beside the `checksum_mismatch` that refuted it. Now
+`checksums_verified` is emitted only when the **whole gate** found nothing
+fatal; otherwise a neutral `checksums_checked` reports the size of the
+inventory that was walked, with no derived failure count (the fatal delta also
+covers malformed lines and coverage gaps, which are not failed digests).
+
+Three new cases in `TestChecksumGate` plus one in `TestImportFlow`:
+
+- `test_a_clean_gate_reports_what_it_verified` — the positive claim survives,
+  message and all; the neutral code is absent.
+- `test_a_failed_gate_never_claims_verification` — parametrized over
+  `mismatch` / `uncovered_required_file` / `malformed_line`. **Two of those
+  three fail outside the digest loop**, which is the pin that matters: every
+  listed digest can match while the package is still unverifiable because the
+  inventory is malformed or does not cover `manifest.json`. A fix that gates
+  only on the loop passes the mismatch case and fails these two.
+- `test_an_absent_inventory_claims_nothing_either_way` — nothing was hashed, so
+  neither line is emitted.
+- `TestImportFlow::test_a_rejected_result_carries_no_verification_claim` —
+  end-to-end through `dry_run_package`, because `result.info` is the field a
+  human triaging the rejection actually reads.
+
+Counts in the summary table below were not re-measured for this change (no
+execution in the worker role that made it); the delta is +5 backend cases.
+
 🆕 **2026-07-29 — Document-ingestion evaluation harness (+147 root / +6 files)**
 
 `tests/evaluation/{test_normalize,test_annotation,test_metrics,test_fidelity,test_report_and_compare,test_integration}.py`.
