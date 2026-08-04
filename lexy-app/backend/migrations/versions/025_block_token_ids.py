@@ -18,9 +18,10 @@ Postgres cannot enforce it, which is why `downgrade()` enforces it in Python —
 see the guard below.
 
 Append-only note (CLAUDE.md §12): the 2026-08-05 edit that added the downgrade
-guard touched **only** `downgrade()` and this prose. `upgrade()`, `_tokenize`,
-and the revision identifiers are byte-for-byte what was applied, so no
-deployment that already ran 025 can diverge from one that runs it now.
+guard touched **only** `downgrade()`, the module-level SQL constants it reads,
+and this prose. `upgrade()`, `_tokenize`, and the revision identifiers are
+byte-for-byte what was applied, so no deployment that already ran 025 can
+diverge from one that runs it now.
 """
 from alembic import op
 import sqlalchemy as sa
@@ -36,23 +37,55 @@ depends_on = None
 _SPLIT = _re.compile(r'(\p{L}[\p{L}\p{M}\'-]*)')
 _WORD  = _re.compile(r'^\p{L}')
 
-# Counts reading_selections rows that anchor to at least one token_id, i.e. the
-# rows this migration's downgrade would orphan. Rows saved BEFORE 025 have no
-# `token_id` key in their anchors at all (hence the `"legacy"` fallback in
-# routers/reading.py:64) and are correctly NOT counted — they never depended on
-# the column, so they must not block a downgrade.
+# Row-level predicate (alias `rs`): does this reading_selections row anchor to
+# at least one token_id, i.e. is it a row this migration's downgrade would
+# orphan? Rows saved BEFORE 025 have no `token_id` key in their anchors at all
+# (hence the `"legacy"` fallback in routers/reading.py:64) and are correctly NOT
+# counted — they never depended on the column, so they must not block a
+# downgrade.
 #
 # `a->>'token_id' IS NOT NULL` excludes both the missing key and a JSON null.
 # Deliberately written without the `?` jsonb operator: SQLAlchemy's `text()`
 # treats `?` as a parameter marker under some drivers, and this exact string is
 # also executed through asyncpg by tests/test_migration_025_downgrade.py.
-_DEPENDENT_ANCHORS_SQL = """
+#
+# **The CASE is load-bearing.** `jsonb_array_elements` ERRORS on anything that
+# isn't a JSON array ("cannot extract elements from a scalar/object"), and
+# `anchors` is plain `JSONB NOT NULL DEFAULT '[]'` (migration 009:32) — nothing
+# constrains it to an array. A single `'null'::jsonb` or object-shaped row would
+# turn this guard from a refusal into a crash mid-downgrade, which is strictly
+# worse than no guard. Non-array anchors are therefore expanded as `[]`, i.e.
+# counted as zero dependents: `routers/reading.py:59-60` already coerces any
+# non-list to `[]`, so such a row resolves to no anchors in the app today and
+# dropping the column destroys nothing it had not already lost. The inner
+# `jsonb_typeof(a) = 'object'` guards the same way one level down — `->>` is
+# lenient on scalar elements in current Postgres, but not provably so across
+# every version this migration may be replayed on.
+_ANCHOR_DEPENDS_PREDICATE = """EXISTS (
+       SELECT 1
+         FROM jsonb_array_elements(
+                CASE WHEN jsonb_typeof(rs.anchors) = 'array'
+                     THEN rs.anchors
+                     ELSE '[]'::jsonb
+                END
+              ) AS a
+        WHERE jsonb_typeof(a) = 'object'
+          AND a->>'token_id' IS NOT NULL
+     )"""
+
+# Ends with the EXISTS closing paren and no semicolon, so callers can append
+# further conditions (the tests scope it with ` AND rs.user_id = $1::uuid`).
+_DEPENDENT_ANCHORS_SQL = f"""
     SELECT COUNT(*) FROM reading_selections rs
-     WHERE EXISTS (
-       SELECT 1 FROM jsonb_array_elements(rs.anchors) AS a
-        WHERE a->>'token_id' IS NOT NULL
-     )
-"""
+     WHERE {_ANCHOR_DEPENDS_PREDICATE}"""
+
+# The operator's opt-out, quoted verbatim in the refusal below. Derived from the
+# same predicate on purpose: a hand-written copy would drift, and the first thing
+# it would drift on is the CASE — handing the operator a DELETE that crashes on
+# exactly the rows the CASE was added for.
+_DELETE_DEPENDENTS_SQL = "DELETE FROM reading_selections rs WHERE " + " ".join(
+    _ANCHOR_DEPENDS_PREDICATE.split()
+)
 
 
 def _tokenize(text: str) -> list[dict]:
@@ -118,6 +151,10 @@ def downgrade() -> None:
     is here. There is no force flag on purpose: an operator who genuinely wants
     the downgrade deletes the dependent `reading_selections` rows first, which
     makes the data loss an explicit, auditable act rather than a flag.
+
+    The count is deliberately tolerant of malformed `anchors` — see the CASE
+    note on `_ANCHOR_DEPENDS_PREDICATE`. A guard that raised on a stray JSON
+    null would abort the downgrade mid-flight instead of refusing it cleanly.
     """
     conn = op.get_bind()
     dependent = conn.execute(sa.text(_DEPENDENT_ANCHORS_SQL)).scalar() or 0
@@ -130,9 +167,7 @@ def downgrade() -> None:
             "orphaning those anchors — the selections survive but no longer "
             "resolve to any text. To proceed anyway, delete the dependent rows "
             "first (they are the data being destroyed):\n"
-            "    DELETE FROM reading_selections rs WHERE EXISTS ("
-            "SELECT 1 FROM jsonb_array_elements(rs.anchors) AS a "
-            "WHERE a->>'token_id' IS NOT NULL);\n"
+            f"    {_DELETE_DEPENDENTS_SQL};\n"
             "Restore them from a backup afterwards if they matter."
         )
 

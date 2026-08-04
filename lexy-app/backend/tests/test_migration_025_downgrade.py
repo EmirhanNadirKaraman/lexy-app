@@ -11,8 +11,16 @@ What this file locks in:
     unrecoverable rather than merely inconvenient);
   * the guard's counting SQL is valid against the LIVE schema and counts the
     right rows — token_id anchors yes, pre-025 legacy anchors no;
+  * the guard survives every shape `anchors` can actually hold. The column is
+    `JSONB NOT NULL DEFAULT '[]'` (migration 009:32), so "an array of objects"
+    is a convention of the write path, not a constraint;
+    `jsonb_array_elements` ERRORS on a JSON null or an object, which would turn
+    the refusal into a crash mid-downgrade — worse than having no guard;
   * `downgrade()` raises before executing any DDL when dependents exist, and
-    proceeds when they don't.
+    proceeds when they don't;
+  * the DELETE the refusal hands the operator is derived from the same
+    predicate and is itself valid SQL — an escape hatch that crashes on the
+    rows it is meant to clear is not an escape hatch.
 
 **This suite never runs `alembic downgrade`.** The tests hit the shared dev
 database (see conftest); a real downgrade would drop `book_blocks.tokens` out
@@ -176,6 +184,54 @@ def test_downgrade_treats_null_count_as_zero(fake_op):
     assert any("DROP COLUMN tokens" in sql for sql in op.executed)
 
 
+def test_refusal_quotes_the_guarded_delete_verbatim(fake_op):
+    """The suggested DELETE must be the guard's own predicate, not a copy.
+
+    A hand-written copy drifts, and the first thing it drifts on is the
+    `jsonb_typeof` CASE — handing the operator a DELETE that errors on exactly
+    the non-array rows the CASE exists for.
+    """
+    fake_op(3)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        mig.downgrade()
+
+    assert mig._DELETE_DEPENDENTS_SQL in str(excinfo.value), (
+        "the refusal must quote the derived DELETE, not a re-typed variant"
+    )
+    assert "jsonb_typeof" in mig._DELETE_DEPENDENTS_SQL, (
+        "the DELETE inherits the array guard, so it cannot crash on the rows "
+        "it is offered to clear"
+    )
+
+
+def test_guard_sql_reaches_the_driver_intact(fake_op):
+    """`sa.text()` must hand the predicate through unchanged.
+
+    `downgrade()` wraps the constant in `sa.text()`, which treats `:name` as a
+    bind parameter — and the constant now contains `'[]'::jsonb`. A `::` cast is
+    excluded from that regex, but this is the only place the two meet, and a
+    silently-rewritten guard would surface during a real downgrade rather than
+    here.
+    """
+    op = fake_op(0)
+
+    mig.downgrade()
+
+    (executed_sql,) = op.get_bind().queries
+    assert "jsonb_typeof(rs.anchors)" in executed_sql
+    assert "'[]'::jsonb" in executed_sql
+
+
+def test_guard_sql_stays_append_safe():
+    """Callers extend the constant with ` AND ...` (the scoped tests below).
+
+    So it must end at the EXISTS closing paren, with no trailing semicolon.
+    """
+    assert mig._DEPENDENT_ANCHORS_SQL.rstrip().endswith(")")
+    assert ";" not in mig._DEPENDENT_ANCHORS_SQL
+
+
 def test_downgrade_has_no_force_flag():
     """No env-var escape hatch: the only way past the guard is deleting the rows.
 
@@ -236,7 +292,13 @@ async def _create_block(pool, uid: str) -> tuple[str, int, str]:
     return doc_id, block_id, token_id
 
 
-async def _save_selection(pool, uid: str, doc_id: str, anchors: list) -> None:
+async def _save_selection(pool, uid: str, doc_id: str, anchors) -> None:
+    """Insert one selection with `anchors` set to ANY JSON value.
+
+    Deliberately not typed `list`: the column is `JSONB NOT NULL DEFAULT '[]'`
+    with no array constraint, so a JSON null, an object or a bare scalar are all
+    storable — and each one is a shape the guard has to survive.
+    """
     await pool.execute(
         """
         INSERT INTO reading_selections
@@ -325,3 +387,119 @@ async def test_multi_token_selection_counts_once(db_pool):
     assert count == 1, (
         f"one selection with three anchors must count once, got {count}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Every shape `anchors` can actually hold
+#
+# `JSONB NOT NULL DEFAULT '[]'` (migration 009:32) constrains the column to
+# valid JSON and nothing else. Each builder takes (block_id, token_id) so the
+# dependent case can reference a token that really exists in book_blocks.tokens.
+# ---------------------------------------------------------------------------
+
+_ANCHOR_SHAPES = [
+    # JSON null — `jsonb_array_elements('null')` raises without the CASE guard.
+    pytest.param(lambda b, t: None, 0, id="json-null"),
+    # An un-wrapped anchor object. routers/reading.py:59-60 already coerces any
+    # non-list to [], so this row resolves to zero anchors in the app; the
+    # downgrade destroys nothing it had not already lost.
+    pytest.param(
+        lambda b, t: {"block_id": b, "token_id": t, "surface": "Hund"},
+        0, id="object-not-array",
+    ),
+    # A bare scalar — same reasoning, and the shape most likely to appear from a
+    # bad manual UPDATE.
+    pytest.param(lambda b, t: "legacy", 0, id="scalar-string"),
+    pytest.param(lambda b, t: [], 0, id="empty-array"),
+    # Pre-025 rows: no token_id key at all.
+    pytest.param(
+        lambda b, t: [{"block_id": b, "surface": "Hund"}],
+        0, id="legacy-array-no-token-id",
+    ),
+    # Explicit JSON null token_id must read the same as a missing key.
+    pytest.param(
+        lambda b, t: [{"block_id": b, "token_id": None, "surface": "Hund"}],
+        0, id="array-with-null-token-id",
+    ),
+    # Array of scalars — the inner `jsonb_typeof(a) = 'object'` guard.
+    pytest.param(lambda b, t: ["Hund", 3], 0, id="array-of-scalars"),
+    # The one shape that genuinely depends on book_blocks.tokens.
+    pytest.param(
+        lambda b, t: [{"block_id": b, "token_id": t, "surface": "Hund"}],
+        1, id="token-id-array",
+    ),
+]
+
+
+@pytest.mark.parametrize("build_anchors,expected", _ANCHOR_SHAPES)
+async def test_dependent_anchors_sql_classifies_every_stored_shape(
+    db_pool, build_anchors, expected
+):
+    """One shape per case, counted in isolation — a failure names the shape."""
+    uid = await _create_user(db_pool)
+    doc_id, block_id, token_id = await _create_block(db_pool, uid)
+    await _save_selection(db_pool, uid, doc_id, build_anchors(block_id, token_id))
+
+    scoped = mig._DEPENDENT_ANCHORS_SQL + " AND rs.user_id = $1::uuid"
+    count = await db_pool.fetchval(scoped, uid)
+
+    assert count == expected, (
+        f"expected {expected} dependent row(s) for this anchors shape, got {count}"
+    )
+
+
+async def test_dependent_anchors_sql_survives_non_array_rows_in_the_live_table(db_pool):
+    """The regression the CASE guard exists for, exercised end to end.
+
+    Non-array rows are inserted into the real table and then the constant is run
+    UNSCOPED — exactly as `downgrade()` runs it, over every row in the database.
+    Without the `jsonb_typeof(rs.anchors) = 'array'` guard this raises
+    `cannot extract elements from a scalar/object` and the downgrade dies
+    mid-migration instead of refusing cleanly.
+    """
+    uid = await _create_user(db_pool)
+    doc_id, block_id, token_id = await _create_block(db_pool, uid)
+
+    await _save_selection(db_pool, uid, doc_id, None)
+    await _save_selection(
+        db_pool, uid, doc_id,
+        {"block_id": block_id, "token_id": token_id, "surface": "Hund"},
+    )
+    await _save_selection(db_pool, uid, doc_id, "legacy")
+
+    count = await db_pool.fetchval(mig._DEPENDENT_ANCHORS_SQL)
+
+    assert isinstance(count, int) and count >= 0
+
+
+async def test_predicate_treats_sql_null_anchors_as_no_dependency(db_pool):
+    """SQL NULL — the one shape the live table cannot hold today.
+
+    `anchors` is NOT NULL (migration 009:32), so this is unreachable through the
+    schema and has to be driven over a synthetic single-row VALUES. It is
+    covered because the predicate must stay correct if that constraint is ever
+    dropped: `jsonb_typeof(NULL)` is NULL, so the CASE falls to `'[]'` and the
+    row is not a dependent. The second assertion proves the harness is not
+    vacuously returning 0.
+    """
+    sql = (
+        "SELECT COUNT(*) FROM (VALUES ($1::jsonb)) AS rs(anchors) "
+        f"WHERE {mig._ANCHOR_DEPENDS_PREDICATE}"
+    )
+
+    assert await db_pool.fetchval(sql, None) == 0
+
+    dependent = json.dumps([{"block_id": 1, "token_id": str(uuid.uuid4()), "surface": "Hund"}])
+    assert await db_pool.fetchval(sql, dependent) == 1
+
+
+async def test_delete_dependents_sql_plans_against_the_live_schema(db_pool):
+    """The operator's opt-out must be executable SQL.
+
+    `EXPLAIN` without `ANALYZE` plans the statement — parsing it, resolving
+    every column against the real schema — without executing it, so this cannot
+    delete a row from the shared dev database.
+    """
+    plan = await db_pool.fetch("EXPLAIN " + mig._DELETE_DEPENDENTS_SQL)
+
+    assert plan, "EXPLAIN must return a plan for the suggested DELETE"
