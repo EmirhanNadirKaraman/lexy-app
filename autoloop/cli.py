@@ -1716,7 +1716,7 @@ def _window_git(config) -> GitGateway:
     return GitGateway(Path.cwd(), PolicyEngine(config.policy))
 
 
-def _candidate_publication(config, record) -> tuple[bool, str]:
+def _candidate_publication(config, record, seen=None) -> tuple[bool, str]:
     """Has this record's reviewed candidate already landed on its own remote
     branch? Returns `(published, why_not)`.
 
@@ -1729,12 +1729,27 @@ def _candidate_publication(config, record) -> tuple[bool, str]:
     two fields as one whose push landed, and only the remote can tell them
     apart. Anything unverifiable — no remote configured, ls-remote failing,
     offline — reports not-published, which keeps the window shut.
+
+    `seen` memoizes CONFIRMED publications for the life of one command
+    invocation, and deliberately nothing else. `--wait` polls every 15s by
+    default, so a long wait with three published candidates would otherwise
+    re-ask the remote about all three forever — hundreds of round-trips per
+    hour for an answer that cannot change (a published ref moving would be a
+    force-push, which invalidates the candidate anyway, and the next invocation
+    re-checks from scratch). The fail-closed branches make that worse than
+    wasteful: throttle the remote enough and every lookup starts failing, at
+    which point the wait talks itself into never opening. Negatives are never
+    cached — an unpublished candidate becoming published is exactly the event
+    `--wait` exists to notice.
     """
     candidate = str(record.get("candidate_sha") or "")
     remote = str(record.get("intended_remote") or "")
     dest_ref = str(record.get("intended_remote_ref") or "")
     if not remote or not dest_ref:
         return False, "never pushed"
+    key = (remote, dest_ref, candidate)
+    if seen is not None and key in seen:
+        return True, ""
     try:
         landed = _window_git(config).remote_ref_sha(remote, dest_ref)
     except (GitError, OSError) as exc:
@@ -1743,10 +1758,12 @@ def _candidate_publication(config, record) -> tuple[bool, str]:
         return False, f"{remote}/{dest_ref} does not exist"
     if landed != candidate:
         return False, f"{remote}/{dest_ref} is at {landed[:12]}, not the candidate"
+    if seen is not None:
+        seen.add(key)
     return True, ""
 
 
-def _merge_window_blockers(config) -> tuple[list[str], list[str]]:
+def _merge_window_blockers(config, seen=None) -> tuple[list[str], list[str]]:
     """Why merging into the loop's base is unsafe right now, plus advisory
     notes about work that is safe but not yet reconciled. `([], notes)` means
     the window is open.
@@ -1815,7 +1832,7 @@ def _merge_window_blockers(config) -> tuple[list[str], list[str]]:
                 continue
         if not record.get("candidate_sha"):
             continue
-        published, why_not = _candidate_publication(config, record)
+        published, why_not = _candidate_publication(config, record, seen)
         if published:
             notes.append(
                 f"task {task_id}: candidate {str(record.get('candidate_sha'))[:12]} is "
@@ -1855,8 +1872,9 @@ def _cmd_merge_window(args: argparse.Namespace) -> int:
     """
     config = load_config(args.config)
     deadline = time.monotonic() + args.timeout
+    seen: set = set()          # confirmed publications, for this invocation only
     while True:
-        reasons, notes = _merge_window_blockers(config)
+        reasons, notes = _merge_window_blockers(config, seen)
         if not reasons:
             print("merge window OPEN — no unpublished candidate, no executing phase")
             for note in notes:

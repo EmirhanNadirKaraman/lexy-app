@@ -320,6 +320,35 @@ def test_a_record_with_no_push_intent_never_touches_the_network(wired, remote, c
     assert remote.lookups == []
 
 
+def test_wait_asks_the_remote_about_a_published_candidate_ONCE(wired, remote, capsys):
+    """`--poll` defaults to 15s, so a wait held open by something else would
+    otherwise re-ask the remote about every published candidate forever —
+    hundreds of round-trips an hour for an answer that cannot change. Worse
+    than wasteful: throttle the remote and the fail-closed branch turns every
+    lookup into 'could not verify', so the wait talks itself into never
+    opening."""
+    _state(wired, phase=Phase.EXECUTING.value)      # keeps the loop polling
+    _execution(wired, task_id="rt-9", remote="origin", dest_ref=PUSHED)
+    remote.refs[("origin", PUSHED)] = "abc123def456"
+
+    assert cli._cmd_merge_window(_args(wait=True, timeout=0.05, poll=0.005)) == 1
+
+    assert len(remote.lookups) == 1, (
+        f"one confirmation should serve the whole invocation, got {remote.lookups}"
+    )
+
+
+def test_an_UNPUBLISHED_candidate_is_re_checked_on_every_poll(wired, remote):
+    """The other half: becoming published is precisely the event `--wait`
+    exists to notice, so a negative must never be cached."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="rt-9", remote="origin", dest_ref=PUSHED)
+    # The ref does not exist yet — every poll must go and look again.
+
+    assert cli._cmd_merge_window(_args(wait=True, timeout=0.05, poll=0.005)) == 1
+    assert len(remote.lookups) > 1, "a negative must be re-checked, not memoized"
+
+
 def test_an_executing_phase_still_closes_it_even_with_everything_published(
     wired, remote, capsys
 ):
