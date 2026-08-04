@@ -79,6 +79,9 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("ALTER TABLE user_video_category DROP CONSTRAINT IF EXISTS fk_uvc_category")
     op.execute("ALTER TABLE video DROP CONSTRAINT IF EXISTS fk_video_category")
+    # upgrade() dropped the language values without saving them, so this is not a
+    # restore: every row gets the placeholder default 'de', not its original
+    # per-row language. Restore from backup if the real values are needed.
     op.execute("ALTER TABLE video_category ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'de'")
     op.execute("""
         ALTER TABLE video_category
