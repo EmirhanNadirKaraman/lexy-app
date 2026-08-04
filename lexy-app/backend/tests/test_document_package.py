@@ -33,11 +33,13 @@ from services.document_package.persistence import (
     build_plan,
 )
 from services.document_package.validators import (
+    validate_bbox_page_consistency,
     validate_bboxes,
     validate_confidence,
     validate_coordinate_space,
     validate_element_ids,
     validate_page_dims,
+    validate_page_indices,
     validate_parent_ids,
     validate_reading_order,
 )
@@ -617,6 +619,82 @@ class TestStructuralValidators:
         el["bbox"]["x1"] = "left"
         validate_bboxes(_fake_pkg([el]), issues)
         assert "malformed_bbox" in issues.codes()
+
+    def test_bbox_page_matching_page_index_is_clean(self):
+        """The shared builder writes ``bbox.page == page_index``; that is the
+        contract, not an accident of the fixture."""
+        issues = IssueCollector()
+        validate_bbox_page_consistency(_fake_pkg([element(page=1)]), issues)
+        assert not issues.codes()
+
+    def test_bbox_page_mismatch_is_fatal(self):
+        """One page number written twice. A disagreement means one of the two
+        is wrong and we cannot tell which — and ``build_plan`` picks the page
+        height by ``page_index``, so the y-flip would be off by the height
+        difference (§2b: misplaced content is fatal)."""
+        issues = IssueCollector()
+        el = element(page=1)
+        el["bbox"]["page"] = 2
+        validate_bbox_page_consistency(_fake_pkg([el]), issues)
+        assert not issues.ok
+        assert "bbox_page_mismatch" in issues.codes()
+
+    def test_bbox_page_mismatch_is_caught_by_full_validation(self, tmp_path):
+        """Registration pin: the unit tests above call the validator directly,
+        so an unregistered function would pass them and do nothing in the
+        pipeline."""
+        el = element(page=1)
+        el["bbox"]["page"] = 12
+        write_package(tmp_path, elements=[el])
+        issues = issues_for(tmp_path)
+        assert not issues.ok
+        assert "bbox_page_mismatch" in issues.codes()
+
+    def test_absent_bbox_page_is_accepted(self):
+        """``BoundingBox.to_dict()`` drops it in the worker today (§4), and
+        ``page_index`` alone is unambiguous — warning here would fire on every
+        real package while proving nothing."""
+        issues = IssueCollector()
+        el = element()
+        del el["bbox"]["page"]
+        validate_bbox_page_consistency(_fake_pkg([el]), issues)
+        assert not issues.codes()
+
+    @pytest.mark.parametrize("bad", ["1", 1.0, None, True])
+    def test_non_integer_bbox_page_is_fatal(self, bad):
+        """Including ``True``, which would otherwise compare equal to page 1."""
+        issues = IssueCollector()
+        el = element(page=1)
+        el["bbox"]["page"] = bad
+        validate_bbox_page_consistency(_fake_pkg([el]), issues)
+        assert "bbox_page_mismatch" in issues.codes()
+
+    def test_bbox_page_not_reported_when_page_index_is_unusable(self):
+        """``validate_page_indices`` already owns that defect; reporting it
+        twice would send someone chasing a bbox that is fine."""
+        issues = IssueCollector()
+        el = element(page="eleven")
+        el["bbox"]["page"] = 11
+        validate_bbox_page_consistency(_fake_pkg([el]), issues)
+        assert not issues.codes()
+
+    def test_element_without_bbox_has_no_page_consistency_issue(self):
+        issues = IssueCollector()
+        validate_bbox_page_consistency(_fake_pkg([element(bbox=False)]), issues)
+        assert not issues.codes()
+
+    def test_page_numbering_is_one_based_throughout(self):
+        """The convention itself, pinned once: ``page_index``, ``bbox.page``
+        and the ``page_dims`` keys all count from the same base, so page 0 is
+        invalid rather than "the first page under a zero-based scheme"."""
+        assert contract.PAGE_INDEX_BASE == 1
+        issues = IssueCollector()
+        el = element(page=0)
+        el["bbox"]["page"] = 0
+        validate_page_indices(_fake_pkg([el]), issues)
+        validate_bbox_page_consistency(_fake_pkg([el]), issues)
+        assert "invalid_page_index" in issues.codes()
+        assert "bbox_page_mismatch" not in issues.codes()
 
     def test_unknown_element_type_warns_and_is_preserved(self, tmp_path):
         """Deleting an element for an unrecognised label is the irreversible
