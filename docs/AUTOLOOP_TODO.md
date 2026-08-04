@@ -142,7 +142,7 @@ relative default resolves against cwd and would have silently created a second,
 empty session instead. Worth making first-class: a documented "runner checkout"
 mode, rather than something each operator rediscovers under pressure.
 
-### B10. Nothing at runtime ever marks a task completed
+### ~~B10. Nothing at runtime ever marks a task completed~~ — RESOLVED 2026-08-04
 `TaskRegistry.mark_completed` (`autoloop/tasks.py:333`) is the only line in the
 codebase that writes `status = "completed"`, and it has **no runtime caller** —
 verified 2026-08-04:
@@ -173,7 +173,9 @@ against the remote, which makes it usable, but the underlying gap remains:
 nothing retires an execution record, so a published task is still
 re-dispatchable and would park on `task_base_behind_head` (B9) after a merge.
 
-**Fix:** decide what "completed" means and give it exactly one producer —
+**RESOLVED 2026-08-04.** `Orchestrator._mark_task_completed`, called from exactly one place: immediately after `_dispatch_task_push` has reconciled `landed == candidate_sha` against a fresh `ls-remote`. "Completed" therefore means *the reviewed object is durable on its own side branch* — deliberately NOT "merged into the base", because nothing here observes merges and a completion the loop cannot verify is worse than none. Every failure is swallowed to a log: the push already succeeded, so turning bookkeeping into a park would strand work that is safely published. Writing it surfaced a second gap — `mark_completed` guarded COMPLETED and BLOCKED but not BLOCKED_BY_OPERATOR (unlike `mark_in_progress`), so the first cut silently completed a quarantined task and deleted the operator decision it recorded; guarded now. Five tests; the mutations (never mark, mark without persisting, drop the quarantine guard) fail 3, 1 and 1.
+
+Superseded original plan: give it exactly one producer —
 either post-push (published to its side branch) or post-merge (the side branch
 landed in the base, which nothing currently observes). Whichever is chosen, the
 merge-window predicate should keep gating on publication rather than on task

@@ -2968,6 +2968,7 @@ class Orchestrator:
         # honest about there being nothing left "awaiting publication". The
         # `TaskExecutionStore` record on disk is untouched.
         state.task_execution = None
+        self._mark_task_completed(binding.task_id)
         self._log(
             "task_pushed",
             data={
@@ -2986,6 +2987,66 @@ class Orchestrator:
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
+
+    def _mark_task_completed(self, task_id: str) -> None:
+        """Retire a task whose reviewed candidate has actually landed on its
+        remote branch (AUTOLOOP_TODO B10).
+
+        Until this existed, NOTHING at runtime ever wrote `status="completed"`:
+        `TaskRegistry.mark_completed` had no runtime caller (only tests), and
+        `Decision` has no terminal member, so a reviewer could not express
+        "done" either. Every task the loop published therefore stayed
+        `in_progress` for good — the roadmap over-reported work remaining, and
+        `cli._merge_window_blockers` (which exempted only COMPLETED /
+        BLOCKED_BY_OPERATOR) held the merge window shut permanently until it
+        was re-gated on publication instead.
+
+        Called from exactly ONE place, immediately after `push_exact` has been
+        reconciled against the remote — `landed == candidate_sha` is confirmed
+        by a fresh `ls-remote`, never inferred from the push's own exit status.
+        "Completed" therefore means "the reviewed object is durable on its own
+        side branch", which is the strongest claim the loop can make on its
+        own. It deliberately does NOT mean "merged into the base": nothing here
+        observes merges, and inventing a completion the loop cannot verify is
+        how `presented_report_sha256`-style trust gaps start.
+
+        Every failure is swallowed to a log, because the push already
+        succeeded. Turning a bookkeeping problem into a park would strand a
+        task whose work is safely published — the exact "park and report, never
+        undo" inversion this method exists downstream of. Two cases are
+        expected rather than exceptional:
+
+        * `task_completed` — the crash-recovery reconciliation path re-enters
+          here for a push that already landed in an earlier process. Marking
+          an already-completed task is a no-op, not an error.
+        * `task_blocked_by_operator` — a task quarantined between dispatch and
+          push. `mark_completed` refuses it, and that refusal is correct: an
+          operator's quarantine records a decision they have not made yet, and
+          completing over it deletes the decision rather than resolving it.
+          That guard did not exist until this method needed it (2026-08-04):
+          `mark_completed` checked COMPLETED and BLOCKED but not
+          BLOCKED_BY_OPERATOR, unlike its `mark_in_progress` sibling, so the
+          first version of this method silently completed a quarantined task.
+
+        The audit pseudo-task is not a registry task and never reaches this
+        path (`_dispatch_task_push` requires a `postcommit` binding, which the
+        audit never produces), but `has()` is checked anyway rather than
+        assumed — `get()` on an unknown id raises, and this method must not be
+        the thing that breaks a successful publish.
+        """
+        if not self._registry.has(task_id):
+            self._log("task_completion_skipped", data={"task_id": task_id, "reason": "unknown_task"})
+            return
+        try:
+            self._registry.mark_completed(task_id)
+            self._task_store.save(self._registry)
+        except (TaskGraphError, OSError) as exc:
+            self._log(
+                "task_completion_failed",
+                data={"task_id": task_id, "error": str(exc)},
+            )
+            return
+        self._log("task_completed", data={"task_id": task_id})
 
     def _dispatch_changeset_push(self, directive: Directive, resp: LastResponse) -> None:
         """Publish an operator-authored changeset via the Publisher —

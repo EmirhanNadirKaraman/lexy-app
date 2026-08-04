@@ -25,7 +25,7 @@ from autoloop.orchestrator import Orchestrator
 from autoloop.packet import build_review_packet
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import LastResponse, LoopState, Phase, StateStore
-from autoloop.tasks import TRACKER_PATHS, Task, TaskRegistry, TaskStore
+from autoloop.tasks import TRACKER_PATHS, Task, TaskRegistry, TaskState, TaskStore
 from autoloop.transcript import TranscriptLogger
 from autoloop.worktask import IntentStore, TaskExecutionStore
 from autoloop.worktree import WorktreeManager
@@ -1020,3 +1020,144 @@ def test_the_report_never_widens_scope(tmp_path):
         "the claim must not appear among the git-read changed paths"
     )
     assert execution.allowed_paths == ("feature.py",) or "feature.py" in text
+
+
+# =============================================================================
+# B10 — a published task is marked completed (2026-08-04)
+#
+# Nothing at runtime ever wrote `status="completed"`: `mark_completed` had no
+# runtime caller and `Decision` has no terminal member, so every task the loop
+# published stayed `in_progress` forever. The roadmap over-reported work, and
+# `_merge_window_blockers` — which exempted only COMPLETED /
+# BLOCKED_BY_OPERATOR — held the merge window shut permanently. On 2026-08-04
+# six published tasks (rt-03..rt-08) still read `in_progress` with their
+# candidates sitting on origin.
+
+
+def _push_once(tmp_path, orch, execution_store, task, repo_root):
+    """Drive one full approve-and-push, returning the execution record."""
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+    req = orch.state.pending_request
+    resp = LastResponse(
+        request_id=req.request_id, raw="{}", received_at="now",
+        head_sha=req.head_sha, base_sha=req.base_sha, report_sha256=req.report_sha256,
+        postcommit=req.postcommit,
+    )
+    execution = execution_store.load(task.id)
+    bare = make_bare(tmp_path)
+    run_git(repo_root, "remote", "add", "origin", str(bare))
+    orch._dispatch_task_push(Directive(decision=Decision.PUSH, reason="approved"), resp)
+    return execution, resp
+
+
+def test_a_published_task_is_marked_completed(tmp_path):
+    """The fix. `push_exact` has reconciled `landed == candidate_sha` against a
+    fresh ls-remote by this point, so the work is durable on its side branch."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, repo_root, _wt, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    assert orch._registry.state_of(task.id) is not TaskState.COMPLETED
+
+    _push_once(tmp_path, orch, execution_store, task, repo_root)
+
+    assert orch.state.phase == Phase.READY.value
+    assert orch._registry.state_of(task.id) is TaskState.COMPLETED
+
+
+def test_the_completion_is_PERSISTED_not_only_in_memory(tmp_path):
+    """Load-bearing: the loop reloads `tasks.json` fresh on every outer
+    iteration, so an unsaved completion is invisible on the very next pass and
+    the task comes back as if it had never finished."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, repo_root, _wt, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+
+    _push_once(tmp_path, orch, execution_store, task, repo_root)
+
+    reread = TaskStore(orch._task_store.path).load()
+    assert reread.state_of(task.id) is TaskState.COMPLETED
+
+
+def test_a_re_entered_push_does_not_break_on_the_already_completed_task(tmp_path):
+    """Crash-recovery reconciliation re-enters this path for a push that
+    landed in an earlier process. `mark_completed` refuses an already-completed
+    task; that refusal must stay a no-op, never a park."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, repo_root, _wt, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    _execution, resp = _push_once(tmp_path, orch, execution_store, task, repo_root)
+
+    orch.state.phase = Phase.EXECUTING.value          # simulate re-entry
+    orch._dispatch_task_push(Directive(decision=Decision.PUSH, reason="approved"), resp)
+
+    assert orch.state.phase == Phase.READY.value      # not needs_user
+    assert orch._registry.state_of(task.id) is TaskState.COMPLETED
+
+
+def test_an_operator_quarantine_outranks_the_loop_bookkeeping(tmp_path):
+    """A task blocked between dispatch and push must NOT be completed by the
+    push. `mark_completed` refuses a blocked task, and that is correct — but
+    the push itself already succeeded, so it must still finish cleanly."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, repo_root, _wt, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+    req = orch.state.pending_request
+    resp = LastResponse(
+        request_id=req.request_id, raw="{}", received_at="now",
+        head_sha=req.head_sha, base_sha=req.base_sha, report_sha256=req.report_sha256,
+        postcommit=req.postcommit,
+    )
+    execution = execution_store.load(task.id)
+    bare = make_bare(tmp_path)
+    run_git(repo_root, "remote", "add", "origin", str(bare))
+    orch._registry.block(task.id, "operator set this aside")
+
+    orch._dispatch_task_push(Directive(decision=Decision.PUSH, reason="approved"), resp)
+
+    assert orch.state.phase == Phase.READY.value, "the push succeeded; do not park"
+    assert orch._registry.state_of(task.id) is TaskState.BLOCKED_BY_OPERATOR
+    wt_git = GitGateway(Path(execution.worktree_path), PolicyEngine(PolicyConfig()))
+    assert wt_git.remote_ref_sha(
+        "origin", f"refs/heads/{execution.task_branch}"
+    ) == execution.candidate_sha, "the candidate is published regardless"
+
+
+def test_a_bookkeeping_failure_never_undoes_a_successful_push(tmp_path):
+    """The push already happened and cannot be rolled back. Turning a registry
+    write failure into a park would strand a task whose work is safely on the
+    remote — the inversion of 'park and report, never undo'."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, repo_root, _wt, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+    req = orch.state.pending_request
+    resp = LastResponse(
+        request_id=req.request_id, raw="{}", received_at="now",
+        head_sha=req.head_sha, base_sha=req.base_sha, report_sha256=req.report_sha256,
+        postcommit=req.postcommit,
+    )
+    bare = make_bare(tmp_path)
+    run_git(repo_root, "remote", "add", "origin", str(bare))
+
+    # Installed only NOW: patching before dispatch would break the
+    # `mark_in_progress` save too, and the test would pass for the wrong
+    # reason — proving nothing about the push path at all.
+    def exploding_save(_registry):
+        raise OSError("disk full")
+
+    orch._task_store.save = exploding_save
+
+    orch._dispatch_task_push(Directive(decision=Decision.PUSH, reason="approved"), resp)
+
+    assert orch.state.phase == Phase.READY.value
+    assert orch.state.question is None

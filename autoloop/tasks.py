@@ -330,6 +330,20 @@ class TaskRegistry:
                 "task_blocked",
                 f"task '{task_id}' cannot complete while dependencies are incomplete",
             )
+        if state is TaskState.BLOCKED_BY_OPERATOR:
+            # The same defense in depth `mark_in_progress` applies, and for the
+            # same reason: a quarantine records a decision the operator has not
+            # made yet. Completing over it does not resolve that decision, it
+            # deletes it — the task disappears from the roadmap as "done" and
+            # the operator is never asked. Found 2026-08-04 by the B10 test:
+            # `_mark_task_completed` runs after a successful push, and a task
+            # quarantined between dispatch and push was silently completed,
+            # `blocked_reason` and all.
+            raise TaskGraphError(
+                "task_blocked_by_operator",
+                f"task '{task_id}' is quarantined — answer its blocker before "
+                "completing it (`python -m autoloop answer`)",
+            )
         task.status = "completed"
         task.completed_at = utcnow_iso()
         return task
