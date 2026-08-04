@@ -2,8 +2,12 @@
 result unwrapping, timeout and missing-binary handling. The real CLI is never
 invoked."""
 
+import errno
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from autoloop.audit.agents import (
     DISALLOWED_TOOLS,
@@ -69,6 +73,21 @@ def test_missing_binary_reported(tmp_path):
     result = ClaudeCliRunner(tmp_path, runner=stub).run(SPEC)
     assert not result.ok
     assert "not found" in result.error
+
+
+def test_missing_binary_keeps_its_own_message_not_the_generic_one(tmp_path):
+    """The dedicated FileNotFoundError branch must survive the broad clause
+    added below it. FileNotFoundError is an OSError subclass, so a broad
+    `except Exception` placed ABOVE it would swallow the one message that
+    tells an operator the `claude` binary is missing rather than misbehaving
+    — and this test is what fails if the clauses are ever reordered."""
+
+    def stub(argv, **kwargs):
+        raise FileNotFoundError("claude")
+
+    result = ClaudeCliRunner(tmp_path, runner=stub).run(SPEC)
+    assert result.error.startswith("agent command not found")
+    assert "agent raised" not in result.error
 
 
 def test_nonzero_exit_captures_stderr(tmp_path):
@@ -184,3 +203,169 @@ def test_runner_reports_the_real_cause_end_to_end(tmp_path):
     )
     assert not result.ok
     assert result.error.startswith("OSError: disk full")
+
+
+# ---- run() never raises: an unexpected exception is a result, not an abort ----
+#
+# `AuditExecutor._run_agents` fans the domains out through
+# `list(pool.map(agent_runner.run, specs))`. `pool.map` re-raises the FIRST
+# exception at consumption time, so ONE escaping error discards the whole
+# batch — including the domains that already finished and whose raw output has
+# not been written yet. `run` only caught TimeoutExpired and FileNotFoundError,
+# so anything else (a failed pipe read, a denied cwd, undecodable output) cost
+# an entire audit run rather than one domain.
+#
+# CONSTRUCTING THESE CASES IS THE TRAP. `OSError(errno.ENOENT, "...")` is not
+# an OSError at all: the two-argument form dispatches in `OSError.__new__` to
+# the errno-specific subclass, so it arrives as a FileNotFoundError and is
+# caught by the DEDICATED branch — a "generic exception" test built that way
+# passes through the old code unchanged and proves nothing. Every case below is
+# therefore either a single-argument OSError (never specialized) or an errno
+# that maps to something other than FileNotFoundError, and
+# `test_every_generic_case_really_misses_the_dedicated_branch` pins that.
+
+GENERIC_FAILURES = [
+    ("plain_oserror", OSError("input/output error while spawning the CLI")),
+    ("permission_denied", PermissionError(errno.EACCES, "permission denied")),
+    ("undecodable_output", UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")),
+    ("unexpected_runtime_error", RuntimeError("the CLI wrapper exploded")),
+]
+GENERIC_PARAMS = [pytest.param(exc, id=name) for name, exc in GENERIC_FAILURES]
+
+
+def test_every_generic_case_really_misses_the_dedicated_branch():
+    """The control on the parametrization above — and the reason the previous
+    attempt at this test was wrong. Python turns an ENOENT OSError into a
+    FileNotFoundError at construction time; assert both halves so the trap
+    cannot be walked back into silently."""
+    assert isinstance(OSError(errno.ENOENT, "no such file"), FileNotFoundError)
+    for name, exc in GENERIC_FAILURES:
+        assert not isinstance(exc, FileNotFoundError), name
+        assert not isinstance(exc, subprocess.TimeoutExpired), name
+
+
+@pytest.mark.parametrize("exc", GENERIC_PARAMS)
+def test_an_unexpected_exception_is_reported_not_raised(tmp_path, exc):
+    def stub(argv, **kwargs):
+        raise exc
+
+    runner = ClaudeCliRunner(tmp_path, runner=stub)
+    result = runner.run(SPEC)  # must not raise
+
+    assert not result.ok
+    assert result.returncode == -1
+    assert result.raw_text == ""
+    assert result.domain == SPEC.domain
+    assert result.command == tuple(runner.build_argv(SPEC))
+    assert result.error.startswith("agent raised ")
+    assert type(exc).__name__ in result.error
+    # The two dedicated causes must not be mis-attributed to an unrelated
+    # failure: reporting "command not found" for a permission error sends an
+    # operator to reinstall a binary that is present.
+    assert "command not found" not in result.error
+    assert "timed out" not in result.error
+
+
+def test_an_exception_with_no_message_still_reads_as_a_failure(tmp_path):
+    """`AgentResult.ok` is `returncode == 0 and not error`, so an empty error
+    string reads as SUCCESS. `str(RuntimeError())` is empty — reporting it
+    verbatim would turn a domain that blew up into one covered with zero
+    findings, which is the silent-coverage-loss the executor's honest
+    "COVERAGE INCOMPLETE" path exists to prevent."""
+
+    def stub(argv, **kwargs):
+        raise RuntimeError()
+
+    result = ClaudeCliRunner(tmp_path, runner=stub).run(SPEC)
+    assert not result.ok
+    assert result.error.strip()
+    assert "RuntimeError" in result.error
+
+
+def test_a_failure_after_the_process_exits_is_caught_too(tmp_path):
+    """The guard covers the whole body, not just the spawn. Reading a pipe can
+    fail after the child is gone, and `proc.stdout` / `proc.returncode` are on
+    the same failure surface as the call that produced them."""
+
+    class ExplodingProc:
+        returncode = 0
+        stderr = ""
+
+        @property
+        def stdout(self):
+            raise OSError("pipe read failed after the process exited")
+
+    def stub(argv, **kwargs):
+        return ExplodingProc()
+
+    result = ClaudeCliRunner(tmp_path, runner=stub).run(SPEC)
+    assert not result.ok
+    assert "OSError" in result.error
+    assert "pipe read failed" in result.error
+
+
+def test_a_failure_building_the_argv_is_reported_not_raised(tmp_path):
+    """Argv construction is inside the guard too — it is the part of `run`
+    that executes BEFORE the spawn, so an exception there escaped even after
+    the subprocess call was wrapped, and cost the same whole fan-out.
+
+    Driven through the REAL `build_argv` (a spec stand-in whose `model` raises,
+    since `run` is duck-typed over the spec) rather than an overridden method:
+    an override would only prove the guard catches an override. The result
+    still has to name the command, which is why `argv` is bound to the base
+    command before the try — a failure path that raises `NameError` while
+    reporting a failure is not a failure path at all."""
+    spawned = []
+
+    class ExplodingSpec:
+        domain = "docs_drift"
+        prompt = "audit the docs"
+
+        @property
+        def model(self):
+            raise RuntimeError("model routing lookup failed")
+
+    def stub(argv, **kwargs):
+        spawned.append(argv)
+        return Proc(stdout='{"findings": []}')
+
+    result = ClaudeCliRunner(tmp_path, command=("claude",), runner=stub).run(ExplodingSpec())
+
+    assert not result.ok
+    assert result.returncode == -1
+    assert result.raw_text == ""
+    assert result.domain == "docs_drift"
+    assert "RuntimeError" in result.error
+    assert "model routing lookup failed" in result.error
+    # The record still says WHAT was being run, and the CLI was never spawned:
+    # the failure is upstream of the process, not inside it.
+    assert result.command == ("claude",)
+    assert spawned == []
+
+
+def test_one_domain_blowing_up_does_not_discard_its_siblings(tmp_path):
+    """The acceptance criterion, driven through the exact call shape
+    `AuditExecutor._run_agents` uses. `list(pool.map(...))` re-raises the first
+    exception, so before this fix the two healthy domains' output was lost
+    along with the failing one's."""
+    specs = [
+        AgentSpec(domain=domain, title=domain, prompt=f"audit {domain}")
+        for domain in ("alpha", "boom", "gamma")
+    ]
+
+    def stub(argv, **kwargs):
+        if "boom" in argv[argv.index("-p") + 1]:
+            raise OSError("device not configured")
+        return Proc(stdout='{"findings": []}')
+
+    runner = ClaudeCliRunner(tmp_path, runner=stub)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(runner.run, specs))
+
+    assert [r.domain for r in results] == ["alpha", "boom", "gamma"]
+    assert [r.ok for r in results] == [True, False, True]
+    # The failing domain carries a cause, so the executor lists it under
+    # `agent_failures` instead of counting it as covered with no findings.
+    assert "device not configured" in results[1].error
+    assert results[0].raw_text == '{"findings": []}'
+    assert results[2].raw_text == '{"findings": []}'
