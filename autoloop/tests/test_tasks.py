@@ -227,21 +227,57 @@ def test_store_archive(tmp_path):
 # ---- always-approved repository trackers ------------------------------------
 
 
-def test_tracker_paths_are_exactly_the_four_claude_md_mandates():
+def test_tracker_paths_are_exactly_the_claude_md_mandates():
     """Pinned as a set. CLAUDE.md makes updating these a CONDITION of the work
     (§12 SUMMARY/TESTS/COMMON_ERRORS, §14 SECURITY), which is why they are
     implicitly approved. Anything ADDED here widens the scope of every task in
-    the repository, so it must be a deliberate diff, not an accident."""
+    the repository, so it must be a deliberate diff, not an accident — this
+    test failing is the intended way to notice.
+
+    Widened 2026-08-04 to six. `CLAUDE.md` and `docs/SCHEMA.md` were each
+    earned by a real refusal (rt-06's stale test count, rt-02's migration-table
+    row), not guessed at: both writes documented the task's own change, which
+    is the same shape as the four already here."""
     from autoloop.tasks import TRACKER_PATHS
 
     assert set(TRACKER_PATHS) == {
+        "CLAUDE.md",
         "docs/COMMON_ERRORS.md",
+        "docs/SCHEMA.md",
         "docs/SECURITY.md",
         "docs/SUMMARY.md",
         "docs/TESTS.md",
     }
-    # Markdown trackers only: nothing executable, nothing that changes behaviour.
-    assert all(p.startswith("docs/") and p.endswith(".md") for p in TRACKER_PATHS)
+    # Markdown only: nothing executable, nothing that changes runtime behaviour.
+    # The old `startswith("docs/")` half of this assertion was retired when
+    # CLAUDE.md (repo root) joined — the property that matters is "a document,
+    # not code", and the directory was only ever a proxy for it.
+    assert all(p.endswith(".md") for p in TRACKER_PATHS)
+    assert not any(p.endswith((".py", ".toml", ".json", ".sh", ".yml")) for p in TRACKER_PATHS)
+
+
+def test_CLAUDE_md_is_implicitly_approved_with_its_risk_understood():
+    """The sharpest entry, pinned separately so it cannot be added or dropped
+    without someone reading why.
+
+    Unlike the five docs, CLAUDE.md is not only a record — it is the
+    INSTRUCTIONS future agents read, so an executor may now edit the rules it
+    will later operate under without that being named in its task. What bounds
+    that is NOT trust: `approved_paths` is still enforced from the Task and
+    never from anything an agent writes, so a task cannot use a CLAUDE.md edit
+    to widen its own scope. This test pins that specific non-circularity —
+    if it ever fails, implicit approval has become self-granting."""
+    from autoloop.tasks import TRACKER_PATHS, effective_approved_paths
+
+    assert "CLAUDE.md" in TRACKER_PATHS
+    # An unscoped task gains nothing, CLAUDE.md included: implicit approval
+    # rides along with a real scope, it never creates one.
+    assert effective_approved_paths(()) == ()
+    # And a scoped task's OWN paths are still whatever the Task declared.
+    effective = effective_approved_paths(("only/this.py",))
+    assert "only/this.py" in effective
+    assert "CLAUDE.md" in effective
+    assert "some/other.py" not in effective
 
 
 def test_a_scoped_task_gains_the_trackers():
@@ -272,7 +308,15 @@ def test_trackers_do_not_authorize_code_outside_the_task_scope():
     for outside in (
         "lexy-app/backend/routers/books.py",
         "autoloop/policy.py",
-        "docs/AUTOLOOP.md",   # a doc, but NOT one of the four trackers
-        "CLAUDE.md",
+        "docs/AUTOLOOP.md",   # a doc, but NOT one of the trackers
+        "docs/ROADMAP.md",    # ditto — being markdown is not being a tracker
+        # `CLAUDE.md` used to be listed here as an out-of-scope example. It
+        # became a tracker on 2026-08-04 (rt-06's stale test count), so it is
+        # deliberately NOT in this list any more — the property under test is
+        # "a path the task did not name and the trackers do not cover stays
+        # outside", which is unchanged.
     ):
         assert outside not in effective
+    # The widening itself, asserted rather than implied by omission:
+    assert "CLAUDE.md" in effective
+    assert "docs/SCHEMA.md" in effective

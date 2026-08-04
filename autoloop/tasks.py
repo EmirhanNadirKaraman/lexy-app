@@ -218,8 +218,38 @@ class Task:
 #: that being named in its task. It is documentation and not a control — the
 #: controls are in code — but a weakened finding is a real (if modest) way to
 #: mislead a later reader, and it is the reason this list stays this short.
+#:
+#: Widened 2026-08-04 by two entries, each earned by a REFUSAL rather than
+#: guessed at. Three tasks in two days escaped scope, and every escape was the
+#: same shape: a doc update describing the task's OWN change.
+#:   * `CLAUDE.md` — rt-06 updated the backend test count (1258 → 1266) that
+#:     its own 8 new tests made stale. §11 quotes that count in two places.
+#:   * `docs/SCHEMA.md` — rt-02 added one migration-table row recording that
+#:     025's downgrade is now guarded, which IS the change rt-02 exists to make.
+#: Answering these one task at a time does not converge, for the same reason
+#: rt-01 did not: the obligation is repo-wide, so enumerating it per task keeps
+#: missing a different entry each time.
+#:
+#: `CLAUDE.md` is the sharpest entry here, and is called out rather than lumped
+#: in with the docs. Unlike them it is not only a record — it is the
+#: INSTRUCTIONS future agents read, so an executor can now edit the rules it
+#: will later operate under without that being named in its task. Three things
+#: bound that, none of which is "trust the agent": the file changes no runtime
+#: behaviour, `approved_paths` is still enforced from the Task and never from
+#: anything an agent writes, and every edit stays visible in
+#: `commit_range_paths`.
+#:
+#: One interaction worth naming, because it weakens the old "the reviewer sees
+#: every tracker edit" argument: since report-first packets (2026-08-04), a
+#: diff over `packet.DIFF_INCLUDE_MAX_CHARS` is OMITTED, so on a large commit
+#: the reviewer sees the tracker PATH in the changed-path list — always
+#: rendered, always git-read — but not the edited TEXT. Visibility of the fact
+#: survives; visibility of the content does not. That is an argument for
+#: keeping this list short, not for trusting it less.
 TRACKER_PATHS: tuple[str, ...] = (
+    "CLAUDE.md",
     "docs/COMMON_ERRORS.md",
+    "docs/SCHEMA.md",
     "docs/SECURITY.md",
     "docs/SUMMARY.md",
     "docs/TESTS.md",
