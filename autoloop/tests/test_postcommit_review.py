@@ -1161,3 +1161,35 @@ def test_a_bookkeeping_failure_never_undoes_a_successful_push(tmp_path):
 
     assert orch.state.phase == Phase.READY.value
     assert orch.state.question is None
+
+
+def test_the_cap_is_sized_from_evidence_not_instinct():
+    """A regression guard on the NUMBER, because the number is the whole
+    mechanism and it has been wrong once already.
+
+    8_000 was a guess made the same day as the 40,056-character failure it was
+    reacting to, with nothing between the two tested. It blocked rt-02 at 8,971
+    — a 12-insertion / 87-deletion change that is trivial to review and merely
+    long to print — and the reviewer correctly escalated rather than approve a
+    diff it could not see. Two properties keep the next guess honest:
+
+      * comfortably above an ordinary change (rt-02's 8,971 is the real case),
+        so routine work is reviewed on its actual diff rather than omitted;
+      * still below the only measured failure (40,056), with margin, because
+        that is the number this limit exists to stay under.
+
+    Failing this test means someone moved the cap past its evidence. Move the
+    evidence first: record the new observation in `packet.py`'s comment, then
+    change both.
+    """
+    from autoloop.packet import DIFF_INCLUDE_MAX_CHARS
+
+    RT_02_PATCH = 8_971          # measured, 2026-08-05
+    OBSERVED_FAILURE = 40_056    # measured, 2026-08-04
+
+    assert DIFF_INCLUDE_MAX_CHARS > RT_02_PATCH, (
+        "an ordinary change must be sent, not omitted"
+    )
+    assert DIFF_INCLUDE_MAX_CHARS <= OBSERVED_FAILURE * 0.8, (
+        "keep a real margin below the size that failed to send"
+    )

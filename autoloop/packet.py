@@ -31,7 +31,26 @@ from .worktask import TaskExecution
 #: See `_format_diff_section` for the failure that set it — a 38 KB diff was
 #: accepted by the composer, failed generation server-side, and left no
 #: message in the conversation at all.
-DIFF_INCLUDE_MAX_CHARS = 8_000
+#:
+#: Raised 8_000 → 30_000 on 2026-08-05, because 8_000 was a guess and the
+#: evidence says otherwise. The only measured failure was at 40,056 characters;
+#: 8_000 was picked as a "safe margin" the same day, with nothing between the
+#: two numbers actually tested. It then blocked rt-02 at 8,971 characters — 971
+#: over — and the reviewer escalated to the operator rather than approve a diff
+#: it could not see, which is the notice below working as intended against a
+#: threshold that was not.
+#:
+#: The thing 8_000 got wrong is worth stating, because the next person tuning
+#: this will hit it too: the cap counts PATCH BYTES, not reviewability. rt-02's
+#: candidate was 12 insertions and 87 deletions — trivial to review, large to
+#: print. Sizing the limit to "how big is the text" while reasoning about it as
+#: "how hard is this to review" is what made 8_000 feel defensible.
+#:
+#: 30_000 keeps a ~25% margin below the one real data point while covering
+#: ordinary work. It is still a judgement, not a measurement: if a packet ever
+#: fails to land again, record the size HERE rather than halving the number on
+#: instinct — that is how the first guess got made.
+DIFF_INCLUDE_MAX_CHARS = 30_000
 
 
 def _format_commit_list(commits: list[dict]) -> str:
