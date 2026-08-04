@@ -394,6 +394,26 @@ Three traps, all checked before the 2026-07-27 sweep:
 These cost more than the code errors, because they produce confident wrong
 statements rather than a stack trace.
 
+### CLAUDE.md §8b described a deleted function as the live writer of `status`
+**What happened:** §8b's `status_marked_known` rule said the status field was
+"forced to `known` by `word_service.upsert_word_status` (called from the router
+before `apply_progression`)". That function was deleted 2026-05-19 (#2) and the
+router has made a single `apply_progression(..., status_override=body.status)`
+call ever since — which §8b's *own* atomicity rule and §10 both state correctly,
+two paragraphs apart. Anyone reading §8b top-down met the stale sentence first
+and came away believing the two-call, non-atomic flow was still live. Three
+consecutive audits (2026-07-30, 08-02, 08-03) re-flagged the same sentence
+before it was fixed 2026-08-04.
+**Rule:** treat an internal contradiction inside one doc as a code question, not
+an editorial one — grep `def <symbol>` in `lexy-app/backend/services/` and read
+the caller before deciding which half is stale. And note the inverse trap:
+§8b/§10 name deleted symbols **on purpose** in their `Historical:` /
+`~~struck-through~~` clauses (`word_service.upsert_word_status`,
+`srs_service.py`, `src/app/`), so a grep hit in CLAUDE.md is not
+evidence the symbol exists — and scrubbing those historical mentions destroys
+the trail that `docs/SUMMARY.md`, `docs/TESTS.md` and `WORKFLOW_AUDIT.md` keep
+in sync. Fix the sentence that describes it as *live*; leave the history.
+
 ### Trusting a grouped reference instead of the numbered source
 **What happened:** Reported "Hole 19 (hardcoded `'de'`) is CLOSED, Hole 20
 (per-message detection) still open". The mapping is the **reverse**:
