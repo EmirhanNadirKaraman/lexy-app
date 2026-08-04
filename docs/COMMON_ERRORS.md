@@ -650,6 +650,16 @@ flaky**, which is the harder failure to trace.
 capture with `--color=no`. pytest's `FAILED` lines begin with an ANSI escape,
 so `grep '^FAILED'` silently matches nothing — the same trap that made the
 validation gate report a count with no name.
+**Recurrence 2026-08-04:** a review round on task rt-06 reported
+`test_sigint_release_is_unchanged` failing during that unit's validation. rt-06
+changed only `lexy-app/backend/services/document_package/loader.py` and its
+test file; the signal tests drive `autoloop/lock.py` through a subprocess whose
+script imports `autoloop.lock` and nothing else, so there is no path between
+them. If you see this again, re-run it alone (`python3 -m pytest
+autoloop/tests/test_crash_safety.py -k sigint`) before suspecting the diff —
+and note the mitigation above only removed the *interpreter-teardown* timing
+assumption. `_await_lock_release` still has a 60s deadline, so a child that
+does not get scheduled to unwind within a minute under load still fails.
 
 ### A commit was REFUSED at post-commit review and the blocker does not say which test failed
 **Symptom:** a blocker reads `post-commit validation failed: ... pytest ...:

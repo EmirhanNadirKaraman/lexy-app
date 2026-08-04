@@ -365,7 +365,17 @@ def verify_checksums(pkg: LoadedPackage, issues: IssueCollector) -> None:
     * an entry naming a path outside the root → ``checksum_path_escape``
     * an entry naming an absent file          → ``checksum_missing_file``
     * a digest that does not match            → ``checksum_mismatch``
+
+    The closing INFO line reports what this gate actually established.
+    ``checksums_verified`` is emitted **only** when the gate found nothing
+    fatal; otherwise the neutral ``checksums_checked`` says how many entries
+    were examined without claiming any of them passed. Before 2026-08-04 the
+    "verified N file(s)" line was unconditional, so a rejected package's report
+    carried a success claim next to the mismatch that refuted it (audit
+    ``ingestion_pipeline:ing-06``).
     """
+    fatal_before = len(issues.fatal)
+
     if not pkg.has_checksums:
         issues.add(
             "missing_checksums",
@@ -429,12 +439,24 @@ def verify_checksums(pkg: LoadedPackage, issues: IssueCollector) -> None:
                 actual=actual,
             )
 
-    issues.add(
-        "checksums_verified",
-        f"verified {len(pkg.files)} file(s) against CHECKSUMS.txt",
-        severity=INFO,
-        stage="checksums",
-    )
+    if len(issues.fatal) == fatal_before:
+        issues.add(
+            "checksums_verified",
+            f"verified {len(pkg.files)} file(s) against CHECKSUMS.txt",
+            severity=INFO,
+            stage="checksums",
+        )
+    else:
+        # Deliberately no failure count: the fatal delta also covers malformed
+        # lines, duplicate entries and coverage gaps, which are not "files whose
+        # digest failed". They are already itemised in the result's errors; this
+        # line only records the size of the inventory that was walked.
+        issues.add(
+            "checksums_checked",
+            f"checked {len(pkg.files)} file(s) against CHECKSUMS.txt",
+            severity=INFO,
+            stage="checksums",
+        )
 
 
 # ---------------------------------------------------------------------------
