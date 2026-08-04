@@ -61,6 +61,7 @@ from .errors import (
     AutoloopError,
     ConfigError,
     ExecutorError,
+    GitError,
     StateCorruptError,
     StateError,
     TaskGraphError,
@@ -1703,22 +1704,120 @@ def _cmd_health(args: argparse.Namespace) -> int:
     return 1 if verdict.needs_attention else 0
 
 
-def _merge_window_blockers(config) -> list[str]:
-    """Why merging into the loop's base is unsafe right now, or []."""
-    reasons: list[str] = []
+def _window_git(config) -> GitGateway:
+    """The gateway `merge-window` confirms publication through.
 
-    # An execution record with a candidate is the REAL hazard, and the one a
-    # phase check misses. It pins `task_base_sha`; moving the branch head under
-    # it strands the task, because a review has already seen that candidate and
-    # re-basing would discard reviewed work. Four tasks were stranded this way
-    # on 2026-08-02, every one of them by a merge that looked safe because no
-    # agent happened to be running at that instant.
-    # Records outlive the work they describe: nothing archives one when a
-    # candidate is published or its task is quarantined. Counting those would
-    # close the window permanently on finished work — dogfooding this command
-    # reported two such records the moment it was written — and a tool that
-    # cries wolf gets ignored, which is the failure it exists to prevent.
-    # Only a task that could still be dispatched or reviewed can be stranded.
+    A seam, for two reasons: the check must be testable without a network, and
+    it is built lazily so a run with no candidate to verify makes no subprocess
+    call at all. `Path.cwd()` matches every other gateway construction in this
+    module — the operator runs `merge-window` from the checkout, as its own
+    docstring shows.
+    """
+    return GitGateway(Path.cwd(), PolicyEngine(config.policy))
+
+
+def _candidate_publication(config, record, seen=None) -> tuple[bool, str]:
+    """Has this record's reviewed candidate already landed on its own remote
+    branch? Returns `(published, why_not)`.
+
+    Fail-closed by construction: ONLY an `ls-remote` that comes back equal to
+    `candidate_sha` counts as published. The record's own `intended_remote_ref`
+    is not evidence — `orchestrator._dispatch_task_push` writes it BEFORE the
+    network call on purpose ("durable push intent", so a crash between a
+    successful push and the method returning is recoverable from the remote ref
+    alone). A record whose push was REFUSED therefore carries exactly the same
+    two fields as one whose push landed, and only the remote can tell them
+    apart. Anything unverifiable — no remote configured, ls-remote failing,
+    offline — reports not-published, which keeps the window shut.
+
+    `seen` memoizes CONFIRMED publications for the life of one command
+    invocation, and deliberately nothing else. `--wait` polls every 15s by
+    default, so a long wait with three published candidates would otherwise
+    re-ask the remote about all three forever — hundreds of round-trips per
+    hour for an answer that cannot change (a published ref moving would be a
+    force-push, which invalidates the candidate anyway, and the next invocation
+    re-checks from scratch). The fail-closed branches make that worse than
+    wasteful: throttle the remote enough and every lookup starts failing, at
+    which point the wait talks itself into never opening. Negatives are never
+    cached — an unpublished candidate becoming published is exactly the event
+    `--wait` exists to notice.
+    """
+    candidate = str(record.get("candidate_sha") or "")
+    remote = str(record.get("intended_remote") or "")
+    dest_ref = str(record.get("intended_remote_ref") or "")
+    if not remote or not dest_ref:
+        return False, "never pushed"
+    key = (remote, dest_ref, candidate)
+    if seen is not None and key in seen:
+        return True, ""
+    try:
+        landed = _window_git(config).remote_ref_sha(remote, dest_ref)
+    except (GitError, OSError) as exc:
+        return False, f"could not verify {remote}/{dest_ref} ({exc})"
+    if not landed:
+        return False, f"{remote}/{dest_ref} does not exist"
+    if landed != candidate:
+        return False, f"{remote}/{dest_ref} is at {landed[:12]}, not the candidate"
+    if seen is not None:
+        seen.add(key)
+    return True, ""
+
+
+def _merge_window_blockers(config, seen=None) -> tuple[list[str], list[str]]:
+    """Why merging into the loop's base is unsafe right now, plus advisory
+    notes about work that is safe but not yet reconciled. `([], notes)` means
+    the window is open.
+
+    An execution record with a candidate is the REAL hazard, and the one a
+    phase check misses. It pins `task_base_sha`; moving the branch head under
+    it strands the task — `orchestrator._rebase_execution_if_stale` refuses to
+    re-base a record whose `review_round > 0` and parks it
+    (`task_base_behind_head`), correctly, since a reviewer has already seen
+    that candidate. Four tasks were stranded this way on 2026-08-02, every one
+    of them by a merge that looked safe because no agent happened to be running
+    at that instant.
+
+    Records outlive the work they describe: nothing archives one when a
+    candidate is published or its task is quarantined. Counting those would
+    close the window permanently on finished work — dogfooding this command
+    reported two such records the moment it was written — and a tool that cries
+    wolf gets ignored, which is the failure it exists to prevent.
+
+    Two exemptions, and the difference between them matters:
+
+    * The task reached a terminal registry state (completed / quarantined).
+    * The candidate is already PUBLISHED on its own side branch, confirmed
+      against the remote. Its reviewed object is durable there and the operator
+      merges it later as an ordinary branch, so moving the base cannot discard
+      it. This is the exemption that keeps the window usable at all: nothing in
+      the loop ever calls `TaskRegistry.mark_completed` (verified 2026-08-04 —
+      the only callers are tests, and `Decision` has no terminal member for a
+      reviewer to express "done"), so a task that publishes stays `in_progress`
+      forever and the terminal-state exemption above never fires for it. Gating
+      on a transition that has no producer closed the window permanently.
+
+    The residual, reported as a note rather than hidden: a published record is
+    still re-dispatchable, and a `revise` naming it after the base moves would
+    park on `task_base_behind_head`. That park is recoverable exactly as its
+    message says (publish, abandon, or archive the record) and does not risk
+    the work — but it is a real consequence of merging, so it is printed.
+    """
+    reasons: list[str] = []
+    notes: list[str] = []
+
+    # `state_dir` is routinely a RELATIVE path (`.autoloop` in the shipped
+    # config), so it resolves against the caller's cwd. Run from anywhere but
+    # the checkout — a sibling worktree, a cron wrapper with its own working
+    # directory — and the glob below finds nothing, which reads as "no in-flight
+    # candidate" and prints OPEN. That is the exact false answer this command
+    # exists to prevent, arrived at by reading the wrong directory. Hit while
+    # dry-running this very change from a worktree on 2026-08-04.
+    if not config.state_dir.is_dir():
+        return [
+            f"state directory {config.state_dir} does not exist (resolved from "
+            f"{Path.cwd()}) — nothing could be read, so nothing can be called safe"
+        ], notes
+
     _, registry = _load_tasks(config)
     executions = sorted(config.state_dir.glob("executions/*.json"))
     for path in executions:
@@ -1731,18 +1830,29 @@ def _merge_window_blockers(config) -> list[str]:
             state = registry.state_of(task_id)
             if state in (TaskState.COMPLETED, TaskState.BLOCKED_BY_OPERATOR):
                 continue
-        if record.get("candidate_sha"):
-            reasons.append(
-                f"task {record.get('task_id', path.stem)} has a candidate "
-                f"({str(record.get('candidate_sha'))[:12]}) bound to base "
-                f"{str(record.get('task_base_sha'))[:12]} — merging would strand it"
+        if not record.get("candidate_sha"):
+            continue
+        published, why_not = _candidate_publication(config, record, seen)
+        if published:
+            notes.append(
+                f"task {task_id}: candidate {str(record.get('candidate_sha'))[:12]} is "
+                f"published at {record.get('intended_remote')}/"
+                f"{record.get('intended_remote_ref')} — safe to merge past, but its "
+                "record still reads in_progress, so a later revise would park it"
             )
+            continue
+        reasons.append(
+            f"task {task_id} has a candidate "
+            f"({str(record.get('candidate_sha'))[:12]}) bound to base "
+            f"{str(record.get('task_base_sha'))[:12]} — {why_not}; "
+            "merging would strand it"
+        )
 
     _, state = _load_state(config)
     if state is not None and Phase(state.phase) is Phase.EXECUTING:
         reasons.append("a phase is executing — an agent may be mid-write")
 
-    return reasons
+    return reasons, notes
 
 
 def _cmd_merge_window(args: argparse.Namespace) -> int:
@@ -1762,15 +1872,20 @@ def _cmd_merge_window(args: argparse.Namespace) -> int:
     """
     config = load_config(args.config)
     deadline = time.monotonic() + args.timeout
+    seen: set = set()          # confirmed publications, for this invocation only
     while True:
-        reasons = _merge_window_blockers(config)
+        reasons, notes = _merge_window_blockers(config, seen)
         if not reasons:
-            print("merge window OPEN — no in-flight candidate, no executing phase")
+            print("merge window OPEN — no unpublished candidate, no executing phase")
+            for note in notes:
+                print(f"  note: {note}")
             return 0
         if not args.wait or time.monotonic() > deadline:
             print("merge window CLOSED:")
             for reason in reasons:
                 print(f"  - {reason}")
+            for note in notes:
+                print(f"  note: {note}")
             if not args.wait:
                 print("\n`--wait` blocks until it opens.")
             else:

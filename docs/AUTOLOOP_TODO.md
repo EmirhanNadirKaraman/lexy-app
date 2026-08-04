@@ -142,6 +142,43 @@ relative default resolves against cwd and would have silently created a second,
 empty session instead. Worth making first-class: a documented "runner checkout"
 mode, rather than something each operator rediscovers under pressure.
 
+### B10. Nothing at runtime ever marks a task completed
+`TaskRegistry.mark_completed` (`autoloop/tasks.py:333`) is the only line in the
+codebase that writes `status = "completed"`, and it has **no runtime caller** —
+verified 2026-08-04:
+
+```
+rg -n "mark_completed" autoloop/ --glob '!*/tests/*'
+→ autoloop/tasks.py:323:    def mark_completed(...)      # the definition, nothing else
+```
+
+The `Decision` enum has no terminal member either (audit / plan / implement /
+revise / commit / push / commit_and_push / stop / ask_user), so a reviewer has
+no vocabulary to say "this task is done". The publish path
+(`orchestrator._dispatch_task_push`) clears `state.task_execution`, logs
+`task_pushed` and returns to READY — the registry is never touched. A task that
+publishes its candidate therefore stays `in_progress` forever.
+
+`rt-01`, `dash-02` and `audit-0001` read `completed` because they were marked by
+hand, out of band. Their provenance is inconsistent, which is why the pattern
+looked like a mechanism: `rt-01`'s candidate is not even an ancestor of the
+branch head, so completion never tracked merging either.
+
+Consequence, before the 2026-08-04 fix: `_merge_window_blockers` exempted only
+`COMPLETED` / `BLOCKED_BY_OPERATOR`, so **every task the loop published closed
+the merge window permanently**. Four tasks were holding it shut, three of them
+already pushed to their own side branches, and no amount of waiting could open
+it. That command now exempts a candidate whose publication it can confirm
+against the remote, which makes it usable, but the underlying gap remains:
+nothing retires an execution record, so a published task is still
+re-dispatchable and would park on `task_base_behind_head` (B9) after a merge.
+
+**Fix:** decide what "completed" means and give it exactly one producer —
+either post-push (published to its side branch) or post-merge (the side branch
+landed in the base, which nothing currently observes). Whichever is chosen, the
+merge-window predicate should keep gating on publication rather than on task
+state, because publication is the property that actually makes the work durable.
+
 ### B9. A task's base sha is pinned at first dispatch, so an upstream fix never reaches a retry
 `TaskExecution.task_base_sha` is recorded once, when the record is created, and
 never revisited. Every later attempt recreates the worker at that same base. So
