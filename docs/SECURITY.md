@@ -365,11 +365,45 @@ single, machine-checkable, pre-authorized scope for a task, set before the
 writer ever starts and never widened by anything the executor reports.
 `_dispatch_task_postcommit` refuses to dispatch a task with none
 (`approved_paths_missing`), checks `outcome.changed_paths` against it
-BEFORE `commit_and_capture` runs (`changed_paths_outside_approved` —
-nothing can roll a commit back once it exists), and `execution.
-allowed_paths` is seeded once from it and never unioned again (the
-post-commit check remains as defense in depth for what the pre-commit gate
-cannot see — a hook adding a path after it runs).
+BEFORE `commit_and_capture` runs, and `execution.allowed_paths` is seeded
+once from it and never unioned again (the post-commit check sees what the
+pre-commit one cannot — a hook adding a path after it runs).
+
+**Amended 2026-08-05 — the two scope CHECKS are now ADVISORY (operator
+decision).** Both comparisons still run, unchanged: same
+`tasks.unauthorized_paths` matcher, same inputs, at both ends
+(`orchestrator.py` pre-commit, `_verify_committed` post-commit). Only the
+consequence changed — where they parked the task
+(`changed_paths_outside_approved` / `post_commit_verification_failed`, both
+now gone for this reason) they record onto
+`TaskExecution.out_of_scope_paths` and the round proceeds to review. Six
+parks in three days were all legitimate work, at least three caused by a
+task scope guessed wrong when the task was written; a declared scope is a
+prediction, and a wrong prediction belongs in front of the reviewer rather
+than discarding the round. Both sites had to change together — relaxing
+only the pre-commit one moves the park downstream to the post-commit one
+for the same paths.
+
+**What this does NOT weaken.** `approved_paths` is still the authorization
+and is still never widened by anything an executor reports:
+`out_of_scope_paths` is written ONLY from what the comparisons produced,
+never from an agent claim, and records that scope was exceeded without
+granting it — `allowed_paths` stays `effective_approved_paths(task.
+approved_paths)` (pinned by
+`test_agent_reported_extra_path_is_recorded_but_cannot_widen_authorization`).
+An empty `approved_paths` still refuses dispatch outright — a different
+rule, deliberately not relaxed, since "no scope declared" means there is no
+prediction to be wrong about. Escape detection (a write outside the worker
+repo into the primary checkout) is a different mechanism and stays
+loop-fatal. Every other post-commit refusal — ancestry, empty range, dirty
+worktree, failing validation, validation mutating the tree — is untouched.
+The residual exposure is real and accepted: an out-of-scope path now
+reaches a human reviewer instead of a hard stop, so **the review packet's
+rendering of `out_of_scope_paths` is the control** that replaces the park.
+
+**Verification check:** `rg -n 'out_of_scope_paths' autoloop/orchestrator.py`
+— must show it assigned at BOTH sites (the pre-commit check and
+`_verify_committed`) and appended to `failures` at neither.
 `Orchestrator._prepare_write_capable_worker` requires the worker repo clean
 before every write-capable dispatch; residue is QUARANTINED (moved, never
 deleted — `WorkerRepoManager.quarantine`) rather than reused, and a fresh

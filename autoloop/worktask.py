@@ -171,6 +171,36 @@ class TaskExecution:
     #: own `commit_range_paths` against THAT, never against this.
     report_summary: str = ""
     report_details: str = ""
+    #: Paths this task's commits touched that `allowed_paths` did not authorize.
+    #:
+    #: ADVISORY since 2026-08-05. Both scope gates — the pre-commit one against
+    #: `outcome.changed_paths` and the post-commit one against
+    #: `commit_range_paths` — still run `tasks.unauthorized_paths` with exactly
+    #: the inputs they always did; only the CONSEQUENCE changed. Where they used
+    #: to park the task (`changed_paths_outside_approved` /
+    #: `post_commit_verification_failed`) they now record the result here and let
+    #: the round proceed to review. Operator decision after six refusals in three
+    #: days, every one legitimate work and at least three caused by a task scope
+    #: that was simply guessed wrong: a scope declared up front is a prediction,
+    #: and a wrong prediction should inform the reviewer, not stop the work.
+    #:
+    #: Written ONLY from what those comparisons produced — never from anything an
+    #: agent reports about its own scope. This records that authorization was
+    #: exceeded; it never grants it. `allowed_paths` above remains the
+    #: authorization, still derived solely from `task.approved_paths`, and is
+    #: never widened by what lands here.
+    #:
+    #: ACCUMULATED across rounds (union), not replaced. The post-commit
+    #: comparison spans the whole `task_base_sha..candidate_sha` range, so it is
+    #: already cumulative; making the pre-commit one replace instead would let a
+    #: clean round 2 erase round 1's finding from the record and then have the
+    #: post-commit pass silently put it back. Stored sorted, like
+    #: `allowed_paths`, for a stable on-disk representation.
+    #:
+    #: An empty `approved_paths` is a DIFFERENT rule and is NOT relaxed: a task
+    #: that declared no scope is refused dispatch outright and never reaches
+    #: either comparison.
+    out_of_scope_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -254,6 +284,7 @@ class TaskExecutionStore:
     def save(self, execution: TaskExecution) -> None:
         data = asdict(execution)
         data["allowed_paths"] = sorted(execution.allowed_paths)
+        data["out_of_scope_paths"] = sorted(execution.out_of_scope_paths)
         data["validation_commands"] = [list(c) for c in execution.validation_commands]
         _atomic_write_json(self._path(execution.task_id), data)
 
@@ -264,6 +295,10 @@ class TaskExecutionStore:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             data["allowed_paths"] = tuple(data.get("allowed_paths", ()))
+            # Same JSON-has-no-tuples coercion, and the same `.get` default: a
+            # record written before the scope check became advisory has no key
+            # at all and loads as "nothing recorded out of scope".
+            data["out_of_scope_paths"] = tuple(data.get("out_of_scope_paths", ()))
             # JSON has no tuples: a record written before this field existed
             # has no key at all, and one written after has lists-of-lists.
             # Both normalise to the same shape, so an older record loads as

@@ -1199,8 +1199,11 @@ instead: commit both an approved and unapproved path directly via
 `worker_git.commit_and_capture(...)`, leave `candidate_sha` unpersisted
 (simulating a crash), and let the orchestrator's crash-recovery
 (`reconcile_after_crash` / `CommitIntent`) adopt the commit as `RECOVERABLE`
-— the post-commit path-ownership check still refuses it from there. See
-`test_unexpected_commit_path_from_a_prior_process_is_rejected`.
+— the post-commit path-ownership comparison still SEES it from there. See
+`test_unexpected_commit_path_from_a_prior_process_is_recorded_on_adoption`.
+(Since 2026-08-05 that comparison is ADVISORY: it records the path on
+`TaskExecution.out_of_scope_paths` and the round proceeds to review instead
+of parking, so assert on the record, not on a park.)
 
 ### `WorkerRepoManager.create()` raises `GitCommandError` fetching a `candidate_sha` after quarantine-and-recreate, even though the sha is real and was committed moments earlier
 **Symptom:** a round that already committed successfully (`candidate_sha`

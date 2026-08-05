@@ -42,7 +42,7 @@ from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import MAX_TASK_ATTEMPTS, Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import LoopState, Phase, StateStore
-from autoloop.tasks import Task, TaskRegistry, TaskStore
+from autoloop.tasks import Task, TaskRegistry, TaskStore, effective_approved_paths
 from autoloop.transcript import TranscriptLogger
 from autoloop.worker_env import WorkerRepoManager, validate_workers_root
 from autoloop.worktask import IntentStore, TaskExecutionStore
@@ -676,10 +676,17 @@ def test_approved_path_symlink_check_is_silent_for_paths_that_do_not_exist_yet(t
     assert find_symlink_traversal(repo_root, ["brand/new/file.py"]) == []
 
 
-def test_agent_reported_extra_path_cannot_widen_authorization(tmp_path):
-    """Adversarial test 5: the executor reports a path OUTSIDE
-    `approved_paths` — refused BEFORE any commit; nothing lands, and the
-    task is never left silently "authorized" for what it touched."""
+def test_agent_reported_extra_path_is_recorded_but_cannot_widen_authorization(tmp_path):
+    """Adversarial test 5, under the ADVISORY scope check (2026-08-05).
+
+    The park is gone — the round commits and reaches review — but the
+    invariant this test was written for is untouched and is what it still
+    pins: the executor's own report of what it touched must never EXPAND its
+    authorization. `allowed_paths` stays exactly `effective_approved_paths(
+    task.approved_paths)`; the extra path lands on `out_of_scope_paths`,
+    which records that scope was exceeded and grants nothing.
+
+    Historical: parked as `changed_paths_outside_approved` before that date."""
 
     class WideningExecutor:
         def __init__(self, workers_root, repo_root):
@@ -700,25 +707,28 @@ def test_agent_reported_extra_path_cannot_widen_authorization(tmp_path):
     )
     orch._dispatch_executor(implement(task.id))
 
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert orch.state.park_kind == "task_fatal"
-    assert "b.py" in (orch.state.question or "")
+    assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
+    assert "POST-COMMIT REVIEW PACKET" in (orch.state.outbox or "")
     execution = execution_store.load(task.id)
-    assert execution.candidate_sha == ""  # never committed
+    assert execution.candidate_sha != ""  # committed
+    assert execution.out_of_scope_paths == ("b.py",)
+    # The non-circularity itself — the whole point of M1 finding #2/#3.
+    assert execution.allowed_paths == effective_approved_paths(task.approved_paths)
+    assert "b.py" not in execution.allowed_paths
     assert executor.calls == 1
 
 
-def test_unexpected_commit_path_from_a_prior_process_is_rejected(tmp_path):
+def test_unexpected_commit_path_from_a_prior_process_is_recorded_on_adoption(tmp_path):
     """Adversarial test 7: however an unapproved path ends up in a REAL
-    commit on the task's branch, the post-commit path-ownership check must
-    still catch it. For `worker_repos` specifically, a commit HOOK cannot be
-    the mechanism — `verify_worker_isolation` refuses ANY active hook in the
-    worker's controlled hooks directory unconditionally, before anything
+    commit on the task's branch, the post-commit path-ownership comparison
+    must still SEE it. For `worker_repos` specifically, a commit HOOK cannot
+    be the mechanism — `verify_worker_isolation` refuses ANY active hook in
+    the worker's controlled hooks directory unconditionally, before anything
     else runs (proven directly by `test_worker_isolation_refuses_any_active_
     hook_before_anything_else_runs` below; the equivalent hook-based
-    scenario is already covered for the ONE path where hooks are actually
-    possible — the worktrees fallback — by `test_postcommit_flow.py`'s
-    `test_hook_adding_unexpected_path_is_refused`, unmodified by this pass).
+    scenario is covered for the ONE path where hooks are actually possible —
+    the worktrees fallback — by `test_postcommit_flow.py`'s
+    `test_hook_adding_unexpected_path_is_recorded_not_refused`).
 
     So the realistic way an unapproved path lands in a real worker-repo
     commit is a commit made by something OTHER than the CURRENT
@@ -728,11 +738,21 @@ def test_unexpected_commit_path_from_a_prior_process_is_rejected(tmp_path):
     the commit succeeded but before persisting `candidate_sha`. Crash
     recovery correctly classifies this RECOVERABLE (parent linkage + nonce
     trailer both match) and ADOPTS the commit without re-running the
-    executor — but `execution.allowed_paths` is the FIXED `task.
-    approved_paths` set from creation, never widened by the recovered
-    intent's own `planned_paths` (that widening is exactly the circularity
-    M1 finding #2/#3 closes — see `_dispatch_task_postcommit`'s `is_audit`
-    branch), so the post-commit ownership check still refuses."""
+    executor.
+
+    This is also why the recording lives on the EXECUTION RECORD rather than
+    being passed along from the round: adoption runs in a process where no
+    `ExecutionOutcome` exists and the pre-commit check never ran at all, so
+    the post-commit comparison is the only thing that can see the path — and
+    the record is the only place it can survive to the packet.
+
+    `execution.allowed_paths` is still the FIXED `task.approved_paths` set
+    from creation, never widened by the recovered intent's own
+    `planned_paths` (that widening is exactly the circularity M1 finding
+    #2/#3 closes — see `_dispatch_task_postcommit`'s `is_audit` branch).
+    Since 2026-08-05 the comparison RECORDS instead of refusing, so the
+    adopted commit proceeds to review carrying the unapproved path on its
+    record."""
     from autoloop.worktask import CommitIntent, TaskExecution
 
     repo_root = real_repo(tmp_path)
@@ -809,10 +829,14 @@ def test_unexpected_commit_path_from_a_prior_process_is_rejected(tmp_path):
 
     loaded = execution_store.load("t1")
     assert loaded.candidate_sha == real_sha  # adopted, not re-committed
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert orch.state.park_kind == "task_fatal"
-    assert "sneaked.py" in (orch.state.question or "")
-    assert "outside" in (orch.state.question or "")
+    assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
+    assert "POST-COMMIT REVIEW PACKET" in (orch.state.outbox or "")
+    # Recorded by the post-commit comparison, on the record, after adoption —
+    # the pre-commit check never ran in this process.
+    assert loaded.out_of_scope_paths == ("sneaked.py",)
+    # Never widened by the adopted commit — still exactly the task's own scope
+    # (plus the always-allowed trackers, which `sneaked.py` is not one of).
+    assert loaded.allowed_paths == effective_approved_paths(("a.py",))
 
 
 def test_worker_isolation_refuses_any_active_hook_before_anything_else_runs(tmp_path):
@@ -842,6 +866,12 @@ class _NeverRunExecutor:
 
 
 def test_task_with_no_approved_paths_cannot_be_dispatched(tmp_path):
+    """NOT relaxed by the 2026-08-05 advisory change, and deliberately so: a
+    different rule from a different premise. Making the scope CHECK advisory
+    says a declared scope is a prediction that may turn out wrong. An empty
+    `approved_paths` declares nothing at all, so there is no prediction to be
+    wrong about and nothing for the reviewer to compare the round against —
+    "no scope declared" still means "not dispatchable"."""
     orch, repo_root, execution_store, task, executor = _build_worker_repos_orchestrator(
         tmp_path,
         lambda wr, rr: _NeverRunExecutor(),
@@ -851,6 +881,7 @@ def test_task_with_no_approved_paths_cannot_be_dispatched(tmp_path):
 
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert orch.state.park_kind == "task_fatal"
+    assert "no `approved_paths`" in (orch.state.question or "")
     assert execution_store.load(task.id) is None  # not even a worker repo was created
 
 

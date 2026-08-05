@@ -2201,40 +2201,63 @@ class Orchestrator:
             return
 
         if not is_audit:
-            # M1 finding #2/#3: the pre-commit gate. `outcome.changed_paths`
-            # is the executor's own report — it may never EXPAND what gets
-            # committed beyond `task.approved_paths`. Checked HERE, before
-            # `commit_and_capture` runs at all, because once a commit exists
-            # nothing in this codebase can roll it back (see the module
-            # docstring above `_dispatch_task_postcommit`) — refusing after
-            # the fact would still leave an out-of-scope commit sitting on
-            # the branch. `_verify_committed`'s post-commit path-ownership
-            # check (against `execution.allowed_paths`, itself seeded from
-            # `task.approved_paths`) remains as defense in depth for the
-            # residual case this CANNOT catch: a commit hook adding a path
-            # strictly AFTER this check ran (see
-            # `test_hook_adding_unexpected_path_is_refused`).
-            # `effective_approved_paths`, not `task.approved_paths`: the
-            # always-allowed trackers are part of a task's authorization, and
-            # this PRE-commit gate has to agree with the post-commit one that
-            # compares against `execution.allowed_paths`. Using the raw field
-            # here refused a tracker edit before the commit while the later
-            # check would have allowed it — two gates, two answers.
+            # M1 finding #2/#3, now ADVISORY (operator decision 2026-08-05).
+            # The pre-commit scope check. `outcome.changed_paths` is the
+            # executor's own report of what this round wrote.
+            #
+            # The COMPARISON is unchanged, deliberately: same
+            # `unauthorized_paths` matcher, same inputs. `effective_approved_
+            # paths`, not `task.approved_paths` — the always-allowed trackers
+            # are part of a task's authorization, and this check has to agree
+            # with the post-commit one that compares against
+            # `execution.allowed_paths`. Using the raw field here flagged a
+            # tracker edit the later check would have allowed — two checks,
+            # two answers.
+            #
+            # What changed is only the CONSEQUENCE. This used to park the task
+            # (`task_fatal`, `changed_paths_outside_approved`) before
+            # `commit_and_capture` ran at all. It parked six rounds in three
+            # days, every one of them legitimate work and at least three of
+            # them caused by a task scope that was simply guessed wrong when
+            # the task was written. A scope declared up front is a PREDICTION
+            # of what the work will touch; a wrong prediction is a fact the
+            # reviewer should see, not a reason to throw the round away. So
+            # the out-of-scope paths are recorded on the execution record and
+            # the round proceeds to commit and review, where a human reads
+            # them alongside the diff.
+            #
+            # Recorded from what the comparison produced — never from anything
+            # the agent says about its own scope. `execution.allowed_paths` is
+            # untouched here and stays derived solely from
+            # `task.approved_paths`: this records that authorization was
+            # exceeded, it never grants it.
+            #
+            # Two things this relaxation does NOT reach, both different
+            # mechanisms: a task with an EMPTY `approved_paths` is still
+            # refused dispatch outright (above — no scope declared still means
+            # not dispatchable), and a write that lands OUTSIDE the worker
+            # repository entirely is still loop-fatal escape detection
+            # (`_execute_with_escape_detection`), which is about confinement,
+            # not scope.
             outside = unauthorized_paths(
                 outcome.changed_paths, effective_approved_paths(task.approved_paths)
             )
             if outside:
-                self._to_needs_user(
-                    f"task {task.id}: the executor reported changed path(s) "
-                    f"outside the task's approved scope: {sorted(outside)} — "
-                    f"approved: {sorted(task.approved_paths)}. Refused BEFORE "
-                    "committing; nothing was committed.",
-                    kind="task_fatal",
-                    code="changed_paths_outside_approved",
-                    task_id=task.id,
-                    detail=f"outside={sorted(outside)} approved={sorted(task.approved_paths)}",
+                # Union, not replace — see `TaskExecution.out_of_scope_paths`.
+                # Persisted by the `save` a few lines below, alongside the
+                # executor's report.
+                execution.out_of_scope_paths = tuple(
+                    sorted(set(execution.out_of_scope_paths) | outside)
                 )
-                return
+                self._log(
+                    "changed_paths_outside_approved",
+                    data={
+                        "task_id": task.id,
+                        "outside": sorted(outside),
+                        "approved": sorted(task.approved_paths),
+                        "advisory": True,
+                    },
+                )
 
         # Captured BEFORE the commit, while the outcome is still in hand: this
         # is the executor's own account of the round, and `_finish_postcommit`
@@ -2304,8 +2327,9 @@ class Orchestrator:
             # Audit only — see the `is_audit` comment near the top of this
             # method for why a real task's `allowed_paths` must NOT be
             # widened here (that is exactly the circularity M1 finding #2/#3
-            # closes; the pre-commit gate above already refused before this
-            # point if `outcome.changed_paths` ever left `approved_paths`).
+            # closes; the pre-commit check above RECORDS it on
+            # `execution.out_of_scope_paths` when `outcome.changed_paths`
+            # leaves `approved_paths`, and still never widens the scope).
             execution.allowed_paths = tuple(
                 sorted(set(execution.allowed_paths) | set(outcome.changed_paths))
             )
@@ -2564,14 +2588,19 @@ class Orchestrator:
     ) -> tuple[list[str], str]:
         """The post-commit review gate for `execution.candidate_sha`. Returns
         `(failures, validation_summary)`; `failures` empty means the commit
-        passes every check.
+        passes every blocking check.
 
-        Path ownership is checked against `execution.allowed_paths` — the
+        Path ownership is compared against `execution.allowed_paths` — the
         UNION of every round's `changed_paths` committed so far, not just the
         latest round's. `commit_range_paths(task_base_sha, candidate_sha)`
         spans the WHOLE range once `review_round > 0`, so comparing it against
         only the latest round's paths would wrongly flag an earlier round's
         legitimate paths as "outside" on a second review.
+
+        That one comparison is ADVISORY (2026-08-05): it MUTATES
+        `execution.out_of_scope_paths` rather than adding to `failures`, and
+        the caller persists the record immediately after. Every other check
+        here still refuses.
         """
         failures: list[str] = []
         candidate = execution.candidate_sha
@@ -2583,14 +2612,38 @@ class Orchestrator:
         touched = worktree_git.commit_range_paths(execution.task_base_sha, candidate)
         if not touched:
             failures.append("commit range is empty — nothing was actually committed")
-        # Same matcher as the pre-commit gate, so a directory prefix means the
-        # same thing at both ends. Set subtraction here would have refused
+        # Same matcher as the pre-commit check, so a directory prefix means the
+        # same thing at both ends. Set subtraction here would have flagged
         # after the commit what was accepted before it.
+        #
+        # ADVISORY since 2026-08-05, for the same reason and by the same
+        # operator decision as the pre-commit one — and it had to change in
+        # the SAME breath. Relaxing only the pre-commit check would have moved
+        # the park downstream rather than removing it: the round would commit,
+        # arrive here, and park as `post_commit_verification_failed` for the
+        # very same paths. So this no longer appends to `failures`; it records
+        # onto the execution record and the candidate goes to review.
+        #
+        # The comparison itself is untouched, against `execution.allowed_paths`
+        # exactly as before. This side reads git's own
+        # `commit_range_paths(task_base_sha, candidate_sha)` — the authoritative
+        # account of what the commits actually touched, not the executor's
+        # report — which is why it also catches what the pre-commit side
+        # structurally cannot: a path added by a commit hook strictly after
+        # that check ran (`test_hook_adding_unexpected_path_is_recorded_not_
+        # refused`, which is why that test is the sharpest proof this site
+        # went advisory too — site 1 never sees the path at all). It now
+        # surfaces in the packet instead of parking. Every OTHER failure —
+        # ancestry, an empty range, a dirty worktree, failing validation,
+        # validation mutating the tree — is untouched and still refuses.
         outside = unauthorized_paths(touched, execution.allowed_paths)
         if outside:
-            failures.append(
-                "commit touched path(s) outside what the task was allowed to "
-                f"touch: {sorted(outside)}"
+            # Union, not replace: the range spans every round, and the
+            # pre-commit side may already have recorded these. Saved by
+            # `_finish_postcommit`, which persists `execution` right after this
+            # returns.
+            execution.out_of_scope_paths = tuple(
+                sorted(set(execution.out_of_scope_paths) | outside)
             )
         residual = worktree_git.dirty_entries()
         if residual:
@@ -2704,6 +2757,10 @@ class Orchestrator:
                 "review_round": execution.review_round,
                 "candidate_commit_count": execution.candidate_commit_count,
                 "failures": failures,
+                # Advisory, so it is deliberately NOT in `failures` — but it
+                # belongs in the transcript either way, so an operator reading
+                # the log sees a scope overrun without opening the packet.
+                "out_of_scope_paths": list(execution.out_of_scope_paths),
             },
         )
         state.last_response = None

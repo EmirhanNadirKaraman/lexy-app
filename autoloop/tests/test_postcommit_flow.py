@@ -393,10 +393,19 @@ def test_happy_path_commits_and_passes_review(tmp_path):
     assert orch.state.task_execution["candidate_sha"] == execution.candidate_sha
 
 
-# ---- 6. hook adds an unexpected path -> refused --------------------------------
+# ---- 6. hook adds an unexpected path -> recorded, not refused ------------------
 
 
-def test_hook_adding_unexpected_path_is_refused(tmp_path):
+def test_hook_adding_unexpected_path_is_recorded_not_refused(tmp_path):
+    """Isolates the POST-commit scope check. The hook adds `sneaked.txt`
+    strictly AFTER the pre-commit check ran, so this path is one only the
+    post-commit comparison can see — which makes it the sharpest test that
+    site 2 became advisory too. Leaving site 2 blocking parks here for a path
+    site 1 never had the chance to look at.
+
+    Historical: refused as `post_commit_verification_failed` before
+    2026-08-05. What the hook committed is unchanged and still fully visible
+    to the reviewer in the range diff; only the park is gone."""
     executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
     orch, repo_root, worktrees, execution_store, intent_store, task = build_postcommit(
         tmp_path, executor
@@ -417,9 +426,10 @@ def test_hook_adding_unexpected_path_is_refused(tmp_path):
     ).strip()
     assert on_branch == execution.candidate_sha  # not rolled back
 
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert "REFUSED" in orch.state.question
-    assert "sneaked.txt" in orch.state.question
+    assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
+    assert "POST-COMMIT REVIEW PACKET" in (orch.state.outbox or "")
+    assert execution.out_of_scope_paths == ("sneaked.txt",)
+    assert "sneaked.txt" not in execution.allowed_paths  # recorded, not granted
     assert wt_git.dirty_entries() == []  # the hook's own `git add` left nothing dirty
 
 
@@ -500,6 +510,9 @@ def test_failing_post_commit_validation_is_refused(tmp_path):
     assert "REFUSED" in orch.state.question
     assert "post-commit validation failed" in orch.state.question
     assert "E501" in orch.state.question
+    # Bounds the 2026-08-05 relaxation: ONLY the path-ownership comparison
+    # went advisory. Every other post-commit check still parks the candidate.
+    assert execution.out_of_scope_paths == ()
 
 
 def test_status_error_from_executor_never_reaches_commit(tmp_path):
@@ -1036,9 +1049,15 @@ def test_a_tracker_edit_outside_approved_paths_no_longer_refuses(tmp_path):
     assert execution_store.load(task.id).candidate_sha != "", "should have committed"
 
 
-def test_a_NON_tracker_path_outside_approved_paths_still_refuses(tmp_path):
-    """The guard that makes the widening narrow: only the four trackers are
-    implicit. Any other unnamed path is still an authorization failure."""
+def test_a_NON_tracker_path_outside_approved_paths_commits_and_is_recorded(tmp_path):
+    """The scope check is ADVISORY (2026-08-05). A path the task did not name
+    and the trackers do not cover is still OUT OF SCOPE — it is just no longer
+    a reason to throw the round away. It commits, it reaches review, and the
+    path is on the execution record for the packet to render.
+
+    Historical: this parked as `changed_paths_outside_approved` before that
+    date. Six such parks in three days were all legitimate work, at least
+    three of them caused by a scope guessed wrong when the task was written."""
     executor = WritingExecutor(
         tmp_path / "worktrees",
         {"src/thing.py": "x\n", "src/sneaky.py": "y\n"},
@@ -1050,7 +1069,53 @@ def test_a_NON_tracker_path_outside_approved_paths_still_refuses(tmp_path):
     )
     orch._dispatch_executor(implement(task.id))
 
-    assert orch.state.phase == Phase.NEEDS_USER.value
-    assert "outside the task's approved scope" in orch.state.question
-    assert "src/sneaky.py" in orch.state.question
-    assert execution_store.load(task.id).candidate_sha == "", "must not commit"
+    assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
+    # The mutation-killing assertion, and the reason both gates are one task:
+    # `candidate_sha != ""` alone would still pass with the POST-commit check
+    # left blocking (the commit exists either way — only the park differs).
+    # Reaching the packet is what proves the round was not parked downstream.
+    assert "POST-COMMIT REVIEW PACKET" in (orch.state.outbox or "")
+
+    execution = execution_store.load(task.id)
+    assert execution.candidate_sha != "", "should have committed"
+    assert execution.out_of_scope_paths == ("src/sneaky.py",)
+    # Recorded, never granted: the out-of-scope path must not have widened the
+    # task's own authorization (M1 finding #2/#3 is unchanged by this).
+    assert "src/sneaky.py" not in execution.allowed_paths
+
+
+def test_out_of_scope_paths_survive_a_store_round_trip_as_a_tuple(tmp_path):
+    """It is read back by the packet renderer and by crash-recovery adoption,
+    both of which load the record from disk. JSON has no tuples, so without
+    the coercion in `TaskExecutionStore.load` this comes back a list."""
+    executor = WritingExecutor(
+        tmp_path / "worktrees",
+        {"src/thing.py": "x\n", "src/sneaky.py": "y\n"},
+    )
+    orch, _repo, _wt, execution_store, _intents, task = build_postcommit(
+        tmp_path, executor, approved_paths=("src/thing.py",)
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    reloaded = execution_store.load(task.id)
+    assert reloaded.out_of_scope_paths == ("src/sneaky.py",)
+    assert isinstance(reloaded.out_of_scope_paths, tuple)
+    # An older record — written before the field existed — has no key at all
+    # and must load as "nothing recorded", not raise.
+    path = execution_store.directory / f"{task.id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["out_of_scope_paths"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert execution_store.load(task.id).out_of_scope_paths == ()
+
+
+def test_a_clean_round_records_nothing_out_of_scope(tmp_path):
+    """The negative control — without it the recording could be firing on
+    every round and every assertion above would still pass."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"src/thing.py": "x\n"})
+    orch, _repo, _wt, execution_store, _intents, task = build_postcommit(
+        tmp_path, executor, approved_paths=("src/thing.py",)
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    assert execution_store.load(task.id).out_of_scope_paths == ()
