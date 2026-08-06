@@ -68,7 +68,7 @@ class PolicyConfig:
     # Phase gate: while False (Phase 3 default), `implement` and `revise` of
     # repository tasks are denied deterministically — only the audit-review
     # cycle (audit / revise-of-audit / plan / stamped Markdown commits / push /
-    # ask_user / stop) is executable.
+    # stop) is executable.
     implement_enabled: bool = False
     #: How many times one run may abandon a wedged conversation for a fresh one
     #: in the same project. One is the deliberate default: rotation exists to
@@ -220,8 +220,28 @@ class PolicyEngine:
         completion id on commits) must point at a known task that is not
         blocked and not already completed — deterministic graph state, never
         ChatGPT's claim about it.
+
+        `ask_user` is refused here unconditionally — see the check below.
         """
         decision = directive.decision
+        # Retired at runtime, and deliberately ahead of every configurable
+        # gate below so that "unconditional" reads that way: no policy flag,
+        # branch, or task state can admit it. `ask_user` parked the loop on a
+        # question addressed to a human who, in an autonomous run, is not
+        # there to answer it — the loop stalled instead of either changing
+        # course or ending. `Decision.ASK_USER` deliberately REMAINS in the
+        # contract enum: the parser accepting it is what routes a stale
+        # `ask_user` reply into the budget-capped corrective-reprompt path
+        # below, rather than into a contract violation that says nothing
+        # about why the decision is unavailable.
+        if decision is Decision.ASK_USER:
+            return Verdict.deny(
+                "legacy_ask_user_retired",
+                "`ask_user` is retired — this loop does not pause for a human "
+                "operator. Choose a different course of action, or reply "
+                "`stop` with the reason describing what a human needs to "
+                "decide.",
+            )
         if decision in TASK_DECISIONS:
             if directive.task_id == AUDIT_TASK_ID:
                 # The audit pseudo-task: revise re-runs the audit with
@@ -238,7 +258,7 @@ class PolicyEngine:
                         "of repository tasks is disabled "
                         "(policy.implement_enabled=false). Available: revise the "
                         "audit (task_id='audit'), plan, commit/push approved "
-                        "Markdown, ask_user, stop.",
+                        "Markdown, stop.",
                     )
                 verdict = self._check_task_reference(directive.task_id, registry)
                 if not verdict.allowed:

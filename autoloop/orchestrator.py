@@ -4,7 +4,7 @@ Phases (see state.Phase):
 
     ready ──► submitting ──► awaiting ──► executing ─┬─► ready        (loop)
                    │                                 ├─► stopped      (stop)
-                   │ send attempted,                  └─► needs_user  (ask_user / budgets)
+                   │ send attempted,                  └─► needs_user  (budgets)
                    │ acceptance unknown
                    ▼
        submission_unconfirmed ──reconcile──┬─► awaiting   (it did persist)
@@ -1632,11 +1632,25 @@ class Orchestrator:
             self._log("stopped", data={"reason": directive.reason})
             self._store.save(state)
         elif decision is Decision.ASK_USER:
-            state.last_response = None
-            self._to_needs_user(
-                directive.question or "(no question given)",
-                kind="loop_fatal",
-                code="ask_user",
+            # Retired 2026-08-06, mirroring the retired legacy git path below.
+            # `authorize_directive` denies `ask_user` unconditionally, so a
+            # directive normally never reaches this branch at all — which is
+            # exactly why the branch has to STAY. Deleting it would drop
+            # `ASK_USER` into the terminal `else` and dispatch it to the
+            # executor, which has no task to run and no notion of a question:
+            # a retirement that opened a worse hole than it closed. Refused
+            # here through the SAME budget-capped corrective-reprompt
+            # machinery, so a directive arriving by any path that skipped the
+            # policy gate still cannot park the loop or reach the executor.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "legacy_ask_user_retired",
+                    "`ask_user` is retired — this loop does not pause for a "
+                    "human operator; choose a different course of action, or "
+                    "reply `stop` with the reason describing what a human "
+                    "needs to decide",
+                ),
             )
         elif decision is Decision.PLAN:
             self._dispatch_plan(directive)

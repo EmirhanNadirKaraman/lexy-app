@@ -237,3 +237,59 @@ def test_commit_allowed_under_phase_gate():
     # The audit-review cycle needs stamped Markdown commits even while
     # implement is disabled.
     assert auth(engine(), directive(Decision.COMMIT, task_id="done1")).allowed
+
+
+def test_phase_gate_reason_does_not_offer_ask_user():
+    """The phase-gate denial lists what IS still available. `ask_user` was on
+    that list and is now retired, so leaving it there would have the policy
+    layer recommending the one decision it refuses unconditionally."""
+    verdict = auth(engine(), directive(Decision.IMPLEMENT, task_id="ready1"))
+    assert not verdict.allowed
+    assert "ask_user" not in verdict.reason
+    assert "stop" in verdict.reason  # still names the real alternatives
+
+
+# ---- ask_user retirement -----------------------------------------------------
+
+
+def test_ask_user_denied_under_fully_permissive_config():
+    """Unconditional means no configuration admits it. Everything that could
+    plausibly gate a decision is switched to its most permissive setting
+    here, on a non-protected branch — if the denial were incidental to any
+    of these flags rather than categorical, this is where it would show."""
+    eng = engine(
+        implement_enabled=True,
+        allow_commit=True,
+        allow_push=True,
+        allow_protected_push=True,
+        protected_branches=(),
+    )
+    verdict = auth(eng, directive(Decision.ASK_USER))
+    assert not verdict.allowed
+    assert verdict.code == "legacy_ask_user_retired"
+
+
+@pytest.mark.parametrize("task_id", [None, "ready1", "done1", "blocked1", "ghost"])
+def test_ask_user_denied_regardless_of_task_reference(task_id):
+    """The denial precedes every task-reference check, so the verdict must be
+    the retirement one for a known-ready task and an unknown one alike —
+    never `task_unknown`/`task_blocked`, which would imply that naming a
+    valid task could make `ask_user` executable."""
+    verdict = auth(task_engine(), directive(Decision.ASK_USER, task_id=task_id))
+    assert not verdict.allowed
+    assert verdict.code == "legacy_ask_user_retired"
+
+
+@pytest.mark.parametrize("branch", ["main", "master", "feature/x"])
+def test_ask_user_denied_on_every_branch(branch):
+    verdict = auth(engine(), directive(Decision.ASK_USER), branch=branch)
+    assert not verdict.allowed and verdict.code == "legacy_ask_user_retired"
+
+
+def test_ask_user_denial_reason_does_not_recommend_ask_user():
+    """Guidance that pointed back at the refused decision would loop the
+    reviewer straight into the same denial until the budget ran out."""
+    verdict = auth(engine(), directive(Decision.ASK_USER))
+    assert verdict.reason.count("ask_user") == 1  # names itself, once, as retired
+    assert "retired" in verdict.reason
+    assert "stop" in verdict.reason

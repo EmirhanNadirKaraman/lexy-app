@@ -893,11 +893,65 @@ def test_stop_decision_ends_loop(tmp_path):
     assert executor.calls == []
 
 
-def test_ask_user_parks_loop(tmp_path):
-    orch, _, _, _, _, _, _ = build(tmp_path, responses=[ask_user_block("which DB?")])
+# ---- ask_user retirement ----------------------------------------------------
+#
+# `ask_user` used to park the loop on `needs_user` carrying the reviewer's
+# question. It is retired: `PolicyEngine.authorize_directive` denies it
+# unconditionally, so an arriving one is corrected like any other policy
+# denial instead of stalling an autonomous run on a human who is not there.
+
+
+def test_ask_user_is_denied_and_corrected_instead_of_parking(tmp_path):
+    orch, _, _, executor, clients, _, _ = build(
+        tmp_path, responses=[ask_user_block("which DB?"), stop_block()]
+    )
+    assert orch.run() == Phase.STOPPED.value
+    # corrected through the ordinary denial channel, never parked
+    assert "policy_denied" in clients[0].submitted[1][1]
+    assert not orch.state.question
+    assert executor.calls == []
+
+
+def test_ask_user_dispatch_can_neither_park_nor_reach_the_executor(tmp_path):
+    """Defense in depth for the `_dispatch` branch itself.
+
+    Unreachable through `run()` now that the policy gate denies first, so it
+    takes a direct `_dispatch` call to exercise. The branch is kept rather
+    than deleted precisely because deleting it would let `ASK_USER` fall
+    through to the terminal `else` and be handed to `_dispatch_executor`,
+    which has no task to run — a worse outcome than the park it replaced."""
+    orch, _, _, executor, _, _, _ = build(tmp_path)
+    directive = Directive(
+        decision=Decision.ASK_USER, reason="unsure", question="which DB?"
+    )
+
+    orch._dispatch(directive)
+
+    assert orch.state.phase == Phase.READY.value  # not NEEDS_USER
+    assert not orch.state.question
+    assert executor.calls == []
+    assert "policy_denied" in orch.state.outbox
+    assert "retired" in orch.state.outbox
+
+
+def test_repeated_ask_user_exhausts_the_denial_budget(tmp_path):
+    """The corrective reprompt is budget-capped like every other denial, so a
+    reviewer that keeps answering `ask_user` terminates the run instead of
+    trading messages forever."""
+    orch, _, _, executor, _, _, _ = build(
+        tmp_path,
+        responses=[ask_user_block(), ask_user_block()],
+        policy=PolicyConfig(max_policy_denials=1),
+    )
     assert orch.run() == Phase.NEEDS_USER.value
-    assert orch.state.question == "which DB?"
+    # parked on the BUDGET, not on the reviewer's question
+    assert "policy-denied directives in a row" in orch.state.question
+    assert "which DB?" not in orch.state.question
+    assert orch.state.park_kind == "loop_fatal"
+    # terminal, not retryable — the property the retired ask_user park test
+    # asserted, carried onto the park that replaced it
     assert orch.state.resume_phase is None
+    assert executor.calls == []
 
 
 # ---- policy + git failures --------------------------------------------------
