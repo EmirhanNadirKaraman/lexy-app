@@ -15,7 +15,34 @@ from pathlib import Path
 
 import pytest
 
-from autoloop.dashboard import MARKS, PAGE, STATUS, app_tasks, collect, pipeline
+from autoloop.dashboard import (
+    MARKS,
+    PAGE,
+    STATUS,
+    app_tasks,
+    collect,
+    is_ancestor,
+    merge_states,
+    pipeline,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_dashboard_caches():
+    """The tracker memoizes remote refs (60s), ancestry verdicts and
+    shallowness at module level, so a test would otherwise read the previous
+    test's repository. Ancestry is the sharp one: `make_repo` commits fixed
+    content with a fixed author and no `GIT_AUTHOR_DATE`, so two repos built in
+    the same wall-clock second have the SAME commit sha in different
+    directories — a verdict keyed on the sha alone would leak across them and
+    fail only near a second boundary."""
+    import autoloop.dashboard as dash
+
+    for cache in (dash._REMOTE_CACHE, dash._ANCESTRY_CACHE, dash._SHALLOW_CACHE):
+        cache.clear()
+    yield
+    for cache in (dash._REMOTE_CACHE, dash._ANCESTRY_CACHE, dash._SHALLOW_CACHE):
+        cache.clear()
 
 
 def snapshot(root: Path) -> dict:
@@ -534,3 +561,233 @@ def test_the_served_javascript_actually_parses():
         assert result.returncode == 0, (
             f"script block {index} does not parse:\n{result.stderr[:600]}"
         )
+
+
+# ---- merged vs unmerged (2026-08-06) -----------------------------------------
+#
+# Seven tasks read `completed` while none of their code was in HEAD — published
+# to their side branches and never merged, two of them fixing failures that were
+# still happening while their fix sat unused. Nothing on the page said so; it
+# took a `git ls-remote` loop to find out. `completed` means PUBLISHED, which is
+# not the same as integrated, so the page must show three states and must never
+# turn a network hiccup into an alarming fourth.
+
+
+def merge_fixture(tmp_path):
+    """The production shape: an observed checkout, an `origin`, one branch that
+    IS an ancestor of HEAD, and one pushed from a SEPARATE clone.
+
+    The separate clone is the point rather than tidiness. Workers commit in
+    isolated repos and the publisher pushes from its own, so the observed
+    checkout has never seen an unmerged side branch's objects — `merge-base
+    --is-ancestor` exits 128 there, not 1, and that is the path all seven real
+    tasks took. A fixture that committed the branch locally would exercise the
+    easy exit code and prove nothing about the case that shipped.
+    """
+    repo = make_repo(tmp_path)
+    origin = tmp_path / "origin.git"
+    run_git(tmp_path, "init", "--bare", "-q", str(origin))
+    run_git(repo, "remote", "add", "origin", str(origin))
+    run_git(repo, "push", "-q", "origin", "work")
+
+    merged_sha = run_git(repo, "rev-parse", "HEAD").strip()
+    run_git(repo, "push", "-q", "origin", f"{merged_sha}:refs/heads/autoloop/t-merged")
+    (repo / "f.txt").write_text("second\n")
+    run_git(repo, "add", "f.txt")
+    run_git(repo, "commit", "-q", "-m", "second")
+
+    # Built with init + fetch rather than `git clone`: the bare origin's HEAD is
+    # dangling (it was created empty and only ever had `work` pushed into it),
+    # and clone's handling of that is a needless dependency for a fixture whose
+    # only requirement is that these objects never enter the observed checkout.
+    side = tmp_path / "side"
+    side.mkdir()
+    run_git(side, "init", "-q", "-b", "work")
+    run_git(side, "config", "user.email", "t@e.com")
+    run_git(side, "config", "user.name", "T")
+    run_git(side, "fetch", "-q", str(origin), "work")
+    run_git(side, "checkout", "-q", "-B", "work", "FETCH_HEAD")
+    (side / "g.txt").write_text("side\n")
+    run_git(side, "add", "g.txt")
+    run_git(side, "commit", "-q", "-m", "side work")
+    unmerged_sha = run_git(side, "rev-parse", "HEAD").strip()
+    run_git(side, "push", "-q", str(origin), "HEAD:refs/heads/autoloop/t-unmerged")
+    return repo, merged_sha, unmerged_sha
+
+
+def write_registry(repo, tasks, executions=()):
+    (repo / ".autoloop" / "tasks.json").write_text(
+        json.dumps({"schema_version": 1, "tasks": tasks}), encoding="utf-8"
+    )
+    directory = repo / ".autoloop" / "executions"
+    directory.mkdir(parents=True, exist_ok=True)
+    for record in executions:
+        (directory / f"{record['task_id']}.json").write_text(
+            json.dumps(record), encoding="utf-8"
+        )
+
+
+def completed(task_id):
+    return {"id": task_id, "title": task_id.upper(), "description": "d",
+            "status": "completed", "priority": 100}
+
+
+def by_id(payload):
+    return {row["id"]: row for row in payload["merge"]["rows"]}
+
+
+def test_a_branch_that_is_an_ancestor_of_head_renders_merged(tmp_path):
+    repo, merged_sha, _ = merge_fixture(tmp_path)
+    write_registry(repo, [completed("t-merged")])
+
+    row = by_id(collect(repo))["t-merged"]
+    assert row["state"] == "merged"
+    assert row["branch"] == "autoloop/t-merged"
+    assert row["sha"] == merged_sha[:12]
+
+
+def test_a_branch_on_origin_but_not_in_head_renders_unmerged(tmp_path):
+    """THE case that hides finished work. Its objects were never fetched into
+    this checkout, so git answers with an error rather than a 1 — and an object
+    absent from the local database cannot be reachable from local HEAD, which
+    is what makes that a definite "no" instead of an unknown."""
+    repo, _, unmerged_sha = merge_fixture(tmp_path)
+    write_registry(repo, [completed("t-unmerged")])
+
+    row = by_id(collect(repo))["t-unmerged"]
+    assert row["state"] == "unmerged"
+    assert row["sha"] == unmerged_sha[:12]
+    assert "not in HEAD" in row["detail"]
+
+
+def test_a_completed_task_with_no_branch_renders_not_published(tmp_path):
+    """Should not happen — completed in the registry with nothing pushed. Say
+    so rather than hiding it in one of the other two states."""
+    repo, _, _ = merge_fixture(tmp_path)
+    write_registry(repo, [completed("t-ghost")])
+
+    row = by_id(collect(repo))["t-ghost"]
+    assert row["state"] == "unpublished"
+    assert "never pushed" in row["detail"]
+
+
+def test_an_unreachable_remote_renders_unknown_never_not_merged(tmp_path):
+    """A network hiccup must not invent "seven tasks are stranded". The row
+    that IS unmerged when origin answers has to read `unknown` when it does
+    not — this fails if the unreachable branch is rendered not-merged."""
+    repo, merged_sha, _ = merge_fixture(tmp_path)
+    write_registry(
+        repo,
+        [completed("t-unmerged"), completed("t-merged")],
+        [{"task_id": "t-merged", "task_branch": "autoloop/t-merged",
+          "candidate_sha": merged_sha}],
+    )
+    # A path that is not a repository fails instantly; an unroutable URL would
+    # sit on the ls-remote timeout and stall the suite instead.
+    run_git(repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+    payload = collect(repo)
+    rows = by_id(payload)
+    assert rows["t-unmerged"]["state"] != "unmerged", "a failed lookup is not evidence"
+    assert rows["t-unmerged"]["state"] == "unknown"
+    assert payload["merge"]["counts"]["unmerged"] == 0
+    assert payload["merge"]["remote_ok"] is False
+    # …and a task whose own commit is provably IN HEAD still reads merged: the
+    # execution record supplies a commit id, git decides ancestry, and that
+    # answer does not need the network.
+    assert rows["t-merged"]["state"] == "merged"
+
+
+def test_the_unmerged_count_matches_the_rows(tmp_path):
+    """The count is the sentence this feature exists to say, so it must be
+    derived from the rows and must not tally anything git could not answer."""
+    repo, _, _ = merge_fixture(tmp_path)
+    write_registry(
+        repo,
+        [completed("t-merged"), completed("t-unmerged"), completed("t-ghost"),
+         {"id": "t-open", "title": "OPEN", "description": "d",
+          "status": "pending", "priority": 100}],
+    )
+
+    payload = collect(repo)
+    counts = payload["merge"]["counts"]
+    rows = payload["merge"]["rows"]
+    assert counts["unmerged"] == sum(1 for r in rows if r["state"] == "unmerged") == 1
+    assert counts["merged"] == 1 and counts["unpublished"] == 1
+    # Roadmap order (priority, then id), completed rows only: the pending task
+    # has no merged-ness to report and must not appear.
+    assert [r["id"] for r in rows] == ["t-ghost", "t-merged", "t-unmerged"]
+
+
+def test_is_ancestor_maps_gits_three_answers(tmp_path):
+    """The exit code IS the answer: 0 yes, 1 no, anything else needs triage.
+    Driven against a real repository, because the triage is where the risk is
+    and an injected stub would never reach it."""
+    repo, merged_sha, unmerged_sha = merge_fixture(tmp_path)
+    head = run_git(repo, "rev-parse", "HEAD").strip()
+
+    assert is_ancestor(repo, merged_sha, head) == "yes"          # exit 0
+    # A commit that IS in this object database and is not an ancestor of HEAD —
+    # the plain exit-1 answer.
+    run_git(repo, "checkout", "-q", "-b", "detour")
+    (repo / "h.txt").write_text("detour\n")
+    run_git(repo, "add", "h.txt")
+    run_git(repo, "commit", "-q", "-m", "detour")
+    local_other = run_git(repo, "rev-parse", "HEAD").strip()
+    run_git(repo, "checkout", "-q", "work")
+    # Without this the three verdicts below could be measured against a HEAD
+    # the checkouts moved, and every one of them would pass for the wrong pair.
+    assert run_git(repo, "rev-parse", "HEAD").strip() == head
+    assert is_ancestor(repo, local_other, head) == "no"
+
+    # Absent from this object database entirely — git errors out, and the
+    # answer is still a definite no.
+    assert is_ancestor(repo, unmerged_sha, head) == "no"
+    # Nothing to compare against is never a verdict.
+    assert is_ancestor(repo, unmerged_sha, "") == "unknown"
+
+
+def test_the_execution_record_is_positive_evidence_only():
+    """The record may supply a commit id; it may never assert a state. Every
+    negative has to come from git, because "the record says it was pushed" is
+    exactly what read as done for seven unmerged tasks."""
+    task = [{"id": "rt-10", "title": "T"}]
+    record = {"rt-10": {"task_branch": "autoloop/rt-10", "candidate_sha": "c" * 40,
+                        "intended_remote": "origin",
+                        "intended_remote_ref": "refs/heads/autoloop/rt-10"}}
+
+    # A pushed-looking record whose commit is not in HEAD, remote readable.
+    rows = merge_states(task, record, True, {}, lambda sha: "no")
+    assert rows[0]["state"] == "unpublished"
+    # Same record, remote unreadable -> unknown, never a negative.
+    rows = merge_states(task, record, False, {}, lambda sha: "unknown")
+    assert rows[0]["state"] == "unknown"
+    # Same record, but git says the commit IS in HEAD -> merged even though
+    # origin no longer carries the branch (merged then deleted is ordinary).
+    rows = merge_states(task, record, True, {}, lambda sha: "yes")
+    assert rows[0]["state"] == "merged"
+    # The branch name comes from the record's own ref, not a guess.
+    assert rows[0]["branch"] == "autoloop/rt-10"
+
+
+def test_a_task_with_no_execution_record_still_gets_a_branch_looked_up():
+    """The naming convention is allowed to FIND a branch. It is never allowed
+    to decide anything about it — the state below comes from ancestry."""
+    rows = merge_states([{"id": "rt-11", "title": "T"}], {}, True,
+                        {"autoloop/rt-11": "a" * 40}, lambda sha: "no")
+    assert rows[0]["branch"] == "autoloop/rt-11"
+    assert rows[0]["state"] == "unmerged"
+
+
+def test_the_unmerged_count_is_a_stat_tile_not_only_a_table_row():
+    """The sentence this feature exists to say is `seven finished tasks are not
+    in your branch`, and a number nobody scrolls to does not say it. The tile
+    grid renders above the pipeline, before every other section."""
+    tiles = PAGE.split('getElementById("tiles").innerHTML = [', 1)[1].split("].map", 1)[0]
+    assert "not merged" in tiles and "nUnmerged" in tiles
+    assert PAGE.index('id="tiles"') < PAGE.index('id="merged"')
+    # Icon + word beside the number, like every other state on the page: the
+    # warn border must not be the only thing carrying the meaning.
+    merge_marks = PAGE.split("const MS = {", 1)[1].split("};", 1)[0]
+    for state in ("merged", "unmerged", "unpublished", "unknown"):
+        assert f"{state}:[" in merge_marks.replace(" ", "")

@@ -24,6 +24,12 @@ and `docs/SECURITY.md` S28 before widening what that endpoint accepts.
 The one thing it learns that is not already on disk: which domain each in-flight
 agent is on, parsed from the process table. Agent prompts carry
 `Your domain: <title>.`, so a live fan-out is legible without changing the loop.
+
+The second thing it learns that no file records: whether a COMPLETED task's work
+is actually in the branch. `completed` means published, not integrated, and the
+difference is where finished work goes missing — see `merge_report` /
+`is_ancestor` below, which ask git rather than the registry, and which read
+nothing the rest of this module does not already read.
 """
 
 from __future__ import annotations
@@ -90,21 +96,46 @@ def _source_stamp() -> str:
 
 
 _IMPORT_STAMP = _source_stamp()
-_REMOTE_CACHE: dict = {"at": 0.0, "refs": []}
+
+#: `git ls-remote` per observed checkout: `{str(repo): {"at", "ok", "refs"}}`.
+#: Keyed by repo rather than global because a single flat dict silently served
+#: one checkout's refs for another — harmless for a dashboard that watches one
+#: repo, wrong for anything (tests included) that reads two inside the TTL.
+_REMOTE_CACHE: dict = {}
+#: `(repo, sha, head) -> "yes" | "no"`. Ancestry of a fixed commit pair can
+#: never change, so a hit is permanently valid and the 2s poll costs nothing
+#: after the first answer. "unknown" is deliberately NEVER cached: it means git
+#: could not answer, and a transient failure must not freeze into a verdict.
+#: The repo is part of the key because `make_repo`-style fixtures produce
+#: identical shas across different directories.
+_ANCESTRY_CACHE: dict = {}
+_SHALLOW_CACHE: dict = {}
 
 
-def _run(args, cwd=None, timeout=8):
+def _run_status(args, cwd=None, timeout=8):
+    """`(returncode, stdout)`. -1 on a launch failure or timeout.
+
+    The exit code is the payload for `git merge-base --is-ancestor`, whose whole
+    answer IS its status: 0 yes, 1 no, anything else "git could not tell you".
+    """
     # `git status` refreshes the index and rewrites `.git/index` as a side
     # effect, so a "read-only" tracker polling every 2s was in fact writing to
     # the repository it observes. `--no-optional-locks` exists for exactly this
     # case: it tells git not to take the index lock or write refreshed state.
+    # It is injected HERE, the single subprocess entry point, so a call added
+    # later cannot quietly skip it.
     if args and args[0] == "git":
         args = ["git", "--no-optional-locks", *args[1:]]
     try:
         p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-        return p.stdout if p.returncode == 0 else ""
+        return p.returncode, p.stdout
     except (subprocess.SubprocessError, OSError):
-        return ""
+        return -1, ""
+
+
+def _run(args, cwd=None, timeout=8):
+    code, out = _run_status(args, cwd=cwd, timeout=timeout)
+    return out if code == 0 else ""
 
 
 def _json(path: Path):
@@ -241,6 +272,157 @@ def _pending_inbox(repo: Path) -> list[dict]:
     return out
 
 
+#: How a task's side branch is named when nothing on disk says otherwise
+#: (`worker_env.py:330`, `worktree.branch_for`). Used ONLY to look a branch up;
+#: it never decides whether that branch is merged.
+BRANCH_PREFIX = "autoloop/"
+
+#: The four states a completed task can be in, in the order the page lists
+#: them. `unpublished` is not a normal state — it means the registry says done
+#: and no side branch exists anywhere — so it is shown rather than folded into
+#: one of the others.
+MERGE_STATES = ("merged", "unmerged", "unpublished", "unknown")
+
+
+def _is_shallow(repo: Path) -> bool:
+    key = str(repo)
+    if key not in _SHALLOW_CACHE:
+        out = _run(["git", "rev-parse", "--is-shallow-repository"], cwd=repo).strip()
+        _SHALLOW_CACHE[key] = out == "true"
+    return _SHALLOW_CACHE[key]
+
+
+def is_ancestor(repo: Path, sha: str, head: str) -> str:
+    """Is `sha` an ancestor of `head`? `"yes"` / `"no"` / `"unknown"`.
+
+    Git's own answer, not a guess: `merge-base --is-ancestor` exits 0 for yes
+    and 1 for no. That is the ONLY thing allowed to decide merged-ness here —
+    not the task status, not the execution record, not a branch-name match,
+    which are exactly what let seven finished-but-unmerged tasks read as done
+    on 2026-08-06.
+
+    Any other exit is triaged rather than guessed. The common one is 128, "not
+    a valid object name", and it is the PRODUCTION case rather than an edge:
+    workers commit in isolated repos and the publisher pushes from its own, so
+    the observed checkout usually has never seen a side branch's objects. The
+    inference that makes this feature work at all: **every ancestor of local
+    HEAD is in the local object database, so an object that is absent cannot be
+    one** — that is a definite "no", not an unknown. It is only unsound in a
+    shallow clone, where history is deliberately truncated, so that case is
+    probed and reported unknown instead. A repository git cannot read at all
+    stays unknown, because inventing "not merged" from a broken read would put
+    an alarming state on the page that nothing observed.
+    """
+    if not sha or not head:
+        return "unknown"
+    key = (str(repo), sha, head)
+    cached = _ANCESTRY_CACHE.get(key)
+    if cached:
+        return cached
+    code, _ = _run_status(["git", "merge-base", "--is-ancestor", sha, head], cwd=repo)
+    if code in (0, 1):
+        verdict = "yes" if code == 0 else "no"
+    elif _run_status(["git", "cat-file", "-e", sha + "^{commit}"], cwd=repo)[0] == 0:
+        # The object IS here and git still would not answer — something is
+        # wrong with the repository, so say so.
+        verdict = "unknown"
+    elif _run(["git", "rev-parse", "--verify", "--quiet", head + "^{commit}"], cwd=repo).strip():
+        # The object is absent and HEAD reads fine: absent cannot be reachable.
+        verdict = "unknown" if _is_shallow(repo) else "no"
+    else:
+        verdict = "unknown"
+    if verdict != "unknown":
+        _ANCESTRY_CACHE[key] = verdict
+        if len(_ANCESTRY_CACHE) > 4096:  # a long-lived process, not a leak
+            _ANCESTRY_CACHE.clear()
+    return verdict
+
+
+def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
+                 refs: dict, ancestor) -> list[dict]:
+    """One row per completed task: which of `MERGE_STATES` it is in, and why.
+
+    Pure resolution logic — `ancestor(sha) -> "yes"/"no"/"unknown"` is injected,
+    so the four states are decidable without a repository, while the git-facing
+    half stays in `is_ancestor` above.
+
+    Order of evidence, and why:
+
+    1. `refs` (what `git ls-remote` reported) gives the branch's published sha.
+       Ancestry against HEAD then answers merged vs not.
+    2. With no ref for the branch, the execution record's `candidate_sha` is
+       used as POSITIVE evidence only: if that commit is in HEAD, the work is
+       integrated whatever became of the branch (merged then deleted on origin
+       is ordinary). It can never produce "not merged" — the record is not
+       allowed to make a negative claim, which is the failure this replaces.
+    3. Otherwise: `unpublished` when the remote was readable and simply had no
+       such branch, `unknown` when it was not readable, because an unreachable
+       remote cannot distinguish "no branch" from "seven branches".
+    """
+    out = []
+    for task in completed:
+        task_id = task.get("id") or ""
+        record = executions.get(task_id) or {}
+        ref = str(record.get("intended_remote_ref") or "")
+        branch = (
+            ref[len("refs/heads/"):] if ref.startswith("refs/heads/")
+            else str(record.get("task_branch") or "") or f"{BRANCH_PREFIX}{task_id}"
+        )
+        published = refs.get(branch) or ""
+        candidate = str(record.get("candidate_sha") or "")
+        state, detail = "unknown", "origin unreachable — merged-ness unverified"
+        if published:
+            verdict = ancestor(published)
+            if verdict == "yes":
+                state, detail = "merged", f"{published[:12]} is an ancestor of HEAD"
+            elif verdict == "no":
+                state, detail = "unmerged", f"on origin at {published[:12]}, not in HEAD"
+            else:
+                state, detail = "unknown", "git could not resolve the branch against HEAD"
+        elif candidate and ancestor(candidate) == "yes":
+            state = "merged"
+            detail = f"no branch on origin; commit {candidate[:12]} is in HEAD"
+        elif remote_ok:
+            state = "unpublished"
+            detail = f"completed, but origin has no {branch} — the work was never pushed"
+        out.append({
+            "id": task_id, "title": task.get("title") or "", "branch": branch,
+            "sha": (published or candidate)[:12], "state": state, "detail": detail,
+        })
+    return out
+
+
+def merge_report(repo: Path, roadmap: list[dict], head: str,
+                 remote_ok: bool, refs: list[dict], branch: str) -> dict:
+    """The payload the page renders: rows plus a count per state.
+
+    Read-only and lock-free, like everything else here: the execution records
+    are read as plain JSON (a corrupt one is skipped, never raised — a tracker
+    that 500s because one record is half-written tells the operator nothing),
+    and every git call is a local read.
+    """
+    completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
+    executions = {}
+    records_dir = repo / ".autoloop" / "executions"
+    if records_dir.is_dir():
+        for path in sorted(records_dir.glob("*.json")):
+            record = _json(path)
+            if isinstance(record, dict):
+                executions[str(record.get("task_id") or path.stem)] = record
+    rows = merge_states(
+        completed, executions, remote_ok,
+        {r["ref"]: r.get("full") or r.get("sha") or "" for r in refs},
+        lambda sha: is_ancestor(repo, sha, head),
+    )
+    return {
+        "base_branch": branch or "HEAD",
+        "base_head": head[:12],
+        "remote_ok": remote_ok,
+        "counts": {s: sum(1 for r in rows if r["state"] == s) for s in MERGE_STATES},
+        "rows": rows,
+    }
+
+
 def pipeline(state: dict, agents: list, blockers: list) -> list[dict]:
     """The loop's stages, each with a state the page can render.
 
@@ -276,6 +458,36 @@ def pipeline(state: dict, agents: list, blockers: list) -> list[dict]:
         {"key": "publisher", "label": "Publisher", "detail": "exact-SHA push",
          "state": st(decision == "push" and phase == "executing")},
     ]
+
+
+def _remote_refs(repo: Path, ttl: int = 60) -> tuple[bool, list[dict]]:
+    """`(reachable, [{"ref","sha","full"}, …])` for `origin`, cached per repo.
+
+    `reachable` is the whole reason this returns a pair. A failed `ls-remote`
+    and a remote with no branches both produce an empty list, and the merge
+    column must NOT read those the same way: no branches means work was never
+    published, a failed lookup means nothing is known. Collapsing them would
+    invent an alarming state out of a network hiccup.
+
+    Cached for `ttl` seconds because the page polls every 2s and this is the
+    only call that touches the network.
+    """
+    entry = _REMOTE_CACHE.get(str(repo))
+    now = time.time()
+    if entry and now - entry["at"] <= ttl:
+        return entry["ok"], entry["refs"]
+    code, out = _run_status(["git", "ls-remote", "--heads", "origin"], cwd=repo, timeout=15)
+    refs = []
+    for line in out.splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref:
+            # `full` is what ancestry is asked about; `sha` stays the short
+            # display value the Git panel has always shown.
+            refs.append({"ref": ref.replace("refs/heads/", ""), "sha": sha[:12],
+                         "full": sha.strip()})
+    ok = code == 0
+    _REMOTE_CACHE[str(repo)] = {"at": now, "ok": ok, "refs": refs}
+    return ok, refs
 
 
 def collect(repo: Path) -> dict:
@@ -369,14 +581,7 @@ def collect(repo: Path) -> dict:
     branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo).strip()
     head = _run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
     dirty = len([x for x in _run(["git", "status", "--porcelain"], cwd=repo).splitlines() if x])
-    now = time.time()
-    if now - _REMOTE_CACHE["at"] > 60:
-        refs = []
-        for line in _run(["git", "ls-remote", "--heads", "origin"], cwd=repo, timeout=15).splitlines():
-            sha, _, ref = line.partition("\t")
-            if ref:
-                refs.append({"ref": ref.replace("refs/heads/", ""), "sha": sha[:12]})
-        _REMOTE_CACHE.update(at=now, refs=refs)
+    remote_ok, remote_refs = _remote_refs(repo)
 
     live_agents_cache = live_agents()
     ex = state.get("task_execution") or {}
@@ -405,7 +610,10 @@ def collect(repo: Path) -> dict:
         "inbox": _pending_inbox(repo),
         "app_tasks": app_tasks(repo),
         "pipeline": pipeline(state, live_agents_cache, blockers),
-        "git": {"branch": branch, "head": head[:12], "dirty": dirty, "remote": _REMOTE_CACHE["refs"]},
+        # Completed is not integrated: which finished tasks are actually in the
+        # branch, decided by git ancestry rather than by their status.
+        "merge": merge_report(repo, roadmap, head, remote_ok, remote_refs, branch),
+        "git": {"branch": branch, "head": head[:12], "dirty": dirty, "remote": remote_refs},
         "served_at": time.strftime("%H:%M:%S"),
         # `stale` means the file on disk has changed since this process
         # imported it — restart the dashboard to pick the change up.
@@ -448,6 +656,12 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink2
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
 .tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:11px 13px}
+/* The one tile allowed a status role, and only when the count is non-zero:
+   "finished work is not in your branch" IS a health verdict, unlike `phase` or
+   `iteration`. Reuses the existing --warning variable rather than declaring a
+   new colour, and the value still ships an icon + the word, so the border is
+   never the only thing saying it. */
+.tile.warn{border-color:var(--warning)}
 .k{font-size:11px;color:var(--ink2);text-transform:uppercase;letter-spacing:.06em}
 /* Proportional figures on standalone values — tabular-nums makes `121` look
    loose at display sizes. It belongs on columns that align vertically, which is
@@ -537,6 +751,21 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
          dark-mode contrast WARN on `critical` has its required relief. -->
     <details><summary>Table view — all stages as text</summary>
       <div id="flowtable" class="scroll"></div></details>
+  </section>
+
+  <!-- Directly under the pipeline, and the count is also a tile above it: the
+       sentence "N finished tasks are not in your branch" is the point of this
+       panel, and a number nobody scrolls to says nothing. -->
+  <section>
+    <h2>Merged into the branch — completed is published, not integrated</h2>
+    <div id="mergehead" style="font-size:13px;margin-bottom:9px"></div>
+    <div id="merged" class="scroll"></div>
+    <p class="muted" style="font-size:12px;margin:9px 0 0">
+      Merged means git's own answer: the branch sha is an ancestor of this
+      checkout's HEAD. Never the task status, the execution record or a name
+      match — those all read "done" for work that was only ever pushed to a side
+      branch. <b>unknown</b> means git could not answer (origin unreachable, or
+      the repository would not read); it is never reported as not-merged.</p>
   </section>
 
   <section>
@@ -686,13 +915,46 @@ function render(d, force){
     `${hi} ${d.health.label}` + (d.health.pids.length ? ` · pid ${d.health.pids.join(", ")}` : "");
 
   const t = d.task;
+  // Completed-but-not-in-the-branch, above the fold. The tile carries the icon
+  // and the word as well as the number, so the border colour is decoration.
+  const mg = d.merge || {counts:{}, rows:[], base_branch:"HEAD", base_head:""};
+  const mc = mg.counts || {};
+  const nUnmerged = mc.unmerged || 0, nUnknown = mc.unknown || 0;
   document.getElementById("tiles").innerHTML = [
     ["phase", d.session.phase], ["iteration", d.session.iteration],
     ["agents live", d.agents.length], ["open blockers", d.blockers.length],
     ["unit", t.id || "—"], ["candidate", t.candidate || "—"],
-  ].map(([k,v]) => `<div class="tile"><div class="k">${esc(k)}</div><div class="v">${esc(v ?? "—")}</div></div>`).join("");
+    ["not merged", (nUnmerged ? "▲ " : "✓ ") + nUnmerged, nUnmerged ? "warn" : ""],
+  ].map(([k,v,cls]) => `<div class="tile ${cls || ""}"><div class="k">${esc(k)}</div>`
+      + `<div class="v">${esc(v ?? "—")}</div></div>`).join("");
 
   drawFlow(d);
+
+  // ---- merged vs unmerged ------------------------------------------------
+  // Three real states plus unknown, every one of them icon + word: a colour
+  // alone could not tell "not published" from "not merged", and those need
+  // different actions (nothing was ever pushed vs it is pushed and stranded).
+  const MS = {merged:["✓","merged"], unmerged:["▲","NOT merged"],
+              unpublished:["○","not published"], unknown:["?","unknown"]};
+  const mrows = mg.rows || [];
+  const base = `${esc(mg.base_branch)} (${esc(mg.base_head || "?")})`;
+  const mergeHead = document.getElementById("mergehead");
+  mergeHead.innerHTML = (nUnmerged
+      ? `<b>▲ ${nUnmerged} completed task(s) are published but NOT in ${base}.</b> `
+        + `Their code is finished and is not in your branch.`
+      : `✓ none of the ${mrows.length} completed task(s) are missing from ${base}.`)
+    + (nUnknown ? ` <span class="muted">? ${nUnknown} unknown — git could not answer, `
+                  + `so they are not counted either way.</span>` : "")
+    + ((mc.unpublished || 0) ? ` <span class="muted">○ ${mc.unpublished} completed with `
+                               + `no side branch at all.</span>` : "");
+  document.getElementById("merged").innerHTML = rows(["task","branch","sha","state","why"],
+    mrows.map(r => {
+      const [ic, word] = MS[r.state] || MS.unknown;
+      return `<tr class="${r.state === "unmerged" ? "row-active" : ""}">
+        <td><code>${esc(r.id)}</code></td><td><code>${esc(r.branch)}</code></td>
+        <td><code>${esc(r.sha || "—")}</code></td><td>${esc(ic)} ${esc(word)}</td>
+        <td class="muted">${esc(r.detail)}</td></tr>`;
+    }).join(""));
 
   // ---- roadmap priority editor ------------------------------------------
   // Writes go to the task INBOX, never to tasks.json: the loop is the only
