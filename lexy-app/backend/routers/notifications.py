@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 
 from ..core.deps import get_current_user
 from ..database import get_pool
+from ..services import notification_service
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -29,17 +30,11 @@ async def _yield_unseen(pool, user_id):
 
     Yields one ": heartbeat\\n\\n" line when there are no unseen rows, so the
     SSE connection stays alive across idle polling cycles.
+
+    The SQL lives in `notification_service`; the ordering below is the part
+    that matters here and is deliberately kept in the router.
     """
-    rows = await pool.fetch(
-        """
-        SELECT notification_id, type, payload
-          FROM notification
-         WHERE user_id = $1::uuid
-           AND seen   = FALSE
-         ORDER BY created_at
-        """,
-        user_id,
-    )
+    rows = await notification_service.fetch_unseen(pool, user_id)
     if not rows:
         yield ": heartbeat\n\n"
         return
@@ -55,10 +50,7 @@ async def _yield_unseen(pool, user_id):
         yield f"data: {data}\n\n"
         # Mark seen AFTER the yield has resumed. If the consumer disconnected
         # mid-yield this never runs and the row stays in the queue.
-        await pool.execute(
-            "UPDATE notification SET seen = TRUE WHERE notification_id = $1",
-            row["notification_id"],
-        )
+        await notification_service.mark_seen(pool, row["notification_id"])
 
 
 @router.get("/stream")

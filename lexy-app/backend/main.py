@@ -75,11 +75,9 @@ async def lifespan(app: FastAPI):
     # remains as a final safety net so a pending-request scan can't crash startup.
     try:
         from .routers.content_requests import _spawn_pipeline
+        from .services import content_request_service
         pool = get_pool()
-        async with pool.acquire() as conn:
-            count = await conn.fetchval(
-                "SELECT COUNT(*) FROM content_request WHERE status = 'pending'"
-            )
+        count = await content_request_service.count_pending(pool)
         if count:
             await _spawn_pipeline()
     except (asyncpg.PostgresError, OSError) as exc:

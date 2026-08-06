@@ -16,6 +16,7 @@ import uuid
 
 
 from backend.routers.notifications import _yield_unseen
+from backend.services import notification_service
 from ._email_helper import make_test_email
 
 
@@ -138,6 +139,57 @@ async def test_yield_unseen_payload_parses_string_jsonb(db_pool):
         assert parsed["payload"] == payload
     finally:
         await gen.aclose()
+
+
+# ---------------------------------------------------------------------------
+# notification_service — the extracted SQL, driven directly (arch-05)
+#
+# The service is the plain fetch + the plain mark. The *ordering* that makes a
+# disconnect re-deliverable stays in _yield_unseen (see the tests above) — that
+# split is deliberate, so these tests deliberately assert nothing about it.
+# ---------------------------------------------------------------------------
+
+async def test_service_fetch_unseen_returns_unseen_oldest_first(db_pool):
+    user_id = await _make_user(db_pool)
+    n1 = await _insert_notification(db_pool, user_id, "channel_done", {"channel_id": "a"})
+    n2 = await _insert_notification(db_pool, user_id, "video_done",   {"video_id":   "b"})
+
+    rows = await notification_service.fetch_unseen(db_pool, user_id)
+
+    assert [r["notification_id"] for r in rows] == [n1, n2]
+    assert [r["type"] for r in rows] == ["channel_done", "video_done"]
+
+
+async def test_service_fetch_unseen_excludes_seen_rows(db_pool):
+    user_id = await _make_user(db_pool)
+    n1 = await _insert_notification(db_pool, user_id, "channel_done", {"channel_id": "a"})
+    n2 = await _insert_notification(db_pool, user_id, "video_done",   {"video_id":   "b"})
+
+    await notification_service.mark_seen(db_pool, n1)
+    rows = await notification_service.fetch_unseen(db_pool, user_id)
+
+    assert [r["notification_id"] for r in rows] == [n2]
+
+
+async def test_service_fetch_unseen_is_scoped_to_user(db_pool):
+    user_a = await _make_user(db_pool)
+    user_b = await _make_user(db_pool)
+    a_nid = await _insert_notification(db_pool, user_a, "channel_done", {"channel_id": "a"})
+
+    rows_b = await notification_service.fetch_unseen(db_pool, user_b)
+
+    assert all(r["notification_id"] != a_nid for r in rows_b)
+
+
+async def test_service_mark_seen_flips_only_that_row(db_pool):
+    user_id = await _make_user(db_pool)
+    n1 = await _insert_notification(db_pool, user_id, "channel_done", {"channel_id": "a"})
+    n2 = await _insert_notification(db_pool, user_id, "video_done",   {"video_id":   "b"})
+
+    await notification_service.mark_seen(db_pool, n1)
+
+    assert await _is_seen(db_pool, n1) is True
+    assert await _is_seen(db_pool, n2) is False
 
 
 # ---------------------------------------------------------------------------

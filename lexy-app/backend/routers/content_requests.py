@@ -11,6 +11,7 @@ from pydantic import BaseModel, model_validator
 
 from ..core.deps import get_current_user
 from ..database import get_pool
+from ..services import content_request_service
 
 router = APIRouter(prefix="/content-requests", tags=["content-requests"])
 
@@ -136,29 +137,14 @@ async def submit_request(
     Uniqueness is per-user (migration 029): a different user submitting the
     same (request_type, content_id) creates a separate row so each user can
     track their own request and receive their own notifications. Idempotency
-    for the *same* user is preserved via the ON CONFLICT below.
+    for the *same* user is preserved via the ON CONFLICT in the service.
     """
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO content_request (user_id, request_type, content_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id, request_type, content_id) DO UPDATE
-                SET status     = CASE WHEN content_request.status = 'failed'
-                                      THEN 'pending'
-                                      ELSE content_request.status END,
-                    error      = CASE WHEN content_request.status = 'failed'
-                                      THEN NULL
-                                      ELSE content_request.error END,
-                    updated_at = NOW()
-            RETURNING *
-            """,
-            current_user["user_id"],
-            body.request_type,
-            body.content_id,
-        )
-
-    result = dict(row)
+    result = await content_request_service.create_or_reset(
+        pool,
+        current_user["user_id"],
+        body.request_type,
+        body.content_id,
+    )
 
     # Only spawn if the request is actually pending (not already done/in-progress)
     if result["status"] == "pending":
@@ -173,13 +159,4 @@ async def list_requests(
     current_user: dict = Depends(get_current_user),
 ):
     """Return the current user's content requests, newest first."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT * FROM content_request
-            WHERE user_id = $1
-            ORDER BY created_at DESC
-            """,
-            current_user["user_id"],
-        )
-    return [dict(r) for r in rows]
+    return await content_request_service.list_for_user(pool, current_user["user_id"])
