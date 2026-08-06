@@ -7,7 +7,9 @@ import json
 import pytest
 
 from autoloop.contract import (
+    ACTIVE_DECISIONS,
     CONTRACT_INSTRUCTIONS,
+    RETIRED_DECISIONS,
     Decision,
     parse_response,
     verify_review,
@@ -118,9 +120,36 @@ def test_stop_parses():
     assert parse_response(block(base("stop"))).decision is Decision.STOP
 
 
-def test_ask_user_parses():
+# ---- ask_user: parseable legacy shape, unadvertised decision ---------------
+#
+# `ask_user` is retired at runtime — `PolicyEngine.authorize_directive` denies
+# it unconditionally. The PARSER keeps accepting it on purpose: that is what
+# lands a stale reply in the corrective-reprompt path carrying the retirement
+# reason, instead of an `unknown_decision` violation that never mentions it.
+
+
+def test_ask_user_still_parses_for_legacy_replies():
     directive = parse_response(block(base("ask_user", question="which DB?")))
+    assert directive.decision is Decision.ASK_USER
     assert directive.question == "which DB?"
+
+
+def test_ask_user_parses_without_a_question():
+    """The instructions no longer document `question`, so a reply that omits
+    it must still reach the policy layer — answering it with
+    `missing_field:question` would correct a field the contract stopped
+    asking for and never say the decision itself is retired."""
+    directive = parse_response(block(base("ask_user")))
+    assert directive.decision is Decision.ASK_USER
+    assert directive.question is None
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 42, ["which DB?"], {}])
+def test_ask_user_question_is_validated_when_present(bad):
+    """Optional is not unvalidated. Omitting the field is the legacy shape;
+    sending a junk one is malformed, and the parser never defaults or
+    stringifies it into `Directive.question`."""
+    expect_code(block(base("ask_user", question=bad)), "missing_field:question")
 
 
 def test_notes_accepted():
@@ -177,6 +206,18 @@ def test_wrong_version():
 
 def test_unknown_decision():
     expect_code(block(base("deploy_to_prod")), "unknown_decision")
+
+
+def test_unknown_decision_correction_lists_only_active_decisions():
+    """The correction is the reviewer's menu after a bad decision. Naming
+    `ask_user` there would offer the one decision policy refuses
+    unconditionally — a denied turn produced by the guidance itself."""
+    with pytest.raises(ContractError) as excinfo:
+        parse_response(block(base("deploy_to_prod")))
+    message = str(excinfo.value)
+    assert "ask_user" not in message
+    for decision in ACTIVE_DECISIONS:
+        assert decision.value in message
 
 
 def test_missing_reason():
@@ -248,10 +289,6 @@ def test_commit_paths_bad_types():
         block(base("commit", commit={"message": "m", "paths": []}, reviewed=REVIEWED)),
         "bad_type:commit.paths",
     )
-
-
-def test_question_required_for_ask_user():
-    expect_code(block(base("ask_user")), "missing_field:question")
 
 
 def test_scope_forbidden_outside_audit():
@@ -461,18 +498,38 @@ def test_contract_states_the_single_envelope_rule():
         assert forbidden in text
 
 
-@pytest.mark.parametrize("decision", [d.value for d in Decision])
-def test_contract_names_every_decision(decision):
+@pytest.mark.parametrize("decision", [d.value for d in ACTIVE_DECISIONS])
+def test_contract_names_every_active_decision(decision):
     """A decision the parser accepts but the instructions never mention is
     unreachable in practice."""
     assert decision in CONTRACT_INSTRUCTIONS
 
 
+@pytest.mark.parametrize("decision", sorted(d.value for d in RETIRED_DECISIONS))
+def test_contract_never_advertises_a_retired_decision(decision):
+    """The mirror of the test above, and the reason this file knows about
+    `ACTIVE_DECISIONS` at all. These instructions are appended to EVERY
+    outgoing message (`prompts.build_prompt`) — including the corrective
+    reprompt sent after a policy denial — so a retired decision left in the
+    menu is re-offered on the very turn spent refusing it."""
+    assert decision not in CONTRACT_INSTRUCTIONS
+
+
+def test_active_and_retired_decisions_partition_the_enum():
+    """Neither set may drift from `Decision`: a member in neither would be
+    parseable, unadvertised, and unaccounted for."""
+    assert set(ACTIVE_DECISIONS) | set(RETIRED_DECISIONS) == set(Decision)
+    assert not set(ACTIVE_DECISIONS) & set(RETIRED_DECISIONS)
+
+
 @pytest.mark.parametrize(
     "field",
+    # `question` is deliberately absent: it belonged to the retired `ask_user`
+    # and is documented nowhere now, though the parser still accepts it (see
+    # the ask_user section above). Every other top-level key is solicited.
     [
         "version", "decision", "reason", "scope", "tasks", "task_id",
-        "feedback", "commit", "reviewed", "question", "notes",
+        "feedback", "commit", "reviewed", "notes",
     ],
 )
 def test_contract_documents_every_top_level_field(field):

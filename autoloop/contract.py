@@ -44,7 +44,25 @@ class Decision(str, Enum):
     PUSH = "push"
     COMMIT_AND_PUSH = "commit_and_push"
     STOP = "stop"
+    #: Retired at runtime: `PolicyEngine.authorize_directive` denies it
+    #: unconditionally. It stays in the enum deliberately — the parser
+    #: accepting a stale `ask_user` reply is what routes it into the
+    #: budget-capped corrective-reprompt path carrying a reason that explains
+    #: the retirement, rather than into an `unknown_decision` violation that
+    #: says nothing about why the decision is unavailable.
     ASK_USER = "ask_user"
+
+
+#: Retired decisions: still parseable (above), never advertised (below).
+RETIRED_DECISIONS = frozenset({Decision.ASK_USER})
+#: The decisions the loop actually offers. Both pieces of guidance that
+#: enumerate decisions — `CONTRACT_INSTRUCTIONS` and the `unknown_decision`
+#: correction — are built from this, never from `Decision` itself. Every
+#: outgoing message re-sends the instructions verbatim (`prompts.build_prompt`),
+#: including the corrective reprompt after a denial, so advertising a decision
+#: that policy refuses would invite the same denial on the very turn spent
+#: correcting it.
+ACTIVE_DECISIONS = tuple(d for d in Decision if d not in RETIRED_DECISIONS)
 
 
 # Decisions that authorize executor work on a referenced task.
@@ -167,7 +185,7 @@ object with these keys and no others:
 
   version    (required) always 3
   decision   (required) one of: audit | plan | implement | revise | commit |
-             push | commit_and_push | stop | ask_user
+             push | commit_and_push | stop
   reason     (required) one short sentence explaining the decision
   scope      (audit only, optional) what the audit should focus on
   tasks      (required for plan) list of {id, title, description, depends_on?,
@@ -189,7 +207,6 @@ object with these keys and no others:
              Copy all three EXACTLY from the CONTEXT block of the request you
              are answering; never approve from memory. A stamp that does not
              match the reviewed state is rejected.
-  question   (required for ask_user) the question for the human operator
   notes      (optional) anything else worth recording
 
 Decisions:
@@ -203,8 +220,7 @@ Decisions:
   commit — commit the reviewed work; no push. task_id marks the task completed.
   push — push the current branch (the reviewed commit); no new commit.
   commit_and_push — commit, then push.
-  stop — end the loop.
-  ask_user — pause the loop and surface `question` to the human operator."""
+  stop — end the loop."""
 
 
 def _require_str(field: str, value: object) -> str:
@@ -341,9 +357,13 @@ def parse_response(text: str) -> Directive:
     try:
         decision = Decision(raw_decision)
     except ValueError:
+        # Enumerates ACTIVE_DECISIONS, not `Decision`: a correction that
+        # listed `ask_user` would be handing the reviewer a decision the
+        # policy engine refuses unconditionally. A literal `ask_user` reply
+        # never lands here — it parses, then gets the retirement denial.
         raise ContractError(
             "unknown_decision",
-            f"'{raw_decision}' is not one of {sorted(d.value for d in Decision)}",
+            f"'{raw_decision}' is not one of {sorted(d.value for d in ACTIVE_DECISIONS)}",
         ) from None
 
     reason = _require_str("reason", data.get("reason"))
@@ -430,7 +450,15 @@ def parse_response(text: str) -> Directive:
 
     question = None
     if decision is Decision.ASK_USER:
-        question = _require_str("question", question_raw)
+        # Optional, exactly like `scope` above, and for the retirement's sake:
+        # the instructions no longer ask for a question, so requiring one
+        # would answer a stale `ask_user` with `missing_field:question` — a
+        # correction naming a field the contract no longer documents, in
+        # place of the denial that says the decision itself is gone. Still
+        # validated when present: an omitted question is legacy, a
+        # present-but-empty one is malformed, and the two are not the same.
+        if question_raw is not None:
+            question = _require_str("question", question_raw)
     else:
         _forbid("question", question_raw, decision)
 
