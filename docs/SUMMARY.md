@@ -345,7 +345,7 @@ sandbox — recorded as open finding S24, on purpose.
 | `.env.example` | Env schema. Real `.env` is secrets — never read it. |
 | `.gitignore` | |
 | `requirements.txt` | Delegates to backend's requirements. |
-| `pytest.ini`, `conftest.py` | Pytest config; conftest adds `src/` to path. |
+| `pytest.ini` | Root pytest config. `testpaths = tests autoloop/tests` (a bare `pytest` covers both trees); `addopts = -p no:randomly -m "not isolated"` — the plugin block works around a spaCy/thinc seed conflict, the marker keeps the flaky-in-company test out of every shared run, and there is deliberately no `-n` here: parallelism belongs on the individual validation command (`autoloop/config.example.toml`) so it cannot silently reach the dedicated `-m isolated` run. There is no root `conftest.py`. |
 | `README.md` | Repo-root readme. |
 | `CLAUDE.md` | This project's master guide (read first). |
 | `docs/TODO.md` | Bugs + tasks, ordered by blocking dependency. |

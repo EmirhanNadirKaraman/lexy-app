@@ -108,8 +108,42 @@ agent_command = ["claude"]
 agent_timeout_seconds = 900.0
 max_parallel_agents = 3
 # Safe validation commands run before the agents (argv lists; binaries are
-# restricted to ruff/pytest/python/npm/npx/tsc — nothing that mutates).
-validation_commands = [["ruff", "check", "."], ["python3", "-m", "pytest", "autoloop/tests", "-q"], ["python3", "-m", "pytest", "tests/", "-q"]]
+# restricted to ruff/pytest/python/npm/npx/tsc — nothing that mutates). This is
+# also the DEFAULT for post-commit validation: every task that declares no
+# `validation` of its own has its committed tree graded by exactly this list,
+# re-run in full on EVERY round, including the rounds that end in a revise.
+#
+# Each command is reported separately ("<command>: PASS" / ": FAIL (<digest>)"),
+# so keeping the trees on separate lines keeps a failure attributable to one of
+# them rather than to "pytest".
+#
+# Three things on the pytest lines are load-bearing:
+#
+#   * `-n auto` — pytest-xdist, one worker per core. Run serially the two suites
+#     cost minutes of wall clock per round, paid against a change that usually
+#     touches two or three files. Needs `pytest-xdist` installed in the
+#     interpreter the loop invokes (root `requirements.txt` pulls it in via
+#     `lexy-app/backend/requirements.txt`); without it pytest exits 4 on an
+#     unrecognised argument and EVERY task fails validation, so check that
+#     first if validation starts refusing everything at once.
+#
+#   * `-p no:cacheprovider` — pytest writes `.pytest_cache/` the moment a test
+#     fails. Post-commit validation runs inside the task's own worker repo and
+#     the gate after it refuses a worktree validation dirtied, so one failing
+#     test produced two refusals instead of one (2026-08-03). Disabling the
+#     plugin keeps a failing run from mutating the tree it is grading.
+#
+#   * the last line runs the `isolated` marker, alone and SERIALLY. `pytest.ini`
+#     deselects that marker from every default run, so without a dedicated
+#     command the coverage silently disappears; and it stays off `-n auto`
+#     because the marker means "this test needs its own process", which is the
+#     one thing a shared parallel run cannot give it.
+validation_commands = [
+  ["ruff", "check", "."],
+  ["python3", "-m", "pytest", "autoloop/tests", "-q", "-n", "auto", "-p", "no:cacheprovider"],
+  ["python3", "-m", "pytest", "tests/", "-q", "-n", "auto", "-p", "no:cacheprovider"],
+  ["python3", "-m", "pytest", "autoloop/tests", "-q", "-m", "isolated", "-p", "no:cacheprovider"],
+]
 
 [paths]
 # Runtime state (state.json, tasks.json, transcript.jsonl, diagnostics/, PAUSE).

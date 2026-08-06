@@ -1467,6 +1467,8 @@ record what it actually reports rather than trusting a summed total.
 | `test_m1_hardening.py` | 58 | **New 2026-07-31 — worker-isolation hardening (`docs/AUTOLOOP.md` §4e, `docs/SECURITY.md` S23-S26); +6 across two rounds of same-day follow-up (S25/S26 addenda).** See the narrative entry above this table for the full description; self-contained, real git throughout, no shared fixtures imported from other test files. |
 | `test_blockers.py` | 15 | **New 2026-07-31 — continuous-mode blockers (`docs/AUTOLOOP.md` §9c).** A `task_fatal` park (review-round cap, driven directly through `_dispatch_executor` — real git, `WorktreeManager`-backed) quarantines only that task (`TaskRegistry.block`, `TaskState.BLOCKED_BY_OPERATOR`) and the NEXT ready task (`next_ready()`, asserted by id) is what `_select_and_kickoff` picks up; the block survives a fresh `TaskStore` reload (proving `_handle_parked_task`'s `task_store.save` isn't decorative). A `loop_fatal` park (pre-seeded `needs_user` state) stops `_run_continuous` (`rc == 2`) and leaves every task's status untouched. `_to_needs_user`'s default (`kind` unset) persists as `loop_fatal`/`unclassified`; a `None`/unrecognised `park_kind` on a pre-existing state file is treated as `loop_fatal` by `_handle_parked_task`, never task_fatal. `Blocker` round-trips through `BlockerStore` with the full question text; a corrupt record raises (`load`/`open_blockers`/`all_blockers` all propagate, never silently skip) EXCEPT inside `_summary`, which degrades to a `?` display rather than taking `status`/every park message down with it. `blockers`/`answer` CLI commands: listing shows id/task/question, `answer` resolves + unblocks a `task_fatal` blocker's task, refuses an unknown id and an already-resolved one (second answer never overwrites the first). Exhaustion (no ready task, unchanged fingerprint, >=1 open blocker) prints every open blocker and exits 0; with zero open blockers and everything blocked, `_run_continuous` still makes zero Claude/zero ChatGPT calls (counting fakes). `next_ready()`/`ready_tasks()` skip every blocked task with no changes to either method. A pre-existing `tasks.json` with no `blocked_reason` key loads, defaults to `""`, and supports `block()` immediately. Round-trip: block → `answer` → task READY → selected by `_select_and_kickoff` on the next pass. **Enforcement:** a quarantined task's id cannot be dispatched around — `policy.authorize_directive` denies `implement`/`revise` naming it directly (`task_blocked_by_operator`), and `TaskRegistry.mark_in_progress` refuses it too, defense in depth for any dispatch path that bypasses policy. |
 
+| `test_validation_parallelism.py` | 7 | **New 2026-08-06 (val-01) — the shipped validation list stays parallel, cache-free and honest about `isolated`.** Post-commit validation re-runs the full suites against the committed worker repo on EVERY round, revises included, so the list is read from `autoloop/config.example.toml` (the file an operator copies to `.autoloop/config.toml` — nothing else in the repo reads it, which is why it can rot unnoticed) rather than asserted against a literal. Pins: every shipped binary is in `SAFE_VALIDATION_BINARIES`, so no shipped command can be REFUSED unrun; the shared pytest commands carry `-n auto`; every pytest command carries `-p no:cacheprovider` (a failing test writing `.pytest_cache` into the worker repo turns one refusal into two — 2026-08-03); exactly one command runs `-m isolated`, and it carries no `-n`/`--numprocesses`, because the marker means "its own process"; `pytest.ini` `addopts` still deselects `isolated` and still carries no parallelism, since `-n` there would silently reach both the dedicated isolated run and `test_crash_safety.py`'s `--collect-only` subprocess. The seventh drives `run_validation_commands` over the real shipped list with one command failing, and asserts the summary still carries a `PASS`/`FAIL` report for each command by name, with the failing test named — parallelism lives inside a command, not across the report. |
+
 Fakes live in the test files themselves; `conftest.py` only inserts the repo
 root on `sys.path`.
 
@@ -2262,6 +2264,18 @@ Run all three. The lint step is not optional.
 > was made without a shell to run them in. Record what a real run reports; do
 > not sum the rows above (the same idiom as the autoloop section's own note).
 
+> **The loop runs the root trees in parallel; you can too (val-01, 2026-08-06).**
+> `autoloop/config.example.toml`'s `[audit].validation_commands` — the list
+> post-commit validation re-runs against a task's committed worker repo on every
+> round — carries `-n auto -p no:cacheprovider` on each pytest command, plus a
+> separate, deliberately SERIAL `-m isolated` run. The two flags are not
+> interchangeable with the plain command above: `-p no:cacheprovider` exists
+> because a failing test writes `.pytest_cache/` into the tree it is grading and
+> the gate after validation refuses a worktree validation dirtied. Adding `-n
+> auto` to your own run is safe; adding it to `pytest.ini`'s `addopts` is not —
+> it would reach the isolated run as well. Pinned by
+> `autoloop/tests/test_validation_parallelism.py`.
+>
 > **Backend command reconciled 2026-07-29:** it must be `python3 -m pytest`,
 > NOT the bare `pytest` entrypoint. `python -m` puts the cwd on `sys.path`,
 > which `tests/test_document_package.py` (A2, 107 tests) requires for its bare
