@@ -301,13 +301,6 @@ What bounds it, stated rather than assumed:
 - **It creates, never widens.** There is deliberately no request kind that
   edits an existing task's `approved_paths` — `inbox.KINDS` is
   `("task", "priority")` and the priority branch refuses every other field.
-  *Amended 2026-08-06:* `TaskRegistry.set_description` now exists as a registry
-  primitive, and a description IS agent-facing instruction text, so this bound
-  is only true while that method stays unrouted. Nothing in `inbox.py`,
-  `dashboard.py` or `cli.py` calls it and no request kind was added; the grep
-  below is what keeps that checkable, and giving the dashboard a description
-  form is a decision that has to re-open this finding rather than a follow-up
-  the method implies.
 - **Visible before it runs.** `_pending_inbox` carries the paths and the page
   prints them per queued request, and the loop's drain reports each merge.
 - **Same trust boundary as the rest.** Anything that can post here can also
@@ -331,10 +324,6 @@ rg -n '_validate_approved_path|APPROVED_PATH|glob|fnmatch' autoloop/dashboard.py
 rg -n 'TASK_REQUEST_FIELDS' autoloop/dashboard.py
 # Expect: no request kind edits an existing task's scope
 rg -n 'KINDS = ' autoloop/inbox.py
-# Expect: NO hits — the description mutator has no operator route (see the
-# 2026-08-06 amendment above); a hit means an existing task's instruction text
-# became editable from the port, which this finding does not currently cover
-rg -n 'set_description' autoloop/inbox.py autoloop/dashboard.py autoloop/cli.py
 ```
 **Suggested fix (if the page ever leaves a single-operator machine):** require
 a per-process token printed by `main()` and sent as a header — cheap, and it

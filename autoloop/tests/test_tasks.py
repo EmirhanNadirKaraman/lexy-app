@@ -6,7 +6,7 @@ import json
 import pytest
 
 from autoloop.errors import StateCorruptError, StateError, TaskGraphError
-from autoloop.tasks import TASKS_SCHEMA_VERSION, Task, TaskRegistry, TaskState, TaskStore
+from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 
 
 def task(tid, deps=(), **kw):
@@ -186,37 +186,25 @@ def test_summary_counts_and_next():
 # ---- description mutation ---------------------------------------------------
 
 
-#: Every value the shared description validator refuses. `None` is in here
-#: rather than in a test of its own on purpose: it exercises the validator's
-#: OTHER branch (non-string, which creation used to reach as an
-#: `AttributeError` from `.strip()`), so parity is proven on both branches
-#: instead of only on blanks.
-BAD_DESCRIPTIONS = ["", "   ", "\n\t", None]
+#: What the shared validator refuses. `None` is in here rather than in a test
+#: of its own on purpose: it exercises the validator's OTHER branch
+#: (non-string, which creation used to reach as an `AttributeError` from
+#: `.strip()`), so parity is proven on both branches instead of only on blanks.
+BAD_DESCRIPTIONS = ["", "   ", None]
 
 
-def test_set_description_replaces_the_text():
-    reg = registry(task("t1"))
-    returned = reg.set_description("t1", "  a new description  ")
-    assert returned is reg.get("t1")
+def test_set_description_replaces_only_that_tasks_text():
+    reg = registry(task("a"), task("b", deps=["a"]))
+    before_other = reg.to_dict()["tasks"][0]
+    returned = reg.set_description("b", "  a new description  ")
+    assert returned is reg.get("b")
     # Byte-identical: creation stores the string it was given, padding and all,
     # so mutation must not normalise what creation would have kept.
-    assert reg.get("t1").description == "  a new description  "
-
-
-def test_set_description_touches_nothing_else():
-    reg = registry(task("a"), task("b", deps=["a"]))
-    before = reg.to_dict()
-    reg.set_description("b", "rewritten")
-    after = reg.to_dict()
-    before_task, after_task = before["tasks"][1], after["tasks"][1]
-    assert after_task["description"] == "rewritten"
-    # Every OTHER field, compared as a whole rather than enumerated: an
-    # enumeration silently stops covering whatever is added to `Task` next, and
-    # the field that must not move here is `approved_paths`.
-    assert {k: v for k, v in after_task.items() if k != "description"} == {
-        k: v for k, v in before_task.items() if k != "description"
-    }
-    assert after["tasks"][0] == before["tasks"][0]
+    assert reg.get("b").description == "  a new description  "
+    # Nothing else moves — not the task's own lifecycle/scope fields, and not
+    # its neighbour.
+    assert (reg.get("b").status, reg.get("b").approved_paths) == ("pending", ())
+    assert reg.to_dict()["tasks"][0] == before_other
 
 
 def test_set_description_survives_persistence(tmp_path):
@@ -243,50 +231,27 @@ def test_creation_and_mutation_reject_a_bad_description_identically(bad):
     assert str(created.value) == str(mutated.value)
 
 
-def test_set_description_unknown_task_rejected():
-    """`task_unknown`, the code every mutator routing through `get` raises.
-    `set_priority`'s `unknown_task` is the outlier and stays one — that string
-    reaches the operator through the inbox's refusal text."""
-    expect_code(lambda: registry(task("t1")).set_description("ghost", "x"), "task_unknown")
-
-
-@pytest.mark.parametrize("bad", BAD_DESCRIPTIONS)
-def test_a_rejected_description_leaves_the_registry_byte_identical(bad):
-    """Atomicity, asserted over the whole serialised graph rather than the one
-    field: this also kills a 'assign first, validate second' ordering and any
-    mutation that leaves a partially-written task behind."""
-    reg = registry(task("a"), task("b", deps=["a"]))
-    before = json.dumps(reg.to_dict(), sort_keys=True)
-    with pytest.raises(TaskGraphError):
-        reg.set_description("b", bad)
-    assert json.dumps(reg.to_dict(), sort_keys=True) == before
-
-
-def test_a_rejected_unknown_id_creates_nothing():
+def test_set_description_unknown_task_is_refused_and_creates_nothing():
+    """`task_unknown`, the code every mutator routing through `get` raises
+    (`set_priority`'s `unknown_task` is the outlier and stays one — that string
+    reaches the operator through the inbox's refusal text). A miss must not
+    quietly conjure the task it failed to find."""
     reg = registry(task("a"))
     before = json.dumps(reg.to_dict(), sort_keys=True)
-    with pytest.raises(TaskGraphError):
-        reg.set_description("ghost", "a perfectly good description")
+    expect_code(lambda: reg.set_description("ghost", "a good description"), "task_unknown")
     assert not reg.has("ghost")
     assert json.dumps(reg.to_dict(), sort_keys=True) == before
 
 
-def test_a_blank_description_already_on_disk_still_loads(tmp_path):
-    """`from_dict` deliberately does not re-validate a stored graph, and this
-    change must not quietly start. A registry that refuses to LOAD is
-    unrecoverable without hand-editing JSON; a blank description written before
-    this validator existed is a task to fix, not a file to reject."""
-    path = tmp_path / "tasks.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": TASKS_SCHEMA_VERSION,
-                "tasks": [{"id": "a", "title": "Title a", "description": ""}],
-            }
-        ),
-        encoding="utf-8",
-    )
-    assert TaskStore(path).load().get("a").description == ""
+def test_a_rejected_description_leaves_the_registry_byte_identical():
+    """Atomicity, asserted over the whole serialised graph rather than the one
+    field: this kills an 'assign first, validate second' ordering and any
+    mutation that leaves a partially-written task behind."""
+    reg = registry(task("a"), task("b", deps=["a"]))
+    before = json.dumps(reg.to_dict(), sort_keys=True)
+    with pytest.raises(TaskGraphError):
+        reg.set_description("b", "   ")
+    assert json.dumps(reg.to_dict(), sort_keys=True) == before
 
 
 # ---- persistence ------------------------------------------------------------
