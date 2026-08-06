@@ -44,9 +44,20 @@ class Decision(str, Enum):
     PUSH = "push"
     COMMIT_AND_PUSH = "commit_and_push"
     STOP = "stop"
+    #: RETIRED — no longer offered by CONTRACT_INSTRUCTIONS, still parsed. A
+    #: live conversation that already saw the old instructions can answer
+    #: `ask_user` at any time; keeping the member means such a reply parks the
+    #: loop through `orchestrator._dispatch`'s ASK_USER branch instead of being
+    #: rejected as `unknown_decision` and re-prompted into a parse-retry budget.
     ASK_USER = "ask_user"
 
 
+# Decisions the contract still advertises, and the ones kept only so a reply
+# written against older instructions parses. Derived by subtraction, not
+# listed twice: a new enum member is ACTIVE unless it is explicitly retired,
+# so it can never end up in neither set.
+RETIRED_DECISIONS = frozenset({Decision.ASK_USER})
+ACTIVE_DECISIONS = frozenset(Decision) - RETIRED_DECISIONS
 # Decisions that authorize executor work on a referenced task.
 TASK_DECISIONS = frozenset({Decision.IMPLEMENT, Decision.REVISE})
 # Decisions that authorize a git commit.
@@ -66,6 +77,9 @@ _TOP_LEVEL_KEYS = {
     "feedback",
     "commit",
     "reviewed",
+    # Legacy: no longer documented in CONTRACT_INSTRUCTIONS, but still an
+    # accepted key — dropping it here would fail a legacy `ask_user` at
+    # `unknown_keys` before its own (retired) branch is ever reached.
     "question",
     "notes",
 }
@@ -154,6 +168,8 @@ class Directive:
     commit_message: str | None = None
     commit_paths: tuple[str, ...] | None = None
     reviewed: ReviewRef | None = None
+    #: Only ever set by the retired `ask_user` shape, and optional even there —
+    #: the contract no longer asks for it, so a legacy reply may omit it.
     question: str | None = None
     notes: str | None = None
 
@@ -167,7 +183,7 @@ object with these keys and no others:
 
   version    (required) always 3
   decision   (required) one of: audit | plan | implement | revise | commit |
-             push | commit_and_push | stop | ask_user
+             push | commit_and_push | stop
   reason     (required) one short sentence explaining the decision
   scope      (audit only, optional) what the audit should focus on
   tasks      (required for plan) list of {id, title, description, depends_on?,
@@ -189,7 +205,6 @@ object with these keys and no others:
              Copy all three EXACTLY from the CONTEXT block of the request you
              are answering; never approve from memory. A stamp that does not
              match the reviewed state is rejected.
-  question   (required for ask_user) the question for the human operator
   notes      (optional) anything else worth recording
 
 Decisions:
@@ -203,8 +218,7 @@ Decisions:
   commit — commit the reviewed work; no push. task_id marks the task completed.
   push — push the current branch (the reviewed commit); no new commit.
   commit_and_push — commit, then push.
-  stop — end the loop.
-  ask_user — pause the loop and surface `question` to the human operator."""
+  stop — end the loop."""
 
 
 def _require_str(field: str, value: object) -> str:
@@ -343,7 +357,11 @@ def parse_response(text: str) -> Directive:
     except ValueError:
         raise ContractError(
             "unknown_decision",
-            f"'{raw_decision}' is not one of {sorted(d.value for d in Decision)}",
+            # Active decisions only: the correction is what the model is told
+            # to choose from next, and naming a retired decision there would
+            # invite it back into use.
+            f"'{raw_decision}' is not one of "
+            f"{sorted(d.value for d in ACTIVE_DECISIONS)}",
         ) from None
 
     reason = _require_str("reason", data.get("reason"))
@@ -430,7 +448,12 @@ def parse_response(text: str) -> Directive:
 
     question = None
     if decision is Decision.ASK_USER:
-        question = _require_str("question", question_raw)
+        # Optional, not required: `question` is no longer documented, so a
+        # legacy reply may omit it (the orchestrator parks with a placeholder).
+        # Present-but-blank is still rejected — a park with an empty question is
+        # worse than one that admits it has none.
+        if question_raw is not None:
+            question = _require_str("question", question_raw)
     else:
         _forbid("question", question_raw, decision)
 
