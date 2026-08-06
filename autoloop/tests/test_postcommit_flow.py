@@ -707,10 +707,19 @@ def test_post_commit_reruns_the_tasks_own_validation_not_the_audit_set(tmp_path)
 
     Recorded through ONE runner shared by both ends, so "the same commands"
     is observed rather than asserted twice against two separate doubles.
+
+    Compared against the EFFECTIVE form (`effective_validation_command`, which
+    adds `-n auto` / `-p no:cacheprovider` to a pytest run — val-01,
+    2026-08-06) rather than the declared literal. Both ends normalize at the
+    same single point, `run_validation_commands`, so they still agree by
+    construction; this test is what proves the parallel flags reach the live
+    post-commit gate and not just the config template.
     """
     from autoloop.implement_executor import ImplementExecutor
+    from autoloop.validation import effective_validation_command
 
     DECLARED = (("pytest", "-q", "tests/test_thing.py"),)
+    EFFECTIVE = effective_validation_command(DECLARED[0])
     AUDIT_DEFAULT = (("ruff", "check", "."),)
     calls: list[tuple[tuple[str, ...], str]] = []
 
@@ -751,9 +760,14 @@ def test_post_commit_reruns_the_tasks_own_validation_not_the_audit_set(tmp_path)
     orch._dispatch(implement())
 
     ran = [argv for argv, _cwd in calls]
-    assert ran.count(DECLARED[0]) == 2, (
+    assert ran.count(EFFECTIVE) == 2, (
         f"expected the declared command before AND after the commit, saw {ran}"
     )
+    for argv in ran:
+        assert ("-n", "auto") in set(zip(argv, argv[1:])), (
+            "a validation run went serial — whatever a task declares, both ends "
+            f"run it in parallel: {' '.join(argv)}"
+        )
     assert AUDIT_DEFAULT[0] not in ran, (
         f"the audit default was substituted for the task's declared validation: {ran}"
     )

@@ -138,6 +138,15 @@ max_parallel_agents = 3
 #     command the coverage silently disappears; and it stays off `-n auto`
 #     because the marker means "this test needs its own process", which is the
 #     one thing a shared parallel run cannot give it.
+#
+# Both flags are also applied AT RUN TIME by `autoloop/validation.py`
+# (`effective_validation_commands`), to whatever list is configured here, to a
+# task's own declared `validation`, and to command lists persisted by sessions
+# that dispatched earlier. Nothing re-reads this template after you copy it, so
+# a config.toml written before a flag existed would otherwise never gain it.
+# Spelling them out here anyway keeps the file readable as what it does; a
+# command that already says `-n 0`, `-n 4` or `--numprocesses` is left exactly
+# as written, and marker selection is never rewritten.
 validation_commands = [
   ["ruff", "check", "."],
   ["python3", "-m", "pytest", "autoloop/tests", "-q", "-n", "auto", "-p", "no:cacheprovider"],
