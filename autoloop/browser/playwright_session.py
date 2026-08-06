@@ -8,6 +8,11 @@ with a dedicated, already-logged-in profile:
 It never launches a browser, never touches the login flow, and never sees
 credentials. `close()` only disconnects — the user's browser stays open.
 
+The one tab it will close on someone else's behalf is a DUPLICATE of the
+conversation it just bound to (`_reap_duplicates`, called from `connect`),
+because `close()` cannot run on an abrupt exit and those pile up. Every other
+tab in the profile is left alone.
+
 The Playwright driver itself is a per-process singleton (`_driver`): starting
 a second one while the first is alive is a hard error, so sessions share one
 and `close()` drops only the CDP connection.
@@ -149,7 +154,56 @@ class PlaywrightSession:
         opened_here = page is None
         if opened_here:
             page = context.new_page()
+        elif conversation_url:
+            cls._reap_duplicates(context, page, conversation_url)
         return cls(page, pw, PlaywrightError, browser, opened_page=opened_here)
+
+    @classmethod
+    def _reap_duplicates(cls, context, page, conversation_url: str) -> None:
+        """Close OTHER tabs sitting on the conversation we just bound to.
+
+        `close()` already closes the tab it opened, but it has to RUN, and it
+        does not when the process ends abruptly — every pause-and-exit, kill or
+        crash, plus `doctor` and any ad-hoc probe. `_drop_client` swallows a
+        failed `close()` by design, so nothing notices. Tabs therefore pile up
+        in the profile until Chrome is restarted (observed 2026-08-04: two tabs
+        on the SAME conversation, one of them orphaned).
+
+        Reaping here is the same shape as `autoloop start` repairing a provably
+        stale lock: clean up what is demonstrably orphaned, leave anything
+        ambiguous alone. Hence three bounds, all load-bearing:
+
+        * ONLY duplicates of the conversation this session bound to. A tab on a
+          DIFFERENT chat may be deliberate — an operator reading a past
+          conversation — and must survive.
+        * NEVER the bound page, compared by IDENTITY. A duplicate has the same
+          URL by definition, so a URL comparison would skip exactly the tab
+          this exists to close.
+        * Only for a CONFIGURED conversation, and only in the context we bound
+          in. The caller with no conversation in hand (`doctor`, the smoke
+          test) picked its page by bare substring, so "duplicates of whatever
+          we landed on" is precisely the ambiguous case. That costs no
+          coverage: a tab `doctor` orphans on the configured conversation is
+          reaped by the next loop `connect`, which does pass one.
+
+        Safe only because `~/.autoloop-chrome` is a dedicated profile. Never
+        generalise this to an arbitrary CDP endpoint — that could be a human's
+        main browser, full of their own tabs.
+        """
+        # list(): closing a page mutates `context.pages` in real Playwright.
+        for candidate in list(context.pages):
+            if candidate is page:
+                continue
+            try:
+                # The URL read is inside the try too — a dying page raises on
+                # that, not only on close(). Best-effort per candidate, like
+                # the existing teardown: one stray that refuses to close must
+                # not abort the connect, nor stop the remaining strays being
+                # reaped.
+                if cls._same_conversation(conversation_url, candidate.url):
+                    candidate.close()
+            except Exception:
+                pass
 
     def _call(self, fn):
         try:
