@@ -6,7 +6,7 @@ import json
 import pytest
 
 from autoloop.errors import StateCorruptError, StateError, TaskGraphError
-from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
+from autoloop.tasks import TASKS_SCHEMA_VERSION, Task, TaskRegistry, TaskState, TaskStore
 
 
 def task(tid, deps=(), **kw):
@@ -181,6 +181,112 @@ def test_summary_counts_and_next():
     assert "1 ready" in text
     assert "0 blocked" in text
     assert "next ready: b" in text
+
+
+# ---- description mutation ---------------------------------------------------
+
+
+#: Every value the shared description validator refuses. `None` is in here
+#: rather than in a test of its own on purpose: it exercises the validator's
+#: OTHER branch (non-string, which creation used to reach as an
+#: `AttributeError` from `.strip()`), so parity is proven on both branches
+#: instead of only on blanks.
+BAD_DESCRIPTIONS = ["", "   ", "\n\t", None]
+
+
+def test_set_description_replaces_the_text():
+    reg = registry(task("t1"))
+    returned = reg.set_description("t1", "  a new description  ")
+    assert returned is reg.get("t1")
+    # Byte-identical: creation stores the string it was given, padding and all,
+    # so mutation must not normalise what creation would have kept.
+    assert reg.get("t1").description == "  a new description  "
+
+
+def test_set_description_touches_nothing_else():
+    reg = registry(task("a"), task("b", deps=["a"]))
+    before = reg.to_dict()
+    reg.set_description("b", "rewritten")
+    after = reg.to_dict()
+    before_task, after_task = before["tasks"][1], after["tasks"][1]
+    assert after_task["description"] == "rewritten"
+    # Every OTHER field, compared as a whole rather than enumerated: an
+    # enumeration silently stops covering whatever is added to `Task` next, and
+    # the field that must not move here is `approved_paths`.
+    assert {k: v for k, v in after_task.items() if k != "description"} == {
+        k: v for k, v in before_task.items() if k != "description"
+    }
+    assert after["tasks"][0] == before["tasks"][0]
+
+
+def test_set_description_survives_persistence(tmp_path):
+    store = TaskStore(tmp_path / "tasks.json")
+    reg = registry(task("a"))
+    reg.set_description("a", "the rewritten description")
+    store.save(reg)
+    assert store.load().get("a").description == "the rewritten description"
+
+
+@pytest.mark.parametrize("bad", BAD_DESCRIPTIONS)
+def test_creation_and_mutation_reject_a_bad_description_identically(bad):
+    """The point of extracting `_validate_description`: the two paths must be
+    the SAME check, not two checks that happen to agree today. Comparing the
+    message as well as the code is what makes that load-bearing — a
+    re-implemented check would almost certainly word its refusal differently,
+    and this fails the moment mutation stops calling what creation calls."""
+    with pytest.raises(TaskGraphError) as created:
+        registry(Task(id="t1", title="Title t1", description=bad))
+    reg = registry(task("t1"))
+    with pytest.raises(TaskGraphError) as mutated:
+        reg.set_description("t1", bad)
+    assert created.value.code == mutated.value.code == "empty_task_field"
+    assert str(created.value) == str(mutated.value)
+
+
+def test_set_description_unknown_task_rejected():
+    """`task_unknown`, the code every mutator routing through `get` raises.
+    `set_priority`'s `unknown_task` is the outlier and stays one — that string
+    reaches the operator through the inbox's refusal text."""
+    expect_code(lambda: registry(task("t1")).set_description("ghost", "x"), "task_unknown")
+
+
+@pytest.mark.parametrize("bad", BAD_DESCRIPTIONS)
+def test_a_rejected_description_leaves_the_registry_byte_identical(bad):
+    """Atomicity, asserted over the whole serialised graph rather than the one
+    field: this also kills a 'assign first, validate second' ordering and any
+    mutation that leaves a partially-written task behind."""
+    reg = registry(task("a"), task("b", deps=["a"]))
+    before = json.dumps(reg.to_dict(), sort_keys=True)
+    with pytest.raises(TaskGraphError):
+        reg.set_description("b", bad)
+    assert json.dumps(reg.to_dict(), sort_keys=True) == before
+
+
+def test_a_rejected_unknown_id_creates_nothing():
+    reg = registry(task("a"))
+    before = json.dumps(reg.to_dict(), sort_keys=True)
+    with pytest.raises(TaskGraphError):
+        reg.set_description("ghost", "a perfectly good description")
+    assert not reg.has("ghost")
+    assert json.dumps(reg.to_dict(), sort_keys=True) == before
+
+
+def test_a_blank_description_already_on_disk_still_loads(tmp_path):
+    """`from_dict` deliberately does not re-validate a stored graph, and this
+    change must not quietly start. A registry that refuses to LOAD is
+    unrecoverable without hand-editing JSON; a blank description written before
+    this validator existed is a task to fix, not a file to reject."""
+    path = tmp_path / "tasks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": TASKS_SCHEMA_VERSION,
+                "tasks": [{"id": "a", "title": "Title a", "description": ""}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert TaskStore(path).load().get("a").description == ""
 
 
 # ---- persistence ------------------------------------------------------------
