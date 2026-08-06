@@ -341,7 +341,8 @@ sandbox — recorded as open finding S24, on purpose.
 | Path | Purpose |
 |---|---|
 | `Procfile` | `web: uvicorn backend.main:app` |
-| `.github/workflows/dependency-audit.yml` | The repo's CI (S15). `pip-audit` (backend) + `npm audit` (frontend) on push/PR to main + weekly cron. |
+| `.github/workflows/dependency-audit.yml` | Dependency CI (S15). `pip-audit` (backend) + `npm audit` (frontend) on push/PR to main + weekly cron. |
+| `.github/workflows/tests.yml` | Test CI (rt-10). `ruff check .`, `pytest tests/`, `pytest autoloop/tests` (+ the `isolated` marker run) on push/PR to main. The backend suite is **not** gated — blocked by hb-01; see the CI section of `docs/TESTS.md`. |
 | `.env.example` | Env schema. Real `.env` is secrets — never read it. |
 | `.gitignore` | |
 | `requirements.txt` | Delegates to backend's requirements. |

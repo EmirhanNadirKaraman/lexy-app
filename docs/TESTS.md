@@ -2271,6 +2271,62 @@ Run all three. The lint step is not optional.
 > here predated the A2/backfill work; the 221 root figure predated the
 > evaluation-harness tests — both were stale doc claims, now measured.)
 
+### CI — `.github/workflows/tests.yml` (rt-10, 2026-08-06)
+
+Until this landed, the table above was a convention enforced by whoever
+remembered it. The workflow runs it on every push and pull request to `main`,
+one job per command so a failure names its own suite:
+
+| Job | Command(s) | Notes |
+|---|---|---|
+| `lint` | `ruff check .` *(repo root)* | ruff installed at the pin read out of `lexy-app/backend/requirements.txt`, so a bump there moves CI with it instead of silently diverging |
+| `pipeline` | `python3 -m pytest tests/ -q` | installs the full backend requirement set, then downloads three spaCy models |
+| `autoloop` | `python3 -m pytest autoloop/tests -q`, then `python3 -m pytest autoloop/tests -q -m isolated -p no:cacheprovider` | both steps blocking |
+
+Deliberate choices, so they don't get "fixed" back:
+
+- **CI runs the two split rows, not the bare root `pytest`.** Same files and
+  the same `addopts` either way — `testpaths` is exactly those two trees — but
+  in separate processes, so the duplicate-module-basename collision
+  `pytest.ini` warns about cannot occur and a red job names the tree that
+  broke. Coverage identical, attribution better. The bare command remains the
+  right one to type locally.
+- **The `isolated` step is blocking, not decoration.** Root `pytest.ini`
+  justifies excluding that test from the shared run by saying the coverage "is
+  still enforced" because it runs separately. If CI is the gate and CI skips
+  it, that sentence stops being true.
+- **spaCy models are downloaded, not skipped.** `de_core_news_sm` is a hard
+  requirement — `subtitle-scraper/phrase_finder.py:15` loads it at module
+  scope, so its absence is a collection error, not a skip. `de_core_news_md`
+  and `es_core_news_sm` back fixtures that *do* skip cleanly, which is why they
+  are installed too: a green job that quietly skipped a third of its assertions
+  is the drift this workflow exists to catch. `en_core_web_sm` is only asserted
+  as a config string (`tests/test_language_config.py:47`) and is not installed.
+- **`python3 -m pytest` everywhere**, matching the backend note above and
+  `pytest.ini`'s own isolated-test invocation.
+- **No expected pass counts in the workflow or in this section.** Green/red is
+  the signal; the counts live in the table above and are only ever written from
+  a measured run.
+
+**The backend suite is not gated, and that is hb-01, not an oversight.** Every
+backend test pulls the autouse `cleanup` fixture (`tests/conftest.py:67`),
+which takes `db_pool`, so there is no DB-free subset to run — and the database
+itself cannot be built from this repo: `video`, `word_table` and eight more
+tables are `ALTER`ed by migrations but never `CREATE`d, so `alembic upgrade
+head` fails at revision 006 on an empty database (`006_video_channel_genre.py:16`
+against no `CREATE TABLE video` anywhere in the 37 revisions). A job that
+cannot pass would make the gate red on its first run and train everyone to
+ignore it; a job gated to *skip* is worse, because branch protection scores a
+skip as a success. The workflow header records what to add once hb-01 is
+resolved (a `postgres:16` service, `alembic upgrade head`, then
+`python3 -m pytest -n auto`). Until then, **CI green does not mean the backend
+suite passed** — run it locally.
+
+**Frontend vitest is also not in this workflow.** It is not one of the Python
+validation commands rt-10 was scoped to, and `npm audit` already runs in
+`dependency-audit.yml`. `npm run build` + `npx vitest run` remain ungated — a
+separate gap, deliberately left named rather than half-closed.
+
 How the backend baseline got to 847, newest last:
 
 | Count | What landed |
