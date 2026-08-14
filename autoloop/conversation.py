@@ -33,6 +33,18 @@ implements only the protocol above stays valid:
 * **Rotation** — `retarget(url)` + `current_url()` let the orchestrator move an
   in-flight request to a replacement conversation. Without them, a wedged
   conversation parks instead of rotating.
+* **Chunked delivery** — `supports_chunked_delivery` declares that this adapter
+  holds ONE persistent conversation, so a review packet whose diff is too large
+  for a single message may be deposited as numbered parts before the message
+  that asks for a verdict. An adapter that does not declare it gets the
+  historical behaviour: the diff is omitted with a notice saying so. The
+  declaration is a claim about shared history, not about size limits — a
+  transport whose every turn is a separate process (`codex.conversation`) must
+  not set it, because parts sent to it would be reviewed as separate fragments.
+* **Mounting the message tail** — `mount_message_tail()` scrolls older turns
+  into a virtualized message list, so a readback does not conclude a message is
+  absent when it is merely unmounted. Optional and best-effort: its failures
+  are swallowed, and an adapter without it simply reads what is rendered.
 """
 
 from __future__ import annotations

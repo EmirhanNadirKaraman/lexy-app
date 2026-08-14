@@ -155,7 +155,13 @@ from .manifest import ManifestStore
 from .executor import ExecutionOutcome, TaskExecutor
 from . import heartbeat
 from .git_gateway import GitGateway
-from .packet import build_review_packet
+from .packet import (
+    DIFF_INCLUDE_MAX_CHARS,
+    build_review_packet_with_diff,
+    omission_payload,
+    payload_carries_diff,
+    plan_chunked_delivery,
+)
 from .policy import PolicyEngine, Verdict
 from .publisher import Publisher, redact_url
 from .worker_env import verify_worker_isolation, worker_env
@@ -170,6 +176,7 @@ from .prompts import (
 )
 from .state import (
     TERMINAL_PHASES,
+    ChunkedDelivery,
     LastResponse,
     LoopState,
     PendingRequest,
@@ -446,6 +453,8 @@ class Orchestrator:
     def _step(self, phase: Phase) -> None:
         if phase is Phase.READY:
             self._step_ready()
+        elif phase is Phase.DELIVERING:
+            self._step_delivering()
         elif phase is Phase.SUBMITTING:
             self._step_submitting()
         elif phase is Phase.SUBMISSION_UNCONFIRMED:
@@ -478,6 +487,19 @@ class Orchestrator:
         if state.outbox is None:
             raise StateError("phase=ready but outbox is empty — nothing to send")
         request_id = f"alr-{state.session_id[:8]}-{next_iteration:04d}"
+        # Planned BEFORE the context is built, because a payload that cannot be
+        # chunked is rewritten to the omission form in here — and the hash has
+        # to cover the packet as it finally stands, not the one that was ruled
+        # out.
+        #
+        # The hash then covers `state.outbox`: the COMPLETE logical packet,
+        # patch inline, whether or not that patch fits in one message.
+        # `sent_payload` is what actually goes out; the two differ only when the
+        # patch is being deposited as parts first, and the abridged message
+        # names every part id. Hashing the DELIVERED message instead would let
+        # an approval bind to a review of less than the whole change — the
+        # replay gap `report_sha256` exists to close.
+        plan = self._plan_delivery(state, request_id)
         ctx = build_context(
             state,
             self._git,
@@ -486,7 +508,8 @@ class Orchestrator:
             state.outbox,
             executions=self._execution_store,
         )
-        prompt = build_prompt(request_id, next_iteration, render_context(ctx), state.outbox)
+        sent_payload = plan.final_payload if plan is not None else state.outbox
+        prompt = build_prompt(request_id, next_iteration, render_context(ctx), sent_payload)
         postcommit = self._current_pending_postcommit(state.outbox, ctx.report_sha256)
         changeset = self._current_pending_changeset(state.outbox, ctx.report_sha256)
         if state.changeset and (state.changeset or {}).get("candidate_sha") and changeset is None:
@@ -538,6 +561,23 @@ class Orchestrator:
             # minutes old and killed the run (2026-08-03, twice).
             conversation_url=state.conversation_url,
             conversation_epoch=state.conversation_epoch,
+            delivery=(
+                ChunkedDelivery(
+                    parts=[
+                        {
+                            "part_id": part.part_id,
+                            "index": part.index,
+                            "total": part.total,
+                            "text": part.text,
+                        }
+                        for part in plan.parts
+                    ],
+                    delivered=0,
+                    fallback_payload=plan.fallback_payload,
+                )
+                if plan is not None
+                else None
+            ),
         )
         if postcommit is not None:
             # Bind the exact report this candidate was reviewed under, on the
@@ -549,8 +589,14 @@ class Orchestrator:
                 execution.review_request_id = request_id
                 self._execution_store.save(execution)
         state.outbox = None
+        state.outbox_diff = None
         state.iteration = next_iteration
-        state.phase = Phase.SUBMITTING.value
+        # A chunked packet deposits its parts BEFORE anything is asked. The
+        # verdict message is `submitting`'s job and stays untouched: it is only
+        # reached from `delivering` once every part is confirmed.
+        state.phase = (
+            Phase.DELIVERING.value if plan is not None else Phase.SUBMITTING.value
+        )
         self._log(
             "request_prepared",
             request_id=request_id,
@@ -560,8 +606,275 @@ class Orchestrator:
                 "report_sha256": ctx.report_sha256,
                 "timestamp": ctx.timestamp,
                 "chars": len(prompt),
+                "diff_parts": len(plan.parts) if plan is not None else 0,
             },
         )
+        self._store.save(state)
+
+    def _plan_delivery(self, state: LoopState, request_id: str):
+        """Decide how `state.outbox` reaches the reviewer, and normalise the
+        outbox to match that decision BEFORE anything hashes it.
+
+        Returns a `packet.DeliveryPlan` when the payload's patch is too large
+        for one message and CAN be delivered as numbered parts; `None`
+        otherwise. `None` covers two very different situations, and the
+        difference is already resolved by the time it is returned:
+
+        * the ordinary case — no oversized patch, `state.outbox` is sent as it
+          stands, exactly as before chunking existed;
+        * chunking was ruled out (the stored patch does not match the payload,
+          a part id would collide with the request id, or the patch needs more
+          parts than `packet.DIFF_MAX_PARTS`) — `state.outbox` is REWRITTEN to
+          the omission notice here, so the caller cannot accidentally send a
+          payload that was already known not to fit.
+
+        The provider's ability to deliver parts at all is deliberately NOT
+        checked here: it is a property of the live client, and this phase must
+        stay transport-free. `_step_delivering` probes it and falls back on the
+        first step instead.
+        """
+        diff = (state.outbox_diff or "").strip()
+        if not state.outbox or not diff:
+            return None
+        if not payload_carries_diff(state.outbox, diff):
+            # The recorded patch is not inside THIS payload — a packet queued
+            # by `_finish_postcommit` was replaced before it was sent (a git
+            # failure re-prompt, an operator edit, a hand-modified state file).
+            # Drop the stale patch rather than rewrite an unrelated payload
+            # around it; nothing here is oversized as far as we can prove.
+            state.outbox_diff = None
+            self._log(
+                "review_diff_plan_skipped",
+                request_id=request_id,
+                data={"reason_code": "diff_not_in_payload", "diff_chars": len(diff)},
+            )
+            return None
+        if len(diff) <= DIFF_INCLUDE_MAX_CHARS:
+            return None  # fits in one message: nothing to plan, nothing to omit
+        task_exec = state.task_execution or {}
+        plan = plan_chunked_delivery(
+            state.outbox,
+            diff,
+            request_id,
+            task_id=str(task_exec.get("task_id", "")),
+            candidate_sha=str(task_exec.get("candidate_sha", "")),
+        )
+        if plan is None:
+            state.outbox = omission_payload(state.outbox, diff)
+            self._log(
+                "review_diff_omitted",
+                request_id=request_id,
+                data={"reason_code": "not_chunkable", "diff_chars": len(diff)},
+            )
+        return plan
+
+    def _step_delivering(self) -> None:
+        """Deposit an oversized packet's diff as numbered parts, then hand the
+        verdict request to `submitting`.
+
+        Three rules, and they are what make this safe rather than merely
+        clever:
+
+        1. **All or nothing.** No decision is requested until every part is
+           confirmed present. A half-delivered patch plus a verdict is approval
+           on a partial diff — strictly worse than omitting the diff, because
+           the omission notice at least tells the reviewer exactly what it
+           cannot see. The transition to `submitting` happens after the loop
+           below, never inside it, and `_step_submitting` re-checks the same
+           condition rather than trusting the transition.
+        2. **Fall back to omission on any failure.** A part that does not land
+           sends the pre-chunking notice — which now also disowns whatever
+           parts DID land — instead of proceeding with what arrived.
+        3. **The integrity binding is untouched.** `report_sha256` covers the
+           complete logical packet (`req.payload`, patch inline); the parts and
+           the abridged verdict message are both derived from it. A fallback
+           re-renders that packet and re-stamps every place its digest is held
+           (`_fall_back_to_omission`), so the hash never describes something
+           other than what the reviewer was shown.
+
+        Confirmation is by READBACK from persisted history, the same standard a
+        submission is held to — a part is confirmed because the conversation
+        shows it, never because the send returned.
+        """
+        state = self.state
+        req = state.pending_request
+        if req is None:
+            raise StateError("phase=delivering but no pending request")
+        delivery = req.delivery
+        if delivery is None or not delivery.parts:
+            raise StateError(
+                f"phase=delivering but request {req.request_id} carries no delivery "
+                "plan — there is nothing to deliver and nothing that authorises "
+                "asking for a verdict"
+            )
+        client = self._client_for_request(req)
+        client.attach()
+        if not getattr(client, "supports_chunked_delivery", False):
+            # Probed, not assumed. A provider whose "conversation" is a fresh
+            # process per turn (`codex.conversation`) accumulates no shared
+            # history, so parts sent to it would be separate reviews of
+            # fragments rather than one review of the whole patch. Falling back
+            # is the pre-chunking behaviour for that provider, not a
+            # regression.
+            self._fall_back_to_omission(req, reason_code="provider_cannot_chunk")
+            return
+
+        while delivery.delivered < len(delivery.parts):
+            part = delivery.parts[delivery.delivered]
+            part_id = str(part.get("part_id", ""))
+            if not self._deliver_part(client, req, part_id, str(part.get("text", ""))):
+                self._fall_back_to_omission(
+                    req, reason_code="part_not_confirmed", part_id=part_id
+                )
+                return
+            delivery.delivered += 1
+            # Persisted per part, so a crash resumes at the first UNCONFIRMED
+            # part instead of re-posting the ones already in the conversation.
+            self._store.save(state)
+            self._log(
+                "review_part_delivered",
+                request_id=req.request_id,
+                data={
+                    "part_id": part_id,
+                    "index": delivery.delivered,
+                    "total": len(delivery.parts),
+                    "chars": len(str(part.get("text", ""))),
+                },
+            )
+
+        self._log(
+            "review_parts_complete",
+            request_id=req.request_id,
+            data={"parts": len(delivery.parts), "part_ids": delivery.part_ids()},
+        )
+        state.phase = Phase.SUBMITTING.value
+        self._store.save(state)
+
+    def _deliver_part(self, client, req: PendingRequest, part_id: str, text: str) -> bool:
+        """Send one part and report whether persisted history now shows it.
+
+        `submit`'s own return value is deliberately not the verdict. A part
+        asks for nothing, so no assistant turn starts for it and the browser
+        transport reports UNCONFIRMED after its submit timeout — which is the
+        EXPECTED outcome here, not an ambiguity to park a human on. What
+        settles it is the same thing that settles a submission: a reload, and
+        the id being there afterwards.
+        """
+        if self._part_present(client, part_id):
+            # Already in the conversation: a resumed delivery, or a send whose
+            # confirmation the previous process never got to record.
+            return True
+        result = client.submit(part_id, text)
+        if result is SubmitResult.ALREADY_PERSISTED:
+            return True
+        confirmed = client.reconcile(part_id) or self._part_present(client, part_id)
+        if not confirmed:
+            self._log(
+                "review_part_absent",
+                request_id=req.request_id,
+                data={
+                    "part_id": part_id,
+                    "submit_result": getattr(result, "value", str(result)),
+                    "observations": self._observation_summary(client),
+                },
+            )
+        return confirmed
+
+    @staticmethod
+    def _part_present(client, part_id: str) -> bool:
+        """Is `part_id` in the conversation as the loop can currently read it?
+
+        Mounts the virtualized message tail first, when the provider offers
+        that. ChatGPT renders only the newest few turns into the DOM
+        (docs/AUTOLOOP.md §11), so a part several turns back can be present
+        server-side and absent from `innerText` — and a rendered-but-unpainted
+        message reading as missing is exactly how a complete delivery would be
+        thrown away and replaced by an omission notice.
+
+        Probed with `getattr`, like every other optional transport capability,
+        and its ordinary failures are swallowed: mounting more history can only
+        ever ADD evidence, so it must never be able to turn a present part into
+        an absent one by raising.
+
+        `BrowserError` is deliberately NOT swallowed. Its subclasses are the
+        two conditions the loop routes rather than retries — a logged-out
+        profile (`LoginExpiredError`, which no amount of scrolling fixes) and a
+        wedged conversation (`ConversationUnusableError`, which authorizes a
+        rotation). Eating those here would demote a routed fault into a silent
+        "the part is absent", and the loop would answer a login prompt by
+        omitting a diff.
+        """
+        mount = getattr(client, "mount_message_tail", None)
+        if mount is not None:
+            try:
+                mount()
+            except BrowserError:
+                raise
+            except Exception:
+                pass
+        return bool(client.has_request(part_id))
+
+    def _fall_back_to_omission(
+        self, req: PendingRequest, *, reason_code: str, part_id: str = ""
+    ) -> None:
+        """Abandon a chunked delivery and ask for the verdict on the packet
+        with its diff OMITTED — the behaviour that predates chunking, and still
+        the honest one: the reviewer is told exactly what it cannot see.
+
+        The fallback payload also disowns any parts that already landed, so a
+        reviewer never holds a fragment it believes is the whole patch.
+
+        Re-stamping is the delicate part. Swapping the payload changes
+        `report_sha256`, and that digest is held in THREE places that must
+        agree or a legitimate approval is refused at push time — long after the
+        mistake, with nothing on screen explaining it:
+
+          1. the request itself (payload / prompt / prompt_sha256 / report_sha256)
+          2. `postcommit.packet_sha256`, which `_dispatch_task_push` compares
+          3. `TaskExecution.presented_report_sha256`, the record's own binding
+
+        Safe to do here precisely because nothing has been sent under this
+        request id yet — parts carry their own ids (`packet.diff_part_id`), so
+        no message in the conversation claims the digest being replaced.
+        `review_round` is deliberately NOT re-incremented: it was spent in
+        `_finish_postcommit` and this is the same round, delivered differently.
+        """
+        state = self.state
+        delivery = req.delivery
+        landed = delivery.delivered if delivery is not None else 0
+        payload = delivery.fallback_payload if delivery is not None else req.payload
+        if not payload:  # pragma: no cover - defensive; always captured at plan time
+            payload = req.payload
+        ctx = build_context(state, self._git, self._registry, req.request_id, payload)
+        prompt = build_prompt(
+            req.request_id, state.iteration, render_context(ctx), payload
+        )
+        req.payload = payload
+        req.prompt = prompt
+        req.prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        req.report_sha256 = ctx.report_sha256
+        req.head_sha = ctx.head_sha
+        req.base_sha = ctx.base_sha
+        req.timestamp = ctx.timestamp
+        req.delivery = None
+        if req.postcommit is not None:
+            req.postcommit.packet_sha256 = ctx.report_sha256
+            execution = self._execution_store.load(req.postcommit.task_id)
+            if execution is not None:
+                execution.presented_report_sha256 = ctx.report_sha256
+                execution.review_request_id = req.request_id
+                self._execution_store.save(execution)
+        self._log(
+            "review_diff_omitted",
+            request_id=req.request_id,
+            data={
+                "reason_code": reason_code,
+                "part_id": part_id,
+                "parts_landed": landed,
+                "report_sha256": ctx.report_sha256,
+            },
+        )
+        state.phase = Phase.SUBMITTING.value
         self._store.save(state)
 
     def _step_submitting(self) -> None:
@@ -569,6 +882,19 @@ class Orchestrator:
         req = state.pending_request
         if req is None:
             raise StateError("phase=submitting but no pending request")
+        # Rule 1, enforced here rather than left to the phase ordering that
+        # normally satisfies it: this is the message that asks for a verdict,
+        # so it is the right place to refuse when the patch it refers to is
+        # only partly in the conversation. Without this check, "never ask on a
+        # partial delivery" would be a property of two lines being in the right
+        # order — true today, and silently untrue after any future edit that
+        # reorders them.
+        if req.delivery is not None and not req.delivery.complete:
+            raise StateError(
+                f"request {req.request_id} asks for a review decision while only "
+                f"{req.delivery.delivered} of {len(req.delivery.parts)} diff parts "
+                "are confirmed. Refusing to request a verdict on a partial patch."
+            )
         client = self._client_for_request(req)
         client.attach()
         # One controlled reload BEFORE sending, so the duplicate check reads
@@ -1047,6 +1373,21 @@ class Orchestrator:
             )
             return
 
+        if req.delivery is not None:
+            # A chunked packet's parts live in the conversation being ABANDONED.
+            # A rotation carries only the verdict message, which would name part
+            # ids the replacement chat does not contain — the reviewer would be
+            # asked to decide on a patch that is not there. Re-sending the parts
+            # is not an option either: the rotation posts the verdict message
+            # itself, so they would arrive after the question. Fall back to the
+            # omission notice first — rule 2 applied to a different failure, and
+            # the reviewer is told plainly what it cannot see.
+            #
+            # Deliberately AFTER both preconditions: a rotation refused for a
+            # missing `project_url` or a spent budget sends nothing, so the old
+            # conversation still holds the whole delivery and there is nothing
+            # to give up.
+            self._fall_back_to_omission(req, reason_code="rotation_leaves_parts_behind")
         old_url = req.conversation_url or state.conversation_url
         # Consume the budget BEFORE the attempt, durably. A rotation SENDS a
         # message; if the process dies between that send and the binding below,
@@ -2806,7 +3147,9 @@ class Orchestrator:
         # the same "park and report, never undo" rule as every other refusal
         # in this method.
         try:
-            packet_text = build_review_packet(execution, worktree_git, task)
+            packet_text, packet_diff = build_review_packet_with_diff(
+                execution, worktree_git, task
+            )
         except GitCommandError as exc:
             self._to_needs_user(
                 f"task {task.id}: commit {execution.candidate_sha[:12]} on "
@@ -2827,6 +3170,13 @@ class Orchestrator:
         state.task_execution = asdict(execution)
         state.outbox = TEMPLATES["postcommit_review"].render(
             task_id=task.id, task_title=task.title, packet=packet_text
+        )
+        # The patch, carried alongside the payload it is already inside, so
+        # `_step_ready` can plan a chunked delivery for it without re-reading
+        # git. Only when it is actually too large for one message: an ordinary
+        # packet leaves this `None` and takes exactly the path it always did.
+        state.outbox_diff = (
+            packet_diff if len(packet_diff.strip()) > DIFF_INCLUDE_MAX_CHARS else None
         )
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
@@ -3482,6 +3832,24 @@ class Orchestrator:
                 resume_phase=Phase.READY.value,
                 kind="loop_fatal",
                 code="git_unavailable_in_ready",
+                detail=str(exc),
+            )
+            return
+        if phase is Phase.DELIVERING:
+            # Same shape as `ready` above, and for a sharper reason. The generic
+            # path below writes a git-error payload into `outbox` and returns to
+            # `ready`, which then OVERWRITES `pending_request` with a fresh one —
+            # abandoning a part-delivered patch in the conversation with nothing
+            # left to disown it. That is rule 2 broken by a route that never
+            # decided to break it. Reachable in practice: `_fall_back_to_omission`
+            # builds a context, and `build_context` reads git.
+            self._to_needs_user(
+                f"git unavailable while delivering the review packet: {exc}. "
+                "The request and its delivery cursor are intact; parts already "
+                "confirmed are not re-sent on retry.",
+                resume_phase=Phase.DELIVERING.value,
+                kind="loop_fatal",
+                code="git_unavailable_in_delivering",
                 detail=str(exc),
             )
             return
