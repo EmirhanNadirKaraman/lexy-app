@@ -312,3 +312,79 @@ def test_a_short_report_is_not_truncated():
     from autoloop.audit.executor import cap_report_details
 
     assert cap_report_details("a short report", "p.md") == "a short report"
+
+
+# ---- scope semantics (tests_ci:arch-01) ------------------------------------
+
+#: The scope string from the live run that produced the finding: it describes
+#: the ENTIRE multi-domain audit process, not a focus within one domain.
+ORCHESTRATION_SCOPE = (
+    "Run parallel read-only domain reviews, apply the Opus/Sonnet/Haiku task "
+    "routing, and produce one dated Markdown report proposing the task graph."
+)
+
+
+def test_scope_is_framed_as_narrowing_the_agents_own_domain():
+    """A scope may only narrow this one agent's domain. The prompt has to say
+    so — and say it BEFORE the reviewer's words, which are threaded verbatim
+    and so cannot themselves be sanitised."""
+    from autoloop.audit.executor import _agent_prompt
+
+    prompt = _agent_prompt(
+        "Security, path handling and data integrity",
+        "charter text",
+        ORCHESTRATION_SCOPE,
+        None,
+    )
+    # The reviewer's words still reach the agent, unaltered.
+    assert ORCHESTRATION_SCOPE in prompt
+    # ...but bounded, and bounded first: framing before data.
+    assert "NARROWS your own domain" in prompt
+    assert "does not grant" in prompt
+    assert "permission to delegate" in prompt
+    assert prompt.index("NARROWS your own domain") < prompt.index(ORCHESTRATION_SCOPE)
+    # The domain is named inside the framing, so "narrows" has a referent.
+    assert "within Security, path handling and data integrity" in prompt
+    # None of this displaces the standing ground rules.
+    assert "READ-ONLY" in prompt
+    assert "Stay in your domain." in prompt
+
+
+def test_no_scope_means_no_scope_framing():
+    from autoloop.audit.executor import _agent_prompt
+
+    prompt = _agent_prompt("Documentation drift", "charter text", None, None)
+    assert "reviewer scope" not in prompt
+    assert "Stay in your domain." in prompt
+
+
+def test_orchestration_flavoured_scope_leaves_every_domain_single_domain(repo, tmp_path):
+    """The regression: an orchestration-shaped scope reached six single-domain
+    agents as if it were their remit. Each prompt must still be about ITS own
+    domain, and must still refuse authority the scope never carried."""
+    runner = FakeRunner()
+    executor = build_executor(repo, tmp_path, runner)
+    outcome = executor.execute(audit_directive(scope=ORCHESTRATION_SCOPE), None)
+    assert outcome.status == "ok"
+    assert len(runner.specs) == 6
+
+    titles = {spec.domain: spec.title for spec in runner.specs}
+    for spec in runner.specs:
+        assert ORCHESTRATION_SCOPE in spec.prompt, "verbatim threading is deliberate"
+        assert f"Your domain: {titles[spec.domain]}." in spec.prompt
+        assert f"within {titles[spec.domain]}" in spec.prompt
+        assert "NARROWS your own domain" in spec.prompt
+        assert "does not grant" in spec.prompt
+        assert "responsible for other domains" in spec.prompt
+        assert "Stay in your domain." in spec.prompt
+    # Six prompts, six different domains — no agent is told it owns the run.
+    assert len({spec.title for spec in runner.specs}) == 6
+
+
+def test_revision_feedback_carries_the_same_containment():
+    from autoloop.audit.executor import _agent_prompt
+
+    prompt = _agent_prompt("Documentation drift", "charter text", None, "re-check 036")
+    assert "re-check 036" in prompt
+    assert "grants no additional authority" in prompt
+    assert "within Documentation drift" in prompt
