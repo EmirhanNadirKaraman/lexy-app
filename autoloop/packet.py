@@ -124,19 +124,37 @@ DIFF_INCLUDE_MAX_CHARS = 30_000
 PART_INCLUDE_MAX_CHARS = 8_000
 
 #: How many parts a chunked delivery may take before the loop gives up and
-#: falls back to the omission notice. A judgement, and labelled as one: the
-#: only real data point is sub-01's 41 KB patch, which is six parts at the
-#: current part size. Six parts is therefore a ceiling of ~48 KB of patch —
-#: down from the ~180 KB it meant while parts were 30,000 characters, because
-#: the ceiling is `DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS` and the part size
-#: dropped to a deliverable one on 2026-08-14. That still covers the largest
-#: candidate ever observed; past it, "reply `revise` asking for a smaller
-#: commit" — which the omission notice already says — is a better answer than a
-#: dozen chat messages nobody can hold in their head at once. The COUNT is the
-#: lever if a real patch needs more: raise it only with that patch's size
-#: recorded here, and never by re-raising the part size, which is the number
-#: that has a measured failure behind it.
-DIFF_MAX_PARTS = 6
+#: falls back to the omission notice. A judgement, and labelled as one — but
+#: one with two measured patch sizes behind it, because the ceiling this count
+#: sets is `DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS` and the part size dropped
+#: to a deliverable one on 2026-08-14:
+#:
+#:   * sub-01's 41 KB patch (2026-08-05) — the patch chunking was built for.
+#:     Six parts at 8,000 characters.
+#:   * pkt-02's own candidate, an 83,476-character diff observed 2026-08-14 —
+#:     eleven parts at 8,000 characters. Under the six-part bound this constant
+#:     carried until then, that patch would have been OMITTED: the change that
+#:     shrank the part size would have made its own review packet unreviewable
+#:     by the mechanism it was changing.
+#:
+#: Twelve is therefore the smallest bound that covers both observations with
+#: any headroom at all — a ~96 KB ceiling against an 83.5 KB candidate is ~15%,
+#: not a comfortable margin. It is still down from the ~180 KB the old six-part
+#: bound meant while parts were 30,000 characters, which is the right direction:
+#: that ceiling was nominal, since those parts could not be sent.
+#:
+#: Past it, "reply `revise` asking for a smaller commit" — which the omission
+#: notice already says — is a better answer than a dozen-plus chat messages
+#: nobody can hold in their head at once. The cost is real and paid per part:
+#: `_step_delivering` sends them one at a time, each paying a reload and a
+#: swallowed ChatGPT reply, so twelve parts is roughly twice the wall clock six
+#: was. It resumes from a persisted cursor rather than re-posting, which is what
+#: makes that cost recoverable rather than fatal.
+#:
+#: The COUNT is the lever if a real patch needs more: raise it only with that
+#: patch's size recorded here, and never by re-raising the part size, which is
+#: the number that has a measured failure behind it.
+DIFF_MAX_PARTS = 12
 
 #: The literal line the inline diff section starts with. `plan_chunked_delivery`
 #: locates `_INLINE_DIFF_HEADER + diff` inside the rendered payload and swaps it

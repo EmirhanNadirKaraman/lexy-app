@@ -960,10 +960,10 @@ def test_an_oversized_diff_is_OMITTED_not_truncated(tmp_path):
     enters `delivering`, but inside `DIFF_MAX_PARTS` parts of
     `PART_INCLUDE_MAX_CHARS`, so what refuses the delivery is the provider —
     the condition named in the docstring. It was 4000 lines (~147 KB of patch),
-    which fitted the six-part bound only because a part was 30,000 characters;
-    at 8,000 it needs far more, so a fixture that big now falls back at
-    PLANNING time and this test would have been asserting the part-count bound
-    while claiming to test the provider.
+    which fitted the old six-part bound only because a part was 30,000
+    characters; at 8,000 it needs ~19 parts, past even the twelve now allowed,
+    so a fixture that big falls back at PLANNING time and this test would have
+    been asserting the part-count bound while claiming to test the provider.
     """
     from autoloop import packet as packet_mod
 
@@ -1157,6 +1157,13 @@ def test_the_out_of_scope_section_survives_an_omitted_diff(tmp_path):
     Between pkt-01 and pkt-02 the same fixture was chunkable (two 30,000-
     character parts), which quietly turned this into a test of the inline
     payload; the assertions have been put back on the omitted case.
+
+    4000 lines is ~148 KB of file text against a 96 KB ceiling — a 1.5x margin,
+    where it was 3x before the part count was raised to 12. The assertion below
+    is what keeps that honest, but it fails LOUDLY rather than drifting: if
+    `DIFF_MAX_PARTS` rises again, raise the line count with it rather than
+    deleting the assertion, or this test goes back to exercising a chunked
+    delivery under an omission test's name.
     """
     from autoloop import packet as packet_mod
 

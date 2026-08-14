@@ -2214,10 +2214,14 @@ raises, restarts the browser, and re-enters `delivering`, which resumes from the
 persisted cursor without re-posting anything. Recoverable, but it is why the
 part count is bounded rather than open-ended. **That cost roughly tripled with
 pkt-02**: at 8,000 characters a part, sub-01's 41 KB patch is six messages
-rather than two. The correction bought a delivery that actually lands in
-exchange for more round trips per patch — the right trade, since the two-part
-version did not send at all, but worth knowing before reading a slow
-`delivering` phase as a fault.
+rather than two, and the worst case the bound now permits is twelve sequential
+deposits, each paying its own reload and swallowed reply. The correction bought
+a delivery that actually lands in exchange for more round trips per patch — the
+right trade, since the two-part version did not send at all, but worth knowing
+before reading a slow `delivering` phase as a fault. Nothing bounds that phase
+by wall clock; what keeps the cost recoverable is the per-part cursor persisted
+after each confirmation, so a restart resumes at the first unconfirmed part
+instead of re-posting the ones already in the conversation.
 
 **Failures in `delivering` never discard the request.** `_handle_git_failure`
 treats `delivering` like `ready`: it parks retryably instead of writing a
@@ -2226,16 +2230,20 @@ git-error payload and returning to `ready`, which would overwrite
 nothing left to disown it. Reachable in practice, since the fallback itself
 builds a context and `build_context` reads git.
 
-**Bounds.** `packet.DIFF_MAX_PARTS` (6) caps the mechanism; past that, "reply
+**Bounds.** `packet.DIFF_MAX_PARTS` (12) caps the mechanism; past that, "reply
 `revise` asking for a smaller commit" — which the omission notice already says —
-beats a dozen messages nobody can hold in their head. That number is a
-judgement and is labelled as one: the only real data point is sub-01's 41 KB,
-which is six parts at the current part size. The ceiling is
-`DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, so it moved from ≈180 KB to ≈48 KB
-when the part size was corrected (pkt-02) — still covering the largest candidate
-ever observed. If a real patch needs more, raise the COUNT and record that
-patch's size; do not raise the part size, which is the number with a measured
-failure behind it.
+beats a dozen-plus messages nobody can hold in their head. The ceiling is
+`DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, so correcting the part size (pkt-02)
+dropped it from a nominal ≈180 KB — nominal because 30,000-character parts did
+not send — and the count then had to move with it. Two measured patches set
+where: sub-01's 41 KB (2026-08-05), six parts; and pkt-02's own candidate, an
+83,476-character diff observed 2026-08-14, eleven parts. At six parts that
+second one would have been OMITTED, so the change that shrank the part size
+would have made its own review packet unreviewable by the mechanism it was
+changing. Twelve covers both at ≈96 KB — about 15% over the larger, which is
+headroom, not comfort. If a real patch needs more, raise the COUNT and record
+that patch's size; do not raise the part size, which is the number with a
+measured failure behind it.
 
 **Not in scope, stated so it is not mistaken for covered.**
 `changeset_review.build_changeset_packet` embeds its diff with no per-message

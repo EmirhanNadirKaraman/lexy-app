@@ -686,10 +686,19 @@ a fast honest failure for a slow one and leaves the real bound unmeasured.
 about generation; they are limits on different systems and the whole point of
 splitting the constant was that one number could not carry both.
 **Knock-on to know about:** the chunkable ceiling is
-`DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, so it moved from ~180 KB to ~48 KB.
-A patch past it is OMITTED with the usual notice rather than chunked. sub-01's
-41 KB — the patch chunking was built for — still fits. If a real patch does not,
-raise the part COUNT and record its size, never the part size.
+`DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, so cutting the part size cut it too —
+from a nominal ~180 KB (nominal because those parts did not send) to ~48 KB at
+the six-part bound then in force. That was too low, and the patch that proved it
+was this one: pkt-02's own candidate is an 83,476-character diff (measured
+2026-08-14), eleven parts at 8,000 characters, which a six-part bound would have
+OMITTED — the fix for un-sendable parts would have made its own review packet
+unreviewable. `DIFF_MAX_PARTS` therefore went 6 → 12 in the same change, a
+~96 KB ceiling covering both that patch and sub-01's 41 KB with about 15% to
+spare. A patch past it is still OMITTED with the usual notice rather than
+chunked; if a real patch needs more, raise the part COUNT and record its size
+here, never the part size. Twelve sequential deposits is also roughly twice the
+`delivering` wall clock six was — recoverable, because the per-part cursor is
+persisted, but it is why the count is bounded at all.
 **Still open:** whether an ordinary single message near 30,000 characters syncs
 reliably. Nothing has reported it failing since 2026-08-05, and the 104k data
 point argues it does, but no one has measured it either. Answering it properly

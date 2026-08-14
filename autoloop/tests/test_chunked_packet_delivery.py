@@ -84,12 +84,13 @@ def big_file_text(lines: int = 800) -> str:
     inside `DIFF_MAX_PARTS` parts of `PART_INCLUDE_MAX_CHARS` each.
 
     44 characters per line, so 800 lines is a ~36 KB patch: over the 30,000
-    threshold that triggers chunking, and 5 parts of the 6 allowed — margin on
+    threshold that triggers chunking, and 5 parts of the 12 allowed — margin on
     both sides, deliberately, because a fixture sitting exactly on either bound
     turns an unrelated rounding change into a mystery failure. It was 1200
     lines (~54 KB) while parts were 30,000 characters; at 8,000 that needs 7
-    parts and would exercise the part-count fallback instead of the delivery
-    this section is about.
+    parts, which was over the six-part bound in force for one revision of
+    pkt-02 and would have exercised the part-count fallback instead of the
+    delivery this section is about.
     """
     return "".join(f"line {i:05d} of a large generated source file\n" for i in range(lines))
 
@@ -938,12 +939,31 @@ def test_the_part_budget_is_a_separate_number_from_the_send_threshold():
 
 def test_the_part_count_bound_still_covers_the_patch_that_motivated_chunking():
     """Shrinking the part size shrinks what a bounded delivery can carry —
-    `DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, ~48 KB now rather than ~180 KB.
-    sub-01's 41 KB patch is why chunking exists, so it must still fit; if a
-    real patch ever does not, the COUNT is the lever, never the part size."""
-    SUB_01_PATCH = 41_000  # measured, 2026-08-05
+    the ceiling is `DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, so at 8,000
+    characters a part the COUNT is what keeps ordinary patches deliverable.
+
+    Two measured sizes, not one. sub-01's 41 KB is why chunking exists. The
+    larger one is pkt-02's own candidate: an 83,476-character diff observed
+    2026-08-14, eleven parts at the current part size. Against the six-part
+    bound that shipped with the smaller parts it would have been OMITTED —
+    the change that shrank the part size would have made its own review packet
+    unreviewable by the mechanism it was changing, which is why the count moved
+    to twelve in the same breath.
+    """
+    SUB_01_PATCH = 41_000        # measured, 2026-08-05
+    PKT_02_PATCH = 83_476        # measured, 2026-08-14
 
     ceiling = packet_mod.DIFF_MAX_PARTS * packet_mod.PART_INCLUDE_MAX_CHARS
     assert ceiling >= SUB_01_PATCH, (
         "the patch chunking was built for must still be deliverable"
+    )
+    assert ceiling >= PKT_02_PATCH, (
+        "a patch this loop has actually produced must not fall back to omission"
+    )
+    # The ceiling has two factors and only one of them may be used to raise it.
+    # Asserted here rather than left to the docstring: a future ceiling reached
+    # by re-raising the part size would satisfy both bounds above while
+    # reintroducing the composer failure pkt-02 fixed.
+    assert packet_mod.PART_INCLUDE_MAX_CHARS == 8_000, (
+        "raise the part COUNT to carry a bigger patch, never the part size"
     )
