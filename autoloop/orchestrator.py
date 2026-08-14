@@ -478,7 +478,14 @@ class Orchestrator:
         if state.outbox is None:
             raise StateError("phase=ready but outbox is empty — nothing to send")
         request_id = f"alr-{state.session_id[:8]}-{next_iteration:04d}"
-        ctx = build_context(state, self._git, self._registry, request_id, state.outbox)
+        ctx = build_context(
+            state,
+            self._git,
+            self._registry,
+            request_id,
+            state.outbox,
+            executions=self._execution_store,
+        )
         prompt = build_prompt(request_id, next_iteration, render_context(ctx), state.outbox)
         postcommit = self._current_pending_postcommit(state.outbox, ctx.report_sha256)
         changeset = self._current_pending_changeset(state.outbox, ctx.report_sha256)
