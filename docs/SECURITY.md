@@ -463,11 +463,41 @@ loop-fatal. Every other post-commit refusal — ancestry, empty range, dirty
 worktree, failing validation, validation mutating the tree — is untouched.
 The residual exposure is real and accepted: an out-of-scope path now
 reaches a human reviewer instead of a hard stop, so **the review packet's
-rendering of `out_of_scope_paths` is the control** that replaces the park.
+out-of-scope section is the control** that replaces the park.
+
+**The control, built 2026-08-05** (`packet._format_out_of_scope`). Every
+review packet carries an `OUT-OF-SCOPE PATHS (n)` section naming each path,
+with three properties the control depends on:
+
+* **Computed from git at render time** — `commit_range_paths` vs
+  `execution.allowed_paths`, the same inputs `_verify_committed` uses — and
+  deliberately NOT read from `TaskExecution.out_of_scope_paths`. That record
+  holds the same answer by then, but it is the union of both gates and the
+  pre-commit gate's input is `outcome.changed_paths`, the executor's own
+  report; sourcing the section from it would let an agent's report state a
+  path as a fact about the commit. Pinned by
+  `test_the_out_of_scope_paths_come_from_git_not_from_the_record`.
+* **Rendered unconditionally**, with an explicit `(none)` line. If it only
+  appeared when something was wrong, ABSENCE would be the signal — and an
+  absent section is indistinguishable from one dropped in a refactor.
+* **Placed above the diff**, so it survives the omission below.
+
+**Residual risk, stated plainly.** Detection now depends on a human reading
+that list; an agent that touches unexpected files produces a reviewable
+candidate rather than a refusal. And on a diff over
+`packet.DIFF_INCLUDE_MAX_CHARS` (30,000 chars) the patch is OMITTED, so the
+reviewer sees the out-of-scope PATHS but not the CONTENT of those edits —
+the same degradation `tasks.py`'s `TRACKER_PATHS` comment names for tracker
+files, and an argument for reviewing large commits harder, not for trusting
+the list less.
 
 **Verification check:** `rg -n 'out_of_scope_paths' autoloop/orchestrator.py`
 — must show it assigned at BOTH sites (the pre-commit check and
-`_verify_committed`) and appended to `failures` at neither.
+`_verify_committed`) and appended to `failures` at neither. And
+`rg -n 'OUT-OF-SCOPE PATHS' autoloop/packet.py` must hit: that string IS the
+replacement control, and a grep for the field name alone would never notice
+it had gone (the section is computed from git and does not mention the
+field).
 `Orchestrator._prepare_write_capable_worker` requires the worker repo clean
 before every write-capable dispatch; residue is QUARANTINED (moved, never
 deleted — `WorkerRepoManager.quarantine`) rather than reused, and a fresh

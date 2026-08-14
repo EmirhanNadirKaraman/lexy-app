@@ -1023,6 +1023,120 @@ def test_the_report_never_widens_scope(tmp_path):
 
 
 # =============================================================================
+# The out-of-scope section (2026-08-05)
+#
+# The path-scope check went ADVISORY at both gates: a commit touching paths the
+# task never declared now COMMITS and is reviewed, where it used to park. That
+# only relaxes a control if the reviewer is told; if the packet is silent it
+# REMOVES one. So `docs/SECURITY.md` S25 names the packet's rendering as the
+# replacement control, and these tests are what make that sentence true.
+
+
+def out_of_scope_packet(tmp_path, files, approved_paths):
+    """Drive one round whose committed paths exceed `approved_paths`, and hand
+    back both the sent packet and the pieces a direct `build_review_packet`
+    call needs."""
+    executor = WritingExecutor(tmp_path / "worktrees", files)
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor, approved_paths=approved_paths
+    )
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+    return orch, worktrees, execution_store, task
+
+
+def test_the_packet_names_every_out_of_scope_path(tmp_path):
+    """The replacement control itself. The round is no longer refused, so the
+    ONLY thing standing between an unexpected edit and an approval is a
+    reviewer reading these names."""
+    orch, _worktrees, _store, _task = out_of_scope_packet(
+        tmp_path,
+        {"feature.py": "print('hi')\n", "extra/helper.py": "x = 1\n", "cli.py": "y = 2\n"},
+        approved_paths=("feature.py",),
+    )
+
+    payload = orch.state.pending_request.payload
+    assert "POST-COMMIT REVIEW PACKET" in payload, "the round reached review, not a park"
+    assert "OUT-OF-SCOPE PATHS (2)" in payload
+    # The `! ` marker is what makes these assertions section-specific: every
+    # changed path also appears in the changed-path list above it, so a bare
+    # substring check would pass against a packet with no section at all.
+    assert "! extra/helper.py" in payload
+    assert "! cli.py" in payload
+    assert "! feature.py" not in payload, "an in-scope path must not be flagged"
+    assert "Declared scope: " in payload, "unjudgeable without what the scope WAS"
+
+
+def test_the_out_of_scope_paths_come_from_git_not_from_the_record(tmp_path):
+    """The mutation this section exists to survive.
+
+    `TaskExecution.out_of_scope_paths` holds the same answer by the time a
+    packet is built, so rendering from it would pass every other test here —
+    but it is the union of both gates, and the PRE-commit gate compares the
+    executor's own `changed_paths`. Sourcing the section from the record would
+    let an executor's report put a path it never touched in front of the
+    reviewer as a fact about the commit.
+
+    The record is overwritten with a set DISJOINT from git's, which is what
+    makes this test self-evidently non-vacuous: the two directions pin opposite
+    halves of the same mutation, and neither can pass while the other holds.
+    Read from the record, the packet loses `extra/helper.py` and gains two
+    fabrications; read from git, exactly the reverse. An overlapping set would
+    leave the `not in` assertions passing against a section that renders
+    nothing at all.
+    """
+    _orch, worktrees, execution_store, task = out_of_scope_packet(
+        tmp_path,
+        {"feature.py": "print('hi')\n", "extra/helper.py": "x = 1\n"},
+        approved_paths=("feature.py",),
+    )
+    execution = execution_store.load(task.id)
+    assert execution.out_of_scope_paths == ("extra/helper.py",), "the record was written"
+    # A report claiming two files the commit does not contain, and dropping the
+    # one it does. Neither fabrication is a `TRACKER_PATHS` entry, so neither
+    # can reach the packet via the declared-scope line either.
+    execution.out_of_scope_paths = ("etc/passwd", "lexy-app/main.py")
+
+    text = build_review_packet(execution, worktree_git_for(worktrees, task.id), task)
+
+    assert "! extra/helper.py" in text, "git's answer survives a record that omits it"
+    assert "etc/passwd" not in text
+    assert "lexy-app/main.py" not in text
+
+
+def test_a_round_inside_its_scope_says_so_rather_than_going_silent(tmp_path):
+    """Rendered unconditionally. If the section only appeared when something
+    was wrong, its ABSENCE would be the signal — and an absent section is
+    indistinguishable from one that was never built, dropped in a refactor, or
+    lost with an omitted diff."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, _wt, _store, _intent, task = build_postcommit(tmp_path, executor)
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+
+    payload = orch.state.pending_request.payload
+    assert "Out-of-scope paths (0):" in payload
+    assert "(none — every changed path is inside the task's declared scope)" in payload
+
+
+def test_the_out_of_scope_section_survives_an_omitted_diff(tmp_path):
+    """The case `docs/SECURITY.md` records as the residual risk: over
+    `DIFF_INCLUDE_MAX_CHARS` the reviewer sees the PATHS but not the content.
+    Paths-without-content is a degraded control; paths-and-no-content-and-no-
+    section is none at all, so the section must not be a casualty of the very
+    commits most likely to overrun a scope."""
+    big = "\n".join(f"line {i} of a large generated file" for i in range(4000)) + "\n"
+    orch, _worktrees, _store, _task = out_of_scope_packet(
+        tmp_path, {"big.py": big}, approved_paths=("feature.py",)
+    )
+
+    payload = orch.state.pending_request.payload
+    assert "Full diff: OMITTED" in payload
+    assert "OUT-OF-SCOPE PATHS (1)" in payload
+    assert "! big.py" in payload
+
+
+# =============================================================================
 # B10 — a published task is marked completed (2026-08-04)
 #
 # Nothing at runtime ever wrote `status="completed"`: `mark_completed` had no

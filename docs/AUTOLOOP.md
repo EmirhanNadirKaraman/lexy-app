@@ -1035,14 +1035,18 @@ review path (§4b):
   gate. `_dispatch_task_postcommit` refuses to dispatch a non-audit
   implement/revise for a task whose `approved_paths` is empty (task_fatal,
   code `approved_paths_missing`) and, once dispatched, checks
-  `outcome.changed_paths` against it BEFORE `commit_and_capture` ever runs
-  (task_fatal, code `changed_paths_outside_approved` — nothing can roll a
-  commit back once it exists, so this has to happen before one does).
+  `outcome.changed_paths` against it BEFORE `commit_and_capture` ever runs.
+  **That second check is ADVISORY since 2026-08-05 (operator decision), as
+  is the post-commit one** — see the amendment below; the park code
+  `changed_paths_outside_approved` is retired and survives only as a
+  transcript entry. The EMPTY-scope refusal above is a different rule and is
+  NOT relaxed: "no scope declared" still means "not dispatchable", so a task
+  cannot become write-capable by omitting the field.
   `execution.allowed_paths` is now seeded ONCE from `task.approved_paths` at
   creation and never unioned with anything self-reported again — the
   post-commit check remains as defense in depth for what the pre-commit
   gate cannot see (a commit hook adding a path strictly after it runs; see
-  `test_hook_adding_unexpected_path_is_refused`, unmodified). A LOADED
+  `test_hook_adding_unexpected_path_is_recorded_not_refused`). A LOADED
   (not freshly created) `TaskExecution` whose `allowed_paths` disagrees with
   the task's CURRENT `approved_paths` is re-synced to match on every
   dispatch — covers a resumed task whose on-disk `TaskExecution` predates
@@ -1105,6 +1109,46 @@ review path (§4b):
   would double-count a fresh commit's already-bumped value, and a
   crash-recovered adoption's value was already bumped in the earlier,
   crashed process before ITS executor call).
+
+**Amendment, 2026-08-05 — the two path-scope CHECKS are ADVISORY; the review
+packet is the control.** Operator decision, after six parks in three days that
+were all legitimate work and at least three of which were caused by a task
+scope guessed wrong when the task was written. `approved_paths` is set before
+an agent runs, i.e. at the moment of least information about what the fix will
+touch, so a declared scope is a PREDICTION — and no amount of pre-authorization
+repairs a prediction made before anyone read the code.
+
+Unchanged: both comparisons still run, same `tasks.unauthorized_paths` matcher,
+same inputs, at both ends — pre-commit (`outcome.changed_paths` vs
+`effective_approved_paths(task.approved_paths)`) and post-commit
+(`commit_range_paths` vs `execution.allowed_paths`). Changed: the CONSEQUENCE
+only. They record onto `TaskExecution.out_of_scope_paths` (accumulated across
+rounds, written solely from what the comparisons produced) and the round
+proceeds to commit and review. Both had to move together — relaxing only the
+pre-commit one would have moved the park downstream to
+`post_commit_verification_failed` for the very same paths.
+
+The information must survive, and that is the whole point rather than a
+caveat: `packet._format_out_of_scope` renders an `OUT-OF-SCOPE PATHS (n)`
+section into every review packet, computed FROM GIT at render time
+(`commit_range_paths` vs `execution.allowed_paths`) and never from
+`out_of_scope_paths` — that record is the union of both gates, and the
+pre-commit gate's input is the executor's own report, so reading it would let a
+false report state a fact about the commit. The section renders
+unconditionally, with an explicit `(none)` line, so its absence can never be
+mistaken for a clean round, and it sits ABOVE the diff, which is omitted over
+`packet.DIFF_INCLUDE_MAX_CHARS`. Residual risk, accepted and named: an agent
+touching unexpected files now produces a reviewable candidate instead of a
+refusal, so detection depends on the reviewer reading that list — and on a
+large commit they see the paths but not the content.
+
+NOT relaxed, all different mechanisms: an empty `approved_paths` still refuses
+dispatch (`approved_paths_missing`); escape detection (a write outside the
+worker repo into the primary checkout) is still loop_fatal; every other
+post-commit refusal — ancestry, empty range, dirty worktree, failing
+validation, validation mutating the tree — still parks; and candidates still go
+to their own side branch for an operator to merge. See `docs/SECURITY.md` S25's
+amendment for the security accounting.
 
 **Finding #7 — blocker preconditions that could not do what their comment
 claimed.** `cli._RESOLUTION_PRECONDITIONS` maps a blocker `code` to a
