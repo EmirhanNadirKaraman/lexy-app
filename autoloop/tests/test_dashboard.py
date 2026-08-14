@@ -6,16 +6,27 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
 import subprocess
 import threading
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-from autoloop.dashboard import MARKS, PAGE, STATUS, app_tasks, collect, pipeline
+from autoloop.dashboard import (
+    MARKS,
+    PAGE,
+    STATUS,
+    app_tasks,
+    collect,
+    pipeline,
+    worker_progress,
+)
+from autoloop.state import utcnow_iso
 
 
 def snapshot(root: Path) -> dict:
@@ -495,6 +506,214 @@ def test_the_retired_table_format_still_renders(tmp_path):
     found = app_tasks(repo)
     assert found[0]["id"] == "rt-01"
     assert found[0]["priority"] == "P1"
+
+
+# ---- live progress for the running task (2026-08-14) -------------------------
+#
+# "An agent is running" and "an agent is running and has written 400 lines in 12
+# minutes" are different facts, and only the second one tells a productive round
+# from a wedged one. merge-01 ran twice for 1800s on 2026-08-06 and was killed by
+# the timeout both times, having written 591 insertions across 16 files and then
+# 532 across 15 — that it was working at all was discoverable only afterwards, by
+# hand, in the quarantined worker repo.
+#
+# Every number must come from GIT IN THE WORKER. The executor's own
+# `report_summary`/`report_details` are claims, and these fixtures carry
+# deliberately absurd ones so a test fails the moment anything reads them.
+
+_CLAIMED_INSERTIONS = 424242  # numbers no path or sha will coincidentally contain
+_CLAIMED_FILES = 31337
+
+
+def make_worker(tmp_path, name="worker"):
+    """A worker repo with one base commit — `(path, base_sha)`."""
+    worker = tmp_path / name
+    worker.mkdir(parents=True)
+    run_git(worker, "init", "-q", "-b", "work")
+    run_git(worker, "config", "user.email", "t@e.com")
+    run_git(worker, "config", "user.name", "T")
+    (worker / "kept.py").write_text("one\ntwo\nthree\n")
+    run_git(worker, "add", "kept.py")
+    run_git(worker, "commit", "-q", "-m", "base")
+    return worker, run_git(worker, "rev-parse", "HEAD").strip()
+
+
+def executing_state(worker, base_sha, *, started_at, task_id="merge-01"):
+    """`state.json` shaped like a loop mid-round, agent claims included."""
+    return {
+        "phase": "executing",
+        "current_task": {"task_id": task_id, "title": "t", "decision": "implement",
+                         "started_at": started_at},
+        "task_execution": {
+            "task_id": task_id,
+            "task_branch": f"autoloop/{task_id}",
+            "worktree_path": str(worker),
+            "task_base_sha": base_sha,
+            # What the executor SAID it did. Present on every real record, and
+            # never a source for anything below.
+            "report_summary": f"wrote {_CLAIMED_INSERTIONS} insertions "
+                              f"across {_CLAIMED_FILES} files",
+            "report_details": f"{_CLAIMED_INSERTIONS} insertions, {_CLAIMED_FILES} files",
+        },
+    }
+
+
+def test_progress_counts_lines_from_git_in_the_worker(tmp_path):
+    """Tracked edits AND untracked files, because a brand-new file is where most
+    of an agent's output lands — counting only tracked changes would show 0
+    lines for a round that wrote hundreds."""
+    worker, base = make_worker(tmp_path)
+    (worker / "kept.py").write_text("one\nTWO\nthree\nfour\n")   # +2 −1, 1 file
+    (worker / "added.py").write_text("a\nb\nc\nd\ne\n")          # +5, 1 file
+    dispatched = datetime(2026, 8, 6, 12, 0, 0, tzinfo=timezone.utc)
+
+    progress = worker_progress(
+        executing_state(worker, base, started_at=dispatched.isoformat()),
+        # Injected so `elapsed_seconds` is an exact number: a live clock puts a
+        # 17-digit float in the payload, and the claim-absence assertions below
+        # search that payload as text.
+        now=dispatched.timestamp() + 60.0,
+    )
+
+    assert (progress["insertions"], progress["deletions"], progress["files"]) == (7, 1, 2)
+    assert progress["base"] == "task_base_sha", "the figure must span the whole task"
+    assert progress["partial"] is False
+    # The mutation this guards: sourcing any of it from the agent's own report.
+    assert str(_CLAIMED_INSERTIONS) not in json.dumps(progress)
+    assert str(_CLAIMED_FILES) not in json.dumps(progress)
+
+
+def test_an_unreadable_worker_reads_unknown_never_zero_and_never_the_agents_claim(tmp_path):
+    """Zero lines means "nothing written yet", which is exactly the alarming
+    state — inventing it from a directory we cannot open would be a lie in the
+    dangerous direction. And the agent's own figures must not fill the gap: a
+    fallback to them is the one change that makes this test fail."""
+    worker, base = make_worker(tmp_path)
+    state = executing_state(worker, base, started_at=utcnow_iso())
+    shutil.rmtree(worker)  # quarantined, moved, or never created
+
+    progress = worker_progress(state)
+
+    assert progress["insertions"] is None
+    assert progress["deletions"] is None
+    assert progress["files"] is None
+    dumped = json.dumps(progress)
+    assert str(_CLAIMED_INSERTIONS) not in dumped and str(_CLAIMED_FILES) not in dumped
+    assert progress["note"], "unknown must say why it is unknown"
+    # Elapsed is independent of the worker: the clock still runs.
+    assert progress["elapsed_seconds"] is not None
+
+
+def test_a_half_read_worker_is_unknown_rather_than_an_understatement(tmp_path, monkeypatch):
+    """Both git reads or neither. Reporting the tracked diff alone when the
+    untracked listing failed understates the work in exactly the direction that
+    matters: an agent whose output is new files would read as idle."""
+    import autoloop.dashboard as dash
+
+    worker, base = make_worker(tmp_path)
+    (worker / "kept.py").write_text("one\nTWO\nthree\n")
+    real = dash._run_checked
+    monkeypatch.setattr(
+        dash, "_run_checked",
+        lambda args, **kw: None if "ls-files" in args else real(args, **kw),
+    )
+
+    progress = dash.worker_progress(executing_state(worker, base, started_at=utcnow_iso()))
+
+    assert (progress["insertions"], progress["deletions"], progress["files"]) == (None, None, None)
+    assert progress["note"]
+
+
+def test_an_idle_loop_shows_no_progress_figures_at_all(tmp_path):
+    """`state.task_execution` is cleared the moment a candidate is published, so
+    its absence is the loop's own statement that nothing is in flight. Figures
+    left beside an idle loop read as live activity — the exact confusion this
+    panel exists to remove."""
+    repo = make_repo(tmp_path)
+    worker, _base = make_worker(tmp_path)
+    (worker / "added.py").write_text("a\nb\nc\n")  # last round's work, still on disk
+    (repo / ".autoloop" / "state.json").write_text(json.dumps({
+        "phase": "ready",
+        # The finished round is still named here; it must not resurrect figures.
+        "current_task": {"task_id": "merge-01", "started_at": utcnow_iso()},
+        "task_execution": None,
+    }), encoding="utf-8")
+
+    assert collect(repo)["progress"] is None
+
+    # …and the page renders nothing for it: the section ships hidden and the
+    # renderer hides it again on a falsy payload.
+    assert '<section id="progressbox" style="display:none">' in PAGE
+    script = PAGE.split("<script>", 1)[1]
+    assert 'if (!p) { box.style.display = "none"' in script
+
+
+def test_elapsed_is_computed_from_the_dispatch_timestamp(tmp_path):
+    """Dispatch, not file mtimes and not the page's own start: the stamp below is
+    hours away from anything this test writes, so only the timestamp can produce
+    the expected number."""
+    worker, base = make_worker(tmp_path)
+    dispatched = datetime(2026, 8, 6, 12, 0, 0, tzinfo=timezone.utc)
+    now = dispatched.timestamp() + 1500.0  # the 25-minute round that got killed
+
+    progress = worker_progress(
+        executing_state(worker, base, started_at=dispatched.isoformat()), now=now
+    )
+
+    assert progress["elapsed_seconds"] == 1500.0
+    assert progress["dispatched_at"] == dispatched.isoformat()
+
+    # A `current_task` naming a DIFFERENT task cannot date this round, so elapsed
+    # reads unknown — while the lines, which come from git, still render. The 0
+    # here is measured (a worker with no changes yet), not invented.
+    state = executing_state(worker, base, started_at=dispatched.isoformat())
+    state["current_task"]["task_id"] = "someone-else"
+    mismatched = worker_progress(state, now=now)
+    assert mismatched["elapsed_seconds"] is None
+    assert mismatched["insertions"] == 0
+
+
+def test_reading_progress_writes_nothing_to_the_worker_repo(tmp_path):
+    """The dashboard takes no lock and a scheduler may hit it mid-round, so the
+    worker repo must be byte-identical across a poll — same property the
+    observed checkout already has, now extended to the directory the loop's
+    agent is actively writing."""
+    repo = make_repo(tmp_path)
+    worker, base = make_worker(tmp_path)
+    (worker / "added.py").write_text("a\nb\nc\n")
+    (repo / ".autoloop" / "state.json").write_text(
+        json.dumps(executing_state(worker, base, started_at=utcnow_iso())), encoding="utf-8"
+    )
+    # Snapshot AFTER the last `run_git` above: it does NOT pass
+    # --no-optional-locks and rewrites .git/index, so snapshotting earlier would
+    # measure the test's own side effect and blame the tracker.
+    before = snapshot(worker)
+
+    payload = collect(repo)
+
+    assert snapshot(worker) == before, "the worker repo must not be written to"
+    assert payload["progress"]["files"] == 1
+
+
+def test_the_page_renders_the_counts_and_the_clock():
+    """A payload carrying the numbers is not a page showing them. Every test
+    above drives `worker_progress`; `renderProgress` is the display path, and
+    deleting an interpolation there leaves all of them green while the operator
+    sees nothing."""
+    block = PAGE.split("function renderProgress(p){", 1)[1].split("\nfunction ", 1)[0]
+    for field in ("p.insertions", "p.deletions", "p.files", "p.elapsed_seconds"):
+        assert field in block, f"{field} never reaches the DOM"
+
+
+def test_the_progress_figures_stay_out_of_the_re_render_signature():
+    """Their clock ticks every poll. In the signature, the unchanged-payload
+    guard would never fire and the whole DOM would be rebuilt every 2s, losing
+    hover state and any text selection — so they are excluded and rendered
+    before the guard, exactly as `served_at` is."""
+    script = PAGE.split("<script>", 1)[1]
+    assert "const {served_at, progress, ...rest} = d;" in script
+    body = script.split("function render(d, force){", 1)[1]
+    assert body.index("renderProgress(progress);") < body.index("sig === LASTJSON")
 
 
 def test_the_served_javascript_actually_parses():
