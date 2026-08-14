@@ -7,7 +7,9 @@ import json
 import pytest
 
 from autoloop.contract import (
+    ACTIVE_DECISIONS,
     CONTRACT_INSTRUCTIONS,
+    RETIRED_DECISIONS,
     Decision,
     parse_response,
     verify_review,
@@ -118,9 +120,21 @@ def test_stop_parses():
     assert parse_response(block(base("stop"))).decision is Decision.STOP
 
 
-def test_ask_user_parses():
+def test_legacy_ask_user_with_a_question_still_parses():
+    """`ask_user` is retired from the instructions, not from the parser: a
+    conversation that saw the old contract can still answer it, and that reply
+    must park the loop rather than burn the parse-retry budget."""
     directive = parse_response(block(base("ask_user", question="which DB?")))
+    assert directive.decision is Decision.ASK_USER
     assert directive.question == "which DB?"
+
+
+def test_legacy_ask_user_without_a_question_parses():
+    """The contract no longer asks for `question`, so a legacy reply may omit
+    it — the orchestrator parks with a placeholder instead."""
+    directive = parse_response(block(base("ask_user")))
+    assert directive.decision is Decision.ASK_USER
+    assert directive.question is None
 
 
 def test_notes_accepted():
@@ -250,8 +264,14 @@ def test_commit_paths_bad_types():
     )
 
 
-def test_question_required_for_ask_user():
-    expect_code(block(base("ask_user")), "missing_field:question")
+def test_blank_question_on_a_legacy_ask_user_rejected():
+    """Optional, but never blank: a park whose question is an empty string is
+    worse than one that says it has none."""
+    expect_code(block(base("ask_user", question="  ")), "missing_field:question")
+
+
+def test_question_forbidden_outside_ask_user():
+    expect_code(block(base("stop", question="which DB?")), "unexpected_field")
 
 
 def test_scope_forbidden_outside_audit():
@@ -461,18 +481,44 @@ def test_contract_states_the_single_envelope_rule():
         assert forbidden in text
 
 
-@pytest.mark.parametrize("decision", [d.value for d in Decision])
-def test_contract_names_every_decision(decision):
-    """A decision the parser accepts but the instructions never mention is
-    unreachable in practice."""
+@pytest.mark.parametrize("decision", sorted(d.value for d in ACTIVE_DECISIONS))
+def test_contract_names_every_active_decision(decision):
+    """An active decision the instructions never mention is unreachable in
+    practice."""
     assert decision in CONTRACT_INSTRUCTIONS
+
+
+@pytest.mark.parametrize("decision", sorted(d.value for d in RETIRED_DECISIONS))
+def test_contract_never_offers_a_retired_decision(decision):
+    """Retirement is exactly this: still parsed, never advertised. A retired
+    value left in the guidance keeps being chosen."""
+    assert decision not in CONTRACT_INSTRUCTIONS
+
+
+def test_active_and_retired_partition_the_enum():
+    """Derived by subtraction, so a decision can be in neither set only if the
+    derivation is broken."""
+    assert ACTIVE_DECISIONS | RETIRED_DECISIONS == set(Decision)
+    assert not ACTIVE_DECISIONS & RETIRED_DECISIONS
+    assert Decision.ASK_USER in RETIRED_DECISIONS
+
+
+def test_unknown_decision_correction_lists_active_decisions_only():
+    """The correction is what the model picks from next — naming a retired
+    decision there invites it back into use."""
+    with pytest.raises(ContractError) as excinfo:
+        parse_response(block(base("deploy_to_prod")))
+    message = str(excinfo.value)
+    for decision in ACTIVE_DECISIONS:
+        assert decision.value in message
+    assert "ask_user" not in message
 
 
 @pytest.mark.parametrize(
     "field",
     [
         "version", "decision", "reason", "scope", "tasks", "task_id",
-        "feedback", "commit", "reviewed", "question", "notes",
+        "feedback", "commit", "reviewed", "notes",
     ],
 )
 def test_contract_documents_every_top_level_field(field):
