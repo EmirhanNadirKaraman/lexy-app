@@ -248,7 +248,7 @@ remaining App-Store compliance checklist.
 |---|---|
 | 023 | `notification` table — per-user event queue for the SSE stream. |
 | 024 | Phrase/grammar polymorphic key consolidation. |
-| 025 | `book_blocks.tokens` JSONB → per-block stable `token_id`s. |
+| 025 | `book_blocks.tokens` JSONB → per-block stable `token_id`s. `reading_selections.anchors` references these ids with **no FK**, and the backfill mints fresh UUIDs on every run — so `downgrade()` refuses while any anchor still points at a `token_id` (db-02). |
 | 026 | Transcript-click dedup — `word_usage_events.sentence_id` + stored `event_day` generated col + unique partial index (T1.1 / Hole 3 + Hole 4). |
 | 027 | `user_channel_preference` table — moves channel followed/liked/disliked out of `users.settings` JSONB into a relational shape (T1.4). |
 | 028 | `client_error_log` table — W7 backend sink for the frontend ErrorBoundary. |

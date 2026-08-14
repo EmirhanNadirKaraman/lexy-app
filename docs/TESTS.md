@@ -65,6 +65,7 @@ line.
 | `test_grammar_rules_srs.py` | grammar rule via `/words/{type}/{id}/status`; status_marked_learning currently creates passive only (grammar_rule guard added in this session) |
 | `test_llm_cache.py` | cache key generation, hit/miss, TTL |
 | `test_matcher.py` | phrase matching via `/sentences/match` (🆕 auth-gated, S16): 403 unauth / 200 auth / 422 over-length cap; German + Spanish (es-model) extraction; unknown-language → []. |
+| `test_migration_025_downgrade.py` | 🆕 db-02 downgrade guard for migration 025: `_tokenize` id instability, refuse-before-DDL when `reading_selections` anchors exist, proceed at zero dependents, the counting SQL against the live schema (token_id counts, legacy/null/empty don't), and a shape matrix proving the predicate never *errors* on non-array `anchors` (JSON null / object / scalar / SQL NULL). **Never runs `alembic downgrade`** — see the caveat below the table. |
 | `test_client_errors.py` | W7 crash-sink coverage; 🆕 extended with S6 per-IP throttle tests (429 after limit, authed below-limit still 204) |
 | `test_playlist.py` | playlist generation from target words |
 | `test_prioritization.py` | get_prioritized_items signal weights |
@@ -1032,6 +1033,86 @@ Three new cases in `TestChecksumGate` plus one in `TestImportFlow`:
 
 Counts in the summary table below were not re-measured for this change (no
 execution in the worker role that made it); the delta is +5 backend cases.
+
+🆕 **2026-08-05 — Migration 025 downgrade guard (+23 backend / +1 file)**
+
+Audit `tests_ci:db-02` (rt-02). `025_block_token_ids.downgrade()` was a bare
+`DROP COLUMN tokens`. `reading_selections.anchors` holds `{block_id, token_id,
+surface}` pointing into that column with **no FK**, and `_tokenize` mints fresh
+`uuid4()`s on every run — so downgrade + re-upgrade silently reassigns every id
+and orphans every anchor. No error, no warning; the selections survive but stop
+resolving to any text. `downgrade()` now counts dependent rows and raises
+before touching the schema.
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_migration_025_downgrade.py` (NEW) | 23 | `_tokenize` id instability across runs (the reason the loss is unrecoverable); refusal with the row count + the DELETE that constitutes explicit consent; **no DDL executed on the refusal path**; proceed at zero dependents and on a `None` scalar; no env-var force flag; the counting SQL run against the live schema — a token_id anchor counts, pre-025 legacy anchors / JSON-null token_id / empty anchors do not, and a 3-anchor selection counts once; an 8-case shape matrix over every JSON value `anchors` can hold; the unscoped constant run over a table that really contains non-array rows; SQL-NULL anchors via a synthetic row; `EXPLAIN` on the DELETE the refusal quotes; and the constant surviving `sa.text()` intact (the `'[]'::jsonb` cast vs. its bind-param regex) |
+
+**No force flag, deliberately.** Nothing else in this repo gates destruction on
+an env var (022 raises flatly, 035 deletes only rows it created), and the
+escape hatch already exists and is better: the operator deletes the dependent
+`reading_selections` rows, which makes the loss explicit and auditable. The
+refusal message hands them that exact statement.
+
+**The load-bearing test is `test_dependent_anchors_sql_counts_only_token_id_anchors`.**
+Anchors written before 025 have no `token_id` key at all — that's why
+`routers/reading.py:64` falls back to `"legacy"`. A guard that counted every
+`reading_selections` row would block the downgrade on deployments that never
+depended on the column, which is a bug in the opposite direction. The scoped
+count pins both halves on one user's fixtures.
+
+**Second round (same day): the predicate is shape-safe, not just correct on
+well-formed rows.** `anchors` is `JSONB NOT NULL DEFAULT '[]'` (migration
+009:32) — an array of objects is a convention of the write path, not a
+constraint — and `jsonb_array_elements` *errors* on a JSON null, an object or a
+scalar. One such row anywhere in the table turned the guard from a clean refusal
+into `cannot extract elements from a scalar` **mid-downgrade**, which is worse
+than having no guard at all. The predicate now expands only arrays
+(`CASE WHEN jsonb_typeof(rs.anchors) = 'array' … ELSE '[]'::jsonb END`) and only
+object elements. Non-array anchors count as zero dependents on purpose:
+`routers/reading.py:59-60` already coerces any non-list to `[]`, so the row
+resolves to no anchors in the app today and the downgrade destroys nothing it
+had not already lost.
+
+Coverage for that: `test_dependent_anchors_sql_classifies_every_stored_shape`
+(8 params — JSON null, un-wrapped object, bare scalar, empty array, legacy
+array, array with a JSON-null token_id, array of scalars, token_id array) plus
+`test_dependent_anchors_sql_survives_non_array_rows_in_the_live_table`, which
+inserts the non-array rows and then runs the constant **unscoped**, exactly as
+`downgrade()` does — that is the one that fails pre-fix. SQL NULL is the only
+shape the live schema cannot hold (NOT NULL), so
+`test_predicate_treats_sql_null_anchors_as_no_dependency` drives it over a
+synthetic `(VALUES ($1::jsonb)) AS rs(anchors)` row, with a positive control so
+the harness can't pass vacuously.
+
+**The refusal's DELETE is derived, not re-typed.** `_DELETE_DEPENDENTS_SQL` is
+built from `_ANCHOR_DEPENDS_PREDICATE`, so the operator's escape hatch inherits
+the array guard instead of crashing on exactly the rows it exists to clear.
+`test_delete_dependents_sql_plans_against_the_live_schema` runs `EXPLAIN` on it
+— plans against the real schema, executes nothing, deletes nothing.
+
+**This suite never runs `alembic downgrade`** — the tests share the dev
+database, and a real downgrade would drop `book_blocks.tokens` out from under
+every other suite. The SQL constant is executed directly through asyncpg
+instead, and `downgrade()` is driven with a fake `op` that only records what it
+was handed. The two live tests scope their count by *appending* to
+`mig._DEPENDENT_ANCHORS_SQL` rather than copying the predicate, so the string
+under test is the one that ships and the count stays deterministic under xdist.
+
+Note this edits a migration that has already been applied (CLAUDE.md §12,
+append-only). Only `downgrade()`, the module-level SQL constants it reads, and
+the prose changed — `upgrade()`, `_tokenize` and the revision ids are
+byte-for-byte unchanged, so no deployment can diverge. The docstring says so, to
+save the next reader the diff.
+
+**Latent sibling, deliberately not touched:** `services/reading_service.py:155`
+runs the same unguarded `jsonb_array_elements(anchors)` on the request path and
+would raise on the same non-array rows. Out of scope for this task (a migration
+guard), recorded here so it isn't mistaken for coverage.
+
+Counts in the summary table below were not re-measured for this change (no
+execution in the worker role that made it); the delta is +23 backend cases,
+counted from the file rather than from a run.
 
 🆕 **2026-07-29 — Document-ingestion evaluation harness (+147 root / +6 files)**
 
