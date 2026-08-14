@@ -117,6 +117,53 @@ PYTHONSAFEPATH=1 PYTHONPATH=/path/to/worktree python3 -c "import autoloop; print
 (2026-08-04) — an unreadable directory is not evidence of safety. Any other
 command reading `state_dir` still has this shape.
 
+### Autoloop's Chrome restart reports success while restarting nothing
+**Symptom:** the loop cycles forever on a ~3-minute period. Every cycle logs
+`browser_restarted` with `returncode 0` and `"autoloop chrome up on 9222"`,
+immediately followed by `browser_error: cannot connect to Chrome DevTools at
+http://127.0.0.1:9222`. A hand-run `curl http://127.0.0.1:9222/json/version`
+returns 200 the whole time, so the browser looks healthy. The pid the script
+claims to have stopped is different on every cycle.
+**Cause:** two faults stacked, and the second hid the first.
+
+The underlying fault was a wedged browser: `BrowserType.connect_over_cdp`
+reached `<ws connected>` and then hung until its 180000ms timeout — which is
+exactly the 3-minute cycle. HTTP `/json/version` still answered, so no probe
+built on it could see the problem. It ignored `SIGTERM`.
+
+The fault that made it unrecoverable was `restart_autoloop_chrome.sh` selecting
+its target with `ps ... | head -1`. `ps` lists ascending by pid, every Chrome
+helper inherits `--user-data-dir`, so `head -1` reliably picked a **renderer**,
+not the browser. Chrome respawns a killed renderer instantly; the readiness
+`curl` then hit the untouched main process and returned 200. Result:
+`returncode 0`, a plausible "stopping autoloop chrome (pid NNNN)" line, and a
+browser that was never restarted. **A recovery command that lies is worse than
+one that fails** — the loop retried against the same wedged browser for hours
+and reported healthy recovery each time.
+**Fix:** `main_pids()` in the script now requires all three of: the command
+*is* the Chrome browser binary, no `--type=` (that excludes helpers), and an
+exact `--user-data-dir` match (so `.autoloop-chrome` does not select
+`.autoloop-chrome-backup`). It also proves port 9222 is **free** after killing
+and before launching — otherwise a stale holder makes the readiness probe pass
+against the impostor — escalates to `SIGKILL` when `SIGTERM` is ignored, and
+requires `webSocketDebuggerUrl` in the probe rather than any 200.
+
+One trap while writing that filter, and it is the same bug in a new costume:
+`awk -v prof="--user-data-dir=$PROFILE"` carries the profile path in its **own**
+argv, so a plain content match selects the matcher process itself. The old
+`grep -v grep` was covering this. Requiring the command to start with the Chrome
+binary path is what actually closes it.
+
+```bash
+# Verify a real restart: the main pid must CHANGE and helpers must be ignored.
+BEFORE=$(ps -eo pid,command | grep -- "--user-data-dir=$HOME/.autoloop-chrome" \
+    | grep -v grep | grep -v -- '--type=' | awk '{print $1}')
+bash scripts/restart_autoloop_chrome.sh
+AFTER=$(ps -eo pid,command | grep -- "--user-data-dir=$HOME/.autoloop-chrome" \
+    | grep -v grep | grep -v -- '--type=' | awk '{print $1}')
+[ "$BEFORE" != "$AFTER" ] && echo "PASS: browser actually restarted"
+```
+
 ### `ImportError: cannot import name 'markcoroutinefunction'` from a partially initialized `inspect`
 **Symptom:** A throwaway script that only does `import asyncio, asyncpg` dies with
 a traceback that ends inside `asyncpg/compat.py`:
