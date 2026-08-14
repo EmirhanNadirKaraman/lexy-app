@@ -8,6 +8,7 @@ import pytest
 
 from autoloop.contract import (
     CONTRACT_INSTRUCTIONS,
+    NEXT_WORK_PREFERENCE,
     Decision,
     parse_response,
     verify_review,
@@ -524,15 +525,93 @@ def test_contract_says_version_is_three():
     assert "3" in CONTRACT_INSTRUCTIONS
 
 
+# ---- the finish-before-start scheduling preference --------------------------
+#
+# The one advisory paragraph in the instructions. It is prose the model reads,
+# not something `parse_response` can enforce, so the tests below pin its
+# CONTENT the same way the format tests above do — and pin it to the CONTEXT
+# numbers it depends on, because a preference the reviewer cannot evaluate is
+# not a preference, it is decoration.
+
+
+def test_preference_states_finish_before_start():
+    assert "finish before you start" in NEXT_WORK_PREFERENCE
+    # ...and names which decisions that ranks against which.
+    assert "prefer `revise` or an approval on" in NEXT_WORK_PREFERENCE
+    assert "`implement` on a fresh task" in NEXT_WORK_PREFERENCE
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "when nothing is in flight",
+        "blocked on something external",
+        "when the operator asks",
+    ],
+)
+def test_preference_keeps_all_three_start_anyway_conditions(condition):
+    """Prefer, never forbid. Each of the three is a real case where starting
+    fresh work is right; the external-blocker one especially — a task stuck on
+    an outside condition must not stall everything queued behind it."""
+    assert condition in NEXT_WORK_PREFERENCE
+
+
+def test_preference_is_advisory_not_a_refusal():
+    """It must read as a ranking the reviewer applies, not as a rule something
+    enforces — a refusal would park the loop rather than redirect it."""
+    assert "a preference, not a parser rule" in NEXT_WORK_PREFERENCE
+
+
+def test_preference_cites_the_context_counts_that_make_it_checkable():
+    """The mutation this guards: drop the counts from the CONTEXT block (or
+    rename the label) and the rule points at numbers that are not there.
+
+    Written as a literal on purpose. The other half of the pin — that this is
+    the same label `render_context` actually emits — lives in `test_context.py`
+    (`test_the_label_the_contract_points_at_is_the_label_that_is_rendered`),
+    which owns `IN_FLIGHT_LABEL`. Importing it here would point a test-only
+    dependency back down the import chain (`context` already reaches `contract`
+    via `git_gateway` → `policy`) to prove something once more."""
+    assert "`in_flight`" in NEXT_WORK_PREFERENCE
+    assert "in progress" in NEXT_WORK_PREFERENCE
+    assert "unpublished candidate" in NEXT_WORK_PREFERENCE
+
+
+def test_preference_does_not_restate_the_audit_rule():
+    """Whether a fresh audit or ready roadmap work comes first is a separate
+    rule with its own home. This clause orders implement/revise/approve among
+    themselves; duplicating the audit rule here would give one preference two
+    texts to drift between. (`audit` itself stays documented above — see
+    test_contract_names_every_decision.)"""
+    assert "audit" not in NEXT_WORK_PREFERENCE.lower()
+
+
+def test_preference_is_actually_shipped_in_the_instructions():
+    assert NEXT_WORK_PREFERENCE in CONTRACT_INSTRUCTIONS
+
+
 def test_contract_stays_within_its_budget():
     """A ceiling, not a target. The instructions are re-sent on EVERY turn, so
     they are a per-turn tax on a metered allowance.
 
-    2,850 is set just above the 2,812 the 2026-08-01 trim actually achieved,
-    NOT at a number chosen in advance. The pre-work estimate was ~1,800, which
-    turned out to be wrong: the remaining text is field definitions, decision
-    semantics and path restrictions — rules, not prose — and reaching a lower
-    figure would have meant deleting requirements to hit a guess. Raising this
-    ceiling is fine when a genuine new requirement lands; raising it to make
-    room for explanation is not."""
-    assert len(CONTRACT_INSTRUCTIONS) <= 2850
+    2,850 was set just above the 2,812 the 2026-08-01 trim achieved. Adding
+    the finish-before-start preference (2026-08-14) grew the text by a
+    measured 402 characters — the 400-character clause plus the two-character
+    blank-line join — for a total of 3,214.
+
+    3,240 is that measurement plus a 26-character margin, NOT the previous
+    ceiling plus a guess at what the clause might cost. The measurement was
+    made by hand, summing line lengths, because the executor for this change
+    had no shell; the method was checked against the recorded 2,812 for the
+    unchanged part first and reproduced it exactly. Raising this ceiling is
+    fine when a genuine new requirement lands; raising it to make room for
+    explanation is not."""
+    assert len(CONTRACT_INSTRUCTIONS) <= 3240
+
+
+def test_preference_clause_has_its_own_tighter_budget():
+    """The clause is the part likely to attract elaboration, so it carries a
+    separate ceiling: measured 400, capped at 420. The whole rule fits in six
+    lines — anything materially longer is explanation, and explanation belongs
+    in the source comment next to it, which costs nothing per turn."""
+    assert len(NEXT_WORK_PREFERENCE) <= 420

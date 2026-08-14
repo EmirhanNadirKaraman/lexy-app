@@ -12,7 +12,9 @@ Protocol v2. Two structural rules distinguish it from v1:
   `verify_review` checks the stamp against what was actually sent, so an
   approval can never be applied to a state ChatGPT did not review.
 
-Every prompt embeds CONTRACT_INSTRUCTIONS. `parse_response` validates
+Every prompt embeds CONTRACT_INSTRUCTIONS, which is the response format plus
+NEXT_WORK_PREFERENCE — the one advisory part of the text, stating which
+decision to prefer when work is already in flight. `parse_response` validates
 strictly; failures raise ContractError with a stable code that is echoed back
 for correction. Nothing is guessed or defaulted.
 """
@@ -158,7 +160,7 @@ class Directive:
     notes: str | None = None
 
 
-CONTRACT_INSTRUCTIONS = """\
+_RESPONSE_FORMAT = """\
 RESPONSE FORMAT — mandatory.
 Your ENTIRE reply must be exactly one fenced JSON code block (```json ... ```)
 and nothing else: no sentence before it, no sentence after it. Two blocks, a
@@ -205,6 +207,35 @@ Decisions:
   commit_and_push — commit, then push.
   stop — end the loop.
   ask_user — pause the loop and surface `question` to the human operator."""
+
+#: A scheduling PREFERENCE, appended to the response format above.
+#:
+#: Advisory by construction. `parse_response` never reads this text and
+#: `policy.py` gains no refusal from it, because a scheduling preference
+#: expressed as a policy denial is the wrong layer twice over: policy
+#: authorizes actions, and a denial would park the loop instead of redirecting
+#: it. It is also deliberately not absolute — a task can be legitimately stuck
+#: on an external condition, and forbidding new work would stall everything
+#: queued behind it — so it names the three cases where starting fresh work is
+#: still the right call.
+#:
+#: It orders `implement`/`revise`/approval among themselves and says nothing
+#: about `audit`: which of a fresh audit or ready roadmap work comes first is a
+#: separate rule with its own home, and restating it here would give the same
+#: preference two texts to drift between.
+#:
+#: The numbers it depends on are rendered by `context.render_context` under
+#: `context.IN_FLIGHT_LABEL`. A rule the reviewer cannot evaluate is not a
+#: rule, so the two are pinned to each other by test.
+NEXT_WORK_PREFERENCE = """\
+CHOOSING WHAT TO DO NEXT — a preference, not a parser rule.
+CONTEXT's `in_flight` line gives tasks in progress and how many hold an
+unpublished candidate. While any holds one, prefer `revise` or an approval on
+it over `implement` on a fresh task: finish before you start. Start new work
+when nothing is in flight, when everything in flight is
+blocked on something external, or when the operator asks."""
+
+CONTRACT_INSTRUCTIONS = _RESPONSE_FORMAT + "\n\n" + NEXT_WORK_PREFERENCE
 
 
 def _require_str(field: str, value: object) -> str:
