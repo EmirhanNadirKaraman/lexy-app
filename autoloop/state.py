@@ -80,6 +80,14 @@ if TYPE_CHECKING:
 # `postcommit` above: all three are new fields with a `None` default, and a
 # session written before this existed has no in-flight changeset review to
 # backfill — `None` is exactly correct for it.
+#
+# NOT bumped for chunked packet delivery either (`LoopState.outbox_diff`,
+# `PendingRequest.delivery`, and the new `Phase.DELIVERING` member). The two
+# fields default to `None`, which is exactly right for a state file written
+# before this existed: its payload was sent as one message, so there is no
+# delivery to backfill. The phase is additive — an old state file cannot
+# contain a value that did not exist when it was written, and `Phase(...)`
+# still rejects anything unknown.
 SCHEMA_VERSION = 3
 
 
@@ -105,6 +113,14 @@ def utcnow_iso() -> str:
 
 class Phase(str, Enum):
     READY = "ready"            # outbox holds the next payload to send
+    # The request's payload is too large for one message and is being deposited
+    # as numbered parts BEFORE the message that asks for a verdict. Nothing has
+    # been asked yet: a request in this phase has sent zero or more parts and no
+    # question. All-or-nothing — the verdict message is only reached once every
+    # part is confirmed present in persisted history; any part that does not
+    # land sends the omission notice instead (see `packet.plan_chunked_delivery`
+    # and `Orchestrator._step_delivering`).
+    DELIVERING = "delivering"
     SUBMITTING = "submitting"  # pending_request created, may or may not be sent
     # A send was attempted but acceptance is UNKNOWN. Only reconciliation (a
     # controlled reload) may resolve this; it must never auto-resend, because
@@ -156,6 +172,45 @@ class PostcommitBinding:
     candidate_sha: str
     candidate_tree_sha: str
     packet_sha256: str
+
+
+@dataclass
+class ChunkedDelivery:
+    """Progress through a chunked packet delivery, for ONE pending request.
+
+    Distinct from `packet.DeliveryPlan`, which is the pure, freshly computed
+    rendering: this is the durable half — what has actually been confirmed
+    present in the conversation, plus the payload to fall back to if the rest
+    does not make it.
+
+    `delivered` is a cursor into `parts`, saved after each part is confirmed by
+    READBACK from persisted history (never on the send's own say-so). A crash
+    mid-delivery therefore resumes at the first unconfirmed part instead of
+    re-posting the ones already there.
+
+    `fallback_payload` is the SAME packet with its diff replaced by the
+    omission notice. It is captured up front rather than re-derived at failure
+    time so the fallback needs nothing from git, the worktree, or a diff that
+    may no longer render identically — a part failing is the worst moment to
+    depend on any of that.
+    """
+
+    #: `[{"part_id": str, "index": int, "total": int, "text": str}, ...]` in
+    #: send order. Plain dicts, like `LoopState.task_execution`, because they
+    #: round-trip through the state file's JSON with no custom decoding.
+    parts: list[dict] = field(default_factory=list)
+    delivered: int = 0
+    fallback_payload: str = ""
+
+    @property
+    def complete(self) -> bool:
+        """Every part confirmed. The ONLY condition under which a verdict may
+        be requested — see `Orchestrator._step_submitting`'s guard, which
+        refuses rather than asks when this is False."""
+        return bool(self.parts) and self.delivered >= len(self.parts)
+
+    def part_ids(self) -> list[str]:
+        return [str(part.get("part_id", "")) for part in self.parts]
 
 
 @dataclass
@@ -236,6 +291,14 @@ class PendingRequest:
     #: silence there is what may authorize a rotation (see
     #: `docs/AUTOLOOP.md` §5c).
     start_timeouts: int = 0
+    #: Set only when this request's payload is too large for one message and
+    #: is being delivered as numbered parts first (`packet.plan_chunked_delivery`).
+    #: `None` — every ordinary request — means the payload is sent as a single
+    #: message exactly as it always was. Cleared to `None` by a fallback to the
+    #: omission notice, which is what makes "a request with a delivery still
+    #: has parts outstanding" a real, checkable condition rather than a
+    #: leftover.
+    delivery: ChunkedDelivery | None = None
     #: Accumulated ACTUAL wait (`ResponseTimeoutError.elapsed`, monotonic
     #: seconds — not the configured timeout value) behind `start_timeouts`.
     #: Checked against a floor computed from
@@ -305,12 +368,17 @@ def _load_changeset(raw: dict | None) -> ChangesetBinding | None:
     return ChangesetBinding(**raw)
 
 
+def _load_delivery(raw: dict | None) -> ChunkedDelivery | None:
+    return ChunkedDelivery(**raw) if raw else None
+
+
 def _load_pending_request(raw: dict | None) -> PendingRequest | None:
     if not raw:
         return None
     data = dict(raw)
     data["postcommit"] = _load_postcommit(data.get("postcommit"))
     data["changeset"] = _load_changeset(data.get("changeset"))
+    data["delivery"] = _load_delivery(data.get("delivery"))
     return PendingRequest(**data)
 
 
@@ -367,6 +435,20 @@ class LoopState:
     parse_retries: int = 0
     policy_denials: int = 0
     outbox: str | None = None
+    #: The raw patch text embedded in `outbox`, when that payload is a review
+    #: packet whose diff is too large for one chat message. `None` for every
+    #: other payload, and for a packet that fits — which is the common case and
+    #: behaves exactly as it always has.
+    #:
+    #: Carried rather than recovered later by slicing `outbox`, because
+    #: `_step_ready` needs the exact bytes to build the parts and cannot ask
+    #: git for them (the diff lives in the task's own worktree, and the payload
+    #: may have been queued by an earlier process). It is a duplicate of text
+    #: already inside `outbox`, so it is checked against it before use: the
+    #: inline section must appear there exactly once or the loop falls back to
+    #: the omission notice. That check is what stops a hand-edited or corrupted
+    #: state file from delivering parts that differ from the hashed packet.
+    outbox_diff: str | None = None
     pending_request: PendingRequest | None = None
     last_response: LastResponse | None = None
     current_task: dict | None = None

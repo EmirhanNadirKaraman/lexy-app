@@ -946,7 +946,15 @@ def test_the_report_is_labelled_as_claimed_not_read(tmp_path):
 
 def test_an_oversized_diff_is_OMITTED_not_truncated(tmp_path):
     """Silent truncation is worse than omission: a reviewer who cannot see
-    that the patch was cut reads a partial diff as the whole change."""
+    that the patch was cut reads a partial diff as the whole change.
+
+    Since chunked delivery (pkt-01) an oversized patch is normally sent as
+    numbered parts instead — see `test_chunked_packet_delivery.py`. This drives
+    the FALLBACK, which is what a provider without a shared conversation gets
+    and what any failed part delivery reverts to. The property under test is
+    unchanged and is the reason the notice exists at all: omission is loud,
+    complete, and never a partial view.
+    """
     from autoloop import packet as packet_mod
 
     big = "\n".join(f"line {i} of a large generated file" for i in range(4000)) + "\n"
@@ -954,8 +962,12 @@ def test_an_oversized_diff_is_OMITTED_not_truncated(tmp_path):
     orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
         tmp_path, executor
     )
+    client = FakeClient()          # declares no `supports_chunked_delivery`
+    orch._client_factory = lambda: client
     orch._dispatch_executor(implement(task.id))
     orch._step_ready()
+    assert orch.state.phase == Phase.DELIVERING.value
+    orch._step_delivering()
 
     payload = orch.state.pending_request.payload
     assert "Full diff: OMITTED" in payload
@@ -966,6 +978,7 @@ def test_an_oversized_diff_is_OMITTED_not_truncated(tmp_path):
     assert "big.py" in payload
     assert "Diff stat:" in payload
     assert len(payload) < packet_mod.DIFF_INCLUDE_MAX_CHARS + 4_000
+    assert client.submitted == [], "no part may be sent to a provider that cannot chunk"
 
 
 def test_a_small_diff_is_still_sent_in_full(tmp_path):

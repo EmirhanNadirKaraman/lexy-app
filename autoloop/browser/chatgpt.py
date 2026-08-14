@@ -42,6 +42,17 @@ the live page so a streaming answer is never interrupted.
 synchronisation, Send readiness, submission confirmation, response start,
 response completion, reconciliation), and every timeout writes a structured,
 secret-free diagnostic snapshot.
+
+Two further OPTIONAL capabilities the orchestrator probes with `getattr`:
+
+* `supports_chunked_delivery` (declared below) — this transport keeps one
+  persistent conversation, so an oversized review packet may be deposited as
+  numbered parts before the message that asks for a verdict.
+* `mount_message_tail()` — scroll older turns into the virtualized message list
+  before a readback concludes something is absent (docs/AUTOLOOP.md §11: a
+  10-message conversation mounted only the 6 newest nodes). Not implemented
+  here yet; `Orchestrator._part_present` calls it when present and reads only
+  what is mounted when it is not, which is the historical behaviour.
 """
 
 from __future__ import annotations
@@ -115,6 +126,17 @@ class TransportDiagnostics:
 
 
 class BrowserChatGPT:
+    #: Declares that this transport holds ONE persistent, shared conversation,
+    #: so several messages sent in sequence accumulate as context the next
+    #: message can refer back to. That is what a chunked review packet needs:
+    #: the diff arrives as numbered parts and the message asking for a verdict
+    #: refers to them. Probed by the orchestrator with `getattr`, so a provider
+    #: that does not set it (`codex.conversation`, whose every turn is a fresh
+    #: process with no shared history) keeps the pre-chunking behaviour — an
+    #: oversized diff is omitted with a notice rather than split into parts
+    #: that would each be reviewed as if it were the whole change.
+    supports_chunked_delivery = True
+
     def __init__(
         self,
         session: BrowserSession,

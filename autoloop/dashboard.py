@@ -272,7 +272,10 @@ def pipeline(state: dict, agents: list, blockers: list) -> list[dict]:
          "state": "done" if candidate else st(False)},
         {"key": "review", "label": "ChatGPT review",
          "detail": f"decision {decision}" if decision else "awaiting",
-         "state": st(phase in ("submitting", "awaiting"), done=bool(decision))},
+         # `delivering` is part of getting the packet in front of the reviewer
+         # (an oversized diff sent as numbered parts), so it reads as the same
+         # step here rather than as a separate stall.
+         "state": st(phase in ("delivering", "submitting", "awaiting"), done=bool(decision))},
         {"key": "publisher", "label": "Publisher", "detail": "exact-SHA push",
          "state": st(decision == "push" and phase == "executing")},
     ]

@@ -44,7 +44,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 
 | Component | File(s) | Owns |
 |---|---|---|
-| Orchestrator | `orchestrator.py` | Persisted state machine (ready → submitting → awaiting → executing), failure routing, budgets, review-integrity gates, produce-then-review dispatch (`_dispatch_task_postcommit` — the only executor-dispatch path). |
+| Orchestrator | `orchestrator.py` | Persisted state machine (ready → [delivering] → submitting → awaiting → executing), failure routing, budgets, review-integrity gates, produce-then-review dispatch (`_dispatch_task_postcommit` — the only executor-dispatch path). `delivering` is entered only for a review packet whose patch is too large for one chat message (§5d-bis). |
 | Lock | `lock.py` | Single-instance lock per state dir (see §3). |
 | Change manifest (retired, kept for its own unit tests) | `manifest.py` | The old task-owned change-manifest commit gate (see §4) — **no production caller since 2026-07-30** (docs/SECURITY.md S21/S22). |
 | Worktrees / task execution | `worktree.py` (`WorktreeManager`, unused in production — see §4c), `worktask.py` (`TaskExecution`, `CommitIntent`, `reconcile_after_crash`) | Per-task worktree/branch bookkeeping, and the crash-safe commit-intent/candidate-sha bookkeeping for produce-then-review (see §4b). |
@@ -608,6 +608,13 @@ bytes. Two different commits can produce byte-identical diff TEXT, so a
 digest over the diff alone would not pin which commit was reviewed; the four
 identifiers inside the hashed body are what make an approval of candidate A
 structurally unable to authorize publishing a swapped-in candidate B.
+
+The packet inlines the WHOLE patch, however large — that string is the logical
+packet, and bounding it here would mean the hash covered less than the review
+did. What a single chat message can carry is a separate question, answered at
+DELIVERY: a patch too large for one message is sent as numbered parts before
+the message asking for a verdict, and omitted (loudly, never truncated) only
+when that cannot be done. See §5d-bis.
 
 **Request/response binding (`state.PostcommitBinding`).** A dedicated field
 on `PendingRequest`/`LastResponse` — never `last_manifest_id`, which belongs
@@ -1947,6 +1954,117 @@ reason — exercising that transport is its whole purpose.
 
 ---
 
+## 5d-bis. Chunked packet delivery: a big diff arrives in parts, not omitted
+
+Added 2026-08-14 (pkt-01).
+
+**The problem.** A diff over `packet.DIFF_INCLUDE_MAX_CHARS` (30,000) was
+OMITTED with an honest notice, and the reviewer correctly refused to approve
+what it could not see. On 2026-08-05 sub-01 produced a 41 KB patch and the
+reviewer escalated to the operator, asking either to raise the cap or to
+authorize approval unseen. Neither is acceptable: 41 KB is *above* the 40,056
+character message that actually failed to send on 2026-08-04 (the composer
+accepted it, generation failed server-side, and the turn was never persisted),
+and approving unseen removes the review.
+
+**The insight.** The measured failure was ONE MESSAGE being too big, not the
+total volume. Several smaller messages are fine.
+
+**The shape.** The packet's git-read facts and the abridged verdict request go
+in one message; the patch goes ahead of it as numbered parts, each carrying at
+most `DIFF_INCLUDE_MAX_CHARS` of diff — the same budget an inline diff has
+always respected. `DIFF_INCLUDE_MAX_CHARS` is **not raised**; chunking is what
+removes the pressure to raise it, and
+`test_the_cap_is_sized_from_evidence_not_instinct` still pins the number to its
+evidence.
+
+Three rules make this safe rather than merely clever:
+
+1. **All or nothing.** No decision is requested until every part is confirmed
+   present. A half-delivered patch plus a verdict is approval on a partial
+   diff — strictly worse than today's omission, because the notice at least
+   tells the reviewer exactly what it cannot see. The transition out of
+   `delivering` happens after the delivery loop, and `_step_submitting` raises
+   a `StateError` rather than asking when parts are outstanding: the rule is
+   not left resting on two lines being in the right order.
+2. **Fall back to omission on any failure.** A part that does not land sends
+   the pre-chunking notice instead — and that notice now also **disowns** the
+   parts that already landed ("If any `autoloop review diff part` messages
+   appear above, IGNORE them … whatever landed is a FRAGMENT"), so the reviewer
+   is never left holding part of a patch it believes is whole. It says "if any"
+   rather than naming a count, because the thing that just failed is precisely
+   our knowledge of how many messages reached the conversation.
+3. **The integrity binding survives.** `context.report_sha256` hashes the
+   COMPLETE logical packet — `state.outbox`, patch inline — not the abridged
+   message that is sent. Every part carries a part id derived from the request
+   id, and the verdict message lists all of them. A fallback re-renders the
+   packet and re-stamps all three holders of the digest (the request,
+   `postcommit.packet_sha256`, and `TaskExecution.presented_report_sha256`);
+   missing the third would refuse a legitimate approval at push time, long
+   after the mistake.
+
+**Confirmation is by readback, never by the send.** Each part is confirmed the
+same way a submission is: reload, then look for the id in *persisted* history.
+Before concluding a part is absent, the loop mounts the virtualized message tail
+if the provider offers `mount_message_tail()` — ChatGPT renders only the newest
+few turns (§11), so a rendered-but-unmounted message reading as missing would
+throw away a complete delivery. The mount is best-effort and its failures are
+swallowed: mounting more history can only ADD evidence.
+
+**Part ids deliberately do not contain the request id.** Every provider answers
+"did this land?" with a substring search over user messages
+(`BrowserChatGPT.has_request`). A part carrying `alr-…-0007` verbatim would make
+`submitting`'s pre-send reconciliation match part 1, conclude the verdict
+request had already been sent, and leave the loop waiting for a reply to a
+question nobody was asked. `packet.diff_part_id` transforms the id
+(`alr-x-0007` → `diffpart_alr_x_0007_01of02`) and `plan_chunked_delivery`
+re-checks the built values rather than trusting the format string.
+
+**A rotation gives up the parts.** The parts live in the conversation being
+abandoned, and a rotation (§5c) posts only the verdict message — which would
+name part ids the replacement chat does not contain. Re-sending them is not an
+option either, since the rotation posts the question itself and they would
+arrive after it. So `_attempt_rotation` falls back to the omission notice before
+rotating a chunked request. That happens AFTER both rotation preconditions: a
+rotation refused for a missing `project_url` or a spent budget posts nothing, so
+the old conversation still holds the whole delivery and there is nothing to give
+up.
+
+**Chunking is opt-in per provider.** `supports_chunked_delivery` is probed with
+`getattr`, like every other optional transport capability. `browser_chatgpt`
+declares it (one persistent conversation, so earlier messages are context for
+later ones); `codex_cli` does not and must not — every turn there is a separate
+process with no shared history, so parts sent to it would be reviewed as
+separate fragments. A provider without the declaration gets the omission
+notice, exactly as before.
+
+**What it costs.** One reload per part (`_deliver_part` reconciles rather than
+trusting the send — the same price `submitting` already pays). And ChatGPT
+answers each part despite being told not to, so the next part's `submit` waits
+out that generation; a reply longer than `browser.send_ready_timeout_seconds`
+raises, restarts the browser, and re-enters `delivering`, which resumes from the
+persisted cursor without re-posting anything. Recoverable, but it is why the
+part count is bounded rather than open-ended.
+
+**Failures in `delivering` never discard the request.** `_handle_git_failure`
+treats `delivering` like `ready`: it parks retryably instead of writing a
+git-error payload and returning to `ready`, which would overwrite
+`pending_request` and abandon a part-delivered patch in the conversation with
+nothing left to disown it. Reachable in practice, since the fallback itself
+builds a context and `build_context` reads git.
+
+**Bounds.** `packet.DIFF_MAX_PARTS` (6, ≈180 KB of patch) caps the mechanism;
+past that, "reply `revise` asking for a smaller commit" — which the omission
+notice already says — beats a dozen messages nobody can hold in their head.
+That number is a judgement and is labelled as one: the only real data point is
+sub-01's 41 KB, which is two parts.
+
+**Not in scope, stated so it is not mistaken for covered.**
+`changeset_review.build_changeset_packet` embeds its diff with no per-message
+cap at all — a different path, a different bug, untouched here.
+
+---
+
 ## 5e. Report compaction: smaller reports, nothing lost
 
 Added 2026-08-01, to cut what the reviewer must read per turn — the packet is
@@ -2435,11 +2553,15 @@ reports this rather than raising.
 * **ChatGPT virtualizes the message DOM.** Measured live 2026-07-30: a
   10-message conversation mounted only the 6 most recent nodes (3 turns);
   older turns exist server-side but are not in `innerText` until you scroll.
-  Everything the loop needs is in the newest turn, so this is currently
-  harmless — `reconcile` checks the request that was just sent, and
-  `await_response` needs the last message. But it means **a DOM read is not a
-  full history read**: never infer "the conversation contains only X" from a
-  message count, and if a future change needs older turns it must scroll them
-  in rather than assume they are present.
+  Everything the loop needs is *usually* in the newest turn — `reconcile`
+  checks the request that was just sent, and `await_response` needs the last
+  message. But it means **a DOM read is not a full history read**: never infer
+  "the conversation contains only X" from a message count. Chunked packet
+  delivery (§5d-bis) is the one path that can need an older turn, when a
+  resumed delivery re-confirms parts sent before a crash; it calls the optional
+  `mount_message_tail()` before ruling a part absent. That capability is not
+  implemented on `BrowserChatGPT` yet, so today a resumed delivery reads only
+  what is mounted and falls back to the omission notice if an earlier part is
+  no longer rendered — safe, but a re-send of work that did land.
 * Selector defaults will drift with ChatGPT's UI eventually
   (`browser/selectors.py` is the fix point).

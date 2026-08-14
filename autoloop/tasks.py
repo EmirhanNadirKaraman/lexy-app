@@ -239,13 +239,17 @@ class Task:
 #: anything an agent writes, and every edit stays visible in
 #: `commit_range_paths`.
 #:
-#: One interaction worth naming, because it weakens the old "the reviewer sees
-#: every tracker edit" argument: since report-first packets (2026-08-04), a
-#: diff over `packet.DIFF_INCLUDE_MAX_CHARS` is OMITTED, so on a large commit
-#: the reviewer sees the tracker PATH in the changed-path list — always
-#: rendered, always git-read — but not the edited TEXT. Visibility of the fact
-#: survives; visibility of the content does not. That is an argument for
-#: keeping this list short, not for trusting it less.
+#: One interaction worth naming, because it used to weaken the old "the
+#: reviewer sees every tracker edit" argument: since report-first packets
+#: (2026-08-04) a diff over `packet.DIFF_INCLUDE_MAX_CHARS` was OMITTED, so on
+#: a large commit the reviewer saw the tracker PATH in the changed-path list —
+#: always rendered, always git-read — but not the edited TEXT. Since chunked
+#: delivery (2026-08-14, `docs/AUTOLOOP.md` §5d-bis) an oversized patch is
+#: normally sent as numbered parts instead, so the edited text does reach the
+#: reviewer. The gap is narrower, not closed: a patch that still cannot be
+#: chunked (no shared conversation on the provider, a part that fails to land,
+#: over `packet.DIFF_MAX_PARTS`) falls back to the same omission. That is an
+#: argument for keeping this list short, not for trusting it less.
 TRACKER_PATHS: tuple[str, ...] = (
     "CLAUDE.md",
     "docs/COMMON_ERRORS.md",

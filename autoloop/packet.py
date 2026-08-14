@@ -15,11 +15,24 @@ the hashed body is what closes that gap: an approval computed over candidate
 A's packet cannot be replayed to authorize publishing candidate B, because
 B's packet — differing in at least its `candidate_sha:` line — hashes to a
 different `report_sha256`.
+
+**The packet always carries the whole patch; DELIVERY is what is bounded.**
+`build_review_packet` inlines the complete diff unconditionally, however
+large it is, because that string is the *logical* packet — the thing
+`report_sha256` must cover. What a single chat message can carry is a
+separate question, answered by `plan_chunked_delivery` below: an oversized
+patch is delivered as numbered parts, each under the same per-message budget
+an inline diff has always respected, and the verdict is asked for only once
+every part is confirmed present. The hash still covers the complete packet
+(diff included), so an approval echoing it cannot bind to a subset of the
+review — see `orchestrator._step_delivering` for the all-or-nothing rule and
+`_fall_back_to_omission` for what happens when a part does not land.
 """
 
 from __future__ import annotations
 
 import textwrap
+from dataclasses import dataclass
 
 from .git_gateway import GitGateway
 from .tasks import Task
@@ -50,7 +63,31 @@ from .worktask import TaskExecution
 #: ordinary work. It is still a judgement, not a measurement: if a packet ever
 #: fails to land again, record the size HERE rather than halving the number on
 #: instinct — that is how the first guess got made.
+#:
+#: Since chunked delivery (2026-08-14) this doubles as the per-PART patch
+#: budget: a part carries at most this much diff text, which is exactly as much
+#: as an inline diff has always been allowed to carry. Deliberately the same
+#: number rather than a second one — there is one measured failure behind it,
+#: and a separate "chunk size" constant would be a second guess with no
+#: evidence of its own. It is NOT raised by chunking; chunking is what removes
+#: the pressure to raise it (see `test_the_cap_is_sized_from_evidence_not_instinct`).
 DIFF_INCLUDE_MAX_CHARS = 30_000
+
+#: How many parts a chunked delivery may take before the loop gives up and
+#: falls back to the omission notice. A judgement, and labelled as one: the
+#: only real data point is sub-01's 41 KB patch, which is two parts. Six
+#: (~180 KB of patch) covers four times the largest candidate observed so far;
+#: past that, "reply `revise` asking for a smaller commit" — which the omission
+#: notice already says — is a better answer than twelve chat messages nobody
+#: can hold in their head at once. Raise it only with a real patch that needed
+#: it, and record the size here.
+DIFF_MAX_PARTS = 6
+
+#: The literal line the inline diff section starts with. `plan_chunked_delivery`
+#: locates `_INLINE_DIFF_HEADER + diff` inside the rendered payload and swaps it
+#: for a delivery notice, which is what lets the *sent* message stay small while
+#: `state.outbox` — the thing `report_sha256` covers — keeps the whole patch.
+_INLINE_DIFF_HEADER = "Full diff:\n"
 
 
 def _format_commit_list(commits: list[dict]) -> str:
@@ -99,9 +136,26 @@ def _format_changed_paths(
 
 
 def build_review_packet(execution: TaskExecution, worktree_git: GitGateway, task: Task) -> str:
+    """The rendered review packet — see `build_review_packet_with_diff`, of
+    which this is the text half. Kept as the plain-string entry point because
+    most callers (and every test that only inspects the rendered packet) have
+    no use for the diff separately."""
+    return build_review_packet_with_diff(execution, worktree_git, task)[0]
+
+
+def build_review_packet_with_diff(
+    execution: TaskExecution, worktree_git: GitGateway, task: Task
+) -> tuple[str, str]:
     """Render the full review packet for `execution.candidate_sha` against
     `execution.task_base_sha`, reading only from the worktree's own
-    `GitGateway` (never the main checkout's).
+    `GitGateway` (never the main checkout's), and return it together with the
+    raw patch text it embeds.
+
+    The patch is returned separately, rather than recovered later by slicing
+    the rendered string, because the caller needs the exact bytes twice: once
+    inside the hashed packet and once as the source of the delivery parts. Two
+    derivations of "the diff" that could ever disagree is precisely the drift
+    that would let an approval bind to something other than what was shown.
 
     Raises `GitCommandError` (via `range_diff`/`range_diff_stat`) if the diff
     exceeds the byte cap — the caller decides how to handle that; this
@@ -142,7 +196,7 @@ def build_review_packet(execution: TaskExecution, worktree_git: GitGateway, task
             "",
             _format_diff_section(diff),
         ]
-    )
+    ), diff
 
 
 def _format_executor_report(execution: TaskExecution) -> str:
@@ -180,14 +234,18 @@ def _format_executor_report(execution: TaskExecution) -> str:
 
 
 def _format_diff_section(diff: str) -> str:
-    """The full patch when it is small enough to send, an honest omission
-    notice when it is not.
+    """The full patch, inline, whatever its size.
 
-    `GitGateway.RANGE_DIFF_MAX_BYTES` (400 KB) is a safety cap on what git is
-    asked to render; it is not a limit on what the REVIEWER can receive. On
-    2026-08-04 rt-09 produced a 38 KB diff — legal by that cap — and ChatGPT
-    could not process the message at all: the composer accepted it and
-    rendered optimistically (so the loop logged `request_submitted:
+    This is the LOGICAL packet: `context.report_sha256` hashes it, so it has
+    to contain everything the review is about. Bounding it here would mean the
+    hash covered less than the review did.
+
+    What a single chat message can carry is a different question, and it has a
+    measured answer. `GitGateway.RANGE_DIFF_MAX_BYTES` (400 KB) is a safety cap
+    on what git is asked to render; it is not a limit on what the REVIEWER can
+    receive. On 2026-08-04 rt-09 produced a 38 KB diff — legal by that cap —
+    and ChatGPT could not process the message at all: the composer accepted it
+    and rendered optimistically (so the loop logged `request_submitted:
     confirmed`), generation then failed server-side, and the whole turn was
     never persisted. Reloading the conversation showed no user message. The
     loop waited 486s for a reply to a message that did not exist, restarted
@@ -195,24 +253,270 @@ def _format_diff_section(diff: str) -> str:
     which failed identically, because the same oversized payload could not
     land there either. Three separate blockers, one cause.
 
-    Truncating silently would be worse than omitting loudly: a reviewer who
-    cannot see that the patch was cut will read a partial diff as the whole
-    change. So the notice states the real size, names what IS still authorative
-    (paths + stat, both read from git), and says how to read the rest.
+    That failure was ONE MESSAGE being too big, not the total volume — several
+    smaller messages land fine. So the size question is answered at DELIVERY
+    (`plan_chunked_delivery`), not by amputating the packet here.
     """
     diff = diff.strip()
     if not diff:
-        return "Full diff:\n  (empty)"
-    if len(diff) <= DIFF_INCLUDE_MAX_CHARS:
-        return "Full diff:\n" + diff
+        return _INLINE_DIFF_HEADER + "  (empty)"
+    return _INLINE_DIFF_HEADER + diff
+
+
+# ---- chunked delivery -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DiffPart:
+    """One numbered message of an oversized patch.
+
+    `part_id` is what the loop reads back from persisted history to confirm the
+    part landed — the same standard a submission is held to, never the send's
+    own say-so.
+    """
+
+    part_id: str
+    index: int
+    total: int
+    body: str
+    text: str
+
+
+@dataclass(frozen=True)
+class DeliveryPlan:
+    """How to deliver one oversized packet: the parts to send first, the
+    abridged payload to ask the verdict with, and the payload to fall back to
+    if any part does not land.
+
+    All three are derived from the SAME rendered payload the caller passes in,
+    so nothing here can present a patch that differs from the hashed one:
+    `final_payload` and `fallback_payload` are that payload with the inline
+    diff section textually replaced, and every part body is a slice of the
+    exact diff string it contained.
+    """
+
+    parts: tuple[DiffPart, ...]
+    final_payload: str
+    fallback_payload: str
+
+
+def payload_carries_diff(payload: str, diff: str) -> bool:
+    """Is `diff` inlined in `payload` exactly once, as the diff section?
+
+    The precondition for every rewrite below. It is what lets a patch be
+    carried alongside the payload it is already inside without the two being
+    able to drift: a stored diff that does not match its payload is not
+    "close enough to use", it is a different packet, and the caller must
+    ignore it rather than deliver parts of something nobody hashed.
+    """
+    return payload.count(_INLINE_DIFF_HEADER + diff.strip()) == 1
+
+
+def diff_part_id(request_id: str, index: int, total: int) -> str:
+    """The confirmation token for part `index` of `total`.
+
+    Deliberately NOT `request_id` with a suffix. Every provider answers
+    "did this land?" with a substring search over user messages
+    (`BrowserChatGPT.has_request`), so a part carrying the request id verbatim
+    would make `_step_submitting`'s pre-send reconciliation match part 1 and
+    conclude the verdict request had already been sent — the verdict message
+    would never go out, and the loop would sit waiting for a reply to a
+    question nobody was asked. The id is therefore transformed (hyphens to
+    underscores) so it is unmistakably the same request to a human reader and
+    structurally not the same token to a substring search.
+
+    `plan_chunked_delivery` re-checks that property on the values it actually
+    built rather than trusting this construction; see it for what happens when
+    the check fails.
+    """
+    return f"diffpart_{request_id.replace('-', '_')}_{index:02d}of{total:02d}"
+
+
+def split_diff_into_parts(diff: str, max_chars: int = DIFF_INCLUDE_MAX_CHARS) -> list[str]:
+    """Split `diff` into ordered slices of at most `max_chars`, preferring line
+    boundaries. Concatenating the result reproduces `diff` byte for byte —
+    that is the property the reviewer's "is this the whole patch?" rests on, so
+    nothing is trimmed, re-joined or normalised along the way.
+
+    A single line longer than `max_chars` (a minified bundle, a generated blob)
+    is cut mid-line rather than allowed to overflow the message budget. Losing
+    the line boundary is cosmetic; overflowing is the failure this whole
+    mechanism exists to avoid.
+    """
+    if max_chars <= 0:  # pragma: no cover - defensive; callers pass the constant
+        raise ValueError("max_chars must be positive")
+    slices: list[str] = []
+    rest = diff
+    while rest:
+        if len(rest) <= max_chars:
+            slices.append(rest)
+            break
+        window = rest[:max_chars]
+        cut = window.rfind("\n")
+        # `cut + 1` keeps the newline with the part that precedes it. A cut at
+        # 0 would produce an empty slice and never terminate, so fall through
+        # to the hard cut in that case too.
+        if cut <= 0:
+            cut = max_chars - 1
+        slices.append(rest[: cut + 1])
+        rest = rest[cut + 1:]
+    return slices
+
+
+def _render_part(
+    part_id: str, index: int, total: int, body: str, task_id: str, candidate_sha: str
+) -> str:
+    """One part message.
+
+    Deliberately NOT built through `prompts.build_prompt`: that appends
+    `CONTRACT_INSTRUCTIONS`, which tells the reviewer to answer with a
+    directive. A part is a deposit, not a request — asking for a verdict here
+    would invite exactly the partial-diff approval the all-or-nothing rule
+    exists to prevent.
+    """
+    return "\n".join(
+        [
+            f"[autoloop review diff part {index} of {total} | {part_id}]",
+            f"task_id: {task_id}",
+            f"candidate_sha: {candidate_sha}",
+            "",
+            f"This is part {index} of {total} of the patch for the review request "
+            "that follows. It is NOT a question and needs no reply — do not "
+            "review, approve or comment yet. The packet asking for your verdict "
+            f"arrives after part {total}, and names all {total} part ids so you "
+            "can check none is missing before deciding.",
+            "",
+            body,
+        ]
+    )
+
+
+def _format_diff_delivered_in_parts(part_ids: tuple[str, ...], diff_chars: int) -> str:
+    listed = "\n".join(f"    {i}. {pid}" for i, pid in enumerate(part_ids, start=1))
     return (
-        f"Full diff: OMITTED — {len(diff)} characters, over the "
+        f"Full diff: DELIVERED ABOVE IN {len(part_ids)} PARTS — {diff_chars} "
+        f"characters, over the {DIFF_INCLUDE_MAX_CHARS}-character single-message\n"
+        "  limit, so it was sent as numbered messages rather than omitted.\n"
+        "  Nothing was truncated and nothing was summarised: concatenating the\n"
+        "  parts in order reproduces the patch exactly. The parts, in order:\n"
+        f"{listed}\n"
+        "  Every part was confirmed present in this conversation's persisted\n"
+        "  history before this message was sent — you are not being asked to\n"
+        "  decide on a partial delivery. If any part is nevertheless missing\n"
+        "  from what you can read, say so and reply `revise` rather than\n"
+        "  approving on the parts you do have."
+    )
+
+
+def _format_diff_omitted(diff_chars: int, parts_may_have_landed: bool) -> str:
+    # Worded "if any appear" rather than "the parts above", because the caller
+    # knows a chunked delivery was ATTEMPTED but not how many messages actually
+    # reached the conversation — that is the very thing that failed. Naming a
+    # count we cannot verify would be the same class of claim this packet
+    # exists to avoid.
+    disown = (
+        "\n"
+        "  If any `autoloop review diff part` messages appear above, IGNORE\n"
+        "  them: a chunked delivery of this patch was started and did not\n"
+        "  complete, so whatever landed is a FRAGMENT, not the change. Do not\n"
+        "  review it as if it were the patch.\n"
+        if parts_may_have_landed
+        else ""
+    )
+    return (
+        f"Full diff: OMITTED — {diff_chars} characters, over the "
         f"{DIFF_INCLUDE_MAX_CHARS}-character send limit.\n"
         "  Nothing was truncated: the patch is absent, not shortened, so no\n"
         "  section above is a partial view of it. The changed-path list and\n"
         "  diff stat ARE complete and are read from git.\n"
+        f"{disown}"
         "  To read the patch itself:\n"
         f"    git diff-tree -r -p <base_sha> <candidate_sha>\n"
         "  If you cannot review the change without it, reply `revise` asking\n"
         "  for a smaller commit rather than approving unseen."
+    )
+
+
+def plan_chunked_delivery(
+    payload: str,
+    diff: str,
+    request_id: str,
+    task_id: str,
+    candidate_sha: str,
+    max_chars: int = DIFF_INCLUDE_MAX_CHARS,
+    max_parts: int = DIFF_MAX_PARTS,
+) -> DeliveryPlan | None:
+    """Plan the delivery of `payload` — the complete logical packet, diff
+    inline — as parts plus a verdict request. `None` means "do not chunk":
+    either the patch fits in one message (the common case, unchanged
+    behaviour) or chunking cannot be done safely.
+
+    A returned plan always carries its own `fallback_payload`, and the caller
+    must keep it: a part that does not land is answered by sending THAT
+    instead, never by proceeding with a half-delivered patch.
+
+    Returns `None` when a precondition cannot be guaranteed — the caller then
+    renders `omission_payload` and behaves exactly as it did before chunking
+    existed:
+
+    * the inline diff section does not appear exactly once in `payload` — the
+      payload is not the one this diff was rendered into, so the abridged
+      message could not be derived from it honestly;
+    * a part id would contain the request id as a substring, which would break
+      every provider's "has this request landed?" check (see `diff_part_id`);
+    * the patch needs more than `max_parts` parts.
+    """
+    diff = diff.strip()
+    if not diff or len(diff) <= max_chars:
+        return None
+
+    section = _INLINE_DIFF_HEADER + diff
+    if payload.count(section) != 1:
+        return None
+
+    slices = split_diff_into_parts(diff, max_chars)
+    if len(slices) > max_parts:
+        return None
+
+    total = len(slices)
+    part_ids = tuple(diff_part_id(request_id, i, total) for i in range(1, total + 1))
+    if any(request_id in pid for pid in part_ids):
+        # Checked on the built values, not argued from the format string: if
+        # the request-id shape ever changes so the transform stops separating
+        # them, this must fail closed to omission rather than silently make
+        # the verdict message unsendable.
+        return None
+
+    parts = tuple(
+        DiffPart(
+            part_id=pid,
+            index=i,
+            total=total,
+            body=body,
+            text=_render_part(pid, i, total, body, task_id, candidate_sha),
+        )
+        for i, (pid, body) in enumerate(zip(part_ids, slices), start=1)
+    )
+    return DeliveryPlan(
+        parts=parts,
+        final_payload=payload.replace(
+            section, _format_diff_delivered_in_parts(part_ids, len(diff))
+        ),
+        fallback_payload=payload.replace(section, _format_diff_omitted(len(diff), True)),
+    )
+
+
+def omission_payload(payload: str, diff: str, parts_may_have_landed: bool = False) -> str:
+    """`payload` with its inline diff replaced by the omission notice — the
+    pre-chunking rendering, used when chunking is unavailable or has failed.
+
+    Returns `payload` unchanged when the section is not found exactly once;
+    there is nothing honest to substitute in that case, and a payload that
+    already lacks an inline diff is already in this form.
+    """
+    section = _INLINE_DIFF_HEADER + diff.strip()
+    if payload.count(section) != 1:
+        return payload
+    return payload.replace(
+        section, _format_diff_omitted(len(diff.strip()), parts_may_have_landed)
     )
