@@ -104,6 +104,21 @@ class PolicyConfig:
     #: would require a quota window to have reset, which does not happen inside
     #: a single run.
     max_provider_switches: int = 1
+    #: How many consecutive browser failures may go unrecovered because
+    #: `browser.restart_cooldown_seconds` refused their restart, before the
+    #: loop parks. Deliberately NOT `max_consecutive_failures`: a failure
+    #: whose restart was skipped is evidence that recovery was never tried,
+    #: not that it does not work, so it is charged here instead (see
+    #: `orchestrator._handle_browser_failure`). This budget exists so that
+    #: exemption can never become a silent forever-retry — it ends in a park
+    #: that NAMES the cooldown, which an operator can see and answer, rather
+    #: than a `failed` phase with no blocker record.
+    #:
+    #: Its value is deliberately not coupled to the cooldown or to
+    #: `max_consecutive_failures`: the exemption above is what makes the fix
+    #: hold for any pair of numbers, and a bound that only works for one pair
+    #: is a trap for whoever tunes them next.
+    max_browser_restart_skips: int = 5
 
 
 # Whitelist, not blacklist: a git invocation is allowed only if its subcommand
@@ -513,6 +528,25 @@ class PolicyEngine:
             return Verdict.deny(
                 "failure_budget",
                 f"more than {self.config.max_consecutive_failures} consecutive browser failures",
+            )
+        return Verdict.ok()
+
+    def check_browser_restart_skip_budget(self, restart_skips: int) -> Verdict:
+        """Consecutive browser failures whose restart the cooldown refused.
+
+        `>` like the other post-hoc budgets above (the counter is incremented
+        first, then checked), and a SEPARATE budget from
+        `check_failure_budget` on purpose: those failures were never acted
+        on, so counting them as browser failures would let a cooldown that
+        outlives the failure budget kill a session in which no restart was
+        ever attempted — observed 2026-08-04.
+        """
+        if restart_skips > self.config.max_browser_restart_skips:
+            return Verdict.deny(
+                "browser_restart_skip_budget",
+                f"more than {self.config.max_browser_restart_skips} consecutive "
+                "browser failures went unrecovered because the browser-restart "
+                "cooldown had not elapsed",
             )
         return Verdict.ok()
 

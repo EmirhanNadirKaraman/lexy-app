@@ -432,6 +432,17 @@ class LoopState:
     phase: str = Phase.READY.value
     iteration: int = 0
     consecutive_failures: int = 0
+    #: Consecutive browser failures whose restart was SKIPPED because
+    #: `browser.restart_cooldown_seconds` had not elapsed since the last one.
+    #: Deliberately its own counter rather than part of `consecutive_failures`
+    #: above: a restart that never ran says nothing about whether restarting
+    #: works, and charging those failures to the failure budget killed a
+    #: session on 2026-08-04 in which Chrome was never once restarted. Reset
+    #: the moment a restart command actually runs (success or failure), and
+    #: bounded by `policy.max_browser_restart_skips` so the exemption ends in
+    #: a park naming the cooldown rather than an unbounded retry — see
+    #: `orchestrator._handle_browser_failure`.
+    browser_restart_skips: int = 0
     parse_retries: int = 0
     policy_denials: int = 0
     outbox: str | None = None

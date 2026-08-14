@@ -1887,9 +1887,12 @@ exactly one replacement in the configured project, resend the same request id
 bounded by the SAME `policy.max_conversation_rotations` budget as the other two
 triggers, not a separate allowance — a replacement chat that is also silent
 parks `loop_fatal` on the second attempt, same as any other rotation-cap
-refusal. Every occurrence, first through third, is still charged to the
-ordinary failure budget too (`_handle_browser_failure` runs first, every time);
-the silent-conversation check is layered on top of it, never a bypass. A
+refusal. Every occurrence, first through third, still goes through
+`_handle_browser_failure` first, every time, and is charged to the ordinary
+failure budget by it — with the one exemption that handler makes for a restart
+the cooldown refused (see "A restart that was never attempted is not a failed
+restart" below); the silent-conversation check is layered on top of it, never a
+bypass. A
 completed rotation resets `consecutive_failures` to 0 alongside the silence
 count, exactly like an ordinary successful `awaiting` step already does — the
 replacement conversation does not inherit the retired one's fault count. This
@@ -1938,6 +1941,43 @@ config did not) and continues; any *other* disagreement still refuses to start.
 
 `doctor` reports which conversation is actually live, how much rotation budget is
 left, and whether `project_url` looks like a project.
+
+**A restart that was never attempted is not a failed restart.** Two guards sit
+on the browser path and, until 2026-08-04, cancelled each other out.
+`browser.restart_cooldown_seconds` (default 120s) stops a genuinely broken
+browser being restarted in a tight loop; `policy.max_consecutive_failures`
+(default 3) stops a permanently broken transport churning forever. Both are
+wanted. What was wrong was the interaction: every one of four consecutive
+browser failures logged `browser_restart_skipped {reason: within cooldown}` —
+so the loop could not restart Chrome, the one action that would have fixed the
+hang — while those same failures spent the failure budget. The budget ran out
+before the cooldown did, and the session ended `failed` with no blocker record,
+which is the state that hides its own cause.
+
+`_handle_browser_failure` now distinguishes WHY no restart happened:
+
+| Restart outcome | Charged to |
+|---|---|
+| ran, succeeded | nothing — the attempt is free, as before |
+| ran, failed | `max_consecutive_failures` (real evidence recovery does not work) |
+| no `restart_command` configured | `max_consecutive_failures` (nothing to try later either — the default deployment's budget stays reachable) |
+| skipped, still within the cooldown | `policy.max_browser_restart_skips` (default 5) — **never** the failure budget |
+
+The fix is the exemption, not a re-tuned pair of numbers: it holds however
+either constant is later changed, whereas "make the cooldown shorter than the
+budget takes to exhaust" would be a coupling that works for exactly one pair
+and traps whoever edits them next. `state.browser_restart_skips` counts only
+within one cooldown window — any restart that actually RUNS, success or
+failure, resets it — so it cannot accumulate across healthy periods, and a
+fresh process (whose cooldown stamp is empty) always gets a real attempt.
+
+Exhausting the skip budget **parks** `loop_fatal` with
+`code="browser_restart_cooldown_blocked"`, naming
+`browser.restart_cooldown_seconds` and its value in the question, so
+`python -m autoloop blockers` shows the operator what stopped the session and
+`run --retry` resumes it (that path clears both fault counts). It deliberately
+does not enter `failed`: a terminal state whose cause is recoverable only by
+reading the transcript is the defect underneath this one.
 
 ---
 
@@ -2553,6 +2593,7 @@ reports this rather than raising.
 | `stale lock` error | Inspect `python -m autoloop status`, then `python -m autoloop unlock` (refuses live locks). |
 | Logged out mid-run (`needs_user`) | Log the profile back in, `run --retry`. |
 | Browser dead / CDP unreachable | Relaunch the profile (§8), `run --retry` (or just `run` if not parked). |
+| Parked `browser_restart_cooldown_blocked` | Repeated browser failures whose restart `browser.restart_cooldown_seconds` refused, so none was ever attempted (§5c). Restart the browser by hand (`scripts/restart_autoloop_chrome.sh`) — or lower that cooldown if it is set too high for this machine. Then close the blocker it recorded (`python -m autoloop blockers`, then `answer <id> "..."`) and `run --retry`: an open blocker stops `start` and ends a `--continuous` pass, so retrying without it just parks again. Those failures never spent the failure budget, so nothing else needs resetting. |
 | Repeated malformed replies / denials | Loop parks with the reason; talk to the conversation manually if needed, then `run --answer "..."`. |
 | **Ambiguous submission** (`needs_user`, "submission … is AMBIGUOUS") | Open the conversation and look. If the request is there, `run --retry` (reconciles and continues). If it is genuinely absent, `run --resubmit` authorizes exactly one more send of the same id. Autoloop will not decide this for you — see §5b. |
 | `send-not-ready` / `composer-not-synchronised` diagnostics | The editor never accepted the input, so **nothing was sent**: safe to `run --retry`. If it repeats, the composer selectors or the input method need attention (`browser/selectors.py`, `browser/chatgpt.py::_enter_prompt`). |
