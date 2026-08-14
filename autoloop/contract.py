@@ -386,6 +386,10 @@ def parse_response(text: str) -> Directive:
     try:
         decision = Decision(raw_decision)
     except ValueError:
+        # Enumerates ACTIVE_DECISIONS, not `Decision`: a correction that
+        # listed `ask_user` would be handing the reviewer a decision the
+        # policy engine refuses unconditionally. A literal `ask_user` reply
+        # never lands here — it parses, then gets the retirement denial.
         raise ContractError(
             "unknown_decision",
             # Active decisions only: the correction is what the model is told
@@ -479,10 +483,13 @@ def parse_response(text: str) -> Directive:
 
     question = None
     if decision is Decision.ASK_USER:
-        # Optional, not required: `question` is no longer documented, so a
-        # legacy reply may omit it (the orchestrator parks with a placeholder).
-        # Present-but-blank is still rejected — a park with an empty question is
-        # worse than one that admits it has none.
+        # Optional, exactly like `scope` above, and for the retirement's sake:
+        # the instructions no longer ask for a question, so requiring one
+        # would answer a stale `ask_user` with `missing_field:question` — a
+        # correction naming a field the contract no longer documents, in
+        # place of the denial that says the decision itself is gone. Still
+        # validated when present: an omitted question is legacy, a
+        # present-but-empty one is malformed, and the two are not the same.
         if question_raw is not None:
             question = _require_str("question", question_raw)
     else:

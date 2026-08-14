@@ -162,7 +162,7 @@ TEMPLATES: dict[str, PromptTemplate] = {
                 "`reviewed` stamp copied from CONTEXT — this publishes exactly "
                 "the candidate commit above to {dest_ref}, nothing else. This "
                 "review path has no revise loop; if you do not approve, reply "
-                "`ask_user` describing what must change."
+                "`stop` with the reason describing what must change."
             ),
         ),
         PromptTemplate(
@@ -218,8 +218,9 @@ def policy_denied_payload(decision: str, reason: str) -> str:
         failure_kind=f"policy_denied (decision={decision})",
         detail=reason,
         guidance=(
-            "Choose a different course of action, or use ask_user if the human "
-            "operator needs to change the policy."
+            "Choose a different course of action. If the policy itself has to "
+            "change before this can proceed, reply `stop` with that in the "
+            "reason — this loop does not pause for a human operator mid-run."
         ),
     )
 
