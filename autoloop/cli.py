@@ -52,7 +52,7 @@ from .audit.executor import AuditExecutor
 from .audit.markdown import MarkdownPolicy
 from .blockers import NO_TASK, Blocker, BlockerStore
 from .changeset_review import build_changeset_binding, build_changeset_packet
-from .config import AutoloopConfig, load_config
+from .config import AutoloopConfig, load_config as _read_config_file
 from .contract import AUDIT_TASK_ID, Decision, Directive
 from .conversation import create_conversation
 from . import health, heartbeat
@@ -82,6 +82,7 @@ from .publisher import (
     redact_url,
     reprovision_publisher as _reprovision_publisher_snapshot,
 )
+from .stall import StallPolicy
 from .state import TERMINAL_PHASES, LoopState, Phase, StateStore
 from .tasks import Task, TaskRegistry, TaskState, TaskStore
 from .transcript import TranscriptLogger
@@ -90,6 +91,45 @@ from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_
 from .worktask import IntentStore, TaskExecutionStore
 
 DEFAULT_CONFIG = Path(".autoloop/config.toml")
+
+#: Migration notices already printed by THIS process. Deliberately the only
+#: piece of "have we said this yet" state in the codebase: `config.load_config`
+#: stays pure and returns notices as data, so nothing about which tests ran
+#: first can change what a config parses to.
+_EMITTED_MIGRATION_NOTICES: set[str] = set()
+
+
+def emit_migration_notices(config: AutoloopConfig, stream=None) -> None:
+    """Print each retired-key notice on stderr, at most once per process.
+
+    **stderr, not stdout**: `status`, `tasks`, `next-task` and `blockers` are
+    read-only commands whose stdout gets piped and parsed. A notice on stdout
+    would corrupt that output; on stderr it reaches the operator regardless.
+
+    **Once per process**, because the loop calls `load_config` on every command
+    and `run --continuous` is a long-lived process — a notice repeated each
+    round is one an operator learns to scroll past, which defeats the point of
+    warning at all.
+    """
+    stream = sys.stderr if stream is None else stream
+    for notice in config.migration_notices:
+        if notice in _EMITTED_MIGRATION_NOTICES:
+            continue
+        _EMITTED_MIGRATION_NOTICES.add(notice)
+        print(notice, file=stream)
+
+
+def load_config(path: Path) -> AutoloopConfig:
+    """`config.load_config` plus the operator-facing notice for retired keys.
+
+    Every CLI command reads its config through this wrapper, so a config naming
+    a retired key is reported no matter which command is run. It is also what
+    the test suite monkeypatches (`cli.load_config`), and patching it continues
+    to bypass both the file read and the notice — as those tests intend.
+    """
+    config = _read_config_file(path)
+    emit_migration_notices(config)
+    return config
 
 
 def _load_state(config: AutoloopConfig) -> tuple[StateStore, LoopState | None]:
@@ -243,10 +283,18 @@ def _build_executor(
 ) -> TaskExecutor:
     if getattr(args, "null_executor", False) or config.executor.kind == "null":
         return NullExecutor()
+    # Read-only audit subagents keep an ELAPSED bound — they change no files,
+    # so there is no progress to observe, and a timeout there costs a re-run
+    # rather than destroying work. The write-capable executor below is the one
+    # that gets the stall detector (`autoloop/stall.py`).
+    stall_policy = StallPolicy(
+        stall_seconds=config.audit.agent_stall_seconds,
+        ceiling_seconds=config.audit.agent_ceiling_seconds,
+    )
     audit_runner = ClaudeCliRunner(
         repo_root=git.repo_root,
         command=config.audit.agent_command,
-        timeout_seconds=config.audit.agent_timeout_seconds,
+        timeout_seconds=config.audit.audit_agent_timeout_seconds,
     )
     audit_executor = AuditExecutor(
         git=git,
@@ -268,15 +316,21 @@ def _build_executor(
         agent_runner_factory=lambda root: ClaudeCliRunner(
             repo_root=root,
             command=config.audit.agent_command,
-            timeout_seconds=config.audit.agent_timeout_seconds,
+            timeout_seconds=config.audit.audit_agent_timeout_seconds,
         ),
     )
     implement_executor = ImplementExecutor(
         git=git,
+        # The STANDALONE binding, rooted at the main checkout and never
+        # reached in production (the factory below wins whenever
+        # `worker_repo_root_for` is set, which it always is here). It gets no
+        # `policy=` and therefore no progress probe ON PURPOSE: a probe built
+        # here would watch the main checkout, not a worker repo, and would
+        # report progress made by something else entirely.
         agent_runner=implement_agent_runner(
             git.repo_root,
             command=config.audit.agent_command,
-            timeout_seconds=config.audit.agent_timeout_seconds,
+            timeout_seconds=config.audit.agent_ceiling_seconds,
         ),
         # Same validation commands and agent CLI settings as the audit —
         # there is no separate `[implement]` config section (kept minimal;
@@ -288,10 +342,15 @@ def _build_executor(
         validation_env=validation_env,
         worker_repo_root_for=worker_repos.path_for,
         policy=policy,
+        # The production binding. `policy=` is what builds the
+        # `stall.WorkerTreeProbe` over THIS task's worker repo, so the agent
+        # is bounded by silence in the tree it is actually writing to.
         agent_runner_factory=lambda root: implement_agent_runner(
             root,
             command=config.audit.agent_command,
-            timeout_seconds=config.audit.agent_timeout_seconds,
+            timeout_seconds=config.audit.agent_ceiling_seconds,
+            policy=policy,
+            stall_policy=stall_policy,
         ),
     )
     return _DispatchingExecutor(audit_executor, implement_executor)

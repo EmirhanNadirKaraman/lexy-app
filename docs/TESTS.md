@@ -1360,6 +1360,78 @@ guard (`build_changeset_binding` raising on a protected branch) via
 `pytest.raises`, folded into the existing test rather than a 5th one. **736
 tests.**
 
+**Progress-based stall detection replaces the agent timeout (2026-08-14,
+`stall-01`).** `audit.agent_timeout_seconds` bounded every subagent by ELAPSED
+TIME. Measured over 2026-08-05/06 it never once caught a hung agent and killed
+six agents mid-write (merge-01 twice at 1800s — 591 and 532 insertions across
+16 and 15 files — plus scope-01/dash-04/exec-01/hlth-01 at 900s, 503/631/605/499
+insertions). A hung agent leaves nothing behind; every one of those was writing
+when it was cut off, and raising the ceiling 900 → 1800 changed only the size of
+the loss. New `autoloop/stall.py` bounds the LACK OF PROGRESS instead: while the
+worker repository keeps changing the agent runs, and it is killed only after
+`agent_stall_seconds` (default 1800) with NO filesystem change at all, or at the
+absolute backstop `agent_ceiling_seconds` (default 14400), which should
+effectively never fire and reports itself as a finding when it does. The
+observation is `git status --porcelain -z -uall` through the policy-validated
+`GitGateway` plus per-path `st_mtime_ns`/`st_size` — never anything the agent
+says about itself, and deliberately not a raw filesystem walk (the probe's own
+`git status` refreshes `.git/index`, so a walk including `.git` would see churn
+every tick and never fire). The old key is handled EXPLICITLY at load rather
+than ignored: a config still naming it loads, its value migrates onto
+`audit_agent_timeout_seconds` (the read-only audit path, which keeps the old
+key's exact meaning — a read-only agent has no progress to observe, and a
+timeout there costs a re-run rather than destroying work), an explicit
+`audit_agent_timeout_seconds` takes precedence over it, and the retired name
+never reaches `AuditConfig`. `load_config` stays PURE — it returns the notice
+as `AutoloopConfig.migration_notices` and writes to no stream — while
+`cli.emit_migration_notices` prints it on stderr once per process. That split
+is deliberate: notice *content* is then asserted by ordinary tests in any
+order, and only the once-per-process contract needs isolation. New
+`test_stall_detector.py` (33 test functions, 34 collected — the first is
+parametrized over both retired timeout values): an agent writing
+steadily for 90 minutes is not killed (parametrized over BOTH retired timeout
+values — this is the mutation guard, and reintroducing any elapsed bound fails
+it); a 1400s pause inside a 1800s window is not a stall; silence past the window
+IS killed and the report leads with `STALLED:` naming the silence, not the
+elapsed time; the report carries the partial-work numbers and a stall that
+produced nothing reads differently from one that produced 591 lines; SIGTERM
+escalates to SIGKILL; a process that finishes between the decision and the
+signal is `COMPLETED`, not stalled; the ceiling still terminates a run that
+"progresses" forever and says loudly that it fired; a probe that cannot observe
+the tree never triggers a stall kill (only the ceiling can end a run nobody can
+see) and its report says the silence was unobserved; the probe sees one file
+growing though the path set is unchanged, counts new files plus tracked
+insertions, skips binaries, distinguishes a measured zero from an unreadable
+repo, and carries its own shortfall when the tracked diff fails — "16 files
+changed, ~0 lines written" for a run that wrote 591 would be a wrong number
+presented as a measured one, which is worse than the timeout this replaced;
+the supervised runner reports a stall instead of a timeout while keeping
+the killed run's partial output, and a runner with no probe still passes the old
+elapsed `timeout=` to `subprocess.run`; and the executor surfaces the stall,
+`changed_paths` read from git, and — for ANY agent failure, not only stalls —
+what was left behind. Config coverage: the retired key migrates onto
+`audit_agent_timeout_seconds` while leaving the write path on the stall
+defaults, with a notice naming all three replacements; an explicit
+`audit_agent_timeout_seconds` wins when both are named; a config without the
+retired key produces no notice; a junk value for the retired key is still
+refused (it is migrated onto a live setting, so it is validated like one);
+`load_config` writes to no stream and returns the same notices however many
+times it runs; the CLI routes the notice to stderr, never stdout (`status` /
+`tasks` / `next-task` have parseable stdout); a stall window at or above the
+ceiling is refused (it would read as configured while being unreachable); and a
+non-positive bound is refused.
+
+`test_the_cli_prints_the_migration_notice_on_stderr_once` runs a real
+SUBPROCESS (`sys.executable -c`, `PYTHONPATH` at the repo root) that loads the
+same legacy config three times and asserts exactly one notice on stderr. It is
+the one test here that cannot run in-process: the suppression ledger is
+process-global by design, so any earlier test that loaded a legacy config
+through the CLI would consume the single emission and leave this one asserting
+against an empty stream — which is how it failed on the previous round. A
+subprocess makes "this process has not printed it yet" true by construction
+instead of by test ordering; the in-process sibling test resets only that
+ledger, via `monkeypatch`, and never touches production semantics.
+
 **584 tests (pre-blockers baseline), fully hermetic** — no network, no ChatGPT, no playwright import,
 no live `claude` CLI (agent runner stubbed), no app DB. `test_git_gateway.py`,
 `test_manifest.py`, `test_audit_executor.py`, `test_postcommit_primitives.py`,
@@ -1428,6 +1500,7 @@ record what it actually reports rather than trusting a summed total.
 | `test_markdown_policy.py` | 7 | Markdown-only gate: canonical files ok, ONE dated report max, production code / non-canonical md / traversal / absolute paths refused. |
 | `test_audit_agents.py` | 24 | ClaudeCliRunner with stubbed subprocess: read-only headless argv (allow Read/Grep/Glob, disallow Edit/Write/Bash/Task/…), result-JSON unwrap, timeout / missing binary / non-zero exit reported not raised. Tool set is now a constructor parameter (`allowed_tools`/`disallowed_tools`, defaulting to the read-only pair asserted here); `test_implement_executor.py` is the other construction site, via `implement_agent_runner`. Env is stripped of the validation credentials for BOTH tool sets. **+5 for failure summarisation (2026-08-01):** an advisory banner leading stderr must NOT become the reported cause (the real regression — the CLI's connectors notice prints first, and `stderr[:2000]` made it the whole answer, which reached ChatGPT as "unset ANTHROPIC_API_KEY" for a variable that was never set); banner-only stderr reports `NO diagnostic output` instead of blaming the notice; a 400-frame traceback keeps its TAIL, where the cause lives; plain failures and the stdout fallback are unchanged; and one end-to-end case through `run()` itself, verified to FAIL against the old head-only capture. **+10 for `run()` never raising (2026-08-04, rt-04):** `run` caught only `TimeoutExpired` and `FileNotFoundError`, and `_run_agents` consumes the fan-out via `list(pool.map(...))`, which re-raises the first exception — so one denied `cwd` or failed pipe read discarded every domain that had already finished. Four parametrized generic causes (plain `OSError`, `PermissionError`, `UnicodeDecodeError`, `RuntimeError`) now come back as an `AgentResult`, with the control assertion that neither dedicated message (`command not found` / `timed out`) is mis-attributed to them. **The construction trap has its own test:** `OSError(errno.ENOENT, …)` is built as a `FileNotFoundError` by `OSError.__new__`, so a "generic exception" case written that way hits the DEDICATED branch and passes against the unfixed code — `test_every_generic_case_really_misses_the_dedicated_branch` asserts that specialization explicitly and that no parametrized case is an instance of it (see `docs/COMMON_ERRORS.md`). Plus: the `FileNotFoundError` message survives the broad clause added below it (the reorder guard, since it is an `OSError` subclass); an exception whose `str()` is EMPTY still reads as a failure, because `AgentResult.ok` is `not error` and a blank one would count a blown-up domain as covered with zero findings; a `proc.stdout` read that fails AFTER the child exits is caught too (the whole body is guarded, not just the spawn); **argv CONSTRUCTION is inside the guard as well** (review follow-up — `build_argv` ran before the `try`, so a failure there still escaped and still cost the whole fan-out; driven through the real `build_argv` via a spec stand-in whose `model` raises, not an override, which would only prove the guard catches an override — and the result still names the command, since `argv` is bound to the base command *before* the `try` so reporting a failure cannot itself raise `NameError`, with the stub asserted never spawned); and the acceptance case driven through a real `ThreadPoolExecutor.map` — one domain raising leaves its two siblings' output intact. `autoloop/audit/executor.py` was deliberately NOT changed: it already turns `not result.ok` into an `agent_failures` entry. |
 | `test_implement_executor.py` | 13 | `ImplementExecutor` with fake/stubbed agents: write-capable argv (Edit/Write allowed, Bash/Task disallowed), no `--model` flag (automatic selection), subagent `cwd` is the task's own worker repo not the main checkout, `changed_paths` derived from the worker repo's real `git status` and NOT from the agent's own claim (a fake agent claims a file it never touched — ignored), a filename with both a space AND a tab round-trips (`-uall`/`-z` NUL-safety), agent failure / no-files-changed / validation failure each `status="error"` without raising, success is `status="ok"` with `changed_paths`/`validation` populated, and nothing is written outside the worker repo (main checkout + `.autoloop/` marker both provably untouched); plus the audit/`None`-task defense-in-depth refusals and the `worker_repo_root_for`/`policy` constructor pairing contract. |
+| `test_stall_detector.py` (new, 2026-08-14) | 27 | The progress-based stall detector that replaced `audit.agent_timeout_seconds` (see the narrative entry above for the six measured losses). `supervise()` is pure over an injected handle/probe/clock/sleep, so no test spawns a process or waits. The load-bearing one is `test_an_agent_writing_steadily_past_the_old_timeouts_is_not_killed`, parametrized over BOTH values the retired key ever held (900/1800): a steadily-writing agent runs 90 minutes and exits on its own, never signalled — reintroduce any elapsed bound and it fails. Also: a 1400s pause inside the 1800s window is not a stall; silence past the window IS killed, leads with `STALLED:` and names the silence rather than the elapsed time; the report carries the partial-work numbers, and a stall that produced NOTHING is worded differently from one that produced 591 lines across 16 files (the two mean opposite things to a reviewer); SIGTERM escalates to SIGKILL for a process that ignores it; a process that finishes between the stall decision and the signal is `COMPLETED`; the ceiling terminates a run that "progresses" forever and reports itself as a finding, not a routine timeout; **a blind probe never stall-kills** — "I cannot see the tree" is not "the tree is not changing", so only the ceiling ends an unobservable run and the report says the silence was unobserved. `WorkerTreeProbe` against a real `tmp_path` git repo: one file growing is progress even though `git status`'s path set is unchanged (why the per-path stat is load-bearing), an untouched tree samples identically, tracked insertions plus whole new files are counted (2 + 3 = 5), a binary new file counts as a file but not as lines, a measured zero is distinct from an unreadable repo, and a failed tracked diff makes the report say `INCOMPLETE` and name how many tracked files it excluded rather than quietly reporting `~0` lines (`HEAD` always resolves in a real worker repo — `WorkerRepoManager.create` ends with `git checkout -B <branch> FETCH_HEAD` — but a wrong number presented as measured would be worse than the timeout this replaced). Through `ClaudeCliRunner` with a fake spawn: a stall is reported instead of a timeout and the killed run's partial stdout survives; a long healthy run finishes with the retired 900s value passed in and provably unused; and a runner with NO probe still hands `timeout=900.0` to `subprocess.run` (the read-only audit path, unchanged). Through `ImplementExecutor`: the stall report and `changed_paths` (read from git, never the agent) reach `ExecutionOutcome`, exactly one set of numbers is printed, and an ORDINARY agent failure now also reports what it left behind. Config: the retired key is refused with a message naming all three replacements (not remapped — the old meaning survives in none of them), a stall window at or above the ceiling is refused, and a non-positive bound is refused. |
 | `test_postcommit_flow.py` (+2, 2026-08-01) | — | **B4b regression.** `test_post_commit_reruns_the_tasks_own_validation_not_the_audit_set` drives a REAL `ImplementExecutor` and the orchestrator's post-commit re-run through ONE recording `command_runner`, so "the same commands ran before and after the commit" is *observed* rather than asserted twice against two separate doubles: the task's declared command must appear exactly twice and the audit default (`ruff check .`) never, and the persisted `TaskExecution.validation_commands` is checked as the thing that carried it across a resume. Verified to FAIL when the fix is reverted — it then records `[declared, ruff-check]`, which is the bug exactly. `test_post_commit_validation_honours_the_declared_cwd` pins that a declared `validation_cwd` applies post-commit too (right commands, wrong directory checks nothing). `build_postcommit` gained `task_validation` / `task_validation_cwd` / `executor_factory` — the last because a real `ImplementExecutor` must be rooted at a worktree that does not exist until the helper builds it. |
 | `test_tasks.py` (+4, 2026-08-01) | — | **Always-approved trackers.** `TRACKER_PATHS` pinned as an exact set (anything added widens every task in the repo, so it must be a deliberate diff) and asserted to be markdown-under-`docs/` only; a scoped task gains the four and stays sorted; an UNSCOPED task stays unscoped — the property that must not regress, since returning just the trackers would turn "no scope authorized yet" into a dispatchable task that may write docs; and non-tracker paths (source files, `docs/AUTOLOOP.md`, `CLAUDE.md`) are still outside scope. |
 | `test_postcommit_flow.py` (+2, 2026-08-01; second test rewritten 2026-08-05) | — | End-to-end: a `docs/SUMMARY.md` edit NOT named in `approved_paths` now commits instead of parking (rt-01's actual failure, twice). The first cut of the change patched three of four gates, and the PRE-commit gate then refused what the POST-commit check allowed — these two are what caught it. The companion used to pin "a non-tracker path outside scope still refuses and still does not commit"; since the scope check went ADVISORY it is `test_a_NON_tracker_path_outside_approved_paths_commits_and_is_recorded` — see the advisory row below. |

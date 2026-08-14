@@ -2150,7 +2150,28 @@ Pipeline (`implement_executor.py`):
    the agent) runs validation and owns the commit, and nested delegation is
    out of scope. No `--model` flag is ever passed (`AgentSpec.model` stays
    `""`), so model selection is whatever the `claude` CLI defaults to — there
-   is no per-task model table.
+   is no per-task model table. **Bounded by SILENCE, not elapsed time
+   (2026-08-14, `stall-01`).** The runner carries a `stall.WorkerTreeProbe`
+   over this task's worker repo, so it SPAWNS and supervises instead of
+   running under a wall-clock timeout: while the repo keeps changing the agent
+   runs, however long the task takes, and it is killed only after
+   `audit.agent_stall_seconds` (default 1800) with no filesystem change at
+   all, or at `audit.agent_ceiling_seconds` (default 14400), the absolute
+   backstop that should effectively never fire. The retired
+   `audit.agent_timeout_seconds` killed six agents mid-write over
+   2026-08-05/06 and never once caught a hang. A config still naming it loads
+   and is handled explicitly: the value migrates onto
+   `audit.audit_agent_timeout_seconds` — the one replacement that keeps its
+   meaning — and `cli.emit_migration_notices` prints a notice on stderr, once
+   per process, saying what it now does and does not govern. An explicit
+   `audit_agent_timeout_seconds` wins over it. The retired name never survives
+   into `AuditConfig`, so nothing can read it back. Read-only audit subagents (§7a) keep an
+   elapsed bound under `audit.audit_agent_timeout_seconds`: they change no
+   files, so there is nothing to observe, and a timeout there costs a re-run
+   rather than destroying work. A killed run comes back as an ordinary
+   `status="error"` outcome whose summary names the silence, the elapsed time,
+   the files and lines it had produced, and that validation never started —
+   see `autoloop/stall.py`.
 3. **Never trust the agent's own account of what it changed.** After the
    agent returns, `changed_paths` is read from the worker repo's OWN `git
    status --porcelain -z -uall` (`GitGateway.dirty_paths_all`) — `-uall`
