@@ -11,6 +11,14 @@ Hard rules with no configuration escape hatch:
     — their subcommands are simply not on the whitelist
 Configurable rules:
   * protected branches, commit/push enablement, iteration + retry budgets
+  * auto-merge (`auto_merge_enabled`, default off)
+
+`merge` IS on the whitelist (auto_merge.py) and is the one subcommand there
+that moves the checkout's own branch head. It is not a history rewrite — it
+only ever adds a commit whose parents include the previous head — and it
+carries its own shape check below: exactly two legal forms, `merge --abort`
+with no other token, and a merge of a literal 40-hex commit id. There is
+still no way to reach reset/clean/rebase/checkout from any setting.
 """
 
 from __future__ import annotations
@@ -76,6 +84,20 @@ class PolicyConfig:
     #: systemic outage would fan out a chat per iteration while looking like it
     #: is making progress.
     max_conversation_rotations: int = 1
+    #: Integrate a completed task's published side branch into the base the
+    #: loop builds against, and push the base — `auto_merge.py`. OFF by
+    #: default, and deliberately so: it is the only setting that moves the
+    #: shared branch head without an operator in the loop, and every
+    #: in-flight execution record pins a `task_base_sha` that a moved head
+    #: can invalidate. The gate (`cli._merge_window_blockers`) makes that
+    #: safe; the flag makes it opt-in.
+    #:
+    #: Note for a base branch listed in `protected_branches`: the merge still
+    #: happens locally, but `push_exact` refuses to publish it (logged as
+    #: `auto_merge_push_refused`) unless `allow_protected_push` is also set.
+    #: That pairing is intentional — enabling auto-merge is not by itself
+    #: permission to push `main`.
+    auto_merge_enabled: bool = False
     #: How many times one run may hand the reviewer role to the configured
     #: fallback provider after an exhausted allowance. One is the deliberate
     #: default: the useful move is primary -> fallback, and switching back
@@ -167,6 +189,19 @@ _ALLOWED_GIT: dict[str, frozenset[str]] = {
     # want-token and source-path shape checks below (F2-style) are what keep
     # this from becoming an arbitrary-refspec fetch.
     "fetch": frozenset(),
+    # Auto-merge (`auto_merge.py`): integrating a completed task's reviewed
+    # candidate into the base. THE FIRST MUTATING CHECKOUT SUBCOMMAND on this
+    # whitelist, so it carries its own shape check below (`sub == "merge"`)
+    # rather than relying on the flag loop alone: the thing being merged must
+    # be a literal 40-hex commit id, exactly like `push`'s refspec source and
+    # `fetch`'s want-token (F2). A branch name can move between the moment the
+    # merge window is checked and the moment the merge runs.
+    #
+    # `--abort` is here so the conflict path can restore the checkout through
+    # the same gateway. It is deliberately NOT in `_REQUIRED_GIT` alongside
+    # `--no-ff`, because the two forms are mutually exclusive: requiring
+    # either flag would deny the other invocation outright.
+    "merge": frozenset({"--no-ff", "--no-edit", "--abort", "-m"}),
     # Per-task worktree lifecycle (`worktree.py`'s WorktreeManager). Only the
     # real FLAGS live here — the action verb (add/remove/list/prune) is
     # checked separately below via `_ALLOWED_GIT_VERBS`, because the flag loop
@@ -361,6 +396,40 @@ class PolicyEngine:
                             "through this gateway (F2); a branch name, tag or "
                             "'HEAD' can move between review and push",
                         )
+        if sub == "merge":
+            # Two shapes and nothing else: `merge --abort` (restore the
+            # checkout after a conflict) and `merge [--no-ff] [--no-edit]
+            # [-m <msg>] <40-hex>` (integrate one already-resolved commit).
+            tokens = list(args[1:])
+            if "--abort" in tokens:
+                if tokens != ["--abort"]:
+                    return Verdict.deny(
+                        "git_merge_abort_shape",
+                        "'git merge --abort' takes no other arguments — mixing it "
+                        f"with {sorted(t for t in tokens if t != '--abort')} is refused",
+                    )
+                return Verdict.ok()
+            positionals = []
+            expect_message = False
+            for token in tokens:
+                if expect_message:
+                    expect_message = False
+                    continue
+                if token == "-m":
+                    expect_message = True
+                    continue
+                if token.startswith("-"):
+                    continue
+                positionals.append(token)
+            if len(positionals) != 1 or not _HEX40.match(positionals[0]):
+                return Verdict.deny(
+                    "git_merge_commit",
+                    "'git merge' is only allowed as 'merge [flags] <40-hex commit "
+                    f"id>' (got {positionals!r}) — a branch name, tag or 'HEAD' can "
+                    "move between the merge-window check and the merge itself, so "
+                    "only an already-resolved, already-reviewed commit id may be "
+                    "merged through this gateway",
+                )
         if sub == "fetch":
             # Autoloop M2: `git fetch <source> <want>` — exactly two
             # positional arguments, no refspec, no wildcard, no remote name.

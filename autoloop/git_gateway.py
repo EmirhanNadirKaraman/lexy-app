@@ -516,6 +516,66 @@ class GitGateway:
     def worktree_prune(self) -> None:
         self._git("worktree", "prune")
 
+    # ---- integration (auto_merge.py) ----------------------------------------
+    #
+    # The only place in this gateway that moves the CHECKOUT's own branch head.
+    # Everything else either reads, or writes a commit onto a worker's separate
+    # worktree, or publishes an already-resolved sha by refspec. Both methods
+    # here are deliberately thin: the ordering, the gate, the verification and
+    # the abort-on-conflict discipline all live in `auto_merge.py`, so this
+    # class keeps its "one git invocation per method, no policy of its own"
+    # shape.
+
+    #: Conflict markers in `git status --porcelain`'s XY field. `U` on either
+    #: side is git's unmerged flag; `AA` (both added) and `DD` (both deleted)
+    #: are the two conflict states that use no `U` at all.
+    _CONFLICT_STATUSES = ("DD", "AA")
+
+    def merge_commit(self, sha: str, message: str) -> None:
+        """`git merge --no-ff --no-edit -m <message> <sha>` in this checkout.
+
+        `--no-ff` on purpose: a real merge commit records WHEN a task's
+        candidate was integrated and keeps the base's first-parent history a
+        list of integrations. A fast-forward would move the head just as well,
+        but the caller then has no commit of its own to name in a log or a
+        deferral record.
+
+        Raises `GitCommandError` on any non-zero exit, conflicts included —
+        the caller is expected to read `conflicted_paths()` BEFORE calling
+        `merge_abort()`, because the abort clears them.
+
+        Nothing here validates `sha`: the policy layer independently refuses
+        anything that is not a literal 40-hex commit id (`sub == "merge"` in
+        `validate_git_command`), so a branch name cannot reach git even if a
+        caller passes one.
+        """
+        self._git("merge", "--no-ff", "--no-edit", "-m", message, sha)
+
+    def merge_abort(self) -> None:
+        """`git merge --abort` — restore the checkout to exactly its
+        pre-merge state. Never combined with any other flag (the policy layer
+        refuses that shape outright).
+
+        A zero exit is not by itself evidence the checkout is clean again;
+        `auto_merge.py` re-reads `head_sha()` and `is_dirty()` afterwards,
+        the same discipline `push_exact` applies to its own confirmation.
+        """
+        self._git("merge", "--abort")
+
+    def conflicted_paths(self) -> list[str]:
+        """Paths git currently reports as unmerged, sorted.
+
+        Read from `dirty_entries()` rather than `git diff --diff-filter=U`,
+        which would need a wider `diff` flag whitelist for information the
+        status output already carries. NUL-parsed via `dirty_entries`, so a
+        conflicted path containing a space or a tab is reported literally.
+        """
+        return sorted(
+            path
+            for status, path in self.dirty_entries()
+            if "U" in status or status in self._CONFLICT_STATUSES
+        )
+
     # ---- produce-then-review commit path ------------------------------------
     #
     # Unlike `commit_adopted`, hooks are expected to run here — the artifact
