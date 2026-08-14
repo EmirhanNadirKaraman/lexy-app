@@ -1376,11 +1376,19 @@ observation is `git status --porcelain -z -uall` through the policy-validated
 `GitGateway` plus per-path `st_mtime_ns`/`st_size` — never anything the agent
 says about itself, and deliberately not a raw filesystem walk (the probe's own
 `git status` refreshes `.git/index`, so a walk including `.git` would see churn
-every tick and never fire). The old key is REFUSED at load with a migration
-message rather than remapped, and the read-only audit path keeps an elapsed
-bound under the unambiguous name `audit_agent_timeout_seconds` — a read-only
-agent has no progress to observe, and a timeout there costs a re-run rather than
-destroying work. New `test_stall_detector.py` (27 tests): an agent writing
+every tick and never fire). The old key is handled EXPLICITLY at load rather
+than ignored: a config still naming it loads, its value migrates onto
+`audit_agent_timeout_seconds` (the read-only audit path, which keeps the old
+key's exact meaning — a read-only agent has no progress to observe, and a
+timeout there costs a re-run rather than destroying work), an explicit
+`audit_agent_timeout_seconds` takes precedence over it, and the retired name
+never reaches `AuditConfig`. `load_config` stays PURE — it returns the notice
+as `AutoloopConfig.migration_notices` and writes to no stream — while
+`cli.emit_migration_notices` prints it on stderr once per process. That split
+is deliberate: notice *content* is then asserted by ordinary tests in any
+order, and only the once-per-process contract needs isolation. New
+`test_stall_detector.py` (33 test functions, 34 collected — the first is
+parametrized over both retired timeout values): an agent writing
 steadily for 90 minutes is not killed (parametrized over BOTH retired timeout
 values — this is the mutation guard, and reintroducing any elapsed bound fails
 it); a 1400s pause inside a 1800s window is not a stall; silence past the window
@@ -1401,10 +1409,28 @@ the supervised runner reports a stall instead of a timeout while keeping
 the killed run's partial output, and a runner with no probe still passes the old
 elapsed `timeout=` to `subprocess.run`; and the executor surfaces the stall,
 `changed_paths` read from git, and — for ANY agent failure, not only stalls —
-what was left behind. Config coverage: the retired key is refused with a message
-naming all three replacements, a stall window at or above the ceiling is refused
-(it would read as configured while being unreachable), and a non-positive bound
-is refused.
+what was left behind. Config coverage: the retired key migrates onto
+`audit_agent_timeout_seconds` while leaving the write path on the stall
+defaults, with a notice naming all three replacements; an explicit
+`audit_agent_timeout_seconds` wins when both are named; a config without the
+retired key produces no notice; a junk value for the retired key is still
+refused (it is migrated onto a live setting, so it is validated like one);
+`load_config` writes to no stream and returns the same notices however many
+times it runs; the CLI routes the notice to stderr, never stdout (`status` /
+`tasks` / `next-task` have parseable stdout); a stall window at or above the
+ceiling is refused (it would read as configured while being unreachable); and a
+non-positive bound is refused.
+
+`test_the_cli_prints_the_migration_notice_on_stderr_once` runs a real
+SUBPROCESS (`sys.executable -c`, `PYTHONPATH` at the repo root) that loads the
+same legacy config three times and asserts exactly one notice on stderr. It is
+the one test here that cannot run in-process: the suppression ledger is
+process-global by design, so any earlier test that loaded a legacy config
+through the CLI would consume the single emission and leave this one asserting
+against an empty stream — which is how it failed on the previous round. A
+subprocess makes "this process has not printed it yet" true by construction
+instead of by test ordering; the in-process sibling test resets only that
+ledger, via `monkeypatch`, and never touches production semantics.
 
 **584 tests (pre-blockers baseline), fully hermetic** — no network, no ChatGPT, no playwright import,
 no live `claude` CLI (agent runner stubbed), no app DB. `test_git_gateway.py`,

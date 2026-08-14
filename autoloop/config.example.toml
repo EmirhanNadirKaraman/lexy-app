@@ -106,12 +106,19 @@ kind = "audit"
 # How subagents are launched (the Claude Code CLI in headless mode).
 agent_command = ["claude"]
 #
-# `agent_timeout_seconds` was RETIRED on 2026-08-14 and is now REFUSED, not
-# ignored: a config still naming it fails to load with a message pointing here.
-# It bounded every agent by elapsed time, which cannot tell a large task from a
-# wedged one — measured over 2026-08-05/06 it never once caught a hung agent
-# and killed six agents mid-write, discarding up to 631 insertions at a time.
-# It splits into three settings that mean different things.
+# `agent_timeout_seconds` was RETIRED on 2026-08-14. It bounded every agent by
+# elapsed time, which cannot tell a large task from a wedged one — measured
+# over 2026-08-05/06 it never once caught a hung agent and killed six agents
+# mid-write, discarding up to 631 insertions at a time. It splits into three
+# settings that mean different things.
+#
+# A config still naming it LOADS, and is handled explicitly rather than
+# ignored: the value migrates onto `audit_agent_timeout_seconds` below (the one
+# replacement that keeps its exact meaning) and the loop prints a notice on
+# stderr, once per process, saying so. It does NOT carry over to the
+# write-capable agent — that path is bounded by silence now, not by elapsed
+# time. If `audit_agent_timeout_seconds` is also set, that wins and the notice
+# says the legacy value was dropped. Delete the old key to silence the notice.
 #
 # READ-ONLY audit agents: an elapsed bound, the old key's exact meaning and
 # value. Correct here — they change no files, so there is no progress to

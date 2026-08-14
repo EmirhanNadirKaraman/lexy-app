@@ -103,9 +103,14 @@ class ExecutorConfig:
     kind: str = "audit"  # audit | null (null = record-only dry run)
 
 
-#: The key retired on 2026-08-14, kept ONLY so `load_config` can recognise it
-#: and say what replaced it. Never read as a value anywhere.
+#: The key retired on 2026-08-14. An existing config may still name it, and
+#: naming it still loads — but it is handled EXPLICITLY, never ignored: it is
+#: migrated onto `audit_agent_timeout_seconds` (see `_migrate_retired_timeout`)
+#: and the operator is told, once per process, what it now does and does not
+#: govern. It is never stored under its old name.
 RETIRED_AGENT_TIMEOUT_KEY = "agent_timeout_seconds"
+#: The key it migrates onto — the ONE replacement that kept its exact meaning.
+MIGRATED_TIMEOUT_KEY = "audit_agent_timeout_seconds"
 
 
 @dataclass(frozen=True)
@@ -164,6 +169,14 @@ class AutoloopConfig:
     codex: CodexConfig = CodexConfig()
     executor: ExecutorConfig = ExecutorConfig()
     audit: AuditConfig = AuditConfig()
+    #: Operator-facing messages about retired keys this config still names —
+    #: DATA, not a side effect. `load_config` stays pure: it never writes to a
+    #: stream and holds no "already warned" global, so the notice text can be
+    #: asserted by any test in any order without contaminating another. The
+    #: once-per-process suppression lives in exactly one place, `cli.py`'s
+    #: `emit_migration_notices`. Last field and defaulted, because the direct
+    #: `AutoloopConfig(...)` constructions across the test suite predate it.
+    migration_notices: tuple[str, ...] = ()
 
     @property
     def state_file(self) -> Path:
@@ -320,6 +333,95 @@ def _check_keys(section: str, data: dict, allowed: set[str]) -> None:
         raise ConfigError(f"unknown keys in [{section}]: {sorted(unknown)}")
 
 
+def _migrate_retired_timeout(audit_data: dict) -> tuple[str, ...]:
+    """Handle a config that still names `audit.agent_timeout_seconds`.
+
+    Explicitly, which is the whole requirement — an existing config must not
+    quietly acquire different behaviour under a name it already uses. Three
+    things make that true, and all three are load-bearing:
+
+    * **The key is consumed here**, so it never reaches `AuditConfig` and
+      `config.audit.agent_timeout_seconds` does not exist. Nothing can read
+      the old name and get a value.
+    * **Its MEANING is preserved, not its scope.** The old key meant "elapsed
+      bound for a subagent". That meaning survives intact on exactly one path
+      — read-only audit agents, which change no files and so offer no progress
+      to watch — so the value migrates onto `audit_agent_timeout_seconds` and
+      governs there exactly as before. It no longer bounds the write-capable
+      implement agent, because bounding THAT by elapsed time is the measured
+      failure this whole change exists to correct (`stall.py`).
+    * **The operator is told**, via a notice the CLI prints. Migrating in
+      silence would be the "silently acquires different behaviour" failure
+      wearing a different hat.
+
+    An explicit `audit_agent_timeout_seconds` WINS: it is the current name for
+    the setting, so someone who wrote both has already chosen, and the notice
+    says the legacy value was dropped rather than letting the retired key
+    quietly override the key that replaced it.
+
+    Refusing the config outright was the alternative. It is rejected because a
+    config naming this key is a config written when the loop worked, and the
+    only action it enables — delete one line — is one the loader can take
+    itself without making a running deployment unstartable.
+    """
+    if RETIRED_AGENT_TIMEOUT_KEY not in audit_data:
+        return ()
+    legacy = audit_data.pop(RETIRED_AGENT_TIMEOUT_KEY)
+    # Validated with the same rule the key it migrates onto gets, and BEFORE
+    # anything is said about it: a migration notice quoting a value that is
+    # about to be refused would be noise in front of the real error.
+    if not isinstance(legacy, (int, float)) or isinstance(legacy, bool) or legacy <= 0:
+        raise ConfigError(
+            f"audit.{RETIRED_AGENT_TIMEOUT_KEY} must be a positive number, got {legacy!r}"
+        )
+    head = (
+        f"autoloop: NOTICE — audit.{RETIRED_AGENT_TIMEOUT_KEY} was RETIRED on "
+        "2026-08-14. It bounded every subagent by ELAPSED TIME, which cannot "
+        "tell a large task from a wedged one: measured over 2026-08-05/06 it "
+        "never once caught a hung agent and killed six agents mid-write, "
+        "discarding up to 631 insertions at a time. Your config still loads; "
+        "the key has been handled as follows."
+    )
+    if MIGRATED_TIMEOUT_KEY in audit_data:
+        outcome = (
+            f"  IGNORED: audit.{MIGRATED_TIMEOUT_KEY} = "
+            f"{audit_data[MIGRATED_TIMEOUT_KEY]} is also set and WINS — it is "
+            "the current name for this setting. The retired key's value "
+            f"({legacy}) was dropped."
+        )
+    else:
+        audit_data[MIGRATED_TIMEOUT_KEY] = legacy
+        outcome = (
+            f"  MIGRATED: its value ({legacy}) now sets "
+            f"audit.{MIGRATED_TIMEOUT_KEY}, the elapsed bound for READ-ONLY "
+            "audit subagents. That is the one replacement which keeps the old "
+            "meaning exactly — those agents change no files, so there is no "
+            "progress to observe, and a timeout there costs a re-run rather "
+            "than destroying work."
+        )
+    return (
+        "\n".join(
+            [
+                head,
+                outcome,
+                "  NOT carried over: write-capable implement subagents are no "
+                "longer bounded by elapsed time at all. They are bounded by "
+                "SILENCE — audit.agent_stall_seconds (default "
+                f"{DEFAULT_STALL_SECONDS:.0f}) is how long the worker "
+                "repository may show NO change before the agent counts as "
+                "hung. While files keep changing, the agent keeps running, "
+                "however long the task takes.",
+                "  Backstop: audit.agent_ceiling_seconds (default "
+                f"{DEFAULT_CEILING_SECONDS:.0f}) still terminates a "
+                "pathological run. It is set far above any real task and "
+                "should effectively never fire.",
+                f"  Silence this by deleting audit.{RETIRED_AGENT_TIMEOUT_KEY} "
+                "from your config and setting the keys above deliberately.",
+            ]
+        ),
+    )
+
+
 def load_config(path: Path) -> AutoloopConfig:
     path = Path(path)
     if not path.exists():
@@ -437,35 +539,9 @@ def load_config(path: Path) -> AutoloopConfig:
 
     audit_data = dict(data.get("audit", {}))
     # BEFORE `_check_keys`, which would otherwise report the retired key as a
-    # generic "unknown key" — true, but useless. A config written against the
-    # old build asked for a specific safety behaviour; it deserves to be told
-    # exactly what that behaviour became, and it must NOT be silently mapped
-    # onto either replacement, because neither one means what it meant.
-    if RETIRED_AGENT_TIMEOUT_KEY in audit_data:
-        raise ConfigError(
-            f"audit.{RETIRED_AGENT_TIMEOUT_KEY} was RETIRED on 2026-08-14 and is "
-            "not read anymore. It bounded every agent by ELAPSED TIME, which "
-            "cannot tell a large task from a wedged one: measured over "
-            "2026-08-05/06 it never once caught a hung agent and killed six "
-            "agents mid-write, discarding up to 631 insertions at a time. It "
-            "splits into two settings with different meanings, so remove the "
-            "old key and choose deliberately rather than letting a number "
-            "carry over:\n"
-            "  audit.agent_stall_seconds       (default "
-            f"{DEFAULT_STALL_SECONDS:.0f}) — write-capable implement agents "
-            "are killed after this much time with NO change in the worker "
-            "repository. It is a silence window, NOT a time budget: while "
-            "files keep changing the agent keeps running.\n"
-            "  audit.agent_ceiling_seconds     (default "
-            f"{DEFAULT_CEILING_SECONDS:.0f}) — absolute backstop for every "
-            "agent, set far above any real task. It should effectively never "
-            "fire.\n"
-            "  audit.audit_agent_timeout_seconds (default 900) — the elapsed "
-            "bound for READ-ONLY audit agents, which produce no filesystem "
-            "change and so have no progress to measure. This is the one key "
-            "that keeps the old meaning; copy your old value here if you had "
-            "tuned it."
-        )
+    # generic "unknown key" — true, but useless to someone holding a config
+    # that used to work.
+    migration_notices = _migrate_retired_timeout(audit_data)
     _check_keys("audit", audit_data, {f.name for f in dataclasses.fields(AuditConfig)})
     if "agent_command" in audit_data:
         cmd = audit_data["agent_command"]
@@ -509,4 +585,5 @@ def load_config(path: Path) -> AutoloopConfig:
         codex=codex,
         executor=executor,
         audit=audit,
+        migration_notices=migration_notices,
     )

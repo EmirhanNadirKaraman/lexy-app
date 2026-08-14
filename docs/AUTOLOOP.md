@@ -2159,8 +2159,13 @@ Pipeline (`implement_executor.py`):
    all, or at `audit.agent_ceiling_seconds` (default 14400), the absolute
    backstop that should effectively never fire. The retired
    `audit.agent_timeout_seconds` killed six agents mid-write over
-   2026-08-05/06 and never once caught a hang — a config still naming it is
-   refused with a migration message. Read-only audit subagents (§7a) keep an
+   2026-08-05/06 and never once caught a hang. A config still naming it loads
+   and is handled explicitly: the value migrates onto
+   `audit.audit_agent_timeout_seconds` — the one replacement that keeps its
+   meaning — and `cli.emit_migration_notices` prints a notice on stderr, once
+   per process, saying what it now does and does not govern. An explicit
+   `audit_agent_timeout_seconds` wins over it. The retired name never survives
+   into `AuditConfig`, so nothing can read it back. Read-only audit subagents (§7a) keep an
    elapsed bound under `audit.audit_agent_timeout_seconds`: they change no
    files, so there is nothing to observe, and a timeout there costs a re-run
    rather than destroying work. A killed run comes back as an ordinary

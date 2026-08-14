@@ -9,20 +9,28 @@ are written around that failure rather than around the mechanism:
   any elapsed-time bound at 900s or 1800s and it fails.
 * the silence, partial-work and ceiling tests cover the other direction — the
   bound really was replaced, not removed.
-* the config test pins that an existing config naming the retired key is
-  refused with a migration message rather than quietly acquiring different
-  behaviour.
+* the config tests pin that an existing config naming the retired key is
+  handled EXPLICITLY — migrated onto the one replacement that kept its meaning,
+  announced, and never left to quietly govern the write-capable path it used
+  to.
 
-No real process is ever spawned and no test ever waits: `supervise` is pure
-over an injected handle, probe, clock and sleep. The probe tests DO use a real
-git repository, because the probe's whole job is to observe one honestly.
+No real process is ever spawned by the supervisor tests and none of them ever
+waits: `supervise` is pure over an injected handle, probe, clock and sleep. Two
+places do use the real world, both because the thing under test is an honest
+observation of it: the probe tests drive a real git repository, and the
+once-per-process notice test runs a real subprocess (see its docstring — the
+contract is about process-global state, so it cannot be observed from inside a
+process other tests have already touched).
 """
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from autoloop import cli
 from autoloop.audit.agents import AgentResult, AgentSpec, ClaudeCliRunner
 from autoloop.config import load_config
 from autoloop.contract import Decision, Directive
@@ -314,7 +322,7 @@ def test_a_probe_that_cannot_observe_never_triggers_a_stall_kill():
     assert "UNKNOWN" in result.report.partial.describe()
 
 
-# ---- 5. the retired config key is refused, not ignored -----------------------
+# ---- 5. the retired config key is handled explicitly, not ignored ------------
 
 
 def _write_config(tmp_path: Path, audit_lines: str) -> Path:
@@ -335,25 +343,144 @@ def _write_config(tmp_path: Path, audit_lines: str) -> Path:
     return path
 
 
-def test_an_old_config_naming_agent_timeout_seconds_is_refused_with_a_migration_message(tmp_path):
-    """Explicitly handled, not ignored and NOT silently remapped: the old key
-    meant "elapsed bound for every agent", and neither replacement means that,
-    so carrying its number over would hand an existing config different
-    behaviour under the same name."""
-    path = _write_config(tmp_path, "agent_timeout_seconds = 900.0")
+def test_an_old_config_naming_agent_timeout_seconds_is_migrated_explicitly(tmp_path):
+    """Handled explicitly, which is the requirement — not ignored, and not
+    silently left to mean what it used to mean.
 
-    with pytest.raises(ConfigError) as excinfo:
-        load_config(path)
+    The old key meant "elapsed bound for a subagent". That meaning survives on
+    exactly one path (read-only audit agents, which have no progress to watch),
+    so the value lands there and governs it exactly as before. It does NOT
+    reach the write-capable agent, because bounding that by elapsed time is the
+    failure being corrected — and the notice says so rather than leaving the
+    operator to discover it.
+    """
+    config = load_config(_write_config(tmp_path, "agent_timeout_seconds = 1200.0"))
 
-    message = str(excinfo.value)
-    assert "agent_timeout_seconds" in message
-    assert "RETIRED" in message
+    # Its meaning is preserved where the meaning still applies...
+    assert config.audit.audit_agent_timeout_seconds == 1200.0
+    # ...and it does NOT become an elapsed bound on the write-capable path,
+    # which now gets the stall defaults.
+    assert config.audit.agent_stall_seconds == 1800.0
+    assert config.audit.agent_ceiling_seconds == 14400.0
+    # The retired name is consumed, so nothing can read it back.
+    assert not hasattr(config.audit, "agent_timeout_seconds")
+
+    (notice,) = config.migration_notices
+    assert "agent_timeout_seconds" in notice
+    assert "RETIRED" in notice
+    assert "1200.0" in notice
     # It names all three replacements and what each one means.
-    assert "agent_stall_seconds" in message
-    assert "agent_ceiling_seconds" in message
-    assert "audit_agent_timeout_seconds" in message
-    # And it is a migration message, not the generic unknown-key one.
-    assert "unknown keys" not in message
+    assert "audit_agent_timeout_seconds" in notice
+    assert "agent_stall_seconds" in notice
+    assert "agent_ceiling_seconds" in notice
+    # A migration message, not the generic unknown-key one.
+    assert "unknown keys" not in notice
+
+
+def test_the_new_key_wins_when_a_config_names_both(tmp_path):
+    """Someone who wrote both has already chosen, and the current name is the
+    choice. Letting the retired key override the key that replaced it would be
+    the one outcome nobody could have intended."""
+    config = load_config(
+        _write_config(
+            tmp_path,
+            "agent_timeout_seconds = 1200.0\naudit_agent_timeout_seconds = 300.0",
+        )
+    )
+
+    assert config.audit.audit_agent_timeout_seconds == 300.0
+    (notice,) = config.migration_notices
+    assert "IGNORED" in notice
+    assert "300.0" in notice  # the winner is named
+    assert "1200.0" in notice  # so is the value that lost
+
+
+def test_a_config_without_the_retired_key_produces_no_notice(tmp_path):
+    """The notice must be evidence the key was seen, not decoration printed on
+    every start — otherwise it says nothing when it appears."""
+    assert load_config(_write_config(tmp_path, "")).migration_notices == ()
+
+
+def test_a_junk_value_for_the_retired_key_is_still_refused(tmp_path):
+    """Migrating a value onto a live setting means validating it like one. A
+    notice announcing that `0` now bounds the audit agents would be worse than
+    the error it replaced."""
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(_write_config(tmp_path, "agent_timeout_seconds = 0"))
+
+    assert "agent_timeout_seconds" in str(excinfo.value)
+    assert "positive number" in str(excinfo.value)
+
+
+def test_loading_a_config_never_writes_to_stderr_itself(tmp_path, capsys):
+    """`load_config` is PURE — notices come back as data and no global records
+    that they were produced.
+
+    This is what makes the notice content testable in any order: were the
+    loader to print (and to remember printing), the first test in the file to
+    load a legacy config would consume the one emission and every later
+    assertion about it would depend on test ordering.
+    """
+    first = load_config(_write_config(tmp_path, "agent_timeout_seconds = 1200.0"))
+    second = load_config(_write_config(tmp_path, "agent_timeout_seconds = 1200.0"))
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+    # Same input, same output — no "already warned" state anywhere.
+    assert first.migration_notices == second.migration_notices != ()
+
+
+def test_the_cli_prints_the_migration_notice_on_stderr(tmp_path, capsys, monkeypatch):
+    """Routing: stderr, never stdout. `status` / `tasks` / `next-task` have
+    parseable stdout, and a notice mixed into it would corrupt a pipe."""
+    # Only the process-global emission ledger is reset, and monkeypatch puts it
+    # back afterwards. Production semantics are untouched.
+    monkeypatch.setattr(cli, "_EMITTED_MIGRATION_NOTICES", set())
+
+    config = cli.load_config(_write_config(tmp_path, "agent_timeout_seconds = 1200.0"))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "RETIRED" in captured.err
+    assert config.audit.audit_agent_timeout_seconds == 1200.0
+
+
+def test_the_cli_prints_the_migration_notice_on_stderr_once(tmp_path):
+    """The once-PER-PROCESS contract, tested in a process of its own.
+
+    It cannot be tested in-process: the ledger is module-global by design (the
+    loop reads its config on every command, and `run --continuous` is one
+    long-lived process, so a notice repeated each round is one an operator
+    learns to scroll past). Any earlier test that loads a legacy config through
+    the CLI would consume the single emission and leave this one asserting
+    against an empty stream — which is exactly how it failed before. A
+    subprocess makes "this process has not printed it yet" true by
+    construction instead of by test ordering.
+    """
+    path = _write_config(tmp_path, "agent_timeout_seconds = 1200.0")
+    repo_root = Path(__file__).resolve().parents[2]
+    program = (
+        "import sys\n"
+        "from autoloop.cli import load_config\n"
+        "for _ in range(3):\n"
+        "    load_config(sys.argv[1])\n"
+        "print('loaded 3 times', file=sys.stdout)\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(repo_root)}
+
+    proc = subprocess.run(
+        [sys.executable, "-c", program, str(path)],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "loaded 3 times" in proc.stdout
+    # Three loads, one notice.
+    assert proc.stderr.count("was RETIRED on 2026-08-14") == 1
 
 
 def test_the_new_settings_load_and_default_generously(tmp_path):

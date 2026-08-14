@@ -52,7 +52,7 @@ from .audit.executor import AuditExecutor
 from .audit.markdown import MarkdownPolicy
 from .blockers import NO_TASK, Blocker, BlockerStore
 from .changeset_review import build_changeset_binding, build_changeset_packet
-from .config import AutoloopConfig, load_config
+from .config import AutoloopConfig, load_config as _read_config_file
 from .contract import AUDIT_TASK_ID, Decision, Directive
 from .conversation import create_conversation
 from . import health, heartbeat
@@ -91,6 +91,45 @@ from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_
 from .worktask import IntentStore, TaskExecutionStore
 
 DEFAULT_CONFIG = Path(".autoloop/config.toml")
+
+#: Migration notices already printed by THIS process. Deliberately the only
+#: piece of "have we said this yet" state in the codebase: `config.load_config`
+#: stays pure and returns notices as data, so nothing about which tests ran
+#: first can change what a config parses to.
+_EMITTED_MIGRATION_NOTICES: set[str] = set()
+
+
+def emit_migration_notices(config: AutoloopConfig, stream=None) -> None:
+    """Print each retired-key notice on stderr, at most once per process.
+
+    **stderr, not stdout**: `status`, `tasks`, `next-task` and `blockers` are
+    read-only commands whose stdout gets piped and parsed. A notice on stdout
+    would corrupt that output; on stderr it reaches the operator regardless.
+
+    **Once per process**, because the loop calls `load_config` on every command
+    and `run --continuous` is a long-lived process — a notice repeated each
+    round is one an operator learns to scroll past, which defeats the point of
+    warning at all.
+    """
+    stream = sys.stderr if stream is None else stream
+    for notice in config.migration_notices:
+        if notice in _EMITTED_MIGRATION_NOTICES:
+            continue
+        _EMITTED_MIGRATION_NOTICES.add(notice)
+        print(notice, file=stream)
+
+
+def load_config(path: Path) -> AutoloopConfig:
+    """`config.load_config` plus the operator-facing notice for retired keys.
+
+    Every CLI command reads its config through this wrapper, so a config naming
+    a retired key is reported no matter which command is run. It is also what
+    the test suite monkeypatches (`cli.load_config`), and patching it continues
+    to bypass both the file read and the notice — as those tests intend.
+    """
+    config = _read_config_file(path)
+    emit_migration_notices(config)
+    return config
 
 
 def _load_state(config: AutoloopConfig) -> tuple[StateStore, LoopState | None]:

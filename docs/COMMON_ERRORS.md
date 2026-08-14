@@ -359,6 +359,34 @@ serially and in isolation.
 deterministically (`ORDER BY <pk> LIMIT 1`). Full detail and the audit hint for
 the next round are in `docs/TESTS.md`.
 
+### A "happens once per process" test fails with an EMPTY stream, not a doubled one
+**Symptom:** `test_the_cli_prints_the_migration_notice_on_stderr_once` fails on
+`assert captured.err.count(...) == 1` with an actual count of **0**. The stream
+is empty, not duplicated. Passes when run alone (`-k once`), fails in the full
+suite. Nothing about the assertion looks order-dependent.
+**Cause:** the behaviour under test is suppression by **process-global** state —
+`cli._EMITTED_MIGRATION_NOTICES`, which makes a retired-key notice print at most
+once per process (`run --continuous` reloads its config every round, and a
+notice repeated each round is one an operator scrolls past). Any earlier test in
+the same process that loaded a legacy config through the CLI already consumed
+the one emission. The "once" test then correctly observes nothing. Read
+literally the failure says "it printed zero times", which points at emission
+being broken; the actual fault is that it printed already, somewhere else.
+**Fix:** test a per-process contract in a **process of its own** — run the
+scenario via `subprocess.run([sys.executable, "-c", program, …])` with
+`PYTHONPATH` at the repo root, and assert on `proc.stderr`. That makes "this
+process has not printed yet" true by construction rather than by test ordering.
+See the test named above.
+**Do NOT** fix it by weakening production semantics (dropping the ledger, or
+re-emitting per call) so the in-process assertion passes — that discards the
+behaviour the test exists to pin. If you need an in-process test for the
+*routing* or the *content*, reset only the ledger and only for that test
+(`monkeypatch.setattr(cli, "_EMITTED_MIGRATION_NOTICES", set())`), which
+restores itself. Better still, keep the producer pure: `config.load_config`
+returns notices as data (`AutoloopConfig.migration_notices`) and writes to no
+stream, so content assertions cannot be contaminated by ordering at all — only
+the genuinely global "once" contract needs the subprocess.
+
 ---
 
 ## 3. Frontend build
