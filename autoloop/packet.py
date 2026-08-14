@@ -35,7 +35,7 @@ import textwrap
 from dataclasses import dataclass
 
 from .git_gateway import GitGateway
-from .tasks import Task
+from .tasks import Task, unauthorized_paths
 from .worktask import TaskExecution
 
 #: How much patch text a packet may carry. Deliberately far below
@@ -135,6 +135,58 @@ def _format_changed_paths(
     return "\n".join(lines)
 
 
+def _format_out_of_scope(changed: set[str], allowed: tuple[str, ...]) -> str:
+    """Which changed paths the task's declared scope did not authorize —
+    computed HERE, from `changed` (git's own `commit_range_paths`) against
+    `execution.allowed_paths`, exactly like every other read section.
+
+    This is the control that replaces a refusal. Since 2026-08-05 both scope
+    gates are ADVISORY (`docs/SECURITY.md` S25 amendment): an out-of-scope path
+    no longer parks the task, it reaches a human. So a reviewer who never sees
+    the list is a reviewer who cannot exercise the judgement the park used to
+    make for them — which is why this renders UNCONDITIONALLY, with an explicit
+    none-line. Absence of the section must never be the signal; "(none)" is.
+
+    Deliberately NOT read from `TaskExecution.out_of_scope_paths`, even though
+    that field holds the same answer by the time a packet is built. That record
+    is the union of BOTH gates, and the pre-commit one compares
+    `outcome.changed_paths` — the executor's own report. Sourcing the section
+    from it would let a report naming a file it never touched put that file in
+    front of the reviewer as a fact about the commit. Same rule as everywhere
+    else in this module: the executor gets exactly one labelled section, and
+    this is not it.
+
+    `allowed` is `execution.allowed_paths`, the same input `_verify_committed`
+    compares against, so the packet and the post-commit check cannot disagree
+    about what counted as out of scope. Note an AUDIT execution unions its
+    committed paths into `allowed_paths` by design (`orchestrator.py`'s
+    `is_audit` branch), so an audit packet reports none — that is the audit
+    path having no declared scope to exceed, not a missing check.
+    """
+    outside = unauthorized_paths(changed, allowed)
+    if not outside:
+        return (
+            "Out-of-scope paths (0):\n"
+            "  (none — every changed path is inside the task's declared scope)"
+        )
+    scope = ", ".join(sorted(allowed)) or "(nothing declared)"
+    return (
+        f"OUT-OF-SCOPE PATHS ({len(outside)}) — this commit touched "
+        f"{len(outside)} path(s) the task's\n"
+        "declared scope did not authorize. Read from git (the changed paths of\n"
+        "the range above, checked against the task's approved paths), NOT from\n"
+        "anything the executor reported:\n"
+        + "\n".join(f"  ! {path}" for path in sorted(outside))
+        + "\n"
+        "  The scope check is ADVISORY — these paths did NOT stop the commit,\n"
+        "  so this list is the only place the overrun surfaces. A declared\n"
+        "  scope is a prediction made before the code was read, so a wrong one\n"
+        "  is ordinary; judge whether these edits belong to THIS task, and\n"
+        "  reply `revise` if they do not.\n"
+        f"  Declared scope: {scope}"
+    )
+
+
 def build_review_packet(execution: TaskExecution, worktree_git: GitGateway, task: Task) -> str:
     """The rendered review packet — see `build_review_packet_with_diff`, of
     which this is the text half. Kept as the plain-string entry point because
@@ -188,6 +240,12 @@ def build_review_packet_with_diff(
             "",
             f"Changed paths ({len(changed)}):",
             _format_changed_paths(changed, base_entries, candidate_entries),
+            "",
+            # Directly under the path list it is about, and ABOVE both the
+            # executor's report and the diff — the diff is what gets OMITTED on
+            # a large commit, and this must survive that (see
+            # `_format_diff_section`).
+            _format_out_of_scope(changed, execution.allowed_paths),
             "",
             "Diff stat:",
             stat.strip() or "  (empty)",
