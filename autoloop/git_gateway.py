@@ -267,6 +267,25 @@ class GitGateway:
         )
         return {p for p in raw.split("\0") if p}
 
+    def worktree_diff_stat(self) -> str:
+        """`git diff HEAD --stat` — the uncommitted work in this tree.
+
+        Against `HEAD` rather than the index, so STAGED and unstaged edits are
+        both counted: a caller asking "how much has been written here" wants
+        everything since the round began, and which side of the index a change
+        happens to sit on is an implementation detail of whoever wrote it.
+
+        `--stat`, not `--numstat`: the latter is exact and per-file, and is
+        NOT on the policy whitelist (`policy._ALLOWED_GIT["diff"]`). Widening
+        a security whitelist to prettify a progress report is not a trade
+        worth making, so the summary line is parsed instead — see
+        `stall.WorkerTreeProbe.partial_work`, its only caller, which says
+        plainly in its own output that the number is close to but not
+        identical with git's insertion count. Untracked files are absent from
+        any diff and are counted separately there.
+        """
+        return self._out("diff", "HEAD", "--stat")
+
     # ---- checkout enumeration (M1 escape detector) ---------------------------
     #
     # `git status` (even with `-uall`) only reports what CHANGED against the

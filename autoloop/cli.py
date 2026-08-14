@@ -82,6 +82,7 @@ from .publisher import (
     redact_url,
     reprovision_publisher as _reprovision_publisher_snapshot,
 )
+from .stall import StallPolicy
 from .state import TERMINAL_PHASES, LoopState, Phase, StateStore
 from .tasks import Task, TaskRegistry, TaskState, TaskStore
 from .transcript import TranscriptLogger
@@ -243,10 +244,18 @@ def _build_executor(
 ) -> TaskExecutor:
     if getattr(args, "null_executor", False) or config.executor.kind == "null":
         return NullExecutor()
+    # Read-only audit subagents keep an ELAPSED bound — they change no files,
+    # so there is no progress to observe, and a timeout there costs a re-run
+    # rather than destroying work. The write-capable executor below is the one
+    # that gets the stall detector (`autoloop/stall.py`).
+    stall_policy = StallPolicy(
+        stall_seconds=config.audit.agent_stall_seconds,
+        ceiling_seconds=config.audit.agent_ceiling_seconds,
+    )
     audit_runner = ClaudeCliRunner(
         repo_root=git.repo_root,
         command=config.audit.agent_command,
-        timeout_seconds=config.audit.agent_timeout_seconds,
+        timeout_seconds=config.audit.audit_agent_timeout_seconds,
     )
     audit_executor = AuditExecutor(
         git=git,
@@ -268,15 +277,21 @@ def _build_executor(
         agent_runner_factory=lambda root: ClaudeCliRunner(
             repo_root=root,
             command=config.audit.agent_command,
-            timeout_seconds=config.audit.agent_timeout_seconds,
+            timeout_seconds=config.audit.audit_agent_timeout_seconds,
         ),
     )
     implement_executor = ImplementExecutor(
         git=git,
+        # The STANDALONE binding, rooted at the main checkout and never
+        # reached in production (the factory below wins whenever
+        # `worker_repo_root_for` is set, which it always is here). It gets no
+        # `policy=` and therefore no progress probe ON PURPOSE: a probe built
+        # here would watch the main checkout, not a worker repo, and would
+        # report progress made by something else entirely.
         agent_runner=implement_agent_runner(
             git.repo_root,
             command=config.audit.agent_command,
-            timeout_seconds=config.audit.agent_timeout_seconds,
+            timeout_seconds=config.audit.agent_ceiling_seconds,
         ),
         # Same validation commands and agent CLI settings as the audit —
         # there is no separate `[implement]` config section (kept minimal;
@@ -288,10 +303,15 @@ def _build_executor(
         validation_env=validation_env,
         worker_repo_root_for=worker_repos.path_for,
         policy=policy,
+        # The production binding. `policy=` is what builds the
+        # `stall.WorkerTreeProbe` over THIS task's worker repo, so the agent
+        # is bounded by silence in the tree it is actually writing to.
         agent_runner_factory=lambda root: implement_agent_runner(
             root,
             command=config.audit.agent_command,
-            timeout_seconds=config.audit.agent_timeout_seconds,
+            timeout_seconds=config.audit.agent_ceiling_seconds,
+            policy=policy,
+            stall_policy=stall_policy,
         ),
     )
     return _DispatchingExecutor(audit_executor, implement_executor)

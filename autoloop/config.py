@@ -15,6 +15,7 @@ import tomllib
 
 from .errors import ConfigError
 from .policy import PolicyConfig
+from .stall import DEFAULT_CEILING_SECONDS, DEFAULT_STALL_SECONDS
 
 
 @dataclass(frozen=True)
@@ -102,10 +103,31 @@ class ExecutorConfig:
     kind: str = "audit"  # audit | null (null = record-only dry run)
 
 
+#: The key retired on 2026-08-14, kept ONLY so `load_config` can recognise it
+#: and say what replaced it. Never read as a value anywhere.
+RETIRED_AGENT_TIMEOUT_KEY = "agent_timeout_seconds"
+
+
 @dataclass(frozen=True)
 class AuditConfig:
     agent_command: tuple[str, ...] = ("claude",)
-    agent_timeout_seconds: float = 900.0
+    #: **Read-only AUDIT subagents only** — an elapsed-time bound, exactly
+    #: what the retired `agent_timeout_seconds` meant, at its old value. Kept
+    #: as a timeout for this path on purpose: a read-only agent produces no
+    #: filesystem change, so there is no progress signal to watch, and a
+    #: timeout there costs a re-run rather than destroying work.
+    audit_agent_timeout_seconds: float = 900.0
+    #: **Write-capable IMPLEMENT subagents** — how long the worker repository
+    #: may show NO change at all before the agent is treated as hung and
+    #: killed. Not a task budget: while files keep changing, the agent keeps
+    #: running however long the work takes. Defaulted generously (30 min) —
+    #: a long compile or test run is not a stall, and killing a healthy agent
+    #: is the failure this setting exists to correct. See `stall.py`.
+    agent_stall_seconds: float = DEFAULT_STALL_SECONDS
+    #: The absolute backstop for BOTH paths, set far above any real task
+    #: (4 hours). It should effectively never fire; when it does, that is a
+    #: finding, and `StallReport.describe()` says so loudly.
+    agent_ceiling_seconds: float = DEFAULT_CEILING_SECONDS
     max_parallel_agents: int = 3
     validation_commands: tuple[tuple[str, ...], ...] = (("ruff", "check", "."),)
 
@@ -414,6 +436,36 @@ def load_config(path: Path) -> AutoloopConfig:
         raise ConfigError(f"executor.kind must be 'audit' or 'null', got '{executor.kind}'")
 
     audit_data = dict(data.get("audit", {}))
+    # BEFORE `_check_keys`, which would otherwise report the retired key as a
+    # generic "unknown key" — true, but useless. A config written against the
+    # old build asked for a specific safety behaviour; it deserves to be told
+    # exactly what that behaviour became, and it must NOT be silently mapped
+    # onto either replacement, because neither one means what it meant.
+    if RETIRED_AGENT_TIMEOUT_KEY in audit_data:
+        raise ConfigError(
+            f"audit.{RETIRED_AGENT_TIMEOUT_KEY} was RETIRED on 2026-08-14 and is "
+            "not read anymore. It bounded every agent by ELAPSED TIME, which "
+            "cannot tell a large task from a wedged one: measured over "
+            "2026-08-05/06 it never once caught a hung agent and killed six "
+            "agents mid-write, discarding up to 631 insertions at a time. It "
+            "splits into two settings with different meanings, so remove the "
+            "old key and choose deliberately rather than letting a number "
+            "carry over:\n"
+            "  audit.agent_stall_seconds       (default "
+            f"{DEFAULT_STALL_SECONDS:.0f}) — write-capable implement agents "
+            "are killed after this much time with NO change in the worker "
+            "repository. It is a silence window, NOT a time budget: while "
+            "files keep changing the agent keeps running.\n"
+            "  audit.agent_ceiling_seconds     (default "
+            f"{DEFAULT_CEILING_SECONDS:.0f}) — absolute backstop for every "
+            "agent, set far above any real task. It should effectively never "
+            "fire.\n"
+            "  audit.audit_agent_timeout_seconds (default 900) — the elapsed "
+            "bound for READ-ONLY audit agents, which produce no filesystem "
+            "change and so have no progress to measure. This is the one key "
+            "that keeps the old meaning; copy your old value here if you had "
+            "tuned it."
+        )
     _check_keys("audit", audit_data, {f.name for f in dataclasses.fields(AuditConfig)})
     if "agent_command" in audit_data:
         cmd = audit_data["agent_command"]
@@ -431,6 +483,21 @@ def load_config(path: Path) -> AutoloopConfig:
             )
         audit_data["validation_commands"] = tuple(tuple(c) for c in commands)
     audit = AuditConfig(**audit_data)
+    # Checked here rather than left to fail at kill time. A stall window at or
+    # above the ceiling reads as configured while being unreachable — the
+    # backstop would always fire first and the progress detector would never
+    # run, which is precisely the elapsed-time bound this replaced.
+    for name in ("audit_agent_timeout_seconds", "agent_stall_seconds", "agent_ceiling_seconds"):
+        value = getattr(audit, name)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            raise ConfigError(f"audit.{name} must be a positive number, got {value!r}")
+    if audit.agent_stall_seconds >= audit.agent_ceiling_seconds:
+        raise ConfigError(
+            f"audit.agent_stall_seconds ({audit.agent_stall_seconds}) must be "
+            f"strictly below audit.agent_ceiling_seconds ({audit.agent_ceiling_seconds}) "
+            "— otherwise the absolute backstop always fires first and the stall "
+            "detector never runs, while still reading as configured"
+        )
 
     return AutoloopConfig(
         browser=browser,

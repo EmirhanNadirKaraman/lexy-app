@@ -20,20 +20,42 @@ commits, and a subagent spawning nested agents is out of scope for either
 phase; that is what "no uncontrolled nested delegation" means mechanically,
 independent of which tool set is otherwise in force.
 
+**Two ways to bound a run, chosen by whether progress can be OBSERVED.**
+A write-capable agent runs against a worker repository whose changes are a
+direct, first-hand signal that it is still working, so it is supervised by
+`stall.py`'s progress detector: spawn, watch the tree, kill only on silence
+(or on the absolute ceiling). A read-only audit agent produces no filesystem
+change at all, so no such signal exists for it and elapsed time remains the
+only bound available — which is also the RIGHT bound there, because a timeout
+on a read-only agent costs a re-run and never destroys work. Passing
+`progress_probe` is what selects the supervised path; every caller that omits
+it keeps the exact `subprocess.run(..., timeout=...)` behaviour it had before
+this existed. See `stall.py`'s module docstring for the six measured losses
+that motivated the split.
+
 Tests never invoke the real CLI — AgentRunner is a protocol; the executors
 are exercised with fakes, and ClaudeCliRunner itself is tested with a
-stubbed subprocess runner.
+stubbed subprocess runner (unsupervised path) or a fake spawn + fake clock
+(supervised path).
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from ..stall import (
+    ProgressProbe,
+    StallPolicy,
+    StallReport,
+    spawn_supervised,
+    supervise,
+)
 from ..validation_env import strip_validation_vars
 
 READ_ONLY_ALLOWED_TOOLS = ("Read", "Grep", "Glob")
@@ -69,6 +91,12 @@ class AgentResult:
     duration_seconds: float
     command: tuple[str, ...]
     error: str = ""
+    #: Present ONLY when the supervisor killed this run — a stall or the
+    #: absolute ceiling. Defaulted, so every existing construction site (and
+    #: every test fake) is unaffected. `error` already carries the same story
+    #: as prose; this is the structured form the executor uses to report the
+    #: partial-work numbers without re-deriving them.
+    stall: StallReport | None = None
 
     @property
     def ok(self) -> bool:
@@ -88,18 +116,47 @@ class ClaudeCliRunner:
         runner=None,
         allowed_tools: tuple[str, ...] = READ_ONLY_ALLOWED_TOOLS,
         disallowed_tools: tuple[str, ...] = DISALLOWED_TOOLS,
+        progress_probe: ProgressProbe | None = None,
+        stall_policy: StallPolicy | None = None,
+        spawn=None,
+        clock=time.monotonic,
+        sleep=time.sleep,
     ):
         """`allowed_tools`/`disallowed_tools` default to the read-only audit
         set — every caller that does not pass them (every existing one)
         builds the exact same argv as before these became parameters. Pass a
         different pair (see `implement_executor.implement_agent_runner`) to
-        run a write-capable subagent instead."""
+        run a write-capable subagent instead.
+
+        `progress_probe` is what selects HOW the run is bounded, and it is
+        the only switch:
+
+        * absent (every audit caller) — `subprocess.run(..., timeout=
+          timeout_seconds)`, byte for byte the behaviour that existed before
+          the stall detector. `timeout_seconds` is an ELAPSED bound and means
+          exactly what it always meant.
+        * present (the write-capable implement runner) — spawn and supervise
+          against `stall_policy`: killed on SILENCE in the worker repository,
+          not on elapsed time, with `stall_policy.ceiling_seconds` as the
+          absolute backstop. `timeout_seconds` is then unused, deliberately:
+          two live time bounds on one run is how a "progress-based" detector
+          quietly goes back to being a timeout.
+
+        `spawn`/`clock`/`sleep` exist so the supervised path is testable with
+        no real process and no real waiting; production leaves all three at
+        their defaults.
+        """
         self._repo_root = Path(repo_root)
         self._command = tuple(command)
         self._timeout = timeout_seconds
         self._runner = runner or subprocess.run
         self._allowed_tools = tuple(allowed_tools)
         self._disallowed_tools = tuple(disallowed_tools)
+        self._progress_probe = progress_probe
+        self._stall_policy = stall_policy or StallPolicy()
+        self._spawn = spawn or spawn_supervised
+        self._clock = clock
+        self._sleep = sleep
 
     def build_argv(self, spec: AgentSpec) -> list[str]:
         model_flag = ["--model", spec.model] if spec.model else []
@@ -151,25 +208,37 @@ class ClaudeCliRunner:
         # variable, so the agent never learns where the file lives.
         try:
             argv = self.build_argv(spec)
-            proc = self._runner(
-                argv,
-                cwd=str(self._repo_root),
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-                env=strip_validation_vars(),
-            )
-            text = _extract_result_text(proc.stdout or "")
+            if self._progress_probe is None:
+                proc = self._runner(
+                    argv,
+                    cwd=str(self._repo_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout,
+                    env=strip_validation_vars(),
+                )
+                stdout, stderr = proc.stdout or "", proc.stderr
+                returncode, stall = proc.returncode, None
+            else:
+                stdout, stderr, returncode, stall = self._run_supervised(argv)
+            text = _extract_result_text(stdout)
             error = ""
-            if proc.returncode != 0:
-                error = summarize_failure(proc.stderr, proc.stdout, proc.returncode)
+            if stall is not None:
+                # The stall report IS the cause — it already names the silence,
+                # the elapsed time and the partial work. Whatever the killed
+                # process left on stderr is a consequence of the kill, not the
+                # reason for it, so it must not be reported as one.
+                error = stall.describe()
+            elif returncode != 0:
+                error = summarize_failure(stderr, stdout, returncode)
             return AgentResult(
                 domain=spec.domain,
                 raw_text=text,
-                returncode=proc.returncode,
+                returncode=returncode,
                 duration_seconds=time.monotonic() - started,
                 command=tuple(argv),
                 error=error,
+                stall=stall,
             )
         except subprocess.TimeoutExpired:
             return self._failed(spec, argv, started, f"agent timed out after {self._timeout}s")
@@ -188,6 +257,39 @@ class ClaudeCliRunner:
             detail = str(exc).strip()
             described = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
             return self._failed(spec, argv, started, f"agent raised {described}")
+
+    def _run_supervised(self, argv: list[str]) -> tuple[str, str, int, StallReport | None]:
+        """Spawn, watch the worker tree, collect whatever the run produced.
+
+        Output goes to temporary FILES rather than pipes for two reasons, both
+        load-bearing: an undrained pipe blocks the child once its OS buffer
+        fills — a hang manufactured by the hang detector — and a temp file
+        sits outside the worker repository, so the agent's own output can
+        never be mistaken for filesystem progress by the probe watching that
+        repository. Partial output from a killed run is kept: it is often the
+        only account of what the agent was doing when it wedged.
+        """
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            handle = self._spawn(
+                argv,
+                cwd=str(self._repo_root),
+                env=strip_validation_vars(),
+                stdout=out,
+                stderr=err,
+            )
+            supervision = supervise(
+                handle,
+                self._progress_probe,
+                self._stall_policy,
+                clock=self._clock,
+                sleep=self._sleep,
+            )
+            out.seek(0)
+            stdout = out.read().decode("utf-8", "replace")
+            err.seek(0)
+            stderr = err.read().decode("utf-8", "replace")
+        returncode = supervision.returncode
+        return stdout, stderr, (returncode if returncode is not None else -1), supervision.report
 
     def _failed(
         self, spec: AgentSpec, argv: list[str], started: float, error: str

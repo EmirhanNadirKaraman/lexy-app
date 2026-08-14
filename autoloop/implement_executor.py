@@ -41,6 +41,18 @@ the reproduced failure mode this avoids.
 its default (`""`), so `ClaudeCliRunner.build_argv` omits `--model` entirely
 — no model table lives here or should be added; whatever the `claude` CLI
 picks by default is what runs.
+
+**The agent is bounded by SILENCE, not by elapsed time** (2026-08-14). The
+write-capable runner this module builds carries a `stall.WorkerTreeProbe`, so
+`ClaudeCliRunner` spawns and supervises rather than running under a wall-clock
+timeout: while the worker repo keeps changing the agent runs, and it is killed
+only after `stall_seconds` of no filesystem change at all (or at the absolute
+ceiling, which should never fire). The retired `audit.agent_timeout_seconds`
+killed six agents mid-write in two days and never once caught a hang — see
+`stall.py`. A failed run of ANY kind now also reports what it left behind:
+`_partial_work` reads the numbers from the worker repo's own git state, so a
+reviewer can tell a wedge that produced 600 lines from one that produced
+nothing.
 """
 
 from __future__ import annotations
@@ -55,6 +67,7 @@ from .errors import GitError
 from .executor import ExecutionOutcome
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
+from .stall import DEFAULT_CEILING_SECONDS, PartialWork, StallPolicy, WorkerTreeProbe
 from .tasks import Task
 from .validation import run_validation_commands
 from .validation_env import ValidationEnv
@@ -79,8 +92,13 @@ IMPLEMENT_DISALLOWED_TOOLS: tuple[str, ...] = (
 def implement_agent_runner(
     root: Path,
     command: tuple[str, ...] = ("claude",),
-    timeout_seconds: float = 900.0,
+    timeout_seconds: float = DEFAULT_CEILING_SECONDS,
     runner=None,
+    policy: PolicyEngine | None = None,
+    stall_policy: StallPolicy | None = None,
+    spawn=None,
+    clock=None,
+    sleep=None,
 ) -> ClaudeCliRunner:
     """The ONE place a write-capable `ClaudeCliRunner` is constructed.
 
@@ -91,7 +109,29 @@ def implement_agent_runner(
     too, with a stubbed subprocess `runner`, so the argv asserted on in
     `tests/test_implement_executor.py` is the argv production actually
     sends — not a description of it.
+
+    **`policy` is what turns the stall detector on.** Given one, this builds
+    a `stall.WorkerTreeProbe` over a `GitGateway` rooted at `root` and running
+    under the scrubbed `worker_env()` — the same construction
+    `ImplementExecutor._bindings_for` makes for its own git access, so the
+    probe observes the worker repository through the policy whitelist like
+    everything else in the loop, and the write-capable agent is then bounded
+    by SILENCE rather than by elapsed time (see `stall.py` for the six
+    measured losses that bound cost). Without a `policy` there is no probe and
+    the run falls back to the plain elapsed bound — which is what keeps every
+    direct-`execute()` test and every stubbed-`runner` test working unchanged,
+    and is why `timeout_seconds` now defaults to the absolute ceiling instead
+    of the retired 900s: an unsupervised write-capable run should still not be
+    cut off at a duration real tasks routinely exceed.
     """
+    probe = None
+    if policy is not None:
+        probe = WorkerTreeProbe(GitGateway(root, policy, env=worker_env()), root)
+    kwargs = {}
+    if clock is not None:
+        kwargs["clock"] = clock
+    if sleep is not None:
+        kwargs["sleep"] = sleep
     return ClaudeCliRunner(
         repo_root=root,
         command=command,
@@ -99,6 +139,10 @@ def implement_agent_runner(
         runner=runner,
         allowed_tools=WRITE_ALLOWED_TOOLS,
         disallowed_tools=IMPLEMENT_DISALLOWED_TOOLS,
+        progress_probe=probe,
+        stall_policy=stall_policy,
+        spawn=spawn,
+        **kwargs,
     )
 
 
@@ -214,6 +258,26 @@ class ImplementExecutor:
 
     # ---- implementation pipeline --------------------------------------------
 
+    @staticmethod
+    def _partial_work(git: GitGateway) -> tuple[tuple[str, ...], PartialWork]:
+        """What survives in the worker repo after a failed agent run.
+
+        Never raises: this runs on the failure path, and a report that can
+        itself fail is not a report. A worker repo that cannot be read yields
+        `PartialWork(measured=False)` and an empty path tuple — which is
+        distinct from, and must not be confused with, a measured zero.
+        """
+        try:
+            changed = tuple(sorted(git.dirty_paths_all()))
+        except Exception:
+            changed = ()
+        try:
+            return changed, WorkerTreeProbe(git).partial_work()
+        except Exception as exc:
+            return changed, PartialWork(
+                measured=False, note=f"{type(exc).__name__} reading the worker repository"
+            )
+
     def _run_implementation(
         self,
         directive: Directive,
@@ -225,14 +289,36 @@ class ImplementExecutor:
         spec = AgentSpec(domain=task.id, title=task.title, prompt=_agent_prompt(task, feedback))
         result = agent_runner.run(spec)
         if not result.ok:
+            # A failed agent still leaves whatever it had already written in
+            # the worker repo, and a reviewer cannot act on "the agent failed"
+            # alone: a failure that produced 600 lines and one that produced
+            # nothing call for opposite responses. So the numbers are read
+            # here, from the worker repo's own git state (never from anything
+            # the agent said), and reported alongside the cause.
+            #
+            # `changed_paths` on an error outcome is safe and deliberate:
+            # `orchestrator._dispatch_task_postcommit` returns as soon as
+            # `outcome.status != "ok"`, well before it ever reaches the commit
+            # path, so nothing here can cause partial work to be committed.
+            changed, partial = self._partial_work(git)
+            summary = (
+                f"task '{task.id}': implementation agent failed — "
+                f"{result.error or f'rc={result.returncode}'}"
+            )
+            if result.stall is None:
+                # A stall report already states the partial work it measured
+                # at kill time; repeating it here would print two numbers for
+                # one fact. Every OTHER failure has said nothing about it.
+                summary += (
+                    f" Partial work left in the worker repository: "
+                    f"{partial.describe()}. Validation did not run."
+                )
             return ExecutionOutcome(
                 status="error",
-                summary=(
-                    f"task '{task.id}': implementation agent failed — "
-                    f"{result.error or f'rc={result.returncode}'}"
-                ),
+                summary=summary,
                 details=result.raw_text,
                 validation="not run",
+                changed_paths=changed,
             )
 
         try:

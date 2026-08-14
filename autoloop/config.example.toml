@@ -103,9 +103,32 @@ fallback_provider = "browser_chatgpt"
 kind = "audit"
 
 [audit]
-# How audit subagents are launched (the Claude Code CLI in headless mode).
+# How subagents are launched (the Claude Code CLI in headless mode).
 agent_command = ["claude"]
-agent_timeout_seconds = 900.0
+#
+# `agent_timeout_seconds` was RETIRED on 2026-08-14 and is now REFUSED, not
+# ignored: a config still naming it fails to load with a message pointing here.
+# It bounded every agent by elapsed time, which cannot tell a large task from a
+# wedged one — measured over 2026-08-05/06 it never once caught a hung agent
+# and killed six agents mid-write, discarding up to 631 insertions at a time.
+# It splits into three settings that mean different things.
+#
+# READ-ONLY audit agents: an elapsed bound, the old key's exact meaning and
+# value. Correct here — they change no files, so there is no progress to
+# observe, and a timeout costs a re-run rather than destroying work.
+audit_agent_timeout_seconds = 900.0
+# WRITE-CAPABLE implement agents: how long the worker repository may show NO
+# change at all before the agent counts as hung and is killed. A silence
+# window, NOT a time budget — while files keep changing the agent keeps
+# running, however long the task takes. Keep it generous: a long compile or a
+# long test run is not a stall, and killing a healthy agent is the failure
+# this replaced.
+agent_stall_seconds = 1800.0
+# The absolute backstop, for every agent, set far above any real task. It
+# should effectively never fire; if it does, the report says so loudly and
+# that is worth investigating rather than tuning away. Must be strictly above
+# agent_stall_seconds, or the stall detector could never run.
+agent_ceiling_seconds = 14400.0
 max_parallel_agents = 3
 # Safe validation commands run before the agents (argv lists; binaries are
 # restricted to ruff/pytest/python/npm/npx/tsc — nothing that mutates).
