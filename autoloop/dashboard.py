@@ -40,6 +40,7 @@ import json
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -124,6 +125,11 @@ def _run_status(args, cwd=None, timeout=8):
     # case: it tells git not to take the index lock or write refreshed state.
     # It is injected HERE, the single subprocess entry point, so a call added
     # later cannot quietly skip it.
+    #
+    # It costs nothing in accuracy: git still compares CONTENT for entries whose
+    # stat data looks dirty; what it skips is writing the refreshed index back.
+    # Never drop it to "speed up" a call — every git read here runs against a
+    # repo the loop is actively writing.
     if args and args[0] == "git":
         args = ["git", "--no-optional-locks", *args[1:]]
     try:
@@ -133,9 +139,22 @@ def _run_status(args, cwd=None, timeout=8):
         return -1, ""
 
 
-def _run(args, cwd=None, timeout=8):
+def _run_checked(args, cwd=None, timeout=8) -> str | None:
+    """Run a command, returning `None` when it FAILED and its stdout when it did
+    not — so an empty success and a failure are two different answers.
+
+    `_run` below collapses both to `""`, which is fine wherever empty means
+    "nothing to show". It is a lie for the progress figures: an unreadable
+    worker repo would render as zero lines changed, and zero is precisely the
+    alarming state ("the agent has written nothing"), invented out of a
+    directory we could not read.
+    """
     code, out = _run_status(args, cwd=cwd, timeout=timeout)
-    return out if code == 0 else ""
+    return out if code == 0 else None
+
+
+def _run(args, cwd=None, timeout=8):
+    return _run_checked(args, cwd=cwd, timeout=timeout) or ""
 
 
 def _json(path: Path):
@@ -229,6 +248,209 @@ def app_tasks(repo: Path, limit: int = 40) -> list[dict]:
             break
     return out
 
+
+
+# ---- live progress for the task executing right now --------------------------
+#
+# An operator watching a 25-minute round can see THAT an agent is running and
+# nothing about whether it is getting anywhere. On 2026-08-06 merge-01 ran twice
+# for 1800s and was killed by the timeout both times, having written 591
+# insertions across 16 files and then 532 across 15 — that it was working rather
+# than wedged was only discoverable afterwards, by hand, in the quarantined
+# worker repo. These figures make that visible while it happens.
+#
+# Read from GIT IN THE WORKER, never from anything the agent reports about
+# itself. `TaskExecution.report_summary`/`report_details` are the executor's own
+# claims (that file says so in as many words); they are not consulted here and
+# must never become a fallback — a fallback would turn "we could not read the
+# worker" into a confident number authored by the process being observed.
+
+#: Caps on the untracked-file scan. It runs on every 2s poll, so this is a
+#: page-responsiveness property, not a nicety. Tripping either cap sets
+#: `partial`, which means the LINE counts are a lower bound; the file count
+#: stays exact either way, because `git ls-files` reports it without reading a
+#: byte of content.
+_UNTRACKED_FILE_CAP = 400
+_UNTRACKED_BYTE_BUDGET = 8_000_000
+#: Shorter than `_run`'s 8s: these calls sit on the 2s poll, and a page that
+#: blocks on git is worse than a page that says "unknown" for one tick.
+_PROGRESS_TIMEOUT = 2.0
+#: Wall clocks get adjusted. A dispatch stamp a couple of minutes in the future
+#: is skew, and 0 is the honest reading of it; anything further ahead is not a
+#: measurable elapsed time at all, so it reads unknown rather than a made-up 0.
+_CLOCK_SKEW_GRACE = 120.0
+
+
+def _elapsed_seconds(started_at: str, now: float) -> float | None:
+    """Seconds since `started_at`, or `None` when that cannot be established."""
+    try:
+        stamp = datetime.fromisoformat(started_at)
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:  # `utcnow_iso()` is tz-aware; older stamps may not be
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    delta = now - stamp.timestamp()
+    if delta < 0:
+        return 0.0 if delta > -_CLOCK_SKEW_GRACE else None
+    return delta
+
+
+def _numstat(out: str) -> tuple[int, int, int]:
+    """`(insertions, deletions, files)` from `git diff --numstat` output.
+
+    A binary file's row is `-`, `-`, path: it counts as a touched FILE with no
+    line counts, which is what git itself reports rather than a zero we chose.
+    """
+    insertions = deletions = files = 0
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        added, removed = parts[0], parts[1]
+        files += 1
+        if added.isdigit():
+            insertions += int(added)
+        if removed.isdigit():
+            deletions += int(removed)
+    return insertions, deletions, files
+
+
+def _untracked_lines(worker: Path, paths: list[str]) -> tuple[int, int, bool]:
+    """`(insertions, files, partial)` for untracked files.
+
+    A brand-new file is where most of an agent's output lands, and git's own
+    diff says nothing about it until something adds it — so counting it is the
+    difference between "0 lines written" and the truth. Every line of a new file
+    is an insertion, exactly as `git diff` would report it once added.
+    """
+    insertions = 0
+    partial = len(paths) > _UNTRACKED_FILE_CAP
+    budget = _UNTRACKED_BYTE_BUDGET
+    for rel in paths[:_UNTRACKED_FILE_CAP]:
+        if budget <= 0:
+            partial = True
+            break
+        path = worker / rel
+        if path.is_symlink():
+            # git records a symlink's TARGET as its whole content — one line —
+            # and following it could read something enormous or a device. Never
+            # open it; take git's own count.
+            insertions += 1
+            continue
+        try:
+            if not path.is_file():
+                continue  # a fifo/socket would block on open; count it, read none
+            with path.open("rb") as handle:
+                data = handle.read(budget + 1)
+        except OSError:
+            # One unreadable file is not an unreadable worker: it is one file we
+            # could not count, so the total becomes a lower bound rather than
+            # discarding everything else that was read successfully.
+            partial = True
+            continue
+        if len(data) > budget:
+            data, partial = data[:budget], True
+        budget -= len(data)
+        if b"\x00" in data[:8000]:
+            continue  # binary: a touched file, no line count — git says the same
+        insertions += data.count(b"\n") + (0 if (not data or data.endswith(b"\n")) else 1)
+    return insertions, len(paths), partial
+
+
+def worker_progress(state: dict, now: float | None = None) -> dict | None:
+    """What the task executing RIGHT NOW has written, and for how long.
+
+    `None` means nothing is executing, and the page then shows nothing at all.
+    That is deliberate: `state.task_execution` is cleared the moment a candidate
+    is published (`orchestrator._dispatch_task_push`), so its absence is the
+    loop's own statement that no unit of work is in flight — and leftover
+    figures beside an idle loop read as live activity, which is the one thing
+    this panel exists to make legible.
+
+    A dict with `insertions`/`deletions`/`files` set to `None` means UNKNOWN —
+    the worker repo could not be read. Never zero: zero means "nothing written
+    yet", which is exactly the alarming state, and inventing it from a directory
+    we could not open would be a lie in the dangerous direction.
+
+    Read-only and lock-free by construction: two `git` reads through
+    `_run_checked` (which injects `--no-optional-locks`) plus plain file reads.
+    No lock is taken, so a scheduler hitting this mid-round is safe.
+    """
+    execution = state.get("task_execution") or {}
+    task_id = execution.get("task_id")
+    if not task_id:
+        return None
+
+    now = time.time() if now is None else now
+    current = state.get("current_task") or {}
+    # Only THIS task's dispatch stamp will do. `current_task` outlives its round
+    # and can name a different task than the one in flight; borrowing its
+    # timestamp then would date the round from someone else's dispatch.
+    started = str(current.get("started_at") or "") if current.get("task_id") == task_id else ""
+    worker_path = str(execution.get("worktree_path") or "")
+    progress = {
+        "task_id": task_id,
+        "worker": worker_path,
+        "dispatched_at": started,
+        "elapsed_seconds": _elapsed_seconds(started, now) if started else None,
+        "insertions": None,
+        "deletions": None,
+        "files": None,
+        "partial": False,
+        "base": "",
+        "note": "",
+    }
+
+    if not worker_path or not Path(worker_path).is_dir():
+        progress["note"] = (
+            f"no readable worker repo at {worker_path or '(none recorded)'}"
+        )
+        return progress
+
+    worker = Path(worker_path)
+    # Against the task's base sha, so the figure spans every round committed so
+    # far plus the uncommitted work in the tree — the whole of what this task has
+    # written. A bare `git diff` would be worktree-vs-index and would miss
+    # anything already staged. `HEAD` is the fallback when the base sha does not
+    # resolve here, and the payload says which one was used so the number is
+    # self-describing.
+    base = str(execution.get("task_base_sha") or "").strip()
+    label = "task_base_sha"
+    numstat = (
+        _run_checked(["git", "diff", "--numstat", base, "--"],
+                     cwd=worker, timeout=_PROGRESS_TIMEOUT)
+        if base else None
+    )
+    if numstat is None:
+        label = "HEAD"
+        numstat = _run_checked(["git", "diff", "--numstat", "HEAD", "--"],
+                               cwd=worker, timeout=_PROGRESS_TIMEOUT)
+    # `-z`: NUL-delimited, which also turns OFF git's path quoting. Without it a
+    # name with an umlaut or a space comes back as `"caf\303\251.py"` and every
+    # such file fails to open — an undercount, silently, on a German-language
+    # repo where those names are ordinary.
+    others = _run_checked(["git", "ls-files", "-z", "--others", "--exclude-standard"],
+                          cwd=worker, timeout=_PROGRESS_TIMEOUT)
+    # EITHER read failing makes the whole figure unknown. Reporting the tracked
+    # diff alone when the untracked listing failed would understate the work in
+    # exactly the direction that matters — a productive agent writing new files
+    # would look idle.
+    if numstat is None or others is None:
+        progress["note"] = f"git could not be read in {worker_path}"
+        return progress
+
+    insertions, deletions, files = _numstat(numstat)
+    new_lines, new_files, partial = _untracked_lines(
+        worker, [name for name in others.split("\0") if name]
+    )
+    progress.update(
+        insertions=insertions + new_lines,
+        deletions=deletions,
+        files=files + new_files,
+        partial=partial,
+        base=label,
+    )
+    return progress
 
 
 def _inbox_dir(repo: Path) -> Path:
@@ -603,6 +825,9 @@ def collect(repo: Path) -> dict:
             "round": ex.get("review_round"), "attempts": ex.get("attempt_count"),
         },
         "agents": live_agents_cache,
+        # `None` when nothing is executing — the page then renders no figures at
+        # all rather than the last round's. See `worker_progress`.
+        "progress": worker_progress(state),
         "audit": {"run": run_dir.name if run_dir else None, "completed": completed},
         "events": events,
         "blockers": blockers,
@@ -736,6 +961,17 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
   <div id="stale" style="display:none;border:1px solid var(--warning);border-radius:8px;
        padding:9px 12px;margin-bottom:14px;font-size:13px"></div>
   <div class="grid" id="tiles"></div>
+
+  <!-- Live progress for the task executing NOW. STATIC markup, and outside
+       `#tiles` on purpose: `render()` rewrites that grid's innerHTML whenever
+       the payload changes, so a value updated on every tick regardless would be
+       clobbered on the next payload-change tick. Hidden until a payload carries
+       a running task — an idle loop shows nothing here, never the last round's
+       numbers. -->
+  <section id="progressbox" style="display:none">
+    <h2>Live progress — read from the worker repo, not from the agent</h2>
+    <div id="progress"></div>
+  </section>
 
   <section>
     <h2>Pipeline — hover or focus for detail, click to inspect</h2>
@@ -887,6 +1123,45 @@ function drawFlow(d){
     : "no stage selected";
 }
 
+// Elapsed time, as a duration a human reads at a glance rather than a raw
+// second count. `null`/`undefined` is UNKNOWN and says so — never 0s.
+function fmtDur(s){
+  if (typeof s !== "number") return "unknown";
+  const t = Math.max(0, Math.floor(s)), h = Math.floor(t/3600),
+        m = Math.floor((t%3600)/60), sec = t%60;
+  return (h ? `${h}h ` : "") + (h || m ? `${m}m ` : "") + `${sec}s`;
+}
+
+// Live progress for the task executing now. Every number here came from git in
+// the worker repo; nothing the agent reported about itself is consulted, and an
+// unreadable worker prints "unknown" rather than a zero it did not measure.
+function renderProgress(p){
+  const box = document.getElementById("progressbox");
+  const el = document.getElementById("progress");
+  // Falsy means NOTHING is executing. Hide the whole section: figures left
+  // beside an idle loop read as live activity, which is the failure this panel
+  // exists to prevent.
+  if (!p) { box.style.display = "none"; el.innerHTML = ""; return; }
+  box.style.display = "";
+  const known = typeof p.insertions === "number";
+  // A capped scan counts fewer lines than were written, never more, so the
+  // figure is marked as the lower bound it is.
+  const ge = p.partial ? "≥" : "";
+  const lines = known
+    ? `<b>+${ge}${esc(p.insertions)}</b> <b>−${ge}${esc(p.deletions)}</b> in `
+      + `<b>${ge}${esc(p.files)}</b> file(s)`
+    : `<b>lines changed unknown</b>`;
+  const why = known
+    ? `git diff --numstat against ${esc(p.base)} plus untracked files in `
+      + `<code>${esc(p.worker)}</code>`
+      + (p.partial ? " — capped scan, so the line counts are a lower bound" : "")
+    : `${esc(p.note || "the worker repo could not be read")} — shown as `
+      + `unknown, never as zero: zero would mean the agent has written nothing.`;
+  el.innerHTML = `<div class="v">▶ ${esc(p.task_id)} · ${lines} · `
+    + `${esc(fmtDur(p.elapsed_seconds))} since dispatch</div>`
+    + `<p class="muted" style="font-size:12px;margin:6px 0 0">${why}</p>`;
+}
+
 function render(d, force){
   if (!d) return;
   // No skeleton flash on refetch: a 2s poll that rebuilt identical DOM threw
@@ -895,9 +1170,13 @@ function render(d, force){
   // excluded from the signature on purpose — it ticks every poll, so leaving
   // it in would make the guard never fire; its own line is updated below
   // regardless, so "updated HH:MM:SS" still moves.
-  const {served_at, ...rest} = d;
+  // `progress` is excluded for the same reason — its elapsed clock ticks every
+  // poll — and is rendered BELOW, before the guard, so the live figures move
+  // without rebuilding the rest of the page.
+  const {served_at, progress, ...rest} = d;
   const sig = JSON.stringify(rest);
   document.getElementById("served").textContent = `updated ${esc(served_at)}`;
+  renderProgress(progress);
   // A stale process serves the old PAGE forever, which looks exactly like a
   // missing feature. Say so instead of letting someone wonder.
   const stale = document.getElementById("stale");
