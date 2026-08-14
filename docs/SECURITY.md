@@ -484,8 +484,11 @@ with three properties the control depends on:
 
 **Residual risk, stated plainly.** Detection now depends on a human reading
 that list; an agent that touches unexpected files produces a reviewable
-candidate rather than a refusal. And on a diff over
-`packet.DIFF_INCLUDE_MAX_CHARS` (30,000 chars) the patch is OMITTED, so the
+candidate rather than a refusal. A diff over `packet.DIFF_INCLUDE_MAX_CHARS`
+(30,000 chars) is delivered as numbered parts (pkt-01) and the content is still
+reviewed; the patch is OMITTED only when that delivery is unavailable,
+unverifiable, or would need more than `DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`
+(~48 KB) of patch. In that case the
 reviewer sees the out-of-scope PATHS but not the CONTENT of those edits —
 the same degradation `tasks.py`'s `TRACKER_PATHS` comment names for tracker
 files, and an argument for reviewing large commits harder, not for trusting

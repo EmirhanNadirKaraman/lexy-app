@@ -649,6 +649,53 @@ the captured `page.html`). `innerText` then contains none of it, so
 prompts do not hit this — `keyboard.insert_text` fires no paste event — but a
 human paste into the same conversation does.
 
+### `composer did not accept the full request diffpart_… within 30.0s (nothing was sent)`
+**Symptom:** a review packet's diff parts stop going out. `brw-08`
+(request `alr-7ad33735-0006`, 2026-08-14) failed on part `02of02` three cycles
+running, exhausted `max_consecutive_failures`, and parked
+`failed (resumable: delivering)`. The operator watching the browser could SEE
+the part's text sitting in the composer while the loop declared it had not been
+accepted.
+**Cause:** two different limits, one constant. `packet.py` sized diff parts with
+`DIFF_INCLUDE_MAX_CHARS` (30,000) — a number sized against a **generation**
+failure (the 40,056-character message of 2026-08-04, which the composer took
+and the server then dropped). It says nothing about the **composer**, and the
+composer's own bound is lower. `_enter_prompt` (`browser/chatgpt.py:573`)
+refuses to click Send until it can read the whole request back out of the
+contenteditable, bounded by `input_sync_timeout_seconds` (30.0s,
+`config.py:36`). At 30,000-character parts that read-back did not finish, so the
+client refused to send — correctly: a part sent unverified may be partial, and a
+partial part passed off as whole is exactly the gap `report_sha256` exists to
+close.
+**The bound is latency-shaped, not capacity-shaped**, so there is no clean
+character cliff to quote. The entry above records 104k- and 113k-character
+prompts that synced fine on 2026-07-31, and those were prose packets, not runs
+of raw patch lines. What is measured is narrower and is all we have: *at 30,000
+characters per part, the read-back did not complete within 30s, repeatedly.*
+**Fix:** `packet.PART_INCLUDE_MAX_CHARS` (2026-08-14) — the per-composer-message
+patch budget, separate from `DIFF_INCLUDE_MAX_CHARS`, set to 8,000. That is the
+largest per-message budget with an unbroken read-back record: it was the cap in
+force until 2026-08-05 and never failed to sync, and it was raised then for
+being too conservative for the SINGLE-message case (it blocked rt-02 at 8,971
+characters), never for failing to send. `DIFF_INCLUDE_MAX_CHARS` stays 30,000
+and stays the threshold that decides *whether* to chunk.
+**Do not** raise `input_sync_timeout_seconds` to make this go away: that trades
+a fast honest failure for a slow one and leaves the real bound unmeasured.
+**Do not** truncate a part or send one unverified — the refusal is the control.
+**Do not** quote 40,056 as evidence about the composer, or 8,000 as evidence
+about generation; they are limits on different systems and the whole point of
+splitting the constant was that one number could not carry both.
+**Knock-on to know about:** the chunkable ceiling is
+`DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, so it moved from ~180 KB to ~48 KB.
+A patch past it is OMITTED with the usual notice rather than chunked. sub-01's
+41 KB — the patch chunking was built for — still fits. If a real patch does not,
+raise the part COUNT and record its size, never the part size.
+**Still open:** whether an ordinary single message near 30,000 characters syncs
+reliably. Nothing has reported it failing since 2026-08-05, and the 104k data
+point argues it does, but no one has measured it either. Answering it properly
+needs an instrumented live run recording read-back latency against message size
+— record the numbers here if you do one.
+
 ---
 
 ## 7. Autoloop worker/publisher separation (M2)

@@ -1143,8 +1143,8 @@ section into every review packet, computed FROM GIT at render time
 pre-commit gate's input is the executor's own report, so reading it would let a
 false report state a fact about the commit. The section renders
 unconditionally, with an explicit `(none)` line, so its absence can never be
-mistaken for a clean round, and it sits ABOVE the diff, which is omitted over
-`packet.DIFF_INCLUDE_MAX_CHARS`. Residual risk, accepted and named: an agent
+mistaken for a clean round, and it sits ABOVE the diff, which is omitted
+whenever chunked delivery (§5d-bis) cannot carry it. Residual risk, accepted and named: an agent
 touching unexpected files now produces a reviewable candidate instead of a
 refusal, so detection depends on the reviewer reading that list — and on a
 large commit they see the paths but not the content.
@@ -2123,11 +2123,28 @@ total volume. Several smaller messages are fine.
 
 **The shape.** The packet's git-read facts and the abridged verdict request go
 in one message; the patch goes ahead of it as numbered parts, each carrying at
-most `DIFF_INCLUDE_MAX_CHARS` of diff — the same budget an inline diff has
-always respected. `DIFF_INCLUDE_MAX_CHARS` is **not raised**; chunking is what
-removes the pressure to raise it, and
-`test_the_cap_is_sized_from_evidence_not_instinct` still pins the number to its
-evidence.
+most `packet.PART_INCLUDE_MAX_CHARS` (8,000) of diff.
+`DIFF_INCLUDE_MAX_CHARS` is **not raised**; chunking is what removes the
+pressure to raise it, and `test_the_cap_is_sized_from_evidence_not_instinct`
+still pins the number to its evidence.
+
+**Two limits, and they are not the same number** (pkt-02, 2026-08-14 — parts
+were sized with `DIFF_INCLUDE_MAX_CHARS` until then):
+
+| Constant | Bounds | Sized against |
+|---|---|---|
+| `DIFF_INCLUDE_MAX_CHARS` (30,000) | whether a patch is inlined or chunked | GENERATION: the 40,056-character message the composer accepted and the server then dropped (2026-08-04) |
+| `PART_INCLUDE_MAX_CHARS` (8,000) | how much patch one deposited part carries | THE COMPOSER: 30,000-character parts whose read-back did not finish inside `input_sync_timeout_seconds` (brw-08, 2026-08-14) |
+
+The composer bound is the lower of the two and was invisible while one constant
+did both jobs: `_enter_prompt` refuses to click Send until it can read the whole
+message back out of the contenteditable, so an over-large part is not sent at
+all — a fast, honest refusal that then repeats until the loop parks. It is a
+latency bound rather than a capacity one (104k-character prompts have synced
+fine), so 8,000 is the largest per-message budget with an unbroken record, not a
+measured cliff. Raising the read-back timeout instead would only make the same
+failure slower. Full account in `docs/COMMON_ERRORS.md` §6, under the literal
+error text.
 
 Three rules make this safe rather than merely clever:
 
@@ -2195,7 +2212,12 @@ answers each part despite being told not to, so the next part's `submit` waits
 out that generation; a reply longer than `browser.send_ready_timeout_seconds`
 raises, restarts the browser, and re-enters `delivering`, which resumes from the
 persisted cursor without re-posting anything. Recoverable, but it is why the
-part count is bounded rather than open-ended.
+part count is bounded rather than open-ended. **That cost roughly tripled with
+pkt-02**: at 8,000 characters a part, sub-01's 41 KB patch is six messages
+rather than two. The correction bought a delivery that actually lands in
+exchange for more round trips per patch — the right trade, since the two-part
+version did not send at all, but worth knowing before reading a slow
+`delivering` phase as a fault.
 
 **Failures in `delivering` never discard the request.** `_handle_git_failure`
 treats `delivering` like `ready`: it parks retryably instead of writing a
@@ -2204,11 +2226,16 @@ git-error payload and returning to `ready`, which would overwrite
 nothing left to disown it. Reachable in practice, since the fallback itself
 builds a context and `build_context` reads git.
 
-**Bounds.** `packet.DIFF_MAX_PARTS` (6, ≈180 KB of patch) caps the mechanism;
-past that, "reply `revise` asking for a smaller commit" — which the omission
-notice already says — beats a dozen messages nobody can hold in their head.
-That number is a judgement and is labelled as one: the only real data point is
-sub-01's 41 KB, which is two parts.
+**Bounds.** `packet.DIFF_MAX_PARTS` (6) caps the mechanism; past that, "reply
+`revise` asking for a smaller commit" — which the omission notice already says —
+beats a dozen messages nobody can hold in their head. That number is a
+judgement and is labelled as one: the only real data point is sub-01's 41 KB,
+which is six parts at the current part size. The ceiling is
+`DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, so it moved from ≈180 KB to ≈48 KB
+when the part size was corrected (pkt-02) — still covering the largest candidate
+ever observed. If a real patch needs more, raise the COUNT and record that
+patch's size; do not raise the part size, which is the number with a measured
+failure behind it.
 
 **Not in scope, stated so it is not mistaken for covered.**
 `changeset_review.build_changeset_packet` embeds its diff with no per-message

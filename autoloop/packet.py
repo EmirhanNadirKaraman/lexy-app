@@ -21,9 +21,14 @@ different `report_sha256`.
 large it is, because that string is the *logical* packet — the thing
 `report_sha256` must cover. What a single chat message can carry is a
 separate question, answered by `plan_chunked_delivery` below: an oversized
-patch is delivered as numbered parts, each under the same per-message budget
-an inline diff has always respected, and the verdict is asked for only once
-every part is confirmed present. The hash still covers the complete packet
+patch is delivered as numbered parts, each under `PART_INCLUDE_MAX_CHARS` —
+its own budget, sized against what the COMPOSER accepts and reads back rather
+than against the generation failure that sizes `DIFF_INCLUDE_MAX_CHARS` — and
+the verdict is asked for only once every part is confirmed present. The two
+limits are separate constants on purpose; conflating them is what stalled
+delivery on 2026-08-14 (see `PART_INCLUDE_MAX_CHARS`).
+
+The hash still covers the complete packet
 (diff included), so an approval echoing it cannot bind to a subset of the
 review — see `orchestrator._step_delivering` for the all-or-nothing rule and
 `_fall_back_to_omission` for what happens when a part does not land.
@@ -38,12 +43,13 @@ from .git_gateway import GitGateway
 from .tasks import Task, unauthorized_paths
 from .worktask import TaskExecution
 
-#: How much patch text a packet may carry. Deliberately far below
-#: `GitGateway.RANGE_DIFF_MAX_BYTES` (400 KB): that cap bounds what git is
-#: asked to RENDER, this one bounds what a chat message can actually DELIVER.
-#: See `_format_diff_section` for the failure that set it — a 38 KB diff was
-#: accepted by the composer, failed generation server-side, and left no
-#: message in the conversation at all.
+#: How much patch text may be INLINED in the one message that asks for a
+#: verdict — i.e. the size at which a patch stops being inlined and starts
+#: being chunked. Deliberately far below `GitGateway.RANGE_DIFF_MAX_BYTES`
+#: (400 KB): that cap bounds what git is asked to RENDER, this one bounds what
+#: a chat message can actually DELIVER. See `_format_diff_section` for the
+#: failure that set it — a 38 KB diff was accepted by the composer, failed
+#: generation server-side, and left no message in the conversation at all.
 #:
 #: Raised 8_000 → 30_000 on 2026-08-05, because 8_000 was a guess and the
 #: evidence says otherwise. The only measured failure was at 40,056 characters;
@@ -64,23 +70,72 @@ from .worktask import TaskExecution
 #: fails to land again, record the size HERE rather than halving the number on
 #: instinct — that is how the first guess got made.
 #:
-#: Since chunked delivery (2026-08-14) this doubles as the per-PART patch
-#: budget: a part carries at most this much diff text, which is exactly as much
-#: as an inline diff has always been allowed to carry. Deliberately the same
-#: number rather than a second one — there is one measured failure behind it,
-#: and a separate "chunk size" constant would be a second guess with no
-#: evidence of its own. It is NOT raised by chunking; chunking is what removes
-#: the pressure to raise it (see `test_the_cap_is_sized_from_evidence_not_instinct`).
+#: This is the THRESHOLD, not the part size. A patch over it is chunked rather
+#: than inlined; how much patch each of those parts carries is
+#: `PART_INCLUDE_MAX_CHARS` below, which is sized from different evidence
+#: entirely. Until 2026-08-14 one constant did both jobs, and the composer
+#: bound — the lower of the two — went unrepresented. It is NOT raised by
+#: chunking; chunking is what removes the pressure to raise it (see
+#: `test_the_cap_is_sized_from_evidence_not_instinct`).
 DIFF_INCLUDE_MAX_CHARS = 30_000
+
+#: How much patch text ONE DEPOSITED PART may carry — the per-composer-message
+#: budget, and deliberately NOT `DIFF_INCLUDE_MAX_CHARS`.
+#:
+#: The two numbers answer different questions and failed in different places:
+#:
+#:   * `DIFF_INCLUDE_MAX_CHARS` is sized against GENERATION. A 40,056-character
+#:     message was accepted by the composer on 2026-08-04 and then failed
+#:     server-side, leaving no message in the conversation at all.
+#:   * this one is sized against the COMPOSER. `_enter_prompt`
+#:     (`browser/chatgpt.py`) refuses to click Send until it can read the whole
+#:     request back out of the contenteditable, and that read-back is bounded by
+#:     `input_sync_timeout_seconds` (30.0s).
+#:
+#: Observed 2026-08-14 on brw-08 (request alr-7ad33735-0006): with parts at
+#: 30,000 the read-back timed out repeatedly — `composer did not accept the
+#: full request diffpart_..._02of02 within 30.0s (nothing was sent)` — while the
+#: operator could SEE the text sitting in the composer. The refusal is correct
+#: (a part sent unverified could be partial, and a partial part passed off as
+#: whole is exactly what `report_sha256` exists to prevent), so the loop
+#: correctly declined to send, exhausted its failure budget and parked.
+#:
+#: The bound is LATENCY-shaped, not capacity-shaped, so there is no clean
+#: character cliff to put here: `docs/COMMON_ERRORS.md` §6 records 104k- and
+#: 113k-character prompts that synced fine on 2026-07-31. 8,000 is the largest
+#: per-message patch budget with an unbroken read-back record — it was the cap
+#: in force until 2026-08-05 and never failed to sync; it was raised because it
+#: was too CONSERVATIVE for the SINGLE-message case (it blocked rt-02 at 8,971
+#: characters), never because it failed to send.
+#:
+#: It bounds the part's BODY, and `_render_part` adds ~450 characters of
+#: identity block and instruction on top — which is still comfortably inside
+#: that record rather than at its edge. Under the old cap the same 8,000
+#: bounded the diff inside a WHOLE packet: commit list, changed paths, diff
+#: stat, executor report, plus `build_prompt`'s context block and contract
+#: instructions, for 12–15k-character messages that synced every time. A part
+#: at ~8,450 is smaller than any message that ever synced under that cap.
+#:
+#: Raising it needs an instrumented live run that records read-back latency
+#: against part size, not another instinct. Record what such a run measures in
+#: the `docs/COMMON_ERRORS.md` §6 entry ("composer did not accept the full
+#: request diffpart_…") alongside the two numbers already there, so the next
+#: person can still tell the composer limit from the generation one.
+PART_INCLUDE_MAX_CHARS = 8_000
 
 #: How many parts a chunked delivery may take before the loop gives up and
 #: falls back to the omission notice. A judgement, and labelled as one: the
-#: only real data point is sub-01's 41 KB patch, which is two parts. Six
-#: (~180 KB of patch) covers four times the largest candidate observed so far;
-#: past that, "reply `revise` asking for a smaller commit" — which the omission
-#: notice already says — is a better answer than twelve chat messages nobody
-#: can hold in their head at once. Raise it only with a real patch that needed
-#: it, and record the size here.
+#: only real data point is sub-01's 41 KB patch, which is six parts at the
+#: current part size. Six parts is therefore a ceiling of ~48 KB of patch —
+#: down from the ~180 KB it meant while parts were 30,000 characters, because
+#: the ceiling is `DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS` and the part size
+#: dropped to a deliverable one on 2026-08-14. That still covers the largest
+#: candidate ever observed; past it, "reply `revise` asking for a smaller
+#: commit" — which the omission notice already says — is a better answer than a
+#: dozen chat messages nobody can hold in their head at once. The COUNT is the
+#: lever if a real patch needs more: raise it only with that patch's size
+#: recorded here, and never by re-raising the part size, which is the number
+#: that has a measured failure behind it.
 DIFF_MAX_PARTS = 6
 
 #: The literal line the inline diff section starts with. `plan_chunked_delivery`
@@ -390,32 +445,6 @@ def diff_part_id(request_id: str, index: int, total: int) -> str:
     return f"diffpart_{request_id.replace('-', '_')}_{index:02d}of{total:02d}"
 
 
-#: How much patch text one DEPOSITED PART may carry. Deliberately NOT
-#: `DIFF_INCLUDE_MAX_CHARS`: that number is sized against ChatGPT's
-#: GENERATION limit (a 40,056-character message it accepted and then failed
-#: server-side), and says nothing about what the composer will accept and read
-#: back before the send is verified.
-#:
-#: Measured the hard way on 2026-08-14: with parts at 30,000 the composer
-#: repeatedly failed `composer did not accept the full request
-#: diffpart_..._02of02 within 30.0s (nothing was sent)` — the text was visibly
-#: present in the box, but the read-back that proves the composer holds ALL of
-#: it never completed, so the client correctly refused to send a part it could
-#: not verify. That deadlocked the loop: every task with a diff over 30,000
-#: characters failed to deliver its review packet, including the task filed to
-#: fix this.
-#:
-#: 8,000 is not a guess — it is the cap that was in force before 2026-08-05 and
-#: delivered without a single composer failure. It was raised because it was too
-#: CONSERVATIVE (it blocked rt-02 at 8,971 characters), never because it failed
-#: to send. Returning the PART size to a proven-deliverable value while leaving
-#: the single-message threshold at 30,000 keeps that fix and undoes the
-#: regression.
-#:
-#: pkt-02 replaces this with a measured bound rather than a known-good one.
-PART_INCLUDE_MAX_CHARS = 8_000
-
-
 def split_diff_into_parts(diff: str, max_chars: int = PART_INCLUDE_MAX_CHARS) -> list[str]:
     """Split `diff` into ordered slices of at most `max_chars`, preferring line
     boundaries. Concatenating the result reproduces `diff` byte for byte —
@@ -529,11 +558,20 @@ def plan_chunked_delivery(
     candidate_sha: str,
     max_chars: int = DIFF_INCLUDE_MAX_CHARS,
     max_parts: int = DIFF_MAX_PARTS,
+    part_max_chars: int = PART_INCLUDE_MAX_CHARS,
 ) -> DeliveryPlan | None:
     """Plan the delivery of `payload` — the complete logical packet, diff
     inline — as parts plus a verdict request. `None` means "do not chunk":
     either the patch fits in one message (the common case, unchanged
     behaviour) or chunking cannot be done safely.
+
+    `max_chars` and `part_max_chars` are two different limits and are kept as
+    two parameters on purpose. `max_chars` decides WHETHER to chunk — it is the
+    single-message threshold, sized against the generation failure. Once the
+    answer is yes, `part_max_chars` decides how big each part is, and it is
+    sized against what the composer accepts and reads back. They were one
+    parameter until 2026-08-14, which sized every part to a number no part had
+    ever been measured against; see `PART_INCLUDE_MAX_CHARS`.
 
     A returned plan always carries its own `fallback_payload`, and the caller
     must keep it: a part that does not land is answered by sending THAT
@@ -548,7 +586,7 @@ def plan_chunked_delivery(
       message could not be derived from it honestly;
     * a part id would contain the request id as a substring, which would break
       every provider's "has this request landed?" check (see `diff_part_id`);
-    * the patch needs more than `max_parts` parts.
+    * the patch needs more than `max_parts` parts of `part_max_chars` each.
     """
     diff = diff.strip()
     if not diff or len(diff) <= max_chars:
@@ -558,7 +596,7 @@ def plan_chunked_delivery(
     if payload.count(section) != 1:
         return None
 
-    slices = split_diff_into_parts(diff, max_chars)
+    slices = split_diff_into_parts(diff, part_max_chars)
     if len(slices) > max_parts:
         return None
 

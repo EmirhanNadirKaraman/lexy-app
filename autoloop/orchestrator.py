@@ -646,6 +646,14 @@ class Orchestrator:
           the omission notice here, so the caller cannot accidentally send a
           payload that was already known not to fit.
 
+        Two limits, not one, and this is the path that has to keep them
+        straight. `packet.DIFF_INCLUDE_MAX_CHARS` decides whether a patch needs
+        chunking at all (the check just below); `packet.PART_INCLUDE_MAX_CHARS`
+        — `plan_chunked_delivery`'s `part_max_chars` default — decides how much
+        patch each part carries. The first is sized against a generation
+        failure, the second against a composer read-back failure, and the
+        second is the smaller of the two.
+
         The provider's ability to deliver parts at all is deliberately NOT
         checked here: it is a property of the live client, and this phase must
         stay transport-free. `_step_delivering` probes it and falls back on the

@@ -9,8 +9,13 @@ failed to send on 2026-08-04, and approving unseen removes the review.
 
 The measured failure was ONE MESSAGE being too big, not the total volume.
 Several smaller messages are fine — so the patch is deposited as numbered
-parts, each under the same per-message budget an inline diff has always
-respected, and only then is a verdict requested.
+parts, each under `PART_INCLUDE_MAX_CHARS`, and only then is a verdict
+requested.
+
+That part budget is a SEPARATE number from the single-message threshold since
+pkt-02 (2026-08-14): the threshold is sized against the generation failure
+above, the part budget against a composer read-back failure that is smaller and
+was invisible while one constant did both jobs. Section 7 pins both.
 
 The three rules under test here are what make that safe rather than clever:
 
@@ -44,6 +49,7 @@ from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import Orchestrator
 from autoloop.packet import (
     DIFF_INCLUDE_MAX_CHARS,
+    PART_INCLUDE_MAX_CHARS,
     diff_part_id,
     plan_chunked_delivery,
     split_diff_into_parts,
@@ -73,10 +79,18 @@ def ok_validation(argv, **kwargs):
     return Proc()
 
 
-def big_file_text(lines: int = 1200) -> str:
-    """A file whose patch comfortably exceeds one message but stays inside
-    `DIFF_MAX_PARTS`. ~42 KB — deliberately close to sub-01's real 41 KB
-    candidate rather than an arbitrary giant."""
+def big_file_text(lines: int = 800) -> str:
+    """A file whose patch exceeds the single-message threshold and still fits
+    inside `DIFF_MAX_PARTS` parts of `PART_INCLUDE_MAX_CHARS` each.
+
+    44 characters per line, so 800 lines is a ~36 KB patch: over the 30,000
+    threshold that triggers chunking, and 5 parts of the 6 allowed — margin on
+    both sides, deliberately, because a fixture sitting exactly on either bound
+    turns an unrelated rounding change into a mystery failure. It was 1200
+    lines (~54 KB) while parts were 30,000 characters; at 8,000 that needs 7
+    parts and would exercise the part-count fallback instead of the delivery
+    this section is about.
+    """
     return "".join(f"line {i:05d} of a large generated source file\n" for i in range(lines))
 
 
@@ -281,16 +295,23 @@ def test_an_oversized_diff_is_planned_as_numbered_parts(tmp_path):
     assert all(p["total"] == len(parts) for p in parts)
 
 
-def test_every_part_stays_under_the_single_message_limit(tmp_path):
-    """The whole point. 40,056 characters is the only measured failure; each
-    part carries at most `DIFF_INCLUDE_MAX_CHARS` of patch, which is exactly
-    what an inline diff has always been allowed to carry."""
+def test_every_part_stays_under_the_composer_limit(tmp_path):
+    """The whole point, and the assertion pkt-02 had to retarget.
+
+    A part must fit what the COMPOSER accepts and reads back
+    (`PART_INCLUDE_MAX_CHARS`), which is a smaller and differently-sourced
+    number than the single-message threshold. Asserting against
+    `DIFF_INCLUDE_MAX_CHARS` here — as this did while one constant served both
+    — passed happily on 30,000-character parts that could not be sent at all.
+    The whole rendered message is checked too, not just its patch slice: the
+    composer holds the identity block and the instruction paragraph as well.
+    """
     client = ChunkingClient()
     orch, _store, _task = oversized_round(tmp_path, client)
 
     for part in orch.state.pending_request.delivery.parts:
-        assert len(part["text"]) < 40_056, part["part_id"]
-        assert len(_body_of(part["text"])) <= DIFF_INCLUDE_MAX_CHARS, part["part_id"]
+        assert len(_body_of(part["text"])) <= PART_INCLUDE_MAX_CHARS, part["part_id"]
+        assert len(part["text"]) < DIFF_INCLUDE_MAX_CHARS, part["part_id"]
 
 
 def test_the_parts_reproduce_the_patch_byte_for_byte(tmp_path):
@@ -506,7 +527,7 @@ def test_the_fallback_never_sends_a_partial_patch_as_the_verdict(tmp_path):
 
     orch._step_delivering()
 
-    assert "line 01199 of a large generated source file" not in req.prompt
+    assert "line 00799 of a large generated source file" not in req.prompt
 
 
 def test_a_provider_without_shared_history_never_chunks(tmp_path):
@@ -525,16 +546,47 @@ def test_a_provider_without_shared_history_never_chunks(tmp_path):
 
 def test_a_patch_needing_too_many_parts_is_omitted_not_chunked():
     """A bound on the mechanism itself: past `DIFF_MAX_PARTS`, 'reply `revise`
-    asking for a smaller commit' beats a dozen chat messages."""
+    asking for a smaller commit' beats a dozen chat messages.
+
+    `part_max_chars` is the knob this test sets, because the part-count bound
+    is a function of the PART size, not of the threshold. Setting only
+    `max_chars` (as this did while one parameter served both) leaves parts at
+    their 8,000-character default, makes a 200-character patch one part, and
+    the test passes for no reason at all.
+    """
     diff = "x" * 200 + "\n"
     payload = "header\n\nFull diff:\n" + diff
 
     plan = plan_chunked_delivery(
         payload, diff, "alr-abc12345-0007", task_id="t1", candidate_sha="a" * 40,
-        max_chars=20, max_parts=3,
+        max_chars=20, max_parts=3, part_max_chars=20,
     )
 
     assert plan is None
+
+
+def test_the_part_size_governs_the_split_not_the_send_threshold():
+    """The pkt-02 defect, pinned as behaviour. One parameter used to decide
+    both 'is this too big for one message?' and 'how big is a part?', so parts
+    were sized to the threshold — 30,000 characters the composer would not read
+    back. A patch just over the threshold must come out as several parts, not
+    as one part of the same size as the message that could not be sent."""
+    # Derived from the threshold, not hardcoded: at 22 characters per line this
+    # is 200 lines past it, so moving `DIFF_INCLUDE_MAX_CHARS` cannot break this
+    # test with a failure that reads as unrelated to the change that caused it.
+    lines = DIFF_INCLUDE_MAX_CHARS // 22 + 200
+    diff = "".join(f"line {i:05d} of a patch\n" for i in range(lines))
+    payload = "header\n\nFull diff:\n" + diff
+    assert DIFF_INCLUDE_MAX_CHARS < len(diff.strip())
+
+    plan = plan_chunked_delivery(
+        payload, diff, "alr-abc12345-0007", task_id="t1", candidate_sha="a" * 40,
+    )
+
+    assert plan is not None
+    assert len(plan.parts) > 1, "one part of threshold size is the bug being fixed"
+    assert all(len(p.body) <= PART_INCLUDE_MAX_CHARS for p in plan.parts)
+    assert "".join(p.body for p in plan.parts) == diff.strip()
 
 
 def test_a_patch_that_does_not_match_its_payload_is_not_chunked():
@@ -609,7 +661,7 @@ def test_the_hash_covers_the_complete_packet_not_the_sent_message(tmp_path):
     assert hashlib.sha256(req.payload.encode("utf-8")).hexdigest() == req.report_sha256
     # The discriminating pair: the last line of the patch is inside the hashed
     # payload and NOT inside the message that asks for the verdict.
-    last_line = "line 01199 of a large generated source file"
+    last_line = "line 00799 of a large generated source file"
     assert last_line in req.payload
     assert last_line not in req.prompt
 
@@ -862,3 +914,36 @@ def test_the_cap_is_not_raised_by_chunking():
     because raising it is the tempting shortcut this task exists to avoid."""
     assert packet_mod.DIFF_INCLUDE_MAX_CHARS == 30_000
     assert packet_mod.DIFF_INCLUDE_MAX_CHARS <= 40_056 * 0.8
+
+
+def test_the_part_budget_is_a_separate_number_from_the_send_threshold():
+    """Two limits, two pins, so a future edit cannot quietly re-merge them.
+
+    `DIFF_INCLUDE_MAX_CHARS` is sized against a GENERATION failure (40,056
+    characters accepted by the composer, then failed server-side, 2026-08-04).
+    This one is sized against a COMPOSER failure: 30,000-character parts whose
+    read-back did not complete within the 30s `input_sync_timeout`, so the
+    client refused to send them (brw-08, 2026-08-14). The composer limit is the
+    lower of the two, and while one constant served both it was the one nobody
+    could see.
+    """
+    assert packet_mod.PART_INCLUDE_MAX_CHARS == 8_000
+    assert packet_mod.PART_INCLUDE_MAX_CHARS < packet_mod.DIFF_INCLUDE_MAX_CHARS, (
+        "a part must be smaller than a whole message, or chunking buys nothing"
+    )
+    assert packet_mod.PART_INCLUDE_MAX_CHARS <= 30_000 * 0.8, (
+        "keep a real margin under the part size whose read-back failed"
+    )
+
+
+def test_the_part_count_bound_still_covers_the_patch_that_motivated_chunking():
+    """Shrinking the part size shrinks what a bounded delivery can carry —
+    `DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, ~48 KB now rather than ~180 KB.
+    sub-01's 41 KB patch is why chunking exists, so it must still fit; if a
+    real patch ever does not, the COUNT is the lever, never the part size."""
+    SUB_01_PATCH = 41_000  # measured, 2026-08-05
+
+    ceiling = packet_mod.DIFF_MAX_PARTS * packet_mod.PART_INCLUDE_MAX_CHARS
+    assert ceiling >= SUB_01_PATCH, (
+        "the patch chunking was built for must still be deliverable"
+    )

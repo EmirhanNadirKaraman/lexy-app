@@ -954,10 +954,20 @@ def test_an_oversized_diff_is_OMITTED_not_truncated(tmp_path):
     and what any failed part delivery reverts to. The property under test is
     unchanged and is the reason the notice exists at all: omission is loud,
     complete, and never a partial view.
+
+    The fixture is sized to REACH that fallback rather than to trip an earlier
+    one: over the 30,000-character threshold, so a plan is built and the loop
+    enters `delivering`, but inside `DIFF_MAX_PARTS` parts of
+    `PART_INCLUDE_MAX_CHARS`, so what refuses the delivery is the provider —
+    the condition named in the docstring. It was 4000 lines (~147 KB of patch),
+    which fitted the six-part bound only because a part was 30,000 characters;
+    at 8,000 it needs far more, so a fixture that big now falls back at
+    PLANNING time and this test would have been asserting the part-count bound
+    while claiming to test the provider.
     """
     from autoloop import packet as packet_mod
 
-    big = "\n".join(f"line {i} of a large generated file" for i in range(4000)) + "\n"
+    big = "".join(f"line {i:05d} of a large generated file\n" for i in range(900))
     executor = WritingExecutor(tmp_path / "worktrees", {"big.py": big})
     orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
         tmp_path, executor
@@ -966,13 +976,15 @@ def test_an_oversized_diff_is_OMITTED_not_truncated(tmp_path):
     orch._client_factory = lambda: client
     orch._dispatch_executor(implement(task.id))
     orch._step_ready()
-    assert orch.state.phase == Phase.DELIVERING.value
+    assert orch.state.phase == Phase.DELIVERING.value, (
+        "the fixture must be chunkable, or the provider check is never reached"
+    )
     orch._step_delivering()
 
     payload = orch.state.pending_request.payload
     assert "Full diff: OMITTED" in payload
     assert "Nothing was truncated" in payload
-    assert "line 3999 of a large generated file" not in payload, "no patch body"
+    assert "line 00899 of a large generated file" not in payload, "no patch body"
     # The git-read facts are still complete — that is what makes the omission
     # honest rather than a hole.
     assert "big.py" in payload
@@ -1133,25 +1145,32 @@ def test_a_round_inside_its_scope_says_so_rather_than_going_silent(tmp_path):
 
 
 def test_the_out_of_scope_section_survives_an_omitted_diff(tmp_path):
-    """The case `docs/SECURITY.md` records as the residual risk: over
-    `DIFF_INCLUDE_MAX_CHARS` the reviewer sees the PATHS but not the content.
+    """The case `docs/SECURITY.md` records as the residual risk: when the patch
+    cannot be shown, the reviewer sees the PATHS but not the content.
     Paths-without-content is a degraded control; paths-and-no-content-and-no-
     section is none at all, so the section must not be a casualty of the very
-    commits most likely to overrun a scope."""
-    big = "\n".join(f"line {i} of a large generated file" for i in range(4000)) + "\n"
+    commits most likely to overrun a scope.
+
+    The fixture is deliberately past the chunkable ceiling —
+    `DIFF_MAX_PARTS * PART_INCLUDE_MAX_CHARS`, asserted below rather than
+    assumed — so the packet takes the omission path this test is named for.
+    Between pkt-01 and pkt-02 the same fixture was chunkable (two 30,000-
+    character parts), which quietly turned this into a test of the inline
+    payload; the assertions have been put back on the omitted case.
+    """
+    from autoloop import packet as packet_mod
+
+    big = "".join(f"line {i:05d} of a large generated file\n" for i in range(4000))
+    ceiling = packet_mod.DIFF_MAX_PARTS * packet_mod.PART_INCLUDE_MAX_CHARS
+    assert len(big) > ceiling, "the fixture must be past what chunking can carry"
     orch, _worktrees, _store, _task = out_of_scope_packet(
         tmp_path, {"big.py": big}, approved_paths=("feature.py",)
     )
 
     payload = orch.state.pending_request.payload
-    # The precondition changed shape when pkt-01 landed: an oversized diff is
-    # no longer OMITTED from the packet. The payload now carries the COMPLETE
-    # patch inline — that is what report_sha256 binds an approval to — and the
-    # split into parts happens at DELIVERY, not here. What this test is about
-    # is unchanged: the section must survive the commits most likely to
-    # overrun a scope, and must sit above the diff rather than after it.
-    assert len(payload) > DIFF_INCLUDE_MAX_CHARS, "expected the oversized case"
-    assert "Full diff:" in payload
+    assert "Full diff: OMITTED" in payload, "expected the un-chunkable case"
+    assert "line 03999 of a large generated file" not in payload, "no patch body"
+    assert len(payload) < DIFF_INCLUDE_MAX_CHARS, "the omission notice is what was sent"
     assert "OUT-OF-SCOPE PATHS (1)" in payload
     assert "! big.py" in payload
     assert payload.index("OUT-OF-SCOPE PATHS (1)") < payload.index("Full diff:")
@@ -1316,6 +1335,11 @@ def test_the_cap_is_sized_from_evidence_not_instinct():
     Failing this test means someone moved the cap past its evidence. Move the
     evidence first: record the new observation in `packet.py`'s comment, then
     change both.
+
+    This is the GENERATION-sized threshold only. The per-message composer bound
+    is `packet.PART_INCLUDE_MAX_CHARS`, pinned by
+    `test_the_part_budget_is_a_separate_number_from_the_send_threshold` against
+    a different failure; do not read either number as evidence for the other.
     """
     from autoloop.packet import DIFF_INCLUDE_MAX_CHARS
 
