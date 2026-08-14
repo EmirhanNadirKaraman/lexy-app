@@ -92,6 +92,27 @@ def _validate_approved_path(path: object) -> None:
             )
 
 
+def _validate_description(task_id: object, description: object) -> None:
+    """Raise `TaskGraphError` unless `description` is a non-blank string.
+
+    THE description check, called from both `TaskRegistry.add_many` (creation)
+    and `TaskRegistry.set_description` (mutation), so the two cannot drift.
+    Two implementations would mean a description the registry refuses to be
+    created with could still be written onto an existing task — same reasoning
+    as `unauthorized_paths` and `effective_approved_paths` above.
+
+    Whitespace-only is refused (`strip()`), and so is a non-string: creation
+    reached this through `Task.description.strip()` and would have raised
+    `AttributeError` on a non-string, which is a crash rather than a refusal,
+    and mutation takes its value straight from a caller. The value is NOT
+    normalised — creation stores the string it was given, padding and all, so
+    mutation stores it unchanged too.
+    """
+    if not isinstance(description, str) or not description.strip():
+        raise TaskGraphError(
+            "empty_task_field", f"task '{task_id}' needs a non-empty description"
+        )
+
 
 def is_directory_prefix(approved: str) -> bool:
     """A trailing '/' means "this directory and everything under it"."""
@@ -294,10 +315,11 @@ class TaskRegistry:
                 )
             if task.id in candidate:
                 raise TaskGraphError("duplicate_task", f"task id '{task.id}' already exists")
-            if not task.title.strip() or not task.description.strip():
+            if not task.title.strip():
                 raise TaskGraphError(
-                    "empty_task_field", f"task '{task.id}' needs a title and a description"
+                    "empty_task_field", f"task '{task.id}' needs a title"
                 )
+            _validate_description(task.id, task.description)
             seen_paths: set[str] = set()
             for approved in task.approved_paths:
                 _validate_approved_path(approved)
@@ -486,6 +508,33 @@ class TaskRegistry:
                 "bad_priority", f"priority must be an integer, got {priority!r}"
             )
         task.priority = priority
+        return task
+
+    def set_description(self, task_id: str, description: str) -> Task:
+        """Rewrite an existing task's description.
+
+        Registry primitive, deliberately with NO operator route to it. A
+        description is what a write-capable agent reads as its instructions,
+        which puts it in the same class as `approved_paths` rather than
+        `priority` — `inbox.py` says so in as many words, and refuses a general
+        "edit a task" request for exactly that reason. Exposing this through
+        the inbox or a localhost form is therefore a separate decision that has
+        to revisit that comment; it is not a follow-up this method implies.
+
+        Validation is `_validate_description`, the SAME function creation goes
+        through, so a description the registry would refuse to create a task
+        with cannot be written onto an existing one either.
+
+        Rejection is atomic: the lookup and the validation both run before the
+        single assignment, so a refused call leaves the registry exactly as it
+        was rather than half-mutated. An unknown id raises `task_unknown` via
+        `get`, like every other mutator here — `set_priority`'s hand-rolled
+        `unknown_task` is the outlier, and it is left alone because that code
+        string reaches the operator through the inbox's refusal text.
+        """
+        task = self.get(task_id)
+        _validate_description(task_id, description)
+        task.description = description
         return task
 
     def next_ready(self) -> Task | None:

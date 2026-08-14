@@ -183,6 +183,77 @@ def test_summary_counts_and_next():
     assert "next ready: b" in text
 
 
+# ---- description mutation ---------------------------------------------------
+
+
+#: What the shared validator refuses. `None` is in here rather than in a test
+#: of its own on purpose: it exercises the validator's OTHER branch
+#: (non-string, which creation used to reach as an `AttributeError` from
+#: `.strip()`), so parity is proven on both branches instead of only on blanks.
+BAD_DESCRIPTIONS = ["", "   ", None]
+
+
+def test_set_description_replaces_only_that_tasks_text():
+    reg = registry(task("a"), task("b", deps=["a"]))
+    before_other = reg.to_dict()["tasks"][0]
+    returned = reg.set_description("b", "  a new description  ")
+    assert returned is reg.get("b")
+    # Byte-identical: creation stores the string it was given, padding and all,
+    # so mutation must not normalise what creation would have kept.
+    assert reg.get("b").description == "  a new description  "
+    # Nothing else moves — not the task's own lifecycle/scope fields, and not
+    # its neighbour.
+    assert (reg.get("b").status, reg.get("b").approved_paths) == ("pending", ())
+    assert reg.to_dict()["tasks"][0] == before_other
+
+
+def test_set_description_survives_persistence(tmp_path):
+    store = TaskStore(tmp_path / "tasks.json")
+    reg = registry(task("a"))
+    reg.set_description("a", "the rewritten description")
+    store.save(reg)
+    assert store.load().get("a").description == "the rewritten description"
+
+
+@pytest.mark.parametrize("bad", BAD_DESCRIPTIONS)
+def test_creation_and_mutation_reject_a_bad_description_identically(bad):
+    """The point of extracting `_validate_description`: the two paths must be
+    the SAME check, not two checks that happen to agree today. Comparing the
+    message as well as the code is what makes that load-bearing — a
+    re-implemented check would almost certainly word its refusal differently,
+    and this fails the moment mutation stops calling what creation calls."""
+    with pytest.raises(TaskGraphError) as created:
+        registry(Task(id="t1", title="Title t1", description=bad))
+    reg = registry(task("t1"))
+    with pytest.raises(TaskGraphError) as mutated:
+        reg.set_description("t1", bad)
+    assert created.value.code == mutated.value.code == "empty_task_field"
+    assert str(created.value) == str(mutated.value)
+
+
+def test_set_description_unknown_task_is_refused_and_creates_nothing():
+    """`task_unknown`, the code every mutator routing through `get` raises
+    (`set_priority`'s `unknown_task` is the outlier and stays one — that string
+    reaches the operator through the inbox's refusal text). A miss must not
+    quietly conjure the task it failed to find."""
+    reg = registry(task("a"))
+    before = json.dumps(reg.to_dict(), sort_keys=True)
+    expect_code(lambda: reg.set_description("ghost", "a good description"), "task_unknown")
+    assert not reg.has("ghost")
+    assert json.dumps(reg.to_dict(), sort_keys=True) == before
+
+
+def test_a_rejected_description_leaves_the_registry_byte_identical():
+    """Atomicity, asserted over the whole serialised graph rather than the one
+    field: this kills an 'assign first, validate second' ordering and any
+    mutation that leaves a partially-written task behind."""
+    reg = registry(task("a"), task("b", deps=["a"]))
+    before = json.dumps(reg.to_dict(), sort_keys=True)
+    with pytest.raises(TaskGraphError):
+        reg.set_description("b", "   ")
+    assert json.dumps(reg.to_dict(), sort_keys=True) == before
+
+
 # ---- persistence ------------------------------------------------------------
 
 
