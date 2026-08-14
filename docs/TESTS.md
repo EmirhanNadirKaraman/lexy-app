@@ -78,6 +78,8 @@ line.
 | `test_transcript_click.py` | `/words/word/{id}/transcript-click` → passive_level + create card |
 | `test_usage_events.py` | record_event + aggregations |
 | `test_words.py` | lookup, knowledge list, status PUT |
+| `test_content_requests.py` | `/content-requests` POST/GET: pending-row creation, per-user idempotency + failed→pending reset, per-user uniqueness (migration 029), notification routing, S7 `content_id` validation/normalization, auth. 🆕 arch-05: a `content_request_service` section drives the extracted SQL directly — `create_or_reset` (insert, idempotent, resets `failed`, leaves `done`), `list_for_user` (newest-first + user-scoped), `count_pending`. `user_id` is passed as a **str** to match `get_current_user`'s normalization; `count_pending` asserts a `>= 1` lower bound, not an exact count, because the query is global and the suite runs `-n auto`. New rows use `_channel_id()`/`_video_id()` so the per-worker cleanup fixture reaps them |
+| `test_notifications.py` | SSE stream (#4a): per-row mark-after-yield ordering, disconnect leaves rows unseen, heartbeat on empty, string-JSONB payload parsing, `request_failed` write + delivery. 🆕 arch-05: a `notification_service` section covers `fetch_unseen` (oldest-first, excludes seen, user-scoped) and `mark_seen` (flips only its row). Ordering assertions stay on `_yield_unseen` — the sequencing is deliberately router-side |
 
 ### Pre-existing failures (NOT introduced by current work)
 
@@ -1645,8 +1647,8 @@ gaps closed.
 
 ### Closed gaps (formerly listed here)
 - `insights.py` / `insights_service` — covered by `test_insights.py` (#5a + #5c).
-- `notifications.py` SSE — covered by `test_notifications.py` (#4a).
-- `content_requests.py` — covered by `test_content_requests.py`.
+- `notifications.py` SSE — covered by `test_notifications.py` (#4a); its extracted `notification_service` is covered directly in the same file (arch-05).
+- `content_requests.py` — covered by `test_content_requests.py`; its extracted `content_request_service` is covered directly in the same file (arch-05).
 - `recommendation_service.enrich_by_type` — covered by `test_recommendations.py` (#5c).
 
 ### Indirect coverage that should be made direct

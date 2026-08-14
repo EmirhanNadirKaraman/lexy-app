@@ -435,6 +435,117 @@ async def test_invalid_request_not_inserted_and_not_spawned(client: AsyncClient,
 
 
 # ---------------------------------------------------------------------------
+# content_request_service — the extracted SQL, driven directly (arch-05)
+#
+# The router owns HTTP concerns (content_id validation, spawning the scraper);
+# the service owns every statement against content_request. These tests call
+# the service without going through the routes, so a future router refactor
+# can't silently take the query behaviour with it.
+#
+# user_id is passed as a **str**, exactly as the router does — get_current_user
+# normalizes the UUID to a str (core/deps.py:47) and the service's SQL casts
+# nothing, so the type has to match the real call path.
+# ---------------------------------------------------------------------------
+
+async def test_service_create_or_reset_inserts_pending_row(client: AsyncClient, db_pool):
+    from backend.services import content_request_service
+    _, uid = await _register_and_get_user(client, db_pool, _email())
+    cid = _channel_id()
+
+    row = await content_request_service.create_or_reset(db_pool, uid, "channel", cid)
+
+    assert row["status"] == "pending"
+    assert row["error"] is None
+    assert row["content_id"] == cid
+    assert row["request_type"] == "channel"
+    # RETURNING * — the service hands back the whole row (including user_id,
+    # which the route's response_model filters out). Asserted so a switch to an
+    # explicit column list shows up as a test failure, not a silent narrowing.
+    assert str(row["user_id"]) == uid
+
+
+async def test_service_create_or_reset_is_idempotent_for_same_user(client: AsyncClient, db_pool):
+    from backend.services import content_request_service
+    _, uid = await _register_and_get_user(client, db_pool, _email())
+    cid = _channel_id()
+
+    first  = await content_request_service.create_or_reset(db_pool, uid, "channel", cid)
+    second = await content_request_service.create_or_reset(db_pool, uid, "channel", cid)
+
+    assert first["request_id"] == second["request_id"]
+    assert second["status"] == "pending"
+
+
+async def test_service_create_or_reset_resets_failed_row(client: AsyncClient, db_pool):
+    from backend.services import content_request_service
+    _, uid = await _register_and_get_user(client, db_pool, _email())
+    cid = _channel_id()
+
+    created = await content_request_service.create_or_reset(db_pool, uid, "channel", cid)
+    await db_pool.execute(
+        "UPDATE content_request SET status='failed', error='boom' WHERE request_id = $1",
+        created["request_id"],
+    )
+
+    again = await content_request_service.create_or_reset(db_pool, uid, "channel", cid)
+
+    assert again["request_id"] == created["request_id"]
+    assert again["status"] == "pending"
+    assert again["error"] is None
+
+
+async def test_service_create_or_reset_leaves_done_row_done(client: AsyncClient, db_pool):
+    """Only 'failed' is reset. A completed request stays completed — otherwise a
+    resubmit would re-run the scraper over content already indexed."""
+    from backend.services import content_request_service
+    _, uid = await _register_and_get_user(client, db_pool, _email())
+    cid = _channel_id()
+
+    created = await content_request_service.create_or_reset(db_pool, uid, "channel", cid)
+    await db_pool.execute(
+        "UPDATE content_request SET status='done' WHERE request_id = $1",
+        created["request_id"],
+    )
+
+    again = await content_request_service.create_or_reset(db_pool, uid, "channel", cid)
+
+    assert again["request_id"] == created["request_id"]
+    assert again["status"] == "done"
+
+
+async def test_service_list_for_user_is_newest_first_and_scoped(client: AsyncClient, db_pool):
+    from backend.services import content_request_service
+    _, uid_a = await _register_and_get_user(client, db_pool, _email())
+    _, uid_b = await _register_and_get_user(client, db_pool, _email())
+
+    ids = [_channel_id() for _ in range(3)]
+    for cid in ids:
+        await content_request_service.create_or_reset(db_pool, uid_a, "channel", cid)
+    b_only = _channel_id()
+    await content_request_service.create_or_reset(db_pool, uid_b, "channel", b_only)
+
+    rows_a = await content_request_service.list_for_user(db_pool, uid_a)
+
+    assert [r["content_id"] for r in rows_a][:3] == list(reversed(ids))
+    assert all(r["content_id"] != b_only for r in rows_a)
+
+
+async def test_service_count_pending_sees_a_pending_row(client: AsyncClient, db_pool):
+    """Feeds the startup resume in main.py's lifespan.
+
+    Asserted as a lower bound, not an exact count: the query is global across
+    users and the suite runs under -n auto, so a concurrent worker's rows are
+    legitimately in scope. '>= 1 while my own row is pending' holds regardless.
+    """
+    from backend.services import content_request_service
+    _, uid = await _register_and_get_user(client, db_pool, _email())
+    created = await content_request_service.create_or_reset(db_pool, uid, "channel", _channel_id())
+    assert created["status"] == "pending"
+
+    assert await content_request_service.count_pending(db_pool) >= 1
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
