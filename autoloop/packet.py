@@ -332,7 +332,33 @@ def diff_part_id(request_id: str, index: int, total: int) -> str:
     return f"diffpart_{request_id.replace('-', '_')}_{index:02d}of{total:02d}"
 
 
-def split_diff_into_parts(diff: str, max_chars: int = DIFF_INCLUDE_MAX_CHARS) -> list[str]:
+#: How much patch text one DEPOSITED PART may carry. Deliberately NOT
+#: `DIFF_INCLUDE_MAX_CHARS`: that number is sized against ChatGPT's
+#: GENERATION limit (a 40,056-character message it accepted and then failed
+#: server-side), and says nothing about what the composer will accept and read
+#: back before the send is verified.
+#:
+#: Measured the hard way on 2026-08-14: with parts at 30,000 the composer
+#: repeatedly failed `composer did not accept the full request
+#: diffpart_..._02of02 within 30.0s (nothing was sent)` — the text was visibly
+#: present in the box, but the read-back that proves the composer holds ALL of
+#: it never completed, so the client correctly refused to send a part it could
+#: not verify. That deadlocked the loop: every task with a diff over 30,000
+#: characters failed to deliver its review packet, including the task filed to
+#: fix this.
+#:
+#: 8,000 is not a guess — it is the cap that was in force before 2026-08-05 and
+#: delivered without a single composer failure. It was raised because it was too
+#: CONSERVATIVE (it blocked rt-02 at 8,971 characters), never because it failed
+#: to send. Returning the PART size to a proven-deliverable value while leaving
+#: the single-message threshold at 30,000 keeps that fix and undoes the
+#: regression.
+#:
+#: pkt-02 replaces this with a measured bound rather than a known-good one.
+PART_INCLUDE_MAX_CHARS = 8_000
+
+
+def split_diff_into_parts(diff: str, max_chars: int = PART_INCLUDE_MAX_CHARS) -> list[str]:
     """Split `diff` into ordered slices of at most `max_chars`, preferring line
     boundaries. Concatenating the result reproduces `diff` byte for byte —
     that is the property the reviewer's "is this the whole patch?" rests on, so
