@@ -1,0 +1,149 @@
+name: Tests
+
+# The validation commands CLAUDE.md §11 and docs/TESTS.md already call mandatory
+# for a Python change, run as a gate instead of on trust. Three of the four run
+# here, one per job so a failure names its own suite:
+#
+#   ruff check .                    -> lint
+#   python3 -m pytest tests/        -> pipeline   (root pipeline + subtitle-scraper)
+#   python3 -m pytest autoloop/tests -> autoloop  (loop harness, + the isolated test)
+#
+# THE FOURTH IS DELIBERATELY ABSENT: `cd lexy-app/backend && python3 -m pytest
+# -n auto`. Every backend test pulls the autouse `cleanup` fixture
+# (lexy-app/backend/tests/conftest.py:67), which takes `db_pool`, so the suite
+# needs a live Postgres and there is no database-free subset to gate on. That
+# database cannot be built from this repository: `video`, `word_table` and eight
+# more tables are ALTERed by migrations but never CREATEd (006_video_channel_genre.py:16
+# runs `ALTER TABLE video ADD COLUMN …`; no `CREATE TABLE video` exists in any of
+# the 37 revisions), so `alembic upgrade head` fails at revision 006 on an empty
+# database. That is audit blocker hb-01 (docs/AUDIT_2026-07-30.md) and it needs a
+# human decision, not a workflow edit. A job that cannot pass would make this gate
+# red from its first run and teach everyone to ignore it, so it is not written
+# here — not as a skipped job either, since "skipped" reads as success to branch
+# protection. When hb-01 is resolved, the job to add is: a `postgres:16` service
+# container, `alembic upgrade head` from lexy-app/backend, then
+# `python3 -m pytest -n auto` with DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD
+# pointing at that service.
+#
+# Frontend vitest is out of scope for this workflow (it is not one of the Python
+# validation commands); `npm audit` and `pip-audit` live in dependency-audit.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A superseded push to the same ref does not need its old run finished.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff check . (repo root)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff at the repo's pinned version
+        # The pin lives in lexy-app/backend/requirements.txt and is deliberate —
+        # ruff's rule set shifts between releases, so an unpinned ruff reports
+        # differently machine-to-machine (see /ruff.toml). Reading the pin from
+        # that file keeps one source of truth: a bump there moves CI with it, and
+        # a missing pin fails this step loudly rather than installing whatever is
+        # newest.
+        run: |
+          pin=$(grep -E '^ruff==' lexy-app/backend/requirements.txt)
+          echo "Installing $pin"
+          pip install "$pin"
+      - name: ruff check .
+        # From the repo root, not lexy-app/backend — /ruff.toml covers backend,
+        # scraper, root pipeline, scripts, masking and ilp in one pass. Baseline
+        # is zero findings, so any output at all is a regression.
+        run: ruff check .
+
+  pipeline:
+    name: pytest tests/ (root pipeline + scraper)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            lexy-app/backend/requirements.txt
+      - name: Install dependencies
+        # Root requirements.txt is `-r lexy-app/backend/requirements.txt`, i.e.
+        # the full backend set. Installing the superset is deliberate: the root
+        # tests load subtitle-scraper and pipeline modules by file path, so their
+        # transitive imports are not enumerable from the test files themselves.
+        run: pip install -r requirements.txt
+      - name: Download spaCy models
+        # de_core_news_sm is NOT optional: subtitle-scraper/phrase_finder.py:15
+        # calls spacy.load at module scope, so without it the scraper half of the
+        # suite dies at collection rather than skipping. The other two back
+        # fixtures that DO skip cleanly when the model is missing — installed
+        # anyway, because a green job that quietly skipped a third of its
+        # assertions is exactly the drift this workflow exists to catch.
+        # (en_core_web_sm is only asserted as a config string in
+        # tests/test_language_config.py:47 — never loaded, so not installed.)
+        run: |
+          python -m spacy download de_core_news_sm
+          python -m spacy download de_core_news_md
+          python -m spacy download es_core_news_sm
+      - name: pytest tests/
+        # `python3 -m pytest`, not the bare console script: `python -m` puts the
+        # cwd on sys.path, which the by-path module loading in tests/ relies on.
+        # Same reason the backend command is written that way (docs/COMMON_ERRORS.md §2).
+        # Root pytest.ini supplies `-p no:randomly -m "not isolated"`.
+        run: python3 -m pytest tests/ -q
+
+  autoloop:
+    name: pytest autoloop/tests (loop harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The suite shells out to real `git` and commits in throwaway repos under
+      # tmp_path. Most helpers set a per-repo identity, but a runner has no
+      # global one to fall back on, and the loop's own worker environment forces
+      # GIT_CONFIG_GLOBAL=/dev/null (autoloop/worker_env.py:94) — so `git config
+      # --global` would not reach those subprocesses. Identity via env does.
+      GIT_AUTHOR_NAME: CI
+      GIT_AUTHOR_EMAIL: ci@example.com
+      GIT_COMMITTER_NAME: CI
+      GIT_COMMITTER_EMAIL: ci@example.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            lexy-app/backend/requirements.txt
+      - name: Install dependencies
+        # Same superset as the pipeline job. autoloop/requirements.txt (playwright)
+        # is runtime-only — the browser session is imported lazily and mocked in
+        # tests — so it is not installed here.
+        run: pip install -r requirements.txt
+      - name: pytest autoloop/tests
+        # Hermetic: no database, no network, no real `claude` CLI. Every state
+        # dir, worker root and lock path is derived from tmp_path.
+        run: python3 -m pytest autoloop/tests -q
+      - name: pytest autoloop/tests -m isolated
+        # The default run inherits `-m "not isolated"` from root pytest.ini, whose
+        # comment justifies the exclusion by saying the coverage "is still
+        # enforced" because the loop runs it separately. If CI is the gate and CI
+        # skips it, that sentence stops being true — so the documented separate
+        # invocation runs here, verbatim and blocking.
+        run: python3 -m pytest autoloop/tests -q -m isolated -p no:cacheprovider
