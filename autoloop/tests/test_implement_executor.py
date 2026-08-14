@@ -335,7 +335,16 @@ def test_task_declared_validation_overrides_the_configured_default(main_repo, wo
     """The configured default is ruff + the autoloop and root suites, none of
     which touch `lexy-app/backend`. Without a per-task override, rt-01's change
     would pass validation with NOTHING exercising it — including the test the
-    agent just wrote."""
+    agent just wrote.
+
+    The declared command is compared through `effective_validation_command`:
+    since val-01 (2026-08-06) `run_validation_commands` adds the flags a
+    validation run needs (`-p no:cacheprovider` here — the declared command
+    already asks for `-n auto`), so the literal that was declared is not the
+    literal that runs. What this test pins is unchanged: the DECLARED command
+    is what ran, and the configured default was not substituted for it."""
+    from autoloop.validation import effective_validation_command
+
     (worker_repo / "lexy-app" / "backend").mkdir(parents=True, exist_ok=True)
     ran = []
 
@@ -364,7 +373,8 @@ def test_task_declared_validation_overrides_the_configured_default(main_repo, wo
 
     assert outcome.status == "ok"
     argvs = [a for a, _ in ran]
-    assert ("python3", "-m", "pytest", "-n", "auto", "-q") in argvs
+    declared = ("python3", "-m", "pytest", "-n", "auto", "-q")
+    assert effective_validation_command(declared) in argvs
     assert ("ruff", "check", ".") not in argvs, "the configured default must be REPLACED"
     assert all(c.endswith("lexy-app/backend") for _, c in ran), (
         "must run from the declared cwd — `python -m` needs it on sys.path"

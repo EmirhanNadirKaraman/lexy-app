@@ -588,9 +588,18 @@ never "undo".
    flag an earlier round's legitimate paths as "outside" once
    `review_round > 0`, since `commit_range_paths(task_base_sha,
    candidate_sha)` spans every round); the worktree is clean after commit;
-   `config.audit.validation_commands` re-run against the committed tree
-   (pre-commit validation is not enough — a hook can change committed
-   content after the executor last saw it).
+   the task's own `execution.validation_commands` (falling back to
+   `config.audit.validation_commands` when it declared none) re-run against
+   the committed tree — pre-commit validation is not enough, a hook can
+   change committed content after the executor last saw it. **Every pytest
+   command in that list runs with `-n auto -p no:cacheprovider`** (val-01,
+   2026-08-06): `validation.effective_validation_commands` adds them on the
+   way to the subprocess, so a config copied before the flags existed, a
+   task's declared `validation`, and a command list persisted by an earlier
+   session all get them. A command selecting the `isolated` marker is left
+   serial — that marker means "its own process" — and one that already states
+   a worker count is left exactly as written. The summary is still one
+   `PASS`/`FAIL` line per command, naming the command that really ran.
 8. On success: `packet.build_review_packet` renders the packet and it is sent
    for review (state re-enters `ready`, it does not park). On failure: parks
    in `needs_user` with every reason; the commit is not rolled back.
