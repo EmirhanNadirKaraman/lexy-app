@@ -303,3 +303,134 @@ def test_without_a_conversation_the_old_substring_match_still_applies(fake_playw
 
     session = ps.PlaywrightSession.connect("http://cdp")
     assert "chatgpt.com" in session._page.url
+
+
+# ---- reaping orphaned duplicates at connect ---------------------------------
+#
+# `close()` closes the tab it opened and never one it merely borrowed — that
+# part was never broken. The leak is that `close()` has to RUN, and it does not
+# when the process ends abruptly: every pause-and-exit, kill or crash, plus
+# `doctor` and any ad-hoc probe. `Orchestrator._drop_client` swallows a failed
+# `close()` by design, so nothing notices, and tabs accumulate in the dedicated
+# profile until Chrome is restarted. Observed 2026-08-04: two tabs on the SAME
+# conversation, one of them orphaned.
+#
+# So `connect` reaps what is DEMONSTRABLY orphaned — another tab on the very
+# conversation it just bound to — and nothing else. A tab on a different chat
+# may be an operator reading a past conversation.
+
+
+def _connect_with_pages(context):
+    """Run a connect whose single context is `context`, restoring the double."""
+    original = FakeChromium.connect_over_cdp
+
+    def with_pages(self, url):
+        self._driver.connects += 1
+        browser = FakeBrowser(self._driver)
+        browser.contexts = [context]
+        return browser
+
+    FakeChromium.connect_over_cdp = with_pages
+    try:
+        return ps.PlaywrightSession.connect("http://cdp", conversation_url=WANTED)
+    finally:
+        FakeChromium.connect_over_cdp = original
+
+
+def test_a_duplicate_of_the_bound_conversation_is_closed(fake_playwright):
+    """The orphan. Two tabs on the same conversation, one of them left by a
+    session that never got to run `close()`."""
+    context = FakeContext((WANTED, WANTED))
+    bound, duplicate = context.pages
+
+    session = _connect_with_pages(context)
+
+    assert session._page is bound
+    assert duplicate.closed is True
+    assert bound.closed is False, "never the page this session bound to"
+
+
+def test_a_tab_on_a_different_chat_survives_the_reaper(fake_playwright):
+    """The bound that keeps this safe: a tab on ANOTHER conversation may be
+    deliberate — an operator reading a past chat — so only provable duplicates
+    of the bound conversation may be closed."""
+    context = FakeContext((WANTED, WANTED, STRAY))
+    bound, duplicate, stray = context.pages
+
+    session = _connect_with_pages(context)
+
+    assert session._page is bound
+    assert bound.closed is False
+    assert duplicate.closed is True
+    assert stray.closed is False, "a different conversation is not ours to close"
+
+
+def test_the_bound_page_is_never_closed_even_when_it_is_the_only_tab(fake_playwright):
+    """Identity, not URL: a duplicate has the SAME url by definition, so a
+    url-based skip would close exactly the tab we are working in."""
+    context = FakeContext((WANTED,))
+    (bound,) = context.pages
+
+    session = _connect_with_pages(context)
+
+    assert session._page is bound
+    assert bound.closed is False
+
+
+def test_a_stray_that_refuses_to_close_does_not_abort_the_connect(fake_playwright):
+    """Best-effort per candidate, like the existing teardown. A single `try`
+    around the whole loop would satisfy 'does not raise' while silently
+    abandoning every stray after the first failure."""
+    context = FakeContext((WANTED, WANTED, WANTED))
+    bound, exploding, second = context.pages
+
+    def boom():
+        raise RuntimeError("page is already gone")
+
+    exploding.close = boom
+
+    session = _connect_with_pages(context)  # must not raise
+
+    assert session._page is bound
+    assert bound.closed is False
+    assert exploding.closed is False  # it refused; nothing we can do
+    assert second.closed is True, "one bad stray must not stop the reaping"
+
+
+def test_no_conversation_means_no_reaping(fake_playwright):
+    """`doctor` and the smoke test pick their page by bare substring, so
+    'duplicates of whatever we landed on' is the ambiguous case, not a provable
+    orphan. Costs no coverage: the next loop `connect` passes a conversation
+    and reaps anything doctor orphaned on it."""
+    context = FakeContext((WANTED, WANTED))
+    bound, other = context.pages
+
+    original = FakeChromium.connect_over_cdp
+
+    def with_pages(self, url):
+        self._driver.connects += 1
+        browser = FakeBrowser(self._driver)
+        browser.contexts = [context]
+        return browser
+
+    FakeChromium.connect_over_cdp = with_pages
+    try:
+        session = ps.PlaywrightSession.connect("http://cdp")
+    finally:
+        FakeChromium.connect_over_cdp = original
+
+    assert session._page is bound
+    assert other.closed is False
+
+
+def test_opening_our_own_tab_reaps_nothing(fake_playwright):
+    """Nothing matched the conversation — by construction there is no
+    duplicate to reap, and the stray we declined to adopt stays open."""
+    context = FakeContext((STRAY,))
+    (stray,) = context.pages
+
+    session = _connect_with_pages(context)
+
+    assert session._opened_page is True
+    assert session._page.url == "about:blank"
+    assert stray.closed is False

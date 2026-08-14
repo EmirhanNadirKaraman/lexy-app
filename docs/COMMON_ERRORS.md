@@ -861,8 +861,16 @@ Chrome sitting on a third chat while the config named another.
 and binds to THAT tab, comparing host+path so a query string or trailing slash
 does not defeat the match. With no match it opens its own tab rather than
 adopting a stranger's (a new tab in that profile is logged in identically, and
-the caller navigates to the conversation anyway), and closes only tabs it
-opened — closing one the operator opened would be the mirror of this bug.
+the caller navigates to the conversation anyway). It closes two things and no
+others: a tab it opened itself (in `close()`), and — since 2026-08-06 — any
+OTHER tab already sitting on the conversation it just bound to, reaped at
+connect time. That second case exists because `close()` has to RUN and does not
+on an abrupt exit (pause-and-exit, kill, crash, `doctor`, any ad-hoc probe), so
+duplicates accumulated in the profile until Chrome was restarted (observed
+2026-08-04). A tab on a DIFFERENT chat is still never touched — it may be the
+operator reading a past conversation, and closing that would be the mirror of
+this bug. Safe only because `~/.autoloop-chrome` is dedicated; never point the
+reaper at a human's main browser.
 **Diagnosing it:** list the profile's pages and compare against the config —
 `curl -s localhost:9222/json | python3 -c "…"` versus
 `grep ^conversation_url .autoloop/config.toml`. If they differ, this is it.
