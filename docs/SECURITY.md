@@ -39,6 +39,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S22 | INFO | `commit_adopted` is sound but has no production call site (tracked, not a vulnerability) | `autoloop/git_gateway.py`, `autoloop/manifest.py` |
 | S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
+| S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py` |
 
 ---
 
@@ -331,6 +332,69 @@ distinguishes "the operator's tab" from "a local process". Do NOT fix it by
 validating paths inside `dashboard.py`: a second rule set would drift from
 `add_many`, which is the failure S25 closed. Binding anything other than
 `127.0.0.1` must stay out of the question.
+
+### S29 — `merge` is on the git whitelist, and the loop now pushes the BASE branch — LOW — OPEN (deliberate, gated, accepted)
+
+**What:** auto-merge (`autoloop/auto_merge.py`, 2026-08-14) needed two things
+that did not exist before, and both widen surface that S21/S22/F2/F5 spent
+effort narrowing. Recorded here rather than left to a reviewer to find in the
+diff.
+
+1. **`merge` joined `_ALLOWED_GIT`.** It is the first subcommand there that
+   moves the CHECKOUT's own branch head. Everything else either reads, writes
+   into a worker's separate worktree, or publishes an already-resolved sha by
+   refspec. The whitelist's stated hard rule — reset/clean/rebase/checkout are
+   simply absent — is unchanged; `merge` is not a history rewrite (it only
+   adds a commit whose parents include the previous head), and it is verified
+   to be one afterwards.
+2. **`push_exact` now publishes the base branch**, not only a task side
+   branch. That is a new destination class for the loop.
+
+What bounds it, stated rather than assumed:
+- **Shape-checked like `push` and `fetch` (F2).** `validate_git_command`
+  admits exactly two forms: `merge --abort` with **no other token**, and
+  `merge [--no-ff] [--no-edit] [-m <msg>] <40-hex>`. A branch name, `HEAD`, a
+  tag or a second commit is refused before any subprocess runs — a branch can
+  move between the merge-window check and the merge.
+- **Off by default.** `policy.auto_merge_enabled = False`, and it is the only
+  setting that moves the shared branch head with no operator in the loop.
+- **Only reviewed, already-published objects.** The merged sha comes from a
+  `TaskExecution.candidate_sha` whose task is COMPLETED, re-confirmed against
+  the remote by `ls-remote` (`cli._candidate_publication`) at merge time, not
+  merely at completion time.
+- **The base push obeys the existing gate.** `gateway_protected` is computed
+  exactly as `_dispatch_task_push` computes it, so a base in
+  `protected_branches` is refused unless `allow_protected_push` is set.
+  Enabling auto-merge is not permission to push `main`.
+- **No new undo primitive.** `reset` was NOT added. A merge that fails
+  verification stops and reports; it is never unwound by the loop.
+- **Verified, not assumed.** After the merge: head moved, head contains the
+  candidate, head still contains the previous head, tree clean — then, and
+  only then, `push_exact`, whose own confirmation is a fresh `ls-remote`.
+
+**file:line** — `autoloop/policy.py` (`_ALLOWED_GIT["merge"]` and the
+`sub == "merge"` shape check in `validate_git_command`);
+`autoloop/git_gateway.py` `merge_commit` / `merge_abort` / `conflicted_paths`;
+`autoloop/auto_merge.py` `AutoMerger._merge` / `_verify_merge` / `_push`.
+**Severity:** LOW — the merge target is a literal, already-reviewed,
+already-published commit id; the feature is off by default; and no
+history-rewriting subcommand became reachable.
+**Verification check:**
+```bash
+# Expect: only the two legal merge shapes; a branch name is refused
+rg -n 'git_merge_commit|git_merge_abort_shape' autoloop/policy.py
+# Expect: still absent from the whitelist — no undo primitive was added
+rg -n '"(reset|clean|rebase|checkout|filter-branch)":' autoloop/policy.py
+# Expect: false — the flag must stay opt-in
+rg -n 'auto_merge_enabled: bool' autoloop/policy.py
+# Expect: the protected-ref computation is the same one _dispatch_task_push uses
+rg -n 'allow_protected_push' autoloop/auto_merge.py autoloop/orchestrator.py
+```
+**Suggested fix:** none — the exposure is the feature. If it ever needs
+narrowing, the cheapest lever is refusing the merge outright when any commit
+hook is active (`active_commit_hooks`), mirroring `push_exact`'s push-hook
+refusal; today a `post-merge` hook is caught after the fact by the dirty-tree
+check rather than refused before it.
 
 ### S25 — Circular task-scope authorization, failed-round residue, and unbounded pre-commit retries — HIGH — RESOLVED 2026-07-31
 
@@ -855,6 +919,8 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-08-14** — **`merge` joined the git whitelist and the loop can now push the BASE branch (new finding S29, LOW, deliberate).** Auto-merge (`autoloop/auto_merge.py`) closes the gap between publication and integration: B10 retires a task once its candidate is confirmed on its own side branch, and on 2026-08-06 seven completed tasks sat unmerged, including fixes for failures the loop was still hitting. Two widenings, recorded rather than absorbed. (1) `merge` is the FIRST subcommand on `_ALLOWED_GIT` that moves the checkout's own branch head — it is not a history rewrite, and it carries an F2-style shape check admitting exactly two forms: `merge --abort` with no other token, and a merge of a literal 40-hex commit id (a branch name can move between the merge-window check and the merge). (2) `push_exact` now publishes the base branch, a new destination class, gated by the same `protected_branches` / `allow_protected_push` computation `_dispatch_task_push` uses — so a `main` base merges locally and refuses to publish unless that flag is set. What did NOT change: `reset`/`clean`/`rebase`/`checkout` are still absent, so a merge that fails verification is reported and never unwound; the merged object is a COMPLETED task's candidate re-confirmed on the remote by `ls-remote` at merge time, not merely at completion time; the merge-window predicate is `cli._merge_window_blockers` **called**, not a second copy (a drifted copy is how thirteen tasks get parked at once); and the whole feature is off by default (`policy.auto_merge_enabled = False`). A merge exit of 0 is not treated as evidence — head moved, head contains the candidate, head still contains the old head, tree clean, then push. Verification check: `rg -n 'git_merge_commit|git_merge_abort_shape' autoloop/policy.py` and `python3 -c "from autoloop.policy import PolicyConfig; print(PolicyConfig().auto_merge_enabled)"` prints `False`.
 
 - **2026-08-05** — **Review-packet diff cap raised 8,000 → 30,000 characters (widens what a reviewer sees; the 2026-08-04 residual risk narrows).** The report-first change capped included patch text at 8,000 to avoid the 40,056-character message ChatGPT could not process. That number was a same-day guess with nothing between it and the failure tested, and it blocked rt-02 at 8,971 characters — a 12-insertion/87-deletion change — causing the reviewer to escalate to the operator rather than approve an omitted diff. The cap counts PATCH BYTES, not reviewability, which is what made 8,000 feel defensible while being ~5× tighter than the evidence warranted. 30,000 keeps a ~25% margin below the only measured failure. **This REDUCES the residual risk recorded on 2026-08-04** (a reviewer approving a large change without the patch in front of them): the omission threshold now bites far less often. Everything else is unchanged — an oversized diff is still OMITTED rather than truncated, the changed-path list and diff stat are still complete and git-read, and the executor's report is still labelled as claimed. Verification check: `python3 -c "from autoloop.packet import DIFF_INCLUDE_MAX_CHARS as c; print(c)"` prints 30000, and `test_the_cap_is_sized_from_evidence_not_instinct` fails if the value moves outside its measured bounds.
 

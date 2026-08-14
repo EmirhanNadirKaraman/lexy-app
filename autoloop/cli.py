@@ -1716,9 +1716,17 @@ def _window_git(config) -> GitGateway:
     return GitGateway(Path.cwd(), PolicyEngine(config.policy))
 
 
-def _candidate_publication(config, record, seen=None) -> tuple[bool, str]:
+def _candidate_publication(config, record, seen=None, git=None) -> tuple[bool, str]:
     """Has this record's reviewed candidate already landed on its own remote
     branch? Returns `(published, why_not)`.
+
+    `git`, when supplied, is the gateway to ask instead of building one from
+    `_window_git`. It exists for `auto_merge.py`, which runs INSIDE the
+    orchestrator and already holds a gateway rooted at the real checkout —
+    `_window_git` builds against `Path.cwd()`, which is the operator's shell
+    for the `merge-window` command and something else entirely for a loop
+    process. Left as `None` by the CLI so `merge-window`'s own tests keep
+    monkeypatching `_window_git` exactly as before.
 
     Fail-closed by construction: ONLY an `ls-remote` that comes back equal to
     `candidate_sha` counts as published. The record's own `intended_remote_ref`
@@ -1750,8 +1758,9 @@ def _candidate_publication(config, record, seen=None) -> tuple[bool, str]:
     key = (remote, dest_ref, candidate)
     if seen is not None and key in seen:
         return True, ""
+    gateway = git if git is not None else _window_git(config)
     try:
-        landed = _window_git(config).remote_ref_sha(remote, dest_ref)
+        landed = gateway.remote_ref_sha(remote, dest_ref)
     except (GitError, OSError) as exc:
         return False, f"could not verify {remote}/{dest_ref} ({exc})"
     if not landed:
@@ -1763,10 +1772,15 @@ def _candidate_publication(config, record, seen=None) -> tuple[bool, str]:
     return True, ""
 
 
-def _merge_window_blockers(config, seen=None) -> tuple[list[str], list[str]]:
+def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list[str]]:
     """Why merging into the loop's base is unsafe right now, plus advisory
     notes about work that is safe but not yet reconciled. `([], notes)` means
     the window is open.
+
+    THE single predicate for "may the branch head move". `auto_merge.py` calls
+    this rather than re-deriving the same conditions: a second implementation
+    that drifted by one case is how thirteen tasks get parked at once. See
+    `_candidate_publication` for what `git` is for.
 
     An execution record with a candidate is the REAL hazard, and the one a
     phase check misses. It pins `task_base_sha`; moving the branch head under
@@ -1832,7 +1846,7 @@ def _merge_window_blockers(config, seen=None) -> tuple[list[str], list[str]]:
                 continue
         if not record.get("candidate_sha"):
             continue
-        published, why_not = _candidate_publication(config, record, seen)
+        published, why_not = _candidate_publication(config, record, seen, git)
         if published:
             notes.append(
                 f"task {task_id}: candidate {str(record.get('candidate_sha'))[:12]} is "

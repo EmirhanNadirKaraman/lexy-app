@@ -117,6 +117,7 @@ from urllib.parse import urlsplit
 
 from . import environment
 from . import escape_detector
+from .auto_merge import AutoMerger
 from .blockers import NO_TASK, BlockerStore
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
@@ -3044,6 +3045,60 @@ class Orchestrator:
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
+        # AFTER the state save, deliberately. `cli._merge_window_blockers`
+        # reads the phase from `state.json` on DISK, and the last thing
+        # written there before this point was `phase=executing` (set in
+        # `_await_response`). Calling the gate any earlier in this method
+        # would see that stale value, report "a phase is executing", and defer
+        # every single merge forever — a feature that logs busily and never
+        # integrates anything. The registry write in `_mark_task_completed`
+        # above matters for the same reason: it is what makes the gate exempt
+        # the record we just published instead of treating it as a hazard.
+        self._auto_merge_after_completion(binding.task_id)
+
+    def _auto_merge_after_completion(self, task_id: str) -> None:
+        """Merge this task's published branch into the base and push it
+        (`auto_merge.py`), when `policy.auto_merge_enabled` is on.
+
+        Publication is not integration: B10 retires a task once its candidate
+        is durable on its own side branch, and before this call existed that
+        was where the work stopped. On 2026-08-06 seven completed tasks were
+        unmerged at once, including fixes for failures the loop was still
+        hitting.
+
+        Wrapped in the same "never undo a successful push" discipline as
+        `_mark_task_completed`: the push already landed and the task is
+        already completed, so an integration problem is logged, never parked.
+        `AutoMerger` guards each task individually too; this outer guard
+        covers the construction itself.
+
+        The AUDIT pseudo-task reaches here as well, since `_dispatch_task_push`
+        does not distinguish it. Its unit id is only sometimes in the registry
+        (`cli` registers synthetic `audit-NNNN` units so `block` can quarantine
+        them), so the outcome is one of two, both correct: unregistered → the
+        merger's registry check skips it; registered and completed by
+        `_mark_task_completed` → its Markdown report is integrated like any
+        other completed task's work, which is what an operator would do by
+        hand anyway.
+        """
+        if not self._policy.config.auto_merge_enabled:
+            return
+        if self._execution_store is None:
+            return
+        try:
+            AutoMerger(
+                config=self._config,
+                git=self._git,
+                policy=self._policy,
+                execution_store=self._execution_store,
+                registry=self._registry,
+                log=self._log,
+            ).after_completion(task_id)
+        except Exception as exc:      # noqa: BLE001 - bookkeeping must not undo a push
+            self._log(
+                "auto_merge_error",
+                data={"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"},
+            )
 
     def _mark_task_completed(self, task_id: str) -> None:
         """Retire a task whose reviewed candidate has actually landed on its

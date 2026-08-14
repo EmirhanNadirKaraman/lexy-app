@@ -51,6 +51,22 @@ allow_push = true
 # trust the loop; the safe default stays on.
 protected_branches = ["main", "master"]
 allow_protected_push = false
+# Merge a completed task's published side branch into the base and push the
+# base, immediately after the task is retired. OFF by default: it is the only
+# setting that moves the shared branch head with no operator in the loop.
+#
+# It is gated on exactly the same predicate `python -m autoloop merge-window`
+# reports — no unpublished candidate bound to the current base, no executing
+# phase — because moving the head strands any task whose reviewed candidate is
+# pinned to it. When the gate is shut the merge is DEFERRED (recorded under
+# <state_dir>/merge-deferrals/ and retried after the next completion), never
+# forced and never parked. Conflicts abort cleanly and name the files.
+#
+# If your base branch is in protected_branches above, the merge still happens
+# locally but the push is refused until allow_protected_push = true. That
+# pairing is deliberate: turning this on is not by itself permission to push
+# `main`.
+auto_merge_enabled = false
 # Note: force pushes and destructive git commands (reset/clean/rebase/...)
 # cannot be enabled by ANY setting — the git whitelist has no knob for them.
 

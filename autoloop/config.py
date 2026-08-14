@@ -271,6 +271,19 @@ class AutoloopConfig:
         return self.state_dir / "blockers"
 
     @property
+    def merge_deferrals_dir(self) -> Path:
+        """Auto-merge's own retry queue (`auto_merge.MergeDeferralStore`) —
+        one record per task whose completed, published candidate could not be
+        integrated yet because the merge window was shut, the remote base had
+        moved, or the checkout was dirty.
+
+        Durable for the same reason `blockers_dir` is: a deferral that lived
+        only in `state.json` would be discarded by the next `task_fatal` park
+        or `reset`, and the work would go back to being invisible — which is
+        the whole failure auto-merge exists to close."""
+        return self.state_dir / "merge-deferrals"
+
+    @property
     def seed_tasks_file(self) -> Path:
         """Git-tracked seed file (`autoloop/seed_tasks.json`, alongside this
         module) — NOT under `state_dir`. `cli.py`'s `next-task` command loads

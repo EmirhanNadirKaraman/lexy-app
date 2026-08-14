@@ -201,6 +201,64 @@ is dispatched is what trips it (§3e).
 
 ---
 
+### 3f-bis. `policy.auto_merge_enabled` — publication is not integration
+
+```toml
+[policy]
+auto_merge_enabled = false     # the default
+```
+
+B10 retires a task the moment its candidate is confirmed on its own side
+branch. That is publication, and until this flag existed it was also the end
+of the road: the operator merged every branch by hand. On **2026-08-06 seven
+completed tasks were unmerged at once**, among them the tab reaper and the
+Python restart module — fixes for failures the loop was still hitting while
+their code sat on branches nobody had pulled.
+
+With the flag on, `auto_merge.py` runs immediately after a completion
+(`orchestrator._auto_merge_after_completion`, the last statement of
+`_dispatch_task_push`): it merges the candidate into the branch the loop
+builds against and **pushes that branch**. An unpushed merge is the same
+invisibility one level down.
+
+It is gated on the predicate above — `cli._merge_window_blockers`, *called*,
+not reimplemented, because a second copy that drifted by one case is how
+thirteen tasks get stranded at once (which is how many held unpublished
+candidates on 2026-08-06). What happens at each outcome:
+
+| Situation | What happens | Transcript entry |
+|---|---|---|
+| Window open, clean merge | merged + base pushed | `auto_merge_pushed` |
+| Window shut / base moved / dirty checkout | **deferred**, retried after the next completion | `auto_merge_deferred` |
+| Conflict | `merge --abort`, base byte-identical, conflicting files named | `auto_merge_conflict` |
+| Merged but the base push was refused | deferral kept; a retry re-pushes | `auto_merge_push_refused` |
+| HEAD did not move / lost the old base / dirty after merge | nothing pushed | `auto_merge_failed` |
+
+Nothing here ever parks. By the time it runs the push has already landed and
+the task is already completed, so an integration problem is logged and left
+for the next pass — turning it into a park would stop a working loop over a
+step that can simply happen later. **A deferred merge is a normal state.**
+Deferrals live in `<state_dir>/merge-deferrals/`, one file per task, and
+survive a `reset` for the same reason blockers do.
+
+A merge command returning 0 is not evidence: after the merge the head must
+have moved, must contain the candidate, must still contain the previous base,
+and the tree must be clean, before anything is pushed. The remote base is
+checked for divergence *before* the merge rather than left to the push failing
+afterwards — a local merge onto a base the remote is already ahead of has to
+be unwound by hand, and the git whitelist has no `reset`.
+
+Two things it deliberately does not do:
+
+* **Protected bases.** If the base is in `protected_branches`, the merge
+  happens locally and the push is refused until `allow_protected_push = true`.
+  Enabling auto-merge is not by itself permission to push `main`.
+* **The pre-existing backlog.** Branches published before this mechanism
+  existed are not swept. That is separate work; this module only reacts to
+  completions it sees.
+
+---
+
 ### 3e. Heartbeat + the durable monitor
 
 ```bash
