@@ -42,6 +42,12 @@ max_conversation_rotations = 1
 # the useful move is primary -> fallback, and switching back would need a quota
 # window to have reset, which does not happen inside a single run.
 max_provider_switches = 1
+# How many consecutive browser failures may go unrecovered because
+# browser.restart_cooldown_seconds refused their restart. Those failures do NOT
+# spend max_consecutive_failures above — a restart that never ran is no evidence
+# that restarting fails — so this is what stops them retrying forever. Reaching
+# it parks with a question naming the cooldown, rather than failing silently.
+max_browser_restart_skips = 5
 max_parse_retries = 2
 max_policy_denials = 3
 allow_commit = true

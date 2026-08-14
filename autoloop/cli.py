@@ -555,6 +555,11 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
         state.resume_phase = None
         state.question = None
         state.consecutive_failures = 0
+        # Both fault counts, for the same reason: the operator has intervened
+        # (a `browser_restart_cooldown_blocked` park is resumed exactly here,
+        # after restarting the browser by hand), so neither budget should
+        # arrive already spent.
+        state.browser_restart_skips = 0
         store.save(state)
     elif Phase(state.phase) in (Phase.NEEDS_USER, Phase.FAILED, Phase.STOPPED):
         print(_summary(config, state, registry))

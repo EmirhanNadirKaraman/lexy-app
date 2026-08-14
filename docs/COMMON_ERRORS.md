@@ -164,6 +164,33 @@ AFTER=$(ps -eo pid,command | grep -- "--user-data-dir=$HOME/.autoloop-chrome" \
 [ "$BEFORE" != "$AFTER" ] && echo "PASS: browser actually restarted"
 ```
 
+### Autoloop session ends `failed` with zero blockers, transcript full of `browser_restart_skipped`
+**Symptom:** the loop stops with `phase: failed`, `python -m autoloop blockers`
+lists nothing, and the only clue is in the transcript: a run of `browser_error`
+entries, each immediately followed by
+`browser_restart_skipped {"reason": "within cooldown"}`. Chrome was never
+restarted, yet the run died of "more than 3 consecutive browser failures".
+**Cause (observed 2026-08-04, fixed 2026-08-14):** the two browser guards
+cancelled each other. `browser.restart_cooldown_seconds` (120s) refused each
+restart, while every refused failure still spent
+`policy.max_consecutive_failures` (3). The budget ran out before the cooldown
+did, so the one action that would have fixed the hang was never attempted and
+the terminal state recorded no reason for it — `_handle_browser_failure` writes
+`stop_reason` and `phase=failed` directly, and only a `needs_user` park creates
+a `Blocker`.
+**Fix (already in the code — this entry is for reading an OLD transcript):** a
+failure whose restart was skipped for the cooldown no longer touches
+`consecutive_failures`; it is counted against `policy.max_browser_restart_skips`
+instead, and exhausting THAT parks `needs_user` with
+`code="browser_restart_cooldown_blocked"`, naming the cooldown. If you see the
+old shape, the session predates the fix; if you see the new park, restart Chrome
+by hand and `run --retry` (see `docs/AUTOLOOP.md` §5c, §10).
+**Related trap:** a restart that reports success while restarting nothing looks
+almost identical in the transcript — `browser_restarted returncode 0` followed
+immediately by the same `browser_error`. That is the entry above, and it is a
+different bug: there the restart ran and lied, here it never ran at all. Read
+which of the two events sits between the failures.
+
 ### `ImportError: cannot import name 'markcoroutinefunction'` from a partially initialized `inspect`
 **Symptom:** A throwaway script that only does `import asyncio, asyncpg` dies with
 a traceback that ends inside `asyncpg/compat.py`:

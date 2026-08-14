@@ -79,8 +79,15 @@ Failure routing:
 * ResponseTimeoutError(start)  → ordinary budget as below, PLUS: 3rd
                                  consecutive one for the same request may
                                  rotate (see "silent conversation" above)
-* other BrowserError           → drop conversation, retry same phase; failure
-                                 budget exhausted → failed (resume via --retry)
+* other BrowserError           → drop conversation, try a browser restart,
+                                 retry same phase; failure budget exhausted →
+                                 failed (resume via --retry). EXCEPT when the
+                                 restart was skipped for
+                                 `browser.restart_cooldown_seconds`: that
+                                 failure was never acted on, so it is charged
+                                 to `policy.max_browser_restart_skips` instead
+                                 and ends in a needs_user park naming the
+                                 cooldown (`browser_restart_cooldown_blocked`)
 * GitError                     → reported back to ChatGPT (budget-capped);
                                  in `ready` (context build) → needs_user with
                                  the outbox preserved
@@ -239,6 +246,17 @@ CONTINUATION_NOTE = (
 #: needs 180s failed three rotations that had actually succeeded.
 ROTATION_URL_TIMEOUT_SECONDS = 30.0
 ROTATION_URL_POLL_SECONDS = 0.5
+
+
+#: The four outcomes of `Orchestrator._browser_restart_outcome`. They are
+#: distinguished — rather than collapsed into "did the browser come back" —
+#: because `RESTART_SKIPPED_COOLDOWN` is the one case where recovery was never
+#: ATTEMPTED, and a failure nobody tried to recover from must not be charged to
+#: the budget that decides recovery is hopeless. See `_handle_browser_failure`.
+RESTART_OK = "restarted"
+RESTART_FAILED = "failed"
+RESTART_SKIPPED_COOLDOWN = "skipped_cooldown"
+RESTART_DISABLED = "disabled"
 
 
 class Orchestrator:
@@ -3750,8 +3768,33 @@ class Orchestrator:
         self._store.save(state)
 
     def _attempt_browser_restart(self) -> bool:
+        """True when a restart actually ran and reported success.
+
+        Thin wrapper over `_browser_restart_outcome` for callers that only
+        need "did the browser come back" — everything that must also know WHY
+        it did not (the cooldown case is not the same fault as a failed or
+        unconfigured restart) reads the outcome directly.
+        """
+        return self._browser_restart_outcome() == RESTART_OK
+
+    def _browser_restart_outcome(self) -> str:
         """Restart the browser via the operator-declared command, at most once
-        per cooldown. Returns True when a restart actually ran.
+        per cooldown. Returns which of four things happened:
+
+        * `RESTART_OK` — the command ran and reported success.
+        * `RESTART_FAILED` — the command ran and reported failure, or could
+          not be run at all.
+        * `RESTART_SKIPPED_COOLDOWN` — a restart was due and was refused
+          because `browser.restart_cooldown_seconds` had not elapsed since
+          the last one. THE ONLY outcome meaning recovery was never
+          attempted, and the reason this reports an outcome rather than a
+          bool at all: see `_handle_browser_failure`.
+        * `RESTART_DISABLED` — no `restart_command` is configured (the
+          default). Deliberately NOT folded into the skip above: with no
+          command there is nothing to try later either, so those failures
+          keep spending the ordinary failure budget exactly as they always
+          have — otherwise the budget would be unreachable for every
+          deployment that has not configured a restart command.
 
         Declared rather than inferred: the loop knows a `cdp_url`, not which
         Chrome owns it, and pattern-matching process lists to decide what to
@@ -3765,14 +3808,14 @@ class Orchestrator:
         """
         command = self._config.browser.restart_command
         if not command:
-            return False
+            return RESTART_DISABLED
         now = time.monotonic()
         cooldown = self._config.browser.restart_cooldown_seconds
         if self._last_browser_restart is not None and (
             now - self._last_browser_restart
         ) < cooldown:
             self._log("browser_restart_skipped", data={"reason": "within cooldown"})
-            return False
+            return RESTART_SKIPPED_COOLDOWN
         self._last_browser_restart = now
         try:
             proc = subprocess.run(
@@ -3780,7 +3823,7 @@ class Orchestrator:
             )
         except (OSError, subprocess.SubprocessError) as restart_exc:
             self._log("browser_restart_failed", data={"error": str(restart_exc)})
-            return False
+            return RESTART_FAILED
         ok = proc.returncode == 0
         self._log(
             "browser_restarted" if ok else "browser_restart_failed",
@@ -3789,7 +3832,7 @@ class Orchestrator:
                 "output": (proc.stdout or proc.stderr or "").strip()[-400:],
             },
         )
-        return ok
+        return RESTART_OK if ok else RESTART_FAILED
 
     def _handle_browser_failure(self, phase: Phase, exc: BrowserError) -> None:
         state = self.state
@@ -3797,10 +3840,68 @@ class Orchestrator:
         # the fault this recovers from, so spending the budget on it means three
         # stalls end the run even when every one was recoverable — which is what
         # happened three times in one session before this existed. A restart
-        # that actually runs makes this attempt free; one that is skipped or
-        # fails counts exactly as before.
+        # that actually runs makes this attempt free; one that RAN and failed,
+        # or that does not exist because no `restart_command` is configured,
+        # spends the budget exactly as before. The third case — a restart the
+        # cooldown refused — is neither, and is handled on its own below.
         self._drop_client()
-        if self._attempt_browser_restart():
+        outcome = self._browser_restart_outcome()
+        if outcome == RESTART_SKIPPED_COOLDOWN:
+            # The one action that could have fixed this was refused because
+            # the cooldown was still running — so nothing was tried, and an
+            # untried recovery is no evidence that recovery does not work.
+            # Charging these to the failure budget ended a session on
+            # 2026-08-04: four consecutive failures each logged
+            # `browser_restart_skipped`, the budget ran out before the
+            # cooldown did, and the loop reached `failed` having never once
+            # restarted Chrome. They are charged to their own bounded budget
+            # instead (`policy.max_browser_restart_skips`), which ends in a
+            # park that NAMES the cooldown rather than a terminal phase with
+            # no blocker record. Both guards are still wanted; only their
+            # interaction was wrong.
+            state.browser_restart_skips += 1
+            self._log(
+                "browser_error",
+                data={"phase": phase.value, "error": str(exc),
+                      "kind": type(exc).__name__,
+                      "recovered": "restart_skipped_cooldown",
+                      "restart_skips": state.browser_restart_skips},
+            )
+            skip_verdict = self._policy.check_browser_restart_skip_budget(
+                state.browser_restart_skips
+            )
+            if skip_verdict.allowed:
+                # Phase unchanged — the loop re-enters it with a fresh client,
+                # and once the cooldown elapses the next failure gets a real
+                # restart attempt, which is the whole point of not dying here.
+                self._store.save(state)
+                return
+            cooldown = self._config.browser.restart_cooldown_seconds
+            self._to_needs_user(
+                f"{skip_verdict.reason}: each of the last "
+                f"{state.browser_restart_skips} browser failures was left "
+                "unrecovered because browser.restart_cooldown_seconds "
+                f"({cooldown:g}s) had not elapsed since the previous restart, "
+                "so no restart was attempted for any of them. Restart the "
+                "browser by hand (scripts/restart_autoloop_chrome.sh), or "
+                "lower browser.restart_cooldown_seconds, then resume. "
+                f"Last error: {exc}",
+                resume_phase=phase.value,
+                kind="loop_fatal",
+                code="browser_restart_cooldown_blocked",
+                detail=(
+                    f"phase={phase.value} kind={type(exc).__name__} "
+                    f"cooldown_seconds={cooldown} "
+                    f"restart_skips={state.browser_restart_skips}"
+                ),
+            )
+            return
+        # A restart command that actually RAN — whether it succeeded or not —
+        # settles the question the skip counter was holding open, so it starts
+        # over. `RESTART_DISABLED` cannot leave it nonzero (reaching the skip
+        # branch requires a configured command), so this is a no-op there.
+        state.browser_restart_skips = 0
+        if outcome == RESTART_OK:
             self._log(
                 "browser_error",
                 data={"phase": phase.value, "error": str(exc),

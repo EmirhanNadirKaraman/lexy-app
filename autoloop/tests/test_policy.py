@@ -198,6 +198,19 @@ def test_failure_budget():
     assert not eng.check_failure_budget(3).allowed
 
 
+def test_browser_restart_skip_budget_is_separate_from_the_failure_budget():
+    """Failures the restart cooldown refused are counted here instead of on
+    `check_failure_budget` — one is "recovery does not work", the other is
+    "recovery was never tried"."""
+    eng = engine(max_consecutive_failures=3, max_browser_restart_skips=2)
+    assert eng.check_browser_restart_skip_budget(2).allowed
+    verdict = eng.check_browser_restart_skip_budget(3)
+    assert not verdict.allowed and verdict.code == "browser_restart_skip_budget"
+    assert "cooldown" in verdict.reason
+    # Spending one never spends the other.
+    assert eng.check_failure_budget(3).allowed
+
+
 def test_parse_budget():
     eng = engine(max_parse_retries=1)
     assert eng.check_parse_budget(1).allowed
