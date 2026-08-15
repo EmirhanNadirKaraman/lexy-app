@@ -1078,6 +1078,10 @@ def test_the_packet_names_every_out_of_scope_path(tmp_path):
     assert "! cli.py" in payload
     assert "! feature.py" not in payload, "an in-scope path must not be flagged"
     assert "Declared scope: " in payload, "unjudgeable without what the scope WAS"
+    # The section must read as a finding to JUDGE, not as a failure that already
+    # stopped something — the commit is sitting there awaiting a verdict.
+    assert "ADVISORY" in payload
+    assert "did NOT stop the commit" in payload
 
 
 def test_the_out_of_scope_paths_come_from_git_not_from_the_record(tmp_path):
@@ -1117,19 +1121,44 @@ def test_the_out_of_scope_paths_come_from_git_not_from_the_record(tmp_path):
     assert "lexy-app/main.py" not in text
 
 
-def test_a_round_inside_its_scope_says_so_rather_than_going_silent(tmp_path):
-    """Rendered unconditionally. If the section only appeared when something
-    was wrong, its ABSENCE would be the signal — and an absent section is
-    indistinguishable from one that was never built, dropped in a refactor, or
-    lost with an omitted diff."""
+def test_a_round_inside_its_scope_carries_no_section_at_all(tmp_path):
+    """The section is a FINDING, not a standing field: a clean round must not
+    carry it, not even as an empty one.
+
+    Reversed 2026-08-15 from the first cut, which rendered an unconditional
+    `Out-of-scope paths (0): (none …)`. A section present in every packet and
+    empty in nearly all of them is one a reviewer learns to skim — trained by
+    the clean packets, so the control would read weakest on the rare packet
+    that finally had something to say.
+
+    That trade gives up "absence is indistinguishable from a section dropped in
+    a refactor", which was the earlier reasoning and is a real objection. It is
+    answered by `test_the_packet_names_every_out_of_scope_path` rather than by
+    the packet: that test fails the moment a REAL overrun renders nothing, which
+    is the mutation the `(none)` line was standing in for. A regression is
+    caught by a test that fails, not by a line a human might notice missing.
+
+    Asserted in both directions on purpose. `"OUT-OF-SCOPE PATHS" not in
+    payload` alone would also pass against a packet that never rendered, so the
+    header and the in-scope path are pinned too: the section is absent FROM A
+    REAL PACKET.
+    """
     executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
     orch, _root, _wt, _store, _intent, task = build_postcommit(tmp_path, executor)
     orch._dispatch_executor(implement(task.id))
     orch._step_ready()
 
     payload = orch.state.pending_request.payload
-    assert "Out-of-scope paths (0):" in payload
-    assert "(none — every changed path is inside the task's declared scope)" in payload
+    assert "POST-COMMIT REVIEW PACKET" in payload, "the round reached review"
+    assert "feature.py" in payload, "the in-scope path is still reported as changed"
+    assert "OUT-OF-SCOPE PATHS" not in payload
+    assert "Out-of-scope paths" not in payload, "not even an empty/(none) variant"
+    assert "Declared scope:" not in payload, "the section's tail must go with it"
+    # The sections it sat between must still read as one packet — no gap left
+    # behind. Scoped to that span rather than asserted over the whole payload,
+    # because a diff or an executor report may legitimately contain blank runs.
+    between = payload[payload.index("Changed paths (") : payload.index("Diff stat:")]
+    assert "\n\n\n" not in between, "removing the section must not leave a double blank"
 
 
 def test_the_out_of_scope_section_survives_an_omitted_diff(tmp_path):
