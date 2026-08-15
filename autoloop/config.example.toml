@@ -37,6 +37,27 @@ max_consecutive_failures = 3
 # browser.project_url. A second rotation in one run usually means the fault is
 # not the chat, so the default stops and asks instead of fanning out chats.
 max_conversation_rotations = 1
+# How many autoloop messages one conversation may hold before the loop RETIRES
+# it — closes it deliberately and continues in a fresh chat in
+# browser.project_url. This is DEGRADATION, not breakage: the thread still
+# works, it has just grown slow to compose in. 0 disables it entirely.
+#
+# Evidence for the default, so whoever retunes it has what we had: on
+# 2026-08-15 a working conversation reached 90+ request packets, by which point
+# composer_timeout_seconds had already been conceded 30 -> 180 and a single
+# element-read timeout cascaded into two Chrome restarts in four minutes with
+# no request ever sent. Moving to a fresh chat in the same project submitted in
+# 54s and answered in 15s. Counted as MESSAGES (a chunked delivery's parts each
+# count) because it is messages the composer slows down over.
+max_conversation_packets = 80
+# How many times ONE run may retire a conversation for size. Deliberately its
+# own budget: max_conversation_rotations is the emergency allowance for a chat
+# that is BROKEN, and a planned retirement must not spend it. Two, because a
+# second retirement means the run genuinely sent another
+# max_conversation_packets messages — evidence the move worked, not that it
+# failed. Running out never parks the loop; it keeps working in the slow thread
+# and says so in the transcript.
+max_conversation_retirements = 2
 # How many times ONE run may hand the reviewer role to
 # conversation.fallback_provider after an exhausted allowance. One is enough:
 # the useful move is primary -> fallback, and switching back would need a quota

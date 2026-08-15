@@ -88,6 +88,16 @@ if TYPE_CHECKING:
 # delivery to backfill. The phase is additive — an old state file cannot
 # contain a value that did not exist when it was written, and `Phase(...)`
 # still rejects anything unknown.
+#
+# NOT bumped for conversation retirement either (`LoopState.conversation_packets`
+# / `retirements` / `conversation_round_seconds`, `PendingRequest.submitted_at`).
+# All defaulted, and three of the four defaults ARE the truth: a state file
+# written before this existed performed no retirements, measured no round
+# latencies, and has no recorded send instant for its in-flight request.
+# `conversation_packets = 0` is the honest exception and is documented as one on
+# the field itself — it means "this loop has not counted any messages in this
+# thread yet", which for an adopted or pre-existing thread UNDERSTATES its real
+# size. The consequence is a late retirement, never a spurious one.
 SCHEMA_VERSION = 3
 
 
@@ -141,6 +151,11 @@ class Phase(str, Enum):
 
 
 TERMINAL_PHASES = frozenset({Phase.NEEDS_USER, Phase.STOPPED, Phase.FAILED})
+
+#: How many round latencies `LoopState.conversation_round_seconds` keeps. Small
+#: on purpose: the series is evidence for a transcript line, not a time series
+#: anything computes a trend from, and the state file is rewritten on every save.
+MAX_ROUND_LATENCY_SAMPLES = 5
 
 
 @dataclass
@@ -312,6 +327,13 @@ class PendingRequest:
     #: measured, not merely assumed from configuration. Reset alongside
     #: `start_timeouts`.
     start_timeout_wait_seconds: float = 0.0
+    #: When this request was confirmed present in its conversation
+    #: (`utcnow_iso`), stamped once by `Orchestrator._mark_submitted`. Read
+    #: only to measure one round's send-to-reply latency for the transcript —
+    #: nothing decides anything on it. Wall clock rather than monotonic
+    #: deliberately: it has to survive a process restart mid-round, and a
+    #: measurement that is a few seconds off is still a useful record.
+    submitted_at: str = ""
 
 
 @dataclass
@@ -513,8 +535,50 @@ class LoopState:
     #: `RotationRecord`). Read by the CLI's config-drift guard: after a
     #: rotation the state legitimately points somewhere the config does not
     #: yet, and this record is what distinguishes that from an operator
-    #: editing the config out from under a live session.
+    #: editing the config out from under a live session. A RETIREMENT (below)
+    #: writes this field too, with `reason="conversation_degraded"` — it is the
+    #: same move for the same reader, so the drift guard and `doctor` need no
+    #: second record to look at.
     last_rotation: dict | None = None
+    #: Messages THIS LOOP has confirmed into the CURRENT conversation: one per
+    #: request that reached `awaiting`, plus one per chunked-delivery part.
+    #: Reset to 1 by any completed conversation move (the move's own message is
+    #: the new thread's first packet).
+    #:
+    #: Checked against `PolicyConfig.max_conversation_packets` — the signal for
+    #: retiring a thread that has grown too large to compose in. Deliberately
+    #: NOT read from the DOM: ChatGPT's message list is virtualized (a
+    #: 10-message conversation mounted only its 6 newest nodes — docs/AUTOLOOP.md
+    #: §11), so a rendered count under-reports by an unknown amount, while this
+    #: is exact for everything the loop itself sent.
+    #:
+    #: What it is NOT: a count of everything in the thread. Messages a human
+    #: typed, and everything in a thread adopted mid-life (including one
+    #: carried over from before this field existed), are invisible to it. Such a
+    #: conversation is therefore retired LATER than its true size warrants —
+    #: understating is the safe direction, since the cost of a late retirement
+    #: is slowness and the cost of an early one is an abandoned thread.
+    #:
+    #: Not run-scoped: it describes the conversation, which outlives the
+    #: process, so `cli._reset_run_scoped_budgets` must never zero it (see
+    #: `retirements`, which it must).
+    conversation_packets: int = 0
+    #: Conversation retirements performed THIS RUN, checked against
+    #: `PolicyConfig.max_conversation_retirements` BEFORE each one. Separate
+    #: from `rotations` on purpose: that budget is the emergency allowance for a
+    #: BROKEN chat, and a planned retirement must not consume it. Run-scoped
+    #: exactly like `rotations` — zeroed once per process by
+    #: `cli._reset_run_scoped_budgets`.
+    retirements: int = 0
+    #: Send-to-reply seconds for the last few completed rounds in the CURRENT
+    #: conversation, newest last, bounded to `MAX_ROUND_LATENCY_SAMPLES`.
+    #: EVIDENCE ONLY — recorded so a retirement's transcript entry can say what
+    #: the thread actually cost, and so a future retune of
+    #: `max_conversation_packets` has measurements rather than anecdotes.
+    #: Nothing branches on it: a latency trend is the signal this change
+    #: deliberately did NOT make load-bearing, because the degraded thread that
+    #: motivated it never completed a round to measure.
+    conversation_round_seconds: list[float] = field(default_factory=list)
     #: The conversation provider currently holding the reviewer role. Empty
     #: means "whatever `conversation.provider` says" — the state only starts
     #: carrying a value once something has reason to disagree with the config,

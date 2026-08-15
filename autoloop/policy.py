@@ -84,6 +84,33 @@ class PolicyConfig:
     #: systemic outage would fan out a chat per iteration while looking like it
     #: is making progress.
     max_conversation_rotations: int = 1
+    #: How many autoloop messages one conversation may hold before the loop
+    #: RETIRES it — closes it deliberately and continues in a fresh chat in the
+    #: same project. 0 means never, following `max_review_rounds`'s convention
+    #: above that 0 is "no ceiling".
+    #:
+    #: This is degradation, not breakage, and the two are budgeted separately
+    #: (`max_conversation_retirements` below). Evidence for the default:
+    #: on 2026-08-15 a working conversation reached 90+ request packets, at
+    #: which point ChatGPT rendered its composer so slowly that
+    #: `browser.composer_timeout_seconds` had already been conceded 30 -> 180;
+    #: a single `get_attribute` timeout then cascaded into two Chrome restarts
+    #: in four minutes with no request ever sent. 80 retires the thread before
+    #: it reaches the size that produced that, and the operator's own manual
+    #: recovery (a fresh chat in the same project) submitted in 54s.
+    #:
+    #: Counted as MESSAGES, not rounds: a chunked delivery's parts are
+    #: messages too, and it is messages the composer slows down over.
+    max_conversation_packets: int = 80
+    #: How many times one run may retire a conversation for size. Deliberately
+    #: NOT `max_conversation_rotations`: that cap exists so a BROKEN chat cannot
+    #: be rotated round in circles, and spending an emergency allowance on a
+    #: planned move would leave none for the next real fault. Two rather than
+    #: one, because the argument for the rotation cap ("a second rotation in one
+    #: run usually means the fault is not the chat") does not transfer — a second
+    #: retirement means the run genuinely sent another `max_conversation_packets`
+    #: messages, which is evidence the move worked, not that it failed.
+    max_conversation_retirements: int = 2
     #: Integrate a completed task's published side branch into the base the
     #: loop builds against, and push the base — `auto_merge.py`. OFF by
     #: default, and deliberately so: it is the only setting that moves the
@@ -574,6 +601,40 @@ class PolicyEngine:
                 "rotation_budget",
                 f"conversation rotation budget exhausted "
                 f"({self.config.max_conversation_rotations} per run)",
+            )
+        return Verdict.ok()
+
+    def conversation_is_degraded(self, packets: int) -> bool:
+        """Has the current conversation grown past the size that makes it slow?
+
+        The signal is a COUNT, not a latency trend, and the incident that
+        motivated the reflex is what decides between them: on 2026-08-15 the
+        degraded thread never completed a round at all — two Chrome restarts in
+        four minutes with no request sent — so a submit-to-response latency
+        series would have measured nothing during the exact episode it was
+        meant to catch. A count of messages the loop already put in the thread
+        accumulates whether or not a round ever finishes.
+
+        It also satisfies "must not fire on a single slow round" structurally
+        rather than by an added guard: `max_conversation_packets` messages
+        cannot be one round.
+        """
+        cap = self.config.max_conversation_packets
+        return cap > 0 and packets >= cap
+
+    def check_retirement_budget(self, retirements_used: int) -> Verdict:
+        """May this run retire a conversation that has grown too large?
+
+        `>=` like `check_rotation_budget` — it asks permission before the fact.
+        A refusal here is NOT a park: a degraded conversation still works, and
+        stopping a working loop because it is slow is worse than the slowness.
+        See `Orchestrator._maybe_retire_conversation`.
+        """
+        if retirements_used >= self.config.max_conversation_retirements:
+            return Verdict.deny(
+                "retirement_budget",
+                f"conversation retirement budget exhausted "
+                f"({self.config.max_conversation_retirements} per run)",
             )
         return Verdict.ok()
 

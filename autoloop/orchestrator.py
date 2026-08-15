@@ -64,6 +64,10 @@ Transport-recovery additions (this change):
   A response that already started and is merely slow (`stage="complete"`)
   never qualifies, and a reply that appears during that final reconciliation
   cancels the attempt.
+* A conversation that is neither broken nor healthy but DEGRADED BY ITS OWN
+  SIZE is RETIRED rather than rotated: same move, different trigger, different
+  budget, and — the important difference — a refusal never parks. See
+  `_maybe_retire_conversation` and docs/AUTOLOOP.md §5c.
 
 Note for the merge with the blocker/quarantine work (commit 5346551, branch
 `feat/autoloop-postcommit-review`): every park site added here goes through the
@@ -119,6 +123,7 @@ import hashlib
 import subprocess
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -184,6 +189,7 @@ from .prompts import (
     review_mismatch_payload,
 )
 from .state import (
+    MAX_ROUND_LATENCY_SAMPLES,
     TERMINAL_PHASES,
     ChunkedDelivery,
     LastResponse,
@@ -234,6 +240,27 @@ CONTINUATION_NOTE = (
     "a conversation-transport recovery. The previous conversation is abandoned "
     "and nothing in it is authoritative. Reply only here; this conversation is "
     "the only one Autoloop reads."
+)
+
+#: The same job for a RETIREMENT, plus two things a continuation does not carry.
+#:
+#: It opens with the priming convention an operator uses when they create one of
+#: these chats by hand ("conversation reserved for autoloop"): a retirement
+#: creates the chat itself, and its first turn is this request, so folding the
+#: reservation in here is what gives the new thread the convention without
+#: spending an extra turn on it.
+#:
+#: It also states the MEASUREMENT. The retirement is logged with it too, but the
+#: reviewer reading a brand-new thread deserves to know why it exists — nothing
+#: was wrong with the old one, so "the previous conversation is abandoned" on its
+#: own reads like a fault that was never explained.
+RETIREMENT_NOTE_TEMPLATE = (
+    "[autoloop transport note] This conversation is reserved for autoloop. It "
+    "replaces a thread Autoloop retired after {packets} messages — nothing in "
+    "that thread was wrong; a conversation that size had simply become slow to "
+    "compose in.{latency} The retired conversation is abandoned and nothing in "
+    "it is authoritative. Reply only here; this conversation is the only one "
+    "Autoloop reads."
 )
 
 
@@ -797,6 +824,12 @@ class Orchestrator:
                 )
                 return
             delivery.delivered += 1
+            # A part is a MESSAGE in the thread, so it counts towards the size
+            # that eventually retires the conversation (§5c). Idempotent for the
+            # same reason the save below is enough for crash recovery:
+            # `delivered` only ever advances, so a resumed delivery re-counts
+            # nothing.
+            state.conversation_packets += 1
             # Persisted per part, so a crash resumes at the first UNCONFIRMED
             # part instead of re-posting the ones already in the conversation.
             self._store.save(state)
@@ -946,6 +979,54 @@ class Orchestrator:
         state.phase = Phase.SUBMITTING.value
         self._store.save(state)
 
+    def _mark_submitted(self, req: PendingRequest) -> None:
+        """`req` is now confirmed present in its conversation — record the one
+        message that puts there.
+
+        Called on every transition into `awaiting`, not just the one that sends:
+        a request also becomes confirmed-in-thread when `submitting`'s pre-send
+        reconcile finds it already there, when an ambiguous send turns out to
+        have persisted, and when a disproven send turns out to have persisted.
+        Counting only the send path would under-count the thread and let the
+        retirement threshold arrive late.
+
+        Idempotent via `req.submitted`, which is exactly the flag that means
+        "this request is already in the conversation": re-entering `submitting`
+        for a request that got there in an earlier process (a `--retry` after a
+        park) must not inflate the count, and a disproven send that never landed
+        must not add a message its resend then adds again.
+        """
+        if not req.submitted:
+            self.state.conversation_packets += 1
+            req.submitted_at = utcnow_iso()
+        req.submitted = True
+
+    def _note_round_latency(self, req: PendingRequest) -> float | None:
+        """Record how long this round took from send to reply.
+
+        Evidence only — see `LoopState.conversation_round_seconds`. Every
+        failure to measure returns None quietly: a request with no
+        `submitted_at` (one in flight when this field was added), a clock that
+        moved, or an unparseable stamp are all reasons to record nothing, and
+        none of them is a reason to disturb a round that otherwise succeeded.
+        """
+        stamped = getattr(req, "submitted_at", "")
+        if not stamped:
+            return None
+        try:
+            sent = datetime.fromisoformat(stamped)
+        except ValueError:
+            return None
+        if sent.tzinfo is None:
+            sent = sent.replace(tzinfo=timezone.utc)
+        seconds = (datetime.now(timezone.utc) - sent).total_seconds()
+        if seconds < 0:
+            return None
+        series = self.state.conversation_round_seconds
+        series.append(round(seconds, 1))
+        del series[:-MAX_ROUND_LATENCY_SAMPLES]
+        return seconds
+
     def _step_submitting(self) -> None:
         state = self.state
         req = state.pending_request
@@ -964,6 +1045,13 @@ class Orchestrator:
                 f"{req.delivery.delivered} of {len(req.delivery.parts)} diff parts "
                 "are confirmed. Refusing to request a verdict on a partial patch."
             )
+        # Checked BEFORE `attach()`, which is the call that actually loads the
+        # conversation — and loading a thread this big is the expensive thing
+        # being escaped. A retirement that first paid the degraded thread's
+        # rendering cost, and could time out doing it, would be defeated by the
+        # condition it exists to answer.
+        if self._maybe_retire_conversation(req):
+            return  # `req` now lives in a fresh chat and is already `awaiting`
         client = self._client_for_request(req)
         client.attach()
         # One controlled reload BEFORE sending, so the duplicate check reads
@@ -972,7 +1060,7 @@ class Orchestrator:
         req.reconcile_attempts += 1
         if client.reconcile(req.request_id):
             self._log("request_already_submitted", request_id=req.request_id)
-            req.submitted = True
+            self._mark_submitted(req)
             state.phase = Phase.AWAITING.value
             self._store.save(state)
             return
@@ -1104,7 +1192,7 @@ class Orchestrator:
             self._store.save(state)
             return
 
-        req.submitted = True
+        self._mark_submitted(req)
         state.phase = Phase.AWAITING.value
         self._log(
             "request_submitted",
@@ -1129,7 +1217,7 @@ class Orchestrator:
             data={"persisted": persisted, "attempts": req.reconcile_attempts},
         )
         if persisted:
-            req.submitted = True
+            self._mark_submitted(req)
             state.phase = Phase.AWAITING.value
             self._store.save(state)
             return
@@ -1166,7 +1254,7 @@ class Orchestrator:
             # History wins: it is the direct evidence, the status code is a
             # proxy. Resending now would be the double-post this whole phase
             # exists to prevent.
-            req.submitted = True
+            self._mark_submitted(req)
             req.last_send_outcome = SendOutcome.ACCEPTED.value
             state.phase = Phase.AWAITING.value
             self._store.save(state)
@@ -1465,7 +1553,6 @@ class Orchestrator:
             # conversation still holds the whole delivery and there is nothing
             # to give up.
             self._fall_back_to_omission(req, reason_code="rotation_leaves_parts_behind")
-        old_url = req.conversation_url or state.conversation_url
         # Consume the budget BEFORE the attempt, durably. A rotation SENDS a
         # message; if the process dies between that send and the binding below,
         # recovery must not be able to open a second chat and post again. Same
@@ -1474,7 +1561,7 @@ class Orchestrator:
         state.rotations += 1
         self._store.save(state)
         try:
-            new_url, sent_prompt = self._rotate_conversation(req, project_url)
+            self._move_conversation(req, project_url, reason=reason)
         except LoginExpiredError:
             raise
         except (BrowserError, AutoloopError) as exc:
@@ -1492,6 +1579,36 @@ class Orchestrator:
                 "posted before failing, so autoloop will not try again on its own.",
             )
             return
+
+    def _move_conversation(
+        self,
+        req: PendingRequest,
+        project_url: str,
+        *,
+        reason: str,
+        note: str = CONTINUATION_NOTE,
+        event: str = "conversation_rotated",
+        measurement: dict | None = None,
+    ) -> str:
+        """Open one fresh chat, land `req` in it, and COMMIT the move.
+
+        The shared half of every conversation move. Both triggers reach it —
+        `_attempt_rotation` (the chat is broken) and `_maybe_retire_conversation`
+        (the chat has grown too large) — and they differ only in what they check
+        first, which budget they spend, and what a failure costs. Everything
+        after the decision is identical, so it lives here once: the move itself
+        is the same act.
+
+        Raises on failure (`BrowserError` / `AutoloopError` / `LoginExpiredError`
+        from `_rotate_conversation`), leaving `req` exactly as it was — still
+        bound to the old conversation, still holding its original prompt. The
+        caller decides what a failed move means; nothing here has an opinion.
+
+        Returns the new conversation URL.
+        """
+        state = self.state
+        old_url = req.conversation_url or state.conversation_url
+        new_url, sent_prompt = self._rotate_conversation(req, project_url, note=note)
 
         # Only now is the request's prompt the one that was actually sent. Doing
         # this before the send would leave a failed rotation holding a prompt
@@ -1531,15 +1648,28 @@ class Orchestrator:
         # cap even gets a chance to refuse a second rotation. Cannot loop:
         # `max_conversation_rotations` bounds rotations, not this reset.
         state.consecutive_failures = 0
+        # Fresh thread, fresh size. ONE, not zero: the message this move just
+        # posted is the new conversation's first packet, and a count that
+        # disagreed with the thread by one would make the NEXT retirement's
+        # recorded justification off by one too.
+        state.conversation_packets = 1
+        req.submitted_at = utcnow_iso()
+        # Latencies measured in the retired thread describe the retired thread.
+        # Carrying them forward would put the old conversation's cost in the new
+        # one's record — the same reason `start_timeouts` is reset above.
+        state.conversation_round_seconds = []
         state.phase = Phase.AWAITING.value
         state.resume_phase = None
         self._log(
-            "conversation_rotated",
+            event,
             request_id=req.request_id,
-            data=asdict(record) | {"rotations": state.rotations},
+            data=asdict(record)
+            | {"rotations": state.rotations}
+            | (measurement or {}),
         )
         self._store.save(state)
         self._heal_config_url(new_url)
+        return new_url
 
     def _attempt_silence_rotation(self, req: PendingRequest) -> None:
         """The third consecutive response-START timeout for `req`, with the
@@ -1623,6 +1753,208 @@ class Orchestrator:
         )
         self._attempt_rotation(req, reason="response_start_silence")
 
+    # ---- conversation retirement (degradation, not breakage) ----------------
+
+    def _maybe_retire_conversation(self, req: PendingRequest) -> bool:
+        """Retire a conversation that has grown too large to work in, and send
+        `req` into its replacement instead. True when that happened.
+
+        Rotation escapes a chat that is BROKEN. This escapes one that still
+        works and has simply become slow, which is a different event and is
+        treated as one throughout:
+
+        * **Its own budget.** `policy.max_conversation_retirements`, never
+          `max_conversation_rotations` — that cap exists so a broken chat cannot
+          be rotated round in circles, and a planned move must not spend the
+          emergency allowance for the next real fault.
+        * **A refusal never parks.** Every `return False` below leaves the loop
+          exactly where it was: the request is sent into the existing
+          conversation on the very next line of `_step_submitting`, and the
+          round proceeds. A degraded conversation still works, so stopping a
+          working loop because it is slow would be worse than the slowness —
+          which is the whole difference from `_park_rotation`.
+        * **It cannot fire on one slow round**, the case §5c deliberately
+          refuses to rotate for. That holds structurally rather than by a guard:
+          the signal is a count of messages, and
+          `policy.max_conversation_packets` of them cannot be one round.
+
+        Only ever reached from `submitting`, and only for a request nothing has
+        been sent for yet (`send_attempted`). That is what keeps a retirement
+        from ever straddling an in-flight turn: there is no message in the old
+        thread to abandon and no reply to lose.
+        """
+        state = self.state
+        if not self._policy.conversation_is_degraded(state.conversation_packets):
+            # Includes the disabled case (`max_conversation_packets = 0`).
+            # Silent on purpose: this runs on every round, and a transcript
+            # line per round saying nothing happened is noise, not evidence.
+            return False
+
+        def refuse(event: str, reason_code: str, **extra) -> bool:
+            self._log(
+                event,
+                request_id=req.request_id,
+                data={
+                    "reason_code": reason_code,
+                    "conversation_packets": state.conversation_packets,
+                    "retirements": state.retirements,
+                    **extra,
+                },
+            )
+            return False
+
+        # Every refusal below carries its own code, so "retirement never fires
+        # in this deployment" is answerable from the transcript rather than by
+        # reading this method.
+        if req.send_attempted:
+            # Something may already be in the old thread under this request id.
+            # Deferring costs one round; getting this wrong risks a double post.
+            return refuse("retirement_deferred", "send_already_attempted")
+        if req.delivery is not None:
+            # The parts live in the thread being retired, and the verdict
+            # message names them — exactly the situation `_attempt_rotation`
+            # answers by falling back to the omission notice. A rotation has no
+            # choice; a planned retirement does, and waiting one round for a
+            # thread to be delivered is strictly better than throwing that
+            # delivery away for a move that was never urgent.
+            return refuse("retirement_deferred", "delivery_in_flight")
+        if req.attachment:
+            # `_rotate_conversation` submits the prompt WITHOUT re-uploading the
+            # attachment, so retiring here would send a payload that refers to a
+            # file the new chat does not have. Same reasoning as the delivery
+            # above: defer rather than degrade the review.
+            return refuse("retirement_deferred", "attachment_in_flight")
+        project_url = self._config.browser.project_url
+        if not project_url:
+            return refuse("retirement_declined", "no_project_url")
+        verdict = self._policy.check_retirement_budget(state.retirements)
+        if not verdict.allowed:
+            return refuse("retirement_declined", "retirement_budget", detail=verdict.reason)
+        # Does NOT navigate — `_client_for_request` only retargets — so nothing
+        # here has yet paid the cost of loading the degraded thread.
+        client = self._client_for_request(req)
+        can_move = getattr(client, "retarget", None) is not None and (
+            getattr(client, "current_url", None) is not None
+        )
+        if not can_move:
+            # Probed like every other optional transport capability. A provider
+            # that cannot rotate cannot retire either, and finding that out by
+            # spending the budget on a failed attempt would be worse.
+            return refuse("retirement_declined", "provider_cannot_rotate")
+        throttled = self._throttle_defers_retirement(client)
+        if throttled:
+            return refuse("retirement_deferred", "throttled", detail=throttled)
+
+        measurement = {
+            "conversation_packets": state.conversation_packets,
+            "max_conversation_packets": self._policy.config.max_conversation_packets,
+            "round_seconds": list(state.conversation_round_seconds),
+        }
+        # Spent BEFORE the send and durably, for the same reason a rotation is:
+        # this posts a message, and a process that dies between the post and the
+        # binding must not be able to open a second chat and post again.
+        state.retirements += 1
+        self._store.save(state)
+        try:
+            self._move_conversation(
+                req,
+                project_url,
+                reason="conversation_degraded",
+                note=self._retirement_note(measurement),
+                event="conversation_retired",
+                measurement=measurement | {"retirements": state.retirements},
+            )
+        except LoginExpiredError:
+            # Re-raised, unlike every other failure here: `_step_submitting`
+            # runs inside `run()`'s try, whose `except LoginExpiredError` parks
+            # with the resume phase intact. A logged-out profile is not
+            # something the next line of this round can proceed through.
+            raise
+        except (BrowserError, AutoloopError) as exc:
+            # The move failed, so `req` is untouched — still bound to the old
+            # conversation, still holding its original prompt. Log it and let
+            # the round continue there: the thread is slow, not broken, and
+            # parking a loop that can still work is the outcome this whole
+            # reflex is shaped to avoid. The budget stays spent (the attempt may
+            # have posted before failing), so this cannot become a retry loop.
+            self._log(
+                "retirement_failed",
+                request_id=req.request_id,
+                data={"reason_code": "retirement_failed", "error": str(exc)} | measurement,
+            )
+            # `_rotate_conversation` retargets the cached client at the project
+            # page before it submits. Without this drop, the next `attach()` in
+            # `_step_submitting` would load THAT page and post the request
+            # somewhere nobody is reading. Rotation gets the same repair on its
+            # park path; this path has no park to do it.
+            self._drop_client()
+            return False
+        return True
+
+    def _retirement_note(self, measurement: dict) -> str:
+        """The first message of the replacement thread — see
+        `RETIREMENT_NOTE_TEMPLATE`."""
+        rounds = measurement.get("round_seconds") or []
+        latency = ""
+        if rounds:
+            latency = (
+                " The last measured rounds in it took "
+                + ", ".join(f"{value:g}s" for value in rounds)
+                + " from send to reply."
+            )
+        return RETIREMENT_NOTE_TEMPLATE.format(
+            packets=measurement.get("conversation_packets", 0), latency=latency
+        )
+
+    def _throttle_defers_retirement(self, client) -> str:
+        """The one place a planned retirement asks "am I rate-limited?".
+
+        Retiring under a throttle would add requests to the condition it is
+        reacting to — a new chat is the same account — so this must defer, and
+        the constraint is worth more than the convenience of firing on time.
+
+        This loop does NOT detect throttling itself; brw-09 owns that signal.
+        So this is deliberately a SEAM rather than a detector, shaped so brw-09
+        lands in it without touching any caller:
+
+        * `LoopState.throttled_until` (an ISO-8601 instant) is read with
+          `getattr`, so that change can add the field and start deferring
+          retirements with no edit here.
+        * `client.is_throttled()` is probed exactly like every other optional
+          transport capability (`retarget`, `reconcile_no_response`,
+          `mount_message_tail`).
+
+        Fails OPEN: no signal means not throttled. Failing closed would make
+        retirement unreachable until brw-09 lands, which is the opposite of
+        what this is for — and being wrong costs one extra chat, not a lost
+        request.
+
+        Returns a reason string when the retirement must be deferred, "" when
+        it may proceed.
+        """
+        until = getattr(self.state, "throttled_until", "")
+        if until:
+            try:
+                deadline = datetime.fromisoformat(str(until))
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                if deadline > datetime.now(timezone.utc):
+                    return f"state.throttled_until={until}"
+            except (TypeError, ValueError):
+                # An unparseable value is not evidence of a throttle, and this
+                # is not the place to fail a round over a malformed field.
+                pass
+        probe = getattr(client, "is_throttled", None)
+        if probe is not None:
+            try:
+                if probe():
+                    return "provider reports a throttle"
+            except (BrowserError, AutoloopError):
+                # The probe is an optional courtesy. If asking fails, the
+                # retirement proceeds on the evidence it already has.
+                pass
+        return ""
+
     @staticmethod
     def _reconcile_no_response(client, request_id: str) -> bool:
         """Probe the optional final-silence-check capability the same way
@@ -1638,7 +1970,7 @@ class Orchestrator:
         return check(request_id)
 
     def _rotate_conversation(
-        self, req: PendingRequest, project_url: str
+        self, req: PendingRequest, project_url: str, *, note: str = CONTINUATION_NOTE
     ) -> tuple[str, str]:
         """Open one new chat in the project and land `req` in it.
 
@@ -1663,7 +1995,7 @@ class Orchestrator:
         retarget(project_url)
         client.attach()
 
-        prompt = self._continuation_prompt(req)
+        prompt = self._continuation_prompt(req, note)
         result = client.submit(req.request_id, prompt)
         if result not in (SubmitResult.CONFIRMED, SubmitResult.ALREADY_PERSISTED):
             raise BrowserError(
@@ -1769,7 +2101,7 @@ class Orchestrator:
                 return False
         return have_segs[len(want_segs)] == "c" and bool(have_segs[len(want_segs) + 1])
 
-    def _continuation_prompt(self, req: PendingRequest) -> str:
+    def _continuation_prompt(self, req: PendingRequest, note: str = CONTINUATION_NOTE) -> str:
         """The same request, plus one line saying the transport moved.
 
         The payload is already self-contained (`prompts.build_prompt` re-sends
@@ -1777,8 +2109,12 @@ class Orchestrator:
         contract-complete without replaying any history. The note exists so the
         reviewer knows which conversation is authoritative — not to reconstruct
         what the abandoned one said.
+
+        `note` is the caller's, because a retirement has more to say than a
+        recovery does: it also carries the priming convention and the
+        measurement that justified the move (`RETIREMENT_NOTE_TEMPLATE`).
         """
-        return req.prompt.rstrip("\n") + "\n\n" + CONTINUATION_NOTE
+        return req.prompt.rstrip("\n") + "\n\n" + note
 
     def _heal_config_url(self, new_url: str) -> None:
         """Point the config file at the new conversation.
@@ -1952,7 +2288,19 @@ class Orchestrator:
         state.pending_request = None
         state.consecutive_failures = 0
         state.phase = Phase.EXECUTING.value
-        self._log("response_received", request_id=req.request_id, data={"raw": raw})
+        # Evidence for the transcript, not a signal: recorded so a later
+        # retirement can say what the thread actually cost. Nothing branches on
+        # it — see `LoopState.conversation_round_seconds`.
+        round_seconds = self._note_round_latency(req)
+        self._log(
+            "response_received",
+            request_id=req.request_id,
+            data={
+                "raw": raw,
+                "round_seconds": round_seconds,
+                "conversation_packets": state.conversation_packets,
+            },
+        )
         self._store.save(state)
 
     def _step_executing(self) -> None:

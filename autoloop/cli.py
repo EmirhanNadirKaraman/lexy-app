@@ -162,7 +162,12 @@ def _drift_is_recorded_rotation(state: LoopState, config: AutoloopConfig) -> boo
     conversation nobody chose.
     """
     record = state.last_rotation
-    if not record or not state.rotations:
+    # `retirements` alongside `rotations`: a conversation RETIRED for size
+    # (docs/AUTOLOOP.md §5c) performs the same move and writes the same
+    # `last_rotation` record, but charges its own budget — so a retirement whose
+    # config heal failed leaves `rotations == 0` and would otherwise be refused
+    # as an edited config, stranding the session for having recovered correctly.
+    if not record or not (state.rotations or state.retirements):
         return False
     return (
         record.get("new_url") == state.conversation_url
@@ -442,18 +447,34 @@ def _reset_run_scoped_budgets(config: AutoloopConfig) -> None:
     failed attempt is still not refunded — within one run the cap is exactly
     as strict as before. What changes is that a deliberate operator restart,
     like `--retry` itself, is treated as a new run.
+
+    `state.retirements` (`policy.max_conversation_retirements`) is per-run for
+    exactly the same reasons and is reset here alongside it. What is emphatically
+    NOT reset is `state.conversation_packets`: that counts how large the current
+    CONVERSATION has grown, and a conversation outlives the process. Zeroing it
+    per run would make a long-lived thread permanently unretirable — every
+    restart would forget its size and start counting from nothing.
     """
     store, state = _load_state(config)
-    if state is None or not state.rotations:
+    # Both counters, or a run that happened to spend only the retirement budget
+    # would keep it spent — the exact per-session trap this function exists to
+    # close, one field over.
+    if state is None or not (state.rotations or state.retirements):
         return
-    spent = state.rotations
+    spent, retired = state.rotations, state.retirements
     state.rotations = 0
+    state.retirements = 0
     store.save(state)
     TranscriptLogger(config.transcript_file).append(
         "rotation_budget_reset",
         data={
             "rotations_spent_in_previous_run": spent,
-            "note": "per-run budget; a new run starts fresh",
+            "retirements_spent_in_previous_run": retired,
+            "conversation_packets": state.conversation_packets,
+            "note": (
+                "per-run budgets; a new run starts fresh. conversation_packets "
+                "is NOT reset — it describes the conversation, not the run"
+            ),
         },
     )
 

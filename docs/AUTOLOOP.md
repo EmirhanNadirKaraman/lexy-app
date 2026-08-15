@@ -1865,7 +1865,10 @@ abandon the chat for a fresh one in the configured project:
   attempt does not also increment `consecutive_failures`.
 * Never rotates for: generation already started, a slow answer, a single or
   merely occasional response-start timeout, login expiry, rate limits,
-  capacity, a malformed reply, or a policy denial.
+  capacity, a malformed reply, or a policy denial. "A slow answer" still holds
+  exactly as written — a conversation that has grown too LARGE is retired by a
+  separate reflex with a separate budget, on a message count rather than on any
+  round's latency, and it never parks. See §5c-bis.
 
 **One Playwright driver per process.** `sync_playwright().start()` raises
 "Playwright Sync API inside the asyncio loop" when another driver is already
@@ -2022,6 +2025,131 @@ Exhausting the skip budget **parks** `loop_fatal` with
 `run --retry` resumes it (that path clears both fault counts). It deliberately
 does not enter `failed`: a terminal state whose cause is recoverable only by
 reading the transcript is the defect underneath this one.
+
+### 5c-bis. Retiring a conversation that has become slow, not broken
+
+Added 2026-08-15. Everything above rotates for a chat that cannot be used. This
+retires one that still can, and has simply grown too large to work in.
+
+**The gap.** Every trigger above describes breakage: a second disproven send, a
+`ConversationUnusableError`, a confirmed silence. There was no trigger for a
+conversation that is neither broken nor healthy but **degraded by its own size**.
+On 2026-08-15 the working conversation had accumulated 90+ request packets.
+ChatGPT rendered its composer so slowly on a thread that size that
+`browser.composer_timeout_seconds` had already been conceded 30 → 180. One
+`get_attribute` timeout then triggered a Chrome restart; the restart killed the
+page the loop's own Playwright session held (`Target page, context or browser has
+been closed`), which triggered another. Chrome's pid changed twice in four
+minutes and no request was ever sent. Nothing in that sequence matches a trigger
+above — the conversation was reachable, not unusable, not rejecting, not silent.
+The operator rotated by hand; the next exchange took 54s to submit and 15s to a
+directive, with no browser errors and no restarts.
+
+**The signal is a packet COUNT, and the incident is what chose it.** Two
+candidates were on the table — messages in the thread, or a submit-to-response
+latency trend. Latency is closer to what actually hurts, and it is the wrong
+signal here for a reason the incident demonstrates rather than a matter of taste:
+*a latency series accumulates only on completed rounds*, and during those four
+minutes no round completed. It would have measured nothing during the exact
+episode it exists to catch. A count of messages the loop has already placed in
+the thread accumulates whether or not anything finishes.
+
+Two further properties settle it:
+
+* **It cannot fire on a single slow round** — the case §5c refuses to rotate for
+  — *structurally*, not by an added guard. `policy.max_conversation_packets`
+  messages cannot be one round.
+* **It is not read from the DOM.** ChatGPT's message list is virtualized (§11: a
+  10-message conversation mounted only its 6 newest nodes), so a rendered count
+  under-reports by an unknown amount. `state.conversation_packets` is exact for
+  everything the loop itself sent: one per request that reached `awaiting`
+  (counted on the transition, so the pre-send reconcile and the
+  ambiguous/disproven-then-persisted paths all count), plus one per chunked
+  delivery part, because a part is a message and it is messages the composer
+  slows over.
+
+**What it does NOT count**, stated plainly because the default is a guess rather
+than the truth: messages a human typed, and everything in a thread the loop
+adopted mid-life (including one carried over from before this field existed).
+Such a conversation is retired **later** than its real size warrants.
+Understating is the safe direction — a late retirement costs slowness, an early
+one abandons a thread that was fine.
+
+**A refusal never parks.** This is the load-bearing difference from
+`_attempt_rotation`, which parks on every precondition it fails. A degraded
+conversation still works, so stopping a working loop because it is slow would be
+worse than the slowness. Every refusal logs a stable reason code and the round
+proceeds in the existing thread on the very next line of `_step_submitting`:
+
+| Condition | Event | `reason_code` |
+|---|---|---|
+| a send was already attempted for this request | `retirement_deferred` | `send_already_attempted` |
+| a chunked delivery is in flight | `retirement_deferred` | `delivery_in_flight` |
+| the request carries an uploaded diff | `retirement_deferred` | `attachment_in_flight` |
+| the loop is throttled | `retirement_deferred` | `throttled` |
+| `browser.project_url` unset | `retirement_declined` | `no_project_url` |
+| `policy.max_conversation_retirements` spent | `retirement_declined` | `retirement_budget` |
+| provider has no `retarget`/`current_url` | `retirement_declined` | `provider_cannot_rotate` |
+| the move itself failed | `retirement_failed` | `retirement_failed` |
+
+The two deferrals for a delivery and an attachment are choices a rotation does
+not get to make: its parts would be orphaned and it falls back to the omission
+notice, whereas a planned retirement was never urgent and can wait one round for
+the diff to be reviewed as sent.
+
+**It has its own budget.** `policy.max_conversation_retirements` (default **2**),
+never `max_conversation_rotations`. That cap exists so a broken chat cannot be
+rotated round in circles; a planned retirement is not that event and must not
+consume the emergency allowance. Two rather than one because the rotation cap's
+justification ("a second rotation in one run usually means the fault is not the
+chat") does not transfer — a second retirement means the run genuinely sent
+another `max_conversation_packets` messages, which is evidence the move worked.
+Run-scoped like `rotations`, and reset by the same `cli._reset_run_scoped_budgets`
+— whose guard had to widen, because a run that spent *only* the retirement budget
+would otherwise have kept it spent forever, the per-session trap that function
+exists to close, one field over. `conversation_packets` is emphatically **not**
+reset there: it describes the conversation, which outlives the process, and
+zeroing it per run would make a long-lived thread permanently unretirable.
+
+**It defers to the throttle signal.** A new chat is the same account, so retiring
+under a rate limit adds requests to the condition it is reacting to. This loop
+does not detect throttling — **brw-09 owns that signal** — so
+`_throttle_defers_retirement` is a *seam*, not a detector, shaped so that change
+lands in it without editing any caller: it reads `LoopState.throttled_until` via
+`getattr` (so brw-09 can add the field and start deferring immediately) and
+probes `client.is_throttled()` like every other optional transport capability. It
+fails **open** — no signal means not throttled — because failing closed would
+make retirement unreachable until brw-09 lands, and being wrong costs one extra
+chat rather than a lost request.
+
+**The move itself is shared, and so is its record.** `_move_conversation` is the
+common half of both triggers: prove, then bind, then rewrite the config
+(`_heal_config_url`), exactly as §5c describes. A retirement writes the same
+`RotationRecord` with `reason="conversation_degraded"`, so the CLI's drift guard
+and `doctor` need no second record to read — the guard only had to learn that
+`retirements` is also evidence of a recorded move, or a retirement whose config
+heal failed would strand the next run for having recovered correctly. Both
+counters reset the new thread's clocks: `conversation_packets = 1` (the move's own
+message is the new thread's first packet — zero would put every later
+justification off by one) and an empty latency series, since latencies measured in
+the retired thread describe the retired thread.
+
+**Nothing is a mystery in the transcript.** `conversation_retired` carries the
+measurement that justified it — the packet count, the threshold it crossed, and
+the last few measured round latencies — alongside the ordinary rotation record.
+The same measurement goes into the *replacement thread's first message*
+(`RETIREMENT_NOTE_TEMPLATE`), which also opens with the priming convention an
+operator types by hand ("this conversation is reserved for autoloop"). A
+retirement creates the chat itself and its first turn is the request, so folding
+the reservation in there is what gives the new thread the convention without
+spending a turn on it — and it means the reviewer opening a brand-new thread is
+told why it exists rather than left to infer a fault that never happened.
+
+**The latency series is evidence, never a signal.** `state.conversation_round_seconds`
+keeps the last five send-to-reply measurements so a retirement can say what the
+thread actually cost and a future retune of `max_conversation_packets` has
+measurements rather than anecdotes. Nothing branches on it. Keep it that way:
+making it load-bearing would smuggle back the signal this section rejected.
 
 ---
 

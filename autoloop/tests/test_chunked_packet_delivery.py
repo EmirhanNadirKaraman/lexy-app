@@ -566,7 +566,10 @@ def test_a_rotation_gives_up_the_parts_rather_than_pointing_at_a_chat_without_th
     orch._step_delivering()
     assert req.delivery.complete
 
-    def rotation_fails(_req, _project_url):
+    # `note=` is the caller-supplied first-message text (a rotation's
+    # continuation line, a retirement's priming + measurement note), so the
+    # double has to accept it or it stops modelling the method it replaces.
+    def rotation_fails(_req, _project_url, *, note=None):
         raise BrowserError("the replacement chat never loaded")
 
     orch._rotate_conversation = rotation_fails

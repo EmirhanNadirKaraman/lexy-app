@@ -466,6 +466,37 @@ def run_doctor(
                 + (" — the next unusable conversation will park, not rotate"
                    if state.rotations >= cap else ""),
             )
+            # 13b-2. how large the live conversation has grown, and whether the
+            # loop can still retire it for size. Reported separately from the
+            # rotation budget because it answers a different question: not "can
+            # I escape a broken chat" but "is the chat I am in about to become
+            # slow" — see docs/AUTOLOOP.md §5c.
+            packet_cap = config.policy.max_conversation_packets
+            retire_cap = config.policy.max_conversation_retirements
+            if packet_cap <= 0:
+                add(
+                    "conversation_size",
+                    "ok",
+                    f"{state.conversation_packets} autoloop messages — retirement "
+                    "for size is disabled (policy.max_conversation_packets = 0)",
+                )
+            else:
+                over = state.conversation_packets >= packet_cap
+                spent = state.retirements >= retire_cap
+                add(
+                    "conversation_size",
+                    "warn" if over and spent else "ok",
+                    f"{state.conversation_packets}/{packet_cap} autoloop messages, "
+                    f"{state.retirements}/{retire_cap} retirements used this run"
+                    + (
+                        " — over the size threshold with no retirement budget "
+                        "left, so the loop will keep working in this thread"
+                        if over and spent
+                        else " — the next round will retire this conversation"
+                        if over
+                        else ""
+                    ),
+                )
 
         # 13c. rotation target
         project_url = config.browser.project_url
