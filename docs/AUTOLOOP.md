@@ -179,11 +179,23 @@ looked like "safe to merge".
 
 The real condition is not the phase — it is whether any
 `.autoloop/executions/*.json` carries a `candidate_sha` **for a task that could
-still be dispatched or reviewed**. Records outlive the work they describe
-(nothing archives one when a candidate is published), so a completed or
-quarantined task's record is skipped; an unknown id is not. A dispatched task
-that has not committed yet holds nothing reviewed, so it does not close the
-window; an executing phase does.
+still be dispatched or reviewed**. Records outlive the work they describe, so a
+completed or quarantined task's record is skipped; an unknown id is not. A
+dispatched task that has not committed yet holds nothing reviewed, so it does
+not close the window; an executing phase does. A candidate already PUBLISHED on
+its own side branch — confirmed against the remote, never inferred from the
+record's own `intended_remote_ref`, which is written *before* the push — is
+durable and does not close it either.
+
+There is a third exemption, added 2026-08-15 after fourteen records held the
+window shut at once: a record whose task is back in the queue **and** whose
+recorded worker repo is gone **and** whose candidate the checkout cannot
+resolve is a defect in the record, not work in flight — there is no reachable
+commit for a moved base to strand. All three conditions are required, and an
+empty `worktree_path` does not satisfy the second ("we never recorded where it
+was" is not "we know it is gone"). It is reported as a `note:`, never hidden:
+`release` retires its record now, so seeing one means something should have
+been retired and was not.
 
 The intended workflow:
 
@@ -335,10 +347,27 @@ python -m autoloop archive-blocker <id> --reason "..."   # close a dead blocker
 in-progress at dispatch and cleared when the round finishes; a `loop_fatal`
 park in between finishes nothing, so `state_of` reports IN_PROGRESS,
 `next_ready` skips it forever, and no command could move it — `unblock`
-correctly refuses anything that is not `blocked`. It clears both halves: the
-status AND the stale worker repo, which would otherwise make the next dispatch
-refuse. The worker is moved to quarantine, never deleted, because an
-interrupted round usually holds real work.
+correctly refuses anything that is not `blocked`.
+
+It clears **three** things, not one: the STATUS; the stale WORKER REPO, which
+would otherwise make the next dispatch refuse (`create()` will not write into
+an existing directory); and the EXECUTION RECORD, which would otherwise keep
+claiming a live unpublished `candidate_sha` for a task that is back in the
+queue and will be redone from scratch. That third one was silently left behind
+until 2026-08-15: releasing 25 stranded tasks the day before left 14 records
+pinned to the pre-merge HEAD, `merge-window` held the window shut on every one
+of them, and it could not reopen by itself — each of those tasks would have had
+to be re-dispatched *and* re-published first. With `auto_merge_enabled` on, the
+next task to complete published and then logged `auto_merge_deferred "merge
+window closed"`, and the published-but-unmerged backlog began rebuilding
+silently. An operator archived the 14 records by hand.
+
+Nothing is deleted. The worker moves to `quarantine/<task-id>-<label>` (an
+interrupted round usually holds real work) and the record to
+`.autoloop/executions/archive/<task-id>-<label>.json`, **under the same label**,
+so the two halves name each other and the candidate stays recoverable.
+`worktask.retire_execution` does both in one call precisely so they cannot
+drift apart.
 
 **`archive-blocker`** closes a blocker whose session has been retired. Some
 blockers cannot be answered at all — `checkout_escape_detected` refuses every

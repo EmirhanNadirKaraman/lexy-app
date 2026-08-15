@@ -122,6 +122,32 @@ class TaskExecution:
     review_request_id: str = ""
     intended_remote: str = ""
     intended_remote_ref: str = ""
+    #: The candidate sha CONFIRMED to be on `intended_remote_ref`, and when.
+    #:
+    #: Written by `orchestrator._dispatch_task_push` at the one point where
+    #: publication is already established from git — the fresh `ls-remote`
+    #: reconciliation that `_mark_task_completed` depends on — and never from
+    #: anything the record, the executor or a directive asserts about itself.
+    #: `intended_remote`/`intended_remote_ref` above are push INTENT, written
+    #: BEFORE the network call on purpose, so a refused push leaves them
+    #: looking exactly like a landed one; these two are the other half of that
+    #: pair, and the only fields here that mean "it actually landed".
+    #:
+    #: Publication is where the other half of the record/lifecycle drift lives.
+    #: A task can be published while its record still describes work in flight
+    #: — merge-window reported exactly that for `audit-0002` on 2026-08-15
+    #: ("safe to merge past, but its record still reads in_progress, so a later
+    #: revise would park it"). Advancing the record here is what lets
+    #: `_rebase_execution_if_stale` tell "reviewed work that would be
+    #: discarded" from "work that already shipped" — after RE-CONFIRMING it
+    #: against the remote, because git is the authority and this field is only
+    #: a pointer at what to go and ask about.
+    #:
+    #: Empty on every record written before this field existed, and on every
+    #: candidate that has not published — both load as "not known to have
+    #: landed", which is the fail-closed reading.
+    published_sha: str = ""
+    published_at: str = ""
     #: Union of `changed_paths` across every round committed so far (pass 1's
     #: round produces the first set; each `revise` round adds its own on top).
     #: The post-commit path-ownership check (`Orchestrator._verify_committed`)
@@ -314,6 +340,108 @@ class TaskExecutionStore:
 
     def clear(self, task_id: str) -> None:
         self._path(task_id).unlink(missing_ok=True)
+
+    def archive(self, task_id: str, label: str) -> Path | None:
+        """MOVE (never delete) the record for `task_id` into
+        `directory/archive/<task_id>-<label>.json`. Returns the destination,
+        or `None` when there was no record to retire.
+
+        The counterpart to `WorkerRepoManager.quarantine`, and deliberately
+        the same shape: a record describes work that may still be recoverable
+        (its `candidate_sha` names a real commit inside the worker repo being
+        quarantined alongside it), so retiring it must never be `clear()`.
+        Same uniqueness contract too — a colliding destination raises rather
+        than clobbering an earlier retirement's evidence.
+
+        **The `archive/` SUBDIRECTORY is load-bearing.** Both readers of these
+        records — `cli._merge_window_blockers` and `dashboard.merge_states` —
+        glob `executions/*.json`, which does not recurse. Filing a retired
+        record one level down is therefore what actually takes it out of the
+        merge-window gate; renaming it in place would leave it counted.
+
+        No `validate_task_id` here, deliberately, even though the other half of
+        a retirement (`WorkerRepoManager.quarantine`) does call it. That check
+        refuses `..`, which `TaskRegistry`'s own id rule
+        (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`) permits — so adding it would make
+        `release` raise on a legal task id that has no worker repo, a path that
+        works today. It would also buy nothing: the registry rule admits no
+        `/`, so `<task_id>-<label>.json` is always a single filename and `..`
+        without a separator traverses nothing. `save`/`load`/`clear` build their
+        names from the same id on the same reasoning.
+        """
+        path = self._path(task_id)
+        if not path.exists():
+            return None
+        dest_dir = self.directory / "archive"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{task_id}-{label}.json"
+        if dest.exists():
+            raise StateCorruptError(
+                f"execution archive destination {dest} already exists — 'label' "
+                "must be unique per call"
+            )
+        os.replace(path, dest)
+        return dest
+
+
+@dataclass(frozen=True)
+class Retirement:
+    """What one `retire_execution` call filed away, and under what label."""
+
+    label: str
+    record_path: Path | None = None
+    worker_path: Path | None = None
+
+
+def retire_execution(
+    task_id: str,
+    execution_store: TaskExecutionStore,
+    worker_repos,
+    reason: str = "released-by-operator",
+) -> Retirement:
+    """Retire BOTH halves of a task's execution — the `TaskExecution` record
+    AND the worker repository that produced it — under ONE label, in one call.
+
+    Why one call and one label. `release` used to fix the task STATUS and
+    quarantine the WORKER REPO, and left the execution record exactly where it
+    was, `candidate_sha` and all. The record then claimed live unpublished work
+    for a task that had been returned to pending and would be redone from
+    scratch, and `cli._merge_window_blockers` — which reads those records — held
+    the merge window shut on it. Observed 2026-08-15: releasing 25 stranded
+    tasks the day before left 14 such records, every one bound to the
+    pre-merge HEAD, and the window could not reopen by itself because each of
+    those tasks would have had to be re-dispatched AND re-published first. With
+    `auto_merge_enabled` on, the next task to complete logged
+    `auto_merge_deferred "merge window closed"` and the published-but-unmerged
+    backlog started rebuilding silently. An operator archived the 14 records by
+    hand.
+
+    The two halves describe the same attempt, so retiring them is ONE call: no
+    caller can reach one half without invoking the other, which is the drift
+    this exists to prevent. That is a structural guarantee about the CALL, not
+    an atomic transaction over the filesystem — the ordering rule below is what
+    covers a half that fails. The shared label is what makes the pairing visible
+    on disk afterwards: the quarantined worker at
+    `quarantine/<task_id>-<label>` and the archived record at
+    `executions/archive/<task_id>-<label>.json` name each other, so a human
+    reading either one can find the other half of the same attempt.
+
+    RECORD FIRST, worker second, deliberately. Either half can fail
+    (a filesystem error, a colliding label), and the two residues are not
+    equally safe. A left-behind record is SILENT: it holds the merge window
+    shut and nothing announces it — the exact failure this function exists to
+    end. A left-behind worker repo is LOUD: the next dispatch's
+    `WorkerRepoManager.create` refuses to write into an existing directory and
+    parks with a message naming it. Order the risk so the surviving failure is
+    the one that reports itself.
+    """
+    stamp = utcnow_iso().replace("+00:00", "Z").replace(":", "").replace("-", "")
+    label = f"{reason}-{stamp}"
+    record_path = execution_store.archive(task_id, label)
+    worker_path = None
+    if worker_repos is not None and worker_repos.path_for(task_id).exists():
+        worker_path = worker_repos.quarantine(task_id, label)
+    return Retirement(label=label, record_path=record_path, worker_path=worker_path)
 
 
 class IntentStore:

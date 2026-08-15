@@ -18,6 +18,7 @@ import pytest
 
 from autoloop import cli
 from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
+from autoloop.errors import GitCommandError
 from autoloop.state import LoopState, Phase, StateStore
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 
@@ -56,6 +57,7 @@ def _execution(
     base="000111222333",
     remote="",
     dest_ref="",
+    worktree_path="",
 ):
     d = config.state_dir / "executions"
     d.mkdir(parents=True, exist_ok=True)
@@ -66,6 +68,7 @@ def _execution(
             "task_base_sha": base,
             "intended_remote": remote,
             "intended_remote_ref": dest_ref,
+            "worktree_path": worktree_path,
         }),
         encoding="utf-8",
     )
@@ -269,6 +272,35 @@ def test_the_exemption_reports_the_residual_rather_than_hiding_it(wired, remote,
     assert "rt-9" in out and "would park it" in out
 
 
+def test_a_record_that_KNOWS_it_published_reports_no_park(wired, remote, capsys):
+    """The residual is only a park while the RECORD does not know what the
+    remote just said. Since 2026-08-15 publication writes a confirmed
+    `published_sha`, and a later revise reconciles from the remote instead of
+    refusing to re-base — so reporting a park there would send the operator
+    after a problem that no longer exists."""
+    _state(wired, phase=Phase.AWAITING.value)
+    d = wired.state_dir / "executions"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "rt-9.json").write_text(
+        json.dumps({
+            "task_id": "rt-9",
+            "candidate_sha": "abc123def456",
+            "task_base_sha": "000111222333",
+            "intended_remote": "origin",
+            "intended_remote_ref": PUSHED,
+            "published_sha": "abc123def456",
+        }),
+        encoding="utf-8",
+    )
+    remote.refs[("origin", PUSHED)] = "abc123def456"
+
+    assert cli._cmd_merge_window(_args()) == 0
+    out = capsys.readouterr().out
+    assert "note:" in out and "rt-9" in out
+    assert "reconciles it against the remote" in out
+    assert "would park it" not in out
+
+
 def test_push_INTENT_alone_is_not_publication(wired, remote, capsys):
     """The whole reason this check goes to the network. The orchestrator writes
     `intended_remote_ref` BEFORE the push so a crash is recoverable, so a
@@ -297,8 +329,6 @@ def test_a_remote_ref_at_a_DIFFERENT_sha_is_not_publication(wired, remote, capsy
 def test_an_unverifiable_remote_keeps_the_window_shut(wired, monkeypatch, capsys):
     """Offline, or a remote that refuses. Fail-closed: an unanswerable question
     is never answered 'safe'."""
-    from autoloop.errors import GitCommandError
-
     fake = _FakeRemote(error=GitCommandError("ls-remote", "network is unreachable"))
     monkeypatch.setattr(cli, "_window_git", lambda _config: fake)
     _state(wired, phase=Phase.AWAITING.value)
@@ -360,6 +390,139 @@ def test_an_executing_phase_still_closes_it_even_with_everything_published(
 
     assert cli._cmd_merge_window(_args()) == 1
     assert "executing" in capsys.readouterr().out
+
+
+# --- a record that is a DEFECT, not a hazard ----------------------------------
+#
+# What `release` used to leave behind. It returned the task to pending and
+# quarantined the worker repo, and left the execution record in place with
+# `candidate_sha` still set — a record claiming live unpublished work for a task
+# that would be redone from scratch. The commit it names exists only inside the
+# quarantined worker, unreachable from the checkout.
+#
+# On 2026-08-15, 14 such records (auto-01, auto-03, inbox-05, loop-01, …), all
+# bound to the pre-merge HEAD, held the window shut. It could not reopen by
+# itself: every one of those tasks would have had to be re-dispatched AND
+# re-published first. `release` retires the record now; this is the belt and
+# braces for records that predate that fix or drifted some other way — reported
+# as a NOTE, because a record that should have been retired is worth seeing.
+
+
+class _FakeCheckout:
+    """A checkout that can answer questions, and knows a fixed set of commits."""
+
+    def __init__(self, head="head1234", commits=()):
+        self._head = head
+        self.commits = set(commits)
+        self.lookups = []
+
+    def head_sha(self):
+        if not self._head:
+            raise GitCommandError("rev-parse", "not a git repository")
+        return self._head
+
+    def read_commit(self, oid):
+        if oid not in self.commits:
+            raise GitCommandError("cat-file", f"{oid}: bad file")
+        return {"tree": "t", "parents": [], "message": ""}
+
+    def remote_ref_sha(self, remote, dest_ref):
+        self.lookups.append((remote, dest_ref))
+        return ""
+
+
+def _released(config, task_id="auto-01", worker=None):
+    """A record `release` left behind: the task is back in the queue and the
+    worker repo it names is gone."""
+    _execution(config, task_id=task_id, worktree_path=str(worker or "/gone/workers/" + task_id))
+    TaskStore(config.tasks_file).save(
+        TaskRegistry([Task(id=task_id, title="t", description="d")])
+    )
+
+
+def test_a_record_left_behind_by_release_does_not_close_the_window(wired, capsys):
+    """The 2026-08-15 case. Pending task + vanished worker + a candidate the
+    checkout cannot resolve is provably not in-flight work."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)
+    git = _FakeCheckout()
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), git)
+
+    assert reasons == [], f"nothing is in flight to strand: {reasons}"
+    assert any("auto-01" in n and "NOT in flight" in n for n in notes), notes
+    assert any("should have been retired" in n for n in notes), (
+        "a defect must be visible, not silently ignored"
+    )
+
+
+def test_a_vanished_worker_is_not_enough_while_the_commit_is_REACHABLE(wired):
+    """Two of the three conditions is not the answer. If the checkout can
+    resolve the candidate, a moved base can still strand it — the worker repo
+    being gone says nothing about that."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)
+    git = _FakeCheckout(commits={"abc123def456"})
+
+    reasons, _notes = cli._merge_window_blockers(wired, set(), git)
+
+    assert reasons and "would strand it" in reasons[0]
+
+
+def test_a_record_with_NO_recorded_worker_path_still_closes_the_window(wired):
+    """'We never recorded where it was' is not 'we know it is gone'. An empty
+    `worktree_path` is absence of evidence, and the fail-closed reading of it
+    keeps the window shut."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="auto-01", worktree_path="")
+    TaskStore(wired.tasks_file).save(
+        TaskRegistry([Task(id="auto-01", title="t", description="d")])
+    )
+    git = _FakeCheckout()
+
+    reasons, _notes = cli._merge_window_blockers(wired, set(), git)
+
+    assert reasons and "would strand it" in reasons[0]
+
+
+def test_an_IN_PROGRESS_task_is_never_written_off(wired):
+    """A dispatched round is exactly the work this command protects. Its worker
+    repo can be missing for reasons that are not 'it was retired' — a crash
+    mid-`create`, a half-finished quarantine — and writing it off would strand
+    the thing the gate exists for."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="auto-01", worktree_path="/gone/workers/auto-01")
+    store = TaskStore(wired.tasks_file)
+    registry = TaskRegistry([Task(id="auto-01", title="t", description="d")])
+    registry.mark_in_progress("auto-01")
+    store.save(registry)
+
+    reasons, _notes = cli._merge_window_blockers(wired, set(), _FakeCheckout())
+
+    assert reasons and "would strand it" in reasons[0]
+
+
+def test_a_checkout_that_cannot_answer_keeps_the_window_shut(wired):
+    """Fail-closed, exactly like `_candidate_publication`: git being unable to
+    answer is not git answering 'no such object'."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)
+
+    reasons, _notes = cli._merge_window_blockers(wired, set(), _FakeCheckout(head=""))
+
+    assert reasons and "would strand it" in reasons[0]
+
+
+def test_writing_a_record_off_never_touches_the_network(wired):
+    """It is decided entirely from the registry, the filesystem and local git
+    — the record has no push intent to ask the remote about anyway."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)
+    git = _FakeCheckout()
+
+    cli._merge_window_blockers(wired, set(), git)
+
+    assert git.lookups == []
 
 
 # --- a stale park whose task has since completed ------------------------------
