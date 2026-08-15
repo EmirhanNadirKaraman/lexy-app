@@ -29,19 +29,199 @@ is that narrow.
 
 Playwright is imported lazily inside `connect`, so nothing else in autoloop
 (including the whole test suite) needs the package installed.
+
+EVERY call into Playwright is guarded POSITIONALLY (`connect`, `_call`), not by
+exception type. Playwright's `rewrite_error` turns a driver-channel failure into
+a plain `Exception` — "Connection closed while reading from the driver" is not a
+`playwright.sync_api.Error` and not a subclass of anything we can name — so a
+narrow `except` clause misses exactly the fault that kills the transport. On
+2026-08-15 one such connect took the whole loop down: the exception reached the
+top level, the process ended with `phase=submitting`, `stop_reason=None` and no
+blocker, and from outside it was indistinguishable from a clean exit. Everything
+raised out of this module is a `BrowserError`, so the orchestrator's existing
+recovery (restart → failure budget → a park that names the cause) sees it.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from ..errors import BrowserError, SessionLostError
+from ..errors import AutoloopError, BrowserError, SessionLostError
+from . import chrome_restart
 from .observation import SendObservation, is_send_path, scrub_path
 
 
 #: The one Playwright driver for this process, started lazily and never
 #: stopped while the process lives. See `_driver` for why it is a singleton.
 _DRIVER = None
+
+#: Hosts this machine is evidence about. `chrome_restart`'s probes dial
+#: 127.0.0.1 and `ps` lists local processes, so for a CDP URL pointing anywhere
+#: else NOTHING here — port, endpoint or browser process — describes it, and the
+#: whole diagnosis degrades to "unknown" (see `_unmeasured`). The loop's own
+#: default is `http://127.0.0.1:9222` (`config.py`), so this is the rare path.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
+
+
+def _port_in_use(port: int) -> bool:
+    """Thin seam over `chrome_restart` so a test can fake the machine."""
+    return chrome_restart._default_port_in_use(port)
+
+
+def _endpoint_ready(port: int) -> bool:
+    """True when `/json/version` answers with a browser websocket URL."""
+    return chrome_restart._default_endpoint_ready(port)
+
+
+def _list_processes() -> list[tuple[int, str]]:
+    return chrome_restart._default_list_processes()
+
+
+def _endpoint_host_port(cdp_url: str) -> tuple[str, int | None]:
+    """Host and port, or `("", None)` for anything this cannot parse.
+
+    The whole `urlsplit` is inside the guard, not just the `.port` read: a
+    malformed authority raises `ValueError` from `.port` on today's CPython but
+    can raise from the parse itself, and which one it is must not decide whether
+    the operator gets a diagnosis. An unparseable endpoint IS an unprobeable
+    one, so it takes the `port is None` branch and says to fix the url.
+    """
+    try:
+        parts = urlsplit(cdp_url if "//" in cdp_url else f"//{cdp_url}")
+        return (parts.hostname or "", parts.port)
+    except ValueError:  # a malformed authority, e.g. ":not-a-port"
+        return ("", None)
+
+
+def _chrome_pids(profile: str, port: int | None) -> tuple[list[int], list[int]]:
+    """Browser processes on `profile`, and browser processes claiming `port`.
+
+    Helpers are excluded by `--type=`: every Chrome renderer inherits the
+    parent's `--user-data-dir` and its `--remote-debugging-port`, so counting
+    them would report "Chrome is running" from a pile of children whose browser
+    process has gone (the same trap that made the old restart script kill a
+    renderer and declare success — see docs/COMMON_ERRORS.md).
+    """
+    on_profile: list[int] = []
+    on_port: list[int] = []
+    port_flag = f"--remote-debugging-port={port}" if port is not None else None
+    for pid, command in _list_processes():
+        if "--type=" in command:
+            continue
+        if chrome_restart.matches_profile(command, profile):
+            on_profile.append(pid)
+        if port_flag is not None and port_flag in command:
+            on_port.append(pid)
+    return (on_profile, on_port)
+
+
+def _format_pids(pids: list[int]) -> str:
+    """A count plus the first few pids — the operator needs something to signal,
+    not the whole list a busy profile produces."""
+    if not pids:
+        return "0"
+    shown = ", ".join(str(pid) for pid in pids[:3])
+    return f"{len(pids)} (pid {shown}{', ...' if len(pids) > 3 else ''})"
+
+
+def describe_cdp_endpoint(cdp_url: str) -> str:
+    """What the machine looked like at the moment a connect failed.
+
+    'Chrome is running but the port is dead' and 'there is no browser at all'
+    need opposite operator actions — restart the wedged one (it may ignore
+    SIGTERM) versus start one — and a bare "cannot connect" describes both. The
+    third case is real too and neither of the first two: a Chrome whose
+    `/json/version` still returns 200 while CDP itself is wedged
+    (docs/COMMON_ERRORS.md, 2026-08-14), so the endpoint is probed separately
+    from the port rather than inferred from it.
+
+    Measured HERE, in the failing connect, because it cannot be measured later:
+    `_handle_browser_failure` drops the client and restarts the browser before
+    anything is written, so an orchestrator-side probe would describe the world
+    after the repair, not the fault.
+
+    Never raises — see `_diagnose`. A diagnosis that throws would replace the
+    recorded park with the crash it exists to prevent.
+
+    The ACTION leads and the evidence follows, because not every surface shows
+    the whole string: `autoloop start` prints `blocker.question[:160]`. Ordered
+    the other way, the compact view would show four key=value pairs and cut off
+    the one sentence saying what to do.
+
+    Only for an endpoint this machine can actually measure — see `_unmeasured`
+    for the rest, which get no evidence rather than local evidence.
+
+    Bounded: a 0.5s port probe, a 2s HTTP probe and one `ps` (30s timeout),
+    against a restart command the callers already allow 180s. The unmeasurable
+    path runs none of the three.
+    """
+    try:
+        return _diagnose(cdp_url)
+    except Exception as exc:
+        return (
+            f"diagnosis=unavailable ({type(exc).__name__}: {exc}) "
+            f"[endpoint={cdp_url}]"
+        )
+
+
+def _unmeasured(cdp_url: str, hint: str) -> str:
+    """The diagnosis for an endpoint this machine cannot probe.
+
+    EVERY field is unknown, and none of them is quietly filled in from local
+    state. That is the whole point: a Chrome on this machine says nothing about
+    a CDP endpoint on another one, so reporting its pids here — or reading them
+    to choose between "Chrome IS running, restart it" and "NO Chrome is
+    running, start it" — produces a confident diagnosis of the wrong machine,
+    which is worse than none. The `ps` is skipped too, rather than run and
+    discarded: it costs up to 30s and could not inform the answer either way.
+    """
+    return (
+        f"{hint} [endpoint={cdp_url} port_open=unknown cdp_answering=unknown "
+        "chrome_on_profile=unknown chrome_on_port=unknown]"
+    )
+
+
+def _diagnose(cdp_url: str) -> str:
+    host, port = _endpoint_host_port(cdp_url)
+    if port is None:
+        # A malformed authority (":not-a-port", a bare hostname). Nothing to
+        # probe and nothing to restart — the endpoint itself is the fault.
+        return _unmeasured(
+            cdp_url,
+            "fix the CDP url — it names no usable port (expected something like "
+            "http://127.0.0.1:9222), so nothing here can reach it",
+        )
+    if host not in _LOOPBACK_HOSTS:
+        return _unmeasured(
+            cdp_url,
+            f"check Chrome on {host} (and the route to it) — this endpoint is "
+            "not on this machine, so nothing measurable from here describes it",
+        )
+    port_open = "yes" if _port_in_use(port) else "no"
+    answering = "yes" if _endpoint_ready(port) else "no"
+
+    profile = os.environ.get("AUTOLOOP_CHROME_PROFILE", chrome_restart.DEFAULT_PROFILE)
+    on_profile, on_port = _chrome_pids(profile, port)
+    running = bool(on_profile or on_port)
+    if running:
+        hint = (
+            "Chrome IS running but this endpoint is unusable — restart the "
+            "dedicated profile (python3 -m autoloop.browser.chrome_restart); a "
+            "wedged browser can keep answering HTTP and can ignore SIGTERM"
+        )
+    else:
+        hint = (
+            "NO Chrome is running on that profile — start the dedicated profile "
+            "(python3 -m autoloop.browser.chrome_restart) and check nothing else "
+            "holds the port"
+        )
+    return (
+        f"{hint} [endpoint={cdp_url} port_open={port_open} "
+        f"cdp_answering={answering} chrome_on_profile={_format_pids(on_profile)} "
+        f"chrome_on_port={_format_pids(on_port)} profile={profile}]"
+    )
 
 
 def _driver():
@@ -78,6 +258,10 @@ class PlaywrightSession:
     def __init__(self, page, playwright, error_cls, browser=None, opened_page=False):
         self._page = page
         self._playwright = playwright
+        #: Kept, and deliberately no longer branched on. Every guard in this
+        #: class is positional now (see the module docstring): Playwright's
+        #: driver-channel failures are plain `Exception`s, so this type
+        #: identifies the library, not the set of faults it can raise.
         self._error_cls = error_cls
         self._browser = browser
         #: True when `connect` opened this tab rather than adopting one. Only
@@ -106,6 +290,21 @@ class PlaywrightSession:
         match_url_substring: str = "chatgpt.com",
         conversation_url: str | None = None,
     ) -> "PlaywrightSession":
+        """Bind to the already-running browser, or raise a `BrowserError`.
+
+        The guard is POSITIONAL — one `except Exception` around every call that
+        reaches the driver — because the fault that matters here has no type to
+        catch. Playwright's `rewrite_error` produces a plain `Exception` for a
+        driver-channel failure, so the old `except PlaywrightError` let
+        "Connection closed while reading from the driver" straight past the
+        browser-failure routing and out of the process (2026-08-15). Nothing
+        about that fault is exotic; only its type was.
+
+        `AutoloopError` is re-raised untouched so a deliberate diagnosis (a
+        missing playwright, a future `LoginExpiredError`) is not flattened into
+        a transport fault, and `KeyboardInterrupt`/`SystemExit` pass through
+        because they are not `Exception`.
+        """
         try:
             from playwright.sync_api import Error as PlaywrightError
         except ImportError as exc:
@@ -113,16 +312,40 @@ class PlaywrightSession:
                 "playwright is not installed — run: pip install -r autoloop/requirements.txt "
                 "&& playwright install chromium"
             ) from exc
-        pw = _driver()
         try:
-            browser = pw.chromium.connect_over_cdp(cdp_url)
-        except PlaywrightError as exc:
+            return cls._connect(cdp_url, PlaywrightError, match_url_substring, conversation_url)
+        except AutoloopError:
+            raise
+        except Exception as exc:
             # Deliberately NOT stopping the driver: it is shared, and a failed
             # connect is the case most likely to be retried.
+            #
+            # The original type is named in the text because
+            # `_handle_browser_failure` logs `kind=type(exc).__name__`, which
+            # from here on always reads `SessionLostError` — without this the
+            # transcript could not tell a driver crash from a refused socket.
+            #
+            # Order: what to DO, then the evidence, then the raw fault. A park
+            # is read in a 160-character summary before it is read in full.
             raise SessionLostError(
-                f"cannot connect to Chrome DevTools at {cdp_url} — is the dedicated "
-                f"profile running with --remote-debugging-port? ({exc})"
+                f"cannot connect to Chrome DevTools at {cdp_url} — "
+                f"{describe_cdp_endpoint(cdp_url)} "
+                f"(original fault: {type(exc).__name__}: {exc})"
             ) from exc
+
+    @classmethod
+    def _connect(
+        cls,
+        cdp_url: str,
+        error_cls,
+        match_url_substring: str,
+        conversation_url: str | None,
+    ) -> "PlaywrightSession":
+        """The connect itself. Every line of it runs inside `connect`'s guard,
+        including `_driver()` — starting the driver talks to the same
+        subprocess channel that fails here, so it fails the same way."""
+        pw = _driver()
+        browser = pw.chromium.connect_over_cdp(cdp_url)
         context = browser.contexts[0] if browser.contexts else browser.new_context()
 
         # Bind to the CONFIGURED conversation, never to whatever ChatGPT tab
@@ -156,7 +379,7 @@ class PlaywrightSession:
             page = context.new_page()
         elif conversation_url:
             cls._reap_duplicates(context, page, conversation_url)
-        return cls(page, pw, PlaywrightError, browser, opened_page=opened_here)
+        return cls(page, pw, error_cls, browser, opened_page=opened_here)
 
     @classmethod
     def _reap_duplicates(cls, context, page, conversation_url: str) -> None:
@@ -206,10 +429,30 @@ class PlaywrightSession:
                 pass
 
     def _call(self, fn):
+        """Run one Playwright operation; anything it raises becomes a
+        `BrowserError`.
+
+        Positional for the same reason `connect` is: once the driver channel
+        dies, the NEXT `goto` / `locator` / `inner_text` raises the same plain
+        `Exception` that killed the loop from `connect_over_cdp`, and
+        `except self._error_cls` misses it identically. Guarding only the
+        connect would leave the same crash reachable from every submit and
+        every poll.
+
+        The wider net can relabel a non-transport bug (a bad path handed to
+        `set_input_files`, say) as a lost session. That trade is deliberate:
+        the cost is one restart and a park that still quotes the original
+        exception type and message, against a process that dies with no reason
+        recorded. `AutoloopError` still passes through unconverted.
+        """
         try:
             return fn()
-        except self._error_cls as exc:
-            raise SessionLostError(f"browser session lost: {exc}") from exc
+        except AutoloopError:
+            raise
+        except Exception as exc:
+            raise SessionLostError(
+                f"browser session lost ({type(exc).__name__}: {exc})"
+            ) from exc
 
     # ---- BrowserSession protocol --------------------------------------------
 
@@ -324,10 +567,13 @@ class PlaywrightSession:
         try:
             self._page.on("response", _on_response)
             self._page.on("requestfailed", _on_request_failed)
-        except self._error_cls:
+        except Exception:
             # A page that cannot take listeners is a dead page; the caller
             # discovers that on its next real operation. Observation is an
-            # optimisation, never a precondition.
+            # optimisation, never a precondition — so this swallows by
+            # POSITION, not by `self._error_cls`: a driver-channel failure here
+            # is a plain `Exception`, and letting it out would turn an optional
+            # capability into the thing that ends the process.
             return
         self._listening = True
 

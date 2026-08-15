@@ -79,6 +79,21 @@ class FakeDriver:
         self.stops += 1
 
 
+@pytest.fixture(autouse=True)
+def no_machine_probes(monkeypatch):
+    """Nothing in this module may touch the real machine.
+
+    `describe_cdp_endpoint` runs a TCP probe, an HTTP probe and `ps` on every
+    failed connect — pointed at the operator's OWN Chrome if a test let it run
+    for real, which is neither hermetic nor fast. Every test starts from the
+    "nothing is running" machine and says so itself when it wants another.
+    """
+    monkeypatch.setattr(ps, "_port_in_use", lambda port: False)
+    monkeypatch.setattr(ps, "_endpoint_ready", lambda port: False)
+    monkeypatch.setattr(ps, "_list_processes", lambda: [])
+    monkeypatch.setenv("AUTOLOOP_CHROME_PROFILE", "/tmp/autoloop-chrome-test")
+
+
 @pytest.fixture
 def fake_playwright(monkeypatch):
     """Install a fake `playwright.sync_api` and reset the module singleton."""
@@ -434,3 +449,363 @@ def test_opening_our_own_tab_reaps_nothing(fake_playwright):
     assert session._opened_page is True
     assert session._page.url == "about:blank"
     assert stray.closed is False
+
+
+# ---- no browser fault may leave this module as a plain Exception -------------
+#
+# Observed 2026-08-15: the loop did not park, it DIED. `connect_over_cdp` raised
+#
+#     Exception: BrowserType.connect_over_cdp: Connection closed while reading
+#     from the driver
+#
+# — a PLAIN `Exception`, because Playwright's `rewrite_error` gives driver-channel
+# failures no type of their own. `except playwright.sync_api.Error` therefore did
+# not match, the exception reached the top level, and the process ended with
+# phase=submitting, stop_reason=None, consecutive_failures=0 and no blocker: from
+# the outside, indistinguishable from a clean exit. So the guards here are
+# POSITIONAL, and these tests raise things that are NOT `module.Error` —
+# `FakeError` is, so a test built on it proves nothing about this bug.
+
+DRIVER_DEAD = "BrowserType.connect_over_cdp: Connection closed while reading from the driver"
+
+
+def _connect_over_cdp_raises(monkeypatch, exc):
+    def boom(self, url):
+        self._driver.connects += 1
+        raise exc
+
+    monkeypatch.setattr(FakeChromium, "connect_over_cdp", boom)
+
+
+def test_a_plain_exception_from_the_driver_becomes_a_browser_error(
+    fake_playwright, monkeypatch
+):
+    """The 2026-08-15 crash. A fault with no catchable type must still be a
+    `BrowserError`, because that is the only thing `Orchestrator.run` routes to
+    a restart, the failure budget and a park."""
+    from autoloop.errors import BrowserError
+
+    _connect_over_cdp_raises(monkeypatch, Exception(DRIVER_DEAD))
+
+    with pytest.raises(SessionLostError) as caught:
+        ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+    assert isinstance(caught.value, BrowserError)
+    assert "Connection closed while reading from the driver" in str(caught.value)
+    # The shared driver survives a failed connect, exactly as before.
+    assert fake_playwright["drivers"][0].stops == 0
+
+
+def test_the_converted_error_still_names_the_original_exception_type(
+    fake_playwright, monkeypatch
+):
+    """`_handle_browser_failure` logs `kind=type(exc).__name__`, which from now
+    on always reads `SessionLostError`. Without the original type in the text,
+    a driver crash and a refused socket look identical in the transcript."""
+    _connect_over_cdp_raises(monkeypatch, RuntimeError("driver went away"))
+
+    with pytest.raises(SessionLostError, match="RuntimeError: driver went away"):
+        ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+
+def test_a_failure_starting_the_driver_is_routed_too(fake_playwright, monkeypatch):
+    """`_driver()` talks to the same subprocess channel, so it dies the same
+    way — and it runs inside the same guard."""
+
+    def no_driver():
+        raise Exception("Playwright Sync API inside the asyncio loop")
+
+    monkeypatch.setattr(ps, "_driver", no_driver)
+
+    with pytest.raises(SessionLostError, match="asyncio loop"):
+        ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+
+def test_an_autoloop_error_is_not_flattened_into_a_transport_fault(
+    fake_playwright, monkeypatch
+):
+    """The guard is wide, not indiscriminate: a deliberate diagnosis raised
+    inside the connect keeps its own type and its own routing."""
+    from autoloop.errors import LoginExpiredError
+
+    _connect_over_cdp_raises(monkeypatch, LoginExpiredError("profile is logged out"))
+
+    with pytest.raises(LoginExpiredError):
+        ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+
+def test_a_dead_driver_channel_mid_operation_is_a_browser_error(fake_playwright):
+    """Guarding only `connect` would leave the identical crash reachable from
+    every submit and every poll: once the channel is dead, the next `goto`
+    raises the same untyped exception."""
+    session = ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+    def boom(url, wait_until=None):
+        raise Exception(DRIVER_DEAD)
+
+    session._page.goto = boom
+
+    with pytest.raises(SessionLostError, match="Connection closed"):
+        session.goto("https://chatgpt.com/c/abc")
+
+
+def test_an_operation_raising_an_autoloop_error_passes_through(fake_playwright):
+    from autoloop.errors import LoginExpiredError
+
+    session = ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+    def boom(url, wait_until=None):
+        raise LoginExpiredError("logged out mid-run")
+
+    session._page.goto = boom
+
+    with pytest.raises(LoginExpiredError):
+        session.goto("https://chatgpt.com/c/abc")
+
+
+def test_a_listener_that_cannot_attach_never_ends_the_process(fake_playwright):
+    """The observation capability is an optimisation. A driver-channel failure
+    while attaching it used to escape as a plain Exception, from a call site
+    that exists only to make diagnostics nicer."""
+    session = ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+    def boom(event, handler):
+        raise Exception(DRIVER_DEAD)
+
+    session._page.on = boom
+
+    session.start_send_observation()  # must not raise
+
+    assert session._listening is False
+
+
+# ---- the park has to say WHICH browser fault this was ------------------------
+#
+# "browser process alive, port dead" and "no browser at all" need opposite
+# operator actions — restart the wedged one (it can ignore SIGTERM) versus start
+# one — and the old message described both as "cannot connect". The endpoint is
+# probed separately from the port because a third case is real: a Chrome whose
+# `/json/version` answers 200 while CDP itself is wedged (2026-08-14).
+#
+# Every one of those measurements is LOCAL — the probes dial 127.0.0.1 and `ps`
+# lists this machine — so an endpoint that cannot be probed from here (another
+# host, or no usable port) gets NONE of it: every field unknown, and no advice
+# about the local dedicated profile. A local Chrome is not evidence about a
+# browser somewhere else.
+
+
+def _machine(monkeypatch, *, processes=(), port_open=False, answering=False):
+    monkeypatch.setattr(ps, "_list_processes", lambda: list(processes))
+    monkeypatch.setattr(ps, "_port_in_use", lambda port: port_open)
+    monkeypatch.setattr(ps, "_endpoint_ready", lambda port: answering)
+
+
+def test_the_diagnosis_reports_a_running_browser_that_stopped_serving_cdp(monkeypatch):
+    _machine(
+        monkeypatch,
+        processes=[(4711, "/Applications/Chrome --user-data-dir=/tmp/autoloop-chrome-test")],
+        port_open=True,
+        answering=False,
+    )
+
+    described = ps.describe_cdp_endpoint("http://127.0.0.1:9222")
+
+    assert "endpoint=http://127.0.0.1:9222" in described
+    assert "port_open=yes" in described
+    assert "cdp_answering=no" in described
+    assert "chrome_on_profile=1 (pid 4711)" in described
+    assert "Chrome IS running" in described
+
+
+def test_the_diagnosis_reports_when_there_is_no_browser_at_all(monkeypatch):
+    _machine(monkeypatch, processes=[], port_open=False, answering=False)
+
+    described = ps.describe_cdp_endpoint("http://127.0.0.1:9222")
+
+    assert "chrome_on_profile=0" in described
+    assert "chrome_on_port=0" in described
+    assert "NO Chrome is running" in described
+
+
+def test_helper_processes_are_not_evidence_of_a_running_browser(monkeypatch):
+    """Every renderer inherits `--user-data-dir` and `--remote-debugging-port`,
+    so counting them reports a live browser from the children of a dead one —
+    the same mistake that made the old restart script kill a renderer and
+    report success."""
+    _machine(
+        monkeypatch,
+        processes=[
+            (5001, "/Applications/Chrome --type=renderer --user-data-dir=/tmp/autoloop-chrome-test"),
+            (5002, "/Applications/Chrome --type=gpu-process --remote-debugging-port=9222"),
+        ],
+    )
+
+    described = ps.describe_cdp_endpoint("http://127.0.0.1:9222")
+
+    assert "chrome_on_profile=0" in described
+    assert "chrome_on_port=0" in described
+    assert "NO Chrome is running" in described
+
+
+def test_a_process_on_the_debug_port_counts_even_under_another_profile(monkeypatch):
+    """The profile is a guess (an env default); the port is what we actually
+    failed to reach, so a browser holding it is reported either way."""
+    _machine(
+        monkeypatch,
+        processes=[(6001, "/Applications/Chrome --user-data-dir=/tmp/other --remote-debugging-port=9222")],
+        port_open=True,
+    )
+
+    described = ps.describe_cdp_endpoint("http://127.0.0.1:9222")
+
+    assert "chrome_on_profile=0" in described
+    assert "chrome_on_port=1 (pid 6001)" in described
+    assert "Chrome IS running" in described
+
+
+def test_a_non_local_endpoint_is_reported_unknown_rather_than_measured(monkeypatch):
+    """The probes talk to 127.0.0.1. Reporting their answer for another host
+    would be a confident wrong diagnosis, which is worse than none."""
+    _machine(monkeypatch, port_open=True, answering=True)
+
+    described = ps.describe_cdp_endpoint("http://gpu-box:9222")
+
+    assert "port_open=unknown" in described
+    assert "cdp_answering=unknown" in described
+
+
+def test_a_non_local_endpoint_is_not_diagnosed_from_local_chrome_processes(monkeypatch):
+    """The sharp version of the test above, and the one that fails against
+    unknown port fields bolted onto a local verdict.
+
+    `ps` lists THIS machine, so a Chrome here is not evidence about a browser on
+    another host — not even one matching the dedicated profile AND holding 9222,
+    which is exactly the machine an operator running a local loop also has. If
+    the pid counts or the ACTION come from that scan, `http://gpu-box:9222` gets
+    diagnosed from an unrelated local Chrome and the operator is sent to restart
+    the wrong browser.
+    """
+    scans = {"count": 0}
+
+    def counted():
+        scans["count"] += 1
+        return [
+            (
+                4711,
+                "/Applications/Chrome --user-data-dir=/tmp/autoloop-chrome-test "
+                "--remote-debugging-port=9222",
+            )
+        ]
+
+    monkeypatch.setattr(ps, "_list_processes", counted)
+    monkeypatch.setattr(ps, "_port_in_use", lambda port: True)
+    monkeypatch.setattr(ps, "_endpoint_ready", lambda port: True)
+
+    described = ps.describe_cdp_endpoint("http://gpu-box:9222")
+
+    assert "chrome_on_profile=unknown" in described
+    assert "chrome_on_port=unknown" in described
+    assert "4711" not in described, "a local pid says nothing about another host"
+    assert "Chrome IS running" not in described
+    assert "NO Chrome is running" not in described
+    assert "chrome_restart" not in described, "never the local profile for a remote endpoint"
+    assert "gpu-box" in described, "and it still has to say where to look instead"
+    assert scans["count"] == 0, "nor spend a 30s `ps` on an answer it cannot use"
+
+
+def test_an_endpoint_with_no_usable_port_is_not_diagnosed_from_local_chrome(monkeypatch):
+    """The other unprobeable shape, held to the same rule. With no port there is
+    nothing to probe and nothing a local browser can settle — the url itself is
+    the fault — so a running local Chrome must not turn that into 'restart the
+    dedicated profile', which would leave the broken url in place."""
+    _machine(
+        monkeypatch,
+        processes=[(4711, "/Applications/Chrome --user-data-dir=/tmp/autoloop-chrome-test")],
+        port_open=True,
+    )
+
+    described = ps.describe_cdp_endpoint("http://127.0.0.1")
+
+    assert "port_open=unknown" in described
+    assert "chrome_on_profile=unknown" in described
+    assert "chrome_on_port=unknown" in described
+    assert "Chrome IS running" not in described
+    assert "fix the CDP url" in described
+    assert "endpoint=http://127.0.0.1" in described
+
+
+def test_an_unparseable_endpoint_is_diagnosed_rather_than_crashing(monkeypatch):
+    """Same branch, reached the other way: `:not-a-port` raises out of the url
+    parse instead of merely being absent. Which of the two it is must not decide
+    whether the operator gets a diagnosis at all — hence `_endpoint_host_port`
+    guards the whole `urlsplit`, not just the `.port` read, and the operator is
+    told to fix the url rather than handed `diagnosis=unavailable`."""
+    _machine(
+        monkeypatch,
+        processes=[(4711, "/Applications/Chrome --user-data-dir=/tmp/autoloop-chrome-test")],
+        port_open=True,
+    )
+
+    described = ps.describe_cdp_endpoint("http://127.0.0.1:not-a-port")
+
+    assert "fix the CDP url" in described
+    assert "diagnosis=unavailable" not in described, "a bad url is diagnosable, not a crash"
+    assert "chrome_on_profile=unknown" in described
+    assert "Chrome IS running" not in described
+
+
+def test_the_diagnosis_reaches_the_raised_error(fake_playwright, monkeypatch):
+    """It is only worth measuring if it survives into the park: the message is
+    what `stop_reason` and the blocker question carry."""
+    _connect_over_cdp_raises(monkeypatch, Exception(DRIVER_DEAD))
+    _machine(
+        monkeypatch,
+        processes=[(4711, "/Applications/Chrome --user-data-dir=/tmp/autoloop-chrome-test")],
+        port_open=True,
+    )
+
+    with pytest.raises(SessionLostError) as caught:
+        ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+    message = str(caught.value)
+    assert "http://127.0.0.1:9222" in message
+    assert "chrome_on_profile=1 (pid 4711)" in message
+    assert "cdp_answering=no" in message
+
+
+def test_the_action_survives_a_160_character_summary(fake_playwright, monkeypatch):
+    """`autoloop start` prints `blocker.question[:160]`. Ordered evidence-first
+    — which is how this was first written — that view shows four key=value
+    pairs and cuts off the one sentence saying what to do."""
+    _connect_over_cdp_raises(monkeypatch, Exception(DRIVER_DEAD))
+    _machine(
+        monkeypatch,
+        processes=[(4711, "/Applications/Chrome --user-data-dir=/tmp/autoloop-chrome-test")],
+        port_open=True,
+    )
+
+    with pytest.raises(SessionLostError) as caught:
+        ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+    summary = str(caught.value)[:160]
+    assert "restart the dedicated profile" in summary
+    assert "9222" in summary, "and which endpoint it is about"
+
+
+def test_a_diagnosis_that_throws_never_becomes_the_failure(fake_playwright, monkeypatch):
+    """`ps` can time out, a socket probe can raise. The thing added to prevent a
+    crash must not be the crash — on the one path where a second exception is
+    fatal."""
+    _connect_over_cdp_raises(monkeypatch, Exception(DRIVER_DEAD))
+
+    def no_ps():
+        raise OSError("ps: command not found")
+
+    monkeypatch.setattr(ps, "_list_processes", no_ps)
+
+    with pytest.raises(SessionLostError) as caught:
+        ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+
+    message = str(caught.value)
+    assert "diagnosis=unavailable" in message
+    assert "Connection closed while reading from the driver" in message
