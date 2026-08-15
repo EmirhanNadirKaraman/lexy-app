@@ -331,10 +331,25 @@ What it adds to auto-merge, which it CALLS rather than reimplements:
   ref and an unreachable remote are indistinguishable, and
   `_candidate_publication` is not asked to distinguish them); the execution
   record cannot be READ; there is no live record and no archived one shows the
-  work already landed; the record names no candidate. None is attempted, none
-  halts the sweep, and every one of them makes the run not-clear:
-  `merge-backlog` exits **1** and the startup hook prints instead of staying
-  silent. Exit 0 means the backlog is provably clear and nothing weaker.
+  work already landed; the record names no candidate. None is attempted, and
+  every one of them makes the run not-clear: `merge-backlog` exits **1** and the
+  startup hook prints instead of staying silent. Exit 0 means the backlog is
+  provably clear and nothing weaker.
+* **One unjudgeable task holds the WHOLE invocation** (`merge_sweep_held`,
+  since 2026-08-15). Naming it and sweeping on is not safe, because this module
+  deliberately supports a later branch being cut from an earlier one: publish A,
+  cut B from A, lose A's ref, and merging B makes A an ancestor of HEAD anyway —
+  the refusal to merge A undone transitively by the next branch in the list.
+  Excluding only the candidates that DESCEND from an unresolved one needs the
+  ancestry of a commit the sweep may be unable to name or resolve at all, so the
+  invariant is the coarse one: any enumeration-time unresolved ⇒ nothing is
+  merged this invocation. **The cost is real and accepted** — one stale
+  unjudgeable task blocks every sweep until an operator deals with it — but
+  nothing has been mutated at that point, so it costs a delay, never a bad base.
+  Startup still only REPORTS and the loop starts normally. A publication that
+  stops being confirmed *mid-sweep* is a different answer and keeps its own
+  (`merge_sweep_publication_changed`, below): branches have already landed by
+  then, so the honest report is where the sweep got to.
 * **Retired records are still read, for one question only.** `retire_execution`
   archives a record once publication is CONFIRMED, which is not the same as
   merged — with the flag off, nothing integrates it. The sweep therefore checks
@@ -347,6 +362,19 @@ What it adds to auto-merge, which it CALLS rather than reimplements:
   differs from `merge-window`, which ignores the archive deliberately — the
   gate asks "could moving the base strand this?" (a retired record cannot),
   this asks "is this branch in the base?" (retirement says nothing either way).
+* **Only the NEWEST retirement answers** (since 2026-08-15). `archive` keeps
+  every generation — a release, a retry, the `published-<sha>` retirement that
+  completed the task — and they describe different commits, so "any archived
+  copy names an ancestor" clears a task on the strength of a superseded attempt
+  while its completing publication sits unmerged. Generation is read off the
+  archive FILENAME (`retire_execution` appends a fixed-width `YYYYMMDDTHHMMSSZ`
+  instant to every label; whole labels do not order across differing reasons,
+  that trailing component does). A single archived copy needs no ordering and is
+  judged directly, which keeps pre-stamp records answerable; from two upwards an
+  unstamped label is unresolved rather than guessed at, and a same-second tie
+  requires all of the tied copies. Superseded generations are *not* required to
+  have landed — a released attempt's candidate is usually abandoned — or every
+  retried task would be unresolved forever.
 * **Publication is re-confirmed per branch, at the moment it is merged.** The
   `seen` cache of confirmed publications is shared with the merge-window gate,
   but a candidate's own key is evicted immediately before its merge, so every
@@ -384,9 +412,10 @@ re-enumerates what is left next time.
 |---|---|---|
 | Outstanding branches found | listed before anything is merged | `merge_sweep_backlog` |
 | Window shut | nothing attempted at all | `merge_sweep_deferred` |
+| Any task the enumeration could not judge | nothing attempted at all; the withheld branches are named | `merge_sweep_held` |
 | Each branch that lands | merged + base pushed by `AutoMerger` | `auto_merge_pushed` |
 | First branch that does not | sweep halts, remainder named | `merge_sweep_stopped` |
-| A completed task it could not judge (ref gone, remote unreachable, record unreadable/absent/candidate-less) | named, not merged, run does NOT count as clear (exit 1) | `merge_sweep_unresolved` |
+| A completed task it could not judge (ref gone, remote unreachable, record unreadable/absent/candidate-less, archive unorderable or superseded) | named, not merged, run does NOT count as clear (exit 1), and the whole sweep is held | `merge_sweep_unresolved` |
 | A ref that changed DURING the sweep | that branch and the rest are left alone; the sweep stops | `merge_sweep_publication_changed` |
 | Backlog cleared | — | `merge_sweep_completed` |
 

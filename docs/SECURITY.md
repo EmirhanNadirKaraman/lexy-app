@@ -499,7 +499,26 @@ What bounds the wider window:
   authority granted to anything the archived record asserts about itself. That
   answer can only make the sweep report MORE (an unresolved branch); it can
   never make a branch mergeable, because the merge path loads the LIVE record
-  and skips a task without one.
+  and skips a task without one. Since the third merge-03 review round only the
+  NEWEST archived generation answers, and an archive whose generations cannot be
+  ordered answers "unresolved": `archive` keeps one file per retirement, so an
+  older released/salvaged copy could otherwise clear a task whose completing
+  publication is still outstanding — a report-clear on evidence about a
+  different commit. The archive is globbed by filename PREFIX and task ids may
+  contain `-`, so `rt-1-*.json` also matches `rt-1-b-published-<stamp>.json`;
+  each copy is now checked against the `task_id` it carries and dropped only
+  when it proves it belongs to another task (an unreadable or owner-less copy
+  is kept, since "cannot tell" must not read as "not mine"). All three changes
+  move the answer toward "unresolved", i.e. toward reporting more and merging
+  less.
+- **An unjudgeable task withholds the whole invocation.** Since the third
+  merge-03 review round, any completed task the enumeration cannot judge makes
+  the sweep non-mutating for that run (`merge_sweep_held`). The reason is an
+  ancestry one rather than a reporting one: a candidate the remote DOES confirm
+  may be descended from the one it does not, so merging the judgeable branch
+  carries the unconfirmed publication into the base transitively — granting
+  exactly what refusing to merge it directly withheld. Fail-closed before
+  mutation; it can only reduce what the sweep merges, never widen it.
 - **Enumeration cannot invent a target.** The set comes from the registry and
   the execution records, never from the remote's ref namespace, so no branch a
   third party pushes to origin becomes mergeable by appearing there.
@@ -529,6 +548,12 @@ rg -n 'def _cmd_merge_backlog' -A 12 autoloop/cli.py
 # (enumeration, then `_reconfirm` immediately before that branch's own merge),
 # and the memo key is evicted before the second so it cannot answer from cache
 rg -n '_candidate_publication|seen.discard' autoloop/merge_sweep.py
+# Expect: the hold is checked BEFORE the gate and BEFORE any `_attempt` call —
+# i.e. an unjudgeable task makes the invocation non-mutating, not merely noisy
+rg -n 'if result.unresolved|_merge_window_blockers|self._attempt' autoloop/merge_sweep.py
+# Expect: only the newest archived generation is judged (no loop over every
+# archived copy returning True on the first ancestral one)
+rg -n '_newest_generation|_retirement_stamp' autoloop/merge_sweep.py
 ```
 
 ### S25 — Circular task-scope authorization, failed-round residue, and unbounded pre-commit retries — HIGH — RESOLVED 2026-07-31

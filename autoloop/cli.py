@@ -478,6 +478,12 @@ def _sweep_backlog_on_startup(config: AutoloopConfig) -> None:
     the sweep could not judge is exactly the thing that must not pass
     unmentioned, whether it was the remote, the record or the archive that
     would not answer. Every outcome is in the transcript regardless.
+
+    REPORTS, never blocks. A sweep that merged nothing — held on an unjudgeable
+    task, deferred by the window, stopped on a conflict — prints and returns,
+    and the loop starts normally. The unmerged branch it is complaining about
+    has already waited days; refusing to start the loop over it would be a
+    strictly worse failure than the one being reported.
     """
     result = merge_sweep.sweep_on_startup(config)
     if result.outcome == merge_sweep.DISABLED:
@@ -2162,6 +2168,17 @@ def _format_sweep(result: "merge_sweep.SweepResult") -> list[str]:
             "may still be outstanding — NOT the same as 'nothing to merge'. "
             "Fix what the reasons name and run this again."
         )
+    if result.outcome == merge_sweep.HELD:
+        lines.append(
+            f"  nothing was merged; {len(result.pending)} branch(es) left "
+            "untouched: " + (", ".join(result.pending) if result.pending else "(none)")
+        )
+        lines.append(
+            "  a task named above could not be judged, and this sweep merges "
+            "branches that may be DESCENDED from it — merging one of them would "
+            "carry that unconfirmed work into the base without ever confirming "
+            "it. Resolve what the reasons name, then run `merge-backlog` again."
+        )
     if result.outcome == merge_sweep.DEFERRED:
         for reason in result.reasons:
             lines.append(f"  - {reason}")
@@ -2216,6 +2233,11 @@ def _cmd_merge_backlog(args: argparse.Namespace) -> int:
     — all exit 1. Exiting 0 on any of those would be this command reporting "I
     looked, there is nothing there" for a run in which it could not look, which
     is the exact invisibility it exists to end.
+
+    One unjudgeable task does more than change the exit code: it withholds the
+    whole sweep (`merge_sweep.HELD`), because a branch that IS judgeable may be
+    descended from it. `merge_sweep.py`'s "could not look" section has the
+    reasoning and what it costs.
     """
     config = load_config(args.config)
     with LoopLock(config.state_dir):

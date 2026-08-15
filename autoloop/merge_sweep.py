@@ -75,24 +75,60 @@ very likely a branch out there, and this module cannot name it:
   permission failure. Named since 2026-08-15; before that it was logged and
   then dropped, so a sweep whose only completed task had a corrupt record
   reported `nothing_to_do` and exited 0 having inspected nothing.
-* **There is no live record, and no archived one proves the work landed.**
+* **There is no live record, and the NEWEST archived one does not prove the
+  work landed** — including when the archived copies cannot be put in
+  generation order at all, or the newest of them will not load.
   `_retired_publication_is_integrated` explains why the archive is read here
-  when the merge window deliberately ignores it.
+  when the merge window deliberately ignores it, and why only its newest
+  generation is allowed to answer.
 * **The record loads but names no candidate.** Completion implies a candidate,
   so such a record cannot be describing the publication completion implies.
 
 None of the four is ATTEMPTED: there is nothing here this module is allowed to
 merge, and inventing a branch out of a record's own claim is the fail-open
-reading `_candidate_publication` exists to refuse. None of them HALTS the sweep
-either — nothing has been mutated, so this is not the half-done state stopping
-exists to prevent. Each leaves a hole in the publication order, which is safe
-for the same reason a wrong order is: the next branch either applies or
-conflicts, and a conflict stops cleanly.
+reading `_candidate_publication` exists to refuse.
 
-But every one of them makes the run not-clear. `SweepResult.is_clear` is false
+And since 2026-08-15 none of the OTHER branches is attempted either. **Any
+unresolved task found during enumeration makes the whole invocation
+non-mutating** (`HELD`), because an unjudgeable task is not provably independent
+of the candidates that ARE judgeable:
+
+    publish A; cut B from A; A's ref is deleted (or its record goes unreadable)
+    while B's is still confirmed.
+
+A is excluded — correctly, nothing here may merge it. But B is a DESCENDANT of
+A, so merging B makes A an ancestor of HEAD anyway, without A's publication ever
+having been confirmed. This module exists precisely because a later branch is
+allowed to build on an earlier one (see the order section), so that shape is
+ordinary rather than exotic, and it is worse for the unreadable-record case: a
+record nobody can read cannot even be checked for the relationship. Skipping the
+unresolved entry and sweeping on therefore integrates, transitively, exactly the
+work the skip refused to integrate directly.
+
+Being unresolved is per-task, but the safe response is per-INVOCATION, and
+deliberately so. The alternative — excluding every candidate that descends from
+an unresolved one — needs the ancestry of a commit the sweep may be unable to
+name or resolve at all, which is the same unanswerable question one step along.
+Nothing has been mutated at that point, so holding costs only a delay.
+
+**The cost is real and accepted**: one stale unjudgeable task blocks every sweep
+until an operator deals with it. That is the intended trade — the branches this
+module merges have already sat unmerged for days, and the report names what to
+fix — but it is a cost, not a free win. `merge_sweep_held` names both the
+unjudgeable tasks and the untouched branches so the operator can see what the
+one is holding up.
+
+Every one of them makes the run not-clear. `SweepResult.is_clear` is false
 whenever `unresolved` is non-empty, so `merge-backlog` exits 1 and the startup
 hook prints rather than staying quiet. Exit 0 means "I looked, and there is
-provably nothing outstanding", never "I could not look".
+provably nothing outstanding", never "I could not look". Startup still only
+REPORTS: a held sweep does not stop the loop from running, exactly as a deferred
+or stopped one does not.
+
+A publication that stops being confirmed MID-SWEEP is a different answer and
+keeps its own (`UNCONFIRMED`, below): by then branches have already been merged
+and pushed, so the honest report is where the sweep got to, not a pretence that
+nothing happened.
 
 ## Enumeration evidence is not mutation authority
 
@@ -163,9 +199,13 @@ policy-legal way to fetch it from the remote (`fetch_object` takes a local path
 by design), so that branch cannot be integrated here at all, and every sweep
 from now on will stop at it. That is the intended report, not an oversight: the
 branches behind it may well build on it, and a tool quietly working around a
-branch it can never merge is how a backlog becomes invisible again. The
-recovery is an operator `git fetch` + merge, or a `release` of the record; both
-end the stall, and `merge_sweep_stopped` names the branch and the remainder.
+branch it can never merge is how a backlog becomes invisible again. The recovery
+is an operator `git fetch` of the branch followed by a merge by hand: the
+candidate is then an ancestor of HEAD, so the next sweep skips it silently and
+carries on with the rest. NOT `release` — that refuses anything not in progress
+(`TaskRegistry.release`), and every task the sweep enumerates is completed, so
+suggesting it here would send the operator at a command that cannot run.
+`merge_sweep_stopped` names the branch and the remainder.
 
 ## The gate defers the whole sweep, never part of it
 
@@ -215,6 +255,7 @@ from .worktask import TaskExecutionStore
 SWEPT = "swept"                  # every outstanding branch reached the base
 NOTHING_TO_DO = "nothing_to_do"  # no completed, published, unmerged branch
 DEFERRED = "deferred"            # the gate was shut: NOTHING was attempted
+HELD = "held"                    # a task could not be judged: NOTHING was attempted
 STOPPED = "stopped"              # a branch did not land; the rest are untouched
 DISABLED = "disabled"            # policy.auto_merge_enabled is false
 FAILED = "failed"                # the sweep itself could not run
@@ -259,9 +300,10 @@ class SweepResult:
     #: Branches that reached the base, in the order they were attempted.
     merged: list[str] = field(default_factory=list)
     #: Branches still outstanding: the gate shut before any of them was tried,
-    #: or the sweep stopped — in which case the one it stopped ON leads the
-    #: list, since it did not land either. Named so "the rest were left alone"
-    #: is a checkable claim rather than an absence.
+    #: a task could not be judged and held the whole invocation (`HELD`), or the
+    #: sweep stopped — in which case the one it stopped ON leads the list, since
+    #: it did not land either. Named so "the rest were left alone" is a checkable
+    #: claim rather than an absence.
     pending: list[str] = field(default_factory=list)
     #: `(task_id, reason)` for a completed task the sweep could not JUDGE —
     #: an unconfirmed publication, an unreadable record, a retired record whose
@@ -289,6 +331,9 @@ class SweepResult:
         one of those runs as `nothing_to_do` would say "I looked, the backlog is
         clear" instead: the 2026-08-06 invisibility rebuilt one layer up, in the
         tool written to end it.
+
+        `HELD` never reaches the first test either, so it needs no case of its
+        own: it exists only when `unresolved` is non-empty.
         """
         return self.outcome in (SWEPT, NOTHING_TO_DO) and not self.unresolved
 
@@ -371,6 +416,25 @@ class BacklogSweeper:
                 ],
             },
         )
+
+        # A task the enumeration could not JUDGE holds the whole invocation,
+        # before the gate and before any merge. Not because the sweep is tidy
+        # about reporting, but because an unjudgeable task is not provably
+        # independent of the ones below it: this module deliberately supports a
+        # later branch being cut from an earlier one, so merging a confirmed
+        # candidate can carry an unconfirmed ancestor into the base with it.
+        # See the module docstring's "could not look" section, including what
+        # this deliberately costs.
+        if result.unresolved:
+            result.outcome = HELD
+            self._log(
+                "merge_sweep_held",
+                data={
+                    "unresolved": [task_id for task_id, _why in result.unresolved],
+                    "pending": list(result.pending),
+                },
+            )
+            return result
 
         # THE GATE, once, for the whole sweep. See the module docstring.
         from . import cli
@@ -601,45 +665,92 @@ class BacklogSweeper:
         its candidate demonstrably merged. Wolf-crying, on exactly the records
         this branch exists to stop wolf-crying about.
 
-        Every archived record for the task is considered and the first
-        integrated one wins, so this does not depend on sorting `<reason>-<stamp>`
-        labels chronologically (they are not lexicographically ordered across
-        different reasons). Nothing here is ever merged FROM: an archived record
-        is not a merge source, because `AutoMerger.attempt` reads the LIVE
-        record and would skip the task anyway. The honest report is the output.
+        **Only the NEWEST retirement answers, and it answers alone.**
+        `TaskExecutionStore.archive` preserves one file per retirement and
+        refuses to clobber an earlier one, so a single task legitimately has
+        several generations on disk — a `release`, a later retry, the
+        `published-<sha>` retirement that produced the state being judged here.
+        Those generations describe DIFFERENT commits. An earlier one is very
+        often integrated precisely because it was superseded and its work
+        reached the base another way, so "any archived copy names an ancestor"
+        clears a task whose newest publication is still outstanding — the
+        invisibility this module exists to end, granted by its own reconciler.
+        The newest generation is the one whose publication produced the task's
+        current COMPLETED state, so it is the only one asked.
+
+        Superseded generations are not required to be integrated, and must not
+        be: a released attempt's candidate is usually abandoned and never
+        merged, so demanding it would report every retried task unresolved
+        forever — the same wolf-crying, from the opposite direction.
+
+        Generation comes from the archive FILENAME, not from the record inside
+        it: `retire_execution` appends a fixed-width UTC instant to every label
+        (`<task_id>-<reason>-<stamp>.json`, stamp `YYYYMMDDTHHMMSSZ`), and while
+        whole labels do not order across differing reasons, that trailing
+        component does. When it cannot be read — an unstamped label, a
+        hand-made file — the generations cannot be ordered, and an unorderable
+        archive is unresolved rather than guessed at. A task with exactly ONE
+        archived record needs no ordering and is judged directly, which is what
+        keeps records written before the stamp existed answerable.
+
+        **The glob matches by filename PREFIX, so it can land on another task's
+        record.** Task ids may contain `-` (`TaskRegistry`'s rule admits it) and
+        so may labels, so `rt-1-*.json` matches `rt-1-b-published-<stamp>.json`.
+        That was a latent fail-open under any "some copy names an ancestor" rule
+        and is a sharper one under this one: a sibling's copy carrying the newest
+        stamp would BECOME the newest generation, and this task's own newest
+        archive would never be consulted — another task's commit standing in for
+        this task's completed publication. Each copy is therefore checked against
+        the `task_id` it carries (a required field on every record this store has
+        ever written) and dropped only when it PROVES it belongs to someone else.
+        A copy that cannot be read, or one carrying no owner at all, is kept: not
+        provably foreign is not foreign, and keeping it can only make the answer
+        more conservative.
+
+        Nothing here is ever merged FROM: an archived record is not a merge
+        source, because `AutoMerger.attempt` reads the LIVE record and would
+        skip the task anyway. The honest report is the output.
         """
         archive = Path(self._execution_store.directory) / "archive"
         try:
             paths = sorted(archive.glob(f"{task_id}-*.json"))
         except OSError as exc:
             return False, f"its execution archive could not be listed ({exc})"
-        if not paths:
+        copies = [
+            copy
+            for copy in (_read_archived(path) for path in paths)
+            if not _is_another_tasks_copy(copy, task_id)
+        ]
+        if not copies:
+            # Either the glob found nothing, or everything it found proved to
+            # belong to another task — which is the same answer: nothing here
+            # names the branch this task's completion says was published.
             return False, (
                 "it has no execution record, live or archived — nothing names "
                 "the candidate its completion says was published"
             )
-        unreadable: list[str] = []
-        for path in paths:
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                unreadable.append(f"{path.name} ({exc})")
-                continue
-            if not isinstance(data, dict):
-                unreadable.append(f"{path.name} (not a record)")
-                continue
-            for sha in (data.get("candidate_sha"), data.get("published_sha")):
-                if sha and self._is_integrated(head, str(sha)):
-                    return True, ""
+        newest, why_not = _newest_generation(copies)
+        if not newest:
+            return False, why_not
+        unreadable = [f"{c.name} ({c.error})" for c in newest if c.data is None]
         if unreadable:
             return False, (
-                "its record was retired and the archived copy could not be "
-                "read: " + "; ".join(unreadable)
+                "its record was retired and the newest archived copy could not "
+                "be read: " + "; ".join(unreadable)
             )
+        integrated = all(
+            any(
+                sha and self._is_integrated(head, str(sha))
+                for sha in (c.data.get("candidate_sha"), c.data.get("published_sha"))
+            )
+            for c in newest
+        )
+        if integrated:
+            return True, ""
         return False, (
-            "its record was retired and no sha any archived copy names is an "
-            f"ancestor of {head[:12]} — the branch may still be outstanding; "
-            "merge it by hand"
+            "its record was retired and no sha its newest archived copy "
+            f"({', '.join(c.name for c in newest)}) names is an ancestor of "
+            f"{head[:12]} — the branch may still be outstanding; merge it by hand"
         )
 
     def _is_integrated(self, head: str, candidate_sha: str) -> bool:
@@ -694,6 +805,129 @@ def _as_record_dict(record) -> dict:
     return _publication_dict(
         record.candidate_sha, record.intended_remote, record.intended_remote_ref
     )
+
+
+@dataclass(frozen=True)
+class _ArchivedCopy:
+    """One file in `executions/archive/`, read exactly once.
+
+    Read up front rather than on demand because the owner check and the
+    ancestry check both need the contents, and a file that will not load has to
+    survive as an ANSWER ("could not read this") rather than as an absence —
+    dropping it silently is the shape that made the corrupt live record exit 0.
+    """
+
+    path: Path
+    #: The record, or None when the file could not be read as one.
+    data: dict | None = None
+    #: Why, when `data` is None.
+    error: str = ""
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+
+def _read_archived(path: Path) -> _ArchivedCopy:
+    """Load one archived record as raw JSON. Never raises: an unreadable copy
+    is a fact about the archive, and the caller reports it rather than crashing
+    a sweep that runs before the loop starts."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return _ArchivedCopy(path, None, str(exc))
+    if not isinstance(data, dict):
+        return _ArchivedCopy(path, None, "not a record")
+    return _ArchivedCopy(path, data)
+
+
+def _is_another_tasks_copy(copy: _ArchivedCopy, task_id: str) -> bool:
+    """Does this copy PROVE it belongs to a different task?
+
+    Only a readable record naming a different owner counts. The archive glob
+    matches by filename prefix and both task ids and labels may contain `-`, so
+    `rt-1-*.json` picks up `rt-1-b-published-<stamp>.json`; without this the
+    sibling's copy could take the newest-generation slot and answer for a task
+    it says nothing about. Asked in the negative on purpose — an unreadable copy
+    and one with no `task_id` at all are both KEPT, because "cannot tell" must
+    not read as "not mine": keeping them can only make the answer more
+    conservative, while dropping them could clear an outstanding branch.
+    """
+    if copy.data is None:
+        return False
+    owner = copy.data.get("task_id")
+    return isinstance(owner, str) and bool(owner) and owner != task_id
+
+
+def _newest_generation(copies: list[_ArchivedCopy]) -> tuple[list[_ArchivedCopy], str]:
+    """The archived record(s) describing the LATEST retirement of one task, or
+    `([], why_not)` when the generations cannot be ordered.
+
+    One archived file is one retirement; several are several attempts at the
+    same task, describing different commits (see
+    `_retired_publication_is_integrated`). Ordering them is therefore the whole
+    question, and it is answered from the filename rather than the contents —
+    the record inside carries no field that is written per-retirement.
+
+    A single copy is returned untouched: one generation has nothing to be
+    ordered against, so a record retired before the stamp existed is still
+    answerable. From two upwards every label must carry a stamp, because an
+    unstamped one could be the newest and there is no way to tell — the
+    fail-closed answer, matching every other unanswerable question here.
+
+    Ties (two retirements inside the same second — `utcnow_iso` writes seconds)
+    return BOTH, and the caller then requires all of them to be integrated.
+    Same reasoning: with no way to tell which came last, the safe reading is the
+    one that cannot clear an outstanding branch.
+    """
+    if len(copies) == 1:
+        return list(copies), ""
+    generations: dict[str, list[_ArchivedCopy]] = {}
+    unstamped: list[str] = []
+    for copy in copies:
+        stamp = _retirement_stamp(copy.path)
+        if not stamp:
+            unstamped.append(copy.name)
+            continue
+        generations.setdefault(stamp, []).append(copy)
+    if unstamped:
+        return [], (
+            "its record was retired more than once and "
+            + ", ".join(sorted(unstamped))
+            + " carries no retirement stamp, so the archived copies cannot be "
+            "put in order — the newest may be describing work that is still "
+            "outstanding; merge it by hand"
+        )
+    return generations[max(generations)], ""
+
+
+def _retirement_stamp(path: Path) -> str:
+    """The `YYYYMMDDTHHMMSSZ` instant `retire_execution` appends to every
+    archive label, or `""` when this filename does not carry one.
+
+    Read off the END of the stem rather than by stripping the task id from the
+    front: `label = f"{reason}-{stamp}"` and both task ids and reasons contain
+    `-` (`published-8d96c52aeca4`, `released-by-operator`), so the last
+    `-`-separated component is the only one whose position is fixed. The stamp
+    itself has none — `utcnow_iso().replace(":", "").replace("-", "")` strips
+    them — which is what makes that split unambiguous and the result
+    lexicographically ordered.
+
+    Shape-checked rather than parsed: the value is only ever compared with
+    another of its own kind, so a real instant is not needed, only a fixed-width
+    ASCII one. `isascii()` is not decoration — `str.isdigit()` is true for
+    non-ASCII digits, which sort nowhere useful.
+    """
+    tail = path.stem.rsplit("-", 1)[-1]
+    if (
+        len(tail) == 16
+        and tail[8] == "T"
+        and tail.endswith("Z")
+        and tail[:8].isascii() and tail[:8].isdigit()
+        and tail[9:15].isascii() and tail[9:15].isdigit()
+    ):
+        return tail
+    return ""
 
 
 def _parse_iso(value: str) -> float | None:

@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import subprocess
+from pathlib import Path
 
 from autoloop import auto_merge, cli, merge_sweep
 from autoloop.auto_merge import AutoMerger, MergeDeferralStore
@@ -39,7 +40,7 @@ from autoloop.merge_sweep import BacklogSweeper
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.transcript import TranscriptLogger
 from autoloop.tasks import Task, TaskRegistry, TaskStore
-from autoloop.worktask import TaskExecution, TaskExecutionStore
+from autoloop.worktask import TaskExecution, TaskExecutionStore, retire_execution
 
 URL = "https://chatgpt.com/c/merge-sweep"
 BASE = "work"
@@ -105,12 +106,20 @@ class Backlog:
         return self.head()
 
     def publish(self, task_id, files, *, when=None, published_at="", dest_ref=None,
-                base=None, complete=True):
+                base=None, complete=True, branch=None, register=True):
         """One completed task whose reviewed candidate is on its own branch on
         origin and is NOT in the base — the exact state the 2026-08-06 seven
-        were found in."""
+        were found in.
+
+        `branch` / `register=False` publish a SECOND generation for a task the
+        registry already knows: a retry after a release, which is what leaves
+        several archived records for one task id (`TaskExecutionStore.archive`
+        keeps every retirement). The registry refuses a duplicate id and a
+        second `mark_completed`, correctly — the task is completed once, by the
+        publication that finished it.
+        """
         base_sha = base or self.head()
-        branch = f"autoloop/{task_id}"
+        branch = branch or f"autoloop/{task_id}"
         ref = dest_ref or f"refs/heads/{branch}"
         run_git(self.repo, "checkout", "-q", "-b", branch, base_sha)
         for rel, content in files.items():
@@ -123,11 +132,11 @@ class Backlog:
         run_git(self.repo, "push", "-q", "origin", f"{sha}:{ref}")
         run_git(self.repo, "checkout", "-q", BASE)
         self.record(task_id, sha, base_sha, dest_ref=ref, published_at=published_at,
-                    complete=complete)
+                    complete=complete, register=register)
         return sha
 
     def record(self, task_id, candidate, base_sha, *, dest_ref, published_at="",
-               remote="origin", complete=True):
+               remote="origin", complete=True, register=True):
         self.execution_store.save(
             TaskExecution(
                 task_id=task_id,
@@ -142,6 +151,8 @@ class Backlog:
                 published_at=published_at,
             )
         )
+        if not register:
+            return
         self.registry.add_many([Task(id=task_id, title=f"Title {task_id}", description="d")])
         if complete:
             self.registry.mark_completed(task_id)
@@ -578,6 +589,150 @@ def test_a_retired_record_whose_work_is_NOT_in_the_base_is_unresolved(tmp_path):
     assert b.entries("auto_merge_skipped") == [], "it was never handed to the merger"
 
 
+def test_an_OLDER_archived_retirement_cannot_stand_in_for_the_newest(tmp_path):
+    """`TaskExecutionStore.archive` keeps EVERY retirement — a release, a later
+    retry, the `published-<sha>` retirement that completed the task — and those
+    generations describe different commits. Judging the task on whichever
+    archived copy happens to name an ancestor therefore clears it on the
+    strength of a superseded attempt: the first one landed and was released, the
+    retry that actually completed the task is still sitting on its branch, and
+    the sweep reports the backlog clear. That is the 2026-08-06 invisibility
+    granted by the reconciler written to end it.
+
+    The older copy here really is integrated, so this fails against the
+    first-integrated-archive-wins rule rather than passing vacuously.
+    """
+    b = build(tmp_path)
+    released = b.publish("twice-01", {"a.py": "one\n"})
+    run_git(b.repo, "merge", "--no-ff", "--no-edit", "-m", "attempt one landed", released)
+    merged_head = b.head()
+    b.retire_record("twice-01", label="released-by-operator-20260801T000000Z")
+    retry = b.publish(
+        "twice-01", {"b.py": "two\n"},
+        branch="autoloop/twice-01-retry", register=False,
+    )
+    b.retire_record("twice-01", label=f"published-{retry[:12]}-20260810T000000Z")
+    assert contains(b.repo, merged_head, released), "the OLDER attempt really did land"
+
+    result = b.sweep()
+
+    assert result.is_clear is False, (
+        "an older ancestral retirement must not answer for a newer publication"
+    )
+    assert [t for t, _why in result.unresolved] == ["twice-01"]
+    assert "merge it by hand" in result.unresolved[0][1]
+    assert "20260810T000000Z" in result.unresolved[0][1], (
+        "the operator is told WHICH generation is outstanding"
+    )
+    assert b.head() == merged_head
+    assert not contains(b.repo, b.head(), retry), "the newest publication is unmerged"
+
+
+def test_the_NEWEST_retirement_being_in_the_base_clears_a_task_with_older_ones(tmp_path):
+    """The control that stops the rule above from being merely strict. A
+    superseded generation is NOT required to have landed — a released attempt's
+    candidate is usually abandoned and never merged — so demanding that every
+    archived copy be an ancestor would report every retried task unresolved
+    forever, the same wolf-crying from the other direction. Only the newest is
+    asked, and when it answers, the task is silent."""
+    b = build(tmp_path)
+    abandoned = b.publish("retried-01", {"a.py": "one\n"})
+    b.retire_record("retried-01", label="released-by-operator-20260801T000000Z")
+    shipped = b.publish(
+        "retried-01", {"b.py": "two\n"},
+        branch="autoloop/retried-01-retry", register=False,
+    )
+    run_git(b.repo, "merge", "--no-ff", "--no-edit", "-m", "the retry landed", shipped)
+    merged_head = b.head()
+    b.retire_record("retried-01", label=f"published-{shipped[:12]}-20260810T000000Z")
+    assert not contains(b.repo, merged_head, abandoned), "the older attempt never landed"
+
+    result = b.sweep()
+
+    assert result.is_clear is True, "the newest publication is provably integrated"
+    assert result.unresolved == []
+    assert b.head() == merged_head
+    assert b.sweep_entries() == [], "silently means silently"
+
+
+def test_archived_copies_that_cannot_be_PUT_IN_ORDER_are_unresolved(tmp_path):
+    """Generation comes from the archive filename — `retire_execution` appends a
+    fixed-width UTC instant to every label — so a label without one cannot be
+    placed against the others, and the unstamped copy could be the newest. An
+    unorderable archive is unresolved rather than guessed at, matching every
+    other unanswerable question here. (A task with exactly ONE archived copy has
+    nothing to order and is judged directly; that is what keeps pre-stamp
+    records answerable, and the two tests above cover it.)"""
+    b = build(tmp_path)
+    landed = b.publish("murky-01", {"a.py": "one\n"})
+    run_git(b.repo, "merge", "--no-ff", "--no-edit", "-m", "attempt one landed", landed)
+    b.retire_record("murky-01", label="released-by-operator")
+    b.publish("murky-01", {"b.py": "two\n"},
+              branch="autoloop/murky-01-retry", register=False)
+    b.retire_record("murky-01", label="published-20260810T000000Z")
+
+    result = b.sweep()
+
+    assert result.is_clear is False
+    assert [t for t, _why in result.unresolved] == ["murky-01"]
+    assert "cannot be put in order" in result.unresolved[0][1]
+    assert "murky-01-released-by-operator.json" in result.unresolved[0][1], (
+        "the operator is told which file has no stamp"
+    )
+
+
+def test_another_TASKS_archive_cannot_answer_through_a_shared_id_PREFIX(tmp_path):
+    """The archive is globbed by filename prefix, and task ids may contain `-`
+    (`TaskRegistry`'s rule admits it), so `rt-1-*.json` matches
+    `rt-1-b-published-<stamp>.json`. Judging the newest generation makes that
+    sharper rather than safer: the sibling's copy here carries the newer stamp,
+    so without an owner check it BECOMES `rt-1`'s newest generation and answers
+    with a commit that has nothing to do with `rt-1` — the sibling's work landed,
+    so `rt-1` would be reported clear while its own branch sits outstanding.
+
+    `rt-1-b` is genuinely integrated, so this fails against the unguarded
+    version rather than passing vacuously.
+    """
+    b = build(tmp_path)
+    stranded = b.publish("rt-1", {"a.py": "one\n"})
+    b.retire_record("rt-1", label="published-20260801T000000Z")
+    sibling = b.publish("rt-1-b", {"b.py": "two\n"})
+    run_git(b.repo, "merge", "--no-ff", "--no-edit", "-m", "the sibling landed", sibling)
+    b.retire_record("rt-1-b", label="published-20260810T000000Z")
+
+    result = b.sweep()
+
+    assert [t for t, _why in result.unresolved] == ["rt-1"], (
+        "rt-1's own branch is outstanding; rt-1-b's really did land"
+    )
+    assert "merge it by hand" in result.unresolved[0][1]
+    assert "rt-1-b" not in result.unresolved[0][1], (
+        "and the sibling's copy is not what it was judged on"
+    )
+    assert result.is_clear is False
+    assert not contains(b.repo, b.head(), stranded)
+
+
+def test_a_newest_archived_copy_that_cannot_be_READ_is_unresolved(tmp_path):
+    """Same fail-closed rule as the live record's. The newest generation is the
+    one that answers, so a newest copy that will not load leaves the question
+    unanswered — an older readable one does not get to answer in its place."""
+    b = build(tmp_path)
+    landed = b.publish("torn-arch-01", {"a.py": "one\n"})
+    run_git(b.repo, "merge", "--no-ff", "--no-edit", "-m", "attempt one landed", landed)
+    b.retire_record("torn-arch-01", label="released-by-operator-20260801T000000Z")
+    b.publish("torn-arch-01", {"b.py": "two\n"},
+              branch="autoloop/torn-arch-01-retry", register=False)
+    newest = b.retire_record("torn-arch-01", label="published-20260810T000000Z")
+    newest.write_text("{not json", encoding="utf-8")
+
+    result = b.sweep()
+
+    assert result.is_clear is False
+    assert [t for t, _why in result.unresolved] == ["torn-arch-01"]
+    assert "newest archived copy could not be read" in result.unresolved[0][1]
+
+
 def test_a_completed_record_that_names_no_candidate_is_unresolved(tmp_path):
     """Completion means a candidate was published, so a completed task's record
     that names none cannot be describing that publication. Skipping it silently
@@ -603,6 +758,115 @@ def test_a_completed_record_that_names_no_candidate_is_unresolved(tmp_path):
     assert result.is_clear is False
     assert [t for t, _why in result.unresolved] == ["blank-01"]
     assert "names no candidate" in result.unresolved[0][1]
+
+
+# --- an unjudgeable task holds the WHOLE sweep --------------------------------
+
+
+def test_a_branch_DESCENDED_from_an_unjudgeable_task_is_not_merged_either(tmp_path):
+    """Naming an unjudgeable task and sweeping on is not safe, because this
+    module deliberately supports a later branch being cut from an earlier one.
+
+    Publish A, cut B from A, then lose A's ref before the enumeration while B's
+    is still confirmed. A is excluded — correctly, nothing here may merge a
+    publication the remote will not confirm. But B is a DESCENDANT of A, so
+    merging B makes A an ancestor of HEAD anyway, and A's publication was never
+    confirmed by anything. The refusal to merge A directly would be undone
+    transitively by the very next branch in the list.
+    """
+    b = build(tmp_path)
+    before = b.head()
+    a_sha = b.publish(
+        "a-first", {"shared.py": "line one\n"}, published_at="2026-08-06T01:00:00+00:00"
+    )
+    b_sha = b.publish(
+        "b-on-a", {"shared.py": "line one\nline two\n"},
+        base=a_sha, published_at="2026-08-06T02:00:00+00:00",
+    )
+    assert contains(b.repo, b_sha, a_sha), "B really is built on A"
+    run_git(b.repo, "push", "-q", "origin", "--delete", "refs/heads/autoloop/a-first")
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.HELD
+    assert result.merged == [], "nothing may be merged while a task is unjudged"
+    assert [t for t, _why in result.unresolved] == ["a-first"]
+    assert result.pending == ["b-on-a"], "the withheld branch is named, not swept"
+    assert result.is_clear is False
+    assert b.head() == before, "the base is exactly as it was"
+    assert not contains(b.repo, b.head(), b_sha)
+    assert not contains(b.repo, b.head(), a_sha), (
+        "and the unconfirmed publication must not arrive as B's ancestor"
+    )
+    assert b.origin_base() == before, "nothing was pushed"
+    assert b.entries("auto_merge_merged") == [], "the merger was never called"
+    held = b.entries("merge_sweep_held")[0]["data"]
+    assert held["unresolved"] == ["a-first"] and held["pending"] == ["b-on-a"]
+
+
+def test_a_task_whose_RECORD_will_not_load_holds_the_sweep_the_same_way(tmp_path):
+    """The less provable half of the same shape. A publication the remote denies
+    at least leaves a candidate sha to reason about; a record nobody can read
+    names no commit at all, so whether the branches below it descend from its
+    work is not merely unknown but unaskable. Fail closed identically."""
+    b = build(tmp_path)
+    before = b.head()
+    b.publish("torn-01", {"a.py": "one\n"}, published_at="2026-08-06T01:00:00+00:00")
+    later = b.publish("later-01", {"b.py": "two\n"},
+                      published_at="2026-08-06T02:00:00+00:00")
+    (b.config.executions_dir / "torn-01.json").write_text("{not json", encoding="utf-8")
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.HELD
+    assert result.merged == []
+    assert [t for t, _why in result.unresolved] == ["torn-01"]
+    assert result.pending == ["later-01"]
+    assert b.head() == before
+    assert not contains(b.repo, b.head(), later)
+
+
+def test_the_hold_is_per_INVOCATION_not_per_lineage(tmp_path):
+    """Deliberately an over-approximation: the withheld branch here shares no
+    history with the unjudgeable task beyond the base they were both cut from.
+
+    Excluding only the candidates that DESCEND from an unresolved one would need
+    the ancestry of a commit the sweep may be unable to name or resolve at all —
+    the same unanswerable question one step along — so the invariant is the
+    coarse one. It costs a delay and nothing else: nothing has been mutated at
+    the point the sweep holds, and the next run re-derives the work-list from
+    git ancestry.
+    """
+    b = build(tmp_path)
+    before = b.head()
+    unrelated = b.publish("unrelated-01", {"elsewhere.py": "untouched\n"})
+    b.publish("gone-01", {"a.py": "one\n"})
+    run_git(b.repo, "push", "-q", "origin", "--delete", "refs/heads/autoloop/gone-01")
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.HELD
+    assert result.merged == []
+    assert result.pending == ["unrelated-01"]
+    assert not contains(b.repo, b.head(), unrelated)
+    assert b.head() == before
+
+
+def test_an_unjudgeable_task_with_NOTHING_to_sweep_is_not_reported_as_held(tmp_path):
+    """`held` is a claim about branches that were withheld, so it must not fire
+    when there were none to withhold — `pending == []` under a line saying
+    "N branch(es) left untouched" reads as a lie. The task is still unresolved
+    and the run still is not clear; that is `is_clear`'s job, not the outcome's."""
+    b = build(tmp_path)
+    b.publish("gone-01", {"a.py": "one\n"})
+    run_git(b.repo, "push", "-q", "origin", "--delete", "refs/heads/autoloop/gone-01")
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.NOTHING_TO_DO
+    assert result.pending == []
+    assert result.is_clear is False, "unjudged is still not clear"
+    assert b.entries("merge_sweep_held") == []
 
 
 # --- order --------------------------------------------------------------------
@@ -996,6 +1260,28 @@ def test_the_command_exits_one_when_a_record_could_not_be_READ(tmp_path, monkeyp
     )
 
 
+def test_the_command_names_the_branches_it_WITHHELD(tmp_path, monkeypatch, capsys):
+    """Holding the sweep is only defensible if the operator can see what it is
+    holding up. Both halves have to be on screen: the task that could not be
+    judged, and the branch that is waiting on it."""
+    b = build(tmp_path)
+    before = b.head()
+    b.publish("gone-01", {"a.py": "one\n"}, published_at="2026-08-06T01:00:00+00:00")
+    b.publish("waiting-01", {"b.py": "two\n"}, published_at="2026-08-06T02:00:00+00:00")
+    run_git(b.repo, "push", "-q", "origin", "--delete", "refs/heads/autoloop/gone-01")
+    monkeypatch.setattr(cli, "load_config", lambda _p: b.config)
+    monkeypatch.chdir(b.repo)
+
+    assert cli._cmd_merge_backlog(_args()) == 1
+
+    assert b.head() == before
+    out = capsys.readouterr().out
+    assert "held" in out
+    assert "UNJUDGED" in out and "gone-01" in out
+    assert "waiting-01" in out, "the withheld branch must be named"
+    assert "DESCENDED" in out, "and WHY a judgeable branch was not merged anyway"
+
+
 def test_the_command_refuses_when_the_flag_is_off(tmp_path, monkeypatch, capsys):
     b = build(tmp_path, auto_merge_enabled=False)
     b.publish("auto-08", {"a.py": "one\n"})
@@ -1049,6 +1335,46 @@ def test_startup_REPORTS_a_completed_task_it_could_not_judge(tmp_path, monkeypat
     out = capsys.readouterr().out
     assert "UNJUDGED" in out and "torn-01" in out
     assert "could not be read" in out
+
+
+def test_a_HELD_sweep_REPORTS_and_still_lets_the_loop_start(tmp_path, monkeypatch,
+                                                            capsys):
+    """The second half of the hold invariant, and the one that stops it being a
+    denial of service: withholding the merges must not withhold the RUN.
+
+    The branches this module integrates have already sat unmerged for days, so a
+    startup sweep that refused to let the loop start over one unjudgeable task
+    would be a strictly worse failure than the one it is reporting. It reports
+    and returns; `_run_locked` is reached exactly as it would be otherwise.
+    """
+    b = build(tmp_path)
+    before = b.head()
+    a_sha = b.publish(
+        "a-first", {"shared.py": "line one\n"}, published_at="2026-08-06T01:00:00+00:00"
+    )
+    b_sha = b.publish(
+        "b-on-a", {"shared.py": "line one\nline two\n"},
+        base=a_sha, published_at="2026-08-06T02:00:00+00:00",
+    )
+    run_git(b.repo, "push", "-q", "origin", "--delete", "refs/heads/autoloop/a-first")
+    started = []
+    monkeypatch.setattr(cli, "load_config", lambda _p: b.config)
+    monkeypatch.chdir(b.repo)
+    monkeypatch.setattr(cli, "_run_locked",
+                        lambda args, config: (started.append(True), 0)[1])
+    monkeypatch.setattr(cli.heartbeat, "publish", lambda *a, **k: None)
+
+    assert cli._cmd_run(argparse.Namespace(
+        config=None, continuous=False, max_steps=None
+    )) == 0
+
+    assert started == [True], "a held sweep must not stop the loop from starting"
+    assert b.head() == before, "and must not have merged anything on the way"
+    assert not contains(b.repo, b.head(), b_sha)
+    out = capsys.readouterr().out
+    assert "held" in out
+    assert "UNJUDGED" in out and "a-first" in out
+    assert "b-on-a" in out, "the operator is told which branch is waiting on it"
 
 
 def test_startup_stays_quiet_when_the_backlog_really_is_clear(tmp_path, monkeypatch,
@@ -1106,7 +1432,45 @@ def test_the_outcome_slugs_match_the_transcript_types():
     """The log grep and the test assertion must name the same thing."""
     assert merge_sweep.SWEPT == "swept"
     assert merge_sweep.DEFERRED == "deferred"
+    assert merge_sweep.HELD == "held"
     assert merge_sweep.STOPPED == "stopped"
+
+
+def test_the_retirement_stamp_is_read_off_a_label_retire_execution_really_wrote(tmp_path):
+    """Generation ordering reads the archive FILENAME, so it is coupled to how
+    `retire_execution` builds a label. Pinned against the real function rather
+    than a hand-written string, so a change to that format fails here instead of
+    quietly making every multi-generation archive unorderable.
+
+    `reason` is the awkward real one — it contains `-`, exactly like the task id
+    on the other side of it — which is why the stamp is read off the END of the
+    stem and not by stripping a prefix."""
+    store = TaskExecutionStore(tmp_path / "executions")
+    store.directory.mkdir(parents=True, exist_ok=True)
+    store.save(
+        TaskExecution(
+            task_id="stamp-01",
+            task_branch="autoloop/stamp-01",
+            worktree_path="",
+            task_base_sha="a" * 40,
+            candidate_sha="b" * 40,
+        )
+    )
+    retired = retire_execution("stamp-01", store, None, reason="published-abc123def456")
+
+    stamp = merge_sweep._retirement_stamp(retired.record_path)
+    assert stamp and stamp == retired.label.rsplit("-", 1)[-1]
+    assert len(stamp) == 16 and stamp[8] == "T" and stamp.endswith("Z")
+
+
+def test_a_label_with_no_retirement_stamp_reads_as_unorderable():
+    """Both halves of the shape check, since the answer decides between "judge
+    the newest" and "refuse to guess"."""
+    assert merge_sweep._retirement_stamp(Path("t-published-20260810T000000Z.json"))
+    assert merge_sweep._retirement_stamp(Path("t-released-by-operator.json")) == ""
+    assert merge_sweep._retirement_stamp(Path("t-published.json")) == ""
+    assert merge_sweep._retirement_stamp(Path("t-20260810T00000Z.json")) == "", "too short"
+    assert merge_sweep._retirement_stamp(Path("t-2026081OT000000Z.json")) == "", "not digits"
 
 
 def test_a_publication_that_stopped_being_confirmed_is_not_an_auto_merge_slug():
