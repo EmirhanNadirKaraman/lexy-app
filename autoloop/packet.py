@@ -138,14 +138,28 @@ def _format_changed_paths(
 def _format_out_of_scope(changed: set[str], allowed: tuple[str, ...]) -> str:
     """Which changed paths the task's declared scope did not authorize —
     computed HERE, from `changed` (git's own `commit_range_paths`) against
-    `execution.allowed_paths`, exactly like every other read section.
+    `execution.allowed_paths`, exactly like every other read section. `""`
+    means nothing was out of scope, and the caller then renders NO section at
+    all.
 
     This is the control that replaces a refusal. Since 2026-08-05 both scope
     gates are ADVISORY (`docs/SECURITY.md` S25 amendment): an out-of-scope path
     no longer parks the task, it reaches a human. So a reviewer who never sees
     the list is a reviewer who cannot exercise the judgement the park used to
-    make for them — which is why this renders UNCONDITIONALLY, with an explicit
-    none-line. Absence of the section must never be the signal; "(none)" is.
+    make for them.
+
+    The section is therefore EXCEPTIONAL, not standing (changed 2026-08-15,
+    reversing the first cut's unconditional `(none)` line). A section that
+    appears in every packet and says "(none)" in almost all of them is a
+    section a reviewer learns to skip, and it would have been trained to skip
+    it by the packets where nothing was wrong — i.e. the control would be
+    weakest exactly when it finally had something to say. The objection the
+    `(none)` line answered is real and is now answered elsewhere: that absence
+    is indistinguishable from a section dropped in a refactor. What catches
+    that is `test_the_packet_names_every_out_of_scope_path`, which fails the
+    moment a real overrun renders nothing, plus `docs/SECURITY.md` S25's
+    verification grep for the `OUT-OF-SCOPE PATHS` literal below. A regression
+    is caught by a test that fails, not by a line a human might notice missing.
 
     Deliberately NOT read from `TaskExecution.out_of_scope_paths`, even though
     that field holds the same answer by the time a packet is built. That record
@@ -160,15 +174,12 @@ def _format_out_of_scope(changed: set[str], allowed: tuple[str, ...]) -> str:
     compares against, so the packet and the post-commit check cannot disagree
     about what counted as out of scope. Note an AUDIT execution unions its
     committed paths into `allowed_paths` by design (`orchestrator.py`'s
-    `is_audit` branch), so an audit packet reports none — that is the audit
-    path having no declared scope to exceed, not a missing check.
+    `is_audit` branch), so an audit packet never carries this section — that is
+    the audit path having no declared scope to exceed, not a missing check.
     """
     outside = unauthorized_paths(changed, allowed)
     if not outside:
-        return (
-            "Out-of-scope paths (0):\n"
-            "  (none — every changed path is inside the task's declared scope)"
-        )
+        return ""
     scope = ", ".join(sorted(allowed)) or "(nothing declared)"
     return (
         f"OUT-OF-SCOPE PATHS ({len(outside)}) — this commit touched "
@@ -223,38 +234,47 @@ def build_review_packet_with_diff(
     stat = worktree_git.range_diff_stat(base_sha, candidate_sha)
     diff = worktree_git.range_diff(base_sha, candidate_sha)
 
-    return "\n".join(
-        [
-            "POST-COMMIT REVIEW PACKET — every section below is READ from",
-            "immutable git objects in the range shown, except the one section",
-            "explicitly labelled as the executor's own claims.",
-            f"task_id: {task.id}",
-            f"task_title: {task.title}",
-            f"branch: {execution.task_branch}",
-            f"base_sha: {base_sha}",
-            f"candidate_sha: {candidate_sha}",
-            f"review_round: {execution.review_round}",
-            "",
-            f"Commits ({base_sha[:12]}..{candidate_sha[:12]}, oldest first):",
-            _format_commit_list(commits),
-            "",
-            f"Changed paths ({len(changed)}):",
-            _format_changed_paths(changed, base_entries, candidate_entries),
-            "",
-            # Directly under the path list it is about, and ABOVE both the
-            # executor's report and the diff — the diff is what gets OMITTED on
-            # a large commit, and this must survive that (see
-            # `_format_diff_section`).
-            _format_out_of_scope(changed, execution.allowed_paths),
-            "",
-            "Diff stat:",
-            stat.strip() or "  (empty)",
-            "",
-            _format_executor_report(execution),
-            "",
-            _format_diff_section(diff),
-        ]
-    ), diff
+    sections = [
+        "POST-COMMIT REVIEW PACKET — every section below is READ from",
+        "immutable git objects in the range shown, except the one section",
+        "explicitly labelled as the executor's own claims.",
+        f"task_id: {task.id}",
+        f"task_title: {task.title}",
+        f"branch: {execution.task_branch}",
+        f"base_sha: {base_sha}",
+        f"candidate_sha: {candidate_sha}",
+        f"review_round: {execution.review_round}",
+        "",
+        f"Commits ({base_sha[:12]}..{candidate_sha[:12]}, oldest first):",
+        _format_commit_list(commits),
+        "",
+        f"Changed paths ({len(changed)}):",
+        _format_changed_paths(changed, base_entries, candidate_entries),
+    ]
+
+    # Appended only when there IS an overrun — the section is a finding, not a
+    # standing field, and `_format_out_of_scope` returns "" for a clean round.
+    # Built by extending the list rather than joining an empty string in, so a
+    # clean packet gets one blank line here instead of three, and a packet WITH
+    # an overrun is byte-identical to what this rendered before.
+    #
+    # Placed directly under the path list it is about, and ABOVE both the
+    # executor's report and the diff — the diff is what gets OMITTED on a large
+    # commit, and this must survive that (see `_format_diff_section`).
+    out_of_scope = _format_out_of_scope(changed, execution.allowed_paths)
+    if out_of_scope:
+        sections += ["", out_of_scope]
+
+    sections += [
+        "",
+        "Diff stat:",
+        stat.strip() or "  (empty)",
+        "",
+        _format_executor_report(execution),
+        "",
+        _format_diff_section(diff),
+    ]
+    return "\n".join(sections), diff
 
 
 def _format_executor_report(execution: TaskExecution) -> str:

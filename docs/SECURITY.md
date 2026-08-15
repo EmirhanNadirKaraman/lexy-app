@@ -664,9 +664,22 @@ with three properties the control depends on:
   report; sourcing the section from it would let an agent's report state a
   path as a fact about the commit. Pinned by
   `test_the_out_of_scope_paths_come_from_git_not_from_the_record`.
-* **Rendered unconditionally**, with an explicit `(none)` line. If it only
-  appeared when something was wrong, ABSENCE would be the signal — and an
-  absent section is indistinguishable from one dropped in a refactor.
+* **Rendered only when there IS an overrun** (changed 2026-08-15; the first
+  cut rendered unconditionally with an explicit `(none)` line). A section
+  present in every packet and empty in nearly all of them is one a reviewer
+  learns to skip — and it would be trained to skip it by the clean packets,
+  so the control would read weakest on the rare packet that finally had
+  something to say. The objection the `(none)` line answered stands and is
+  answered elsewhere: absence is indistinguishable from a section dropped in
+  a refactor, so what guards against that is now
+  `test_the_packet_names_every_out_of_scope_path` — which fails the moment a
+  REAL overrun renders nothing — plus the literal-string grep below. A
+  regression must be caught by a failing test, not by a human noticing a
+  missing line.
+* **Labelled as advisory in its own text.** The section states that the
+  scope check did NOT stop the commit and asks for a `revise` verdict if the
+  edits do not belong to the task, so a reviewer reads it as a judgement
+  call on a live candidate rather than as a failure already handled.
 * **Placed above the diff**, so it survives the omission below.
 
 **Residual risk, stated plainly.** Detection now depends on a human reading
@@ -684,7 +697,9 @@ the list less.
 `rg -n 'OUT-OF-SCOPE PATHS' autoloop/packet.py` must hit: that string IS the
 replacement control, and a grep for the field name alone would never notice
 it had gone (the section is computed from git and does not mention the
-field).
+field). That grep is load-bearing now that a clean packet omits the section
+entirely — reading one packet with no overrun can no longer tell you the
+control exists.
 `Orchestrator._prepare_write_capable_worker` requires the worker repo clean
 before every write-capable dispatch; residue is QUARANTINED (moved, never
 deleted — `WorkerRepoManager.quarantine`) rather than reused, and a fresh

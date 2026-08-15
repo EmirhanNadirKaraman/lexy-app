@@ -1340,10 +1340,16 @@ section into every review packet, computed FROM GIT at render time
 (`commit_range_paths` vs `execution.allowed_paths`) and never from
 `out_of_scope_paths` — that record is the union of both gates, and the
 pre-commit gate's input is the executor's own report, so reading it would let a
-false report state a fact about the commit. The section renders
-unconditionally, with an explicit `(none)` line, so its absence can never be
-mistaken for a clean round, and it sits ABOVE the diff, which is omitted over
-`packet.DIFF_INCLUDE_MAX_CHARS`. Residual risk, accepted and named: an agent
+false report state a fact about the commit. The section renders ONLY when a
+path is actually out of scope (changed 2026-08-15 from an unconditional
+`(none)` line: a section that is empty in nearly every packet trains a reviewer
+to skim past the one packet where it matters — what guards against it being
+dropped in a refactor is now `test_the_packet_names_every_out_of_scope_path`
+plus S25's literal-string grep, not a line a human might notice missing). It
+says in its own text that the check is advisory and did not stop the commit, so
+it reads as a judgement call rather than a handled failure, and it sits ABOVE
+the diff, which is omitted over `packet.DIFF_INCLUDE_MAX_CHARS`. Residual risk,
+accepted and named: an agent
 touching unexpected files now produces a reviewable candidate instead of a
 refusal, so detection depends on the reviewer reading that list — and on a
 large commit they see the paths but not the content.
