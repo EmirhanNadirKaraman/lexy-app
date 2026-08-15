@@ -22,6 +22,16 @@ from .stall import DEFAULT_CEILING_SECONDS, DEFAULT_STALL_SECONDS
 class BrowserConfig:
     conversation_url: str
     cdp_url: str = "http://127.0.0.1:9222"
+    #: Deliver an oversized review diff as an UPLOADED FILE instead of chunking
+    #: it into messages. OFF by default: it changes what the reviewer receives,
+    #: and the chunking path it replaces is the one every existing test pins.
+    #:
+    #: Why it exists: the composer cannot be proven to hold a large patch —
+    #: `_enter_prompt` reads the editor back and a 30,000-character part never
+    #: returns its own tail — so chunking fails permanently on exactly the
+    #: changes most worth reviewing. Measured 2026-08-15: a 336 KB .md attached
+    #: to a chat was read in full, quoting canaries from its last line.
+    attach_oversized_diff: bool = False
     #: The ChatGPT *project* the conversation belongs to, e.g.
     #: "https://chatgpt.com/g/g-p-<id>-<slug>/project". Required for conversation
     #: rotation and for nothing else — a rotation opens a new chat here.

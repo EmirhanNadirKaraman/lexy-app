@@ -119,6 +119,7 @@ import hashlib
 import subprocess
 import time
 from dataclasses import asdict
+import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -164,6 +165,7 @@ from . import heartbeat
 from .git_gateway import GitGateway
 from .packet import (
     DIFF_INCLUDE_MAX_CHARS,
+    attached_payload,
     build_review_packet_with_diff,
     omission_payload,
     payload_carries_diff,
@@ -606,8 +608,15 @@ class Orchestrator:
                 execution.presented_report_sha256 = ctx.report_sha256
                 execution.review_request_id = request_id
                 self._execution_store.save(execution)
+        # The attachment moves ONTO the request, then leaves shared state. A
+        # path left here would outlive its packet and be attached to a LATER
+        # review — presenting one change's diff as another's, the exact
+        # substitution report_sha256 exists to prevent.
+        if state.outbox_attachment and state.pending_request is not None:
+            state.pending_request.attachment = state.outbox_attachment
         state.outbox = None
         state.outbox_diff = None
+        state.outbox_attachment = None
         state.iteration = next_iteration
         # A chunked packet deposits its parts BEFORE anything is asked. The
         # verdict message is `submitting`'s job and stays untouched: it is only
@@ -670,6 +679,25 @@ class Orchestrator:
         if len(diff) <= DIFF_INCLUDE_MAX_CHARS:
             return None  # fits in one message: nothing to plan, nothing to omit
         task_exec = state.task_execution or {}
+
+        # Prefer an upload. The composer cannot be PROVEN to hold a large
+        # patch — `_enter_prompt` reads the editor back and a 30,000-character
+        # part never returns its own tail — so chunking fails permanently on
+        # exactly the changes most worth reviewing. A file sidesteps the editor
+        # (measured 2026-08-15: a 336 KB .md was read in full). The diff is
+        # written OUTSIDE the checkout: a file created under the repository
+        # mid-run is what escape_detector reports, and it would park the loop.
+        attachment = self._write_diff_attachment(request_id, diff)
+        if attachment is not None:
+            state.outbox = attached_payload(state.outbox, diff, Path(attachment).name)
+            state.outbox_attachment = attachment
+            self._log(
+                "review_diff_attached",
+                request_id=request_id,
+                data={"diff_chars": len(diff), "path": attachment},
+            )
+            return None  # no parts: one message carries the verdict request
+
         plan = plan_chunked_delivery(
             state.outbox,
             diff,
@@ -685,6 +713,29 @@ class Orchestrator:
                 data={"reason_code": "not_chunkable", "diff_chars": len(diff)},
             )
         return plan
+
+    def _write_diff_attachment(self, request_id: str, diff: str) -> str | None:
+        """Write `diff` to a file for upload, or None if that is not possible.
+
+        None is not a failure path — it means "fall back to what this loop did
+        before attachments existed", so a provider without upload support, or a
+        filesystem that refuses, degrades to chunking rather than stopping.
+        """
+        if not getattr(self._config.browser, "attach_oversized_diff", False):
+            return None
+        try:
+            root = Path(tempfile.gettempdir()) / "autoloop-review-diffs"
+            root.mkdir(parents=True, exist_ok=True)
+            path = root / f"{request_id.replace('-', '_')}.md"
+            path.write_text(diff, encoding="utf-8")
+            return str(path)
+        except OSError as exc:
+            self._log(
+                "review_diff_attachment_failed",
+                request_id=request_id,
+                data={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            return None
 
     def _step_delivering(self) -> None:
         """Deposit an oversized packet's diff as numbered parts, then hand the
@@ -1005,7 +1056,15 @@ class Orchestrator:
         req.provider = self.active_provider()
         self._store.save(state)
         try:
-            result = client.submit(req.request_id, req.prompt)
+            # The attachment rides with the request it belongs to. Passed
+            # positionally-by-name so a provider that does not accept it fails
+            # loudly at the call rather than silently sending a review request
+            # whose diff never arrived.
+            attachment = getattr(req, "attachment", "") or None
+            if attachment:
+                result = client.submit(req.request_id, req.prompt, attachment=attachment)
+            else:
+                result = client.submit(req.request_id, req.prompt)
         except BrowserError:
             if not getattr(client, "send_attempted", True):
                 # Nothing was sent (composer/Send never accepted the input), so

@@ -233,6 +233,11 @@ class PendingRequest:
     #: state-file tampering between a crash and a `--retry` sending a prompt
     #: nobody actually reviewed the stamps for.
     prompt_sha256: str = ""
+    #: Absolute path to a file uploaded WITH this request — the review diff,
+    #: when it is delivered as an attachment rather than as message text.
+    #: Belongs to the request, not the loop: a path left on shared state would
+    #: outlive its packet and attach one change's diff to another's review.
+    attachment: str = ""
     template: str = ""
     head_sha: str = ""
     base_sha: str = ""
@@ -460,6 +465,15 @@ class LoopState:
     #: the omission notice. That check is what stops a hand-edited or corrupted
     #: state file from delivering parts that differ from the hashed packet.
     outbox_diff: str | None = None
+    #: Absolute path to the file holding `outbox_diff`, when the patch is
+    #: being delivered as an UPLOAD rather than as message text.
+    #:
+    #: Written outside the checkout on purpose: anything created under the
+    #: repository mid-run is what `escape_detector` reports, and it would park
+    #: the loop loop-fatal. Set by `_plan_delivery` and consumed by
+    #: `_step_submitting`; cleared with the rest of the outbox once the request
+    #: is answered, so a stale path can never be attached to a later packet.
+    outbox_attachment: str | None = None
     pending_request: PendingRequest | None = None
     last_response: LastResponse | None = None
     current_task: dict | None = None

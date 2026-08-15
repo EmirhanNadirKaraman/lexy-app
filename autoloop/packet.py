@@ -492,6 +492,26 @@ def _format_diff_delivered_in_parts(part_ids: tuple[str, ...], diff_chars: int) 
     )
 
 
+def _format_diff_attached(diff_chars: int, filename: str) -> str:
+    """The patch went as an uploaded file rather than as message text.
+
+    Worded to make the reviewer's obligation explicit: the diff is COMPLETE and
+    attached, so `revise for a smaller commit` is not the right answer here —
+    but if the attachment is not readable, saying so is, and approving without
+    it never is.
+    """
+    return (
+        f"Full diff: ATTACHED as `{filename}` — {diff_chars} characters, over "
+        f"the {DIFF_INCLUDE_MAX_CHARS}-character single-message limit, so it\n"
+        "  was uploaded as a file rather than typed into this message.\n"
+        "  Nothing was truncated and nothing was summarised: the attachment is\n"
+        "  the complete patch, byte for byte, and the changed-path list and\n"
+        "  diff stat above are read from git and also complete.\n"
+        "  Read the attachment before deciding. If you cannot open it, say so\n"
+        "  and reply `revise` — do not approve a change you could not see."
+    )
+
+
 def _format_diff_omitted(diff_chars: int, parts_may_have_landed: bool) -> str:
     # Worded "if any appear" rather than "the parts above", because the caller
     # knows a chunked delivery was ATTEMPTED but not how many messages actually
@@ -587,6 +607,21 @@ def plan_chunked_delivery(
             section, _format_diff_delivered_in_parts(part_ids, len(diff))
         ),
         fallback_payload=payload.replace(section, _format_diff_omitted(len(diff), True)),
+    )
+
+
+def attached_payload(payload: str, diff: str, filename: str) -> str:
+    """`payload` with its inline diff replaced by the attachment notice.
+
+    Same contract as `omission_payload`: returns `payload` unchanged when the
+    inline section is not present exactly once, because there is nothing
+    honest to substitute in that case.
+    """
+    section = _INLINE_DIFF_HEADER + diff.strip()
+    if payload.count(section) != 1:
+        return payload
+    return payload.replace(
+        section, _format_diff_attached(len(diff.strip()), filename), 1
     )
 
 

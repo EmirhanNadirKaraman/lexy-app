@@ -27,6 +27,7 @@ helpers are duplicated rather than imported, per this suite's convention (see
 
 from __future__ import annotations
 
+import pathlib
 import hashlib
 import subprocess
 from pathlib import Path
@@ -862,3 +863,98 @@ def test_the_cap_is_not_raised_by_chunking():
     because raising it is the tempting shortcut this task exists to avoid."""
     assert packet_mod.DIFF_INCLUDE_MAX_CHARS == 30_000
     assert packet_mod.DIFF_INCLUDE_MAX_CHARS <= 40_056 * 0.8
+
+
+# =============================================================================
+# Attachment delivery (2026-08-15, pkt-03) — opt-in, off by default
+#
+# Chunking fails permanently on exactly the changes most worth reviewing: the
+# composer cannot be PROVEN to hold a large patch, because `_enter_prompt`
+# reads the editor back and a 30,000-character part never returns its own
+# tail. Uploading the diff sidesteps the editor. These pin the switch, both
+# ways — a feature that silently changed what the reviewer receives would be
+# worse than the bug it fixes.
+# =============================================================================
+
+
+def _enable_attachments(orch):
+    """Both config dataclasses are frozen — deliberately, so nothing mutates
+    configuration at runtime. Rebuild the browser section and swap it in."""
+    import dataclasses
+
+    browser = dataclasses.replace(orch._config.browser, attach_oversized_diff=True)
+    object.__setattr__(orch._config, "browser", browser)
+
+
+def test_attachments_are_off_by_default_and_chunking_still_happens(tmp_path):
+    """The regression guard. Landing this feature must not change any existing
+    deployment until it is asked for."""
+    client = ChunkingClient()
+    orch, _store, _task = oversized_round(tmp_path, client)
+
+    assert orch.state.pending_request.delivery is not None, "still chunking"
+    assert not orch.state.pending_request.attachment
+
+
+def test_an_oversized_diff_is_attached_instead_of_chunked_when_enabled(tmp_path):
+    client = ChunkingClient()
+    executor = WritingExecutor(tmp_path / "worktrees", {"big.py": big_file_text()})
+    orch, _repo, _wt, _store, task = build_postcommit(tmp_path, executor, client=client)
+    _enable_attachments(orch)
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+
+    req = orch.state.pending_request
+    assert req.delivery is None, "an attached diff needs no parts"
+    assert orch.state.phase != Phase.DELIVERING.value
+    assert orch.state.pending_request.attachment
+
+
+def test_the_attached_file_is_the_patch_byte_for_byte(tmp_path):
+    """The property the whole mechanism rests on. A truncated or re-encoded
+    attachment would be a partial review presented as a whole one."""
+    client = ChunkingClient()
+    executor = WritingExecutor(tmp_path / "worktrees", {"big.py": big_file_text()})
+    orch, _repo, _wt, _store, task = build_postcommit(tmp_path, executor, client=client)
+    _enable_attachments(orch)
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+
+    path = pathlib.Path(orch.state.pending_request.attachment)
+    assert path.is_file()
+    written = path.read_text(encoding="utf-8")
+    # The patch git produced for this candidate, compared directly: a
+    # truncated or re-encoded attachment would be a partial review presented
+    # as a whole one.
+    execution = _store.load(task.id)
+    expected = orch._git.range_diff(execution.task_base_sha, execution.candidate_sha)
+    assert written.strip() == expected.strip()
+    assert len(written) > DIFF_INCLUDE_MAX_CHARS, "fixture must be oversized"
+
+
+def test_the_attachment_lives_outside_the_checkout(tmp_path):
+    """A file written under the repository mid-run is what escape_detector
+    reports, and it would park the loop loop-fatal."""
+    client = ChunkingClient()
+    executor = WritingExecutor(tmp_path / "worktrees", {"big.py": big_file_text()})
+    orch, repo_root, _wt, _store, task = build_postcommit(tmp_path, executor, client=client)
+    _enable_attachments(orch)
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+
+    attachment = pathlib.Path(orch.state.pending_request.attachment).resolve()
+    assert repo_root.resolve() not in attachment.parents
+
+
+def test_the_payload_says_the_diff_is_attached_and_drops_the_inline_copy(tmp_path):
+    client = ChunkingClient()
+    executor = WritingExecutor(tmp_path / "worktrees", {"big.py": big_file_text()})
+    orch, _repo, _wt, _store, task = build_postcommit(tmp_path, executor, client=client)
+    _enable_attachments(orch)
+    orch._dispatch_executor(implement(task.id))
+    orch._step_ready()
+
+    payload = orch.state.pending_request.payload
+    assert "Full diff: ATTACHED as" in payload
+    assert "do not approve a change you could not see" in payload
+    assert len(payload) < DIFF_INCLUDE_MAX_CHARS, "the message itself must be sendable"
