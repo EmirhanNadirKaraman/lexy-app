@@ -277,7 +277,13 @@ class MeddlingMerger:
         return outcome
 
 
-def build(tmp_path, *, auto_merge_enabled=True, seed_files=None):
+def build(tmp_path, *, auto_merge_enabled=True, seed_files=None, protected=None):
+    """`protected` overrides `protected_branches`. Passing `(BASE,)` is how a
+    test gets a REAL refused push: the merge runs and verifies, `push_exact`
+    then refuses the base ref, and the checkout is left with a head the remote
+    has never seen. No mock reproduces that shape, and it is the one that comes
+    back as `auto_merge.DEFERRED` — the slug that otherwise means "nothing was
+    touched"."""
     repo = tmp_path / "repo"
     repo.mkdir()
     run_git(repo, "init", "-q", "-b", BASE)
@@ -295,9 +301,12 @@ def build(tmp_path, *, auto_merge_enabled=True, seed_files=None):
     run_git(repo, "remote", "add", "origin", str(origin))
     run_git(repo, "push", "-q", "-u", "origin", BASE)
 
+    policy_kwargs = {"auto_merge_enabled": auto_merge_enabled}
+    if protected is not None:
+        policy_kwargs["protected_branches"] = tuple(protected)
     config = AutoloopConfig(
         browser=BrowserConfig(conversation_url=URL),
-        policy=PolicyConfig(auto_merge_enabled=auto_merge_enabled),
+        policy=PolicyConfig(**policy_kwargs),
         state_dir=tmp_path / ".al",
         workers_root=tmp_path / "workers",
     )
@@ -943,6 +952,10 @@ def test_the_sweep_stops_at_the_first_conflict_with_the_base_unchanged(tmp_path)
     assert result.stopped_on == "conflicting"
     assert result.stopped_outcome == auto_merge.CONFLICT
     assert result.merged == []
+    assert result.is_reconciled is True, (
+        "an abort that restored the head and the tree IS the restored case — the "
+        "claim is checked against the checkout, not assumed from the outcome"
+    )
     assert b.head() == before, "the base is exactly as it was"
     assert is_clean(b.repo), "no half-merged checkout is left behind"
     assert (b.repo / "shared.py").read_text() == "a different version\n"
@@ -1007,6 +1020,142 @@ def test_a_merge_that_cannot_be_verified_stops_the_sweep_too(tmp_path, monkeypat
     assert b.origin_base() == before, "a failed merge must never reach the remote"
     assert not contains(b.repo, b.head(), later)
     assert "HEAD did not move" in b.entries("auto_merge_failed")[0]["data"]["reason"]
+    assert result.is_reconciled is True, (
+        "this particular failure mutated nothing — the merge command was a no-op"
+    )
+
+
+# --- a stop is not automatically a restoration --------------------------------
+#
+# Stopping keeps the sweep from stacking a second merge onto a head nobody
+# understands. It does NOT by itself mean the checkout came back. Two outcomes
+# leave the base MOVED, and one of them wears the slug that otherwise means
+# "nothing was touched", so the claim has to be an observation of the checkout
+# rather than a reading of the outcome.
+
+
+def _merge_for_real_then_dirty_the_tree(b, monkeypatch):
+    """A REAL merge — real commit, real head move, all three of
+    `_verify_merge`'s ancestry checks satisfied — that then leaves a file behind,
+    so verification fails on its last check (`the checkout is dirty after the
+    merge`) with the merge already in the checkout.
+
+    A stray write after a merge is not exotic: a `post-merge` hook, an editor, a
+    watcher. What matters is that this is the shape `AutoMerger._merge`
+    deliberately does not undo, because `reset` is off the git whitelist.
+    """
+    real_merge = GitGateway.merge_commit
+
+    def merge_then_dirty(self, sha, message):
+        real_merge(self, sha, message)
+        (b.repo / "left-behind.txt").write_text("a hook wrote this\n", encoding="utf-8")
+
+    monkeypatch.setattr(GitGateway, "merge_commit", merge_then_dirty)
+
+
+def test_a_merge_that_moved_HEAD_then_failed_verification_is_NOT_called_restored(
+    tmp_path, monkeypatch
+):
+    """The base really did move, and nothing here will move it back. Reporting
+    "the base is exactly as it was before this branch" for that — which is what
+    every STOPPED outcome used to print — tells the operator the one thing that
+    would stop them looking."""
+    b = build(tmp_path)
+    before = b.head()
+    candidate = b.publish("auto-08", {"a.py": "one\n"},
+                          published_at="2026-08-06T01:00:00+00:00")
+    later = b.publish("later", {"b.py": "two\n"},
+                      published_at="2026-08-06T02:00:00+00:00")
+    _merge_for_real_then_dirty_the_tree(b, monkeypatch)
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.STOPPED
+    assert result.stopped_outcome == auto_merge.FAILED
+    assert result.is_reconciled is False
+    assert "HEAD moved from" in result.unreconciled
+    assert before[:12] in result.unreconciled and b.head()[:12] in result.unreconciled, (
+        "both ends are named — the operator has to find the merge to judge it"
+    )
+    assert b.head() != before, "the merge really is in the checkout"
+    assert contains(b.repo, b.head(), candidate)
+    assert b.origin_base() == before, "and never reached the remote"
+    assert not contains(b.repo, b.head(), later), "the rest were left alone"
+    assert result.base_before == before and result.base_after == b.head()
+
+    stopped = b.entries("merge_sweep_stopped")[0]["data"]
+    assert stopped["base_sha_before_attempt"] == before
+    assert stopped["base_sha_after_attempt"] == b.head()
+    assert stopped["unreconciled"], "the transcript carries it too, not just stdout"
+
+
+def test_a_REFUSED_push_leaves_the_base_moved_under_the_deferred_slug(tmp_path):
+    """The case that cannot be classified by outcome. `_push` catches the
+    refusal and calls `_defer`, so this comes back as `auto_merge.DEFERRED` —
+    the same slug a shut gate or a dirty checkout produces, both of which touch
+    nothing. Here the merge ran, verified, and moved the base to a commit the
+    remote has never seen.
+
+    Reproduced with no mock at all: `protected_branches` containing the base is
+    exactly the pairing `PolicyConfig` documents (auto-merge on is not by itself
+    permission to push `main`), and it is a configuration an operator can
+    plausibly be running.
+    """
+    b = build(tmp_path, protected=(BASE,))
+    before = b.head()
+    candidate = b.publish("auto-08", {"a.py": "one\n"})
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.STOPPED
+    assert result.stopped_outcome == auto_merge.DEFERRED, (
+        "the slug that otherwise means 'a precondition failed, nothing moved'"
+    )
+    assert result.is_reconciled is False, (
+        "and the checkout says otherwise — which is why the slug is not asked"
+    )
+    assert b.head() != before and contains(b.repo, b.head(), candidate)
+    assert b.origin_base() == before, "the merge is local only"
+    assert is_clean(b.repo), "a clean tree is not evidence the base is where it was"
+    assert b.entries("auto_merge_push_refused"), "the refusal is the real one"
+
+
+def test_a_conflict_whose_ABORT_did_not_restore_is_not_called_restored(tmp_path,
+                                                                       monkeypatch):
+    """`_abort` already distrusts a zero exit from `git merge --abort` and logs
+    `restored: false` when the head or the tree disagrees. The sweep has to
+    reach the same conclusion independently, because it is the layer deciding
+    whether anything else may run in this checkout — and the outcome it gets
+    back is `CONFLICT` either way."""
+    b = build(tmp_path, seed_files={"shared.py": "the original\n"})
+    b.publish("collides", {"shared.py": "the task's version\n"})
+    before = b.commit_on_base({"shared.py": "a different version\n"})
+    monkeypatch.setattr(GitGateway, "merge_abort", lambda self: None)
+
+    result = b.sweep()
+
+    assert result.stopped_outcome == auto_merge.CONFLICT
+    assert result.is_reconciled is False
+    assert "the working tree is not what the attempt found" in result.unreconciled
+    assert b.head() == before, "a conflicted merge does not move HEAD"
+    assert not is_clean(b.repo), "it leaves the conflict in the tree"
+    assert b.entries("auto_merge_conflict")[0]["data"]["restored"] is False
+
+
+def test_a_probe_that_cannot_read_the_checkout_is_not_read_as_unchanged(tmp_path):
+    """"Could not look" is not "nothing moved" — the same rule the enumeration
+    applies to a branch, applied to the base. Asserted on the helper directly:
+    getting git into a state where `rev-parse` fails midway through a merge is
+    not reproducible, and the decision is one comparison."""
+    clean = merge_sweep._Checkout(head="a" * 40, dirty=())
+    assert merge_sweep._unreconciled(clean, clean) == ""
+    unreadable = merge_sweep._Checkout(error="GitCommandError: no such ref")
+    assert "unknown" in merge_sweep._unreconciled(clean, unreadable)
+    assert "unknown" in merge_sweep._unreconciled(unreadable, clean)
+    assert "no such ref" in merge_sweep._unreconciled(unreadable, unreadable), (
+        "two unreadable observations are not a match either, and the operator is "
+        "told WHAT would not answer rather than only that something did not"
+    )
 
 
 # --- publication is re-confirmed per branch, at the moment it is merged -------
@@ -1220,6 +1369,31 @@ def test_the_command_exits_one_when_it_stops(tmp_path, monkeypatch, capsys):
     assert "never-tried" in out, "the untouched remainder must be named"
 
 
+def test_the_command_does_not_claim_a_base_it_left_MOVED_is_where_it_was(
+    tmp_path, monkeypatch, capsys
+):
+    """`_format_sweep` is shared with the startup hook, and it printed "the base
+    is exactly as it was before this branch" for every STOPPED outcome — while
+    the same module documents that a merge which failed verification is
+    deliberately left in place. The operator most likely to act on that line is
+    the one it is wrong for."""
+    b = build(tmp_path)
+    before = b.head()
+    b.publish("auto-08", {"a.py": "one\n"})
+    _merge_for_real_then_dirty_the_tree(b, monkeypatch)
+    monkeypatch.setattr(cli, "load_config", lambda _p: b.config)
+    monkeypatch.chdir(b.repo)
+
+    assert cli._cmd_merge_backlog(_args()) == 1
+
+    out = capsys.readouterr().out
+    assert "the base is exactly as it was" not in out
+    assert "UNRECONCILED" in out
+    assert "the base is NOT as it was" in out
+    assert before[:12] in out and b.head()[:12] in out, "both ends are on screen"
+    assert "reset" in out, "and why nothing here will undo it for them"
+
+
 def test_the_command_exits_one_when_a_branch_could_not_be_judged(tmp_path, monkeypatch,
                                                                 capsys):
     """Exit 0 must mean "provably clear", never "I could not look". The two
@@ -1300,20 +1474,36 @@ def test_the_command_is_wired_into_the_parser():
 # --- startup ------------------------------------------------------------------
 
 
+def _run(b, monkeypatch, started, beats=None):
+    """`run` with the loop body stubbed and the heartbeat captured. Every
+    startup test needs the same wiring, and what each one is really asserting is
+    whether `_run_locked` was reached at all — so the stub records that.
+
+    `beats` collects `(status, detail)` for the tests that care what a monitor
+    would see afterwards."""
+    monkeypatch.setattr(cli, "load_config", lambda _p: b.config)
+    monkeypatch.chdir(b.repo)
+    monkeypatch.setattr(cli, "_run_locked",
+                        lambda args, config: (started.append(True), 0)[1])
+    monkeypatch.setattr(
+        cli.heartbeat, "publish",
+        lambda config, state=None, status="running", detail="": (
+            beats.append((status, detail)) if beats is not None else None
+        ),
+    )
+    return cli._cmd_run(argparse.Namespace(config=None, continuous=False, max_steps=None))
+
+
 def test_run_sweeps_the_backlog_before_starting_the_loop(tmp_path, monkeypatch):
     """The startup half. Nothing reports a stranded branch, so the only moment
     left to look for one is before the loop does anything else."""
     b = build(tmp_path)
     candidate = b.publish("auto-08", {"a.py": "one\n"})
-    monkeypatch.setattr(cli, "load_config", lambda _p: b.config)
-    monkeypatch.chdir(b.repo)
-    monkeypatch.setattr(cli, "_run_locked", lambda args, config: 0)
-    monkeypatch.setattr(cli.heartbeat, "publish", lambda *a, **k: None)
+    started = []
 
-    assert cli._cmd_run(argparse.Namespace(
-        config=None, continuous=False, max_steps=None
-    )) == 0
+    assert _run(b, monkeypatch, started) == 0
 
+    assert started == [True]
     assert contains(b.repo, b.head(), candidate), "swept before the loop ran"
     assert b.origin_base() == b.head()
 
@@ -1358,15 +1548,8 @@ def test_a_HELD_sweep_REPORTS_and_still_lets_the_loop_start(tmp_path, monkeypatc
     )
     run_git(b.repo, "push", "-q", "origin", "--delete", "refs/heads/autoloop/a-first")
     started = []
-    monkeypatch.setattr(cli, "load_config", lambda _p: b.config)
-    monkeypatch.chdir(b.repo)
-    monkeypatch.setattr(cli, "_run_locked",
-                        lambda args, config: (started.append(True), 0)[1])
-    monkeypatch.setattr(cli.heartbeat, "publish", lambda *a, **k: None)
 
-    assert cli._cmd_run(argparse.Namespace(
-        config=None, continuous=False, max_steps=None
-    )) == 0
+    assert _run(b, monkeypatch, started) == 0
 
     assert started == [True], "a held sweep must not stop the loop from starting"
     assert b.head() == before, "and must not have merged anything on the way"
@@ -1375,6 +1558,117 @@ def test_a_HELD_sweep_REPORTS_and_still_lets_the_loop_start(tmp_path, monkeypatc
     assert "held" in out
     assert "UNJUDGED" in out and "a-first" in out
     assert "b-on-a" in out, "the operator is told which branch is waiting on it"
+
+
+def test_a_merge_that_moved_HEAD_and_failed_verification_stops_the_LOOP_starting(
+    tmp_path, monkeypatch, capsys
+):
+    """The post-mutation startup hole. The sweep already stops at this branch,
+    and stops for the right reason — `AutoMerger._merge` does not undo a merge
+    that failed verification, so nothing further may be stacked on that head.
+    But stopping only the SWEEP and then dispatching ordinary roadmap work onto
+    the same checkout defeats the entire point of stopping: the next task would
+    be cut from a head nobody verified, and its own push would carry the
+    unverified merge along with it.
+
+    There is no policy-legal way to undo it (`reset` is off the git whitelist),
+    so the only honest response is to refuse to start and say so.
+    """
+    b = build(tmp_path)
+    before = b.head()
+    candidate = b.publish("auto-08", {"a.py": "one\n"})
+    _merge_for_real_then_dirty_the_tree(b, monkeypatch)
+    started, beats = [], []
+
+    rc = _run(b, monkeypatch, started, beats)
+
+    assert started == [], "the loop must not run in a checkout nobody can explain"
+    assert rc == 1, "and the refusal has to be visible in the exit code"
+    assert [status for status, _detail in beats] == ["parked"], (
+        "a monitor must not keep reading a dead run's `running` beat — and "
+        "`stopped` is deliberately not an attention status, while nobody chose "
+        "this"
+    )
+    assert "unreconciled" in beats[0][1]
+    assert b.head() != before and contains(b.repo, b.head(), candidate), (
+        "the merge really is in the checkout — this is not the untouched case"
+    )
+    assert b.origin_base() == before, "and never reached the remote"
+    out = capsys.readouterr().out
+    assert "UNRECONCILED" in out
+    assert "NOT starting the loop" in out
+    assert "the base is exactly as it was" not in out, (
+        "the line that would send the operator away is the whole regression"
+    )
+
+
+def test_a_REFUSED_push_at_startup_stops_the_loop_too(tmp_path, monkeypatch, capsys):
+    """Same refusal, reached through the outcome that looks safest. `deferred`
+    is what a shut gate and a dirty checkout return, and both of those start the
+    loop normally two tests below — so a startup guard written against the slug
+    would let exactly this one through, with the base sitting on a merge commit
+    the remote has never seen."""
+    b = build(tmp_path, protected=(BASE,))
+    before = b.head()
+    b.publish("auto-08", {"a.py": "one\n"})
+    started = []
+
+    rc = _run(b, monkeypatch, started)
+
+    assert started == [] and rc == 1
+    assert b.head() != before, "merged locally"
+    assert b.origin_base() == before, "and unpushed — pushing later work stacks on it"
+    out = capsys.readouterr().out
+    assert "UNRECONCILED" in out and "the base is exactly as it was" not in out
+
+
+def test_a_conflict_that_restored_the_base_still_lets_the_loop_start(tmp_path,
+                                                                     monkeypatch,
+                                                                     capsys):
+    """The control, and the reason the guard is a probe rather than "any stop
+    blocks". A conflict aborts back to the exact pre-merge head with a clean
+    tree; the branch is outstanding, but the checkout is untouched and the loop
+    has every business running in it. Blocking here would turn one unmergeable
+    branch into a loop that will not start — strictly worse than what it is
+    reporting, and the same denial of service the HELD outcome avoids."""
+    b = build(tmp_path, seed_files={"shared.py": "the original\n"})
+    b.publish("collides", {"shared.py": "the task's version\n"})
+    b.publish("never-tried", {"b.py": "two\n"}, published_at="2026-08-06T03:00:00+00:00")
+    before = b.commit_on_base({"shared.py": "a different version\n"})
+    started = []
+
+    rc = _run(b, monkeypatch, started)
+
+    assert started == [True], "a clean stop must not stop the loop"
+    assert rc == 0
+    assert b.head() == before and is_clean(b.repo)
+    out = capsys.readouterr().out
+    assert "STOPPED at" in out and "collides" in out
+    assert "the base is exactly as it was" in out, (
+        "and here the claim is true, so it is made"
+    )
+    assert "UNRECONCILED" not in out and "NOT starting the loop" not in out
+
+
+def test_a_dirty_checkout_defers_and_still_lets_the_loop_start(tmp_path, monkeypatch,
+                                                               capsys):
+    """The other `deferred` the guard must not confuse with a refused push. The
+    checkout was ALREADY dirty when the attempt found it and is dirty in exactly
+    the same way afterwards — the sweep declined to merge into it and changed
+    nothing, which is why the comparison is against the pre-ATTEMPT observation
+    rather than against "is the tree clean"."""
+    b = build(tmp_path)
+    before = b.head()
+    b.publish("first", {"a.py": "one\n"})
+    (b.repo / "README.md").write_text("edited by hand\n", encoding="utf-8")
+    started = []
+
+    rc = _run(b, monkeypatch, started)
+
+    assert started == [True] and rc == 0
+    assert b.head() == before
+    assert (b.repo / "README.md").read_text() == "edited by hand\n"
+    assert "UNRECONCILED" not in capsys.readouterr().out
 
 
 def test_startup_stays_quiet_when_the_backlog_really_is_clear(tmp_path, monkeypatch,
@@ -1395,8 +1689,11 @@ def test_startup_stays_quiet_when_the_backlog_really_is_clear(tmp_path, monkeypa
 def test_a_sweep_that_blows_up_never_stops_the_run(tmp_path, monkeypatch):
     """It runs before the loop has done anything. An integration problem that
     prevented the loop from starting would be a strictly worse failure than the
-    unmerged branch it was trying to fix."""
+    unmerged branch it was trying to fix — so a crash that touched nothing is
+    still reported and still lets the run go ahead."""
     b = build(tmp_path)
+    monkeypatch.chdir(b.repo)
+    before = b.head()
     monkeypatch.setattr(
         merge_sweep, "sweep_backlog",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
@@ -1406,6 +1703,38 @@ def test_a_sweep_that_blows_up_never_stops_the_run(tmp_path, monkeypatch):
 
     assert result.outcome == merge_sweep.FAILED
     assert "boom" in b.entries("merge_sweep_error")[0]["data"]["error"]
+    assert result.is_reconciled is True, "nothing was mutated, so nothing is withheld"
+    assert result.base_before == before == result.base_after
+
+
+def test_a_crash_that_left_the_base_MOVED_is_not_waved_through(tmp_path, monkeypatch):
+    """The other side of the guard above, and why the crash path is answered by
+    a comparison rather than by the outcome slug.
+
+    `sweep()` returns a result for every path it decides, so an exception
+    reaching `sweep_on_startup` came either from construction — before anything
+    could move — or from the transcript write that follows a stop, which happens
+    after one. `FAILED` cannot tell those apart, so it is not asked to: HEAD and
+    the tree are observed on both sides of the call.
+    """
+    b = build(tmp_path)
+    monkeypatch.chdir(b.repo)
+    before = b.head()
+
+    def merge_then_die(*_a, **_k):
+        run_git(b.repo, "commit", "-q", "--allow-empty", "-m", "half-done integration")
+        raise RuntimeError("boom, after the head moved")
+
+    monkeypatch.setattr(merge_sweep, "sweep_backlog", merge_then_die)
+
+    result = merge_sweep.sweep_on_startup(b.config)
+
+    assert result.outcome == merge_sweep.FAILED
+    assert result.is_reconciled is False
+    assert "HEAD moved from" in result.unreconciled
+    assert result.base_before == before
+    assert result.base_after == b.head()
+    assert result.base_after != before, "the crash really did leave the head moved"
 
 
 # --- ordering helpers ---------------------------------------------------------

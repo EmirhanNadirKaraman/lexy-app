@@ -462,15 +462,17 @@ def _reset_run_scoped_budgets(config: AutoloopConfig) -> None:
     )
 
 
-def _sweep_backlog_on_startup(config: AutoloopConfig) -> None:
+def _sweep_backlog_on_startup(config: AutoloopConfig) -> bool:
     """Integrate any published-but-unmerged branch before the loop starts.
+    Returns whether it is safe for the loop to run in this checkout.
 
     Once per PROCESS, here rather than anywhere inside the loop: `Orchestrator.
     run()` is called per iteration of `_run_continuous` (which rebuilds the
     orchestrator each time), so hooking either would re-sweep every round for a
     backlog that only changes when something completes — and completions
-    already have `auto_merge.py`. `start` and `resume` both funnel into this
-    function, so one hook covers all three commands.
+    already have `auto_merge.py`. `start` and `resume` both funnel into
+    `_cmd_run`, so one hook covers all three commands and both the single-round
+    and `--continuous` paths.
 
     Inside the lock, because it moves the branch head. Silent only when the
     backlog is PROVABLY clear (`SweepResult.is_clear`) — an operator starting a
@@ -479,27 +481,66 @@ def _sweep_backlog_on_startup(config: AutoloopConfig) -> None:
     unmentioned, whether it was the remote, the record or the archive that
     would not answer. Every outcome is in the transcript regardless.
 
-    REPORTS, never blocks. A sweep that merged nothing — held on an unjudgeable
-    task, deferred by the window, stopped on a conflict — prints and returns,
-    and the loop starts normally. The unmerged branch it is complaining about
-    has already waited days; refusing to start the loop over it would be a
-    strictly worse failure than the one being reported.
+    **Reports and continues, EXCEPT when the sweep left the checkout somewhere
+    it did not finish putting it** (`SweepResult.is_reconciled`). Almost every
+    way a sweep merges nothing mutates nothing — held on an unjudgeable task,
+    deferred by the window, refused over a dirty checkout, stopped on a conflict
+    that aborted back to the exact pre-merge head — and all of those print and
+    let the loop start, because the branch being complained about has already
+    waited days and refusing to start over it would be the strictly worse
+    failure.
+
+    Two ways do not. A merge that ran and then failed verification is
+    deliberately NOT undone (`reset` is off the git whitelist by design), and a
+    merge whose push was refused leaves the base moved locally and absent from
+    the remote — the latter reported as `auto_merge.DEFERRED`, which is why the
+    question is answered from a probe of the checkout rather than from the
+    outcome slug. Dispatching ordinary roadmap work onto either state is the
+    exact thing stopping the sweep exists to prevent: the loop would build its
+    next task on a head nobody verified, or push work stacked on a merge the
+    remote has never seen. There is no policy-legal automatic undo, so the only
+    honest response is to stop and hand it to the operator.
     """
     result = merge_sweep.sweep_on_startup(config)
     if result.outcome == merge_sweep.DISABLED:
-        return
+        return True
     if result.outcome == merge_sweep.NOTHING_TO_DO and result.is_clear:
-        return
+        return True
     for line in _format_sweep(result):
         print(line)
     print("")
+    if not result.is_reconciled:
+        print(
+            "NOT starting the loop: this checkout is not in a state the sweep "
+            "finished putting it in (above), and every round would build on it. "
+            "Reconcile it by hand, then start again.\n"
+        )
+        return False
+    return True
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     with LoopLock(config.state_dir):
         _reset_run_scoped_budgets(config)
-        _sweep_backlog_on_startup(config)
+        if not _sweep_backlog_on_startup(config):
+            # Returned BEFORE the try, so the `finally` below never runs and
+            # `stopped` is NOT what gets published: that status is deliberately
+            # outside `ATTENTION_STATUSES` ("you stopped it, you know"), and
+            # nobody chose this. `parked` is the honest one — the loop is not
+            # running and a person has to decide something. Publishing SOMETHING
+            # is the point: a previous run that died leaves a `running` beat, and
+            # refusing silently would leave the monitor reading it forever while
+            # the only notice is on a terminal nobody is watching.
+            _, refused_state = _load_state(config)
+            heartbeat.publish(
+                config,
+                refused_state,
+                heartbeat.PARKED,
+                detail="startup sweep left the checkout unreconciled — reconcile "
+                       "it by hand, then `merge-backlog`",
+            )
+            return 1
         try:
             if getattr(args, "continuous", False):
                 _validate_continuous_args(args)
@@ -2196,10 +2237,24 @@ def _format_sweep(result: "merge_sweep.SweepResult") -> list[str]:
             f"  {len(remaining)} branch(es) left untouched: "
             + (", ".join(remaining) if remaining else "(none)")
         )
-        lines.append(
-            "  the base is exactly as it was before this branch. Resolve it by "
-            "hand, then run `merge-backlog` again."
-        )
+        # Only claimed when it was ESTABLISHED. Stopping is not by itself a
+        # restoration: a merge that failed verification is deliberately left in
+        # place, and a refused push leaves the base moved locally under the
+        # `deferred` slug. `is_reconciled` is a probe of the checkout, not a
+        # reading of the outcome — see `merge_sweep.py`'s "a stop is not
+        # automatically a restoration". The block below says what to do about
+        # it; this line only stops the report from asserting the opposite.
+        if result.is_reconciled:
+            lines.append(
+                "  the base is exactly as it was before this branch. Resolve it by "
+                "hand, then run `merge-backlog` again."
+            )
+        else:
+            lines.append(
+                "  the base is NOT as it was before this branch — HEAD was "
+                f"{_short_sha(result.base_before)} when this started and is "
+                f"{_short_sha(result.base_after)} now."
+            )
     if result.outcome == merge_sweep.DISABLED:
         lines.append(
             "  policy.auto_merge_enabled is false — this command moves the "
@@ -2210,7 +2265,26 @@ def _format_sweep(result: "merge_sweep.SweepResult") -> list[str]:
             "  every completed task's published branch is already an ancestor "
             "of HEAD"
         )
+    if not result.is_reconciled:
+        # Last, so it reads as the conclusion of whatever the outcome block
+        # above described, and shared across outcomes: a crash after a merge
+        # (`failed`) needs the same reconciliation as a stop after one.
+        lines.append(f"  UNRECONCILED {result.unreconciled}")
+        lines.append(
+            "  nothing here can put that back: `reset` is off the git whitelist "
+            "by design, so an unverified or unpushed merge is reported, never "
+            "undone. Reconcile it by hand (`git status`, `git log --oneline -5`) "
+            "before running the loop or this command again — the loop will not "
+            "start until you do."
+        )
     return lines
+
+
+def _short_sha(sha: str) -> str:
+    """A sha for an operator, or an explicit marker that there was none to
+    print. `""` here means the checkout would not answer, which is a different
+    thing from a sha and must not render as an empty gap in the sentence."""
+    return sha[:12] if sha else "(unreadable)"
 
 
 def _cmd_merge_backlog(args: argparse.Namespace) -> int:
@@ -2238,6 +2312,14 @@ def _cmd_merge_backlog(args: argparse.Namespace) -> int:
     whole sweep (`merge_sweep.HELD`), because a branch that IS judgeable may be
     descended from it. `merge_sweep.py`'s "could not look" section has the
     reasoning and what it costs.
+
+    A stop is reported as a restoration only when the checkout was OBSERVED to
+    be where the stopping attempt found it. The two ways it is not — a merge
+    that failed verification (left in place on purpose) and one whose push was
+    refused (moved locally, absent from the remote, reported `deferred`) — print
+    an UNRECONCILED block instead, and are the one sweep outcome that also stops
+    `run` from starting the loop. The exit code does not change: neither was
+    clear to begin with.
     """
     config = load_config(args.config)
     with LoopLock(config.state_dir):

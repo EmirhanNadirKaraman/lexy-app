@@ -401,6 +401,25 @@ What it adds to auto-merge, which it CALLS rather than reimplements:
   has to resolve that conflict before the rest mean anything. Order is a
   heuristic and is allowed to be, because stopping is what makes a wrong order
   safe: it costs a stalled sweep, never a corrupted base.
+* **A stop is not automatically a restoration** (since 2026-08-15). Two
+  outcomes leave the base MOVED: a merge that ran and then failed verification
+  (deliberately not undone — `reset` is off the git whitelist by design), and
+  one that verified and whose PUSH was then refused, which comes back as
+  `deferred` — the same slug a shut gate and a dirty checkout produce, both of
+  which touch nothing. So the answer is never read off the outcome: HEAD and
+  `status --porcelain` are observed immediately before each attempt and again
+  the moment one does not land, and "the base is exactly as it was" is printed
+  only when those two match. Anything else — including a probe that could not
+  read the checkout — prints `UNRECONCILED`, names both ends of the move, and
+  says that nothing here will undo it. This is also the ONE sweep outcome that
+  stops `run` from starting the loop: dispatching roadmap work onto a head
+  nobody verified, or pushing work stacked on a merge the remote has never
+  seen, is exactly what stopping the sweep exists to prevent. Every other way a
+  sweep merges nothing — held, deferred, refused over a dirty checkout, stopped
+  on a conflict that aborted cleanly — still reports and lets the loop start.
+  The refusal publishes a `parked` heartbeat, not `stopped`: nobody chose it and
+  it needs a decision, and staying silent would leave a monitor reading the
+  previous run's `running` beat forever.
 
 The gate is checked ONCE, before the first merge, so a shut merge window defers
 the **whole** sweep rather than merging part of it and writing one deferral per
@@ -415,6 +434,7 @@ re-enumerates what is left next time.
 | Any task the enumeration could not judge | nothing attempted at all; the withheld branches are named | `merge_sweep_held` |
 | Each branch that lands | merged + base pushed by `AutoMerger` | `auto_merge_pushed` |
 | First branch that does not | sweep halts, remainder named | `merge_sweep_stopped` |
+| A stop that left HEAD moved or the tree changed (failed verification, refused push) | reported `UNRECONCILED` with both shas; `run` refuses to start the loop | `merge_sweep_stopped` (`unreconciled`, `base_sha_before_attempt`, `base_sha_after_attempt`) |
 | A completed task it could not judge (ref gone, remote unreachable, record unreadable/absent/candidate-less, archive unorderable or superseded) | named, not merged, run does NOT count as clear (exit 1), and the whole sweep is held | `merge_sweep_unresolved` |
 | A ref that changed DURING the sweep | that branch and the rest are left alone; the sweep stops | `merge_sweep_publication_changed` |
 | Backlog cleared | — | `merge_sweep_completed` |

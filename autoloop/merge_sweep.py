@@ -207,6 +207,44 @@ carries on with the rest. NOT `release` — that refuses anything not in progres
 suggesting it here would send the operator at a command that cannot run.
 `merge_sweep_stopped` names the branch and the remainder.
 
+## A stop is not automatically a restoration
+
+Stopping keeps the sweep from stacking a second merge onto a head nobody
+understands. It does NOT, by itself, mean the checkout is back where it started
+— and until 2026-08-15 both this module and its report assumed it did.
+
+`AutoMerger.attempt` has two outcomes that leave the base MOVED:
+
+* a merge that ran and then failed VERIFICATION (`auto_merge.FAILED`) — the
+  resulting head fails one of the ancestry checks, or the tree is unexpectedly
+  dirty afterwards. The merge commit is in the checkout and is deliberately
+  not undone, because `reset` is absent from the git whitelist by design.
+* a merge that verified and whose PUSH was then refused or failed
+  (`auto_merge.DEFERRED`, logged `auto_merge_push_refused`). The base moved
+  locally and never reached the remote — which is what a base branch listed in
+  `protected_branches` produces every single time.
+
+The second is exactly the one that must not be classified by outcome slug,
+because `DEFERRED` otherwise means "a precondition was not met and nothing was
+touched". So the answer is not read off the slug at all: the checkout is PROBED
+immediately before each attempt and again the moment one does not land, and
+"the base is exactly as it was" is claimed only when those two observations
+match (`_unreconciled` / `SweepResult.is_reconciled`). A probe that could not
+read the checkout is not a match either — "could not look" is not "nothing
+moved", the same rule the unresolved section applies to enumeration.
+
+That distinction is what the STARTUP hook needs. Reporting a stop and then
+dispatching ordinary roadmap work onto the resulting checkout defeats the whole
+reason for stopping: with no policy-legal undo available, the loop would build
+its next task on a head nobody verified, or push work stacked on a merge the
+remote has never seen. `cli._sweep_backlog_on_startup` therefore reports whether
+it is safe to carry on, and `_cmd_run` refuses to enter `_run_locked` when it is
+not. A conflict that aborted cleanly, a shut gate, a dirty-checkout refusal, a
+publication that changed before its merge and a HELD enumeration all mutate
+nothing, so every one of them still reports-and-continues exactly as before —
+the branches they are complaining about have already waited days, and refusing
+to start the loop over them would be the strictly worse failure.
+
 ## The gate defers the whole sweep, never part of it
 
 `cli._merge_window_blockers` is checked ONCE before the first merge. Shut →
@@ -317,6 +355,35 @@ class SweepResult:
     stopped_outcome: str = ""
     #: The gate's reasons, when the whole sweep was deferred.
     reasons: list[str] = field(default_factory=list)
+    #: HEAD when this invocation began and when it returned, `""` for either
+    #: one the checkout would not answer. Kept so "did this leave the base
+    #: somewhere else?" is a comparison an operator can check rather than an
+    #: inference from the outcome slug — and so the report can name both ends.
+    base_before: str = ""
+    base_after: str = ""
+    #: WHY the checkout cannot be claimed to be where the stopping attempt
+    #: found it — a moved HEAD, a changed working tree, or a probe that could
+    #: not read either. `""` means it provably is, which is the only state in
+    #: which anything downstream may treat this checkout as ordinary. See the
+    #: module docstring's "a stop is not automatically a restoration".
+    unreconciled: str = ""
+
+    @property
+    def is_reconciled(self) -> bool:
+        """Is the checkout provably in a state this module finished putting it
+        in — either untouched, or moved only by merges that were verified AND
+        pushed?
+
+        Deliberately separate from `is_clear`: they answer different questions
+        and have different consequences. `is_clear` is about the BACKLOG (is
+        anything still unmerged) and drives the exit code; this is about the
+        CHECKOUT (is it safe to keep working in) and drives whether the startup
+        hook lets the loop run at all. A stopped sweep is never clear, but it is
+        usually reconciled — a conflict aborts back to the exact pre-merge head
+        — and conflating the two would either block every startup after a
+        conflict or let one through after an unverified merge.
+        """
+        return not self.unreconciled
 
     @property
     def is_clear(self) -> bool:
@@ -333,9 +400,16 @@ class SweepResult:
         tool written to end it.
 
         `HELD` never reaches the first test either, so it needs no case of its
-        own: it exists only when `unresolved` is non-empty.
+        own: it exists only when `unresolved` is non-empty. An unreconciled
+        checkout cannot reach it either today — only `STOPPED` and `FAILED`
+        carry one — but it is tested for anyway, because "provably nothing left
+        unmerged" is not a claim to make about a base nobody can explain.
         """
-        return self.outcome in (SWEPT, NOTHING_TO_DO) and not self.unresolved
+        return (
+            self.outcome in (SWEPT, NOTHING_TO_DO)
+            and not self.unresolved
+            and not self.unreconciled
+        )
 
 
 class BacklogSweeper:
@@ -392,6 +466,14 @@ class BacklogSweeper:
         #: an `ls-remote` taken after the previous merge, not before the sweep.
         seen: set = set()
         result = SweepResult(outcome=NOTHING_TO_DO)
+        # The pre-SWEEP head, read before anything is enumerated. Every early
+        # return below happens before a single merge, so `base_after` starts
+        # equal to it and is only rewritten where the checkout could actually
+        # have moved. A probe that cannot read leaves both `""` rather than
+        # raising; `_backlog`'s own `head_sha()` is the read that decides
+        # whether a git that will not answer is fatal.
+        start = _probe(self._git)
+        result.base_before = result.base_after = start.head
         try:
             candidates = self._backlog(seen, result)
         except Exception as exc:      # noqa: BLE001 - a sweep must not stop a run
@@ -399,8 +481,14 @@ class BacklogSweeper:
             # Whatever the enumeration managed to judge before it blew up is
             # carried out with it, exactly as the gate-failure path below does:
             # the run is not clear either way, but the tasks it could not judge
-            # are the ones an operator has to go and look at.
-            return SweepResult(outcome=FAILED, unresolved=result.unresolved)
+            # are the ones an operator has to go and look at. Nothing has been
+            # merged at this point, so the checkout is not in question.
+            return SweepResult(
+                outcome=FAILED,
+                unresolved=result.unresolved,
+                base_before=start.head,
+                base_after=start.head,
+            )
         if not candidates:
             return result
 
@@ -444,7 +532,11 @@ class BacklogSweeper:
         except Exception as exc:      # noqa: BLE001 - fail closed, never merge
             self._log("merge_sweep_error", data={"error": f"{type(exc).__name__}: {exc}"})
             return SweepResult(
-                outcome=FAILED, pending=result.pending, unresolved=result.unresolved
+                outcome=FAILED,
+                pending=result.pending,
+                unresolved=result.unresolved,
+                base_before=start.head,
+                base_after=start.head,
             )
         for note in notes:
             self._log("merge_sweep_window_note", data={"note": note})
@@ -458,12 +550,26 @@ class BacklogSweeper:
             return result
 
         for index, candidate in enumerate(candidates):
+            # Probed per BRANCH rather than once for the sweep, because the
+            # branches that already landed moved HEAD legitimately: each was
+            # verified and pushed before the next was attempted. The only head
+            # move in question is the one the STOPPING attempt made, so the
+            # baseline has to be where that attempt found the checkout.
+            before_attempt = _probe(self._git)
             outcome = self._attempt(candidate, seen)
             if outcome not in _CONTINUE_ON:
+                # Read from the checkout, never inferred from `outcome`. A
+                # refused push returns `auto_merge.DEFERRED` — the slug that
+                # otherwise means "a precondition failed, nothing was touched"
+                # — over a base that has already moved locally. See the module
+                # docstring's "a stop is not automatically a restoration".
+                after_attempt = _probe(self._git)
                 result.outcome = STOPPED
                 result.stopped_on = candidate.task_id
                 result.stopped_outcome = outcome
                 result.pending = [c.task_id for c in candidates[index:]]
+                result.base_after = after_attempt.head
+                result.unreconciled = _unreconciled(before_attempt, after_attempt)
                 self._log(
                     "merge_sweep_stopped",
                     data={
@@ -471,6 +577,10 @@ class BacklogSweeper:
                         "outcome": outcome,
                         "merged": list(result.merged),
                         "remaining": list(result.pending),
+                        "base_sha_at_start": result.base_before,
+                        "base_sha_before_attempt": before_attempt.head,
+                        "base_sha_after_attempt": after_attempt.head,
+                        "unreconciled": result.unreconciled,
                     },
                 )
                 return result
@@ -478,7 +588,19 @@ class BacklogSweeper:
 
         result.outcome = SWEPT
         result.pending = []
-        self._log("merge_sweep_completed", data={"merged": list(result.merged)})
+        # Every branch here returned `merged` (verified AND pushed) or
+        # `already_integrated` (the remote base already carried it), so the head
+        # moved only into states `AutoMerger` confirmed. Recorded for the report,
+        # not questioned.
+        result.base_after = _probe(self._git).head
+        self._log(
+            "merge_sweep_completed",
+            data={
+                "merged": list(result.merged),
+                "base_sha_before": result.base_before,
+                "base_sha_after": result.base_after,
+            },
+        )
         return result
 
     def _attempt(self, candidate: SweepCandidate, seen: set) -> str:
@@ -784,6 +906,105 @@ class BacklogSweeper:
         return _ident_timestamp(ident)
 
 
+# ---- is the checkout where we left it? ---------------------------------------
+
+
+@dataclass(frozen=True)
+class _Checkout:
+    """Where the checkout is, read as ONE observation.
+
+    Both halves matter and neither answers for the other. HEAD alone misses a
+    conflict abort that returned 0 and left the tree conflicted (`_abort` has
+    its own check for exactly that, and this is the sweep-level version of the
+    same distrust); the working tree alone misses a merge that committed
+    cleanly and then failed a verification check.
+
+    `error` is not an absence but an ANSWER — "the checkout could not be read"
+    — for the same reason `_ArchivedCopy` keeps its own: a probe that silently
+    degraded to "looks unchanged" would let precisely the unreadable case
+    through as safe.
+    """
+
+    head: str = ""
+    #: `git status --porcelain` lines, so two observations compare literally
+    #: rather than through a boolean that cannot tell one dirty tree from
+    #: another.
+    dirty: tuple = ()
+    error: str = ""
+
+    @property
+    def readable(self) -> bool:
+        return not self.error
+
+
+def _probe(git) -> _Checkout:
+    """One observation of the checkout. Never raises: this runs on the failure
+    path of a module whose whole discipline is that an integration problem must
+    not stop a run, and an unreadable checkout is a finding rather than a
+    crash."""
+    try:
+        return _Checkout(head=git.head_sha(), dirty=tuple(git.dirty_files()))
+    except Exception as exc:      # noqa: BLE001 - "could not look" is an answer
+        return _Checkout(error=f"{type(exc).__name__}: {exc}")
+
+
+def _probe_checkout(config: AutoloopConfig, git) -> _Checkout:
+    """`_probe`, building the gateway when the caller has none — the startup
+    guard's case, where the failure being covered may BE the construction.
+    Gateway construction is inside the try for that reason: a gateway that will
+    not build has to come back as an unreadable checkout, not as a second
+    exception thrown from the handler for the first."""
+    try:
+        gateway = (
+            git if git is not None
+            else GitGateway(Path.cwd(), PolicyEngine(config.policy))
+        )
+    except Exception as exc:      # noqa: BLE001 - same reason as `_probe`
+        return _Checkout(error=f"{type(exc).__name__}: {exc}")
+    return _probe(gateway)
+
+
+def _unreconciled(before: _Checkout, after: _Checkout) -> str:
+    """`""` when the checkout is provably exactly where the attempt found it,
+    otherwise why that cannot be claimed.
+
+    Asked in this direction on purpose: the caller needs a REASON to print when
+    the answer is bad, and a bare boolean would have to be paired with a second
+    string that could drift from it. Unreadable is not "unchanged" — see the
+    module docstring; it is the same "could not look" the enumeration refuses to
+    round down, applied to the base instead of to a branch.
+    """
+    if not before.readable or not after.readable:
+        return (
+            "the checkout could not be read "
+            f"({before.error or after.error}), so whether the attempt left HEAD "
+            "or the working tree moved is unknown"
+        )
+    if before.head != after.head:
+        return (
+            f"HEAD moved from {before.head[:12]} to {after.head[:12]} during an "
+            "attempt that did not complete — a merge is in this checkout that was "
+            "not both verified and pushed"
+        )
+    if before.dirty != after.dirty:
+        return (
+            f"HEAD is still {after.head[:12]}, but the working tree is not what "
+            f"the attempt found: before {_describe_tree(before.dirty)}, "
+            f"after {_describe_tree(after.dirty)}"
+        )
+    return ""
+
+
+def _describe_tree(dirty: tuple) -> str:
+    """A `git status --porcelain` listing, short enough to print. Truncated
+    rather than elided entirely: the first few entries are what tells an
+    operator whether they are looking at conflict markers or at a stray file."""
+    if not dirty:
+        return "clean"
+    shown = ", ".join(dirty[:4])
+    return shown if len(dirty) <= 4 else f"{shown}, +{len(dirty) - 4} more"
+
+
 # ---- helpers ----------------------------------------------------------------
 
 
@@ -992,14 +1213,29 @@ def sweep_backlog(config: AutoloopConfig, *, git=None, log=None) -> SweepResult:
 
 
 def sweep_on_startup(config: AutoloopConfig, *, git=None, log=None) -> SweepResult:
-    """`sweep_backlog` with the outer guard the startup path needs: nothing
-    here — not a corrupt registry, not an unreadable config, not a git that
-    will not answer — may stop a run from starting. The sweep's own internals
-    already swallow; this covers the CONSTRUCTION, the same way
+    """`sweep_backlog` with the outer guard the startup path needs: an
+    integration problem — a corrupt registry, an unreadable config, a git that
+    will not answer — must not stop a run from starting. The sweep's own
+    internals already swallow; this covers the CONSTRUCTION, the same way
     `orchestrator._auto_merge_after_completion` wraps `AutoMerger`'s.
+
+    The one thing that DOES stop a run is a checkout this left somewhere it did
+    not finish putting it, and a crash is the case where that is least visible:
+    `sweep()` returns a result for every path it decides, so an exception
+    reaching here came from construction (before any mutation) or from the
+    transcript write that follows a stop (after one), and the slug alone cannot
+    tell those apart. So it is not asked to. HEAD and the working tree are
+    observed before and after, and the answer is a comparison — which keeps the
+    ordinary crash reporting-and-continuing, exactly as documented, while a
+    crash that really did leave the base moved is caught by
+    `cli._sweep_backlog_on_startup` instead of being dispatched onto.
+
+    The flag check stays FIRST, ahead of the probe: with `auto_merge_enabled`
+    off (the default) nothing here may touch git at all, including to look.
     """
     if not config.policy.auto_merge_enabled:
         return SweepResult(outcome=DISABLED)
+    before = _probe_checkout(config, git)
     try:
         return sweep_backlog(config, git=git, log=log)
     except Exception as exc:      # noqa: BLE001 - a sweep must not stop a run
@@ -1008,4 +1244,10 @@ def sweep_on_startup(config: AutoloopConfig, *, git=None, log=None) -> SweepResu
             entry("merge_sweep_error", data={"error": f"{type(exc).__name__}: {exc}"})
         except Exception:         # noqa: BLE001 - logging the failure may fail too
             pass
-        return SweepResult(outcome=FAILED)
+        after = _probe_checkout(config, git)
+        return SweepResult(
+            outcome=FAILED,
+            base_before=before.head,
+            base_after=after.head,
+            unreconciled=_unreconciled(before, after),
+        )
