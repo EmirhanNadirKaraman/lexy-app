@@ -179,11 +179,33 @@ looked like "safe to merge".
 
 The real condition is not the phase — it is whether any
 `.autoloop/executions/*.json` carries a `candidate_sha` **for a task that could
-still be dispatched or reviewed**. Records outlive the work they describe
-(nothing archives one when a candidate is published), so a completed or
-quarantined task's record is skipped; an unknown id is not. A dispatched task
-that has not committed yet holds nothing reviewed, so it does not close the
-window; an executing phase does.
+still be dispatched or reviewed**. Records outlive the work they describe, so a
+completed or quarantined task's record is skipped; an unknown id is not. A
+dispatched task that has not committed yet holds nothing reviewed, so it does
+not close the window; an executing phase does. A candidate already PUBLISHED on
+its own side branch — confirmed against the remote, never inferred from the
+record's own `intended_remote_ref`, which is written *before* the push — is
+durable and does not close it either.
+
+There is a third exemption, added 2026-08-15 after fourteen records held the
+window shut at once: a record whose task is back in the queue **and** whose
+recorded worker repo is gone **and** whose candidate the checkout cannot
+resolve is a defect in the record, not work in flight — there is no reachable
+commit for a moved base to strand. All three conditions are required, and an
+empty `worktree_path` does not satisfy the second ("we never recorded where it
+was" is not "we know it is gone"). It is reported as a `note:`, never hidden:
+`release` retires its record now, so seeing one means something should have
+been retired and was not.
+
+The third condition is answered by git and by nothing else, and only when git
+actually answers. `read_commit` failing is not that answer — `cat-file commit`
+dies the same way for a missing object, a corrupt one, an I/O error and a
+policy refusal — so a failed read leads to one further question,
+`GitGateway.object_exists`, which reports True/False from `cat-file -e`'s exit
+code (0 present, 1 absent) and raises on anything else. Only an explicit
+"the object database does not hold this" writes a record off; every other
+outcome keeps the window shut, the same fail-closed rule publication checking
+follows.
 
 The intended workflow:
 
@@ -240,6 +262,22 @@ for the next pass — turning it into a park would stop a working loop over a
 step that can simply happen later. **A deferred merge is a normal state.**
 Deferrals live in `<state_dir>/merge-deferrals/`, one file per task, and
 survive a `reset` for the same reason blockers do.
+
+**A deferral pins its execution record.** The retry is drained from that
+record — `AutoMerger.attempt` reads `candidate_sha`, `worktree_path` and
+`intended_remote_ref` back off the live file — so anything that retires the
+record while a deferral is outstanding silently ends the retry: the next drain
+finds no record, *skips* the task, and clearing the deferral is part of
+skipping. `_dispatch_task_push` states this where it advances the record rather
+than retiring it, and `orchestrator._reconcile_published_execution` honours the
+same rule: a record it would otherwise retire as "already shipped" is kept
+(logged `execution_retire_pinned_by_deferral`), the task is completed so the
+merger will still touch it, and the dispatch stops without parking — the park
+it would otherwise take asks the operator to archive that very record.
+Retirement happens on a later dispatch, once the merge has been pushed and
+confirmed and the deferral is gone. An unreadable deferral store counts as
+"one is outstanding": a dropped retry is indistinguishable from work that was
+never merged.
 
 A merge command returning 0 is not evidence: after the merge the head must
 have moved, must contain the candidate, must still contain the previous base,
@@ -335,10 +373,27 @@ python -m autoloop archive-blocker <id> --reason "..."   # close a dead blocker
 in-progress at dispatch and cleared when the round finishes; a `loop_fatal`
 park in between finishes nothing, so `state_of` reports IN_PROGRESS,
 `next_ready` skips it forever, and no command could move it — `unblock`
-correctly refuses anything that is not `blocked`. It clears both halves: the
-status AND the stale worker repo, which would otherwise make the next dispatch
-refuse. The worker is moved to quarantine, never deleted, because an
-interrupted round usually holds real work.
+correctly refuses anything that is not `blocked`.
+
+It clears **three** things, not one: the STATUS; the stale WORKER REPO, which
+would otherwise make the next dispatch refuse (`create()` will not write into
+an existing directory); and the EXECUTION RECORD, which would otherwise keep
+claiming a live unpublished `candidate_sha` for a task that is back in the
+queue and will be redone from scratch. That third one was silently left behind
+until 2026-08-15: releasing 25 stranded tasks the day before left 14 records
+pinned to the pre-merge HEAD, `merge-window` held the window shut on every one
+of them, and it could not reopen by itself — each of those tasks would have had
+to be re-dispatched *and* re-published first. With `auto_merge_enabled` on, the
+next task to complete published and then logged `auto_merge_deferred "merge
+window closed"`, and the published-but-unmerged backlog began rebuilding
+silently. An operator archived the 14 records by hand.
+
+Nothing is deleted. The worker moves to `quarantine/<task-id>-<label>` (an
+interrupted round usually holds real work) and the record to
+`.autoloop/executions/archive/<task-id>-<label>.json`, **under the same label**,
+so the two halves name each other and the candidate stays recoverable.
+`worktask.retire_execution` does both in one call precisely so they cannot
+drift apart.
 
 **`archive-blocker`** closes a blocker whose session has been retired. Some
 blockers cannot be answered at all — `checkout_escape_detected` refuses every

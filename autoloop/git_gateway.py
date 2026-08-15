@@ -1046,6 +1046,38 @@ class GitGateway:
         head, sep, _ = ident.rpartition(">")
         return (head + sep) if sep else ident
 
+    def object_exists(self, oid: str) -> bool:
+        """Does this repository's object database hold `oid`? True/False only
+        when git actually ANSWERED; anything else raises.
+
+        `cat-file -e` is the only probe here whose exit code carries that
+        distinction: 0 = present, 1 = absent (silently), and a die — a
+        malformed name, an unreadable/corrupt object, a repository that cannot
+        be opened — is 128, which is not an answer. `read_commit` cannot make
+        it: `cat-file commit <missing>` dies with the same 128 as `cat-file
+        commit <corrupt>`, so a caller that treats its failure as "absent"
+        cannot tell "git says no" from "git could not look". Same reasoning,
+        and the same shape, as `is_descendant` above.
+
+        Plain `oid`, never `<oid>^{commit}`: peeling routes a missing object
+        through revision-name resolution, which dies with 128 and destroys
+        exactly the distinction this method exists for.
+
+        `cli._candidate_is_retired` is the caller that needs it — writing a
+        record off as a defect on the strength of "the checkout cannot resolve
+        its candidate" is only sound when git said so.
+        """
+        proc = self._git("cat-file", "-e", oid, check=False)
+        if proc.returncode == 0:
+            return True
+        if proc.returncode == 1:
+            return False
+        raise GitCommandError(
+            f"git cat-file -e {oid} failed (rc={proc.returncode}): "
+            f"{(proc.stderr or proc.stdout).strip()} — not an answer about whether "
+            "the object exists"
+        )
+
     def read_commit(self, oid: str) -> dict:
         """Parse a commit object: tree, parents, author, committer, message."""
         raw = self._git_bytes("cat-file", "commit", oid).decode("utf-8", "replace")

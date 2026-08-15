@@ -135,7 +135,7 @@ from urllib.parse import urlsplit
 
 from . import environment
 from . import escape_detector
-from .auto_merge import AutoMerger
+from .auto_merge import AutoMerger, MergeDeferral, MergeDeferralStore
 from .blockers import NO_TASK, BlockerStore
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
@@ -210,6 +210,7 @@ from .inbox import apply_requests
 from .tasks import (
     Task,
     TaskRegistry,
+    TaskState,
     TaskStore,
     effective_approved_paths,
     unauthorized_paths,
@@ -223,6 +224,7 @@ from .worktask import (
     TaskExecution,
     TaskExecutionStore,
     reconcile_after_crash,
+    retire_execution,
 )
 from .worktree import WorktreeManager
 
@@ -390,6 +392,14 @@ class Orchestrator:
         #: `--config` can put it anywhere. Only ever written through
         #: `config_writer`, which refuses git-tracked paths.
         self._config_path = Path(config_path) if config_path else config.state_dir / "config.toml"
+        #: Auto-merge's retry queue (`auto_merge.MergeDeferralStore`). Built
+        #: here rather than inside `_auto_merge_after_completion` because TWO
+        #: places need the same view of it: the merger itself, and
+        #: `_reconcile_published_execution`, which must not retire an execution
+        #: record while a deferral still depends on it (see that method). A
+        #: second store constructed at the other site would be the same
+        #: directory, but the coupling is deliberate enough to make explicit.
+        self._merge_deferrals = MergeDeferralStore(config.merge_deferrals_dir)
         self._client = None
 
     # ---- main loop ----------------------------------------------------------
@@ -3475,6 +3485,33 @@ class Orchestrator:
         execution.candidate_commit_count = len(
             worktree_git.commit_list(execution.task_base_sha, execution.candidate_sha)
         )
+        # ADVANCE the record to match what git now says. `landed` came from the
+        # remote — the pre-push `ls-remote`, or `push_exact`'s own fresh
+        # reconciliation of what it pushed — never from the record, the
+        # directive or the executor, so this persists an observation rather than
+        # a claim.
+        #
+        # ADVANCED, not retired, and the order matters:
+        # `_auto_merge_after_completion` runs a few lines below and loads this
+        # record for `worktree_path` / `candidate_sha` / `intended_remote_ref`,
+        # and a merge it DEFERS is retried from the same record on a later
+        # completion. Retiring here would break integration outright and make a
+        # deferred merge unrecoverable. Retirement belongs to `release`, which
+        # abandons the work rather than shipping it.
+        #
+        # Why write it at all: publication and the task lifecycle are updated in
+        # separate places and can disagree, and nothing on the record marked the
+        # difference between "pushed" and "push attempted" —
+        # `intended_remote_ref` is written BEFORE the network call on purpose,
+        # so a refused push leaves a record indistinguishable from a landed one.
+        # A record still describing in-flight work after its candidate shipped
+        # is a latent park: `_rebase_execution_if_stale` meets it on the next
+        # revise and refuses to re-base work "a reviewer has already seen", when
+        # that work is in fact durable on its own branch. `merge-window`
+        # reported exactly that for `audit-0002` on 2026-08-15.
+        if landed == binding.candidate_sha:
+            execution.published_sha = landed
+            execution.published_at = utcnow_iso()
         self._execution_store.save(execution)
         # Clear `state.task_execution` now that the candidate is actually
         # published — NOT just re-mirror it. It is display/tracking state
@@ -3551,6 +3588,7 @@ class Orchestrator:
                 execution_store=self._execution_store,
                 registry=self._registry,
                 log=self._log,
+                deferrals=self._merge_deferrals,
             ).after_completion(task_id)
         except Exception as exc:      # noqa: BLE001 - bookkeeping must not undo a push
             self._log(
@@ -4119,6 +4157,179 @@ class Orchestrator:
         """
         return self.state.active_provider or self._config.conversation.provider
 
+    def _outstanding_merge_deferral(self, task_id: str) -> tuple[MergeDeferral | None, bool]:
+        """`(deferral, known)` — the task's undrained auto-merge retry, if any,
+        and whether the store could actually be read.
+
+        Fail-closed the way this file's other "may I discard something" checks
+        are: an unreadable or corrupt deferral answers `(None, False)`, which
+        every caller must treat as "assume one exists". A dropped retry is
+        indistinguishable from the unmerged-forever state auto-merge exists to
+        end (`MergeDeferralStore`'s own docstring makes the same argument for
+        raising on corruption), so guessing "there is none" is the one answer
+        that cannot be walked back.
+
+        `_merge_deferrals` is always set by `__init__`, but an Orchestrator
+        hand-built by a test via `__new__` may not have it; that reads as
+        unknown too, rather than as an absent deferral.
+        """
+        store = getattr(self, "_merge_deferrals", None)
+        if store is None:
+            return None, False
+        try:
+            return store.load(task_id), True
+        except (StateError, OSError) as exc:
+            self._log(
+                "merge_deferral_unreadable",
+                data={"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            return None, False
+
+    def _reconcile_published_execution(self, execution: TaskExecution, task: Task) -> bool:
+        """Did this record turn out to describe work that ALREADY SHIPPED? If
+        so, complete the task and retire the record — or PIN it, when an
+        undrained auto-merge deferral is still reading from it (see below).
+        True either way, and it means the caller stops here.
+
+        The other direction of the same drift `release` used to leave behind.
+        The task lifecycle and the execution record are written in separate
+        places, so a task can be PUBLISHED while its record still describes a
+        candidate in flight. `merge-window` reported exactly that on
+        2026-08-15:
+
+            note: task audit-0002: candidate 8d96c52aeca4 is published at
+            origin/refs/heads/autoloop/audit-0002 — safe to merge past, but its
+            record still reads in_progress, so a later revise would park it
+
+        Benign for merging, and the check says so — but a latent park. Revise
+        that task after the base moves and `_rebase_execution_if_stale` refuses
+        to re-base "work a reviewer has already seen", which is the right rule
+        for work that is only in a worker repo and the wrong one for work that
+        is durable on its own remote branch. Nothing is discarded by moving on
+        from a published candidate.
+
+        GIT IS THE AUTHORITY, never the record. `published_sha` says only where
+        to go and ask; the decision comes from a fresh `remote_ref_sha`
+        round-trip that must come back equal to the candidate. That ordering is
+        deliberate — `intended_remote`/`intended_remote_ref` are push INTENT,
+        written BEFORE the network call, so a record whose push was REFUSED
+        carries the same fields as one whose push landed, and only the remote
+        can tell them apart (the same reasoning as
+        `cli._candidate_publication`, which is why this does not simply trust
+        `published_sha` either).
+
+        Fail-closed everywhere else: no candidate, no recorded destination, a
+        record predating `published_sha`, an unreachable remote, a ref at a
+        different sha — all return False and leave the existing park exactly as
+        it was. An unanswerable question is never answered "already shipped".
+
+        A QUARANTINED (or dependency-blocked) task is left to the park too, and
+        that guard has to live here rather than in `_mark_task_completed`.
+        `mark_completed` refuses `BLOCKED_BY_OPERATOR` — correctly, since an
+        operator's quarantine records a decision they have not made yet — and
+        `_mark_task_completed` swallows that refusal to a log, which is the
+        right behaviour AFTER a successful push. Reaching it from here would be
+        different: the record is already retired by then, so the task would end
+        up with no record, no completion, no park and nothing behind the blocker
+        the operator was about to answer. Retiring is only safe where completing
+        is.
+
+        A record an OUTSTANDING MERGE DEFERRAL still depends on is pinned
+        instead of retired, and this is the one exemption that is about another
+        subsystem rather than about this one. `_dispatch_task_push` already
+        states the rule (see its "ADVANCED, not retired" comment): auto-merge
+        reads `candidate_sha` / `worktree_path` / `intended_remote_ref` back off
+        the live record, and a deferred merge is retried from that same record
+        on a later completion. Archive it here and the next drain finds no
+        record, `AutoMerger.attempt` SKIPS the task — which also CLEARS the
+        deferral — and published-but-unmerged work silently stops being retried.
+        That is the backlog auto-merge exists to end, rebuilt one task at a
+        time. So the pin: log it, complete the task (the same fresh `ls-remote`
+        that would have justified retiring justifies completing, and auto-merge
+        will only touch a COMPLETED task), and stop this dispatch without
+        parking. Retirement happens on a later dispatch, once the deferral has
+        drained — `_deferrals.clear` runs only on a merge that was pushed and
+        confirmed, or on a task the merger has explicitly written off.
+
+        Parking instead would be worse than doing nothing: its message asks the
+        operator to publish, abandon, or ARCHIVE the record, and archiving is
+        precisely the action that strands the deferral.
+
+        Retirement uses the SAME `retire_execution` as `release`: record and
+        worker filed away together under one label, nothing deleted, so the
+        candidate stays recoverable even though it is also on the remote.
+        """
+        candidate = execution.candidate_sha
+        remote = execution.intended_remote
+        dest_ref = execution.intended_remote_ref
+        if not candidate or not remote or not dest_ref:
+            return False
+        if execution.published_sha != candidate:
+            return False
+        if self._registry.has(task.id) and self._registry.state_of(task.id) in (
+            TaskState.BLOCKED,
+            TaskState.BLOCKED_BY_OPERATOR,
+        ):
+            return False
+        try:
+            landed = self._git.remote_ref_sha(remote, dest_ref)
+        except (GitError, OSError):
+            return False
+        if landed != candidate:
+            return False
+
+        deferral, deferral_known = self._outstanding_merge_deferral(task.id)
+        if deferral is not None or not deferral_known:
+            self._log(
+                "execution_retire_pinned_by_deferral",
+                data={
+                    "task_id": task.id,
+                    "candidate_sha": candidate,
+                    "deferral_reason": deferral.reason if deferral is not None else "",
+                    "deferral_attempts": deferral.attempts if deferral is not None else 0,
+                    "known": deferral_known,
+                },
+            )
+            self._mark_task_completed(task.id)
+            return True
+
+        try:
+            retired = retire_execution(
+                task.id,
+                self._execution_store,
+                self._worker_repos,
+                reason=f"published-{candidate[:12]}",
+            )
+        except (GitError, OSError, StateError) as exc:
+            self._log(
+                "execution_retire_failed",
+                data={"task_id": task.id, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            # Which half failed decides what to do next, and asking the store is
+            # the only honest way to know. If the RECORD half never landed,
+            # nothing changed and the caller's park is still the right answer.
+            # If it landed and the WORKER half failed, falling back to the park
+            # would name a record that no longer exists — and the leftover
+            # worker announces itself at the next dispatch anyway (see
+            # `retire_execution`'s ordering note), so stop here instead.
+            try:
+                return self._execution_store.load(task.id) is None
+            except StateError:
+                return False
+        self._log(
+            "execution_retired_published",
+            data={
+                "task_id": task.id,
+                "candidate_sha": candidate,
+                "remote": remote,
+                "dest_ref": dest_ref,
+                "record_archived_to": str(retired.record_path or ""),
+                "worker_quarantined_to": str(retired.worker_path or ""),
+            },
+        )
+        self._mark_task_completed(task.id)
+        return True
+
     def _rebase_execution_if_stale(self, execution: TaskExecution, task: Task):
         """Re-point a retry at the CURRENT branch head when its pinned base has
         been left behind (docs/AUTOLOOP_TODO.md B9).
@@ -4131,17 +4342,22 @@ class Orchestrator:
         predated the fix. The tell was the worker suite reporting 929 passed
         against the checkout's 931.
 
-        Returns the execution to use, or None when it parked instead.
+        Returns the execution to use, or None when it parked or reconciled
+        instead (either way this dispatch stops here).
 
-        Two cases, deliberately different:
+        Three cases, deliberately different:
 
         * Nothing reviewed yet (review_round == 0) -- re-base. The worker is
           QUARANTINED rather than deleted, so a refused candidate stays on disk
           as evidence, and attempt_count is PRESERVED: a moving base must not
           silently refill the retry budget, or a task could churn forever by
           re-basing.
-        * A review already happened -- refuse, naming both shas. Discarding a
-          candidate a reviewer has seen is not a decision to make quietly.
+        * A review already happened AND the candidate is confirmed published --
+          RECONCILE, do not park (`_reconcile_published_execution`). Nothing
+          would be discarded: the reviewed object is durable on its own branch.
+        * A review already happened and the candidate is not published --
+          refuse, naming both shas. Discarding a candidate a reviewer has seen
+          is not a decision to make quietly.
         """
         head = self._git.head_sha()
         base = execution.task_base_sha
@@ -4153,6 +4369,8 @@ class Orchestrator:
         if not self._git.is_descendant(head, base):
             return execution
 
+        if execution.review_round > 0 and self._reconcile_published_execution(execution, task):
+            return None
         if execution.review_round > 0:
             self._to_needs_user(
                 f"task {task.id}: its recorded base {base[:12]} is behind the "

@@ -88,7 +88,7 @@ from .tasks import Task, TaskRegistry, TaskState, TaskStore
 from .transcript import TranscriptLogger
 from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
-from .worktask import IntentStore, TaskExecutionStore
+from .worktask import IntentStore, TaskExecutionStore, retire_execution
 
 DEFAULT_CONFIG = Path(".autoloop/config.toml")
 
@@ -1653,18 +1653,33 @@ def _cmd_start(args: argparse.Namespace) -> int:
 
 
 def _cmd_release(args: argparse.Namespace) -> int:
-    """Return a task stranded IN-PROGRESS to pending, and clear its worker.
+    """Return a task stranded IN-PROGRESS to pending, and retire the execution
+    it leaves behind — both the worker repo and the `TaskExecution` record.
 
     A `loop_fatal` park mid-round leaves the task marked in-progress with
-    nothing to finish it, so it is never picked again. Both halves are
-    needed: the STATUS keeps it out of `next_ready`, and the stale WORKER
-    REPO would make the next dispatch refuse, since `create()` will not
-    write into an existing directory. Fixing only the status swaps one dead
-    end for another.
+    nothing to finish it, so it is never picked again. THREE things have to
+    move, not one:
 
-    The worker is MOVED to quarantine, never deleted — an interrupted round
-    usually has real work in it (`dash-02` had a half-finished dashboard
-    change), and the operator may want to read it.
+    * the STATUS, or `next_ready` keeps skipping it;
+    * the stale WORKER REPO, or the next dispatch refuses (`create()` will
+      not write into an existing directory);
+    * the EXECUTION RECORD, or `_merge_window_blockers` keeps reading a
+      `candidate_sha` for work that no longer exists as in-flight — the
+      commit is only inside the worker repo this command just quarantined,
+      unreachable from the checkout, and the task is pending again.
+
+    That third one was silently left behind until 2026-08-15. Releasing 25
+    stranded tasks the day before left 14 records pinned to the pre-merge
+    HEAD, and the merge window could not reopen by itself: every one of those
+    tasks would have had to be re-dispatched AND re-published first. The
+    operator archived the 14 by hand.
+
+    Nothing is deleted. The worker is MOVED to quarantine (an interrupted
+    round usually has real work in it — `dash-02` had a half-finished
+    dashboard change) and the record is MOVED to `executions/archive/`, both
+    under one label, so the candidate stays recoverable and the two halves
+    name each other on disk. `worktask.retire_execution` does both in one
+    call precisely so a future caller cannot do one and forget the other.
     """
     config = load_config(args.config)
     with LoopLock(config.state_dir):
@@ -1678,9 +1693,21 @@ def _cmd_release(args: argparse.Namespace) -> int:
         print(f"task {task.id} released: in_progress -> pending")
 
         worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
-        if worker_repos.path_for(args.task_id).exists():
-            moved = worker_repos.quarantine(args.task_id, "released-by-operator")
-            print(f"worker repo moved to {moved} (kept, not deleted — it may hold work)")
+        retired = retire_execution(
+            args.task_id, TaskExecutionStore(config.executions_dir), worker_repos
+        )
+        if retired.record_path is not None:
+            print(
+                f"execution record moved to {retired.record_path} (kept, not "
+                "deleted — its candidate is still in the quarantined worker)"
+            )
+        else:
+            print("no execution record to retire")
+        if retired.worker_path is not None:
+            print(
+                f"worker repo moved to {retired.worker_path} "
+                "(kept, not deleted — it may hold work)"
+            )
         else:
             print("no worker repo to clear")
     return 0
@@ -1836,6 +1863,83 @@ def _candidate_publication(config, record, seen=None, git=None) -> tuple[bool, s
     return True, ""
 
 
+def _candidate_is_retired(config, registry, task_id, record, git) -> str:
+    """Is this record a DEFECT rather than a hazard? A one-line reason if so,
+    `""` if it must still be respected.
+
+    A candidate holds the merge window shut because moving the base under it
+    strands real, reviewed, unpublished work. Three things together prove that
+    a given record is not describing such work, and all three are required:
+
+    1. **The task is pending or dependency-blocked.** Not in progress, so no
+       round is going to finish this candidate; the task will be redone from
+       scratch when it is picked again. (Completed and operator-quarantined
+       tasks never reach here — the caller exempts them first.)
+    2. **The worker repo it names is gone.** `worktree_path` is recorded at
+       dispatch and points at the ONLY place the candidate commit exists, so a
+       path that was recorded and is no longer on disk means the commit has
+       been moved out of reach (quarantined) or destroyed. An EMPTY
+       `worktree_path` is not evidence of anything and is deliberately not
+       accepted — "we never recorded where it was" is not "we know it is gone".
+    3. **The checkout cannot resolve the candidate.** Asked affirmatively, and
+       only ever answered from git: the repository has to prove it is readable
+       (`head_sha`) before its "no such object" counts as an answer. Anything
+       unverifiable — no repository, git unavailable, a probe that raises for
+       any other reason — reports `""` and keeps the window shut, matching
+       `_candidate_publication`'s fail-closed rule.
+
+       That last clause is why the failure of `read_commit` is NOT the answer
+       on its own. `cat-file commit` dies with the same status for a missing
+       object, a corrupt one, an I/O error and a policy refusal, so "it raised"
+       proves only that the question went unanswered — and writing a record off
+       on it would hand the merge window an unreachable-looking candidate
+       whenever the repository was merely having a bad day. So a raise here
+       leads to ONE more question, `GitGateway.object_exists`, which answers
+       True/False only from `cat-file -e`'s exit code and raises on anything
+       ambiguous. Only an explicit False — git itself saying the object
+       database does not hold this commit — writes the record off.
+
+    That combination is what `release` leaves behind, and it is provably not
+    in-flight. Fourteen such records held the window shut on 2026-08-15 (see
+    `worktask.retire_execution`). `release` now retires the record itself, so
+    this is the belt-and-braces for records that predate the fix or drifted
+    some other way — which is why the caller reports it as a NOTE rather than
+    swallowing it. A record that should have been retired is a defect worth
+    seeing, not a thing to ignore silently.
+
+    Ordered cheapest-first: registry lookup, then two filesystem checks, then
+    git. A record that fails an earlier check never reaches a subprocess.
+    """
+    if not registry.has(task_id):
+        # An id the registry has never heard of is not evidence of anything.
+        return ""
+    if registry.state_of(task_id) not in (TaskState.READY, TaskState.BLOCKED):
+        return ""
+    worktree_path = str(record.get("worktree_path") or "")
+    if not worktree_path or Path(worktree_path).exists():
+        return ""
+    candidate = str(record.get("candidate_sha") or "")
+    gateway = git if git is not None else _window_git(config)
+    try:
+        gateway.head_sha()
+    except (GitError, OSError):
+        return ""       # the repository cannot answer; that is not an answer
+    try:
+        gateway.read_commit(candidate)
+        return ""       # resolvable here: a moved base could still strand it
+    except (GitError, OSError):
+        pass
+    try:
+        if gateway.object_exists(candidate):
+            return ""   # the object is there; reading it merely failed
+    except (GitError, OSError):
+        return ""       # corruption, I/O, a policy refusal — still not an answer
+    return (
+        f"its worker repo {worktree_path} is gone and the checkout cannot "
+        f"resolve {candidate[:12]}"
+    )
+
+
 def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list[str]]:
     """Why merging into the loop's base is unsafe right now, plus advisory
     notes about work that is safe but not yet reconciled. `([], notes)` means
@@ -1855,13 +1959,16 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
     of them by a merge that looked safe because no agent happened to be running
     at that instant.
 
-    Records outlive the work they describe: nothing archives one when a
-    candidate is published or its task is quarantined. Counting those would
-    close the window permanently on finished work — dogfooding this command
-    reported two such records the moment it was written — and a tool that cries
-    wolf gets ignored, which is the failure it exists to prevent.
+    Records outlive the work they describe. `release` retires one now (see
+    `worktask.retire_execution`) and publication advances one, but neither did
+    before, and a record can still outlast its work by other routes. Counting
+    those would close the window permanently on finished work — dogfooding this
+    command reported two such records the moment it was written, and on
+    2026-08-15 fourteen released tasks' records held it shut on work that
+    existed only inside quarantined worker repos — and a tool that cries wolf
+    gets ignored, which is the failure it exists to prevent.
 
-    Two exemptions, and the difference between them matters:
+    Three exemptions, and the difference between them matters:
 
     * The task reached a terminal registry state (completed / quarantined).
     * The candidate is already PUBLISHED on its own side branch, confirmed
@@ -1873,6 +1980,13 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
       reviewer to express "done"), so a task that publishes stays `in_progress`
       forever and the terminal-state exemption above never fires for it. Gating
       on a transition that has no producer closed the window permanently.
+    * The record is a DEFECT rather than a hazard: its task is back in the
+      queue AND its worker repo is gone AND the checkout cannot resolve the
+      candidate (`_candidate_is_retired`, which explains each condition and
+      why all three are needed). That is what a `release` used to leave
+      behind, and it is provably not in-flight work — there is no reachable
+      commit for a moved base to strand. Reported as a NOTE, never hidden: a
+      record that should have been retired is worth seeing.
 
     The residual, reported as a note rather than hidden: a published record is
     still re-dispatchable, and a `revise` naming it after the base moves would
@@ -1912,11 +2026,33 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
             continue
         published, why_not = _candidate_publication(config, record, seen, git)
         if published:
+            # The residual differs by whether the RECORD knows what the remote
+            # just told us. A record carrying a confirmed `published_sha` is
+            # reconciled on the next revise (`orchestrator.
+            # _reconcile_published_execution` re-asks the remote and retires it);
+            # one written before that field existed still meets the old
+            # `task_base_behind_head` park, so it is still reported as a park.
+            reconcilable = record.get("published_sha") == record.get("candidate_sha")
             notes.append(
                 f"task {task_id}: candidate {str(record.get('candidate_sha'))[:12]} is "
                 f"published at {record.get('intended_remote')}/"
-                f"{record.get('intended_remote_ref')} — safe to merge past, but its "
-                "record still reads in_progress, so a later revise would park it"
+                f"{record.get('intended_remote_ref')} — safe to merge past, "
+                + (
+                    "and its record records that publication, so a later revise "
+                    "reconciles it against the remote rather than parking"
+                    if reconcilable
+                    else "but its record does not record that publication, so a "
+                    "later revise would park it"
+                )
+            )
+            continue
+        retired = _candidate_is_retired(config, registry, task_id, record, git)
+        if retired:
+            notes.append(
+                f"task {task_id}: candidate {str(record.get('candidate_sha'))[:12]} "
+                f"is NOT in flight — {retired}, and the task is back in the queue. "
+                "The record should have been retired with its worker "
+                "(`release` does this now); ignoring it for the window"
             )
             continue
         reasons.append(

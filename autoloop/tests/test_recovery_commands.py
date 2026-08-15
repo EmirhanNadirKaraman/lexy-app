@@ -11,15 +11,18 @@ one-liner, which is the signal that the CLI was missing something.
 """
 
 import argparse
+import json
 
 import pytest
 
 from autoloop import cli
 from autoloop.blockers import BlockerStore
 from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
-from autoloop.errors import TaskGraphError
+from autoloop.errors import GitCommandError, TaskGraphError
 from autoloop.state import LoopState, StateStore
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
+from autoloop.worker_env import WorkerRepoManager
+from autoloop.worktask import TaskExecution, TaskExecutionStore
 
 URL = "https://chatgpt.com/c/recovery-commands"
 
@@ -99,8 +102,6 @@ def test_release_command_clears_the_status_and_the_worker(wired, capsys):
     registry.mark_in_progress("dash-02")
     store.save(registry)
 
-    from autoloop.worker_env import WorkerRepoManager
-
     workers = WorkerRepoManager(wired.workers_root, wired.worker_hooks_dir)
     worker_path = workers.path_for("dash-02")
     worker_path.mkdir(parents=True)
@@ -136,7 +137,141 @@ def test_release_command_works_when_there_is_no_worker_repo(wired, capsys):
     store.save(registry)
 
     assert cli._cmd_release(argparse.Namespace(config=None, task_id="t-1")) == 0
-    assert "no worker repo to clear" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "no worker repo to clear" in out
+    # Absence is a no-op, not an error: a task parked before it ever committed
+    # has neither half to retire, and `release` must still return it to pending.
+    assert "no execution record to retire" in out
+
+
+# --- CLI: release retires the EXECUTION RECORD too ----------------------------
+#
+# The third half. `release` fixed the task STATUS and quarantined the WORKER
+# REPO, and left the `TaskExecution` record exactly where it was — still
+# carrying `candidate_sha`, still claiming live unpublished work for a task
+# that had been returned to pending and would be redone from scratch.
+#
+# `cli._merge_window_blockers` reads those records and held the window shut on
+# them. Observed 2026-08-15: releasing 25 stranded tasks the day before left 14
+# such records, every one bound to the pre-merge HEAD, and the window could not
+# reopen by itself — each of those tasks would have had to be re-dispatched AND
+# re-published first. With `auto_merge_enabled` on, pkt-02 completed, published,
+# then logged `auto_merge_deferred "merge window closed"`, and the
+# published-but-unmerged backlog began rebuilding silently. An operator
+# archived the 14 records by hand.
+
+
+def _stranded(config, task_id="auto-01", candidate="c" * 40):
+    """A task interrupted mid-round after a review: in-progress, a worker repo
+    on disk with real work in it, and an execution record holding a candidate."""
+    store = _seed(config, _task(task_id))
+    registry = store.load()
+    registry.mark_in_progress(task_id)
+    store.save(registry)
+
+    workers = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+    worker_path = workers.path_for(task_id)
+    worker_path.mkdir(parents=True)
+    (worker_path / "half-done.txt").write_text("work in progress", encoding="utf-8")
+
+    executions = TaskExecutionStore(config.executions_dir)
+    executions.save(
+        TaskExecution(
+            task_id=task_id,
+            task_branch=f"autoloop/{task_id}",
+            worktree_path=str(worker_path),
+            task_base_sha="d2d4d6b8" + "0" * 32,
+            candidate_sha=candidate,
+            review_round=1,
+        )
+    )
+    return store, executions
+
+
+def test_release_retires_the_execution_record_alongside_the_worker(wired, capsys):
+    """The record must go where the worker goes: archived, never deleted, so
+    the candidate stays recoverable — and out of the merge-window gate, which
+    is the whole reason the leftover records mattered."""
+    store, executions = _stranded(wired)
+
+    assert cli._cmd_release(argparse.Namespace(config=None, task_id="auto-01")) == 0
+
+    assert store.load().state_of("auto-01") is TaskState.READY
+    # The LIVE record is gone: nothing reads a candidate for work that will be
+    # redone from scratch.
+    assert executions.load("auto-01") is None
+    assert not (wired.executions_dir / "auto-01.json").exists()
+    # ...but it is ARCHIVED, not deleted. The commit it names is inside the
+    # quarantined worker repo, so throwing the pointer away would be the one
+    # irreversible half of this command.
+    archived = sorted((wired.executions_dir / "archive").glob("auto-01-*.json"))
+    assert len(archived) == 1, f"expected exactly one archived record, got {archived}"
+    record = json.loads(archived[0].read_text(encoding="utf-8"))
+    assert record["candidate_sha"] == "c" * 40
+    assert record["task_base_sha"] == "d2d4d6b8" + "0" * 32
+    assert "kept, not deleted" in capsys.readouterr().out
+
+    # THE POINT: the window is no longer held shut by a record for a task that
+    # is back in the queue. Before this, it could not reopen without that task
+    # being re-dispatched and re-published first.
+    reasons, _notes = cli._merge_window_blockers(wired)
+    assert reasons == [], f"the released task must not hold the window shut: {reasons}"
+
+
+def test_both_halves_are_filed_under_the_same_label(wired):
+    """One operation, not two that happen to run next to each other. The label
+    is what proves it: the quarantined worker and the archived record name the
+    same attempt, so a human reading either finds the other half.
+
+    A CONSTANT label would make this vacuous, which is why the assertion also
+    demands a per-call suffix."""
+    _stranded(wired, task_id="inbox-05")
+
+    assert cli._cmd_release(argparse.Namespace(config=None, task_id="inbox-05")) == 0
+
+    quarantined = sorted(wired.workers_root.parent.glob("quarantine/inbox-05-*"))
+    archived = sorted((wired.executions_dir / "archive").glob("inbox-05-*.json"))
+    assert len(quarantined) == 1 and len(archived) == 1
+
+    worker_label = quarantined[0].name[len("inbox-05-"):]
+    record_label = archived[0].stem[len("inbox-05-"):]
+    assert worker_label == record_label, (
+        f"the two halves drifted apart: worker {worker_label!r} vs "
+        f"record {record_label!r}"
+    )
+    prefix = "released-by-operator-"
+    assert worker_label.startswith(prefix)
+    assert worker_label[len(prefix):], "the label must be unique per call, not a constant"
+    # And the evidence really is there, under that shared label.
+    assert (quarantined[0] / "half-done.txt").read_text(encoding="utf-8") == "work in progress"
+
+
+def test_the_record_is_retired_before_the_worker(wired, monkeypatch):
+    """Either half can fail, and the two residues are not equally safe.
+
+    A left-behind RECORD is silent: it holds the merge window shut and nothing
+    announces it — the exact failure this change ends. A left-behind WORKER is
+    loud: the next dispatch's `create()` refuses to write into the existing
+    directory and parks naming it. So the record goes first, and whichever half
+    fails, the survivor is the one that reports itself."""
+    _stranded(wired, task_id="loop-01")
+
+    def refuse(self, task_id, label):
+        raise GitCommandError("mv", "quarantine destination is not writable")
+
+    monkeypatch.setattr(WorkerRepoManager, "quarantine", refuse)
+
+    with pytest.raises(GitCommandError):
+        cli._cmd_release(argparse.Namespace(config=None, task_id="loop-01"))
+
+    assert not (wired.executions_dir / "loop-01.json").exists(), (
+        "the record must be retired first — a surviving one is the silent failure"
+    )
+    assert sorted((wired.executions_dir / "archive").glob("loop-01-*.json"))
+    # The worker survives, and its next dispatch will say so out loud.
+    assert WorkerRepoManager(
+        wired.workers_root, wired.worker_hooks_dir
+    ).path_for("loop-01").exists()
 
 
 # --- CLI: archive-blocker -----------------------------------------------------

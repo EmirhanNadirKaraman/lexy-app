@@ -363,7 +363,15 @@ class AutoMerger:
 
         if not already_merged:
             # 7. THE GATE. Same predicate as `merge-window`, called not copied.
-            reasons, _notes = cli._merge_window_blockers(self._config, seen, self._git)
+            reasons, notes = cli._merge_window_blockers(self._config, seen, self._git)
+            # The gate's notes are the ONLY report of a record that is being
+            # ignored rather than respected — a published-but-unretired record,
+            # or one a `release` left behind. `merge-window` prints them to the
+            # operator; this path has no operator, so discarding them (as it did
+            # until 2026-08-15) made "the window opened because a record was
+            # written off" indistinguishable from "the window was simply clear".
+            for note in notes:
+                self._log("auto_merge_window_note", data={"task_id": task_id, "note": note})
             if reasons:
                 return self._defer(execution, "merge window closed: " + "; ".join(reasons))
             if self._git.is_dirty():
