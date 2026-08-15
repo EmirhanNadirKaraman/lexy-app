@@ -1379,6 +1379,11 @@ def test_security_and_environment_codes_all_have_a_precondition():
     security_and_environment_codes = {
         "login_expired",
         "submission_ambiguous",
+        # Same class one layer out (conv-01, 2026-08-15): a conversation
+        # retirement whose replacement send may have landed in a chat it could
+        # not bind to. Where the message is cannot be settled by answer text,
+        # so it needs a precondition exactly as `submission_ambiguous` does.
+        "retirement_send_ambiguous",
         "git_failure_budget_exhausted",
         "publisher_url_drift",
         "worker_environment_drift",

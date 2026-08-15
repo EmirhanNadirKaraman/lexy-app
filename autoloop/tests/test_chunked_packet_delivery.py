@@ -567,9 +567,12 @@ def test_a_rotation_gives_up_the_parts_rather_than_pointing_at_a_chat_without_th
     assert req.delivery.complete
 
     # `note=` is the caller-supplied first-message text (a rotation's
-    # continuation line, a retirement's priming + measurement note), so the
-    # double has to accept it or it stops modelling the method it replaces.
-    def rotation_fails(_req, _project_url, *, note=None):
+    # continuation line, a retirement's priming + measurement note) and
+    # `attempt=` is the move's running send record, so the double has to accept
+    # both or it stops modelling the method it replaces. Raising before the
+    # record is touched is what "the replacement chat never loaded" means: the
+    # attempt keeps its `unsent` default, and nothing was posted anywhere.
+    def rotation_fails(_req, _project_url, *, note=None, attempt=None):
         raise BrowserError("the replacement chat never loaded")
 
     orch._rotate_conversation = rotation_fails

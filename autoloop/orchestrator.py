@@ -66,8 +66,13 @@ Transport-recovery additions (this change):
   cancels the attempt.
 * A conversation that is neither broken nor healthy but DEGRADED BY ITS OWN
   SIZE is RETIRED rather than rotated: same move, different trigger, different
-  budget, and — the important difference — a refusal never parks. See
-  `_maybe_retire_conversation` and docs/AUTOLOOP.md §5c.
+  budget, and — the important difference — a REFUSAL never parks; the round
+  simply proceeds in the slow thread. The one exception is a move that already
+  posted the request and then failed, which may not carry on because that
+  would put the same request id in two conversations: it adopts the
+  replacement chat if that chat can be proven to hold the request, and parks
+  otherwise. See `_maybe_retire_conversation`, `SendCertainty` and
+  docs/AUTOLOOP.md §5c-bis.
 
 Note for the merge with the blocker/quarantine work (commit 5346551, branch
 `feat/autoloop-postcommit-review`): every park site added here goes through the
@@ -122,8 +127,9 @@ from __future__ import annotations
 import hashlib
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from enum import Enum
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -275,6 +281,74 @@ RETIREMENT_NOTE_TEMPLATE = (
 #: needs 180s failed three rotations that had actually succeeded.
 ROTATION_URL_TIMEOUT_SECONDS = 30.0
 ROTATION_URL_POLL_SECONDS = 0.5
+
+
+class SendCertainty(str, Enum):
+    """What a conversation move is KNOWN to have done to the transport.
+
+    A move is not one act. It opens a chat, posts the request into it, reads
+    the URL the server assigned, checks that URL is inside the project, and
+    reconciles the chat for the request — and it can fail at any of those. The
+    caller's only safe question afterwards is *"can this request still be sent
+    somewhere else?"*, and only the SEND answers it. So the send's outcome is
+    recorded as it happens rather than inferred from the exception, which says
+    which step died and nothing about what the previous ones left behind.
+
+    The distinction exists because a retirement, unlike a rotation, is allowed
+    to carry on in the old conversation when its move fails (§5c-bis: never
+    park a working loop for slowness). Carrying on is only safe for `UNSENT`.
+    A `POSSIBLE` or `PERSISTED` send that then went on to submit in the old
+    thread would put the same request in two conversations, which is the one
+    thing the transport layer promises never to do.
+    """
+
+    #: The send was never issued, or the composer provably refused the input:
+    #: no message exists anywhere under this request id. The only value that
+    #: licenses submitting into the old conversation.
+    UNSENT = "unsent"
+    #: Issued, and the transport's own network evidence DISPROVES acceptance
+    #: (`SubmitResult.REJECTED`). Strong, but not proof — `_step_submission_
+    #: rejected` exists precisely because persisted history outranks a status
+    #: code — so this still requires the replacement chat to be searched
+    #: before the old one is used again.
+    DISPROVEN = "disproven"
+    #: Issued; acceptance neither confirmed nor disproven. Never resend.
+    POSSIBLE = "possible"
+    #: The transport confirmed the request is in the replacement chat. The
+    #: message exists; the only open question is which URL holds it.
+    PERSISTED = "persisted"
+
+
+@dataclass
+class MoveAttempt:
+    """The running record of one `_move_conversation` call.
+
+    Mutated in place as the move proceeds, so a caller holding it can read what
+    actually happened AFTER the move raised. An exception cannot carry this:
+    the failure that matters most (a send that persisted, then a later step
+    dying) raises from a step that knows nothing about the send.
+    """
+
+    certainty: SendCertainty = SendCertainty.UNSENT
+    #: The prompt actually posted into the replacement chat, once posted.
+    prompt: str = ""
+    #: The replacement chat's URL as last observed — address bar or content
+    #: search — WITHOUT the containment check. Kept separately from `new_url`
+    #: so a park can name where a stranded message probably is, even when that
+    #: URL is exactly the reason the move refused to bind.
+    captured_url: str = ""
+    #: The candidate that passed `_url_in_project`. Only ever a URL this loop
+    #: would be willing to adopt.
+    new_url: str = ""
+    #: True once a content search over the project has COMPLETED — a search that
+    #: could not run is not evidence of absence, and the one path allowed to
+    #: carry on after a send needs that distinction to be explicit.
+    search_completed: bool = False
+    #: True while `req` carries the pessimistic send marks this move set before
+    #: handing the prompt to the transport (see `_submit_into_replacement`).
+    marked: bool = False
+    prior_send_attempted: bool = False
+    prior_outcome: str = ""
 
 
 #: The four outcomes of `Orchestrator._browser_restart_outcome`. They are
@@ -1051,7 +1125,11 @@ class Orchestrator:
         # rendering cost, and could time out doing it, would be defeated by the
         # condition it exists to answer.
         if self._maybe_retire_conversation(req):
-            return  # `req` now lives in a fresh chat and is already `awaiting`
+            # The round ends here: either `req` now lives in a fresh chat and is
+            # already `awaiting`, or the move's own send could not be accounted
+            # for and the loop parked. Falling through in the second case would
+            # send the same request into a second conversation.
+            return
         client = self._client_for_request(req)
         client.attach()
         # One controlled reload BEFORE sending, so the duplicate check reads
@@ -1589,6 +1667,7 @@ class Orchestrator:
         note: str = CONTINUATION_NOTE,
         event: str = "conversation_rotated",
         measurement: dict | None = None,
+        attempt: MoveAttempt | None = None,
     ) -> str:
         """Open one fresh chat, land `req` in it, and COMMIT the move.
 
@@ -1600,16 +1679,58 @@ class Orchestrator:
         is the same act.
 
         Raises on failure (`BrowserError` / `AutoloopError` / `LoginExpiredError`
-        from `_rotate_conversation`), leaving `req` exactly as it was — still
-        bound to the old conversation, still holding its original prompt. The
-        caller decides what a failed move means; nothing here has an opinion.
+        from `_rotate_conversation`), leaving `req` STILL BOUND to the old
+        conversation and still holding its original prompt. What it does not
+        leave untouched is the send bookkeeping: pass an `attempt` and read
+        `attempt.certainty` afterwards to learn whether the replacement chat may
+        already hold the request. The caller decides what a failed move means —
+        but it cannot decide correctly without that, so a caller that intends to
+        keep using the old conversation must pass one.
 
         Returns the new conversation URL.
         """
         state = self.state
         old_url = req.conversation_url or state.conversation_url
-        new_url, sent_prompt = self._rotate_conversation(req, project_url, note=note)
+        new_url, sent_prompt = self._rotate_conversation(
+            req, project_url, note=note, attempt=attempt
+        )
+        return self._commit_conversation_move(
+            req,
+            old_url=old_url,
+            new_url=new_url,
+            sent_prompt=sent_prompt,
+            reason=reason,
+            event=event,
+            measurement=measurement,
+        )
 
+    def _commit_conversation_move(
+        self,
+        req: PendingRequest,
+        *,
+        old_url: str,
+        new_url: str,
+        sent_prompt: str,
+        reason: str,
+        event: str = "conversation_rotated",
+        measurement: dict | None = None,
+    ) -> str:
+        """Bind `req` and the loop to a replacement chat that is PROVEN to hold
+        the request, and record the move.
+
+        Split out of `_move_conversation` because there are two ways to arrive
+        at that proof and they must commit identically. The ordinary one is the
+        move itself. The other is `_adopt_replacement_conversation`: a move that
+        posted the request and then failed on a later step has already put the
+        message in a chat, and re-reconciling that chat is the same proof
+        arriving through a different door. Duplicating this bookkeeping for it
+        would be the way the two drift apart.
+
+        Every caller must have re-established the SAME fact first — the
+        conversation at `new_url` contains `req.request_id` — because nothing
+        below re-checks it.
+        """
+        state = self.state
         # Only now is the request's prompt the one that was actually sent. Doing
         # this before the send would leave a failed rotation holding a prompt
         # that announces the conversation is abandoned, in the conversation that
@@ -1757,7 +1878,14 @@ class Orchestrator:
 
     def _maybe_retire_conversation(self, req: PendingRequest) -> bool:
         """Retire a conversation that has grown too large to work in, and send
-        `req` into its replacement instead. True when that happened.
+        `req` into its replacement instead.
+
+        Returns True when THE ROUND ENDS HERE — normally because `req` now lives
+        in a fresh chat and is already `awaiting`, but also when the move's own
+        send could not be accounted for and the loop parked rather than risk
+        posting it twice. False means "nothing was sent anywhere; carry on in
+        the existing conversation", which is what `_step_submitting` then does
+        on its very next line.
 
         Rotation escapes a chat that is BROKEN. This escapes one that still
         works and has simply become slow, which is a different event and is
@@ -1767,12 +1895,15 @@ class Orchestrator:
           `max_conversation_rotations` — that cap exists so a broken chat cannot
           be rotated round in circles, and a planned move must not spend the
           emergency allowance for the next real fault.
-        * **A refusal never parks.** Every `return False` below leaves the loop
-          exactly where it was: the request is sent into the existing
-          conversation on the very next line of `_step_submitting`, and the
-          round proceeds. A degraded conversation still works, so stopping a
-          working loop because it is slow would be worse than the slowness —
-          which is the whole difference from `_park_rotation`.
+        * **A REFUSAL never parks.** Every `return False` from the precondition
+          block below leaves the loop exactly where it was and the round
+          proceeds in the existing thread. A degraded conversation still works,
+          so stopping a working loop because it is slow would be worse than the
+          slowness — which is the whole difference from `_park_rotation`. The
+          one thing that CAN park is a move that already posted the request and
+          then failed (`_resolve_uncertain_retirement`): that is not a refusal,
+          and carrying on there would mean sending the same request into two
+          conversations.
         * **It cannot fire on one slow round**, the case §5c deliberately
           refuses to rotate for. That holds structurally rather than by a guard:
           the signal is a count of messages, and
@@ -1809,6 +1940,12 @@ class Orchestrator:
         if req.send_attempted:
             # Something may already be in the old thread under this request id.
             # Deferring costs one round; getting this wrong risks a double post.
+            #
+            # Load-bearing that this is the FIRST check: it is also what a
+            # `--retry` after `_park_retirement_ambiguous` hits, because that
+            # park leaves the mark set deliberately. Reordering it below any
+            # check that can pass would let the resumed round retire (and
+            # therefore send) a request whose earlier send is unaccounted for.
             return refuse("retirement_deferred", "send_already_attempted")
         if req.delivery is not None:
             # The parts live in the thread being retired, and the verdict
@@ -1855,6 +1992,7 @@ class Orchestrator:
         # binding must not be able to open a second chat and post again.
         state.retirements += 1
         self._store.save(state)
+        attempt = MoveAttempt()
         try:
             self._move_conversation(
                 req,
@@ -1863,25 +2001,40 @@ class Orchestrator:
                 note=self._retirement_note(measurement),
                 event="conversation_retired",
                 measurement=measurement | {"retirements": state.retirements},
+                attempt=attempt,
             )
         except LoginExpiredError:
             # Re-raised, unlike every other failure here: `_step_submitting`
             # runs inside `run()`'s try, whose `except LoginExpiredError` parks
             # with the resume phase intact. A logged-out profile is not
-            # something the next line of this round can proceed through.
+            # something the next line of this round can proceed through. Safe
+            # for the same reason the park below is: `req` keeps whatever send
+            # marks the attempt left on it, so the resumed round reconciles
+            # rather than resends.
             raise
         except (BrowserError, AutoloopError) as exc:
-            # The move failed, so `req` is untouched — still bound to the old
-            # conversation, still holding its original prompt. Log it and let
-            # the round continue there: the thread is slow, not broken, and
-            # parking a loop that can still work is the outcome this whole
-            # reflex is shaped to avoid. The budget stays spent (the attempt may
-            # have posted before failing), so this cannot become a retry loop.
             self._log(
                 "retirement_failed",
                 request_id=req.request_id,
-                data={"reason_code": "retirement_failed", "error": str(exc)} | measurement,
+                data={
+                    "reason_code": "retirement_failed",
+                    "error": str(exc),
+                    "send_certainty": attempt.certainty.value,
+                }
+                | measurement,
             )
+            if attempt.certainty is not SendCertainty.UNSENT:
+                # The replacement chat may already hold this request. Everything
+                # from here is about finding out WHERE the message is, never
+                # about sending it again.
+                return self._resolve_uncertain_retirement(req, attempt, exc, measurement)
+            # Nothing left the browser, so `req` is untouched — still bound to
+            # the old conversation, still holding its original prompt. Log it and
+            # let the round continue there: the thread is slow, not broken, and
+            # parking a loop that can still work is the outcome this whole reflex
+            # is shaped to avoid. The budget stays spent (the failure is still an
+            # attempt), so this cannot become a retry loop.
+            self._restore_send_marks(req, attempt)
             # `_rotate_conversation` retargets the cached client at the project
             # page before it submits. Without this drop, the next `attach()` in
             # `_step_submitting` would load THAT page and post the request
@@ -1890,6 +2043,234 @@ class Orchestrator:
             self._drop_client()
             return False
         return True
+
+    def _resolve_uncertain_retirement(
+        self,
+        req: PendingRequest,
+        attempt: MoveAttempt,
+        exc: Exception,
+        measurement: dict,
+    ) -> bool:
+        """A retirement whose move may already have posted the request, and then
+        failed before anything was bound to the replacement chat.
+
+        This is the one place the "a retirement never parks" rule bends, and it
+        bends because the alternative is worse. `_step_submitting` continues
+        into the ordinary send the moment this returns False, so returning False
+        with a message sitting in a replacement chat would put the same request
+        id in two conversations — the exactly-once property every other
+        transport path is built to hold (`submission_unconfirmed` never resends;
+        `submission_rejected` reconciles before it does).
+
+        In order of evidence:
+
+        1. **Adopt.** If the replacement chat can be found and RE-RECONCILED,
+           the move actually succeeded and only the bookkeeping died. Bind to it
+           and the round carries on there — the best outcome, and the common one
+           for a transient failure on the URL/reconcile steps.
+        2. **Carry on, but only on disproof.** A transport that DISPROVED the
+           send, plus a content search that RAN and found the request in no chat
+           in the project, is the same pair of facts `_step_submission_rejected`
+           treats as authorizing a resend (network disproof + confirmed
+           absence). A search that could not run is not absence, and does not
+           qualify. It is also the one case the platform itself argues for:
+           ChatGPT mints a `/c/<id>` only when a turn is accepted, so a turn the
+           backend refused at the project page leaves no chat behind to hold it.
+        3. **Park.** Anything else is genuinely ambiguous, and the operator gets
+           the URL we last saw rather than a mystery.
+
+        Always ends the round except in case 2.
+        """
+        adopted = self._adopt_replacement_conversation(req, attempt, measurement, exc)
+        if adopted:
+            return True
+        if (
+            attempt.certainty is SendCertainty.DISPROVEN
+            and attempt.search_completed
+            and not attempt.captured_url
+        ):
+            self._log(
+                "retirement_send_disproven",
+                request_id=req.request_id,
+                data={
+                    "reason_code": "retirement_send_disproven",
+                    "error": str(exc),
+                    "note": (
+                        "the transport disproved the replacement send and no chat "
+                        "in the project carries this request — the old "
+                        "conversation is safe to use"
+                    ),
+                }
+                | measurement,
+            )
+            self._restore_send_marks(req, attempt)
+            self._drop_client()
+            return False
+        self._park_retirement_ambiguous(req, attempt, exc, measurement)
+        return True
+
+    def _adopt_replacement_conversation(
+        self,
+        req: PendingRequest,
+        attempt: MoveAttempt,
+        measurement: dict,
+        exc: Exception,
+    ) -> bool:
+        """Bind `req` to the chat a failed move already posted it into — but
+        only on the same proof an ordinary move requires.
+
+        Two candidates, strongest first: the URL the move itself validated
+        (`attempt.new_url`, so a reconcile that failed once is simply retried),
+        then the chat that CONTAINS the request id (`find_conversation_with`,
+        the witness `_rotate_conversation` already prefers over the address bar
+        when the two disagree). Each must pass `_url_in_project` and then
+        `reconcile` before anything binds — a message that landed outside the
+        configured project is a stranded message to report, never a
+        conversation to adopt.
+        """
+        state = self.state
+        project_url = self._config.browser.project_url
+        client = self._get_client()
+        retarget = getattr(client, "retarget", None)
+        if retarget is None or not project_url:
+            return False
+
+        candidates = [attempt.new_url] if attempt.new_url else []
+        finder = getattr(client, "find_conversation_with", None)
+        if finder is not None:
+            try:
+                found = finder(req.request_id, project_url)
+            except LoginExpiredError:
+                raise
+            except (BrowserError, AutoloopError):
+                # A search that could not run says nothing about where the
+                # message is. Recorded as such: `search_completed` stays False,
+                # so the disproven-send carry-on refuses to treat this as
+                # absence.
+                found = None
+            else:
+                attempt.search_completed = True
+            if found:
+                # Recorded even when it is refused below: an operator hunting a
+                # stranded message needs the URL more than the loop does.
+                attempt.captured_url = found
+                if found not in candidates:
+                    candidates.append(found)
+
+        old_url = req.conversation_url or state.conversation_url
+        for candidate in candidates:
+            if not self._url_in_project(candidate, project_url):
+                continue
+            if candidate.rstrip("/") == (old_url or "").rstrip("/"):
+                # Adopting the thread being retired as its own replacement would
+                # spend an epoch and retire nothing.
+                continue
+            try:
+                retarget(candidate)
+                client.attach()
+                if not client.reconcile(req.request_id):
+                    continue
+            except LoginExpiredError:
+                raise
+            except (BrowserError, AutoloopError) as adopt_exc:
+                self._log(
+                    "retirement_adoption_failed",
+                    request_id=req.request_id,
+                    data={
+                        "reason_code": "retirement_adoption_failed",
+                        "url": candidate,
+                        "error": str(adopt_exc),
+                    },
+                )
+                return False
+            self._log(
+                "retirement_send_adopted",
+                request_id=req.request_id,
+                data={
+                    "reason_code": "retirement_send_adopted",
+                    "url": candidate,
+                    "send_certainty": attempt.certainty.value,
+                    "error": str(exc),
+                    "note": (
+                        "the move posted the request and then failed; the "
+                        "replacement chat still holds it, so it is adopted "
+                        "rather than sent again"
+                    ),
+                },
+            )
+            self._commit_conversation_move(
+                req,
+                old_url=old_url,
+                new_url=candidate,
+                sent_prompt=attempt.prompt,
+                reason="conversation_degraded",
+                event="conversation_retired",
+                measurement=measurement
+                | {"retirements": state.retirements, "adopted_after_failure": str(exc)},
+            )
+            return True
+        return False
+
+    def _park_retirement_ambiguous(
+        self,
+        req: PendingRequest,
+        attempt: MoveAttempt,
+        exc: Exception,
+        measurement: dict,
+    ) -> None:
+        """Stop, with the request's send marked ambiguous rather than resent.
+
+        `req` keeps `send_attempted=True` — and whatever outcome the send
+        actually recorded — on purpose: that is the state `submitting`'s own
+        ambiguity handling reads, so a `--retry` refuses the retirement
+        (`send_already_attempted`), reconciles the old conversation, finds
+        nothing and parks again. Safe at every entry point, rather than only
+        through the door that parked here.
+        """
+        where = attempt.captured_url or "no replacement chat could be identified"
+        self._log(
+            "retirement_send_ambiguous",
+            request_id=req.request_id,
+            data={
+                "reason_code": "retirement_send_ambiguous",
+                "error": str(exc),
+                "send_certainty": attempt.certainty.value,
+                "captured_url": attempt.captured_url,
+            }
+            | measurement,
+        )
+        self._drop_client()
+        self._to_needs_user(
+            f"retiring the oversized conversation for {req.request_id} may already "
+            f"have posted the request into a replacement chat, and then failed "
+            f"before it could be bound to one: {exc}. The send is "
+            f"'{attempt.certainty.value}', so autoloop will not send this request "
+            "again on its own — doing so would put the same request in two "
+            f"conversations. Last seen: {where}. Find the chat in the configured "
+            "project, and either point `browser.conversation_url` at it and "
+            "`run --retry`, or, once you have confirmed no chat holds this "
+            "request, `run --resubmit`.",
+            resume_phase=Phase.SUBMITTING.value,
+            kind="loop_fatal",
+            code="retirement_send_ambiguous",
+            detail=f"request_id={req.request_id} send_certainty={attempt.certainty.value}",
+        )
+
+    def _restore_send_marks(self, req: PendingRequest, attempt: MoveAttempt) -> None:
+        """Give `req` back the send marks it had before the move set them
+        pessimistically — and only ever on PROOF that nothing was sent.
+
+        The marks exist so a crash mid-move leads recovery to reconcile instead
+        of resending (`_submit_into_replacement`). Clearing them is therefore
+        the act that re-authorizes an ordinary send, which is exactly what the
+        two carry-on paths above need and nothing else may do.
+        """
+        if not attempt.marked:
+            return
+        req.send_attempted = attempt.prior_send_attempted
+        req.last_send_outcome = attempt.prior_outcome
+        attempt.marked = False
+        self._store.save(self.state)
 
     def _retirement_note(self, measurement: dict) -> str:
         """The first message of the replacement thread — see
@@ -1970,20 +2351,33 @@ class Orchestrator:
         return check(request_id)
 
     def _rotate_conversation(
-        self, req: PendingRequest, project_url: str, *, note: str = CONTINUATION_NOTE
+        self,
+        req: PendingRequest,
+        project_url: str,
+        *,
+        note: str = CONTINUATION_NOTE,
+        attempt: MoveAttempt | None = None,
     ) -> tuple[str, str]:
         """Open one new chat in the project and land `req` in it.
 
         Returns `(new_conversation_url, prompt_actually_sent)` — both already
-        verified. Mutates nothing on `req`: a rotation that fails partway must
-        leave the request exactly as it was, still bound to the old
-        conversation, so the caller commits the new prompt only on success.
+        verified. Binds nothing: a rotation that fails partway leaves the
+        request pointed at the old conversation and still holding its original
+        prompt, so the caller commits the new one only on success.
+
+        It does write the SEND BOOKKEEPING as it goes, on `req` (pessimistically
+        and durably, so a crash is recovered by reconciliation) and on `attempt`
+        (so the caller can tell a failure that sent nothing from one that may
+        have posted). Those are the two records of a fact the return value
+        cannot carry, because the steps that fail after the send do not know it
+        happened.
 
         ChatGPT does not mint a `/c/<id>` until a chat has its first turn, so
         the order is forced: retarget to the project page, submit there, and
         only then read the id the server assigned. Every step after the submit
         is verification.
         """
+        attempt = attempt if attempt is not None else MoveAttempt()
         client = self._get_client()
         retarget = getattr(client, "retarget", None)
         current_url = getattr(client, "current_url", None)
@@ -1996,7 +2390,8 @@ class Orchestrator:
         client.attach()
 
         prompt = self._continuation_prompt(req, note)
-        result = client.submit(req.request_id, prompt)
+        attempt.prompt = prompt
+        result = self._submit_into_replacement(client, req, prompt, attempt)
         if result not in (SubmitResult.CONFIRMED, SubmitResult.ALREADY_PERSISTED):
             raise BrowserError(
                 f"the replacement chat did not accept the request ({result.value})"
@@ -2013,6 +2408,11 @@ class Orchestrator:
         while new_url.rstrip("/") == project_url.rstrip("/") and time.monotonic() < deadline:
             time.sleep(ROTATION_URL_POLL_SECONDS)
             new_url = current_url()
+        # Recorded before it is judged. A URL that fails the containment check
+        # below is refused as a binding target and is still the best answer to
+        # "where did the message this move already posted actually go?".
+        if new_url.rstrip("/") != project_url.rstrip("/"):
+            attempt.captured_url = new_url
         if not self._url_in_project(new_url, project_url):
             # The address bar is a poor witness for a chat that was just
             # created: ChatGPT mints `/c/<id>` some time after accepting the
@@ -2038,6 +2438,7 @@ class Orchestrator:
                     data={"url": found, "note": "address bar had not caught up"},
                 )
                 new_url = found
+                attempt.captured_url = found
             else:
                 detail = (
                     "it is still the project page and no chat in the project "
@@ -2048,6 +2449,7 @@ class Orchestrator:
                 raise BrowserError(
                     f"the replacement chat is not inside the configured project: {detail}"
                 )
+        attempt.new_url = new_url
         retarget(new_url)
         # The address bar said the send landed here; make the conversation say
         # it. Until this returns True the rotation has not happened and nothing
@@ -2058,6 +2460,58 @@ class Orchestrator:
                 "reconciliation — refusing to bind to it"
             )
         return new_url, prompt
+
+    def _submit_into_replacement(
+        self, client, req: PendingRequest, prompt: str, attempt: MoveAttempt
+    ) -> SubmitResult:
+        """Post `prompt` into the freshly opened chat, recording what the send is
+        known to have done — before it happens, durably, and on every way out.
+
+        The marking mirrors `_step_submitting`'s ordinary send exactly, and for
+        the same reason: from the moment the transport is handed the prompt, a
+        message may exist, so a crash here must lead recovery to reconcile
+        rather than resend. Without it the exactly-once property would hold only
+        for the exception path — a SIGKILL in this window would resume at
+        `submitting` with `send_attempted=False` and post the request a second
+        time, in the old conversation.
+
+        The marks are pessimistic, so they are also cleared pessimistically:
+        only `_restore_send_marks`, and only where the send is proven to have
+        left nothing behind.
+        """
+        attempt.prior_send_attempted = req.send_attempted
+        attempt.prior_outcome = req.last_send_outcome
+        attempt.marked = True
+        req.send_attempted = True
+        req.last_send_outcome = SendOutcome.UNKNOWN.value
+        self._store.save(self.state)
+        try:
+            result = client.submit(req.request_id, prompt)
+        except (BrowserError, AutoloopError):
+            # The same probe the ordinary send path uses, and pessimistic in the
+            # same direction: a transport that does not report the fact is
+            # assumed to have clicked Send. Consulted ONLY here — the flag is
+            # sticky across requests, so reading it after a failure that never
+            # reached this call would report a send from some earlier round.
+            if getattr(client, "send_attempted", True):
+                attempt.certainty = SendCertainty.POSSIBLE
+            else:
+                attempt.certainty = SendCertainty.UNSENT
+                self._restore_send_marks(req, attempt)
+            raise
+        if result in (SubmitResult.CONFIRMED, SubmitResult.ALREADY_PERSISTED):
+            attempt.certainty = SendCertainty.PERSISTED
+            req.last_send_outcome = SendOutcome.ACCEPTED.value
+        elif result is SubmitResult.REJECTED:
+            # Disproven, not proven-absent: `_step_submission_rejected` exists
+            # because persisted history outranks a status code. The marks stay
+            # set until something reads the chats.
+            attempt.certainty = SendCertainty.DISPROVEN
+            req.last_send_outcome = SendOutcome.REJECTED.value
+        else:
+            attempt.certainty = SendCertainty.POSSIBLE
+        self._store.save(self.state)
+        return result
 
     @staticmethod
     def _url_in_project(candidate: str, project_url: str) -> bool:

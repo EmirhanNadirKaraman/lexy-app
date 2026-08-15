@@ -1241,6 +1241,17 @@ follow-up — "does the recheck actually re-verify the condition that fired
 the park" is a design question the exhaustiveness test cannot answer, as
 this section's own history shows.
 
+That rule has been applied once since: `retirement_send_ambiguous` (§5c-bis,
+2026-08-15) parks when a conversation retirement may already have posted the
+request into a replacement chat it could not then bind to. It reuses
+`_precondition_browser`, deliberately and not for convenience — the condition
+is `submission_ambiguous`'s one layer out (the message's location is unknown
+and only a human looking at the project can settle it), and nothing automatable
+can distinguish "the operator found and dealt with the stray message" from "the
+operator typed something". The recheck that IS meaningful is the same one that
+blocker's sibling uses: the browser must at least be usable for that inspection
+to have happened. It is in the curated set too.
+
 ---
 
 ## 4f. Operator-changeset review (publishing a hand-authored commit)
@@ -1968,6 +1979,19 @@ the prompt before the send succeeded would leave a failed rotation holding text
 that announces the conversation is abandoned — sitting in the request that
 `--resubmit` would send into the conversation that was never abandoned.
 
+One thing a failed move DOES change, and it belongs to the shared move rather
+than to either trigger (added 2026-08-15 with §5c-bis): the replacement send is
+marked on `req` pessimistically and durably *before* the prompt reaches the
+transport, exactly as `_step_submitting`'s ordinary send is, and cleared only
+where the transport proves nothing left the browser. Without it the crash
+window is real for a rotation too — killed between the replacement send and the
+binding, recovery would resume at `submitting` with `send_attempted=False` and
+post the request a second time, in the old conversation. A rotation therefore
+now leaves a failed-but-possibly-posted attempt looking ambiguous rather than
+unsent, which is what it is; a `--retry` reconciles instead of resending. This
+is not a retirement-only rule, and reading it as one is how it would get
+removed.
+
 **Every request owns its conversation.** `PendingRequest.conversation_url` and
 `conversation_epoch` are the authority for submitting, awaiting and reconciling
 that request — never `LoopState.conversation_url`, which moves. That is what makes
@@ -2090,12 +2114,66 @@ proceeds in the existing thread on the very next line of `_step_submitting`:
 | `browser.project_url` unset | `retirement_declined` | `no_project_url` |
 | `policy.max_conversation_retirements` spent | `retirement_declined` | `retirement_budget` |
 | provider has no `retarget`/`current_url` | `retirement_declined` | `provider_cannot_rotate` |
-| the move itself failed | `retirement_failed` | `retirement_failed` |
 
 The two deferrals for a delivery and an attachment are choices a rotation does
 not get to make: its parts would be orphaned and it falls back to the omission
 notice, whereas a planned retirement was never urgent and can wait one round for
 the diff to be reviewed as sent.
+
+**A failed move is not a refusal, and what it costs depends on the SEND.** The
+rule above governs the preconditions — everything decided before anything is
+posted. The move itself is not one act: it opens a chat, posts the request,
+reads the URL the server assigned, checks that URL is inside the project, and
+reconciles the chat for the request. Any step after the post can fail with the
+message already sitting in a replacement chat, and carrying on there would
+submit the same request id a second time, into a second conversation. No other
+transport path in this loop does that (`submission_unconfirmed` never resends;
+`submission_rejected` reconciles before it does), and a *planned* move is the
+worst possible place to start.
+
+So the move records what it is KNOWN to have done, as it does it
+(`SendCertainty` on a `MoveAttempt`, written by `_submit_into_replacement`),
+because the exception says which step died and nothing about what the earlier
+ones left behind. Certainty comes from the move's own position — the transport's
+`send_attempted` flag is sticky for the life of the process, so it is consulted
+only inside the `except` around the one call that can set it:
+
+| Certainty | Meaning | Outcome |
+|---|---|---|
+| `unsent` | the submit was never reached, or the composer provably refused the input | `retirement_failed`, and the round carries on in the slow thread |
+| `disproven` | `SubmitResult.REJECTED` — the transport's own network evidence refuses it | adopt if a chat holds it after all, else `retirement_send_disproven` + carry on |
+| `possible` | the send was clicked and acceptance is unknown | adopt if a chat holds it, else `retirement_send_ambiguous` + park |
+| `persisted` | the transport confirmed the request is in the replacement chat | adopt if a chat holds it, else `retirement_send_ambiguous` + park |
+
+*Adopt* (`_adopt_replacement_conversation`) is the good outcome and the common
+one: a move that posted and then died on the URL or reconcile step actually
+worked, so the chat is found — by the URL the move already validated, or by the
+request id it CONTAINS (`find_conversation_with`, the witness this transport
+already trusts over the address bar) — re-reconciled, and committed through the
+same `_commit_conversation_move` an ordinary move uses. Nothing binds without
+`_url_in_project` **and** a `reconcile` that says the chat holds the request, and
+a candidate equal to the thread being retired is skipped: adopting it would
+spend an epoch and retire nothing.
+
+`disproven` is the one post-send failure allowed to carry on, and only with
+confirmed absence from the project alongside the network's verdict — the same
+pair of facts `_step_submission_rejected` treats as conclusive. A content search
+that could not RUN is not absence and does not qualify (`MoveAttempt.
+search_completed`). The platform agrees with the rest: ChatGPT mints a
+`/c/<id>` only for an accepted turn, so a turn the backend refused at the
+project page leaves no chat behind.
+
+Otherwise the loop parks (`_park_retirement_ambiguous`, `loop_fatal`,
+`code="retirement_send_ambiguous"`), naming the last URL the move saw so an
+operator hunting a stranded message has somewhere to look. The park is not the
+safety mechanism, though — the MARK is: `req.send_attempted` is set
+pessimistically and durably *before* the prompt is handed to the transport, so a
+SIGKILL in that window is recovered by reconciliation instead of a duplicate
+send, and it is cleared only where the send is proven to have left nothing
+behind. That is also why `send_already_attempted` is the FIRST refusal checked:
+a `--retry` after this park hits it, reconciles the old chat, finds nothing and
+parks as an ordinary ambiguous submission — safe at every entry point rather
+than only through the door that parked.
 
 **It has its own budget.** `policy.max_conversation_retirements` (default **2**),
 never `max_conversation_rotations`. That cap exists so a broken chat cannot be

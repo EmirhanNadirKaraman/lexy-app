@@ -1294,6 +1294,15 @@ def _precondition_checkout_escape_detected(config) -> str:
 _RESOLUTION_PRECONDITIONS = {
     "login_expired": _precondition_browser,
     "submission_ambiguous": _precondition_browser,
+    # A retirement that may already have posted the request into a replacement
+    # chat it could not then bind to (`_park_retirement_ambiguous`). Same
+    # condition as `submission_ambiguous` one layer out — the message's location
+    # is unknown and only a human looking at the project can settle it — so it
+    # gets the same recheck: the browser must at least be usable for that
+    # inspection to have been possible. Deliberately not a stricter, dedicated
+    # probe: nothing automatable can tell "the operator found and dealt with the
+    # stray message" from "the operator typed something".
+    "retirement_send_ambiguous": _precondition_browser,
     "git_failure_budget_exhausted": _precondition_browser,
     "publisher_url_drift": _precondition_publisher_url,
     # `changeset_publisher_required` (`Orchestrator._dispatch_changeset_push`)

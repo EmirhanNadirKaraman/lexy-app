@@ -15,8 +15,12 @@ The invariants under test, all of which follow from "degradation is not
 breakage":
 
 * the trigger is a COUNT of messages, so it cannot fire on one slow round;
-* a refusal — no budget, no project, throttled, mid-delivery — LOGS and lets the
+* a REFUSAL — no budget, no project, throttled, mid-delivery — LOGS and lets the
   round proceed in the existing thread. It never parks a working loop;
+* a move that already POSTED the request and then failed is not a refusal: it
+  adopts the chat that holds the message, or parks. Carrying on there would put
+  the same request id in two conversations, and no other transport path in this
+  loop does that (§4b below);
 * it spends its own budget, never the rotation allowance;
 * the move is recorded with the measurement that justified it, and the
   replacement thread is told the same thing in its first message.
@@ -301,18 +305,29 @@ def test_a_provider_that_cannot_rotate_never_spends_the_budget(tmp_path):
     assert declined and declined[-1]["data"]["reason_code"] == "provider_cannot_rotate"
 
 
-def test_a_failed_retirement_spends_its_budget_and_carries_on(tmp_path):
-    """A retirement SENDS. If it fails after that, autoloop must not be able to
-    open a second chat and post again — so the attempt is charged. What it must
-    NOT do is park: the old thread is still there and still works."""
+class RetireSendNeverHappens(RotatingFakeClient):
+    """The move dies at the composer, BEFORE the send: `send_attempted` is
+    never set, so nothing exists under this request id in any chat.
 
-    class RetireSendExplodes(RotatingFakeClient):
-        def submit(self, request_id, prompt):
-            if self.conversation_url == PROJECT_URL:
-                raise BrowserError("died right after posting")
-            return super().submit(request_id, prompt)
+    The distinction is the whole point of `SendCertainty` — this is the only
+    shape of failure that may go on to submit in the old conversation, and it
+    is only provable because the transport reports it. (An earlier version of
+    this double claimed it died "right after posting" while raising before it
+    posted anything, which is exactly the case it needed to be modelling and
+    was not.)"""
 
-    client = RetireSendExplodes(responses=[stop_block()])
+    def submit(self, request_id, prompt):
+        if self.conversation_url == PROJECT_URL:
+            raise BrowserError("the composer never accepted the input")
+        return super().submit(request_id, prompt)
+
+
+def test_a_retirement_that_provably_sent_nothing_carries_on(tmp_path):
+    """A retirement SENDS. If it fails BEFORE that, the old thread is still
+    there, still works, and still holds nothing under this request id — so the
+    round proceeds in it. The attempt is still charged: a failure is an
+    attempt, and refunding it would make this a retry loop."""
+    client = RetireSendNeverHappens(responses=[stop_block()])
     orch, _store, config = build(tmp_path, client, state=degraded_state())
 
     orch.run(max_steps=1)
@@ -322,28 +337,384 @@ def test_a_failed_retirement_spends_its_budget_and_carries_on(tmp_path):
     assert orch.state.phase != Phase.NEEDS_USER.value
     failed = transcript_entries(config, "retirement_failed")
     assert failed and failed[-1]["data"]["reason_code"] == "retirement_failed"
+    assert failed[-1]["data"]["send_certainty"] == "unsent"
     # The request keeps its original prompt: a `--resubmit` into the old chat
     # must not send it a note saying that chat is abandoned.
     assert "reserved for autoloop" not in orch.state.pending_request.prompt
+    # And the round really did go ahead in the old thread.
+    assert [url for url, _rid, _p in client.submitted] == [CONV_URL]
+
+
+def test_a_pre_send_failure_after_an_earlier_successful_send_still_carries_on(tmp_path):
+    """`send_attempted` on the transport is STICKY — it stays True for the rest
+    of the process once any send is clicked. Reading it after a failure that
+    never reached the submit would report a send from an earlier round, park a
+    loop whose thread is merely slow, and destroy the carry-on this whole
+    reflex exists for. So certainty comes from the move's own position, and the
+    flag is consulted only around the one call that can set it."""
+
+    class RetargetDies(RotatingFakeClient):
+        def retarget(self, url):
+            if url == PROJECT_URL:
+                raise BrowserError("the project page never loaded")
+            return super().retarget(url)
+
+    client = RetargetDies(responses=[stop_block()])
+    # Exactly what an earlier successful round in the same process leaves behind.
+    client.send_attempted = True
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert orch.state.phase != Phase.NEEDS_USER.value
+    failed = transcript_entries(config, "retirement_failed")
+    assert failed and failed[-1]["data"]["send_certainty"] == "unsent"
+    # The round went ahead in the old thread, which is only correct because the
+    # move never reached its submit.
+    assert [url for url, _rid, _p in client.submitted] == [CONV_URL]
 
 
 def test_a_failed_retirement_drops_the_client_it_left_on_the_project_page(tmp_path):
     """The move retargets the cached client at the project page before it
     submits. Without dropping it, the next `attach()` would load THAT page and
     post the request where nobody is reading."""
-
-    class RetireSendExplodes(RotatingFakeClient):
-        def submit(self, request_id, prompt):
-            if self.conversation_url == PROJECT_URL:
-                raise BrowserError("died right after posting")
-            return super().submit(request_id, prompt)
-
-    client = RetireSendExplodes(responses=[stop_block()])
+    client = RetireSendNeverHappens(responses=[stop_block()])
     orch, _store, _config = build(tmp_path, client, state=degraded_state())
 
     orch.run(max_steps=1)
 
     assert client.closed
+
+
+# ---- 4b. a move that ALREADY POSTED may not carry on ------------------------
+#
+# The move is not one act: it opens a chat, posts the request, reads the URL the
+# server assigned, checks that URL is in the project, and reconciles the chat.
+# Everything after the post can fail with the message already sitting in a
+# replacement chat — and carrying on there would submit the same request id a
+# second time, in a second conversation. Nothing else in the transport does
+# that: `submission_unconfirmed` never resends, `submission_rejected` reconciles
+# first. So "a refusal never parks" governs the PRECONDITIONS above; a failure
+# after the send is not a refusal.
+
+
+class PostsThenDiesLater(RotatingFakeClient):
+    """The exact failure the carry-on rule cannot survive: the replacement chat
+    accepts and persists the request, and the move then dies on the reconcile
+    that was supposed to confirm it."""
+
+    def __init__(self, reconcile_failures=1, **kwargs):
+        super().__init__(**kwargs)
+        self.reconcile_failures = reconcile_failures
+
+    def reconcile(self, request_id):
+        if self.conversation_url == NEW_CONV_URL and self.reconcile_failures:
+            self.reconcile_failures -= 1
+            raise BrowserError("the page went away while confirming the send")
+        return super().reconcile(request_id)
+
+
+def test_a_persisted_send_is_never_submitted_again_into_the_old_chat(tmp_path):
+    """The regression this section exists for. The request IS in the
+    replacement chat when the move fails; the old conversation must never
+    receive it too."""
+    client = PostsThenDiesLater(responses=[stop_block()])
+    orch, _store, _config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    # Posted exactly once, in the replacement chat, and never in the old one.
+    assert [(url, rid) for url, rid, _p in client.submitted] == [
+        (PROJECT_URL, "alr-test-0001")
+    ]
+    assert "alr-test-0001" in client.persisted[NEW_CONV_URL]
+    assert client.persisted.get(CONV_URL, set()) == set()
+
+
+def test_the_send_is_marked_on_disk_before_the_transport_is_handed_the_prompt(tmp_path):
+    """A crash is the same failure without the exception, so the guarantee has
+    to be on DISK, not in a live object. Killed in this window, recovery resumes
+    at `submitting`, refuses the retirement on `send_already_attempted`,
+    reconciles and parks — instead of cheerfully posting a duplicate."""
+    seen = {}
+
+    class ReadsTheStateFileMidSend(RotatingFakeClient):
+        def submit(self, request_id, prompt):
+            seen["request"] = StateStore(config.state_file).load().pending_request
+            return super().submit(request_id, prompt)
+
+    client = ReadsTheStateFileMidSend(responses=[stop_block()])
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert seen["request"].send_attempted is True
+    assert seen["request"].last_send_outcome == "unknown"
+    # And it is still the OLD conversation's request at that instant: nothing is
+    # bound until the replacement chat is proven to hold the message.
+    assert seen["request"].conversation_url == CONV_URL
+
+
+def test_a_move_that_posted_and_then_failed_adopts_the_chat_holding_the_request(
+    tmp_path,
+):
+    """Best outcome, and the common one for a transient failure on a step after
+    the send: the move actually worked and only its bookkeeping died, so the
+    chat is re-reconciled and adopted rather than abandoned with the request
+    stranded in it."""
+    client = PostsThenDiesLater(responses=[stop_block()])
+    orch, _store, config = build(tmp_path, client, state=degraded_state(packets=93))
+
+    orch.run(max_steps=1)
+
+    assert orch.state.conversation_url == NEW_CONV_URL
+    assert orch.state.pending_request.conversation_url == NEW_CONV_URL
+    assert orch.state.phase == Phase.AWAITING.value
+    assert orch.state.retirements == 1
+    assert orch.state.conversation_packets == 1  # the new thread's own clock
+    adopted = transcript_entries(config, "retirement_send_adopted")
+    assert adopted and adopted[-1]["data"]["send_certainty"] == "persisted"
+    assert adopted[-1]["data"]["url"] == NEW_CONV_URL
+    # Bound like any other completed move, and recorded with the measurement
+    # that justified it — an adoption is the same event arriving another way.
+    retired = transcript_entries(config, "conversation_retired")
+    assert retired and retired[-1]["data"]["conversation_packets"] == 93
+    assert retired[-1]["data"]["adopted_after_failure"]
+    # The committed prompt is the one that was actually posted, not the original.
+    assert "reserved for autoloop" in orch.state.pending_request.prompt
+
+
+def test_an_adoption_binds_only_to_a_chat_that_still_holds_the_request(tmp_path):
+    """Adoption is a second door to the SAME proof, not a shortcut past it: a
+    chat that does not contain the request is not bound to, however plausible
+    its URL."""
+
+    class PostsNowhereButLooksFine(RotatingFakeClient):
+        """The address bar moves to a chat id the server never filled — so the
+        move fails its reconcile, and so does every re-check."""
+
+        def submit(self, request_id, prompt):
+            result = super().submit(request_id, prompt)
+            self.persisted.pop(NEW_CONV_URL, None)  # the turn evaporated
+            return result
+
+    client = PostsNowhereButLooksFine(responses=[stop_block()])
+    client.find_finds_nothing = True
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert orch.state.conversation_url == CONV_URL  # nothing was bound
+    assert transcript_entries(config, "retirement_send_adopted") == []
+    # Ambiguous, not carried on: the transport confirmed the send even though no
+    # chat will show it, so a resend could still duplicate.
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert [url for url, _rid, _p in client.submitted] == [PROJECT_URL]
+
+
+def test_a_stranded_send_parks_and_names_where_it_last_saw_the_message(tmp_path):
+    """Containment failure ALWAYS means the send happened — a chat exists only
+    because a turn was accepted into it — so this can never be carried on. The
+    message is in a chat outside the configured project, and the operator is
+    told which one instead of being left to find it."""
+
+    class OpensOutsideTheProject(RotatingFakeClient):
+        def __init__(self, **kwargs):
+            super().__init__(new_url="https://chatgpt.com/c/loose-chat", **kwargs)
+
+    client = OpensOutsideTheProject(responses=[stop_block()])
+    client.find_finds_nothing = True
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.resume_phase == Phase.SUBMITTING.value
+    assert orch.state.conversation_url == CONV_URL  # never bound outside the project
+    ambiguous = transcript_entries(config, "retirement_send_ambiguous")
+    assert ambiguous and ambiguous[-1]["data"]["reason_code"] == "retirement_send_ambiguous"
+    assert ambiguous[-1]["data"]["captured_url"] == "https://chatgpt.com/c/loose-chat"
+    assert "loose-chat" in orch.state.question
+    # The request was posted once, and never into the conversation being retired.
+    assert [url for url, _rid, _p in client.submitted] == [PROJECT_URL]
+
+
+def test_the_park_leaves_the_send_marked_so_a_retry_cannot_resend_it(tmp_path):
+    """The park is not the mechanism — the MARK is. A resumed round must be
+    safe at every entry point, not only through the door that parked."""
+
+    class OpensOutsideTheProject(RotatingFakeClient):
+        def __init__(self, **kwargs):
+            super().__init__(new_url="https://chatgpt.com/c/loose-chat", **kwargs)
+
+    client = OpensOutsideTheProject(responses=[stop_block()])
+    client.find_finds_nothing = True
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+    req = StateStore(config.state_file).load().pending_request
+    assert req.send_attempted is True
+    assert req.last_send_outcome == "accepted"
+
+    # `--retry` resumes at `submitting`: the retirement refuses first
+    # (`send_already_attempted`), the old chat is reconciled, the request is not
+    # there, and the round parks again rather than posting a duplicate.
+    orch.state.phase = Phase.SUBMITTING.value
+    orch.run(max_steps=1)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert [url for url, _rid, _p in client.submitted] == [PROJECT_URL]
+    deferred = transcript_entries(config, "retirement_deferred")
+    assert deferred and deferred[-1]["data"]["reason_code"] == "send_already_attempted"
+    assert transcript_entries(config, "submission_ambiguous")
+
+
+def test_an_ambiguous_send_during_a_move_is_never_resent_either(tmp_path):
+    """The submit raised AFTER the click, so the transport cannot say whether
+    anything landed. Unknown acceptance never earns a resend anywhere else in
+    this loop, and a retirement is not the exception."""
+
+    class DiesAfterClickingSend(RotatingFakeClient):
+        def submit(self, request_id, prompt):
+            if self.conversation_url == PROJECT_URL:
+                self.send_attempted = True  # the click happened...
+                raise BrowserError("the tab died while confirming")  # ...the rest did not
+            return super().submit(request_id, prompt)
+
+    client = DiesAfterClickingSend(responses=[stop_block()])
+    client.find_finds_nothing = True
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert client.submitted == []  # nothing the fake could record, and no resend
+    failed = transcript_entries(config, "retirement_failed")
+    assert failed and failed[-1]["data"]["send_certainty"] == "possible"
+    ambiguous = transcript_entries(config, "retirement_send_ambiguous")
+    assert ambiguous and ambiguous[-1]["data"]["send_certainty"] == "possible"
+
+
+def test_an_ambiguous_send_that_turns_out_to_have_landed_is_adopted(tmp_path):
+    """Same failure, different truth: the click did land, and the chat holding
+    the request is found by CONTENT — the witness this transport already trusts
+    over the address bar. Adopting beats parking, and beats resending twice
+    over."""
+
+    class DiesAfterTheSendLands(RotatingFakeClient):
+        def submit(self, request_id, prompt):
+            if self.conversation_url == PROJECT_URL:
+                self.send_attempted = True
+                self.seed(self._new_url, request_id)  # the server kept it
+                raise BrowserError("the tab died while confirming")
+            return super().submit(request_id, prompt)
+
+    client = DiesAfterTheSendLands(responses=[stop_block()])
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert orch.state.conversation_url == NEW_CONV_URL
+    assert orch.state.phase == Phase.AWAITING.value
+    adopted = transcript_entries(config, "retirement_send_adopted")
+    assert adopted and adopted[-1]["data"]["url"] == NEW_CONV_URL
+    assert client.find_calls  # found by content, not by the address bar
+    assert [url for url, _rid, _p in client.submitted] == []
+
+
+def test_a_send_the_transport_disproved_and_no_chat_holds_carries_on(tmp_path):
+    """The one post-send failure that may still use the old thread, and only on
+    the pair of facts `submission_rejected` already treats as conclusive:
+    network disproof AND confirmed absence from the project. ChatGPT mints a
+    chat id only for an accepted turn, so a refused turn leaves nothing
+    behind."""
+    client = RotatingFakeClient(
+        submit_results=[SubmitResult.REJECTED, SubmitResult.CONFIRMED],
+        responses=[stop_block()],
+    )
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert orch.state.phase != Phase.NEEDS_USER.value
+    disproven = transcript_entries(config, "retirement_send_disproven")
+    assert disproven and disproven[-1]["data"]["reason_code"] == "retirement_send_disproven"
+    assert client.find_calls  # absence was CHECKED, not assumed
+    # The round went ahead in the old thread — the only place the request is.
+    assert [url for url, _rid, _p in client.submitted] == [PROJECT_URL, CONV_URL]
+    assert orch.state.conversation_url == CONV_URL
+
+
+def test_a_search_that_could_not_run_is_not_treated_as_absence(tmp_path):
+    """The carry-on above rests on CONFIRMED absence, not on the absence of an
+    answer. A search that failed knows nothing about where the message is, so
+    the disproven send goes back to being ambiguous."""
+
+    class SearchIsBroken(RotatingFakeClient):
+        def find_conversation_with(self, request_id, project_url, limit=6):
+            raise BrowserError("the project sidebar never rendered")
+
+    client = SearchIsBroken(
+        submit_results=[SubmitResult.REJECTED], responses=[stop_block()]
+    )
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert transcript_entries(config, "retirement_send_disproven") == []
+    ambiguous = transcript_entries(config, "retirement_send_ambiguous")
+    assert ambiguous and ambiguous[-1]["data"]["send_certainty"] == "disproven"
+    assert [url for url, _rid, _p in client.submitted] == [PROJECT_URL]
+
+
+def test_a_disproved_send_that_actually_landed_is_adopted_not_repeated(tmp_path):
+    """History outranks the network here exactly as it does in
+    `_step_submission_rejected`: the status code said the send failed, the
+    project says otherwise, and the project wins."""
+
+    class RejectsButKeepsIt(RotatingFakeClient):
+        def submit(self, request_id, prompt):
+            result = super().submit(request_id, prompt)
+            if self.conversation_url == PROJECT_URL:
+                self.seed(self._new_url, request_id)  # persisted despite the verdict
+            return result
+
+    client = RejectsButKeepsIt(
+        submit_results=[SubmitResult.REJECTED], responses=[stop_block()]
+    )
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert orch.state.conversation_url == NEW_CONV_URL
+    assert orch.state.phase == Phase.AWAITING.value
+    adopted = transcript_entries(config, "retirement_send_adopted")
+    assert adopted and adopted[-1]["data"]["send_certainty"] == "disproven"
+    assert [url for url, _rid, _p in client.submitted] == [PROJECT_URL]
+
+
+def test_an_adoption_never_binds_the_thread_it_is_retiring(tmp_path):
+    """A content search that answers with the OLD conversation is not a
+    replacement chat — adopting it would spend an epoch and retire nothing,
+    leaving the loop in the same slow thread while its record says it moved."""
+
+    class FindsOnlyTheOldChat(RotatingFakeClient):
+        def submit(self, request_id, prompt):
+            result = super().submit(request_id, prompt)
+            self.persisted.pop(NEW_CONV_URL, None)
+            self.seed(CONV_URL, request_id)  # the only chat that holds it
+            return result
+
+    client = FindsOnlyTheOldChat(responses=[stop_block()])
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    assert orch.state.conversation_url == CONV_URL
+    assert orch.state.conversation_epoch == 0  # nothing was "moved"
+    assert transcript_entries(config, "retirement_send_adopted") == []
+    assert orch.state.phase == Phase.NEEDS_USER.value
 
 
 # ---- 5. deference: throttling, deliveries, in-flight turns ------------------
@@ -589,8 +960,13 @@ def test_a_request_with_no_send_stamp_records_no_latency(tmp_path):
 
 def test_url_containment_still_governs_a_retirement(tmp_path):
     """Retirement reuses `_rotate_conversation`, so a chat that opens outside
-    the configured project is refused here exactly as it is for a rotation —
-    and, being a retirement, the refusal carries on rather than parking."""
+    the configured project is refused here exactly as it is for a rotation:
+    nothing is bound, and nothing is bound to the loose chat either.
+
+    What it does NOT do is carry on. Containment can only fail after the send —
+    the chat exists because a turn was accepted into it — so the message is out
+    there, and the difference is covered in full by
+    `test_a_stranded_send_parks_and_names_where_it_last_saw_the_message`."""
 
     class OpensOutsideTheProject(RotatingFakeClient):
         def __init__(self, **kwargs):
@@ -603,8 +979,9 @@ def test_url_containment_still_governs_a_retirement(tmp_path):
     orch.run(max_steps=1)
 
     assert orch.state.conversation_url == CONV_URL
-    assert orch.state.phase != Phase.NEEDS_USER.value
+    assert orch.state.pending_request.conversation_url == CONV_URL
     assert transcript_entries(config, "retirement_failed")
+    assert transcript_entries(config, "retirement_send_adopted") == []
 
 
 @pytest.mark.parametrize("packets", [0, 1, 79])
