@@ -31,7 +31,7 @@ import os
 import subprocess
 
 from autoloop import auto_merge, cli, merge_sweep
-from autoloop.auto_merge import MergeDeferralStore
+from autoloop.auto_merge import AutoMerger, MergeDeferralStore
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.errors import GitCommandError
 from autoloop.git_gateway import GitGateway
@@ -147,6 +147,23 @@ class Backlog:
             self.registry.mark_completed(task_id)
         self.task_store.save(self.registry)
 
+    def complete_without_record(self, task_id):
+        """A COMPLETED task whose live execution record is gone — what
+        `retire_execution` leaves behind (`_reconcile_published_execution`
+        completes the task and archives the record in the same call)."""
+        self.registry.add_many([Task(id=task_id, title=f"Title {task_id}", description="d")])
+        self.registry.mark_completed(task_id)
+        self.task_store.save(self.registry)
+
+    def retire_record(self, task_id, *, label="published"):
+        """MOVE the live record into `executions/archive/`, exactly as
+        `TaskExecutionStore.archive` does."""
+        source = self.config.executions_dir / f"{task_id}.json"
+        destination = self.config.executions_dir / "archive" / f"{task_id}-{label}.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+        return destination
+
     def in_flight(self, task_id, base_sha):
         """An UNPUBLISHED candidate bound to the base — what must keep the
         merge window shut (`cli._merge_window_blockers`)."""
@@ -184,6 +201,18 @@ class Backlog:
             merger=merger,
         ).sweep()
 
+    def real_merger(self):
+        """A REAL `AutoMerger`, wired exactly as `sweep_backlog` wires one, for
+        the tests that need real merges under an observed attempt order."""
+        return AutoMerger(
+            config=self.config,
+            git=self.git(),
+            policy=PolicyEngine(self.config.policy),
+            execution_store=self.execution_store,
+            registry=self.task_store.load(),
+            log=TranscriptLogger(self.config.transcript_file).append,
+        )
+
     # -- observing it --
 
     def entries(self, entry_type=None):
@@ -214,6 +243,27 @@ class RecordingMerger:
     def attempt(self, task_id, seen=None):
         self.attempted.append(task_id)
         return self.outcomes.get(task_id, auto_merge.MERGED)
+
+
+class MeddlingMerger:
+    """A REAL `AutoMerger` with a hand on the remote between branches.
+
+    `between(n)` runs after the n-th branch has been integrated and before the
+    sweep looks at the next one — the window in which a second operator, a
+    `release` or a CI job can move a ref the sweep confirmed at enumeration
+    time and has not asked about since.
+    """
+
+    def __init__(self, inner, between):
+        self._inner = inner
+        self._between = between
+        self.attempted = []
+
+    def attempt(self, task_id, seen=None):
+        self.attempted.append(task_id)
+        outcome = self._inner.attempt(task_id, seen)
+        self._between(len(self.attempted))
+        return outcome
 
 
 def build(tmp_path, *, auto_merge_enabled=True, seed_files=None):
@@ -376,11 +426,11 @@ def test_a_completed_task_whose_branch_is_gone_is_named_not_merged(tmp_path):
 
     result = b.sweep()
 
-    assert [t for t, _why in result.skipped] == ["gone-01"]
+    assert [t for t, _why in result.unresolved] == ["gone-01"]
     assert result.is_clear is False, "a branch it could not judge is not a clear backlog"
     assert b.head() == before
     assert not contains(b.repo, b.head(), candidate)
-    assert b.entries("merge_sweep_skipped")[0]["data"]["task_id"] == "gone-01"
+    assert b.entries("merge_sweep_unresolved")[0]["data"]["task_id"] == "gone-01"
 
 
 def test_a_remote_that_cannot_be_REACHED_never_reports_a_clear_backlog(tmp_path,
@@ -403,11 +453,156 @@ def test_a_remote_that_cannot_be_REACHED_never_reports_a_clear_backlog(tmp_path,
     result = b.sweep()
 
     assert result.is_clear is False, "an unreachable remote is not a clear backlog"
-    assert [t for t, _why in result.skipped] == ["auto-08"]
-    assert "could not verify" in result.skipped[0][1]
+    assert [t for t, _why in result.unresolved] == ["auto-08"]
+    assert "could not verify" in result.unresolved[0][1]
     assert result.merged == []
     assert b.head() == before, "nothing may be merged on evidence nobody could read"
     assert not contains(b.repo, b.head(), candidate)
+
+
+# --- metadata the sweep cannot read -------------------------------------------
+
+
+def test_an_execution_record_it_cannot_READ_is_never_a_clear_backlog(tmp_path):
+    """The corrupt-record hole, and the reason this task exists in a second
+    round. A completed task's record is the ONE thing naming the branch its
+    completion says was published; a record that will not load therefore means
+    "I could not look", never "there is nothing there". It used to log
+    `merge_sweep_error` and simply continue, so a sweep whose only completed
+    task had a torn record returned `nothing_to_do` with nothing skipped —
+    `is_clear` true, exit 0, having inspected precisely nothing.
+
+    The task is the ONLY completed one on purpose: that is the exact shape that
+    exited 0.
+    """
+    b = build(tmp_path)
+    before = b.head()
+    b.publish("torn-01", {"a.py": "one\n"})
+    (b.config.executions_dir / "torn-01.json").write_text("{not json", encoding="utf-8")
+
+    result = b.sweep()
+
+    assert result.is_clear is False, (
+        "a record the sweep could not read is not a provably clear backlog"
+    )
+    assert [t for t, _why in result.unresolved] == ["torn-01"]
+    assert "could not be read" in result.unresolved[0][1]
+    assert result.merged == []
+    assert b.head() == before, "nothing may be merged on metadata nobody could read"
+    assert b.entries("merge_sweep_unresolved")[0]["data"]["task_id"] == "torn-01"
+
+
+def test_a_completed_task_with_no_record_at_all_is_unresolved(tmp_path):
+    """Completion implies a confirmed publication, so a completed task with no
+    record — live or archived — has a branch somewhere that nothing here can
+    name. Silence would be the 2026-08-06 invisibility exactly."""
+    b = build(tmp_path)
+    b.complete_without_record("ghost-01")
+
+    result = b.sweep()
+
+    assert result.is_clear is False
+    assert [t for t, _why in result.unresolved] == ["ghost-01"]
+    assert "no execution record, live or archived" in result.unresolved[0][1]
+
+
+def test_a_retired_record_whose_work_IS_in_the_base_stays_silent(tmp_path):
+    """The other side of the same rule, and what stops it crying wolf.
+    `retire_execution` archives the record of a task that published, so every
+    such task would otherwise be permanently unresolved. The archived copy
+    answers the question authoritatively — `published_sha == candidate_sha` is
+    the remote's own confirmation, and the candidate is an ancestor of HEAD —
+    so this one is provably clear and says nothing at all."""
+    b = build(tmp_path)
+    candidate = b.publish("retired-01", {"a.py": "one\n"})
+    run_git(b.repo, "merge", "--no-ff", "--no-edit", "-m", "merged earlier", candidate)
+    merged_head = b.head()
+    b.retire_record("retired-01")
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.NOTHING_TO_DO
+    assert result.is_clear is True, "provably integrated is provably clear"
+    assert result.unresolved == []
+    assert b.head() == merged_head
+    assert b.sweep_entries() == [], "silently means silently"
+
+
+def test_a_LEGACY_archive_with_no_published_sha_is_judged_on_ancestry_alone(tmp_path):
+    """`published_sha` only exists from 2026-08-15, so every archive written
+    before it has no such key. Requiring one would be a stricter rule than the
+    LIVE path applies — that one asks ancestry and nothing else — and a rule
+    with a date on it: every legacy archive would report unresolved forever,
+    with its candidate demonstrably merged and no action an operator could
+    take. Git is authoritative about what is in the base and needs no second
+    opinion; the remote's confirmation answers a different question."""
+    b = build(tmp_path)
+    candidate = b.publish("legacy-01", {"a.py": "one\n"})
+    run_git(b.repo, "merge", "--no-ff", "--no-edit", "-m", "merged earlier", candidate)
+    archived = b.retire_record("legacy-01")
+    record = json.loads(archived.read_text(encoding="utf-8"))
+    del record["published_sha"]
+    del record["published_at"]
+    archived.write_text(json.dumps(record), encoding="utf-8")
+
+    result = b.sweep()
+
+    assert result.is_clear is True, (
+        "an archived candidate that IS an ancestor is provably integrated, "
+        "whether or not the record predates the field that says the remote agreed"
+    )
+    assert result.unresolved == []
+    assert b.sweep_entries() == []
+
+
+def test_a_retired_record_whose_work_is_NOT_in_the_base_is_unresolved(tmp_path):
+    """Retirement means the publication was confirmed, never that it was
+    merged: `_reconcile_published_execution` archives the record and completes
+    the task in one call, and with `auto_merge_enabled` off nothing integrates
+    it. Reading the archive is what keeps that branch visible — and it is only
+    ever READ, never merged from, since `AutoMerger.attempt` loads the live
+    record and would skip the task anyway."""
+    b = build(tmp_path)
+    before = b.head()
+    candidate = b.publish("stranded-01", {"a.py": "one\n"})
+    b.retire_record("stranded-01")
+
+    result = b.sweep()
+
+    assert result.is_clear is False
+    assert [t for t, _why in result.unresolved] == ["stranded-01"]
+    assert "merge it by hand" in result.unresolved[0][1]
+    assert result.merged == []
+    assert b.head() == before
+    assert not contains(b.repo, b.head(), candidate)
+    assert b.entries("auto_merge_skipped") == [], "it was never handed to the merger"
+
+
+def test_a_completed_record_that_names_no_candidate_is_unresolved(tmp_path):
+    """Completion means a candidate was published, so a completed task's record
+    that names none cannot be describing that publication. Skipping it silently
+    (as an in-flight record with no candidate is skipped, correctly, by
+    `_merge_window_blockers`) would write off the branch it fails to name."""
+    b = build(tmp_path)
+    b.execution_store.save(
+        TaskExecution(
+            task_id="blank-01",
+            task_branch="autoloop/blank-01",
+            worktree_path="",
+            task_base_sha=b.head(),
+            candidate_sha="",
+            review_round=1,
+        )
+    )
+    b.registry.add_many([Task(id="blank-01", title="blank", description="d")])
+    b.registry.mark_completed("blank-01")
+    b.task_store.save(b.registry)
+
+    result = b.sweep()
+
+    assert result.is_clear is False
+    assert [t for t, _why in result.unresolved] == ["blank-01"]
+    assert "names no candidate" in result.unresolved[0][1]
 
 
 # --- order --------------------------------------------------------------------
@@ -550,6 +745,107 @@ def test_a_merge_that_cannot_be_verified_stops_the_sweep_too(tmp_path, monkeypat
     assert "HEAD did not move" in b.entries("auto_merge_failed")[0]["data"]["reason"]
 
 
+# --- publication is re-confirmed per branch, at the moment it is merged -------
+
+
+def test_a_branch_DELETED_after_enumeration_is_not_merged_on_stale_evidence(tmp_path):
+    """`seen` memoizes CONFIRMED publications, and the enumeration fills it for
+    every candidate before the first merge runs. Share that positive cache with
+    the merges and branch N is integrated on an `ls-remote` taken before
+    branches 1..N-1 were even attempted — so a delete or force-move during the
+    sweep (a second operator, a `release`, a CI job) is HIDDEN by the cache
+    rather than caught by it. A seven-branch sweep is minutes of merging and
+    pushing; that window is real.
+
+    Here `second`'s ref is deleted after `first` lands. The candidate must not
+    reach `AutoMerger.attempt` at all — with the stale cache it does, and it
+    merges, because `attempt`'s own publication check hits the same cached
+    positive.
+    """
+    b = build(tmp_path)
+    first = b.publish("first", {"a.py": "one\n"}, published_at="2026-08-06T01:00:00+00:00")
+    second = b.publish("second", {"b.py": "two\n"}, published_at="2026-08-06T02:00:00+00:00")
+
+    def meddle(count):
+        if count == 1:
+            run_git(b.repo, "push", "-q", "origin", "--delete", "refs/heads/autoloop/second")
+
+    merger = MeddlingMerger(b.real_merger(), meddle)
+    result = b.sweep_with(merger)
+
+    assert merger.attempted == ["first"], (
+        "the second candidate must never reach the merger on enumeration-time evidence"
+    )
+    assert result.outcome == merge_sweep.STOPPED
+    assert result.stopped_on == "second"
+    assert result.stopped_outcome == merge_sweep.UNCONFIRMED
+    assert result.merged == ["first"]
+    assert result.pending == ["second"], "the remainder is reported, not swept"
+    assert result.is_clear is False
+
+    after = b.head()
+    assert contains(b.repo, after, first), "what landed before the change stands"
+    assert not contains(b.repo, after, second)
+    assert b.origin_base() == after, "and was pushed"
+    changed = b.entries("merge_sweep_publication_changed")[0]["data"]
+    assert changed["task_id"] == "second"
+    assert "does not exist" in changed["reason"]
+
+
+def test_a_branch_MOVED_after_enumeration_is_not_merged_either(tmp_path):
+    """The sneakier half: the ref still exists, it just no longer carries the
+    reviewed candidate. Only a fresh `ls-remote` compared against the recorded
+    candidate can tell — the ref being present is exactly what a cached
+    positive would keep reporting."""
+    b = build(tmp_path)
+    first = b.publish("first", {"a.py": "one\n"}, published_at="2026-08-06T01:00:00+00:00")
+    second = b.publish("second", {"b.py": "two\n"}, published_at="2026-08-06T02:00:00+00:00")
+
+    def meddle(count):
+        if count == 1:
+            run_git(
+                b.repo, "push", "-q", "-f", "origin",
+                f"{first}:refs/heads/autoloop/second",
+            )
+
+    merger = MeddlingMerger(b.real_merger(), meddle)
+    result = b.sweep_with(merger)
+
+    assert merger.attempted == ["first"]
+    assert result.stopped_on == "second"
+    assert result.stopped_outcome == merge_sweep.UNCONFIRMED
+    assert not contains(b.repo, b.head(), second)
+    assert "not the candidate" in (
+        b.entries("merge_sweep_publication_changed")[0]["data"]["reason"]
+    )
+
+
+def test_the_re_confirmation_costs_one_lookup_per_branch_not_two(tmp_path, monkeypatch):
+    """Fresh evidence, without paying twice for it. `_reconfirm` evicts only
+    the candidate's own key and `_candidate_publication` re-adds it on success,
+    so `AutoMerger.attempt`'s step 3 reads the answer this just obtained rather
+    than making a second round-trip for the same ref."""
+    b = build(tmp_path)
+    b.publish("solo-01", {"a.py": "one\n"})
+    asked = []
+    real = GitGateway.remote_ref_sha
+
+    def counting(self, remote, dest_ref):
+        asked.append(dest_ref)
+        return real(self, remote, dest_ref)
+
+    monkeypatch.setattr(GitGateway, "remote_ref_sha", counting)
+
+    result = b.sweep()
+
+    assert result.merged == ["solo-01"]
+    side = [ref for ref in asked if ref == "refs/heads/autoloop/solo-01"]
+    assert len(side) == 2, (
+        "one lookup for the enumeration, one immediately before the merge — a "
+        f"third would mean `attempt` re-asked what `_reconfirm` just cached: {asked}"
+    )
+
+
 # --- the gate -----------------------------------------------------------------
 
 
@@ -679,6 +975,27 @@ def test_the_command_exits_one_when_a_branch_could_not_be_judged(tmp_path, monke
     )
 
 
+def test_the_command_exits_one_when_a_record_could_not_be_READ(tmp_path, monkeypatch,
+                                                               capsys):
+    """The exit-code half of the corrupt-record hole. One completed task, its
+    record torn, nothing else in the backlog: the sweep inspected nothing and
+    must not answer 0. It did, until 2026-08-15."""
+    b = build(tmp_path)
+    b.publish("torn-01", {"a.py": "one\n"})
+    (b.config.executions_dir / "torn-01.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(cli, "load_config", lambda _p: b.config)
+    monkeypatch.chdir(b.repo)
+
+    assert cli._cmd_merge_backlog(_args()) == 1
+
+    out = capsys.readouterr().out
+    assert "UNJUDGED" in out and "torn-01" in out
+    assert "could not be read" in out, "the operator is told WHICH thing would not answer"
+    assert "already an ancestor" not in out, (
+        "it must not claim the backlog is clear on metadata it could not read"
+    )
+
+
 def test_the_command_refuses_when_the_flag_is_off(tmp_path, monkeypatch, capsys):
     b = build(tmp_path, auto_merge_enabled=False)
     b.publish("auto-08", {"a.py": "one\n"})
@@ -713,6 +1030,40 @@ def test_run_sweeps_the_backlog_before_starting_the_loop(tmp_path, monkeypatch):
 
     assert contains(b.repo, b.head(), candidate), "swept before the loop ran"
     assert b.origin_base() == b.head()
+
+
+def test_startup_REPORTS_a_completed_task_it_could_not_judge(tmp_path, monkeypatch,
+                                                             capsys):
+    """The startup hook is silent only when the backlog is PROVABLY clear, and
+    a torn record is the case most likely to slip through that test: the
+    outcome is still `nothing_to_do`, so an outcome comparison would return
+    early and print nothing. `is_clear` is what stops it — and the operator
+    starting a loop is the last person who will ever be told."""
+    b = build(tmp_path)
+    b.publish("torn-01", {"a.py": "one\n"})
+    (b.config.executions_dir / "torn-01.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.chdir(b.repo)
+
+    cli._sweep_backlog_on_startup(b.config)
+
+    out = capsys.readouterr().out
+    assert "UNJUDGED" in out and "torn-01" in out
+    assert "could not be read" in out
+
+
+def test_startup_stays_quiet_when_the_backlog_really_is_clear(tmp_path, monkeypatch,
+                                                              capsys):
+    """The control that keeps the test above from passing vacuously — and the
+    reason `is_clear` has to be provable rather than merely non-alarming. An
+    operator who sees a report every single startup stops reading them."""
+    b = build(tmp_path)
+    candidate = b.publish("done-01", {"a.py": "one\n"})
+    run_git(b.repo, "merge", "--no-ff", "--no-edit", "-m", "merged earlier", candidate)
+    monkeypatch.chdir(b.repo)
+
+    cli._sweep_backlog_on_startup(b.config)
+
+    assert capsys.readouterr().out == ""
 
 
 def test_a_sweep_that_blows_up_never_stops_the_run(tmp_path, monkeypatch):
@@ -756,3 +1107,13 @@ def test_the_outcome_slugs_match_the_transcript_types():
     assert merge_sweep.SWEPT == "swept"
     assert merge_sweep.DEFERRED == "deferred"
     assert merge_sweep.STOPPED == "stopped"
+
+
+def test_a_publication_that_stopped_being_confirmed_is_not_an_auto_merge_slug():
+    """`UNCONFIRMED` is minted here, not returned by `auto_merge`: nothing
+    reached `AutoMerger.attempt`, so borrowing one of its outcomes would report
+    a decision the merge machinery never made. It must also stay OUT of the
+    continue-list, which is what makes it stop the sweep."""
+    assert merge_sweep.UNCONFIRMED == "publication_unconfirmed"
+    assert merge_sweep.UNCONFIRMED not in vars(auto_merge).values()
+    assert merge_sweep.UNCONFIRMED not in merge_sweep._CONTINUE_ON

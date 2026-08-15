@@ -322,16 +322,38 @@ What it adds to auto-merge, which it CALLS rather than reimplements:
 * **Enumeration.** Every COMPLETED task whose execution record carries a
   candidate, whose candidate is not already in the base, and whose branch the
   remote confirms is carrying exactly that candidate. A completed, unmerged
-  task whose branch is gone from origin is NAMED (`merge_sweep_skipped`), never
-  merged from the record's own claim.
-* **"Could not look" is not "nothing to merge".** `_candidate_publication`
-  cannot tell a deleted ref from an unreachable remote, and is not asked to —
-  an unverifiable answer is not an answer. Either way the branch is named and
-  the run does not count as clear: `merge-backlog` exits **1**, and the startup
-  hook prints instead of staying silent. Exit 0 means the backlog is provably
-  clear and nothing weaker; an offline run exiting 0 would be this tool
-  reporting "I looked, there is nothing there" for a run in which it could
-  not look.
+  task whose branch is gone from origin is NAMED (`merge_sweep_unresolved`),
+  never merged from the record's own claim.
+* **"Could not look" is not "nothing to merge".** A completed task has three
+  possible answers, not two — in the base, outstanding, or *unjudgeable* — and
+  the third has to survive into the exit code or it collapses into the first.
+  Four states are unresolved: the remote does not confirm the branch (a deleted
+  ref and an unreachable remote are indistinguishable, and
+  `_candidate_publication` is not asked to distinguish them); the execution
+  record cannot be READ; there is no live record and no archived one shows the
+  work already landed; the record names no candidate. None is attempted, none
+  halts the sweep, and every one of them makes the run not-clear:
+  `merge-backlog` exits **1** and the startup hook prints instead of staying
+  silent. Exit 0 means the backlog is provably clear and nothing weaker.
+* **Retired records are still read, for one question only.** `retire_execution`
+  archives a record once publication is CONFIRMED, which is not the same as
+  merged — with the flag off, nothing integrates it. The sweep therefore checks
+  `executions/archive/` for a sha that is already an ancestor of HEAD (silent
+  if so, unresolved if not) — ancestry alone, exactly as on the live path,
+  since requiring the archived record's own `published_sha` would leave every
+  archive predating that field permanently unresolved with its candidate
+  demonstrably merged. It never merges FROM an archived record; the merge
+  machinery reads the live one. This is the one place that
+  differs from `merge-window`, which ignores the archive deliberately — the
+  gate asks "could moving the base strand this?" (a retired record cannot),
+  this asks "is this branch in the base?" (retirement says nothing either way).
+* **Publication is re-confirmed per branch, at the moment it is merged.** The
+  `seen` cache of confirmed publications is shared with the merge-window gate,
+  but a candidate's own key is evicted immediately before its merge, so every
+  branch is integrated on an `ls-remote` taken after the previous one landed —
+  never on evidence gathered before the sweep started. A ref deleted or
+  force-moved mid-sweep stops it (`merge_sweep_publication_changed`) rather
+  than being merged from a stale positive.
 * **Merged-ness by ancestry, and by nothing else.** `merge-base --is-ancestor`.
   Not the task status, not a branch-name match — those are what made the
   backlog invisible in the first place, since both are equally true of a branch
@@ -364,7 +386,8 @@ re-enumerates what is left next time.
 | Window shut | nothing attempted at all | `merge_sweep_deferred` |
 | Each branch that lands | merged + base pushed by `AutoMerger` | `auto_merge_pushed` |
 | First branch that does not | sweep halts, remainder named | `merge_sweep_stopped` |
-| Publication unconfirmed (ref gone, or remote unreachable) | named, not merged, run does NOT count as clear (exit 1) | `merge_sweep_skipped` |
+| A completed task it could not judge (ref gone, remote unreachable, record unreadable/absent/candidate-less) | named, not merged, run does NOT count as clear (exit 1) | `merge_sweep_unresolved` |
+| A ref that changed DURING the sweep | that branch and the rest are left alone; the sweep stops | `merge_sweep_publication_changed` |
 | Backlog cleared | — | `merge_sweep_completed` |
 
 ---

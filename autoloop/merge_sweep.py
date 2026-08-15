@@ -19,12 +19,17 @@ Every rule about *how* a branch reaches the base already exists in
 `auto_merge.AutoMerger.attempt`: the merge window gate, the dirty-checkout
 refusal, the moved-remote-base check, the merge itself, the four-part
 verification that the merge really happened, the conflict abort, and the push.
-This module CALLS that method once per branch. It contributes exactly three
-things `attempt` has no way to know about:
+This module CALLS that method once per branch. It contributes exactly four
+things `attempt` has no way to know about, all of which are properties of the
+SEQUENCE rather than of any one merge:
 
 1. **Enumeration** — which branches are outstanding at all.
 2. **Order** — oldest publication first.
 3. **Stopping** — the whole sweep halts at the first branch that does not land.
+4. **Freshness** — `attempt` cannot tell whether the publication evidence it
+   was handed came from a moment ago or from before the merges that preceded
+   it, because it only ever sees one task. The sweep can, so the sweep is where
+   the memoized answer is invalidated per branch (`_reconfirm`).
 
 A second implementation of the merge rules that drifted by one case is the
 same failure `_merge_window_blockers` exists to prevent; see `auto_merge.py`'s
@@ -50,23 +55,72 @@ The registry is still read — the sweep only touches COMPLETED tasks, matching
 quarantined — but it is used to narrow the candidate set, never to conclude
 that something is already merged.
 
-A completed, unmerged task whose branch the remote does NOT confirm is named
-(`merge_sweep_skipped`) and passed over rather than halting the sweep. There is
-nothing to merge from — `_mark_task_completed` only fires on a confirmed
-publication, so this means the ref was deleted or force-moved afterwards, or
-the remote is unreachable right now — and nothing has been mutated, so it is
-not the half-done state stopping exists to prevent. It does leave a hole in the
-publication order, which is safe for the same reason a wrong order is: the next
-branch either applies or conflicts, and a conflict stops cleanly.
+## "Could not look" is never "nothing to merge"
 
-**A skipped branch is never reported as a clear backlog.** `SweepResult.
-is_clear` is false whenever anything was skipped, so the command exits 1 and
-the startup hook prints rather than staying quiet. `_candidate_publication`
-cannot tell "the ref is gone" from "the remote did not answer", and it is not
-asked to: an unverifiable answer is not an answer. Letting an offline run
-report `nothing_to_do` would be this module saying "I looked, the backlog is
-clear" when the truth is "I could not look" — the 2026-08-06 invisibility
-rebuilt one layer up, inside the tool written to end it.
+A completed task has THREE possible answers here, not two: its branch is in the
+base, its branch is outstanding, or **the sweep could not tell**. The third has
+to survive into the exit code, or it silently collapses into the first — the
+2026-08-06 invisibility rebuilt one layer up, inside the tool written to end it.
+
+`SweepResult.unresolved` is that third answer. Four states reach it, and what
+they share is that being COMPLETED implies a confirmed publication
+(`_mark_task_completed` fires on nothing else) — so for each of them there is
+very likely a branch out there, and this module cannot name it:
+
+* **The remote does not confirm the branch.** The ref was deleted or
+  force-moved after completion, or the remote is unreachable right now.
+  `_candidate_publication` cannot tell those apart and is not asked to: an
+  unverifiable answer is not an answer.
+* **The execution record cannot be READ** — a torn file, an I/O error, a
+  permission failure. Named since 2026-08-15; before that it was logged and
+  then dropped, so a sweep whose only completed task had a corrupt record
+  reported `nothing_to_do` and exited 0 having inspected nothing.
+* **There is no live record, and no archived one proves the work landed.**
+  `_retired_publication_is_integrated` explains why the archive is read here
+  when the merge window deliberately ignores it.
+* **The record loads but names no candidate.** Completion implies a candidate,
+  so such a record cannot be describing the publication completion implies.
+
+None of the four is ATTEMPTED: there is nothing here this module is allowed to
+merge, and inventing a branch out of a record's own claim is the fail-open
+reading `_candidate_publication` exists to refuse. None of them HALTS the sweep
+either — nothing has been mutated, so this is not the half-done state stopping
+exists to prevent. Each leaves a hole in the publication order, which is safe
+for the same reason a wrong order is: the next branch either applies or
+conflicts, and a conflict stops cleanly.
+
+But every one of them makes the run not-clear. `SweepResult.is_clear` is false
+whenever `unresolved` is non-empty, so `merge-backlog` exits 1 and the startup
+hook prints rather than staying quiet. Exit 0 means "I looked, and there is
+provably nothing outstanding", never "I could not look".
+
+## Enumeration evidence is not mutation authority
+
+`seen` memoizes CONFIRMED publications so a long-running command does not
+re-ask the remote about the same ref forever (`cli._candidate_publication`
+documents the cache and why negatives are never cached). Sharing one such cache
+between the ENUMERATION and the MERGES would quietly change what it means:
+branch N would be merged on an `ls-remote` taken before branches 1..N-1 were
+attempted, so a delete or force-move in between — another operator, a
+`release`, a CI job — is hidden by the positive cache instead of caught by it.
+A seven-branch sweep is minutes of merging and pushing; that window is real.
+
+So each candidate's own key is EVICTED from `seen` immediately before its own
+merge (`_reconfirm`), which forces one live `ls-remote` for that branch at the
+moment it matters; re-adding it on success means `AutoMerger.attempt`'s own
+publication check (its step 3) costs nothing on top. A ref that no longer
+carries the reviewed candidate yields `UNCONFIRMED`, which is not in
+`_CONTINUE_ON`: that branch is not merged, and neither is anything after it.
+
+That is deliberately harsher than the enumeration-time version of the same
+finding, which is merely named and passed over. A ref that changed WHILE the
+sweep was running means something else is mutating the remote right now, and
+that invalidates the whole enumeration rather than one entry of it. The other
+way this answer comes back False — a transient `ls-remote` failure partway
+through — stops the sweep for the plainer reason: mid-sweep is the one moment
+when "the remote stopped answering" and "the ref moved" are indistinguishable
+AND the base has already changed under the remaining candidates, so fail-closed
+means halt. Nothing is lost either way; the next run re-enumerates from git.
 
 ## Order: oldest publication first
 
@@ -140,6 +194,7 @@ run from starting, so every failure swallows to a transcript entry.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -164,10 +219,18 @@ STOPPED = "stopped"              # a branch did not land; the rest are untouched
 DISABLED = "disabled"            # policy.auto_merge_enabled is false
 FAILED = "failed"                # the sweep itself could not run
 
+#: A PER-BRANCH outcome this module mints itself rather than getting back from
+#: `auto_merge`: the remote no longer confirmed the candidate at the moment its
+#: own merge was about to run. Deliberately not an `auto_merge` slug — nothing
+#: reached `AutoMerger.attempt`, so claiming one of its outcomes would say the
+#: merge machinery decided something it never saw.
+UNCONFIRMED = "publication_unconfirmed"
+
 #: The only two per-branch outcomes the sweep continues past. Everything else
-#: — conflict, failed verification, deferral, an unexpected skip — halts it.
-#: `already_integrated` is a success: merging an earlier branch can carry a
-#: later one in with it, which is exactly what building on it means.
+#: — conflict, failed verification, deferral, a publication that stopped being
+#: confirmed, an unexpected skip — halts it. `already_integrated` is a success:
+#: merging an earlier branch can carry a later one in with it, which is exactly
+#: what building on it means.
 _CONTINUE_ON = (auto_merge.MERGED, auto_merge.ALREADY_INTEGRATED)
 
 
@@ -177,6 +240,9 @@ class SweepCandidate:
 
     task_id: str
     candidate_sha: str
+    #: Where the enumeration confirmed the candidate, kept so the merge can
+    #: re-ask the SAME ref without reloading the record. See `_reconfirm`.
+    remote: str
     dest_ref: str
     #: `(group, timestamp, task_id)` — see the module docstring's order section.
     #: `group` is 0 for a record with no `published_at` (older than any record
@@ -197,10 +263,14 @@ class SweepResult:
     #: list, since it did not land either. Named so "the rest were left alone"
     #: is a checkable claim rather than an absence.
     pending: list[str] = field(default_factory=list)
-    #: `(task_id, reason)` for a completed, unmerged task whose publication
-    #: could not be confirmed against the remote. Not attempted, not fatal.
-    skipped: list[tuple[str, str]] = field(default_factory=list)
-    #: The branch that halted the sweep, and the `auto_merge` outcome it got.
+    #: `(task_id, reason)` for a completed task the sweep could not JUDGE —
+    #: an unconfirmed publication, an unreadable record, a retired record whose
+    #: work cannot be shown to have landed, a record naming no candidate. Not
+    #: attempted, not fatal, and never counted as clear. See the module
+    #: docstring's "could not look" section for why all four belong together.
+    unresolved: list[tuple[str, str]] = field(default_factory=list)
+    #: The branch that halted the sweep, and the outcome it got — an
+    #: `auto_merge` slug, or `UNCONFIRMED` when it never reached the merger.
     stopped_on: str = ""
     stopped_outcome: str = ""
     #: The gate's reasons, when the whole sweep was deferred.
@@ -211,17 +281,16 @@ class SweepResult:
         """Is there provably nothing left unmerged? The ONE definition both
         callers use for their exit code and their output.
 
-        A skipped branch counts as not-clear, and that is the whole point of
-        this being a property rather than an outcome comparison. `skipped`
-        holds branches whose publication could not be CONFIRMED, which covers
-        both "the ref is gone" and "the remote could not be reached" —
-        `_candidate_publication` deliberately does not distinguish them,
-        because an unverifiable answer is not an answer. Reporting an offline
-        run as `nothing_to_do` would say "I looked, the backlog is clear" when
-        the truth is "I could not look": the 2026-08-06 invisibility rebuilt
-        one layer up, in the tool written to end it.
+        An unresolved task counts as not-clear, and that is the whole point of
+        this being a property rather than an outcome comparison. `unresolved`
+        holds every completed task the sweep could not JUDGE — an unverifiable
+        publication, a record it could not read, a retired record whose work it
+        cannot show landed. All of them mean "I could not look", and reporting
+        one of those runs as `nothing_to_do` would say "I looked, the backlog is
+        clear" instead: the 2026-08-06 invisibility rebuilt one layer up, in the
+        tool written to end it.
         """
-        return self.outcome in (SWEPT, NOTHING_TO_DO) and not self.skipped
+        return self.outcome in (SWEPT, NOTHING_TO_DO) and not self.unresolved
 
 
 class BacklogSweeper:
@@ -272,15 +341,21 @@ class BacklogSweeper:
             return SweepResult(outcome=DISABLED)
         #: Confirmed publications, memoized for this invocation only, exactly
         #: as `_cmd_merge_window` and `AutoMerger.after_completion` do it. It
-        #: is passed to BOTH the enumeration and every `attempt`, so a branch
-        #: costs one `ls-remote` for the whole sweep rather than one per phase.
+        #: spares the OTHER records the gate re-reads on every branch a repeat
+        #: round-trip. It is emphatically NOT authority for the branch about to
+        #: be merged: `_reconfirm` evicts that key first, so every merge runs on
+        #: an `ls-remote` taken after the previous merge, not before the sweep.
         seen: set = set()
         result = SweepResult(outcome=NOTHING_TO_DO)
         try:
             candidates = self._backlog(seen, result)
         except Exception as exc:      # noqa: BLE001 - a sweep must not stop a run
             self._log("merge_sweep_error", data={"error": f"{type(exc).__name__}: {exc}"})
-            return SweepResult(outcome=FAILED)
+            # Whatever the enumeration managed to judge before it blew up is
+            # carried out with it, exactly as the gate-failure path below does:
+            # the run is not clear either way, but the tasks it could not judge
+            # are the ones an operator has to go and look at.
+            return SweepResult(outcome=FAILED, unresolved=result.unresolved)
         if not candidates:
             return result
 
@@ -305,7 +380,7 @@ class BacklogSweeper:
         except Exception as exc:      # noqa: BLE001 - fail closed, never merge
             self._log("merge_sweep_error", data={"error": f"{type(exc).__name__}: {exc}"})
             return SweepResult(
-                outcome=FAILED, pending=result.pending, skipped=result.skipped
+                outcome=FAILED, pending=result.pending, unresolved=result.unresolved
             )
         for note in notes:
             self._log("merge_sweep_window_note", data={"note": note})
@@ -343,11 +418,25 @@ class BacklogSweeper:
         return result
 
     def _attempt(self, candidate: SweepCandidate, seen: set) -> str:
-        """One branch, through the shared merge machinery. An exception is an
-        outcome like any other here — it stops the sweep, because a branch that
-        blew up mid-merge is exactly the state nothing further should be
-        stacked onto."""
+        """One branch, through the shared merge machinery, on publication
+        evidence taken NOW rather than at enumeration.
+
+        An exception is an outcome like any other here — it stops the sweep,
+        because a branch that blew up mid-merge is exactly the state nothing
+        further should be stacked onto."""
         try:
+            published, why_not = self._reconfirm(candidate, seen)
+            if not published:
+                self._log(
+                    "merge_sweep_publication_changed",
+                    data={
+                        "task_id": candidate.task_id,
+                        "candidate_sha": candidate.candidate_sha,
+                        "dest_ref": candidate.dest_ref,
+                        "reason": why_not,
+                    },
+                )
+                return UNCONFIRMED
             return self._merger.attempt(candidate.task_id, seen)
         except Exception as exc:      # noqa: BLE001 - deliberate; see the docstring
             self._log(
@@ -358,6 +447,29 @@ class BacklogSweeper:
                 },
             )
             return auto_merge.FAILED
+
+    def _reconfirm(self, candidate: SweepCandidate, seen: set) -> tuple[bool, str]:
+        """Does the remote STILL carry this candidate, asked right now?
+
+        The eviction is the whole method. `seen` was populated during
+        enumeration, potentially several merges and pushes ago; leaving this
+        key in it would answer "published" from a cache instead of from the
+        remote, which is the one question that must never be answered from a
+        cache here (see the module docstring). Re-added on success by
+        `_candidate_publication` itself, so `AutoMerger.attempt`'s own check
+        does not pay for a second round-trip.
+        """
+        from . import cli
+
+        seen.discard((candidate.remote, candidate.dest_ref, candidate.candidate_sha))
+        return cli._candidate_publication(
+            self._config,
+            _publication_dict(
+                candidate.candidate_sha, candidate.remote, candidate.dest_ref
+            ),
+            seen,
+            self._git,
+        )
 
     # ---- enumeration --------------------------------------------------------
 
@@ -380,14 +492,40 @@ class BacklogSweeper:
             try:
                 record = self._execution_store.load(task_id)
             except (StateCorruptError, OSError) as exc:
-                # Loud, and not fatal to the sweep: an unreadable record is one
-                # branch this cannot see, not a reason to leave the other six
-                # unmerged. It is named so the operator can repair it.
-                self._log(
-                    "merge_sweep_error", data={"task_id": task_id, "error": str(exc)}
+                # Not fatal to the sweep — an unreadable record is one branch
+                # this cannot see, not a reason to leave the other six unmerged
+                # — but never silent either. Completion implies a confirmed
+                # publication, so the record that will not load is the only
+                # thing naming a branch that may well be outstanding. Until
+                # 2026-08-15 this logged and then `continue`d, so a sweep whose
+                # only completed task had a torn record exited 0.
+                self._unresolved(
+                    result, task_id, f"its execution record could not be read ({exc})"
                 )
                 continue
-            if record is None or not record.candidate_sha:
+            if record is None:
+                # Retired by `retire_execution` (`release`, or
+                # `_reconcile_published_execution`, which completes the task and
+                # archives the record in one call). Only the archive can say
+                # whether that retirement happened over work that had already
+                # landed; anything less is a guess.
+                integrated, why_not = self._retired_publication_is_integrated(
+                    head, task_id
+                )
+                if not integrated:
+                    self._unresolved(result, task_id, why_not)
+                continue
+            if not record.candidate_sha:
+                # A completed task's record HAS to name the candidate that was
+                # published — that is what completion means here. One that does
+                # not cannot be describing this task's publication, so the
+                # branch behind it is unaccounted for rather than absent.
+                self._unresolved(
+                    result,
+                    task_id,
+                    "its execution record names no candidate, though completion "
+                    "means one was published",
+                )
                 continue
             # ANCESTRY, and nothing else, decides merged-ness. Silent on
             # purpose: a branch already in the base is the ordinary case for
@@ -407,21 +545,102 @@ class BacklogSweeper:
                 # allowed to integrate, and inventing a branch to merge from a
                 # record's own claim is the fail-open reading
                 # `_candidate_publication` exists to refuse.
-                result.skipped.append((task_id, why_not))
-                self._log(
-                    "merge_sweep_skipped", data={"task_id": task_id, "reason": why_not}
-                )
+                self._unresolved(result, task_id, why_not)
                 continue
             candidates.append(
                 SweepCandidate(
                     task_id=task_id,
                     candidate_sha=record.candidate_sha,
+                    remote=record.intended_remote,
                     dest_ref=record.intended_remote_ref,
                     order=self._publication_order(task_id, record),
                 )
             )
         candidates.sort(key=lambda c: c.order)
         return candidates
+
+    def _unresolved(self, result: SweepResult, task_id: str, why_not: str) -> None:
+        """Record a completed task the sweep could not judge. ONE funnel, so
+        every such state reaches the same list, the same transcript entry and
+        therefore the same exit code — the four of them differ only in the
+        reason string, and a second path that forgot one of those three is how
+        the corrupt-record case came to exit 0."""
+        result.unresolved.append((task_id, why_not))
+        self._log("merge_sweep_unresolved", data={"task_id": task_id, "reason": why_not})
+
+    def _retired_publication_is_integrated(
+        self, head: str, task_id: str
+    ) -> tuple[bool, str]:
+        """A COMPLETED task with no live execution record: is its work provably
+        in the base already? `(True, "")` only when it demonstrably is.
+
+        Why the archive is read here at all, when `cli._merge_window_blockers`
+        deliberately does NOT recurse into it: the two ask different questions.
+        The gate asks "could moving the base strand this?", and a retired record
+        describes work nobody is going to build on, so ignoring it is right.
+        This asks "is this branch in the base?", which retirement does not
+        answer either way — `retire_execution` files a record away on
+        publication being CONFIRMED, not on it having been merged, and with
+        `auto_merge_enabled` off nothing merges it at all. Skip the archive and
+        every such branch becomes invisible again, which is the whole failure
+        this module exists to end.
+
+        Read as raw JSON rather than through `TaskExecutionStore.load`: an
+        archived record can predate any field this dataclass now requires, and
+        `TaskExecution(**data)` would raise on it.
+
+        **ANCESTRY decides, exactly as it does for a live record.** Either sha
+        the record names being in the base answers the question, because git is
+        authoritative about what is in the base and needs no second opinion.
+        `published_sha` is CORROBORATION — it is the one field meaning "the
+        remote confirmed this", written by `_dispatch_task_push` from an
+        `ls-remote` — but requiring it would be a stricter rule than the live
+        path applies, and a stricter rule with a date on it: the field only
+        exists from 2026-08-15, so every archive written before then would be
+        permanently unresolved with no action an operator could take, even with
+        its candidate demonstrably merged. Wolf-crying, on exactly the records
+        this branch exists to stop wolf-crying about.
+
+        Every archived record for the task is considered and the first
+        integrated one wins, so this does not depend on sorting `<reason>-<stamp>`
+        labels chronologically (they are not lexicographically ordered across
+        different reasons). Nothing here is ever merged FROM: an archived record
+        is not a merge source, because `AutoMerger.attempt` reads the LIVE
+        record and would skip the task anyway. The honest report is the output.
+        """
+        archive = Path(self._execution_store.directory) / "archive"
+        try:
+            paths = sorted(archive.glob(f"{task_id}-*.json"))
+        except OSError as exc:
+            return False, f"its execution archive could not be listed ({exc})"
+        if not paths:
+            return False, (
+                "it has no execution record, live or archived — nothing names "
+                "the candidate its completion says was published"
+            )
+        unreadable: list[str] = []
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                unreadable.append(f"{path.name} ({exc})")
+                continue
+            if not isinstance(data, dict):
+                unreadable.append(f"{path.name} (not a record)")
+                continue
+            for sha in (data.get("candidate_sha"), data.get("published_sha")):
+                if sha and self._is_integrated(head, str(sha)):
+                    return True, ""
+        if unreadable:
+            return False, (
+                "its record was retired and the archived copy could not be "
+                "read: " + "; ".join(unreadable)
+            )
+        return False, (
+            "its record was retired and no sha any archived copy names is an "
+            f"ancestor of {head[:12]} — the branch may still be outstanding; "
+            "merge it by hand"
+        )
 
     def _is_integrated(self, head: str, candidate_sha: str) -> bool:
         """Is `candidate_sha` already in the base? An object git cannot resolve
@@ -457,16 +676,24 @@ class BacklogSweeper:
 # ---- helpers ----------------------------------------------------------------
 
 
-def _as_record_dict(record) -> dict:
+def _publication_dict(candidate_sha: str, remote: str, dest_ref: str) -> dict:
     """`_candidate_publication` reads its input with `.get()`, so it takes a
     plain dict. Built by hand from the three fields it actually reads rather
     than `dataclasses.asdict`, which would copy the whole record (including
-    the report text) on every enumeration."""
+    the report text) on every enumeration — and, since `_reconfirm` asks the
+    same question again per branch, on every merge as well."""
     return {
-        "candidate_sha": record.candidate_sha,
-        "intended_remote": record.intended_remote,
-        "intended_remote_ref": record.intended_remote_ref,
+        "candidate_sha": candidate_sha,
+        "intended_remote": remote,
+        "intended_remote_ref": dest_ref,
     }
+
+
+def _as_record_dict(record) -> dict:
+    """The same three fields, off a `TaskExecution`."""
+    return _publication_dict(
+        record.candidate_sha, record.intended_remote, record.intended_remote_ref
+    )
 
 
 def _parse_iso(value: str) -> float | None:

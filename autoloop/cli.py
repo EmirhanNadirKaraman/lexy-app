@@ -474,9 +474,10 @@ def _sweep_backlog_on_startup(config: AutoloopConfig) -> None:
 
     Inside the lock, because it moves the branch head. Silent only when the
     backlog is PROVABLY clear (`SweepResult.is_clear`) — an operator starting a
-    loop with nothing outstanding should see nothing new, but a branch the
-    sweep could not judge is exactly the thing that must not pass unmentioned.
-    Every outcome is in the transcript regardless.
+    loop with nothing outstanding should see nothing new, but a completed task
+    the sweep could not judge is exactly the thing that must not pass
+    unmentioned, whether it was the remote, the record or the archive that
+    would not answer. Every outcome is in the transcript regardless.
     """
     result = merge_sweep.sweep_on_startup(config)
     if result.outcome == merge_sweep.DISABLED:
@@ -2146,16 +2147,20 @@ def _format_sweep(result: "merge_sweep.SweepResult") -> list[str]:
     lines = [f"merge backlog: {result.outcome}"]
     for task_id in result.merged:
         lines.append(f"  merged      {task_id}")
-    for task_id, why in result.skipped:
+    for task_id, why in result.unresolved:
         lines.append(f"  UNJUDGED    {task_id} — {why}")
-    if result.skipped:
+    if result.unresolved:
         # Never folded into the outcome line. "Could not look" and "looked,
         # nothing there" are the two answers this whole module exists to keep
-        # apart, and the exit code says so too (`is_clear`).
+        # apart, and the exit code says so too (`is_clear`). The per-task
+        # reason above carries the CAUSE — an unanswering remote, a record that
+        # would not load, a retirement over work that cannot be shown to have
+        # landed — because each needs a different thing done about it.
         lines.append(
-            f"  {len(result.skipped)} branch(es) could not be judged — the "
-            "remote did not confirm the candidate is on them. NOT the same as "
-            "'nothing to merge'; check the remote and run this again."
+            f"  {len(result.unresolved)} completed task(s) could not be judged; "
+            "each is named above with why. Every one of them is a branch that "
+            "may still be outstanding — NOT the same as 'nothing to merge'. "
+            "Fix what the reasons name and run this again."
         )
     if result.outcome == merge_sweep.DEFERRED:
         for reason in result.reasons:
@@ -2183,7 +2188,7 @@ def _format_sweep(result: "merge_sweep.SweepResult") -> list[str]:
             "  policy.auto_merge_enabled is false — this command moves the "
             "branch head, so it is opt-in like the auto-merge it reuses"
         )
-    if result.outcome == merge_sweep.NOTHING_TO_DO and not result.skipped:
+    if result.outcome == merge_sweep.NOTHING_TO_DO and not result.unresolved:
         lines.append(
             "  every completed task's published branch is already an ancestor "
             "of HEAD"
@@ -2205,11 +2210,12 @@ def _cmd_merge_backlog(args: argparse.Namespace) -> int:
     loop.
 
     Exit 0 means the backlog is PROVABLY clear, and nothing weaker
-    (`SweepResult.is_clear`): deferred, stopped, the flag off, or so much as
-    one branch the remote would not confirm all exit 1. An unreachable remote
-    exiting 0 would be this command reporting "I looked, there is nothing
-    there" for a run in which it could not look — the exact invisibility it
-    exists to end.
+    (`SweepResult.is_clear`): deferred, stopped, the flag off, or so much as one
+    completed task the sweep could not JUDGE — an unconfirmed publication, a
+    record it could not read, a retired record whose work it cannot show landed
+    — all exit 1. Exiting 0 on any of those would be this command reporting "I
+    looked, there is nothing there" for a run in which it could not look, which
+    is the exact invisibility it exists to end.
     """
     config = load_config(args.config)
     with LoopLock(config.state_dir):

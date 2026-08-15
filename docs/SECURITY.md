@@ -480,11 +480,26 @@ What bounds the wider window:
   window means zero merges rather than a partial one. A crash-left
   `phase=executing` in `state.json` therefore defers the startup sweep, which
   is correct: an agent may have been mid-write.
-- **The same objects.** A branch is only attempted when its task is COMPLETED
-  and an `ls-remote` reports the branch carrying exactly that
-  `candidate_sha` — the record's own `intended_remote_ref` is never taken as
-  evidence, which is what stops a deleted or force-moved ref from being merged
-  from a stale claim.
+- **The same objects, on evidence that is FRESH per branch.** A branch is only
+  attempted when its task is COMPLETED and an `ls-remote` reports the branch
+  carrying exactly that `candidate_sha` — the record's own
+  `intended_remote_ref` is never taken as evidence, which is what stops a
+  deleted or force-moved ref from being merged from a stale claim. Since the
+  merge-03 review round the confirmation is re-taken immediately before each
+  branch's own merge (`BacklogSweeper._reconfirm` evicts that candidate's key
+  from the memo set first): a sweep spends minutes merging and pushing, and
+  reusing the enumeration's positive cache would have let a ref deleted or
+  force-moved during that window be merged from an answer obtained before the
+  earlier merges ran. A candidate the remote no longer confirms stops the sweep
+  there.
+- **Reading the execution ARCHIVE is read-only and never a merge source.** A
+  completed task with no live record is checked against
+  `executions/archive/<task_id>-*.json` for a sha already ancestral to HEAD —
+  a local `merge-base` question, answered from the object database, with no
+  authority granted to anything the archived record asserts about itself. That
+  answer can only make the sweep report MORE (an unresolved branch); it can
+  never make a branch mergeable, because the merge path loads the LIVE record
+  and skips a task without one.
 - **Enumeration cannot invent a target.** The set comes from the registry and
   the execution records, never from the remote's ref namespace, so no branch a
   third party pushes to origin becomes mergeable by appearing there.
@@ -510,8 +525,10 @@ rg -n 'auto_merge_enabled' autoloop/merge_sweep.py
 rg -n '_sweep_backlog_on_startup' -B 4 -A 2 autoloop/cli.py
 # Expect: merge-backlog takes LoopLock (merge-window deliberately does not)
 rg -n 'def _cmd_merge_backlog' -A 12 autoloop/cli.py
-# Expect: publication is re-confirmed per branch, remote-first
-rg -n '_candidate_publication' autoloop/merge_sweep.py
+# Expect: publication is re-confirmed per branch, remote-first — TWO call sites
+# (enumeration, then `_reconfirm` immediately before that branch's own merge),
+# and the memo key is evicted before the second so it cannot answer from cache
+rg -n '_candidate_publication|seen.discard' autoloop/merge_sweep.py
 ```
 
 ### S25 — Circular task-scope authorization, failed-round residue, and unbounded pre-commit retries — HIGH — RESOLVED 2026-07-31
