@@ -585,20 +585,60 @@ class BrowserChatGPT:
     # ---- input --------------------------------------------------------------
 
     def _attach_file(self, request_id: str, path: str) -> None:
-        """Upload `path` and PROVE it landed before anything is typed.
+        """Upload `path` and PROVE the right file is on the composer.
 
-        A `set_input_files` that silently did nothing is indistinguishable
-        from success, and a review packet whose diff never arrived is worse
-        than one that failed loudly: the reviewer would approve a change it
-        could not see. So the chip is required, and its absence raises rather
-        than proceeding.
+        Three things this must get right, all learned live on 2026-08-15:
+
+        * **The tile carries no data-testid.** An upload renders as
+          `role="group" aria-label="<filename>"`. Matching the FILENAME rather
+          than "any attachment" is what makes this proof: a previous attempt's
+          file still sitting on the composer would otherwise read as success
+          and send a review request whose diff belongs to another change.
+        * **Re-uploading is the ordinary retry case, and ChatGPT blocks it.**
+          A file it has already seen produces a duplicate-file modal instead of
+          a second attachment. So check for the tile FIRST — if the right file
+          is already there, the upload has nothing to do.
+        * **A silent no-op is indistinguishable from success.** Without the
+          tile check, `set_input_files` returning would be taken as proof, and
+          the reviewer would be asked to approve a diff it never received.
         """
+        filename = Path(path).name
+        chip = self._sel.attachment_chip_for.format(filename=filename)
+
+        # Idempotent: a retry after a failed send usually finds its own file
+        # still attached, and re-uploading it only raises the duplicate modal.
+        if self._session.exists(chip):
+            return
+
         self._session.set_input_files(self._sel.file_input, path)
 
         deadline = self._monotonic() + self._input_sync_timeout
         while True:
-            if self._session.exists(self._sel.attachment_chip):
+            if self._session.exists(chip):
                 return
+            if self._session.exists(self._sel.duplicate_file_modal):
+                # "You've already uploaded this file." ChatGPT refuses to
+                # attach it a second time. DISMISS it before deciding anything:
+                # the modal covers the composer, so leaving it up would block
+                # every later attempt as well as this one.
+                self._session.click(self._sel.duplicate_file_dismiss)
+                self._sleep(self._poll_interval)
+                if self._session.exists(chip):
+                    return  # it was already attached after all
+                self.save_diagnostics(
+                    "attachment-duplicate-modal",
+                    request_id=request_id,
+                    stage="attach",
+                    retry_prohibited=False,
+                    note=(
+                        f"{filename} was refused as a duplicate and is not on the "
+                        "composer — the modal was dismissed, nothing was sent"
+                    ),
+                )
+                raise SubmissionError(
+                    f"attachment {filename} for {request_id} was refused as a "
+                    "duplicate-file and is not attached (nothing was sent)"
+                )
             if self._monotonic() >= deadline:
                 self.save_diagnostics(
                     "attachment-not-accepted",
@@ -606,12 +646,12 @@ class BrowserChatGPT:
                     stage="attach",
                     retry_prohibited=False,
                     note=(
-                        f"no attachment appeared within {self._input_sync_timeout}s "
+                        f"no tile for {filename} within {self._input_sync_timeout}s "
                         "— nothing was sent"
                     ),
                 )
                 raise SubmissionError(
-                    f"attachment for {request_id} did not appear within "
+                    f"attachment {filename} for {request_id} did not appear within "
                     f"{self._input_sync_timeout}s (nothing was sent)"
                 )
             self._sleep(self._poll_interval)

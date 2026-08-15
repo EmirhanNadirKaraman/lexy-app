@@ -72,6 +72,9 @@ class FakeSession:
         #: to catch: the call returns, and nothing ever attaches.
         self.uploaded: list[tuple[str, str]] = []
         self.accepts_uploads = True
+        self.seen_uploads: set[str] = set()
+        #: filename revealed once the duplicate modal is dismissed
+        self.duplicate_reveals_tile: str | None = None
         #: When set, any navigation redirects to the auth page, as a real
         #: logged-out ChatGPT does.
         self.logged_out = False
@@ -120,6 +123,13 @@ class FakeSession:
 
     def click(self, selector):
         self.clicks.append(selector)
+        if selector == SEL.duplicate_file_dismiss:
+            self.present.discard(SEL.duplicate_file_modal)
+            if self.duplicate_reveals_tile:
+                self.present.add(
+                    SEL.attachment_chip_for.format(filename=self.duplicate_reveals_tile)
+                )
+            return
         if selector != SEL.send_button:
             return
         if not self.send_enabled:
@@ -143,9 +153,19 @@ class FakeSession:
             self.send_enabled = False
 
     def set_input_files(self, selector, path):
+        import os
+
         self.uploaded.append((selector, path))
-        if self.accepts_uploads:
-            self.present.add(SEL.attachment_chip)
+        name = os.path.basename(path)
+        if not self.accepts_uploads:
+            return
+        if name in self.seen_uploads:
+            # ChatGPT refuses a file it has already seen with a modal instead
+            # of attaching it a second time.
+            self.present.add(SEL.duplicate_file_modal)
+            return
+        self.seen_uploads.add(name)
+        self.present.add(SEL.attachment_chip_for.format(filename=name))
 
     def insert_text(self, text):
         self.inserted.append(text)
@@ -780,7 +800,7 @@ def test_an_attachment_is_uploaded_before_the_prompt_is_typed(tmp_path):
 
     assert client.submit(RID, PROMPT, attachment="/tmp/diff.md") is SubmitResult.CONFIRMED
     assert session.uploaded == [(SEL.file_input, "/tmp/diff.md")]
-    assert SEL.attachment_chip in session.present
+    assert SEL.attachment_chip_for.format(filename="diff.md") in session.present
 
 
 def test_no_attachment_leaves_the_typed_path_untouched(tmp_path):
@@ -810,3 +830,69 @@ def test_an_upload_that_silently_does_nothing_refuses_to_send(tmp_path):
     # Seeded history is still there; what matters is that NO NEW turn was sent.
     assert len(session.persisted) == before
     assert session.uploaded == [(SEL.file_input, "/tmp/diff.md")]
+
+
+def test_a_file_already_on_the_composer_is_not_uploaded_again(tmp_path):
+    """Idempotence, and it is not an optimisation. A retry after a failed send
+    finds its own file still attached, and re-uploading it raises ChatGPT's
+    duplicate-file modal, which covers the composer and blocks everything."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.present.add(SEL.attachment_chip_for.format(filename="diff.md"))
+    clock.events[1] = lambda: session.dom.append(("assistant", "ok"))
+    client = make_client(session, clock, tmp_path)
+
+    assert client.submit(RID, PROMPT, attachment="/tmp/diff.md") is SubmitResult.CONFIRMED
+    assert session.uploaded == [], "the file was already there; nothing to upload"
+
+
+def test_the_duplicate_file_modal_refuses_rather_than_sending(tmp_path):
+    """ChatGPT answers a repeat upload with a modal instead of an attachment.
+    The modal covers the composer, so proceeding would type into a blocked
+    page — and sending would ask for a verdict on a diff that is not attached."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.seen_uploads.add("diff.md")  # ChatGPT has seen this file before
+    client = make_client(session, clock, tmp_path)
+    before = len(session.persisted)
+
+    with pytest.raises(SubmissionError) as excinfo:
+        client.submit(RID, PROMPT, attachment="/tmp/diff.md")
+    assert "duplicate-file" in str(excinfo.value)
+    assert "nothing was sent" in str(excinfo.value)
+    assert len(session.persisted) == before
+    # Dismissed, not merely detected: the modal covers the composer, so
+    # leaving it up would block every later attempt too.
+    assert SEL.duplicate_file_dismiss in session.clicks
+    assert SEL.duplicate_file_modal not in session.present
+
+
+def test_the_tile_must_name_THIS_file_not_merely_any_attachment(tmp_path):
+    """A previous attempt's file still on the composer must not read as
+    success: the review request would carry a diff belonging to another
+    change — the substitution report_sha256 exists to prevent."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.present.add(SEL.attachment_chip_for.format(filename="someone-elses.md"))
+    session.accepts_uploads = False  # our own upload silently does nothing
+    client = make_client(session, clock, tmp_path)
+
+    with pytest.raises(SubmissionError) as excinfo:
+        client.submit(RID, PROMPT, attachment="/tmp/diff.md")
+    assert "diff.md" in str(excinfo.value)
+
+
+def test_a_duplicate_that_turns_out_to_be_attached_proceeds(tmp_path):
+    """Dismissing the modal can reveal the file already on the composer — that
+    is a success, not a failure, and re-uploading would only raise it again."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.seen_uploads.add("diff.md")
+    session.duplicate_reveals_tile = "diff.md"
+    # Dismissing the modal costs an extra poll, so the reply is scheduled a
+    # tick later than in the tests that take the plain path.
+    clock.events[2] = lambda: session.dom.append(("assistant", "ok"))
+    client = make_client(session, clock, tmp_path)
+
+    assert client.submit(RID, PROMPT, attachment="/tmp/diff.md") is SubmitResult.CONFIRMED
+    assert SEL.duplicate_file_dismiss in session.clicks

@@ -16,10 +16,24 @@ class ChatGPTSelectors:
     send_button: str = '[data-testid="send-button"]'
     #: Hidden behind the attach button; Playwright can still set files on it.
     file_input: str = 'input[type=file]'
-    #: Proof an attachment actually landed. Presence is the only evidence
-    #: that the file reached the composer — a set_input_files that silently
-    #: did nothing looks identical to success without it.
-    attachment_chip: str = '[data-testid="composer-attachment"], [data-testid*="attachment"], .group\\/attachment'
+    #: Proof an attachment actually landed, as a format string taking the
+    #: FILENAME. ChatGPT renders an upload as a "file tile" carrying
+    #: role="group" and aria-label="<filename>" — there is no data-testid on
+    #: it (checked live 2026-08-15).
+    #:
+    #: Matching the filename rather than "any attachment" is deliberate: it
+    #: proves THE RIGHT file is on the composer. A previous attempt's file
+    #: still sitting there would otherwise read as success and send a review
+    #: request whose diff belongs to another change.
+    attachment_chip_for: str = '[role="group"][aria-label="{filename}"]'
+    #: ChatGPT refuses a file it has already seen with a blocking modal rather
+    #: than attaching it again. A retry re-uploads the same path, so this is
+    #: the ordinary case on the second attempt, not an edge case.
+    duplicate_file_modal: str = '[data-testid="modal-duplicate-file"]'
+    #: Its only control ("OK"). The modal must be DISMISSED, not merely
+    #: detected: it covers the composer, so leaving it up blocks every
+    #: subsequent attempt as well as this one.
+    duplicate_file_dismiss: str = '[data-testid="modal-duplicate-file"] button'
     stop_button: str = '[data-testid="stop-button"]'
     message: str = "[data-message-author-role]"
     #: Links to conversations in a project's chat list. Used to find a
