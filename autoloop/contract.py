@@ -13,10 +13,12 @@ Protocol v2. Two structural rules distinguish it from v1:
   approval can never be applied to a state ChatGPT did not review.
 
 Every prompt embeds CONTRACT_INSTRUCTIONS, which is the response format plus
-NEXT_WORK_PREFERENCE — the one advisory part of the text, stating which
-decision to prefer when work is already in flight. `parse_response` validates
-strictly; failures raise ContractError with a stable code that is echoed back
-for correction. Nothing is guessed or defaulted.
+two advisory clauses: NEXT_WORK_PREFERENCE (which decision to prefer when work
+is already in flight) and AUDIT_VS_READY_PREFERENCE (ready roadmap work before
+a fresh audit). Neither is enforced by the parser or by policy — see the
+comments on each. `parse_response` validates strictly; failures raise
+ContractError with a stable code that is echoed back for correction. Nothing is
+guessed or defaulted.
 """
 
 from __future__ import annotations
@@ -235,8 +237,8 @@ Decisions:
 #:
 #: It orders `implement`/`revise`/approval among themselves and says nothing
 #: about `audit`: which of a fresh audit or ready roadmap work comes first is a
-#: separate rule with its own home, and restating it here would give the same
-#: preference two texts to drift between.
+#: separate rule with its own home — `AUDIT_VS_READY_PREFERENCE` below — and
+#: restating it here would give the same preference two texts to drift between.
 #:
 #: The numbers it depends on are rendered by `context.render_context` under
 #: `context.IN_FLIGHT_LABEL`. A rule the reviewer cannot evaluate is not a
@@ -249,7 +251,65 @@ it over `implement` on a fresh task: finish before you start. Start new work
 when nothing is in flight, when everything in flight is
 blocked on something external, or when the operator asks."""
 
-CONTRACT_INSTRUCTIONS = _RESPONSE_FORMAT + "\n\n" + NEXT_WORK_PREFERENCE
+#: The second scheduling PREFERENCE: ready roadmap work before a fresh audit.
+#:
+#: Advisory for the same reasons `NEXT_WORK_PREFERENCE` is, and deliberately
+#: NOT a policy denial. `policy.py` authorizes actions; a scheduling preference
+#: refused there would park the loop instead of redirecting it, and the loop
+#: would have no way to answer "then what should I have done?".
+#:
+#: Why it exists: an audit ADDS findings. Choosing one while the roadmap
+#: already holds ready tasks moves the backlog in the wrong direction —
+#: observed 2026-08-05, a synthetic audit unit was running with 15 tasks
+#: ready, six of them priority 1. The reviewer makes this call with the
+#: roadmap summary in front of it, so the fix is to state the preference,
+#: not to hope.
+#:
+#: Why it never forbids: an empty or fully blocked roadmap is exactly when an
+#: audit is right, and continuous mode depends on that to find new work at
+#: all. A hard denial would stall the loop the moment the queue drains, so the
+#: clause names the three cases where `audit` is still the correct answer.
+#:
+#: It lives here rather than inside `NEXT_WORK_PREFERENCE` — which orders
+#: `implement`/`revise`/approval among themselves and says nothing about
+#: `audit` — so one preference never has two texts to drift between. This is
+#: the "separate rule with its own home" that comment refers to.
+#:
+#: Why it names `implement` and ONLY `implement`: the count it ranks against
+#: `audit` is the READY count, and `implement` is the one directive this
+#: protocol defines for a READY task. `revise` sends an already-started task
+#: back to its executor and is phase-gated on top of that, so recommending it
+#: for a ready task would name a directive that is invalid for exactly the
+#: tasks being counted. Ordering `revise` and the approvals against fresh work
+#: is `NEXT_WORK_PREFERENCE`'s job, and it stays there.
+#:
+#: Why the second escape hatch says "outside the roadmap" rather than "waiting
+#: on a dependency": `TaskRegistry.state_of` calls a task READY only once its
+#: declared `depends_on` are completed, so a ready task with an unmet declared
+#: dependency does not exist and a rule phrased that way describes nothing.
+#: The real case is a task the registry can schedule but a human cannot start
+#: — waiting on an upstream release, an operator decision, a service that is
+#: down — a blocker the graph does not model, which is why the text names it
+#: as being outside the roadmap rather than inside its dependency edges. The
+#: near-parallel with `NEXT_WORK_PREFERENCE`'s "blocked on something external"
+#: is deliberate and the two are NOT to be unified: that one qualifies tasks
+#: already in flight, this one qualifies tasks the registry calls READY, and
+#: collapsing them would put one preference back into two texts.
+#:
+#: The numbers it depends on are rendered by `context.render_context` under
+#: `context.ROADMAP_LABEL`, from `tasks.TaskRegistry.summary`. A rule the
+#: reviewer cannot evaluate is not a rule, so the two are pinned by test.
+AUDIT_VS_READY_PREFERENCE = """\
+CHOOSING AUDIT VS READY WORK — a preference, not a parser rule.
+CONTEXT's `roadmap` line gives how many tasks are ready and how many of those
+are priority 1. While any task is ready, prefer `implement` on one of them
+over `audit`: an audit adds findings, so auditing ahead of queued work grows
+the backlog. Choose `audit` when no task is ready, when every ready task is
+blocked on something outside the roadmap, or when the operator asks."""
+
+CONTRACT_INSTRUCTIONS = (
+    _RESPONSE_FORMAT + "\n\n" + NEXT_WORK_PREFERENCE + "\n\n" + AUDIT_VS_READY_PREFERENCE
+)
 
 
 def _require_str(field: str, value: object) -> str:

@@ -1,13 +1,19 @@
 """Review-context builder: integrity stamp values, git summary, changed-file
 parsing, previous decision/task, roadmap and validation summaries, and the
-in-flight counts the scheduling preference in CONTRACT_INSTRUCTIONS reads."""
+counts the two scheduling preferences in CONTRACT_INSTRUCTIONS read — in-flight
+work, and how much of the roadmap is ready."""
 
 import hashlib
 
 import pytest
 
-from autoloop.context import IN_FLIGHT_LABEL, build_context, render_context
-from autoloop.contract import NEXT_WORK_PREFERENCE
+from autoloop.context import (
+    IN_FLIGHT_LABEL,
+    ROADMAP_LABEL,
+    build_context,
+    render_context,
+)
+from autoloop.contract import AUDIT_VS_READY_PREFERENCE, NEXT_WORK_PREFERENCE
 from autoloop.errors import StateCorruptError
 from autoloop.state import LoopState
 from autoloop.tasks import Task, TaskRegistry
@@ -225,3 +231,67 @@ def test_the_label_the_contract_points_at_is_the_label_that_is_rendered():
     assert f"`{IN_FLIGHT_LABEL}`" in NEXT_WORK_PREFERENCE
     ctx = context_for(busy_registry())
     assert f"{IN_FLIGHT_LABEL}:" in render_context(ctx)
+
+
+# ---- ready counts -----------------------------------------------------------
+#
+# The second scheduling preference (`contract.AUDIT_VS_READY_PREFERENCE`) tells
+# the reviewer to implement a READY task rather than order a fresh audit while
+# the queue has work in it. That is only checkable if the CONTEXT
+# block says how many tasks ARE ready and how many of those are priority 1, so
+# these tests own those numbers on the rendered side — `test_tasks.py` owns the
+# summary string itself.
+
+
+def queued_registry():
+    """Five tasks: two ready at priority 1, one ready at the default priority,
+    one in progress, one blocked on it."""
+    reg = TaskRegistry(
+        [
+            Task(id="p1a", title="Urgent A", description="d", priority=1),
+            Task(id="p1b", title="Urgent B", description="d", priority=1),
+            Task(id="later", title="Later", description="d"),
+            Task(id="wip", title="In flight", description="d"),
+            Task(id="waiting", title="Waiting", description="d", depends_on=("wip",)),
+        ]
+    )
+    reg.mark_in_progress("wip")
+    return reg
+
+
+def test_render_carries_the_ready_count_and_the_priority_one_count():
+    """The mutation this guards: drop either number from `summary()` and the
+    rule in CONTRACT_INSTRUCTIONS is asking the reviewer to weigh a count that
+    never reaches it."""
+    block = render_context(context_for(queued_registry()))
+    assert f"{ROADMAP_LABEL}: " in block
+    assert "3 ready (2 at priority 1)" in block
+
+
+def test_render_carries_zeroes_when_the_ready_queue_is_empty():
+    """The case where an audit IS the right call — the counts must still be
+    rendered, because 0 ready is what tells the reviewer so."""
+    reg = TaskRegistry(
+        [
+            Task(id="wip", title="In flight", description="d"),
+            Task(id="waiting", title="Waiting", description="d", depends_on=("wip",)),
+        ]
+    )
+    reg.mark_in_progress("wip")
+    block = render_context(context_for(reg))
+    assert "0 ready (0 at priority 1)" in block
+    assert "next ready:" not in block  # nothing to point at
+
+
+def test_ready_tasks_at_the_default_priority_are_not_counted_as_urgent():
+    """100 is the default, so a roadmap nobody has prioritised must report 0 at
+    priority 1 rather than reporting every task as urgent."""
+    reg = TaskRegistry([Task(id="t1", title="First task", description="d")])
+    assert "1 ready (0 at priority 1)" in render_context(context_for(reg))
+
+
+def test_the_roadmap_label_the_contract_points_at_is_the_label_that_is_rendered():
+    """Same pin as the in-flight one above, for the other preference: the audit
+    rule names this line as where the counts are read from."""
+    assert f"`{ROADMAP_LABEL}`" in AUDIT_VS_READY_PREFERENCE
+    assert f"{ROADMAP_LABEL}:" in render_context(context_for(queued_registry()))
