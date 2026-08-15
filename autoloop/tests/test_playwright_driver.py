@@ -586,6 +586,12 @@ def test_a_listener_that_cannot_attach_never_ends_the_process(fake_playwright):
 # one — and the old message described both as "cannot connect". The endpoint is
 # probed separately from the port because a third case is real: a Chrome whose
 # `/json/version` answers 200 while CDP itself is wedged (2026-08-14).
+#
+# Every one of those measurements is LOCAL — the probes dial 127.0.0.1 and `ps`
+# lists this machine — so an endpoint that cannot be probed from here (another
+# host, or no usable port) gets NONE of it: every field unknown, and no advice
+# about the local dedicated profile. A local Chrome is not evidence about a
+# browser somewhere else.
 
 
 def _machine(monkeypatch, *, processes=(), port_open=False, answering=False):
@@ -666,6 +672,86 @@ def test_a_non_local_endpoint_is_reported_unknown_rather_than_measured(monkeypat
 
     assert "port_open=unknown" in described
     assert "cdp_answering=unknown" in described
+
+
+def test_a_non_local_endpoint_is_not_diagnosed_from_local_chrome_processes(monkeypatch):
+    """The sharp version of the test above, and the one that fails against
+    unknown port fields bolted onto a local verdict.
+
+    `ps` lists THIS machine, so a Chrome here is not evidence about a browser on
+    another host — not even one matching the dedicated profile AND holding 9222,
+    which is exactly the machine an operator running a local loop also has. If
+    the pid counts or the ACTION come from that scan, `http://gpu-box:9222` gets
+    diagnosed from an unrelated local Chrome and the operator is sent to restart
+    the wrong browser.
+    """
+    scans = {"count": 0}
+
+    def counted():
+        scans["count"] += 1
+        return [
+            (
+                4711,
+                "/Applications/Chrome --user-data-dir=/tmp/autoloop-chrome-test "
+                "--remote-debugging-port=9222",
+            )
+        ]
+
+    monkeypatch.setattr(ps, "_list_processes", counted)
+    monkeypatch.setattr(ps, "_port_in_use", lambda port: True)
+    monkeypatch.setattr(ps, "_endpoint_ready", lambda port: True)
+
+    described = ps.describe_cdp_endpoint("http://gpu-box:9222")
+
+    assert "chrome_on_profile=unknown" in described
+    assert "chrome_on_port=unknown" in described
+    assert "4711" not in described, "a local pid says nothing about another host"
+    assert "Chrome IS running" not in described
+    assert "NO Chrome is running" not in described
+    assert "chrome_restart" not in described, "never the local profile for a remote endpoint"
+    assert "gpu-box" in described, "and it still has to say where to look instead"
+    assert scans["count"] == 0, "nor spend a 30s `ps` on an answer it cannot use"
+
+
+def test_an_endpoint_with_no_usable_port_is_not_diagnosed_from_local_chrome(monkeypatch):
+    """The other unprobeable shape, held to the same rule. With no port there is
+    nothing to probe and nothing a local browser can settle — the url itself is
+    the fault — so a running local Chrome must not turn that into 'restart the
+    dedicated profile', which would leave the broken url in place."""
+    _machine(
+        monkeypatch,
+        processes=[(4711, "/Applications/Chrome --user-data-dir=/tmp/autoloop-chrome-test")],
+        port_open=True,
+    )
+
+    described = ps.describe_cdp_endpoint("http://127.0.0.1")
+
+    assert "port_open=unknown" in described
+    assert "chrome_on_profile=unknown" in described
+    assert "chrome_on_port=unknown" in described
+    assert "Chrome IS running" not in described
+    assert "fix the CDP url" in described
+    assert "endpoint=http://127.0.0.1" in described
+
+
+def test_an_unparseable_endpoint_is_diagnosed_rather_than_crashing(monkeypatch):
+    """Same branch, reached the other way: `:not-a-port` raises out of the url
+    parse instead of merely being absent. Which of the two it is must not decide
+    whether the operator gets a diagnosis at all — hence `_endpoint_host_port`
+    guards the whole `urlsplit`, not just the `.port` read, and the operator is
+    told to fix the url rather than handed `diagnosis=unavailable`."""
+    _machine(
+        monkeypatch,
+        processes=[(4711, "/Applications/Chrome --user-data-dir=/tmp/autoloop-chrome-test")],
+        port_open=True,
+    )
+
+    described = ps.describe_cdp_endpoint("http://127.0.0.1:not-a-port")
+
+    assert "fix the CDP url" in described
+    assert "diagnosis=unavailable" not in described, "a bad url is diagnosable, not a crash"
+    assert "chrome_on_profile=unknown" in described
+    assert "Chrome IS running" not in described
 
 
 def test_the_diagnosis_reaches_the_raised_error(fake_playwright, monkeypatch):

@@ -1914,7 +1914,15 @@ are load-bearing:
   HTTP answering while CDP is wedged (2026-08-14). Measured inside the failing
   connect, because `_handle_browser_failure` drops the client and restarts the
   browser before anything is written, so a later probe would describe the repair
-  rather than the fault. The diagnosis can never raise: it degrades to
+  rather than the fault. Every one of those measurements is LOCAL — the probes
+  dial 127.0.0.1 and `ps` lists this machine — so an endpoint this machine
+  cannot speak for (a non-loopback host, or no usable port) is reported with
+  ALL four fields `unknown` and is pointed at that host or at the url, never at
+  the local dedicated profile: a Chrome here, even one on that profile holding
+  9222, is not evidence about a browser somewhere else, and "restart the
+  profile" would be a confident diagnosis of the wrong machine. The loop's own
+  default `cdp_url` is `http://127.0.0.1:9222`, so this is the rare path, not
+  the usual one. The diagnosis can never raise: it degrades to
   `diagnosis=unavailable` instead of becoming the crash it exists to prevent.
   The ACTION leads and the key=value evidence follows, because `autoloop start`
   prints `blocker.question[:160]` — ordered the other way, the compact view

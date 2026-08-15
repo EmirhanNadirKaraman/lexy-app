@@ -241,6 +241,14 @@ browser (it may ignore SIGTERM — `chrome_restart` escalates).
 A zero `chrome_on_profile` means nothing is running: start the dedicated profile.
 `cdp_answering=yes` alongside a failed connect is the 2026-08-14 shape, where
 HTTP answers and CDP itself is wedged.
+**All four fields `unknown`** is the fifth reading, and it is not a broken probe:
+every measurement above is LOCAL (the probes dial 127.0.0.1, `ps` lists this
+machine), so an endpoint this machine cannot speak for gets none of them rather
+than a confident diagnosis of the wrong host. Two shapes reach it — a
+non-loopback `cdp_url` (`http://gpu-box:9222`: check Chrome on *that* host and
+the route to it; a local Chrome on the dedicated profile is not evidence about
+it, and restarting it would fix nothing) and a `cdp_url` with no usable port
+(fix the url — the default is `http://127.0.0.1:9222`).
 **If you are reading an OLD transcript:** a crash predating this fix leaves NO
 `browser_error` entry at all — that is how to tell it from every other browser
 failure, all of which log one.

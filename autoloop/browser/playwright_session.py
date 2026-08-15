@@ -57,9 +57,11 @@ from .observation import SendObservation, is_send_path, scrub_path
 #: stopped while the process lives. See `_driver` for why it is a singleton.
 _DRIVER = None
 
-#: Hosts whose port/endpoint we may probe from here. A CDP URL pointing
-#: anywhere else is reported as "unknown" rather than measured against
-#: 127.0.0.1, which is what `chrome_restart`'s probes actually talk to.
+#: Hosts this machine is evidence about. `chrome_restart`'s probes dial
+#: 127.0.0.1 and `ps` lists local processes, so for a CDP URL pointing anywhere
+#: else NOTHING here — port, endpoint or browser process — describes it, and the
+#: whole diagnosis degrades to "unknown" (see `_unmeasured`). The loop's own
+#: default is `http://127.0.0.1:9222` (`config.py`), so this is the rare path.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
 
 
@@ -78,12 +80,19 @@ def _list_processes() -> list[tuple[int, str]]:
 
 
 def _endpoint_host_port(cdp_url: str) -> tuple[str, int | None]:
-    parts = urlsplit(cdp_url if "//" in cdp_url else f"//{cdp_url}")
+    """Host and port, or `("", None)` for anything this cannot parse.
+
+    The whole `urlsplit` is inside the guard, not just the `.port` read: a
+    malformed authority raises `ValueError` from `.port` on today's CPython but
+    can raise from the parse itself, and which one it is must not decide whether
+    the operator gets a diagnosis. An unparseable endpoint IS an unprobeable
+    one, so it takes the `port is None` branch and says to fix the url.
+    """
     try:
-        port = parts.port
+        parts = urlsplit(cdp_url if "//" in cdp_url else f"//{cdp_url}")
+        return (parts.hostname or "", parts.port)
     except ValueError:  # a malformed authority, e.g. ":not-a-port"
-        port = None
-    return (parts.hostname or "", port)
+        return ("", None)
 
 
 def _chrome_pids(profile: str, port: int | None) -> tuple[list[int], list[int]]:
@@ -141,8 +150,12 @@ def describe_cdp_endpoint(cdp_url: str) -> str:
     the other way, the compact view would show four key=value pairs and cut off
     the one sentence saying what to do.
 
+    Only for an endpoint this machine can actually measure — see `_unmeasured`
+    for the rest, which get no evidence rather than local evidence.
+
     Bounded: a 0.5s port probe, a 2s HTTP probe and one `ps` (30s timeout),
-    against a restart command the callers already allow 180s.
+    against a restart command the callers already allow 180s. The unmeasurable
+    path runs none of the three.
     """
     try:
         return _diagnose(cdp_url)
@@ -153,13 +166,41 @@ def describe_cdp_endpoint(cdp_url: str) -> str:
         )
 
 
+def _unmeasured(cdp_url: str, hint: str) -> str:
+    """The diagnosis for an endpoint this machine cannot probe.
+
+    EVERY field is unknown, and none of them is quietly filled in from local
+    state. That is the whole point: a Chrome on this machine says nothing about
+    a CDP endpoint on another one, so reporting its pids here — or reading them
+    to choose between "Chrome IS running, restart it" and "NO Chrome is
+    running, start it" — produces a confident diagnosis of the wrong machine,
+    which is worse than none. The `ps` is skipped too, rather than run and
+    discarded: it costs up to 30s and could not inform the answer either way.
+    """
+    return (
+        f"{hint} [endpoint={cdp_url} port_open=unknown cdp_answering=unknown "
+        "chrome_on_profile=unknown chrome_on_port=unknown]"
+    )
+
+
 def _diagnose(cdp_url: str) -> str:
     host, port = _endpoint_host_port(cdp_url)
-    if port is None or host not in _LOOPBACK_HOSTS:
-        port_open = answering = "unknown"
-    else:
-        port_open = "yes" if _port_in_use(port) else "no"
-        answering = "yes" if _endpoint_ready(port) else "no"
+    if port is None:
+        # A malformed authority (":not-a-port", a bare hostname). Nothing to
+        # probe and nothing to restart — the endpoint itself is the fault.
+        return _unmeasured(
+            cdp_url,
+            "fix the CDP url — it names no usable port (expected something like "
+            "http://127.0.0.1:9222), so nothing here can reach it",
+        )
+    if host not in _LOOPBACK_HOSTS:
+        return _unmeasured(
+            cdp_url,
+            f"check Chrome on {host} (and the route to it) — this endpoint is "
+            "not on this machine, so nothing measurable from here describes it",
+        )
+    port_open = "yes" if _port_in_use(port) else "no"
+    answering = "yes" if _endpoint_ready(port) else "no"
 
     profile = os.environ.get("AUTOLOOP_CHROME_PROFILE", chrome_restart.DEFAULT_PROFILE)
     on_profile, on_port = _chrome_pids(profile, port)
