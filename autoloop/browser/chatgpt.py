@@ -359,11 +359,23 @@ class BrowserChatGPT:
 
     # ---- actions ------------------------------------------------------------
 
-    def submit(self, request_id: str, prompt: str) -> SubmitResult:
+    def submit(
+        self, request_id: str, prompt: str, attachment: str | None = None
+    ) -> SubmitResult:
         """Type and send one prompt. Never raises on mere ambiguity.
 
         Returns ALREADY_PERSISTED (nothing sent), CONFIRMED (server accepted),
         or UNCONFIRMED (send attempted, acceptance unknown → reconcile).
+
+        `attachment` is an absolute path uploaded BEFORE the prompt is typed.
+        It exists because the composer cannot be verified to hold a large
+        patch: `_enter_prompt` reads the editor back and a 30,000-character
+        part never returns its own tail, so the client refuses to send —
+        correctly, but permanently. A file sidesteps the editor entirely
+        (measured 2026-08-15: a 336 KB .md was read in full, quoting canaries
+        from its last line). The PROMPT stays small and inline, so the
+        review-integrity values remain in the message where the reviewer must
+        copy them from.
         """
         self._send_attempted = False
         self._observations = []
@@ -372,6 +384,8 @@ class BrowserChatGPT:
             # Only trustworthy because callers attach/reconcile first.
             return SubmitResult.ALREADY_PERSISTED
         self._wait_not_generating(request_id)
+        if attachment is not None:
+            self._attach_file(request_id, attachment)
         self._enter_prompt(request_id, prompt)
         self._await_send_ready(request_id)
         # Open the observation window immediately before the click, so nothing
@@ -569,6 +583,38 @@ class BrowserChatGPT:
         return last.text
 
     # ---- input --------------------------------------------------------------
+
+    def _attach_file(self, request_id: str, path: str) -> None:
+        """Upload `path` and PROVE it landed before anything is typed.
+
+        A `set_input_files` that silently did nothing is indistinguishable
+        from success, and a review packet whose diff never arrived is worse
+        than one that failed loudly: the reviewer would approve a change it
+        could not see. So the chip is required, and its absence raises rather
+        than proceeding.
+        """
+        self._session.set_input_files(self._sel.file_input, path)
+
+        deadline = self._monotonic() + self._input_sync_timeout
+        while True:
+            if self._session.exists(self._sel.attachment_chip):
+                return
+            if self._monotonic() >= deadline:
+                self.save_diagnostics(
+                    "attachment-not-accepted",
+                    request_id=request_id,
+                    stage="attach",
+                    retry_prohibited=False,
+                    note=(
+                        f"no attachment appeared within {self._input_sync_timeout}s "
+                        "— nothing was sent"
+                    ),
+                )
+                raise SubmissionError(
+                    f"attachment for {request_id} did not appear within "
+                    f"{self._input_sync_timeout}s (nothing was sent)"
+                )
+            self._sleep(self._poll_interval)
 
     def _enter_prompt(self, request_id: str, prompt: str) -> None:
         """Drive the contenteditable the way a person does: focus, clear with

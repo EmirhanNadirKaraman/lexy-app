@@ -67,6 +67,11 @@ class FakeSession:
         self.send_enabled = False
         self.send_mode = send_mode
         self.editor_registers_input = editor_registers_input
+        #: Files handed to set_input_files, and whether the upload "takes".
+        #: accepts_uploads=False models the silent no-op the chip guard exists
+        #: to catch: the call returns, and nothing ever attaches.
+        self.uploaded: list[tuple[str, str]] = []
+        self.accepts_uploads = True
         #: When set, any navigation redirects to the auth page, as a real
         #: logged-out ChatGPT does.
         self.logged_out = False
@@ -136,6 +141,11 @@ class FakeSession:
         if keys == "Delete":
             self.composer = ""
             self.send_enabled = False
+
+    def set_input_files(self, selector, path):
+        self.uploaded.append((selector, path))
+        if self.accepts_uploads:
+            self.present.add(SEL.attachment_chip)
 
     def insert_text(self, text):
         self.inserted.append(text)
@@ -746,3 +756,57 @@ def test_retarget_moves_every_page_identity_check(tmp_path):
     assert client.conversation_url == other
     client.attach()  # now considers the old URL "elsewhere" and navigates
     assert session.navigations == [f"goto:{other}"]
+
+
+# ---------------------------------------------------------------------------
+# Attachment delivery (2026-08-15)
+#
+# The composer cannot be verified to hold a large patch: `_enter_prompt` reads
+# the editor back, and a 30,000-character part never returns its own tail, so
+# the client refuses to send — correctly, and permanently. Uploading the diff
+# sidesteps the editor. What must not be lost in the move is the proof that the
+# file arrived: a review packet whose diff never landed would be approved
+# unseen, which is strictly worse than a send that fails loudly.
+# ---------------------------------------------------------------------------
+
+
+def test_an_attachment_is_uploaded_before_the_prompt_is_typed(tmp_path):
+    """Order matters: attaching after the text would leave a window where the
+    send control is live with the prompt but without the diff."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    clock.events[1] = lambda: session.dom.append(("assistant", "ok"))
+    client = make_client(session, clock, tmp_path)
+
+    assert client.submit(RID, PROMPT, attachment="/tmp/diff.md") is SubmitResult.CONFIRMED
+    assert session.uploaded == [(SEL.file_input, "/tmp/diff.md")]
+    assert SEL.attachment_chip in session.present
+
+
+def test_no_attachment_leaves_the_typed_path_untouched(tmp_path):
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    clock.events[1] = lambda: session.dom.append(("assistant", "ok"))
+    client = make_client(session, clock, tmp_path)
+
+    assert client.submit(RID, PROMPT) is SubmitResult.CONFIRMED
+    assert session.uploaded == []
+
+
+def test_an_upload_that_silently_does_nothing_refuses_to_send(tmp_path):
+    """The failure the chip guard exists for: set_input_files returns, no
+    attachment ever appears, and without the check the loop would ask for a
+    verdict on a diff the reviewer never received."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.accepts_uploads = False
+    client = make_client(session, clock, tmp_path)
+    before = len(session.persisted)
+
+    with pytest.raises(SubmissionError) as excinfo:
+        client.submit(RID, PROMPT, attachment="/tmp/diff.md")
+    message = str(excinfo.value)
+    assert "attachment" in message and "nothing was sent" in message
+    # Seeded history is still there; what matters is that NO NEW turn was sent.
+    assert len(session.persisted) == before
+    assert session.uploaded == [(SEL.file_input, "/tmp/diff.md")]

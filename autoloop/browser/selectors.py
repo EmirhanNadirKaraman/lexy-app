@@ -14,6 +14,12 @@ from dataclasses import dataclass
 class ChatGPTSelectors:
     composer: str = "#prompt-textarea"
     send_button: str = '[data-testid="send-button"]'
+    #: Hidden behind the attach button; Playwright can still set files on it.
+    file_input: str = 'input[type=file]'
+    #: Proof an attachment actually landed. Presence is the only evidence
+    #: that the file reached the composer — a set_input_files that silently
+    #: did nothing looks identical to success without it.
+    attachment_chip: str = '[data-testid="composer-attachment"], [data-testid*="attachment"], .group\\/attachment'
     stop_button: str = '[data-testid="stop-button"]'
     message: str = "[data-message-author-role]"
     #: Links to conversations in a project's chat list. Used to find a

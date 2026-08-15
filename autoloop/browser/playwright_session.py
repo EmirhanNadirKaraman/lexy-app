@@ -250,6 +250,15 @@ class PlaywrightSession:
         # It emits no key events, so it can never trigger an accidental send.
         self._call(lambda: self._page.keyboard.insert_text(text))
 
+    def set_input_files(self, selector: str, path: str) -> None:
+        """Attach a file to a (usually hidden) file input.
+
+        Playwright sets files directly on the element, so the input does not
+        need to be visible — which matters because ChatGPT keeps it behind the
+        attach button. This uploads; it does not send.
+        """
+        self._call(lambda: self._page.locator(selector).first.set_input_files(path, timeout=60000))
+
     def inner_text(self, selector: str) -> str:
         def _read():
             loc = self._page.locator(selector)

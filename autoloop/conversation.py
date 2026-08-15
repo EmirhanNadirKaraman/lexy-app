@@ -77,7 +77,15 @@ class LLMConversation(Protocol):
         """True if this request id appears in the currently loaded history."""
         ...
 
-    def submit(self, request_id: str, prompt: str) -> SubmitResult: ...
+    def submit(
+        self, request_id: str, prompt: str, attachment: str | None = None
+    ) -> SubmitResult:
+        """Send one prompt, optionally uploading `attachment` first.
+
+        A provider that cannot attach must raise rather than drop the file: a
+        review packet delivered without its diff would be approved unseen.
+        """
+        ...
 
     def reconcile(self, request_id: str) -> bool:
         """Controlled reload; True if the request is in persisted history."""
