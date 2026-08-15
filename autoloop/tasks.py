@@ -554,16 +554,35 @@ class TaskRegistry:
         return sorted(ready, key=lambda t: (t.priority, t.id))[0]
 
     def summary(self) -> str:
+        """One line of roadmap state, rendered into every review request.
+
+        The READY count carries a priority-1 breakdown with it because
+        `contract.AUDIT_VS_READY_PREFERENCE` tells the reviewer to implement or
+        revise a ready task instead of ordering a fresh audit, and to weigh how
+        urgent the queue is. A rule that depends on a number the reviewer
+        cannot see is not a rule — so the two are coupled the same way
+        `context.IN_FLIGHT_LABEL` is, and pinned by test on both sides.
+
+        Priority 1 specifically, not "the lowest priority present": P1 is the
+        audit reports' own vocabulary for "this blocks other work", and the
+        default is 100, so a roadmap nobody has prioritised reports 0 rather
+        than reporting every task as urgent.
+        """
         if not self._tasks:
             return "no tasks planned yet"
         counts = {state: 0 for state in TaskState}
+        ready_priority_one = 0
         for task in self._tasks.values():
-            counts[self.state_of(task.id)] += 1
+            state = self.state_of(task.id)
+            counts[state] += 1
+            if state is TaskState.READY and task.priority == 1:
+                ready_priority_one += 1
         nxt = self.next_ready()
         parts = (
             f"{len(self._tasks)} tasks: {counts[TaskState.COMPLETED]} completed, "
             f"{counts[TaskState.IN_PROGRESS]} in progress, "
-            f"{counts[TaskState.READY]} ready, {counts[TaskState.BLOCKED]} blocked, "
+            f"{counts[TaskState.READY]} ready ({ready_priority_one} at priority 1), "
+            f"{counts[TaskState.BLOCKED]} blocked, "
             f"{counts[TaskState.BLOCKED_BY_OPERATOR]} quarantined"
         )
         if nxt is not None:

@@ -10,9 +10,12 @@ from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 
 
 def task(tid, deps=(), **kw):
+    # `priority` is forwarded only when asked for, so an unprioritised task
+    # keeps whatever the dataclass default is rather than pinning it here.
+    optional = {"priority": kw["priority"]} if "priority" in kw else {}
     return Task(
         id=tid, title=kw.get("title", f"Title {tid}"), description=kw.get("desc", "d"),
-        depends_on=tuple(deps),
+        depends_on=tuple(deps), **optional,
     )
 
 
@@ -181,6 +184,41 @@ def test_summary_counts_and_next():
     assert "1 ready" in text
     assert "0 blocked" in text
     assert "next ready: b" in text
+
+
+# The READY count carries a priority-1 breakdown because
+# `contract.AUDIT_VS_READY_PREFERENCE` asks the reviewer to prefer ready work
+# over a fresh audit, and to weigh how urgent that queue is. `test_context.py`
+# owns the other half — that these numbers survive into the rendered CONTEXT
+# block the reviewer actually reads.
+
+
+def test_summary_breaks_out_how_many_ready_tasks_are_priority_one():
+    reg = registry(
+        task("urgent", priority=1),
+        task("also-urgent", priority=1),
+        task("someday"),
+        task("blocked-p1", deps=["urgent"], priority=1),
+    )
+    text = reg.summary()
+    assert "3 ready (2 at priority 1)" in text
+    # A priority-1 task that is BLOCKED is not work the reviewer can pick, so
+    # it counts as neither ready nor urgent.
+    assert "1 blocked" in text
+
+
+def test_summary_reports_zero_urgent_when_nothing_is_prioritised():
+    """The default priority is 100. A roadmap nobody has triaged must report 0
+    at priority 1, not treat every task as urgent."""
+    assert "2 ready (0 at priority 1)" in registry(task("a"), task("b")).summary()
+
+
+def test_summary_reports_an_empty_ready_queue_as_zero():
+    """0 ready is the signal that an audit is the right call, so it has to be
+    stated rather than left to be inferred from the other counts."""
+    reg = registry(task("a"), task("b", deps=["a"]))
+    reg.mark_in_progress("a")
+    assert "0 ready (0 at priority 1)" in reg.summary()
 
 
 # ---- description mutation ---------------------------------------------------

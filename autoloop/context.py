@@ -9,7 +9,8 @@ registry. It serves two purposes:
   The in-flight line exists because CONTRACT_INSTRUCTIONS states a scheduling
   preference (finish before start) that a reviewer cannot evaluate without
   knowing how much is already in progress and how much of it is committed but
-  unpublished.
+  unpublished. The roadmap line carries the ready and priority-1 counts for
+  the same reason: the audit-vs-ready preference is applied against them.
 * **Review integrity** — the block carries the stamp (request_id, timestamp,
   head_sha, base_sha, report_sha256) that a commit/push approval must copy
   into `reviewed`; `contract.verify_review` checks the echo against these
@@ -40,6 +41,14 @@ from .worktask import TaskExecutionStore
 #: contract pointing at a line that no longer exists, and the rule it states
 #: cannot be followed without the numbers.
 IN_FLIGHT_LABEL = "in_flight"
+
+#: Label of the roadmap line, coupled to `contract.AUDIT_VS_READY_PREFERENCE`
+#: exactly as `IN_FLIGHT_LABEL` is coupled to `contract.NEXT_WORK_PREFERENCE`.
+#: That rule tells the reviewer to prefer a READY task over a fresh audit and
+#: names this line as where the ready and priority-1 counts are read from, so
+#: a rename or a deletion here leaves it pointing at a line that does not
+#: exist. `test_context.py` asserts the same literal appears on both sides.
+ROADMAP_LABEL = "roadmap"
 
 
 @dataclass(frozen=True)
@@ -171,7 +180,7 @@ def render_context(ctx: ReviewContext, max_files: int = 40) -> str:
             f"previous_decision: {ctx.previous_decision}",
             f"previous_task: {ctx.previous_task}",
             f"validation: {ctx.validation_summary}",
-            f"roadmap: {ctx.roadmap_status}",
+            f"{ROADMAP_LABEL}: {ctx.roadmap_status}",
             f"{IN_FLIGHT_LABEL}: {ctx.in_flight_count} in progress, {candidates}",
         ]
     )

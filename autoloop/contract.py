@@ -13,10 +13,12 @@ Protocol v2. Two structural rules distinguish it from v1:
   approval can never be applied to a state ChatGPT did not review.
 
 Every prompt embeds CONTRACT_INSTRUCTIONS, which is the response format plus
-NEXT_WORK_PREFERENCE — the one advisory part of the text, stating which
-decision to prefer when work is already in flight. `parse_response` validates
-strictly; failures raise ContractError with a stable code that is echoed back
-for correction. Nothing is guessed or defaulted.
+two advisory clauses: NEXT_WORK_PREFERENCE (which decision to prefer when work
+is already in flight) and AUDIT_VS_READY_PREFERENCE (ready roadmap work before
+a fresh audit). Neither is enforced by the parser or by policy — see the
+comments on each. `parse_response` validates strictly; failures raise
+ContractError with a stable code that is echoed back for correction. Nothing is
+guessed or defaulted.
 """
 
 from __future__ import annotations
@@ -235,8 +237,8 @@ Decisions:
 #:
 #: It orders `implement`/`revise`/approval among themselves and says nothing
 #: about `audit`: which of a fresh audit or ready roadmap work comes first is a
-#: separate rule with its own home, and restating it here would give the same
-#: preference two texts to drift between.
+#: separate rule with its own home — `AUDIT_VS_READY_PREFERENCE` below — and
+#: restating it here would give the same preference two texts to drift between.
 #:
 #: The numbers it depends on are rendered by `context.render_context` under
 #: `context.IN_FLIGHT_LABEL`. A rule the reviewer cannot evaluate is not a
@@ -249,7 +251,44 @@ it over `implement` on a fresh task: finish before you start. Start new work
 when nothing is in flight, when everything in flight is
 blocked on something external, or when the operator asks."""
 
-CONTRACT_INSTRUCTIONS = _RESPONSE_FORMAT + "\n\n" + NEXT_WORK_PREFERENCE
+#: The second scheduling PREFERENCE: ready roadmap work before a fresh audit.
+#:
+#: Advisory for the same reasons `NEXT_WORK_PREFERENCE` is, and deliberately
+#: NOT a policy denial. `policy.py` authorizes actions; a scheduling preference
+#: refused there would park the loop instead of redirecting it, and the loop
+#: would have no way to answer "then what should I have done?".
+#:
+#: Why it exists: an audit ADDS findings. Choosing one while the roadmap
+#: already holds ready tasks moves the backlog in the wrong direction —
+#: observed 2026-08-05, a synthetic audit unit was running with 15 tasks
+#: ready, six of them priority 1. The reviewer makes this call with the
+#: roadmap summary in front of it, so the fix is to state the preference,
+#: not to hope.
+#:
+#: Why it never forbids: an empty or fully blocked roadmap is exactly when an
+#: audit is right, and continuous mode depends on that to find new work at
+#: all. A hard denial would stall the loop the moment the queue drains, so the
+#: clause names the three cases where `audit` is still the correct answer.
+#:
+#: It lives here rather than inside `NEXT_WORK_PREFERENCE` — which orders
+#: `implement`/`revise`/approval among themselves and says nothing about
+#: `audit` — so one preference never has two texts to drift between. This is
+#: the "separate rule with its own home" that comment refers to.
+#:
+#: The numbers it depends on are rendered by `context.render_context` under
+#: `context.ROADMAP_LABEL`, from `tasks.TaskRegistry.summary`. A rule the
+#: reviewer cannot evaluate is not a rule, so the two are pinned by test.
+AUDIT_VS_READY_PREFERENCE = """\
+CHOOSING AUDIT VS READY WORK — a preference, not a parser rule.
+CONTEXT's `roadmap` line gives how many tasks are ready and how many of those
+are priority 1. While any task is ready, prefer `implement` or `revise` on one
+of them over `audit`: an audit adds findings, so auditing ahead of queued work
+grows the backlog. Choose `audit` when no task is ready, when every ready task
+is waiting on a dependency that is not met, or when the operator asks."""
+
+CONTRACT_INSTRUCTIONS = (
+    _RESPONSE_FORMAT + "\n\n" + NEXT_WORK_PREFERENCE + "\n\n" + AUDIT_VS_READY_PREFERENCE
+)
 
 
 def _require_str(field: str, value: object) -> str:

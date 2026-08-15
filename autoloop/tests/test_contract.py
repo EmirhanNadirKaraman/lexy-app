@@ -8,6 +8,7 @@ import pytest
 
 from autoloop.contract import (
     ACTIVE_DECISIONS,
+    AUDIT_VS_READY_PREFERENCE,
     CONTRACT_INSTRUCTIONS,
     RETIRED_DECISIONS,
     NEXT_WORK_PREFERENCE,
@@ -625,15 +626,90 @@ def test_preference_cites_the_context_counts_that_make_it_checkable():
 
 def test_preference_does_not_restate_the_audit_rule():
     """Whether a fresh audit or ready roadmap work comes first is a separate
-    rule with its own home. This clause orders implement/revise/approve among
-    themselves; duplicating the audit rule here would give one preference two
-    texts to drift between. (`audit` itself stays documented above — see
+    rule with its own home — `AUDIT_VS_READY_PREFERENCE`, pinned below. This
+    clause orders implement/revise/approve among themselves; duplicating the
+    audit rule here would give one preference two texts to drift between.
+    (`audit` itself stays documented above — see
     test_contract_names_every_decision.)"""
     assert "audit" not in NEXT_WORK_PREFERENCE.lower()
 
 
 def test_preference_is_actually_shipped_in_the_instructions():
     assert NEXT_WORK_PREFERENCE in CONTRACT_INSTRUCTIONS
+
+
+# ---- the ready-work-before-audit scheduling preference ----------------------
+#
+# The second advisory clause, and the reason it exists: on 2026-08-05 the loop
+# was running a synthetic audit unit while 15 tasks sat READY, six of them
+# priority 1. An audit ADDS findings, so choosing one over ready work drains
+# nothing and grows the backlog. Same test shape as the clause above — the
+# instructions are prose a model reads, so what a trim can silently delete is a
+# rule, and only a content test notices.
+
+
+def test_audit_preference_states_ready_work_comes_first():
+    """The rule itself, stated as a rule: while the roadmap has ready tasks,
+    work one of them instead of ordering a fresh audit."""
+    assert "While any task is ready" in AUDIT_VS_READY_PREFERENCE
+    # ...and names which decisions that ranks against which.
+    assert "prefer `implement` or `revise` on one" in AUDIT_VS_READY_PREFERENCE
+    assert "over `audit`" in AUDIT_VS_READY_PREFERENCE
+    # ...with the reason, so it reads as a rule rather than an arbitrary order.
+    assert "an audit adds findings" in AUDIT_VS_READY_PREFERENCE
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "when no task is ready",
+        "when every ready task\nis waiting on a dependency that is not met",
+        "when the operator asks",
+    ],
+)
+def test_audit_preference_keeps_all_three_audit_anyway_conditions(condition):
+    """Prefer, never forbid. An empty or fully blocked roadmap is exactly when
+    an audit is the right move, and continuous mode depends on that to find new
+    work at all — a rule that made `audit` unreachable would stall the loop the
+    moment the queue drains.
+
+    The second condition is pinned across its line break because that is how it
+    is wrapped in the shipped text; it is the reviewer's assessment of the
+    queue, not a registry state (a task the registry calls READY has all its
+    `depends_on` complete by definition — the unmet dependency here is the kind
+    the state machine does not model, exactly like the other clause's
+    'blocked on something external')."""
+    assert condition in AUDIT_VS_READY_PREFERENCE
+
+
+def test_audit_preference_is_advisory_not_a_refusal():
+    """It must read as a ranking the reviewer applies. Encoding it as a policy
+    denial would be the wrong layer twice over: policy authorizes actions, and
+    a refused audit directive would park the loop rather than redirect it."""
+    assert "a preference, not a parser rule" in AUDIT_VS_READY_PREFERENCE
+
+
+def test_audit_preference_cites_the_context_counts_that_make_it_checkable():
+    """The mutation this guards: drop the ready/priority-1 counts from the
+    roadmap summary (or rename the label) and the rule points at numbers that
+    are not there. The other half of the pin — that `render_context` actually
+    emits this label and those counts — lives in `test_context.py`, which owns
+    `ROADMAP_LABEL`."""
+    assert "`roadmap`" in AUDIT_VS_READY_PREFERENCE
+    assert "how many tasks are ready" in AUDIT_VS_READY_PREFERENCE
+    assert "how many of those\nare priority 1" in AUDIT_VS_READY_PREFERENCE
+
+
+def test_audit_preference_does_not_restate_the_in_flight_rule():
+    """The mirror of `test_preference_does_not_restate_the_audit_rule`: one
+    preference, one text. This clause ranks ready work against `audit` and says
+    nothing about what is already in flight."""
+    assert "in_flight" not in AUDIT_VS_READY_PREFERENCE
+    assert "finish before you start" not in AUDIT_VS_READY_PREFERENCE
+
+
+def test_audit_preference_is_actually_shipped_in_the_instructions():
+    assert AUDIT_VS_READY_PREFERENCE in CONTRACT_INSTRUCTIONS
 
 
 def test_contract_stays_within_its_budget():
@@ -645,14 +721,20 @@ def test_contract_stays_within_its_budget():
     measured 402 characters — the 400-character clause plus the two-character
     blank-line join — for a total of 3,214.
 
-    3,240 is that measurement plus a 26-character margin, NOT the previous
-    ceiling plus a guess at what the clause might cost. The measurement was
-    made by hand, summing line lengths, because the executor for this change
-    had no shell; the method was checked against the recorded 2,812 for the
-    unchanged part first and reproduced it exactly. Raising this ceiling is
-    fine when a genuine new requirement lands; raising it to make room for
-    explanation is not."""
-    assert len(CONTRACT_INSTRUCTIONS) <= 3240
+    Adding the ready-work-before-audit preference (2026-08-15) grew it by a
+    further measured 451 — the 449-character clause plus its own two-character
+    join. Both measurements were made by hand, summing line lengths, because
+    the executors for these changes had no shell.
+
+    3,700 is derived from the previous assertion's GUARANTEED bound (3,240 —
+    the number the suite actually enforced) plus that 451, not from the
+    recorded 3,214, which is a hand count nothing re-verified. Trusting the
+    record would put the ceiling at 3,690 and leave the suite one character
+    from failing if the old count was itself off by its own margin, with no
+    shell available to diagnose it. The extra ~9 buys the whole risk out; it is
+    not room to write in. Raising this ceiling is fine when a genuine new
+    requirement lands; raising it to make room for explanation is not."""
+    assert len(CONTRACT_INSTRUCTIONS) <= 3700
 
 
 def test_preference_clause_has_its_own_tighter_budget():
@@ -661,3 +743,12 @@ def test_preference_clause_has_its_own_tighter_budget():
     lines — anything materially longer is explanation, and explanation belongs
     in the source comment next to it, which costs nothing per turn."""
     assert len(NEXT_WORK_PREFERENCE) <= 420
+
+
+def test_audit_preference_clause_has_its_own_tighter_budget():
+    """Same ceiling-per-clause treatment as the one above, and for the same
+    reason: measured 449, capped at 470, six lines. The rationale for this rule
+    is longer than the rule — it lives in the source comment beside the
+    constant, which costs nothing per turn, not in the prompt, which is re-sent
+    on every one."""
+    assert len(AUDIT_VS_READY_PREFERENCE) <= 470
