@@ -152,7 +152,13 @@ _ALLOWED_GIT: dict[str, frozenset[str]] = {
     "restore": frozenset({"--staged", "--"}),
     # Read-only index inspection, needed to verify what was actually STAGED
     # rather than what the working tree currently shows (adopted manifests).
-    "cat-file": frozenset(),
+    # `-e` is the existence probe (`GitGateway.object_exists`): it prints
+    # nothing and its EXIT CODE carries the one distinction the merge-window
+    # gate needs — 1 means "the object database does not have this", anything
+    # else means git could not answer. Strictly less than the reads already
+    # admitted here (`cat-file commit`/`blob` return the object's content),
+    # and read-only like the rest of this entry.
+    "cat-file": frozenset({"-e"}),
     # `-s`/`--` are the pre-existing staged-index-inspection flags (`staged_mode`).
     # `--others`/`--ignored`/`--exclude-standard` are read-only enumeration
     # flags added for the M1 escape detector (`escape_detector.py`), which

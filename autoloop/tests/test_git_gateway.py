@@ -49,6 +49,41 @@ def test_reads(repo):
     assert not gw.is_dirty()
 
 
+def test_object_exists_answers_from_the_object_database(repo):
+    """True/False are the only two answers, and they come from `cat-file -e`'s
+    exit code — 0 present, 1 absent. `read_commit` cannot make this
+    distinction: it dies with the same status whether the object is missing,
+    corrupt or unreadable, which is why `cli._candidate_is_retired` needs a
+    separate probe before writing a record off."""
+    gw = gateway(repo)
+
+    assert gw.object_exists(gw.head_sha()) is True
+    # Deliberately not the all-zeros sha: that is git's null OID and some
+    # versions special-case it, which would test the one value git treats
+    # differently rather than an ordinary absent object.
+    assert gw.object_exists("c" * 40) is False, "well-formed, simply not here"
+    with pytest.raises(GitCommandError):
+        gw.read_commit("c" * 40)        # the read alone cannot say which it was
+
+
+def test_object_exists_raises_rather_than_guessing_at_a_name_git_refuses(repo):
+    """A die (rc 128) is not an answer about existence. Reporting it as
+    "absent" is exactly the fail-open the merge-window gate must not have."""
+    with pytest.raises(GitCommandError) as excinfo:
+        gateway(repo).object_exists("not a valid object name")
+    assert "not an answer" in str(excinfo.value)
+
+
+def test_object_exists_admits_only_the_existence_flag():
+    """`-e` prints nothing and returns only a status. Every other `cat-file`
+    flag stays off the whitelist."""
+    engine = PolicyEngine(PolicyConfig())
+    assert engine.validate_git_command(("cat-file", "-e", "a" * 40)).allowed
+    assert engine.validate_git_command(("cat-file", "commit", "a" * 40)).allowed
+    assert not engine.validate_git_command(("cat-file", "-p", "a" * 40)).allowed
+    assert not engine.validate_git_command(("cat-file", "--batch")).allowed
+
+
 def test_gateway_has_no_ambient_push_method(repo):
     """`push()` was removed 2026-07-30 (pass 2b) — it pushed whatever the
     current branch tip happened to be, exactly the wrong-destination race M1

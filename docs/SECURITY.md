@@ -419,7 +419,19 @@ candidate. What bounds it:
 - **Fail-closed on the git probe.** The repository must first prove it can
   answer (`head_sha`) before its "no such object" counts; anything else —
   no repository, git unavailable, any other raise — keeps the window shut,
-  the same rule `_candidate_publication` already states.
+  the same rule `_candidate_publication` already states. Strengthened
+  2026-08-15 (same task, review round 3): a failing `read_commit` was being
+  read as "the object is absent", which it is not — `cat-file commit` dies
+  identically for a corrupt object, an I/O error and a `GitOperationDenied`
+  policy refusal, so operational trouble could open the window. A failed read
+  now asks `GitGateway.object_exists`, which answers True/False from
+  `cat-file -e`'s exit code and RAISES on anything else; only an explicit
+  False writes the record off.
+- **One new whitelist flag, read-only.** `_ALLOWED_GIT["cat-file"]` gained
+  `-e` for that probe. It prints nothing and returns only a status — strictly
+  less than the `cat-file commit`/`blob` content reads already admitted there
+  — and no other `cat-file` flag was added (`-p`, `--batch` and friends stay
+  refused).
 - **Never silent.** It is reported as a `note:` by `merge-window` and logged as
   `auto_merge_window_note` by `AutoMerger`, which previously discarded the
   gate's notes entirely. A record being written off is visible on both paths.
@@ -431,11 +443,19 @@ candidate. What bounds it:
 **Verification check:**
 ```bash
 # Expect: all three conditions present, and the fail-closed head_sha probe
-rg -n 'def _candidate_is_retired' -A 25 autoloop/cli.py
+rg -n 'def _candidate_is_retired' -A 40 autoloop/cli.py
+# Expect: the write-off happens only after object_exists answers False; every
+# other outcome of either probe returns "" (window stays shut)
+rg -n 'object_exists' autoloop/cli.py autoloop/git_gateway.py
+# Expect: -e only; no other cat-file flag on the whitelist
+rg -n '"cat-file": frozenset' autoloop/policy.py
 # Expect: the gate's notes are logged, not discarded, on the auto-merge path
 rg -n 'auto_merge_window_note' autoloop/auto_merge.py
 # Expect: release retires BOTH halves through one call
 rg -n 'retire_execution' autoloop/cli.py autoloop/worktask.py autoloop/orchestrator.py
+# Expect: reconciliation refuses to retire a record an undrained merge
+# deferral still reads from
+rg -n 'execution_retire_pinned_by_deferral|_outstanding_merge_deferral' autoloop/orchestrator.py
 ```
 
 ### S25 — Circular task-scope authorization, failed-round residue, and unbounded pre-commit retries — HIGH — RESOLVED 2026-07-31

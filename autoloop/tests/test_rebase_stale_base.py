@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from autoloop.auto_merge import MergeDeferralStore
 from autoloop.git_gateway import GitGateway
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import Phase
@@ -71,6 +72,10 @@ def _orch(repo, tmp_path, execution, review_round=0):
     orch = Orchestrator.__new__(Orchestrator)
     orch._git = GitGateway(repo, PolicyEngine(PolicyConfig()))
     orch._worker_repos = _FakeWorkerRepos(tmp_path / "workers")
+    # Reconciliation asks this before retiring anything — a record an
+    # undrained auto-merge retry still reads must not be archived out from
+    # under it. Empty here; the pin tests below put a deferral in it.
+    orch._merge_deferrals = MergeDeferralStore(tmp_path / "deferrals")
     store = TaskExecutionStore(tmp_path / "executions")
     orch._execution_store = store
     orch._logged: list = []
@@ -273,6 +278,102 @@ def test_a_QUARANTINED_task_is_parked_not_reconciled(repo, tmp_path):
     )
     assert TaskExecutionStore(tmp_path / "executions").load("t1") is not None
     assert orch._registry.state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+
+
+def _defer(orch, task_id="t1", candidate="c" * 40, reason="merge window closed"):
+    """An auto-merge retry that has not drained yet — the state
+    `AutoMerger.after_completion` reads the live record back for."""
+    return orch._merge_deferrals.record(
+        task_id=task_id, candidate_sha=candidate,
+        dest_ref="refs/heads/work", base_sha="b" * 40,
+        reason=reason, now="2026-08-15T00:00:00+00:00",
+    )
+
+
+def test_a_record_an_UNDRAINED_merge_retry_still_needs_is_pinned(repo, tmp_path):
+    """Retiring here would break the integration `_dispatch_task_push`
+    deliberately kept alive. `AutoMerger.attempt` reads the candidate and the
+    worktree path back off the LIVE record; with the record archived it finds
+    none, SKIPS the task — which also clears the deferral — and the published
+    branch stops being retried, which is the unmerged-forever backlog
+    auto-merge exists to end.
+
+    So: completed (the same fresh `ls-remote` justifies it), record kept, no
+    park — the park's own advice is to archive the record, which is exactly
+    what must not happen while a retry depends on it."""
+    old_base = git(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("two\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "later")
+
+    candidate = "c" * 40
+    execution = _published(repo, old_base, candidate)
+    orch = _wire_registry(_orch(repo, tmp_path, execution, review_round=1), tmp_path)
+    _with_remote(orch, {("origin", "refs/heads/autoloop/t1"): candidate})
+    _defer(orch)
+
+    result = orch._rebase_execution_if_stale(execution, Task(id="t1", title="T", description="d"))
+
+    assert result is None, "this dispatch still stops"
+    assert orch._parked == [], "a published candidate is not an operator problem"
+    store = TaskExecutionStore(tmp_path / "executions")
+    assert store.load("t1") is not None, "the retry has nothing to read without it"
+    assert store.load("t1").candidate_sha == candidate
+    assert not sorted((tmp_path / "executions" / "archive").glob("t1-*.json"))
+    assert orch._worker_repos.quarantined == [], "and its worker is still there"
+    assert orch._merge_deferrals.load("t1") is not None, "the retry survives too"
+    # Completed, so the merger will still touch it: `attempt` skips (and clears
+    # the deferral for) anything that is not COMPLETED.
+    assert orch._registry.state_of("t1") is TaskState.COMPLETED
+    assert [e for e, _ in orch._logged if e == "execution_retire_pinned_by_deferral"]
+    assert [e for e, _ in orch._logged if e == "execution_retired_published"] == []
+
+
+def test_a_DRAINED_retry_leaves_the_record_free_to_retire(repo, tmp_path):
+    """The pin is the deferral, not the history of one. Once the merge landed
+    and cleared it, the next dispatch retires the record exactly as before —
+    otherwise 'pinned' would quietly mean 'never retired again'."""
+    old_base = git(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("two\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "later")
+
+    candidate = "c" * 40
+    execution = _published(repo, old_base, candidate)
+    orch = _wire_registry(_orch(repo, tmp_path, execution, review_round=1), tmp_path)
+    _with_remote(orch, {("origin", "refs/heads/autoloop/t1"): candidate})
+    _defer(orch)
+    orch._merge_deferrals.clear("t1")        # what a pushed merge does
+
+    orch._rebase_execution_if_stale(execution, Task(id="t1", title="T", description="d"))
+
+    assert TaskExecutionStore(tmp_path / "executions").load("t1") is None
+    assert orch._parked == [], "retiring is not a park either"
+    assert [e for e, _ in orch._logged if e == "execution_retired_published"]
+
+
+def test_a_deferral_store_that_cannot_be_read_pins_the_record_too(repo, tmp_path):
+    """Fail-closed on the same rule `MergeDeferralStore` states for itself: a
+    dropped retry is indistinguishable from work that was never merged, so an
+    unanswerable "is one outstanding?" must read as "assume so"."""
+    old_base = git(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("two\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "later")
+
+    candidate = "c" * 40
+    execution = _published(repo, old_base, candidate)
+    orch = _wire_registry(_orch(repo, tmp_path, execution, review_round=1), tmp_path)
+    _with_remote(orch, {("origin", "refs/heads/autoloop/t1"): candidate})
+    directory = tmp_path / "deferrals"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "t1.json").write_text("{not json", encoding="utf-8")
+
+    orch._rebase_execution_if_stale(execution, Task(id="t1", title="T", description="d"))
+
+    assert TaskExecutionStore(tmp_path / "executions").load("t1") is not None
+    assert [e for e, _ in orch._logged if e == "merge_deferral_unreadable"]
+    assert [e for e, _ in orch._logged if e == "execution_retire_pinned_by_deferral"]
 
 
 def test_an_unpublished_reviewed_candidate_parks_exactly_as_before(repo, tmp_path):

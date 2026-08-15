@@ -18,7 +18,7 @@ import pytest
 
 from autoloop import cli
 from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
-from autoloop.errors import GitCommandError
+from autoloop.errors import GitCommandError, GitOperationDenied
 from autoloop.state import LoopState, Phase, StateStore
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 
@@ -409,11 +409,19 @@ def test_an_executing_phase_still_closes_it_even_with_everything_published(
 
 
 class _FakeCheckout:
-    """A checkout that can answer questions, and knows a fixed set of commits."""
+    """A checkout that can answer questions, and knows a fixed set of commits.
 
-    def __init__(self, head="head1234", commits=()):
+    `read_error` / `exists_error` make the two probes fail INDEPENDENTLY, which
+    is the whole distinction the write-off rests on: `read_commit` raising says
+    only that the read failed, and `object_exists` is the one that answers
+    whether the object database holds the commit at all.
+    """
+
+    def __init__(self, head="head1234", commits=(), read_error=None, exists_error=None):
         self._head = head
         self.commits = set(commits)
+        self.read_error = read_error
+        self.exists_error = exists_error
         self.lookups = []
 
     def head_sha(self):
@@ -422,9 +430,16 @@ class _FakeCheckout:
         return self._head
 
     def read_commit(self, oid):
+        if self.read_error is not None:
+            raise self.read_error
         if oid not in self.commits:
             raise GitCommandError("cat-file", f"{oid}: bad file")
         return {"tree": "t", "parents": [], "message": ""}
+
+    def object_exists(self, oid):
+        if self.exists_error is not None:
+            raise self.exists_error
+        return oid in self.commits
 
     def remote_ref_sha(self, remote, dest_ref):
         self.lookups.append((remote, dest_ref))
@@ -509,6 +524,40 @@ def test_a_checkout_that_cannot_answer_keeps_the_window_shut(wired):
     _released(wired)
 
     reasons, _notes = cli._merge_window_blockers(wired, set(), _FakeCheckout(head=""))
+
+    assert reasons and "would strand it" in reasons[0]
+
+
+def test_a_READ_that_fails_for_any_other_reason_keeps_the_window_shut(wired):
+    """`read_commit` raising is not git saying "no such object". A corrupt
+    object, an I/O error, a policy refusal and a missing commit all fail the
+    same `cat-file commit` the same way, so its failure alone proves only that
+    the question went unanswered — and an unanswered question must never write
+    a record off."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)
+    denied = GitOperationDenied("git_denied: cat-file is not allowed here")
+
+    reasons, notes = cli._merge_window_blockers(
+        wired, set(), _FakeCheckout(read_error=denied, exists_error=denied)
+    )
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == [], "nothing may be written off on an unanswered question"
+
+
+def test_a_candidate_that_IS_there_but_unreadable_keeps_the_window_shut(wired):
+    """The mutation the second probe exists to catch: same failing read, but
+    the object database does hold the commit. A moved base can still strand
+    it, so the affirmative answer wins over the failed read."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)
+    git = _FakeCheckout(
+        commits={"abc123def456"},
+        read_error=GitCommandError("cat-file", "abc123def456: unable to read"),
+    )
+
+    reasons, _notes = cli._merge_window_blockers(wired, set(), git)
 
     assert reasons and "would strand it" in reasons[0]
 

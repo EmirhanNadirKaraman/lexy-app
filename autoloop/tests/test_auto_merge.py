@@ -402,6 +402,65 @@ def test_a_deferred_merge_retries_after_the_next_completion(tmp_path):
     assert {e["data"]["task_id"] for e in h.entries("auto_merge_pushed")} == {"t1", "t2"}
 
 
+def test_a_pending_retry_survives_the_reconciliation_of_its_own_record(tmp_path):
+    """The other half of the drift, and where the two subsystems meet.
+
+    `_reconcile_published_execution` retires the record of a candidate the
+    remote confirms — right for a record nothing is reading anymore, wrong
+    while a deferral is still waiting to be drained from it. `AutoMerger.
+    attempt` loads `candidate_sha` / `worktree_path` / `intended_remote_ref`
+    back off the LIVE record; archive it and the next drain finds none, SKIPS
+    the task (which CLEARS the deferral), and the published branch stops being
+    retried — the unmerged backlog rebuilding one task at a time, with
+    auto-merge switched on and apparently working.
+
+    So the record is pinned until the retry drains, and this asserts the whole
+    way through: it survives reconciliation, and the merge it was holding open
+    still lands."""
+    h = build(tmp_path, per_task={"t1": {"a.py": "one\n"}, "t2": {"b.py": "two\n"}})
+    before = h.head()
+    h.orch._registry.add_many([Task(id="t9", title="in flight", description="d")])
+    h.orch._task_store.save(h.orch._registry)
+    in_flight(h.config, "t9", before)
+
+    record = h.push("t1")             # published, completed, integration deferred
+    assert [d.task_id for d in h.deferrals.all_deferrals()] == ["t1"]
+    assert record.published_sha == record.candidate_sha
+    assert record.review_round > 0, (
+        "round 0 would take the RE-BASE branch and never reach reconciliation"
+    )
+
+    # The base moves under that record — an operator merge, the situation
+    # `merge-window` exists for — and t1 is dispatched again.
+    (h.repo / "elsewhere.txt").write_text("someone else was here\n")
+    run_git(h.repo, "add", "-A")
+    run_git(h.repo, "commit", "-q", "-m", "the base moves on")
+
+    assert h.orch._rebase_execution_if_stale(
+        h.execution_store.load("t1"), h.tasks["t1"]
+    ) is None, "the dispatch stops either way"
+
+    pinned = h.execution_store.load("t1")
+    assert pinned is not None, "the retry has nothing to read without this record"
+    assert pinned.candidate_sha == record.candidate_sha
+    assert [d.task_id for d in h.deferrals.all_deferrals()] == ["t1"], "and the retry itself"
+    assert h.orch.state.park_kind in (None, ""), "pinning is not parking"
+
+    # The window opens, the next task completes, and the pinned retry drains.
+    (h.config.executions_dir / "t9.json").unlink()
+    second = h.push("t2")
+
+    after = h.head()
+    assert contains(h.repo, after, record.candidate_sha), "the PINNED task merged"
+    assert contains(h.repo, after, second.candidate_sha)
+    assert h.origin_base() == after, "and reached the remote"
+    assert h.deferrals.all_deferrals() == [], "the retry drained rather than being lost"
+    assert {e["data"]["task_id"] for e in h.entries("auto_merge_pushed")} == {"t1", "t2"}
+    assert h.entries("auto_merge_skipped") == [], (
+        "a skipped drain is how the deferral would have been silently discarded"
+    )
+
+
 def test_a_published_candidate_does_not_hold_the_window_shut(tmp_path):
     """The exemption that keeps this usable at all: a candidate already on its
     own side branch is durable there, so moving the base cannot discard it.

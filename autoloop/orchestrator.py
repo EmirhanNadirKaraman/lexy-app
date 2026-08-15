@@ -125,7 +125,7 @@ from urllib.parse import urlsplit
 
 from . import environment
 from . import escape_detector
-from .auto_merge import AutoMerger
+from .auto_merge import AutoMerger, MergeDeferral, MergeDeferralStore
 from .blockers import NO_TASK, BlockerStore
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
@@ -382,6 +382,14 @@ class Orchestrator:
         #: `--config` can put it anywhere. Only ever written through
         #: `config_writer`, which refuses git-tracked paths.
         self._config_path = Path(config_path) if config_path else config.state_dir / "config.toml"
+        #: Auto-merge's retry queue (`auto_merge.MergeDeferralStore`). Built
+        #: here rather than inside `_auto_merge_after_completion` because TWO
+        #: places need the same view of it: the merger itself, and
+        #: `_reconcile_published_execution`, which must not retire an execution
+        #: record while a deferral still depends on it (see that method). A
+        #: second store constructed at the other site would be the same
+        #: directory, but the coupling is deliberate enough to make explicit.
+        self._merge_deferrals = MergeDeferralStore(config.merge_deferrals_dir)
         self._client = None
 
     # ---- main loop ----------------------------------------------------------
@@ -3570,6 +3578,7 @@ class Orchestrator:
                 execution_store=self._execution_store,
                 registry=self._registry,
                 log=self._log,
+                deferrals=self._merge_deferrals,
             ).after_completion(task_id)
         except Exception as exc:      # noqa: BLE001 - bookkeeping must not undo a push
             self._log(
@@ -4138,9 +4147,39 @@ class Orchestrator:
         """
         return self.state.active_provider or self._config.conversation.provider
 
+    def _outstanding_merge_deferral(self, task_id: str) -> tuple[MergeDeferral | None, bool]:
+        """`(deferral, known)` — the task's undrained auto-merge retry, if any,
+        and whether the store could actually be read.
+
+        Fail-closed the way this file's other "may I discard something" checks
+        are: an unreadable or corrupt deferral answers `(None, False)`, which
+        every caller must treat as "assume one exists". A dropped retry is
+        indistinguishable from the unmerged-forever state auto-merge exists to
+        end (`MergeDeferralStore`'s own docstring makes the same argument for
+        raising on corruption), so guessing "there is none" is the one answer
+        that cannot be walked back.
+
+        `_merge_deferrals` is always set by `__init__`, but an Orchestrator
+        hand-built by a test via `__new__` may not have it; that reads as
+        unknown too, rather than as an absent deferral.
+        """
+        store = getattr(self, "_merge_deferrals", None)
+        if store is None:
+            return None, False
+        try:
+            return store.load(task_id), True
+        except (StateError, OSError) as exc:
+            self._log(
+                "merge_deferral_unreadable",
+                data={"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            return None, False
+
     def _reconcile_published_execution(self, execution: TaskExecution, task: Task) -> bool:
         """Did this record turn out to describe work that ALREADY SHIPPED? If
-        so, retire it and complete the task; True means the caller stops here.
+        so, complete the task and retire the record — or PIN it, when an
+        undrained auto-merge deferral is still reading from it (see below).
+        True either way, and it means the caller stops here.
 
         The other direction of the same drift `release` used to leave behind.
         The task lifecycle and the execution record are written in separate
@@ -4185,6 +4224,27 @@ class Orchestrator:
         the operator was about to answer. Retiring is only safe where completing
         is.
 
+        A record an OUTSTANDING MERGE DEFERRAL still depends on is pinned
+        instead of retired, and this is the one exemption that is about another
+        subsystem rather than about this one. `_dispatch_task_push` already
+        states the rule (see its "ADVANCED, not retired" comment): auto-merge
+        reads `candidate_sha` / `worktree_path` / `intended_remote_ref` back off
+        the live record, and a deferred merge is retried from that same record
+        on a later completion. Archive it here and the next drain finds no
+        record, `AutoMerger.attempt` SKIPS the task — which also CLEARS the
+        deferral — and published-but-unmerged work silently stops being retried.
+        That is the backlog auto-merge exists to end, rebuilt one task at a
+        time. So the pin: log it, complete the task (the same fresh `ls-remote`
+        that would have justified retiring justifies completing, and auto-merge
+        will only touch a COMPLETED task), and stop this dispatch without
+        parking. Retirement happens on a later dispatch, once the deferral has
+        drained — `_deferrals.clear` runs only on a merge that was pushed and
+        confirmed, or on a task the merger has explicitly written off.
+
+        Parking instead would be worse than doing nothing: its message asks the
+        operator to publish, abandon, or ARCHIVE the record, and archiving is
+        precisely the action that strands the deferral.
+
         Retirement uses the SAME `retire_execution` as `release`: record and
         worker filed away together under one label, nothing deleted, so the
         candidate stays recoverable even though it is also on the remote.
@@ -4207,6 +4267,21 @@ class Orchestrator:
             return False
         if landed != candidate:
             return False
+
+        deferral, deferral_known = self._outstanding_merge_deferral(task.id)
+        if deferral is not None or not deferral_known:
+            self._log(
+                "execution_retire_pinned_by_deferral",
+                data={
+                    "task_id": task.id,
+                    "candidate_sha": candidate,
+                    "deferral_reason": deferral.reason if deferral is not None else "",
+                    "deferral_attempts": deferral.attempts if deferral is not None else 0,
+                    "known": deferral_known,
+                },
+            )
+            self._mark_task_completed(task.id)
+            return True
 
         try:
             retired = retire_execution(

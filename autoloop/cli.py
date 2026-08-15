@@ -1888,6 +1888,17 @@ def _candidate_is_retired(config, registry, task_id, record, git) -> str:
        any other reason — reports `""` and keeps the window shut, matching
        `_candidate_publication`'s fail-closed rule.
 
+       That last clause is why the failure of `read_commit` is NOT the answer
+       on its own. `cat-file commit` dies with the same status for a missing
+       object, a corrupt one, an I/O error and a policy refusal, so "it raised"
+       proves only that the question went unanswered — and writing a record off
+       on it would hand the merge window an unreachable-looking candidate
+       whenever the repository was merely having a bad day. So a raise here
+       leads to ONE more question, `GitGateway.object_exists`, which answers
+       True/False only from `cat-file -e`'s exit code and raises on anything
+       ambiguous. Only an explicit False — git itself saying the object
+       database does not hold this commit — writes the record off.
+
     That combination is what `release` leaves behind, and it is provably not
     in-flight. Fourteen such records held the window shut on 2026-08-15 (see
     `worktask.retire_execution`). `release` now retires the record itself, so
@@ -1915,12 +1926,18 @@ def _candidate_is_retired(config, registry, task_id, record, git) -> str:
         return ""       # the repository cannot answer; that is not an answer
     try:
         gateway.read_commit(candidate)
+        return ""       # resolvable here: a moved base could still strand it
     except (GitError, OSError):
-        return (
-            f"its worker repo {worktree_path} is gone and the checkout cannot "
-            f"resolve {candidate[:12]}"
-        )
-    return ""
+        pass
+    try:
+        if gateway.object_exists(candidate):
+            return ""   # the object is there; reading it merely failed
+    except (GitError, OSError):
+        return ""       # corruption, I/O, a policy refusal — still not an answer
+    return (
+        f"its worker repo {worktree_path} is gone and the checkout cannot "
+        f"resolve {candidate[:12]}"
+    )
 
 
 def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list[str]]:

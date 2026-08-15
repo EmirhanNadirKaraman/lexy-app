@@ -197,6 +197,16 @@ was" is not "we know it is gone"). It is reported as a `note:`, never hidden:
 `release` retires its record now, so seeing one means something should have
 been retired and was not.
 
+The third condition is answered by git and by nothing else, and only when git
+actually answers. `read_commit` failing is not that answer — `cat-file commit`
+dies the same way for a missing object, a corrupt one, an I/O error and a
+policy refusal — so a failed read leads to one further question,
+`GitGateway.object_exists`, which reports True/False from `cat-file -e`'s exit
+code (0 present, 1 absent) and raises on anything else. Only an explicit
+"the object database does not hold this" writes a record off; every other
+outcome keeps the window shut, the same fail-closed rule publication checking
+follows.
+
 The intended workflow:
 
 ```bash
@@ -252,6 +262,22 @@ for the next pass — turning it into a park would stop a working loop over a
 step that can simply happen later. **A deferred merge is a normal state.**
 Deferrals live in `<state_dir>/merge-deferrals/`, one file per task, and
 survive a `reset` for the same reason blockers do.
+
+**A deferral pins its execution record.** The retry is drained from that
+record — `AutoMerger.attempt` reads `candidate_sha`, `worktree_path` and
+`intended_remote_ref` back off the live file — so anything that retires the
+record while a deferral is outstanding silently ends the retry: the next drain
+finds no record, *skips* the task, and clearing the deferral is part of
+skipping. `_dispatch_task_push` states this where it advances the record rather
+than retiring it, and `orchestrator._reconcile_published_execution` honours the
+same rule: a record it would otherwise retire as "already shipped" is kept
+(logged `execution_retire_pinned_by_deferral`), the task is completed so the
+merger will still touch it, and the dispatch stops without parking — the park
+it would otherwise take asks the operator to archive that very record.
+Retirement happens on a later dispatch, once the merge has been pushed and
+confirmed and the deferral is gone. An unreadable deferral store counts as
+"one is outstanding": a dropped retry is indistinguishable from work that was
+never merged.
 
 A merge command returning 0 is not evidence: after the merge the head must
 have moved, must contain the candidate, must still contain the previous base,
