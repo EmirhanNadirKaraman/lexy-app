@@ -2479,6 +2479,13 @@ class Orchestrator:
         only `_restore_send_marks`, and only where the send is proven to have
         left nothing behind.
         """
+        # Armed BEFORE anything else and OUTSIDE the try, because this sets up
+        # an OBSERVATION rather than performing part of the send: if arming
+        # fails there is simply no observation, and the pessimistic reading
+        # below stands. Nothing durable has been written at this point, so an
+        # arm that raises leaves `req` untouched and `attempt.marked` False —
+        # the state a move that never reached its transport should be in.
+        armed = self._arm_send_probe(client)
         attempt.prior_send_attempted = req.send_attempted
         attempt.prior_outcome = req.last_send_outcome
         attempt.marked = True
@@ -2488,16 +2495,29 @@ class Orchestrator:
         try:
             result = client.submit(req.request_id, prompt)
         except (BrowserError, AutoloopError):
-            # The same probe the ordinary send path uses, and pessimistic in the
-            # same direction: a transport that does not report the fact is
-            # assumed to have clicked Send. Consulted ONLY here — the flag is
-            # sticky across requests, so reading it after a failure that never
-            # reached this call would report a send from some earlier round.
-            if getattr(client, "send_attempted", True):
-                attempt.certainty = SendCertainty.POSSIBLE
-            else:
+            # Pessimistic in the same direction as the ordinary send path: a
+            # transport that cannot report the fact is assumed to have clicked
+            # Send.
+            #
+            # `armed` is what makes the flag evidence about THIS call. On its
+            # own `send_attempted` says only "a send was clicked" — nothing
+            # about which one — so in a process where an earlier round sent
+            # successfully, a transport that does not clear it per call reports
+            # that earlier send here. This submit can be entered and still fail
+            # before its click (composer focus, the input-sync readback, the
+            # send-ready wait), and reading a stale True for one of those would
+            # call a provably-unsent retirement `possible`: the loop would park
+            # `retirement_send_ambiguous` instead of restoring the marks and
+            # carrying on in the old thread — precisely the working-but-slow
+            # loop this whole reflex exists to keep running.
+            #
+            # UNSENT therefore requires a live observation, never an absence of
+            # one. No capability, a failed arm, or a flag that is set: POSSIBLE.
+            if armed and not getattr(client, "send_attempted", True):
                 attempt.certainty = SendCertainty.UNSENT
                 self._restore_send_marks(req, attempt)
+            else:
+                attempt.certainty = SendCertainty.POSSIBLE
             raise
         if result in (SubmitResult.CONFIRMED, SubmitResult.ALREADY_PERSISTED):
             attempt.certainty = SendCertainty.PERSISTED
@@ -2512,6 +2532,43 @@ class Orchestrator:
             attempt.certainty = SendCertainty.POSSIBLE
         self._store.save(self.state)
         return result
+
+    @staticmethod
+    def _arm_send_probe(client) -> bool:
+        """Clear the transport's send marker so reading it after a failed
+        `submit()` describes THAT call, and report whether that succeeded.
+
+        Probed with `getattr`, exactly like `retarget` / `current_url` /
+        `reconcile_no_response` / `find_conversation_with`: a transport without
+        the capability contributes no observation and the caller stays
+        pessimistic. False therefore means "this reading cannot be trusted to
+        be about one invocation", which covers both the absent method and an
+        arm that raised — an arm that failed is not an arm.
+
+        Deliberately not used by `_step_submitting`'s ordinary send, which
+        reads the same flag at a lower stake: a misread there parks
+        `submission_ambiguous`, the same pessimistic direction, and that path
+        has no carry-on to protect. A retirement's whole purpose is to keep
+        working in the old thread when nothing was sent, so it is the one
+        caller that needs the stronger evidence.
+
+        ROTATION shares `_submit_into_replacement` and so is armed too, though
+        it never reads `MoveAttempt.certainty` — it parks on any failed move.
+        The one visible effect there is the restore: a rotation whose submit
+        provably never clicked now gives the request back the marks it arrived
+        with, rather than leaving the move's placeholder `unknown` outcome on
+        top of them. That is the direction `_step_submitting` already argues
+        for — a resumed run should meet the same evidence the live one had,
+        instead of a disproven send silently downgraded to ambiguous.
+        """
+        arm = getattr(client, "begin_send_probe", None)
+        if arm is None:
+            return False
+        try:
+            arm()
+        except (BrowserError, AutoloopError):
+            return False
+        return True
 
     @staticmethod
     def _url_in_project(candidate: str, project_url: str) -> bool:

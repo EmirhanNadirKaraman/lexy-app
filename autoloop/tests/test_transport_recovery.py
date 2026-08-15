@@ -128,6 +128,16 @@ class RotatingFakeClient:
         return None
 
     # -- LLMConversation surface -------------------------------------------
+    def begin_send_probe(self):
+        """Clear the send marker, as `BrowserChatGPT.begin_send_probe` does.
+
+        This double's `send_attempted` is otherwise STICKY — `submit()` sets it
+        and nothing ever clears it — which models the pessimistic case exactly
+        and is why the flag needs arming to be read as evidence about a single
+        call.
+        """
+        self.send_attempted = False
+
     def attach(self):
         self.attach_calls += 1
         if self.attach_errors:

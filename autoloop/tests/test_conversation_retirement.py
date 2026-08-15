@@ -345,13 +345,15 @@ def test_a_retirement_that_provably_sent_nothing_carries_on(tmp_path):
     assert [url for url, _rid, _p in client.submitted] == [CONV_URL]
 
 
-def test_a_pre_send_failure_after_an_earlier_successful_send_still_carries_on(tmp_path):
-    """`send_attempted` on the transport is STICKY — it stays True for the rest
-    of the process once any send is clicked. Reading it after a failure that
-    never reached the submit would report a send from an earlier round, park a
-    loop whose thread is merely slow, and destroy the carry-on this whole
-    reflex exists for. So certainty comes from the move's own position, and the
-    flag is consulted only around the one call that can set it."""
+def test_a_failure_before_the_submit_is_reached_carries_on(tmp_path):
+    """The move died on a step BEFORE its transport was handed anything, so no
+    reading of any flag is involved: certainty comes from the move's own
+    position, and `unsent` is simply where it starts.
+
+    The transport's `send_attempted` is True on the way in — what an earlier
+    successful round in the same process leaves behind — and must not be
+    consulted here. It says a send was clicked; it does not say which one, and
+    this move clicked nothing."""
 
     class RetargetDies(RotatingFakeClient):
         def retarget(self, url):
@@ -371,6 +373,57 @@ def test_a_pre_send_failure_after_an_earlier_successful_send_still_carries_on(tm
     assert failed and failed[-1]["data"]["send_certainty"] == "unsent"
     # The round went ahead in the old thread, which is only correct because the
     # move never reached its submit.
+    assert [url for url, _rid, _p in client.submitted] == [CONV_URL]
+
+
+def test_a_pre_send_failure_inside_the_submit_of_a_process_that_already_sent(tmp_path):
+    """The boundary between the two cases above, and the one the send probe
+    exists for.
+
+    A `submit()` can be ENTERED and still fail before its click — composer
+    focus, the input-sync readback, the send-ready wait all sit in front of it —
+    while this process clicked Send in an earlier round, so the transport's flag
+    is already True on the way in. Read as-is, that stale True would call a
+    provably-unsent retirement `possible`, park `retirement_send_ambiguous`, and
+    stop a loop whose thread is merely slow — the exact outcome the carry-on
+    rule exists to prevent, arrived at through a flag describing a different
+    request.
+
+    Armed immediately before the call, the flag reports THIS invocation, which
+    never clicked, so the marks are restored and the round proceeds in the old
+    thread."""
+    seen = {}
+
+    class SnapshotsTheMarksBeforeTheOldChatIsUsed(RetireSendNeverHappens):
+        def reconcile(self, request_id):
+            # `submitting`'s pre-send reconcile of the OLD conversation is the
+            # first thing after the failed retirement, and the last moment the
+            # restored marks are observable: the ordinary send re-marks them a
+            # few lines later. Read from DISK, because a restore that lives only
+            # in a live object would not survive the crash the marks are for.
+            if self.conversation_url == CONV_URL and "marks" not in seen:
+                seen["marks"] = StateStore(config.state_file).load().pending_request
+            return super().reconcile(request_id)
+
+    client = SnapshotsTheMarksBeforeTheOldChatIsUsed(responses=[stop_block()])
+    # Exactly what an earlier successful round in the same process leaves behind
+    # on a transport that does not clear the flag per call.
+    client.send_attempted = True
+    orch, _store, config = build(tmp_path, client, state=degraded_state())
+
+    orch.run(max_steps=1)
+
+    failed = transcript_entries(config, "retirement_failed")
+    assert failed and failed[-1]["data"]["send_certainty"] == "unsent"
+    # The pessimistic marks the move wrote are given back, on disk.
+    assert seen["marks"].send_attempted is False
+    assert seen["marks"].last_send_outcome == ""
+    # Not parked, and specifically not parked as an unaccounted-for send.
+    assert orch.state.phase != Phase.NEEDS_USER.value
+    assert transcript_entries(config, "retirement_send_ambiguous") == []
+    # And the request was posted exactly once, into the conversation it was
+    # already bound to. Restoring the marks is what makes this legal: left set,
+    # `submitting` would have parked on them instead.
     assert [url for url, _rid, _p in client.submitted] == [CONV_URL]
 
 

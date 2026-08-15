@@ -295,6 +295,33 @@ class BrowserChatGPT:
         """
         return self._send_attempted
 
+    def begin_send_probe(self) -> None:
+        """Clear the send marker so the next read describes ONE `submit()`.
+
+        `send_attempted` on its own answers "was Send ever clicked", and a
+        caller cannot tell from the outside which call it is answering about.
+        `submit()` happens to clear it on entry, but that is an implementation
+        detail of this class — a caller relying on it is relying on something
+        no other transport promises, and the in-memory doubles in the test
+        suite genuinely do not: their flag stays True for the life of the
+        object.
+
+        So the property is declared here instead. Arm it immediately before a
+        `submit()` and the flag afterwards is evidence about THAT invocation:
+        False means this call never reached its click. That distinction is what
+        lets a retirement whose move failed at the composer carry on in the old
+        thread rather than park a loop that is merely slow (see
+        `Orchestrator._submit_into_replacement`) — and a transport that does not
+        declare this method simply does not get the distinction, and is treated
+        pessimistically.
+
+        Deliberately narrow: only the send marker. `_observations` and
+        `_send_outcome` describe the network verdict, which nothing reads
+        through this probe, and clearing them here would mean two places reset
+        the same diagnostics.
+        """
+        self._send_attempted = False
+
     # ---- conversation reads -------------------------------------------------
 
     def messages(self) -> list[Message]:

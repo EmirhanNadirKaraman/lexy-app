@@ -2134,9 +2134,21 @@ worst possible place to start.
 So the move records what it is KNOWN to have done, as it does it
 (`SendCertainty` on a `MoveAttempt`, written by `_submit_into_replacement`),
 because the exception says which step died and nothing about what the earlier
-ones left behind. Certainty comes from the move's own position — the transport's
-`send_attempted` flag is sticky for the life of the process, so it is consulted
-only inside the `except` around the one call that can set it:
+ones left behind. Certainty comes from the move's own position: a failure on a
+step before the submit is `unsent` without consulting anything, because nothing
+was handed to the transport.
+
+Inside the submit the position is not enough — a `submit()` can be entered and
+still fail before its click (composer focus, the input-sync readback, the
+send-ready wait) — so that one call is wrapped in an `except` that asks the
+transport. It asks with a **probe armed immediately beforehand**
+(`begin_send_probe()`, `Orchestrator._arm_send_probe`), because
+`send_attempted` on its own answers "was Send ever clicked", not "did THIS call
+click": in a process where an earlier round sent successfully, a transport that
+does not clear it per call reports that earlier send. Reading it unarmed would
+mark a provably-unsent retirement `possible` and park a merely-slow loop.
+`unsent` therefore requires a live observation and never the absence of one — no
+capability, an arm that raised, or a flag that is set all give `possible`.
 
 | Certainty | Meaning | Outcome |
 |---|---|---|
