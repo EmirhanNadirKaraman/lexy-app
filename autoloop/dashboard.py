@@ -30,6 +30,14 @@ is actually in the branch. `completed` means published, not integrated, and the
 difference is where finished work goes missing — see `merge_report` /
 `is_ancestor` below, which ask git rather than the registry, and which read
 nothing the rest of this module does not already read.
+
+The roadmap is grouped by `TaskRegistry.state_of()` and by nothing else (see
+`GROUPS` / `task_groups`). That is a correctness rule rather than a style
+choice: `ready` vs `blocked` is DERIVED from dependencies and never stored, and
+a stored `status="blocked"` means QUARANTINED — so a page that read the status
+string would disagree with the code that dispatches, in both directions at
+once. Constructing a registry is a pure read; no mutating registry method is
+called from here, and no lock is taken.
 """
 
 from __future__ import annotations
@@ -43,6 +51,9 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from .errors import StateError, TaskGraphError
+from .tasks import TaskRegistry, TaskState
 
 #: Reserved status roles (dataviz palette). Never reused for anything else, and
 #: every use in the page ships an icon + label so state is never colour-alone.
@@ -614,23 +625,38 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
     return out
 
 
+def _executions(repo: Path) -> dict:
+    """`{task_id: record}` for every LIVE execution record.
+
+    `glob("*.json")`, deliberately NOT `rglob`: `worktask.retire_execution`
+    files a retired record one level down in `executions/archive/`, and that
+    non-recursion is what actually takes it out of everything reading this
+    directory (`worktask.py:357` says so in as many words). Recursing here
+    would resurrect retired candidates in both callers at once.
+
+    A corrupt record is skipped, never raised — a tracker that 500s because one
+    record is half-written tells the operator nothing.
+    """
+    out: dict = {}
+    directory = repo / ".autoloop" / "executions"
+    if not directory.is_dir():
+        return out
+    for path in sorted(directory.glob("*.json")):
+        record = _json(path)
+        if isinstance(record, dict):
+            out[str(record.get("task_id") or path.stem)] = record
+    return out
+
+
 def merge_report(repo: Path, roadmap: list[dict], head: str,
-                 remote_ok: bool, refs: list[dict], branch: str) -> dict:
+                 remote_ok: bool, refs: list[dict], branch: str,
+                 executions: dict) -> dict:
     """The payload the page renders: rows plus a count per state.
 
-    Read-only and lock-free, like everything else here: the execution records
-    are read as plain JSON (a corrupt one is skipped, never raised — a tracker
-    that 500s because one record is half-written tells the operator nothing),
-    and every git call is a local read.
+    Read-only and lock-free, like everything else here: `executions` is read by
+    `_executions` as plain JSON and every git call is a local read.
     """
     completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
-    executions = {}
-    records_dir = repo / ".autoloop" / "executions"
-    if records_dir.is_dir():
-        for path in sorted(records_dir.glob("*.json")):
-            record = _json(path)
-            if isinstance(record, dict):
-                executions[str(record.get("task_id") or path.stem)] = record
     rows = merge_states(
         completed, executions, remote_ok,
         {r["ref"]: r.get("full") or r.get("sha") or "" for r in refs},
@@ -643,6 +669,164 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
         "counts": {s: sum(1 for r in rows if r["state"] == s) for s in MERGE_STATES},
         "rows": rows,
     }
+
+
+# ---- the roadmap, grouped by state -------------------------------------------
+#
+# One flat list of 20+ tasks answers none of the three questions an operator
+# actually has — what is moving, what needs me, what is next — so the list is
+# split by state, each group counted under its own heading.
+#
+# `TaskRegistry.state_of()` is the ONLY source of that state. Re-deriving it
+# from the stored `status` string would disagree with the code that dispatches,
+# in both directions at once: READY vs BLOCKED is derived from dependencies and
+# is never stored at all, and a stored `status="blocked"` means QUARANTINED
+# (`TaskState.BLOCKED_BY_OPERATOR`), which is the opposite kind of problem from
+# "waiting on a dependency" — one needs an operator answer, the other resolves
+# itself. Sending someone to `autoloop answer` for a task that is merely queued
+# behind another is exactly the confusion this panel exists to remove.
+
+#: The groups, in the order the page lists them, each pinned to the `TaskState`
+#: it renders. The order is the order an operator triages in: act on it, decide
+#: it, expect it, understand why it is stuck, and only then history.
+GROUPS: tuple[tuple[str, str, TaskState], ...] = (
+    ("in_progress", "In progress", TaskState.IN_PROGRESS),
+    ("needs_human", "Needs a human", TaskState.BLOCKED_BY_OPERATOR),
+    ("ready", "Ready", TaskState.READY),
+    ("blocked", "Blocked", TaskState.BLOCKED),
+    ("done", "Done", TaskState.COMPLETED),
+)
+
+#: The group that renders even when it is empty, and says `none` in as many
+#: words. Silence and "nothing needs you" must not look identical: a hidden
+#: group is indistinguishable from a section that failed to render, and this is
+#: the one group whose emptiness IS the answer the operator came for.
+ALWAYS_SHOWN = frozenset({"needs_human"})
+
+#: Collapsed behind a `<details>`, with its count in the summary. Only `done`,
+#: which only ever grows — an operator scrolling past 40 finished tasks to
+#: reach the four that matter is the flat list's failure repeated inside the
+#: fix.
+COLLAPSED = frozenset({"done"})
+
+
+def _ready_order(registry: TaskRegistry) -> list:
+    """The READY tasks in the order `next_ready()` would pick them.
+
+    The same key that method uses — `(priority, id)`, ascending — and
+    deliberately NOT a simulation of it: replaying successive picks means
+    COMPLETING tasks, and this page may not call a mutating registry method (it
+    holds no lock and must never write). The duplicated key is pinned instead
+    by `test_the_ready_group_is_in_next_ready_order`, which runs the real
+    `next_ready()` / `mark_completed()` loop on a registry of its own and
+    demands the same sequence — so changing that key fails there rather than
+    quietly showing an order the loop does not follow.
+    """
+    return sorted(registry.ready_tasks(), key=lambda t: (t.priority, t.id))
+
+
+def _in_progress_detail(record: dict) -> str:
+    """What an operator acts on: the commit under review, and which round.
+
+    Both come from the loop's own bookkeeping (`worktask.TaskExecution`), never
+    from anything an agent reported about itself. A record carrying neither
+    says so rather than rendering blank — a task dispatched two minutes ago has
+    genuinely not committed anything yet, and empty space reads as a missing
+    feature.
+    """
+    sha = str(record.get("candidate_sha") or "")[:12]
+    review_round = record.get("review_round")
+    bits = []
+    if sha:
+        bits.append(f"candidate {sha}")
+    if review_round is not None and str(review_round).strip():
+        bits.append(f"review round {review_round}")
+    return " · ".join(bits) or "no candidate committed yet"
+
+
+def _blocked_detail(registry: TaskRegistry, task) -> str:
+    """Which dependency is holding this task up. "Blocked" without saying by
+    what is not actionable — it is the difference between a fact and a chore.
+
+    Incompleteness is asked of `state_of` rather than of the dependency's
+    status string, for the same reason the groups are: a dependency that is
+    itself quarantined is not completed either, and only one of those two
+    readings survives a task being blocked behind a blocked task.
+    """
+    waiting = [
+        dep for dep in task.depends_on
+        if registry.state_of(dep) is not TaskState.COMPLETED
+    ]
+    return ("waiting on " + ", ".join(waiting)) if waiting else "waiting on a dependency"
+
+
+def _group_detail(key: str, task, index: int, registry: TaskRegistry,
+                  executions: dict) -> str:
+    if key == "in_progress":
+        return _in_progress_detail(executions.get(task.id) or {})
+    if key == "needs_human":
+        # `block()` always records a reason, so an empty one means a
+        # hand-edited or pre-`blocked_reason` file — say which rather than
+        # rendering a quarantined task with nothing beside it.
+        return task.blocked_reason or "no reason recorded"
+    if key == "blocked":
+        return _blocked_detail(registry, task)
+    if key == "ready" and index == 0:
+        return "next to be dispatched"
+    return ""
+
+
+def _grouped(registry: TaskRegistry, executions: dict) -> list[dict]:
+    states = {task.id: registry.state_of(task.id) for task in registry.all_tasks()}
+    ready = _ready_order(registry)
+    groups = []
+    for key, label, state in GROUPS:
+        members = ready if key == "ready" else sorted(
+            (t for t in registry.all_tasks() if states[t.id] is state),
+            key=lambda t: (t.priority, t.id),
+        )
+        tasks = [
+            {"id": task.id, "title": task.title, "priority": task.priority,
+             "detail": _group_detail(key, task, index, registry, executions)}
+            for index, task in enumerate(members)
+        ]
+        groups.append({
+            "key": key, "label": label, "state": state.value, "count": len(tasks),
+            # The hide/show policy lives HERE rather than in the template, so
+            # "an empty `Needs a human` is still rendered" is a fact a test can
+            # assert about the payload instead of a substring of a script. It
+            # governs the INLINE groups only: a collapsed group is a disclosure
+            # that always renders its count, and `Done (0)` costs one line.
+            "hidden": not tasks and key not in ALWAYS_SHOWN and key not in COLLAPSED,
+            "collapsed": key in COLLAPSED,
+            "tasks": tasks,
+        })
+    return groups
+
+
+def task_groups(tasks_data: dict, executions: dict) -> list[dict]:
+    """The roadmap split into `GROUPS`, in order, each with its count.
+
+    Pure and read-only: it builds a `TaskRegistry` from the same JSON the loop
+    persists and asks it, which is a constructor plus lookups. No mutating
+    registry method is reachable from here, and nothing is written.
+
+    An EMPTY list means the task graph could not be read at all — a roadmap
+    with no tasks in it still returns all five groups, zeroed, so the two
+    cannot be confused. Anything unparseable lands here: a record shaped for a
+    different schema, a dependency naming a task that does not exist (which
+    `from_dict` tolerates and `state_of` then raises on). The page says so in
+    those words, because "no tasks" and "unreadable" call for opposite
+    reactions, and the flat `roadmap` list still renders from the raw JSON
+    beside it.
+    """
+    try:
+        registry = TaskRegistry.from_dict(
+            {"tasks": list((tasks_data or {}).get("tasks") or ())}
+        )
+        return _grouped(registry, executions or {})
+    except (StateError, TaskGraphError, AttributeError, KeyError, TypeError, ValueError):
+        return []
 
 
 def pipeline(state: dict, agents: list, blockers: list) -> list[dict]:
@@ -785,6 +969,11 @@ def collect(repo: Path) -> dict:
             "priority": t.get("priority", 100),
         })
     roadmap.sort(key=lambda r: (r.get("priority", 100), r.get("id") or ""))
+    # Read ONCE and shared: the grouped roadmap and the merge panel ask the
+    # same records different questions (which commit is under review now, which
+    # commit landed), and two globs of the same directory could disagree
+    # mid-write.
+    executions = _executions(repo)
 
     # --- recent events --------------------------------------------------
     events = []
@@ -835,12 +1024,17 @@ def collect(repo: Path) -> dict:
         "events": events,
         "blockers": blockers,
         "roadmap": roadmap,
+        # The same tasks, split by `TaskRegistry.state_of()`. `roadmap` stays
+        # the flat, tolerant read of the raw JSON — the app-task panel joins
+        # against it, and it still renders when the graph itself does not load.
+        "groups": task_groups(tasks, executions),
         "inbox": _pending_inbox(repo),
         "app_tasks": app_tasks(repo),
         "pipeline": pipeline(state, live_agents_cache, blockers),
         # Completed is not integrated: which finished tasks are actually in the
         # branch, decided by git ancestry rather than by their status.
-        "merge": merge_report(repo, roadmap, head, remote_ok, remote_refs, branch),
+        "merge": merge_report(repo, roadmap, head, remote_ok, remote_refs, branch,
+                              executions),
         "git": {"branch": branch, "head": head[:12], "dirty": dirty, "remote": remote_refs},
         "served_at": time.strftime("%H:%M:%S"),
         # `stale` means the file on disk has changed since this process
@@ -923,6 +1117,13 @@ code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);
 .legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;font-size:12px;color:var(--ink2)}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .legend i{width:10px;height:10px;border-radius:50%;display:inline-block;font-style:normal}
+/* Roadmap group headings. The count sits IN the heading rather than under it:
+   "Needs a human 0" is the whole sentence an operator came to read, and a
+   number one line away from its label is a number nobody reads. */
+h3.gh{font-size:11px;margin:16px 0 6px;color:var(--ink);font-weight:600;
+      text-transform:uppercase;letter-spacing:.06em}
+h3.gh:first-child{margin-top:0}
+.gc{color:var(--ink2);font-weight:400;font-variant-numeric:tabular-nums}
 details{margin-top:10px}
 summary{font-size:12px;color:var(--ink2);cursor:pointer}
 summary:hover{color:var(--ink)}
@@ -1007,9 +1208,24 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       the repository would not read); it is never reported as not-merged.</p>
   </section>
 
+  <!-- Grouped by state, in triage order. `Done` is a <details> in STATIC
+       markup rather than inside the container `render()` rebuilds, for the
+       same reason `#flowtable` is: expanding it would otherwise snap shut on
+       the next payload change. Only its summary text and its rows are
+       rewritten, so it starts collapsed on load and stays where the operator
+       put it after that. -->
   <section>
-    <h2>Roadmap — set priority, then Save</h2>
+    <h2>Roadmap — grouped by state; set priority, then Save</h2>
     <div id="roadmap" class="scroll"></div>
+    <details id="donebox">
+      <summary id="donesum">✓ Done</summary>
+      <div id="done" class="scroll"></div>
+      <p class="muted" style="font-size:12px;margin:9px 0 0">
+        Done means the reviewed candidate landed on the task's OWN side branch
+        (AUTOLOOP_TODO B10) — published, not merged into this branch. Whether
+        the work is actually here is a different question, answered by the
+        merged-into-the-branch panel above.</p>
+    </details>
     <div id="queued" class="muted" style="font-size:12px;margin-top:9px"></div>
   </section>
 
@@ -1238,25 +1454,56 @@ function render(d, force){
         <td class="muted">${esc(r.detail)}</td></tr>`;
     }).join(""));
 
-  // ---- roadmap priority editor ------------------------------------------
-  // Writes go to the task INBOX, never to tasks.json: the loop is the only
-  // registry writer, and a write into .autoloop/ mid-run would trip the
-  // escape detector. So a Save is "queued", applied on the loop's next run.
-  const RS = {completed:["\u2713","done"],in_progress:["\u25b6","in progress"],
-              blocked:["\u25a0","blocked"],blocked_by_operator:["\u25a0","quarantined"],
-              pending:["\u25cb","queued"]};
-  document.getElementById("roadmap").innerHTML = rows(["task","priority","state","title"],
-    (d.roadmap||[]).map(t => {
-      const [ic,word] = RS[t.status] || RS.pending;
-      return `<tr><td><code>${esc(t.id)}</code></td>
-        <td><input class="pri" type="number" step="1" value="${esc(t.priority)}"
-             data-id="${esc(t.id)}" aria-label="priority for ${esc(t.id)}">
-            <button class="save" data-id="${esc(t.id)}">Save</button>
-            <span class="note" data-id="${esc(t.id)}"></span></td>
-        <td>${esc(ic)} ${esc(word)}</td>
-        <td>${esc((t.title||"").slice(0,80))}</td></tr>`;
-    }).join(""))
-    + `<p class="muted" style="font-size:12px;margin:9px 0 0">Lower number runs first; 100 is the default. Saved changes queue in the inbox and apply on the loop's next run.</p>`;
+  // ---- roadmap, grouped by state ----------------------------------------
+  // Every group here was decided by `TaskRegistry.state_of()` on the backend \u2014
+  // the same function the loop dispatches on. NOTHING in this block reads a
+  // status string: `blocked` on disk means QUARANTINED, while the Blocked
+  // group means "waiting on an incomplete dependency", and a page that mixed
+  // those up would send an operator to answer a blocker that does not exist.
+  //
+  // Priority editing is unchanged: writes go to the task INBOX, never to
+  // tasks.json \u2014 the loop is the only registry writer, and a write into
+  // .autoloop/ mid-run would trip the escape detector. A Save is "queued".
+  const GICON = {in_progress:"\u25b6", needs_human:"\u25a0", ready:"\u25cb", blocked:"\u25cd", done:"\u2713"};
+  const groups = d.groups || [];
+  const priCell = t => `<input class="pri" type="number" step="1" value="${esc(t.priority)}"
+         data-id="${esc(t.id)}" aria-label="priority for ${esc(t.id)}">
+        <button class="save" data-id="${esc(t.id)}">Save</button>
+        <span class="note" data-id="${esc(t.id)}"></span>`;
+  const groupRows = g => rows(["task","priority","title","detail"], g.tasks.map(t =>
+    `<tr><td><code>${esc(t.id)}</code></td><td>${priCell(t)}</td>
+      <td>${esc((t.title||"").slice(0,70))}</td>
+      <td class="muted">${esc(t.detail || "\u2014")}</td></tr>`).join(""));
+  const board = document.getElementById("roadmap");
+  if (!groups.length) {
+    // A roadmap with no tasks still renders five zeroed groups, so an empty
+    // list can only mean the graph itself did not load. Say which: "no tasks"
+    // and "unreadable" call for opposite reactions.
+    board.innerHTML = `<p class="empty">the task graph could not be read \u2014 `
+      + `tasks.json did not load as a registry, so nothing here is grouped. `
+      + `The tasks themselves are still listed by the loop's own commands.</p>`;
+  } else {
+    // `hidden` is the backend's call, not this template's: an empty group is
+    // dropped EXCEPT "Needs a human", which renders and says none. Silence and
+    // "nothing needs you" must not look the same.
+    board.innerHTML = groups.filter(g => !g.collapsed && !g.hidden).map(g =>
+      `<h3 class="gh">${esc(GICON[g.key] || "\u00b7")} ${esc(g.label)} `
+      + `<span class="gc">${esc(g.count)}</span></h3>` + groupRows(g)).join("")
+      + `<p class="muted" style="font-size:12px;margin:9px 0 0">Lower number runs `
+      + `first; 100 is the default. Ready is listed in the order the loop would `
+      + `pick it. Saved changes queue in the inbox and apply on the loop's next run.</p>`;
+  }
+  // Collapsed, counted, and never carrying a priority input: the per-render
+  // Save binding below is scoped to #roadmap, so a button here would render
+  // with no listener \u2014 and re-prioritising a finished task means nothing.
+  const gDone = groups.find(g => g.collapsed);
+  document.getElementById("donesum").textContent =
+    gDone ? `\u2713 Done (${gDone.count})` : "\u2713 Done";
+  document.getElementById("done").innerHTML = gDone
+    ? rows(["task","title"], gDone.tasks.map(t =>
+        `<tr><td><code>${esc(t.id)}</code></td>
+          <td>${esc((t.title||"").slice(0,70))}</td></tr>`).join(""))
+    : `<p class="empty">unknown</p>`;
 
   // SCOPED to #roadmap on purpose. These rows are rebuilt as fresh DOM on every
   // render, so rebinding them each time is free — but the new-task form's

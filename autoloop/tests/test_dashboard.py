@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from autoloop.dashboard import (
+    GROUPS,
     MARKS,
     PAGE,
     STATUS,
@@ -26,9 +27,11 @@ from autoloop.dashboard import (
     is_ancestor,
     merge_states,
     pipeline,
+    task_groups,
     worker_progress,
 )
 from autoloop.state import utcnow_iso
+from autoloop.tasks import TaskRegistry, TaskState
 
 
 @pytest.fixture(autouse=True)
@@ -1003,3 +1006,232 @@ def test_the_unmerged_count_is_a_stat_tile_not_only_a_table_row():
     merge_marks = PAGE.split("const MS = {", 1)[1].split("};", 1)[0]
     for state in ("merged", "unmerged", "unpublished", "unknown"):
         assert f"{state}:[" in merge_marks.replace(" ", "")
+
+
+# ---- the roadmap, grouped by state (2026-08-15) -------------------------------
+#
+# One flat list of 20+ tasks answers none of the three questions an operator has
+# — what is moving, what needs me, what is next. The grouping is only as good as
+# its source, so the load-bearing property is that every group comes from
+# `TaskRegistry.state_of()`: `pending` on disk covers BOTH Ready and Blocked (the
+# difference is derived from dependencies and never stored), and a stored
+# `blocked` means QUARANTINED, which is the opposite kind of problem from waiting
+# on a dependency. A page reading the status string would be wrong in both
+# directions at once.
+#
+# These drive `task_groups` directly where a registry is all that is needed (no
+# git, no repo) and `collect()` where the wiring itself is the point. The new
+# rendering lives in the one <script> block
+# `test_the_served_javascript_actually_parses` extracts and runs `node --check`
+# over, so a broken escape in it fails there rather than needing a second parse
+# test.
+
+
+def roadmap_task(task_id, **over):
+    """A `tasks.json` row carrying every field the registry needs, so each test
+    below states only what it is actually about."""
+    row = {"id": task_id, "title": task_id.upper(), "description": "d",
+           "status": "pending", "priority": 100, "depends_on": []}
+    row.update(over)
+    return row
+
+
+def groups_by_key(groups):
+    return {g["key"]: g for g in groups}
+
+
+def test_the_in_progress_group_carries_the_candidate_and_the_review_round(tmp_path):
+    """The group an operator acts on, so it must say WHICH commit is under
+    review and which round it is on. Both come from the execution record — the
+    loop's own bookkeeping — and this drives `collect()` end to end because
+    reading those records is half the feature."""
+    repo = make_repo(tmp_path)
+    write_registry(
+        repo,
+        [roadmap_task("wip-1", status="in_progress"),
+         roadmap_task("wip-2", status="in_progress", priority=200)],
+        [{"task_id": "wip-1", "candidate_sha": "a" * 40, "review_round": 2}],
+    )
+
+    group = groups_by_key(collect(repo)["groups"])["in_progress"]
+
+    assert group["count"] == 2
+    assert [t["id"] for t in group["tasks"]] == ["wip-1", "wip-2"]
+    assert group["tasks"][0]["detail"] == f"candidate {'a' * 12} · review round 2"
+    # A task dispatched moments ago has genuinely committed nothing yet. Saying
+    # so beats a blank cell, which reads as a missing feature.
+    assert group["tasks"][1]["detail"] == "no candidate committed yet"
+
+
+def test_the_needs_a_human_group_shows_the_blocker_reason():
+    """`blocked` on disk is a quarantine: it never resolves itself, so the
+    reason is the whole content of the row — it is what the operator has to
+    answer. And it must not land in the Blocked group, which means something
+    that WILL resolve itself."""
+    groups = groups_by_key(task_groups({"tasks": [
+        roadmap_task("q-1", status="blocked",
+                     blocked_reason="approved_paths refused: docs/"),
+    ]}, {}))
+
+    assert groups["needs_human"]["count"] == 1
+    assert groups["needs_human"]["tasks"][0]["detail"] == "approved_paths refused: docs/"
+    assert groups["blocked"]["count"] == 0
+
+
+def test_the_ready_group_holds_pending_tasks_whose_dependencies_are_satisfied():
+    """Ready is what `next_ready()` would actually pick, which is not a stored
+    field: `r-1` and `b-1` carry the same `pending` status and only one of them
+    can run."""
+    groups = groups_by_key(task_groups({"tasks": [
+        roadmap_task("done-1", status="completed"),
+        roadmap_task("r-1", depends_on=["done-1"]),
+        roadmap_task("b-1", depends_on=["r-1"]),
+    ]}, {}))
+
+    assert [t["id"] for t in groups["ready"]["tasks"]] == ["r-1"]
+    assert groups["ready"]["tasks"][0]["detail"] == "next to be dispatched"
+    assert [t["id"] for t in groups["blocked"]["tasks"]] == ["b-1"]
+
+
+def test_the_blocked_group_names_the_dependency_it_is_waiting_on():
+    """Saying blocked without saying by what is not actionable. Only the
+    INCOMPLETE dependencies are named — a completed one is not why anything is
+    still waiting."""
+    groups = groups_by_key(task_groups({"tasks": [
+        roadmap_task("done-1", status="completed"),
+        roadmap_task("wip-1", status="in_progress"),
+        roadmap_task("b-1", depends_on=["done-1", "wip-1"]),
+    ]}, {}))
+
+    group = groups["blocked"]
+    assert [t["id"] for t in group["tasks"]] == ["b-1"]
+    assert group["tasks"][0]["detail"] == "waiting on wip-1"
+
+
+def test_the_done_group_is_counted_and_collapsed_by_default():
+    """Done only ever grows, so it is a counted disclosure rather than 40 rows
+    between the operator and the four that matter. It is never `hidden`: the
+    count is the point, and `Done (0)` costs one line."""
+    groups = groups_by_key(task_groups({"tasks": [
+        roadmap_task(f"d-{i}", status="completed") for i in range(3)
+    ]}, {}))
+
+    group = groups["done"]
+    assert group["count"] == 3
+    assert group["collapsed"] is True and group["hidden"] is False
+    # The page ships it closed (a <details> with no `open` attribute) and puts
+    # the count in the summary, which is the only part of it always on screen.
+    assert '<details id="donebox">' in PAGE
+    assert "Done (${gDone.count})" in PAGE
+    # Completed is PUBLISHED, not merged — said on the page, since the two are
+    # exactly what looked identical when seven finished tasks sat unmerged.
+    assert "published, not merged into this branch" in PAGE
+
+
+def test_needs_a_human_renders_explicitly_when_empty_and_other_groups_do_not():
+    """Silence and "nothing needs you" must not look identical: a hidden group
+    is indistinguishable from a section that failed to render, and this is the
+    one group whose emptiness IS the answer."""
+    groups = groups_by_key(task_groups({"tasks": [roadmap_task("r-1")]}, {}))
+
+    assert groups["needs_human"]["count"] == 0
+    assert groups["needs_human"]["hidden"] is False
+    for key in ("in_progress", "blocked"):
+        assert groups[key]["count"] == 0
+        assert groups[key]["hidden"] is True, f"an empty {key} may be dropped"
+
+    # …and the page prints the word: it drops only what the backend marked
+    # hidden, and `rows()` renders "none" for an empty body.
+    script = PAGE.split("<script>", 1)[1]
+    assert "groups.filter(g => !g.collapsed && !g.hidden)" in script
+    assert '<p class="empty">none</p>' in script
+
+
+def test_the_ready_group_is_in_next_ready_order():
+    """The order shown must be the order the loop picks, or the panel is
+    telling the operator something the code will not do.
+
+    `_ready_order` cannot simulate `next_ready()` — replaying picks means
+    COMPLETING tasks, and this page may not call a mutating registry method —
+    so it repeats that method's `(priority, id)` key. This is what stops the
+    repetition drifting: the real `next_ready()` / `mark_completed()` loop runs
+    here, on a registry of its own, and the sequences must be equal.
+
+    The fixture is built so the comparison can be full equality: insertion
+    order differs from priority order, `r-a`/`r-b` tie so the id tiebreak is
+    exercised, and the blocked task waits on the IN-PROGRESS one — completing
+    the ready set can therefore never add a new pick mid-loop.
+    """
+    rows = [
+        roadmap_task("r-c", priority=5),
+        roadmap_task("r-b", priority=1),
+        roadmap_task("r-a", priority=1),
+        roadmap_task("wip-1", status="in_progress"),
+        roadmap_task("b-1", depends_on=["wip-1"]),
+    ]
+    shown = [t["id"] for t in groups_by_key(task_groups({"tasks": rows}, {}))["ready"]["tasks"]]
+
+    registry = TaskRegistry.from_dict({"tasks": [dict(row) for row in rows]})
+    picks = []
+    while (nxt := registry.next_ready()) is not None:
+        picks.append(nxt.id)
+        registry.mark_completed(nxt.id)
+
+    assert picks == ["r-a", "r-b", "r-c"], "the fixture must exercise both keys"
+    assert shown == picks
+
+
+def test_the_groups_come_from_state_of_and_never_from_the_status_string():
+    """The invariant the whole panel rests on. `status` cannot answer this:
+    `pending` covers Ready and Blocked alike, and `blocked` means quarantined —
+    so a page reading it would be wrong in both directions at once, sending an
+    operator to answer a blocker that does not exist while a task that really
+    is waiting for them reads as merely queued."""
+    payload = task_groups({"tasks": [
+        roadmap_task("open-1"),
+        roadmap_task("waiting-1", depends_on=["open-1"]),
+        roadmap_task("quarantined-1", status="blocked", blocked_reason="answer me"),
+    ]}, {})
+    groups = groups_by_key(payload)
+
+    # Two tasks, the same stored status, two different groups.
+    assert [t["id"] for t in groups["ready"]["tasks"]] == ["open-1"]
+    assert [t["id"] for t in groups["blocked"]["tasks"]] == ["waiting-1"]
+    # And the one whose stored status IS "blocked" is in neither.
+    assert [t["id"] for t in groups["needs_human"]["tasks"]] == ["quarantined-1"]
+
+    # Every TaskState is claimed by exactly one group, so a state added to the
+    # registry cannot silently render nowhere.
+    assert [g["state"] for g in payload] == [state.value for _key, _label, state in GROUPS]
+    assert {g["state"] for g in payload} == {state.value for state in TaskState}
+
+
+def test_an_unreadable_task_graph_says_so_rather_than_rendering_five_empty_groups():
+    """A roadmap with no tasks renders five zeroed groups, so an empty list can
+    only mean the graph itself did not load — and "no tasks" and "unreadable"
+    call for opposite reactions. A dependency naming a task that does not exist
+    is the real shape of this: `from_dict` accepts it and `state_of` then
+    raises, which must not take the page down."""
+    assert task_groups({"tasks": []}, {}) != []
+    assert task_groups({"tasks": [roadmap_task("a", depends_on=["ghost"])]}, {}) == []
+    assert task_groups({"tasks": [{"id": "a", "surprise": 1}]}, {}) == []
+
+    script = PAGE.split("<script>", 1)[1]
+    assert "the task graph could not be read" in script
+
+
+def test_the_page_renders_every_group_with_its_heading_and_count():
+    """A payload carrying the groups is not a page showing them — the lesson
+    `renderProgress` already recorded. Deleting an interpolation here leaves
+    every test above green while the operator sees nothing."""
+    static_markup, script = PAGE.split("<script>", 1)
+    assert '<div id="roadmap" class="scroll"></div>' in static_markup
+    assert '<details id="donebox">' in static_markup and 'id="donesum"' in static_markup
+    for field in ("g.label", "g.count", "t.detail", "t.priority"):
+        assert field in script, f"{field} never reaches the DOM"
+
+    # The per-render Save binding is scoped to #roadmap, so a priority input
+    # under #done would render with no listener — and re-prioritising a
+    # finished task means nothing anyway.
+    assert 'querySelectorAll("#roadmap button.save")' in script
+    assert "priCell" not in script.split('getElementById("done").innerHTML', 1)[1]
