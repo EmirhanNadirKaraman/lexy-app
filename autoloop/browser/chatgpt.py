@@ -608,13 +608,24 @@ class BrowserChatGPT:
         # Idempotent: a retry after a failed send usually finds its own file
         # still attached, and re-uploading it only raises the duplicate modal.
         if self._session.exists(chip):
+            self._await_upload_complete(request_id, filename)
             return
+
+        # Clear the composer BEFORE attaching. The upload-complete signal below
+        # is the Send control becoming enabled, and typed text enables it on
+        # its own — so any leftover text would make an in-flight upload look
+        # finished. `_enter_prompt` clears it again; doing it here is what
+        # makes the signal mean what it says.
+        self._session.focus(self._sel.composer)
+        self._session.press("ControlOrMeta+a")
+        self._session.press("Delete")
 
         self._session.set_input_files(self._sel.file_input, path)
 
         deadline = self._monotonic() + self._input_sync_timeout
         while True:
             if self._session.exists(chip):
+                self._await_upload_complete(request_id, filename)
                 return
             if self._session.exists(self._sel.duplicate_file_modal):
                 # "You've already uploaded this file." ChatGPT refuses to
@@ -624,6 +635,7 @@ class BrowserChatGPT:
                 self._session.click(self._sel.duplicate_file_dismiss)
                 self._sleep(self._poll_interval)
                 if self._session.exists(chip):
+                    self._await_upload_complete(request_id, filename)
                     return  # it was already attached after all
                 self.save_diagnostics(
                     "attachment-duplicate-modal",
@@ -653,6 +665,43 @@ class BrowserChatGPT:
                 raise SubmissionError(
                     f"attachment {filename} for {request_id} did not appear within "
                     f"{self._input_sync_timeout}s (nothing was sent)"
+                )
+            self._sleep(self._poll_interval)
+
+    def _await_upload_complete(self, request_id: str, filename: str) -> None:
+        """Block until the attachment has finished uploading, not merely appeared.
+
+        The tile is a PROMISE, not a completion. Measured live 2026-08-15 on a
+        105 KB file: the tile rendered after 0.5s while the Send control stayed
+        disabled until 6.3s, which is when the upload actually finished.
+
+        Sending in that window is what lost request alr-75bdba23-0002 — the
+        click was accepted, the attachment was consumed, and no turn ever
+        persisted, surfacing as `submission_ambiguous`. The composer is empty
+        at this point (the caller clears it), so an enabled Send control can
+        only mean the upload is done: typed text would enable it on its own and
+        make an in-flight upload look finished.
+        """
+        deadline = self._monotonic() + self._input_sync_timeout
+        while True:
+            if self._session.exists(self._sel.send_button) and self._session.is_enabled(
+                self._sel.send_button
+            ):
+                return
+            if self._monotonic() >= deadline:
+                self.save_diagnostics(
+                    "attachment-upload-incomplete",
+                    request_id=request_id,
+                    stage="attach",
+                    retry_prohibited=False,
+                    note=(
+                        f"{filename} attached but the upload did not complete within "
+                        f"{self._input_sync_timeout}s — nothing was sent"
+                    ),
+                )
+                raise SubmissionError(
+                    f"attachment {filename} for {request_id} did not finish uploading "
+                    f"within {self._input_sync_timeout}s (nothing was sent)"
                 )
             self._sleep(self._poll_interval)
 

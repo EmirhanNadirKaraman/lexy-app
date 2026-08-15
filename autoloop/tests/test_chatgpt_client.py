@@ -75,6 +75,9 @@ class FakeSession:
         self.seen_uploads: set[str] = set()
         #: filename revealed once the duplicate modal is dismissed
         self.duplicate_reveals_tile: str | None = None
+        #: polls the upload takes to finish before Send enables
+        self.upload_completes_after = 1
+        self.upload_pending = 0
         #: When set, any navigation redirects to the auth page, as a real
         #: logged-out ChatGPT does.
         self.logged_out = False
@@ -118,7 +121,9 @@ class FakeSession:
 
     def is_enabled(self, selector):
         if selector == SEL.send_button:
-            return self.send_enabled
+            enabled = self.send_enabled
+            self._tick_upload()
+            return enabled
         return selector in self.present
 
     def click(self, selector):
@@ -129,6 +134,7 @@ class FakeSession:
                 self.present.add(
                     SEL.attachment_chip_for.format(filename=self.duplicate_reveals_tile)
                 )
+                self.send_enabled = True  # an already-uploaded file is complete
             return
         if selector != SEL.send_button:
             return
@@ -165,7 +171,17 @@ class FakeSession:
             self.present.add(SEL.duplicate_file_modal)
             return
         self.seen_uploads.add(name)
+        # The tile is a PROMISE: it renders immediately, while the upload is
+        # still in flight. Send stays disabled until upload_completes_after
+        # further polls — measured at ~6s against ~0.5s for the tile.
         self.present.add(SEL.attachment_chip_for.format(filename=name))
+        self.upload_pending = self.upload_completes_after
+
+    def _tick_upload(self):
+        if self.upload_pending > 0:
+            self.upload_pending -= 1
+            if self.upload_pending == 0:
+                self.send_enabled = True
 
     def insert_text(self, text):
         self.inserted.append(text)
@@ -795,7 +811,9 @@ def test_an_attachment_is_uploaded_before_the_prompt_is_typed(tmp_path):
     send control is live with the prompt but without the diff."""
     session, clock = FakeSession(), FakeClock()
     session.seed(OLD_TURN)
-    clock.events[1] = lambda: session.dom.append(("assistant", "ok"))
+    # Waiting for the upload to COMPLETE costs polls before the send, so the
+    # scripted reply lands later than on the plain typed path.
+    clock.events[3] = lambda: session.dom.append(("assistant", "ok"))
     client = make_client(session, clock, tmp_path)
 
     assert client.submit(RID, PROMPT, attachment="/tmp/diff.md") is SubmitResult.CONFIRMED
@@ -839,6 +857,7 @@ def test_a_file_already_on_the_composer_is_not_uploaded_again(tmp_path):
     session, clock = FakeSession(), FakeClock()
     session.seed(OLD_TURN)
     session.present.add(SEL.attachment_chip_for.format(filename="diff.md"))
+    session.send_enabled = True  # an already-attached file has finished uploading
     clock.events[1] = lambda: session.dom.append(("assistant", "ok"))
     client = make_client(session, clock, tmp_path)
 
@@ -896,3 +915,37 @@ def test_a_duplicate_that_turns_out_to_be_attached_proceeds(tmp_path):
 
     assert client.submit(RID, PROMPT, attachment="/tmp/diff.md") is SubmitResult.CONFIRMED
     assert SEL.duplicate_file_dismiss in session.clicks
+
+
+def test_the_send_waits_for_the_upload_to_finish_not_merely_to_appear(tmp_path):
+    """The bug that lost request alr-75bdba23-0002. The tile is a PROMISE:
+    measured live, it rendered after 0.5s while Send stayed disabled until
+    6.3s. Sending in that window was accepted, consumed the attachment, and
+    persisted no turn at all — surfacing as submission_ambiguous with the
+    review request simply absent from the conversation."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.upload_completes_after = 3  # slow upload: tile early, Send late
+    clock.events[5] = lambda: session.dom.append(("assistant", "ok"))
+    client = make_client(session, clock, tmp_path)
+
+    assert client.submit(RID, PROMPT, attachment="/tmp/diff.md") is SubmitResult.CONFIRMED
+    # Nothing was typed before the upload finished: the composer is cleared
+    # first precisely so an enabled Send can only mean the upload is done.
+    assert session.uploaded == [(SEL.file_input, "/tmp/diff.md")]
+
+
+def test_an_upload_that_never_finishes_refuses_to_send(tmp_path):
+    """A tile that appears and an upload that never completes must not send.
+    The attachment would be consumed and the turn lost."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.upload_completes_after = 10_000  # never, within the timeout
+    client = make_client(session, clock, tmp_path)
+    before = len(session.persisted)
+
+    with pytest.raises(SubmissionError) as excinfo:
+        client.submit(RID, PROMPT, attachment="/tmp/diff.md")
+    assert "did not finish uploading" in str(excinfo.value)
+    assert "nothing was sent" in str(excinfo.value)
+    assert len(session.persisted) == before
