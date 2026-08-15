@@ -72,6 +72,14 @@ allow_protected_push = false
 # locally but the push is refused until allow_protected_push = true. That
 # pairing is deliberate: turning this on is not by itself permission to push
 # `main`.
+#
+# The SAME flag also enables the backlog sweep (`merge_sweep.py`): at startup,
+# and from `python -m autoloop merge-backlog`, every completed task whose
+# published branch is not an ancestor of the base head is merged, oldest
+# publication first, stopping at the first branch that does not land. That is
+# the half auto-merge cannot cover — a branch published before it existed has
+# no completion event left to react to, which is how seven finished tasks sat
+# unmerged on 2026-08-06. Same gate, same rules, same off-by-default.
 auto_merge_enabled = false
 # Note: force pushes and destructive git commands (reset/clean/rebase/...)
 # cannot be enabled by ANY setting — the git whitelist has no knob for them.

@@ -39,7 +39,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S22 | INFO | `commit_adopted` is sound but has no production call site (tracked, not a vulnerability) | `autoloop/git_gateway.py`, `autoloop/manifest.py` |
 | S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
-| S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py` |
+| S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
 
@@ -456,6 +456,131 @@ rg -n 'retire_execution' autoloop/cli.py autoloop/worktask.py autoloop/orchestra
 # Expect: reconciliation refuses to retire a record an undrained merge
 # deferral still reads from
 rg -n 'execution_retire_pinned_by_deferral|_outstanding_merge_deferral' autoloop/orchestrator.py
+```
+
+**Amendment 2026-08-15 (merge-03) — the base head can now move at STARTUP, and
+from a new command.** `autoloop/merge_sweep.py` integrates branches that were
+published before auto-merge existed. It adds no git primitive and no policy
+flag: it calls `AutoMerger.attempt` per branch, so every bound listed above —
+the two legal merge shapes, the publication re-confirmation, the protected-base
+refusal, the four-part verification, no undo primitive — applies unchanged.
+What genuinely widens is WHEN the shared head may move: previously only in the
+last statement of `_dispatch_task_push`, now also once per `run`/`start`/
+`resume` process before the loop begins, and whenever an operator runs
+`merge-backlog`. Recorded because "the head only moves right after a
+completion" was a real property of the previous design, and losing it silently
+is the regression CLAUDE.md §14 asks about.
+
+What bounds the wider window:
+
+- **The same flag.** `policy.auto_merge_enabled`, still default False. With it
+  off, both entry points return `disabled` before reading anything.
+- **The same gate, checked before anything mutates.**
+  `cli._merge_window_blockers` — called once for the whole sweep, so a shut
+  window means zero merges rather than a partial one. A crash-left
+  `phase=executing` in `state.json` therefore defers the startup sweep, which
+  is correct: an agent may have been mid-write.
+- **The same objects, on evidence that is FRESH per branch.** A branch is only
+  attempted when its task is COMPLETED and an `ls-remote` reports the branch
+  carrying exactly that `candidate_sha` — the record's own
+  `intended_remote_ref` is never taken as evidence, which is what stops a
+  deleted or force-moved ref from being merged from a stale claim. Since the
+  merge-03 review round the confirmation is re-taken immediately before each
+  branch's own merge (`BacklogSweeper._reconfirm` evicts that candidate's key
+  from the memo set first): a sweep spends minutes merging and pushing, and
+  reusing the enumeration's positive cache would have let a ref deleted or
+  force-moved during that window be merged from an answer obtained before the
+  earlier merges ran. A candidate the remote no longer confirms stops the sweep
+  there.
+- **Reading the execution ARCHIVE is read-only and never a merge source.** A
+  completed task with no live record is checked against
+  `executions/archive/<task_id>-*.json` for a sha already ancestral to HEAD —
+  a local `merge-base` question, answered from the object database, with no
+  authority granted to anything the archived record asserts about itself. That
+  answer can only make the sweep report MORE (an unresolved branch); it can
+  never make a branch mergeable, because the merge path loads the LIVE record
+  and skips a task without one. Since the third merge-03 review round only the
+  NEWEST archived generation answers, and an archive whose generations cannot be
+  ordered answers "unresolved": `archive` keeps one file per retirement, so an
+  older released/salvaged copy could otherwise clear a task whose completing
+  publication is still outstanding — a report-clear on evidence about a
+  different commit. The archive is globbed by filename PREFIX and task ids may
+  contain `-`, so `rt-1-*.json` also matches `rt-1-b-published-<stamp>.json`;
+  each copy is now checked against the `task_id` it carries and dropped only
+  when it proves it belongs to another task (an unreadable or owner-less copy
+  is kept, since "cannot tell" must not read as "not mine"). All three changes
+  move the answer toward "unresolved", i.e. toward reporting more and merging
+  less.
+- **An unjudgeable task withholds the whole invocation.** Since the third
+  merge-03 review round, any completed task the enumeration cannot judge makes
+  the sweep non-mutating for that run (`merge_sweep_held`). The reason is an
+  ancestry one rather than a reporting one: a candidate the remote DOES confirm
+  may be descended from the one it does not, so merging the judgeable branch
+  carries the unconfirmed publication into the base transitively — granting
+  exactly what refusing to merge it directly withheld. Fail-closed before
+  mutation; it can only reduce what the sweep merges, never widen it.
+- **Enumeration cannot invent a target.** The set comes from the registry and
+  the execution records, never from the remote's ref namespace, so no branch a
+  third party pushes to origin becomes mergeable by appearing there.
+- **It stops rather than continuing.** The first branch that does not land
+  (conflict, unverified merge, deferral) halts the sweep; nothing is stacked
+  onto a head that failed verification, and no second merge follows a
+  `merge --abort`.
+- **A stop that LEFT the head moved fails closed at startup.** Since the fourth
+  merge-03 review round. Stopping bounds the sweep, but two of its outcomes
+  leave the base moved and unpublished — a merge that failed verification (not
+  undone, deliberately: there is no undo primitive) and one whose push was
+  refused, which reports as `deferred`, the same slug a shut gate produces. The
+  checkout is therefore PROBED (HEAD + `status --porcelain`) immediately before
+  each attempt and again the moment one does not land, and only a match is
+  reported as "the base is exactly as it was"; an unreadable probe is not a
+  match. When it does not match, `cli._sweep_backlog_on_startup` returns False
+  and `_cmd_run` returns 1 without entering `_run_locked` — otherwise the loop
+  would dispatch a task cut from a head nobody verified, and its own
+  `_dispatch_task_push` would carry the unverified or unpushed merge along with
+  it, which is the very stacking the stop exists to prevent. This narrows what
+  runs after a sweep; it grants nothing. The refusal publishes a `parked`
+  heartbeat (an ATTENTION status) rather than `stopped` or nothing at all, so a
+  monitor cannot go on reading a dead run's `running` beat while the only notice
+  sits on a terminal.
+- **Under the loop lock, both ways.** The startup sweep runs inside `_cmd_run`'s
+  `LoopLock`, and `merge-backlog` takes the same lock (unlike `merge-window`,
+  which only reports), so it cannot race a live loop.
+- **It cannot stop a run, except over its own residue.** Every failure swallows
+  to a transcript entry — a sweep that refused to let the loop start over an
+  unmergeable branch would be a strictly worse failure than the branch itself,
+  so held, deferred, dirty-refused and cleanly-aborted-conflict outcomes all
+  report and continue. The single exception is the bullet above: a checkout this
+  module moved and could not finish integrating, which no later round can be
+  trusted to build on.
+
+**Verification check:**
+```bash
+# Expect: the sweep CALLS the gate and the merger; it defines no merge/push of
+# its own (no merge_commit / push_exact / update-ref in this module)
+rg -n '_merge_window_blockers|\.attempt\(|merge_commit|push_exact' autoloop/merge_sweep.py
+# Expect: both entry points gate on the flag before doing anything
+rg -n 'auto_merge_enabled' autoloop/merge_sweep.py
+# Expect: the startup sweep is inside the lock, once per process
+rg -n '_sweep_backlog_on_startup' -B 4 -A 2 autoloop/cli.py
+# Expect: merge-backlog takes LoopLock (merge-window deliberately does not)
+rg -n 'def _cmd_merge_backlog' -A 12 autoloop/cli.py
+# Expect: publication is re-confirmed per branch, remote-first — TWO call sites
+# (enumeration, then `_reconfirm` immediately before that branch's own merge),
+# and the memo key is evicted before the second so it cannot answer from cache
+rg -n '_candidate_publication|seen.discard' autoloop/merge_sweep.py
+# Expect: the hold is checked BEFORE the gate and BEFORE any `_attempt` call —
+# i.e. an unjudgeable task makes the invocation non-mutating, not merely noisy
+rg -n 'if result.unresolved|_merge_window_blockers|self._attempt' autoloop/merge_sweep.py
+# Expect: only the newest archived generation is judged (no loop over every
+# archived copy returning True on the first ancestral one)
+rg -n '_newest_generation|_retirement_stamp' autoloop/merge_sweep.py
+# Expect: "the base is where it was" is a PROBE of the checkout, not a reading
+# of the outcome slug — one observation before each attempt, one after a stop
+rg -n '_probe\(|_unreconciled\(' autoloop/merge_sweep.py
+# Expect: startup FAILS CLOSED on an unreconciled checkout — `_cmd_run` returns
+# without reaching `_run_locked`, and no `stopped` heartbeat is published
+rg -n 'if not _sweep_backlog_on_startup' -A 8 autoloop/cli.py
 ```
 
 ### S25 — Circular task-scope authorization, failed-round residue, and unbounded pre-commit retries — HIGH — RESOLVED 2026-07-31

@@ -97,6 +97,12 @@ class PolicyConfig:
     #: `auto_merge_push_refused`) unless `allow_protected_push` is also set.
     #: That pairing is intentional — enabling auto-merge is not by itself
     #: permission to push `main`.
+    #:
+    #: ALSO gates the backlog sweep (`merge_sweep.py`) — the same merge, the
+    #: same gate, applied to branches that have no completion event left to
+    #: react to, at startup and from `merge-backlog`. One flag on purpose:
+    #: both move the shared head through the same primitives, and a second
+    #: switch would let an operator enable half of integration.
     auto_merge_enabled: bool = False
     #: How many times one run may hand the reviewer role to the configured
     #: fallback provider after an exhausted allowance. One is the deliberate

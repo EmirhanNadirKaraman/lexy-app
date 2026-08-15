@@ -291,9 +291,153 @@ Two things it deliberately does not do:
 * **Protected bases.** If the base is in `protected_branches`, the merge
   happens locally and the push is refused until `allow_protected_push = true`.
   Enabling auto-merge is not by itself permission to push `main`.
-* **The pre-existing backlog.** Branches published before this mechanism
-  existed are not swept. That is separate work; this module only reacts to
-  completions it sees.
+* **The pre-existing backlog.** This module only reacts to completions it
+  sees. Sweeping the branches nobody is going to report is §3f-ter.
+
+---
+
+### 3f-ter. `merge-backlog` — the branches nobody will report
+
+```bash
+python -m autoloop merge-backlog     # exit 0 = the backlog is clear
+```
+
+`auto_merge.py` (§3f-bis) reacts to ONE completion. A branch published before
+that existed — or by a process that died before integrating anything — has no
+event left to react to, and until `merge_sweep.py` nothing ever looked for it.
+That is how **2026-08-06** happened: seven completed tasks published and
+unmerged at the same moment (auto-08, auto-12, brw-01, brw-07, inbox-09,
+rt-10, rt-11), the base still at d2d4d6b, noticed only by a hand-written
+`git ls-remote` loop. Two of the seven were fixes for failures the loop was
+still hitting.
+
+The sweep runs **at startup** (once per process, inside the loop lock, so
+`run`, `start` and `resume` all get it) and **on demand** from the command
+above. Same flag as auto-merge — `policy.auto_merge_enabled`, default off —
+because it moves the same branch head, and the command takes the loop lock for
+the same reason (`merge-window` does not: it only reports).
+
+What it adds to auto-merge, which it CALLS rather than reimplements:
+
+* **Enumeration.** Every COMPLETED task whose execution record carries a
+  candidate, whose candidate is not already in the base, and whose branch the
+  remote confirms is carrying exactly that candidate. A completed, unmerged
+  task whose branch is gone from origin is NAMED (`merge_sweep_unresolved`),
+  never merged from the record's own claim.
+* **"Could not look" is not "nothing to merge".** A completed task has three
+  possible answers, not two — in the base, outstanding, or *unjudgeable* — and
+  the third has to survive into the exit code or it collapses into the first.
+  Four states are unresolved: the remote does not confirm the branch (a deleted
+  ref and an unreachable remote are indistinguishable, and
+  `_candidate_publication` is not asked to distinguish them); the execution
+  record cannot be READ; there is no live record and no archived one shows the
+  work already landed; the record names no candidate. None is attempted, and
+  every one of them makes the run not-clear: `merge-backlog` exits **1** and the
+  startup hook prints instead of staying silent. Exit 0 means the backlog is
+  provably clear and nothing weaker.
+* **One unjudgeable task holds the WHOLE invocation** (`merge_sweep_held`,
+  since 2026-08-15). Naming it and sweeping on is not safe, because this module
+  deliberately supports a later branch being cut from an earlier one: publish A,
+  cut B from A, lose A's ref, and merging B makes A an ancestor of HEAD anyway —
+  the refusal to merge A undone transitively by the next branch in the list.
+  Excluding only the candidates that DESCEND from an unresolved one needs the
+  ancestry of a commit the sweep may be unable to name or resolve at all, so the
+  invariant is the coarse one: any enumeration-time unresolved ⇒ nothing is
+  merged this invocation. **The cost is real and accepted** — one stale
+  unjudgeable task blocks every sweep until an operator deals with it — but
+  nothing has been mutated at that point, so it costs a delay, never a bad base.
+  Startup still only REPORTS and the loop starts normally. A publication that
+  stops being confirmed *mid-sweep* is a different answer and keeps its own
+  (`merge_sweep_publication_changed`, below): branches have already landed by
+  then, so the honest report is where the sweep got to.
+* **Retired records are still read, for one question only.** `retire_execution`
+  archives a record once publication is CONFIRMED, which is not the same as
+  merged — with the flag off, nothing integrates it. The sweep therefore checks
+  `executions/archive/` for a sha that is already an ancestor of HEAD (silent
+  if so, unresolved if not) — ancestry alone, exactly as on the live path,
+  since requiring the archived record's own `published_sha` would leave every
+  archive predating that field permanently unresolved with its candidate
+  demonstrably merged. It never merges FROM an archived record; the merge
+  machinery reads the live one. This is the one place that
+  differs from `merge-window`, which ignores the archive deliberately — the
+  gate asks "could moving the base strand this?" (a retired record cannot),
+  this asks "is this branch in the base?" (retirement says nothing either way).
+* **Only the NEWEST retirement answers** (since 2026-08-15). `archive` keeps
+  every generation — a release, a retry, the `published-<sha>` retirement that
+  completed the task — and they describe different commits, so "any archived
+  copy names an ancestor" clears a task on the strength of a superseded attempt
+  while its completing publication sits unmerged. Generation is read off the
+  archive FILENAME (`retire_execution` appends a fixed-width `YYYYMMDDTHHMMSSZ`
+  instant to every label; whole labels do not order across differing reasons,
+  that trailing component does). A single archived copy needs no ordering and is
+  judged directly, which keeps pre-stamp records answerable; from two upwards an
+  unstamped label is unresolved rather than guessed at, and a same-second tie
+  requires all of the tied copies. Superseded generations are *not* required to
+  have landed — a released attempt's candidate is usually abandoned — or every
+  retried task would be unresolved forever.
+* **Publication is re-confirmed per branch, at the moment it is merged.** The
+  `seen` cache of confirmed publications is shared with the merge-window gate,
+  but a candidate's own key is evicted immediately before its merge, so every
+  branch is integrated on an `ls-remote` taken after the previous one landed —
+  never on evidence gathered before the sweep started. A ref deleted or
+  force-moved mid-sweep stops it (`merge_sweep_publication_changed`) rather
+  than being merged from a stale positive.
+* **Merged-ness by ancestry, and by nothing else.** `merge-base --is-ancestor`.
+  Not the task status, not a branch-name match — those are what made the
+  backlog invisible in the first place, since both are equally true of a branch
+  that landed in the base an hour ago. A candidate the checkout cannot resolve
+  reads as not-integrated, which is not a guess: every ancestor of HEAD is in
+  the local object database by definition.
+* **Order: oldest publication first.** A branch cut from another branch only
+  applies cleanly after the one it builds on; arbitrary order manufactures
+  conflicts that do not really exist. `published_at` when the record has one,
+  and a record with none sorts ahead of every record that has one — the field
+  only exists from 2026-08-15, so its absence dates the record — with the
+  candidate's committer date ordering that older group among itself.
+* **Stop at the first branch that does not land.** Conflict, a merge that
+  failed verification, or a deferral: all of them halt the sweep, leave every
+  later branch untouched, and name them. A half-swept backlog with one branch
+  aborted mid-way is harder to reason about than a clean stop, and the operator
+  has to resolve that conflict before the rest mean anything. Order is a
+  heuristic and is allowed to be, because stopping is what makes a wrong order
+  safe: it costs a stalled sweep, never a corrupted base.
+* **A stop is not automatically a restoration** (since 2026-08-15). Two
+  outcomes leave the base MOVED: a merge that ran and then failed verification
+  (deliberately not undone — `reset` is off the git whitelist by design), and
+  one that verified and whose PUSH was then refused, which comes back as
+  `deferred` — the same slug a shut gate and a dirty checkout produce, both of
+  which touch nothing. So the answer is never read off the outcome: HEAD and
+  `status --porcelain` are observed immediately before each attempt and again
+  the moment one does not land, and "the base is exactly as it was" is printed
+  only when those two match. Anything else — including a probe that could not
+  read the checkout — prints `UNRECONCILED`, names both ends of the move, and
+  says that nothing here will undo it. This is also the ONE sweep outcome that
+  stops `run` from starting the loop: dispatching roadmap work onto a head
+  nobody verified, or pushing work stacked on a merge the remote has never
+  seen, is exactly what stopping the sweep exists to prevent. Every other way a
+  sweep merges nothing — held, deferred, refused over a dirty checkout, stopped
+  on a conflict that aborted cleanly — still reports and lets the loop start.
+  The refusal publishes a `parked` heartbeat, not `stopped`: nobody chose it and
+  it needs a decision, and staying silent would leave a monitor reading the
+  previous run's `running` beat forever.
+
+The gate is checked ONCE, before the first merge, so a shut merge window defers
+the **whole** sweep rather than merging part of it and writing one deferral per
+branch. And the sweep keeps no queue of its own: the work-list is re-derived
+from git ancestry every run, so a sweep that stopped halfway simply
+re-enumerates what is left next time.
+
+| Situation | What happens | Transcript entry |
+|---|---|---|
+| Outstanding branches found | listed before anything is merged | `merge_sweep_backlog` |
+| Window shut | nothing attempted at all | `merge_sweep_deferred` |
+| Any task the enumeration could not judge | nothing attempted at all; the withheld branches are named | `merge_sweep_held` |
+| Each branch that lands | merged + base pushed by `AutoMerger` | `auto_merge_pushed` |
+| First branch that does not | sweep halts, remainder named | `merge_sweep_stopped` |
+| A stop that left HEAD moved or the tree changed (failed verification, refused push) | reported `UNRECONCILED` with both shas; `run` refuses to start the loop | `merge_sweep_stopped` (`unreconciled`, `base_sha_before_attempt`, `base_sha_after_attempt`) |
+| A completed task it could not judge (ref gone, remote unreachable, record unreadable/absent/candidate-less, archive unorderable or superseded) | named, not merged, run does NOT count as clear (exit 1), and the whole sweep is held | `merge_sweep_unresolved` |
+| A ref that changed DURING the sweep | that branch and the rest are left alone; the sweep stops | `merge_sweep_publication_changed` |
+| Backlog cleared | — | `merge_sweep_completed` |
 
 ---
 
