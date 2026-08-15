@@ -275,16 +275,37 @@ blocked on something external, or when the operator asks."""
 #: `audit` — so one preference never has two texts to drift between. This is
 #: the "separate rule with its own home" that comment refers to.
 #:
+#: Why it names `implement` and ONLY `implement`: the count it ranks against
+#: `audit` is the READY count, and `implement` is the one directive this
+#: protocol defines for a READY task. `revise` sends an already-started task
+#: back to its executor and is phase-gated on top of that, so recommending it
+#: for a ready task would name a directive that is invalid for exactly the
+#: tasks being counted. Ordering `revise` and the approvals against fresh work
+#: is `NEXT_WORK_PREFERENCE`'s job, and it stays there.
+#:
+#: Why the second escape hatch says "outside the roadmap" rather than "waiting
+#: on a dependency": `TaskRegistry.state_of` calls a task READY only once its
+#: declared `depends_on` are completed, so a ready task with an unmet declared
+#: dependency does not exist and a rule phrased that way describes nothing.
+#: The real case is a task the registry can schedule but a human cannot start
+#: — waiting on an upstream release, an operator decision, a service that is
+#: down — a blocker the graph does not model, which is why the text names it
+#: as being outside the roadmap rather than inside its dependency edges. The
+#: near-parallel with `NEXT_WORK_PREFERENCE`'s "blocked on something external"
+#: is deliberate and the two are NOT to be unified: that one qualifies tasks
+#: already in flight, this one qualifies tasks the registry calls READY, and
+#: collapsing them would put one preference back into two texts.
+#:
 #: The numbers it depends on are rendered by `context.render_context` under
 #: `context.ROADMAP_LABEL`, from `tasks.TaskRegistry.summary`. A rule the
 #: reviewer cannot evaluate is not a rule, so the two are pinned by test.
 AUDIT_VS_READY_PREFERENCE = """\
 CHOOSING AUDIT VS READY WORK — a preference, not a parser rule.
 CONTEXT's `roadmap` line gives how many tasks are ready and how many of those
-are priority 1. While any task is ready, prefer `implement` or `revise` on one
-of them over `audit`: an audit adds findings, so auditing ahead of queued work
-grows the backlog. Choose `audit` when no task is ready, when every ready task
-is waiting on a dependency that is not met, or when the operator asks."""
+are priority 1. While any task is ready, prefer `implement` on one of them
+over `audit`: an audit adds findings, so auditing ahead of queued work grows
+the backlog. Choose `audit` when no task is ready, when every ready task is
+blocked on something outside the roadmap, or when the operator asks."""
 
 CONTRACT_INSTRUCTIONS = (
     _RESPONSE_FORMAT + "\n\n" + NEXT_WORK_PREFERENCE + "\n\n" + AUDIT_VS_READY_PREFERENCE

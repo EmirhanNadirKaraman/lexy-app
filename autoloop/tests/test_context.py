@@ -236,8 +236,8 @@ def test_the_label_the_contract_points_at_is_the_label_that_is_rendered():
 # ---- ready counts -----------------------------------------------------------
 #
 # The second scheduling preference (`contract.AUDIT_VS_READY_PREFERENCE`) tells
-# the reviewer to implement or revise a READY task rather than order a fresh
-# audit while the queue has work in it. That is only checkable if the CONTEXT
+# the reviewer to implement a READY task rather than order a fresh audit while
+# the queue has work in it. That is only checkable if the CONTEXT
 # block says how many tasks ARE ready and how many of those are priority 1, so
 # these tests own those numbers on the rendered side — `test_tasks.py` owns the
 # summary string itself.

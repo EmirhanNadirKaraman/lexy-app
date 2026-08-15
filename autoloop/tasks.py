@@ -557,9 +557,9 @@ class TaskRegistry:
         """One line of roadmap state, rendered into every review request.
 
         The READY count carries a priority-1 breakdown with it because
-        `contract.AUDIT_VS_READY_PREFERENCE` tells the reviewer to implement or
-        revise a ready task instead of ordering a fresh audit, and to weigh how
-        urgent the queue is. A rule that depends on a number the reviewer
+        `contract.AUDIT_VS_READY_PREFERENCE` tells the reviewer to implement a
+        ready task instead of ordering a fresh audit, and to weigh how urgent
+        the queue is. A rule that depends on a number the reviewer
         cannot see is not a rule — so the two are coupled the same way
         `context.IN_FLIGHT_LABEL` is, and pinned by test on both sides.
 

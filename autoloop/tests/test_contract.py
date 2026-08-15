@@ -574,8 +574,9 @@ def test_contract_says_version_is_three():
 
 # ---- the finish-before-start scheduling preference --------------------------
 #
-# The one advisory paragraph in the instructions. It is prose the model reads,
-# not something `parse_response` can enforce, so the tests below pin its
+# The first of the two advisory paragraphs in the instructions (the second,
+# `AUDIT_VS_READY_PREFERENCE`, is pinned further down). It is prose the model
+# reads, not something `parse_response` can enforce, so the tests below pin its
 # CONTENT the same way the format tests above do — and pin it to the CONTEXT
 # numbers it depends on, because a preference the reviewer cannot evaluate is
 # not a preference, it is decoration.
@@ -653,7 +654,7 @@ def test_audit_preference_states_ready_work_comes_first():
     work one of them instead of ordering a fresh audit."""
     assert "While any task is ready" in AUDIT_VS_READY_PREFERENCE
     # ...and names which decisions that ranks against which.
-    assert "prefer `implement` or `revise` on one" in AUDIT_VS_READY_PREFERENCE
+    assert "prefer `implement` on one" in AUDIT_VS_READY_PREFERENCE
     assert "over `audit`" in AUDIT_VS_READY_PREFERENCE
     # ...with the reason, so it reads as a rule rather than an arbitrary order.
     assert "an audit adds findings" in AUDIT_VS_READY_PREFERENCE
@@ -663,7 +664,7 @@ def test_audit_preference_states_ready_work_comes_first():
     "condition",
     [
         "when no task is ready",
-        "when every ready task\nis waiting on a dependency that is not met",
+        "blocked on something outside the roadmap",
         "when the operator asks",
     ],
 )
@@ -673,13 +674,40 @@ def test_audit_preference_keeps_all_three_audit_anyway_conditions(condition):
     work at all — a rule that made `audit` unreachable would stall the loop the
     moment the queue drains.
 
-    The second condition is pinned across its line break because that is how it
-    is wrapped in the shipped text; it is the reviewer's assessment of the
-    queue, not a registry state (a task the registry calls READY has all its
-    `depends_on` complete by definition — the unmet dependency here is the kind
-    the state machine does not model, exactly like the other clause's
-    'blocked on something external')."""
+    The middle condition is about a blocker the task graph does not model — an
+    upstream release, an operator decision, a service that is down. It has to
+    be phrased that way round: `TaskRegistry.state_of` only calls a task READY
+    once its declared `depends_on` are complete, so "ready but waiting on an
+    unmet dependency" describes no task that can exist. Each fragment is pinned
+    inside a single line of the shipped text rather than across its wrap, so
+    re-flowing the clause cannot break these assertions for a reason that has
+    nothing to do with the rule."""
     assert condition in AUDIT_VS_READY_PREFERENCE
+
+
+def test_audit_preference_recommends_implement_and_never_revise_for_ready_work():
+    """The regression this pins. `implement` is the directive the protocol
+    defines for a READY task; `revise` sends an already-started task back to
+    its executor and is phase-gated besides. Recommending `revise` for the
+    tasks the READY count describes would point the reviewer at a directive
+    that is invalid for exactly those tasks. Ranking `revise` and the approvals
+    against fresh work belongs to `NEXT_WORK_PREFERENCE`, not here.
+
+    The positive assertion comes first on purpose: an absence check alone would
+    also pass against an empty clause."""
+    assert "prefer `implement` on one" in AUDIT_VS_READY_PREFERENCE
+    assert "revise" not in AUDIT_VS_READY_PREFERENCE.lower()
+
+
+def test_audit_preference_never_calls_a_ready_task_dependency_blocked():
+    """The other half of the same regression: a READY task cannot have an unmet
+    declared dependency — `TaskRegistry.state_of` returns BLOCKED until every
+    `depends_on` is completed — so the audit-anyway condition must name the
+    unmodelled, external kind of blocker instead. Paired with a positive anchor
+    for the same reason as above."""
+    assert "blocked on something outside the roadmap" in AUDIT_VS_READY_PREFERENCE
+    assert "dependency" not in AUDIT_VS_READY_PREFERENCE.lower()
+    assert "depends_on" not in AUDIT_VS_READY_PREFERENCE.lower()
 
 
 def test_audit_preference_is_advisory_not_a_refusal():
@@ -722,12 +750,15 @@ def test_contract_stays_within_its_budget():
     blank-line join — for a total of 3,214.
 
     Adding the ready-work-before-audit preference (2026-08-15) grew it by a
-    further measured 451 — the 449-character clause plus its own two-character
+    further measured 440 — the 438-character clause plus its own two-character
     join. Both measurements were made by hand, summing line lengths, because
-    the executors for these changes had no shell.
+    the executors for these changes had no shell. (The clause was 449 when
+    first written; the same-day revision that dropped `revise` from it and
+    renamed its second escape hatch took 11 characters back out.)
 
     3,700 is derived from the previous assertion's GUARANTEED bound (3,240 —
-    the number the suite actually enforced) plus that 451, not from the
+    the number the suite actually enforced) plus 451, the growth measured when
+    this clause was first written and 11 more than it now costs, not from the
     recorded 3,214, which is a hand count nothing re-verified. Trusting the
     record would put the ceiling at 3,690 and leave the suite one character
     from failing if the old count was itself off by its own margin, with no
@@ -747,7 +778,7 @@ def test_preference_clause_has_its_own_tighter_budget():
 
 def test_audit_preference_clause_has_its_own_tighter_budget():
     """Same ceiling-per-clause treatment as the one above, and for the same
-    reason: measured 449, capped at 470, six lines. The rationale for this rule
+    reason: measured 438, capped at 470, six lines. The rationale for this rule
     is longer than the rule — it lives in the source comment beside the
     constant, which costs nothing per turn, not in the prompt, which is re-sent
     on every one."""
