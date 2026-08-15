@@ -1886,6 +1886,44 @@ answering — verified). Sharing the driver makes the failure unreachable
 regardless of which teardown path forgets what, rather than depending on all
 of them being correct.
 
+**A browser fault may not end the process — and the guard is positional, not by
+type (2026-08-15).** The loop did not park, it DIED: `connect_over_cdp` raised
+a plain `Exception` ("Connection closed while reading from the driver"), because
+Playwright's `rewrite_error` gives driver-channel failures no type of their own.
+It matched no `except` clause, reached the top level, and left `phase=submitting`,
+`stop_reason=None`, `consecutive_failures=0` and no blocker — indistinguishable
+from a clean exit, and the notify watcher had a stop with no reason to report.
+The trigger was the familiar one (a Chrome running but no longer serving CDP);
+what failed was the handling.
+
+So `PlaywrightSession.connect` and `PlaywrightSession._call` each wrap the call
+POSITIONALLY: `AutoloopError` re-raises untouched, everything else becomes
+`SessionLostError`, and `KeyboardInterrupt`/`SystemExit` pass through because
+they are not `Exception`. From there the routing above applies unchanged —
+restart, failure budget, then a park or `failed` naming the cause. Two details
+are load-bearing:
+
+* The converted message keeps the ORIGINAL exception's type name. The
+  transcript's `kind=` field now always reads `SessionLostError`, so without it
+  a driver crash and a refused socket are indistinguishable after the fact.
+* It carries `describe_cdp_endpoint(cdp_url)`: the endpoint, whether the port is
+  open, whether `/json/version` answers, and how many BROWSER processes
+  (`--type=` helpers excluded) run on the dedicated profile and on the debug
+  port. "Chrome alive, port dead" and "no Chrome at all" need opposite operator
+  actions and read identically as "cannot connect"; a third shape is real too —
+  HTTP answering while CDP is wedged (2026-08-14). Measured inside the failing
+  connect, because `_handle_browser_failure` drops the client and restarts the
+  browser before anything is written, so a later probe would describe the repair
+  rather than the fault. The diagnosis can never raise: it degrades to
+  `diagnosis=unavailable` instead of becoming the crash it exists to prevent.
+  The ACTION leads and the key=value evidence follows, because `autoloop start`
+  prints `blocker.question[:160]` — ordered the other way, the compact view
+  shows the fields and cuts off the sentence saying what to do.
+
+Same principle as the throttling back-off and the "a failure nobody could
+recover from must not spend the budget" rule: a transport fault degrades into a
+recorded decision, never into silence.
+
 **A silent conversation — send confirmed, model never starts — is the third
 trigger.** Added 2026-07-31, after this exact shape recurred three times: the
 send is CONFIRMED and persisted (§5b/§5c above already rule out ambiguity and a

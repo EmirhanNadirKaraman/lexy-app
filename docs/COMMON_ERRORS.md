@@ -191,6 +191,60 @@ immediately by the same `browser_error`. That is the entry above, and it is a
 different bug: there the restart ran and lied, here it never ran at all. Read
 which of the two events sits between the failures.
 
+### The autoloop process is simply GONE — `phase: submitting`, `stop_reason: null`, no blocker
+**Symptom:** nothing in the loop's own records says anything happened. The state
+file shows a mid-flight phase (`submitting`), `stop_reason: null`,
+`consecutive_failures: 0`, `python -m autoloop blockers` lists nothing, and the
+notify watcher reports a stop with no reason to report. The process is not
+running. From the outside this is indistinguishable from a clean exit or an
+operator `kill`; the only evidence is on the terminal the loop was started
+from — an unhandled traceback ending in:
+
+```
+Exception: BrowserType.connect_over_cdp: Connection closed while reading from the driver
+```
+
+**Cause (observed 2026-08-15, fixed the same day):** the exception type. Chrome
+was RUNNING but no longer serving CDP on 9222 — the wedged shape of the entry
+two above — and Playwright's `rewrite_error` turns a driver-channel failure into
+a **plain `Exception`**, not a `playwright.sync_api.Error` and not a subclass of
+anything nameable. `PlaywrightSession.connect` caught only the narrow type, so
+the fault sailed past `Orchestrator.run`'s `except BrowserError` routing —
+restart, failure budget, park — and out of the process. Every mechanism the loop
+has for failing safely was bypassed by a type mismatch.
+**Fix (already in the code):** every call into Playwright is guarded
+POSITIONALLY — one `except Exception` around `connect`/`_call`, re-raising
+`AutoloopError` untouched and everything else as `SessionLostError`. Catching by
+type cannot work here, because the fault has no type to catch. The message keeps
+the original exception's type name (`kind=` in the transcript now always reads
+`SessionLostError`) and appends what the machine looked like at fault time:
+
+```
+cannot connect to Chrome DevTools at http://127.0.0.1:9222 — Chrome IS running
+but this endpoint is unusable — restart the dedicated profile (python3 -m
+autoloop.browser.chrome_restart); a wedged browser can keep answering HTTP and
+can ignore SIGTERM [endpoint=http://127.0.0.1:9222 port_open=yes
+cdp_answering=no chrome_on_profile=1 (pid 4711) chrome_on_port=1
+profile=~/.autoloop-chrome] (original fault: Exception: BrowserType.connect_over_cdp: ...)
+```
+
+The action leads and the evidence follows on purpose: `autoloop start` prints
+`blocker.question[:160]`, so a message ordered evidence-first would show four
+key=value pairs in the compact view and cut off the sentence saying what to do.
+
+`chrome_on_*` counts BROWSER processes only (`--type=` helpers excluded), and it
+is measured inside the failing connect because `_handle_browser_failure` drops
+the client and restarts Chrome before anything is written — a later probe would
+describe the repair, not the fault.
+**Reading it:** `chrome_on_profile>0` with `cdp_answering=no` is a wedged
+browser (it may ignore SIGTERM — `chrome_restart` escalates).
+A zero `chrome_on_profile` means nothing is running: start the dedicated profile.
+`cdp_answering=yes` alongside a failed connect is the 2026-08-14 shape, where
+HTTP answers and CDP itself is wedged.
+**If you are reading an OLD transcript:** a crash predating this fix leaves NO
+`browser_error` entry at all — that is how to tell it from every other browser
+failure, all of which log one.
+
 ### `ImportError: cannot import name 'markcoroutinefunction'` from a partially initialized `inspect`
 **Symptom:** A throwaway script that only does `import asyncio, asyncpg` dies with
 a traceback that ends inside `asyncpg/compat.py`:

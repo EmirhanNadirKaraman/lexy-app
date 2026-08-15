@@ -95,6 +95,16 @@ Failure routing:
 * review-integrity mismatch    → failure_recovery re-prompt; denial budget
 * policy denial / plan reject  → failure_recovery re-prompt; denial budget
 
+This routing is only as good as the transport's promise to raise inside the
+hierarchy, and on 2026-08-15 that promise broke: a Playwright driver-channel
+failure is a PLAIN `Exception` (`rewrite_error` gives it no type), so it matched
+no clause here, reached the top level and ended the process with
+`phase=submitting`, `stop_reason=None` and no blocker. `browser/playwright_session.py`
+now guards every Playwright call POSITIONALLY rather than by type, so a browser
+fault always arrives here as a `BrowserError` and always leaves a record. Add no
+catch-all in `run()` — the routing is by type by design, and a blanket handler
+would swallow the non-browser bugs each clause above deliberately distinguishes.
+
 Blocker classification (continuous mode, see `docs/AUTOLOOP.md`'s blockers
 section for the full table):
 
