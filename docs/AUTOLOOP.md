@@ -291,9 +291,81 @@ Two things it deliberately does not do:
 * **Protected bases.** If the base is in `protected_branches`, the merge
   happens locally and the push is refused until `allow_protected_push = true`.
   Enabling auto-merge is not by itself permission to push `main`.
-* **The pre-existing backlog.** Branches published before this mechanism
-  existed are not swept. That is separate work; this module only reacts to
-  completions it sees.
+* **The pre-existing backlog.** This module only reacts to completions it
+  sees. Sweeping the branches nobody is going to report is §3f-ter.
+
+---
+
+### 3f-ter. `merge-backlog` — the branches nobody will report
+
+```bash
+python -m autoloop merge-backlog     # exit 0 = the backlog is clear
+```
+
+`auto_merge.py` (§3f-bis) reacts to ONE completion. A branch published before
+that existed — or by a process that died before integrating anything — has no
+event left to react to, and until `merge_sweep.py` nothing ever looked for it.
+That is how **2026-08-06** happened: seven completed tasks published and
+unmerged at the same moment (auto-08, auto-12, brw-01, brw-07, inbox-09,
+rt-10, rt-11), the base still at d2d4d6b, noticed only by a hand-written
+`git ls-remote` loop. Two of the seven were fixes for failures the loop was
+still hitting.
+
+The sweep runs **at startup** (once per process, inside the loop lock, so
+`run`, `start` and `resume` all get it) and **on demand** from the command
+above. Same flag as auto-merge — `policy.auto_merge_enabled`, default off —
+because it moves the same branch head, and the command takes the loop lock for
+the same reason (`merge-window` does not: it only reports).
+
+What it adds to auto-merge, which it CALLS rather than reimplements:
+
+* **Enumeration.** Every COMPLETED task whose execution record carries a
+  candidate, whose candidate is not already in the base, and whose branch the
+  remote confirms is carrying exactly that candidate. A completed, unmerged
+  task whose branch is gone from origin is NAMED (`merge_sweep_skipped`), never
+  merged from the record's own claim.
+* **"Could not look" is not "nothing to merge".** `_candidate_publication`
+  cannot tell a deleted ref from an unreachable remote, and is not asked to —
+  an unverifiable answer is not an answer. Either way the branch is named and
+  the run does not count as clear: `merge-backlog` exits **1**, and the startup
+  hook prints instead of staying silent. Exit 0 means the backlog is provably
+  clear and nothing weaker; an offline run exiting 0 would be this tool
+  reporting "I looked, there is nothing there" for a run in which it could
+  not look.
+* **Merged-ness by ancestry, and by nothing else.** `merge-base --is-ancestor`.
+  Not the task status, not a branch-name match — those are what made the
+  backlog invisible in the first place, since both are equally true of a branch
+  that landed in the base an hour ago. A candidate the checkout cannot resolve
+  reads as not-integrated, which is not a guess: every ancestor of HEAD is in
+  the local object database by definition.
+* **Order: oldest publication first.** A branch cut from another branch only
+  applies cleanly after the one it builds on; arbitrary order manufactures
+  conflicts that do not really exist. `published_at` when the record has one,
+  and a record with none sorts ahead of every record that has one — the field
+  only exists from 2026-08-15, so its absence dates the record — with the
+  candidate's committer date ordering that older group among itself.
+* **Stop at the first branch that does not land.** Conflict, a merge that
+  failed verification, or a deferral: all of them halt the sweep, leave every
+  later branch untouched, and name them. A half-swept backlog with one branch
+  aborted mid-way is harder to reason about than a clean stop, and the operator
+  has to resolve that conflict before the rest mean anything. Order is a
+  heuristic and is allowed to be, because stopping is what makes a wrong order
+  safe: it costs a stalled sweep, never a corrupted base.
+
+The gate is checked ONCE, before the first merge, so a shut merge window defers
+the **whole** sweep rather than merging part of it and writing one deferral per
+branch. And the sweep keeps no queue of its own: the work-list is re-derived
+from git ancestry every run, so a sweep that stopped halfway simply
+re-enumerates what is left next time.
+
+| Situation | What happens | Transcript entry |
+|---|---|---|
+| Outstanding branches found | listed before anything is merged | `merge_sweep_backlog` |
+| Window shut | nothing attempted at all | `merge_sweep_deferred` |
+| Each branch that lands | merged + base pushed by `AutoMerger` | `auto_merge_pushed` |
+| First branch that does not | sweep halts, remainder named | `merge_sweep_stopped` |
+| Publication unconfirmed (ref gone, or remote unreachable) | named, not merged, run does NOT count as clear (exit 1) | `merge_sweep_skipped` |
+| Backlog cleared | — | `merge_sweep_completed` |
 
 ---
 

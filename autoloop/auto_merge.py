@@ -18,8 +18,11 @@ Scope, so the boundary survives review:
 * **This module handles completions it SEES.** The deferral queue below is its
   own retry state for those, nothing more.
 * **The backlog of branches published before this existed is NOT in scope.**
-  That is a separate sweep (merge-03). Do not grow this module into it: a
-  sweep enumerates the remote, this reacts to one event.
+  That is `merge_sweep.py`, which enumerates completed tasks and decides
+  merged-ness by git ancestry. It CALLS `attempt` below once per branch rather
+  than reimplementing any of this; keep it that way, and keep the enumeration
+  out of here — this reacts to one event, that one looks for work nobody
+  reported.
 
 ## The gate is the whole design
 

@@ -8,13 +8,16 @@
     python -m autoloop answer <blocker-id> "<text>"
     python -m autoloop smoke-browser [--config PATH]
     python -m autoloop pause | resume | unlock | reset --yes [--tasks]
+    python -m autoloop merge-window [--wait] | merge-backlog
     python -m autoloop reprovision-publisher --confirm
     python -m autoloop review-changeset --base <sha> --candidate <sha> [--packet FILE]
 
-Locking: run / resume / reset / smoke-browser / answer take the single-
-instance lock on the state directory (fail closed against a live process;
-`unlock` is the only stale-lock recovery, and it refuses live locks). status /
-tasks / doctor / next-task / blockers / pause stay available while locked.
+Locking: run / resume / reset / smoke-browser / answer / merge-backlog take
+the single-instance lock on the state directory (fail closed against a live
+process; `unlock` is the only stale-lock recovery, and it refuses live locks).
+status / tasks / doctor / next-task / blockers / pause / merge-window stay
+available while locked — they only report. `merge-backlog` moves the branch
+head, so it does not.
 
 **Blockers (`blockers.py`).** `run --continuous` no longer stops on every
 park: a `task_fatal` one (see `orchestrator._to_needs_user`'s classification)
@@ -72,6 +75,7 @@ from .implement_executor import ImplementExecutor, implement_agent_runner
 from .inbox import InboxError, TaskInbox, apply_requests, inbox_dir_for
 from .lock import LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
+from . import merge_sweep
 from .orchestrator import Orchestrator
 from .policy import PolicyConfig, PolicyEngine
 from .prompts import TEMPLATES, kickoff_payload, user_answer_payload
@@ -458,10 +462,37 @@ def _reset_run_scoped_budgets(config: AutoloopConfig) -> None:
     )
 
 
+def _sweep_backlog_on_startup(config: AutoloopConfig) -> None:
+    """Integrate any published-but-unmerged branch before the loop starts.
+
+    Once per PROCESS, here rather than anywhere inside the loop: `Orchestrator.
+    run()` is called per iteration of `_run_continuous` (which rebuilds the
+    orchestrator each time), so hooking either would re-sweep every round for a
+    backlog that only changes when something completes — and completions
+    already have `auto_merge.py`. `start` and `resume` both funnel into this
+    function, so one hook covers all three commands.
+
+    Inside the lock, because it moves the branch head. Silent only when the
+    backlog is PROVABLY clear (`SweepResult.is_clear`) — an operator starting a
+    loop with nothing outstanding should see nothing new, but a branch the
+    sweep could not judge is exactly the thing that must not pass unmentioned.
+    Every outcome is in the transcript regardless.
+    """
+    result = merge_sweep.sweep_on_startup(config)
+    if result.outcome == merge_sweep.DISABLED:
+        return
+    if result.outcome == merge_sweep.NOTHING_TO_DO and result.is_clear:
+        return
+    for line in _format_sweep(result):
+        print(line)
+    print("")
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     with LoopLock(config.state_dir):
         _reset_run_scoped_budgets(config)
+        _sweep_backlog_on_startup(config)
         try:
             if getattr(args, "continuous", False):
                 _validate_continuous_args(args)
@@ -2108,6 +2139,86 @@ def _cmd_merge_window(args: argparse.Namespace) -> int:
         time.sleep(args.poll)
 
 
+def _format_sweep(result: "merge_sweep.SweepResult") -> list[str]:
+    """One block of operator-facing lines for a finished sweep, shared by the
+    `merge-backlog` command and the startup hook so both describe the same
+    outcome the same way."""
+    lines = [f"merge backlog: {result.outcome}"]
+    for task_id in result.merged:
+        lines.append(f"  merged      {task_id}")
+    for task_id, why in result.skipped:
+        lines.append(f"  UNJUDGED    {task_id} — {why}")
+    if result.skipped:
+        # Never folded into the outcome line. "Could not look" and "looked,
+        # nothing there" are the two answers this whole module exists to keep
+        # apart, and the exit code says so too (`is_clear`).
+        lines.append(
+            f"  {len(result.skipped)} branch(es) could not be judged — the "
+            "remote did not confirm the candidate is on them. NOT the same as "
+            "'nothing to merge'; check the remote and run this again."
+        )
+    if result.outcome == merge_sweep.DEFERRED:
+        for reason in result.reasons:
+            lines.append(f"  - {reason}")
+        lines.append(
+            f"  nothing was merged; {len(result.pending)} branch(es) still "
+            "outstanding — the whole sweep waits for the window, never half of it"
+        )
+    if result.outcome == merge_sweep.STOPPED:
+        lines.append(
+            f"  STOPPED at  {result.stopped_on} ({result.stopped_outcome}) — "
+            "see the transcript for the detail"
+        )
+        remaining = [t for t in result.pending if t != result.stopped_on]
+        lines.append(
+            f"  {len(remaining)} branch(es) left untouched: "
+            + (", ".join(remaining) if remaining else "(none)")
+        )
+        lines.append(
+            "  the base is exactly as it was before this branch. Resolve it by "
+            "hand, then run `merge-backlog` again."
+        )
+    if result.outcome == merge_sweep.DISABLED:
+        lines.append(
+            "  policy.auto_merge_enabled is false — this command moves the "
+            "branch head, so it is opt-in like the auto-merge it reuses"
+        )
+    if result.outcome == merge_sweep.NOTHING_TO_DO and not result.skipped:
+        lines.append(
+            "  every completed task's published branch is already an ancestor "
+            "of HEAD"
+        )
+    return lines
+
+
+def _cmd_merge_backlog(args: argparse.Namespace) -> int:
+    """Merge every published-but-unmerged branch into the base, oldest first.
+
+    The on-demand half of `merge_sweep.py`; `run` does the same thing at
+    startup. Exists because publication is not integration and nothing used to
+    look BACK: on 2026-08-06 seven completed tasks were published and unmerged
+    at once, the base still at d2d4d6b, and it took a hand-written `ls-remote`
+    loop to notice.
+
+    Takes the loop lock — unlike `merge-window`, which only reports, this
+    MOVES the branch head and pushes it, so it cannot run alongside a live
+    loop.
+
+    Exit 0 means the backlog is PROVABLY clear, and nothing weaker
+    (`SweepResult.is_clear`): deferred, stopped, the flag off, or so much as
+    one branch the remote would not confirm all exit 1. An unreachable remote
+    exiting 0 would be this command reporting "I looked, there is nothing
+    there" for a run in which it could not look — the exact invisibility it
+    exists to end.
+    """
+    config = load_config(args.config)
+    with LoopLock(config.state_dir):
+        result = merge_sweep.sweep_backlog(config)
+    for line in _format_sweep(result):
+        print(line)
+    return 0 if result.is_clear else 1
+
+
 def _cmd_pause(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     config.pause_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2263,6 +2374,16 @@ def build_parser() -> argparse.ArgumentParser:
     window.add_argument("--timeout", type=float, default=7200, help="give up after N seconds")
     window.add_argument("--poll", type=float, default=15, help="seconds between checks")
     window.set_defaults(func=_cmd_merge_window)
+
+    backlog = sub.add_parser(
+        "merge-backlog",
+        help=(
+            "merge every completed task's published branch that is not yet in "
+            "the base, oldest publication first, stopping at the first conflict"
+        ),
+    )
+    add_config(backlog)
+    backlog.set_defaults(func=_cmd_merge_backlog)
 
     healthp = sub.add_parser(
         "health",
