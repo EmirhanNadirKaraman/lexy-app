@@ -53,7 +53,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Conversation | `conversation.py` (interface/registry), `browser/chatgpt.py` (`BrowserChatGPT`), `browser/playwright_session.py` (CDP, lazy, **one driver per process** — see below), `browser/selectors.py` | One persistent reviewer conversation; duplicate/stale/streaming/login guards; provider-pluggable. |
 | Contract | `contract.py` | Response contract **v3** + strict parser + `verify_review`. `CONTRACT_INSTRUCTIONS` = the response format plus **two** advisory paragraphs, each prose the reviewer weighs and **not** a `policy.py` refusal (which would park the loop instead of redirecting it). `NEXT_WORK_PREFERENCE`: prefer finishing work already in flight (revise/approve a task holding an unpublished candidate) over dispatching a fresh one, unless nothing is in flight, everything in flight is blocked on something external, or the operator asks; it reads the `in_flight` counts from the CONTEXT block. `AUDIT_VS_READY_PREFERENCE` (added 2026-08-15): while the roadmap has READY tasks, `implement` one of them rather than ordering a fresh `audit`, since an audit ADDS findings — `audit` stays right when no task is ready, when every ready task is blocked on something outside the roadmap (an unmodelled blocker; a task with an unmet *declared* dependency is BLOCKED, never READY), or when the operator asks; it reads the ready and priority-1 counts from the CONTEXT `roadmap` line. One rule, one text: neither clause restates the other. |
 | Policy | `policy.py` | Deterministic gates: git whitelist (`add -A` and force pushes structurally impossible), task-reference checks, **phase gate**, budgets. |
-| Tasks | `tasks.py` | Task registry/graph (derived ready/blocked, cycles rejected, atomic persistence). `seed_tasks.json` (git-tracked, alongside `tasks.py`) seeds a fresh registry with `rt-01` when `.autoloop/tasks.json` does not exist yet (§9b). `block`/`unblock` quarantine a task after a `task_fatal` park (§9c) via a dedicated `blocked` status/`TaskState.BLOCKED_BY_OPERATOR`, distinct from the dependency-derived `blocked` state. |
+| Tasks | `tasks.py` | Task registry/graph (derived ready/blocked, cycles rejected, atomic persistence). `seed_tasks.json` (git-tracked, alongside `tasks.py`) seeds a fresh registry with `rt-01` when `.autoloop/tasks.json` does not exist yet (§9b). **Three states mean "not running", and they are not interchangeable:** the dependency-derived `BLOCKED` resolves itself; `block`/`unblock` quarantine a task after a `task_fatal` park (§9c) via a dedicated `blocked` status/`TaskState.BLOCKED_BY_OPERATOR`, which resolves when an operator answers; and `retire` (§9d) marks work SUPERSEDED via `status="retired"`/`TaskState.RETIRED` + `Task.superseded_by`, which resolves for nobody. |
 | Blockers | `blockers.py` | Persisted operator-facing `Blocker` records (one JSON file per blocker, `.autoloop/blockers/`) for every park, `task_fatal` or `loop_fatal` (§9c) — `python -m autoloop blockers`/`answer`. |
 | Context | `context.py` | Per-request CONTEXT block: integrity stamp + previous decision/task, roadmap, `in_flight` counts (in progress / holding an unpublished candidate), git summary, changed files, validation summary. |
 | Prompts | `prompts.py` | Strict template library (incl. `audit_kickoff`, `smoke_test`, `postcommit_review`). |
@@ -62,7 +62,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Audit executor | `audit/` | The read-only production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner, tool set now a constructor param — see §7b), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. Dispatched as a task-shaped unit of work (`Orchestrator._resolve_audit_task`), so it runs through §4b like any other task. |
 | Implement executor | `implement_executor.py` | The write-capable production executor (§7b): `ImplementExecutor` runs ONE `Edit`/`Write`-capable subagent (`implement_agent_runner`, built on the SAME `audit.agents.ClaudeCliRunner` the audit uses, configured with a different tool set) against a task's own worker repo, derives `changed_paths` from the worker repo's real `git status`, then re-runs validation. `cli._build_executor`'s `_DispatchingExecutor` routes `implement`/`revise`-of-a-real-task here; `audit`/`revise("audit")` still go to `AuditExecutor`. |
 | State / transcript | `state.py`, `transcript.py` | Atomic crash-safe state; append-only JSONL audit log. |
-| CLI | `cli.py` | `run [--continuous] status tasks next-task blockers answer doctor smoke-browser pause resume unlock reset reprovision-publisher` (§8/§9). |
+| CLI | `cli.py` | `run [--continuous] status tasks next-task blockers answer retire release doctor smoke-browser pause resume unlock reset reprovision-publisher` (§8/§9). |
 
 ---
 
@@ -506,12 +506,19 @@ a monitor that goes quiet when it breaks is the worst kind.
 
 ---
 
-### 3c. Two recovery commands for interrupted work
+### 3c. Three recovery commands for interrupted work
 
 ```bash
 python -m autoloop release <task-id>                     # in-progress -> pending
 python -m autoloop archive-blocker <id> --reason "..."   # close a dead blocker
+python -m autoloop retire <task-id> --superseded-by <id> # superseded, for good (§9d)
 ```
+
+The first two put work BACK; the third takes it out. `release` says "this round
+was interrupted, run it again"; `retire` says "this will never run again,
+because it already happened under another id". Reaching for the wrong one is
+recoverable in only one direction, which is why `release` refuses anything that
+is not in-progress and `retire` refuses only completed work.
 
 **`release`** returns a task stranded IN-PROGRESS to pending. A task is marked
 in-progress at dispatch and cleared when the round finishes; a `loop_fatal`
@@ -548,6 +555,12 @@ open blocker, and nothing on the CLI could close it. It writes
 `archived_reason`, never `answer`, and it REFUSES a blocker belonging to the
 session that is still live — otherwise it would become the "clear the escape
 detection" button the precondition table deliberately withholds.
+
+**`retire`** is documented in full in §9d, with the six tasks it was written
+for. In short: it is the only way to say that work is superseded rather than
+stuck, it records the successor id(s) in `Task.superseded_by` so the chain is
+machine-readable, and it deletes nothing — including the original
+`blocked_reason`.
 
 ---
 
@@ -2929,8 +2942,9 @@ could have kept going. Every park is now classified with a `kind`:
   not be built (e.g. an oversized diff), or a commit refused before it
   happened (environment/HEAD drift for that task). Continuous mode
   quarantines the task (`TaskRegistry.block` — a NEW `blocked` status,
-  distinct from the dependency-derived `blocked` `TaskState`, so it never
-  auto-resolves) and clears the session, so the very next pass starts a
+  distinct from the dependency-derived `blocked` `TaskState`, and distinct
+  again from `retired` (§9d), so it never auto-resolves) and clears the
+  session, so the very next pass starts a
   clean round on whatever else is READY. **Enforced, not advisory:**
   `policy._check_task_reference` denies any `implement`/`revise` directive
   that names a quarantined task id directly (`task_blocked_by_operator`) —
@@ -2981,6 +2995,83 @@ Zero open blockers is still the ordinary idle steady state, unchanged.
 `reset` + fresh plan no longer has will fail to `unblock` (there is nothing
 to unblock), but `answer` still resolves the blocker record itself; the CLI
 reports this rather than raising.
+
+### 9d. Retired: superseded work is not blocked work
+
+`blocked` used to carry a THIRD meaning, and it was the one that made the
+dashboard's blocked count useless. As of 2026-08-14 seven tasks were stored
+`blocked`; six of them were retirements — work superseded by a successor task
+and never coming back — saying so only in free-text `blocked_reason`:
+
+| task | why it stopped |
+|---|---|
+| `brw-02`, `brw-04` | superseded by `brw-06` |
+| `brw-05` | retired alongside `brw-02` / `brw-04` |
+| `brw-06` | split at the reviewer's request (`blk-(loop)-018`) into `brw-07` + `brw-08` |
+| `sub-01` | superseded by `sub-02` and `sub-03` |
+| `dash-01` | stale since 2026-08-03 — in_progress at dispatch with no candidate and no execution record, so nothing will ever finish it |
+
+Only `audit-0003` was a genuine failure. The operator read the dashboard, saw
+seven blocked rows, and reasonably asked when they would be fixed; for six the
+answer was "never — they already were, under a different id". **A status that
+means both "needs you" and "needs nobody" is not a call to action.**
+
+So there are three not-running states, and they differ by WHO resolves them:
+
+| state | stored `status` | resolved by |
+|---|---|---|
+| `BLOCKED` | `pending` (derived) | the dependency completing — nobody has to do anything |
+| `BLOCKED_BY_OPERATOR` | `blocked` | an operator answering the blocker (`autoloop answer`) |
+| `RETIRED` | `retired` | nobody. It is already over. |
+
+**`Task.superseded_by`** names the successor id(s), so the chain is
+machine-readable instead of prose: `brw-05 → brw-02 → brw-06 → brw-07/brw-08`
+is followable one hop at a time, each hop recording what that task's own reason
+said. It is validated for SHAPE only — a successor need not exist (brw-06 was
+split before brw-07/brw-08 were planned), it is not a dependency, and nothing
+schedules off it. Empty is legal and means "stale, not replaced" (`dash-01`).
+
+**Nothing is deleted, ever.** `retire` keeps the task, its description, its
+scope and its `blocked_reason`; there is no un-retire and no remove. The
+supersession chain is the only record that brw-07/brw-08 continue brw-02/brw-04
+— regression history, the same rule `docs/SECURITY.md` findings live under.
+
+```bash
+python -m autoloop retire <task-id> --superseded-by <id> [--superseded-by <id>] \
+                                    [--reason "..."]
+```
+
+Takes the loop lock (it writes `tasks.json`). Accepts a pending, in-progress or
+quarantined task — `dash-01` was in-progress, which is exactly the shape that
+needs retiring — and refuses only a completed one.
+
+**The six above are migrated in code, not by hand.** `tasks._RETIREMENTS` maps
+each id to the successors read from its existing reason, and
+`_migrate_retirements` applies it inside `TaskRegistry.from_dict`; the live
+`tasks.json` is loop state outside the repository, so a load-time migration is
+the only route to it. Two guards: the stored status must still be `blocked`
+(making it idempotent — after the first save nothing matches) AND a marker must
+still appear in the reason (making it self-limiting — a revived task
+quarantined later for a real reason is left alone). A reason that was reworded
+simply does not migrate and stays quarantined, and `autoloop retire` is the
+manual route. `audit-0003` is deliberately absent from the table.
+
+Enforcement mirrors the quarantine's: `policy._check_task_reference` denies an
+`implement`/`revise` naming a retired id (`task_retired`, naming the
+successor), and `TaskRegistry.mark_in_progress`/`mark_completed` refuse it too
+as defense in depth. `cli._merge_window_blockers` treats RETIRED as terminal
+alongside completed and quarantined, so a superseded task's leftover execution
+record cannot hold the merge window shut on work nobody will finish.
+
+The dashboard groups by it (§ the roadmap panel in `dashboard.py`): **Ready /
+In progress / Blocked / Needs a human / Retired / Done**, with the Retired
+group collapsed like Done and its rows naming the successor.
+
+One consequence, stated rather than hidden: a task that DEPENDS on a retired
+one stays BLOCKED forever, since only `completed` satisfies a dependency. That
+is correct — the prerequisite genuinely never happened under that id — and it
+is not new (a retirement stored as `blocked` did the same). Re-plan the
+dependent against the successor `superseded_by` names.
 
 ## 10. Recovery procedures
 

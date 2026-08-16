@@ -333,6 +333,284 @@ def test_store_archive(tmp_path):
     assert store.load() is None
 
 
+# ---- retirement: superseded work is not blocked work -------------------------
+#
+# The distinction these pin: BLOCKED resolves itself, BLOCKED_BY_OPERATOR
+# resolves when a human answers, RETIRED resolves for nobody. Six of the seven
+# `blocked` tasks on 2026-08-14 were the third kind, saying so only in free
+# text, so "7 blocked" meant two opposite things at once.
+
+
+def test_retire_records_the_successor_and_leaves_the_reason_alone():
+    """`superseded_by` is the machine-readable half; `blocked_reason` is the
+    prose half and is NOT overwritten by a retirement that brings no new
+    reason. Deleting either loses the record."""
+    reg = registry(task("brw-02"))
+    reg.block("brw-02", "superseded by brw-06")
+
+    retired = reg.retire("brw-02", superseded_by=["brw-06"])
+
+    assert reg.state_of("brw-02") is TaskState.RETIRED
+    assert retired.superseded_by == ("brw-06",)
+    assert retired.blocked_reason == "superseded by brw-06"
+
+
+def test_retire_accepts_a_new_reason_and_several_successors():
+    reg = registry(task("brw-06"))
+    reg.retire("brw-06", superseded_by=("brw-07", "brw-08"), reason="split by the reviewer")
+    assert reg.get("brw-06").superseded_by == ("brw-07", "brw-08")
+    assert reg.get("brw-06").blocked_reason == "split by the reviewer"
+
+
+def test_retire_takes_an_in_progress_task():
+    """`dash-01` is the reason this is not `release`'s pending-only guard: it
+    was in_progress at dispatch with no candidate and no execution record, so
+    nothing would ever finish it — which is exactly what needs retiring."""
+    reg = registry(task("dash-01"))
+    reg.mark_in_progress("dash-01")
+    reg.retire("dash-01", reason="stale since 2026-08-03")
+    assert reg.state_of("dash-01") is TaskState.RETIRED
+    # No successor is legal: it was abandoned, not replaced.
+    assert reg.get("dash-01").superseded_by == ()
+
+
+def test_retire_takes_a_quarantined_task_without_a_trip_through_ready():
+    """Deciding a `task_fatal` park will never be worked IS a retirement.
+    Forcing it through `unblock` first would put the task back in the READY
+    queue in between, where the loop could pick it up."""
+    reg = registry(task("t1"))
+    reg.block("t1", "attempt ceiling")
+    reg.retire("t1", superseded_by=["t2"])
+    assert reg.state_of("t1") is TaskState.RETIRED
+
+
+def test_retire_refuses_a_completed_task():
+    reg = registry(task("a"))
+    reg.mark_completed("a")
+    expect_code(lambda: reg.retire("a"), "task_completed")
+
+
+def test_a_retired_task_is_never_ready_even_with_every_dependency_done():
+    """The state is checked BEFORE the dependency scan, like `blocked` — a
+    retired task that still declares its old dependencies must not reappear as
+    READY, nor be re-described as BLOCKED."""
+    reg = registry(task("a"), task("b", deps=["a"]))
+    reg.mark_completed("a")
+    reg.retire("b", superseded_by=["c"])
+    assert reg.state_of("b") is TaskState.RETIRED
+    assert reg.ready_tasks() == []
+    assert reg.next_ready() is None
+
+
+def test_a_retired_task_is_retired_rather_than_blocked_by_its_dependencies():
+    reg = registry(task("a"), task("b", deps=["a"]))
+    reg.retire("b")
+    assert reg.state_of("b") is TaskState.RETIRED
+
+
+def test_a_task_depending_on_a_retired_one_stays_blocked():
+    """Stated because it is a real consequence, not an oversight: retirement
+    does not satisfy a dependency — the prerequisite genuinely never happened
+    under that id. The dependent must be re-planned against the successor."""
+    reg = registry(task("a"), task("b", deps=["a"]))
+    reg.retire("a", superseded_by=["a2"])
+    assert reg.state_of("b") is TaskState.BLOCKED
+
+
+def test_a_retired_task_cannot_be_dispatched_or_completed():
+    """Defense in depth behind `policy._check_task_reference`, and the message
+    names the successor so the refusal is actionable."""
+    reg = registry(task("brw-02"))
+    reg.retire("brw-02", superseded_by=["brw-06"])
+    expect_code(lambda: reg.mark_in_progress("brw-02"), "task_retired")
+    expect_code(lambda: reg.mark_completed("brw-02"), "task_retired")
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.mark_in_progress("brw-02")
+    assert "brw-06" in str(excinfo.value)
+
+
+def test_unblock_refuses_a_retired_task_and_says_which_state_it_is_in():
+    """`answer` calls `unblock`, so a retired task reached from a stale blocker
+    must not read as "not blocked" — that is the generic message an operator
+    would take for a bug."""
+    reg = registry(task("t1"))
+    reg.retire("t1", superseded_by=["t2"])
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.unblock("t1")
+    assert excinfo.value.code == "task_retired"
+    assert "t2" in str(excinfo.value)
+    assert reg.state_of("t1") is TaskState.RETIRED  # unchanged
+
+
+def test_release_still_refuses_a_retired_task():
+    """`release` is for an interrupted round. A retirement is not that, and it
+    must not be launderable back into the queue by the recovery command."""
+    reg = registry(task("t1"))
+    reg.mark_in_progress("t1")
+    reg.retire("t1")
+    expect_code(lambda: reg.release("t1"), "task_not_in_progress")
+
+
+def test_summary_counts_retired_separately_from_quarantined():
+    """Folded together, the roadmap line tells the reviewer that superseded
+    work is waiting on someone."""
+    reg = registry(task("a"), task("b"), task("c"))
+    reg.block("b", "answer me")
+    reg.retire("c", superseded_by=["d"])
+    text = reg.summary()
+    assert "1 quarantined" in text
+    assert "1 retired" in text
+
+
+@pytest.mark.parametrize(
+    "successors",
+    [["has space"], ["t1"], ["t2", "t2"], "t2", [None], [""], 7],
+)
+def test_superseded_by_shape_is_validated(successors):
+    """Shape only: a bad id, a self-reference, a repeat, and a bare string
+    (which would otherwise iterate character by character)."""
+    reg = registry(task("t1"))
+    expect_code(lambda: reg.retire("t1", superseded_by=successors), "bad_superseded_by")
+
+
+def test_a_successor_does_not_have_to_exist_yet():
+    """brw-06 was split into brw-07 + brw-08 before either was planned. A
+    supersession is a record, not a schedule — nothing dispatches off it, so it
+    is neither a dependency nor part of the cycle check."""
+    reg = registry(task("brw-06"))
+    reg.retire("brw-06", superseded_by=["brw-07", "brw-08"])
+    assert not reg.has("brw-07")
+    assert reg.get("brw-06").superseded_by == ("brw-07", "brw-08")
+
+
+def test_creation_validates_superseded_by_too():
+    """One validator, two callers — a shape the registry refuses to create
+    must not be writable onto an existing task, and vice versa."""
+    expect_code(
+        lambda: registry(Task(id="t1", title="t", description="d",
+                              superseded_by=("bad id",))),
+        "bad_superseded_by",
+    )
+
+
+def test_retirement_survives_a_store_round_trip_as_a_tuple(tmp_path):
+    """JSON has no tuples. Without the conversion in `from_dict` the field
+    reloads as a list and compares unequal to everything else here."""
+    store = TaskStore(tmp_path / "tasks.json")
+    reg = registry(task("brw-02"))
+    reg.retire("brw-02", superseded_by=["brw-06"], reason="superseded by brw-06")
+    store.save(reg)
+
+    loaded = store.load()
+    assert loaded.state_of("brw-02") is TaskState.RETIRED
+    assert loaded.get("brw-02").superseded_by == ("brw-06",)
+    assert loaded.get("brw-02").blocked_reason == "superseded by brw-06"
+
+
+def test_a_task_file_without_superseded_by_still_loads(tmp_path):
+    """Backward compatibility, same rule as `blocked_reason`/`approved_paths`:
+    every `tasks.json` on disk today predates this field."""
+    path = tmp_path / "tasks.json"
+    path.write_text(
+        json.dumps({"schema_version": 1, "tasks": [
+            {"id": "t1", "title": "t", "description": "d", "depends_on": [],
+             "priority": 100, "status": "pending", "created_at": "2026-08-14T00:00:00+00:00",
+             "completed_at": None, "blocked_reason": "", "validation": [],
+             "validation_cwd": "", "approved_paths": []},
+        ]}),
+        encoding="utf-8",
+    )
+    assert TaskStore(path).load().get("t1").superseded_by == ()
+
+
+# ---- migrating the retirements that predate the state ------------------------
+#
+# The live `tasks.json` is loop state under `.autoloop/`, outside this
+# repository, so the migration is code that runs on load rather than a data
+# edit. These pin the two guards that keep it from retiring anything nobody
+# retired.
+
+
+def stored(task_id, **over):
+    row = {"id": task_id, "title": task_id.upper(), "description": "d",
+           "depends_on": [], "priority": 100, "status": "pending"}
+    row.update(over)
+    return row
+
+
+def test_the_six_pre_state_retirements_are_migrated_on_load():
+    """Read from each task's own `blocked_reason`, as of 2026-08-14. brw-05
+    records brw-02/brw-04 rather than brw-06 because that is what ITS reason
+    says — the chain stays traversable one hop at a time."""
+    reg = TaskRegistry.from_dict({"tasks": [
+        stored("brw-02", status="blocked", blocked_reason="superseded by brw-06"),
+        stored("brw-04", status="blocked", blocked_reason="superseded by brw-06"),
+        stored("brw-05", status="blocked", blocked_reason="retired with brw-02/brw-04"),
+        stored("brw-06", status="blocked",
+               blocked_reason="split at the reviewer's request into brw-07 + brw-08"),
+        stored("sub-01", status="blocked", blocked_reason="superseded by sub-02 and sub-03"),
+        stored("dash-01", status="blocked",
+               blocked_reason="stale since 2026-08-03: in_progress at dispatch with "
+                              "no candidate and no execution record"),
+    ]})
+
+    assert {t.id for t in reg.all_tasks() if reg.state_of(t.id) is TaskState.RETIRED} == {
+        "brw-02", "brw-04", "brw-05", "brw-06", "sub-01", "dash-01"
+    }
+    assert reg.get("brw-02").superseded_by == ("brw-06",)
+    assert reg.get("brw-05").superseded_by == ("brw-02", "brw-04")
+    assert reg.get("brw-06").superseded_by == ("brw-07", "brw-08")
+    assert reg.get("sub-01").superseded_by == ("sub-02", "sub-03")
+    # Stale, not replaced. An invented successor would be a false record.
+    assert reg.get("dash-01").superseded_by == ()
+    # Nothing is deleted: every reason survives the migration verbatim.
+    assert reg.get("brw-02").blocked_reason == "superseded by brw-06"
+    assert "no candidate" in reg.get("dash-01").blocked_reason
+
+
+def test_the_migration_leaves_a_genuine_failure_quarantined():
+    """audit-0003 is the one real failure among the seven blocked rows. It
+    must keep asking for an operator — a migration that swept it up would
+    delete the only task on that list anybody has to act on."""
+    reg = TaskRegistry.from_dict({"tasks": [
+        stored("audit-0003", status="blocked", blocked_reason="failed its own validation"),
+    ]})
+    assert reg.state_of("audit-0003") is TaskState.BLOCKED_BY_OPERATOR
+
+
+def test_the_migration_needs_the_reason_to_still_match():
+    """The self-limiting guard: a listed id whose reason no longer names its
+    successor is left alone. If brw-02 is ever revived and quarantined again
+    for a real reason, this must not silently re-retire it — the manual route
+    (`autoloop retire`) is then the only way, on purpose."""
+    reg = TaskRegistry.from_dict({"tasks": [
+        stored("brw-02", status="blocked", blocked_reason="post-commit validation failed"),
+    ]})
+    assert reg.state_of("brw-02") is TaskState.BLOCKED_BY_OPERATOR
+    assert reg.get("brw-02").superseded_by == ()
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress", "completed"])
+def test_the_migration_only_touches_a_blocked_row(status):
+    """The idempotence guard. After the first save the status is `retired`, so
+    nothing here matches again — and a listed id that is legitimately pending
+    or running is never yanked out from under the loop."""
+    reg = TaskRegistry.from_dict({"tasks": [
+        stored("brw-02", status=status, blocked_reason="superseded by brw-06"),
+    ]})
+    assert reg.state_of("brw-02") is not TaskState.RETIRED
+
+
+def test_the_migration_is_idempotent_across_a_save_and_reload(tmp_path):
+    store = TaskStore(tmp_path / "tasks.json")
+    store.save(TaskRegistry.from_dict({"tasks": [
+        stored("brw-02", status="blocked", blocked_reason="superseded by brw-06"),
+    ]}))
+    reloaded = store.load()
+    assert reloaded.state_of("brw-02") is TaskState.RETIRED
+    assert reloaded.get("brw-02").superseded_by == ("brw-06",)
+
+
 # ---- always-approved repository trackers ------------------------------------
 
 

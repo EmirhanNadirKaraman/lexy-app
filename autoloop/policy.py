@@ -384,6 +384,22 @@ class PolicyEngine:
                 f"task '{task_id}' is quarantined pending an operator answer "
                 "(see `python -m autoloop blockers`)",
             )
+        if state is TaskState.RETIRED:
+            # Retirement used to be stored as `blocked`, so these ids were
+            # denied by the branch above and nothing noticed the gate was
+            # carrying two meanings. Now that they are their own state the
+            # denial has to be restated here, or giving retirement its own
+            # status would have QUIETLY MADE SIX SUPERSEDED TASKS
+            # DISPATCHABLE — a strictly worse roadmap than the confusing one
+            # it replaces. The successor is named because a reviewer that
+            # asked for a retired task wants its continuation, not a refusal.
+            successors = ", ".join(registry.get(task_id).superseded_by)
+            return Verdict.deny(
+                "task_retired",
+                f"task '{task_id}' is retired — it was superseded and will not "
+                "be worked again"
+                + (f"; its successor is {successors}" if successors else ""),
+            )
         return Verdict.ok()
 
     # ---- git command validation (defense in depth) --------------------------

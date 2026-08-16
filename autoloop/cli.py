@@ -6,13 +6,15 @@
     python -m autoloop status | tasks | doctor | next-task | blockers [--all]
                                                                (read-only, no lock)
     python -m autoloop answer <blocker-id> "<text>"
+    python -m autoloop retire <task-id> [--superseded-by ID ...] [--reason TEXT]
     python -m autoloop smoke-browser [--config PATH]
     python -m autoloop pause | resume | unlock | reset --yes [--tasks]
     python -m autoloop merge-window [--wait] | merge-backlog
     python -m autoloop reprovision-publisher --confirm
     python -m autoloop review-changeset --base <sha> --candidate <sha> [--packet FILE]
 
-Locking: run / resume / reset / smoke-browser / answer / merge-backlog take
+Locking: run / resume / reset / smoke-browser / answer / retire / release /
+merge-backlog take
 the single-instance lock on the state directory (fail closed against a live
 process; `unlock` is the only stale-lock recovery, and it refuses live locks).
 status / tasks / doctor / next-task / blockers / pause / merge-window stay
@@ -1792,6 +1794,52 @@ def _cmd_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_retire_task(args: argparse.Namespace) -> int:
+    """Record that a task is superseded and will never be worked again.
+
+    The operator route to `TaskRegistry.retire`, and the manual fallback for a
+    pre-`RETIRED` retirement whose `blocked_reason` was reworded and so did not
+    match `tasks._RETIREMENTS` on load (that table is guarded on the reason
+    text precisely so it never retires something nobody retired).
+
+    Distinct from `release`, which is about an INTERRUPTED round: that returns
+    a task to the queue, this takes it out of the queue for good. Distinct from
+    the quarantine `answer` clears, too — a quarantine is a question waiting
+    for the operator, a retirement is an answer that already happened under
+    another task id.
+
+    `--superseded-by` is repeatable and optional. Optional because `dash-01` —
+    the task that motivated this command — went stale rather than being
+    replaced, and naming an invented successor would put a false chain in the
+    record. Successors are NOT required to exist: brw-06 was split into
+    brw-07 + brw-08 before either was planned.
+
+    Nothing is deleted, here or in the registry: the task keeps its id, its
+    description, its reason, and its place in the graph. Takes the loop lock,
+    like `release`, because it writes `tasks.json`.
+    """
+    config = load_config(args.config)
+    with LoopLock(config.state_dir):
+        task_store, registry = _load_tasks(config)
+        previous = registry.get(args.task_id).status if registry.has(args.task_id) else ""
+        try:
+            task = registry.retire(
+                args.task_id,
+                superseded_by=tuple(args.superseded_by or ()),
+                reason=args.reason or "",
+            )
+        except TaskGraphError as exc:
+            print(f"error: {exc}")
+            return 1
+        task_store.save(registry)
+    successors = ", ".join(task.superseded_by) or "nothing (stale, not replaced)"
+    print(
+        f"task {task.id} retired: {previous} -> retired; superseded by {successors}\n"
+        f"reason kept: {task.blocked_reason or '(none recorded)'}"
+    )
+    return 0
+
+
 def _cmd_archive_blocker(args: argparse.Namespace) -> int:
     """Close a blocker whose session is gone, recording a machine reason.
 
@@ -2099,7 +2147,19 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
         task_id = record.get("task_id") or path.stem
         if registry.has(task_id):
             state = registry.state_of(task_id)
-            if state in (TaskState.COMPLETED, TaskState.BLOCKED_BY_OPERATOR):
+            # RETIRED belongs here for the same reason the other two do: it is
+            # a terminal registry state, and this docstring's own exemption
+            # says so ("the task reached a terminal registry state"). It is
+            # also a REGRESSION GUARD — these six tasks were stored as
+            # `blocked` and exempted via BLOCKED_BY_OPERATOR, so giving
+            # retirement its own status without listing it here would let a
+            # superseded task's leftover execution record hold the merge
+            # window shut permanently, on work nobody will ever finish.
+            if state in (
+                TaskState.COMPLETED,
+                TaskState.BLOCKED_BY_OPERATOR,
+                TaskState.RETIRED,
+            ):
                 continue
         if not record.get("candidate_sha"):
             continue
@@ -2455,6 +2515,32 @@ def build_parser() -> argparse.ArgumentParser:
     add_config(release)
     release.add_argument("task_id")
     release.set_defaults(func=_cmd_release)
+
+    retire = sub.add_parser(
+        "retire",
+        help=(
+            "record that a task is superseded and will never be worked again "
+            "(kept, never deleted — the successor ids are the record)"
+        ),
+    )
+    add_config(retire)
+    retire.add_argument("task_id")
+    retire.add_argument(
+        "--superseded-by",
+        action="append",
+        metavar="TASK_ID",
+        help=(
+            "the task that continues this one; repeatable. Omit when the task "
+            "went stale rather than being replaced — an invented successor is "
+            "worse than none"
+        ),
+    )
+    retire.add_argument(
+        "--reason",
+        default="",
+        help="why it was retired; the existing reason is kept when this is omitted",
+    )
+    retire.set_defaults(func=_cmd_retire_task)
 
     archive_blocker = sub.add_parser(
         "archive-blocker",

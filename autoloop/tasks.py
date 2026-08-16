@@ -1,9 +1,17 @@
 """Task registry / task graph.
 
 The roadmap ChatGPT plans against. Tasks have stable ids, dependencies, and a
-stored status (pending / in_progress / completed); ready vs blocked is DERIVED
-from dependencies, never stored, so it can not go stale. ChatGPT authorizes
-work by task id only (contract v2) — free-form instructions are gone.
+stored status (pending / in_progress / completed / blocked / retired); ready vs
+blocked is DERIVED from dependencies, never stored, so it can not go stale.
+ChatGPT authorizes work by task id only (contract v2) — free-form instructions
+are gone.
+
+Three states mean "not running right now" and they are NOT interchangeable —
+conflating them is what made the dashboard's blocked count unreadable:
+`BLOCKED` waits on a dependency and resolves itself, `BLOCKED_BY_OPERATOR`
+waits on a human and resolves when they answer, `RETIRED` waits on nobody
+because the work already happened (or stopped) under another id. See
+`TaskState` and `_RETIREMENTS`.
 
 Graph invariants enforced on every mutation: unique slug ids, dependencies
 must reference known tasks (same batch counts), no cycles, no completing a
@@ -114,6 +122,61 @@ def _validate_description(task_id: object, description: object) -> None:
         )
 
 
+def _validate_superseded_by(task_id: object, successors: object) -> tuple[str, ...]:
+    """Return `successors` as a tuple, or raise `TaskGraphError`.
+
+    THE successor check, called from both `TaskRegistry.add_many` (creation,
+    so a hand-written `tasks.json` row is checked) and `TaskRegistry.retire`
+    (mutation) — the same "one validator, two callers" rule
+    `_validate_description` is written for.
+
+    SHAPE only, deliberately. Each entry must be a well-formed task id, no
+    entry may name the task itself, and no id may repeat. What is NOT checked
+    is whether the successor exists: a supersession is a historical record,
+    not a schedule. brw-06 was retired into brw-07 + brw-08 at the reviewer's
+    request before either existed, and refusing that would have forced the
+    operator to either invent the successors early or leave the chain in
+    prose. Nothing dispatches off this field, so an id that never materialises
+    costs a dangling pointer in a record, not a broken graph.
+    """
+    if isinstance(successors, str) or not isinstance(successors, (list, tuple)):
+        raise TaskGraphError(
+            "bad_superseded_by",
+            f"task '{task_id}' needs superseded_by as a list of task ids, "
+            f"got {successors!r}",
+        )
+    seen: set[str] = set()
+    for successor in successors:
+        if not isinstance(successor, str) or not _ID_RE.match(successor):
+            raise TaskGraphError(
+                "bad_superseded_by",
+                f"task '{task_id}' names {successor!r} as a successor, which is "
+                "not a valid task id (slug of [A-Za-z0-9._-], max 64)",
+            )
+        if successor == task_id:
+            raise TaskGraphError(
+                "bad_superseded_by", f"task '{task_id}' cannot supersede itself"
+            )
+        if successor in seen:
+            raise TaskGraphError(
+                "bad_superseded_by",
+                f"task '{task_id}' names successor {successor!r} more than once",
+            )
+        seen.add(successor)
+    return tuple(successors)
+
+
+def _successor_hint(task: "Task") -> str:
+    """A parenthetical naming the successors, empty when none is recorded:
+    ` (superseded by brw-07, brw-08)`.
+
+    Every refusal that mentions a retirement carries it, because "this task is
+    retired" without naming what replaced it sends the reader back to the
+    free-text reason this field exists to replace.
+    """
+    return f" (superseded by {', '.join(task.superseded_by)})" if task.superseded_by else ""
+
+
 def is_directory_prefix(approved: str) -> bool:
     """A trailing '/' means "this directory and everything under it"."""
     return approved.endswith("/")
@@ -155,6 +218,22 @@ class TaskState(str, Enum):
     #: the recorded blocker (`python -m autoloop answer`), which calls
     #: `unblock()` below.
     BLOCKED_BY_OPERATOR = "blocked_by_operator"
+    #: Superseded and never coming back. The THIRD meaning that used to be
+    #: stored as `blocked`, and the one that made the dashboard's blocked count
+    #: worthless: `BLOCKED` resolves itself when a dependency completes,
+    #: `BLOCKED_BY_OPERATOR` resolves when an operator answers, and RETIRED
+    #: resolves for nobody — the work was already done, or abandoned, under a
+    #: different task id. As of 2026-08-14 six of the seven `blocked` tasks
+    #: were retirements saying so only in free-text `blocked_reason`, so an
+    #: operator reading "7 blocked" was reading one number for two opposite
+    #: calls to action (needs you / needs nobody).
+    #:
+    #: The successor ids live in `Task.superseded_by`, so the supersession
+    #: chain is machine-readable rather than prose. Neither the task nor its
+    #: reason is ever deleted — the chain is the only record that (say)
+    #: brw-07/brw-08 continue brw-02/brw-04, and that is regression history in
+    #: the same sense `docs/SECURITY.md` findings are.
+    RETIRED = "retired"
 
 
 @dataclass
@@ -170,16 +249,31 @@ class Task:
     #: selection stays deterministic (a non-deterministic `next_ready` would
     #: make "which task ran" depend on dict ordering).
     priority: int = 100
-    status: str = "pending"  # pending | in_progress | completed | blocked
+    status: str = "pending"  # pending | in_progress | completed | blocked | retired
     created_at: str = field(default_factory=utcnow_iso)
     completed_at: str | None = None
     #: Operator-facing reason, set by `TaskRegistry.block` and cleared by
     #: `unblock`. Empty for every task that has never been quarantined.
+    #: `retire` writes it too and NOTHING clears it — a retirement's reason is
+    #: the prose half of the record `superseded_by` makes machine-readable, and
+    #: deleting it would delete the only account of why the work stopped.
     #: New field with a default — an old `tasks.json` written before this
     #: existed loads fine (`Task(**raw)` falls back to the default), see
     #: `TaskRegistry.from_dict` below and `test_blockers.py`'s backward-
     #: compatibility test.
     blocked_reason: str = ""
+    #: Which task(s) continue this one, set by `retire`. Empty is legal and
+    #: means "retired with no successor" — `dash-01` went stale rather than
+    #: being superseded, and inventing a successor for it would be worse than
+    #: recording none.
+    #:
+    #: NOT a dependency. It is deliberately excluded from `_check_acyclic` and
+    #: from the known-task check `depends_on` gets: a successor may be planned
+    #: later (or never — a retired task's successor can itself be retired), and
+    #: nothing schedules off this field. Only its SHAPE is validated
+    #: (`_validate_superseded_by`). New field with a default, same
+    #: backward-compatible pattern as `blocked_reason`/`approved_paths`.
+    superseded_by: tuple[str, ...] = ()
     #: Validation commands for THIS task, overriding the configured default.
     #: Empty means "use the configured commands". A task whose change lives
     #: outside what the default commands exercise must declare its own, or
@@ -333,6 +427,7 @@ class TaskRegistry:
                         f"task '{task.id}' lists approved path {approved!r} more than once",
                     )
                 seen_paths.add(approved)
+            task.superseded_by = _validate_superseded_by(task.id, task.superseded_by)
             candidate[task.id] = task
         for task in tasks:
             for dep in task.depends_on:
@@ -373,6 +468,17 @@ class TaskRegistry:
                 f"task '{task_id}' is quarantined — answer its blocker first "
                 "(`python -m autoloop answer`)",
             )
+        if state is TaskState.RETIRED:
+            # The same defense in depth, for the opposite reason: a quarantine
+            # is a decision nobody has made yet, a retirement is one already
+            # made. Re-dispatching a retired task redoes work that shipped
+            # under its successor's id — and `policy._check_task_reference`
+            # denying it is not the only thing that should stand in the way.
+            raise TaskGraphError(
+                "task_retired",
+                f"task '{task_id}' is retired{_successor_hint(task)} — plan a "
+                "new task instead of reviving it",
+            )
         task.status = "in_progress"
         return task
 
@@ -400,6 +506,17 @@ class TaskRegistry:
                 f"task '{task_id}' is quarantined — answer its blocker before "
                 "completing it (`python -m autoloop answer`)",
             )
+        if state is TaskState.RETIRED:
+            # Completing a retirement would erase it: the row would read as
+            # finished work on the dashboard, the supersession chain would
+            # point at a "completed" task nobody ever ran, and the merge panel
+            # would start asking git whether a commit that does not exist is in
+            # the branch. A retired task's outcome already happened elsewhere.
+            raise TaskGraphError(
+                "task_retired",
+                f"task '{task_id}' is retired{_successor_hint(task)} — the work "
+                "it describes did not complete under this id",
+            )
         task.status = "completed"
         task.completed_at = utcnow_iso()
         return task
@@ -422,13 +539,87 @@ class TaskRegistry:
         task.blocked_reason = reason
         return task
 
+    def retire(
+        self, task_id: str, superseded_by=(), reason: str = ""
+    ) -> Task:
+        """Record that `task_id` is superseded and will never be worked again.
+
+        The third meaning `blocked` used to carry (see `TaskState.RETIRED`).
+        Distinct from `block` because the two ask opposite things of an
+        operator: a quarantine is a question waiting for them, a retirement is
+        an answer that already happened somewhere else.
+
+        `superseded_by` names the successor task(s) — the machine-readable half
+        of what used to be prose in `blocked_reason`. Empty is legal:
+        `dash-01` went stale at dispatch with nothing to continue it, and
+        naming an invented successor would be worse than naming none.
+
+        NOTHING IS DELETED. `blocked_reason` is preserved when `reason` is
+        empty and overwritten only when a new one is given, `depends_on`,
+        `approved_paths` and the timestamps are untouched, and there is no
+        method here that removes a task from the registry. The supersession
+        chain is the only record that a successor continues this work, so it
+        is kept for the same reason `docs/SECURITY.md` keeps resolved
+        findings: regression history.
+
+        Accepts an IN-PROGRESS task, unlike `release`'s mirror-image guard.
+        That is not an oversight — `dash-01` was `in_progress` at dispatch with
+        no candidate and no execution record, which is exactly the shape of
+        work that needs retiring, and a pending-only rule would have refused
+        the one task that most needed this. It accepts a quarantined task too:
+        deciding that a `task_fatal` park is never going to be worked is a
+        retirement, and forcing it through `unblock` first would put the task
+        back in the READY queue in between.
+
+        Refuses only `completed`, mirroring `block`: finished work is not
+        superseded work, and rewriting it as retired would hide a real
+        completion from the merge panel.
+
+        One consequence stated rather than papered over: a task that DEPENDS
+        on a retired one stays BLOCKED forever, because `state_of` only counts
+        a dependency satisfied when it is `completed`. That is deliberate — the
+        prerequisite genuinely never happened under this id — and it is not new
+        behaviour (a retirement stored as `blocked` did the same). The fix is
+        to plan the dependent against the successor, which is what
+        `superseded_by` is there to tell you; the dashboard's Blocked group
+        names the dependency, and its Retired group now names the successor.
+        """
+        task = self.get(task_id)
+        if task.status == "completed":
+            raise TaskGraphError(
+                "task_completed",
+                f"task '{task_id}' is already completed — it was not superseded",
+            )
+        successors = _validate_superseded_by(task_id, superseded_by)
+        task.status = "retired"
+        task.superseded_by = successors
+        if reason:
+            task.blocked_reason = reason
+        return task
+
     def unblock(self, task_id: str) -> Task:
         """Reverse of `block`: back to `pending`, i.e. READY again once its
         dependencies are still satisfied (`state_of` re-derives that from
         `depends_on` exactly as for any other pending task). Called by
         `python -m autoloop answer` once the operator resolves the blocker
-        that quarantined it."""
+        that quarantined it.
+
+        Deliberately no reverse of `retire`. Un-retiring is not an operator
+        answer — it is the claim that a supersession was wrong, which means
+        planning a task, not flipping a status back to pending and losing the
+        chain in the process.
+        """
         task = self.get(task_id)
+        if task.status == "retired":
+            # `answer` reaches here (`cli._cmd_answer`), so the message has to
+            # say which of the two non-resolving states this is rather than
+            # "not blocked" — a retired task looks blocked in every listing
+            # written before this state existed.
+            raise TaskGraphError(
+                "task_retired",
+                f"task '{task_id}' is retired{_successor_hint(task)}, not "
+                "quarantined — there is no blocker to answer",
+            )
         if task.status != "blocked":
             raise TaskGraphError("task_not_blocked", f"task '{task_id}' is not blocked")
         task.status = "pending"
@@ -486,6 +677,13 @@ class TaskRegistry:
             return TaskState.COMPLETED
         if task.status == "blocked":
             return TaskState.BLOCKED_BY_OPERATOR
+        # Before the dependency check, exactly like `blocked` above: a retired
+        # task usually still declares the dependencies it was planned with, and
+        # reading it as BLOCKED would put it back under "waiting on brw-01" —
+        # the flat-status confusion this state exists to end, rebuilt one row
+        # further down.
+        if task.status == "retired":
+            return TaskState.RETIRED
         if any(self._tasks[dep].status != "completed" for dep in task.depends_on):
             return TaskState.BLOCKED
         if task.status == "in_progress":
@@ -583,7 +781,11 @@ class TaskRegistry:
             f"{counts[TaskState.IN_PROGRESS]} in progress, "
             f"{counts[TaskState.READY]} ready ({ready_priority_one} at priority 1), "
             f"{counts[TaskState.BLOCKED]} blocked, "
-            f"{counts[TaskState.BLOCKED_BY_OPERATOR]} quarantined"
+            f"{counts[TaskState.BLOCKED_BY_OPERATOR]} quarantined, "
+            # Counted separately for the same reason the state exists: folded
+            # into `quarantined` it reads as work waiting on the reviewer, and
+            # `AUDIT_VS_READY_PREFERENCE` has them weighing exactly that.
+            f"{counts[TaskState.RETIRED]} retired"
         )
         if nxt is not None:
             parts += f"; next ready: {nxt.id} — {nxt.title}"
@@ -609,6 +811,10 @@ class TaskRegistry:
                         tuple(c) for c in raw.get("validation", ())
                     ),
                     "approved_paths": tuple(raw.get("approved_paths", ())),
+                    # JSON has no tuples here either. Miss this and the field
+                    # round-trips as a list, which compares unequal to every
+                    # tuple the rest of this module builds.
+                    "superseded_by": tuple(raw.get("superseded_by", ())),
                 })
                 for raw in data["tasks"]
             ]
@@ -621,8 +827,77 @@ class TaskRegistry:
             if task.id in registry._tasks:
                 raise StateCorruptError(f"task file contains duplicate id '{task.id}'")
             registry._tasks[task.id] = task
+        _migrate_retirements(registry._tasks)
         _check_acyclic(registry._tasks)
         return registry
+
+
+#: The retirements that predate `TaskState.RETIRED`: `{task_id: (markers,
+#: successors)}`.
+#:
+#: A one-shot data migration living in code, because the data it migrates does
+#: not live in this repository — `tasks.json` is loop state under `.autoloop/`,
+#: outside the checkout, and there is no schema-migration runner for it. This
+#: is the whole of the mechanism: `from_dict` applies it, so the very next
+#: `TaskStore.save` persists the result and the dashboard (which builds a
+#: registry from the same JSON without writing) shows it immediately.
+#:
+#: Each entry was read off that task's own `blocked_reason` as of 2026-08-14:
+#:   brw-02, brw-04  superseded by brw-06
+#:   brw-05          retired alongside brw-02/brw-04
+#:   brw-06          split at the reviewer's request (blk-(loop)-018) into
+#:                   brw-07 + brw-08
+#:   sub-01          superseded by sub-02 and sub-03
+#:   dash-01         went stale on 2026-08-03 — in_progress at dispatch with no
+#:                   candidate and no execution record, so nothing will ever
+#:                   finish it. No successor: it was abandoned, not replaced,
+#:                   and inventing one would put a false chain in the record.
+#: audit-0003 is deliberately ABSENT. It is the one genuine failure among the
+#: seven, and it must keep asking for an operator.
+#:
+#: brw-05 records brw-02/brw-04 rather than brw-06 because that is what its own
+#: reason says. The chain then stays traversable one hop at a time
+#: (brw-05 → brw-02 → brw-06 → brw-07/brw-08) and no link is asserted that a
+#: human did not write down.
+#:
+#: TWO guards, not one. A task is migrated only when its stored status is still
+#: `blocked` AND one of its markers still appears in its `blocked_reason`
+#: (case-insensitive). The status guard makes it idempotent — after the first
+#: save nothing here matches again. The marker guard makes it self-limiting: if
+#: brw-02 is ever revived and later quarantined for a real reason, the reason no
+#: longer matches and this leaves it alone. A task whose reason was reworded
+#: simply does not migrate and stays quarantined, which is the pre-existing
+#: state rather than a wrong one — `python -m autoloop retire` is then the
+#: manual route, and that is the ONLY intended fallback. Never widen this into
+#: a general "parse the reason for a successor id" heuristic: the reasons are
+#: free text, and a heuristic that misfires retires a task nobody retired.
+_RETIREMENTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "brw-02": (("brw-06",), ("brw-06",)),
+    "brw-04": (("brw-06",), ("brw-06",)),
+    "brw-05": (("brw-02", "brw-04"), ("brw-02", "brw-04")),
+    "brw-06": (("brw-07", "brw-08"), ("brw-07", "brw-08")),
+    "sub-01": (("sub-02", "sub-03"), ("sub-02", "sub-03")),
+    "dash-01": (("stale",), ()),
+}
+
+
+def _migrate_retirements(tasks: dict[str, Task]) -> None:
+    """Re-file the pre-`RETIRED` retirements listed in `_RETIREMENTS`.
+
+    In place, on load, guarded twice (see `_RETIREMENTS`). `blocked_reason` is
+    left exactly as it was: the prose is the account of WHY, `superseded_by` is
+    the machine-readable WHO, and the migration adds the second without
+    touching the first.
+    """
+    for task_id, (markers, successors) in _RETIREMENTS.items():
+        task = tasks.get(task_id)
+        if task is None or task.status != "blocked":
+            continue
+        reason = (task.blocked_reason or "").lower()
+        if not any(marker in reason for marker in markers):
+            continue
+        task.status = "retired"
+        task.superseded_by = successors
 
 
 def _check_acyclic(tasks: dict[str, Task]) -> None:

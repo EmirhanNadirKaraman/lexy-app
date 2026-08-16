@@ -2509,10 +2509,21 @@ class Orchestrator:
         case (a fresh audit), not an error: only a unit that previously
         parked task_fatal is in the registry at all, put there by
         `TaskRegistry.block`. Anything unknown is therefore dispatchable.
+
+        Asked of `state_of` rather than of the status string, so RETIRED
+        counts too. It is the same question — "has a human taken this unit out
+        of the queue?" — and a retirement is the stronger form of the answer:
+        it never resolves at all. Reading the string would have re-dispatched
+        a retired unit, which is the failure this method was written for
+        (2026-08-02, a quarantined `audit-0001` dispatched four times), with
+        one word changed.
         """
         if not self._registry.has(unit_id):
             return False
-        return self._registry.get(unit_id).status == "blocked"
+        return self._registry.state_of(unit_id) in (
+            TaskState.BLOCKED_BY_OPERATOR,
+            TaskState.RETIRED,
+        )
 
     def _resolve_audit_task(self, directive: Directive, state: LoopState) -> Task | None:
         """The audit's own stable per-run identity, distinct from the
@@ -2562,7 +2573,7 @@ class Orchestrator:
                     Verdict.deny(
                         "audit_unit_quarantined",
                         f"the audit unit {unit_id} is quarantined "
-                        "(blocked_by_operator) and re-running `audit` would "
+                        "(blocked_by_operator, or retired) and re-running `audit` would "
                         "re-dispatch that same unit, not a fresh one — the id is "
                         "derived from the loop iteration, which a parked audit "
                         "does not advance. Choose a different ready task, or ask "

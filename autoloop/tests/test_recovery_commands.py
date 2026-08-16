@@ -274,6 +274,81 @@ def test_the_record_is_retired_before_the_worker(wired, monkeypatch):
     ).path_for("loop-01").exists()
 
 
+# --- CLI: retire --------------------------------------------------------------
+#
+# The third dead end, and the one that produced a wrong ANSWER rather than a
+# stuck task. Six of the seven `blocked` rows on 2026-08-14 were retirements
+# saying so only in free text, so the dashboard's blocked count meant "needs
+# you" and "needs nobody" at the same time. `tasks._RETIREMENTS` migrates those
+# six on load; this command is the route for every retirement after them, and
+# the fallback when a reason no longer matches that table.
+
+
+def _retire_args(task_id, superseded_by=None, reason=""):
+    return argparse.Namespace(
+        config=None, task_id=task_id, superseded_by=superseded_by, reason=reason
+    )
+
+
+def test_retire_command_records_the_successor_and_keeps_everything_else(wired, capsys):
+    """Deliberately NOT one of the six ids in `tasks._RETIREMENTS` — those are
+    re-filed by the load-time migration, so a test using one would pass
+    without the command doing anything. This is a retirement decided after
+    that table, which is what the command exists for."""
+    store = _seed(wired, _task("old-01"))
+    registry = store.load()
+    registry.block("old-01", "superseded by new-01")
+    store.save(registry)
+
+    code = cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"]))
+
+    assert code == 0
+    reloaded = store.load()
+    assert reloaded.state_of("old-01") is TaskState.RETIRED
+    assert reloaded.get("old-01").superseded_by == ("new-01",)
+    # Nothing is deleted: the task, its reason and its scope all survive.
+    assert reloaded.get("old-01").blocked_reason == "superseded by new-01"
+    assert reloaded.get("old-01").approved_paths == ("docs/A.md",)
+    out = capsys.readouterr().out
+    assert "blocked -> retired" in out and "new-01" in out
+
+
+def test_retire_command_takes_a_task_stranded_in_progress(wired, capsys):
+    """`dash-01`, the task this command was written for: in_progress at
+    dispatch with no candidate and no execution record, so nothing will ever
+    finish it. No successor — it went stale rather than being replaced."""
+    store = _seed(wired, _task("dash-01"))
+    registry = store.load()
+    registry.mark_in_progress("dash-01")
+    store.save(registry)
+
+    assert cli._cmd_retire_task(_retire_args("dash-01", reason="stale since 2026-08-03")) == 0
+
+    reloaded = store.load()
+    assert reloaded.state_of("dash-01") is TaskState.RETIRED
+    assert reloaded.get("dash-01").superseded_by == ()
+    assert "stale, not replaced" in capsys.readouterr().out
+
+
+def test_retire_command_refuses_completed_work_and_a_bad_successor(wired, capsys):
+    store = _seed(wired, _task("t-1"), _task("t-2"))
+    registry = store.load()
+    registry.mark_completed("t-1")
+    store.save(registry)
+
+    assert cli._cmd_retire_task(_retire_args("t-1", superseded_by=["t-2"])) == 1
+    assert "already completed" in capsys.readouterr().out
+
+    # Rejected before anything is written — `retire` validates the successor
+    # shape ahead of the single assignment, like every other mutator here.
+    assert cli._cmd_retire_task(_retire_args("t-2", superseded_by=["not an id"])) == 1
+    assert "not a valid task id" in capsys.readouterr().out
+
+    reloaded = store.load()
+    assert reloaded.state_of("t-1") is TaskState.COMPLETED
+    assert reloaded.state_of("t-2") is TaskState.READY, "a refused retirement writes nothing"
+
+
 # --- CLI: archive-blocker -----------------------------------------------------
 
 
