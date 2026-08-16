@@ -305,6 +305,41 @@ def test_a_mutation_cannot_strand_a_task_the_loop_is_running(tmp_path):
     )
 
 
+def test_an_inbox_request_cannot_empty_a_running_tasks_scope(tmp_path):
+    """The same refusal as `test_a_mutation_cannot_strand_a_task_the_loop_is_running`,
+    driven with the value that test cannot use: `[]`. A rewrite is
+    stranding; an EMPTY scope is stranding plus un-authorized, since an empty
+    `approved_paths` is what dispatch refuses outright — so the running round
+    would end up judged against a scope it is no longer allowed to have.
+
+    The control in the same batch is the other half of the rule: a non-empty
+    edit against a task the loop is NOT running still lands, and lands in the
+    `applied` bucket, which is what both drain sites gate `task_store.save()`
+    on. A guard written as "refuse approved_paths from the inbox" would pass the
+    refusal assertions here and fail this one."""
+    from autoloop.inbox import apply_requests
+
+    inbox = TaskInbox(tmp_path / "inbox")
+    inbox.submit_mutation("approved_paths", "running", [])
+    inbox.submit_mutation("approved_paths", "queued", ["autoloop/tasks.py"])
+
+    registry = TaskRegistry()
+    registry.add_many([Task(id="running", title="R", description="d",
+                            approved_paths=("autoloop/inbox.py",)),
+                       Task(id="queued", title="Q", description="d",
+                            approved_paths=("autoloop/inbox.py",))])
+    registry.mark_in_progress("running")
+
+    specs, _ = inbox.drain()
+    _, applied, refused = apply_requests(registry, specs)
+
+    assert len(refused) == 1, refused
+    assert "in progress" in refused[0], refused[0]
+    assert registry.get("running").approved_paths == ("autoloop/inbox.py",)
+    assert applied == ["queued -> approved_paths: autoloop/tasks.py"]
+    assert registry.get("queued").approved_paths == ("autoloop/tasks.py",)
+
+
 def test_blocking_through_the_inbox_has_a_reverse_through_the_inbox(tmp_path):
     """A hold placed here writes no `blockers.Blocker` record, and
     `python -m autoloop answer` — the only route out of `blocked` — takes a

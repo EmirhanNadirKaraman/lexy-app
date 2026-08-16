@@ -430,6 +430,26 @@ def test_an_in_progress_task_cannot_be_edited(method, value):
     expect_code(lambda: getattr(reg, method)("a", value), "task_in_progress")
 
 
+def test_an_in_progress_scope_cannot_be_emptied():
+    """The sharpest shape of the refusal above, and the one `CONTENT_MUTATIONS`
+    cannot reach: it passes a NON-empty scope, so nothing pinned the case where
+    the mutation UN-authorizes a dispatch that has already started. Emptying is
+    worse than rewriting — the round is being judged against the old scope, and
+    an empty one is also what `_dispatch_task_postcommit` refuses outright, so
+    the running task would be left with no scope to complete against.
+
+    The guard runs BEFORE `_validate_approved_paths`, which is why the refusal
+    is `task_in_progress` rather than anything about the empty list — clearing a
+    scope is legal (`test_set_approved_paths_can_revoke_a_scope_entirely`), just
+    not on a task the loop is running. The scope is re-read afterwards because
+    "refused" and "refused without writing" are different claims."""
+    reg = registry(task("a"))
+    reg.set_approved_paths("a", ["autoloop/inbox.py"])
+    reg.mark_in_progress("a")
+    expect_code(lambda: reg.set_approved_paths("a", []), "task_in_progress")
+    assert reg.get("a").approved_paths == ("autoloop/inbox.py",)
+
+
 def test_the_strand_guard_reads_stored_status_not_the_derived_state():
     """The mutation check that matters most. `state_of` tests dependencies
     BEFORE the in_progress branch, so an in-progress task that already has an
