@@ -1031,6 +1031,11 @@ class FakeProjectSession:
         self.present = {SEL.composer}
         self.mounted = window
         self.scrolls = 0
+        #: How many nodes each read of the message list returned. The
+        #: sliding-window fake below keeps this CONSTANT while painting
+        #: different messages, which is why a node count cannot prove the
+        #: mount reached the tail.
+        self.window_sizes = []
         self.navigations = []
         self.keys = []
         self.logged_out = False
@@ -1056,11 +1061,11 @@ class FakeProjectSession:
             self.current_url = self.project_lands_on
         else:
             self.current_url = self._slugged(url) + self.url_suffix
-        self.mounted = self.window  # a fresh load re-virtualizes the list
+        self._remount()  # a fresh load re-virtualizes the list
 
     def reload(self):
         self.navigations.append("reload")
-        self.mounted = self.window
+        self._remount()
 
     def url(self):
         return self.current_url
@@ -1094,7 +1099,9 @@ class FakeProjectSession:
                 return []  # only a project page lists that project's chats
             return [(href, f"chat titled {i}") for i, href in enumerate(self.links)]
         if selector == SEL.message:
-            return list(self._history()[: self.mounted])
+            window = list(self._window(self._history()))
+            self.window_sizes.append(len(window))
+            return window
         return []
 
     def screenshot(self, path):
@@ -1143,9 +1150,26 @@ class FakeProjectSession:
                 return history
         return []
 
+    def _remount(self):
+        """What a fresh page load does to the virtualized list."""
+        self.mounted = self.window
+
+    def _window(self, history):
+        """The slice of `history` currently in the DOM. Counted from the TOP,
+        so this fake's tail is what stays unpainted — the 2026-08-05 shape."""
+        return history[: self.mounted]
+
+    def _advance(self):
+        """What one "go to the end" gesture mounts."""
+        self.mounted += self.step
+
+    def _paint_all(self):
+        """Every message at once, for a chat we did not scroll ourselves."""
+        self.mounted = 10_000
+
     def _paint_more(self):
         self.scrolls += 1
-        self.mounted += self.step
+        self._advance()
         if self.growing:
             self._history().extend(_turns(self.step, marker=f"live {self.scrolls}"))
         if (
@@ -1154,7 +1178,7 @@ class FakeProjectSession:
             and self.drift_to
         ):
             self.current_url = self.drift_to
-            self.mounted = 10_000  # the chat we drifted onto is fully painted
+            self._paint_all()  # the chat we drifted onto is fully painted
 
 
 class FakeScrollingSession(FakeProjectSession):
@@ -1164,6 +1188,44 @@ class FakeScrollingSession(FakeProjectSession):
     def scroll_to_end(self, selector):
         assert selector == SEL.message  # the list being mounted, not the composer
         self._paint_more()
+
+
+class FakeSlidingWindowSession(FakeScrollingSession):
+    """A virtualizer that keeps a CONSTANT-SIZE mounted window: every gesture
+    mounts newer nodes and DROPS the older ones it replaces, so
+    `len(messages())` never moves however far the list travels.
+
+    The shape the node count cannot see, and the reason convergence is judged
+    on content. Against a count-based proof this fake settles after two
+    gestures — the count read 6 before and after, so "it stopped growing" —
+    and reports a request that six more gestures would have painted as absent
+    from persisted history. That is the 2026-08-05 park, reintroduced by the
+    fix for it.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        #: Index of the first mounted node. `window` nodes are mounted from
+        #: here; everything before and after is out of the DOM entirely.
+        self.offset = 0
+
+    def _remount(self):
+        super()._remount()
+        self.offset = 0
+
+    def _window(self, history):
+        # Clamped at the end: a gesture cannot scroll past the last message,
+        # so the window comes to rest on the tail rather than off it.
+        start = max(0, min(self.offset, len(history) - self.window))
+        end = start + self.window
+        return history[start:end]
+
+    def _advance(self):
+        self.offset += self.step
+
+    def _paint_all(self):
+        self.window = 10_000
+        self.offset = 0
 
 
 def test_a_request_in_the_already_mounted_window_is_found(tmp_path):
@@ -1190,6 +1252,66 @@ def test_a_request_only_in_the_unmounted_tail_is_also_found(tmp_path):
 
     assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_TWO
     assert session.scrolls >= 6  # the tail was six scrolls down, as observed
+
+
+def test_a_sliding_constant_size_window_is_not_settled_by_a_steady_node_count(tmp_path):
+    """The node count is not a convergence proof, and this is the shape that
+    shows it: the virtualizer mounts newer nodes as it drops older ones, so the
+    count reads 6 at every single read while six different messages go past.
+
+    A mount that settles on "the count stopped growing" concludes after two
+    gestures, reads an intermediate window, and reports the request absent —
+    the 2026-08-05 park, produced by the code written to prevent it. Judging
+    convergence on the window's CONTENT is what keeps the gesture going until
+    the request is painted.
+    """
+    session = FakeSlidingWindowSession({CHAT_ONE: _chat_holding(RID)}, window=6, step=2)
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    # Four gestures to walk a 13-message chat 6 nodes at a time — well past the
+    # two a count-based proof would have stopped at.
+    assert session.scrolls >= 4
+    # ... and the count that proof watches never moved once.
+    assert set(session.window_sizes) == {6}
+
+
+def test_a_request_the_window_slid_past_is_still_found(tmp_path):
+    """Evidence accumulates across windows; it is not read off the last one.
+
+    Once the assistant has answered (the 2026-08-05 chat held the request AND
+    its reply), the request is no longer the final message — so a wide enough
+    slide carries it into the mounted window and out again. Mounting to the end
+    and THEN calling `has_request` is a false absence in exactly that case,
+    which is why the verdict comes from what the mount saw.
+    """
+    history = _turns(3, marker="before") + [
+        ("user", f"[autoloop request {RID} | iteration 1]"),
+        ("assistant", "decision: push"),
+    ] + _turns(4, marker="after")
+    session = FakeSlidingWindowSession({CHAT_ONE: history}, window=4, step=4)
+    client = make_client(session, FakeClock(), tmp_path)
+
+    # Fully mounted, the tail no longer shows the request at all.
+    session.goto(CHAT_ONE)
+    for _ in range(10):
+        session.scroll_to_end(SEL.message)
+    assert client.has_request(RID) is False
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+
+
+def test_a_sliding_window_that_comes_to_rest_still_reports_absent(tmp_path):
+    """The content proof must still be able to say no. A sliding window stops
+    changing once it reaches the tail, and a request in none of the chats is
+    absent — otherwise the fix would trade every false absence for a refusal
+    and rotation would never get an answer."""
+    session = FakeSlidingWindowSession({CHAT_ONE: _turns(6)}, window=6, step=2)
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) is None
+    assert session.scrolls > 0
+    assert set(session.window_sizes) == {6}
 
 
 def test_the_chat_list_is_read_from_the_href_not_the_title(tmp_path):
@@ -1315,6 +1437,10 @@ def test_a_list_still_painting_when_the_bound_runs_out_does_not_report_absent(tm
     with pytest.raises(ConversationSearchInconclusive) as excinfo:
         client.find_conversation_with(RID, PROJECT_URL)
     assert "unseen and absent are not the same thing" in str(excinfo.value)
+    # The gestures actually spent separate the two ways to be unsettled: the
+    # whole bound spent still changing (this chat) versus a gesture that failed
+    # early. An operator reading the park needs to know which.
+    assert "(4 gestures)" in str(excinfo.value)
 
 
 def test_a_session_without_the_scroll_capability_presses_end(tmp_path):

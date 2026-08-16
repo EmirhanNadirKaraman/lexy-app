@@ -99,6 +99,29 @@ class SubmitResult(str, Enum):
 
 
 @dataclass(frozen=True)
+class TailMount:
+    """What one attempt at painting a virtualized message list established.
+
+    `found` is the OR over every window the mount observed, not a property of
+    the last one — see `BrowserChatGPT._mount_message_tail` for why the final
+    window is the wrong place to look.
+
+    `settled` means the mounted window demonstrably STOPPED CHANGING, which is
+    the only state in which `found=False` describes the conversation rather
+    than the viewport. False means the attempt bound ran out or the gesture
+    failed, and the caller must refuse to conclude rather than report absent.
+    (Trivially True alongside `found`: a sighting needs no convergence.)
+
+    `gestures` is how many "go to the end" gestures were actually spent, for
+    diagnostics and for tests that pin the 2026-08-05 six-scroll observation.
+    """
+
+    found: bool
+    settled: bool
+    gestures: int
+
+
+@dataclass(frozen=True)
 class TransportDiagnostics:
     """Structured failure context. Deliberately carries no cookies, tokens or
     storage — the session protocol cannot even read them."""
@@ -178,16 +201,25 @@ class BrowserChatGPT:
         self._stability_seconds = stability_seconds
         # How many "go to the end" gestures a single readback may spend
         # painting a virtualized message list, and how many consecutive
-        # no-growth reads prove it has finished.
+        # gestures that leave the mounted window UNCHANGED prove it has
+        # finished.
         #
-        # Deliberately generous. Running out means the list was STILL growing,
-        # which is not a licence to call anything absent — so a bound set too
-        # tight turns an ordinary long conversation into a refusal, and that
-        # failure mode is invisible in tests (every fixture is short). Six
-        # scrolls sufficed by hand on 2026-08-05 and a real gesture mounts a
-        # viewport rather than a node or two, so 40 leaves room for a chat an
-        # order of magnitude longer. The cost is paid only while the list keeps
-        # growing: a settled conversation ends after two no-growth reads.
+        # The proof is the window's CONTENT, never its node count. A
+        # virtualizer is free to slide a constant-size window — mounting newer
+        # nodes while dropping older ones — so a count that reads 6 before and
+        # after a gesture says nothing about whether six different messages
+        # went past. Two consecutive gestures that leave the window identical
+        # do say something.
+        #
+        # The attempt bound is deliberately generous. Running out means the
+        # window was STILL changing, which is not a licence to call anything
+        # absent — so a bound set too tight turns an ordinary long conversation
+        # into a refusal, and that failure mode is invisible in tests (every
+        # fixture is short). Six scrolls sufficed by hand on 2026-08-05 and a
+        # real gesture mounts a viewport rather than a node or two, so 40
+        # leaves room for a chat an order of magnitude longer. The cost is paid
+        # only while the window keeps changing: a settled conversation ends
+        # after two identical reads.
         self._tail_mount_attempts = tail_mount_attempts
         self._tail_mount_settle_reads = tail_mount_settle_reads
         # After the first observed send response arrives, wait this long before
@@ -363,8 +395,11 @@ class BrowserChatGPT:
           present AND already answered, and seeing it took pressing End and
           scrolling six times before the tail rendered. So this MOUNTS the tail
           first (`_mount_message_tail`) and treats absence as concluded only
-          once the mounted set demonstrably stops growing — otherwise "not in
-          persisted history" is a statement about the scroll position.
+          once the mounted window demonstrably stops CHANGING — otherwise "not
+          in persisted history" is a statement about the scroll position. The
+          verdict comes from what the mount SAW, not from a readback after it:
+          a sliding window can mount the request and drop it again, so the
+          final window is not where the evidence lives.
         * **It confirms WHICH page it read.** Every navigation here is a page
           the client shares with everything else; a rotation mid-flight can
           leave it on a different chat, and a search that reads one
@@ -404,38 +439,42 @@ class BrowserChatGPT:
             if len(hrefs) >= limit:
                 break
 
-        unsettled: list[str] = []
+        unsettled: list[tuple[str, TailMount]] = []
         for candidate in hrefs:
             self._session.goto(candidate)
             self._await_composer("find_conversation", request_id=request_id)
             self._require_search_page(candidate, request_id, "opened")
-            settled = self._mount_message_tail(request_id)
-            present = self.has_request(request_id)
+            mount = self._mount_message_tail(request_id, candidate)
             # Bracket the READ, not just the navigation: the drift this guards
-            # against happens while the mount is dwelling, i.e. after the check
-            # above and before this one. Nothing may be concluded from `present`
-            # until the page is confirmed to still be the candidate.
+            # against happens while the mount is dwelling. The mount confirms
+            # the page before every window it reads, so this covers the one gap
+            # left — between its last read and this conclusion.
             self._require_search_page(candidate, request_id, "read")
-            if present:
+            if mount.found:
                 return candidate
-            if not settled:
-                unsettled.append(candidate)
+            if not mount.settled:
+                unsettled.append((candidate, mount))
 
         if unsettled:
-            # A positive hit stands on its own — it was read off a confirmed
-            # page — so only the ABSENT verdict is withheld here, and only
-            # because these chats never finished painting.
+            # A positive hit stands on its own — every window behind it was
+            # read off a confirmed page — so only the ABSENT verdict is
+            # withheld here, and only because these chats never finished
+            # painting. The gesture count goes in the note because it separates
+            # the two ways to be unsettled: a chat that spent the whole bound
+            # still changing is a long or streaming conversation, while one that
+            # stopped early had its gesture fail.
+            detail = ", ".join(f"{url} ({m.gestures} gestures)" for url, m in unsettled)
             self._refuse_search(
                 request_id,
                 "find-conversation-unmounted",
                 f"{len(unsettled)} conversation(s) were still painting messages "
                 f"when the mount bound ({self._tail_mount_attempts} scrolls) ran "
-                f"out — {', '.join(unsettled)}; the request was not seen, but "
+                f"out — {detail}; the request was not seen, but "
                 "unseen and absent are not the same thing in a virtualized list",
             )
         return None
 
-    def _mount_message_tail(self, request_id: str) -> bool:
+    def _mount_message_tail(self, request_id: str, expected_url: str) -> TailMount:
         """Paint the newest turns into the virtualized message list.
 
         ChatGPT mounts a WINDOW of a conversation, never its history, so what
@@ -445,40 +484,74 @@ class BrowserChatGPT:
         rendered — and the request was in that tail, already answered, while
         the loop parked it as `submission_ambiguous`.
 
-        Returns True when the mounted set demonstrably STOPPED GROWING (the
-        only state in which "not here" describes the conversation rather than
-        the viewport), or when the request turned up on the way. Returns False
-        when the attempt bound ran out with the list still growing, or the
-        gesture failed — the caller must not read absence out of either.
+        **The node count proves nothing.** A virtualizer may slide a
+        constant-size window, mounting newer nodes as it drops older ones, so
+        `len(messages())` can sit at 6 while six different messages are painted
+        and scrolled past. Convergence is therefore judged on the window's
+        CONTENT: only `_tail_mount_settle_reads` consecutive gestures that
+        leave it identical settle the list. What that cannot distinguish is two
+        genuinely different windows whose text is byte-identical — possible in
+        a fixture, not in a chat where every autoloop turn carries its own
+        request id.
+
+        The proof's other boundary, stated because it is real and not closed
+        here: an unchanged window means the GESTURE stopped mounting, which is
+        the tail when the gesture works and the opening window when it does not
+        (`_scroll_message_tail` falls back to End, and End goes to whatever
+        holds focus). Telling "short chat, fully mounted" from "the gesture did
+        nothing" needs an end-of-list or scroll-position signal, and
+        `BrowserSession` exposes none — adding one is a protocol change, not a
+        change to this readback. Requiring a change before allowing a settle is
+        NOT the fix: it would refuse every conversation short enough to fit in
+        the first window.
+
+        Evidence ACCUMULATES across windows rather than being read off the
+        final one: the search returns on the first sighting, because a slide
+        wide enough can carry the request in and out again between two reads.
 
         `BrowserError` passes through: its subclasses are the faults the loop
         routes rather than retries (a logged-out profile, a dead session), and
         swallowing one here would demote it into "the request is absent".
         Anything else the gesture raises costs only the settled verdict.
+
+        Every window is read off a page confirmed to still be `expected_url`,
+        so a chat drifted onto mid-mount can neither donate a sighting nor
+        launder one by drifting back; that check refuses the whole search
+        rather than returning.
+
+        This is deliberately more suspicious than the count it replaces: a
+        conversation still streaming never settles, and the caller answers
+        `ConversationSearchInconclusive` instead of `None`. That is the trade
+        the search exists to make — refusing to rule beats ruling wrong.
         """
-        mounted = len(self.messages())
-        settled = 0
+        fingerprint: tuple[tuple[str, str], ...] | None = None
+        unchanged = 0
+        gestures = 0
         for _ in range(self._tail_mount_attempts):
-            if self.has_request(request_id):
-                # Positive evidence needs no further painting: mounting more
-                # can add messages, never retract one.
-                return True
+            self._require_search_page(expected_url, request_id, "mount")
+            window = self.messages()
+            if any(m.role == "user" and request_id in m.text for m in window):
+                # Positive evidence needs no further painting, and taking it
+                # HERE is what makes the accumulation monotone: a later gesture
+                # can scroll this window away.
+                return TailMount(found=True, settled=True, gestures=gestures)
+            current = tuple((m.role, m.text) for m in window)
+            if current == fingerprint:
+                unchanged += 1
+                if unchanged >= self._tail_mount_settle_reads:
+                    return TailMount(found=False, settled=True, gestures=gestures)
+            else:
+                unchanged = 0
+                fingerprint = current
             try:
                 self._scroll_message_tail()
             except BrowserError:
                 raise
             except Exception:
-                return False
+                return TailMount(found=False, settled=False, gestures=gestures)
+            gestures += 1
             self._sleep(self._poll_interval)
-            painted = len(self.messages())
-            if painted > mounted:
-                mounted = painted
-                settled = 0
-                continue
-            settled += 1
-            if settled >= self._tail_mount_settle_reads:
-                return True
-        return False
+        return TailMount(found=False, settled=False, gestures=gestures)
 
     def _scroll_message_tail(self) -> None:
         """One "go to the end of the conversation" gesture.
@@ -487,8 +560,8 @@ class BrowserChatGPT:
         `start_send_observation`, so an in-memory fake or a future adapter
         without it stays valid — it falls back to the End key, which is what a
         human presses. The fallback can legitimately do nothing (End goes to
-        whatever holds focus), which is why the caller judges progress by the
-        mounted count rather than by this returning.
+        whatever holds focus), which is why the caller judges progress by what
+        the mounted window then CONTAINS rather than by this returning.
         """
         scroll = getattr(self._session, "scroll_to_end", None)
         if scroll is not None:

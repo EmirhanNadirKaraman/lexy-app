@@ -3020,12 +3020,25 @@ reports this rather than raising.
   no longer rendered — safe, but a re-send of work that did land.
   The one readback that DOES mount its own tail is the by-content conversation
   search (`find_conversation_with`, 2026-08-16): it repeats a "go to the end"
-  gesture until the mounted count stops growing, and refuses to answer at all
+  gesture until the mounted window stops CHANGING, and refuses to answer at all
   rather than call something absent while the list is still painting. It got
   that because it is the read a decision is made from — on 2026-08-05
   `alr-af11e1b3-0006` parked as ambiguous while the chat held the request and
   its answer, six scrolls below the fold. The mount is deliberately private
   (`_mount_message_tail`), so the delivery probe above still finds no public
   capability and keeps its historical behaviour.
+  **The convergence test is content, never the node count** (corrected
+  2026-08-16, before the search was wired to any decision). A virtualizer is
+  free to slide a constant-size window — mounting newer nodes as it drops older
+  ones — so a count that reads 6 before and after a gesture is consistent with
+  six different messages having gone past. A count-based proof stops after two
+  gestures, reads an intermediate window and reports a present request absent:
+  the same park, reproduced by the code written to prevent it. Two consecutive
+  gestures that leave the window byte-identical are the proof instead, and the
+  verdict comes from what the mount SAW rather than from a readback after it,
+  since a slide can carry the request into the window and out again. The
+  deliberate cost is that a still-streaming chat never settles and the search
+  answers `ConversationSearchInconclusive` instead of `None` — refusing to rule
+  beats ruling wrong, which is the whole reason this readback exists.
 * Selector defaults will drift with ChatGPT's UI eventually
   (`browser/selectors.py` is the fix point).

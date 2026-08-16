@@ -71,9 +71,9 @@ class ConversationSearchInconclusive(BrowserError):
 
     Raised by `BrowserChatGPT.find_conversation_with` when the page it read is
     not the page it asked for, or when the virtualized message list was still
-    growing when its mount bound ran out. Both mean the same thing: what was
-    read is not evidence about the conversation that was asked about, so
-    "found here" and "not in this project" are equally unsupported.
+    CHANGING under the mount gesture when its bound ran out. Both mean the same
+    thing: what was read is not evidence about the conversation that was asked
+    about, so "found here" and "not in this project" are equally unsupported.
 
     Deliberately NOT a `ConversationUnusableError` — that one authorizes
     spending the run's single rotation, and an inconclusive read says nothing
