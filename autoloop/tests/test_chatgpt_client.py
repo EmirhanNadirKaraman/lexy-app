@@ -18,10 +18,12 @@ import pytest
 from autoloop.browser.chatgpt import BrowserChatGPT, SubmitResult
 from autoloop.browser.selectors import ChatGPTSelectors
 from autoloop.errors import (
+    AutoloopError,
     BrowserError,
     ConversationSearchInconclusive,
     ConversationUnusableError,
     LoginExpiredError,
+    RateLimitedError,
     ResponseTimeoutError,
     SubmissionError,
 )
@@ -95,6 +97,21 @@ class FakeSession:
         self.persisted = list(messages)
         self.dom = list(messages)
 
+    def throttle(self, with_dismiss_button=True):
+        """Model ChatGPT's ACCOUNT rate limit exactly as it presents.
+
+        The overlay appears and intercepts pointer events. Nothing else
+        changes: the composer is still present, still enabled, the message
+        list is intact, and the page's `inner_text` contains none of the
+        modal's prose. Every one of those was checked live on 2026-08-15 and
+        every one reported healthy against a firmly throttled account — which
+        is why this fake keeps them healthy too. A test that passes against a
+        fake which ALSO removes the composer proves nothing about the fault.
+        """
+        self.present.add(SEL.rate_limit_modal)
+        if with_dismiss_button:
+            self.present.add(SEL.rate_limit_dismiss[0])
+
     def _render_from_server(self):
         self.dom = list(self.persisted)
         self.composer = ""
@@ -130,6 +147,10 @@ class FakeSession:
 
     def click(self, selector):
         self.clicks.append(selector)
+        if selector in SEL.rate_limit_dismiss:
+            self.present.discard(SEL.rate_limit_modal)
+            self.present.discard(SEL.rate_limit_dismiss[0])
+            return
         if selector == SEL.duplicate_file_dismiss:
             self.present.discard(SEL.duplicate_file_modal)
             if self.duplicate_reveals_tile:
@@ -152,6 +173,15 @@ class FakeSession:
         self.send_enabled = False
 
     def focus(self, selector):
+        if SEL.rate_limit_modal in self.present:
+            # What Playwright actually reports while the overlay is up: the
+            # element is there, so the locator resolves, and the click never
+            # lands because something else is on top of it. Verbatim shape of
+            # the message the loop logged all night on 2026-08-14/15.
+            raise BrowserError(
+                "Locator.click: Timeout 30000ms exceeded. "
+                'waiting for locator("#prompt-textarea")'
+            )
         self.focused.append(selector)
 
     def press(self, keys):
@@ -1634,3 +1664,168 @@ def test_an_inconclusive_search_leaves_a_diagnostic(tmp_path):
     folder = diagnostics(tmp_path)[-1]
     assert "conversation-search-inconclusive" in folder.name
     assert PROJECT_URL in read_meta(folder)["note"]
+
+
+# ---------------------------------------------------------------------------
+# ChatGPT's ACCOUNT rate limit
+# ---------------------------------------------------------------------------
+#
+# Recorded overnight 2026-08-14/15: from 07:56 the loop reported nothing but
+#
+#   browser session lost: Locator.click: Timeout 30000ms exceeded.
+#     waiting for locator("#prompt-textarea")
+#
+# and answered each one by restarting Chrome and retrying — which is what
+# generates requests too quickly, so it deepened the exact condition it was
+# failing on. The words "rate", "limit" and "throttle" appear nowhere in the
+# transcript for that period; the only trace was a composer that would not take
+# a click. An operator found it by opening the browser and reading the screen.
+#
+# THE TRAP THESE TESTS EXIST TO PIN: the composer still EXISTS and reports
+# visible/enabled while throttled. Presence is not evidence the page is usable.
+
+
+def test_a_throttled_page_still_has_a_composer_and_is_still_unusable(tmp_path):
+    """The whole fault in one assertion pair. Any readiness probe written
+    against composer presence alone reports a false all-clear here."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.throttle()
+    client = make_client(session, clock, tmp_path)
+
+    assert session.exists(SEL.composer), "the composer is right there"
+    with pytest.raises(RateLimitedError):
+        client.attach()
+
+
+def test_the_throttle_is_detected_by_testid_not_by_its_prose(tmp_path):
+    """The visible wording moves with copy edits and locale; the testid does
+    not. A live search for "Too many requests" in the page text reported
+    healthy while the account was firmly limited, so the prose is not even a
+    fallback — it is a false negative."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.present.add(SEL.rate_limit_modal)
+    client = make_client(session, clock, tmp_path)
+
+    assert "Too many requests" not in session.inner_text(SEL.composer)
+    assert client.is_rate_limited() is True
+
+
+def test_a_throttle_is_not_a_browser_error(tmp_path):
+    """The routing depends on this: `BrowserError` is answered by dropping the
+    client, restarting Chrome and retrying, and every one of those is another
+    request into the window that caused the limit."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.throttle()
+    client = make_client(session, clock, tmp_path)
+
+    with pytest.raises(RateLimitedError) as caught:
+        client.attach()
+    assert not isinstance(caught.value, BrowserError)
+    assert isinstance(caught.value, AutoloopError)
+
+
+def test_a_throttle_snapshot_records_the_modal_beside_the_present_composer(tmp_path):
+    """An existing dump shows `composer_present: true`, which is precisely the
+    misleading half. The modal flag next to it is what makes the snapshot
+    readable by someone who was not there."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.throttle()
+    client = make_client(session, clock, tmp_path)
+
+    with pytest.raises(RateLimitedError):
+        client.attach()
+    meta = read_meta(diagnostics(tmp_path)[-1])
+    assert meta["rate_limit_modal_present"] is True
+    assert meta["composer_present"] is True, "the trap, recorded in the evidence"
+
+
+def test_a_throttle_arriving_mid_send_is_named_rather_than_reported_as_lost(tmp_path):
+    """The overnight path, end to end. `focus()` fails with the click timeout
+    Playwright really produced; without the re-read that becomes a generic
+    transport fault and the loop restarts the browser."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    client = make_client(session, clock, tmp_path)
+    client.attach()  # healthy at this point
+
+    session.throttle()
+    with pytest.raises(RateLimitedError):
+        client.submit(RID, PROMPT)
+    assert client.send_attempted is False, "nothing left the browser"
+
+
+def test_an_ordinary_composer_failure_is_still_an_ordinary_failure(tmp_path):
+    """The re-read must not turn every send fault into a throttle: with no
+    modal, the original error passes through untouched."""
+    session, clock = FakeSession(editor_registers_input=False), FakeClock()
+    session.seed(OLD_TURN)
+    client = make_client(session, clock, tmp_path)
+
+    with pytest.raises(SubmissionError):
+        client.submit(RID, PROMPT)
+
+
+def test_a_throttle_during_an_await_is_named_rather_than_timed_out(tmp_path):
+    """`await_response` would otherwise sit out its whole start timeout and
+    report silence, which reads as a slow model rather than a limited
+    account."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    client = make_client(session, clock, tmp_path)
+    clock.events[1] = lambda: session.throttle()
+
+    with pytest.raises(RateLimitedError):
+        client.await_response(RID)
+
+
+def test_dismissing_the_modal_clears_it_and_the_page_works_again(tmp_path):
+    """The modal hides the composer even after the server-side limit expires,
+    so a stale one must not read as a continuing throttle."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.throttle()
+    client = make_client(session, clock, tmp_path)
+
+    assert client.dismiss_rate_limit_modal() is True
+    assert client.is_rate_limited() is False
+    client.attach()  # no longer raises
+
+
+def test_dismissal_reports_the_probe_not_the_click(tmp_path):
+    """The element carrying the testid is a full-screen overlay, so the
+    button may be a sibling rather than a descendant and the candidate
+    selectors may match nothing. A click that hit nothing must never read as
+    cleared."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.throttle(with_dismiss_button=False)
+    client = make_client(session, clock, tmp_path)
+
+    assert client.dismiss_rate_limit_modal() is False
+    assert client.is_rate_limited() is True
+
+
+def test_dismissing_when_nothing_is_up_is_a_no_op(tmp_path):
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    client = make_client(session, clock, tmp_path)
+
+    assert client.dismiss_rate_limit_modal() is True
+    assert session.clicks == [], "nothing to dismiss, nothing clicked"
+
+
+def test_a_logged_out_profile_still_wins_over_the_throttle_check(tmp_path):
+    """Ordered deliberately: a logged-out page has no conversation to
+    throttle, and answering an auth prompt with a back-off would wait out a
+    limit that does not exist."""
+    session, clock = FakeSession(), FakeClock()
+    session.present.add(SEL.login_markers[0])
+    session.throttle()
+    client = make_client(session, clock, tmp_path)
+
+    with pytest.raises(LoginExpiredError):
+        client.attach()

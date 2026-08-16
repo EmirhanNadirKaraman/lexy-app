@@ -637,11 +637,18 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
         state.resume_phase = None
         state.question = None
         state.consecutive_failures = 0
-        # Both fault counts, for the same reason: the operator has intervened
-        # (a `browser_restart_cooldown_blocked` park is resumed exactly here,
-        # after restarting the browser by hand), so neither budget should
-        # arrive already spent.
+        # All three fault counts, for the same reason: the operator has
+        # intervened (a `browser_restart_cooldown_blocked` park is resumed
+        # exactly here, after restarting the browser by hand; a `rate_limited`
+        # park after leaving the account idle), so no budget should arrive
+        # already spent.
         state.browser_restart_skips = 0
+        state.rate_limit_backoffs = 0
+        state.rate_limit_wait_seconds = 0.0
+        # And any back-off still owed with it: the operator has already left
+        # the account idle, so making them wait out a deadline recorded before
+        # they intervened would answer their intervention by ignoring it.
+        state.rate_limit_retry_not_before = None
         store.save(state)
     elif Phase(state.phase) in (Phase.NEEDS_USER, Phase.FAILED, Phase.STOPPED):
         # A fault stop takes its own branch, because BOTH suggestions below are

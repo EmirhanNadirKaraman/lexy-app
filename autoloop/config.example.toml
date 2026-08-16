@@ -52,6 +52,22 @@ restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]
 # transport becomes a restart loop. Failures whose restart THIS refused are
 # charged to policy.max_browser_restart_skips, never to the failure budget.
 restart_cooldown_seconds = 120.0
+# ChatGPT throttles the ACCOUNT when it sees too many requests, with a
+# full-screen "Too many requests … please wait a few minutes" modal. That is not
+# a browser fault and a restart cannot clear it — the limit is server-side, so a
+# fresh browser meets the same wall while adding another request. The loop waits
+# instead: this is the first wait, doubling on each consecutive occurrence up to
+# the ceiling below, dismissing the modal and re-probing after each one. The wait
+# is persisted as a deadline, so killing and restarting the loop mid-wait serves
+# the rest of it rather than skipping it.
+#
+# Raise this if you keep hitting the limit; the modal asks for "a few minutes"
+# and the schedule below is built around that.
+rate_limit_backoff_seconds = 60.0
+# Ceiling on ONE such wait. Kept under the heartbeat monitor's 45-minute
+# staleness threshold (scripts/check_heartbeat.py): the loop heartbeats BETWEEN
+# steps, so a sleep inside one is a gap in the record.
+rate_limit_backoff_max_seconds = 600.0
 
 [policy]
 max_iterations = 20
@@ -71,6 +87,14 @@ max_provider_switches = 1
 # that restarting fails — so this is what stops them retrying forever. Reaching
 # it parks with a question naming the cooldown, rather than failing silently.
 max_browser_restart_skips = 5
+# How many consecutive back-offs the loop may take against ChatGPT's account
+# rate limit before parking. Like the setting above these do NOT spend
+# max_consecutive_failures — the loop cannot recover from a server-side limit,
+# only outlast it, so a wait is evidence about the account, not the transport.
+# Six waits on the default schedule is 60+120+240+480+600+600 = 2100 seconds,
+# i.e. 35 minutes; exhausting it parks with a question naming the throttle
+# instead of "browser session lost".
+max_rate_limit_backoffs = 6
 max_parse_retries = 2
 max_policy_denials = 3
 allow_commit = true

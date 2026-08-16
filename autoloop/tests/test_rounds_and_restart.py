@@ -4,8 +4,10 @@ Both exist because of the same session: three browser stalls each cleared by
 restarting one Chrome profile by hand, and an audit abandoned at a hard cap of
 2 while it was arguably still converging.
 
-The last section covers the INTERACTION between the restart cooldown and the
-failure budget, which is where the two guards used to cancel each other out.
+The last two sections cover interactions with the failure budget: the restart
+cooldown, where the two guards used to cancel each other out, and ChatGPT's
+account-level rate limit, where the browser recovery itself was the mechanism
+of the failure.
 """
 
 from __future__ import annotations
@@ -13,13 +15,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from autoloop.blockers import BlockerStore
 from autoloop.config import BrowserConfig
 from autoloop.contract import Decision, Directive
-from autoloop.errors import SessionLostError
+from autoloop.errors import RateLimitedError, SessionLostError
 from autoloop.orchestrator import Orchestrator
 from autoloop.policy import PolicyConfig
 from autoloop.state import Phase
@@ -165,10 +168,15 @@ def test_a_restart_command_that_cannot_run_never_escapes(monkeypatch):
 # record. Both guards are wanted; their interaction was the defect.
 
 
-def _browser_orch(tmp_path, policy=None, **browser_kw):
+def _browser_orch(tmp_path, policy=None, state=None, **browser_kw):
     """A real Orchestrator (state store, policy engine, transcript) whose
-    browser config carries the restart settings under test."""
-    orch, _, _, _, _, _, _ = build(tmp_path, policy=policy)
+    browser config carries the restart settings under test.
+
+    `state` stands in for a SECOND process over the same state directory: pass
+    the state a previous orchestrator left on disk and this one resumes from
+    it, exactly as `run` does after a crash.
+    """
+    orch, _, _, _, _, _, _ = build(tmp_path, policy=policy, state=state)
     orch._config = dataclasses.replace(
         orch._config,
         browser=dataclasses.replace(orch._config.browser, **browser_kw),
@@ -334,3 +342,430 @@ def test_restart_command_must_be_a_list_of_strings(tmp_path):
     )
     with pytest.raises(ConfigError, match="list of strings"):
         load_config(cfg)
+
+
+# ---- account rate limit vs the browser recovery -------------------------------
+#
+# Observed overnight 2026-08-14/15. ChatGPT throttled the account and put up its
+# "Too many requests" overlay; the loop, having no selector for it, saw only a
+# composer that would not take a click, called that a lost session, restarted
+# Chrome and retried — from 07:56 onward. Restarting and retrying IS what
+# generates requests too quickly, so it deepened the condition it was failing on
+# and reported the deepening as further browser failures. pkt-03 burned through
+# its five-attempt ceiling without ever reaching an approved review.
+#
+# A restart cannot help: the limit is account-level and server-side. So this
+# fault must reach NONE of the browser recovery — not the restart, not the
+# failure budget, not even the client drop (re-attaching navigates, and a
+# navigation is another request).
+
+
+def _sleeps(orch):
+    """Record the back-offs instead of taking them."""
+    taken = []
+    orch._sleep = taken.append
+    return taken
+
+
+class _ThrottleAwareClient:
+    """A transport whose overlay can be dismissed while the LIMIT holds.
+
+    This is the distinction the whole escalation turns on. Dismissing the
+    modal always succeeds — it is a click on a page the loop already has — and
+    proves nothing: the limit is server-side and answers to a timer. A fake
+    whose `is_rate_limited()` went permanently False after a dismissal would
+    model the limit LIFTING, and would let a reset-on-dismissal
+    implementation pass while, in production, the delay never doubled and the
+    loop never parked.
+    """
+
+    def __init__(self):
+        self.dismissals = 0
+        self.closed = False
+
+    def dismiss_rate_limit_modal(self):
+        self.dismissals += 1
+        return True  # the overlay is gone; the limit is not
+
+    def is_rate_limited(self):
+        return True  # still throttled, whatever the modal is doing
+
+    def close(self):
+        self.closed = True
+
+
+def test_a_rate_limit_never_restarts_the_browser(tmp_path, monkeypatch):
+    """The restart is not merely useless here, it is the mechanism of the
+    failure: a fresh browser meets the same server-side wall and adds one more
+    request to the window that caused it."""
+    orch = _browser_orch(
+        tmp_path, restart_command=("true",), restart_cooldown_seconds=0.0
+    )
+    calls = _fake_restart(monkeypatch, returncode=0)
+    _sleeps(orch)
+
+    orch._handle_rate_limited(Phase.SUBMITTING, RateLimitedError("throttled"))
+
+    assert calls == [], "the one recovery that deepens this must not run"
+    assert orch.state.browser_restart_skips == 0
+
+
+def test_a_rate_limit_does_not_spend_the_failure_budget(tmp_path):
+    """Same principle as the cooldown-skipped restart above: a failure nobody
+    could have recovered from must not be charged to the budget that decides
+    recovery is hopeless."""
+    orch = _browser_orch(tmp_path, policy=PolicyConfig(max_consecutive_failures=1))
+    _sleeps(orch)
+    orch.state.phase = Phase.AWAITING.value
+
+    for _ in range(4):
+        orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    assert orch.state.consecutive_failures == 0
+    assert orch.state.phase == Phase.AWAITING.value, "the phase is re-entered, not failed"
+    assert orch.state.rate_limit_backoffs == 4
+
+
+def test_the_client_is_kept_so_the_wait_costs_no_further_requests(tmp_path):
+    """Every other browser handler drops the client. Here that is wrong:
+    re-attaching navigates, and the page is already in the right place — the
+    modal is dismissed where it stands."""
+    client = _ThrottleAwareClient()
+    orch = _browser_orch(tmp_path)
+    orch._client = client
+    _sleeps(orch)
+
+    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    assert orch._client is client
+    assert client.closed is False
+    assert client.dismissals == 1, "dismissed in place, on the page already held"
+
+
+def test_no_client_is_constructed_just_to_dismiss(tmp_path):
+    """`_get_client()` would BUILD one when none is held, and constructing the
+    Playwright client binds to the conversation and can navigate — the extra
+    request this path exists to avoid. With nothing held there is nothing to
+    dismiss, and the next step's own attach raises again."""
+    built = []
+    orch = _browser_orch(tmp_path)
+    orch._client = None
+    orch._client_factory = lambda: built.append(1)
+    _sleeps(orch)
+
+    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    assert built == []
+
+
+def test_the_backoff_escalates_and_is_capped(tmp_path):
+    """A limit still up after the first wait is a limit the first wait was too
+    short for; re-probing on a fixed short interval is a slower version of the
+    hammering this exists to stop."""
+    orch = _browser_orch(
+        tmp_path,
+        rate_limit_backoff_seconds=10.0,
+        rate_limit_backoff_max_seconds=40.0,
+    )
+    taken = _sleeps(orch)
+
+    for _ in range(5):
+        orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    assert taken == [10.0, 20.0, 40.0, 40.0, 40.0]
+
+
+def test_the_recorded_wait_is_the_one_actually_taken(tmp_path):
+    """Measured, not assumed from config — so the park can state a total that
+    was really observed rather than one reconstructed from the schedule."""
+    orch = _browser_orch(
+        tmp_path,
+        rate_limit_backoff_seconds=10.0,
+        rate_limit_backoff_max_seconds=40.0,
+    )
+    taken = _sleeps(orch)
+
+    for _ in range(3):
+        orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    assert orch.state.rate_limit_wait_seconds == sum(taken)
+
+
+def test_the_wait_is_durable_before_it_starts_and_credited_only_once_served(tmp_path):
+    """A crash mid-wait must resume knowing a throttle is in progress AND how
+    much of the wait is still owed. Reset to zero it would come back ready to
+    hammer again; credited up front it would come back believing it had
+    already waited, which is the same thing arriving by the other door."""
+    orch = _browser_orch(tmp_path)
+    checked = []
+
+    def inspect_state_mid_wait(_seconds):
+        reloaded = orch._store.load()
+        checked.append(
+            (
+                reloaded.rate_limit_backoffs,
+                reloaded.rate_limit_wait_seconds,
+                reloaded.rate_limit_retry_not_before,
+            )
+        )
+
+    orch._sleep = inspect_state_mid_wait
+
+    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    # Asserted OUTSIDE the callback: an assertion that only runs inside a
+    # sleep nobody called would pass by never running at all.
+    assert len(checked) == 1
+    backoffs, waited, deadline = checked[0]
+    assert backoffs == 1, "the streak is on disk before the sleep"
+    assert waited == 0.0, "and no second of it is credited before it happens"
+    assert deadline, "the instant the wait runs to is on disk too"
+    assert datetime.fromisoformat(deadline) > datetime.now(timezone.utc)
+
+    # Only now, with the sleep returned, is the wait a fact.
+    assert orch.state.rate_limit_wait_seconds == 60.0
+    assert orch.state.rate_limit_retry_not_before is None, "and nothing is still owed"
+    assert orch._store.load().rate_limit_retry_not_before is None, "durably"
+
+
+def test_a_crash_mid_wait_resumes_into_the_remaining_wait_not_the_browser(tmp_path):
+    """THE durability test: the process that started the back-off dies inside
+    it, and the one that takes over owes the rest of it.
+
+    Without a persisted deadline the successor sees a counter it cannot
+    distinguish from a wait already served, re-enters the step immediately, and
+    a supervisor that restarts the loop skips every back-off in turn — the
+    restart storm this whole path exists to stop, rebuilt one level up out of
+    process restarts instead of browser ones.
+    """
+    first = _browser_orch(
+        tmp_path,
+        rate_limit_backoff_seconds=600.0,
+        rate_limit_backoff_max_seconds=600.0,
+    )
+    first.state.phase = Phase.AWAITING.value
+
+    def killed_mid_wait(_seconds):
+        raise KeyboardInterrupt("SIGINT while waiting out the throttle")
+
+    first._sleep = killed_mid_wait
+    with pytest.raises(KeyboardInterrupt):
+        first._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    handover = first._store.load()
+    assert handover.rate_limit_retry_not_before, "the debt outlives the process"
+    assert handover.rate_limit_wait_seconds == 0.0, "and none of it is paid yet"
+
+    # A SECOND process over the same state directory.
+    second = _browser_orch(
+        tmp_path,
+        state=handover,
+        rate_limit_backoff_seconds=600.0,
+        rate_limit_backoff_max_seconds=600.0,
+    )
+    order = []
+    second._sleep = lambda seconds: order.append(("slept", seconds))
+    second._step = lambda phase: order.append(("stepped", phase))
+    # Construction alone reaches ChatGPT (it binds to the conversation and can
+    # navigate), so it counts as touching the account, not merely as a step.
+    second._client_factory = lambda: order.append(("client built", None))
+    # Attached in place, as a resumed process finds it: the overlay outlives the
+    # wait and does NOT record into `order` (it is a click on a page already
+    # held, not a request), so the ordering assertion below is unaffected.
+    client = _ThrottleAwareClient()
+    second._client = client
+
+    second.run(max_steps=1)
+
+    assert [event for event, _ in order] == ["slept", "stepped"], (
+        "nothing may touch ChatGPT — not a step, not even a client — until the "
+        "rest of the wait has been served"
+    )
+    assert order[0][1] == pytest.approx(600.0, abs=5.0), "the REMAINDER, resumed"
+    # The resumed process is where a stale overlay is most likely: the whole
+    # wait elapsed with nobody holding the page, and the modal hides the
+    # composer even after the server-side limit expires — left standing it
+    # would read as a throttle that never lifts.
+    assert client.dismissals == 1, "the overlay is cleared before the re-probe"
+    assert second.state.rate_limit_retry_not_before is None, "and now settled"
+    assert second.state.rate_limit_backoffs == 0, "the completed step ended the episode"
+    # Serving an inherited wait is not a fresh occurrence of the throttle: the
+    # transport raised once, across both processes.
+    assert sum(1 for event, _ in _transcript(second) if event == "rate_limited") == 1
+
+
+def test_a_resumed_wait_is_capped_by_the_schedule_not_by_the_stored_stamp(tmp_path):
+    """A backward system-clock jump (or a hand-edited state file) would
+    otherwise become an arbitrarily long sleep inside one step — and the
+    heartbeat is published BETWEEN steps, so that is a gap in the record. The
+    ceiling on one wait is what keeps the monitor's staleness alarm meaning
+    what it says."""
+    orch = _browser_orch(
+        tmp_path,
+        rate_limit_backoff_seconds=10.0,
+        rate_limit_backoff_max_seconds=40.0,
+    )
+    orch.state.phase = Phase.AWAITING.value
+    orch.state.rate_limit_backoffs = 1
+    orch.state.rate_limit_retry_not_before = (
+        datetime.now(timezone.utc) + timedelta(days=3)
+    ).isoformat(timespec="milliseconds")
+    taken = _sleeps(orch)
+    orch._step = lambda _phase: None
+
+    orch.run(max_steps=1)
+
+    assert taken == [10.0], "clamped to the delay the schedule prescribes"
+
+
+def test_an_unreadable_deadline_does_not_take_the_loop_down(tmp_path):
+    """Fail open, deliberately: the counter is what bounds the episode, and if
+    the limit is still up the next step raises again and re-enters the back-off
+    with the streak intact. A hand-edited stamp must not be fatal."""
+    orch = _browser_orch(tmp_path)
+    orch.state.phase = Phase.AWAITING.value
+    orch.state.rate_limit_retry_not_before = "whenever"
+    taken = _sleeps(orch)
+    stepped = []
+    orch._step = stepped.append
+
+    orch.run(max_steps=1)
+
+    assert taken == []
+    assert stepped == [Phase.AWAITING]
+    assert any(event == "rate_limit_deadline_unreadable" for event, _ in _transcript(orch))
+    # Discarded rather than kept: a stamp nothing can read is a wait nobody can
+    # serve, and left in place it would re-log on every step of the session.
+    assert orch.state.rate_limit_retry_not_before is None
+    assert orch._store.load().rate_limit_retry_not_before is None
+
+
+def test_a_resumed_wait_says_so_in_the_transcript(tmp_path):
+    """The incident behind this task is a loop that was stuck for hours and
+    said nothing. A process that sleeps ten minutes before its first step
+    without a word is a smaller copy of it."""
+    orch = _browser_orch(tmp_path)
+    orch.state.phase = Phase.AWAITING.value
+    orch.state.rate_limit_backoffs = 2
+    orch.state.rate_limit_retry_not_before = (
+        datetime.now(timezone.utc) + timedelta(seconds=90)
+    ).isoformat(timespec="milliseconds")
+    _sleeps(orch)
+    orch._step = lambda _phase: None
+
+    orch.run(max_steps=1)
+
+    data = next(
+        data for event, data in _transcript(orch) if event == "rate_limit_wait_resumed"
+    )
+    assert data["reason_code"] == "rate_limited"
+    assert data["backoffs"] == 2
+    assert data["remaining_seconds"] > 0
+
+
+def test_dismissing_the_modal_is_not_evidence_the_limit_lifted(tmp_path):
+    """THE mutation test for the whole escalation.
+
+    The overlay is gone after every wait — the loop closed it. If that counted
+    as cleared, the streak would reset on every occurrence: the delay would
+    never double, `max_rate_limit_backoffs` would never accumulate, and the
+    park would be unreachable. A fixed 60-second retry loop wearing the shape
+    of a back-off, which is a slower version of the failure being fixed.
+    """
+    client = _ThrottleAwareClient()
+    orch = _browser_orch(
+        tmp_path,
+        rate_limit_backoff_seconds=10.0,
+        rate_limit_backoff_max_seconds=40.0,
+    )
+    orch._client = client
+    taken = _sleeps(orch)
+
+    for _ in range(3):
+        orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    assert client.dismissals == 3, "dismissed every time, as it must be"
+    assert orch.state.rate_limit_backoffs == 3, "and never once read as cleared"
+    assert taken == [10.0, 20.0, 40.0], "so the wait actually escalates"
+
+
+def test_a_completed_step_is_what_clears_the_streak(tmp_path):
+    """The one honest signal that the limit lifted, and it costs no request.
+    The counter describes ONE throttle episode; waits from unrelated episodes
+    accumulating into a park would stop a working account."""
+    orch, _, _, _, _, _, _ = build(tmp_path)
+    orch.state.rate_limit_backoffs = 4
+    orch.state.rate_limit_wait_seconds = 150.0
+    orch.state.phase = Phase.READY.value
+    # Stubbed so the property under test is the RESET SITE and not whatever a
+    # particular phase happens to need — the symmetric twin of the test below.
+    orch._step = lambda _phase: None
+
+    orch.run(max_steps=1)
+
+    assert orch.state.rate_limit_backoffs == 0
+    assert orch.state.rate_limit_wait_seconds == 0.0
+    assert orch._store.load().rate_limit_backoffs == 0, "and durably"
+
+
+def test_a_step_that_raises_the_throttle_again_does_not_clear_it(tmp_path):
+    """The counterpart: the reset must sit on the success path only, or it
+    would undo the very count it was about to be charged."""
+    orch, _, _, _, _, _, _ = build(tmp_path)
+    _sleeps(orch)
+    orch.state.phase = Phase.READY.value
+
+    def always_throttled(_phase):
+        raise RateLimitedError("throttled")
+
+    orch._step = always_throttled
+
+    orch.run(max_steps=2)
+
+    assert orch.state.rate_limit_backoffs == 2
+
+
+def test_ending_on_backoffs_parks_naming_the_throttle(tmp_path):
+    """The whole point of the task: the operator sees "rate limited", not
+    "browser session lost". Bounded, and the bound ends in a blocker they can
+    read rather than a terminal phase whose cause only the transcript holds."""
+    blockers = BlockerStore(tmp_path / "blockers")
+    orch = _browser_orch(
+        tmp_path,
+        policy=PolicyConfig(max_rate_limit_backoffs=2),
+        rate_limit_backoff_seconds=10.0,
+    )
+    orch._blocker_store = blockers
+    orch.state.phase = Phase.AWAITING.value
+    _sleeps(orch)
+
+    for _ in range(3):
+        orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.phase != Phase.FAILED.value
+    assert orch.state.consecutive_failures == 0, "still never charged"
+    assert orch.state.resume_phase == Phase.AWAITING.value
+
+    open_blockers = blockers.open_blockers()
+    assert len(open_blockers) == 1
+    parked = open_blockers[0]
+    assert parked.code == "rate_limited"
+    assert "rate limited" in parked.question.lower()
+    assert "30s" in parked.question, "the measured wait, so 'when' is answerable"
+    assert "restart" in parked.question, "and that a restart is not the remedy"
+
+
+def test_the_transcript_says_rate_limited_not_browser_error(tmp_path):
+    """The transcript is where the overnight run left no trace at all — the
+    words rate, limit and throttle appeared nowhere in it."""
+    orch = _browser_orch(tmp_path)
+    _sleeps(orch)
+
+    orch._handle_rate_limited(Phase.SUBMITTING, RateLimitedError("throttled", stage="submit-input"))
+
+    events = _transcript(orch)
+    assert any(event == "rate_limited" for event, _ in events)
+    assert not any(event == "browser_error" for event, _ in events)
+    data = next(data for event, data in events if event == "rate_limited")
+    assert data["stage"] == "submit-input"

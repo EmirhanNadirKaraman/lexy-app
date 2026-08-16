@@ -173,6 +173,23 @@ class PolicyConfig:
     #: hold for any pair of numbers, and a bound that only works for one pair
     #: is a trap for whoever tunes them next.
     max_browser_restart_skips: int = 5
+    #: How many consecutive back-offs the loop may take against ChatGPT's
+    #: account-level throttle before parking. Same principle as
+    #: `max_browser_restart_skips` above and deliberately not
+    #: `max_consecutive_failures`: a server-side limit is not something the
+    #: loop can recover from, only outlast, so each wait is evidence about the
+    #: ACCOUNT and never about the transport.
+    #:
+    #: Six, against the default 60s-doubling-to-600s schedule, is a total
+    #: measured wait of 60+120+240+480+600+600 = 2100 seconds, i.e. 35 minutes
+    #: — comfortably past the "a few minutes" the modal itself asks for, and
+    #: short enough that an operator
+    #: is told about a limit that is not lifting rather than left guessing why
+    #: the loop is quiet. The value is deliberately uncoupled from
+    #: `browser.rate_limit_backoff_seconds`: the exemption is what makes the
+    #: fix hold for any pair, and a bound that only works for one pair traps
+    #: whoever tunes them next.
+    max_rate_limit_backoffs: int = 6
 
 
 # Whitelist, not blacklist: a git invocation is allowed only if its subcommand
@@ -625,6 +642,26 @@ class PolicyEngine:
                 f"more than {self.config.max_browser_restart_skips} consecutive "
                 "browser failures went unrecovered because the browser-restart "
                 "cooldown had not elapsed",
+            )
+        return Verdict.ok()
+
+    def check_rate_limit_backoff_budget(self, backoffs: int) -> Verdict:
+        """Consecutive waits taken against ChatGPT's account-level throttle.
+
+        `>` like the other post-hoc budgets (increment, then check), and
+        separate from `check_failure_budget` for the same reason
+        `check_browser_restart_skip_budget` is: neither restarting nor
+        retrying could have cleared a server-side limit, so spending the
+        failure budget on it fails the loop for a condition it was never
+        able to act on — and each retry adds a request to the window that
+        caused it (observed 2026-08-14/15).
+        """
+        if backoffs > self.config.max_rate_limit_backoffs:
+            return Verdict.deny(
+                "rate_limit_backoff_budget",
+                f"more than {self.config.max_rate_limit_backoffs} consecutive "
+                "back-offs against ChatGPT's account rate limit without it "
+                "clearing",
             )
         return Verdict.ok()
 
