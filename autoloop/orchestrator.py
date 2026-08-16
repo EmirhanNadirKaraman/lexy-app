@@ -166,6 +166,7 @@ import hashlib
 import subprocess
 import time
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -497,6 +498,12 @@ class Orchestrator:
             if max_steps is not None and steps >= max_steps:
                 return phase.value
             steps += 1
+            # Before the step, because the step is what talks to ChatGPT. An
+            # unfinished back-off left by a killed process is served here — the
+            # ordinary case is no wait outstanding and this costs nothing. It
+            # sits AFTER the terminal-phase check on purpose: a parked loop is
+            # not about to make a request, so it should return, not sleep.
+            self._await_rate_limit_deadline()
             try:
                 self._step(phase)
             except LoginExpiredError as exc:
@@ -571,6 +578,11 @@ class Orchestrator:
                 if self.state.rate_limit_backoffs:
                     self.state.rate_limit_backoffs = 0
                     self.state.rate_limit_wait_seconds = 0.0
+                    # The episode is over, so any deadline it left is stale.
+                    # Normally already `None` (the wait cleared it when it
+                    # finished); belt and braces for the step that completes
+                    # against a state file some other path wrote.
+                    self.state.rate_limit_retry_not_before = None
                     self._store.save(self.state)
 
     def _step(self, phase: Phase) -> None:
@@ -1320,6 +1332,104 @@ class Orchestrator:
         delay = base * (2 ** max(0, backoffs - 1))
         return min(delay, ceiling) if ceiling else delay
 
+    def _rate_limit_deadline(self) -> datetime | None:
+        """The persisted `retry_not_before` instant, or `None` when no wait is
+        in progress.
+
+        An unparseable value reads as no wait rather than raising, and is
+        DISCARDED on the spot — a stamp nothing can read is a wait nobody can
+        serve, and left in place it would re-log on every step for the rest of
+        the session. The counter is what bounds the episode; a state file
+        somebody hand-edited must not take the loop down, and if the limit is
+        still in force the next step raises `RateLimitedError` again and
+        re-enters the back-off with `rate_limit_backoffs` intact.
+        """
+        raw = self.state.rate_limit_retry_not_before
+        if not raw:
+            return None
+        try:
+            deadline = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            # TypeError as well as ValueError: a hand-edited file can hold a
+            # NUMBER there, and `fromisoformat(123)` raises the one the obvious
+            # `except ValueError` misses — straight out of `run()`, which is the
+            # opposite of what this fail-open exists for.
+            self._log(
+                "rate_limit_deadline_unreadable",
+                data={"reason_code": "rate_limited", "retry_not_before": raw},
+            )
+            self.state.rate_limit_retry_not_before = None
+            self._store.save(self.state)
+            return None
+        # A file written by hand can carry a naive stamp; everything this loop
+        # writes is UTC-aware.
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return deadline
+
+    def _await_rate_limit_deadline(self) -> None:
+        """Serve whatever remains of a back-off STARTED BY AN EARLIER PROCESS,
+        before this one touches ChatGPT. No-op — and free — when no wait is in
+        progress, which is every ordinary step.
+
+        This is the half that makes the back-off durable. `rate_limit_backoffs`
+        alone records that a wait was ENTERED, not that it was served: a
+        process killed just after that save would resume treating the whole
+        delay as waited and re-enter the browser step immediately, so a
+        supervisor restarting the loop could skip every back-off in turn — the
+        restart storm this task exists to stop, one level up.
+
+        The remainder is CLAMPED to the delay the schedule prescribes for the
+        current streak. Without it a backward system-clock jump or a
+        hand-edited stamp becomes an arbitrarily long sleep, and this loop
+        publishes its heartbeat BETWEEN steps: a sleep inside one is a gap in
+        the record, which is why `browser.rate_limit_backoff_max_seconds` is
+        deliberately kept under the monitor's 45-minute staleness threshold.
+        The clamp is what keeps that ceiling meaning what it says.
+        """
+        deadline = self._rate_limit_deadline()
+        if deadline is None:
+            return
+        planned = self._rate_limit_delay(self.state.rate_limit_backoffs)
+        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+        remaining = min(planned, max(0.0, remaining))
+        self._log(
+            "rate_limit_wait_resumed",
+            data={
+                "reason_code": "rate_limited",
+                "backoffs": self.state.rate_limit_backoffs,
+                "retry_not_before": self.state.rate_limit_retry_not_before,
+                "remaining_seconds": remaining,
+                "waited_seconds": self.state.rate_limit_wait_seconds,
+            },
+        )
+        self._serve_rate_limit_wait(remaining, planned)
+
+    def _serve_rate_limit_wait(self, seconds: float, planned: float) -> None:
+        """Sleep `seconds`, then credit the wait, clear the deadline and clear
+        the modal. The one place any of that happens, so the fresh and the
+        resumed path cannot drift apart.
+
+        `planned` is credited rather than `seconds` because they differ only on
+        the resumed path, where the difference was spent with this process
+        dead — and for a server-side limit the remedy is calendar time in which
+        the account makes no requests, which a dead process supplies as well as
+        a sleeping one. Crediting after the sleep, never before, is what keeps
+        `rate_limit_wait_seconds` a record of waiting that actually happened:
+        a crash mid-wait credits nothing, and the resuming process credits the
+        episode once, when its deadline is finally met.
+        """
+        if seconds > 0:
+            self._sleep(seconds)
+        state = self.state
+        state.rate_limit_wait_seconds += planned
+        state.rate_limit_retry_not_before = None
+        self._store.save(state)
+        # Clear the overlay so the next step meets the page. This is NOT a
+        # verdict on the limit — see `_dismiss_rate_limit_modal`. The streak
+        # ends where a step completes (`run`), not here.
+        self._dismiss_rate_limit_modal()
+
     def _dismiss_rate_limit_modal(self) -> None:
         """Close the throttle overlay, if this transport can, so the next step
         meets the page rather than the modal.
@@ -1379,6 +1489,11 @@ class Orchestrator:
           another request. The page stays exactly where it is; the modal is
           dismissed in place and re-probed there.
 
+        The wait itself is DURABLE, not just its counter: the deadline is
+        persisted before the sleep and served by `_await_rate_limit_deadline`
+        on whatever process is running when it expires. See that method for the
+        restart-storm this closes.
+
         The phase is left untouched, so the loop re-enters the step it was in
         and republishes its heartbeat. **That re-entry IS the re-probe**, and
         the streak is reset only when it completes (`run`'s `else` branch).
@@ -1410,8 +1525,9 @@ class Orchestrator:
             self._to_needs_user(
                 f"{verdict.reason}: ChatGPT has rate limited this account "
                 f"('Too many requests — please wait a few minutes before trying "
-                f"again') and it has not lifted after {state.rate_limit_backoffs} "
-                f"waits totalling {waited:g}s. This is NOT a browser fault — the "
+                f"again') and it has not lifted across {state.rate_limit_backoffs} "
+                f"throttled attempts and {waited:g}s of completed waiting. "
+                "This is NOT a browser fault — the "
                 "composer is present the whole time and a restart cannot help, "
                 "because the limit is server-side. Leave the account idle for a "
                 "while (an hour is usually more than enough), then resume with "
@@ -1427,16 +1543,20 @@ class Orchestrator:
                 ),
             )
             return
-        # Persisted BEFORE the sleep: a crash during the wait must resume with
-        # the count and the measured total intact, not reset to zero and ready
-        # to start hammering again.
-        state.rate_limit_wait_seconds += delay
+        # Persisted BEFORE the sleep — the count AND the instant the wait runs
+        # to. A crash during the wait must resume knowing both, or the next
+        # process starts from zero with no wait outstanding and is ready to
+        # hammer again. The elapsed total is deliberately NOT credited here:
+        # crediting a wait that has not happened yet is how a killed process
+        # comes back believing it already waited.
+        state.rate_limit_retry_not_before = (
+            datetime.now(timezone.utc) + timedelta(seconds=delay)
+        ).isoformat(timespec="milliseconds")
         self._store.save(state)
-        self._sleep(delay)
-        # Clear the overlay so the next step meets the page. This is NOT a
-        # verdict on the limit — see `_dismiss_rate_limit_modal`. The streak
-        # ends where a step completes (`run`), not here.
-        self._dismiss_rate_limit_modal()
+        # `delay` itself, not the clock difference: this process opened the
+        # window a moment ago and owes the whole of it. Serving the remainder
+        # against the deadline is the RESUMED path's job.
+        self._serve_rate_limit_wait(delay, delay)
 
     def _handle_quota_exhausted(self, phase: Phase, exc: QuotaExhaustedError) -> None:
         """Hand the reviewer role to the fallback provider, or park saying why.

@@ -816,6 +816,15 @@ because the loop closed it, so resetting on a dismissal would reset on every
 occurrence and turn the back-off into a fixed-interval retry that never
 escalates and never parks.
 
+**The wait survives the process.** `state.rate_limit_retry_not_before` is a
+persisted deadline written *before* the sleep, and `run()` serves whatever
+remains of it before every step (transcript: `rate_limit_wait_resumed`). Kill the
+loop mid-wait and restart it and it finishes the wait; without that, a supervisor
+restart would resume with a counter it cannot tell apart from a wait already
+served, skip the back-off entirely, and rebuild the same storm out of process
+restarts. `rate_limit_wait_seconds` is credited when a wait finishes, not when it
+starts — so if the park message says 30s, 30s of waiting really happened.
+
 **If you are reading an OLD transcript:** a run of identical
 `Locator.click: Timeout … #prompt-textarea` errors with `browser_restarted`
 between them is this, before the fix. A run that says `rate_limited` is this,

@@ -181,8 +181,9 @@ class PolicyConfig:
     #: ACCOUNT and never about the transport.
     #:
     #: Six, against the default 60s-doubling-to-600s schedule, is a total
-    #: measured wait of about 27 minutes — comfortably past the "a few
-    #: minutes" the modal itself asks for, and short enough that an operator
+    #: measured wait of 60+120+240+480+600+600 = 2100 seconds, i.e. 35 minutes
+    #: — comfortably past the "a few minutes" the modal itself asks for, and
+    #: short enough that an operator
     #: is told about a limit that is not lifting rather than left guessing why
     #: the loop is quiet. The value is deliberately uncoupled from
     #: `browser.rate_limit_backoff_seconds`: the exemption is what makes the

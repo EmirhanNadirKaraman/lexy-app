@@ -2480,8 +2480,31 @@ reach that recovery at all. `orchestrator._handle_rate_limited` waits instead:
 | drop the client | **never** — re-attaching navigates, and a navigation is another request |
 | `max_consecutive_failures` | **never charged** — same principle as the row above about skipped restarts |
 | what it does | wait `browser.rate_limit_backoff_seconds` (doubling per consecutive occurrence to `rate_limit_backoff_max_seconds`), dismiss the modal in place, leave the phase untouched so the loop re-enters the step |
-| bounded by | `policy.max_rate_limit_backoffs` (default 6 ≈ 27 minutes of measured wait) |
+| bounded by | `policy.max_rate_limit_backoffs` (default 6 = 60+120+240+480+600+600 = 2100s, 35 minutes of measured wait) |
 | streak reset by | a step that COMPLETES — nothing else |
+| survives a crash | the wait is a persisted DEADLINE, served by whichever process is running when it expires |
+
+**The wait is durable, not just its counter.** `rate_limit_backoffs` records that
+a back-off was *entered*; `rate_limit_retry_not_before` records the instant it
+runs *to*. Both are saved before the sleep. Without the second, a process killed
+just after that save would resume treating the whole delay as already waited and
+walk straight back into the browser step — so a supervisor restarting the loop
+would skip every back-off in turn, rebuilding the restart storm this path exists
+to stop out of process restarts instead of browser ones. `run()` therefore serves
+whatever remains of the deadline before EVERY step (logged as
+`rate_limit_wait_resumed`, so a resumed process sleeping ten minutes before its
+first step says so), and the remainder is clamped to the delay the schedule
+prescribes — a backward clock jump or a hand-edited stamp must not become a sleep
+long enough to break the heartbeat monitor's staleness alarm. An unreadable stamp
+fails open and is discarded: the counter still bounds the episode, and a limit
+still in force raises again on the next step.
+
+`rate_limit_wait_seconds` is credited when a wait FINISHES, never when it starts.
+A crash mid-wait therefore credits nothing, and the process that finally meets
+the deadline credits that wait once — including the part of it spent with the
+loop dead, which for a server-side limit is real waiting: the remedy is calendar
+time in which the account makes no requests, and a process that is not running
+makes none.
 
 **The re-probe is the next step, and only a step that completes ends the
 streak.** Dismissal is still required — the modal hides the composer even

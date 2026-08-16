@@ -57,7 +57,9 @@ restart_cooldown_seconds = 120.0
 # a browser fault and a restart cannot clear it — the limit is server-side, so a
 # fresh browser meets the same wall while adding another request. The loop waits
 # instead: this is the first wait, doubling on each consecutive occurrence up to
-# the ceiling below, dismissing the modal and re-probing after each one.
+# the ceiling below, dismissing the modal and re-probing after each one. The wait
+# is persisted as a deadline, so killing and restarting the loop mid-wait serves
+# the rest of it rather than skipping it.
 #
 # Raise this if you keep hitting the limit; the modal asks for "a few minutes"
 # and the schedule below is built around that.
@@ -89,8 +91,9 @@ max_browser_restart_skips = 5
 # rate limit before parking. Like the setting above these do NOT spend
 # max_consecutive_failures — the loop cannot recover from a server-side limit,
 # only outlast it, so a wait is evidence about the account, not the transport.
-# Six waits on the default schedule is about 27 minutes; exhausting it parks
-# with a question naming the throttle instead of "browser session lost".
+# Six waits on the default schedule is 60+120+240+480+600+600 = 2100 seconds,
+# i.e. 35 minutes; exhausting it parks with a question naming the throttle
+# instead of "browser session lost".
 max_rate_limit_backoffs = 6
 max_parse_retries = 2
 max_policy_denials = 3

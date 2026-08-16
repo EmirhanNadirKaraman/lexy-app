@@ -90,6 +90,11 @@ if TYPE_CHECKING:
 # POSITIVE value (`stop_kind == "contract"`), so an unclassified stop reads as a
 # failure, which is the fail-closed direction.
 #
+# NOT bumped for the rate-limit wait deadline either
+# (`LoopState.rate_limit_retry_not_before`). It defaults to `None`, which is
+# exactly right for a state file written before it existed: that process was not
+# in the middle of a throttle back-off, so there is no wait to resume.
+#
 # NOT bumped for chunked packet delivery either (`LoopState.outbox_diff`,
 # `PendingRequest.delivery`, and the new `Phase.DELIVERING` member). The two
 # fields default to `None`, which is exactly right for a state file written
@@ -467,16 +472,36 @@ class LoopState:
     #: evidence that the transport is hopeless and must never spend
     #: `consecutive_failures`. Charging them there is what turned one overnight
     #: throttle into a restart-and-retry storm that deepened the limit it was
-    #: failing on (2026-08-14/15). Reset the moment a re-probe finds the
-    #: overlay gone, and bounded by `policy.max_rate_limit_backoffs` so the
-    #: exemption ends in a park NAMING the throttle rather than an unbounded
-    #: wait — see `orchestrator._handle_rate_limited`.
+    #: failing on (2026-08-14/15). Reset only when a STEP COMPLETES — never on
+    #: a clear overlay probe, which says only that the loop closed the modal
+    #: (see `orchestrator.run`'s `else` branch and `_dismiss_rate_limit_modal`)
+    #: — and bounded by `policy.max_rate_limit_backoffs` so the exemption ends
+    #: in a park NAMING the throttle rather than an unbounded wait — see
+    #: `orchestrator._handle_rate_limited`.
     rate_limit_backoffs: int = 0
-    #: Seconds ACTUALLY slept across those back-offs, accumulated as they are
-    #: taken rather than derived from the configured schedule — so the park
-    #: message states a wait that was really observed. Same distinction as
+    #: Seconds of back-off this throttle episode has actually COMPLETED,
+    #: credited when each wait finishes rather than when it starts — so the park
+    #: message states a wait that really elapsed. Same distinction as
     #: `PendingRequest.start_timeout_wait_seconds`. Reset with the counter.
+    #:
+    #: A completed wait is credited its full scheduled length even when part of
+    #: it was spent with the process dead (crash mid-wait, resumed against
+    #: `rate_limit_retry_not_before` below). That is not pre-crediting: the
+    #: remedy for a server-side limit is calendar time in which the account
+    #: makes no requests, and a process that is not running makes none.
     rate_limit_wait_seconds: float = 0.0
+    #: ISO-8601 UTC instant before which nothing may touch ChatGPT, set when a
+    #: back-off STARTS and cleared when it finishes. `None` outside a wait.
+    #:
+    #: The counter above alone is not enough to make the back-off durable: it
+    #: records that a wait was entered, not that it was served. A process killed
+    #: just after saving it would resume with the whole delay treated as already
+    #: waited and walk straight back into the browser step, so repeated restarts
+    #: could skip the very back-off this exists to enforce — the restart-storm
+    #: shape again, one level up. `orchestrator.run` honours whatever remains of
+    #: this deadline before EVERY step, so the wait survives the process that
+    #: began it.
+    rate_limit_retry_not_before: str | None = None
     parse_retries: int = 0
     policy_denials: int = 0
     outbox: str | None = None
