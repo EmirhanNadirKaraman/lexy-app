@@ -22,14 +22,17 @@ import pytest
 
 from autoloop.dashboard import (
     GROUPS,
+    IN_PROGRESS_KINDS,
     MARKS,
     PAGE,
+    STAT_BUCKETS,
     STATUS,
     app_tasks,
     collect,
     is_ancestor,
     merge_states,
     pipeline,
+    roadmap_stats,
     task_groups,
     worker_progress,
 )
@@ -1549,3 +1552,345 @@ def test_the_page_renders_every_group_with_its_heading_and_count():
     # finished task means nothing anyway.
     assert 'querySelectorAll("#roadmap button.save")' in script
     assert "priCell" not in script.split('getElementById("done").innerHTML', 1)[1]
+
+
+# ---- the summary at the top (2026-08-16) --------------------------------------
+#
+# The page listed tasks and answered none of the three questions an operator
+# arrives with: how much is done, how much is moving, is the queue converging.
+# Counting it by hand on 2026-08-06 took a script — 66 tasks, 17 completed, 23
+# in progress, 18 pending, 8 blocked — and the flat list is what shipped.
+#
+# Two properties carry the feature, and both are asserted below rather than
+# described:
+#
+# * every count is derived from `TaskRegistry.state_of()` (through the same
+#   `groups` payload the Roadmap panel renders), so the summary cannot disagree
+#   with what actually dispatches; and
+# * an unreachable remote reads UNKNOWN, never "not published". That is the
+#   mutation test: twelve unpublished candidates is a real alarm, and inventing
+#   it out of a network failure would make the number worthless.
+
+
+def stats_for(rows, executions=None, remote_ok=True, refs=None, remote_name="origin"):
+    """`roadmap_stats` wired exactly as `collect()` wires it: the groups come
+    from `task_groups`, so these tests exercise the derivation the page renders
+    rather than a parallel one built for the test."""
+    executions = executions or {}
+    groups = task_groups({"tasks": rows}, executions)
+    return roadmap_stats(groups, executions, remote_ok, refs or {}, remote_name)
+
+
+def test_the_counts_are_what_state_of_reports_and_nothing_else():
+    """The load-bearing property. `status` cannot answer this: `pending` covers
+    Ready and Blocked alike and `blocked` means quarantined, so the counts are
+    compared against `state_of()` run directly on the same rows."""
+    rows = [
+        roadmap_task("done-1", status="completed"),
+        roadmap_task("done-2", status="completed"),
+        roadmap_task("wip-1", status="in_progress"),
+        roadmap_task("ready-1"),
+        roadmap_task("dep-1", depends_on=["wip-1"]),
+        roadmap_task("q-1", status="blocked", blocked_reason="answer me"),
+        roadmap_task("rt-1", status="retired", superseded_by=["done-1"]),
+    ]
+    registry = TaskRegistry.from_dict({"tasks": [dict(row) for row in rows]})
+    seen = {state: 0 for state in TaskState}
+    for task in registry.all_tasks():
+        seen[registry.state_of(task.id)] += 1
+
+    stats = stats_for(rows)
+
+    assert stats["total"] == len(rows) == 7
+    assert stats["counts"] == {
+        "completed": seen[TaskState.COMPLETED],
+        "in_progress": seen[TaskState.IN_PROGRESS],
+        # Stored `pending` is exactly READY ∪ BLOCKED — the split between them
+        # is derived from dependencies and never stored, which is why the hand
+        # count read one number for both.
+        "pending": seen[TaskState.READY] + seen[TaskState.BLOCKED],
+        "blocked": seen[TaskState.BLOCKED_BY_OPERATOR],
+        "retired": seen[TaskState.RETIRED],
+    }
+    # Spelled out too, so a bug that moved a task between states consistently in
+    # both halves of the comparison above still fails here.
+    assert stats["counts"] == {"completed": 2, "in_progress": 1, "pending": 2,
+                               "blocked": 1, "retired": 1}
+    # And the roll-up loses nothing: dispatchable-now vs waiting-on-a-dependency
+    # is still readable beside it.
+    assert stats["by_state"] == {state.value: seen[state] for state in TaskState}
+
+
+def test_every_task_state_is_claimed_by_exactly_one_bucket():
+    """A state added to the registry must not vanish from the summary. The
+    buckets are spelled in GROUP KEYS, and `GROUPS` pins each key to its state,
+    so this asks whether the five buckets partition all six states."""
+    key_to_state = {key: state for key, _label, state in GROUPS}
+    claimed = [key_to_state[key] for _name, keys in STAT_BUCKETS for key in keys]
+
+    assert len(claimed) == len(set(claimed)), "a state is counted in two buckets"
+    assert {state.value for state in claimed} == {state.value for state in TaskState}
+
+
+def test_retired_tasks_leave_the_percentage_denominator_on_both_sides():
+    """A retirement was deliberately dropped. Counting it as outstanding
+    understates progress; counting it as done overstates it. Neither reading is
+    allowed, so it comes out of the fraction entirely — and the denominator
+    ships with the percentage so the exclusion is visible rather than assumed."""
+    rows = [
+        roadmap_task("d-1", status="completed"),
+        roadmap_task("o-1"),
+        roadmap_task("rt-1", status="retired", superseded_by=["d-1"]),
+    ]
+
+    stats = stats_for(rows)
+
+    assert stats["total"] == 3 and stats["counts"]["retired"] == 1
+    assert stats["open"] == 1 and stats["denominator"] == 2
+    assert stats["denominator"] == stats["counts"]["completed"] + stats["open"]
+    assert stats["denominator"] == stats["total"] - stats["counts"]["retired"]
+    assert stats["percent_done"] == 50.0
+    # Retired-as-outstanding would read 33.3; retired-as-done would read 66.7.
+    assert stats["percent_done"] not in (round(100 / 3, 1), round(200 / 3, 1))
+
+
+def test_a_roadmap_with_nothing_to_divide_by_reports_no_percentage():
+    """0% is a verdict. With every task retired there is nothing to be a
+    fraction of, so the figure is absent rather than an alarming zero."""
+    stats = stats_for([roadmap_task("rt-1", status="retired")])
+
+    assert stats["denominator"] == 0
+    assert stats["percent_done"] is None
+
+
+def test_each_in_progress_sub_category_is_classified_including_a_published_one():
+    """`in progress: 23` hides three quite different situations. A published
+    candidate is retireable (B10 should have completed it); an unpublished one
+    pins a task_base_sha and is a task_base_behind_head park waiting to happen;
+    no candidate at all is a timeout, a refusal or an abandoned round."""
+    rows = [roadmap_task(f"wip-{n}", status="in_progress") for n in (1, 2, 3)]
+    executions = {
+        "wip-1": {"task_id": "wip-1", "task_branch": "autoloop/wip-1",
+                  "candidate_sha": "a" * 40},
+        "wip-2": {"task_id": "wip-2", "task_branch": "autoloop/wip-2",
+                  "candidate_sha": "b" * 40},
+        "wip-3": {"task_id": "wip-3", "task_branch": "autoloop/wip-3"},
+    }
+    # wip-1's branch is AT its candidate; wip-2's branch exists at some other
+    # commit, so the branch head does not carry this candidate.
+    refs = {"autoloop/wip-1": "a" * 40, "autoloop/wip-2": "c" * 40}
+
+    stats = stats_for(rows, executions, True, refs)
+
+    by_id = {row["id"]: row for row in stats["in_progress"]["rows"]}
+    assert by_id["wip-1"]["kind"] == "published"
+    assert by_id["wip-2"]["kind"] == "unpublished_candidate"
+    assert by_id["wip-3"]["kind"] == "no_candidate"
+    assert stats["in_progress"]["counts"] == {
+        "published": 1, "unpublished_candidate": 1, "no_candidate": 1, "unknown": 0,
+    }
+    # The breakdown must account for every in-progress task, or the flat count
+    # and the sub-counts tell the operator two different things.
+    assert sum(stats["in_progress"]["counts"].values()) == stats["counts"]["in_progress"] == 3
+    # A mismatch names BOTH shas, so the verdict can be checked rather than
+    # merely believed.
+    assert "b" * 12 in by_id["wip-2"]["detail"] and "c" * 12 in by_id["wip-2"]["detail"]
+
+
+def test_an_unreachable_remote_is_unknown_never_not_published():
+    """THE mutation. A failed `ls-remote` and a remote with no such branch both
+    produce an empty ref map; reading them the same way would manufacture the
+    alarming state out of a network hiccup. Treating unreachable as
+    not-published fails here."""
+    rows = [roadmap_task("wip-1", status="in_progress"),
+            roadmap_task("wip-2", status="in_progress")]
+    executions = {
+        "wip-1": {"task_id": "wip-1", "candidate_sha": "a" * 40},
+        "wip-2": {"task_id": "wip-2"},
+    }
+
+    stats = stats_for(rows, executions, remote_ok=False, refs={})
+
+    kinds = {row["id"]: row["kind"] for row in stats["in_progress"]["rows"]}
+    assert kinds["wip-1"] == "unknown"
+    assert stats["in_progress"]["counts"]["unpublished_candidate"] == 0
+    assert stats["in_progress"]["counts"]["unknown"] == 1
+    # …and the answer that never needed the network is still given: nothing was
+    # committed, and no remote could change that.
+    assert kinds["wip-2"] == "no_candidate"
+    assert stats["in_progress"]["counts"]["no_candidate"] == 1
+
+
+def test_a_record_naming_no_remote_is_read_against_the_one_that_was_polled():
+    """Most records carry no `intended_remote` at all. Reading that absence as
+    "some other remote" would make the whole breakdown read `unknown` against
+    live data while every test above still passed — so absence means the remote
+    that was actually polled, and only a DIFFERENT named remote is unknown."""
+    rows = [roadmap_task("wip-1", status="in_progress"),
+            roadmap_task("wip-2", status="in_progress")]
+    executions = {
+        "wip-1": {"task_id": "wip-1", "task_branch": "autoloop/wip-1",
+                  "candidate_sha": "a" * 40},
+        "wip-2": {"task_id": "wip-2", "task_branch": "autoloop/wip-2",
+                  "candidate_sha": "a" * 40, "intended_remote": "elsewhere"},
+    }
+    refs = {"autoloop/wip-1": "a" * 40, "autoloop/wip-2": "a" * 40}
+
+    kinds = {row["id"]: row["kind"]
+             for row in stats_for(rows, executions, True, refs)["in_progress"]["rows"]}
+
+    assert kinds["wip-1"] == "published"
+    assert kinds["wip-2"] == "unknown", "a remote nobody read cannot be evidence"
+
+
+def test_the_branch_comes_from_the_record_before_the_naming_convention():
+    """`intended_remote_ref` is what the publisher meant to write, so it beats
+    the checked-out branch, which beats `autoloop/<id>` — a lookup key, never
+    evidence. The merge panel resolves it the same way, through the same
+    helper, so the two panels cannot name different branches for one task."""
+    rows = [roadmap_task("wip-1", status="in_progress"),
+            roadmap_task("wip-2", status="in_progress"),
+            roadmap_task("wip-3", status="in_progress")]
+    executions = {
+        "wip-1": {"task_id": "wip-1", "candidate_sha": "a" * 40,
+                  "task_branch": "ignored/wip-1",
+                  "intended_remote_ref": "refs/heads/published/wip-1"},
+        "wip-2": {"task_id": "wip-2", "candidate_sha": "a" * 40,
+                  "task_branch": "worker/wip-2"},
+        "wip-3": {"task_id": "wip-3", "candidate_sha": "a" * 40},
+    }
+
+    branches = {row["id"]: row["branch"]
+                for row in stats_for(rows, executions)["in_progress"]["rows"]}
+
+    assert branches == {"wip-1": "published/wip-1", "wip-2": "worker/wip-2",
+                        "wip-3": "autoloop/wip-3"}
+
+
+def test_the_open_work_is_broken_down_by_priority_and_by_area():
+    """The counts say how much is left; these say whether what is left is worth
+    doing next. 31 open reads differently once eleven of them are p2, and once
+    eight turn out to be one over-split family."""
+    rows = [
+        roadmap_task("inbox-01", priority=2),
+        roadmap_task("inbox-02", priority=2),
+        roadmap_task("dash-05", priority=1, status="in_progress"),
+        roadmap_task("rt-09"),
+        # Neither of these is open work, so neither may appear in either split.
+        roadmap_task("port-02", priority=2, status="completed"),
+        roadmap_task("auto-01", priority=1, status="retired", superseded_by=["rt-09"]),
+    ]
+
+    stats = stats_for(rows)
+
+    assert stats["open"] == 4
+    # Priority keeps its own order — 1 outranks 2 outranks the default 100 — so
+    # sorting these by size would scramble the answer.
+    assert stats["open_by_priority"] == [
+        {"key": 1, "count": 1}, {"key": 2, "count": 2}, {"key": 100, "count": 1},
+    ]
+    # Areas have no order of their own, so the biggest family leads.
+    assert stats["open_by_area"] == [
+        {"key": "inbox", "count": 2}, {"key": "dash", "count": 1}, {"key": "rt", "count": 1},
+    ]
+    assert sum(row["count"] for row in stats["open_by_priority"]) == stats["open"]
+    assert sum(row["count"] for row in stats["open_by_area"]) == stats["open"]
+
+
+def test_an_unreadable_graph_reports_unknown_rather_than_a_row_of_zeros():
+    """A summary is the one panel where a fabricated 0 would be believed. An
+    empty `groups` means the graph did not load as a registry (see
+    `task_groups`), which is not the same as a roadmap with no tasks in it."""
+    unreadable = roadmap_stats([], {}, True, {})
+    empty = stats_for([])
+
+    assert unreadable["readable"] is False
+    assert unreadable["percent_done"] is None
+    assert "could not be read" in unreadable["line"]
+    # A genuinely empty roadmap IS readable, and reports zeros honestly.
+    assert empty["readable"] is True and empty["total"] == 0
+    assert empty["percent_done"] is None
+
+    script = PAGE.split("<script>", 1)[1]
+    assert "!s.readable" in script, "the page must distinguish unreadable from empty"
+
+
+def test_the_summary_is_wired_from_the_same_groups_the_roadmap_renders(tmp_path):
+    """End to end, against a real checkout with a real origin: the payload's
+    counts must equal the group counts rendered below them, or the page shows
+    two answers to one question. A published candidate is exercised against an
+    actual `git ls-remote`, not a hand-written ref map."""
+    repo, merged_sha, _ = merge_fixture(tmp_path)
+    write_registry(
+        repo,
+        [roadmap_task("t-merged", status="in_progress"),
+         roadmap_task("t-ghost", status="in_progress"),
+         roadmap_task("d-1", status="completed"),
+         roadmap_task("r-1")],
+        [{"task_id": "t-merged", "task_branch": "autoloop/t-merged",
+          "candidate_sha": merged_sha},
+         {"task_id": "t-ghost", "task_branch": "autoloop/t-ghost",
+          "candidate_sha": "f" * 40}],
+    )
+
+    payload = collect(repo)
+    stats, groups = payload["stats"], groups_by_key(payload["groups"])
+
+    assert stats["readable"] is True
+    assert stats["counts"]["in_progress"] == groups["in_progress"]["count"] == 2
+    assert stats["counts"]["completed"] == groups["done"]["count"] == 1
+    assert stats["counts"]["pending"] == groups["ready"]["count"] + groups["blocked"]["count"]
+    assert stats["total"] == len(payload["roadmap"]) == 4
+    kinds = {row["id"]: row["kind"] for row in stats["in_progress"]["rows"]}
+    assert kinds == {"t-merged": "published", "t-ghost": "unpublished_candidate"}
+
+
+def test_an_unreachable_origin_leaves_the_breakdown_unknown_end_to_end(tmp_path):
+    """The same wiring with the network gone. A path that is not a repository
+    fails instantly; an unroutable URL would sit on the `ls-remote` timeout and
+    stall the suite instead."""
+    repo, merged_sha, _ = merge_fixture(tmp_path)
+    write_registry(
+        repo,
+        [roadmap_task("t-merged", status="in_progress")],
+        [{"task_id": "t-merged", "task_branch": "autoloop/t-merged",
+          "candidate_sha": merged_sha}],
+    )
+    run_git(repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+    stats = collect(repo)["stats"]
+
+    assert stats["in_progress"]["rows"][0]["kind"] == "unknown"
+    assert stats["in_progress"]["counts"]["unpublished_candidate"] == 0
+    assert stats["in_progress"]["counts"]["unknown"] == 1
+
+
+def test_the_summary_renders_at_the_top_of_the_page():
+    """A payload carrying the counts is not a page showing them, and the
+    operator's request was specifically about placement: above the task list,
+    because it is what gets read first."""
+    static_markup, script = PAGE.split("<script>", 1)
+
+    assert '<section id="summary">' in static_markup
+    for later in ('id="tiles"', 'id="progressbox"', 'id="merged"', 'id="roadmap"'):
+        assert static_markup.index('id="summary"') < static_markup.index(later), \
+            f"the counts must render above {later}"
+
+    assert "renderStats(d.stats)" in script
+    for field in ("s.line", "s.total", "s.open", "s.denominator", "s.percent_done",
+                  "s.open_by_priority", "s.open_by_area", "c.completed",
+                  "c.in_progress", "c.pending", "c.blocked", "c.retired",
+                  "w.unpublished_candidate", "r.detail"):
+        assert field in script, f"{field} never reaches the DOM"
+
+    # Identity is never colour-alone on this page: every in-progress state ships
+    # an icon and a word, and the table below repeats all of it as text.
+    marks = PAGE.split("const WIP = {", 1)[1].split("};", 1)[0].replace(" ", "")
+    for kind in IN_PROGRESS_KINDS:
+        assert f"{kind}:[" in marks
+
+    # Inside the change guard, unlike `renderProgress`: nothing in the summary
+    # ticks on a clock, so rebuilding it on every 2s poll would discard text
+    # selection for nothing.
+    body = script.split("function render(d, force){", 1)[1]
+    assert body.index("sig === LASTJSON") < body.index("renderStats(d.stats)")
