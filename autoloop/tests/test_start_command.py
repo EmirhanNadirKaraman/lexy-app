@@ -256,9 +256,15 @@ def test_check_only_never_launches_the_loop(wired, monkeypatch, capsys):
 # file over. These run the whole path, `retire` command included.
 
 
-def _quarantine(config, task_id, code):
+def _quarantine(config, task_id, code, kind="task_fatal"):
     """A task blocked in the registry AND holding an open blocker record —
-    what a `task_fatal` park actually leaves behind."""
+    what a `task_fatal` park actually leaves behind.
+
+    `kind="loop_fatal"` writes the other shape: a LOOP-WIDE condition that
+    merely names the task that happened to be in flight when it fired. The
+    registry side is the same either way (a `loop_fatal` park leaves the task
+    in_progress rather than blocked, but what is under test here is the blocker
+    record, and `block` is the shorter route to a task the sweep will consider)."""
     from autoloop.tasks import Task, TaskRegistry, TaskStore
 
     store = TaskStore(config.tasks_file)
@@ -268,7 +274,7 @@ def _quarantine(config, task_id, code):
     registry.block(task_id, f"parked: {code}")
     store.save(registry)
     return BlockerStore(config.blockers_dir).record(
-        task_id=task_id, kind="task_fatal", code=code,
+        task_id=task_id, kind=kind, code=code,
         question=f"task {task_id} parked with {code}; what now?", detail="",
         phase="executing", now="2026-08-14T00:00:00+00:00",
     )
@@ -340,6 +346,79 @@ def test_start_reconciles_a_retirement_that_predates_the_state(wired, capsys):
     out = capsys.readouterr().out
     assert "task brw-02 is retired" in out
     assert not BlockerStore(wired.blockers_dir).open_blockers()
+
+
+def test_retiring_a_task_never_closes_a_loop_fatal_blocker_naming_it(wired, capsys):
+    """The sweep is scoped by KIND, not just by task id.
+
+    A `loop_fatal` park is a loop-wide safety condition, and several of them
+    name whatever task was in flight when they fired — `checkout_escape_detected`
+    here, but `primary_checkout_dirty` and the worker/publisher environment
+    failures are the same shape. Retiring that task answers the quarantine and
+    NOTHING about the escaped write: closing it would manufacture resolution of
+    the safety condition and let `start` proceed into a checkout that was
+    written outside the worker."""
+    from dataclasses import asdict
+
+    from autoloop import health
+
+    quarantine = _quarantine(wired, "old-01", "attempt_count_ceiling")
+    escape = _quarantine(wired, "old-01", "checkout_escape_detected", kind="loop_fatal")
+    StateStore(wired.state_file).save(_a_state())
+    assert len(BlockerStore(wired.blockers_dir).open_blockers()) == 2, (
+        "two distinct codes, so two records — `record` upserts on (task, code, phase)"
+    )
+    before = asdict(BlockerStore(wired.blockers_dir).load(escape.id))
+
+    assert cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"])) == 0
+    capsys.readouterr()
+
+    blockers = BlockerStore(wired.blockers_dir)
+    # The quarantine goes, archived rather than answered — nobody responded.
+    closed = blockers.load(quarantine.id)
+    assert closed.resolved_at is not None
+    assert closed.answer is None
+    assert "retired" in closed.archived_reason
+
+    # The loop-fatal record survives untouched — not resolved, not archived,
+    # not re-worded, not even bumped.
+    assert [b.id for b in blockers.open_blockers()] == [escape.id]
+    assert asdict(blockers.load(escape.id)) == before
+
+    # And it still stops the loop and still reads as needing attention.
+    assert cli._cmd_start(_args()) == 2
+    out = capsys.readouterr().out
+    assert "1 OPEN" in out and escape.id in out
+    assert quarantine.id not in out
+    assert health.check(wired).code == health.STUCK_BLOCKED
+
+
+def test_the_historical_sweep_cannot_clear_a_loop_fatal_record_either(wired, capsys):
+    """Same rule on the load-time path. `brw-02` is one of the six migrated by
+    `tasks._RETIREMENTS` — its status moves with no command run, so `start`'s
+    preflight is the sweep that sees it, and that sweep must be no broader than
+    the one `retire` runs. A migration silently clearing a dirty-checkout record
+    would be the worst version of this: nobody typed anything."""
+    from dataclasses import asdict
+
+    from autoloop.tasks import TaskStore
+
+    quarantine = _quarantine(wired, "brw-02", "attempt_count_ceiling")
+    dirty = _quarantine(wired, "brw-02", "primary_checkout_dirty", kind="loop_fatal")
+    store = TaskStore(wired.tasks_file)
+    registry = store.load()
+    registry.block("brw-02", "superseded by brw-06")  # the reason the table matches on
+    store.save(registry)
+    StateStore(wired.state_file).save(_a_state())
+    before = asdict(BlockerStore(wired.blockers_dir).load(dirty.id))
+
+    assert cli._cmd_start(_args()) == 2, "the loop-fatal record still needs a human"
+
+    out = capsys.readouterr().out
+    assert f"{quarantine.id} closed" in out and "task brw-02 is retired" in out
+    blockers = BlockerStore(wired.blockers_dir)
+    assert [b.id for b in blockers.open_blockers()] == [dirty.id]
+    assert asdict(blockers.load(dirty.id)) == before
 
 
 def test_start_leaves_a_genuinely_quarantined_task_alone(wired, capsys):

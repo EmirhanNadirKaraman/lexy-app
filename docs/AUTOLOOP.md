@@ -3064,9 +3064,25 @@ that task. `cli._reconcile_retired_blockers` closes them via
 `BlockerStore.archive_stale`, so the record keeps its question, detail,
 recurrence count and session id and gains a machine reason naming the
 retirement — never an `answer`, which would forge the operator confirmation
-`_RESOLUTION_PRECONDITIONS` exists to demand. `(loop)` blockers are never
-swept: a login expiry is a loop-level condition no task retirement answers. It
-runs from `retire` itself, from `start`'s preflight, and at the top of every
+`_RESOLUTION_PRECONDITIONS` exists to demand.
+
+**Only the QUARANTINE is closed — `kind="task_fatal"`, as an allowlist.** A
+quarantine asks about the one task at fault, so retiring that task genuinely
+makes it unanswerable. A `loop_fatal` record is the opposite: a loop-wide
+safety condition that merely names whichever task was in flight when it fired
+(`checkout_escape_detected`, `primary_checkout_dirty`, a worker or publisher
+environment failure). Closing one of those on a retirement would manufacture
+resolution of the condition itself — `start` proceeds, `health` goes quiet, and
+the escaped write or the dirty checkout is still there. So every `loop_fatal`
+blocker is preserved regardless of its task id, until its own precondition
+recheck clears it or the operator archives it explicitly; a task holding both
+kinds has exactly one of them closed. An unrecognised or empty `kind` counts as
+loop_fatal and is left alone, the same fail-closed reading
+`orchestrator._to_needs_user` and `_handle_parked_task` already use. `(loop)`
+blockers are never swept either: a login expiry is a loop-level condition no
+task retirement answers.
+
+The sweep runs from `retire` itself, from `start`'s preflight, and at the top of every
 `run --continuous` iteration — the last two because the six migrated
 retirements below change status on LOAD, with no command run to notice their
 records were left open. The continuous sweep is at the top of the iteration

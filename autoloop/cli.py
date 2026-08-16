@@ -706,10 +706,12 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
         store, state = _load_state(config)
         task_store, registry = _load_tasks(config)
         # At the TOP of the iteration, not down at the exhaustion check: the
-        # readers that see an orphaned blocker are out of process
+        # readers that see an orphaned QUARANTINE are out of process
         # (`health.check`, the heartbeat, a monitor), so a loop with plenty of
         # ready work would otherwise report `stuck_blocked` for hours while
-        # working perfectly. This is also the only sweep an operator who runs
+        # working perfectly. Orphaned is the operative word — a `loop_fatal`
+        # record is never orphaned by a retirement, whatever task it names, and
+        # this sweep leaves it open. This is also the only sweep an operator who runs
         # `run --continuous` directly, without `start`, ever gets — and the six
         # pre-`RETIRED` retirements change status on the load one line up, with
         # no command run to notice their records were left open. Costs a set
@@ -1722,9 +1724,11 @@ def _cmd_start(args: argparse.Namespace) -> int:
     else:
         print("pause        not set")
 
-    # Before the blocker report, not after: a blocker whose task is retired is
-    # not a decision anyone can make, so listing it under "each needs a
-    # decision" and refusing to start is the wrong answer to it. This is where
+    # Before the blocker report, not after: a QUARANTINE whose task is retired
+    # is not a decision anyone can make, so listing it under "each needs a
+    # decision" and refusing to start is the wrong answer to it. Only that kind
+    # — a `loop_fatal` record naming the same task is a loop-wide condition the
+    # retirement does not touch, and still stops `start`. This is where
     # the six pre-`RETIRED` retirements get their blockers reconciled —
     # `tasks._migrate_retirements` re-files those on load, with no command run
     # and nothing else to notice their records were left open (`run
@@ -1840,7 +1844,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
 
 
 def _reconcile_retired_blockers(config, registry) -> list[Blocker]:
-    """Close every OPEN blocker whose task is RETIRED. Returns what it closed.
+    """Close the open QUARANTINE blockers of RETIRED tasks. Returns what it closed.
 
     A retirement lives in `tasks.json`; a quarantine lives in its own record
     under `blockers/`. Retiring a quarantined task used to move only the first,
@@ -1859,7 +1863,28 @@ def _reconcile_retired_blockers(config, registry) -> list[Blocker]:
     deleted: the record keeps its question, its detail, its recurrence count and
     its session id, and gains a machine reason naming the retirement.
 
-    Two exclusions. `NO_TASK` (`"(loop)"`) blockers are never swept — a
+    **Only `kind="task_fatal"` records, and it is an ALLOWLIST.** The question a
+    quarantine asks is about the one task at fault, so retiring that task really
+    does make it unanswerable. A `loop_fatal` blocker is the opposite: it is a
+    LOOP-WIDE safety condition that merely happened to be recorded while some
+    task was in flight, and several of them name that task —
+    `checkout_escape_detected`, `primary_checkout_dirty`, a worker/publisher
+    environment failure. Retiring the in-flight task must not manufacture
+    resolution of those: `start` would proceed, `health` would go quiet, and the
+    dirty checkout or the escaped write would still be there. So every
+    `loop_fatal` record is preserved regardless of its task id, until its own
+    `_RESOLUTION_PRECONDITIONS` recheck clears it (or `archive-blocker` does,
+    which stays deliberately unrestricted — it is the operator's explicit
+    escape hatch for the ones no answer can close).
+
+    The decision is per BLOCKER, not per task: a retired task holding both kinds
+    has its quarantine closed and its loop-fatal record left open, which is the
+    honest reading of each. An unrecognised or empty `kind` is treated as
+    loop_fatal and left alone, matching the fail-closed default in
+    `orchestrator._to_needs_user` and `_handle_parked_task` — a record we cannot
+    classify is not one to close automatically.
+
+    Two further exclusions. `NO_TASK` (`"(loop)"`) blockers are never swept — a
     login expiry or an exhausted iteration budget is a loop-level condition that
     no task retirement answers. And a task that is merely quarantined keeps its
     blocker, obviously; membership is decided by `state_of`, so a genuine
@@ -1890,6 +1915,11 @@ def _reconcile_retired_blockers(config, registry) -> list[Blocker]:
     store = BlockerStore(config.blockers_dir)
     closed: list[Blocker] = []
     for blocker in store.open_blockers():
+        # Allowlist, not a `!= "loop_fatal"` denylist: `kind` is a bare string
+        # with no default, so an old or hand-written record can carry anything,
+        # and anything we cannot classify must stay open.
+        if blocker.kind != "task_fatal":
+            continue
         if blocker.task_id == NO_TASK or blocker.task_id not in retired:
             continue
         successors = ", ".join(registry.get(blocker.task_id).superseded_by)
@@ -1929,7 +1959,9 @@ def _cmd_retire_task(args: argparse.Namespace) -> int:
     row here, and the open blocker record that quarantined it
     (`_reconcile_retired_blockers`). Moving only the first would leave `start`,
     `health` and the heartbeat still stopped on a question about work nobody is
-    going to do.
+    going to do. Only that record: a `loop_fatal` blocker naming the same task
+    is a loop-wide condition (a dirty checkout, an escaped write) that this
+    command has no evidence about, so it stays open and `start` stays refused.
 
     Nothing is deleted, here or in the registry: the task keeps its id, its
     description, its reason, and its place in the graph; the blocker keeps its
