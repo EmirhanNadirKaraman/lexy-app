@@ -175,16 +175,24 @@ reasons, both from this entry:
   exactly, never the binary name — the operator's everyday Chrome runs from the
   same binary under a different `--user-data-dir`.
 
-**A config still naming the script is refused at load** with the replacement
-line in the message (`config._refuse_retired_restart_script`) — not left to
-surface as bash's exit 127 in the middle of a browser fault. The `.autoloop/`
-config is not in the repository, so this is a hand edit each deployment makes
-once. The script itself is a failing tombstone: it restarts nothing, names the
-replacement on stderr and exits 1. The loop can no longer reach it at all — that
-refusal closes the route — so the tombstone is for the path still being typed by
-hand, out of shell history, or by a wrapper of your own. Non-zero deliberately:
-both callers surface `result.stderr` only on a non-zero exit, and this is the
-file that taught us what a zero exit costs.
+**The `.autoloop/config.toml` that decides this is NOT in the repository**, so
+changing `config.example.toml` changed nothing for a running deployment: until
+the operator hand-edits `[browser].restart_command`, the loop still launches the
+script. That is why the script is still on disk, as a **failing tombstone** — it
+restarts nothing, prints the replacement line on stderr and exits 1, which both
+callers surface as `restart FAILED: …`. Non-zero deliberately: they surface
+`result.stderr` only on a non-zero exit, and this is the file that taught us
+what a zero exit costs.
+
+`load_config` deliberately does **not** refuse a config that still names it.
+Refusing would fail `status`, `doctor`, `run` and the recovery commands the
+moment the change merged, over a setting only a restart reads — taking away the
+tooling the operator would use to recover. So an unmigrated deployment keeps
+working everywhere except the restart, and the restart fails with the fix
+attached rather than with bash's exit 127 (`No such file or directory`), which
+is what deleting the file outright would have produced. `git rm` and any
+load-time refusal both belong to a later cleanup, once live configs have been
+migrated.
 
 ```bash
 # Verify a real restart: the main pid must CHANGE and helpers must be ignored.

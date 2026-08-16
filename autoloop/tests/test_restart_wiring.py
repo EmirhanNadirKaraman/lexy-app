@@ -1,13 +1,19 @@
-"""What `browser.restart_command` points at, and what happens when it still
-points at the shell script retired on 2026-08-16.
+"""What `browser.restart_command` points at, and what an unmigrated config still
+gets when it points at the shell script retired on 2026-08-16.
 
 The wiring is the part no other test covers. `test_chrome_restart.py` proves the
 module restarts the right browser; nothing there says the loop ever calls it —
 that lives in a TOML template and in the operator's own `.autoloop/config.toml`,
-which is not in this repository at all. So the two failures this file exists to
-catch are a template naming a module that does not exist, and a live config
-still naming the script, which would otherwise surface as bash's exit 127 in the
-middle of the browser fault a restart exists to clear.
+which is not in this repository at all. So this file pins the two ends of the
+transition:
+
+* the shipped template names the module, and that module exists and runs;
+* a live config still naming the script keeps LOADING, unchanged, because the
+  loader deliberately does not refuse it — refusing would break `status`,
+  `doctor`, `run` and the recovery commands on every deployment that had not yet
+  hand-edited its config, i.e. take away the tooling needed to fix it. What the
+  operator gets instead is the tombstone: a restart that fails non-zero carrying
+  the exact line to paste, rather than bash's exit 127 naming a missing file.
 
 Nothing here touches the machine: no process is listed, signalled or launched,
 and `no_machine_access` makes that structural rather than a promise.
@@ -25,12 +31,16 @@ from autoloop.config import (
     RETIRED_RESTART_SCRIPT,
     load_config,
 )
-from autoloop.errors import ConfigError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG = REPO_ROOT / "autoloop" / "config.example.toml"
 RETIRED_SCRIPT = REPO_ROOT / "scripts" / RETIRED_RESTART_SCRIPT
 RESTART_MODULE = REPO_ROOT / "autoloop" / "browser" / "chrome_restart.py"
+
+#: The config line an operator has to end up with, built from the constant so a
+#: change to the replacement command cannot leave the tombstone advertising the
+#: old one.
+PASTE_LINE = "restart_command = [" + ", ".join(f'"{t}"' for t in RESTART_COMMAND_REPLACEMENT) + "]"
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +59,16 @@ def no_machine_access(monkeypatch):
     monkeypatch.setattr(subprocess, "run", refuse)
     monkeypatch.setattr(subprocess, "Popen", refuse)
     monkeypatch.setattr(os, "kill", refuse)
+
+
+def _tombstone_message() -> str:
+    """What the retired script actually prints on stderr — the heredoc body,
+    without the comments around it."""
+    body = RETIRED_SCRIPT.read_text(encoding="utf-8")
+    _, _, rest = body.partition("<<'MSG'\n")
+    assert rest, "the tombstone no longer prints a heredoc message"
+    message, _, _ = rest.partition("\nMSG\n")
+    return message
 
 
 def _write_config(tmp_path: Path, restart_command: str) -> Path:
@@ -71,9 +91,9 @@ def _write_config(tmp_path: Path, restart_command: str) -> Path:
 
 
 def test_the_shipped_template_restarts_via_the_module():
-    """Parsed by the real loader, not `tomllib`: the retired-script refusal
-    lives in `load_config`, so a template that tripped it would ship a file
-    nobody can copy."""
+    """Parsed by the real loader rather than bare `tomllib`, so the assertion
+    covers the template as something copyable — every other rule in
+    `load_config` applies to it too."""
     config = load_config(EXAMPLE_CONFIG)
     assert config.browser.restart_command == RESTART_COMMAND_REPLACEMENT
     assert config.browser.restart_command[1:] == ("-m", "autoloop.browser.chrome_restart")
@@ -108,42 +128,43 @@ def test_the_template_never_advertises_the_retired_script():
 
 
 @pytest.mark.parametrize(
-    "restart_command",
+    "restart_command, expected",
     [
-        '["bash", "scripts/restart_autoloop_chrome.sh"]',  # what the template shipped
-        '["scripts/restart_autoloop_chrome.sh"]',
-        '["./scripts/restart_autoloop_chrome.sh"]',
-        '["/Users/op/dev/lexy/scripts/restart_autoloop_chrome.sh"]',
-        '["bash", "-x", "scripts/restart_autoloop_chrome.sh"]',
+        # What the template used to ship.
+        ('["bash", "scripts/restart_autoloop_chrome.sh"]', ("bash", "scripts/restart_autoloop_chrome.sh")),
+        ('["scripts/restart_autoloop_chrome.sh"]', ("scripts/restart_autoloop_chrome.sh",)),
+        ('["./scripts/restart_autoloop_chrome.sh"]', ("./scripts/restart_autoloop_chrome.sh",)),
+        (
+            '["/Users/op/dev/lexy/scripts/restart_autoloop_chrome.sh"]',
+            ("/Users/op/dev/lexy/scripts/restart_autoloop_chrome.sh",),
+        ),
+        (
+            '["bash", "-x", "scripts/restart_autoloop_chrome.sh"]',
+            ("bash", "-x", "scripts/restart_autoloop_chrome.sh"),
+        ),
     ],
 )
-def test_a_config_still_naming_the_retired_script_is_refused(tmp_path, restart_command):
-    """Every invocation form, because the rule is a substring of any token and
-    not a guess at the argv shape — an operator who wrote `bash -x` or an
-    absolute path must get the same answer as one who copied the template."""
-    with pytest.raises(ConfigError) as excinfo:
-        load_config(_write_config(tmp_path, restart_command))
-    assert RETIRED_RESTART_SCRIPT in str(excinfo.value)
+def test_a_config_still_naming_the_retired_script_still_loads(tmp_path, restart_command, expected):
+    """The transition rule, and the mutation test against re-adding a refusal.
 
-
-def test_the_refusal_carries_the_line_to_paste(tmp_path):
-    """`cli.main` prints `error: <exc>` and nothing else, so this message is
-    plausibly all the operator sees. A refusal that only says the old thing is
-    gone leaves them to search for what replaced it — while their loop is
-    down."""
-    with pytest.raises(ConfigError) as excinfo:
-        load_config(_write_config(tmp_path, '["bash", "scripts/restart_autoloop_chrome.sh"]'))
-    message = str(excinfo.value)
-    assert 'restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]' in message
-    assert "RETIRED" in message
-    # The failure it replaces: bash exiting 127 through `result.stderr`, which
-    # names a path and nothing else.
-    assert "No such file or directory" not in message
+    The live `.autoloop/config.toml` is not in this repository, so on the day
+    this change merges every unmigrated deployment is still holding one of these
+    lines. Refusing them in `load_config` would fail `status`, `doctor`, `run`
+    and the recovery commands alike — every tool the operator would reach for —
+    over a setting only a browser restart reads. So the value LOADS, and loads
+    exactly as written: not refused, not rewritten to the module, since the
+    loader inventing a command that starts a browser is not a repair either.
+    Every invocation form, because "we handle the template's spelling" is not
+    the same claim as "we leave restart commands alone".
+    """
+    config = load_config(_write_config(tmp_path, restart_command))
+    assert config.browser.restart_command == expected
 
 
 def test_the_module_invocation_itself_is_accepted(tmp_path):
-    """The refusal is keyed to the retired name, not to restart commands in
-    general — the mutation that refuses everything must fail somewhere."""
+    """The complement of the above: the value the operator migrates TO also
+    round-trips, so `load_config` is shown to pass restart commands through
+    rather than merely tolerate the old one."""
     config = load_config(_write_config(tmp_path, '["python3", "-m", "autoloop.browser.chrome_restart"]'))
     assert config.browser.restart_command == RESTART_COMMAND_REPLACEMENT
 
@@ -157,18 +178,24 @@ def test_an_unrelated_restart_command_is_left_alone(tmp_path):
 # --- the retired script itself -----------------------------------------------
 
 
+def test_the_retired_script_is_still_on_disk():
+    """Load-bearing, not leftover. Since a config naming it still loads, this
+    file is what an unmigrated deployment actually launches after a browser
+    fault. Delete it and that deployment gets bash's exit 127 — `restart
+    FAILED: … No such file or directory` — during the fault the restart exists
+    to clear, saying nothing about what to write instead. It goes (`git rm`) in
+    a later cleanup, once live configs have been migrated."""
+    assert RETIRED_SCRIPT.exists(), (
+        "the tombstone is the compatibility path for configs that still name it"
+    )
+
+
 def test_the_retired_script_is_not_a_working_restart_path():
-    """Correct in both worlds, because the file leaves in two steps: it is a
-    failing tombstone while any live config might still invoke it, and `git rm`
-    once none does. What must hold either way is that it never again exits 0
-    having restarted nothing."""
-    if not RETIRED_SCRIPT.exists():
-        return  # removed outright — the end state
+    """What must never come back: a zero exit, or any action on a browser.
+    Asserted on statements rather than substrings — the prose here explains an
+    exit code and a `kill`, and a doc edit must not fail this test."""
     body = RETIRED_SCRIPT.read_text(encoding="utf-8")
-    assert "RETIRED" in body, "the file still exists, so it must say it is dead"
-    assert "autoloop.browser.chrome_restart" in body, "it must name the replacement"
-    # Asserted on statements rather than substrings: the prose here explains an
-    # exit code and a `kill`, and a doc edit must not fail this test.
+    assert "RETIRED" in body, "it must say it is dead"
     statements = [
         line.strip()
         for line in body.splitlines()
@@ -179,6 +206,21 @@ def test_the_retired_script_is_not_a_working_restart_path():
     assert not [line for line in statements if line.startswith(("kill", "open ", "pkill"))], (
         "it must not act on any browser"
     )
+
+
+def test_the_retired_script_carries_the_line_to_paste():
+    """This is where the "must not be a bare file-not-found" requirement lives
+    now that the loader refuses nothing. Both callers surface `result.stderr`
+    only on a non-zero exit, so this message is plausibly all the operator sees
+    of the fault — it has to carry the fix, not just the news.
+
+    Asserted on the heredoc the script prints, not on the file: the comments
+    above it discuss bash's exit 127 by name, and a test that could not tell an
+    explanation from the message would pass on a script that only explains."""
+    message = _tombstone_message()
+    assert "autoloop.browser.chrome_restart" in message, "it must name the replacement"
+    assert PASTE_LINE in message, "the literal config line, ready to paste"
+    assert "No such file or directory" not in message
 
 
 # --- the guard above is real -------------------------------------------------

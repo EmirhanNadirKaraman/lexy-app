@@ -123,18 +123,29 @@ RETIRED_AGENT_TIMEOUT_KEY = "agent_timeout_seconds"
 #: The key it migrates onto — the ONE replacement that kept its exact meaning.
 MIGRATED_TIMEOUT_KEY = "audit_agent_timeout_seconds"
 
-#: The shell helper retired on 2026-08-16 (brw-08). Matched as a SUBSTRING of
-#: any token, so `["bash", "scripts/…"]`, `["./scripts/…"]` and an absolute
-#: path are all caught by one rule instead of a guess at the argv shape.
+#: The shell helper retired on 2026-08-16 (brw-08), kept here as ONE spelling
+#: shared by the tombstone that replaced it and the tests that pin this path.
+#:
+#: `load_config` deliberately does NOT act on it. A `restart_command` still
+#: naming the script keeps loading, exactly as written, for the length of the
+#: transition — the live `.autoloop/config.toml` is not in this repository, so
+#: refusing here would make every command (`status`, `doctor`, `run`, the
+#: recovery commands) fail on an unmigrated deployment the moment this branch
+#: merged, taking away the tooling the operator would use to recover. The
+#: compatibility boundary is the tombstone at `scripts/restart_autoloop_chrome.sh`
+#: instead: ordinary commands keep working, and only an actual browser restart
+#: fails — non-zero, with the replacement line on stderr. Re-adding a refusal
+#: here belongs to a later cleanup, once live configs have been migrated.
 RETIRED_RESTART_SCRIPT = "restart_autoloop_chrome.sh"
 #: The module that replaced it, spelled exactly as it goes in the config.
 RESTART_COMMAND_REPLACEMENT = ("python3", "-m", "autoloop.browser.chrome_restart")
 
 
 def _restart_command_toml(command: tuple[str, ...] = RESTART_COMMAND_REPLACEMENT) -> str:
-    """`restart_command = [...]`, ready to paste. The error below may be the
-    only thing the operator sees — `cli.main` prints `error: <exc>` and nothing
-    else — so it carries the literal line rather than a pointer to a file."""
+    """`restart_command = [...]`, ready to paste. A config error is plausibly
+    the only thing the operator sees — `cli.main` prints `error: <exc>` and
+    nothing else — so it carries the literal line rather than a pointer to a
+    file. Used by the shape check in `load_config`."""
     return "restart_command = [" + ", ".join(f'"{token}"' for token in command) + "]"
 
 
@@ -371,40 +382,6 @@ def _check_keys(section: str, data: dict, allowed: set[str]) -> None:
         raise ConfigError(f"unknown keys in [{section}]: {sorted(unknown)}")
 
 
-def _refuse_retired_restart_script(command: list[str]) -> None:
-    """Refuse a `restart_command` still naming the retired shell helper.
-
-    REFUSED, not migrated, and the difference from `_migrate_retired_timeout`
-    below is the difference between a value and an executable. That key kept its
-    exact meaning under a new name, so the loader could carry it over. Here the
-    thing named is a file that no longer exists: there is nothing to carry, and
-    guessing that a hand-written invocation of it meant the module would be the
-    loader inventing a command that starts a browser.
-
-    Refused BY NAME rather than left to fail where it runs, because of *when* it
-    would run. A restart command is launched only after a browser fault, inside
-    `cli._repair_browser` / `orchestrator._attempt_browser_restart`, which
-    surface `result.stderr` — so the operator's first news of this would be
-    `restart FAILED: … No such file or directory` (bash's exit 127), arriving
-    during the one failure it exists to recover from, saying nothing about what
-    to write instead. Here it costs one config edit before anything runs.
-    """
-    if not any(RETIRED_RESTART_SCRIPT in token for token in command):
-        return
-    raise ConfigError(
-        f"browser.restart_command still names {RETIRED_RESTART_SCRIPT}, which was "
-        "RETIRED on 2026-08-16 and replaced by the Python module that does the "
-        "same job — and stops EVERY Chrome on the profile rather than one pid, "
-        "which is the fault that made the shell version report success while "
-        "restarting nothing (docs/COMMON_ERRORS.md). Replace it with:\n"
-        f"  {_restart_command_toml()}\n"
-        "Run the loop from the checkout: `-m` resolves `autoloop` from the "
-        "working directory, exactly as the old relative script path did. The "
-        "module honours the same AUTOLOOP_CHROME_PROFILE / AUTOLOOP_CHROME_PORT "
-        "environment variables, and takes --profile / --port / --chrome."
-    )
-
-
 def _migrate_retired_timeout(audit_data: dict) -> tuple[str, ...]:
     """Handle a config that still names `audit.agent_timeout_seconds`.
 
@@ -525,7 +502,10 @@ def load_config(path: Path) -> AutoloopConfig:
                 "browser.restart_command must be a list of strings, e.g. "
                 f"{_restart_command_toml()}"
             )
-        _refuse_retired_restart_script(cmd)
+        # Stored EXACTLY as written, including a command still naming the
+        # retired shell helper (see `RETIRED_RESTART_SCRIPT` above): the loader
+        # neither refuses nor rewrites it, so an unmigrated deployment keeps
+        # every non-browser command working while the operator migrates.
         browser_data["restart_command"] = tuple(cmd)
     browser = BrowserConfig(**browser_data)
 
