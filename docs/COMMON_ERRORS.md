@@ -908,7 +908,8 @@ only the detection failed; point `browser.conversation_url` at that chat.
 
 ### A readback says a message is not in the conversation, and it plainly is
 **Symptom:** the loop parks `submission_ambiguous` (or drops a chunked part and
-re-sends it) reporting that the request is not in persisted history. Open the
+re-sends it) reporting that a readback did not see the request — on builds before
+2026-08-16 the park said outright that it "is not in persisted history". Open the
 chat and the request is there — on 2026-08-05 `alr-af11e1b3-0006` was there
 *and already answered with a decision*. Seeing it took pressing End and
 scrolling six times before the tail rendered.
@@ -955,6 +956,33 @@ streaming conversation (retry), `never reached its end` is a gesture that is not
 driving the scroller (a selector or focus problem), and `cannot report a scroll
 position` is a session without the signal at all (expected for the End-key
 fallback; on a real `PlaywrightSession` it means the measurement kept failing).
+**The park it caused now resolves itself (2026-08-16).** `reconcile` still reads
+a mounted window, so it can still miss a turn — but a miss no longer ends the
+run. Before parking `submission_ambiguous`, the orchestrator runs the search
+above (`_resolve_or_park_ambiguous`); if it PROVES the request is in this
+request's own conversation, the park is cancelled and the loop resumes into
+`awaiting`, sending nothing. Only that direction is automatic. Absence, a hit in a different
+chat, a search that refused to conclude, and no `browser.project_url` all park
+exactly as before, and the park text says which of them happened — so if you are
+reading a `submission_ambiguous` question, start there rather than opening the
+chat blind. **Read the note, not just the first sentence.** That sentence now
+claims only that reconciliation did not SEE the request in the window it read
+back, because a window read cannot establish more; only the note about a search
+that read the chats to their end and came back empty is evidence of absence, and
+only that one makes `--resubmit` the plausible next move. `run --resubmit` is still the only thing that repeats a send. A
+wedged page during the search (`ConversationUnusableError`) parks the same way,
+and for its own reason: that error's normal route is a rotation, which POSTS the
+request id — and the search reads other chats, so a page that is not even this
+request's conversation must never license a repost of it.
+**A dead browser during that search is NOT a `submission_ambiguous` park.** A
+`SessionLostError` or an ordinary `BrowserError` propagates to `run()` and takes
+the normal browser-restart/failure-budget route, so the phase is retried with a
+fresh client instead of being reported as evidence uncertainty (a dropped CDP
+connection says nothing about what is in the conversation). If you see
+`browser_error` with `"phase": "submission_unconfirmed"` and no
+`presence_search_inconclusive` beside it, that is this path working — restart the
+browser (§ "Browser dead / CDP unreachable") rather than hunting for a lost
+message.
 **Still open elsewhere:** every OTHER readback (`reconcile`, `has_request`,
 `Orchestrator._part_present`) reads what is mounted. That is usually fine —
 they check the newest turn — but do not infer "the conversation contains only

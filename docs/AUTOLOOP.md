@@ -1939,11 +1939,62 @@ marker durable, recovery always reconciles first and parks rather than reposting
 **Ambiguity is never a retry.** Anything weaker yields `UNCONFIRMED`, and the
 loop parks in `submission_unconfirmed`. The backend may have accepted a message
 the browser failed to observe, so an automatic resend could double-post. The
-only resolutions are: reconciliation finds it (→ awaiting), `run --retry`
-(reconcile again), or `run --resubmit` — an explicit operator decision that
-authorizes exactly one more send **of the same request id**, so a message that
-did land is detected and not duplicated. A prior send attempt also blocks an
-automatic resend if the machine re-enters `submitting`.
+only resolutions are: a READ finds it (→ awaiting — see the next paragraph for
+the two reads), `run --retry` (reconcile again), or `run --resubmit` — an
+explicit operator decision that authorizes exactly one more send **of the same
+request id**, so a message that did land is detected and not duplicated. A prior
+send attempt also blocks an automatic resend if the machine re-enters
+`submitting`.
+
+**A false ambiguity is resolved by PROVING the request is there** (added
+2026-08-16, `_resolve_or_park_ambiguous`). `reconcile()` reads the conversation's
+mounted window, and ChatGPT mounts a window of a chat rather than its history: on
+2026-08-05 `alr-af11e1b3-0006` parked as `submission_ambiguous` while the chat
+held the request *and* its answer (`decision push`) — reading it by hand took
+pressing End and scrolling six times. So when the reload comes back empty, the
+by-content search (`find_conversation_with`, which mounts the tail and refuses to
+answer unless it demonstrably reached the end — §5c) gets the last word:
+
+* **found in this request's own conversation** → the park is cancelled, the loop
+  resumes into `awaiting` and reads the answer. Nothing is ambiguous, and
+  resuming **sends nothing**, so the risk is zero.
+* **found in a different chat** → still parks, but the operator is told which
+  chat. Rotation reuses the request id in the replacement chat, so a hit
+  elsewhere can be a retired copy, and rebinding to it would be a rotation
+  performed on a duplicate id.
+* **not found, the search refused to conclude, a page it opened was wedged, or
+  no project is configured** → parks exactly as before, and the park says which
+  of those happened.
+
+**The park question states the evidence obtained, and nothing more.** It used to
+open "the request is not in persisted history after reconciliation" — which
+`reconcile()` cannot establish, because it reads the mounted window. In every
+park where the search did not run or did not conclude, that sentence asserted
+absence and the note under it then said absence was never established: a
+contradiction that reads as licence for `--resubmit`. The base sentence now says
+only that reconciliation did not SEE the request in the window it read back;
+wording that means "it is not there" belongs to the one branch that earned it —
+the search that read the chats to their end and came back empty — and appears
+only in that note.
+
+The asymmetry is the design: **prove presence and proceed; never infer absence
+and act.** Presence is safe to act on because acting means waiting; absence is
+not, because acting means resending — and absence is precisely the conclusion a
+flaky read gets wrong. The park itself is untouched, and `run --resubmit` remains
+the only thing that repeats a send.
+
+**A broken browser is not an ambiguous submission.** Only the search's own
+refusal (`ConversationSearchInconclusive`) is collapsed into that park.
+`SessionLostError`, `LoginExpiredError` and ordinary `BrowserError` propagate to
+`run()` and keep the routes they already have — browser restart and the failure
+budget, or a `login_expired` park with `submission_unconfirmed` as the resume
+point. Every one of those SENDS NOTHING, so nothing is risked by letting them
+through, while catching them would swap a recoverable transport fault for a park
+naming the wrong cause: a dropped CDP connection is not evidence about what is
+in the conversation. The single exception is `ConversationUnusableError`, caught
+here because its route ACTS — it authorizes the rotation that reposts the request
+id, and the search reads the project page and other chats, so a chat that is not
+even this request's must never license a repost of it.
 
 **Navigation is explicit.** `attach()` navigates only when there is no page on
 the conversation (URL compared without query/fragment/trailing slash);
@@ -2942,7 +2993,7 @@ reports this rather than raising.
 | `restart FAILED: … restart_autoloop_chrome.sh was RETIRED` | Your `.autoloop/config.toml` still names the shell helper retired 2026-08-16. Nothing else is broken — the config loads and every other command works — but no browser restart will succeed until you set `restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]` (§8a). The loop's live config is not in this repo, so nothing could have done it for you; the failing tombstone carries that exact line on stderr. |
 | Parked `browser_restart_cooldown_blocked` | Repeated browser failures whose restart `browser.restart_cooldown_seconds` refused, so none was ever attempted (§5c). Restart the browser by hand (`python3 -m autoloop.browser.chrome_restart`, §8a) — or lower that cooldown if it is set too high for this machine. Then close the blocker it recorded (`python -m autoloop blockers`, then `answer <id> "..."`) and `run --retry`: an open blocker stops `start` and ends a `--continuous` pass, so retrying without it just parks again. Those failures never spent the failure budget, so nothing else needs resetting. |
 | Repeated malformed replies / denials | Loop parks with the reason; talk to the conversation manually if needed, then `run --answer "..."`. |
-| **Ambiguous submission** (`needs_user`, "submission … is AMBIGUOUS") | Open the conversation and look. If the request is there, `run --retry` (reconciles and continues). If it is genuinely absent, `run --resubmit` authorizes exactly one more send of the same id. Autoloop will not decide this for you — see §5b. |
+| **Ambiguous submission** (`needs_user`, "submission … is AMBIGUOUS") | The by-content search already ran and did not prove the request present — the park text says what it found (nothing, a different chat, or that it refused to conclude), so read that line first. Open the conversation and look. If the request is there, `run --retry` (reconciles and continues). If it is genuinely absent, `run --resubmit` authorizes exactly one more send of the same id. Autoloop resolves this by itself only when it can PROVE the request is in this request's own conversation; it never decides the absent direction for you — see §5b. |
 | `send-not-ready` / `composer-not-synchronised` diagnostics | The editor never accepted the input, so **nothing was sent**: safe to `run --retry`. If it repeats, the composer selectors or the input method need attention (`browser/selectors.py`, `browser/chatgpt.py::_enter_prompt`). |
 | Crash mid-audit | `run` — the audit directive re-dispatches (`_resolve_audit_task` resumes the SAME per-run worker repo/unit id when redispatching within the same iteration; prior run's raw reports remain under `.autoloop/audit/`). |
 | Crash mid-commit | `run` — `commit_and_capture` is crash-recoverable via `CommitIntent`/`reconcile_after_crash` (§4b), never a bare "message matches HEAD" idempotency shortcut. |
