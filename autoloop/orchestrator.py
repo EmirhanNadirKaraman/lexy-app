@@ -166,6 +166,7 @@ from .errors import (
     AutoloopError,
     BrowserError,
     ContractError,
+    ConversationSearchInconclusive,
     ConversationUnusableError,
     ExecutorError,
     EnvironmentDriftError,
@@ -2005,14 +2006,15 @@ class Orchestrator:
         """The chat that PROVABLY carries `req`, per the by-content search, and
         a sentence saying what the search actually did.
 
-        The URL is returned only on a positive sighting. Every other outcome —
-        no `browser.project_url` to search, a provider without the capability
+        The URL is returned only on a positive sighting. Five outcomes — no
+        `browser.project_url` to search, a provider without the capability
         (probed with `getattr`, like `retarget`/`current_url`), a search that
-        refused to conclude (`ConversationSearchInconclusive`), a transport
-        failure, or a genuine "in none of these chats" — returns None, which
-        leaves the caller parking. That collapse is safe in exactly one
-        direction: None here never authorizes anything, it only declines to
-        cancel a park.
+        refused to conclude (`ConversationSearchInconclusive`), a page that
+        was wedged (`ConversationUnusableError`, caught for a reason of its
+        own — see the `except`), or a genuine "in none of these chats" —
+        return None, which leaves the caller parking. That collapse is safe in
+        exactly one direction: None here never authorizes anything, it only
+        declines to cancel a park.
 
         The note exists because those outcomes collapse into one value and must
         NOT collapse in what the operator is told. "The project was read and
@@ -2020,10 +2022,22 @@ class Orchestrator:
         completely different next actions, and a park that claimed the former
         while doing the latter would be manufacturing evidence.
 
-        `LoginExpiredError` is re-raised rather than collapsed. A logged-out
-        profile makes every read meaningless, and `run()` parks it with this
-        phase as the resume point, so the retry after logging back in comes
-        straight back here and searches again — with nothing sent in between.
+        **A BROKEN BROWSER IS NOT ONE OF THOSE OUTCOMES, and is deliberately
+        not caught here.** `SessionLostError`, `LoginExpiredError` and ordinary
+        `BrowserError` each already have a route in `run()` — restart the
+        browser and re-enter this phase, or park as `login_expired` with this
+        phase as the resume point — and every one of those routes SENDS
+        NOTHING, so letting them through costs nothing and keeps the recovery
+        the loop was built with. Catching them would trade a recoverable
+        transport fault for a `submission_ambiguous` park that names the wrong
+        cause: a dead CDP connection says nothing whatever about whether the
+        request is in the conversation, and reporting it as evidence
+        uncertainty is the same misclassification this method exists to
+        remove.
+
+        The one browser fault that IS caught is `ConversationUnusableError`,
+        and not because it says too little — because its route ACTS. The
+        `except` below carries that reasoning.
         """
         project_url = self._config.browser.project_url
         if not project_url:
@@ -2050,21 +2064,44 @@ class Orchestrator:
             )
         try:
             found = search(req.request_id, project_url)
-        except LoginExpiredError:
-            raise
-        except (BrowserError, AutoloopError) as exc:
-            # Includes `ConversationSearchInconclusive`: the search read a page
-            # it could not vouch for, or never proved it reached the end of a
-            # virtualized list. It is refusing to rule EITHER way, so it has
-            # said nothing about presence — and "said nothing" must not read as
-            # "absent".
+        except (ConversationSearchInconclusive, ConversationUnusableError) as exc:
+            # Two refusals, one park, for two different reasons.
+            #
+            # `ConversationSearchInconclusive` is the search's own verdict on
+            # its evidence: it read a page it could not vouch for, or never
+            # proved it reached the end of a virtualized list. It is declining
+            # to rule EITHER way, so it has said nothing about presence — and
+            # "said nothing" must not read as "absent".
+            #
+            # `ConversationUnusableError` is caught for the opposite reason:
+            # not because its normal route says too little, but because that
+            # route ACTS. It is the one browser fault that authorizes a
+            # rotation (see its docstring), and `_rotate_conversation` POSTS
+            # the request id into the replacement chat — a send, from the one
+            # phase whose entire contract is that only `--resubmit` repeats
+            # one. The search walks the project page and up to `limit` OTHER
+            # chats, so the wedged page here is usually not even this request's
+            # conversation: letting a stranger's broken chat authorize a repost
+            # of this request is exactly the duplicate `submission_ambiguous`
+            # exists to prevent. A wedged page is also no evidence about
+            # presence, so the safe park is the honest answer either way.
+            #
+            # Every OTHER browser fault propagates untouched — see the
+            # docstring.
             self._log(
                 "presence_search_inconclusive",
                 request_id=req.request_id,
-                data={"reason_code": "search_refused_to_conclude", "error": str(exc)},
+                data={
+                    "reason_code": "search_refused_to_conclude",
+                    # Which of the two: an evidence refusal or a wedged page.
+                    # They park identically and read almost identically, so the
+                    # transcript is the only place they stay distinguishable.
+                    "kind": type(exc).__name__,
+                    "error": str(exc),
+                },
             )
             return None, (
-                f"A by-content search ran and REFUSED to conclude ({exc}), so it "
+                f"A by-content search ran and did NOT conclude ({exc}), so it "
                 "is not evidence the request is missing — only that this read "
                 "could not settle it."
             )

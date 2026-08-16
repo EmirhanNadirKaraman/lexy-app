@@ -1962,14 +1962,28 @@ answer unless it demonstrably reached the end — §5c) gets the last word:
   chat. Rotation reuses the request id in the replacement chat, so a hit
   elsewhere can be a retired copy, and rebinding to it would be a rotation
   performed on a duplicate id.
-* **not found, or the search refused to conclude, or no project is configured**
-  → parks exactly as before, and the park says which of those happened.
+* **not found, the search refused to conclude, a page it opened was wedged, or
+  no project is configured** → parks exactly as before, and the park says which
+  of those happened.
 
 The asymmetry is the design: **prove presence and proceed; never infer absence
 and act.** Presence is safe to act on because acting means waiting; absence is
 not, because acting means resending — and absence is precisely the conclusion a
 flaky read gets wrong. The park itself is untouched, and `run --resubmit` remains
 the only thing that repeats a send.
+
+**A broken browser is not an ambiguous submission.** Only the search's own
+refusal (`ConversationSearchInconclusive`) is collapsed into that park.
+`SessionLostError`, `LoginExpiredError` and ordinary `BrowserError` propagate to
+`run()` and keep the routes they already have — browser restart and the failure
+budget, or a `login_expired` park with `submission_unconfirmed` as the resume
+point. Every one of those SENDS NOTHING, so nothing is risked by letting them
+through, while catching them would swap a recoverable transport fault for a park
+naming the wrong cause: a dropped CDP connection is not evidence about what is
+in the conversation. The single exception is `ConversationUnusableError`, caught
+here because its route ACTS — it authorizes the rotation that reposts the request
+id, and the search reads the project page and other chats, so a chat that is not
+even this request's must never license a repost of it.
 
 **Navigation is explicit.** `attach()` navigates only when there is no page on
 the conversation (URL compared without query/fragment/trailing slash);

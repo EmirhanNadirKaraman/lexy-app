@@ -964,7 +964,20 @@ request's own conversation, the park is cancelled and the loop resumes into
 chat, a search that refused to conclude, and no `browser.project_url` all park
 exactly as before, and the park text says which of them happened — so if you are
 reading a `submission_ambiguous` question, start there rather than opening the
-chat blind. `run --resubmit` is still the only thing that repeats a send.
+chat blind. `run --resubmit` is still the only thing that repeats a send. A
+wedged page during the search (`ConversationUnusableError`) parks the same way,
+and for its own reason: that error's normal route is a rotation, which POSTS the
+request id — and the search reads other chats, so a page that is not even this
+request's conversation must never license a repost of it.
+**A dead browser during that search is NOT a `submission_ambiguous` park.** A
+`SessionLostError` or an ordinary `BrowserError` propagates to `run()` and takes
+the normal browser-restart/failure-budget route, so the phase is retried with a
+fresh client instead of being reported as evidence uncertainty (a dropped CDP
+connection says nothing about what is in the conversation). If you see
+`browser_error` with `"phase": "submission_unconfirmed"` and no
+`presence_search_inconclusive` beside it, that is this path working — restart the
+browser (§ "Browser dead / CDP unreachable") rather than hunting for a lost
+message.
 **Still open elsewhere:** every OTHER readback (`reconcile`, `has_request`,
 `Orchestrator._part_present`) reads what is mounted. That is usually fine —
 they check the newest turn — but do not infer "the conversation contains only

@@ -37,11 +37,13 @@ from autoloop.config_writer import (
     update_conversation_url,
 )
 from autoloop.errors import (
+    BrowserError,
     ConfigError,
     ConversationSearchInconclusive,
     ConversationUnusableError,
     LoginExpiredError,
     ResponseTimeoutError,
+    SessionLostError,
 )
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import CONTINUATION_NOTE, Orchestrator
@@ -1547,14 +1549,14 @@ def test_an_inconclusive_search_parks_rather_than_guessing(tmp_path):
 
 
 def test_login_expiry_during_the_search_is_not_demoted_to_ambiguity(tmp_path):
-    """`LoginExpiredError` is a `BrowserError`, so the clause that collapses a
-    refused search into "park ambiguous" would swallow it — and every logged-out
-    profile would be reported as an ambiguous submission, which is precisely the
-    misclassification this whole change exists to remove. It is re-raised
-    instead, and `run()` parks it as `login_expired` with THIS phase as the
-    resume point, so logging back in and retrying comes straight back to the
-    search with nothing sent in between. Swap the two `except` clauses and this
-    test is what fails."""
+    """`LoginExpiredError` is a `BrowserError`, so a search-site clause catching
+    that base would swallow it — and every logged-out profile would be reported
+    as an ambiguous submission, which is precisely the misclassification this
+    whole change exists to remove. It propagates instead, and `run()` parks it
+    as `login_expired` with THIS phase as the resume point, so logging back in
+    and retrying comes straight back to the search with nothing sent in between.
+    Widen `_search_for_request`'s `except` back to `BrowserError` and this test
+    is what fails."""
     client = RotatingFakeClient(responses=[])
     client.find_error = LoginExpiredError("session expired")
     orch, store, config = build(tmp_path, client, state=ambiguous_state())
@@ -1566,6 +1568,86 @@ def test_login_expiry_during_the_search_is_not_demoted_to_ambiguity(tmp_path):
     assert orch.state.resume_phase == Phase.SUBMISSION_UNCONFIRMED.value
     assert client.submitted == []
     assert transcript_entries(config, "submission_ambiguous") == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SessionLostError("cdp connection closed"),
+        BrowserError("navigation failed"),
+    ],
+    ids=["session_lost", "generic_browser_error"],
+)
+def test_a_dead_browser_during_the_search_is_not_demoted_to_ambiguity(tmp_path, error):
+    """A search that DIED is not a search that concluded anything.
+
+    Only `ConversationSearchInconclusive` — the search's own verdict on its own
+    evidence — may be collapsed into the ambiguity park. A dropped CDP
+    connection or a page that never loaded is a transport fault the orchestrator
+    already knows how to recover from: `run()` routes it to
+    `_handle_browser_failure`, which drops the client, tries a browser restart
+    and otherwise charges the ordinary failure budget, leaving the phase intact
+    so the next step re-enters the search with a live browser.
+
+    Catching it here would throw that away twice over: the restart never
+    happens, and a dead browser — which says NOTHING about whether the request
+    is in the conversation — gets reported to a human as evidence uncertainty.
+    That is the same misclassification the whole change exists to remove, so
+    both the named subclass and the bare base are pinned here.
+    """
+    client = RotatingFakeClient(responses=[])
+    client.find_error = error
+    orch, store, config = build(tmp_path, client, state=ambiguous_state())
+
+    # Exactly one step: `run()` checks the budget BEFORE stepping, so this is a
+    # single `_step`. A sticky error retried past `max_consecutive_failures`
+    # would land in `failed` and hide the phase this asserts on.
+    orch.run(max_steps=1)
+
+    assert client.find_calls, "the search must be what failed, not something before it"
+    assert client.submitted == [], "no route out of this phase sends anything"
+    # Routed as the browser failure it is...
+    errors = transcript_entries(config, "browser_error")
+    assert errors and errors[-1]["data"]["kind"] == type(error).__name__
+    assert errors[-1]["data"]["phase"] == Phase.SUBMISSION_UNCONFIRMED.value
+    assert orch.state.consecutive_failures == 1, "the ordinary failure budget governs it"
+    # ...and NOT as anything about the evidence.
+    assert transcript_entries(config, "submission_ambiguous") == []
+    assert transcript_entries(config, "presence_search_inconclusive") == []
+    assert park_code(config) != "submission_ambiguous"
+    # The phase survives, so the retry comes straight back to the search.
+    assert orch.state.phase == Phase.SUBMISSION_UNCONFIRMED.value
+
+
+def test_a_wedged_page_during_the_search_never_licenses_a_rotation(tmp_path):
+    """The one browser fault that is caught here, and why it is the exception
+    that proves the rule.
+
+    `ConversationUnusableError` is not collapsed because its route says too
+    little — it is collapsed because its route ACTS. `run()` sends it to
+    `_handle_conversation_unusable` -> `_attempt_rotation` -> a rotation that
+    POSTS the request id into a replacement chat. That is a send, from the one
+    phase whose entire contract is that only `--resubmit` repeats one.
+
+    And the page that raised it is usually not even this request's conversation:
+    the search walks the project page and up to `limit` OTHER chats, so
+    propagating it would let a stranger's wedged chat license a repost of a
+    request the backend may already hold — exactly the duplicate
+    `submission_ambiguous` exists to prevent. It parks safely instead.
+    """
+    client = RotatingFakeClient(responses=[])
+    client.find_error = ConversationUnusableError("this chat appears wedged")
+    orch, store, config = build(tmp_path, client, state=ambiguous_state())
+
+    orch.run(max_steps=3)
+
+    assert client.submitted == [], "a wedged page must not rotate, because rotating SENDS"
+    assert client.retargets == [], "and must not rebind the loop to another chat"
+    assert orch.state.rotations == 0
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert park_code(config) == "submission_ambiguous"
+    refused = transcript_entries(config, "presence_search_inconclusive")
+    assert refused and refused[-1]["data"]["kind"] == "ConversationUnusableError"
 
 
 def test_a_hit_in_a_different_chat_parks_and_names_it(tmp_path):
