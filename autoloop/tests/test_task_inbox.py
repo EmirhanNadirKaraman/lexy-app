@@ -344,6 +344,70 @@ def test_the_inbox_reverse_will_not_release_a_loop_raised_quarantine(tmp_path):
     assert registry.get("t").blocked_reason == "validation failed three times"
 
 
+def test_the_inbox_reverse_refuses_a_quarantine_that_merely_reads_like_a_hold(tmp_path):
+    """The end-to-end twin of `test_tasks.py`'s registry regression, and the
+    reason provenance is a stored field rather than the reason text.
+    `blocked_reason` is free text the LOOP writes as well, so a park detail
+    beginning with `OPERATOR_HOLD_PREFIX` used to make a real quarantine
+    releasable from here — the blocker record left open and unanswered while
+    the task went straight back into `ready_tasks()`."""
+    from autoloop.inbox import apply_requests
+    from autoloop.tasks import OPERATOR_HOLD_PREFIX
+
+    inbox = TaskInbox(tmp_path / "inbox")
+    registry = TaskRegistry()
+    registry.add_many([Task(id="t", title="T", description="d")])
+    reason = OPERATOR_HOLD_PREFIX + "quoted from the agent's own report"
+    registry.block("t", reason)
+
+    inbox.submit_mutation("unblock", "t")
+    _, applied, refused = apply_requests(registry, inbox.drain()[0])
+
+    assert applied == []
+    assert len(refused) == 1 and "autoloop answer" in refused[0]
+    assert registry.get("t").blocked_reason == reason
+    assert registry.state_of("t").value == "blocked_by_operator"
+
+
+def test_a_creation_request_cannot_carry_a_mutation_field(tmp_path):
+    """The other half of "a request carries only its own kind's fields".
+    `reason` belongs to `block`, and a `task` request naming it meant a hold —
+    checked against one GLOBAL field set it submitted cleanly and was then
+    silently ignored on merge, which is precisely the outcome the per-kind rule
+    exists to prevent."""
+    inbox = TaskInbox(tmp_path / "inbox")
+    with pytest.raises(InboxError, match="mutation-only"):
+        inbox.submit({"kind": "task", "id": "t", "title": "T", "description": "D",
+                      "reason": "hold this instead"})
+    # Same for the no-kind legacy form, which is a creation request too.
+    with pytest.raises(InboxError, match="unknown field"):
+        inbox.submit({"id": "t", "title": "T", "description": "D", "reason": "x"})
+    assert inbox.pending() == [], "nothing malformed should reach the queue"
+    # The control: the same field on the kind that owns it is accepted.
+    inbox.submit({"kind": "block", "id": "t", "reason": "hold this"})
+    assert len(inbox.pending()) == 1
+
+
+def test_no_payload_field_falls_outside_both_per_kind_sets():
+    """A drift guard on the split, not a behaviour test. Every mutation payload
+    has to be either a creation field or declared mutation-only, or
+    `ALLOWED_FIELDS` — the union `dashboard.TASK_REQUEST_FIELDS` documents
+    itself against — quietly stops naming the whole vocabulary. Nothing
+    validates against the union, which is exactly why nothing else would fail
+    when a new kind forgets it."""
+    from autoloop.inbox import (
+        ALLOWED_FIELDS,
+        CREATION_FIELDS,
+        MUTATION_ONLY_FIELDS,
+        MUTATION_PAYLOAD,
+    )
+
+    payloads = {p for p in MUTATION_PAYLOAD.values() if p is not None}
+    assert payloads <= ALLOWED_FIELDS
+    assert ALLOWED_FIELDS == CREATION_FIELDS | MUTATION_ONLY_FIELDS
+    assert "reason" not in CREATION_FIELDS, "the leak this split closed"
+
+
 def test_retire_is_not_in_the_vocabulary(tmp_path):
     """Deliberate and load-bearing. `retire` is written-once with no reverse by
     design, so an inbox request that reached it would be exactly the

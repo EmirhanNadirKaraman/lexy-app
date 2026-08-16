@@ -1769,11 +1769,17 @@ the real hazard, but the hazard was never *which field* — it was *edited
 against what*. Four things carry it:
 
 1. **The registry decides.** Submission checks SHAPE only (is the field there,
-   is it the right JSON type). Every question about content goes to the same
-   validator creation uses — `_validate_description`,
-   `_validate_approved_paths`, `_validate_depends_on` + `_check_acyclic` — so
-   a mutation cannot express what a `plan` or `seed_tasks.json` could not, and
-   a refusal reaches the operator in one authority's words.
+   is it the right JSON type, does this kind even carry it). Every question
+   about content goes to the same validator creation uses —
+   `_validate_description`, `_validate_approved_paths`, `_validate_depends_on`
+   + `_check_acyclic` — so a mutation cannot express what a `plan` or
+   `seed_tasks.json` could not, and a refusal reaches the operator in one
+   authority's words. The shape half is checked PER KIND in both directions: a
+   mutation carries `{kind, id, <its payload>}` and a `task` carries
+   `CREATION_FIELDS`. One global field set could not say that — `reason` is
+   legal on a `block` and meaningless on a `task`, so checking the union let a
+   creation request carrying `reason` submit cleanly and then be ignored on
+   merge, which is the silent drop the rule exists to prevent.
 2. **Nothing in flight is editable.** `TaskRegistry._refuse_immutable` refuses
    `description`, `approved_paths` and `depends_on` on an `in_progress` task,
    because a dispatch is being judged against all three right now: a new
@@ -1782,13 +1788,24 @@ against what*. Four things carry it:
    unauthorized. It refuses `completed` and `retired` too — those are records.
    `blocked` stays editable, which is the point: correcting a scope is what a
    quarantined task usually needs before its blocker can be answered.
-3. **Blocking has a reverse.** A hold placed here writes no `Blocker` record,
-   and `answer` — the only route out of `blocked` — takes a blocker id, so
-   `block` without `unblock` would be a one-way door. `operator_block` stamps
-   the reason and refuses an already-blocked task; `operator_unblock` releases
-   only what carries that stamp, so an inbox request can neither overwrite a
-   real quarantine's recorded reason nor return a quarantined task to the
-   ready queue with its blocker still open.
+3. **Blocking has a reverse, and only its own block does.** A hold placed here
+   writes no `Blocker` record, and `answer` — the only route out of `blocked`
+   — takes a blocker id, so `block` without `unblock` would be a one-way door.
+   `operator_block` refuses an already-blocked task and records the hold in
+   `Task.hold_origin`; `operator_unblock` releases only a task carrying that
+   origin, so an inbox request can neither overwrite a real quarantine's
+   recorded reason nor return a quarantined task to the ready queue with its
+   blocker still open.
+
+   Provenance is a stored field and NOT the reason text. The first cut tested
+   `blocked_reason.startswith(OPERATOR_HOLD_PREFIX)`, and `blocked_reason` is
+   free text the loop writes too — a park detail beginning with those
+   characters made a genuine quarantine releasable from the inbox, which is the
+   one thing this pair exists to prevent. `block()` clears the origin whatever
+   the reason says, `unblock()` clears it on release, `operator_block` is the
+   only writer, and a stored row with no marker (every `tasks.json` written
+   before the field existed) reads as a loop quarantine. The prefix survives on
+   the reason as prose for a human reading the row.
 4. **`retire` is not in the vocabulary**, and must not be added: it is
    written-once with no reverse at all.
 

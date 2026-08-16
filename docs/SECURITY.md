@@ -473,12 +473,30 @@ What bounds it, stated rather than assumed:
   would refuse; `escape_detector.find_symlink_traversal` still re-checks
   traversal at dispatch. As with S28 this is well-formedness, not intent.
 - **Blocking is reversible and cannot launder a quarantine.**
-  `operator_block` stamps `tasks.OPERATOR_HOLD_PREFIX` onto the reason and
-  refuses a task that is already `blocked`; `operator_unblock` releases only
-  what carries that stamp. So an inbox request can neither overwrite the
-  recorded reason of a real `task_fatal` quarantine nor return a quarantined
-  task to `ready_tasks()` with its blocker still open and unanswered — those
-  still go through `python -m autoloop answer`, which resolves both halves.
+  `operator_block` refuses a task that is already `blocked` and records the
+  hold's provenance in `Task.hold_origin` (`tasks.HOLD_ORIGIN_OPERATOR`);
+  `operator_unblock` releases ONLY a task carrying that origin. So an inbox
+  request can neither overwrite the recorded reason of a real `task_fatal`
+  quarantine nor return a quarantined task to `ready_tasks()` with its blocker
+  still open and unanswered — those still go through
+  `python -m autoloop answer`, which resolves both halves.
+
+  **Provenance is a stored value, not the reason text** — and the first cut of
+  this finding shipped the wrong one. It tested
+  `blocked_reason.startswith(OPERATOR_HOLD_PREFIX)`, but `blocked_reason` is
+  unconstrained free text that ordinary loop-raised quarantines write too
+  (`cli._handle_parked_task` passes the park detail straight through), so a
+  genuine quarantine whose reason merely BEGAN with those characters was
+  releasable from the inbox with its blocker record open — the exact bypass
+  this bullet claims is impossible. The field closes it: `block()` clears
+  `hold_origin` unconditionally regardless of reason text (and so an idempotent
+  re-block cannot inherit one), `unblock()` clears it on release,
+  `operator_block` is the only writer and writes it only after the delegate
+  returns, and `from_dict` loads a missing or `null` value as `""` — an
+  unmarked row reads as a loop quarantine, which is the safe direction for a
+  `tasks.json` written before the field existed. `OPERATOR_HOLD_PREFIX` remains
+  on the reason as prose for a human reading the row and decides nothing;
+  re-introducing a check against it would re-open this hole.
 - **`retire` is not in the vocabulary** and must not be added: it is
   written-once with no reverse, so reaching it from here would create a state
   the inbox cannot undo.
@@ -506,10 +524,11 @@ task that adds routes should close. Until then the drain output — which does
 report every applied mutation correctly — is the reliable record, and the page
 is not.
 
-**file:line** — `autoloop/inbox.py` `MUTATION_PAYLOAD` / `TaskInbox.submit` /
-`_apply_mutation`; `autoloop/tasks.py` `_refuse_immutable`,
-`set_approved_paths`, `set_depends_on`, `operator_block`, `operator_unblock`,
-`OPERATOR_HOLD_PREFIX`.
+**file:line** — `autoloop/inbox.py` `MUTATION_PAYLOAD` / `CREATION_FIELDS` /
+`TaskInbox.submit` / `_check_creation` / `_check_mutation` / `_apply_mutation`;
+`autoloop/tasks.py` `_refuse_immutable`, `set_approved_paths`,
+`set_depends_on`, `operator_block`, `operator_unblock`, `Task.hold_origin`,
+`HOLD_ORIGIN_OPERATOR`.
 **Severity:** MEDIUM — same actor and same trust boundary as S28 (local write
 access as the operator), and the concrete gain is that a widened scope can be
 made to look like an untouched, already-reviewed task.
@@ -517,10 +536,17 @@ made to look like an untouched, already-reviewed task.
 ```bash
 # Expect: exactly the six mutation kinds, and NO 'retire' among them
 rg -n 'MUTATION_PAYLOAD|KIND_' autoloop/inbox.py
+# Expect: per-kind allowed fields — a creation request is bounded by
+# CREATION_FIELDS, which must NOT contain 'reason'
+rg -n 'CREATION_FIELDS|MUTATION_ONLY_FIELDS|_check_creation' autoloop/inbox.py
 # Expect: the strand/terminal guard is on all three content mutators
 rg -n '_refuse_immutable' autoloop/tasks.py
-# Expect: the inbox reverse releases only what operator_block stamped
-rg -n 'OPERATOR_HOLD_PREFIX' autoloop/tasks.py
+# Expect: the inbox reverse gates on hold_origin — `operator_block` the only
+# assignment of HOLD_ORIGIN_OPERATOR, `block`/`unblock` both clearing it
+rg -n 'hold_origin' autoloop/tasks.py
+# Expect: EMPTY — no runtime branch on the prose prefix (written, never read;
+# the tests do assert it survives persistence, hence the exclusion)
+rg -n 'startswith\(OPERATOR_HOLD_PREFIX\)' autoloop --glob '!tests/**'
 # Expect: no second validator — the mutators call what add_many calls
 rg -n '_validate_approved_paths|_validate_depends_on|_validate_description' autoloop/tasks.py
 # Expect: EMPTY — no unauthenticated endpoint reaches a mutation kind

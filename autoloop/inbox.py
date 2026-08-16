@@ -36,21 +36,31 @@ through, not by a second implementation that could drift from it.
    `TaskRegistry` method that calls the SAME validator creation calls —
    `_validate_description`, `_validate_approved_paths`, `_validate_depends_on`
    + `_check_acyclic`. Submission checks SHAPE only (is the field present, is
-   it a list), so a refusal an operator reads is always the registry's own
-   words, never a second rule set drifting from it.
+   it a list, does this kind even carry it), so a refusal an operator reads is
+   always the registry's own words, never a second rule set drifting from it.
+   The shape half is PER KIND, in both directions: `_check_mutation` bounds a
+   mutation to `{"kind", "id", <its payload>}` and `_check_creation` bounds a
+   `task` to `CREATION_FIELDS`. A single global field set cannot say this — it
+   accepted `{"kind": "task", …, "reason": …}`, which submitted cleanly and
+   then dropped the reason on merge, which is the silent-ignore the per-kind
+   rule exists to prevent.
 2. **Nothing in flight can be edited.** `TaskRegistry._refuse_immutable`
    refuses `description`, `approved_paths` and `depends_on` on an
    `in_progress` task, because all three are what a dispatch that has ALREADY
    STARTED is judged against, and each one strands the round in a state no
    command can move it out of. It refuses `completed` and `retired` too:
    those are records, not queue.
-3. **Blocking is reversible.** `block` goes through
-   `TaskRegistry.operator_block`, which stamps the reason, and `unblock`
-   through `operator_unblock`, which releases only what was stamped. Without
-   the pair, an inbox block would be a one-way door: it creates no
-   `blockers.Blocker` record, and `python -m autoloop answer` — the only
-   route out of `blocked` — needs one. `retire` is deliberately NOT in the
-   vocabulary for exactly that reason; it has no reverse at all, by design.
+3. **Blocking is reversible, and only its own kind of block is.** `block` goes
+   through `TaskRegistry.operator_block`, which records the hold's origin in
+   `Task.hold_origin`, and `unblock` through `operator_unblock`, which releases
+   only a task carrying that origin. Without the pair, an inbox block would be
+   a one-way door: it creates no `blockers.Blocker` record, and
+   `python -m autoloop answer` — the only route out of `blocked` — needs one.
+   Provenance is a stored field and NOT the `blocked_reason` text, which
+   loop-raised quarantines write too; reading it out of that text made a real
+   quarantine releasable from here whenever its reason happened to start with
+   `OPERATOR_HOLD_PREFIX`. `retire` is deliberately NOT in the vocabulary for
+   the same family of reasons; it has no reverse at all, by design.
 4. **Submission order is application order.** `drain` returns oldest-first and
    `apply_requests` makes ONE pass in that order, so two requests against the
    same field resolve last-write-wins and a mutation queued before its
@@ -68,10 +78,19 @@ import os
 import time
 from pathlib import Path
 
-#: Fields a request may carry. Anything else is refused at submit time rather
-#: than silently dropped on merge — a request that names a field the registry
-#: ignores has almost certainly not done what its author intended.
-ALLOWED_FIELDS = frozenset(
+#: Fields a CREATION request (`kind: "task"`, or no kind at all) may carry.
+#: Anything else is refused at submit time rather than silently dropped on
+#: merge — a request that names a field the receiver ignores has almost
+#: certainly not done what its author intended.
+#:
+#: This is the whole of the creation contract: `reason` is deliberately absent,
+#: because a task nobody has looked at yet cannot already be held, and
+#: `apply_requests`' creation branch has no way to express it. Letting it
+#: through here (which the first cut of the mutation vocabulary did, by
+#: checking one global field set) accepted `{"kind": "task", …, "reason": …}`
+#: at submit and then ignored the reason on merge — exactly the silent drop the
+#: per-kind rule below refuses for every other field.
+CREATION_FIELDS = frozenset(
     {
         "kind",
         "id",
@@ -82,12 +101,22 @@ ALLOWED_FIELDS = frozenset(
         "validation",
         "validation_cwd",
         "approved_paths",
-        # Mutation-only: the account an operator gives for holding a task.
-        # `Task.blocked_reason` on the registry side, but never settable at
-        # creation — a task nobody has looked at yet cannot already be held.
-        "reason",
     }
 )
+
+#: Fields only a MUTATION request can carry, i.e. everything in
+#: `MUTATION_PAYLOAD` that creation has no field for. Today just `reason` —
+#: `Task.blocked_reason` on the registry side, the account an operator gives
+#: for holding a task.
+MUTATION_ONLY_FIELDS = frozenset({"reason"})
+
+#: Every field name the vocabulary knows, across all kinds. A UNION, not a
+#: contract: no single request may carry all of these, and nothing validates
+#: against it (see `_check_creation` / `_check_mutation`, which each hold their
+#: own kind's set). It exists because `dashboard.TASK_REQUEST_FIELDS`
+#: documents itself as narrower than "the inbox's own allowed fields", and that
+#: comparison needs something to point at.
+ALLOWED_FIELDS = CREATION_FIELDS | MUTATION_ONLY_FIELDS
 REQUIRED_FIELDS = ("id", "title", "description")
 
 #: Request kinds. `task` creates a new task (the original shape; a request with
@@ -121,12 +150,12 @@ KIND_UNBLOCK = "unblock"
 #: means the kind is the whole instruction (`unblock` names a task and says
 #: "release it"; there is nothing else to say).
 #:
-#: This table IS the per-kind field rule: `submit` refuses anything outside
-#: `{"kind", "id", <payload>}`, so a request naming a field its kind ignores is
-#: reported at submit rather than silently dropped on merge — the same reason
-#: `ALLOWED_FIELDS` exists. Note the payload name matches `Task`'s field name
-#: wherever there is one, so an operator writing a mutation by hand does not
-#: have to learn a second vocabulary.
+#: This table IS the per-kind field rule for mutations: `submit` refuses
+#: anything outside `{"kind", "id", <payload>}`, so a request naming a field its
+#: kind ignores is reported at submit rather than silently dropped on merge —
+#: the same reason `CREATION_FIELDS` bounds the other kind. Note the payload
+#: name matches `Task`'s field name wherever there is one, so an operator
+#: writing a mutation by hand does not have to learn a second vocabulary.
 MUTATION_PAYLOAD: dict[str, str | None] = {
     KIND_PRIORITY: "priority",
     KIND_DESCRIPTION: "description",
@@ -164,25 +193,25 @@ class TaskInbox:
         the task is in a state that may be edited are all the registry's calls,
         made on merge, so the operator reads one authority's words rather than
         two rule sets that agree until they don't.
+
+        The allowed-field check is PER KIND, and the kind is therefore resolved
+        first. A single global set cannot express the contract — `reason` is
+        legal on a `block` and meaningless on a `task`, so a global check either
+        refuses a valid hold or accepts a creation request carrying a field the
+        merge silently ignores.
         """
         if not isinstance(spec, dict):
             raise InboxError("a task request must be a JSON object")
-        unknown = set(spec) - ALLOWED_FIELDS
-        if unknown:
-            raise InboxError(
-                f"unknown field(s) {sorted(unknown)}; allowed: {sorted(ALLOWED_FIELDS)}"
-            )
         kind = spec.get("kind", KIND_TASK)
+        # Membership in a TUPLE, so an unhashable hand-written kind (`[]`) is
+        # refused here rather than raising `TypeError` off the dict lookup
+        # below.
         if kind not in KINDS:
             raise InboxError(f"unknown kind {kind!r}; expected one of {list(KINDS)}")
-        if "priority" in spec and not isinstance(spec["priority"], int):
-            raise InboxError("priority must be an integer (ascending; 1 outranks 2)")
         if kind in MUTATION_PAYLOAD:
             self._check_mutation(kind, spec)
         else:
-            missing = [f for f in REQUIRED_FIELDS if not str(spec.get(f, "")).strip()]
-            if missing:
-                raise InboxError(f"missing required field(s): {', '.join(missing)}")
+            self._check_creation(spec)
 
         self.directory.mkdir(parents=True, exist_ok=True)
         # Lexicographic filename order MUST equal submission order — `drain`
@@ -200,6 +229,38 @@ class TaskInbox:
         tmp.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
         return path
+
+    @staticmethod
+    def _check_creation(spec: dict) -> None:
+        """Shape-check one CREATION request. Raises `InboxError`.
+
+        The creation half of the same per-kind rule `_check_mutation` applies:
+        a request carries only the fields its kind can act on. `reason` is the
+        field this exists to catch — it is in the vocabulary, so a global check
+        waved it through onto a `task` request that then dropped it on merge.
+        """
+        unknown = set(spec) - CREATION_FIELDS
+        if unknown:
+            # A mutation-only field gets its own sentence. `{"kind": "task",
+            # "reason": …}` is a request whose author meant a hold, and
+            # "unknown field" alone would send them looking for a typo.
+            mutation_only = sorted(unknown & MUTATION_ONLY_FIELDS)
+            hint = (
+                f"; {mutation_only} is mutation-only — use one of "
+                f"{list(MUTATION_KINDS)}"
+                if mutation_only
+                else ""
+            )
+            carries = sorted(CREATION_FIELDS - {"kind"})
+            raise InboxError(
+                f"unknown field(s) {sorted(unknown)} on a {KIND_TASK} request; it "
+                f"carries only {carries}{hint}"
+            )
+        if "priority" in spec and not isinstance(spec["priority"], int):
+            raise InboxError("priority must be an integer (ascending; 1 outranks 2)")
+        missing = [f for f in REQUIRED_FIELDS if not str(spec.get(f, "")).strip()]
+        if missing:
+            raise InboxError(f"missing required field(s): {', '.join(missing)}")
 
     @staticmethod
     def _check_mutation(kind: str, spec: dict) -> None:

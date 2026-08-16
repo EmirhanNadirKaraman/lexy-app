@@ -299,8 +299,9 @@ def _successor_hint(task: "Task") -> str:
     return f" (superseded by {', '.join(task.superseded_by)})" if task.superseded_by else ""
 
 
-#: Prefix stamped onto `blocked_reason` by `TaskRegistry.operator_block`, and
-#: the ONLY thing `operator_unblock` will release.
+#: The value `Task.hold_origin` carries when — and ONLY when — a task was held
+#: through the inbox by `TaskRegistry.operator_block`. It is the ONE thing
+#: `operator_unblock` will release.
 #:
 #: Both meanings of `status == "blocked"` are the same field, and they must not
 #: be reversible by the same route. A `task_fatal` park (`cli._handle_parked_
@@ -308,22 +309,38 @@ def _successor_hint(task: "Task") -> str:
 #: `python -m autoloop answer`, which also resolves the `blockers.Blocker`
 #: record tied to it. An OPERATOR HOLD placed through the inbox has no blocker
 #: record at all, so `answer` cannot reach it — that is precisely the
-#: one-way state this pair exists to avoid, and the reverse has to come from
-#: the inbox too.
+#: one-way state `operator_block`/`operator_unblock` exist to avoid, and the
+#: reverse has to come from the inbox too.
 #:
-#: Without the marker the inbox's reverse would release BOTH: an operator (or
-#: anything that can write to the inbox directory) could clear a quarantine the
-#: loop raised, leaving its blocker open and unanswered while the task went
-#: straight back into `ready_tasks()`. So the reverse is narrowed by
+#: Without a provenance marker the inbox's reverse would release BOTH: an
+#: operator (or anything that can write to the inbox directory) could clear a
+#: quarantine the loop raised, leaving its blocker open and unanswered while the
+#: task went straight back into `ready_tasks()`. So the reverse is narrowed by
 #: provenance rather than by trust.
 #:
-#: A stamped prefix and not a heuristic. `_RETIREMENTS` warns against parsing
-#: free-text `blocked_reason`s for meaning, and that warning stands: this
-#: string is written by this module, matched exactly, and never inferred. It is
-#: deliberately the cheapest representation that is reversible — a dedicated
-#: `blocked_by` field would be the same idea with a schema change and a
-#: migration behind it, and can replace this without changing either method's
-#: contract.
+#: **A dedicated field, deliberately NOT the reason text.** This started life as
+#: a `blocked_reason.startswith(OPERATOR_HOLD_PREFIX)` test, and that was a hole
+#: rather than a shortcut: `blocked_reason` is unconstrained free text written
+#: by ordinary loop-raised quarantines too (`_handle_parked_task` passes the
+#: park detail straight through), so a genuine quarantine whose reason merely
+#: BEGINS with the prefix — a park detail quoting an operator's note, or a
+#: crafted one — read as a hold and was releasable from the inbox with its
+#: blocker still open. That is the exact laundering this pair is supposed to
+#: make impossible. `_RETIREMENTS` already warns against reading free-text
+#: reasons for meaning; this is the same warning applied to the one place it was
+#: still being ignored. The origin is now written by exactly one method, never
+#: inferred, and `block()` clears it unconditionally — see `Task.hold_origin`.
+HOLD_ORIGIN_OPERATOR = "operator"
+
+#: Prose. `operator_block` puts this in front of the reason it is given so a
+#: human reading `tasks.json`, the dashboard or a drain log can see at a glance
+#: which kind of `blocked` they are looking at.
+#:
+#: NOTHING BRANCHES ON IT. Provenance is `Task.hold_origin` (above); this string
+#: carries no authority, and a `blocked_reason` that happens to start with it
+#: proves nothing about who wrote it. Keep those two facts together: the moment
+#: a caller tests this prefix instead of the field, the hole described above is
+#: back.
 OPERATOR_HOLD_PREFIX = "operator hold: "
 
 #: Statuses whose task FIELDS (description, approved_paths, depends_on) an
@@ -428,6 +445,28 @@ class Task:
     #: `TaskRegistry.from_dict` below and `test_blockers.py`'s backward-
     #: compatibility test.
     blocked_reason: str = ""
+    #: WHO put this task in `blocked`, as a value rather than as prose.
+    #: `HOLD_ORIGIN_OPERATOR` means an inbox hold placed by
+    #: `TaskRegistry.operator_block`; `""` means everything else, including
+    #: every loop-raised `task_fatal` quarantine and every task that has never
+    #: been blocked at all.
+    #:
+    #: The authority `operator_unblock` reads. It exists as its own field
+    #: because the alternative — matching `OPERATOR_HOLD_PREFIX` against
+    #: `blocked_reason` — reads provenance out of unconstrained free text that
+    #: the loop also writes, so a real quarantine could be released from the
+    #: inbox with its `blockers.Blocker` record still open (see
+    #: `HOLD_ORIGIN_OPERATOR`). Only `operator_block` ever sets it, `block` and
+    #: `unblock` both clear it, and no reason text can produce it.
+    #:
+    #: New field with a default — an old `tasks.json` written before it existed
+    #: loads with `""`, i.e. as a loop quarantine, which is the SAFE direction:
+    #: a pre-existing hold has to be released by `python -m autoloop answer`
+    #: (or re-held) rather than an unmarked row being releasable from the
+    #: inbox. Same backward-compatible pattern as `blocked_reason` /
+    #: `superseded_by` / `approved_paths`, plus a normalising read in
+    #: `from_dict` so a hand-edited `null` cannot become `None` here.
+    hold_origin: str = ""
     #: Which task(s) continue this one, set by `retire`. Empty is legal and
     #: means "retired with no successor" — `dash-01` went stale rather than
     #: being superseded, and inventing a successor for it would be worse than
@@ -705,6 +744,13 @@ class TaskRegistry:
             )
         task.status = "blocked"
         task.blocked_reason = reason
+        # UNCONDITIONAL, and never a function of `reason`. This is the loop's
+        # quarantine, so its provenance is "not an operator hold" whatever the
+        # reason text happens to say — including a park detail that begins with
+        # `OPERATOR_HOLD_PREFIX`. Clearing (rather than leaving) the field also
+        # covers the idempotent re-block: a second park on a task must not
+        # inherit a marker from whatever put it in `blocked` the first time.
+        task.hold_origin = ""
         return task
 
     def retire(
@@ -829,6 +875,10 @@ class TaskRegistry:
             raise TaskGraphError("task_not_blocked", f"task '{task_id}' is not blocked")
         task.status = "pending"
         task.blocked_reason = ""
+        # Released is released: a pending task has no hold to have an origin,
+        # and a marker left behind here would still be sitting on the row the
+        # next time the loop quarantines it.
+        task.hold_origin = ""
         return task
 
     def release(self, task_id: str) -> Task:
@@ -1085,12 +1135,21 @@ class TaskRegistry:
           * already `blocked` — `block` is idempotent and REFRESHES the reason,
             which is right for a park that re-fires and wrong here: it would
             overwrite the recorded account of a real quarantine with an
-            operator's note, and stamp it as releasable through the inbox.
+            operator's note AND give it an operator `hold_origin`, i.e. convert
+            a quarantine into something the inbox may release.
           * `completed` / `retired` — delegated to `block`, which already
             refuses both.
 
-        The reason is stamped with `OPERATOR_HOLD_PREFIX` so
-        `operator_unblock` can tell this apart from a loop-raised quarantine.
+        Provenance is recorded as `hold_origin = HOLD_ORIGIN_OPERATOR`, which is
+        the ONLY thing `operator_unblock` reads, and this is the only method
+        that ever writes it. The reason also gets `OPERATOR_HOLD_PREFIX` in
+        front of it, but that is prose for whoever reads the row — it decides
+        nothing, deliberately, because `blocked_reason` is free text the loop
+        writes too.
+
+        Written AFTER the delegate returns, so a hold `block` refuses
+        (completed / retired) leaves no marker behind on a task that was never
+        held.
         """
         task = self.get(task_id)
         if not isinstance(reason, str) or not reason.strip():
@@ -1113,7 +1172,9 @@ class TaskRegistry:
                 f"({task.blocked_reason or '(none recorded)'}) — an operator hold "
                 "must not overwrite it",
             )
-        return self.block(task_id, OPERATOR_HOLD_PREFIX + reason)
+        held = self.block(task_id, OPERATOR_HOLD_PREFIX + reason)
+        held.hold_origin = HOLD_ORIGIN_OPERATOR
+        return held
 
     def operator_unblock(self, task_id: str) -> Task:
         """Reverse of `operator_block`, and ONLY of that.
@@ -1126,15 +1187,21 @@ class TaskRegistry:
         unblock would write a state with no way back.
 
         Narrowed by provenance, not by trust: a task quarantined by the loop
-        carries a reason this module did not stamp, and releasing it here would
-        put it back in `ready_tasks()` with its blocker still open and
-        unanswered. Those go through `answer`, which resolves both halves
+        does not carry `hold_origin == HOLD_ORIGIN_OPERATOR`, and releasing it
+        here would put it back in `ready_tasks()` with its blocker still open
+        and unanswered. Those go through `answer`, which resolves both halves
         together.
+
+        The gate is the FIELD and nothing else. It used to be
+        `blocked_reason.startswith(OPERATOR_HOLD_PREFIX)`, which asked an
+        unconstrained free-text field — one ordinary quarantines write too —
+        to prove who wrote it, so a park detail beginning with those characters
+        was releasable from here. Testing both the field and the prefix would
+        keep that text load-bearing; testing only the field is what makes the
+        answer authoritative.
         """
         task = self.get(task_id)
-        if task.status == "blocked" and not task.blocked_reason.startswith(
-            OPERATOR_HOLD_PREFIX
-        ):
+        if task.status == "blocked" and task.hold_origin != HOLD_ORIGIN_OPERATOR:
             raise TaskGraphError(
                 "task_blocked_by_operator",
                 f"task '{task_id}' was quarantined by the loop, not held by an "
@@ -1215,6 +1282,17 @@ class TaskRegistry:
                         tuple(c) for c in raw.get("validation", ())
                     ),
                     "approved_paths": tuple(raw.get("approved_paths", ())),
+                    # Missing key -> `""`, which is how every `tasks.json`
+                    # written before this field existed loads: as a loop
+                    # quarantine, the safe reading (see `Task.hold_origin`).
+                    # Coerced rather than validated, and compared EXACTLY
+                    # everywhere: a hand-edited `null` must become `""` rather
+                    # than `None` (which would blow up on the next `str`
+                    # operation), and anything else that is not the literal
+                    # marker simply is not one. Deliberately no strip/lower —
+                    # normalising here would ACCEPT near-misses, and this field
+                    # decides whether a quarantine can be released.
+                    "hold_origin": str(raw.get("hold_origin", "") or ""),
                     # VALIDATED, not just tuple()-converted — this path never
                     # reaches `add_many` (see the bypass below), so it is the
                     # only gate a stored row passes. See

@@ -524,6 +524,67 @@ def test_the_operator_reverse_will_not_release_a_loop_raised_quarantine():
     assert reg.state_of("a") is TaskState.READY
 
 
+def test_a_loop_quarantine_whose_reason_reads_like_a_hold_is_still_refused():
+    """The hole the previous test could not see. Provenance used to be
+    `blocked_reason.startswith(OPERATOR_HOLD_PREFIX)`, and `blocked_reason` is
+    unconstrained free text that ordinary quarantines write too — a park detail
+    quoting an operator's note, or one crafted to, made a REAL quarantine
+    releasable from the inbox with its `blockers.Blocker` record still open and
+    unanswered. That is exactly the laundering this pair claims to prevent.
+
+    The middle assertion is the one that pins the fix rather than re-testing
+    the refusal: `block` must not set the origin no matter what the reason
+    says, so the marker is written by exactly one method and never inferred."""
+    from autoloop.tasks import HOLD_ORIGIN_OPERATOR, OPERATOR_HOLD_PREFIX
+
+    reg = registry(task("a"))
+    reason = OPERATOR_HOLD_PREFIX + "the agent said it was pausing for review"
+    reg.block("a", reason)
+
+    assert reg.get("a").hold_origin == "", "block never records an operator hold"
+    expect_code(lambda: reg.operator_unblock("a"), "task_blocked_by_operator")
+    assert reg.state_of("a") is TaskState.BLOCKED_BY_OPERATOR
+    assert reg.get("a").blocked_reason == reason, "the record is untouched"
+    # And the real thing still works, so the guard is not simply refusing all.
+    reg.unblock("a")
+    reg.operator_block("a", "waiting on the API key")
+    assert reg.get("a").hold_origin == HOLD_ORIGIN_OPERATOR
+    reg.operator_unblock("a")
+    assert reg.state_of("a") is TaskState.READY
+
+
+def test_a_released_task_keeps_no_hold_origin_for_the_next_quarantine():
+    """The marker has to be cleared on the way out, not just written on the way
+    in. Left behind, it would sit on the row until the loop quarantines that
+    task for real — and then say an operator held it."""
+    from autoloop.tasks import HOLD_ORIGIN_OPERATOR
+
+    reg = registry(task("a"))
+    reg.operator_block("a", "waiting on the API key")
+    reg.operator_unblock("a")
+    assert reg.get("a").hold_origin == ""
+
+    # ... and a re-block by the loop cannot inherit one either.
+    reg.operator_block("a", "waiting again")
+    assert reg.get("a").hold_origin == HOLD_ORIGIN_OPERATOR
+    reg.block("a", "post-commit validation failed")
+    assert reg.get("a").hold_origin == ""
+    expect_code(lambda: reg.operator_unblock("a"), "task_blocked_by_operator")
+
+
+def test_a_refused_hold_leaves_no_marker_behind():
+    """`operator_block` records the origin AFTER the delegate returns, so a
+    hold `block` refuses never stamps a task that was not held."""
+    reg = registry(task("done"), task("gone"), task("running"))
+    reg.mark_completed("done")
+    reg.retire("gone")
+    reg.mark_in_progress("running")
+    for tid in ("done", "gone", "running"):
+        with pytest.raises(TaskGraphError):
+            reg.operator_block(tid, "why")
+        assert reg.get(tid).hold_origin == ""
+
+
 def test_an_operator_hold_never_overwrites_a_recorded_quarantine():
     """`block` is idempotent and REFRESHES the reason, which is right for a
     park that re-fires and wrong here: it would replace the account of a real
@@ -572,9 +633,10 @@ def test_the_operator_pair_delegates_the_terminal_refusals():
 
 
 def test_an_operator_hold_survives_persistence(tmp_path):
-    """The marker lives in `blocked_reason`, which round-trips like any other
-    field — so a hold placed before a restart is still releasable after one."""
-    from autoloop.tasks import OPERATOR_HOLD_PREFIX
+    """`hold_origin` round-trips like any other field, so a hold placed before
+    a restart is still releasable after one — and the prose prefix survives
+    alongside it for whoever reads the file."""
+    from autoloop.tasks import HOLD_ORIGIN_OPERATOR, OPERATOR_HOLD_PREFIX
 
     store = TaskStore(tmp_path / "tasks.json")
     reg = registry(task("a"))
@@ -582,9 +644,45 @@ def test_an_operator_hold_survives_persistence(tmp_path):
     store.save(reg)
 
     loaded = store.load()
+    assert loaded.get("a").hold_origin == HOLD_ORIGIN_OPERATOR
     assert loaded.get("a").blocked_reason.startswith(OPERATOR_HOLD_PREFIX)
     loaded.operator_unblock("a")
     assert loaded.state_of("a") is TaskState.READY
+
+
+@pytest.mark.parametrize("stored_origin", [{}, {"hold_origin": None},
+                                           {"hold_origin": "Operator "},
+                                           {"hold_origin": "loop"}])
+def test_a_stored_row_without_the_operator_marker_is_a_loop_quarantine(
+    tmp_path, stored_origin
+):
+    """Backward compatibility, in the SAFE direction. A `tasks.json` written
+    before `hold_origin` existed has no marker, and an unmarked row must read
+    as a loop quarantine — releasable by `answer`, not by the inbox — rather
+    than as a hold anything with write access to the inbox can clear. The
+    reason text is deliberately the one that used to be trusted.
+
+    A hand-edited `null` must load as `""` and not `None` (the next `str`
+    operation on which would raise), and a near-miss must NOT be normalised
+    into the marker: this field decides whether a quarantine can be released,
+    so widening the match is the wrong direction to be lenient in."""
+    from autoloop.tasks import HOLD_ORIGIN_OPERATOR, OPERATOR_HOLD_PREFIX
+
+    path = tmp_path / "tasks.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "tasks": [{"id": "old", "title": "O", "description": "d",
+                   "status": "blocked",
+                   "blocked_reason": OPERATOR_HOLD_PREFIX + "from before the field",
+                   **stored_origin}],
+    }), encoding="utf-8")
+
+    loaded = TaskStore(path).load()
+    origin = loaded.get("old").hold_origin
+    assert isinstance(origin, str), "a stored null must not load as None"
+    assert origin != HOLD_ORIGIN_OPERATOR
+    expect_code(lambda: loaded.operator_unblock("old"), "task_blocked_by_operator")
+    assert loaded.state_of("old") is TaskState.BLOCKED_BY_OPERATOR
 
 
 # ---- persistence ------------------------------------------------------------

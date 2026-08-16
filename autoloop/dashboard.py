@@ -1844,8 +1844,13 @@ class Handler(BaseHTTPRequestHandler):
           * A queued request is visible as text on this page (`_pending_inbox`
             carries the paths) and in the loop's drain output before anything
             runs against it.
-          * It creates a task; it cannot widen an EXISTING one. There is
-            deliberately no "edit approved_paths" request kind.
+          * It creates a task; THIS endpoint cannot widen an existing one.
+            `TASK_REQUEST_FIELDS` carries no `kind`, so every request it
+            queues is a creation. (The inbox FILE format has carried an
+            `approved_paths` mutation kind since 2026-08-16 — see
+            `docs/SECURITY.md` S30 — but nothing here can reach it, and
+            wiring a route to it is the change S30 names as the one that
+            would make that finding materially worse.)
 
         That is a real widening over the read-only tracker, and it is recorded
         as such in `docs/SECURITY.md` rather than left implied.
