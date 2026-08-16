@@ -291,6 +291,63 @@ def test_question_forbidden_outside_ask_user():
     expect_code(block(base("stop", question="which DB?")), "unexpected_field")
 
 
+#: One COMPLETE, otherwise-valid payload per ACTIVE decision: every field that
+#: decision requires and nothing else, so the only thing wrong with it below is
+#: the added `question`.
+#:
+#: Completeness is the whole point rather than tidiness. `question` is the LAST
+#: field `parse_response` checks — after scope, tasks, task_id, feedback,
+#: commit and reviewed — so a payload missing a required field fails earlier
+#: with that field's own code, and a test written against it would be pinning
+#: `missing_field:task_id` while claiming to pin the question rule.
+_COMPLETE_PAYLOADS = {
+    "audit": {},
+    "plan": {"tasks": [task_spec()]},
+    "implement": {"task_id": "t1"},
+    "revise": {"task_id": "t1", "feedback": "tests missing"},
+    "commit": {"commit": {"message": "m", "paths": ["a.py"]}, "reviewed": REVIEWED},
+    "push": {"reviewed": REVIEWED},
+    "commit_and_push": {
+        "commit": {"message": "m", "paths": ["a.py"]},
+        "reviewed": REVIEWED,
+    },
+    "stop": {},
+}
+
+
+def test_complete_payloads_cover_every_active_decision():
+    """Keeps the two tests below honest as the enum grows: a new active
+    decision with no payload here would otherwise be silently unexercised by
+    both."""
+    assert set(_COMPLETE_PAYLOADS) == {d.value for d in ACTIVE_DECISIONS}
+
+
+@pytest.mark.parametrize("decision", sorted(_COMPLETE_PAYLOADS))
+def test_question_forbidden_for_every_active_decision(decision):
+    """`question` survives in `_TOP_LEVEL_KEYS` only so a legacy `ask_user`
+    reaches its retirement denial instead of dying at `unknown_keys` — see
+    `test_legacy_ask_user_with_a_question_still_parses`. That tolerance must
+    not leak into the decisions the contract still offers: a key kept for one
+    retired shape, accepted on an active one, is a second undocumented way to
+    address a human that policy would never see.
+
+    Generalizes the `stop`-only case above to the whole active set, so the
+    property is pinned for each decision rather than for the one that happens
+    to need no other fields."""
+    payload = base(decision, **_COMPLETE_PAYLOADS[decision], question="which DB?")
+    expect_code(block(payload), "unexpected_field")
+
+
+@pytest.mark.parametrize("decision", sorted(_COMPLETE_PAYLOADS))
+def test_every_complete_payload_parses_without_question(decision):
+    """The positive control for the test above: each payload is valid on its
+    own, so `unexpected_field` there is attributable to the added `question`
+    and to nothing else in the envelope."""
+    directive = parse_response(block(base(decision, **_COMPLETE_PAYLOADS[decision])))
+    assert directive.decision.value == decision
+    assert directive.question is None
+
+
 def test_scope_forbidden_outside_audit():
     expect_code(block(base("stop", scope="x")), "unexpected_field")
 
@@ -529,6 +586,28 @@ def test_unknown_decision_correction_lists_active_decisions_only():
     for decision in ACTIVE_DECISIONS:
         assert decision.value in message
     assert "ask_user" not in message
+
+
+def test_contract_does_not_document_the_legacy_question_field():
+    """The field-level half of the retirement, which the decision-level check
+    above does not cover: a re-added `question (optional) ...` line names no
+    retired DECISION, so `test_contract_never_offers_a_retired_decision`
+    passes right through it.
+
+    `question` is accepted by the parser for exactly one shape — the retired
+    `ask_user` — and rejected as `unexpected_field` for every decision the
+    instructions still offer (pinned by
+    `test_question_forbidden_for_every_active_decision`). Documenting it would
+    therefore advertise a field that cannot be used with any advertised
+    decision: an invitation to a guaranteed contract violation, and a
+    back-door restatement of the retired shape.
+
+    Paired with a positive anchor, so it cannot pass vacuously against an
+    empty or truncated text — `notes` is the optional top-level field that IS
+    documented, and the one a trim would plausibly take `question` down with.
+    """
+    assert "question" not in CONTRACT_INSTRUCTIONS.lower()
+    assert "notes" in CONTRACT_INSTRUCTIONS
 
 
 @pytest.mark.parametrize(
