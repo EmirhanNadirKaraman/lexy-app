@@ -291,17 +291,31 @@ CONTINUATION_NOTE = (
 )
 
 
-#: A replacement chat has no `/c/<id>` until its first turn is processed, so the
-#: rotation polls for it. Bounded: a chat that never leaves the project page is a
-#: failed rotation, not something to wait on forever.
-#: How long to wait for the address bar to show `/c/<id>` after a rotation
-#: posts. Only the FAST PATH now — when it expires, the chat is found by
-#: the request id it contains (`find_conversation_with`), so this being
-#: short costs a few page loads rather than the whole rotation. It used
-#: to be the only witness, and 20s against an account whose composer
-#: needs 180s failed three rotations that had actually succeeded.
+#: A replacement chat has no address inside the project until its first turn is
+#: processed, so the rotation polls for one. Bounded: an address that never
+#: becomes a project conversation is a failed rotation, not something to wait on
+#: forever.
+#: How long to wait for the address bar to show a conversation UNDER THE
+#: PROJECT after a rotation posts — not merely an address that differs from
+#: the project page, which is what this used to wait for and is evidence of
+#: nothing (see `PLACEHOLDER_CONVERSATION_PREFIX`). Only the FAST PATH — when
+#: it expires, the chat is found by the request id it contains
+#: (`find_conversation_with`), so this being short costs a few page loads
+#: rather than the whole rotation. It used to be the only witness, and 20s
+#: against an account whose composer needs 180s failed three rotations that
+#: had actually succeeded. 30s is deliberate on that account: the content
+#: search is the backstop, so a longer wait would only delay it.
 ROTATION_URL_TIMEOUT_SECONDS = 30.0
 ROTATION_URL_POLL_SECONDS = 0.5
+
+#: The address a chat opened from a project page carries BEFORE its first
+#: message lands: `https://chatgpt.com/c/WEB:<uuid>` — note it is not under the
+#: project prefix at all, so it fails the membership check exactly like a chat
+#: in some other project would (2026-08-16, one LOOP-FATAL park). It is used
+#: ONLY to explain a refusal to the operator; nothing branches on it, because a
+#: URL shape ChatGPT owns is the wrong thing to build control flow on, and an
+#: address about to gain the project prefix must be waited through, not judged.
+PLACEHOLDER_CONVERSATION_PREFIX = "WEB:"
 
 
 def _conversation_id(url: str) -> str | None:
@@ -317,6 +331,18 @@ def _conversation_id(url: str) -> str | None:
     if len(segs) >= 2 and segs[-2] == "c":
         return segs[-1]
     return None
+
+
+def _is_placeholder_conversation(url: str) -> bool:
+    """True for the pre-persistence address a brand-new chat carries.
+
+    Explanatory only — see `PLACEHOLDER_CONVERSATION_PREFIX`. A rotation waits
+    the same bounded wait for EVERY address that is not yet inside the project;
+    this exists so the park it eventually writes says "the placeholder was
+    still there" instead of leaving an operator to recognise the shape.
+    """
+    conversation = _conversation_id(url)
+    return bool(conversation and conversation.startswith(PLACEHOLDER_CONVERSATION_PREFIX))
 
 
 #: The four outcomes of `Orchestrator._browser_restart_outcome`. They are
@@ -1878,7 +1904,16 @@ class Orchestrator:
                 "rotation_failed",
                 f"the conversation is unusable and opening a replacement chat "
                 f"failed: {exc}. The rotation attempt is spent — it may have "
-                "posted before failing, so autoloop will not try again on its own.",
+                "posted before failing, so autoloop will not try again on its own. "
+                f"State still points at the RETIRED conversation ({old_url or 'unknown'}) "
+                "with this request marked submitted against it, so a plain restart "
+                "resumes there — which is the conversation that was just found "
+                "unusable. If the message above names an address, open it: when a "
+                "replacement chat exists and holds this request, move the loop to it "
+                "(point browser.conversation_url at that chat, then `reset`, since "
+                "the drift guard requires state and config to agree) rather than "
+                "resending — a resend into a chat that already has the request posts "
+                "it twice.",
             )
             return
 
@@ -2036,10 +2071,20 @@ class Orchestrator:
         leave the request exactly as it was, still bound to the old
         conversation, so the caller commits the new prompt only on success.
 
-        ChatGPT does not mint a `/c/<id>` until a chat has its first turn, so
-        the order is forced: retarget to the project page, submit there, and
-        only then read the id the server assigned. Every step after the submit
-        is verification.
+        ChatGPT does not mint a chat's durable address until it has its first
+        turn, so the order is forced: retarget to the project page, submit
+        there — that submit IS the priming message, sent exactly once — and
+        only then read the address the server assigned. Every step after the
+        submit is verification.
+
+        The address it shows in the meantime is not the project page: a chat
+        opened from a project posts under a PLACEHOLDER
+        (`https://chatgpt.com/c/WEB:<uuid>`) that is not under the project
+        prefix at all. So "the address moved off the project page" was never
+        evidence the chat exists, and judging membership on it refused every
+        rotation (2026-08-16). The wait below is what primes the chat; the
+        membership rule itself is unchanged and still refuses a replacement
+        that really is outside the project.
         """
         client = self._get_client()
         retarget = getattr(client, "retarget", None)
@@ -2053,21 +2098,38 @@ class Orchestrator:
         client.attach()
 
         prompt = self._continuation_prompt(req)
+        # ONE send, never retried. This submit is issued from the PROJECT PAGE,
+        # where every send opens a NEW chat — so a second attempt would not
+        # retry anything, it would create a second conversation and orphan the
+        # first, with the request live in both. Anything short of acceptance
+        # therefore raises, and the caller parks; the rotation budget was
+        # already spent before this method was entered, for the same reason.
         result = client.submit(req.request_id, prompt)
         if result not in (SubmitResult.CONFIRMED, SubmitResult.ALREADY_PERSISTED):
             raise BrowserError(
                 f"the replacement chat did not accept the request ({result.value})"
             )
 
-        # ChatGPT does not mint a `/c/<id>` until the first turn is processed,
-        # so a single read here returns the PROJECT PAGE and the containment
-        # check then refuses it — correctly, but reporting a mismatch between
-        # two identical-looking strings. Poll for the id instead of reading
-        # once, bounded so a genuine failure to leave the project page still
-        # refuses rather than hanging.
+        # Wait for the address to become a project conversation — the question
+        # the membership check actually asks — rather than merely to differ
+        # from the project page.
+        #
+        # The old condition stopped at the first change, and the first change
+        # is the placeholder `/c/WEB:<uuid>` a chat carries until its first
+        # message lands. That address is under no project, so the check refused
+        # it every time and the loop parked LOOP-FATAL on a rotation that had
+        # in fact worked (2026-08-16): an operator sent one short message by
+        # hand and the same address became `/g/g-p-<project>-<slug>/c/<uuid>`,
+        # which passes this check unchanged. Priming, not the rule, was
+        # missing.
+        #
+        # Bounded, and deliberately blind to the placeholder's shape: an
+        # address that is not in the project yet is waited through whatever it
+        # looks like, and an address that never gets there refuses below with
+        # the address actually observed.
         deadline = time.monotonic() + ROTATION_URL_TIMEOUT_SECONDS
         new_url = current_url()
-        while new_url.rstrip("/") == project_url.rstrip("/") and time.monotonic() < deadline:
+        while not self._url_in_project(new_url, project_url) and time.monotonic() < deadline:
             time.sleep(ROTATION_URL_POLL_SECONDS)
             new_url = current_url()
         if not self._url_in_project(new_url, project_url):
@@ -2083,11 +2145,23 @@ class Orchestrator:
             # about a chat that plainly had one (2026-08-03).
             by_content = getattr(client, "find_conversation_with", None)
             found = None
+            searched = False
             if by_content is not None:
                 try:
                     found = by_content(req.request_id, project_url)
+                    searched = True
                 except (BrowserError, AutoloopError):
                     found = None
+            # `found` is NOT re-checked against `_url_in_project`, deliberately.
+            # The search reads the PROJECT'S OWN chat list, so its scoping is
+            # the membership check — and it builds candidates with `urljoin`
+            # against the project page, which yields a prefix-less
+            # `https://chatgpt.com/c/<id>` for a chat that is inside the project
+            # (same trap `_same_conversation` documents). Re-applying the
+            # address-bar rule here would refuse every by-content rescue in
+            # production while passing every test that types URLs by hand,
+            # undoing the 2026-08-03 fix. The rule this changeset defends is the
+            # one on the address bar above, which is where the refusal belongs.
             if found:
                 self._log(
                     "rotation_found_by_content",
@@ -2096,12 +2170,37 @@ class Orchestrator:
                 )
                 new_url = found
             else:
-                detail = (
-                    "it is still the project page and no chat in the project "
-                    "carries this request"
-                    if new_url.rstrip("/") == project_url.rstrip("/")
-                    else f"{new_url!r} is not under {project_url!r}"
-                )
+                # Name the address ACTUALLY OBSERVED. A generic "timed out"
+                # sends the next operator hunting a browser fault; the
+                # placeholder shape says plainly that the chat was never
+                # primed, and a foreign `/c/<id>` says plainly that it opened
+                # somewhere else.
+                if new_url.rstrip("/") == project_url.rstrip("/"):
+                    detail = "it is still the project page"
+                elif _is_placeholder_conversation(new_url):
+                    # Says what was SEEN and nothing more. "so the chat never
+                    # took the message" would be an absence claim nothing here
+                    # established — the 2026-08-03 failure was a chat that held
+                    # the request while its address lagged — and a park that
+                    # implies absence steers an operator to `--resubmit`.
+                    # A fragment, like the other two branches, so the clause
+                    # appended below joins it as one sentence instead of running
+                    # two together across a full stop.
+                    detail = (
+                        f"the address never became a project conversation — it was "
+                        f"still the pre-persistence placeholder {new_url!r} when the "
+                        f"wait expired (a chat opened from a project shows one until "
+                        f"its first message lands)"
+                    )
+                else:
+                    detail = f"{new_url!r} is not under {project_url!r}"
+                if searched:
+                    # Only claimable because the search RAN and came back empty.
+                    # A provider without the capability, or a search that raised,
+                    # read no history at all, and a park that says "no chat
+                    # carries this" on the strength of a read nobody performed is
+                    # manufactured evidence.
+                    detail += " and no chat in the project carries this request"
                 raise BrowserError(
                     f"the replacement chat is not inside the configured project: {detail}"
                 )
