@@ -1371,9 +1371,8 @@ def test_security_and_environment_codes_all_have_a_precondition():
     in the mapping when first written, despite all being loop_fatal parks
     whose condition text can never fix). This list is intentionally
     CURATED, not derived from `_emitted_blocker_codes()` — most parks (every
-    task_fatal one, `ask_user`, etc.) correctly DO resolve on operator text,
-    so a fully exhaustive reverse mapping would be wrong, not just
-    redundant."""
+    task_fatal one, etc.) correctly DO resolve on operator text, so a fully
+    exhaustive reverse mapping would be wrong, not just redundant."""
     from autoloop.cli import _RESOLUTION_PRECONDITIONS
 
     security_and_environment_codes = {

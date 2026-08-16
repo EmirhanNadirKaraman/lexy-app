@@ -1415,7 +1415,7 @@ choice above) and asserts every `_RESOLUTION_PRECONDITIONS` key is one of
 them. The reverse (a real, security-shaped code that has NO
 `_RESOLUTION_PRECONDITIONS` entry at all) is intentionally NOT asserted by
 that same AST walk — most emitted codes correctly resolve by answer text
-alone (`ask_user`, every ordinary `task_fatal`), so a fully exhaustive
+alone (every ordinary `task_fatal`), so a fully exhaustive
 reverse mapping would be wrong, not just redundant, and the walk has no way
 to tell "should have a precondition" from "correctly doesn't."
 
@@ -2705,7 +2705,8 @@ writes land in the change manifest.
 
 **Review cycle**: ChatGPT may `revise` (task_id "audit"), `plan`, `commit` /
 `commit_and_push` the approved Markdown paths (all integrity checks apply),
-`push`, `ask_user`, or `stop`. `implement` is rejected in this phase.
+`push`, or `stop`. `implement` is rejected in this phase, and so is
+`ask_user` — retired, see §9c.
 
 ---
 
@@ -2863,7 +2864,7 @@ python -m autoloop run --kickoff-audit
 `--kickoff-audit` opens the session by offering ChatGPT the audit; on its
 `audit` reply the executor runs (agents take minutes), the commit happens
 automatically (§2/§4b), the review packet goes back for review, and the loop
-continues until `stop`/`ask_user`/budget.
+continues until `stop`/budget/a park.
 
 Ongoing control: `status`, `tasks`, `next-task`, `pause`/`resume`,
 `run --answer "..."`, `run --retry`, `run --resubmit` (§5b), `reset --yes`,
@@ -2955,10 +2956,14 @@ could have kept going. Every park is now classified with a `kind`:
 * **`loop_fatal`** — the problem is about the ENVIRONMENT or the operator:
   browser/login failures, response timeouts, submission ambiguity,
   publisher URL drift, a protected-branch refusal / `allow_push` disabled,
-  a policy-denial or parse/iteration budget exhausted, ChatGPT's own
-  `ask_user` (literally a question for a human), or anything not
+  a policy-denial or parse/iteration budget exhausted, or anything not
   confidently classifiable. The whole loop stops, exactly as every park did
-  before this split existed.
+  before this split existed. **`ask_user` is no longer among these causes:**
+  it is retired, and a legacy one is denied
+  (`legacy_ask_user_retired`) and corrected like any other policy denial, so
+  the only park it can still reach is the exhausted-denial-budget one above —
+  reached by a reviewer that keeps re-answering it, not by the question
+  itself.
 * **The default is `loop_fatal`.** `orchestrator._to_needs_user(question,
   ..., kind="loop_fatal", code="unclassified")` — an unclassified or newly
   added park site fails closed: it stops the loop rather than silently

@@ -32,6 +32,7 @@ from .contract import (
     AUDIT_TASK_ID,
     COMMIT_DECISIONS,
     PUSH_DECISIONS,
+    RETIRED_DECISIONS,
     TASK_DECISIONS,
     Decision,
     Directive,
@@ -52,6 +53,53 @@ class Verdict:
     @classmethod
     def deny(cls, code: str, reason: str) -> "Verdict":
         return cls(False, code, reason)
+
+
+#: The denial a RETIRED decision draws, keyed by decision: one (code, reason)
+#: per retirement, and the ONLY place either string is written.
+#:
+#: Two catch sites refuse a retired decision — `authorize_directive` (the
+#: policy gate every directive passes through) and `orchestrator._dispatch`'s
+#: retired branch (defense in depth for a directive that reached dispatch by
+#: some path that skipped the gate). They used to carry their own copy of the
+#: text, identical apart from one semicolon, which is exactly the shape that
+#: drifts: the guidance a reviewer is given for the same refusal must not
+#: depend on which site caught it.
+#:
+#: Codes are spelled out as literals rather than built from `decision.value`,
+#: because `legacy_ask_user_retired` appears in logs, blocker records and
+#: docs, and a code that only exists as an f-string result cannot be grepped
+#: back to the place that emits it. The one exception is the generated code in
+#: `retired_decision_verdict`'s fallback below, which is why a test asserts
+#: this table covers every retired decision — that keeps the generated form
+#: unemitted rather than merely unlikely.
+_RETIRED_DENIALS: dict[Decision, tuple[str, str]] = {
+    Decision.ASK_USER: (
+        "legacy_ask_user_retired",
+        "`ask_user` is retired — this loop does not pause for a human "
+        "operator. Choose a different course of action, or reply `stop` "
+        "with the reason describing what a human needs to decide.",
+    ),
+}
+
+
+def retired_decision_verdict(decision: Decision) -> Verdict:
+    """The single denial a retired decision draws, wherever it is caught.
+
+    A decision retired without a `_RETIRED_DENIALS` entry still gets denied —
+    fail-closed, with a generic reason — rather than raising KeyError and
+    taking the loop down over a missing table row. The table is kept complete
+    by test, not by this fallback.
+    """
+    code, reason = _RETIRED_DENIALS.get(
+        decision,
+        (
+            f"legacy_{decision.value}_retired",
+            f"`{decision.value}` is retired and is no longer available. Choose "
+            "a different course of action, or reply `stop` with the reason.",
+        ),
+    )
+    return Verdict.deny(code, reason)
 
 
 @dataclass(frozen=True)
@@ -283,7 +331,8 @@ class PolicyEngine:
         blocked and not already completed — deterministic graph state, never
         ChatGPT's claim about it.
 
-        `ask_user` is refused here unconditionally — see the check below.
+        A RETIRED decision (`ask_user` today) is refused here
+        unconditionally — see the check below.
         """
         decision = directive.decision
         # Retired at runtime, and deliberately ahead of every configurable
@@ -296,14 +345,15 @@ class PolicyEngine:
         # `ask_user` reply into the budget-capped corrective-reprompt path
         # below, rather than into a contract violation that says nothing
         # about why the decision is unavailable.
-        if decision is Decision.ASK_USER:
-            return Verdict.deny(
-                "legacy_ask_user_retired",
-                "`ask_user` is retired — this loop does not pause for a human "
-                "operator. Choose a different course of action, or reply "
-                "`stop` with the reason describing what a human needs to "
-                "decide.",
-            )
+        #
+        # Membership in `RETIRED_DECISIONS` rather than an `is Decision.
+        # ASK_USER` identity test: the set is derived in `contract.py` and is
+        # what the parser, the instructions and this gate all read, so a later
+        # retirement is refused here the moment it joins the set instead of
+        # falling through to whichever branch its decision type happens to
+        # match.
+        if decision in RETIRED_DECISIONS:
+            return retired_decision_verdict(decision)
         if decision in TASK_DECISIONS:
             if directive.task_id == AUDIT_TASK_ID:
                 # The audit pseudo-task: revise re-runs the audit with
