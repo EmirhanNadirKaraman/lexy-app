@@ -6,9 +6,12 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 import subprocess
+import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -199,13 +202,20 @@ def test_stat_tile_values_use_proportional_figures():
     assert "tabular-nums" in code_rule
 
 
-# ---- priority editing (the one write path) -----------------------------------
+# ---- priority editing (applied immediately, never queued) --------------------
+#
+# Setting a priority used to write a request into the inbox, which the loop
+# applied whenever it next drained between steps. The page kept re-rendering
+# from `tasks.json` in the meantime, so a save that worked looked exactly like
+# one that did not and the operator resubmitted (two such requests sat in the
+# inbox on 2026-08-05). It is now written straight to `tasks.json` and read
+# back. Creation is still queued — that one carries authorization.
 
 
-def test_the_post_endpoint_writes_only_to_the_inbox(tmp_path, monkeypatch):
-    """The write path must not touch the repo or the state dir. A write into
-    `.autoloop/` mid-run would trip the escape detector and park the loop
-    loop-fatal, which is the whole reason the inbox lives outside the checkout."""
+def test_a_queued_priority_request_is_still_drained(tmp_path, monkeypatch):
+    """The inbox `priority` kind did not go away: a request written into that
+    directory by hand is still the loop's to apply. Only the dashboard stopped
+    queueing them."""
     import autoloop.dashboard as dash
     from autoloop.inbox import TaskInbox
 
@@ -215,11 +225,225 @@ def test_the_post_endpoint_writes_only_to_the_inbox(tmp_path, monkeypatch):
 
     before = snapshot(repo)
     TaskInbox(dash._inbox_dir(repo)).submit_priority("rt-01", 3)
-    assert snapshot(repo) == before, "the checkout must be untouched"
+    assert snapshot(repo) == before, "queueing must still touch nothing observed"
 
     specs, problems = TaskInbox(inbox_dir).drain()
     assert problems == []
     assert specs == [{"kind": "priority", "id": "rt-01", "priority": 3}]
+
+
+def write_tasks(repo, tasks):
+    """A registry file where `collect` and `/api/priority` both look for it."""
+    import autoloop.dashboard as dash
+
+    path = dash._tasks_file(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema_version": 1, "tasks": tasks}), encoding="utf-8")
+    return path
+
+
+def a_task(task_id, **over):
+    row = {"id": task_id, "title": task_id.upper(), "description": "d",
+           "status": "pending", "priority": 100, "depends_on": [],
+           "approved_paths": ["autoloop/dashboard.py"]}
+    row.update(over)
+    return row
+
+
+@contextlib.contextmanager
+def serving_with_store(tmp_path, repo, monkeypatch):
+    """The dashboard served for real, with BOTH operator paths pointed outside
+    the checkout: the inbox directory and the mutation ledger."""
+    import autoloop.dashboard as dash
+    from autoloop.tasks import TaskStore
+
+    outside = tmp_path / "outside"
+    monkeypatch.setattr(
+        dash, "_task_store",
+        lambda r: TaskStore(dash._tasks_file(r), ledger=outside / "task-mutations.jsonl"),
+    )
+    with serving(repo, outside / "inbox", monkeypatch) as base:
+        yield base
+
+
+def test_a_priority_edit_is_applied_and_read_back_immediately(tmp_path, monkeypatch):
+    """Not queued: the file has the new value the moment the POST returns, and
+    the number in the response came from re-reading that file rather than from
+    the request body."""
+    repo = make_repo(tmp_path)
+    tasks_file = write_tasks(repo, [a_task("dash-03", priority=3)])
+
+    with serving_with_store(tmp_path, repo, monkeypatch) as base:
+        status, body = post(base, "/api/priority", {"id": "dash-03", "priority": 2})
+
+    assert status == 200, body
+    assert body["priority"] == 2 and body["applied"] is True
+    stored = json.loads(tasks_file.read_text(encoding="utf-8"))
+    assert stored["tasks"][0]["priority"] == 2
+    # And a fresh read of the page shows it, which is what the operator was
+    # watching snap back before.
+    assert collect(repo)["roadmap"][0]["priority"] == 2
+
+
+def test_a_priority_edit_changes_nothing_but_the_priority(tmp_path, monkeypatch):
+    """The read-only posture is intact except for this ONE field. `status` is
+    what the loop dispatches on, `approved_paths` is authorization, `depends_on`
+    reorders the graph — and none of `state.json`, the execution records or the
+    blockers may be touched at all."""
+    repo = make_repo(tmp_path)
+    state = repo / ".autoloop"
+    (state / "state.json").write_text(json.dumps({"phase": "executing"}), encoding="utf-8")
+    (state / "blockers").mkdir()
+    (state / "blockers" / "blk-1.json").write_text(json.dumps({"id": "blk-1"}), encoding="utf-8")
+    (state / "executions").mkdir()
+    (state / "executions" / "dash-03.json").write_text(
+        json.dumps({"task_id": "dash-03"}), encoding="utf-8")
+    tasks_file = write_tasks(repo, [
+        a_task("dash-03", priority=3, depends_on=[], status="pending"),
+    ])
+    before_rows = json.loads(tasks_file.read_text(encoding="utf-8"))["tasks"]
+    untouched = {p: p.stat().st_mtime_ns for p in repo.rglob("*")
+                 if p.is_file() and p != tasks_file}
+
+    with serving_with_store(tmp_path, repo, monkeypatch) as base:
+        status, body = post(base, "/api/priority", {"id": "dash-03", "priority": 1})
+
+    assert status == 200, body
+    after_rows = json.loads(tasks_file.read_text(encoding="utf-8"))["tasks"]
+    assert after_rows[0]["priority"] == 1
+    assert after_rows[0]["status"] == "pending"
+    assert after_rows[0]["approved_paths"] == ["autoloop/dashboard.py"]
+    assert after_rows[0]["depends_on"] == []
+    for before_row, after_row in zip(before_rows, after_rows):
+        assert {k: v for k, v in before_row.items() if k != "priority"}.items() <= \
+               {k: v for k, v in after_row.items() if k != "priority"}.items()
+    # The only NEW file inside the checkout is the (always empty) mutex file.
+    now = {p: p.stat().st_mtime_ns for p in repo.rglob("*")
+           if p.is_file() and p != tasks_file}
+    appeared = set(now) - set(untouched)
+    assert {p.name for p in appeared} <= {"tasks.json.lock"}
+    assert all(p.read_bytes() == b"" for p in appeared)
+    assert {p: v for p, v in now.items() if p not in appeared} == untouched
+
+
+def test_a_priority_edit_refuses_a_field_it_must_never_apply(tmp_path, monkeypatch):
+    """Refused, not silently dropped. The queued route was gated by
+    `inbox.check_request_shape`; applying directly must not become the lax door
+    into the same field set."""
+    repo = make_repo(tmp_path)
+    tasks_file = write_tasks(repo, [a_task("dash-03", priority=3)])
+
+    with serving_with_store(tmp_path, repo, monkeypatch) as base:
+        status, body = post(base, "/api/priority", {
+            "id": "dash-03", "priority": 1,
+            "approved_paths": ["lexy-app/backend/routers/books.py"],
+        })
+
+    assert status == 400
+    assert "approved_paths" in body["error"]
+    stored = json.loads(tasks_file.read_text(encoding="utf-8"))
+    assert stored["tasks"][0]["priority"] == 3, "a refused edit changes nothing"
+
+
+def test_a_failed_priority_edit_reports_the_reason(tmp_path, monkeypatch):
+    """A row that snaps back with nothing said is the bug this endpoint exists
+    to fix, so a refusal has to arrive as a refusal — in the registry's own
+    words."""
+    repo = make_repo(tmp_path)
+    write_tasks(repo, [a_task("dash-03", priority=3)])
+
+    with serving_with_store(tmp_path, repo, monkeypatch) as base:
+        unknown_status, unknown_body = post(base, "/api/priority",
+                                            {"id": "nope", "priority": 1})
+        bad_status, bad_body = post(base, "/api/priority",
+                                    {"id": "dash-03", "priority": "high"})
+
+    assert unknown_status == 400 and "nope" in unknown_body["error"]
+    assert bad_status == 400 and bad_body["error"]
+
+
+def test_a_priority_edit_will_not_create_the_registry(tmp_path, monkeypatch):
+    """`collect` falls back to the tracked seed for DISPLAY when there is no
+    `tasks.json`. Writing one from a priority form would be a brand-new write
+    path — the loop creates the registry, on its first task-graph change."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    tasks_file = dash._tasks_file(repo)
+    assert not tasks_file.exists()
+
+    with serving_with_store(tmp_path, repo, monkeypatch) as base:
+        status, body = post(base, "/api/priority", {"id": "rt-01", "priority": 1})
+
+    assert status == 500, body
+    assert not tasks_file.exists(), "a refused edit must not create the registry"
+
+
+#: A real process holding the RUN-level lock the way a live `run --continuous`
+#: does: for its whole run, letting go only when told. Spelled out here rather
+#: than imported from `test_tasks.py` — `autoloop/tests/` is not a package, so
+#: one test module cannot import another by path in every runner.
+_LOOP_LOCK_HOLDER = """
+import sys, time
+from pathlib import Path
+from autoloop.lock import LoopLock
+
+state_dir, held_flag, release_flag = sys.argv[1:4]
+lock = LoopLock(Path(state_dir)).acquire()
+Path(held_flag).write_text("held")
+while not Path(release_flag).exists():
+    time.sleep(0.02)
+lock.release()
+"""
+
+
+def test_a_priority_edit_lands_while_the_loop_lock_is_held(tmp_path, monkeypatch):
+    """The case the whole design is for. `LoopLock` is held for the ENTIRE run
+    — that is why `answer` and `release` refuse while the loop is up — so an
+    edit that waited for it would be waiting for the loop to stop. Driven over
+    the real socket, against a lock a REAL other process owns, with the wall
+    clock asserted: "does not block" has to be measured, not implied."""
+    import autoloop
+    from autoloop.errors import LockHeldError
+    from autoloop.lock import LoopLock
+
+    repo = make_repo(tmp_path)
+    tasks_file = write_tasks(repo, [a_task("dash-03", priority=3)])
+    state_dir = repo / ".autoloop"
+    held, release = tmp_path / "held", tmp_path / "release"
+    package_root = Path(autoloop.__file__).resolve().parent.parent
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", _LOOP_LOCK_HOLDER, str(state_dir), str(held), str(release)],
+        env={**os.environ, "PYTHONPATH": str(package_root)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not held.exists() and time.monotonic() < deadline:
+            assert child.poll() is None, child.communicate()
+            time.sleep(0.02)
+        assert held.exists(), "the child never took the lock"
+        with pytest.raises(LockHeldError):
+            LoopLock(state_dir).acquire()  # genuinely held, not merely a file
+        with serving_with_store(tmp_path, repo, monkeypatch) as base:
+            started = time.monotonic()
+            status, body = post(base, "/api/priority", {"id": "dash-03", "priority": 1})
+            elapsed = time.monotonic() - started
+    finally:
+        # Reaped, never ASSERTED here: an assertion inside `finally` would
+        # replace a real failure from the body with a subprocess one.
+        release.write_text("go")
+        try:
+            code = child.wait(timeout=30)
+        except subprocess.TimeoutExpired:  # pragma: no cover - a wedged child
+            child.kill()
+            code = child.wait(timeout=30)
+
+    assert code == 0, "the lock holder failed"
+    assert status == 200, body
+    assert elapsed < 5.0, f"the edit waited {elapsed:.1f}s on a lock it must not take"
+    assert json.loads(tasks_file.read_text(encoding="utf-8"))["tasks"][0]["priority"] == 1
 
 
 def test_a_priority_request_cannot_change_authorization():

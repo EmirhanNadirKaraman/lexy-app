@@ -1304,7 +1304,49 @@ entry planted in the same window that deletes its source); and any symlink or
 directory appearing at a cache path.
 Deliberately NOT covered: `.so`/`.pyd`, which are authored build outputs.
 The same rule reaches the validation mutation guard below, since that
-delegates to `diff_snapshots`. Residual, recorded in `docs/SECURITY.md` S24
+delegates to `diff_snapshots`.
+
+*The second exemption, added 2026-08-16 (dash-04), and why it is not a path
+exclusion either.* `diff_snapshots` now takes an optional
+`exempt(path, prior, current)` predicate. **Nothing in `escape_detector.py`
+decides what it covers** — the module still knows no special paths of its own,
+and a caller that passes nothing gets exactly the behaviour described above,
+loop-fatal park for any write to `tasks.json` included. The one production
+caller is `Orchestrator._operator_priority_exemption`, which exists because an
+operator now re-prioritises a task by writing `.autoloop/tasks.json`
+immediately (§4f-ter): that is the field an operator steers the queue with, so
+a routine priority edit that parked the loop would make steering it a way to
+stop it — the same shape of false loop-fatal the bytecode exemption above
+removes. The predicate is not "this path is fine". It silences a change only
+when BOTH hold: the COMPLETED mutation records in `~/.autoloop/task-mutations.
+jsonl` — a ledger beside `workers_root`, OUTSIDE the checkout, so a write inside
+the checkout cannot produce one — form one unbroken chain, for THIS task file
+and since the watermark captured before the agent started, that leaves the
+digest the snapshot saw BEFORE and TERMINATES at the digest it saw AFTER; and
+the two file states differ in nothing but
+`priority` values, read from the bytes rather than taken from any record's own
+claim (`tasks.priority_only_change`).
+
+*Why a chain and not reachability* (tightened 2026-08-16 after review). The
+first version asked only whether the after-digest was REACHABLE from the
+before-digest across the whole ledger, and that is a weaker claim than "this is
+what happened". Two ways it was weaker, both now closed: a legitimate round trip
+(priority 3 → 2 → 3) left the intermediate digest reachable forever, so an agent
+that later wrote that exact state was exempted for a change no operator made;
+and a record written BEFORE the file write meant an announced-then-failed write
+left an edge to a state that never existed on disk. Records therefore carry a
+`phase`, and only `complete` — appended after the bytes land — is an edge; the
+`intent` written first still exists, because it is what makes a ledger that
+cannot be appended to leave the task file untouched. A creation, a deletion, a shape change or
+an executable-bit change at that path is never exempt. So an agent editing that
+file to widen its own `approved_paths` still parks the loop, which is the
+property finding #3 below rests on, and so does an agent that merely writes a
+priority there directly. The mutex file the write takes (`tasks.json.lock`) is
+pre-created before the "before" snapshot and never written to, so it is
+byte-identical on both sides and needs no exemption at all. Residuals are
+recorded in `docs/SECURITY.md` S32 rather than argued away: nothing signs a
+ledger record, and the transient `tasks.json.tmp` of an atomic replace can in
+principle be caught mid-write by the "after" enumeration. Residual, recorded in `docs/SECURITY.md` S24
 rather than argued away: a forged cache entry whose `(mtime, size)` or
 PEP 552 header matches its source would be loaded by the interpreter and is
 not reported — header verification costs an attacker one `os.stat` to
@@ -1719,6 +1761,14 @@ something. Two independent reasons, both real:
    saves it on task-graph changes, so an external edit can be overwritten by
    the next save. The single-instance lock exists to prevent exactly this.
 
+Both are still true, and neither was relaxed to get the one immediate write
+that exists today (a task's `priority` — see *Editing priorities from the
+tracker* below). The first is answered by an attestation outside the checkout
+plus a check of what actually changed, never by excluding a path; the second by
+a fine-grained mutex both writers take, plus reconciliation on save. Everything
+else — creating a task above all, since a creation carries `approved_paths` —
+goes through the queue described here.
+
 `inbox.py` resolves both without weakening either. Requests go to a directory
 BESIDE `workers_root` — already required to be absolute and outside the
 checkout, its `.git`, the state dir and the publisher paths — so submission
@@ -1726,7 +1776,10 @@ touches nothing the detector watches and needs no lock. The loop drains it
 between steps (`run`, never inside one), validates through
 `TaskRegistry.add_many` — the same gate a ChatGPT `plan` goes through, so
 there is no second implementation to drift — and writes `tasks.json` itself.
-**The loop remains the only writer of the registry.**
+**The loop is the only writer of the registry, with one exception since
+2026-08-16: a task's `priority`, which the dashboard writes immediately.** That
+exception is bounded three ways (mutex, reconciliation, attestation) and is
+described in full under *Editing priorities from the tracker*.
 
     python -m autoloop add-task --id dash-02 --priority 1 \
         --title "..." --description "..." \
@@ -1752,24 +1805,88 @@ and a drift means the same request behaves differently depending on who applied
 it — the same reasoning as `tasks.effective_approved_paths`, and a test pins
 that both call sites use it.
 
-**Editing priorities from the tracker.** The dashboard's roadmap section shows
-each task's priority in a number input with a Save button. Saving POSTs to
-`/api/priority`, which writes a `kind: "priority"` request to the SAME inbox —
-the page's only write path, and it touches neither the repository nor the state
-dir, so the read-only property everything else in that file depends on is
-unchanged and a save is safe while an agent is running. The change is queued,
-not applied: the loop applies it on its next run, and the page says so rather
-than showing a value that is not yet true.
+**Editing priorities from the tracker — applied immediately (2026-08-16).** The
+dashboard's roadmap section shows each task's priority in a number input with a
+Save button. Saving POSTs to `/api/priority`, which writes `tasks.json` THERE
+AND THEN and answers with the value it read back out of the file.
 
-A priority request carries an id and a number, and nothing else — submitting
-one with `approved_paths` is refused. That is deliberate: priority decides what
-runs next, `approved_paths` decides what an agent may touch, and only the first
-belongs on a form. The endpoint has no authentication (the server binds
-127.0.0.1), so it requires an `X-Autoloop` header a cross-origin form post
-cannot set without a preflight this server never approves, and refuses a
-non-local `Origin`. Both are cheap mitigations against a local page in the same
-browser, not claimed to be more; the blast radius is bounded by what the
-endpoint can express.
+It used to queue a `kind: "priority"` request into the inbox like everything
+else, and that failed the operator in a specific way: the change only became
+true when the loop next drained between steps, the page kept re-rendering the
+old number from `tasks.json` meanwhile, so typing `2` into dash-03 and clicking
+Save looked *identical* whether the request had been accepted or dropped — the
+field simply snapped back to `3`. Two resubmissions of the same edit sat in
+`~/.autoloop/inbox` on 2026-08-05 for exactly that reason. An operator sets a
+priority to steer what the loop does next; one that lands minutes later has
+already missed the decision it was for.
+
+Three things make an immediate write safe, and none of them is "the dashboard
+is trusted":
+
+1. **A short-lived mutex, not `LoopLock`.** `LoopLock` is held for the WHOLE
+   run — that is why `answer` and `release` refuse while the loop is up — so
+   waiting for it would mean waiting for the loop to stop. `tasks.task_file_mutex`
+   is the opposite shape: one lock file per task file (`tasks.json.lock`), held
+   for the milliseconds of load/mutate/save. `os.replace` already made a save
+   atomic; what it cannot do is make the read-modify-write around it atomic,
+   and that is where updates went missing. **Both writers take it** — the
+   dashboard's `TaskStore.apply_priority` and every `TaskStore.save`/`archive`
+   in the loop. A mutex only one side respects is not a mutex.
+2. **Stale-memory reconciliation.** A running loop holds its registry in memory
+   for a whole round, so an edit landing mid-round is on disk and not in that
+   object; the next ordinary save (a completion, a park) would write the old
+   number back. `TaskStore.save` therefore adopts the on-disk `priority` for
+   every task the caller has not itself re-prioritised. A drained inbox
+   `priority` request IS such a deliberate change and takes precedence
+   (`TaskRegistry.priority_overrides`), which is the same last-write-wins rule
+   `apply_requests` already documents.
+3. **An attestation the escape detector can check.** `.autoloop/tasks.json` is
+   inside the tree snapshotted around every write-capable agent call, and that
+   coverage stays (point 1 at the top of this section). Each immediate write is
+   recorded in `~/.autoloop/task-mutations.jsonl` — beside `workers_root`,
+   outside the checkout, where the inbox and the PAUSE flag already live — as a
+   `before -> after` content-digest hop, in two phases: an `intent` before the
+   write and a `complete` after it. The loop's exemption
+   (`orchestrator._operator_priority_exemption`) silences a change to that file
+   only when the `complete` records for that exact task file, written since the
+   watermark it captured before the agent started, form one unbroken chain
+   leaving the digest it saw before and TERMINATING at the digest it saw after,
+   AND the two file states differ in nothing but `priority`
+   values, read from the bytes rather than taken from the record's claim. An
+   agent writing that file — to widen `approved_paths`, flip a `status`, or
+   even just to set a priority without going through `apply_priority` — still
+   parks the loop LOOP-FATAL, and so does one that reproduces a state some
+   earlier legitimate edit passed through or merely announced. The lock file
+   needs no exemption at all: it is created before the "before" snapshot and
+   never written to, so it is byte-identical on both sides.
+
+   *Why two phases and a terminal state.* Both come from the same weakness: a
+   reachability question ("could the file have got here?") is not the question
+   the detector needs answered ("is this what happened?"). A round trip
+   (3 → 2 → 3) leaves the intermediate digest reachable forever, and a record
+   written before the file write leaves an edge even when that write FAILED. So
+   only a `complete` record is an edge, and the observed after-state has to be
+   where the window's chain ENDED, not somewhere it passed through. The `intent`
+   is still written first, and is load-bearing for a different reason: it is why
+   a ledger that cannot be appended to leaves the task file untouched instead of
+   producing a change nothing can attest.
+
+Nothing else about the endpoint widened. It still carries an id and a number
+and nothing else — a request naming `approved_paths` is refused
+(`dashboard.PRIORITY_REQUEST_FIELDS`) — it cannot create the registry, add or
+remove a task, or reach `status`/`approved_paths`/`depends_on`, and the page
+still writes no `state.json`, execution record or blocker. Creation stays
+queued through the inbox, because a new task carries authorization and the
+loop merging it is the review step. The endpoint has no authentication (the
+server binds 127.0.0.1), so it requires an `X-Autoloop` header a cross-origin
+form post cannot set without a preflight this server never approves, and
+refuses a non-local `Origin`. Both are cheap mitigations against a local page
+in the same browser, not claimed to be more; the blast radius is bounded by
+what the endpoint can express. Recorded as `docs/SECURITY.md` S32.
+
+`kind: "priority"` remains in the inbox vocabulary: a request written into that
+directory by hand is still drained and applied. Only the dashboard stopped
+queueing them.
 
 **Mutating an existing task (2026-08-16).** The vocabulary was `task` (create)
 and `priority`. It is now `task` plus six mutation kinds — `priority`,

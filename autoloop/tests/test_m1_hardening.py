@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -47,7 +48,14 @@ from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import MAX_TASK_ATTEMPTS, Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import LoopState, Phase, StateStore
-from autoloop.tasks import Task, TaskRegistry, TaskStore, effective_approved_paths
+from autoloop.tasks import (
+    MutationLedger,
+    Task,
+    TaskRegistry,
+    TaskStore,
+    effective_approved_paths,
+    mutation_ledger_for,
+)
 from autoloop.transcript import TranscriptLogger
 from autoloop.worker_env import WorkerRepoManager, validate_workers_root
 from autoloop.worktask import IntentStore, TaskExecutionStore
@@ -823,7 +831,13 @@ def _build_worker_repos_orchestrator(tmp_path, executor_factory, approved_paths=
     store.save(state)
     task = Task(id=task_id, title="T", description="d", approved_paths=tuple(approved_paths))
     registry = TaskRegistry([task])
-    task_store = TaskStore(config.tasks_file)
+    # Wired exactly as `cli._load_tasks` wires a real run: the ledger that
+    # attests an operator's immediate priority edit lives beside
+    # `workers_root`, outside the checkout the detector snapshots.
+    task_store = TaskStore(
+        config.tasks_file,
+        ledger=mutation_ledger_for(config.workers_root, config.state_dir),
+    )
     task_store.save(registry)
 
     executor = executor_factory(workers_root, repo_root)
@@ -1008,6 +1022,281 @@ def test_bytecode_written_into_the_primary_checkout_is_not_an_escape(tmp_path):
     # what it is about.
     assert executor.calls == 1
     assert (pkg / "__pycache__" / "mod.cpython-312.pyc").read_bytes() != stale
+
+
+# ---- an operator priority edit is not an agent escape ------------------------
+#
+# `.autoloop/tasks.json` is inside the snapshotted tree, and that coverage must
+# NOT be dropped: the file holds `approved_paths`, so an agent able to edit it
+# undetected could widen its own authorization (finding #2). But an operator
+# steering the queue with a priority now writes that same file immediately, and
+# a routine priority edit that parked the loop loop-fatal would make steering
+# the loop a way to stop it.
+#
+# So the exemption asks two independent questions — WHO (a ledger outside the
+# checkout, which a write inside it cannot produce) and WHAT (the bytes differ
+# in nothing but `priority`) — and the pair below is the positive and the
+# negative control for exactly that.
+
+
+def _operator_priority_edit(repo_root, workers_root, task_id, priority):
+    """What the dashboard does, from outside the loop: a fresh `TaskStore` on
+    the same file, with the same ledger, applying one priority."""
+    store = TaskStore(
+        repo_root / ".al" / "tasks.json",
+        ledger=mutation_ledger_for(workers_root, repo_root / ".al"),
+    )
+    store.apply_priority(task_id, priority)
+
+
+def test_an_operator_priority_edit_during_the_window_is_not_an_escape(tmp_path):
+    """The regression this whole change turns on: an operator re-prioritises a
+    task WHILE a write-capable agent is running, and the round finishes
+    normally. Before the exemption this parked loop-fatal, cost the in-flight
+    round and needed a `reset --yes` — i.e. the feature meant to steer the loop
+    could stop it."""
+    workers_root = tmp_path / "workers_root"
+
+    def tamper(repo_root):
+        # Not the agent: a separate operator write landing mid-round, through
+        # the same `TaskStore` the dashboard uses.
+        _operator_priority_edit(repo_root, workers_root, "t1", 1)
+
+    orch, repo_root, _store, task, executor = _build_worker_repos_orchestrator(
+        tmp_path, lambda wr, rr: _TamperingExecutor(wr, rr, tamper)
+    )
+
+    orch._dispatch_executor(implement(task.id))
+
+    assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
+    assert "escape" not in (orch.state.question or "").lower()
+    assert executor.calls == 1  # not vacuous: the round really ran
+    # The edit is real, persisted, and adopted into the registry this process
+    # holds — so THIS round's ordering already follows the operator.
+    stored = TaskStore(repo_root / ".al" / "tasks.json").load()
+    assert stored.get("t1").priority == 1
+    assert orch._registry.get("t1").priority == 1
+
+
+def test_an_unattested_edit_of_the_task_file_is_still_an_escape(tmp_path):
+    """The negative control, and the one that keeps the exemption honest: the
+    same FIELD, the same file, the same window — but written directly into the
+    checkout instead of through `TaskStore.apply_priority`, so nothing outside
+    the checkout attests it. An agent has exactly that shape."""
+    def tamper(repo_root):
+        path = repo_root / ".al" / "tasks.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["tasks"][0]["priority"] = 1
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    orch, repo_root, execution_store, task, executor = _build_worker_repos_orchestrator(
+        tmp_path, lambda wr, rr: _TamperingExecutor(wr, rr, tamper)
+    )
+
+    orch._dispatch_executor(implement(task.id))
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert "tasks.json" in (orch.state.question or "")
+    assert "content changed outside the worker repo" in (orch.state.question or "")
+
+
+def _direct_task_file_edit(repo_root, mutate):
+    """An agent writing `.autoloop/tasks.json` itself, from inside the checkout,
+    with the SAME serialisation `TaskStore._serialize` uses.
+
+    Byte-for-byte matters here: these tests turn on an agent producing exactly
+    the digest some legitimate edit produced or announced. A differently-spelled
+    file would be caught for the uninteresting reason that no record names its
+    digest at all."""
+    path = repo_root / ".al" / "tasks.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    mutate(data)
+    path.write_bytes(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+    return path
+
+
+def _set_priority_directly(repo_root, priority):
+    return _direct_task_file_edit(
+        repo_root, lambda data: data["tasks"][0].update(priority=priority)
+    )
+
+
+def test_a_forged_attestation_cannot_widen_authorization(tmp_path):
+    """The exemption's second half, on its own. Suppose an agent finds the
+    ledger and appends a COMPLETED record chaining its own before/after digests
+    — the "who" answer is then yes. It must still be caught, because the bytes
+    it wrote widened `approved_paths` rather than moving a priority, and that is
+    read from the file rather than taken from the record's own claim."""
+    workers_root = tmp_path / "workers_root"
+    forged: dict = {}
+
+    def tamper(repo_root):
+        import hashlib
+
+        before = hashlib.sha256(
+            (repo_root / ".al" / "tasks.json").read_bytes()
+        ).hexdigest()
+
+        def widen(data):
+            data["tasks"][0]["approved_paths"] = ["autoloop/", "lexy-app/"]
+
+        path = _direct_task_file_edit(repo_root, widen)
+        after = hashlib.sha256(path.read_bytes()).hexdigest()
+        ledger = MutationLedger(mutation_ledger_for(workers_root, repo_root / ".al"))
+        # A COMPLETE record, filed under the canonical path the store itself
+        # compares against — so the WHO half genuinely passes and the refusal
+        # can only be coming from the byte-level WHAT half.
+        ledger.record_complete(tasks_path=path, before=before, after=after, ids=("t1",))
+        forged.update(ledger=ledger, path=path, before=before, after=after)
+
+    orch, repo_root, _store, task, _executor = _build_worker_repos_orchestrator(
+        tmp_path, lambda wr, rr: _TamperingExecutor(wr, rr, tamper)
+    )
+
+    orch._dispatch_executor(implement(task.id))
+
+    # NOT VACUOUS, and this is the assertion that keeps it that way: the forged
+    # record really is an unbroken completed chain from the before-state to
+    # exactly the bytes now on disk. If a path-spelling or phase mismatch had
+    # rejected it earlier, the test would still park below — but for a reason
+    # that says nothing about `priority_only_change`.
+    assert forged["ledger"].completed_chain(
+        forged["before"], since=0, tasks_path=forged["path"]
+    ) == [forged["before"], forged["after"]]
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert "tasks.json" in (orch.state.question or "")
+
+
+def test_an_in_window_round_trip_does_not_authorize_a_direct_edit(tmp_path):
+    """Legitimate edits must not leave a reusable licence behind.
+
+    An operator moves a priority and then moves it back — two real, attested
+    edits, and the file ends exactly where it started. The intermediate state B
+    existed for a moment and is on record. An agent then writes B itself, from
+    inside the checkout.
+
+    Read as "is B REACHABLE from A through the ledger" the answer is yes, and
+    the escape goes unreported. Read as "what did the completed mutations in
+    this window actually do", the answer is A -> B -> A, whose terminal state is
+    A; the observed after-state is B, which is not that, so it is reported. This
+    is why the proof is a chain with a terminal state rather than a reachability
+    set."""
+    workers_root = tmp_path / "workers_root"
+
+    def tamper(repo_root):
+        _operator_priority_edit(repo_root, workers_root, "t1", 1)   # A -> B
+        _operator_priority_edit(repo_root, workers_root, "t1", 100)  # B -> A
+        _set_priority_directly(repo_root, 1)  # the agent reproduces B
+
+    orch, repo_root, _store, task, _executor = _build_worker_repos_orchestrator(
+        tmp_path, lambda wr, rr: _TamperingExecutor(wr, rr, tamper)
+    )
+
+    orch._dispatch_executor(implement(task.id))
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert "tasks.json" in (orch.state.question or "")
+    assert "content changed outside the worker repo" in (orch.state.question or "")
+
+
+class _FailingWriteStore(TaskStore):
+    """A store whose ledger works and whose task-file write does not — the shape
+    of a disk that fills between the two. Used to leave a real INTENT on record
+    for a write that never landed."""
+
+    def _write_bytes(self, data):
+        raise OSError("simulated task-file write failure")
+
+
+def test_an_intent_from_a_failed_write_does_not_authorize_a_direct_edit(tmp_path):
+    """An announcement is not an outcome.
+
+    `apply_priority` records its intent BEFORE it writes, so that a ledger it
+    cannot append to leaves the task file untouched. The cost of that ordering
+    is that a write which then FAILS leaves a record naming a state that never
+    existed on disk. If such a record were an edge, an agent could write exactly
+    that state and be exempted for a change no operator ever made — so only a
+    COMPLETE record, written after the bytes landed, is one."""
+    workers_root = tmp_path / "workers_root"
+
+    def tamper(repo_root):
+        store = _FailingWriteStore(
+            repo_root / ".al" / "tasks.json",
+            ledger=mutation_ledger_for(workers_root, repo_root / ".al"),
+        )
+        with pytest.raises(OSError):
+            store.apply_priority("t1", 1)
+        # The failed write is on record as an intent, and named this exact
+        # state. Nothing put it on disk — until the agent does.
+        _set_priority_directly(repo_root, 1)
+
+    orch, repo_root, _store, task, _executor = _build_worker_repos_orchestrator(
+        tmp_path, lambda wr, rr: _TamperingExecutor(wr, rr, tamper)
+    )
+
+    orch._dispatch_executor(implement(task.id))
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "loop_fatal"
+    assert "tasks.json" in (orch.state.question or "")
+    assert "content changed outside the worker repo" in (orch.state.question or "")
+
+
+def test_records_from_an_earlier_window_do_not_break_an_in_window_edit(tmp_path):
+    """The watermark, end to end, and the reason it is a correctness control
+    rather than only a tightening.
+
+    The ledger is append-only and never pruned, so by the second round it
+    already holds records from the first. Those describe hops between states the
+    file has since left. Judged without a watermark, the very first record's
+    `before` no longer matches the current baseline, the chain breaks, and a
+    perfectly ordinary operator edit is reported as an agent escape — the
+    feature meant to steer the loop stopping it, which is the failure this whole
+    exemption exists to prevent.
+
+    Delete the watermark (walk from record 0) and this test parks."""
+    workers_root = tmp_path / "workers_root"
+
+    def tamper(repo_root):
+        _operator_priority_edit(repo_root, workers_root, "t1", 2)  # inside the window
+
+    orch, repo_root, _store, task, executor = _build_worker_repos_orchestrator(
+        tmp_path, lambda wr, rr: _TamperingExecutor(wr, rr, tamper)
+    )
+    # An earlier round's edit, already on record before this window opens.
+    _operator_priority_edit(repo_root, workers_root, "t1", 5)
+
+    orch._dispatch_executor(implement(task.id))
+
+    assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
+    assert "escape" not in (orch.state.question or "").lower()
+    assert executor.calls == 1  # not vacuous: the round really ran
+    assert TaskStore(repo_root / ".al" / "tasks.json").load().get("t1").priority == 2
+
+
+def test_the_task_file_mutex_is_not_reported_as_a_created_path(tmp_path):
+    """The mutex file lives in the state dir, inside the snapshotted tree. It is
+    pre-created before the "before" snapshot and never written to, so it is
+    byte-identical on both sides and the detector has nothing to report — which
+    is why it needs no exemption of its own."""
+    workers_root = tmp_path / "workers_root"
+
+    def tamper(repo_root):
+        _operator_priority_edit(repo_root, workers_root, "t1", 4)
+
+    orch, repo_root, _store, task, _executor = _build_worker_repos_orchestrator(
+        tmp_path, lambda wr, rr: _TamperingExecutor(wr, rr, tamper)
+    )
+
+    orch._dispatch_executor(implement(task.id))
+
+    lock_file = repo_root / ".al" / "tasks.json.lock"
+    assert lock_file.exists() and lock_file.read_bytes() == b""
+    assert "tasks.json.lock" not in (orch.state.question or "")
 
 
 def test_audit_dispatch_is_not_wrapped_by_the_escape_detector(tmp_path, monkeypatch):

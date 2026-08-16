@@ -104,6 +104,26 @@ exemption exists to stop. The residual is the same shape as, and strictly
 smaller than, the `.git/hooks/` gap below — both need the OS-level sandbox
 S24 tracks, not a wider snapshot.
 
+THE SECOND EXEMPTION IS NOT IN THIS MODULE, AND THAT IS THE DESIGN.
+`diff_snapshots` takes an optional `exempt(path, prior, current)` predicate
+(2026-08-16). Nothing here decides which path it covers or what it proves;
+the caller supplies it, and the only caller that supplies one is
+`orchestrator._operator_priority_exemption`, for `.autoloop/tasks.json`
+changing because an operator re-prioritised a task from the dashboard
+mid-round. Priority is the one field an operator must be able to change
+while a round is in flight — it steers what runs next, and a value that
+lands minutes later has missed the decision it was for — and it is safe to
+change mid-flight precisely because nothing already dispatched depends on
+it. The predicate proves BOTH halves before it silences anything: WHO (the
+COMPLETED mutations recorded in this window, in a ledger beside `workers_root`
+outside the checkout, chaining from the before-state to exactly the observed
+after-state — a write inside the checkout cannot produce one) and WHAT (the
+two file states differ only in `priority` values, read from the bytes rather
+than taken from the record's own claim). So an agent editing that file — to
+widen its own `approved_paths`, flip a status, or even just to change a
+priority without going through `TaskStore.apply_priority` — is still
+reported, loop-fatal, exactly as before. See `tasks.MutationLedger`.
+
 SCOPE: the checkout's WORKING TREE, not `.git/` internals. "Tracked,
 untracked and ignored" is exactly the three categories `git status`
 enumerates over the working tree; a write into `.git/hooks/`, `.git/config`,
@@ -356,14 +376,43 @@ def snapshot_checkout(repo_root: Path, paths: list[str]) -> CheckoutSnapshot:
     return snapshot
 
 
-def diff_snapshots(before: CheckoutSnapshot, after: CheckoutSnapshot) -> list[str]:
+def diff_snapshots(
+    before: CheckoutSnapshot,
+    after: CheckoutSnapshot,
+    exempt=None,
+) -> list[str]:
     """Human-readable violations: creation, deletion, content change,
     symlink-target change, or executable-bit change for any path. PATHS
     ONLY — content is never included, so this is safe to put in a blocker
     record or an operator-facing message even if the changed file held a
     secret.
 
-    Exactly one class of path is silent: a CPython bytecode cache entry
+    `exempt(path, prior, current) -> bool` is an OPTIONAL second silence,
+    injected by the caller rather than hard-coded here, and it exists for
+    exactly one thing today: `.autoloop/tasks.json` changing because an
+    operator re-prioritised a task from the dashboard while an agent was
+    running (`orchestrator._operator_priority_exemption`). Two properties keep
+    that from being the "exclude the state dir" hole this module's docstring
+    refuses:
+
+      * it is a PREDICATE the caller supplies, so this module still knows
+        nothing about which paths are special — a deployment that passes
+        nothing gets exactly the behaviour it had before this parameter
+        existed, including a loop-fatal park for any write to `tasks.json`;
+      * the predicate it is given proves BOTH who wrote the change (an unbroken
+        chain of COMPLETED records, in a ledger outside the checkout that a
+        write into the checkout cannot forge into existence, ending at exactly
+        the state the "after" snapshot observed) and what it changed (only
+        `priority` values, verified against the bytes). An agent widening its
+        own `approved_paths` in that same file is still reported — see
+        `tasks.MutationLedger` and `tasks.priority_only_change`.
+
+    It is consulted AFTER the bytecode exemption and BEFORE anything is
+    reported, and a predicate that raises is not caught here: a guard that
+    cannot answer must not be read as "no violation".
+
+    Exactly one class of path is silent unconditionally: a CPython bytecode
+    cache entry
     (`is_derived_bytecode` — the module docstring argues why, and what stays
     in scope) that was a plain file on every side it existed, whose `.py`
     source is a plain file on those same sides. A cache entry that appears,
@@ -407,6 +456,8 @@ def diff_snapshots(before: CheckoutSnapshot, after: CheckoutSnapshot) -> list[st
             # own path — and an exec bit means nothing to `import` anyway. A
             # symlink or directory appearing at this path is NOT a compile
             # product and falls through to the ordinary reporting below.
+            continue
+        if exempt is not None and exempt(path, prior, current):
             continue
         if prior is None and current is not None:
             violations.append(f"created outside the worker repo: {path} ({current.kind})")

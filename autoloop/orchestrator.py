@@ -3723,11 +3723,26 @@ class Orchestrator:
         what stops an out-of-band `import autoloop.…` (a dashboard restart, a
         `health --json` poll) from parking this round as tampering.
 
+        The ONE injected exemption alongside it is
+        `_operator_priority_exemption` — an operator re-prioritising a task
+        from the dashboard writes `.autoloop/tasks.json` immediately, which
+        this window would otherwise report as an agent escape. Read that
+        method and `tasks.MutationLedger` before touching it: it silences a
+        change only when the ledger OUTSIDE the checkout attests the loop's own
+        `TaskStore` made it AND the bytes differ in nothing but `priority`.
+
         Returns the outcome, or `None` if an escape was detected — already
         parked (loop_fatal: the isolation mechanism itself may be
         compromised) — in which case the caller must return immediately
         without committing anything.
         """
+        # The task file's mutex is an always-empty coordination file inside the
+        # state dir. Created here, before the "before" snapshot, so an operator
+        # edit that has to take it mid-round finds it already there: an
+        # identical empty file on both sides is not a violation and needs no
+        # exemption at all. See `TaskStore.ensure_mutex_file`.
+        self._task_store.ensure_mutex_file()
+        exempt = self._operator_priority_exemption()
         paths_before = escape_detector.enumerate_checkout_paths(self._git)
         before = escape_detector.snapshot_checkout(self._git.repo_root, paths_before)
         outcome = self._executor.execute(directive, task)
@@ -3739,7 +3754,17 @@ class Orchestrator:
         after = escape_detector.snapshot_checkout(
             self._git.repo_root, sorted(set(paths_before) | set(paths_after))
         )
-        violations = escape_detector.diff_snapshots(before, after)
+        violations = escape_detector.diff_snapshots(before, after, exempt=exempt)
+        if not violations:
+            # An operator may have steered the queue while the agent ran. The
+            # registry this process holds in memory predates that edit, so
+            # adopt it now: the ordering `next_ready()` uses is then the one on
+            # disk, and the next ordinary save cannot write the stale value
+            # back over it. `TaskStore.save` reconciles too — this is the same
+            # single implementation, called early enough to affect this round.
+            adopted = self._task_store.reconcile_priorities(self._registry)
+            if adopted:
+                self._log("operator_priority_adopted", data={"tasks": adopted})
         if violations:
             self._to_needs_user(
                 f"task {task.id}: the write-capable agent changed the "
@@ -3756,6 +3781,74 @@ class Orchestrator:
             )
             return None
         return outcome
+
+    def _operator_priority_exemption(self):
+        """The `diff_snapshots` predicate that lets an operator re-prioritise a
+        task while a write-capable agent is running — and nothing else.
+
+        `None` (i.e. no exemption at all, the pre-2026-08-16 behaviour) whenever
+        the exemption cannot be justified: no ledger configured on the task
+        store, or a task file that is not inside the observed checkout, in which
+        case a change to it is not this detector's business anyway.
+
+        Captures the task file's BYTES and the mutation ledger's WATERMARK up
+        front, before the agent runs, and does so under the task file's own
+        mutex so the pair describes one instant.
+
+        The bytes are the "what changed" evidence: the snapshot records only a
+        digest, and a digest cannot answer "did this differ in nothing but
+        `priority`". They are checked against the snapshot's own
+        `content_sha256` before being used, so a file that changed between this
+        read and the snapshot cannot be compared against the wrong baseline.
+
+        The watermark is what makes the attestation about THIS window: only
+        completed mutations recorded after it can authorize anything, so a
+        priority edit from an earlier round — including one whose intermediate
+        state a later direct edit might reproduce — proves nothing here. Read
+        under the same lock as the bytes for the reason `capture_priority_window`
+        gives: taken separately they can straddle an in-flight edit and turn a
+        benign operator write into a loop-fatal park.
+
+        Deliberately narrow, item by item:
+          * one path — the task file, spelled as the snapshot spells it;
+          * never a creation or a deletion (`prior`/`current` present), and
+            never a shape change: an operator edit rewrites an existing plain
+            file, so anything else is reported;
+          * never an executable-bit change, which no `os.replace` of a JSON
+            document produces;
+          * and then `TaskStore.attested_priority_edit`, which is where the two
+            real questions (who wrote it, what it changed) are answered.
+        """
+        store = self._task_store
+        if getattr(store, "ledger", None) is None:
+            return None
+        try:
+            relative = str(
+                Path(store.path).resolve().relative_to(Path(self._git.repo_root).resolve())
+            )
+        except (ValueError, OSError):
+            return None  # task file outside the checkout: not snapshotted
+        try:
+            baseline, watermark = store.capture_priority_window()
+        except (OSError, StateError):
+            # No baseline, or the mutex could not be taken: there is no
+            # exemption to offer, so every change to the file is reported. Same
+            # direction as no ledger at all.
+            return None
+
+        def exempt(path: str, prior, current) -> bool:
+            if path != relative or prior is None or current is None:
+                return False
+            if prior.kind != "file" or current.kind != "file":
+                return False
+            if prior.executable != current.executable:
+                return False
+            return store.attested_priority_edit(
+                baseline, prior.content_sha256 or "", current.content_sha256 or "",
+                watermark,
+            )
+
+        return exempt
 
     def _park_round_cap(
         self,
