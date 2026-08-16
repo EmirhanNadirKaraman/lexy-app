@@ -276,6 +276,81 @@ def test_an_absolute_or_traversing_env_example_file_is_refused(tmp_path):
             load_config(write_config(tmp_path, f'[repo]\nenv_example_file = "{bad}"\n'))
 
 
+#: Values that LOOK like the documented empty opt-out, or like a valid path, and
+#: are neither. Whitespace-only is the dangerous half — see the test below — and
+#: padding is refused with it so one rule covers both keys.
+BLANK_OR_PADDED = ["   ", "\t", " ", " .env.example", ".env.example ", "\t.env.example"]
+
+
+@pytest.mark.parametrize("key", ["env_example_file", "audit_report_glob"])
+@pytest.mark.parametrize("padded", BLANK_OR_PADDED)
+def test_a_whitespace_only_or_padded_path_is_refused_for_both_keys(tmp_path, key, padded):
+    """Only the EXACT empty string is the opt-out. Anything that merely strips
+    to empty is a typo, and a typo must not silently become a second, undeclared
+    way to switch a setting off — which is the failure the next test spells
+    out."""
+    with pytest.raises(ConfigError) as exc:
+        load_config(write_config(tmp_path, f'[repo]\n{key} = "{padded}"\n'))
+
+    assert f"repo.{key}" in str(exc.value)
+
+
+@pytest.mark.parametrize("key", ["env_example_file", "audit_report_glob"])
+def test_the_exact_empty_string_is_still_the_documented_opt_out(tmp_path, key):
+    """The other half of the rule, pinned so tightening padding cannot later be
+    widened into removing the opt-out itself. `config.example.toml` documents
+    `env_example_file = ""` for a repo that declares no application database,
+    and an empty `audit_report_glob` for one that files no audit reports."""
+    config = load_config(write_config(tmp_path, f'[repo]\n{key} = ""\n'))
+
+    assert getattr(config.repo, key) == ""
+
+
+def test_a_whitespace_env_example_file_cannot_disable_the_database_guard(tmp_path):
+    """The consequence, end to end, and the reason padding is refused rather
+    than stripped.
+
+    `repo_declared_db_name` reads a blank marker as "this repository declares no
+    application database" and returns `""` — after which `load_validation_env`
+    has nothing to refuse and validation may point at the real database. That is
+    correct for the documented `""` opt-out. It must be UNREACHABLE by accident,
+    so the loader refuses the blank-looking spellings that would reach it.
+    """
+    repo = make_repo_root(tmp_path, ".env.example", "DB_NAME=german_vocabulary\n")
+    env_file = tmp_path / "validation.env"
+    env_file.write_text(
+        "DB_HOST=127.0.0.1\nDB_PORT=5432\nDB_NAME=german_vocabulary\n"
+        "DB_USER=validation_user\nDB_PASSWORD=super-secret-password\n"
+        "SECRET_KEY=jwt-signing-key-for-tests\n",
+        encoding="utf-8",
+    )
+    env_file.chmod(0o600)
+
+    # 1. The guard is real: with the marker as configured, the application
+    #    database is refused.
+    with pytest.raises(ConfigError) as exc:
+        load_validation_env(env_file, repo_root=repo, state_dir=repo / ".autoloop")
+    assert "application" in str(exc.value)
+
+    # 2. A blank marker would turn it OFF — the same file, pointed at the same
+    #    application database, now loads without complaint. (`ValidationEnv`
+    #    exposes no values by design, so the assertion is that it loaded at
+    #    all: reaching this line is the whole finding.)
+    assert repo_declared_db_name(repo, "   ") == ""
+    loaded = load_validation_env(
+        env_file,
+        repo_root=repo,
+        state_dir=repo / ".autoloop",
+        env_example_file="   ",
+    )
+    assert "DB_NAME" in loaded.keys()
+
+    # 3. Which is why no config can put the loop in that state: the only way to
+    #    reach step 2 is the exact empty string, written on purpose.
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, '[repo]\nenv_example_file = "   "\n'))
+
+
 def test_a_malformed_db_key_is_refused_rather_than_silently_never_matching(tmp_path):
     """A key with an '=' or a space in it could never match a parsed line, so
     the refusal it would produce is 'no marker declared' — the silent wrong
@@ -447,6 +522,30 @@ def test_an_unknown_repo_key_is_refused_not_ignored(tmp_path):
         load_config(write_config(tmp_path, '[repo]\ntracker_path = ["a.md"]\n'))
 
     assert "repo" in str(exc.value)
+
+
+def test_a_non_table_repo_value_is_refused_by_the_loader_itself(tmp_path):
+    """`repo = "x"` must produce this loader's own `ConfigError`, not `dict()`'s
+    raw "dictionary update sequence element" complaint — strict config means a
+    malformed section is reported as one, naming the section and the shape it
+    should have had.
+
+    The scalar is written BEFORE any table header on purpose: TOML binds a bare
+    key to the section above it, so `repo = "x"` appended after `[paths]` would
+    be `paths.repo` and would be refused by that section's key check instead —
+    a green test that never reaches the guard under test.
+    """
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'repo = "x"\n\n' + CONFIG_HEAD + f'[paths]\nworkers_root = "{tmp_path / "w"}"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+
+    message = str(exc.value)
+    assert "repo" in message and "table" in message
 
 
 def test_json_serialisable_defaults_survive_a_round_trip():

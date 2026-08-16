@@ -292,12 +292,15 @@ validation_commands = [
 # actually declare. Set env_example_file = "" if your repo declares no such
 # name anywhere; the refusal then does not apply (same as the file being
 # absent), and a dedicated throwaway database is entirely your responsibility.
+# That opt-out is the EXACT empty string only — a blank-looking "   " is refused
+# at load rather than read as one, so the guard is never switched off by a typo.
 env_example_file = ".env.example"
 env_example_db_key = "DB_NAME"
 # Where the dashboard's "Language-app tasks" panel reads the proposed backlog
 # from. A glob relative to the repo root; the NEWEST match by name wins, which
-# works because these reports are date-stamped. Empty leaves the panel empty,
-# which is the right reading for a repo that files no audit reports.
+# works because these reports are date-stamped. The exact empty string leaves
+# the panel empty, which is the right reading for a repo that files no audit
+# reports; padding is refused here too, for the same reason.
 audit_report_glob = "docs/AUDIT_*.md"
 
 [paths]

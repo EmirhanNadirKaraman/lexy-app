@@ -170,17 +170,20 @@ class RepoConfig:
     #: The git-tracked example env file that declares the APPLICATION database
     #: name, and the key inside it. Used for exactly one refusal: a validation
     #: env file pointed at that same database (`validation_env.
-    #: repo_declared_db_name`). Empty `env_example_file` disables the refusal —
-    #: honest for a repository that declares no such name anywhere, and no
-    #: worse than the pre-existing behaviour when the file is simply absent.
+    #: repo_declared_db_name`). Exactly `""` disables the refusal — honest for
+    #: a repository that declares no such name anywhere, and no worse than the
+    #: pre-existing behaviour when the file is simply absent. Only that exact
+    #: value: a blank-looking `"   "` is refused at load, so the disable is
+    #: always something the operator wrote on purpose.
     env_example_file: str = DEFAULT_ENV_EXAMPLE_FILE
     env_example_db_key: str = DEFAULT_ENV_EXAMPLE_DB_KEY
     #: Where the dashboard reads the application backlog from — the newest
     #: audit report, by name. A glob relative to the repo root; metacharacters
     #: are the point here, unlike in `env_example_file`, so it is checked only
-    #: for being relative and traversal-free. Empty means the dashboard's
+    #: for being relative and traversal-free. Exactly `""` means the dashboard's
     #: "Language-app tasks" panel stays empty, which is the correct reading for
-    #: a repository that files no audit reports.
+    #: a repository that files no audit reports — and, as above, only that exact
+    #: value; padding is refused rather than read as the opt-out.
     audit_report_glob: str = DEFAULT_AUDIT_REPORT_GLOB
 
 
@@ -646,7 +649,17 @@ def _load_repo_section(data: dict) -> tuple[RepoConfig, tuple[str, ...]]:
     """`[repo]`, validated, plus any operator notices it produced. Absent means
     `RepoConfig()` — i.e. this repository's own constants, which is the
     pre-configuration behaviour."""
-    repo_data = dict(data.get("repo", {}))
+    raw = data.get("repo", {})
+    # Shape first, so `repo = "docs"` gets this loader's own error rather than
+    # `dict()`'s raw conversion complaint. Strict config means a malformed
+    # section is REPORTED as one; a `ValueError` about dictionary update
+    # sequences names neither the section nor what it should have been.
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"[repo] must be a table, got {raw!r} — write it as a section header "
+            '(`[repo]` followed by `key = "value"` lines), not as a bare key'
+        )
+    repo_data = dict(raw)
     # BEFORE `_check_keys`, exactly like `_migrate_retired_timeout`: the key is
     # consumed here, so it can never reach `RepoConfig`, and the operator gets
     # the reason instead of a generic "unknown key".
@@ -659,7 +672,17 @@ def _load_repo_section(data: dict) -> tuple[RepoConfig, tuple[str, ...]]:
         value = repo_data[key]
         if not isinstance(value, str):
             raise ConfigError(f"repo.{key} must be a string, got {value!r}")
-        if value.strip():
+        # EXACTLY empty is the documented opt-out; everything else is validated,
+        # including `"   "`. The test is `!= ""` rather than `.strip()` because
+        # the two are not the same refusal: blank-but-not-empty reaches
+        # `repo_declared_db_name`, which reads any non-declaring value as "this
+        # repository declares no application database" and returns `""` — so a
+        # stray space in `env_example_file` would turn the validation-database
+        # guard OFF while reading as configured. `_repo_relative` refuses
+        # padding, so routing every non-empty value through it is the whole fix;
+        # `""` is skipped rather than passed in because it would fail that
+        # function's empty-segment check.
+        if value != "":
             _repo_relative(key, value, allow_globs=(key == "audit_report_glob"))
 
     if "env_example_db_key" in repo_data:
