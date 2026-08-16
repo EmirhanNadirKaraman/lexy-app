@@ -40,6 +40,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered. Amended 2026-08-16: derived bytecode (`__pycache__/*.pyc` whose sibling `.py` is a regular file in the same snapshot side(s) — never `.pyo`, never a symlinked source) is exempt from the snapshot diff after three false loop-fatal parks — a forged cache entry whose header matches its source is the new, named residual | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
 | S30 | MEDIUM | The inbox vocabulary grew from create+priority to six mutation kinds, so a queued request can now rewrite an EXISTING task's `approved_paths` and `description` — falsifying S28's "it creates, never widens" bound. Guarded: nothing `in_progress`/`completed`/`retired` is editable, mutations share creation's validators, `block`/`unblock` cannot launder a loop-raised quarantine, `retire` is excluded, and no dashboard endpoint reaches any of it | `autoloop/inbox.py`, `autoloop/tasks.py` |
+| S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -221,6 +222,14 @@ reviewed — not prevention. Residual, explicitly still open:
     opposed to the task's own worker repo, which `verify_worker_isolation`
     already refuses any hook in) would compromise every future commit in the
     checkout and is not covered.
+  * the diff has TWO silences now, and both are argued where they live rather
+    than here: derived bytecode (the 2026-08-16 amendment above,
+    `is_derived_bytecode`) and the caller-injected `exempt` predicate the
+    orchestrator supplies for an operator's immediate `tasks.json` priority
+    edit (**S32**). Neither is a path exclusion — the first requires the `.py`
+    source to be watched byte for byte in the same snapshot, the second
+    requires an attestation outside the checkout AND a byte-level check that
+    nothing but `priority` moved.
 
 **file:line** — `autoloop/escape_detector.py` (new); wired in
 `autoloop/orchestrator.py`'s `_execute_with_escape_detection` /
@@ -383,7 +392,9 @@ pytest autoloop/tests/test_m1_hardening.py -k 'escape_detector or bytecode' -q
 `127.0.0.1` and, since 2026-08-01, accepts `POST /api/priority`. That endpoint
 takes a task id and an integer, and nothing else — the finding it could not
 raise was authorization, because a priority request carries no
-`approved_paths` (refused at `inbox.TaskInbox.submit`).
+`approved_paths` (refused at `inbox.TaskInbox.submit`). Since 2026-08-16 it
+APPLIES that integer instead of queueing it, and still carries nothing else;
+what the timing change costs is tracked separately as **S32**.
 
 `POST /api/task` (2026-08-02) changes that. A creation request carries
 `approved_paths`, which is the scope a write-capable agent is later authorized
@@ -419,8 +430,10 @@ already implies broader access; the concrete gain is a *plausible-looking*
 scope that a hurried operator may not re-read before the loop drains it.
 **Verification check:**
 ```bash
-# Expect: the ONLY writes are inbox submits — no repo/state-dir path is written
-rg -n 'write_text|mkdir|open\(|subprocess\.run' autoloop/dashboard.py
+# Expect: the only writes are inbox submits plus the ONE immediate priority
+# write S32 documents (`_task_store(...).apply_priority`) — no other repo or
+# state-dir path is written from this file
+rg -n 'write_text|mkdir|open\(|subprocess\.run|apply_priority' autoloop/dashboard.py
 # Expect: no second path validator here — add_many stays the single authority
 rg -n '_validate_approved_path|APPROVED_PATH|glob|fnmatch' autoloop/dashboard.py
 # Expect: creation cannot smuggle validation commands or dependencies
@@ -576,6 +589,119 @@ form's original argument ("priority decides what runs next, `approved_paths`
 decides what an agent may touch, and only the first belongs on a form") is
 still the right line for an unauthenticated page, even though it is no longer
 the right line for the inbox file format.
+
+### S32 — The dashboard writes `tasks.json` directly, and the escape detector has an exemption for it — MEDIUM — OPEN (bounded, accepted)
+
+**What:** since 2026-08-16 `POST /api/priority` no longer queues a request. It
+writes `.autoloop/tasks.json` immediately (`tasks.TaskStore.apply_priority`)
+and answers with the value it read back from the file. Two properties this
+tracker previously relied on therefore changed, and both are named here rather
+than left implied:
+
+- **The loop is no longer the only writer of the registry.** It is the only
+  writer of everything except one integer field on one existing task.
+- **`escape_detector.diff_snapshots` now accepts an `exempt` predicate**, and
+  `orchestrator._operator_priority_exemption` supplies one for exactly that
+  file. Without it a routine priority edit landing inside a detection window
+  would park the loop LOOP-FATAL — i.e. the feature for steering the loop would
+  be a way to stop it (the failure mode S24's bytecode amendment already cost
+  three parks for).
+
+**Why it was not done the safe-looking way.** Queuing was the safe-looking way
+and it is what shipped first; it failed the operator, because a queued priority
+becomes true only when the loop next drains between steps while the page keeps
+re-rendering the old value — a save that worked and one that did not looked
+identical. Excluding `tasks.json` from the snapshot was the other
+safe-looking way, and it is the one this file has refused twice (S25's circular
+ownership, the `pause_file` placement note in `config.py`): that file holds
+`approved_paths`, so an agent able to edit it undetected could widen its own
+authorization.
+
+What bounds it, stated rather than assumed:
+- **The exemption proves WHO, from outside the checkout.** Each immediate write
+  appends a `before -> after` content-digest record to
+  `~/.autoloop/task-mutations.jsonl` (`tasks.MutationLedger`), beside
+  `workers_root` — the placement the inbox, PAUSE flag and heartbeat already
+  use because it is required to be outside the checkout. A change to
+  `tasks.json` is silenced only if a chain of such records leads from the digest
+  the snapshot saw before to the one it saw after. An agent writing that file
+  from inside the checkout produces no record and still parks the loop.
+- **The exemption independently proves WHAT, from the bytes.** Even given a
+  matching chain, the two file states must differ in nothing but `priority`
+  values (`tasks.priority_only_change`, which re-reads the file and ignores the
+  ledger's own claim about itself). A widened `approved_paths`, a flipped
+  `status`, a rewritten `depends_on` or `description`, an added or removed task
+  — none of them is a priority edit whatever any record says.
+- **The endpoint cannot express anything else.** `PRIORITY_REQUEST_FIELDS` is
+  `{id, priority}` and anything else is refused (not dropped);
+  `apply_priority` refuses to CREATE the registry, so it cannot materialise a
+  task graph from the seed; and it reaches no other file in the state dir.
+- **Lost updates are answered by a lock, not by hope.** A short-lived mutex
+  (`tasks.task_file_mutex` — a `flock` on `tasks.json.lock`, held for the
+  milliseconds of load/mutate/save) serialises BOTH writers, and
+  `TaskStore.save` reconciles the on-disk priority into the loop's in-memory
+  registry so a round that began before the edit cannot write the stale value
+  back. The lock file is created before the detector's "before" snapshot and
+  never written to, so it is byte-identical on both sides and needs no
+  exemption.
+- **Same actor as S28/S30.** Anything that can post here can already edit the
+  inbox directory or run the CLI. What changed is the timing of one field, not
+  who may set it.
+
+**The residual, named.** The ledger is an ATTESTATION, not an authenticator:
+nothing signs a record, so an agent that writes outside its worker repo AND
+knows the format can append one. What that buys is bounded by the second half
+of the check — the bytes must still differ in nothing but `priority`, which the
+task graph already treats as safe to change mid-flight because nothing already
+dispatched depends on it. A second, smaller residual: the exemption re-reads
+the file under the mutex, so a write still in flight at snapshot time is
+resolved rather than raced, but a write that begins AFTER that read and lands
+before the digests are compared falls outside the attested chain and parks the
+loop. A third of the same shape: `TaskStore._write_bytes` writes
+`.autoloop/tasks.json.tmp` and `os.replace`s it away, so an "after" enumeration
+AND its hashing pass both landing inside that microsecond window would report
+`created outside the worker repo: .autoloop/tasks.json.tmp`. (The mutex file
+itself is not in this class — it is pre-created before the "before" snapshot
+and never written, so it is byte-identical on both sides.) Both of the last two
+are spurious parks in the safe direction, and both are strictly smaller than
+the previous behaviour, where EVERY priority edit during a window parked the
+loop. All three are the same shape as S24's honest residual and want the same
+fix (an OS-level sandbox), not a wider exemption.
+
+**file:line** — `autoloop/dashboard.py` `Handler._submit_priority` /
+`PRIORITY_REQUEST_FIELDS` / `_task_store`; `autoloop/tasks.py`
+`TaskStore.apply_priority` / `attested_priority_edit` / `save` /
+`task_file_mutex` / `MutationLedger` / `priority_only_change`;
+`autoloop/escape_detector.py` `diff_snapshots(exempt=…)`;
+`autoloop/orchestrator.py` `_operator_priority_exemption` /
+`_execute_with_escape_detection`.
+**Severity:** MEDIUM — it opens a checked hole in a security-shaped check, and
+the concrete gain for an attacker who already has local write access is limited
+to one scheduling integer.
+**Verification check:**
+```bash
+# Expect: the ONE exemption call site, in the orchestrator, and nothing in the
+# detector that names a path of its own
+rg -n 'exempt' autoloop/escape_detector.py autoloop/orchestrator.py
+# Expect: both halves of the check in one place — chain reachability AND
+# priority_only_change — never one without the other
+rg -n 'attested_priority_edit|priority_only_change|reachable' autoloop/tasks.py
+# Expect: the ledger resolves BESIDE workers_root, never inside the state dir
+# for a configured run
+rg -n 'def mutation_ledger_for' -A 12 autoloop/tasks.py
+# Expect: every writer of the task file takes the mutex
+rg -n 'with self.lock\(\)|task_file_mutex' autoloop/tasks.py
+# Expect: the endpoint's field set is {id, priority} and unknown fields refuse
+rg -n 'PRIORITY_REQUEST_FIELDS' autoloop/dashboard.py
+# Expect: EMPTY — no endpoint reaches any other registry mutator
+rg -n 'set_approved_paths|set_depends_on|set_description|operator_block' autoloop/dashboard.py
+```
+**Suggested fix (if this ever needs to be stronger):** sign the ledger records
+with a per-run secret the orchestrator writes outside the checkout at startup
+and the dashboard reads — that turns the attestation into an authentication and
+closes the forged-record residual. Do NOT close it by widening the exemption to
+the whole state dir, and do NOT let a second field join `priority`: the "what"
+half of the check is the only thing keeping a forged record cheap.
 
 ### S29 — `merge` is on the git whitelist, and the loop now pushes the BASE branch — LOW — OPEN (deliberate, gated, accepted)
 

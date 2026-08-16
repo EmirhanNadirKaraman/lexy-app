@@ -8,18 +8,35 @@ a wedged loop look identical — an empty `raw/` directory and a silent stdout.
 This reads the state the loop already writes, plus the process table, and shows
 what is happening now.
 
-**It never writes to what it observes.** Not to `.autoloop/`, not to the repo,
-not to git. That is not politeness: the loop's escape detector requires the
-primary checkout to be clean before every write-capable agent invocation, so a
-tracker that touched the working tree would make the next task refuse. Reading
-is `read_text`, `glob`, and `ps`.
+**Reading is `read_text`, `glob`, and `ps`, and it writes nothing while doing
+it.** Every observation path here is read-only, and that is not politeness: the
+loop's escape detector snapshots the primary checkout around every
+write-capable agent call, so a tracker that touched the working tree while
+observing would park the loop.
 
-There IS one write path, and it deliberately points elsewhere: `Handler.do_POST`
-queues operator requests — a task priority, or a new task — into the `TaskInbox`
-directory OUTSIDE the checkout, which the loop drains between steps. So a submit
-is safe at any instant, including mid-agent, and the loop stays the only writer
-of `tasks.json`. A new task carries `approved_paths`; read `do_POST`'s docstring
-and `docs/SECURITY.md` S28 before widening what that endpoint accepts.
+There are exactly TWO write paths, both in `Handler.do_POST`, and they are
+different in kind:
+
+* **A new task is QUEUED** into the `TaskInbox` directory OUTSIDE the checkout,
+  which the loop drains between steps. A creation carries `approved_paths` —
+  authorization — so the loop merging it is the review step. Read `do_POST`'s
+  docstring and `docs/SECURITY.md` S28 before widening what that accepts.
+* **A priority is APPLIED IMMEDIATELY** (2026-08-16), straight into
+  `.autoloop/tasks.json` through `TaskStore.apply_priority`, and the row then
+  shows the value read BACK from that file. Queued was the previous design and
+  it failed the operator: the change only became true when the loop next
+  drained, the page kept re-rendering the old number from `tasks.json`
+  meanwhile, and a save that worked was indistinguishable from one that did
+  not. Priority is the one field safe to change mid-flight — nothing already
+  dispatched depends on it — and it is the field an operator uses to steer what
+  runs next, which is worthless if it lands minutes late.
+
+  That write takes NO `LoopLock` (held for the whole run) and still writes
+  nothing else: not `state.json`, not an execution record, not a blocker, and
+  not `status` / `approved_paths` / `depends_on`. It is serialised against the
+  loop's own saves by the fine-grained mutex in `tasks.py`, and attested in a
+  ledger outside the checkout so the escape detector can tell it from an agent
+  writing into the state dir.
 
 The one thing it learns that is not already on disk: which domain each in-flight
 agent is on, parsed from the process table. Agent prompts carry
@@ -562,6 +579,51 @@ def _inbox_dir(repo: Path) -> Path:
     return Path.home() / ".autoloop" / "inbox"
 
 
+def _state_dir(repo: Path) -> Path:
+    """`[paths].state_dir` for this checkout, defaulted to `.autoloop`.
+
+    A relative value is resolved against the checkout, which is where the loop
+    itself resolves it from (`config.load_config` reads it as a plain `Path` and
+    every real run has the repo root as its cwd).
+    """
+    configured = _config_section(repo, "paths").get("state_dir")
+    if configured and isinstance(configured, str):
+        path = Path(configured).expanduser()
+        return path if path.is_absolute() else repo / path
+    return repo / ".autoloop"
+
+
+def _tasks_file(repo: Path) -> Path:
+    """The registry file this page reads AND, for a priority edit, writes.
+
+    Resolved through the config rather than hard-coded, because the read and
+    the write must be the same file: the row shows a value read back from disk,
+    so a page reading one path and writing another would report a save that did
+    not happen where it was looking.
+    """
+    return _state_dir(repo) / "tasks.json"
+
+
+def _task_store(repo: Path):
+    """A `TaskStore` for this checkout, wired to the mutation ledger.
+
+    Built per request rather than held: the store is stateless (a path, a
+    ledger path, and a mutex resolved from the path), and a long-lived one
+    would keep a stale handle if the operator moved the state dir under it.
+    """
+    from .tasks import TaskStore, mutation_ledger_for
+
+    workers_root = _config_section(repo, "paths").get("workers_root")
+    root = (
+        Path(workers_root).expanduser()
+        if workers_root and isinstance(workers_root, str)
+        else Path.home() / ".autoloop" / "workers"
+    )
+    return TaskStore(
+        _tasks_file(repo), ledger=mutation_ledger_for(root, _state_dir(repo))
+    )
+
+
 def _pending_inbox(repo: Path) -> list[dict]:
     """Queued requests, so a submit is visibly recorded rather than vanishing
     until the loop next runs.
@@ -1031,7 +1093,11 @@ def collect(repo: Path) -> dict:
     # `tasks.json` only exists once a registry has been saved; before that the
     # CLI seeds from the tracked file. Reading only the former showed an empty
     # roadmap while `next-task` correctly reported rt-01.
-    tasks = _json(sd / "tasks.json") or {}
+    #
+    # Through `_tasks_file`, so this is the same path `/api/priority` writes:
+    # the row's number is read back from disk after a save, and a read that
+    # went somewhere else would report the edit as lost.
+    tasks = _json(_tasks_file(repo)) or {}
     if not tasks.get("tasks"):
         seeded = _json(repo / "autoloop" / "seed_tasks.json")
         if isinstance(seeded, list):
@@ -1622,9 +1688,12 @@ function render(d, force){
   // Retired is the third of those and needs nobody at all \u2014 its row names the
   // successor instead of asking for anything.
   //
-  // Priority editing is unchanged: writes go to the task INBOX, never to
-  // tasks.json \u2014 the loop is the only registry writer, and a write into
-  // .autoloop/ mid-run would trip the escape detector. A Save is "queued".
+  // Priority editing writes tasks.json IMMEDIATELY (2026-08-16), under the
+  // fine-grained mutex the loop's own saves take, and the row then shows the
+  // value the server read BACK from the file. A Save is "saved", not "queued":
+  // an operator steers with priority, so a change that lands on the loop's next
+  // drain has missed the decision it was for. Creation is still queued to the
+  // inbox \u2014 that one carries authorization.
   const GICON = {in_progress:"\u25b6", needs_human:"\u25a0", ready:"\u25cb", blocked:"\u25cd",
                  retired:"\u2298", done:"\u2713"};
   const groups = d.groups || [];
@@ -1653,7 +1722,9 @@ function render(d, force){
       + `<span class="gc">${esc(g.count)}</span></h3>` + groupRows(g)).join("")
       + `<p class="muted" style="font-size:12px;margin:9px 0 0">Lower number runs `
       + `first; 100 is the default. Ready is listed in the order the loop would `
-      + `pick it. Saved changes queue in the inbox and apply on the loop's next run.</p>`;
+      + `pick it. Save writes tasks.json straight away — the number that appears `
+      + `beside the field is read back from the file, so it is what the loop will `
+      + `read. Only priority is editable here.</p>`;
   }
   // Collapsed, counted, and never carrying a priority input: the per-render
   // Save binding below is scoped to #roadmap, so a button here would render
@@ -1709,7 +1780,15 @@ function render(d, force){
           body: JSON.stringify({id, priority: value}),
         });
         const body = await r.json();
-        if (r.ok) { note.className = "note saved"; note.textContent = " ✓ queued"; }
+        // The number shown back is the server's READ-BACK from tasks.json, not
+        // the one that was typed, and the input is set to it: if the two ever
+        // disagree the field says what actually persisted rather than what was
+        // asked for. A failure says so and leaves the typed value alone — a row
+        // that silently snapped back is the bug this endpoint exists to fix.
+        if (r.ok) {
+          input.value = body.priority;
+          note.className = "note saved"; note.textContent = ` ✓ saved (${esc(body.priority)})`;
+        }
         else { note.className = "note savefail"; note.textContent = " ✗ " + (body.error || r.status); }
       } catch (e) {
         note.className = "note savefail"; note.textContent = " ✗ " + e;
@@ -1885,18 +1964,48 @@ tick(); setInterval(tick, 2000);
 #: naming a field the receiver ignores has not done what its author intended.
 TASK_REQUEST_FIELDS = frozenset({"id", "title", "description", "priority", "approved_paths"})
 
+#: Fields `/api/priority` accepts — an existing task's id and a number, and
+#: that is the whole vocabulary. It is the same set `inbox.MUTATION_PAYLOAD`
+#: allows a queued `priority` request (`{kind, id, priority}` minus the kind
+#: discriminator, which this endpoint has no use for), spelled here because
+#: this route no longer passes through the inbox's shape gate on its way to the
+#: registry. Anything else is refused rather than dropped: a caller that sent
+#: `approved_paths` here meant something this endpoint must never do.
+PRIORITY_REQUEST_FIELDS = frozenset({"id", "priority"})
+
 
 class Handler(BaseHTTPRequestHandler):
     repo = Path(".")
 
     def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
-        """The ONE write path, and it writes only to the task inbox.
+        """The write paths. There are two, and they are deliberately unequal.
 
-        The inbox lives OUTSIDE the checkout, so this does not touch the repo,
-        `.autoloop/`, or git — the read-only property the rest of this file
-        depends on is unchanged, and a submit is safe while an agent is running
-        (a write into the state dir would trip the escape detector and park the
-        loop loop-fatal).
+        `/api/task` (creation) and `/api/suggest-paths` still touch nothing the
+        loop observes: a creation request goes to the inbox, which lives
+        OUTSIDE the checkout, and is merged by the loop between steps.
+
+        `/api/priority` writes `.autoloop/tasks.json` IMMEDIATELY (2026-08-16).
+        That is a real departure from the read-only posture this file was
+        written around, and it is bounded rather than assumed safe:
+
+          * ONE field, on an existing task. `TaskStore.apply_priority` cannot
+            create the registry, add or remove a task, or reach `status`,
+            `approved_paths` or `depends_on`.
+          * It takes the fine-grained task-file mutex, never `LoopLock` (held
+            for the whole run), and holds it for the milliseconds of
+            load/mutate/save. The loop's own saves take the same mutex, so
+            neither side can lose the other's update.
+          * Nothing else in the state dir is written: not `state.json`, not an
+            execution record, not a blocker.
+          * The write is attested in a ledger BESIDE `workers_root`, outside
+            the checkout, which is what lets the loop's escape detector tell an
+            operator priority edit from an agent writing into the checkout —
+            see `tasks.MutationLedger` and
+            `orchestrator._operator_priority_exemption`. Without it a routine
+            priority edit during a round would park the loop loop-fatal, which
+            would make steering the loop a way to stop it.
+
+        Everything else this page does is still reads.
 
         The page has no authentication and binds 127.0.0.1 only, so the residual
         risk is a *local* page in the same browser posting here. Two cheap
@@ -1905,8 +2014,10 @@ class Handler(BaseHTTPRequestHandler):
         server never approves; and an Origin check when one is present.
 
         **The blast radius is no longer just a priority.** `/api/priority` still
-        cannot express anything but a number against an existing id. But
-        `/api/task` queues a CREATION request, and a new task carries
+        cannot express anything but a number against an existing id — now
+        applied rather than queued, which changes WHEN it takes effect and not
+        what it can say. But `/api/task` queues a CREATION request, and a new
+        task carries
         `approved_paths` — the scope a write-capable agent is later authorized
         against. So a local page that can reach this port can queue a task
         naming paths nobody typed, and the loop merges the inbox without asking
@@ -1983,14 +2094,73 @@ class Handler(BaseHTTPRequestHandler):
         return self._json_response(200, {"suggestions": [s.as_dict() for s in found]})
 
     def _submit_priority(self, body: dict) -> None:
+        """Apply a priority IMMEDIATELY, and report what is now on disk.
+
+        Not queued. An operator sets a priority to steer what the loop does
+        next, and a value that lands minutes later — whenever the loop happens
+        to drain the inbox between steps — has already missed the decision it
+        was for. Worse, the page kept re-rendering from `tasks.json` in the
+        meantime, so a save that worked and a save that did not looked exactly
+        alike and the operator resubmitted (two such resubmissions sat in the
+        inbox on 2026-08-05).
+
+        No `LoopLock` is taken — it is held for the whole run, so waiting for it
+        would mean waiting for the loop to stop. `TaskStore.apply_priority`
+        takes the fine-grained mutex instead, for the milliseconds of
+        load/mutate/save, and every writer of that file takes the same one.
+
+        THE RESPONSE CARRIES A READ-BACK, never the number that was posted:
+        `apply_priority` re-reads the file after writing it and returns the
+        stored task, so `priority` here is what a fresh reader would see. That
+        is the whole point — echoing the input would report success identically
+        whether or not anything reached the disk.
+
+        Still the narrowest possible write: one integer field on one existing
+        task. It cannot create a registry, cannot add or remove a task, and
+        cannot touch `status`, `approved_paths` or `depends_on`. Creation stays
+        queued through the inbox (`/api/task`), because a new task carries
+        authorization and the loop merging it is the review step.
+        """
+        from .errors import StateError, TaskGraphError
+
+        unknown = sorted(set(body) - PRIORITY_REQUEST_FIELDS)
+        if unknown:
+            # Refused, never ignored. The queued route was gated by
+            # `inbox.check_request_shape`, which refuses a `priority` request
+            # carrying anything else; applying directly must not become the lax
+            # door into the same field set, so the same rule is spelled here
+            # for the same reason it is there — a request naming a field the
+            # receiver drops has not done what its author intended.
+            return self._json_response(
+                400,
+                {"error": f"unknown field(s) {unknown}; a priority edit carries "
+                          f"only {sorted(PRIORITY_REQUEST_FIELDS)}"},
+            )
         try:
             task_id = str(body["id"])
             priority = int(body["priority"])
         except (ValueError, KeyError, TypeError) as exc:
             return self._json_response(400, {"error": f"bad request: {exc}"})
-        return self._queue(
-            lambda inbox: inbox.submit_priority(task_id, priority),
-            {"queued": task_id, "priority": priority},
+        try:
+            task = _task_store(self.repo).apply_priority(task_id, priority)
+        except TaskGraphError as exc:
+            # An unknown id or a non-integer priority, in the registry's own
+            # words — the same authority a queued request would have been
+            # refused by, just reported now instead of in a drain log later.
+            return self._json_response(400, {"error": str(exc)})
+        except (StateError, OSError) as exc:
+            # A failed write REPORTS. The row must not snap back to the old
+            # value with nothing said: that is indistinguishable from the bug
+            # this endpoint exists to fix.
+            return self._json_response(500, {"error": f"could not apply: {exc}"})
+        return self._json_response(
+            200,
+            {
+                "id": task.id,
+                "priority": task.priority,
+                "applied": True,
+                "note": "written to tasks.json and read back",
+            },
         )
 
     def _submit_task(self, body: dict) -> None:
@@ -2041,8 +2211,15 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _queue(self, submit, payload: dict) -> None:
-        """Run one inbox submit and turn its failures into responses. Shared so
-        both endpoints report a refusal identically."""
+        """Run one inbox submit and turn its failures into responses.
+
+        Creation only, since 2026-08-16: `/api/priority` no longer queues
+        anything, so this is the task-creation path's error handling. Kept as
+        its own method rather than inlined — the inbox's two failure modes
+        (a refused shape, an unwritable directory) map to different status
+        codes, and that mapping should live in one place if a second queued
+        endpoint ever appears.
+        """
         from .inbox import InboxError, TaskInbox
 
         try:

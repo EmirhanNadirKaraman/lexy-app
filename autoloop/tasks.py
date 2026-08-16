@@ -18,20 +18,32 @@ must reference known tasks (same batch counts), no cycles, no completing a
 task whose dependencies are incomplete. Violations raise TaskGraphError with a
 stable code that the orchestrator reports back to ChatGPT.
 
-Persistence mirrors state.py: one JSON file, atomic replace, schema-versioned.
+Persistence mirrors state.py: one JSON file, atomic replace, schema-versioned —
+plus, since 2026-08-16, a SHORT-LIVED mutex around read-modify-write, because
+atomic replace alone cannot make "load, mutate, save" atomic. See
+`task_file_mutex` and `TaskStore`.
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
 from .errors import StateCorruptError, StateError, TaskGraphError
 from .state import utcnow_iso
+
+try:  # POSIX advisory locking. Absent on Windows, which this loop never runs on.
+    import fcntl
+except ImportError:  # pragma: no cover - not a platform any caller here uses
+    fcntl = None
 
 TASKS_SCHEMA_VERSION = 1
 
@@ -638,8 +650,28 @@ def effective_approved_paths(
 class TaskRegistry:
     def __init__(self, tasks: list[Task] | None = None):
         self._tasks: dict[str, Task] = {}
+        #: Ids whose priority THIS registry has deliberately set since the last
+        #: save. In-memory only, never persisted, cleared by `TaskStore.save`.
+        #:
+        #: It exists because `TaskStore.save` reconciles priorities from disk
+        #: (an operator may have edited one while this registry sat in memory
+        #: for a whole round — see that method), and reconciliation must not
+        #: undo a change the loop itself just made. A drained inbox `priority`
+        #: request is exactly that case: it is a deliberate write, so it takes
+        #: precedence over whatever the file says.
+        self._priority_overrides: set[str] = set()
         if tasks:
             self.add_many(tasks)
+
+    def priority_overrides(self) -> frozenset[str]:
+        """Ids whose priority this registry set since the last save."""
+        return frozenset(self._priority_overrides)
+
+    def clear_priority_overrides(self) -> None:
+        """Called by `TaskStore.save` once the values are on disk: from then on
+        the file and this registry agree, so the next reconciliation has
+        nothing to protect."""
+        self._priority_overrides.clear()
 
     # ---- mutation -----------------------------------------------------------
 
@@ -989,11 +1021,18 @@ class TaskRegistry:
     def set_priority(self, task_id: str, priority: int) -> Task:
         """Re-prioritise an existing task.
 
-        Deliberately the ONLY mutation an operator can make from outside the
-        normal `plan`/`seed_tasks.json` route (see `inbox.KIND_PRIORITY`).
-        Priority changes what runs next; it cannot change what a task is
-        allowed to touch, so it is safe to expose on a form in a way
+        The one mutation an operator can make from outside the normal
+        `plan`/`seed_tasks.json` route without going through the inbox at all:
+        since 2026-08-16 the dashboard applies it IMMEDIATELY, through
+        `TaskStore.apply_priority` (`inbox.KIND_PRIORITY` still exists and is
+        still drained, for anything that queues one by hand). Priority changes
+        what runs next; it cannot change what a task is allowed to touch, so it
+        is safe to expose on a form — and safe to change mid-flight — in a way
         `approved_paths` would not be.
+
+        Every call is remembered in `_priority_overrides` so that
+        `TaskStore.save`'s reconciliation does not read the disk value back
+        over a change the caller just made deliberately.
         """
         task = self._tasks.get(task_id)
         if task is None:
@@ -1003,6 +1042,7 @@ class TaskRegistry:
                 "bad_priority", f"priority must be an integer, got {priority!r}"
             )
         task.priority = priority
+        self._priority_overrides.add(task_id)
         return task
 
     def _refuse_immutable(self, task: Task, field: str) -> None:
@@ -1442,11 +1482,411 @@ def _check_acyclic(tasks: dict[str, Task]) -> None:
             visit(tid, [])
 
 
-class TaskStore:
-    """Atomic JSON persistence for the registry (same pattern as StateStore)."""
+# ---- the fine-grained task-file mutex ---------------------------------------
+#
+# `TaskStore.save` has always been atomic in the sense `os.replace` gives:
+# a reader never sees half a file. That is NOT the same as a read-modify-write
+# being atomic, and the difference is exactly what an operator lost. Two
+# writers each doing `load() -> mutate -> save()` interleave like this:
+#
+#     dashboard: load (priority 3)                     loop: load (priority 3)
+#     dashboard: set priority 2, save                  loop: mark_completed, save
+#
+# and whichever `save` lands second silently discards the other's change. Both
+# directions are real losses; losing a completion or a quarantine is far worse
+# than losing a priority, which is why the immediate priority write may not be
+# uncoordinated.
+#
+# The run-level `LoopLock` cannot be that coordination. It is held for the
+# WHOLE run (that is why `answer` and `release` refuse while the loop is up), so
+# waiting for it means waiting for the loop to stop — the opposite of an
+# immediate edit. This mutex is the opposite shape: one lock file per task file,
+# held for the milliseconds of load/mutate/save and nothing else.
+#
+# THE LOCK FILE IS NEVER WRITTEN TO — it is an empty coordination file, and that
+# is load-bearing rather than incidental. `.autoloop/` sits inside the tree
+# `escape_detector` snapshots around every write-capable agent call, so a lock
+# file whose CONTENT changed mid-round would be reported as an escape. Empty and
+# pre-created (`TaskStore.ensure_mutex_file`, called before the "before"
+# snapshot) it is byte-identical on both sides and produces no violation at all
+# — which is strictly better than teaching the detector to ignore it.
+
+#: Suffix appended to the task file's own name to get its mutex file.
+TASKS_MUTEX_SUFFIX = ".lock"
+
+#: How long a caller waits for the mutex before giving up. Every holder does a
+#: file read, an in-memory mutation and a file write, so a wait this long means
+#: something is wrong (a stopped process holding a `flock`, an unusually slow
+#: filesystem) rather than ordinary contention. Failing LOUDLY is the point: a
+#: priority edit that silently did not happen is the defect this whole change
+#: exists to fix.
+MUTEX_TIMEOUT_SECONDS = 10.0
+
+_MUTEX_POLL_SECONDS = 0.01
+
+
+class TaskStoreBusy(StateError):
+    """The task-file mutex could not be taken within `MUTEX_TIMEOUT_SECONDS`.
+
+    A `StateError` subclass so callers that already treat state faults as
+    reportable (the CLI, the dashboard's write endpoint) surface it as an error
+    instead of quietly writing nothing.
+    """
+
+
+@dataclass
+class _MutexEntry:
+    """Per-lock-file state: the in-process gate plus the cross-process one.
+
+    Both are needed, and neither replaces the other. `flock` is per OPEN FILE
+    DESCRIPTION, so a second `open()` + `LOCK_EX` inside the same process blocks
+    against itself — which is a self-deadlock the moment `save()` (which takes
+    the mutex) is called inside a caller's own `with store.lock():`. The
+    `RLock` makes re-entry free for the owning thread and serialises the others;
+    `depth` decides when the file lock is really taken and really released, and
+    is only ever touched by the thread holding the `RLock`.
+    """
+
+    lock: threading.RLock
+    depth: int = 0
+    handle: object = None
+
+
+#: Keyed by RESOLVED lock-file path, so `/x/tasks.json` and `/x/./tasks.json`
+#: are one mutex rather than two that would then deadlock on each other's
+#: `flock`. Module level because two `TaskStore` INSTANCES pointing at the same
+#: file must share it — the dashboard builds a fresh store per request.
+_MUTEX_REGISTRY: dict[str, _MutexEntry] = {}
+_MUTEX_REGISTRY_GUARD = threading.Lock()
+
+
+def _mutex_entry(lock_path: Path) -> _MutexEntry:
+    key = str(Path(lock_path).resolve())
+    with _MUTEX_REGISTRY_GUARD:
+        entry = _MUTEX_REGISTRY.get(key)
+        if entry is None:
+            entry = _MutexEntry(threading.RLock())
+            _MUTEX_REGISTRY[key] = entry
+        return entry
+
+
+def mutex_path_for(tasks_path: Path) -> Path:
+    """The lock file guarding `tasks_path`. Beside it, never inside it."""
+    return Path(str(tasks_path) + TASKS_MUTEX_SUFFIX)
+
+
+def _acquire_file_lock(lock_path: Path, deadline: float):
+    """An exclusive `flock` on `lock_path`, or `TaskStoreBusy`.
+
+    Opened `"a+b"`: created when absent, NEVER truncated and never written, so
+    the file's bytes stay empty for its whole life (see the section comment
+    above — the escape detector watches this directory).
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    if fcntl is None:  # pragma: no cover - POSIX everywhere this runs
+        return handle  # in-process serialisation only; documented, not silent
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise TaskStoreBusy(
+                    f"another process has held {lock_path} for more than "
+                    f"{MUTEX_TIMEOUT_SECONDS:.0f}s — nothing was written"
+                ) from None
+            time.sleep(_MUTEX_POLL_SECONDS)
+
+
+def _release_file_lock(handle) -> None:
+    with contextlib.suppress(OSError):
+        if fcntl is not None:  # pragma: no branch - POSIX everywhere this runs
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        handle.close()
+
+
+@contextlib.contextmanager
+def task_file_mutex(tasks_path: Path, timeout: float = MUTEX_TIMEOUT_SECONDS):
+    """Hold the fine-grained mutex for `tasks_path` for the body of the block.
+
+    RE-ENTRANT within a thread, so `save()` nested inside a caller's own
+    `with store.lock():` is free rather than a deadlock. EXCLUSIVE across
+    threads (the `RLock`) and across processes (the `flock`). Raises
+    `TaskStoreBusy` rather than blocking forever.
+
+    A mutex only one side respects is not a mutex: every writer of the task
+    file takes this — `TaskStore.save`, `TaskStore.archive`, the dashboard's
+    immediate priority write — and the whole read-modify-write goes inside one
+    hold, never just the write half.
+    """
+    lock_path = mutex_path_for(tasks_path)
+    entry = _mutex_entry(lock_path)
+    deadline = time.monotonic() + timeout
+    if not entry.lock.acquire(timeout=max(0.0, timeout)):
+        raise TaskStoreBusy(
+            f"another thread has held the mutex for {lock_path} for more than "
+            f"{timeout:.0f}s — nothing was written"
+        )
+    try:
+        if entry.depth == 0:
+            entry.handle = _acquire_file_lock(lock_path, deadline)
+        entry.depth += 1
+        try:
+            yield
+        finally:
+            entry.depth -= 1
+            if entry.depth == 0 and entry.handle is not None:
+                _release_file_lock(entry.handle)
+                entry.handle = None
+    finally:
+        entry.lock.release()
+
+
+# ---- the mutation ledger (attestation, OUTSIDE the checkout) -----------------
+
+#: The ledger's filename. It lives beside `workers_root` — the same placement
+#: the inbox, the PAUSE flag and the heartbeat already use, and for the same
+#: reason: that directory is required to be outside the checkout, its `.git`,
+#: the state dir and the publisher paths (`worker_env.validate_workers_root`),
+#: so nothing written here is inside the tree the escape detector snapshots.
+LEDGER_FILENAME = "task-mutations.jsonl"
+
+#: What a ledger record's `kind` says for the one mutation an operator may
+#: apply immediately. Nothing else is ever recorded, so a record is never a
+#: general "I edited the task file" claim.
+LEDGER_KIND_PRIORITY = "priority"
+
+#: Bound on the chain walk in `MutationLedger.reachable`. A ledger is appended
+#: to once per operator priority edit and never pruned, so this is a runaway
+#: guard, not a policy: no real window contains thousands of edits.
+_LEDGER_MAX_HOPS = 4096
+
+
+def mutation_ledger_for(workers_root: Path | None, state_dir: Path) -> Path:
+    """Where the mutation ledger lives, resolved exactly like
+    `inbox.inbox_dir_for` so both sides of the attestation (the dashboard that
+    writes records, the orchestrator that reads them) compute one path from one
+    function.
+
+    Falls back INSIDE the state dir only when no `workers_root` is configured —
+    a configuration `load_config` already refuses for any real run. In that
+    fallback the ledger is inside the snapshotted tree and an edit mid-round is
+    reported as an escape, which is the safe direction: the attestation must
+    live somewhere an agent's own checkout writes cannot reach, and if there is
+    no such place configured there is no attestation to be had.
+    """
+    if workers_root is not None:
+        return Path(workers_root).expanduser().parent / LEDGER_FILENAME
+    return Path(state_dir) / LEDGER_FILENAME
+
+
+class MutationLedger:
+    """Append-only record of the operator priority edits `TaskStore` applied.
+
+    WHAT IT IS FOR, precisely. `.autoloop/tasks.json` is inside the tree
+    `escape_detector` snapshots around every write-capable agent call, and that
+    coverage is not an oversight — the file holds `approved_paths`, so an agent
+    able to edit it undetected could widen its own authorization
+    (`docs/SECURITY.md` finding #2). An immediate priority edit therefore has to
+    be distinguishable from an agent writing into the checkout, and "the path is
+    `tasks.json`" is not a distinction — excluding the file wholesale would hand
+    back exactly the hole the coverage closes.
+
+    So the detector's exemption asks TWO independent questions, and both must
+    answer yes (`TaskStore.attested_priority_edit`):
+
+      1. **Who** — is there a chain of records here leading from the content
+         digest the snapshot saw BEFORE to the one it saw AFTER, every hop
+         written by `TaskStore.apply_priority`? This file is outside the
+         checkout, so a write into the checkout alone cannot produce one. An
+         agent that edits `tasks.json` directly is unattested and is reported.
+      2. **What** — do the two file states differ ONLY in `priority` values
+         (`priority_only_change`, which reads the actual bytes rather than
+         trusting this record's `kind`)? So even a forged record cannot launder
+         a widened `approved_paths`, a flipped `status` or a rewritten
+         `depends_on`.
+
+    Honest residual, recorded rather than argued away: this is an attestation,
+    not an authenticator. Nothing signs a record, so an agent that writes
+    outside its worker repo AND knows this format can append one — but question
+    2 still bounds what that buys it to the priority field, which the task
+    graph's own design already treats as safe to change mid-flight (nothing
+    already dispatched depends on it). Real confinement needs the OS-level
+    sandbox `docs/SECURITY.md` S24 tracks, not a wider ledger.
+    """
 
     def __init__(self, path: Path):
         self.path = Path(path)
+
+    def record(self, *, tasks_path: Path, before: str, after: str,
+               kind: str = LEDGER_KIND_PRIORITY, ids: tuple[str, ...] = ()) -> None:
+        """Append one record. Raises `OSError` if it cannot be written.
+
+        Deliberately NOT best-effort. `TaskStore.apply_priority` records BEFORE
+        it writes the task file, so a ledger that cannot be appended to means
+        nothing was written at all — better than a write nobody can attest,
+        which would park the loop the moment it landed inside a detection
+        window. The reverse ordering (write, then attest) has no such recovery.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {
+                "at": utcnow_iso(),
+                "pid": os.getpid(),
+                "path": str(tasks_path),
+                "kind": kind,
+                "ids": list(ids),
+                "before": before,
+                "after": after,
+            },
+            ensure_ascii=False,
+        )
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+    def read(self) -> list[dict]:
+        """Every readable record, oldest first. A missing ledger is `[]`, and a
+        malformed LINE is skipped rather than raising — an unusable record
+        proves nothing, and refusing to read the whole file because of one bad
+        line would turn a stray byte into a loop-fatal park."""
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        records = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+        return records
+
+    def reachable(self, start: str, kind: str = LEDGER_KIND_PRIORITY) -> set[str]:
+        """Every content digest reachable from `start` by attested `kind` hops,
+        `start` included.
+
+        A SET rather than a single before/after match, because one detection
+        window can contain several edits: two saves in a row leave the snapshot
+        comparing A against C while the ledger holds A->B and B->C.
+        """
+        edges: dict[str, list[str]] = {}
+        for record in self.read():
+            if record.get("kind") != kind:
+                continue
+            before, after = record.get("before"), record.get("after")
+            if isinstance(before, str) and isinstance(after, str) and before and after:
+                edges.setdefault(before, []).append(after)
+        seen = {start}
+        frontier = [start]
+        hops = 0
+        while frontier and hops < _LEDGER_MAX_HOPS:
+            digest = frontier.pop()
+            for nxt in edges.get(digest, ()):
+                hops += 1
+                if nxt not in seen:
+                    seen.add(nxt)
+                    frontier.append(nxt)
+        return seen
+
+
+def _comparable_without_priority(data: object):
+    """A task file reduced to everything EXCEPT the priority of each task, or
+    `None` when it is not a task file at all.
+
+    `None` is never equal to anything here (its callers check for it), so two
+    unreadable files do not compare equal and get exempted together.
+    """
+    if not isinstance(data, dict):
+        return None
+    rows = data.get("tasks")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return None
+    rest = {key: value for key, value in data.items() if key != "tasks"}
+    stripped = [{k: v for k, v in row.items() if k != "priority"} for row in rows]
+    return rest, stripped
+
+
+def priority_only_change(before: bytes, after: bytes) -> bool:
+    """Do these two task-file contents differ ONLY in `priority` values?
+
+    The CONTENT half of the escape-detector exemption (see `MutationLedger`),
+    and the half that does not trust anything an attestation claims about
+    itself: it compares the two files with every task's `priority` removed, so a
+    changed `approved_paths`, `status`, `depends_on`, `description` or task set
+    — anything that could widen an agent's authorization or rewrite the queue —
+    is not a priority edit whatever any record says.
+
+    Row ORDER is significant, deliberately. `TaskStore` writes tasks in registry
+    order and `apply_priority` never reorders them, so a reordered file was
+    written by something else.
+    """
+    try:
+        left = _comparable_without_priority(json.loads(before))
+        right = _comparable_without_priority(json.loads(after))
+    except ValueError:
+        return False
+    return left is not None and left == right
+
+
+class TaskStore:
+    """Atomic JSON persistence for the registry (same pattern as StateStore),
+    serialised by a SHORT-LIVED mutex.
+
+    `os.replace` makes a save atomic; it does nothing for the read-modify-write
+    around it, which is where updates actually go missing (see the section
+    comment above `task_file_mutex`). So every method here that reads and then
+    writes holds `task_file_mutex` for the whole sequence, and so must every
+    other writer of this file — the dashboard's immediate priority edit takes
+    the same lock through `apply_priority`.
+
+    `ledger` is where operator priority edits are attested, and it is optional
+    only in the sense that a store built without one cannot apply an immediate
+    edit (`apply_priority` refuses rather than writing something the escape
+    detector would report as an agent escape). Production wiring passes
+    `mutation_ledger_for(config.workers_root, config.state_dir)`.
+    """
+
+    def __init__(self, path: Path, ledger: Path | None = None):
+        self.path = Path(path)
+        self.ledger = MutationLedger(ledger) if ledger is not None else None
+
+    # ---- coordination -------------------------------------------------------
+
+    def lock(self, timeout: float = MUTEX_TIMEOUT_SECONDS):
+        """The fine-grained mutex for this task file, as a context manager.
+
+        Public because a caller doing its own load/mutate/save must be able to
+        put ALL THREE inside one hold — `save()` taking the lock by itself would
+        only make the write atomic, which it already was.
+        """
+        return task_file_mutex(self.path, timeout=timeout)
+
+    def ensure_mutex_file(self) -> Path:
+        """Create the (always empty) lock file if it does not exist yet, and
+        return it.
+
+        Called by the orchestrator immediately BEFORE the escape detector's
+        "before" snapshot. The lock file lives in the state dir, inside the
+        snapshotted tree, so a dashboard edit that had to create it mid-round
+        would show up as `created outside the worker repo` — a false loop-fatal
+        park. Pre-created, its bytes are empty and identical on both sides and
+        the detector has nothing to report, which needs no exemption at all.
+        """
+        lock_path = mutex_path_for(self.path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            with open(lock_path, "a+b"):
+                pass
+        return lock_path
+
+    # ---- persistence --------------------------------------------------------
 
     def load(self) -> TaskRegistry | None:
         if not self.path.exists():
@@ -1464,20 +1904,216 @@ class TaskStore:
             )
         return TaskRegistry.from_dict(data)
 
-    def save(self, registry: TaskRegistry) -> None:
+    @staticmethod
+    def _serialize(registry: TaskRegistry) -> bytes:
+        """The exact bytes a save writes. One function, because the digest
+        recorded in the ledger has to be the digest of the file that lands —
+        a second `json.dumps` with different arguments would chain the
+        attestation to a state that never existed on disk."""
+        return json.dumps(
+            registry.to_dict(), ensure_ascii=False, indent=2
+        ).encode("utf-8")
+
+    def _write_bytes(self, data: bytes) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(
-            json.dumps(registry.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        tmp.write_bytes(data)
         os.replace(tmp, self.path)
 
-    def archive(self) -> Path | None:
-        if not self.path.exists():
-            return None
-        from datetime import datetime, timezone
+    def _digest(self) -> str:
+        """sha256 of the task file as it is right now; `""` when there is none.
+        Read under the caller's mutex hold, so it is the digest the next write
+        chains from."""
+        try:
+            return hashlib.sha256(self.path.read_bytes()).hexdigest()
+        except OSError:
+            return ""
 
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup = self.path.with_name(f"{self.path.name}.bak-{stamp}")
-        os.replace(self.path, backup)
-        return backup
+    def save(self, registry: TaskRegistry) -> None:
+        """Persist `registry`, under the mutex, after reconciling the ONE field
+        another writer is allowed to have changed underneath.
+
+        The reconciliation is not decoration. A running loop holds its registry
+        in memory for a whole round; an operator priority edit that lands
+        mid-round is on disk, not in that object, so the next ordinary save
+        (`mark_in_progress`, `mark_completed`, a park) would write the stale
+        value back and silently undo it — the lost update the inbox was
+        originally built to avoid, arriving from the other side. So every save
+        adopts the on-disk `priority` for tasks the caller has not itself
+        re-prioritised.
+
+        **Inbox priority requests take precedence over the disk value**, and
+        that is what `TaskRegistry.priority_overrides()` is for: applying a
+        drained request is a deliberate write, so an id `set_priority` touched
+        since the last save keeps the value in memory. Same rule as
+        `inbox.apply_requests`' own last-write-wins.
+
+        The sharp edge that follows, stated for the next author: `set_priority`
+        is the ONLY thing that records an override. A priority passed to
+        `Task(...)`/`add_many` does not, so saving a freshly CONSTRUCTED task
+        over a stored row with the same id adopts the stored number. Nothing in
+        production can hit that — a new task's id is by definition not on disk,
+        and `cli._seed_registry` runs only when `load()` returned `None` — but a
+        test that hand-builds a second registry for a path it already saved to
+        will see the first value win.
+
+        Reconciliation FAILS OPEN. A corrupt, foreign-schema or unreadable task
+        file adopts nothing and the save proceeds: this method is on the path
+        that records completions and quarantines, and a save that started
+        refusing because the file it is about to overwrite will not parse would
+        be a far worse bug than a late priority.
+        """
+        with self.lock():
+            self.reconcile_priorities(registry)
+            self._write_bytes(self._serialize(registry))
+            registry.clear_priority_overrides()
+
+    def reconcile_priorities(self, registry: TaskRegistry) -> list[str]:
+        """Copy the on-disk `priority` onto every in-memory task whose priority
+        the caller has not itself changed since the last save. Returns the ids
+        adopted, so a caller can log what an operator steered.
+
+        Priority ONLY. Nothing else on disk is trusted over the in-memory
+        registry, because nothing else on disk can have been written by the
+        operator path: `apply_priority` is the only immediate write, and it can
+        express nothing but this field.
+        """
+        with self.lock():
+            try:
+                disk = self.load()
+            except (StateError, OSError, ValueError):
+                return []  # fail open — see `save`
+            if disk is None:
+                return []
+            overrides = registry.priority_overrides()
+            adopted = []
+            for task in registry.all_tasks():
+                if task.id in overrides or not disk.has(task.id):
+                    continue
+                stored = disk.get(task.id).priority
+                if stored != task.priority:
+                    task.priority = stored
+                    adopted.append(task.id)
+            return adopted
+
+    def apply_priority(self, task_id: str, priority: int) -> Task:
+        """Set one task's priority and PERSIST IT NOW. Returns the task as read
+        back from disk.
+
+        The operator's immediate steering path (`dashboard`'s `/api/priority`).
+        Queueing it through the inbox meant the value only became true when the
+        loop next drained between steps, while the page kept re-rendering from
+        `tasks.json` — so a save that worked and a save that did not looked
+        identical, and the operator resubmitted. A priority that lands minutes
+        later has already missed the decision it was meant to influence.
+
+        Everything happens inside ONE mutex hold: load, mutate, attest, write,
+        and the read-back. It takes NO `LoopLock` — that lock is held for the
+        entire run, so waiting for it would mean waiting for the loop to stop.
+
+        The return value is re-READ from the file rather than echoed from the
+        argument or from the in-memory registry. That read-back is the proof of
+        persistence the operator's row shows; echoing the input would redisplay
+        the number they typed whether or not anything reached the disk.
+
+        Refusals, all of which leave the file untouched:
+          * no task file yet — this path may not CREATE the registry. The loop
+            seeds it from `seed_tasks.json` on its first real save
+            (`cli._seed_registry`), and materialising it from a priority form
+            would be a brand-new write path, not a priority edit.
+          * no ledger configured — the write would be unattestable and would
+            park the loop as an escape if it landed mid-round. See
+            `MutationLedger`.
+          * unknown task, or a non-integer priority — `TaskRegistry.set_priority`
+            raises `TaskGraphError`, unchanged.
+        """
+        if self.ledger is None:
+            raise StateError(
+                "no mutation ledger configured for this task store — an "
+                "immediate priority write must be attestable outside the "
+                "checkout or the loop's escape detector reports it as an agent "
+                "escape (see MutationLedger)"
+            )
+        with self.lock():
+            registry = self.load()
+            if registry is None:
+                raise StateError(
+                    f"no task registry at {self.path} yet — the loop writes it "
+                    "on its first task-graph change; a priority edit does not "
+                    "create it"
+                )
+            registry.set_priority(task_id, priority)
+            payload = self._serialize(registry)
+            before = self._digest()
+            after = hashlib.sha256(payload).hexdigest()
+            # Recorded BEFORE the write: a ledger that cannot be appended to
+            # must leave the task file untouched rather than produce a change
+            # nothing can attest.
+            self.ledger.record(
+                tasks_path=self.path, before=before, after=after,
+                kind=LEDGER_KIND_PRIORITY, ids=(task_id,),
+            )
+            self._write_bytes(payload)
+            persisted = self.load()
+            if persisted is None or not persisted.has(task_id):  # pragma: no cover
+                raise StateError(
+                    f"priority for {task_id!r} did not survive the write to "
+                    f"{self.path}"
+                )
+            return persisted.get(task_id)
+
+    def attested_priority_edit(self, before_bytes: bytes, before_sha: str,
+                               after_sha: str) -> bool:
+        """Is the change from `before_sha` to `after_sha` an operator priority
+        edit this store applied — and nothing more?
+
+        The predicate behind the escape detector's one exemption for this file.
+        Both halves must hold (see `MutationLedger` for why either alone is
+        insufficient):
+
+          * WHO — `after_sha` is reachable from `before_sha` through ledger
+            records, each written by `apply_priority`, in a file outside the
+            checkout. An agent editing `tasks.json` from inside the checkout
+            produces no record and is reported.
+          * WHAT — the file as it stands now differs from `before_bytes` only
+            in `priority` values, checked against the actual bytes rather than
+            against the ledger's own claim about itself.
+
+        The bytes are re-read under the mutex, so a mutation still in flight
+        when the detector's snapshot was taken has finished by the time this
+        reads. The state read now may therefore be LATER than the snapshot's
+        `after_sha`; both must be attested-reachable, so a later legitimate
+        edit cannot launder an unattested one in between.
+        """
+        if self.ledger is None or not before_sha or not after_sha:
+            return False
+        if hashlib.sha256(before_bytes).hexdigest() != before_sha:
+            return False
+        with self.lock():
+            try:
+                current_bytes = self.path.read_bytes()
+            except OSError:
+                return False
+            reachable = self.ledger.reachable(before_sha, LEDGER_KIND_PRIORITY)
+            current_sha = hashlib.sha256(current_bytes).hexdigest()
+            if after_sha not in reachable or current_sha not in reachable:
+                return False
+            return priority_only_change(before_bytes, current_bytes)
+
+    def archive(self) -> Path | None:
+        """Move the task file aside (`reset --tasks`), under the mutex.
+
+        The lock matters here for the same reason it does in `save`: without it
+        an immediate priority write can land between the `exists()` check and
+        the `os.replace`, and the operator's edit is archived into a backup
+        nobody is looking at while the loop starts from a seed.
+        """
+        with self.lock():
+            if not self.path.exists():
+                return None
+            from datetime import datetime, timezone
+
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = self.path.with_name(f"{self.path.name}.bak-{stamp}")
+            os.replace(self.path, backup)
+            return backup

@@ -2,11 +2,22 @@
 lifecycle transitions, cycle detection, batch atomicity, persistence."""
 
 import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 
 import pytest
 
-from autoloop.errors import StateCorruptError, StateError, TaskGraphError
+import autoloop
+from autoloop.errors import LockHeldError, StateCorruptError, StateError, TaskGraphError
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
+
+#: The directory the `autoloop` package lives in, handed to child processes as
+#: `PYTHONPATH` so they import the SAME source this test does regardless of
+#: where pytest was invoked from.
+PACKAGE_ROOT = Path(autoloop.__file__).resolve().parent.parent
 
 
 def task(tid, deps=(), **kw):
@@ -744,6 +755,334 @@ def test_store_archive(tmp_path):
     backup = store.archive()
     assert backup is not None and backup.exists()
     assert store.load() is None
+
+
+# ---- immediate priority edits, and the mutex that makes them safe ------------
+#
+# `os.replace` has always made a SAVE atomic. It does nothing for the
+# read-modify-write around it, and that is where updates actually went missing:
+# two writers each doing load -> mutate -> save interleave, and whichever save
+# lands second discards the other's change. These pin the fine-grained mutex
+# (`tasks.task_file_mutex`), the immediate write the dashboard uses, and the
+# reconciliation that keeps a loop holding a stale registry in memory from
+# writing an operator's edit back out.
+
+
+def store_with_ledger(tmp_path, *tasks_):
+    """A `TaskStore` wired to a ledger outside the "checkout", pre-populated.
+
+    The ledger is what `apply_priority` attests into; a store without one
+    refuses to write at all (an unattested change would park the loop as an
+    escape if it landed mid-round), so every test of the immediate path needs
+    it.
+    """
+    store = TaskStore(tmp_path / "state" / "tasks.json",
+                      ledger=tmp_path / "outside" / "task-mutations.jsonl")
+    store.save(registry(*tasks_))
+    return store
+
+
+def test_a_priority_write_persists_and_survives_a_reload(tmp_path):
+    """The defect this replaces: the POST succeeded, the request sat in the
+    inbox, and the page re-rendered the OLD number from tasks.json — so a save
+    that worked looked exactly like one that did not."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3), task("t2"))
+
+    written = store.apply_priority("t1", 2)
+
+    assert written.priority == 2
+    # A FRESH store, so nothing in memory can be answering: the value has to
+    # have reached the file.
+    assert TaskStore(store.path).load().get("t1").priority == 2
+
+
+def test_the_returned_priority_is_read_back_from_disk_not_echoed(tmp_path):
+    """Read-back is what proves persistence. Echoing the caller's number would
+    report success identically whether or not anything landed."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    reloaded = TaskStore(store.path).load()
+    assert reloaded.get("t1").priority == 3  # baseline, before the write
+
+    assert store.apply_priority("t1", 7).priority == 7
+    assert json.loads(store.path.read_text(encoding="utf-8"))["tasks"][0]["priority"] == 7
+
+
+def test_a_priority_write_leaves_every_other_field_alone(tmp_path):
+    """One field, on an existing task. This path may not become a task editor:
+    `approved_paths` is authorization, `status` is what the loop dispatches on,
+    and `depends_on` reorders the graph."""
+    original = Task(
+        id="t1", title="T", description="d", priority=100,
+        approved_paths=("autoloop/dashboard.py",), status="pending",
+    )
+    other = task("t0")
+    store = TaskStore(tmp_path / "state" / "tasks.json",
+                      ledger=tmp_path / "outside" / "ledger.jsonl")
+    reg = TaskRegistry([other, original])
+    reg.set_depends_on("t1", ["t0"])
+    store.save(reg)
+    before = json.loads(store.path.read_text(encoding="utf-8"))
+
+    store.apply_priority("t1", 1)
+
+    after = json.loads(store.path.read_text(encoding="utf-8"))
+    assert after["tasks"][1]["priority"] == 1
+    for row_before, row_after in zip(before["tasks"], after["tasks"]):
+        assert {k: v for k, v in row_before.items() if k != "priority"} == \
+               {k: v for k, v in row_after.items() if k != "priority"}
+    assert after["tasks"][1]["status"] == "pending"
+    assert after["tasks"][1]["approved_paths"] == ["autoloop/dashboard.py"]
+    assert after["tasks"][1]["depends_on"] == ["t0"]
+
+
+def test_a_priority_write_refuses_rather_than_creating_the_registry(tmp_path):
+    """`tasks.json` is written by the loop on its first task-graph change
+    (seeded from the tracked `seed_tasks.json`). Materialising it from a
+    priority form would be a brand-new write path, not a priority edit."""
+    store = TaskStore(tmp_path / "state" / "tasks.json",
+                      ledger=tmp_path / "outside" / "ledger.jsonl")
+    with pytest.raises(StateError):
+        store.apply_priority("t1", 1)
+    assert not store.path.exists(), "a refused edit must not create the registry"
+
+
+def test_a_priority_write_without_a_ledger_refuses(tmp_path):
+    """An unattested write into `.autoloop/` would be reported as an agent
+    escape if it landed inside a detection window — i.e. a routine priority
+    edit could stop the loop. Refuse instead."""
+    store = TaskStore(tmp_path / "tasks.json")
+    store.save(registry(task("t1", priority=3)))
+    with pytest.raises(StateError):
+        store.apply_priority("t1", 1)
+    assert TaskStore(store.path).load().get("t1").priority == 3
+
+
+def test_a_failed_priority_write_reports_rather_than_reverting_silently(tmp_path):
+    """Two failures, and neither may look like "nothing happened": an unknown
+    id raises in the registry's own words, and a ledger that cannot be written
+    leaves the file untouched instead of producing a change nothing attests."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    expect_code(lambda: store.apply_priority("nope", 1), "unknown_task")
+    expect_code(lambda: store.apply_priority("t1", "high"), "bad_priority")
+    assert TaskStore(store.path).load().get("t1").priority == 3
+
+    # The ledger's own directory replaced by a file: the append fails, and the
+    # task file must be untouched because the record is written FIRST.
+    ledger = store.ledger.path
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    for stray in list(ledger.parent.iterdir()):
+        stray.unlink()
+    ledger.parent.rmdir()
+    ledger.parent.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(OSError):
+        store.apply_priority("t1", 1)
+    assert TaskStore(store.path).load().get("t1").priority == 3
+
+
+def test_a_save_adopts_an_operator_priority_written_under_it(tmp_path):
+    """Stale memory is the other half of the lost update. A running loop holds
+    its registry for a whole round, so an edit that lands mid-round is on disk
+    and not in that object — and the next ordinary save (a completion, a park)
+    would write the old number straight back over it."""
+    store = store_with_ledger(tmp_path, task("t1", priority=100), task("t2"))
+    loop_registry = store.load()  # what the loop holds for the rest of the round
+
+    store.apply_priority("t1", 1)  # the operator steers, mid-round
+
+    loop_registry.mark_completed("t2")
+    store.save(loop_registry)
+
+    assert TaskStore(store.path).load().get("t1").priority == 1, "the edit was overwritten"
+    assert TaskStore(store.path).load().state_of("t2") is TaskState.COMPLETED
+    # Adopted into the live object too, so THIS round's `next_ready()` already
+    # follows the operator's ordering rather than waiting for a restart.
+    assert loop_registry.get("t1").priority == 1
+
+
+def test_a_deliberate_priority_change_beats_the_stored_value(tmp_path):
+    """Reconciliation must not undo a change the loop itself just made — a
+    drained inbox `priority` request is a deliberate write, so it takes
+    precedence over whatever the file says (`inbox.apply_requests` is
+    last-write-wins, and this is the same rule)."""
+    from autoloop.inbox import apply_requests
+
+    store = store_with_ledger(tmp_path, task("t1", priority=100))
+    loop_registry = store.load()
+    store.apply_priority("t1", 5)  # on disk, not in the loop's memory
+
+    added, applied, refused = apply_requests(
+        loop_registry, [{"kind": "priority", "id": "t1", "priority": 9}]
+    )
+    store.save(loop_registry)
+
+    assert (added, refused) == ([], [])
+    assert applied == ["t1 -> 9"]
+    assert TaskStore(store.path).load().get("t1").priority == 9
+    # And the override is spent: the NEXT save reconciles normally again.
+    assert loop_registry.priority_overrides() == frozenset()
+
+
+def test_reconciliation_fails_open_on_an_unreadable_task_file(tmp_path):
+    """`save` records completions and quarantines. A save that started refusing
+    because the file it is about to overwrite will not parse would be a far
+    worse bug than a late priority."""
+    store = TaskStore(tmp_path / "tasks.json")
+    store.path.write_text("{ this is not json", encoding="utf-8")
+    reg = registry(task("t1"))
+    store.save(reg)  # must not raise
+    assert TaskStore(store.path).load().get("t1").id == "t1"
+
+
+# ---- two real processes, one task file --------------------------------------
+#
+# REAL subprocesses, not monkeypatched sleeps in one interpreter: the mutex is
+# a `flock` on a lock file, and an in-process test can only exercise the
+# `threading.RLock` half of it. The child is given the package root as
+# PYTHONPATH so it imports this source tree whatever pytest's cwd is.
+
+#: The OPERATOR side of the race, spelled out: exactly the sequence
+#: `TaskStore.apply_priority` runs internally (take the mutex, load, mutate,
+#: write) with a deliberate pause inserted between the load and the write, so
+#: the window the mutex has to cover is deterministic instead of a coin flip.
+#: The pause lives HERE and never in production code.
+_PRIORITY_WRITER = """
+import sys, time
+from pathlib import Path
+from autoloop.tasks import TaskStore
+
+tasks_path, loaded_flag, hold, task_id, value = sys.argv[1:6]
+store = TaskStore(tasks_path)
+with store.lock():
+    registry = store.load()
+    Path(loaded_flag).write_text("loaded")
+    time.sleep(float(hold))
+    registry.set_priority(task_id, int(value))
+    store.save(registry)
+"""
+
+#: A real process holding the RUN-level lock, the way a live `run --continuous`
+#: holds it for its whole run. It never lets go until told to, so a test can
+#: prove an immediate write does not wait for it.
+_LOOP_LOCK_HOLDER = """
+import sys, time
+from pathlib import Path
+from autoloop.lock import LoopLock
+
+state_dir, held_flag, release_flag = sys.argv[1:4]
+lock = LoopLock(Path(state_dir)).acquire()
+Path(held_flag).write_text("held")
+while not Path(release_flag).exists():
+    time.sleep(0.02)
+lock.release()
+"""
+
+
+def spawn(script, *args):
+    return subprocess.Popen(
+        [sys.executable, "-c", script, *[str(a) for a in args]],
+        env={**os.environ, "PYTHONPATH": str(PACKAGE_ROOT)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def reap(child, timeout=30.0):
+    """Wait for `child` and return its exit code, never raising.
+
+    Called from a `finally`, where an assertion would replace the body's real
+    failure with a confusing subprocess one — so the code is returned and
+    asserted after the block instead.
+    """
+    try:
+        return child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:  # pragma: no cover - a wedged child
+        child.kill()
+        return child.wait(timeout=timeout)
+
+
+def wait_for(path, child, timeout=20.0):
+    """Block until `path` appears, failing with the child's own stderr if it
+    dies first — a child that crashed on an import would otherwise show up as
+    an unexplained timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if Path(path).exists():
+            return
+        if child.poll() is not None:
+            raise AssertionError(f"child exited early: {child.communicate()}")
+        time.sleep(0.02)
+    raise AssertionError(f"{path} never appeared")
+
+
+def test_two_concurrent_writers_do_not_lose_an_update(tmp_path):
+    """The whole reason a fine-grained mutex exists, with a REAL competing
+    writer rather than a mocked one.
+
+    The child models the operator's immediate priority edit: it holds the mutex
+    across load -> mutate -> save. This process models the loop: it reads, marks
+    a task completed, and saves. Without the mutex the loop's save lands in the
+    middle of the child's read-modify-write and the child then writes its
+    pre-completion snapshot back — the completion is gone, which is exactly the
+    loss the task brief calls far worse than a late priority.
+
+    Delete the `with self.lock()` from `TaskStore.save` / `apply_priority` and
+    this test fails on the completion assertion.
+    """
+    store = store_with_ledger(tmp_path, task("t1", priority=100), task("t2"))
+    loaded_flag = tmp_path / "child-loaded"
+
+    child = spawn(_PRIORITY_WRITER, store.path, loaded_flag, 0.6, "t1", 2)
+    try:
+        wait_for(loaded_flag, child)
+        # The child has read the file and is holding the mutex. Everything this
+        # process does from here has to queue behind it.
+        loop_registry = store.load()
+        loop_registry.mark_completed("t2")
+        started = time.monotonic()
+        store.save(loop_registry)
+        waited = time.monotonic() - started
+    finally:
+        # Reaped, never ASSERTED here: an assertion inside `finally` replaces a
+        # real failure from the body with a confusing subprocess one.
+        code = reap(child)
+
+    assert code == 0, "the competing writer failed"
+    assert waited >= 0.2, "the save did not wait for the other writer's mutex"
+    persisted = TaskStore(store.path).load()
+    assert persisted.get("t1").priority == 2, "the operator's edit was lost"
+    assert persisted.state_of("t2") is TaskState.COMPLETED, "the completion was lost"
+
+
+def test_a_priority_write_succeeds_while_the_loop_lock_is_held(tmp_path):
+    """The case that motivates the whole design. `LoopLock` is held for the
+    ENTIRE run — that is why `answer` and `release` refuse while the loop is up
+    — so an immediate write that waited for it would be waiting for the loop to
+    stop, which is the opposite of immediate. It must not block and must not
+    fail."""
+    store = store_with_ledger(tmp_path, task("t1", priority=100))
+    state_dir = store.path.parent
+    held_flag, release_flag = tmp_path / "lock-held", tmp_path / "lock-release"
+
+    child = spawn(_LOOP_LOCK_HOLDER, state_dir, held_flag, release_flag)
+    try:
+        wait_for(held_flag, child)
+        from autoloop.lock import LoopLock
+
+        # Not merely a file on disk: a LIVE foreign process owns it, so the
+        # loop's own lock acquisition genuinely refuses.
+        with pytest.raises(LockHeldError):
+            LoopLock(state_dir).acquire()
+
+        started = time.monotonic()
+        written = store.apply_priority("t1", 1)
+        elapsed = time.monotonic() - started
+    finally:
+        release_flag.write_text("go")
+        code = reap(child)
+
+    assert code == 0, "the lock holder failed"
+    assert written.priority == 1
+    assert elapsed < 5.0, f"the write waited {elapsed:.1f}s — it must not block on LoopLock"
+    assert TaskStore(store.path).load().get("t1").priority == 1
 
 
 # ---- retirement: superseded work is not blocked work -------------------------

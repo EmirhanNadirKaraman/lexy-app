@@ -11,7 +11,10 @@
    coverage is not an oversight: `tasks.json` holds `approved_paths`, so an
    agent that could edit it undetected could widen its own authorization —
    exactly the circular ownership `docs/SECURITY.md` finding #2 closes. The
-   fix is therefore NOT to exclude the state dir from the snapshot.
+   fix is therefore NOT to exclude the state dir from the snapshot. (Still
+   true. The one immediate write that exists today is distinguished by an
+   ATTESTATION outside the checkout plus a check of what actually changed —
+   never by the path being `tasks.json`; see the note below.)
 2. **Lost updates.** The running orchestrator holds the registry in memory and
    saves it on task-graph changes. An external edit can be silently overwritten
    by the next save, and the single-instance lock exists precisely to stop
@@ -19,8 +22,34 @@
 
 So this inbox lives OUTSIDE the repository (beside `workers_root`, which is
 already required to be external), carries REQUESTS rather than registry state,
-and is drained by the loop itself at a safe point between steps. The loop
-remains the only writer of `tasks.json`, under its own lock.
+and is drained by the loop itself at a safe point between steps.
+
+**One exception since 2026-08-16, and only one: `priority`.** The dashboard now
+writes that field straight into `tasks.json` (`TaskStore.apply_priority`)
+instead of queueing it, so the loop is no longer the *only* writer of the
+registry — it is the only writer of everything except this one integer. Neither
+of the two reasons above was waved away to get there; each was answered:
+
+1. The detector still snapshots `tasks.json`, and `.autoloop/` is still not
+   excluded. The immediate write is ATTESTED in a ledger beside `workers_root`
+   — outside the checkout, exactly where this inbox lives and for exactly the
+   same reason — and the loop's exemption additionally verifies from the bytes
+   that nothing but `priority` moved. An agent editing that file still parks the
+   loop loop-fatal, so the circular-ownership property is intact
+   (`tasks.MutationLedger`, `orchestrator._operator_priority_exemption`).
+2. Lost updates are answered by a lock, just not the run-level one. A
+   fine-grained mutex (`tasks.task_file_mutex`) serialises load/mutate/save for
+   BOTH writers, and `TaskStore.save` reconciles the on-disk priority into the
+   loop's in-memory registry so a round that started before the edit cannot
+   write the stale value back.
+
+Why `priority` and nothing else: it is the field an operator uses to steer what
+runs next, so a change that lands whenever the loop next drains has already
+missed the decision it was for — and it is safe to change mid-flight precisely
+because nothing already dispatched depends on it. Creation still queues here.
+`KIND_PRIORITY` also stays: a request written into this directory by hand is
+still drained and applied, and takes precedence over the file's value when it
+is (see `TaskRegistry.priority_overrides`).
 
 A request is a plain JSON object with the same shape `seed_tasks.json` uses.
 Nothing here validates the task graph — `TaskRegistry.add_many` does that on

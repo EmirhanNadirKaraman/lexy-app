@@ -90,7 +90,7 @@ from .publisher import (
 )
 from .stall import StallPolicy
 from .state import TERMINAL_PHASES, LoopState, Phase, StateStore
-from .tasks import Task, TaskRegistry, TaskState, TaskStore
+from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from .transcript import TranscriptLogger
 from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
@@ -177,7 +177,18 @@ def _drift_is_recorded_rotation(state: LoopState, config: AutoloopConfig) -> boo
 
 
 def _load_tasks(config: AutoloopConfig) -> tuple[TaskStore, TaskRegistry]:
-    task_store = TaskStore(config.tasks_file)
+    """The task store and its registry, wired to the mutation ledger.
+
+    The ledger is where an immediate operator priority edit is attested
+    (`tasks.MutationLedger`). It is passed HERE — the one place a real run
+    builds its store — so the loop reads the same file the dashboard writes;
+    both derive the path from `tasks.mutation_ledger_for`, never by spelling it
+    twice.
+    """
+    task_store = TaskStore(
+        config.tasks_file,
+        ledger=mutation_ledger_for(config.workers_root, config.state_dir),
+    )
     registry = task_store.load()
     if registry is None:
         registry = _seed_registry(config)
@@ -2750,10 +2761,17 @@ def _cmd_reset(args: argparse.Namespace) -> int:
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
-    """Serve the read-only tracker. Takes NO lock and writes nothing — it may
-    run alongside a live `run --continuous`, which is the only time it is
-    useful. Touching the working tree would make the loop's escape detector
-    refuse its next write-capable task."""
+    """Serve the live tracker. Takes NO lock — it is meant to run alongside a
+    live `run --continuous`, which is the only time it is useful, and `LoopLock`
+    is held for the whole of such a run.
+
+    Observation is read-only. It has exactly two write paths, neither of which
+    can disturb the loop: a new task is queued to the inbox outside the
+    checkout, and a task's PRIORITY is written straight into `tasks.json` under
+    the fine-grained mutex the loop's own saves take (`tasks.task_file_mutex`),
+    attested so the escape detector does not read it as an agent escape. It
+    still writes nothing else in the state dir and never touches the working
+    tree."""
     from .dashboard import main as dashboard_main
 
     repo = args.repo or Path.cwd()
@@ -2997,7 +3015,11 @@ def build_parser() -> argparse.ArgumentParser:
     answer.set_defaults(func=_cmd_answer)
 
     dash = sub.add_parser(
-        "dashboard", help="serve a read-only live tracker on localhost (no lock)"
+        "dashboard",
+        help=(
+            "serve the live tracker on localhost (no lock; reads only, except "
+            "an immediate task-priority edit)"
+        ),
     )
     add_config(dash)
     dash.add_argument("--port", type=int, default=8787)
