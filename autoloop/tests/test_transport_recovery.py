@@ -29,6 +29,7 @@ from autoloop.browser.observation import (
     is_send_path,
     scrub_path,
 )
+from autoloop.cli import _authorize_resubmit
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.config_writer import (
     assert_untracked,
@@ -37,6 +38,7 @@ from autoloop.config_writer import (
 )
 from autoloop.errors import (
     ConfigError,
+    ConversationSearchInconclusive,
     ConversationUnusableError,
     LoginExpiredError,
     ResponseTimeoutError,
@@ -107,10 +109,26 @@ class RotatingFakeClient:
         self.find_calls: list[tuple[str, str]] = []
         self._stranded_at = None
         self.find_finds_nothing = False
+        #: (url, request_id) pairs the SERVER holds but a WINDOW READ misses —
+        #: the 2026-08-05 bug in one attribute. ChatGPT mounts a window of a
+        #: conversation, not its history, so `has_request`/`reconcile` (window
+        #: reads) go blind to these while `find_conversation_with` (which
+        #: mounts the tail) still sees them. Without this the fake has a single
+        #: truth and every "the search rescued it" test passes on reconcile.
+        self.unmounted: set[tuple[str, str]] = set()
+        #: Raised by `find_conversation_with` — the search refusing to conclude.
+        self.find_error = None
 
     # -- test helpers ------------------------------------------------------
     def seed(self, url, request_id):
         self.persisted.setdefault(url, set()).add(request_id)
+
+    def hide_from_the_window(self, url, request_id):
+        """Persist a request that a reload will NOT show: it is in the chat,
+        below the mounted window, exactly like the turn a human found by
+        pressing End and scrolling six times."""
+        self.seed(url, request_id)
+        self.unmounted.add((url, request_id))
 
     def strand_the_address_bar(self, project_url):
         """Model the real failure: the chat is created and holds the request,
@@ -118,8 +136,12 @@ class RotatingFakeClient:
         self._stranded_at = project_url
 
     def find_conversation_with(self, request_id, project_url, limit=6):
-        """Find the chat by CONTENT, as the real client does."""
+        """Find the chat by CONTENT, as the real client does — including the
+        turns a window read never mounted, which is the whole reason it is a
+        better witness than `reconcile`."""
         self.find_calls.append((request_id, project_url))
+        if self.find_error is not None:
+            raise self.find_error
         if self.find_finds_nothing:
             return None
         for url, ids in self.persisted.items():
@@ -145,6 +167,8 @@ class RotatingFakeClient:
         return self.page_url
 
     def has_request(self, request_id):
+        if (self.conversation_url, request_id) in self.unmounted:
+            return False
         return request_id in self.persisted.get(self.conversation_url, set())
 
     def reconcile(self, request_id):
@@ -1396,3 +1420,239 @@ def test_a_rotation_still_refuses_when_no_chat_carries_the_request(tmp_path):
     assert client.find_calls, "it must have looked"
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert "no chat in the project carries this request" in (orch.state.question or "")
+
+
+# ---- a FALSE ambiguity is resolved by PROVING the request is there ----------
+#
+# The asymmetry these tests pin down, and the reason it is not symmetric:
+#
+#   * proved PRESENT -> resolve automatically. Nothing is ambiguous, resuming
+#     sends nothing, so the worst a wrong "present" can do is wait in a chat
+#     that holds the request.
+#   * absent, or unproven either way -> park, exactly as before. Acting on
+#     absence means resending, which can duplicate a request the backend
+#     accepted — unrecoverable — and absence is precisely the conclusion a
+#     flaky read gets wrong.
+#
+# So: prove presence and proceed; never infer absence and act.
+
+RESCUED = "alr-af11e1b3-0006"
+
+
+def park_code(config):
+    rows = transcript_entries(config, "needs_user")
+    return rows[-1]["data"]["code"] if rows else None
+
+
+def ambiguous_state(request_id=RESCUED):
+    """A send was attempted, acceptance was never observed, and the loop is
+    about to decide whether a human has to look at it."""
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.SUBMISSION_UNCONFIRMED.value
+    state.pending_request = pending(request_id, send_attempted=True)
+    return state
+
+
+def test_a_request_the_search_proves_present_resolves_without_parking(tmp_path):
+    """The park that should never have happened (2026-08-05, `alr-af11e1b3-0006`).
+
+    The request WAS in the conversation and had already been answered with
+    `decision push`; reading it by hand took pressing End and scrolling six
+    times, because ChatGPT mounts a window of a chat rather than its history.
+    `reconcile`'s window read missed it, so the loop parked a human on an
+    ambiguity that did not exist — and a resend would have double-posted a
+    request that had already been reviewed.
+
+    The by-content search mounts the tail, so it sees what the reload could
+    not. Proof of presence resolves the park by itself: the request is there,
+    so the loop resumes into `awaiting` and reads the answer.
+    """
+    client = RotatingFakeClient(responses=[stop_block()])
+    client.hide_from_the_window(CONV_URL, RESCUED)
+    orch, store, config = build(tmp_path, client, state=ambiguous_state())
+
+    orch.run(max_steps=4)
+
+    # The one assertion that makes this safe rather than merely convenient.
+    assert client.submitted == [], "resolving an ambiguity must SEND NOTHING"
+    assert transcript_entries(config, "submission_ambiguous") == []
+    assert park_code(config) != "submission_ambiguous"
+    confirmed = transcript_entries(config, "submission_confirmed_by_search")
+    assert confirmed and confirmed[-1]["data"]["url"] == CONV_URL
+    assert orch.state.phase != Phase.NEEDS_USER.value
+    assert client.awaited, "it must go on to read the answer that was already there"
+
+
+def test_the_resolution_survives_a_project_relative_search_result(tmp_path):
+    """The trap that would make this fix silently never fire in production
+    while every hand-typed-URL test stayed green. `find_conversation_with`
+    builds candidates with `urljoin(project_url, href)`, and ChatGPT's list
+    hrefs are `/c/<id>` — so the same chat comes back WITHOUT the project
+    prefix the request is bound to. A string compare calls those two different
+    conversations and parks."""
+    stripped = "https://chatgpt.com/c/original-chat"
+    assert stripped != CONV_URL and Orchestrator._same_conversation(stripped, CONV_URL)
+
+    client = RotatingFakeClient(responses=[stop_block()])
+    client.hide_from_the_window(CONV_URL, RESCUED)
+    client.find_conversation_with = lambda rid, project, limit=6: stripped
+    orch, store, config = build(tmp_path, client, state=ambiguous_state())
+
+    orch.run(max_steps=4)
+
+    assert orch.state.phase != Phase.NEEDS_USER.value
+    assert client.submitted == []
+
+
+def test_a_genuinely_absent_request_still_parks(tmp_path):
+    """The direction that is NOT automated. The search read the project to the
+    end and the request is in none of it — which is exactly the reading that
+    would authorize a resend, and exactly the reading a flaky check gets
+    wrong. Absence stays a human's call."""
+    client = RotatingFakeClient(responses=[])
+    orch, store, config = build(tmp_path, client, state=ambiguous_state("alr-absent-0001"))
+
+    orch.run(max_steps=3)
+
+    assert client.find_calls, "it must have looked before parking"
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert park_code(config) == "submission_ambiguous"
+    assert client.submitted == [], "a park never resends"
+    assert transcript_entries(config, "submission_confirmed_by_search") == []
+    # The park must say the project WAS read — the fact that separates this
+    # from a park where no search ran, and the one that tells the operator a
+    # `--resubmit` is the plausible next move.
+    assert "read its recent chats to the end" in (orch.state.question or "")
+
+
+def test_an_inconclusive_search_parks_rather_than_guessing(tmp_path):
+    """A search that read a page it could not vouch for — a rotation moved the
+    client mid-flight, or a virtualized list never proved it reached its end —
+    says NOTHING about presence. "Said nothing" must not read as "absent": it
+    parks, with the refusal recorded so the operator knows the search was not
+    a clean miss."""
+    client = RotatingFakeClient(responses=[])
+    client.find_error = ConversationSearchInconclusive(
+        "the search asked for one chat and is on another"
+    )
+    orch, store, config = build(tmp_path, client, state=ambiguous_state())
+
+    orch.run(max_steps=3)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert park_code(config) == "submission_ambiguous"
+    assert client.submitted == []
+    refused = transcript_entries(config, "presence_search_inconclusive")
+    assert refused and refused[-1]["data"]["reason_code"] == "search_refused_to_conclude"
+
+
+def test_login_expiry_during_the_search_is_not_demoted_to_ambiguity(tmp_path):
+    """`LoginExpiredError` is a `BrowserError`, so the clause that collapses a
+    refused search into "park ambiguous" would swallow it — and every logged-out
+    profile would be reported as an ambiguous submission, which is precisely the
+    misclassification this whole change exists to remove. It is re-raised
+    instead, and `run()` parks it as `login_expired` with THIS phase as the
+    resume point, so logging back in and retrying comes straight back to the
+    search with nothing sent in between. Swap the two `except` clauses and this
+    test is what fails."""
+    client = RotatingFakeClient(responses=[])
+    client.find_error = LoginExpiredError("session expired")
+    orch, store, config = build(tmp_path, client, state=ambiguous_state())
+
+    orch.run(max_steps=3)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert park_code(config) == "login_expired"
+    assert orch.state.resume_phase == Phase.SUBMISSION_UNCONFIRMED.value
+    assert client.submitted == []
+    assert transcript_entries(config, "submission_ambiguous") == []
+
+
+def test_a_hit_in_a_different_chat_parks_and_names_it(tmp_path):
+    """Presence somewhere is not presence HERE. A rotation deliberately reuses
+    the request id in the replacement chat, so a hit outside this request's own
+    conversation can be a retired copy — rebinding to it on that evidence is a
+    rotation performed on a duplicate id. It parks, and the operator is told
+    which chat to read instead of being sent to look for a message that may not
+    exist."""
+    client = RotatingFakeClient(responses=[])
+    client.seed(NEW_CONV_URL, RESCUED)  # some OTHER chat carries the id
+    orch, store, config = build(tmp_path, client, state=ambiguous_state())
+
+    orch.run(max_steps=3)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert park_code(config) == "submission_ambiguous"
+    assert client.submitted == []
+    assert NEW_CONV_URL in (orch.state.question or "")
+    ambiguous = transcript_entries(config, "submission_ambiguous")
+    assert ambiguous[-1]["data"]["found_elsewhere"] == NEW_CONV_URL
+
+
+def test_a_provider_without_the_search_parks_exactly_as_before(tmp_path):
+    """The capability is PROBED, like `retarget`/`current_url`. A transport
+    that cannot search the way ChatGPT's chat list can must lose nothing and
+    gain nothing — it parks on the same evidence it always did."""
+    client = RotatingFakeClient(responses=[])
+    # Assigned None rather than deleted: the method lives on the CLASS, so a
+    # `del` on the instance raises. The orchestrator's `getattr` probe reads
+    # both the same way — no capability.
+    client.find_conversation_with = None
+    orch, store, config = build(tmp_path, client, state=ambiguous_state())
+
+    orch.run(max_steps=3)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert park_code(config) == "submission_ambiguous"
+    skipped = transcript_entries(config, "presence_search_skipped")
+    assert skipped and skipped[-1]["data"]["reason_code"] == "provider_cannot_search"
+
+
+def test_without_a_project_url_there_is_nothing_to_search(tmp_path):
+    """No project configured is no chat list to read, so the search cannot run
+    at all. It must fall through to the park rather than treat "could not
+    look" as "not there"."""
+    client = RotatingFakeClient(responses=[])
+    orch, store, config = build(
+        tmp_path, client, state=ambiguous_state(), project_url=""
+    )
+
+    orch.run(max_steps=3)
+
+    assert client.find_calls == []
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert park_code(config) == "submission_ambiguous"
+    skipped = transcript_entries(config, "presence_search_skipped")
+    assert skipped and skipped[-1]["data"]["reason_code"] == "no_project_url"
+    # And it must not claim a search it never ran. The first draft of the park
+    # message said "a by-content search did not find it either" in this exact
+    # case — manufacturing evidence, and pointing the operator at `--resubmit`
+    # on the strength of a read nobody performed.
+    assert "project_url is not configured" in (orch.state.question or "")
+    assert "did not find the request" not in (orch.state.question or "")
+
+
+def test_resubmit_is_still_the_only_thing_that_repeats_a_send(tmp_path):
+    """The park is not weakened. A request the search cannot find is parked and
+    stays parked: the loop resends nothing on its own, no matter how many times
+    it is run. Only the operator's explicit `--resubmit` — one more send of the
+    SAME request id, so a message that did land is detected rather than
+    duplicated — repeats it."""
+    client = RotatingFakeClient(responses=[stop_block()])
+    orch, store, config = build(tmp_path, client, state=ambiguous_state("alr-absent-0002"))
+
+    orch.run(max_steps=3)
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert client.submitted == []
+
+    # Re-running while parked changes nothing — `needs_user` is terminal for
+    # the run and no automatic path back into `submitting` exists.
+    orch.run(max_steps=3)
+    assert client.submitted == []
+
+    _authorize_resubmit(orch.state)
+    store.save(orch.state)
+    orch.run(max_steps=4)
+
+    assert len(client.submitted) == 1, "the operator's one authorized send, and only it"
+    assert client.submitted[0][:2] == (CONV_URL, "alr-absent-0002")

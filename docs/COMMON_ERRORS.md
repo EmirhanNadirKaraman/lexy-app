@@ -955,6 +955,16 @@ streaming conversation (retry), `never reached its end` is a gesture that is not
 driving the scroller (a selector or focus problem), and `cannot report a scroll
 position` is a session without the signal at all (expected for the End-key
 fallback; on a real `PlaywrightSession` it means the measurement kept failing).
+**The park it caused now resolves itself (2026-08-16).** `reconcile` still reads
+a mounted window, so it can still miss a turn — but a miss no longer ends the
+run. Before parking `submission_ambiguous`, the orchestrator runs the search
+above (`_resolve_or_park_ambiguous`); if it PROVES the request is in this
+request's own conversation, the park is cancelled and the loop resumes into
+`awaiting`, sending nothing. Only that direction is automatic. Absence, a hit in a different
+chat, a search that refused to conclude, and no `browser.project_url` all park
+exactly as before, and the park text says which of them happened — so if you are
+reading a `submission_ambiguous` question, start there rather than opening the
+chat blind. `run --resubmit` is still the only thing that repeats a send.
 **Still open elsewhere:** every OTHER readback (`reconcile`, `has_request`,
 `Orchestrator._part_present`) reads what is mounted. That is usually fine —
 they check the newest turn — but do not infer "the conversation contains only

@@ -7,9 +7,9 @@ Phases (see state.Phase):
                    │ send attempted,                  └─► needs_user  (budgets)
                    │ acceptance unknown
                    ▼
-       submission_unconfirmed ──reconcile──┬─► awaiting   (it did persist)
-                                           └─► needs_user (ambiguous; NEVER
-                                                           an automatic resend)
+   submission_unconfirmed ──reconcile, then search──┬─► awaiting   (it is there)
+                                                    └─► needs_user (ambiguous;
+                                                        NEVER an automatic resend)
 
 Phase 2 additions on top of the v1 machine:
 
@@ -30,11 +30,19 @@ Phase 3.1 (browser-transport repair) additions:
   duplicate check reads persisted history — an optimistic user bubble in the
   live DOM is never taken as proof a message was accepted.
 * An attempted-but-unconfirmed send lands in `submission_unconfirmed`, which
-  only ever reconciles. It never resends: the backend may have accepted a
+  only ever READS. It never resends: the backend may have accepted a
   message the browser failed to observe, so an automatic retry could
   double-post. Resolution is either "it did persist" → awaiting, or a park for
   the operator (`run --retry` to reconcile again, `run --resubmit` to allow one
   more send of the same request id).
+* Reading is two-stage, because a reload proves presence but cannot establish
+  absence in a VIRTUALIZED list: when the reload comes back empty, the
+  by-content search (`find_conversation_with`, which mounts the tail) gets the
+  last word. Finding the request in this request's own conversation resolves
+  the park automatically — nothing is ambiguous and resuming sends nothing.
+  Not finding it changes nothing: the loop still parks. Presence is proved and
+  acted on; absence is never inferred and never acted on
+  (`_resolve_or_park_ambiguous`).
 * `awaiting` performs no navigation at all, so a streaming answer survives.
 
 Transport-recovery additions (this change):
@@ -260,6 +268,21 @@ CONTINUATION_NOTE = (
 #: needs 180s failed three rotations that had actually succeeded.
 ROTATION_URL_TIMEOUT_SECONDS = 30.0
 ROTATION_URL_POLL_SECONDS = 0.5
+
+
+def _conversation_id(url: str) -> str | None:
+    """The id a `/c/<id>` URL ends with, or None for anything else.
+
+    Mirrors `BrowserChatGPT._conversation_id` deliberately rather than
+    importing it: URL comparison on the orchestrator's side of the seam is
+    already its own (`_url_in_project`), and the alternative is the
+    orchestrator reaching into one adapter's private helper to reason about
+    conversations every provider has.
+    """
+    segs = [seg for seg in urlsplit(url).path.split("/") if seg]
+    if len(segs) >= 2 and segs[-2] == "c":
+        return segs[-1]
+    return None
 
 
 #: The four outcomes of `Orchestrator._browser_restart_outcome`. They are
@@ -1034,7 +1057,7 @@ class Orchestrator:
                 # rather than parking: with nothing left behind by the failed
                 # attempt, re-issuing is the correct action, not a compromise.
             else:
-                self._park_ambiguous(req, reconciled=True)
+                self._resolve_or_park_ambiguous(req, reconciled=True)
                 return
 
         # Defensive integrity check: `req.prompt` is set once in `ready` and
@@ -1134,7 +1157,14 @@ class Orchestrator:
         self._store.save(state)
 
     def _step_submission_unconfirmed(self) -> None:
-        """Resolve an ambiguous send by reconciliation only — never by resending."""
+        """Resolve an ambiguous send by READING only — never by resending.
+
+        Two reads, in order of cost: the controlled reload below, then (only
+        when it comes back empty) the by-content search in
+        `_resolve_or_park_ambiguous`, which mounts the tail of a virtualized
+        list the reload's window may never have painted. Both prove presence;
+        neither can conclude absence into an action.
+        """
         state = self.state
         req = state.pending_request
         if req is None:
@@ -1153,7 +1183,7 @@ class Orchestrator:
             state.phase = Phase.AWAITING.value
             self._store.save(state)
             return
-        self._park_ambiguous(req, reconciled=True)
+        self._resolve_or_park_ambiguous(req, reconciled=True)
 
     def _step_submission_rejected(self) -> None:
         """Resolve a DISPROVEN send.
@@ -1914,19 +1944,207 @@ class Orchestrator:
             packet_sha256=report_sha256,
         )
 
-    def _park_ambiguous(self, req: PendingRequest, reconciled: bool) -> None:
-        """Stop on an ambiguous submission. Never resends automatically."""
+    def _resolve_or_park_ambiguous(self, req: PendingRequest, reconciled: bool) -> None:
+        """Last check before parking: is the request actually THERE?
+
+        `reconcile()` reads the conversation's mounted window, and ChatGPT
+        mounts a WINDOW of a chat rather than its history. On 2026-08-05
+        `alr-af11e1b3-0006` parked here as `submission_ambiguous` while the
+        conversation held the request AND its answer (`decision push`) — the
+        turn was simply not painted. That park cost a human, and there was
+        never anything ambiguous about it.
+
+        So before parking, ask the by-content search, which mounts the tail
+        and refuses to answer at all unless it demonstrably read the chat to
+        its end (`BrowserChatGPT.find_conversation_with`).
+
+        **The asymmetry is the design, and only one direction is automated:**
+
+        * *The search PROVES the request present in this request's own
+          conversation* → resolve and resume. Nothing is ambiguous, resuming
+          sends nothing, and the risk is zero: it is the "it did persist"
+          branch of `_step_submission_unconfirmed`, reached by better evidence.
+        * *Anything else* → park exactly as before. Absence is the conclusion
+          a flaky read gets wrong, and acting on it means a resend, which can
+          duplicate a request the backend accepted. Proving presence lets the
+          loop proceed; absence is never inferred and never acted on.
+
+        A hit in a DIFFERENT chat parks too, and is not a contradiction: it
+        proves the id exists somewhere, not that THIS send landed where the
+        loop is listening. Rotation deliberately reuses the request id in the
+        replacement chat, so a hit elsewhere can be a retired copy — and
+        adopting a chat on that evidence is a rotation-grade rebinding
+        (epoch, `state.conversation_url`, the config URL) taken on a duplicate
+        id. The operator gets told which chat instead, which is the one fact
+        that was missing. Nor is such a hit evidence of ABSENCE here: the
+        search returns on its first sighting and stops walking.
+        """
+        found, note = self._search_for_request(req)
+        if found is not None and self._same_conversation(found, req.conversation_url):
+            state = self.state
+            req.submitted = True
+            state.phase = Phase.AWAITING.value
+            self._log(
+                "submission_confirmed_by_search",
+                request_id=req.request_id,
+                data={
+                    "reason_code": "found_in_persisted_history_by_content",
+                    "url": found,
+                    "reconcile_attempts": req.reconcile_attempts,
+                    "note": (
+                        "reconciliation read a window that had not mounted the "
+                        "turn; the request is present, so nothing was sent"
+                    ),
+                },
+            )
+            self._store.save(state)
+            return
+        self._park_ambiguous(req, reconciled, found=found, search_note=note)
+
+    def _search_for_request(self, req: PendingRequest) -> tuple[str | None, str]:
+        """The chat that PROVABLY carries `req`, per the by-content search, and
+        a sentence saying what the search actually did.
+
+        The URL is returned only on a positive sighting. Every other outcome —
+        no `browser.project_url` to search, a provider without the capability
+        (probed with `getattr`, like `retarget`/`current_url`), a search that
+        refused to conclude (`ConversationSearchInconclusive`), a transport
+        failure, or a genuine "in none of these chats" — returns None, which
+        leaves the caller parking. That collapse is safe in exactly one
+        direction: None here never authorizes anything, it only declines to
+        cancel a park.
+
+        The note exists because those outcomes collapse into one value and must
+        NOT collapse in what the operator is told. "The project was read and
+        the request is in none of it" and "no search ran at all" point at
+        completely different next actions, and a park that claimed the former
+        while doing the latter would be manufacturing evidence.
+
+        `LoginExpiredError` is re-raised rather than collapsed. A logged-out
+        profile makes every read meaningless, and `run()` parks it with this
+        phase as the resume point, so the retry after logging back in comes
+        straight back here and searches again — with nothing sent in between.
+        """
+        project_url = self._config.browser.project_url
+        if not project_url:
+            self._log(
+                "presence_search_skipped",
+                request_id=req.request_id,
+                data={"reason_code": "no_project_url"},
+            )
+            return None, (
+                "No by-content search ran: browser.project_url is not configured, "
+                "so autoloop has no chat list to read."
+            )
+        client = self._client_for_request(req)
+        search = getattr(client, "find_conversation_with", None)
+        if search is None:
+            self._log(
+                "presence_search_skipped",
+                request_id=req.request_id,
+                data={"reason_code": "provider_cannot_search"},
+            )
+            return None, (
+                "No by-content search ran: this provider cannot search a project "
+                "by message content."
+            )
+        try:
+            found = search(req.request_id, project_url)
+        except LoginExpiredError:
+            raise
+        except (BrowserError, AutoloopError) as exc:
+            # Includes `ConversationSearchInconclusive`: the search read a page
+            # it could not vouch for, or never proved it reached the end of a
+            # virtualized list. It is refusing to rule EITHER way, so it has
+            # said nothing about presence — and "said nothing" must not read as
+            # "absent".
+            self._log(
+                "presence_search_inconclusive",
+                request_id=req.request_id,
+                data={"reason_code": "search_refused_to_conclude", "error": str(exc)},
+            )
+            return None, (
+                f"A by-content search ran and REFUSED to conclude ({exc}), so it "
+                "is not evidence the request is missing — only that this read "
+                "could not settle it."
+            )
+        self._log(
+            "presence_search_completed",
+            request_id=req.request_id,
+            data={"found": found, "project_url": project_url},
+        )
+        if found is None:
+            return None, (
+                f"A by-content search of {project_url} read its recent chats to "
+                "the end and did not find the request either."
+            )
+        return found, (
+            f"A by-content search DID find {req.request_id} in {found}, which is "
+            f"not this request's conversation ({req.conversation_url}) — a "
+            "replacement chat reuses the request id, so that may be a retired "
+            "copy. Read that chat before deciding; do NOT `--resubmit` on the "
+            "strength of this line alone."
+        )
+
+    @staticmethod
+    def _same_conversation(candidate: str, bound: str) -> bool:
+        """True when two URLs name the SAME chat.
+
+        A conversation is identified by its `/c/<id>`, never by the project
+        prefix in front of it. ChatGPT rewrites that prefix with the project
+        slug, and `find_conversation_with` builds candidates with `urljoin`
+        against the project page, so the same chat legitimately arrives here
+        as `https://chatgpt.com/c/<id>` while the request is bound to
+        `https://chatgpt.com/g/g-p-<id>-<slug>/c/<id>`. Comparing the strings
+        would call those two different chats — turning every resolution back
+        into a park in production while passing every test that types URLs by
+        hand. Same trap `BrowserChatGPT._is_candidate_page` documents.
+
+        Falls back to a path compare when neither side is a `/c/<id>` URL, so
+        a non-ChatGPT provider is compared exactly, not waved through.
+        """
+        if not candidate or not bound:
+            return False
+        left, right = urlsplit(candidate), urlsplit(bound)
+        if left.netloc != right.netloc:
+            return False
+        left_id, right_id = _conversation_id(candidate), _conversation_id(bound)
+        if left_id is not None or right_id is not None:
+            return left_id == right_id
+        return left.path.rstrip("/") == right.path.rstrip("/")
+
+    def _park_ambiguous(
+        self,
+        req: PendingRequest,
+        reconciled: bool,
+        found: str | None = None,
+        search_note: str = "",
+    ) -> None:
+        """Stop on an ambiguous submission. Never resends automatically.
+
+        `search_note` says what the by-content search did — it is the operator's
+        only way to tell "the project was read and the request is in none of it"
+        apart from "no search ran", and those point at different next actions.
+        Its only caller is `_resolve_or_park_ambiguous`, which always has one;
+        it defaults empty so a future park that never searched says nothing
+        about a search rather than inventing one.
+        """
         self._log(
             "submission_ambiguous",
             request_id=req.request_id,
-            data={"reconciled": reconciled, "reconcile_attempts": req.reconcile_attempts},
+            data={
+                "reconciled": reconciled,
+                "reconcile_attempts": req.reconcile_attempts,
+                "found_elsewhere": found,
+            },
         )
         self._to_needs_user(
             f"submission of {req.request_id} is AMBIGUOUS: a send was attempted but "
             "the request is not in persisted history after reconciliation. Autoloop "
             "will not resend on its own — the backend may have accepted a message "
             "the browser never observed, so resending risks a duplicate post. "
-            "Inspect the conversation, then either `run --retry` (reconcile again) "
+            + (search_note + " " if search_note else "")
+            + "Inspect the conversation, then either `run --retry` (reconcile again) "
             "or `run --resubmit` (send this same request id once more; if it did "
             "land, it is detected and not duplicated).",
             resume_phase=Phase.SUBMISSION_UNCONFIRMED.value,

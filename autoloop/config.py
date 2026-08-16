@@ -33,8 +33,10 @@ class BrowserConfig:
     #: to a chat was read in full, quoting canaries from its last line.
     attach_oversized_diff: bool = False
     #: The ChatGPT *project* the conversation belongs to, e.g.
-    #: "https://chatgpt.com/g/g-p-<id>-<slug>/project". Required for conversation
-    #: rotation and for nothing else — a rotation opens a new chat here.
+    #: "https://chatgpt.com/g/g-p-<id>-<slug>/project". Required for the two
+    #: things that read the project's chat list: conversation rotation (which
+    #: opens a new chat here) and the by-content search that resolves a false
+    #: `submission_ambiguous` park (`Orchestrator._resolve_or_park_ambiguous`).
     #: Configured EXPLICITLY rather than sliced out of `conversation_url`:
     #: deriving it would mean guessing which URL shapes are project-scoped, and
     #: a wrong guess opens a chat somewhere the operator never chose. Unset
