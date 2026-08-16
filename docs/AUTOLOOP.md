@@ -1966,6 +1966,17 @@ answer unless it demonstrably reached the end — §5c) gets the last word:
   no project is configured** → parks exactly as before, and the park says which
   of those happened.
 
+**The park question states the evidence obtained, and nothing more.** It used to
+open "the request is not in persisted history after reconciliation" — which
+`reconcile()` cannot establish, because it reads the mounted window. In every
+park where the search did not run or did not conclude, that sentence asserted
+absence and the note under it then said absence was never established: a
+contradiction that reads as licence for `--resubmit`. The base sentence now says
+only that reconciliation did not SEE the request in the window it read back;
+wording that means "it is not there" belongs to the one branch that earned it —
+the search that read the chats to their end and came back empty — and appears
+only in that note.
+
 The asymmetry is the design: **prove presence and proceed; never infer absence
 and act.** Presence is safe to act on because acting means waiting; absence is
 not, because acting means resending — and absence is precisely the conclusion a

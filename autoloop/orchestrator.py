@@ -2111,9 +2111,17 @@ class Orchestrator:
             data={"found": found, "project_url": project_url},
         )
         if found is None:
+            # The ONLY branch that may talk about absence. The park's base
+            # sentence deliberately claims nothing beyond "the readback did not
+            # see it" (see `_park_ambiguous`), so "either" would dangle here —
+            # and this is the one outcome where a search actually walked the
+            # chats to their end, which is what makes the stronger wording
+            # earned rather than assumed.
             return None, (
                 f"A by-content search of {project_url} read its recent chats to "
-                "the end and did not find the request either."
+                "the end and did not find the request in any of them — the "
+                "strongest evidence of absence autoloop can gather, though still "
+                "not proof the backend never accepted the message."
             )
         return found, (
             f"A by-content search DID find {req.request_id} in {found}, which is "
@@ -2159,6 +2167,21 @@ class Orchestrator:
     ) -> None:
         """Stop on an ambiguous submission. Never resends automatically.
 
+        **The question states the evidence obtained, and nothing beyond it.**
+        The base sentence used to open "the request is not in persisted history
+        after reconciliation" — a claim `reconcile()` cannot support, because it
+        reads the conversation's MOUNTED WINDOW and ChatGPT mounts a window of a
+        chat rather than its history (that is the whole reason
+        `_resolve_or_park_ambiguous` exists). In the no-project,
+        search-inconclusive, wedged-page and no-search-capability parks, that
+        sentence asserted absence and the note beneath it then said absence was
+        never established — manufactured evidence, in the exact path this code
+        was written to repair, pointing an operator at `--resubmit`. So the base
+        sentence now reports only what the readback did: it did not SEE the
+        request. Language strong enough to mean "it is not there" belongs to the
+        one branch that earned it — the search that read the chats to their end
+        and came back empty — and lives in `search_note`, not here.
+
         `search_note` says what the by-content search did — it is the operator's
         only way to tell "the project was read and the request is in none of it"
         apart from "no search ran", and those point at different next actions.
@@ -2176,10 +2199,12 @@ class Orchestrator:
             },
         )
         self._to_needs_user(
-            f"submission of {req.request_id} is AMBIGUOUS: a send was attempted but "
-            "the request is not in persisted history after reconciliation. Autoloop "
-            "will not resend on its own — the backend may have accepted a message "
-            "the browser never observed, so resending risks a duplicate post. "
+            f"submission of {req.request_id} is AMBIGUOUS: a send was attempted and "
+            "reconciliation did not SEE the request in the window it read back. That "
+            "readback is the conversation's mounted window, not its full history, so "
+            "it reports what the page had rendered rather than what the chat holds. "
+            "Autoloop will not resend on its own — the backend may have accepted a "
+            "message the browser never observed, so resending risks a duplicate post. "
             + (search_note + " " if search_note else "")
             + "Inspect the conversation, then either `run --retry` (reconcile again) "
             "or `run --resubmit` (send this same request id once more; if it did "

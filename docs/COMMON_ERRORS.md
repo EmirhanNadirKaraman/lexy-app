@@ -908,7 +908,8 @@ only the detection failed; point `browser.conversation_url` at that chat.
 
 ### A readback says a message is not in the conversation, and it plainly is
 **Symptom:** the loop parks `submission_ambiguous` (or drops a chunked part and
-re-sends it) reporting that the request is not in persisted history. Open the
+re-sends it) reporting that a readback did not see the request — on builds before
+2026-08-16 the park said outright that it "is not in persisted history". Open the
 chat and the request is there — on 2026-08-05 `alr-af11e1b3-0006` was there
 *and already answered with a decision*. Seeing it took pressing End and
 scrolling six times before the tail rendered.
@@ -964,7 +965,11 @@ request's own conversation, the park is cancelled and the loop resumes into
 chat, a search that refused to conclude, and no `browser.project_url` all park
 exactly as before, and the park text says which of them happened — so if you are
 reading a `submission_ambiguous` question, start there rather than opening the
-chat blind. `run --resubmit` is still the only thing that repeats a send. A
+chat blind. **Read the note, not just the first sentence.** That sentence now
+claims only that reconciliation did not SEE the request in the window it read
+back, because a window read cannot establish more; only the note about a search
+that read the chats to their end and came back empty is evidence of absence, and
+only that one makes `--resubmit` the plausible next move. `run --resubmit` is still the only thing that repeats a send. A
 wedged page during the search (`ConversationUnusableError`) parks the same way,
 and for its own reason: that error's normal route is a rotation, which POSTS the
 request id — and the search reads other chats, so a page that is not even this

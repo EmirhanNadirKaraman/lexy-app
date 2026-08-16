@@ -1446,6 +1446,30 @@ def park_code(config):
     return rows[-1]["data"]["code"] if rows else None
 
 
+#: Sentences that assert the request IS NOT THERE. Exactly one park may use
+#: them: the one where the by-content search walked the chats to their end and
+#: came back empty. Everywhere else — no project configured, a search that
+#: refused to conclude, a wedged page, a provider that cannot search — nothing
+#: read the history, so claiming absence would be manufacturing the evidence
+#: that points an operator at `--resubmit`.
+#:
+#: Keyed on phrases rather than on the word "absent": the genuine-miss note
+#: legitimately says "evidence of absence", so a bare-token check would flag the
+#: one park that is entitled to the claim and miss "not in persisted history".
+ABSENCE_CLAIMS = (
+    "not in persisted history",
+    "read its recent chats to the end",
+    "did not find the request",
+)
+
+
+def assert_claims_no_absence(question):
+    for claim in ABSENCE_CLAIMS:
+        assert claim not in (question or ""), (
+            f"this park established nothing about presence, so it must not say {claim!r}"
+        )
+
+
 def ambiguous_state(request_id=RESCUED):
     """A send was attempted, acceptance was never observed, and the loop is
     about to decide whether a human has to look at it."""
@@ -1523,8 +1547,12 @@ def test_a_genuinely_absent_request_still_parks(tmp_path):
     assert transcript_entries(config, "submission_confirmed_by_search") == []
     # The park must say the project WAS read — the fact that separates this
     # from a park where no search ran, and the one that tells the operator a
-    # `--resubmit` is the plausible next move.
+    # `--resubmit` is the plausible next move. This is the ONLY park entitled
+    # to language that means "it is not there", so it must keep it: weakening
+    # every park uniformly would leave the operator unable to tell a real miss
+    # from a read that never happened.
     assert "read its recent chats to the end" in (orch.state.question or "")
+    assert "did not find the request in any of them" in (orch.state.question or "")
 
 
 def test_an_inconclusive_search_parks_rather_than_guessing(tmp_path):
@@ -1546,6 +1574,12 @@ def test_an_inconclusive_search_parks_rather_than_guessing(tmp_path):
     assert client.submitted == []
     refused = transcript_entries(config, "presence_search_inconclusive")
     assert refused and refused[-1]["data"]["reason_code"] == "search_refused_to_conclude"
+    # And the question must READ like a refusal. A park whose opening sentence
+    # says the request is not in persisted history, followed by a note saying
+    # the search settled nothing, contradicts itself and steers the operator
+    # toward `--resubmit` on evidence nobody gathered.
+    assert "could not settle it" in (orch.state.question or "")
+    assert_claims_no_absence(orch.state.question)
 
 
 def test_login_expiry_during_the_search_is_not_demoted_to_ambiguity(tmp_path):
@@ -1648,6 +1682,9 @@ def test_a_wedged_page_during_the_search_never_licenses_a_rotation(tmp_path):
     assert park_code(config) == "submission_ambiguous"
     refused = transcript_entries(config, "presence_search_inconclusive")
     assert refused and refused[-1]["data"]["kind"] == "ConversationUnusableError"
+    # A wedged page says nothing about presence, so neither may the park.
+    assert "could not settle it" in (orch.state.question or "")
+    assert_claims_no_absence(orch.state.question)
 
 
 def test_a_hit_in_a_different_chat_parks_and_names_it(tmp_path):
@@ -1669,6 +1706,9 @@ def test_a_hit_in_a_different_chat_parks_and_names_it(tmp_path):
     assert NEW_CONV_URL in (orch.state.question or "")
     ambiguous = transcript_entries(config, "submission_ambiguous")
     assert ambiguous[-1]["data"]["found_elsewhere"] == NEW_CONV_URL
+    # The search FOUND the id — a park that also opened by declaring it not in
+    # persisted history would contradict its own next sentence.
+    assert_claims_no_absence(orch.state.question)
 
 
 def test_a_provider_without_the_search_parks_exactly_as_before(tmp_path):
@@ -1688,6 +1728,9 @@ def test_a_provider_without_the_search_parks_exactly_as_before(tmp_path):
     assert park_code(config) == "submission_ambiguous"
     skipped = transcript_entries(config, "presence_search_skipped")
     assert skipped and skipped[-1]["data"]["reason_code"] == "provider_cannot_search"
+    # No search ran, so no sentence in this park may say the request is missing.
+    assert "cannot search a project" in (orch.state.question or "")
+    assert_claims_no_absence(orch.state.question)
 
 
 def test_without_a_project_url_there_is_nothing_to_search(tmp_path):
@@ -1711,7 +1754,10 @@ def test_without_a_project_url_there_is_nothing_to_search(tmp_path):
     # case — manufacturing evidence, and pointing the operator at `--resubmit`
     # on the strength of a read nobody performed.
     assert "project_url is not configured" in (orch.state.question or "")
-    assert "did not find the request" not in (orch.state.question or "")
+    # The same objection applies to the sentence ABOVE the note, which is where
+    # it survived longest: nothing here read the history, so the park may not
+    # open by asserting the request is not in it.
+    assert_claims_no_absence(orch.state.question)
 
 
 def test_resubmit_is_still_the_only_thing_that_repeats_a_send(tmp_path):
