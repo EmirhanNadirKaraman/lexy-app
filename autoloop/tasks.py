@@ -125,10 +125,23 @@ def _validate_description(task_id: object, description: object) -> None:
 def _validate_superseded_by(task_id: object, successors: object) -> tuple[str, ...]:
     """Return `successors` as a tuple, or raise `TaskGraphError`.
 
-    THE successor check, called from both `TaskRegistry.add_many` (creation,
-    so a hand-written `tasks.json` row is checked) and `TaskRegistry.retire`
-    (mutation) — the same "one validator, two callers" rule
-    `_validate_description` is written for.
+    THE successor check — the same "one validator, every caller" rule
+    `_validate_description` is written for, and here there are FOUR of them:
+
+      * `TaskRegistry.add_many` — creation, so a `seed_tasks.json` row is
+        checked;
+      * `TaskRegistry.retire` — mutation;
+      * `_persisted_superseded_by`, i.e. `TaskRegistry.from_dict` — a stored or
+        hand-edited `tasks.json` row, which reaches `Task` WITHOUT going
+        through `add_many` (see the "bypass add_many" comment there);
+      * `_migrate_retirements` — the successors this module writes itself.
+
+    The third one is why this docstring names its callers instead of saying
+    "creation and mutation". It used to claim persisted rows were checked while
+    `from_dict` only ran `tuple()` over the field, so a bare `"brw-06"` loaded
+    as `('b','r','w','-','0','6')` — six successors, each a valid id, no error
+    anywhere — and a `null` reached the operator as `'NoneType' object is not
+    iterable`, which names neither the task nor the field.
 
     SHAPE only, deliberately. Each entry must be a well-formed task id, no
     entry may name the task itself, and no id may repeat. What is NOT checked
@@ -164,6 +177,35 @@ def _validate_superseded_by(task_id: object, successors: object) -> tuple[str, .
             )
         seen.add(successor)
     return tuple(successors)
+
+
+def _persisted_superseded_by(raw: dict) -> tuple[str, ...]:
+    """`superseded_by` off a stored row, validated, as a tuple.
+
+    `TaskRegistry.from_dict` deliberately bypasses `add_many` — re-validating a
+    stored graph would reject states only the running loop can produce — so
+    every field it reads is on its own for checking, and this one was not
+    checked at all: `tuple(raw.get("superseded_by", ()))` turns the bare string
+    `"brw-06"` into six single-character "successors" — silently, and from there
+    into the dashboard, the refusal messages, and the next `save` — while a
+    `null` came out as `'NoneType' object is not iterable`, a corruption error
+    naming neither the task nor the field.
+
+    Same authority as every other caller (`_validate_superseded_by`), and it
+    FAILS CLOSED into `StateCorruptError` — the registry's normal answer to a
+    file it cannot trust (`from_dict`'s own KeyError/TypeError arm,
+    `TaskStore.load`'s decode arm). Reading a malformed chain as "no successor"
+    would quietly delete the record this whole field exists to keep.
+
+    A MISSING key is not malformed — it defaults to `()`, the backward
+    compatibility every `tasks.json` written before this field relies on. An
+    explicit `null` is: `asdict` serialises `()` as `[]` and never as `null`,
+    so nothing this package writes can produce one.
+    """
+    try:
+        return _validate_superseded_by(raw.get("id"), raw.get("superseded_by", ()))
+    except TaskGraphError as exc:
+        raise StateCorruptError(f"task file has an invalid superseded_by: {exc}") from exc
 
 
 def _successor_hint(task: "Task") -> str:
@@ -528,12 +570,29 @@ class TaskRegistry:
         mode keeps working whatever else is READY. Idempotent — blocking an
         already-blocked task just refreshes the reason, since a task can in
         principle hit a second `task_fatal` park before an operator answers
-        the first (e.g. re-dispatched after a crash). Refuses only a
-        completed task, which can never legitimately need quarantining."""
+        the first (e.g. re-dispatched after a crash). Refuses a completed task,
+        which can never legitimately need quarantining, and a RETIRED one.
+
+        The retired refusal is the last write path that could silently
+        un-retire a task: a bare `task.status = "blocked"` would overwrite
+        `"retired"` and put the row back under "needs a human", with the
+        supersession chain still attached and nothing to say what happened. It
+        should be unreachable — this is called from `_handle_parked_task` for a
+        task that just parked, and a retired task cannot be dispatched
+        (`policy._check_task_reference`, `mark_in_progress`) — so reaching it
+        means the dispatch guards were bypassed, and `_handle_parked_task`
+        fail-closing to loop_fatal on the refusal is the right answer to that,
+        not something to smooth over."""
         task = self.get(task_id)
         if task.status == "completed":
             raise TaskGraphError(
                 "task_completed", f"task '{task_id}' is already completed — cannot block it"
+            )
+        if task.status == "retired":
+            raise TaskGraphError(
+                "task_retired",
+                f"task '{task_id}' is retired{_successor_hint(task)} — it cannot be "
+                "quarantined, and should never have been dispatched",
             )
         task.status = "blocked"
         task.blocked_reason = reason
@@ -571,9 +630,24 @@ class TaskRegistry:
         retirement, and forcing it through `unblock` first would put the task
         back in the READY queue in between.
 
-        Refuses only `completed`, mirroring `block`: finished work is not
-        superseded work, and rewriting it as retired would hide a real
-        completion from the merge panel.
+        Refuses `completed`, mirroring `block`: finished work is not superseded
+        work, and rewriting it as retired would hide a real completion from the
+        merge panel.
+
+        WRITTEN ONCE. A retirement is a historical record, so a second `retire`
+        on the same task may not add, remove, change or reword anything: an
+        exact repeat is a no-op that returns the task untouched, and everything
+        else raises `task_already_retired`. `block` is idempotent in the other
+        direction — it refreshes the reason — because a quarantine is a live
+        question that can legitimately re-fire; a supersession cannot.
+
+        The case that forced this: `python -m autoloop retire brw-02` with no
+        `--superseded-by` used to reach an unconditional
+        `task.superseded_by = successors` and assign `()`, silently erasing the
+        `('brw-06',)` chain that is the ONLY record brw-06 continues brw-02 —
+        deleting exactly the regression history everything else here is careful
+        to keep. Argue with a recorded retirement by planning a task, not by
+        overwriting the record of the last one.
 
         One consequence stated rather than papered over: a task that DEPENDS
         on a retired one stays BLOCKED forever, because `state_of` only counts
@@ -591,6 +665,28 @@ class TaskRegistry:
                 f"task '{task_id}' is already completed — it was not superseded",
             )
         successors = _validate_superseded_by(task_id, superseded_by)
+        if task.status == "retired":
+            # Terminal and immutable. The two checks below are deliberately
+            # asymmetric with the write path underneath: an OMITTED successor
+            # list or reason means "say nothing about it", never "clear it", so
+            # only a value that actually disagrees with what is recorded is a
+            # refusal. Everything else falls through to the early return, which
+            # is what keeps a repeat from reaching the assignments at all.
+            if successors and successors != task.superseded_by:
+                recorded = _successor_hint(task) or " with no successor recorded"
+                raise TaskGraphError(
+                    "task_already_retired",
+                    f"task '{task_id}' is already retired{recorded} — a retirement "
+                    "is history and is never rewritten; plan a new task instead",
+                )
+            if reason and reason != task.blocked_reason:
+                raise TaskGraphError(
+                    "task_already_retired",
+                    f"task '{task_id}' is already retired and its reason is on "
+                    f"record ({task.blocked_reason or '(none recorded)'}) — "
+                    "retiring it again cannot reword it",
+                )
+            return task
         task.status = "retired"
         task.superseded_by = successors
         if reason:
@@ -811,10 +907,11 @@ class TaskRegistry:
                         tuple(c) for c in raw.get("validation", ())
                     ),
                     "approved_paths": tuple(raw.get("approved_paths", ())),
-                    # JSON has no tuples here either. Miss this and the field
-                    # round-trips as a list, which compares unequal to every
-                    # tuple the rest of this module builds.
-                    "superseded_by": tuple(raw.get("superseded_by", ())),
+                    # VALIDATED, not just tuple()-converted — this path never
+                    # reaches `add_many` (see the bypass below), so it is the
+                    # only gate a stored row passes. See
+                    # `_persisted_superseded_by`.
+                    "superseded_by": _persisted_superseded_by(raw),
                 })
                 for raw in data["tasks"]
             ]
@@ -897,7 +994,9 @@ def _migrate_retirements(tasks: dict[str, Task]) -> None:
         if not any(marker in reason for marker in markers):
             continue
         task.status = "retired"
-        task.superseded_by = successors
+        # Through the same authority as every other writer, so the table above
+        # cannot become the one place a malformed chain enters the registry.
+        task.superseded_by = _validate_superseded_by(task_id, successors)
 
 
 def _check_acyclic(tasks: dict[str, Task]) -> None:

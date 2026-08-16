@@ -246,6 +246,125 @@ def test_check_only_never_launches_the_loop(wired, monkeypatch, capsys):
     assert launched[0].continuous is True
 
 
+# --- a retired task cannot keep the loop stopped ------------------------------
+#
+# `start` refuses while any blocker is open, and a blocker is read from its own
+# file rather than from the registry. So retiring a quarantined task used to fix
+# only half of it: the dashboard row said RETIRED / "waits on nobody" while
+# `start` still stopped on the question that task had parked with — the same
+# one-status-two-meanings failure `TaskState.RETIRED` exists to end, rebuilt one
+# file over. These run the whole path, `retire` command included.
+
+
+def _quarantine(config, task_id, code):
+    """A task blocked in the registry AND holding an open blocker record —
+    what a `task_fatal` park actually leaves behind."""
+    from autoloop.tasks import Task, TaskRegistry, TaskStore
+
+    store = TaskStore(config.tasks_file)
+    registry = store.load() or TaskRegistry([])
+    if not registry.has(task_id):
+        registry.add(Task(id=task_id, title="t", description="d"))
+    registry.block(task_id, f"parked: {code}")
+    store.save(registry)
+    return BlockerStore(config.blockers_dir).record(
+        task_id=task_id, kind="task_fatal", code=code,
+        question=f"task {task_id} parked with {code}; what now?", detail="",
+        phase="executing", now="2026-08-14T00:00:00+00:00",
+    )
+
+
+def _retire_args(task_id, superseded_by=None):
+    return argparse.Namespace(
+        config=None, task_id=task_id, superseded_by=superseded_by, reason=""
+    )
+
+
+def test_start_and_health_stop_caring_about_a_retired_task_and_nothing_else(wired, capsys):
+    """End to end, and deliberately with a SECOND quarantined task: the claim
+    is that a retirement stops blocking startup *solely* on its own account,
+    not that retiring one task clears the queue."""
+    from autoloop import health
+
+    superseded = _quarantine(wired, "old-01", "attempt_count_ceiling")
+    genuine = _quarantine(wired, "audit-0003", "validation_failed")
+    StateStore(wired.state_file).save(_a_state())
+
+    assert cli._cmd_start(_args()) == 2, "two open blockers, both unanswered"
+    assert health.check(wired).code == health.STUCK_BLOCKED
+    capsys.readouterr()
+
+    assert cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"])) == 0
+    capsys.readouterr()
+
+    # Still refused — but only on the genuine failure's account now.
+    assert cli._cmd_start(_args()) == 2
+    out = capsys.readouterr().out
+    assert "1 OPEN" in out
+    assert genuine.id in out
+    assert superseded.id not in out
+    assert health.check(wired).open_blockers == 1
+
+    # Answer the one that really is a question, and the loop starts.
+    cli._cmd_answer(argparse.Namespace(config=None, blocker_id=genuine.id, text="rerun it"))
+    capsys.readouterr()
+
+    assert cli._cmd_start(_args()) == 0
+    assert "all clear" in capsys.readouterr().out
+    assert health.check(wired).code != health.STUCK_BLOCKED
+
+    # Nothing was deleted to get here: the superseded task's blocker is closed
+    # with a machine reason, never an operator answer.
+    closed = BlockerStore(wired.blockers_dir).load(superseded.id)
+    assert closed.resolved_at is not None
+    assert closed.answer is None
+    assert "retired" in closed.archived_reason
+
+
+def test_start_reconciles_a_retirement_that_predates_the_state(wired, capsys):
+    """The six historical rows are re-filed by `tasks._migrate_retirements` on
+    LOAD — no command is run, so nothing else would ever notice their blocker
+    records were left open. `start` is where that lands, so `start` is where it
+    is reconciled."""
+    from autoloop.tasks import TaskStore
+
+    _quarantine(wired, "brw-02", "attempt_count_ceiling")
+    store = TaskStore(wired.tasks_file)
+    registry = store.load()
+    registry.block("brw-02", "superseded by brw-06")  # the reason the table matches on
+    store.save(registry)
+    StateStore(wired.state_file).save(_a_state())
+
+    assert cli._cmd_start(_args()) == 0
+
+    out = capsys.readouterr().out
+    assert "task brw-02 is retired" in out
+    assert not BlockerStore(wired.blockers_dir).open_blockers()
+
+
+def test_start_leaves_a_genuinely_quarantined_task_alone(wired, capsys):
+    """audit-0003 is the one real failure among the seven blocked rows, and the
+    sweep must never reach it — `state_of` decides membership, so only an
+    actual retirement counts."""
+    blocker = _quarantine(wired, "audit-0003", "validation_failed")
+    StateStore(wired.state_file).save(_a_state())
+
+    assert cli._cmd_start(_args()) == 2
+
+    assert [b.id for b in BlockerStore(wired.blockers_dir).open_blockers()] == [blocker.id]
+    assert "1 OPEN" in capsys.readouterr().out
+
+
+def test_start_reports_an_unreadable_task_file_instead_of_crashing(wired, capsys):
+    """`start` exists to say what is wrong rather than die of it — the loading
+    it now does for the retirement sweep must not change that."""
+    wired.tasks_file.write_text("{not json", encoding="utf-8")
+    StateStore(wired.state_file).save(_a_state())
+
+    assert cli._cmd_start(_args()) == 2
+    assert "UNREADABLE" in capsys.readouterr().out
+
+
 # --- a failed audit must not take the loop down ------------------------------
 
 

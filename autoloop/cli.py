@@ -705,6 +705,16 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
             return 0
         store, state = _load_state(config)
         task_store, registry = _load_tasks(config)
+        # At the TOP of the iteration, not down at the exhaustion check: the
+        # readers that see an orphaned blocker are out of process
+        # (`health.check`, the heartbeat, a monitor), so a loop with plenty of
+        # ready work would otherwise report `stuck_blocked` for hours while
+        # working perfectly. This is also the only sweep an operator who runs
+        # `run --continuous` directly, without `start`, ever gets — and the six
+        # pre-`RETIRED` retirements change status on the load one line up, with
+        # no command run to notice their records were left open. Costs a set
+        # comprehension over the registry when nothing is retired.
+        _reconcile_retired_blockers(config, registry)
 
         if state is not None and Phase(state.phase) not in TERMINAL_PHASES:
             orchestrator = _build_orchestrator(config, args, store, state, task_store, registry)
@@ -746,6 +756,10 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
         # Clean boundary: no session yet, or the last one ended STOPPED.
         if _select_and_kickoff(config, store, registry):
             continue
+        # Already reconciled at the top of this iteration, so what is left here
+        # genuinely needs a human: exhaustion is announced as "nothing can
+        # proceed until someone answers these", and a question about superseded
+        # work is one nobody can answer.
         open_blockers = blocker_store.open_blockers()
         if open_blockers:
             _print_blocker_summary(open_blockers)
@@ -1708,6 +1722,37 @@ def _cmd_start(args: argparse.Namespace) -> int:
     else:
         print("pause        not set")
 
+    # Before the blocker report, not after: a blocker whose task is retired is
+    # not a decision anyone can make, so listing it under "each needs a
+    # decision" and refusing to start is the wrong answer to it. This is where
+    # the six pre-`RETIRED` retirements get their blockers reconciled —
+    # `tasks._migrate_retirements` re-files those on load, with no command run
+    # and nothing else to notice their records were left open (`run
+    # --continuous` sweeps too, for the operator who skips `start`).
+    #
+    # Reported, never fatal. `start` exists to say what is wrong rather than to
+    # die of it, and a task file it cannot read is a finding for the operator —
+    # the `run` underneath will raise on the same file if they start anyway.
+    # `KeyError`/`TaskGraphError` are in the net because the sweep is the first
+    # thing here to call `state_of`, which raises on a graph `from_dict`
+    # deliberately tolerates: a dependency naming a task that does not exist
+    # survives the load (`_check_acyclic` uses `color.get`) and then fails on
+    # the bare `self._tasks[dep]` lookup. `dashboard.task_groups` catches the
+    # same pair for the same reason. That is a finding to report, not a
+    # traceback out of the command whose whole job is reporting findings.
+    try:
+        _, _start_registry = _load_tasks(config)
+        _closed_blockers = _reconcile_retired_blockers(config, _start_registry)
+    except (StateError, ConfigError, TaskGraphError, KeyError) as exc:
+        print(f"tasks        UNREADABLE ({exc}) — retirements not reconciled")
+        ok = False
+    else:
+        for _closed in _closed_blockers:
+            print(
+                f"blockers     {_closed.id} closed — task {_closed.task_id} is "
+                "retired, so nobody can answer it"
+            )
+
     lines, healthy = _report_blockers_and_phase(config)
     for line in lines:
         print(line)
@@ -1794,6 +1839,72 @@ def _cmd_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reconcile_retired_blockers(config, registry) -> list[Blocker]:
+    """Close every OPEN blocker whose task is RETIRED. Returns what it closed.
+
+    A retirement lives in `tasks.json`; a quarantine lives in its own record
+    under `blockers/`. Retiring a quarantined task used to move only the first,
+    which is a split brain rather than a tidiness problem: the blocker record is
+    read INDEPENDENTLY of the registry by `_report_blockers_and_phase` (so
+    `start` refuses to run), by `health.check` (so the loop reports
+    `stuck_blocked`) and by `heartbeat` (so a monitor alarms). The dashboard row
+    would say RETIRED / "waits on nobody" while the loop stayed stopped waiting
+    on exactly that task, which is the same two-meanings-at-once failure
+    `TaskState.RETIRED` exists to end, rebuilt one file over.
+
+    `archive_stale`, never `resolve`: an archival writes `archived_reason` and
+    leaves `answer` None. Nobody answered these questions — the work they belong
+    to was superseded — and writing an answer would forge the operator
+    confirmation `_RESOLUTION_PRECONDITIONS` exists to demand. Nothing is
+    deleted: the record keeps its question, its detail, its recurrence count and
+    its session id, and gains a machine reason naming the retirement.
+
+    Two exclusions. `NO_TASK` (`"(loop)"`) blockers are never swept — a
+    login expiry or an exhausted iteration budget is a loop-level condition that
+    no task retirement answers. And a task that is merely quarantined keeps its
+    blocker, obviously; membership is decided by `state_of`, so a genuine
+    failure like audit-0003 is untouched.
+
+    Three callers: `_cmd_retire_task` (the supported route — a retirement
+    decided today), `_cmd_start`'s preflight, and the top of every
+    `_run_continuous` iteration. The last two are what cover the six
+    pre-`RETIRED` retirements, which are re-filed in memory by
+    `tasks._migrate_retirements` on load — their status moves with no command
+    run, and nothing else would notice their records were left open. The
+    continuous sweep is at the TOP of the iteration rather than down at the
+    exhaustion check because the readers that misjudge an orphaned blocker are
+    out of process: a loop with plenty of ready work would otherwise leave
+    `health.check` reporting `stuck_blocked` for hours while working perfectly.
+
+    Idempotent, and safe to call on every pass: `open_blockers()` is re-read
+    each time, so an already-archived record is simply not there to archive
+    again.
+    """
+    retired = {
+        task.id
+        for task in registry.all_tasks()
+        if registry.state_of(task.id) is TaskState.RETIRED
+    }
+    if not retired:
+        return []
+    store = BlockerStore(config.blockers_dir)
+    closed: list[Blocker] = []
+    for blocker in store.open_blockers():
+        if blocker.task_id == NO_TASK or blocker.task_id not in retired:
+            continue
+        successors = ", ".join(registry.get(blocker.task_id).superseded_by)
+        closed.append(
+            store.archive_stale(
+                blocker.id,
+                f"task {blocker.task_id} was retired"
+                + (f" (superseded by {successors})" if successors else "")
+                + " — this question belongs to work that will not be dispatched "
+                "again, and was never answered",
+            )
+        )
+    return closed
+
+
 def _cmd_retire_task(args: argparse.Namespace) -> int:
     """Record that a task is superseded and will never be worked again.
 
@@ -1814,9 +1925,21 @@ def _cmd_retire_task(args: argparse.Namespace) -> int:
     record. Successors are NOT required to exist: brw-06 was split into
     brw-07 + brw-08 before either was planned.
 
+    Retiring a QUARANTINED task moves both halves of its state: the registry
+    row here, and the open blocker record that quarantined it
+    (`_reconcile_retired_blockers`). Moving only the first would leave `start`,
+    `health` and the heartbeat still stopped on a question about work nobody is
+    going to do.
+
     Nothing is deleted, here or in the registry: the task keeps its id, its
-    description, its reason, and its place in the graph. Takes the loop lock,
-    like `release`, because it writes `tasks.json`.
+    description, its reason, and its place in the graph; the blocker keeps its
+    question and gains a machine reason rather than a forged answer. Takes the
+    loop lock, like `release`, because it writes `tasks.json`.
+
+    A repeat is not an update. `TaskRegistry.retire` refuses a second
+    retirement that would add, change or reword anything, and reports an exact
+    repeat as the no-op it is — a bare `retire brw-02` must never be the
+    command that erases brw-02's recorded successor.
     """
     config = load_config(args.config)
     with LoopLock(config.state_dir):
@@ -1832,11 +1955,34 @@ def _cmd_retire_task(args: argparse.Namespace) -> int:
             print(f"error: {exc}")
             return 1
         task_store.save(registry)
+        # After the save, and reported rather than raised: the retirement is
+        # already durable at this point, so a graph whose `state_of` cannot be
+        # computed (a dependency naming a task that does not exist survives
+        # `from_dict` by design) must not turn a completed retirement into a
+        # traceback. What it costs is the blocker sweep, which `start` retries.
+        try:
+            closed = _reconcile_retired_blockers(config, registry)
+        except (TaskGraphError, KeyError) as exc:
+            closed = []
+            print(
+                f"warning: the task graph could not be read to reconcile blockers "
+                f"({exc}) — the retirement is saved; any blocker for {task.id} is "
+                "still open"
+            )
     successors = ", ".join(task.superseded_by) or "nothing (stale, not replaced)"
+    if previous == "retired":
+        print(f"task {task.id} was already retired; nothing changed")
+    else:
+        print(f"task {task.id} retired: {previous} -> retired")
     print(
-        f"task {task.id} retired: {previous} -> retired; superseded by {successors}\n"
+        f"superseded by {successors}\n"
         f"reason kept: {task.blocked_reason or '(none recorded)'}"
     )
+    for blocker in closed:
+        print(
+            f"blocker {blocker.id} closed — its task is retired "
+            "(archived with a machine reason, NOT an operator answer)"
+        )
     return 0
 
 

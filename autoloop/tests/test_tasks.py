@@ -473,6 +473,101 @@ def test_superseded_by_shape_is_validated(successors):
     expect_code(lambda: reg.retire("t1", superseded_by=successors), "bad_superseded_by")
 
 
+# ---- a retirement is written once -------------------------------------------
+#
+# The record is the point of the whole state, so the second `retire` is the
+# dangerous one: it used to reach an unconditional
+# `task.superseded_by = successors`, which made a bare
+# `python -m autoloop retire brw-02` the command that DELETES brw-02's chain to
+# brw-06 — the one thing this change says is never deleted.
+
+
+def test_a_bare_second_retirement_cannot_erase_the_recorded_successors():
+    """The exact reported call. `retire brw-02` with no `--superseded-by` after
+    a real retirement must leave the chain alone, not assign `()` over it."""
+    reg = registry(task("brw-02"))
+    reg.retire("brw-02", superseded_by=["brw-06"], reason="superseded by brw-06")
+
+    reg.retire("brw-02")  # no successors, no reason — says nothing, changes nothing
+
+    assert reg.get("brw-02").superseded_by == ("brw-06",)
+    assert reg.get("brw-02").blocked_reason == "superseded by brw-06"
+    assert reg.state_of("brw-02") is TaskState.RETIRED
+
+
+def test_an_exact_repeat_of_a_retirement_is_a_no_op():
+    reg = registry(task("brw-06"))
+    reg.retire("brw-06", superseded_by=["brw-07", "brw-08"], reason="split by the reviewer")
+
+    again = reg.retire("brw-06", superseded_by=("brw-07", "brw-08"), reason="split by the reviewer")
+
+    assert again.superseded_by == ("brw-07", "brw-08")
+    assert again.blocked_reason == "split by the reviewer"
+
+
+@pytest.mark.parametrize("successors", [["brw-09"], ["brw-06", "brw-09"], ["brw-09", "brw-06"]])
+def test_a_second_retirement_refuses_to_change_the_successors(successors):
+    """Adding, replacing or reordering are all rewrites of a historical record.
+    Correcting one means planning a task, not overwriting the last decision."""
+    reg = registry(task("brw-02"))
+    reg.retire("brw-02", superseded_by=["brw-06"])
+
+    expect_code(lambda: reg.retire("brw-02", superseded_by=successors), "task_already_retired")
+    assert reg.get("brw-02").superseded_by == ("brw-06",)
+
+
+def test_a_second_retirement_cannot_reword_the_reason():
+    """`blocked_reason` is the prose half of the same record. `block` refreshes
+    it because a quarantine can genuinely re-fire; a supersession cannot."""
+    reg = registry(task("sub-01"))
+    reg.retire("sub-01", superseded_by=["sub-02", "sub-03"], reason="superseded by sub-02/sub-03")
+
+    expect_code(
+        lambda: reg.retire("sub-01", reason="never mind, it just failed"),
+        "task_already_retired",
+    )
+    assert reg.get("sub-01").blocked_reason == "superseded by sub-02/sub-03"
+    assert reg.get("sub-01").superseded_by == ("sub-02", "sub-03")
+
+
+def test_a_refusal_to_re_retire_names_the_recorded_successor():
+    reg = registry(task("brw-02"))
+    reg.retire("brw-02", superseded_by=["brw-06"])
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.retire("brw-02", superseded_by=["brw-09"])
+    assert "brw-06" in str(excinfo.value)
+
+
+def test_a_stale_retirement_can_still_be_repeated_without_gaining_a_successor():
+    """`dash-01` was retired with no successor because it went stale. Repeating
+    that must stay a no-op — it must not become the moment an invented
+    successor gets written, and it must not raise either."""
+    reg = registry(task("dash-01"))
+    reg.retire("dash-01", reason="stale since 2026-08-03")
+
+    reg.retire("dash-01")
+
+    assert reg.get("dash-01").superseded_by == ()
+    assert reg.get("dash-01").blocked_reason == "stale since 2026-08-03"
+
+
+def test_block_refuses_a_retired_task_rather_than_un_retiring_it():
+    """The last write path that could silently undo a retirement: `block` ends
+    in a bare `status = "blocked"`, which would put a superseded row back under
+    "needs a human" with its supersession chain still attached. It should be
+    unreachable — a retired task cannot be dispatched, so it cannot park — and
+    `_handle_parked_task` fail-closing on the refusal is the right answer if it
+    somehow is."""
+    reg = registry(task("brw-02"))
+    reg.retire("brw-02", superseded_by=["brw-06"], reason="superseded by brw-06")
+
+    expect_code(lambda: reg.block("brw-02", "parked again"), "task_retired")
+
+    assert reg.state_of("brw-02") is TaskState.RETIRED
+    assert reg.get("brw-02").superseded_by == ("brw-06",)
+    assert reg.get("brw-02").blocked_reason == "superseded by brw-06"
+
+
 def test_a_successor_does_not_have_to_exist_yet():
     """brw-06 was split into brw-07 + brw-08 before either was planned. A
     supersession is a record, not a schedule — nothing dispatches off it, so it
@@ -521,6 +616,67 @@ def test_a_task_file_without_superseded_by_still_loads(tmp_path):
         encoding="utf-8",
     )
     assert TaskStore(path).load().get("t1").superseded_by == ()
+
+
+# ---- a stored row is validated too -------------------------------------------
+#
+# `from_dict` deliberately bypasses `add_many`, so it is the ONLY gate a stored
+# or hand-edited row passes. It used to run bare `tuple()` over this field,
+# which quietly accepted shapes `add_many` refuses.
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "brw-06",          # a bare string: tuple() made it six one-letter ids
+        None,              # explicit null: used to be an uncontrolled TypeError
+        ["not an id"],
+        ["t1"],            # naming itself
+        ["brw-06", "brw-06"],
+        7,
+        [None],
+        {"brw-06": True},
+    ],
+)
+def test_a_malformed_persisted_superseded_by_is_corruption(value):
+    """Fails CLOSED, as `StateCorruptError`, like every other unreadable state
+    file in this package. Reading a malformed chain as "no successor" would
+    delete the record — the exact thing retirement exists to preserve."""
+    with pytest.raises(StateCorruptError):
+        TaskRegistry.from_dict({"tasks": [
+            stored("t1", status="retired", superseded_by=value),
+        ]})
+
+
+def test_a_bare_string_never_becomes_a_tuple_of_characters():
+    """Stated separately because this one is silent rather than loud: six valid
+    single-character ids read as six successors everywhere downstream, and the
+    next save writes them back."""
+    with pytest.raises(StateCorruptError) as excinfo:
+        TaskRegistry.from_dict({"tasks": [
+            stored("brw-02", status="retired", superseded_by="brw-06"),
+        ]})
+    assert "superseded_by" in str(excinfo.value)
+
+
+def test_a_store_load_reports_a_malformed_chain_rather_than_dropping_it(tmp_path):
+    path = tmp_path / "tasks.json"
+    path.write_text(
+        json.dumps({"schema_version": 1, "tasks": [
+            {"id": "t1", "title": "t", "description": "d", "depends_on": [],
+             "priority": 100, "status": "retired", "superseded_by": "t2"},
+        ]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(StateCorruptError):
+        TaskStore(path).load()
+
+
+def test_a_well_formed_persisted_chain_still_loads():
+    reg = TaskRegistry.from_dict({"tasks": [
+        stored("brw-02", status="retired", superseded_by=["brw-06"]),
+    ]})
+    assert reg.get("brw-02").superseded_by == ("brw-06",)
 
 
 # ---- migrating the retirements that predate the state ------------------------

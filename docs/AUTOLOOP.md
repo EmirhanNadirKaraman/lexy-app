@@ -3045,6 +3045,36 @@ Takes the loop lock (it writes `tasks.json`). Accepts a pending, in-progress or
 quarantined task — `dash-01` was in-progress, which is exactly the shape that
 needs retiring — and refuses only a completed one.
 
+**A retirement is written ONCE.** A second `retire` on the same task cannot
+add, replace, reorder or reword anything: an exact repeat is reported as the
+no-op it is, and anything else is refused with `task_already_retired`. This is
+not tidiness — omitting `--superseded-by` on a repeat used to assign `()` over
+the recorded chain, so `autoloop retire brw-02` was the command that deleted
+the record this section says is never deleted. `block` stays idempotent in the
+other direction (it refreshes the reason) because a quarantine is a live
+question that can genuinely re-fire; a supersession cannot. Argue with a
+recorded retirement by planning a task, not by overwriting the last decision.
+
+**Retiring a quarantined task closes its blocker too.** The two halves live in
+different files — the row in `tasks.json`, the question in `blockers/` — and
+the blocker list is read independently of the registry by `start`,
+`health.check` and the heartbeat. Moving only the registry produced a row that
+said "waits on nobody" beside a loop that was still stopped waiting on exactly
+that task. `cli._reconcile_retired_blockers` closes them via
+`BlockerStore.archive_stale`, so the record keeps its question, detail,
+recurrence count and session id and gains a machine reason naming the
+retirement — never an `answer`, which would forge the operator confirmation
+`_RESOLUTION_PRECONDITIONS` exists to demand. `(loop)` blockers are never
+swept: a login expiry is a loop-level condition no task retirement answers. It
+runs from `retire` itself, from `start`'s preflight, and at the top of every
+`run --continuous` iteration — the last two because the six migrated
+retirements below change status on LOAD, with no command run to notice their
+records were left open. The continuous sweep is at the top of the iteration
+rather than at the exhaustion check because the readers that misjudge an
+orphaned blocker are out of process: a loop with plenty of ready work would
+otherwise leave `health` reporting `stuck_blocked` for hours while working
+perfectly.
+
 **The six above are migrated in code, not by hand.** `tasks._RETIREMENTS` maps
 each id to the successors read from its existing reason, and
 `_migrate_retirements` applies it inside `TaskRegistry.from_dict`; the live
@@ -3054,12 +3084,21 @@ the only route to it. Two guards: the stored status must still be `blocked`
 still appear in the reason (making it self-limiting — a revived task
 quarantined later for a real reason is left alone). A reason that was reworded
 simply does not migrate and stays quarantined, and `autoloop retire` is the
-manual route. `audit-0003` is deliberately absent from the table.
+manual route. `audit-0003` is deliberately absent from the table. The
+successors it writes go through the same `_validate_superseded_by` every other
+writer uses, and so does the field as READ BACK off `tasks.json`
+(`_persisted_superseded_by`): `from_dict` bypasses `add_many` by design, so it
+is the only gate a stored or hand-edited row passes, and a malformed chain is
+`StateCorruptError` rather than a bare string silently loading as one successor
+per character.
 
 Enforcement mirrors the quarantine's: `policy._check_task_reference` denies an
 `implement`/`revise` naming a retired id (`task_retired`, naming the
-successor), and `TaskRegistry.mark_in_progress`/`mark_completed` refuse it too
-as defense in depth. `cli._merge_window_blockers` treats RETIRED as terminal
+successor), and `TaskRegistry.mark_in_progress`/`mark_completed`/`block` refuse
+it too as defense in depth — `block` because it ends in a bare
+`status = "blocked"` that would silently un-retire the row, which should be
+unreachable (a task that cannot be dispatched cannot park) and so is treated as
+a fail-closed loop_fatal rather than smoothed over. `cli._merge_window_blockers` treats RETIRED as terminal
 alongside completed and quarantined, so a superseded task's leftover execution
 record cannot hold the merge window shut on work nobody will finish.
 
