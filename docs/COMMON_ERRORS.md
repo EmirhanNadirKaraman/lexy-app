@@ -1157,19 +1157,34 @@ rules out the obvious narrower fix: the recompile fires because the source
 changed BEFORE the window (the merge), so "flag a `.pyc` only when its source
 did not change in the window" would have flagged all three.
 **Fix:** applied repo-side 2026-08-16 (esc-01) — `escape_detector.
-is_derived_bytecode` exempts a `.pyc`/`.pyo` sitting directly inside a
-`__pycache__/` directory whose sibling `.py` is itself in the snapshot.
-Derived, not authored: the interpreter writes it from a source that stays
-fully in scope. Still reported, deliberately: a `.pyc` OUTSIDE `__pycache__`
-(the legacy layout, importable with no source), an orphan cache entry with no
-sibling `.py`, and any symlink/directory appearing at a cache path. Contrast
-the `autoloop pause` entry above, where exempting the path was the WRONG fix
-— `PAUSE` is authored, its bytes are the only copy of the claim, and it moved
-outside the tree instead.
+is_derived_bytecode` exempts a `.pyc` sitting directly inside a
+`__pycache__/` directory whose sibling `.py` is in the snapshot **as a
+regular file**, on every side the cache entry itself exists. Derived, not
+authored: the interpreter writes it from a source that stays fully in scope,
+hashed by the same snapshot. Still reported, deliberately: a `.pyc` OUTSIDE
+`__pycache__` (the legacy layout, importable with no source); a **`.pyo`
+anywhere, `__pycache__` included** — no supported CPython emits that name
+(PEP 488 replaced it with the `.opt-N` infix of a `.pyc`), so one is an
+authored file borrowing a derived-looking extension; an orphan cache entry
+with no sibling `.py`; a cache entry whose sibling `.py` is a SYMLINK (the
+snapshot watches a symlink as a target string, never its bytes, so it vouches
+for nothing) or whose source is missing on one side of the window; and any
+symlink/directory appearing at a cache path. Contrast the `autoloop pause`
+entry above, where exempting the path was the WRONG fix — `PAUSE` is
+authored, its bytes are the only copy of the claim, and it moved outside the
+tree instead.
 **Also fixed by the same rule:** the validation mutation guard
 (`diff_worker_tree`), which brackets the post-commit validation run and would
 otherwise read every `.pyc` a `pytest` run compiles as "validation MUTATED the
-worker tree".
+worker tree". **Not all the way, though** — if you see that refusal naming
+something like `tests/__pycache__/test_x.cpython-312-pytest-8.3.4.pyc`, that
+is this same class hitting a stated limit, not a new bug: the exemption strips
+ONE dotted tag group to find the source, and pytest's assertion rewriter puts
+its own dotted version into the tag, so a rewritten TEST-module cache does not
+resolve back to a `.py` and is reported. Ordinary
+`<mod>.cpython-3XX[.opt-N].pyc` names are covered. Run validation with `-B` /
+`PYTHONDONTWRITEBYTECODE=1` to avoid it; widening the stem resolution was
+deliberately not done (it means guessing which prefix owns the entry).
 **Still worth doing on the operator side:** run out-of-band autoloop commands
 with `python3 -B` / `PYTHONDONTWRITEBYTECODE=1`. Per the esc-01 brief this was
 applied as a stopgap to the loop, supervisor, deadman and dashboard

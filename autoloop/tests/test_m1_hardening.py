@@ -31,6 +31,7 @@ from autoloop.config import AutoloopConfig, BrowserConfig, load_config
 from autoloop.contract import Decision, Directive
 from autoloop.errors import ConfigError, TaskGraphError
 from autoloop.escape_detector import (
+    PathState,
     diff_snapshots,
     diff_worker_tree,
     enumerate_checkout_paths,
@@ -405,9 +406,10 @@ def test_escape_detector_ignores_a_recompiled_bytecode_cache_file(tmp_path):
 def test_escape_detector_ignores_bytecode_cache_files_appearing_and_vanishing(tmp_path):
     """Creation (a first import) and deletion (a `find -name __pycache__ -delete`)
     are the same derived class as a rewrite. Covers every name CPython
-    actually produces: the plain cache file, an optimised one, a `.pyo`, and
-    the `<name>.<pid>` temp file `_write_atomic` leaves visible for the
-    instant between writing and `os.replace`."""
+    actually produces: the plain cache file, an optimised one (`.opt-N`,
+    which is what PEP 488 replaced `.pyo` with), and the `<name>.<pid>` temp
+    file `_write_atomic` leaves visible for the instant between writing and
+    `os.replace`."""
     repo_root = _python_repo(tmp_path)
     cache = repo_root / "pkg" / "__pycache__"
     cache.mkdir()
@@ -425,7 +427,6 @@ def test_escape_detector_ignores_bytecode_cache_files_appearing_and_vanishing(tm
     for name in (
         "mod.cpython-312.pyc",
         "mod.cpython-312.opt-1.pyc",
-        "mod.cpython-313.pyo",
         "mod.cpython-312.pyc.98765",
     ):
         (cache / name).write_bytes(b"fresh bytecode")
@@ -472,6 +473,106 @@ def test_escape_detector_still_detects_a_sourceless_pyc_outside_pycache(tmp_path
     after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
     violations = diff_snapshots(before, after)
     assert any("pkg/evil.pyc" in v and "created" in v for v in violations), violations
+
+
+def test_escape_detector_still_detects_a_pyo_inside_a_cache_directory(tmp_path):
+    """`.pyo` is not a name any supported CPython writes — PEP 488 replaced it
+    with the `.opt-N` infix of a `.pyc` — so one appearing inside
+    `__pycache__/` beside a perfectly live `pkg/mod.py` is an authored file
+    wearing a derived-looking extension. A `py[co]`-shaped exemption would
+    have made exactly that write silent for every sourced module in the tree.
+    Discrimination, not just "something was reported": the genuine `.pyc`
+    churns in the same window and stays silent."""
+    repo_root = _python_repo(tmp_path)
+    cache = repo_root / "pkg" / "__pycache__"
+    cache.mkdir()
+    (cache / "mod.cpython-312.pyc").write_bytes(b"stale bytecode")
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths_before = enumerate_checkout_paths(git)
+    assert git.dirty_files() == []  # `*.py[cod]` is ignored: invisible to git status
+    before = snapshot_checkout(repo_root, paths_before)
+
+    (cache / "mod.cpython-312.pyc").write_bytes(b"recompiled by an out-of-band import")
+    (cache / "mod.cpython-312.pyo").write_bytes(b"planted, not compiled")
+
+    paths_after = enumerate_checkout_paths(git)
+    after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
+    violations = diff_snapshots(before, after)
+    assert any("mod.cpython-312.pyo" in v and "created" in v for v in violations), violations
+    assert not [v for v in violations if ".pyc" in v], violations
+
+
+def test_escape_detector_still_detects_a_cache_entry_beside_a_symlinked_source(tmp_path):
+    """The exemption's premise is that the cache entry's source stays watched
+    BYTE FOR BYTE by this same snapshot. A `.py` that is a SYMLINK is watched
+    as a target string only — its bytes live wherever the link points, which
+    may be outside the checkout entirely and is never hashed here — so it
+    vouches for nothing, and the cache entry beside it stays in scope. Proved
+    through `diff_snapshots` rather than the predicate alone: the thing being
+    checked is that the diff hands the predicate real `PathState`s per side,
+    not just a set of path strings."""
+    repo_root = _python_repo(tmp_path)
+    linked = repo_root / "linked"
+    linked.mkdir()
+    (linked / "mod.py").symlink_to("../pkg/mod.py")
+    run_git(repo_root, "add", "-A")
+    run_git(repo_root, "commit", "-q", "-m", "a module that is a symlink")
+    link_cache = linked / "__pycache__"
+    link_cache.mkdir()
+    (link_cache / "mod.cpython-312.pyc").write_bytes(b"bytecode beside a symlinked source")
+    real_cache = repo_root / "pkg" / "__pycache__"
+    real_cache.mkdir()
+    (real_cache / "mod.cpython-312.pyc").write_bytes(b"stale bytecode")
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths_before = enumerate_checkout_paths(git)
+    before = snapshot_checkout(repo_root, paths_before)
+    assert before["linked/mod.py"].kind == "symlink"
+    assert before["linked/mod.py"].content_sha256 is None, "not hashed — nothing to compare"
+
+    (link_cache / "mod.cpython-312.pyc").write_bytes(b"rewritten with its source unwatched")
+    (real_cache / "mod.cpython-312.pyc").write_bytes(b"recompiled")
+
+    paths_after = enumerate_checkout_paths(git)
+    after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
+    violations = diff_snapshots(before, after)
+    assert any(
+        "linked/__pycache__/mod.cpython-312.pyc" in v and "content changed" in v
+        for v in violations
+    ), violations
+    # ...while the one whose source really is a regular file stays exempt.
+    assert not [v for v in violations if "pkg/__pycache__" in v], violations
+
+
+def test_escape_detector_still_detects_a_cache_entry_whose_source_left_the_tree(tmp_path):
+    """Per SIDE, not per union. The `.pyc` is created in the same window that
+    removes `pkg/gone.py`, so on the only side the cache entry exists there is
+    no source in scope at all. Deciding the question against the union of both
+    snapshots' keys would call this derived and go silent — a planted cache
+    entry laundered by a source deletion in the same window."""
+    repo_root = _python_repo(tmp_path)
+    (repo_root / "pkg" / "gone.py").write_text("VALUE = 2\n", encoding="utf-8")
+    run_git(repo_root, "add", "-A")
+    run_git(repo_root, "commit", "-q", "-m", "a module about to be removed")
+    cache = repo_root / "pkg" / "__pycache__"
+    cache.mkdir()
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths_before = enumerate_checkout_paths(git)
+    before = snapshot_checkout(repo_root, paths_before)
+    assert before["pkg/gone.py"].kind == "file"
+
+    (repo_root / "pkg" / "gone.py").unlink()
+    (cache / "gone.cpython-312.pyc").write_bytes(b"planted where the source used to be")
+
+    paths_after = enumerate_checkout_paths(git)
+    after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
+    violations = diff_snapshots(before, after)
+    assert any(
+        "pkg/__pycache__/gone.cpython-312.pyc" in v and "created" in v for v in violations
+    ), violations
+    assert any("pkg/gone.py" in v and "deleted" in v for v in violations), violations
 
 
 def test_escape_detector_still_detects_a_shape_change_at_a_bytecode_cache_path(tmp_path):
@@ -540,16 +641,35 @@ def test_a_real_ignored_path_escape_is_still_reported_when_bytecode_churns_besid
     assert not [v for v in violations if ".pyc" in v], violations
 
 
+def _snapshot_of(*paths: str, symlinks: tuple[str, ...] = ()) -> dict:
+    """A `CheckoutSnapshot` shaped like `snapshot_checkout`'s output, for the
+    predicate-level tests below. `paths` are plain files (the kind whose bytes
+    the real snapshot hashes); `symlinks` are recorded the way the real
+    snapshot records one — a target STRING, no content hash."""
+    snap = {
+        rel: PathState(
+            kind="file", content_sha256=f"sha-{rel}", symlink_target=None, executable=False
+        )
+        for rel in paths
+    }
+    for rel in symlinks:
+        snap[rel] = PathState(
+            kind="symlink", content_sha256=None, symlink_target="/elsewhere", executable=False
+        )
+    return snap
+
+
 def test_is_derived_bytecode_is_keyed_on_the_cache_directory_and_a_live_source():
     """The predicate on its own, so the boundary is stated once in one place
-    rather than inferred from the scenarios above. `source_paths` is the
-    snapshot's own key set."""
-    sources = {"pkg/mod.py", "pkg/sub/mod.py", "top.py", "pkg/dotted.name.py", "pkg/native.so"}
+    rather than inferred from the scenarios above. Each side is a snapshot,
+    not a bare key set — the source's PathState is what decides."""
+    side = _snapshot_of(
+        "pkg/mod.py", "pkg/sub/mod.py", "top.py", "pkg/dotted.name.py", "pkg/native.so"
+    )
     exempt = (
         "pkg/__pycache__/mod.cpython-312.pyc",
         "pkg/__pycache__/mod.cpython-312.opt-2.pyc",
         "pkg/__pycache__/mod.cpython-312.pyc.4242",  # atomic-write temp file
-        "pkg/__pycache__/mod.cpython-311.pyo",
         "pkg/sub/__pycache__/mod.cpython-312.pyc",
         "__pycache__/top.cpython-312.pyc",
         "pkg/__pycache__/dotted.name.cpython-312.pyc",  # non-greedy stem
@@ -557,6 +677,7 @@ def test_is_derived_bytecode_is_keyed_on_the_cache_directory_and_a_live_source()
     in_scope = (
         "pkg/__pycache__/ghost.cpython-312.pyc",  # no `pkg/ghost.py`
         "pkg/mod.pyc",  # legacy layout: importable with no source
+        "pkg/__pycache__/mod.cpython-311.pyo",  # no supported CPython emits this
         "pkg/evil.pyo",
         "__pycache__/mod.cpython-312.pyc",  # source is `pkg/mod.py`, not `mod.py`
         "pkg/__pycache__/mod.py",  # a `.py` hidden in the cache dir is not derived
@@ -565,9 +686,26 @@ def test_is_derived_bytecode_is_keyed_on_the_cache_directory_and_a_live_source()
         "pkg/mod.py",
     )
     for rel in exempt:
-        assert is_derived_bytecode(rel, sources) is True, rel
+        assert is_derived_bytecode(rel, side) is True, rel
+        assert is_derived_bytecode(rel, side, side) is True, rel
     for rel in in_scope:
-        assert is_derived_bytecode(rel, sources) is False, rel
+        assert is_derived_bytecode(rel, side) is False, rel
+
+    # No sides at all: nothing claims to have seen this path, so nothing
+    # vouches for its source. Must not default to exempt.
+    assert is_derived_bytecode("pkg/__pycache__/mod.cpython-312.pyc") is False
+
+    # A source that is not a regular file on a side the cache entry exists on
+    # is not "watched byte for byte" — a symlink is watched as a target
+    # string only, so its bytes can change with the snapshot unmoved.
+    linked = _snapshot_of(symlinks=("pkg/mod.py",))
+    assert is_derived_bytecode("pkg/__pycache__/mod.cpython-312.pyc", linked) is False
+    assert is_derived_bytecode("pkg/__pycache__/mod.cpython-312.pyc", side, linked) is False
+
+    # Per SIDE, not against the union: a source present only in `before` does
+    # not vouch for a cache entry that also exists in `after`.
+    gone = _snapshot_of("pkg/other.py")
+    assert is_derived_bytecode("pkg/__pycache__/mod.cpython-312.pyc", side, gone) is False
 
 
 def test_validation_mutation_guard_shares_the_same_bytecode_exemption(tmp_path):

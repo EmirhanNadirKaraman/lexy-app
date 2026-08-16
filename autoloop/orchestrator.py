@@ -3226,8 +3226,9 @@ class Orchestrator:
         (state.json, the blocker/execution/intent stores, ...) unnecessary:
         nothing in this orchestrator writes any of them between the two
         snapshots below. The single exemption that DOES exist —
-        `escape_detector.is_derived_bytecode`, for `__pycache__` entries
-        whose `.py` source is itself snapshotted — is argued there too; it is
+        `escape_detector.is_derived_bytecode`, for `__pycache__/*.pyc`
+        entries whose `.py` source is itself snapshotted AS A REGULAR FILE —
+        is argued there too; it is
         what stops an out-of-band `import autoloop.…` (a dashboard restart, a
         `health --json` poll) from parking this round as tampering.
 

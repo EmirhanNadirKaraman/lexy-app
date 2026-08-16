@@ -37,7 +37,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
 | S18 | LOW | Self-hosted model server has no auth; `LLM_BASE_URL` egress is operator-controlled (opt-in, unset by default) | `services/llm_provider.py` |
 | S22 | INFO | `commit_adopted` is sound but has no production call site (tracked, not a vulnerability) | `autoloop/git_gateway.py`, `autoloop/manifest.py` |
-| S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered. Amended 2026-08-16: derived bytecode (`__pycache__` entries with a live sibling source) is exempt from the snapshot diff after three false loop-fatal parks — a forged cache entry whose header matches its source is the new, named residual | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
+| S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered. Amended 2026-08-16: derived bytecode (`__pycache__/*.pyc` whose sibling `.py` is a regular file in the same snapshot side(s) — never `.pyo`, never a symlinked source) is exempt from the snapshot diff after three false loop-fatal parks — a forged cache entry whose header matches its source is the new, named residual | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
@@ -289,15 +289,32 @@ indistinguishable from tampering. Each cost a `reset --yes` and the in-flight
 round; one stranded five tasks `in_progress`.
 
 `escape_detector.is_derived_bytecode` now exempts exactly one class from
-`diff_snapshots`: a `.pyc`/`.pyo` directly inside a `__pycache__/` directory
-whose sibling `.py` source is itself in the snapshot. The distinction being
-drawn is AUTHORED vs DERIVED — `state.json` and a blocker record hold the
-only copy of a claim, while a cache entry is written from a source this same
-snapshot still tracks byte for byte. Nothing else was excluded: a `.pyc`
-outside `__pycache__` (the pre-PEP-3147 layout, which imports with no source
-beside it), an orphan cache entry with no sibling `.py`, and any symlink or
-directory appearing at a cache path all still park. `.so`/`.pyd` are NOT
-covered and must never be added — those are authored build outputs.
+`diff_snapshots`: a `.pyc` directly inside a `__pycache__/` directory whose
+sibling `.py` source is present **as a regular file** in every snapshot side
+on which the cache entry itself exists. The distinction being drawn is
+AUTHORED vs DERIVED — `state.json` and a blocker record hold the only copy of
+a claim, while a cache entry is written from a source this same snapshot
+still tracks byte for byte. That last clause is enforced, not assumed, which
+is why both halves of the rule are narrow:
+
+* **`.pyc` only, never `.pyo`.** No supported CPython writes a `.pyo` (PEP 488
+  folded the optimisation level into a `.pyc`'s `.opt-N` infix), so
+  `__pycache__/mod.cpython-312.pyo` is not a compile product — it is an
+  authored file borrowing a derived-looking extension. Accepting the whole
+  `py[co]` family would have granted a silent write beside every sourced
+  module in the tree.
+* **The source must be `kind="file"`, per side.** `snapshot_checkout` records
+  a symlink as a target STRING and never hashes it, so a `.py` symlink's bytes
+  could change with the snapshot unmoved — it vouches for nothing, and a cache
+  entry beside it is not exempt. Checking each side separately (rather than
+  the union of both key sets) also refuses a cache entry created in the same
+  window that deletes its source.
+
+Nothing else was excluded: a `.pyc` outside `__pycache__` (the pre-PEP-3147
+layout, which imports with no source beside it), an orphan cache entry with
+no sibling `.py`, and any symlink or directory appearing at a cache path all
+still park. `.so`/`.pyd` are NOT covered and must never be added — those are
+authored build outputs.
 
 **Two things this changes elsewhere, stated rather than left to be
 discovered.** (1) The same rule reaches `diff_worker_tree`, the validation
@@ -326,6 +343,12 @@ three incidents.
 # The exemption exists, is keyed on the cache DIRECTORY, and is not widened:
 rg -n 'is_derived_bytecode|BYTECODE_CACHE_DIR' autoloop/escape_detector.py
 rg -n '\.so|\.pyd' autoloop/escape_detector.py      # expect: only the "never add these" comments
+# `.pyc` only — the regex must NOT match a `.pyo` (expect no `py[co]` hit;
+# every `.pyo` mention should be prose saying it is deliberately in scope):
+rg -n 'py\[co\]|pyo' autoloop/escape_detector.py
+# The source must be verified as a regular file, per side — not merely present
+# in a key set (expect the `state.kind == "file"` check and the `sides` fan-in):
+rg -n 'state\.kind != "file"|\*sides' autoloop/escape_detector.py
 # The `-B` stopgap is operator-side, not in this checkout — expect NO match,
 # and do not "fix" the docs by claiming the control lives here:
 rg -n 'PYTHONDONTWRITEBYTECODE' .

@@ -1231,11 +1231,14 @@ the brief for this pass asked for is empty BY MEASUREMENT.
 
 *The one exemption, added 2026-08-16 (esc-01), and why it does not reopen
 the paragraph above.* `escape_detector.is_derived_bytecode` reports nothing
-for a `.pyc`/`.pyo` directly inside a `__pycache__/` directory whose sibling
-`.py` source is itself in the snapshot. The line being drawn is AUTHORED vs
-DERIVED, not noisy vs quiet: `state.json` and a blocker record hold the only
-copy of a claim, whereas a cache entry is written by the interpreter from a
-source this same snapshot still tracks byte for byte. It was needed because
+for a `.pyc` directly inside a `__pycache__/` directory whose sibling `.py`
+source is present AS A REGULAR FILE on every snapshot side the cache entry
+exists on. The line being drawn is AUTHORED vs DERIVED, not noisy vs quiet:
+`state.json` and a blocker record hold the only copy of a claim, whereas a
+cache entry is written by the interpreter from a source this same snapshot
+still tracks byte for byte — a claim the predicate checks rather than assumes
+(a `.py` that is a SYMLINK is watched as a target string, never hashed, so it
+qualifies nothing). It was needed because
 any out-of-band `import autoloop.<x>` against the primary checkout — a
 dashboard restart, a `health --json` poll — recompiles a stale cache entry
 mid-round, and `__pycache__/` is gitignored, so the detector saw it. That
@@ -1246,8 +1249,14 @@ anything narrower: the recompile fires because the source changed BEFORE the
 window (a merge the loop itself made), so a rule of "flag a `.pyc` only when
 its source did not change in the window" would have flagged all three.
 Deliberately still reported: a `.pyc` OUTSIDE `__pycache__` (the legacy
-layout — it imports with no source beside it), an orphan cache entry with no
-sibling `.py`, and any symlink or directory appearing at a cache path.
+layout — it imports with no source beside it); a `.pyo` ANYWHERE, including
+inside `__pycache__`, since no supported CPython emits that name (PEP 488
+replaced it with a `.pyc`'s `.opt-N` infix) and so one is authored, not
+compiled; an orphan cache entry with no sibling `.py`; a cache entry whose
+sibling `.py` is a symlink, or is missing on one side of the window (the
+per-side check, rather than a union of both key sets, is what refuses a cache
+entry planted in the same window that deletes its source); and any symlink or
+directory appearing at a cache path.
 Deliberately NOT covered: `.so`/`.pyd`, which are authored build outputs.
 The same rule reaches the validation mutation guard below, since that
 delegates to `diff_snapshots`. Residual, recorded in `docs/SECURITY.md` S24
@@ -1855,7 +1864,17 @@ inherited (2026-08-16, esc-01):** this delegates to `diff_snapshots`, so a
 validation `pytest` run's own `__pycache__` entries — derived from sources
 already in the tree — are silent, and the refusal message says "MUTATED the
 worker tree beyond its own bytecode cache" rather than claiming validation
-wrote nothing at all. See §4e for what stays in scope.
+wrote nothing at all. See §4e for what stays in scope. **Precisely how far
+that reaches:** the exemption resolves a cache file back to its source by
+stripping one dotted tag group, so it covers the ordinary
+`<mod>.cpython-3XX[.opt-N].pyc` a run writes for every non-test module it
+imports, but NOT a name whose tag contains dots — `pytest`'s assertion
+rewriter writes `<mod>.<cache_tag>-pytest-<version>.pyc`, and a version like
+`8.3.4` has dots, so a rewritten TEST-module cache does not resolve to a
+source and is still reported. Erring toward reporting is the right direction
+for a guard; widening the stem resolution would mean guessing which of
+several prefixes a cache entry belongs to. Run validation with
+`-B`/`PYTHONDONTWRITEBYTECODE` and the question does not arise.
 
 **What the mutation guard is NOT** (reviewer's wording, kept because it is
 exactly right): it detects **persistent net changes** to the snapshotted worker
