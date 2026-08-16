@@ -57,6 +57,14 @@ from test_orchestrator import FakeExecutor, FakeGit, block  # noqa: E402 - see c
 PROJECT_URL = "https://chatgpt.com/g/g-p-proj123-demo/project"
 CONV_URL = "https://chatgpt.com/g/g-p-proj123-demo/c/original-chat"
 NEW_CONV_URL = "https://chatgpt.com/g/g-p-proj123-demo/c/replacement-chat"
+#: What the address bar ACTUALLY shows between "send clicked in the project" and
+#: "the chat has a durable address": a placeholder under no project at all.
+#: Observed 2026-08-16, where judging project membership against it parked the
+#: loop LOOP-FATAL on a rotation that had worked.
+PLACEHOLDER_URL = "https://chatgpt.com/c/WEB:0d1f4a6c-2b77-4d51-9f0e-6c2c9a7f1a33"
+#: A chat that really is outside the project — a stray navigation, a redirect to
+#: the plain composer. Refusing this is the rule the priming fix must not relax.
+OUTSIDE_PROJECT_URL = "https://chatgpt.com/c/some-other-chat"
 
 
 def stop_block(reason="all done"):
@@ -110,6 +118,11 @@ class RotatingFakeClient:
         self.no_response_calls: list[tuple[str, str]] = []  # (url, request_id)
         self.find_calls: list[tuple[str, str]] = []
         self._stranded_at = None
+        #: The pre-persistence address the SPA shows before a brand-new chat has
+        #: a durable one, and how many reads keep showing it (None = forever).
+        #: See `placeholder_until`.
+        self._placeholder = None
+        self._placeholder_reads = 0
         self.find_finds_nothing = False
         #: (url, request_id) pairs the SERVER holds but a WINDOW READ misses —
         #: the 2026-08-05 bug in one attribute. ChatGPT mounts a window of a
@@ -136,6 +149,19 @@ class RotatingFakeClient:
         """Model the real failure: the chat is created and holds the request,
         but the SPA leaves the URL on the project page for good."""
         self._stranded_at = project_url
+
+    def placeholder_until(self, reads=None, placeholder=PLACEHOLDER_URL):
+        """Show the pre-persistence placeholder for the first `reads` address
+        reads (None = never resolves), then the real one.
+
+        The ordering the 2026-08-16 park was blind to: a chat opened from a
+        project page has no durable URL until its first message lands, and the
+        address until then is `https://chatgpt.com/c/WEB:<uuid>` — NOT under the
+        project prefix, so it fails the membership check exactly like a foreign
+        chat. It is not the project page either, which is why "the address
+        changed" was never evidence the chat existed."""
+        self._placeholder = placeholder
+        self._placeholder_reads = reads
 
     def find_conversation_with(self, request_id, project_url, limit=6):
         """Find the chat by CONTENT, as the real client does — including the
@@ -166,6 +192,10 @@ class RotatingFakeClient:
         # submit — the project page — no matter how long the loop polls.
         if self._stranded_at is not None:
             return self._stranded_at
+        if self._placeholder is not None and self._placeholder_reads != 0:
+            if self._placeholder_reads is not None:
+                self._placeholder_reads -= 1
+            return self._placeholder
         return self.page_url
 
     def has_request(self, request_id):
@@ -1422,6 +1452,171 @@ def test_a_rotation_still_refuses_when_no_chat_carries_the_request(tmp_path):
     assert client.find_calls, "it must have looked"
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert "no chat in the project carries this request" in (orch.state.question or "")
+
+
+# ---- rotation PRIMES the replacement before judging it (2026-08-16) ---------
+#
+# The failure this block exists for: a chat opened from a project page has no
+# durable URL until its first message lands, and the address until then is
+# `https://chatgpt.com/c/WEB:<uuid>` — under no project at all. The old wait
+# stopped as soon as the address DIFFERED from the project page, so it handed
+# the placeholder to the membership check, which refused it every time and
+# parked the loop LOOP-FATAL on a rotation that had actually worked. The rule
+# was right; the moment it was applied was wrong.
+#
+# What must stay true after the fix: a replacement genuinely outside the project
+# is still refused, the wait is bounded, exactly one message is ever sent, and
+# the rotated URL is what a restart resumes on.
+
+
+def fast_rotation_wait(monkeypatch, timeout=2.0, poll=0.01):
+    """Shrink the bounded wait. Both constants are read as module globals at
+    call time, so patching them here is what stops the placeholder tests from
+    sitting out a real 30-second window.
+
+    The default timeout is generous relative to the handful of poll intervals a
+    resolving test needs: a deadline that can expire under load would silently
+    turn "the address resolved" into "the content search rescued it", which is
+    the distinction those tests exist to make. Tests that WANT the expiry pass a
+    short one explicitly."""
+    from autoloop import orchestrator as orchestrator_module
+
+    monkeypatch.setattr(orchestrator_module, "ROTATION_URL_TIMEOUT_SECONDS", timeout)
+    monkeypatch.setattr(orchestrator_module, "ROTATION_URL_POLL_SECONDS", poll)
+
+
+def rotating_state(request_id="alr-test-0001"):
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.SUBMITTING.value
+    state.pending_request = pending(request_id)
+    return state
+
+
+def test_a_placeholder_address_is_primed_and_then_accepted(tmp_path, monkeypatch):
+    """The incident, in one test. The replacement's address is the placeholder
+    for the first reads and a real project conversation afterwards — exactly
+    what an operator reproduced by hand. The rotation must wait through the
+    placeholder and accept the address it becomes, not refuse the address it
+    starts as."""
+    fast_rotation_wait(monkeypatch)
+    client = RotatingFakeClient(
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
+        responses=[stop_block()],
+    )
+    client.placeholder_until(3)
+    orch, store, config = build(tmp_path, client, state=rotating_state())
+
+    orch.run(max_steps=4)
+
+    assert orch.state.phase != Phase.NEEDS_USER.value, "a placeholder must not park the loop"
+    assert orch.state.rotations == 1
+    assert orch.state.conversation_url == NEW_CONV_URL
+    assert transcript_entries(config, "conversation_rotated"), "rotation must be recorded"
+    # The proof that it PRIMED rather than being rescued: the by-content search
+    # never had to run. Without this the test also passes on the old code, which
+    # refused the placeholder and then recovered via `find_conversation_with`.
+    assert client.find_calls == [], "the address resolved; nothing should need finding"
+
+
+def test_a_replacement_outside_the_project_is_still_refused(tmp_path, monkeypatch):
+    """The membership rule is not relaxed by the priming fix. A chat that opens
+    outside the configured project — and stays there, so the wait cannot be what
+    is missing — is refused, and the park names the address actually observed so
+    the operator can see where it went.
+
+    `find_finds_nothing` because the search reads the PROJECT'S list: a chat
+    outside the project is genuinely not in it, and the fake's search would
+    otherwise return it (it returns any persisted chat). Refusing here is the
+    address-bar check doing its job on `new_url`, which is where the incident
+    happened and where the rule belongs."""
+    fast_rotation_wait(monkeypatch, timeout=0.2)  # this one WANTS the expiry
+    client = RotatingFakeClient(
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
+        responses=[stop_block()],
+        new_url=OUTSIDE_PROJECT_URL,
+    )
+    client.find_finds_nothing = True
+    orch, store, config = build(tmp_path, client, state=rotating_state("alr-x-0003"))
+
+    orch.run(max_steps=4)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    question = orch.state.question or ""
+    assert "not inside the configured project" in question
+    assert OUTSIDE_PROJECT_URL in question, "the park must name the address observed"
+    # Nothing was bound to it: the request still belongs to the old chat.
+    assert orch.state.conversation_url == CONV_URL
+    assert orch.state.pending_request.conversation_url == CONV_URL
+    declined = transcript_entries(config, "rotation_declined")
+    assert declined and declined[-1]["data"]["reason_code"] == "rotation_failed"
+
+
+def test_an_address_that_never_leaves_the_placeholder_parks_bounded(tmp_path, monkeypatch):
+    """The wait is bounded, so a chat that never gets a durable address parks
+    instead of hanging — and the park says PLACEHOLDER, with the address it saw,
+    rather than a generic timeout that sends the next operator hunting a browser
+    fault. This test completing at all is the "does not hang" assertion."""
+    fast_rotation_wait(monkeypatch, timeout=0.2)
+    client = RotatingFakeClient(
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
+        responses=[stop_block()],
+    )
+    client.placeholder_until(None)  # never resolves
+    client.find_finds_nothing = True  # and no chat in the project carries it
+    orch, store, config = build(tmp_path, client, state=rotating_state("alr-x-0004"))
+
+    orch.run(max_steps=4)
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    question = orch.state.question or ""
+    assert PLACEHOLDER_URL in question, "the observed address, not a generic timeout"
+    assert "placeholder" in question
+    # Exactly one message ever left for the project page. A retried send there
+    # does not retry anything — it opens a SECOND chat and orphans the first,
+    # with the same request live in both. (`client.submitted` also holds the two
+    # pre-rotation sends into the original conversation.)
+    assert len([s for s in client.submitted if s[0] == PROJECT_URL]) == 1
+    # And the park tells the operator the loop is still pinned to the retired
+    # conversation, which is the trap this incident left behind by hand.
+    assert CONV_URL in question
+
+
+def test_the_primed_rotation_url_survives_a_restart(tmp_path, monkeypatch):
+    """A restart must resume in the replacement, not the retired thread. The
+    state file is what the next process reads, so the rotation is only finished
+    once the new URL is in it — and the resumed run must await THERE."""
+    fast_rotation_wait(monkeypatch)
+    client = RotatingFakeClient(
+        submit_results=[SubmitResult.REJECTED, SubmitResult.REJECTED, SubmitResult.CONFIRMED],
+        responses=[stop_block()],
+    )
+    client.placeholder_until(2)
+    orch, store, config = build(tmp_path, client, state=rotating_state())
+
+    orch.run(max_steps=4)  # stops at the rotation, before the reply is consumed
+
+    reloaded = StateStore(config.state_file).load()
+    assert reloaded.conversation_url == NEW_CONV_URL
+    assert reloaded.rotations == 1
+    assert reloaded.pending_request.conversation_url == NEW_CONV_URL
+    assert reloaded.pending_request.conversation_epoch == 1
+    assert reloaded.last_rotation["old_url"] == CONV_URL
+    assert reloaded.last_rotation["new_url"] == NEW_CONV_URL
+
+    # A fresh process over that state reads the replacement chat. The config it
+    # is built from still names the retired conversation (the heal is
+    # best-effort), so this is the case that would otherwise resume on the dead
+    # thread with a submitted request against it.
+    resumed = RotatingFakeClient(conversation_url=CONV_URL, responses=[stop_block()])
+    resumed.seed(NEW_CONV_URL, "alr-test-0001")
+    second = tmp_path / "second"
+    second.mkdir()
+    orch2, _, _ = build(second, resumed, state=reloaded)
+
+    orch2.run(max_steps=1)
+
+    assert resumed.awaited, "the resumed run never awaited a response"
+    assert {url for url, _ in resumed.awaited} == {NEW_CONV_URL}
 
 
 # ---- a FALSE ambiguity is resolved by PROVING the request is there ----------

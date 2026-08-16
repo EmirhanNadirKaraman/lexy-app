@@ -985,6 +985,46 @@ an unbound request refuse to guess.
 the request id from the park message. If it exists, the rotation worked and
 only the detection failed; point `browser.conversation_url` at that chat.
 
+### `the replacement chat is not inside the configured project: 'https://chatgpt.com/c/WEB:<uuid>' is not under ...`
+**Symptom:** a rotation parks `loop_fatal` with `rotation_failed`, naming an
+address of the form `https://chatgpt.com/c/WEB:<uuid>` — no project prefix on
+it at all. The loop stays down until an operator intervenes. Nothing else is
+wrong: the project page loads, the composer is clickable, there is no
+rate-limit modal, and the replacement chat is sitting in the project holding
+the request. Hit 2026-08-16, on the first rotation the new
+slow-conversation trigger fired (the retired thread had 90+ packets and a
+direct navigation to it timed out, so retiring it was correct).
+**Cause:** an ORDERING bug, not selector drift and not an outage. A chat
+started from a project page has no durable URL until its first message lands;
+until then the address is that `WEB:` placeholder, which is under no project.
+The rotation's wait stopped as soon as the address DIFFERED from the project
+page, so it handed the placeholder to the membership check — which refused it,
+correctly, given what it was shown. The check is right; the moment it was
+applied was wrong, and it would have failed on every rotation.
+**Confirmed by hand:** open the project page, send one short message, and the
+address immediately becomes `https://chatgpt.com/g/g-p-<project>-<slug>/c/<uuid>`,
+which passes the SAME check unchanged.
+**Fix:** applied repo-side — `_rotate_conversation` now polls for *an address
+inside the project* rather than for *any address other than the project page*,
+so the placeholder is a state to wait through instead of a verdict. The submit
+already in that method is the priming message: one send, never retried, because
+a second send from the project page opens a SECOND chat and orphans the first
+with the same request live in both.
+**What did NOT change:** the membership rule. A replacement genuinely outside
+the project is still refused. It is still applied to the address bar only — not
+to what `find_conversation_with` returns, whose candidates come back prefix-less
+from `urljoin` and would then ALL be refused, undoing the 2026-08-03 rescue (see
+`_same_conversation`). The wait is still bounded, and
+on expiry the park quotes the address actually observed (and says "placeholder"
+when it is one), so the next operator sees the shape rather than a generic
+timeout.
+**If you are looking at a park like this on an older build:** state still points
+at the RETIRED conversation with the request marked submitted against it, so a
+plain restart resumes on the dead thread. Open the project, find the chat
+carrying the request id from the park message, point `browser.conversation_url`
+at it and `reset` (the drift guard requires state and config to agree). Do not
+`--resubmit` into a chat that already holds the request — that posts it twice.
+
 ### A readback says a message is not in the conversation, and it plainly is
 **Symptom:** the loop parks `submission_ambiguous` (or drops a chunked part and
 re-sends it) reporting that a readback did not see the request — on builds before

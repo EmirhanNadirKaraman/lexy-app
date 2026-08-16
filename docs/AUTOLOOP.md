@@ -2363,13 +2363,34 @@ its ceiling from the three timeouts that earned the first rotation) and fail
 the loop before a second rotation attempt — and its cap refusal — is ever
 reached.
 
-**Rotation proves before it binds.** ChatGPT does not mint a `/c/<id>` until a
-chat has its first turn, so the order is forced: retarget to the project page,
-submit there, read the URL the server assigned, check it is inside the configured
-project — and then **reconcile against it**. Until the new conversation itself
-confirms it holds the request, nothing is bound and the rotation has not
-happened. Trusting the address bar would be the same class of mistake as
-trusting an optimistic bubble.
+**Rotation proves before it binds.** ChatGPT does not mint a chat's durable
+address until it has its first turn, so the order is forced: retarget to the
+project page, submit there, read the URL the server assigned, check it is inside
+the configured project — and then **reconcile against it**. Until the new
+conversation itself confirms it holds the request, nothing is bound and the
+rotation has not happened. Trusting the address bar would be the same class of
+mistake as trusting an optimistic bubble.
+
+**Rotation primes the replacement before judging it.** The address a brand-new
+chat carries is not the project page — it is a placeholder,
+`https://chatgpt.com/c/WEB:<uuid>`, under no project at all. So "the address
+moved off the project page" was never evidence a chat exists, and the membership
+check applied to it refused every rotation (2026-08-16: one LOOP-FATAL park; an
+operator sent one message by hand and the same address became
+`/g/g-p-<project>-<slug>/c/<uuid>`, which passes the same check unchanged). The
+submit **is** the priming message — one send, never retried, because a second
+send from the project page opens a SECOND chat and orphans the first — and the
+wait after it polls for *an address inside the project*, not merely a changed
+one. Bounded by `ROTATION_URL_TIMEOUT_SECONDS`; on expiry the by-content search
+still runs, and if that also fails the park names **the address actually
+observed**, so the placeholder shape is visible rather than a generic timeout.
+The membership rule itself is unchanged and still refuses a replacement that
+really is outside the project. It is applied to the ADDRESS BAR only, and
+deliberately not re-applied to what the by-content search returns: that search
+reads the project's own chat list (its scoping *is* the containment check) and
+builds candidates with `urljoin`, so a chat inside the project legitimately
+comes back as a prefix-less `https://chatgpt.com/c/<id>` — the trap
+`_same_conversation` documents.
 
 **A failed rotation still costs its budget, and changes nothing else.** The
 budget is consumed *before* the send, durably — a rotation posts a message, and
