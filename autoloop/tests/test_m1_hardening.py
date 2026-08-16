@@ -23,6 +23,7 @@ from __future__ import annotations
 import ast
 import inspect
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -503,6 +504,36 @@ def test_escape_detector_still_detects_a_pyo_inside_a_cache_directory(tmp_path):
     assert not [v for v in violations if ".pyc" in v], violations
 
 
+def test_escape_detector_still_detects_a_foreign_tagged_pyc_in_a_cache_directory(tmp_path):
+    """The tag is the one part of a cache file's name its writer does not get
+    to choose, so it is what separates "some interpreter compiled this" from
+    "someone put this here". `mod.attacker.pyc` sits in the cache directory
+    beside a perfectly live `pkg/mod.py` — every other clause of the exemption
+    is satisfied — and is still reported, because no interpreter emits that
+    name. A tag pattern loose enough to accept it would be a silent write per
+    sourced module in the tree, the same hole the `.pyo` rule refuses.
+    Discrimination in ONE window, not merely "something was reported": the
+    genuine `cpython-312` entry is rewritten alongside it and stays silent."""
+    repo_root = _python_repo(tmp_path)
+    cache = repo_root / "pkg" / "__pycache__"
+    cache.mkdir()
+    (cache / "mod.cpython-312.pyc").write_bytes(b"stale bytecode")
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths_before = enumerate_checkout_paths(git)
+    assert git.dirty_files() == []  # `*.py[cod]` is ignored: invisible to git status
+    before = snapshot_checkout(repo_root, paths_before)
+
+    (cache / "mod.cpython-312.pyc").write_bytes(b"recompiled by an out-of-band import")
+    (cache / "mod.attacker.pyc").write_bytes(b"planted, not compiled")
+
+    paths_after = enumerate_checkout_paths(git)
+    after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
+    violations = diff_snapshots(before, after)
+    assert any("mod.attacker.pyc" in v and "created" in v for v in violations), violations
+    assert not [v for v in violations if "cpython-312" in v], violations
+
+
 def test_escape_detector_still_detects_a_cache_entry_beside_a_symlinked_source(tmp_path):
     """The exemption's premise is that the cache entry's source stays watched
     BYTE FOR BYTE by this same snapshot. A `.py` that is a SYMLINK is watched
@@ -676,6 +707,13 @@ def test_is_derived_bytecode_is_keyed_on_the_cache_directory_and_a_live_source()
     )
     in_scope = (
         "pkg/__pycache__/ghost.cpython-312.pyc",  # no `pkg/ghost.py`
+        # A tag no interpreter emits: every other clause of the exemption is
+        # satisfied (cache dir, `.pyc`, live regular-file source), so these are
+        # exactly the names an arbitrary dot-free tag would have made silent.
+        "pkg/__pycache__/mod.attacker.pyc",
+        "pkg/__pycache__/mod.cpython312.pyc",  # no hyphen: not the emitted shape
+        "pkg/__pycache__/mod.CPYTHON-312.pyc",  # case matters; tags are lowercase
+        "pkg/__pycache__/mod.cpython-312-pytest-8.3.4.pyc",  # assertion-rewriter name
         "pkg/mod.pyc",  # legacy layout: importable with no source
         "pkg/__pycache__/mod.cpython-311.pyo",  # no supported CPython emits this
         "pkg/evil.pyo",
@@ -690,6 +728,15 @@ def test_is_derived_bytecode_is_keyed_on_the_cache_directory_and_a_live_source()
         assert is_derived_bytecode(rel, side, side) is True, rel
     for rel in in_scope:
         assert is_derived_bytecode(rel, side) is False, rel
+
+    # Whatever tag THIS interpreter writes, whichever build it is — the
+    # backstop alternative in `_CACHE_FILE_RE`, kept out of the literal table
+    # above so that table stays hermetic across versions. (`cache_tag` is None
+    # on an implementation that caches no bytecode; there is nothing to prove
+    # there.)
+    if sys.implementation.cache_tag:
+        runtime = f"pkg/__pycache__/mod.{sys.implementation.cache_tag}.pyc"
+        assert is_derived_bytecode(runtime, side) is True, runtime
 
     # No sides at all: nothing claims to have seen this path, so nothing
     # vouches for its source. Must not default to exempt.

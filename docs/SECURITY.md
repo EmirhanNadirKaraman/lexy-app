@@ -295,7 +295,7 @@ on which the cache entry itself exists. The distinction being drawn is
 AUTHORED vs DERIVED — `state.json` and a blocker record hold the only copy of
 a claim, while a cache entry is written from a source this same snapshot
 still tracks byte for byte. That last clause is enforced, not assumed, which
-is why both halves of the rule are narrow:
+is why every clause of the rule is narrow:
 
 * **`.pyc` only, never `.pyo`.** No supported CPython writes a `.pyo` (PEP 488
   folded the optimisation level into a `.pyc`'s `.opt-N` infix), so
@@ -303,6 +303,21 @@ is why both halves of the rule are narrow:
   authored file borrowing a derived-looking extension. Accepting the whole
   `py[co]` family would have granted a silent write beside every sourced
   module in the tree.
+* **The tag must be one an interpreter really emits.** Accepted:
+  `cpython-<digits>[t]` (the CPython family shape; `t` is the free-threaded ABI
+  flag) and this runtime's own `sys.implementation.cache_tag` as a literal.
+  Everything else — `mod.attacker.pyc`, `mod.cpython312.pyc`, pytest's
+  assertion-rewriter name — is reported. The first version of the rule accepted
+  any dot-free tag, which satisfied every other clause beside a live source and
+  so amounted to one silent write per sourced module in the tree; that is the
+  `.pyo` hole again, one level down the name. The family shape carries the
+  weight, not the runtime tag: the three incidents were written by a DIFFERENT
+  process than the loop (a dashboard restart, `health --json` polls), which
+  need not run the loop's interpreter or version, so keying on
+  `sys.implementation.cache_tag` alone would recreate the parks; the runtime
+  tag is only a backstop for a build (debug, non-CPython) the family shape does
+  not anticipate. A cache file from a genuine but foreign interpreter is
+  reported — a readable park, not a silent write.
 * **The source must be `kind="file"`, per side.** `snapshot_checkout` records
   a symlink as a target STRING and never hashes it, so a `.py` symlink's bytes
   could change with the snapshot unmoved — it vouches for nothing, and a cache
@@ -311,9 +326,9 @@ is why both halves of the rule are narrow:
   window that deletes its source.
 
 Nothing else was excluded: a `.pyc` outside `__pycache__` (the pre-PEP-3147
-layout, which imports with no source beside it), an orphan cache entry with
-no sibling `.py`, and any symlink or directory appearing at a cache path all
-still park. `.so`/`.pyd` are NOT covered and must never be added — those are
+layout, which imports with no source beside it), a `.pyc` wearing a tag no
+interpreter emits, an orphan cache entry with no sibling `.py`, and any
+symlink or directory appearing at a cache path all still park. `.so`/`.pyd` are NOT covered and must never be added — those are
 authored build outputs.
 
 **Two things this changes elsewhere, stated rather than left to be
@@ -346,12 +361,16 @@ rg -n '\.so|\.pyd' autoloop/escape_detector.py      # expect: only the "never ad
 # `.pyc` only — the regex must NOT match a `.pyo` (expect no `py[co]` hit;
 # every `.pyo` mention should be prose saying it is deliberately in scope):
 rg -n 'py\[co\]|pyo' autoloop/escape_detector.py
+# The TAG is constrained to shapes an interpreter emits — expect the family
+# pattern plus the runtime literal, and NO bare `[^.]+`/`.+` in the tag slot:
+rg -n '_CPYTHON_CACHE_TAG|_CACHE_TAG_ALTERNATIVES|cache_tag' autoloop/escape_detector.py
 # The source must be verified as a regular file, per side — not merely present
 # in a key set (expect the `state.kind == "file"` check and the `sides` fan-in):
 rg -n 'state\.kind != "file"|\*sides' autoloop/escape_detector.py
-# The `-B` stopgap is operator-side, not in this checkout — expect NO match,
-# and do not "fix" the docs by claiming the control lives here:
-rg -n 'PYTHONDONTWRITEBYTECODE' .
+# The `-B` stopgap is operator-side, not in this checkout — expect NO match in
+# CODE (the docs discuss it in prose, which is why this is scoped to `autoloop/`
+# and `*.py`), and do not "fix" the docs by claiming the control lives here:
+rg -n 'PYTHONDONTWRITEBYTECODE' autoloop -g '*.py'
 # A genuine ignored-path escape is still detected, including alongside
 # bytecode churn in the same window:
 pytest autoloop/tests/test_m1_hardening.py -k 'escape_detector or bytecode' -q

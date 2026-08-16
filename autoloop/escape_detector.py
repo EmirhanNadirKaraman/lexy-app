@@ -40,7 +40,8 @@ see `orchestrator.py`'s call site, which applies it only to the non-audit
 
 THE ONE EXEMPTION, AND WHY IT IS NOT A CRACK IN THE PARAGRAPH ABOVE.
 `is_derived_bytecode` exempts CPython's own bytecode cache — a `.pyc`
-sitting directly inside a `__pycache__/` directory whose sibling `.py` source
+sitting directly inside a `__pycache__/` directory, CARRYING A TAG SOME
+INTERPRETER REALLY EMITS (`_CACHE_FILE_RE`), whose sibling `.py` source
 is a REGULAR FILE in the same snapshot side(s). That is a different class
 from the volatile files the paragraph above refuses to exclude, and the
 distinction is authorship: `state.json` and a blocker record are AUTHORED
@@ -74,6 +75,13 @@ bytecode stops being merely derived:
     `__pycache__/mod.cpython-312.pyo` is not a compile product; it is an
     authored file borrowing a derived-looking extension, and exempting it
     would grant a silent write beside every sourced module in the tree.
+  * a `.pyc` inside `__pycache__` whose TAG is not one an interpreter
+    generates (`mod.attacker.pyc`, `mod.cpython312.pyc`). The tag is the only
+    part of the name the writer does not get to choose freely, so accepting
+    an arbitrary dot-free tag would have handed back the same silent write
+    per sourced module that the `.pyo` rule above refuses — see
+    `_CACHE_FILE_RE` for the two tag shapes that are accepted and why the
+    family pattern, not this runtime's own tag, is the load-bearing one.
   * a `__pycache__` entry whose sibling source is missing, or is not a plain
     file, on any side the entry exists — an orphan nothing regenerates, or a
     "source" that is itself a symlink and so watched only as a target string
@@ -117,6 +125,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -165,13 +174,57 @@ BYTECODE_CACHE_DIR = "__pycache__"
 #: authored file wearing a derived-looking extension, and accepting it would
 #: hand an attacker a silent write for every module in the tree that happens
 #: to have a source beside it. It stays in scope and is reported.
-_CACHE_FILE_RE = re.compile(r"^(?P<stem>.+?)\.[^.]+(?:\.opt-\d+)?\.pyc(?:\.\d+)?$")
+#:
+#: THE TAG IS CONSTRAINED, and this is the same argument one level down. A
+#: dot-free-anything tag (`[^.]+`, the first version of this regex) made
+#: `pkg/__pycache__/mod.attacker.pyc` "derived" beside any live `pkg/mod.py` —
+#: one silent write per sourced module, i.e. exactly what the `.pyo` rule
+#: refuses, reintroduced through the middle of the name. A cache entry is only
+#: derived if some interpreter would have written that name; a tag no
+#: interpreter emits is authored.
+#:
+#: Two alternatives are accepted, and the asymmetry between them is the point:
+#:   * `cpython-<digits>[t]` — the FAMILY shape, and the load-bearing half.
+#:     The writes behind the incidents came from a DIFFERENT process than the
+#:     one importing this module (a dashboard restart; `python3 -m autoloop
+#:     health --json` polls), so the writing interpreter need not be the loop's
+#:     venv python, or even its version. Pinning to this runtime's tag ALONE
+#:     would recreate the parks the first time an operator polls with another
+#:     `python3`. The optional trailing `t` is the ABI-flag suffix CPython
+#:     folds into the tag for free-threaded builds (PEP 703, 3.13+), which is
+#:     simply the next interpreter likely to poll a checkout out of band; it
+#:     widens the accepted set by one name shape that a non-free-threaded
+#:     import will never load — the same size of residual as the `.<pid>` temp
+#:     suffix above, not a new class.
+#:   * this runtime's own `sys.implementation.cache_tag`, as a LITERAL — the
+#:     backstop for a build whose tag the family shape does not anticipate (a
+#:     debug build, or a non-CPython implementation running the loop itself).
+#:     Exactly one extra string, and only ever a tag something on this machine
+#:     genuinely writes.
+#: Everything else is REPORTED, including a cache file from a foreign
+#: interpreter that is not the one running here (a `pypy39` tag, say). For a
+#: genuine-but-foreign interpreter that is the safe direction — a spurious
+#: park, which an operator can read, rather than a silent write — and no such
+#: interpreter imports this checkout today.
+_CPYTHON_CACHE_TAG = r"cpython-\d{2,}t?"
+_RUNTIME_CACHE_TAG = getattr(sys.implementation, "cache_tag", None)
+_CACHE_TAG_ALTERNATIVES = [_CPYTHON_CACHE_TAG]
+if _RUNTIME_CACHE_TAG:
+    # `cache_tag` is None on an implementation that does not cache bytecode at
+    # all (`importlib.util.cache_from_source` raises there) — nothing to add.
+    _CACHE_TAG_ALTERNATIVES.append(re.escape(_RUNTIME_CACHE_TAG))
+_CACHE_FILE_RE = re.compile(
+    r"^(?P<stem>.+?)\.(?:"
+    + "|".join(_CACHE_TAG_ALTERNATIVES)
+    + r")(?:\.opt-\d+)?\.pyc(?:\.\d+)?$"
+)
 
 
 def is_derived_bytecode(rel: str, *sides: CheckoutSnapshot) -> bool:
     """True when `rel` (repo-relative, as git reports it) is a CPython
-    bytecode cache entry whose `.py` source is a REGULAR FILE in every one of
-    `sides` — the one class of path `diff_snapshots` reports nothing for.
+    bytecode cache entry — cache directory, real cache tag, `.pyc` — whose
+    `.py` source is a REGULAR FILE in every one of `sides`: the one class of
+    path `diff_snapshots` reports nothing for.
 
     `sides` are the snapshot sides on which the cache entry itself exists
     (before, after, or both — `diff_snapshots` passes exactly those). The
@@ -190,7 +243,10 @@ def is_derived_bytecode(rel: str, *sides: CheckoutSnapshot) -> bool:
         Same for a `dir_boundary` (a nested repo where the source should be).
     An orphan cache entry — no `.py` beside it, nothing that would ever
     regenerate it — fails this check too and is reported like any other path,
-    which is what catches a cache file planted where no module exists.
+    which is what catches a cache file planted where no module exists. So does
+    a name no interpreter would have written: the tag between stem and `.pyc`
+    has to be a real cache tag (`_CACHE_FILE_RE`), because a live source next
+    to `mod.attacker.pyc` explains nothing about how that file got there.
 
     Called with no `sides` at all, this is False: a path nothing claims to
     have seen cannot have a verified source, and defaulting the other way
@@ -315,18 +371,18 @@ def diff_snapshots(before: CheckoutSnapshot, after: CheckoutSnapshot) -> list[st
     could not equally say through the `.py` next to it, which this same diff
     still reports byte for byte.
 
-    Known narrowness, stated rather than papered over: the exemption resolves
-    a cache file back to its source by stripping ONE dotted tag group, so a
-    cache name whose tag itself contains dots does not resolve and is
-    reported. `pytest`'s assertion rewriter writes exactly such a name
-    (`<mod>.<cache_tag>-pytest-<version>.pyc`, and a version like `8.3.4` has
-    dots), so a validation run's rewritten TEST-module caches are still
-    reported by `diff_worker_tree` even though the ordinary
-    `<mod>.cpython-3XX.pyc` written for every non-test module it imports is
-    not. Erring toward reporting is the safe direction here, and widening the
-    stem resolution would mean guessing which of several prefixes a cache
-    entry belongs to — deliberately not done. Validation is expected to run
-    with `-B`/`PYTHONDONTWRITEBYTECODE` for that reason.
+    Known narrowness, stated rather than papered over: the exemption only
+    recognises a cache name whose TAG is one an interpreter actually emits
+    (`_CACHE_FILE_RE` — the CPython family shape, or this runtime's own
+    `cache_tag`). `pytest`'s assertion rewriter writes a name that is neither,
+    interposing its own version into the tag position
+    (`<mod>.<cache_tag>-pytest-<version>.pyc`), so a validation run's rewritten
+    TEST-module caches are still reported by `diff_worker_tree` even though the
+    ordinary `<mod>.cpython-3XX.pyc` written for every non-test module it
+    imports is not. Erring toward reporting is the safe direction here: the
+    alternative is a tag pattern loose enough that an authored file can wear
+    it, which is precisely the hole the tag constraint closes. Validation is
+    expected to run with `-B`/`PYTHONDONTWRITEBYTECODE` for that reason.
     """
     violations: list[str] = []
     known = set(before) | set(after)
