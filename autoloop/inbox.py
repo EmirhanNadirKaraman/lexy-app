@@ -32,18 +32,30 @@ through, not by a second implementation that could drift from it.
 `depends_on`, `block` and `unblock`. Four things keep that from being the
 "general edit-a-task request" the `priority`-only design was written to avoid:
 
-1. **The registry decides, here and at creation.** Every mutation lands on a
-   `TaskRegistry` method that calls the SAME validator creation calls —
-   `_validate_description`, `_validate_approved_paths`, `_validate_depends_on`
-   + `_check_acyclic`. Submission checks SHAPE only (is the field present, is
-   it a list, does this kind even carry it), so a refusal an operator reads is
-   always the registry's own words, never a second rule set drifting from it.
-   The shape half is PER KIND, in both directions: `_check_mutation` bounds a
+1. **Two authorities, split by question, one implementation each.** SHAPE — is
+   the field present, is it the right JSON type, does this kind even carry it —
+   belongs to `check_request_shape` here. CONTENT — is the description blank,
+   is the path well-formed, does the dependency exist, may this task be edited
+   at all — belongs to the registry, whose mutators call the SAME validators
+   creation calls (`_validate_description`, `_validate_approved_paths`,
+   `_validate_depends_on` + `_check_acyclic`). So a refusal an operator reads is
+   always one authority's own words, never a second rule set drifting from it.
+
+   The shape rule is PER KIND, in both directions: `_check_mutation` bounds a
    mutation to `{"kind", "id", <its payload>}` and `_check_creation` bounds a
    `task` to `CREATION_FIELDS`. A single global field set cannot say this — it
    accepted `{"kind": "task", …, "reason": …}`, which submitted cleanly and
    then dropped the reason on merge, which is the silent-ignore the per-kind
    rule exists to prevent.
+
+   And it runs at BOTH gates — `TaskInbox.submit` and `apply_requests` — off
+   the one function, because hand-writing the JSON file is the ONLY operator
+   route to the five new kinds (no CLI flag, no dashboard endpoint), and a
+   hand-written file never passes through `submit`. Checking shape only on the
+   way in therefore left the documented route unchecked: a hand-written
+   creation carrying `reason`, or a `block` carrying a stray `approved_paths`,
+   reached `apply_requests`, which consumed the fields it recognised and
+   ignored the rest — the same silent drop, arrived at from the other side.
 2. **Nothing in flight can be edited.** `TaskRegistry._refuse_immutable`
    refuses `description`, `approved_paths` and `depends_on` on an
    `in_progress` task, because all three are what a dispatch that has ALREADY
@@ -79,9 +91,10 @@ import time
 from pathlib import Path
 
 #: Fields a CREATION request (`kind: "task"`, or no kind at all) may carry.
-#: Anything else is refused at submit time rather than silently dropped on
-#: merge — a request that names a field the receiver ignores has almost
-#: certainly not done what its author intended.
+#: Anything else is refused — at submit AND on merge, off the one
+#: `check_request_shape` — rather than silently dropped, because a request that
+#: names a field the receiver ignores has almost certainly not done what its
+#: author intended.
 #:
 #: This is the whole of the creation contract: `reason` is deliberately absent,
 #: because a task nobody has looked at yet cannot already be held, and
@@ -90,6 +103,20 @@ from pathlib import Path
 #: checking one global field set) accepted `{"kind": "task", …, "reason": …}`
 #: at submit and then ignored the reason on merge — exactly the silent drop the
 #: per-kind rule below refuses for every other field.
+#:
+#: Exactly the keys `apply_requests`' creation branch reads, plus the `kind`
+#: discriminator itself — no more and no less. A field the merge consumes but
+#: this omits would be unreachable, and a field this admits but the merge
+#: ignores is the silent drop again.
+#:
+#: A STORED-TASK field is therefore refused rather than ignored: `status`,
+#: `created_at`, `blocked_reason`, `superseded_by` and `hold_origin` are all
+#: real `Task` attributes, but the inbox carries REQUESTS, not registry rows,
+#: and none of them is something an operator gets to assert on the way in.
+#: Since 2026-08-16 (review round 3) that refusal reaches the hand-written
+#: route too, where such a key previously vanished and the task landed without
+#: it — a `seed_tasks.json`-shaped file dropped into the inbox is now refused
+#: with the offending key named instead of quietly meaning something else.
 CREATION_FIELDS = frozenset(
     {
         "kind",
@@ -169,7 +196,121 @@ KINDS = (KIND_TASK, *MUTATION_KINDS)
 
 
 class InboxError(Exception):
-    """A request that cannot even be written — bad shape, caught at submit."""
+    """A request whose SHAPE is unusable, whoever wrote it.
+
+    Raised out of `TaskInbox.submit` (so an operator using the API sees it
+    immediately, and nothing malformed reaches the queue) and caught inside
+    `apply_requests` (so a hand-written file that never passed through `submit`
+    is refused as that request's `refused` line, without stopping the batch).
+    """
+
+
+def check_request_shape(spec: object) -> str:
+    """Shape-check ONE request and return its resolved kind. Raises `InboxError`.
+
+    THE shape gate, called by `TaskInbox.submit` on the way in and by
+    `apply_requests` on the way out, so a hand-written JSON file gets exactly
+    the rule an API submit gets. Two copies would drift, and a drift here means
+    the field an operator typed is refused by one route and silently ignored by
+    the other — which is the whole defect the per-kind rule exists to prevent,
+    and hand-writing the file is the ONLY route to five of the six mutation
+    kinds today.
+
+    SHAPE only, deliberately: is this request even usable, given its kind.
+    Whether the description is blank, the path is well-formed, the dependency
+    exists or the task is in a state that may be edited are all the registry's
+    calls, made by the mutator on merge, so the operator reads one authority's
+    words per question rather than two rule sets that agree until they don't.
+
+    The allowed-field check is PER KIND, and the kind is therefore resolved
+    first. A single global set cannot express the contract — `reason` is legal
+    on a `block` and meaningless on a `task`, so a global check either refuses a
+    valid hold or accepts a creation request carrying a field the merge
+    silently ignores.
+    """
+    if not isinstance(spec, dict):
+        raise InboxError("a task request must be a JSON object")
+    kind = spec.get("kind", KIND_TASK)
+    # `isinstance` BEFORE the membership test, and not for tidiness: a
+    # hand-written `"kind": []` reaches `kind in MUTATION_PAYLOAD` below, which
+    # is a dict lookup and raises `TypeError: unhashable type` rather than the
+    # `InboxError` every caller here is written to expect — taking the whole
+    # drain, and the running loop's step, down with one malformed file.
+    if not isinstance(kind, str) or kind not in KINDS:
+        raise InboxError(f"unknown kind {kind!r}; expected one of {list(KINDS)}")
+    if kind in MUTATION_PAYLOAD:
+        _check_mutation(kind, spec)
+    else:
+        _check_creation(spec)
+    return kind
+
+
+def _check_creation(spec: dict) -> None:
+    """Shape-check one CREATION request. Raises `InboxError`.
+
+    The creation half of the same per-kind rule `_check_mutation` applies:
+    a request carries only the fields its kind can act on. `reason` is the
+    field this exists to catch — it is in the vocabulary, so a global check
+    waved it through onto a `task` request that then dropped it on merge.
+    """
+    unknown = set(spec) - CREATION_FIELDS
+    if unknown:
+        # A mutation-only field gets its own sentence. `{"kind": "task",
+        # "reason": …}` is a request whose author meant a hold, and
+        # "unknown field" alone would send them looking for a typo.
+        mutation_only = sorted(unknown & MUTATION_ONLY_FIELDS)
+        hint = (
+            f"; {mutation_only} is mutation-only — use one of "
+            f"{list(MUTATION_KINDS)}"
+            if mutation_only
+            else ""
+        )
+        carries = sorted(CREATION_FIELDS - {"kind"})
+        raise InboxError(
+            f"unknown field(s) {sorted(unknown)} on a {KIND_TASK} request; it "
+            f"carries only {carries}{hint}"
+        )
+    if "priority" in spec and not isinstance(spec["priority"], int):
+        raise InboxError("priority must be an integer (ascending; 1 outranks 2)")
+    missing = [f for f in REQUIRED_FIELDS if not str(spec.get(f, "")).strip()]
+    if missing:
+        raise InboxError(f"missing required field(s): {', '.join(missing)}")
+
+
+def _check_mutation(kind: str, spec: dict) -> None:
+    """Shape-check one mutation request. Raises `InboxError`.
+
+    Driven off `MUTATION_PAYLOAD` rather than a branch per kind, so adding
+    a kind cannot forget the "carries only these fields" rule — which is
+    the check that turns a typo'd field name into a refusal instead of a
+    silently ignored instruction.
+    """
+    if not str(spec.get("id", "")).strip():
+        raise InboxError(f"a {kind} request needs the task 'id'")
+    payload = MUTATION_PAYLOAD[kind]
+    allowed = {"kind", "id"} | ({payload} if payload else set())
+    extra = set(spec) - allowed
+    if extra:
+        carries = " + ".join(sorted(allowed - {"kind"}))
+        raise InboxError(
+            f"a {kind} request carries only {carries}; got {sorted(extra)}"
+        )
+    if payload is None:
+        return
+    if payload not in spec:
+        raise InboxError(f"a {kind} request needs {payload!r}")
+    value = spec[payload]
+    # Type only, and only where JSON can express the wrong one. The
+    # registry owns every question about CONTENT — blank text, malformed
+    # paths, unknown dependencies — so nothing below asks one.
+    if kind == KIND_PRIORITY and not isinstance(value, int):
+        raise InboxError("a priority request needs an integer 'priority'")
+    if kind in (KIND_DESCRIPTION, KIND_BLOCK) and not isinstance(value, str):
+        raise InboxError(f"a {kind} request needs {payload!r} as a string")
+    if kind in (KIND_APPROVED_PATHS, KIND_DEPENDS_ON) and not isinstance(value, list):
+        raise InboxError(
+            f"a {kind} request needs {payload!r} as a list (use [] to clear it)"
+        )
 
 
 class TaskInbox:
@@ -188,30 +329,18 @@ class TaskInbox:
         """Write one request. Atomic (temp file + `os.replace`), so a drain
         racing a submit can never observe a half-written file.
 
-        SHAPE only — is this request even usable, given its kind. Whether the
-        description is blank, the path is well-formed, the dependency exists or
-        the task is in a state that may be edited are all the registry's calls,
-        made on merge, so the operator reads one authority's words rather than
-        two rule sets that agree until they don't.
+        Shape is checked by `check_request_shape`, the SAME function
+        `apply_requests` runs on merge, so a request queued through this API and
+        one an operator writes into the directory by hand are held to one rule.
+        Raising here rather than queueing is the only difference: nothing
+        malformed reaches the queue in the first place, so the operator finds
+        out at the call instead of in a drain log later.
 
-        The allowed-field check is PER KIND, and the kind is therefore resolved
-        first. A single global set cannot express the contract — `reason` is
-        legal on a `block` and meaningless on a `task`, so a global check either
-        refuses a valid hold or accepts a creation request carrying a field the
-        merge silently ignores.
+        Content — a blank description, a globbed path, an unknown dependency, a
+        task the loop is currently running — is not asked about here at all.
+        That is the registry's half of the split; see `check_request_shape`.
         """
-        if not isinstance(spec, dict):
-            raise InboxError("a task request must be a JSON object")
-        kind = spec.get("kind", KIND_TASK)
-        # Membership in a TUPLE, so an unhashable hand-written kind (`[]`) is
-        # refused here rather than raising `TypeError` off the dict lookup
-        # below.
-        if kind not in KINDS:
-            raise InboxError(f"unknown kind {kind!r}; expected one of {list(KINDS)}")
-        if kind in MUTATION_PAYLOAD:
-            self._check_mutation(kind, spec)
-        else:
-            self._check_creation(spec)
+        check_request_shape(spec)
 
         self.directory.mkdir(parents=True, exist_ok=True)
         # Lexicographic filename order MUST equal submission order — `drain`
@@ -229,74 +358,6 @@ class TaskInbox:
         tmp.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
         return path
-
-    @staticmethod
-    def _check_creation(spec: dict) -> None:
-        """Shape-check one CREATION request. Raises `InboxError`.
-
-        The creation half of the same per-kind rule `_check_mutation` applies:
-        a request carries only the fields its kind can act on. `reason` is the
-        field this exists to catch — it is in the vocabulary, so a global check
-        waved it through onto a `task` request that then dropped it on merge.
-        """
-        unknown = set(spec) - CREATION_FIELDS
-        if unknown:
-            # A mutation-only field gets its own sentence. `{"kind": "task",
-            # "reason": …}` is a request whose author meant a hold, and
-            # "unknown field" alone would send them looking for a typo.
-            mutation_only = sorted(unknown & MUTATION_ONLY_FIELDS)
-            hint = (
-                f"; {mutation_only} is mutation-only — use one of "
-                f"{list(MUTATION_KINDS)}"
-                if mutation_only
-                else ""
-            )
-            carries = sorted(CREATION_FIELDS - {"kind"})
-            raise InboxError(
-                f"unknown field(s) {sorted(unknown)} on a {KIND_TASK} request; it "
-                f"carries only {carries}{hint}"
-            )
-        if "priority" in spec and not isinstance(spec["priority"], int):
-            raise InboxError("priority must be an integer (ascending; 1 outranks 2)")
-        missing = [f for f in REQUIRED_FIELDS if not str(spec.get(f, "")).strip()]
-        if missing:
-            raise InboxError(f"missing required field(s): {', '.join(missing)}")
-
-    @staticmethod
-    def _check_mutation(kind: str, spec: dict) -> None:
-        """Shape-check one mutation request. Raises `InboxError`.
-
-        Driven off `MUTATION_PAYLOAD` rather than a branch per kind, so adding
-        a kind cannot forget the "carries only these fields" rule — which is
-        the check that turns a typo'd field name into a refusal at submit
-        instead of a silently ignored instruction on merge.
-        """
-        if not str(spec.get("id", "")).strip():
-            raise InboxError(f"a {kind} request needs the task 'id'")
-        payload = MUTATION_PAYLOAD[kind]
-        allowed = {"kind", "id"} | ({payload} if payload else set())
-        extra = set(spec) - allowed
-        if extra:
-            carries = " + ".join(sorted(allowed - {"kind"}))
-            raise InboxError(
-                f"a {kind} request carries only {carries}; got {sorted(extra)}"
-            )
-        if payload is None:
-            return
-        if payload not in spec:
-            raise InboxError(f"a {kind} request needs {payload!r}")
-        value = spec[payload]
-        # Type only, and only where JSON can express the wrong one. The
-        # registry owns every question about CONTENT — blank text, malformed
-        # paths, unknown dependencies — so nothing below asks one.
-        if kind == KIND_PRIORITY and not isinstance(value, int):
-            raise InboxError("a priority request needs an integer 'priority'")
-        if kind in (KIND_DESCRIPTION, KIND_BLOCK) and not isinstance(value, str):
-            raise InboxError(f"a {kind} request needs {payload!r} as a string")
-        if kind in (KIND_APPROVED_PATHS, KIND_DEPENDS_ON) and not isinstance(value, list):
-            raise InboxError(
-                f"a {kind} request needs {payload!r} as a list (use [] to clear it)"
-            )
 
     def submit_priority(self, task_id: str, priority: int) -> Path:
         """Re-prioritise an existing task. Same safety as `submit`: outside the
@@ -390,9 +451,14 @@ def _apply_mutation(registry, kind: str, spec: dict) -> str:
     `None` description or a string where a list belongs must be refused by
     `_validate_description` / `_validate_approved_paths` in their words, not
     coerced into something valid by a `str()`/`tuple()` on the way past.
-    `priority` is the one exception, and only because `int()` was already
-    there before mutations existed — narrowing it now would refuse the
-    string-typed priorities the dashboard has always been able to queue.
+    `priority`'s `int()` is the one conversion left, and it is now belt and
+    braces rather than a compatibility shim: `_check_mutation` refuses a
+    non-integer `priority` before this function runs, at BOTH gates since the
+    shape check moved into `apply_requests`, and both dashboard endpoints
+    coerce with `int()` of their own before queueing. It is kept because
+    `set_priority` re-refuses a non-int anyway (`bad_priority`), so nothing
+    reaches the registry unchecked either way — not because a string-typed
+    priority is still expected to arrive.
     """
     task_id = str(spec.get("id", ""))
     if kind == KIND_PRIORITY:
@@ -416,6 +482,18 @@ def _apply_mutation(registry, kind: str, spec: dict) -> str:
         return f"{task.id} -> blocked: {task.blocked_reason}"
     task = registry.operator_unblock(task_id)
     return f"{task.id} -> pending (hold released)"
+
+
+def _request_id(spec: object) -> str:
+    """The id `apply_requests` prints in front of a refusal.
+
+    `str(spec.get("id"))` for a dict, which renders a missing id as `None`
+    exactly as the f-string it replaces did — the refusal lines are unchanged.
+    The non-dict arm exists for the never-raises promise alone: `drain` only
+    ever yields dicts, but a caller passing something else must get a refusal
+    rather than an `AttributeError` out of the id lookup itself.
+    """
+    return str(spec.get("id")) if isinstance(spec, dict) else repr(spec)
 
 
 def apply_requests(registry, specs: list[dict]) -> tuple[list[str], list[str], list[str]]:
@@ -444,10 +522,22 @@ def apply_requests(registry, specs: list[dict]) -> tuple[list[str], list[str], l
     depend on what else happened to be in the batch, and an operator can
     resubmit far more cheaply than they can reason about a retry queue.
 
-    Never raises. The registry is the only validation authority, so a refused
-    request is reported and dropped rather than aborting the batch: one
-    operator typo must not stop a running loop, nor discard the fifteen good
-    requests queued behind it.
+    **Shape is re-checked here, by the same `check_request_shape` `submit`
+    calls.** Not belt-and-braces: hand-writing the JSON file is the documented —
+    and today the only — operator route to five of the six mutation kinds, and
+    such a file reaches this function without ever passing through `submit`.
+    Without the re-check the loop below simply consumed the keys it recognised
+    and ignored the rest, so a creation carrying `reason` and a `block`
+    carrying a stray `approved_paths` both "succeeded" while doing something
+    other than what their author wrote — the exact silent-ignore the per-kind
+    rule exists to prevent, reached from the side that has no gate.
+
+    Never raises, and that governs how the re-check is wired: an `InboxError`
+    becomes THAT request's `refused` line and the batch continues. The two
+    authorities keep their halves — shape is the inbox's answer, content the
+    registry's — and a refusal of either kind is reported and dropped rather
+    than aborting the pass: one operator typo must not stop a running loop, nor
+    discard the fifteen good requests queued behind it.
     """
     from .errors import TaskGraphError
     from .tasks import Task
@@ -456,19 +546,16 @@ def apply_requests(registry, specs: list[dict]) -> tuple[list[str], list[str], l
     applied: list[str] = []
     refused: list[str] = []
     for spec in specs:
-        kind = spec.get("kind", KIND_TASK)
-        # `isinstance` BEFORE the membership test, and not for tidiness: a
-        # hand-written `"kind": []` makes `kind in MUTATION_PAYLOAD` raise
-        # `TypeError: unhashable type` from OUTSIDE the try below, which would
-        # break this function's never-raises promise and take the whole drain —
-        # and the running loop's step — down with one malformed file.
-        if not isinstance(kind, str) or kind not in KINDS:
-            # Only reachable from a hand-written file: `submit` refuses an
-            # unknown kind. Named rather than folded into the creation branch,
-            # which would refuse it for whichever unrelated field it lacks.
-            refused.append(
-                f"{spec.get('id')}: unknown kind {kind!r}; expected one of {list(KINDS)}"
-            )
+        try:
+            # The RESOLVED kind, taken from the checker rather than re-read off
+            # the spec: two reads would be a second source of truth for the one
+            # thing this call exists to centralise. It also means the unknown/
+            # unhashable-kind cases are named here as such, instead of falling
+            # through to the creation branch and being refused for whichever
+            # unrelated field they happen to lack.
+            kind = check_request_shape(spec)
+        except InboxError as exc:
+            refused.append(f"{_request_id(spec)}: {exc}")
             continue
         if kind in MUTATION_PAYLOAD:
             try:

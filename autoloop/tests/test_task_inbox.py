@@ -191,10 +191,11 @@ def test_a_refused_batch_never_raises():
 # ---- the mutation vocabulary -------------------------------------------------
 #
 # `task` + `priority` became `task` + six mutations. What keeps that from being
-# the "general edit-a-task request" the priority-only design refused: the
-# registry stays the single validation authority (submission checks SHAPE
-# only), nothing a dispatch is currently reading can be edited, and blocking
-# has a reverse. These pin all three.
+# the "general edit-a-task request" the priority-only design refused: the two
+# authorities are split by question and each has ONE implementation (shape is
+# `check_request_shape`, run at both gates; content is the registry), nothing a
+# dispatch is currently reading can be edited, and blocking has a reverse.
+# These pin all three.
 
 
 def test_every_mutation_kind_reaches_its_registry_mutator(tmp_path):
@@ -231,8 +232,10 @@ def test_every_mutation_kind_reaches_its_registry_mutator(tmp_path):
 def test_a_mutation_request_carries_only_its_own_field(tmp_path):
     """The rule the priority branch has always had, now driven off
     `MUTATION_PAYLOAD` so a new kind cannot forget it. A request naming a field
-    its kind ignores has not done what its author intended, so it is refused at
-    submit rather than dropped on merge."""
+    its kind ignores has not done what its author intended, so it is refused
+    rather than dropped. This is the submit gate; the merge gate runs the same
+    check — see
+    `test_a_hand_written_mutation_carrying_a_foreign_field_is_refused_atomically`."""
     inbox = TaskInbox(tmp_path / "inbox")
     with pytest.raises(InboxError, match="carries only"):
         inbox.submit({"kind": "description", "id": "t", "description": "d",
@@ -374,7 +377,9 @@ def test_a_creation_request_cannot_carry_a_mutation_field(tmp_path):
     `reason` belongs to `block`, and a `task` request naming it meant a hold —
     checked against one GLOBAL field set it submitted cleanly and was then
     silently ignored on merge, which is precisely the outcome the per-kind rule
-    exists to prevent."""
+    exists to prevent. This is the submit gate; the merge gate runs the same
+    check — see
+    `test_a_hand_written_creation_carrying_a_mutation_field_is_refused_on_merge`."""
     inbox = TaskInbox(tmp_path / "inbox")
     with pytest.raises(InboxError, match="mutation-only"):
         inbox.submit({"kind": "task", "id": "t", "title": "T", "description": "D",
@@ -386,6 +391,87 @@ def test_a_creation_request_cannot_carry_a_mutation_field(tmp_path):
     # The control: the same field on the kind that owns it is accepted.
     inbox.submit({"kind": "block", "id": "t", "reason": "hold this"})
     assert len(inbox.pending()) == 1
+
+
+def test_one_shape_implementation_serves_both_gates():
+    """The drift guard on the split, in the same style as the shared-merge and
+    three-bucket guards above. `submit` is not the only gate: hand-writing the
+    JSON file is the documented — and today the ONLY — operator route to five of
+    the six mutation kinds, and such a file reaches `apply_requests` without
+    ever passing through `submit`. Two shape implementations would mean the
+    field an operator typed is refused by one route and silently ignored by the
+    other, which is the whole defect the per-kind rule exists to prevent."""
+    import ast
+    import inspect
+    import textwrap
+
+    from autoloop import inbox
+
+    for gate in (inbox.TaskInbox.submit, inbox.apply_requests):
+        # An actual CALL node, not a substring of the source. Both of these
+        # discuss the shared check at length in their docstrings, and a guard a
+        # comment can satisfy guards nothing.
+        tree = ast.parse(textwrap.dedent(inspect.getsource(gate)))
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "check_request_shape" in called, (
+            f"{gate.__qualname__} does not go through the shared shape check"
+        )
+
+
+def test_a_hand_written_creation_carrying_a_mutation_field_is_refused_on_merge():
+    """`apply_requests` called DIRECTLY, which is what a hand-written file gets:
+    `drain` hands it the parsed object and nothing else ran `submit`'s checks.
+    The per-kind contract has to hold here too, or the route the vocabulary
+    documents as the only one for the new kinds is the one route with no gate —
+    this request used to be applied as a plain creation with the `reason` the
+    author meant as a hold silently dropped."""
+    from autoloop.inbox import apply_requests
+
+    registry = TaskRegistry()
+    added, applied, refused = apply_requests(registry, [
+        {"kind": "task", "id": "held", "title": "T", "description": "D",
+         "reason": "hold this instead"},
+        {"id": "queued-behind", "title": "Q", "description": "d"},
+    ])
+
+    assert len(refused) == 1, refused
+    assert refused[0].startswith("held: "), refused[0]
+    assert "mutation-only" in refused[0], refused[0]
+    assert not registry.has("held"), "atomic: the task must not be half-created"
+    assert applied == []
+    assert [a.split(" ")[0] for a in added] == ["queued-behind"], (
+        "the valid request queued behind it still lands"
+    )
+
+
+def test_a_hand_written_mutation_carrying_a_foreign_field_is_refused_atomically():
+    """The mutation half of the same hole, and the one that shows why "atomic"
+    needs asserting on BOTH fields: `apply_requests` used to read the key its
+    kind names and ignore the rest, so this landed the hold and dropped the
+    scope rewrite — a request that half-did what it said."""
+    from autoloop.inbox import apply_requests
+
+    registry = TaskRegistry()
+    registry.add_many([Task(id="t", title="T", description="d",
+                            approved_paths=("autoloop/inbox.py",))])
+
+    added, applied, refused = apply_requests(registry, [
+        {"kind": "block", "id": "t", "reason": "hold this",
+         "approved_paths": ["autoloop/tasks.py"]},
+        {"kind": "priority", "id": "t", "priority": 3},
+    ])
+
+    assert len(refused) == 1, refused
+    assert "carries only" in refused[0], refused[0]
+    task = registry.get("t")
+    assert (task.status, task.blocked_reason, task.hold_origin) == ("pending", "", "")
+    assert task.approved_paths == ("autoloop/inbox.py",), "neither field landed"
+    assert added == []
+    assert applied == ["t -> 3"], "the valid request queued behind it still lands"
 
 
 def test_no_payload_field_falls_outside_both_per_kind_sets():

@@ -1768,18 +1768,31 @@ because `approved_paths` is authorization surface. That reasoning still names
 the real hazard, but the hazard was never *which field* — it was *edited
 against what*. Four things carry it:
 
-1. **The registry decides.** Submission checks SHAPE only (is the field there,
-   is it the right JSON type, does this kind even carry it). Every question
-   about content goes to the same validator creation uses —
-   `_validate_description`, `_validate_approved_paths`, `_validate_depends_on`
-   + `_check_acyclic` — so a mutation cannot express what a `plan` or
-   `seed_tasks.json` could not, and a refusal reaches the operator in one
-   authority's words. The shape half is checked PER KIND in both directions: a
-   mutation carries `{kind, id, <its payload>}` and a `task` carries
-   `CREATION_FIELDS`. One global field set could not say that — `reason` is
-   legal on a `block` and meaningless on a `task`, so checking the union let a
-   creation request carrying `reason` submit cleanly and then be ignored on
-   merge, which is the silent drop the rule exists to prevent.
+1. **Two authorities, split by question, one implementation each.** SHAPE — is
+   the field there, is it the right JSON type, does this kind even carry it —
+   is `inbox.check_request_shape`. CONTENT — blank description, malformed path,
+   unknown dependency, a task the loop is running — is the registry's, through
+   the same validator creation uses (`_validate_description`,
+   `_validate_approved_paths`, `_validate_depends_on` + `_check_acyclic`), so a
+   mutation cannot express what a `plan` or `seed_tasks.json` could not, and a
+   refusal reaches the operator in one authority's words. The shape rule is PER
+   KIND in both directions: a mutation carries `{kind, id, <its payload>}` and a
+   `task` carries `CREATION_FIELDS`. One global field set could not say that —
+   `reason` is legal on a `block` and meaningless on a `task`, so checking the
+   union let a creation request carrying `reason` submit cleanly and then be
+   ignored on merge, which is the silent drop the rule exists to prevent.
+
+   **It runs at both gates.** `TaskInbox.submit` and `apply_requests` call the
+   same function, because hand-writing the JSON file is the documented — and
+   today the only — operator route to five of the six kinds, and such a file
+   reaches the merge without ever passing through `submit`. Checking only on
+   the way in therefore left the documented route ungated: `apply_requests`
+   consumed the keys it recognised and ignored the rest, so a hand-written
+   creation carrying `reason` and a `block` carrying a stray `approved_paths`
+   both "succeeded" while doing something other than what they said. On merge
+   the refusal is that request's `refused` line and the batch continues — the
+   never-raises promise is unchanged, and the request is refused whole: a
+   two-field mutation lands neither field.
 2. **Nothing in flight is editable.** `TaskRegistry._refuse_immutable` refuses
    `description`, `approved_paths` and `depends_on` on an `in_progress` task,
    because a dispatch is being judged against all three right now: a new

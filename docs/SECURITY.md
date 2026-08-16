@@ -472,6 +472,18 @@ What bounds it, stated rather than assumed:
   `add_many` and the mutators, so a mutation cannot express a scope creation
   would refuse; `escape_detector.find_symlink_traversal` still re-checks
   traversal at dispatch. As with S28 this is well-formedness, not intent.
+- **The per-kind shape rule is enforced on the route this finding documents.**
+  Hand-writing the JSON file is the only way to queue the five new kinds, and
+  `inbox.check_request_shape` is called by BOTH `TaskInbox.submit` and
+  `apply_requests`, so that route is gated by the same rule the API is.
+  The first cut checked shape at submit only, and `apply_requests` consumed the
+  keys it recognised and ignored the rest — so a hand-written `block` carrying
+  a stray `approved_paths` applied the hold and dropped the scope rewrite. That
+  direction of the failure was silent-ignore rather than over-grant, but it
+  made a request do something other than what its author wrote on the one route
+  an operator actually has. It is now refused whole: neither field lands, and
+  the refusal is that request's line in the drain output rather than an
+  aborted batch.
 - **Blocking is reversible and cannot launder a quarantine.**
   `operator_block` refuses a task that is already `blocked` and records the
   hold's provenance in `Task.hold_origin` (`tasks.HOLD_ORIGIN_OPERATOR`);
@@ -525,7 +537,8 @@ report every applied mutation correctly — is the reliable record, and the page
 is not.
 
 **file:line** — `autoloop/inbox.py` `MUTATION_PAYLOAD` / `CREATION_FIELDS` /
-`TaskInbox.submit` / `_check_creation` / `_check_mutation` / `_apply_mutation`;
+`check_request_shape` (called by `TaskInbox.submit` AND `apply_requests`) /
+`_check_creation` / `_check_mutation` / `_apply_mutation`;
 `autoloop/tasks.py` `_refuse_immutable`, `set_approved_paths`,
 `set_depends_on`, `operator_block`, `operator_unblock`, `Task.hold_origin`,
 `HOLD_ORIGIN_OPERATOR`.
@@ -539,6 +552,10 @@ rg -n 'MUTATION_PAYLOAD|KIND_' autoloop/inbox.py
 # Expect: per-kind allowed fields — a creation request is bounded by
 # CREATION_FIELDS, which must NOT contain 'reason'
 rg -n 'CREATION_FIELDS|MUTATION_ONLY_FIELDS|_check_creation' autoloop/inbox.py
+# Expect: the definition plus exactly TWO call sites — one in TaskInbox.submit,
+# one in apply_requests — so the hand-written-file route (the only route to the
+# five new kinds) is gated by the same rule the API route is
+rg -n 'check_request_shape\(' autoloop/inbox.py
 # Expect: the strand/terminal guard is on all three content mutators
 rg -n '_refuse_immutable' autoloop/tasks.py
 # Expect: the inbox reverse gates on hold_origin — `operator_block` the only
