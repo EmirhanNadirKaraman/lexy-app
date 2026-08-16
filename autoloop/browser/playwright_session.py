@@ -65,6 +65,81 @@ _DRIVER = None
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
 
 
+#: Message fragments `scroll_to_end` chooses to FORGIVE when bringing the last
+#: mounted node into view fails. All describe the node, not the connection: a
+#: virtualizer detaching what we just measured, or a node that cannot be made
+#: visible, is a routine repaint, and restarting Chrome over one would be a
+#: worse bug than the scroll that painted nothing.
+#:
+#: Matched by exception NAME and MESSAGE rather than by class on purpose.
+#: Playwright is imported lazily (see the module docstring) so that nothing
+#: else in autoloop — the whole test suite included — needs the package
+#: installed; naming `playwright.sync_api.TimeoutError` here would both break
+#: that and make this branch unexercisable. This is a list of what we forgive,
+#: NOT a claim about which exception the library raises for a given fault, so
+#: it deliberately covers both shapes the same fault can arrive in.
+_BENIGN_SCROLL_FAULTS = (
+    "not attached to the dom",
+    "detached from document",
+    "element is not visible",
+    "element is outside of the viewport",
+    "element is not stable",
+)
+
+
+#: How many pixels short of the bottom still counts as "at the end of the
+#: list". Fractional device-pixel ratios and sub-pixel layout leave a scroll
+#: container a hair off its own maximum even when the browser considers it
+#: fully scrolled, so an exact comparison would report "more to paint" forever.
+_SCROLL_END_SLACK_PX = 4
+
+#: Distance in pixels from the END of the scroll container that holds the last
+#: mounted node, or `null` when nothing about the position can be measured.
+#:
+#: Walks OUT from the node rather than guessing a container selector: ChatGPT's
+#: scroller is an unnamed div whose classes change with every UI revision, and a
+#: selector for it would rot silently into "no evidence" (which now costs an
+#: answer, not just a scroll). A container that does not scroll at all — a short
+#: conversation that fits — returns 0, i.e. AT the end: everything it holds is
+#: already in view, and calling that "unknown" would refuse every chat short
+#: enough to mount in one window.
+_SCROLL_REMAINING_JS = """
+node => {
+  const remaining = el => el.scrollHeight - el.scrollTop - el.clientHeight;
+  let el = node.parentElement;
+  while (el) {
+    const overflow = getComputedStyle(el).overflowY;
+    if (/(auto|scroll|overlay)/.test(overflow) && el.scrollHeight > el.clientHeight + 1) {
+      return remaining(el);
+    }
+    el = el.parentElement;
+  }
+  const doc = document.scrollingElement || document.documentElement;
+  if (!doc) { return null; }
+  return doc.scrollHeight > doc.clientHeight + 1 ? remaining(doc) : 0;
+}
+"""
+
+
+def _is_benign_scroll_fault(exc: BaseException) -> bool:
+    """May `scroll_to_end` swallow `exc` and carry on?
+
+    Only for an element-local fault. A dead driver channel arrives as a plain
+    `Exception` whose text names the connection ("Connection closed while
+    reading from the driver"), matches nothing here, and is re-raised so
+    `_call` can turn it into the `BrowserError` the loop routes.
+    """
+    if isinstance(exc, AutoloopError):
+        return False  # a deliberate diagnosis keeps its own routing
+    if type(exc).__name__ == "TimeoutError":
+        # `scroll_into_view_if_needed` retries an unactionable element until
+        # its own timeout, so this is the ordinary shape of "that node would
+        # not scroll" — and it is bounded, unlike a lost connection.
+        return True
+    text = str(exc).lower()
+    return any(fragment in text for fragment in _BENIGN_SCROLL_FAULTS)
+
+
 def _port_in_use(port: int) -> bool:
     """Thin seam over `chrome_restart` so a test can fake the machine."""
     return chrome_restart._default_port_in_use(port)
@@ -525,6 +600,77 @@ class PlaywrightSession:
 
     def html(self) -> str:
         return self._call(lambda: self._page.content())
+
+    # ---- optional tail-mounting capability ----------------------------------
+
+    def scroll_to_end(self, selector: str) -> bool | None:
+        """Move the view to the END of a virtualized list, and report whether it
+        got there.
+
+        ChatGPT keeps only a window of a conversation in the DOM and mounts
+        more as the viewport moves, so recent turns can be absent from
+        `innerText` purely because nothing scrolled to them: on 2026-08-05 the
+        chat holding `alr-af11e1b3-0006` needed End plus six scrolls before its
+        tail rendered. This is that gesture, programmatically — bring the last
+        mounted node into view AND press End, because either alone can leave
+        the container where it was.
+
+        Returns True when the list's own scroll container is demonstrably at
+        its end afterwards, False when there is more below, and None when the
+        position could not be measured. **The return value is the point**, not a
+        convenience: the caller has to tell "the list is fully mounted" from
+        "the gesture did nothing", and those two produce the same unchanged
+        window. End goes to whatever holds focus, so a gesture that missed the
+        scroller is silent — this measurement is the only thing that is not.
+        A conversation short enough that nothing scrolls reads as True (see
+        `_SCROLL_REMAINING_JS`); a chat with no mounted node yet reads as None,
+        because there is nothing whose container we could measure.
+
+        Best-effort per call, but only for ELEMENT-local faults: the caller
+        repeats the gesture and watches what the mounted window contains, so a
+        node that refuses to come into view is not a dead session — it costs
+        the measurement (None) and nothing else. Anything else — the driver
+        channel above all — is re-raised into `_call` and surfaces as a
+        `BrowserError`, the same as every other call here. That distinction is
+        the whole contract: the caller rules on ABSENCE from what this reports,
+        so "the gesture painted nothing" and "the browser is gone" must not
+        become the same observation.
+        """
+
+        def _scroll():
+            loc = self._page.locator(selector)
+            count = loc.count()
+            if not count:
+                # A freshly loaded chat mounts nothing for a moment. End is what
+                # paints the first window; there is no node to measure yet.
+                self._page.keyboard.press("End")
+                return None
+            last = loc.nth(count - 1)
+            try:
+                last.scroll_into_view_if_needed(timeout=5000)
+            except Exception as exc:
+                # A node that will not scroll into view (detached by the
+                # virtualizer mid-gesture, covered, zero-sized) says nothing
+                # about the session's health — the End press below is the
+                # other half of the gesture and still runs. Every OTHER
+                # fault leaves through `_call`.
+                if not _is_benign_scroll_fault(exc):
+                    raise
+            self._page.keyboard.press("End")
+            try:
+                remaining = last.evaluate(_SCROLL_REMAINING_JS)
+            except Exception as exc:
+                # Measuring is the same element-local risk as scrolling to it,
+                # and it fails the same ways. Unmeasured is reported as
+                # unmeasured — never as "at the end".
+                if not _is_benign_scroll_fault(exc):
+                    raise
+                return None
+            if not isinstance(remaining, (int, float)) or isinstance(remaining, bool):
+                return None
+            return remaining <= _SCROLL_END_SLACK_PX
+
+        return self._call(_scroll)
 
     # ---- optional send-observation capability -------------------------------
 

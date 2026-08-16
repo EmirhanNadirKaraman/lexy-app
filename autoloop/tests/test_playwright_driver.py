@@ -563,6 +563,209 @@ def test_an_operation_raising_an_autoloop_error_passes_through(fake_playwright):
         session.goto("https://chatgpt.com/c/abc")
 
 
+# ---- the tail-mount gesture keeps the driver-failure contract ----------------
+#
+# `scroll_to_end` is the one call here that swallows an exception on purpose: a
+# virtualizer detaches the node it was asked to scroll to, and restarting Chrome
+# over a repaint would be a worse bug than a gesture that painted nothing. The
+# swallow has to stay ELEMENT-LOCAL, because the caller
+# (`BrowserChatGPT._mount_message_tail`) reads ABSENCE out of a list that stops
+# changing — so a dead driver channel arriving as "the gesture did nothing"
+# turns a lost browser into "the request is not in this conversation", which is
+# the exact class of confident-wrong answer the search exists to avoid.
+
+
+class _FakeLocator:
+    """Enough of a Playwright locator for the tail-mount gesture: a node count,
+    a `scroll_into_view_if_needed` that fails the way a test asks it to, and an
+    `evaluate` standing in for the scroll container's own arithmetic —
+    `remaining` is how many pixels lie below the viewport, which is what
+    decides whether the gesture may claim the list's end."""
+
+    def __init__(self, count, fault=None, remaining=0, evaluate_fault=None):
+        self._count = count
+        self._fault = fault
+        self._remaining = remaining
+        self._evaluate_fault = evaluate_fault
+        self.scrolls = 0
+        self.evaluations = 0
+
+    def count(self):
+        return self._count
+
+    def nth(self, index):
+        return self
+
+    def scroll_into_view_if_needed(self, timeout=None):
+        self.scrolls += 1
+        if self._fault is not None:
+            raise self._fault
+
+    def evaluate(self, expression):
+        self.evaluations += 1
+        if self._evaluate_fault is not None:
+            raise self._evaluate_fault
+        return self._remaining
+
+
+class _FakeKeyboard:
+    def __init__(self):
+        self.pressed = []
+
+    def press(self, keys):
+        self.pressed.append(keys)
+
+
+#: Named exactly as Playwright names its own, which is all the predicate can
+#: match on: `playwright.sync_api` is imported lazily so that autoloop (this
+#: suite included) runs without the package installed, and importing the real
+#: class here to name it would defeat that.
+_FakeTimeoutError = type("TimeoutError", (Exception,), {})
+
+
+def _scrolling_session(fault=None, **locator_kwargs):
+    session = ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+    locator = _FakeLocator(3, fault, **locator_kwargs)
+    keyboard = _FakeKeyboard()
+    session._page.locator = lambda selector: locator
+    session._page.keyboard = keyboard
+    return session, locator, keyboard
+
+
+def test_a_dead_driver_channel_during_a_tail_scroll_is_not_swallowed(fake_playwright):
+    """The contract the swallow must not break. Reported as a benign
+    no-op, this would leave the mount reading an unpainted list and calling a
+    present request absent — with no `BrowserError` for the orchestrator to
+    restart or park on."""
+    session, _locator, keyboard = _scrolling_session(Exception(DRIVER_DEAD))
+
+    with pytest.raises(SessionLostError, match="Connection closed"):
+        session.scroll_to_end("main div")
+    # And it aborted rather than half-running the gesture on a dead channel.
+    assert keyboard.pressed == []
+
+
+def test_an_autoloop_error_during_a_tail_scroll_keeps_its_own_type(fake_playwright):
+    """A deliberate diagnosis raised under the gesture is routed as itself, not
+    demoted to "that node would not scroll"."""
+    from autoloop.errors import LoginExpiredError
+
+    session, _locator, keyboard = _scrolling_session(LoginExpiredError("logged out"))
+
+    with pytest.raises(LoginExpiredError):
+        session.scroll_to_end("main div")
+    assert keyboard.pressed == []
+
+
+def test_a_node_that_times_out_scrolling_still_presses_end(fake_playwright):
+    """The other half: `scroll_into_view_if_needed` retries an unactionable
+    element until its own bounded timeout, which is the ordinary shape of "the
+    virtualizer moved that node". The End press is the rest of the gesture and
+    still runs."""
+    session, locator, keyboard = _scrolling_session(_FakeTimeoutError("Timeout 5000ms exceeded."))
+
+    session.scroll_to_end("main div")  # must not raise
+
+    assert locator.scrolls == 1
+    assert keyboard.pressed == ["End"]
+
+
+def test_a_detached_node_message_is_forgiven_too(fake_playwright):
+    """The same fault can arrive as a plain error with a message instead of a
+    timeout, so the predicate matches both shapes — it is a list of what we
+    choose to forgive, not a claim about which one the library raises."""
+    session, _locator, keyboard = _scrolling_session(
+        FakeError("Element is not attached to the DOM")
+    )
+
+    session.scroll_to_end("main div")  # must not raise
+
+    assert keyboard.pressed == ["End"]
+
+
+def test_an_empty_list_still_presses_end(fake_playwright):
+    """Nothing mounted yet is the normal state of a freshly loaded chat, not a
+    failure — there is no last node to scroll to, and End is what paints one.
+    There is also nothing to measure, so it claims no position."""
+    session = ps.PlaywrightSession.connect("http://127.0.0.1:9222")
+    keyboard = _FakeKeyboard()
+    session._page.locator = lambda selector: _FakeLocator(0)
+    session._page.keyboard = keyboard
+
+    assert session.scroll_to_end("main div") is None
+
+    assert keyboard.pressed == ["End"]
+
+
+# ---- the gesture reports WHERE it got to ------------------------------------
+#
+# The caller cannot tell "the list is fully mounted" from "the gesture went to
+# the wrong element" by watching the window it paints: both leave it unchanged.
+# The scroll container can tell, and this is the only place that reads it. A
+# `None` here costs the caller the ability to conclude ABSENCE, so the one
+# thing this must never do is report a position it did not measure.
+
+
+def test_a_container_scrolled_to_its_bottom_reports_the_end_of_the_list(fake_playwright):
+    """Nothing below the viewport — the gesture arrived, and an unchanged window
+    after this is evidence about the conversation."""
+    session, locator, _keyboard = _scrolling_session(remaining=0)
+
+    assert session.scroll_to_end("main div") is True
+    assert locator.evaluations == 1
+
+
+def test_a_container_with_more_below_reports_it_is_not_at_the_end(fake_playwright):
+    """The gesture ran and the list did not get there. Reported honestly, this
+    is what stops a stuck gesture from settling into a false absence."""
+    session, _locator, _keyboard = _scrolling_session(remaining=1800)
+
+    assert session.scroll_to_end("main div") is False
+
+
+def test_a_hair_short_of_the_bottom_still_counts_as_the_end(fake_playwright):
+    """Fractional device-pixel ratios and sub-pixel layout leave a container a
+    little short of its own maximum even when the browser considers it fully
+    scrolled. An exact comparison would report "more to paint" forever and turn
+    every absence into a refusal."""
+    session, _locator, _keyboard = _scrolling_session(remaining=0.5)
+
+    assert session.scroll_to_end("main div") is True
+
+
+def test_a_measurement_that_fails_locally_reports_no_position(fake_playwright):
+    """Measuring is the same element-local risk as scrolling to the node, and
+    fails the same ways. Unmeasured must arrive as unmeasured: reported as
+    `True` it would license exactly the confident absence this signal exists to
+    prevent."""
+    session, _locator, keyboard = _scrolling_session(
+        evaluate_fault=FakeError("Element is not attached to the DOM")
+    )
+
+    assert session.scroll_to_end("main div") is None
+    assert keyboard.pressed == ["End"]  # the gesture itself still ran
+
+
+def test_a_dead_driver_channel_during_the_measurement_is_not_swallowed(fake_playwright):
+    """Same contract as the scroll half: a lost browser is a lost browser, not
+    "the position is unknown". Demoted to None it would look like an adapter
+    without the capability, and the search would park instead of restarting."""
+    session, _locator, _keyboard = _scrolling_session(
+        evaluate_fault=Exception(DRIVER_DEAD)
+    )
+
+    with pytest.raises(SessionLostError, match="Connection closed"):
+        session.scroll_to_end("main div")
+
+
+def test_a_measurement_that_is_not_a_number_reports_no_position(fake_playwright):
+    """The JS returns `null` when it cannot find anything to measure. Truthiness
+    is not the test — anything that is not a distance is no evidence."""
+    session, _locator, _keyboard = _scrolling_session(remaining=None)
+
+    assert session.scroll_to_end("main div") is None
+
+
 def test_a_listener_that_cannot_attach_never_ends_the_process(fake_playwright):
     """The observation capability is an optimisation. A driver-channel failure
     while attaching it used to escape as a plain Exception, from a call site

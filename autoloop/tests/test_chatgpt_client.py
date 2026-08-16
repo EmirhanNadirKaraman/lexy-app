@@ -11,6 +11,7 @@ No playwright, no network, no clock (virtual time throughout).
 """
 
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -18,6 +19,7 @@ from autoloop.browser.chatgpt import BrowserChatGPT, SubmitResult
 from autoloop.browser.selectors import ChatGPTSelectors
 from autoloop.errors import (
     BrowserError,
+    ConversationSearchInconclusive,
     ConversationUnusableError,
     LoginExpiredError,
     ResponseTimeoutError,
@@ -949,3 +951,686 @@ def test_an_upload_that_never_finishes_refuses_to_send(tmp_path):
     assert "did not finish uploading" in str(excinfo.value)
     assert "nothing was sent" in str(excinfo.value)
     assert len(session.persisted) == before
+
+
+# ---------------------------------------------------------------------------
+# Finding a conversation by the request it contains (2026-08-05)
+#
+# `find_conversation_with` identifies a rotated chat by CONTENT when the
+# address bar has not caught up. Two things kept it from being trustworthy
+# enough to decide anything with:
+#
+#   * ChatGPT's message list is VIRTUALIZED. alr-af11e1b3-0006 parked as
+#     `submission_ambiguous` while the chat held the request and its answer;
+#     seeing them by hand took pressing End and scrolling six times before the
+#     tail rendered. A search that reads only the painted window reports "not
+#     in persisted history" about a message that is merely unmounted.
+#   * It concluded from whatever page it was on. A rotation mid-flight moves
+#     that shared page, and a confident answer about the wrong chat is worse in
+#     BOTH directions than the park it would replace: it can name a chat that
+#     never saw the request, or report absent while looking away from the one
+#     that has it.
+#
+# The fake below is purpose-built rather than an extension of `FakeSession`:
+# that one keeps a single flat `persisted` list and an `elements` that ignores
+# its selector, so it can model neither a chat list nor per-conversation
+# history — and ~40 tests depend on its current shape.
+# ---------------------------------------------------------------------------
+
+PROJECT_URL = "https://chatgpt.com/g/g-p-project123/project"
+CHAT_ONE = "https://chatgpt.com/g/g-p-project123/c/chat-one"
+CHAT_TWO = "https://chatgpt.com/g/g-p-project123/c/chat-two"
+STRAY_CHAT = "https://chatgpt.com/g/g-p-project123/c/somewhere-else"
+
+
+def _turns(count, marker="earlier"):
+    """`count` complete user/assistant exchanges — i.e. 2×count messages."""
+    out = []
+    for i in range(count):
+        out.append(("user", f"{marker} question {i}"))
+        out.append(("assistant", f"{marker} answer {i}"))
+    return out
+
+
+def _chat_holding(request_id, before=6):
+    """A conversation whose LAST message carries the request.
+
+    Where a rotation puts it, and exactly where virtualization leaves it
+    unpainted: 13 messages against a 2-message initial window needs six
+    scrolls to reach — the number the human needed on 2026-08-05.
+    """
+    return _turns(before) + [("user", f"[autoloop request {request_id} | iteration 1]")]
+
+
+class FakeProjectSession:
+    """A project chat list plus per-conversation history behind a virtualized
+    message list. Keyboard-only: it does NOT implement the optional
+    `scroll_to_end` capability, so the client falls back to pressing End.
+
+    A fresh load paints only `window` messages, counted from the TOP — the tail
+    is unmounted, which is the 2026-08-05 failure. Each gesture paints `step`
+    more, and nothing else does: a search that skips the mount can only ever
+    see the opening turns.
+    """
+
+    def __init__(self, chats, *, links=None, window=2, step=2, url_suffix="", growing=False):
+        self.chats = {url: list(history) for url, history in chats.items()}
+        # Real hrefs are relative, so the client's urljoin is exercised too.
+        self.links = list(links) if links is not None else [
+            urlsplit(url).path for url in self.chats
+        ]
+        self.window = window
+        self.step = step
+        #: Appended to every URL the page lands on, as ChatGPT appends
+        #: `?model=…` of its own accord.
+        self.url_suffix = url_suffix
+        #: A conversation that keeps producing messages, so the end of the list
+        #: moves away as fast as the gesture reaches it and absence is never
+        #: established.
+        self.growing = growing
+        self.current_url = PROJECT_URL
+        self.present = {SEL.composer}
+        self.mounted = window
+        self.scrolls = 0
+        #: How many nodes each read of the message list returned. The
+        #: sliding-window fake below keeps this CONSTANT while painting
+        #: different messages, which is why a node count cannot prove the
+        #: mount reached the tail.
+        self.window_sizes = []
+        self.navigations = []
+        self.keys = []
+        self.logged_out = False
+        #: Where a `goto(PROJECT_URL)` actually lands (a slug rewrite, or an
+        #: SPA that restored some other page). None = where it was asked to.
+        self.project_lands_on = None
+        #: ChatGPT's canonical rewrite of a conversation URL: the project
+        #: segment grows the project's name. Same chat, different path.
+        self.slug = None
+        #: Rotation mid-flight: after this many gestures the shared page is on
+        #: `drift_to`, fully painted.
+        self.drift_after_scrolls = None
+        self.drift_to = None
+
+    # -- BrowserSession protocol -------------------------------------------
+    def goto(self, url):
+        self.navigations.append(f"goto:{url}")
+        if self.logged_out:
+            self.current_url = "https://auth.openai.com/authorize"
+            self.present = {SEL.login_markers[0]}
+            return
+        if url == PROJECT_URL and self.project_lands_on:
+            self.current_url = self.project_lands_on
+        else:
+            self.current_url = self._slugged(url) + self.url_suffix
+        self._remount()  # a fresh load re-virtualizes the list
+
+    def reload(self):
+        self.navigations.append("reload")
+        self._remount()
+
+    def url(self):
+        return self.current_url
+
+    def exists(self, selector):
+        return selector in self.present
+
+    def is_enabled(self, selector):
+        return selector in self.present
+
+    def click(self, selector):
+        pass
+
+    def focus(self, selector):
+        pass
+
+    def press(self, keys):
+        self.keys.append(keys)
+        if keys == "End":
+            self._paint_more()
+
+    def insert_text(self, text):
+        pass
+
+    def inner_text(self, selector):
+        return ""
+
+    def elements(self, selector, attr):
+        if selector == SEL.conversation_link:
+            if not self._on_project_page():
+                return []  # only a project page lists that project's chats
+            return [(href, f"chat titled {i}") for i, href in enumerate(self.links)]
+        if selector == SEL.message:
+            window = list(self._window(self._history()))
+            self.window_sizes.append(len(window))
+            return window
+        return []
+
+    def screenshot(self, path):
+        Path(path).write_bytes(b"\x89PNG-fake")
+
+    def html(self):
+        return "<html>fake</html>"
+
+    def close(self):
+        pass
+
+    # -- virtualization ----------------------------------------------------
+    @staticmethod
+    def _same(a, b):
+        pa, pb = urlsplit(a or ""), urlsplit(b or "")
+        return (pa.netloc, pa.path.rstrip("/")) == (pb.netloc, pb.path.rstrip("/"))
+
+    @staticmethod
+    def _chat_id(url):
+        segs = [seg for seg in urlsplit(url or "").path.split("/") if seg]
+        return segs[-1] if len(segs) >= 2 and segs[-2] == "c" else None
+
+    def _slugged(self, url):
+        """`/g/g-p-<id>/c/<chat>` -> `/g/g-p-<id><slug>/c/<chat>`: the same
+        conversation under the path ChatGPT canonicalises it to."""
+        if not self.slug or self._chat_id(url) is None:
+            return url
+        parts = urlsplit(url)
+        segs = parts.path.split("/")
+        segs[2] += self.slug
+        return f"{parts.scheme}://{parts.netloc}{'/'.join(segs)}"
+
+    def _on_project_page(self):
+        """Any project landing page, slug and query included — ChatGPT rewrites
+        `/g/g-p-<id>/project` with the project's name, and the chat list is on
+        the rewritten page just the same."""
+        return urlsplit(self.current_url).path.rstrip("/").endswith("/project")
+
+    def _history(self):
+        for url, history in self.chats.items():
+            same_chat = (
+                self._chat_id(url) is not None
+                and self._chat_id(url) == self._chat_id(self.current_url)
+            )
+            if self._same(url, self.current_url) or same_chat:
+                return history
+        return []
+
+    def _remount(self):
+        """What a fresh page load does to the virtualized list."""
+        self.mounted = self.window
+
+    def _window(self, history):
+        """The slice of `history` currently in the DOM. Counted from the TOP,
+        so this fake's tail is what stays unpainted — the 2026-08-05 shape."""
+        return history[: self.mounted]
+
+    def _advance(self):
+        """What one "go to the end" gesture mounts."""
+        self.mounted += self.step
+
+    def _at_list_end(self):
+        """Is the view at the END of the list — the position a real
+        `scroll_to_end` reads off the scroll container?
+
+        Honest about this fake's own geometry rather than about whether a
+        gesture happened: the whole point of the signal is that it comes from
+        the container, not from the gesture claiming success."""
+        return self.mounted >= len(self._history())
+
+    def _paint_all(self):
+        """Every message at once, for a chat we did not scroll ourselves."""
+        self.mounted = 10_000
+
+    def _paint_more(self):
+        self.scrolls += 1
+        self._advance()
+        if self.growing:
+            self._history().extend(_turns(self.step, marker=f"live {self.scrolls}"))
+        if (
+            self.drift_after_scrolls is not None
+            and self.scrolls >= self.drift_after_scrolls
+            and self.drift_to
+        ):
+            self.current_url = self.drift_to
+            self._paint_all()  # the chat we drifted onto is fully painted
+        return self._at_list_end()
+
+
+class FakeScrollingSession(FakeProjectSession):
+    """The same page, with the optional `scroll_to_end` capability a real
+    `PlaywrightSession` provides — gesture AND position, because reporting
+    where the view got to is the half that lets absence be established at
+    all."""
+
+    def scroll_to_end(self, selector):
+        assert selector == SEL.message  # the list being mounted, not the composer
+        return self._paint_more()
+
+
+class FakeSlidingWindowSession(FakeScrollingSession):
+    """A virtualizer that keeps a CONSTANT-SIZE mounted window: every gesture
+    mounts newer nodes and DROPS the older ones it replaces, so
+    `len(messages())` never moves however far the list travels.
+
+    The shape the node count cannot see, and the reason convergence is judged
+    on content. Against a count-based proof this fake settles after two
+    gestures — the count read 6 before and after, so "it stopped growing" —
+    and reports a request that six more gestures would have painted as absent
+    from persisted history. That is the 2026-08-05 park, reintroduced by the
+    fix for it.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        #: Index of the first mounted node. `window` nodes are mounted from
+        #: here; everything before and after is out of the DOM entirely.
+        self.offset = 0
+
+    def _remount(self):
+        super()._remount()
+        self.offset = 0
+
+    def _window(self, history):
+        # Clamped at the end: a gesture cannot scroll past the last message,
+        # so the window comes to rest on the tail rather than off it.
+        start = self._start(history)
+        end = start + self.window
+        return history[start:end]
+
+    def _start(self, history):
+        return max(0, min(self.offset, len(history) - self.window))
+
+    def _at_list_end(self):
+        # The container is at its end once the mounted window reaches the last
+        # message — the node count is the same 6 either way, which is exactly
+        # why the count is not the signal.
+        history = self._history()
+        return self._start(history) + self.window >= len(history)
+
+    def _advance(self):
+        self.offset += self.step
+
+    def _paint_all(self):
+        self.window = 10_000
+        self.offset = 0
+
+
+class FakeStuckGestureSession(FakeScrollingSession):
+    """A gesture that MOUNTS NOTHING, honestly reported.
+
+    The real shape of this is an End press that went to whatever held focus
+    instead of the scroller, or a scroll container the gesture never found. The
+    view does not move, so the mounted window is byte-identical read after
+    read — indistinguishable, from content alone, from a list that has finished
+    painting. `position` is what the session says about where it got to:
+    False (there is more below) or None (it cannot tell). Neither is a licence
+    to call anything absent.
+    """
+
+    def __init__(self, *args, position=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.position = position
+
+    def scroll_to_end(self, selector):
+        assert selector == SEL.message
+        self.scrolls += 1
+        return self.position
+
+
+def test_a_request_in_the_already_mounted_window_is_found(tmp_path):
+    """The cheap case stays cheap: a request already painted needs no scrolling
+    at all, and mounting more could only ever confirm it."""
+    session = FakeScrollingSession({CHAT_ONE: [("user", f"[autoloop request {RID}]")]})
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    assert session.scrolls == 0
+
+
+def test_a_request_only_in_the_unmounted_tail_is_also_found(tmp_path):
+    """THE defect, reproduced: the request is in persisted history and simply
+    not painted. Skipping the mount step fails this test — which is exactly how
+    alr-af11e1b3-0006 was parked as ambiguous while its answer sat in the
+    chat."""
+    session = FakeScrollingSession({CHAT_ONE: _turns(2), CHAT_TWO: _chat_holding(RID)})
+    client = make_client(session, FakeClock(), tmp_path)
+
+    # The window a plain readback sees on a fresh load does NOT contain it.
+    session.goto(CHAT_TWO)
+    assert client.has_request(RID) is False
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_TWO
+    assert session.scrolls >= 6  # the tail was six scrolls down, as observed
+
+
+def test_a_sliding_constant_size_window_is_not_settled_by_a_steady_node_count(tmp_path):
+    """The node count is not a convergence proof, and this is the shape that
+    shows it: the virtualizer mounts newer nodes as it drops older ones, so the
+    count reads 6 at every single read while six different messages go past.
+
+    A mount that settles on "the count stopped growing" concludes after two
+    gestures, reads an intermediate window, and reports the request absent —
+    the 2026-08-05 park, produced by the code written to prevent it. Judging
+    convergence on the window's CONTENT is what keeps the gesture going until
+    the request is painted.
+    """
+    session = FakeSlidingWindowSession({CHAT_ONE: _chat_holding(RID)}, window=6, step=2)
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    # Four gestures to walk a 13-message chat 6 nodes at a time — well past the
+    # two a count-based proof would have stopped at.
+    assert session.scrolls >= 4
+    # ... and the count that proof watches never moved once.
+    assert set(session.window_sizes) == {6}
+
+
+def test_a_request_the_window_slid_past_is_still_found(tmp_path):
+    """Evidence accumulates across windows; it is not read off the last one.
+
+    Once the assistant has answered (the 2026-08-05 chat held the request AND
+    its reply), the request is no longer the final message — so a wide enough
+    slide carries it into the mounted window and out again. Mounting to the end
+    and THEN calling `has_request` is a false absence in exactly that case,
+    which is why the verdict comes from what the mount saw.
+    """
+    history = _turns(3, marker="before") + [
+        ("user", f"[autoloop request {RID} | iteration 1]"),
+        ("assistant", "decision: push"),
+    ] + _turns(4, marker="after")
+    session = FakeSlidingWindowSession({CHAT_ONE: history}, window=4, step=4)
+    client = make_client(session, FakeClock(), tmp_path)
+
+    # Fully mounted, the tail no longer shows the request at all.
+    session.goto(CHAT_ONE)
+    for _ in range(10):
+        session.scroll_to_end(SEL.message)
+    assert client.has_request(RID) is False
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+
+
+def test_a_sliding_window_that_comes_to_rest_still_reports_absent(tmp_path):
+    """The content proof must still be able to say no. A sliding window stops
+    changing once it reaches the tail, and a request in none of the chats is
+    absent — otherwise the fix would trade every false absence for a refusal
+    and rotation would never get an answer."""
+    session = FakeSlidingWindowSession({CHAT_ONE: _turns(6)}, window=6, step=2)
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) is None
+    assert session.scrolls > 0
+    assert set(session.window_sizes) == {6}
+
+
+def test_a_gesture_that_mounts_nothing_never_settles_into_a_false_absence(tmp_path):
+    """An unchanged window is not a proof on its own, and this is the shape
+    that shows it: the gesture never moves the view, so the SAME opening window
+    comes back read after read while the request sits eleven messages below it.
+
+    Judged on content alone, that is a settled list — two byte-identical reads,
+    conclude absent, park a request that was delivered and answered. The
+    session reporting it is NOT at the end of the list is the only thing that
+    separates "fully mounted" from "the gesture did nothing"."""
+    session = FakeStuckGestureSession({CHAT_ONE: _chat_holding(RID)}, position=False)
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "never reached its end" in str(excinfo.value)
+    # It really did keep trying — the refusal is about evidence, not effort.
+    assert session.scrolls == 4
+
+
+def test_a_gesture_that_reports_no_position_never_settles_either(tmp_path):
+    """The same fault through the other adapter failure: a session that cannot
+    measure where it got to. `None` is not a quiet `True` — an adapter written
+    before the signal existed, or one whose measurement failed, keeps every
+    sighting it makes and loses only the ability to rule things OUT."""
+    session = FakeStuckGestureSession({CHAT_ONE: _chat_holding(RID)}, position=None)
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "cannot report a scroll position" in str(excinfo.value)
+
+
+def test_a_stuck_gesture_still_reports_a_request_it_can_already_see(tmp_path):
+    """Refusing to conclude ABSENCE must not cost a sighting. The window that
+    never moves is enough when the request is in it — a positive is direct
+    evidence about the conversation and needs no statement about the scroll
+    position at all."""
+    session = FakeStuckGestureSession(
+        {CHAT_ONE: [("user", f"[autoloop request {RID}]")]}, position=None
+    )
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+
+
+def test_the_chat_list_is_read_from_the_href_not_the_title(tmp_path):
+    """Regression: `elements` yields (attribute value, inner text), so the href
+    comes FIRST. Unpacking it the other way round read each chat's TITLE as its
+    href — no title contains "/c/", so every candidate was skipped and the
+    search could only return None, whatever the project held."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    assert f"goto:{CHAT_ONE}" in session.navigations
+
+
+def test_a_genuinely_absent_request_is_reported_absent(tmp_path):
+    """The guard must not become "never says no" — a request in none of the
+    chats is absent, and rotation depends on being told so."""
+    session = FakeScrollingSession({CHAT_ONE: _turns(4), CHAT_TWO: _turns(4)})
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) is None
+    # and only after the lists demonstrably finished painting
+    assert session.scrolls > 0
+
+
+def test_a_search_that_drifts_refuses_to_conclude_present(tmp_path):
+    """A rotation mid-flight moves the shared page. Returning the candidate
+    here would bind the loop to a chat that never saw the request — the answer
+    came off a different one."""
+    session = FakeScrollingSession(
+        {CHAT_ONE: _turns(4), STRAY_CHAT: _chat_holding(RID)},
+        links=[urlsplit(CHAT_ONE).path],  # the stray is not in this project
+    )
+    session.drift_after_scrolls, session.drift_to = 1, STRAY_CHAT
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "in either direction" in str(excinfo.value)
+
+
+def test_a_search_that_drifts_refuses_to_conclude_absent(tmp_path):
+    """The other direction of the same fault: the chat we drifted onto does not
+    hold the request, and reporting absent from it would be a verdict about a
+    conversation nobody asked about."""
+    session = FakeScrollingSession(
+        {CHAT_ONE: _chat_holding(RID), STRAY_CHAT: _turns(4)},
+        links=[urlsplit(CHAT_ONE).path],
+    )
+    session.drift_after_scrolls, session.drift_to = 1, STRAY_CHAT
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive):
+        client.find_conversation_with(RID, PROJECT_URL)
+
+
+def test_a_project_page_that_lands_elsewhere_is_refused_before_reading_a_chat(tmp_path):
+    """The chat list of some other page is not this project's, so neither
+    finding nor missing the request in it means anything."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    session.project_lands_on = STRAY_CHAT
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "chat list" in str(excinfo.value)
+    assert session.navigations == [f"goto:{PROJECT_URL}"]  # nothing else opened
+
+
+def test_a_slugged_project_url_is_not_drift(tmp_path):
+    """ChatGPT rewrites `/g/g-p-<id>/project` with the project's name. Refusing
+    that would refuse the page it just loaded, every time."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    session.project_lands_on = "https://chatgpt.com/g/g-p-project123-my-project/project"
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+
+
+def test_a_slugged_conversation_url_is_not_drift(tmp_path):
+    """The sharper half of the same trap: a conversation is identified by its
+    `/c/<id>`, not by the project prefix ChatGPT rewrites in front of it. An
+    exact path compare here would make EVERY search inconclusive in production
+    while passing every test that types its URLs by hand."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    session.slug = "-my-project"
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    assert session.current_url.startswith("https://chatgpt.com/g/g-p-project123-my-project/c/")
+
+
+def test_a_different_chat_id_is_still_drift(tmp_path):
+    """Tolerating the prefix must not tolerate the id — that is the whole
+    identity of a conversation."""
+    session = FakeScrollingSession(
+        {CHAT_ONE: _turns(4), CHAT_TWO: _chat_holding(RID)},
+        links=[urlsplit(CHAT_ONE).path],
+    )
+    session.drift_after_scrolls, session.drift_to = 1, CHAT_TWO
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive):
+        client.find_conversation_with(RID, PROJECT_URL)
+
+
+def test_a_query_string_is_not_drift(tmp_path):
+    """`?model=…` appears on its own; an exact URL compare would refuse every
+    candidate in production while passing every test that omits it."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)}, url_suffix="/?model=gpt-5")
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+
+
+def test_a_list_still_painting_when_the_bound_runs_out_does_not_report_absent(tmp_path):
+    """Unseen and absent are different things in a virtualized list. A chat
+    whose messages never stop arriving has not been ruled out — it has run out
+    of scrolls."""
+    session = FakeScrollingSession({CHAT_ONE: _turns(4)}, growing=True)
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "unseen and absent are not the same thing" in str(excinfo.value)
+    # The gestures spent and the reason separate the ways to be unsettled, and
+    # they call for different responses: this list keeps growing under the
+    # gesture, so its end moves away as fast as the view reaches it — not the
+    # same fault as a gesture that never moved, or a session that cannot
+    # measure. An operator reading the park needs to know which.
+    assert "(4 gestures)" in str(excinfo.value)
+    assert "never reached its end" in str(excinfo.value)
+
+
+class FakeStreamingTailSession(FakeScrollingSession):
+    """A chat pinned to the BOTTOM while it is still generating: the view is
+    genuinely at the end of the list (ChatGPT follows the answer down) and the
+    window changes on every read as tokens land."""
+
+    def scroll_to_end(self, selector):
+        assert selector == SEL.message
+        self.scrolls += 1
+        self._history().append(("assistant", f"token {self.scrolls}"))
+        self._paint_all()
+        return True
+
+
+def test_a_chat_still_streaming_at_the_end_of_the_list_does_not_report_absent(tmp_path):
+    """Being at the end is not the same as having finished painting it, which
+    is why both proofs are required. A streaming answer keeps the view at the
+    bottom while the content underneath it changes every read — so the end
+    signal alone would settle a list that is still arriving, and conclude
+    absence from a window the next token could have completed."""
+    session = FakeStreamingTailSession({CHAT_ONE: _turns(2)})
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "still changing at the end of the list" in str(excinfo.value)
+
+
+def test_a_session_without_the_scroll_capability_presses_end(tmp_path):
+    """The gesture is an OPTIONAL capability, probed like every other one: a
+    session that cannot scroll programmatically falls back to the key a human
+    presses, and still finds the tail."""
+    session = FakeProjectSession({CHAT_ONE: _chat_holding(RID)})
+    assert not hasattr(session, "scroll_to_end")
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    assert session.keys.count("End") >= 6
+
+
+def test_a_session_that_cannot_report_a_position_never_reports_absent(tmp_path):
+    """The negative twin of the fallback, and the cost that makes the fallback
+    honest. The End key presses and paints, but nothing about it says whether
+    the view reached the end of the list — and on a real page End goes to
+    whatever holds focus, so a gesture that painted nothing looks exactly like
+    one that reached the tail.
+
+    So a keyboard-only session keeps its sightings and gives up ABSENCE. The
+    request here is in none of these chats, and the honest answer is still "I
+    cannot tell", because this adapter cannot tell."""
+    session = FakeProjectSession({CHAT_ONE: _turns(4), CHAT_TWO: _turns(4)})
+    assert not hasattr(session, "scroll_to_end")
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "cannot report a scroll position" in str(excinfo.value)
+
+
+def test_a_logged_out_profile_is_routed_not_demoted_to_inconclusive(tmp_path):
+    """The auth redirect lands the page somewhere that is plainly not the
+    project — and it must still surface as a login expiry, because that is the
+    fault the loop routes. Checking page identity before logging in would turn
+    "log back in" into "cannot tell"."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    session.logged_out = True
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(LoginExpiredError):
+        client.find_conversation_with(RID, PROJECT_URL)
+
+
+def test_the_walk_is_bounded_by_limit(tmp_path):
+    """A project accumulates chats and each candidate costs a page load. The
+    one we want was just created, so it is at the top or nowhere."""
+    chats = {
+        f"https://chatgpt.com/g/g-p-project123/c/chat-{i}": _turns(2) for i in range(5)
+    }
+    session = FakeScrollingSession(chats)
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL, limit=2) is None
+    opened = [nav for nav in session.navigations if "/c/" in nav]
+    assert len(opened) == 2
+
+
+def test_an_inconclusive_search_leaves_a_diagnostic(tmp_path):
+    """A refusal is a result, so it is evidenced like every other transport
+    failure — otherwise the operator sees a rotation fail with nothing to
+    read."""
+    session = FakeScrollingSession({CHAT_ONE: _turns(4)})
+    session.project_lands_on = STRAY_CHAT
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive):
+        client.find_conversation_with(RID, PROJECT_URL)
+    folder = diagnostics(tmp_path)[-1]
+    assert "conversation-search-inconclusive" in folder.name
+    assert PROJECT_URL in read_meta(folder)["note"]

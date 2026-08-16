@@ -3018,5 +3018,39 @@ reports this rather than raising.
   implemented on `BrowserChatGPT` yet, so today a resumed delivery reads only
   what is mounted and falls back to the omission notice if an earlier part is
   no longer rendered — safe, but a re-send of work that did land.
+  The one readback that DOES mount its own tail is the by-content conversation
+  search (`find_conversation_with`, 2026-08-16): it repeats a "go to the end"
+  gesture and refuses to answer at all rather than call something absent while
+  the list may still be unpainted. It got that because it is the read a
+  decision is made from — on 2026-08-05 `alr-af11e1b3-0006` parked as ambiguous
+  while the chat held the request and its answer, six scrolls below the fold.
+  The mount is deliberately private (`_mount_message_tail`), so the delivery
+  probe above still finds no public capability and keeps its historical
+  behaviour.
+  **Absence needs two independent proofs** (corrected 2026-08-16, before the
+  search was wired to any decision): the session must report the list is AT ITS
+  END, *and* the mounted window must then stay byte-identical across
+  consecutive reads. Each alone has a false positive that looks exactly like
+  success. The node count is not even a candidate — a virtualizer may slide a
+  constant-size window, so a count reading 6 before and after a gesture is
+  consistent with six different messages having gone past; that count-based
+  version stopped after two gestures and reproduced the very park it was
+  written for. Content-only is ambiguous in a subtler way: an unchanged window
+  says the GESTURE stopped mounting, which is the tail when the gesture works
+  and the opening window when it silently missed (End goes to whatever holds
+  focus). And end-of-list alone is ambiguous because ChatGPT follows a
+  streaming answer down — the view is at the bottom while the content is still
+  arriving.
+  The position signal is a return value on the optional `scroll_to_end`
+  capability: True (container at its end, a chat too short to scroll included),
+  False (more below), None (cannot measure). `PlaywrightSession` computes it
+  from the real container by walking out from the last mounted node; an adapter
+  that answers None — the End-key fallback included — keeps its SIGHTINGS and
+  loses only the ability to rule things out. The verdict comes from what the
+  mount SAW rather than from a readback after it, since a slide can carry the
+  request into the window and out again. The deliberate cost is that a
+  still-streaming chat, a stuck gesture and a session without the signal all
+  answer `ConversationSearchInconclusive` instead of `None` — refusing to rule
+  beats ruling wrong, which is the whole reason this readback exists.
 * Selector defaults will drift with ChatGPT's UI eventually
   (`browser/selectors.py` is the fix point).

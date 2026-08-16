@@ -906,6 +906,63 @@ an unbound request refuse to guess.
 the request id from the park message. If it exists, the rotation worked and
 only the detection failed; point `browser.conversation_url` at that chat.
 
+### A readback says a message is not in the conversation, and it plainly is
+**Symptom:** the loop parks `submission_ambiguous` (or drops a chunked part and
+re-sends it) reporting that the request is not in persisted history. Open the
+chat and the request is there — on 2026-08-05 `alr-af11e1b3-0006` was there
+*and already answered with a decision*. Seeing it took pressing End and
+scrolling six times before the tail rendered.
+**Cause:** ChatGPT's message list is VIRTUALIZED. Only a window of the
+conversation is in the DOM, so `[data-message-author-role]` — the selector
+behind `messages()` / `has_request()` — enumerates what is painted, not what
+the conversation contains. A DOM read is therefore never a full history read
+(`docs/AUTOLOOP.md` §11), and "absent" from an unmounted window is a statement
+about the scroll position.
+**Fix:** applied repo-side for the by-content search only.
+`BrowserChatGPT.find_conversation_with` now mounts the tail before concluding:
+it repeats a "go to the end" gesture (`scroll_to_end` when the session offers
+it, otherwise the End key) and treats absence as established only when **two
+independent things hold** — the session reports the list is AT ITS END, and the
+mounted window then stays byte-identical across consecutive reads. Either alone
+is a false-absence generator:
+
+* *Count stopped growing* proves nothing at all. A virtualizer may slide a
+  constant-size window, mounting newer nodes as it drops older ones, so the
+  count reads 6 before and after while six different messages go past. (This
+  was the first version of this fix, and it reproduced the very park it was
+  written for.)
+* *Window stopped changing* is ambiguous. It says the GESTURE stopped mounting
+  — which is the tail when the gesture works, and the OPENING window when it
+  silently missed. End goes to whatever holds focus, so a misfocused gesture on
+  a short or initially stable list gives two identical reads and a confident
+  wrong "absent".
+* *At the end of the list* is ambiguous too: ChatGPT follows a streaming answer
+  down, so the view sits at the bottom while the content underneath it is still
+  arriving.
+
+`scroll_to_end` therefore RETURNS a position — True (the scroll container is at
+its end; a chat too short to scroll counts), False (more below), None (cannot
+measure). `PlaywrightSession` computes it from the actual container by walking
+out from the last mounted node. An adapter that answers None — the End-key
+fallback included — keeps every SIGHTING it makes and simply cannot establish
+absence; it raises `ConversationSearchInconclusive` instead. So does running out
+of scrolls. The same read also confirms the page is the conversation it asked
+for — a rotation mid-flight moves the shared page, and a confident answer about
+a different chat is wrong in both directions.
+**Reading the refusal:** the note names each chat with the gestures spent and
+why it was not concluded — `still changing at the end of the list` is a long or
+streaming conversation (retry), `never reached its end` is a gesture that is not
+driving the scroller (a selector or focus problem), and `cannot report a scroll
+position` is a session without the signal at all (expected for the End-key
+fallback; on a real `PlaywrightSession` it means the measurement kept failing).
+**Still open elsewhere:** every OTHER readback (`reconcile`, `has_request`,
+`Orchestrator._part_present`) reads what is mounted. That is usually fine —
+they check the newest turn — but do not infer "the conversation contains only
+X" from a message count anywhere.
+**Diagnosing one by hand:** open the chat, press End, and scroll to the bottom
+several times before deciding the message is missing. If it appears, the send
+landed and only the detection failed.
+
 ### The loop vanishes mid-run leaving NO blocker, no park and no heartbeat
 **Symptom:** `autoloop health` reports `not_running` with `open_blockers: 0`
 and a phase that was healthy moments earlier. Unlike every other stop, nothing
