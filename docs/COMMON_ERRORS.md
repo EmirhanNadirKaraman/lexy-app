@@ -140,25 +140,65 @@ not the browser. Chrome respawns a killed renderer instantly; the readiness
 browser that was never restarted. **A recovery command that lies is worse than
 one that fails** — the loop retried against the same wedged browser for hours
 and reported healthy recovery each time.
-**Fix:** `main_pids()` in the script now requires all three of: the command
-*is* the Chrome browser binary, no `--type=` (that excludes helpers), and an
-exact `--user-data-dir` match (so `.autoloop-chrome` does not select
-`.autoloop-chrome-backup`). It also proves port 9222 is **free** after killing
-and before launching — otherwise a stale holder makes the readiness probe pass
-against the impostor — escalates to `SIGKILL` when `SIGTERM` is ignored, and
-requires `webSocketDebuggerUrl` in the probe rather than any 200.
+**Fix (2026-08-14, in the shell script):** `main_pids()` required all three of:
+the command *is* the Chrome browser binary, no `--type=` (that excludes
+helpers), and an exact `--user-data-dir` match (so `.autoloop-chrome` does not
+select `.autoloop-chrome-backup`). It also proved port 9222 was **free** after
+killing and before launching — otherwise a stale holder makes the readiness
+probe pass against the impostor — escalated to `SIGKILL` when `SIGTERM` was
+ignored, and required `webSocketDebuggerUrl` in the probe rather than any 200.
 
 One trap while writing that filter, and it is the same bug in a new costume:
 `awk -v prof="--user-data-dir=$PROFILE"` carries the profile path in its **own**
 argv, so a plain content match selects the matcher process itself. The old
 `grep -v grep` was covering this. Requiring the command to start with the Chrome
-binary path is what actually closes it.
+binary path is what actually closed it.
+
+**Fix (2026-08-16, brw-06/07/08): the shell script is RETIRED.** The restart
+path is now `python3 -m autoloop.browser.chrome_restart`
+(`autoloop/browser/chrome_restart.py`), and `config.example.toml` ships
+`restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]`. Two
+reasons, both from this entry:
+
+* **It was untestable.** The post-commit validation runner allows only
+  ruff/pytest/python/npm/npx/tsc, so no test in this repo could ever have
+  exercised a `.sh` — which is how a recovery command that lies shipped at all.
+  The module is pinned by `autoloop/tests/test_chrome_restart.py` against a
+  fake machine (nothing there lists, signals or launches a real process).
+* **One pid is not enough.** The shell version stopped a single main pid; when
+  two instances were running on the profile, the survivor kept the debug port
+  and the "restart" landed the loop back on the wedged browser. The module
+  stops **every** process carrying that `--user-data-dir`, then polls until
+  nothing holds the port (a kill is not proof it was freed), then launches, then
+  requires `webSocketDebuggerUrl` from `/json/version` before reporting success.
+  The safety bound is unchanged and load-bearing: match the profile path
+  exactly, never the binary name — the operator's everyday Chrome runs from the
+  same binary under a different `--user-data-dir`.
+
+**The `.autoloop/config.toml` that decides this is NOT in the repository**, so
+changing `config.example.toml` changed nothing for a running deployment: until
+the operator hand-edits `[browser].restart_command`, the loop still launches the
+script. That is why the script is still on disk, as a **failing tombstone** — it
+restarts nothing, prints the replacement line on stderr and exits 1, which both
+callers surface as `restart FAILED: …`. Non-zero deliberately: they surface
+`result.stderr` only on a non-zero exit, and this is the file that taught us
+what a zero exit costs.
+
+`load_config` deliberately does **not** refuse a config that still names it.
+Refusing would fail `status`, `doctor`, `run` and the recovery commands the
+moment the change merged, over a setting only a restart reads — taking away the
+tooling the operator would use to recover. So an unmigrated deployment keeps
+working everywhere except the restart, and the restart fails with the fix
+attached rather than with bash's exit 127 (`No such file or directory`), which
+is what deleting the file outright would have produced. `git rm` and any
+load-time refusal both belong to a later cleanup, once live configs have been
+migrated.
 
 ```bash
 # Verify a real restart: the main pid must CHANGE and helpers must be ignored.
 BEFORE=$(ps -eo pid,command | grep -- "--user-data-dir=$HOME/.autoloop-chrome" \
     | grep -v grep | grep -v -- '--type=' | awk '{print $1}')
-bash scripts/restart_autoloop_chrome.sh
+python3 -m autoloop.browser.chrome_restart      # run from the checkout
 AFTER=$(ps -eo pid,command | grep -- "--user-data-dir=$HOME/.autoloop-chrome" \
     | grep -v grep | grep -v -- '--type=' | awk '{print $1}')
 [ "$BEFORE" != "$AFTER" ] && echo "PASS: browser actually restarted"

@@ -29,6 +29,29 @@ reconcile_timeout_seconds = 30.0    # persisted-history check after a reload
 poll_interval_seconds = 2.0
 # The answer must be unchanged this long (and generation stopped) to count.
 stability_seconds = 3.0
+# How the loop restarts Chrome after a session loss. Empty (or absent) disables
+# auto-restart — the loop then parks and asks you to relaunch the profile.
+#
+# Declared, never inferred: the loop knows a cdp_url, not which Chrome owns it,
+# and an automation that pattern-matched process lists would eventually kill
+# someone's everyday browser. The shipped module matches `--user-data-dir`
+# EXACTLY (never the binary name), stops EVERY instance on that profile, waits
+# for the debug port to actually free, and only reports success once the
+# endpoint answers with a browser websocket URL — see
+# autoloop/browser/chrome_restart.py. It replaced a shell helper that stopped
+# one pid and relaunched into a survivor still holding the port, reporting
+# success every time (docs/COMMON_ERRORS.md).
+#
+# Two things to know: `-m` resolves `autoloop` from the WORKING DIRECTORY (run
+# the loop from the checkout — the relative script path this replaced had the
+# same requirement), and the profile/port default to ~/.autoloop-chrome and
+# 9222, overridable with --profile / --port or AUTOLOOP_CHROME_PROFILE /
+# AUTOLOOP_CHROME_PORT.
+restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]
+# Minimum seconds between restart attempts — without it a genuinely dead
+# transport becomes a restart loop. Failures whose restart THIS refused are
+# charged to policy.max_browser_restart_skips, never to the failure budget.
+restart_cooldown_seconds = 120.0
 
 [policy]
 max_iterations = 20

@@ -2737,6 +2737,57 @@ mkdir -p .autoloop && cp autoloop/config.example.toml .autoloop/config.toml
 The test suite needs none of this. The audit and implement executors
 additionally need the `claude` CLI on PATH (it is, in this environment).
 
+### 8a. Restarting Chrome — `browser.restart_command`
+
+```toml
+[browser]
+restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]
+```
+
+That is what the template ships since **2026-08-16**, and it is the only
+restart path: `scripts/restart_autoloop_chrome.sh` is retired. The module
+(`autoloop/browser/chrome_restart.py`) stops **every** Chrome carrying
+`--user-data-dir=<profile>`, polls until nothing holds the debug port, launches,
+and reports success only once `/json/version` answers with a browser websocket
+URL. Its safety bound: the profile path is matched EXACTLY and the binary name
+never is — the operator's everyday browser runs from the same binary under a
+different profile. Defaults are `~/.autoloop-chrome` / `9222`, overridable with
+`--profile` / `--port` / `--chrome` or `AUTOLOOP_CHROME_PROFILE` /
+`AUTOLOOP_CHROME_PORT`. It replaced a shell helper that stopped one pid and
+relaunched into a survivor still owning the port, reporting success every time
+(`docs/COMMON_ERRORS.md`); a `.sh` also could not be validated at all, since the
+validation runner allows only ruff/pytest/python/npm/npx/tsc.
+
+**⚠ Your `.autoloop/config.toml` is not in this repository — change it by
+hand.** Copying the template only fixes a *fresh* deployment. A running one is
+still holding `["bash", "scripts/restart_autoloop_chrome.sh"]` until you make
+the one-line edit above, and nothing in this repo could have made it for you.
+
+**What an unmigrated config gets in the meantime.** It still **loads** —
+`load_config` deliberately does not refuse the old value. Everything except a
+browser restart keeps working: `status`, `doctor`, `run`, the recovery commands.
+Refusing at load would have failed all of them the moment this change merged,
+over a setting only a restart reads, taking away the tooling you would use to
+fix it. The one thing that does fail is the restart itself, and it fails
+**loudly**: `scripts/restart_autoloop_chrome.sh` is now a **failing tombstone**
+— it restarts nothing, prints the replacement line on stderr and exits 1, which
+both callers surface as `restart FAILED: …`. That is deliberately not bash's
+exit 127 (`No such file or directory`), which is what deleting the file would
+have produced: same failure, no instruction, in the middle of the browser fault
+the restart exists to clear. The tombstone also covers the path still typed by
+hand, out of shell history, or by a wrapper of your own outside
+`restart_command`.
+
+The file is removed (`git rm`) in a later cleanup, once the live configs have
+been switched over and the path has stopped being typed. Re-adding a load-time
+refusal belongs to that same cleanup — after migration, not before it.
+
+Run the loop **from the checkout**: `-m` resolves `autoloop` from the working
+directory, exactly as the old relative script path did — neither caller
+(`cli._repair_browser`, `orchestrator._attempt_browser_restart`) passes a `cwd`.
+Those two allow the command 180s; the module's own bounds total ≈123s, sized to
+sit under that, so the two move together or not at all.
+
 ## 9. First-run procedure
 
 ```bash
@@ -2887,8 +2938,9 @@ reports this rather than raising.
 | Crash / Ctrl+C anywhere | Just `run` (or `run --continuous`) again — every phase is persisted; requests are never double-submitted; executing re-verifies from saved state. |
 | `stale lock` error | Inspect `python -m autoloop status`, then `python -m autoloop unlock` (refuses live locks). |
 | Logged out mid-run (`needs_user`) | Log the profile back in, `run --retry`. |
-| Browser dead / CDP unreachable | Relaunch the profile (§8), `run --retry` (or just `run` if not parked). |
-| Parked `browser_restart_cooldown_blocked` | Repeated browser failures whose restart `browser.restart_cooldown_seconds` refused, so none was ever attempted (§5c). Restart the browser by hand (`scripts/restart_autoloop_chrome.sh`) — or lower that cooldown if it is set too high for this machine. Then close the blocker it recorded (`python -m autoloop blockers`, then `answer <id> "..."`) and `run --retry`: an open blocker stops `start` and ends a `--continuous` pass, so retrying without it just parks again. Those failures never spent the failure budget, so nothing else needs resetting. |
+| Browser dead / CDP unreachable | `python3 -m autoloop.browser.chrome_restart` from the checkout (§8a) — or relaunch the profile by hand (§8) — then `run --retry` (or just `run` if not parked). |
+| `restart FAILED: … restart_autoloop_chrome.sh was RETIRED` | Your `.autoloop/config.toml` still names the shell helper retired 2026-08-16. Nothing else is broken — the config loads and every other command works — but no browser restart will succeed until you set `restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]` (§8a). The loop's live config is not in this repo, so nothing could have done it for you; the failing tombstone carries that exact line on stderr. |
+| Parked `browser_restart_cooldown_blocked` | Repeated browser failures whose restart `browser.restart_cooldown_seconds` refused, so none was ever attempted (§5c). Restart the browser by hand (`python3 -m autoloop.browser.chrome_restart`, §8a) — or lower that cooldown if it is set too high for this machine. Then close the blocker it recorded (`python -m autoloop blockers`, then `answer <id> "..."`) and `run --retry`: an open blocker stops `start` and ends a `--continuous` pass, so retrying without it just parks again. Those failures never spent the failure budget, so nothing else needs resetting. |
 | Repeated malformed replies / denials | Loop parks with the reason; talk to the conversation manually if needed, then `run --answer "..."`. |
 | **Ambiguous submission** (`needs_user`, "submission … is AMBIGUOUS") | Open the conversation and look. If the request is there, `run --retry` (reconciles and continues). If it is genuinely absent, `run --resubmit` authorizes exactly one more send of the same id. Autoloop will not decide this for you — see §5b. |
 | `send-not-ready` / `composer-not-synchronised` diagnostics | The editor never accepted the input, so **nothing was sent**: safe to `run --retry`. If it repeats, the composer selectors or the input method need attention (`browser/selectors.py`, `browser/chatgpt.py::_enter_prompt`). |

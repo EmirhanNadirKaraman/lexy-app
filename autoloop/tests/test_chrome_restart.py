@@ -243,8 +243,8 @@ def test_a_failure_is_reported_never_raised():
 
 @pytest.fixture
 def captured(monkeypatch):
-    """`main()` with only `restart` stubbed — the entry point brw-08 will point
-    `restart_command` at is otherwise executed by nothing. `ChromeOps.real()` is
+    """`main()` with only `restart` stubbed — the entry point `restart_command`
+    names since 2026-08-16 is otherwise executed by nothing. `ChromeOps.real()` is
     still built for real, so a renamed field there is a TypeError this catches."""
     seen: dict = {}
 
