@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
@@ -98,6 +98,86 @@ def _validate_approved_path(path: object) -> None:
                 f"approved path {path!r} has an invalid segment {seg!r} — only "
                 "[A-Za-z0-9._-] is allowed (no globs, no whitespace, no leading '-')",
             )
+
+
+def _validate_approved_paths(task_id: object, paths: object) -> tuple[str, ...]:
+    """Return `paths` as a tuple, or raise `TaskGraphError`.
+
+    THE approved-path LIST check — `_validate_approved_path` above checks one
+    entry, this checks the collection, and the difference matters because the
+    duplicate rule used to live inline in `add_many` and nowhere else. A
+    mutation reusing only the singular helper could therefore write a
+    duplicate scope that creation refuses, which is exactly the drift
+    `_validate_description` was extracted to prevent.
+
+    SHAPE is checked first, and it is not decoration: `approved_paths` is
+    declared as a tuple but nothing stops a caller passing the bare string
+    `"a.py"`, and iterating that yields one-character "paths" — the same
+    silent per-character split `_persisted_superseded_by` documents for
+    `superseded_by`. Every downstream consumer (`unauthorized_paths`,
+    `effective_approved_paths`, the manifest) would then reason about the
+    letters of a filename as if they were files.
+    """
+    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
+        raise TaskGraphError(
+            "bad_approved_path",
+            f"task '{task_id}' needs approved_paths as a list of repository-relative "
+            f"paths, got {paths!r}",
+        )
+    seen: set[str] = set()
+    for approved in paths:
+        _validate_approved_path(approved)
+        if approved in seen:
+            raise TaskGraphError(
+                "duplicate_approved_path",
+                f"task '{task_id}' lists approved path {approved!r} more than once",
+            )
+        seen.add(approved)
+    return tuple(paths)
+
+
+def _validate_depends_on(
+    task_id: object, depends_on: object, known: dict[str, "Task"]
+) -> tuple[str, ...]:
+    """Return `depends_on` as a tuple, or raise `TaskGraphError`.
+
+    THE dependency check, shared by `TaskRegistry.add_many` (creation, where
+    `known` is the candidate graph so intra-batch dependencies resolve) and
+    `TaskRegistry.set_depends_on` (mutation, where it is the live graph). Same
+    "one validator, every caller" rule as `_validate_description` and
+    `_validate_superseded_by`.
+
+    What it does NOT check is cycles: that needs the whole graph with the new
+    edges already in it, so it stays with `_check_acyclic` and each caller runs
+    it against a CANDIDATE rather than against a registry it has already
+    mutated.
+
+    The shape arm is new relative to the inline loop this replaces. A bare
+    string `"ab"` used to be iterated per character and refused — but as
+    `unknown task 'a'`, which sends the reader looking for a task that was
+    never named.
+    """
+    if isinstance(depends_on, str) or not isinstance(depends_on, (list, tuple)):
+        raise TaskGraphError(
+            "bad_depends_on",
+            f"task '{task_id}' needs depends_on as a list of task ids, got {depends_on!r}",
+        )
+    for dep in depends_on:
+        if not isinstance(dep, str) or not _ID_RE.match(dep):
+            raise TaskGraphError(
+                "bad_depends_on",
+                f"task '{task_id}' names {dep!r} as a dependency, which is not a "
+                "valid task id (slug of [A-Za-z0-9._-], max 64)",
+            )
+        if dep not in known:
+            raise TaskGraphError(
+                "unknown_dependency", f"task '{task_id}' depends on unknown task '{dep}'"
+            )
+        if dep == task_id:
+            raise TaskGraphError(
+                "dependency_cycle", f"task '{task_id}' depends on itself"
+            )
+    return tuple(depends_on)
 
 
 def _validate_description(task_id: object, description: object) -> None:
@@ -217,6 +297,50 @@ def _successor_hint(task: "Task") -> str:
     free-text reason this field exists to replace.
     """
     return f" (superseded by {', '.join(task.superseded_by)})" if task.superseded_by else ""
+
+
+#: Prefix stamped onto `blocked_reason` by `TaskRegistry.operator_block`, and
+#: the ONLY thing `operator_unblock` will release.
+#:
+#: Both meanings of `status == "blocked"` are the same field, and they must not
+#: be reversible by the same route. A `task_fatal` park (`cli._handle_parked_
+#: task` → `block`) records a real failure and is resolved by
+#: `python -m autoloop answer`, which also resolves the `blockers.Blocker`
+#: record tied to it. An OPERATOR HOLD placed through the inbox has no blocker
+#: record at all, so `answer` cannot reach it — that is precisely the
+#: one-way state this pair exists to avoid, and the reverse has to come from
+#: the inbox too.
+#:
+#: Without the marker the inbox's reverse would release BOTH: an operator (or
+#: anything that can write to the inbox directory) could clear a quarantine the
+#: loop raised, leaving its blocker open and unanswered while the task went
+#: straight back into `ready_tasks()`. So the reverse is narrowed by
+#: provenance rather than by trust.
+#:
+#: A stamped prefix and not a heuristic. `_RETIREMENTS` warns against parsing
+#: free-text `blocked_reason`s for meaning, and that warning stands: this
+#: string is written by this module, matched exactly, and never inferred. It is
+#: deliberately the cheapest representation that is reversible — a dedicated
+#: `blocked_by` field would be the same idea with a schema change and a
+#: migration behind it, and can replace this without changing either method's
+#: contract.
+OPERATOR_HOLD_PREFIX = "operator hold: "
+
+#: Statuses whose task FIELDS (description, approved_paths, depends_on) an
+#: operator may still rewrite: the task is still ahead of the loop, so nothing
+#: is currently being judged against them.
+#:
+#: `in_progress` is excluded because every one of those fields is live during a
+#: dispatch — see `TaskRegistry._refuse_immutable` for what each one strands.
+#: `completed` and `retired` are excluded because they are terminal records:
+#: rewriting the scope a finished commit was checked against, or the
+#: description of work that shipped under another id, edits history rather than
+#: steering the queue.
+#:
+#: `blocked` IS mutable, and that is the point — correcting a description or
+#: widening a scope is exactly what a quarantined task usually needs before its
+#: blocker can be answered.
+_MUTABLE_STATUSES = frozenset({"pending", "blocked"})
 
 
 def is_directory_prefix(approved: str) -> bool:
@@ -460,28 +584,13 @@ class TaskRegistry:
                     "empty_task_field", f"task '{task.id}' needs a title"
                 )
             _validate_description(task.id, task.description)
-            seen_paths: set[str] = set()
-            for approved in task.approved_paths:
-                _validate_approved_path(approved)
-                if approved in seen_paths:
-                    raise TaskGraphError(
-                        "duplicate_approved_path",
-                        f"task '{task.id}' lists approved path {approved!r} more than once",
-                    )
-                seen_paths.add(approved)
+            task.approved_paths = _validate_approved_paths(task.id, task.approved_paths)
             task.superseded_by = _validate_superseded_by(task.id, task.superseded_by)
             candidate[task.id] = task
+        # A second pass, after every task in the batch is in `candidate`, so a
+        # dependency on a task added by this same call resolves.
         for task in tasks:
-            for dep in task.depends_on:
-                if dep not in candidate:
-                    raise TaskGraphError(
-                        "unknown_dependency",
-                        f"task '{task.id}' depends on unknown task '{dep}'",
-                    )
-                if dep == task.id:
-                    raise TaskGraphError(
-                        "dependency_cycle", f"task '{task.id}' depends on itself"
-                    )
+            task.depends_on = _validate_depends_on(task.id, task.depends_on, candidate)
         _check_acyclic(candidate)
         self._tasks = candidate
 
@@ -808,32 +917,231 @@ class TaskRegistry:
         task.priority = priority
         return task
 
+    def _refuse_immutable(self, task: Task, field: str) -> None:
+        """Raise unless `task`'s content fields may still be rewritten.
+
+        THE strand guard, shared by `set_description`, `set_approved_paths` and
+        `set_depends_on` so the three cannot disagree about when an edit is
+        safe. `set_priority` deliberately does NOT call it: priority only
+        orders `next_ready()`, so changing it on a running or finished task is
+        meaningless rather than damaging, and narrowing it now would break the
+        one mutation the dashboard already queues.
+
+        Why `in_progress` is the sharp one — each field is being judged against
+        RIGHT NOW by a dispatch that has already started, and in every case the
+        task ends up somewhere no command can move it from:
+
+          * `depends_on` — `state_of` checks dependencies BEFORE the
+            in_progress branch, so a new incomplete dependency reports the task
+            as BLOCKED. `mark_completed` then refuses it ("cannot complete
+            while dependencies are incomplete") and `release` refuses it too
+            (it demands `state_of(...) is IN_PROGRESS`). The round finishes,
+            the work is pushed, and the task can be neither completed nor
+            returned to pending.
+          * `approved_paths` — the dispatch was authorized against the OLD
+            scope, and the post-commit ownership check runs against the new
+            one. The agent's legitimate writes read as unauthorized paths and
+            the task parks `task_fatal`.
+          * `description` — the instructions the agent is working from were
+            sent at dispatch. Rewriting them mid-round cannot reach the agent,
+            and leaves the record disagreeing with what was actually asked, so
+            the review packet describes work nobody requested.
+
+        Deliberately checked on the STORED `status`, never on `state_of()`.
+        `state_of` reports BLOCKED for an in-progress task with an incomplete
+        dependency (the check runs first, see above), so a `state_of`-based
+        guard would fall silent on precisely the task that is already in the
+        stranded shape.
+        """
+        if task.status in _MUTABLE_STATUSES:
+            return
+        if task.status == "in_progress":
+            raise TaskGraphError(
+                "task_in_progress",
+                f"task '{task.id}' is in progress — its {field} is what the running "
+                "dispatch is being judged against, and changing it now would strand "
+                "the round (neither completable nor releasable). Wait for it to "
+                "finish, or `python -m autoloop release` it first",
+            )
+        if task.status == "completed":
+            raise TaskGraphError(
+                "task_completed",
+                f"task '{task.id}' is already completed — rewriting its {field} "
+                "edits the record of work that already shipped; plan a new task",
+            )
+        if task.status == "retired":
+            raise TaskGraphError(
+                "task_retired",
+                f"task '{task.id}' is retired{_successor_hint(task)} — a retirement "
+                f"is history and its {field} is never rewritten; plan a new task",
+            )
+        raise TaskGraphError(  # pragma: no cover - no other status exists today
+            "task_not_mutable",
+            f"task '{task.id}' has status {task.status!r}, which cannot be edited",
+        )
+
     def set_description(self, task_id: str, description: str) -> Task:
         """Rewrite an existing task's description.
 
-        Registry primitive, deliberately with NO operator route to it. A
-        description is what a write-capable agent reads as its instructions,
-        which puts it in the same class as `approved_paths` rather than
-        `priority` — `inbox.py` says so in as many words, and refuses a general
-        "edit a task" request for exactly that reason. Exposing this through
-        the inbox or a localhost form is therefore a separate decision that has
-        to revisit that comment; it is not a follow-up this method implies.
+        Reachable from the inbox since 2026-08-16 as `kind: "description"`.
+        The docstring here used to say the opposite — "deliberately with NO
+        operator route to it" — and named the decision that would have to be
+        revisited before one existed. This is that decision, so it is recorded
+        rather than quietly reversed: a description IS agent instructions, and
+        what makes exposing it acceptable is not that it stopped being
+        authorization surface but that `_refuse_immutable` keeps it out of
+        reach of any task a dispatch is currently reading. See
+        `inbox.KIND_DESCRIPTION` and `docs/SECURITY.md` S28.
 
         Validation is `_validate_description`, the SAME function creation goes
         through, so a description the registry would refuse to create a task
         with cannot be written onto an existing one either.
 
-        Rejection is atomic: the lookup and the validation both run before the
-        single assignment, so a refused call leaves the registry exactly as it
-        was rather than half-mutated. An unknown id raises `task_unknown` via
-        `get`, like every other mutator here — `set_priority`'s hand-rolled
-        `unknown_task` is the outlier, and it is left alone because that code
-        string reaches the operator through the inbox's refusal text.
+        Rejection is atomic: the lookup, the strand guard and the validation
+        all run before the single assignment, so a refused call leaves the
+        registry exactly as it was rather than half-mutated. An unknown id
+        raises `task_unknown` via `get`, like every other mutator here —
+        `set_priority`'s hand-rolled `unknown_task` is the outlier, and it is
+        left alone because that code string reaches the operator through the
+        inbox's refusal text.
         """
         task = self.get(task_id)
+        self._refuse_immutable(task, "description")
         _validate_description(task_id, description)
         task.description = description
         return task
+
+    def set_approved_paths(self, task_id: str, paths) -> Task:
+        """Replace an existing task's authorization scope.
+
+        REPLACES, never merges. An operator correcting a scope has to be able
+        to take a path away, and a merging mutator can only ever widen — which
+        would make this a one-way ratchet on the field that decides what an
+        agent may write.
+
+        Clearing it to `()` is legal and means "no scope authorized": that is
+        the state `effective_approved_paths` keeps empty and
+        `_dispatch_task_postcommit` refuses to dispatch, so revoking a scope
+        parks the task rather than silently granting the trackers. Creation
+        goes the other way (`dashboard._submit_task` refuses an empty list)
+        because a NEW task with no scope is an undispatchable trap, while an
+        EXISTING one being un-authorized is the whole point.
+
+        Validation is `_validate_approved_paths`, the same function
+        `add_many` calls, so a scope the registry would refuse to create a task
+        with cannot be written onto an existing one — including the duplicate
+        rule, which is why that check was extracted rather than reused by eye.
+
+        Atomic: shape, every path and the duplicate rule are all checked before
+        the single assignment.
+        """
+        task = self.get(task_id)
+        self._refuse_immutable(task, "approved_paths")
+        task.approved_paths = _validate_approved_paths(task_id, paths)
+        return task
+
+    def set_depends_on(self, task_id: str, depends_on) -> Task:
+        """Replace an existing task's dependencies.
+
+        REPLACES, for the same reason `set_approved_paths` does: an operator
+        who cannot remove a dependency cannot correct a mistaken one, and a
+        task waiting on a dependency that will never complete is stuck forever
+        (`state_of` only counts `completed` as satisfied — see `retire`'s
+        closing note).
+
+        Validation is `_validate_depends_on` (shape, known ids, no self-edge)
+        followed by `_check_acyclic`, which is what creation runs; the cycle
+        check needs the whole graph, so it runs against a CANDIDATE copy
+        carrying the new edges. That ordering is the atomicity guarantee: a
+        refused call never touches `self._tasks`, so the registry cannot be
+        left holding a cycle that has to be reverted.
+        """
+        task = self.get(task_id)
+        self._refuse_immutable(task, "depends_on")
+        deps = _validate_depends_on(task_id, depends_on, self._tasks)
+        candidate = dict(self._tasks)
+        candidate[task_id] = replace(task, depends_on=deps)
+        _check_acyclic(candidate)
+        task.depends_on = deps
+        return task
+
+    def operator_block(self, task_id: str, reason: str) -> Task:
+        """Hold a task out of the queue at an operator's request.
+
+        NOT a second `block`. `block` records a `task_fatal` park and its only
+        caller (`cli._handle_parked_task`) blocks a task that is by definition
+        `in_progress` — it was dispatched, it parked, nothing cleared the
+        status. Putting the strand guard inside `block` would therefore turn
+        every park into a `loop_fatal` escalation, because that caller
+        fail-closes on any refusal. So the guard lives here, in the
+        operator-facing entry point, and `block` stays exactly as it was.
+
+        Three refusals, all before the delegate writes anything:
+
+          * `in_progress` — quarantining a running round strands it. The round
+            finishes and pushes, then `mark_completed` refuses
+            (`task_blocked_by_operator`), which is the B10 failure deliberately
+            rather than accidentally.
+          * already `blocked` — `block` is idempotent and REFRESHES the reason,
+            which is right for a park that re-fires and wrong here: it would
+            overwrite the recorded account of a real quarantine with an
+            operator's note, and stamp it as releasable through the inbox.
+          * `completed` / `retired` — delegated to `block`, which already
+            refuses both.
+
+        The reason is stamped with `OPERATOR_HOLD_PREFIX` so
+        `operator_unblock` can tell this apart from a loop-raised quarantine.
+        """
+        task = self.get(task_id)
+        if not isinstance(reason, str) or not reason.strip():
+            raise TaskGraphError(
+                "empty_task_field",
+                f"holding task '{task_id}' needs a non-empty reason — a hold with no "
+                "account of why is the free-text blocker problem, not a fix for it",
+            )
+        if task.status == "in_progress":
+            raise TaskGraphError(
+                "task_in_progress",
+                f"task '{task_id}' is in progress — holding it now would strand the "
+                "round, which would finish and then be refused completion. Wait for "
+                "it, or `python -m autoloop release` it first",
+            )
+        if task.status == "blocked":
+            raise TaskGraphError(
+                "task_blocked_by_operator",
+                f"task '{task_id}' is already blocked and its reason is on record "
+                f"({task.blocked_reason or '(none recorded)'}) — an operator hold "
+                "must not overwrite it",
+            )
+        return self.block(task_id, OPERATOR_HOLD_PREFIX + reason)
+
+    def operator_unblock(self, task_id: str) -> Task:
+        """Reverse of `operator_block`, and ONLY of that.
+
+        The reason this pair exists rather than a bare `block` request kind: a
+        hold placed through the inbox creates no `blockers.Blocker` record, and
+        `python -m autoloop answer` — the only route out of `blocked` — takes a
+        blocker id and unblocks the task that blocker names. There is no
+        standalone `unblock` command. So an inbox that could block and not
+        unblock would write a state with no way back.
+
+        Narrowed by provenance, not by trust: a task quarantined by the loop
+        carries a reason this module did not stamp, and releasing it here would
+        put it back in `ready_tasks()` with its blocker still open and
+        unanswered. Those go through `answer`, which resolves both halves
+        together.
+        """
+        task = self.get(task_id)
+        if task.status == "blocked" and not task.blocked_reason.startswith(
+            OPERATOR_HOLD_PREFIX
+        ):
+            raise TaskGraphError(
+                "task_blocked_by_operator",
+                f"task '{task_id}' was quarantined by the loop, not held by an "
+                "operator — resolve its blocker with `python -m autoloop answer`, "
+                "which records the answer and unblocks the task together",
+            )
+        return self.unblock(task_id)
 
     def next_ready(self) -> Task | None:
         """Highest-priority ready task; ties broken by id.

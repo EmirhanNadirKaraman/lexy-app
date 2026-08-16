@@ -1755,6 +1755,55 @@ non-local `Origin`. Both are cheap mitigations against a local page in the same
 browser, not claimed to be more; the blast radius is bounded by what the
 endpoint can express.
 
+**Mutating an existing task (2026-08-16).** The vocabulary was `task` (create)
+and `priority`. It is now `task` plus six mutation kinds — `priority`,
+`description`, `approved_paths`, `depends_on`, `block`, `unblock` — each
+carrying a task id and its one field, and nothing else. There is still no CLI
+flag or dashboard form for the new five: the only way to queue one today is to
+write the JSON file (or call `TaskInbox.submit_mutation`), which is
+deliberately the same capability as editing the inbox directory.
+
+The paragraph above says a `priority` request was kept deliberately narrow
+because `approved_paths` is authorization surface. That reasoning still names
+the real hazard, but the hazard was never *which field* — it was *edited
+against what*. Four things carry it:
+
+1. **The registry decides.** Submission checks SHAPE only (is the field there,
+   is it the right JSON type). Every question about content goes to the same
+   validator creation uses — `_validate_description`,
+   `_validate_approved_paths`, `_validate_depends_on` + `_check_acyclic` — so
+   a mutation cannot express what a `plan` or `seed_tasks.json` could not, and
+   a refusal reaches the operator in one authority's words.
+2. **Nothing in flight is editable.** `TaskRegistry._refuse_immutable` refuses
+   `description`, `approved_paths` and `depends_on` on an `in_progress` task,
+   because a dispatch is being judged against all three right now: a new
+   dependency makes the finished round fail BOTH `mark_completed` and
+   `release`, and a swapped scope makes the agent's own writes read as
+   unauthorized. It refuses `completed` and `retired` too — those are records.
+   `blocked` stays editable, which is the point: correcting a scope is what a
+   quarantined task usually needs before its blocker can be answered.
+3. **Blocking has a reverse.** A hold placed here writes no `Blocker` record,
+   and `answer` — the only route out of `blocked` — takes a blocker id, so
+   `block` without `unblock` would be a one-way door. `operator_block` stamps
+   the reason and refuses an already-blocked task; `operator_unblock` releases
+   only what carries that stamp, so an inbox request can neither overwrite a
+   real quarantine's recorded reason nor return a quarantined task to the
+   ready queue with its blocker still open.
+4. **`retire` is not in the vocabulary**, and must not be added: it is
+   written-once with no reverse at all.
+
+Requests apply in submission order in a single pass — last write wins, and a
+mutation queued before its target exists is refused rather than deferred.
+Recorded as `docs/SECURITY.md` S30, which also states what would make it
+worse: putting these kinds behind the unauthenticated localhost POST.
+
+**Known gap.** The dashboard's queued-request line branches on
+`kind === "priority"` versus everything else, so a hand-written mutation of any
+other kind currently displays as `new task <id> (priority 100) may write:
+nothing — undispatchable` — reachable by the only route there is today, and
+wrong in the reassuring direction. The drain output is the reliable record
+until the follow-up task that adds operator routes fixes the renderer.
+
 **Priorities.** `Task.priority` is an ascending integer — 1 outranks 2, the
 default 100 sorts last, ties break on id so selection stays deterministic.
 `next_ready()` orders by it instead of insertion order, which is the point: an

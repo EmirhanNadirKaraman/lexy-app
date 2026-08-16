@@ -292,6 +292,301 @@ def test_a_rejected_description_leaves_the_registry_byte_identical():
     assert json.dumps(reg.to_dict(), sort_keys=True) == before
 
 
+# ---- approved_paths + depends_on mutation -----------------------------------
+
+
+def test_set_approved_paths_replaces_rather_than_merges():
+    """REPLACES, on purpose. A merging mutator can only ever widen the field
+    that decides what an agent may write, which makes correcting a mistaken
+    scope impossible — a one-way ratchet on authorization."""
+    reg = registry(task("a"))
+    reg.set_approved_paths("a", ["autoloop/inbox.py", "autoloop/tasks.py"])
+    reg.set_approved_paths("a", ["autoloop/tasks.py"])
+    assert reg.get("a").approved_paths == ("autoloop/tasks.py",)
+
+
+def test_set_approved_paths_can_revoke_a_scope_entirely():
+    """Clearing to () means "no scope authorized", which
+    `effective_approved_paths` keeps empty and dispatch refuses. Revoking must
+    park the task, not silently hand it the always-allowed trackers."""
+    from autoloop.tasks import effective_approved_paths
+
+    reg = registry(task("a"))
+    reg.set_approved_paths("a", ["autoloop/inbox.py"])
+    reg.set_approved_paths("a", [])
+    assert reg.get("a").approved_paths == ()
+    assert effective_approved_paths(reg.get("a").approved_paths) == ()
+
+
+#: Scopes the shared validator refuses, one per branch of
+#: `_validate_approved_paths`: a glob, a traversal, an absolute path, a
+#: duplicate entry, and the bare string that used to be iterated per character.
+BAD_SCOPES = [
+    ["autoloop/*.py"],
+    ["../secrets.txt"],
+    ["/etc/passwd"],
+    ["autoloop/inbox.py", "autoloop/inbox.py"],
+    "autoloop/inbox.py",
+]
+
+
+@pytest.mark.parametrize("bad", BAD_SCOPES)
+def test_creation_and_mutation_reject_a_bad_scope_identically(bad):
+    """The reason `_validate_approved_paths` was extracted rather than reused
+    by eye: the duplicate rule used to live inline in `add_many` and nowhere
+    else, so a mutation calling only the singular `_validate_approved_path`
+    could write a scope creation refuses. Comparing the MESSAGE is what makes
+    this load-bearing — a re-implemented check would word its refusal
+    differently."""
+    with pytest.raises(TaskGraphError) as created:
+        registry(Task(id="t1", title="T", description="d", approved_paths=bad))
+    reg = registry(task("t1"))
+    with pytest.raises(TaskGraphError) as mutated:
+        reg.set_approved_paths("t1", bad)
+    assert created.value.code == mutated.value.code
+    assert str(created.value) == str(mutated.value)
+
+
+def test_a_rejected_scope_leaves_the_registry_byte_identical():
+    """The duplicate is the second entry, so a validator that checked as it
+    assigned would already have written the first one."""
+    reg = registry(task("a"))
+    reg.set_approved_paths("a", ["autoloop/inbox.py"])
+    before = json.dumps(reg.to_dict(), sort_keys=True)
+    expect_code(
+        lambda: reg.set_approved_paths("a", ["docs/TESTS.md", "docs/TESTS.md"]),
+        "duplicate_approved_path",
+    )
+    assert json.dumps(reg.to_dict(), sort_keys=True) == before
+
+
+def test_set_depends_on_replaces_and_redrives_the_derived_state():
+    """Ready/blocked is DERIVED, never stored, so a dependency change must move
+    the state with no second write anywhere."""
+    reg = registry(task("a"), task("b"))
+    assert reg.state_of("b") is TaskState.READY
+    reg.set_depends_on("b", ["a"])
+    assert reg.state_of("b") is TaskState.BLOCKED
+    reg.set_depends_on("b", [])
+    assert reg.state_of("b") is TaskState.READY
+
+
+def test_set_depends_on_refuses_an_unknown_task_a_cycle_and_a_self_edge():
+    reg = registry(task("a"), task("b", deps=["a"]))
+    expect_code(lambda: reg.set_depends_on("a", ["ghost"]), "unknown_dependency")
+    expect_code(lambda: reg.set_depends_on("a", ["a"]), "dependency_cycle")
+    # a -> b -> a. Only `_check_acyclic` catches this one: every id is known
+    # and no edge is a self-edge, so the per-entry checks all pass.
+    expect_code(lambda: reg.set_depends_on("a", ["b"]), "dependency_cycle")
+
+
+def test_a_rejected_dependency_change_leaves_the_registry_byte_identical():
+    """The cycle check needs the whole graph, so the tempting implementation is
+    assign-then-check-then-revert. This fails that one: `to_dict` is compared
+    over the entire registry, and a revert that misses `depends_on`'s tuple
+    identity or leaves the edge in place shows up here."""
+    reg = registry(task("a"), task("b", deps=["a"]), task("c"))
+    before = json.dumps(reg.to_dict(), sort_keys=True)
+    expect_code(lambda: reg.set_depends_on("a", ["b"]), "dependency_cycle")
+    assert json.dumps(reg.to_dict(), sort_keys=True) == before
+    assert reg.get("a").depends_on == ()
+
+
+@pytest.mark.parametrize("bad", ["ab", None, 7, ["has space"], [None]])
+def test_creation_and_mutation_reject_bad_dependencies_identically(bad):
+    """Same parity rule as descriptions and scopes. `"ab"` is the interesting
+    entry: creation used to iterate it per character and refuse it as
+    `unknown task 'a'`, naming a task nobody wrote."""
+    with pytest.raises(TaskGraphError) as created:
+        registry(task("x"), Task(id="t1", title="T", description="d", depends_on=bad))
+    reg = registry(task("x"), task("t1"))
+    with pytest.raises(TaskGraphError) as mutated:
+        reg.set_depends_on("t1", bad)
+    assert created.value.code == mutated.value.code
+    assert str(created.value) == str(mutated.value)
+
+
+# ---- the strand guard -------------------------------------------------------
+
+
+#: Every mutator that rewrites a field a live dispatch is judged against.
+#: `set_priority` is deliberately absent — it only orders `next_ready()`.
+CONTENT_MUTATIONS = [
+    ("set_description", "a new description"),
+    ("set_approved_paths", ["autoloop/tasks.py"]),
+    ("set_depends_on", []),
+]
+
+
+@pytest.mark.parametrize("method,value", CONTENT_MUTATIONS)
+def test_an_in_progress_task_cannot_be_edited(method, value):
+    """The strand: a dispatch has already started and is being judged against
+    all three fields. `depends_on` is the worst — a new incomplete dependency
+    makes `state_of` report BLOCKED, and from there `mark_completed` refuses
+    the finished round AND `release` refuses to return it to pending, so the
+    task is stuck with no command able to move it."""
+    reg = registry(task("a"))
+    reg.mark_in_progress("a")
+    expect_code(lambda: getattr(reg, method)("a", value), "task_in_progress")
+
+
+def test_the_strand_guard_reads_stored_status_not_the_derived_state():
+    """The mutation check that matters most. `state_of` tests dependencies
+    BEFORE the in_progress branch, so an in-progress task that already has an
+    incomplete dependency reports BLOCKED — and a guard written as
+    `state_of(...) is IN_PROGRESS` would fall silent on exactly the task that
+    is already in the stranded shape.
+
+    Built through `from_dict`, which is where this shape really comes from:
+    that path deliberately bypasses `add_many` (re-validating a stored graph
+    would reject states only the running loop can produce), so a `tasks.json`
+    carrying an in-progress task whose dependency is not complete loads
+    exactly as written."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "dep", "title": "D", "description": "d", "status": "pending"},
+            {"id": "a", "title": "A", "description": "d", "status": "in_progress",
+             "depends_on": ["dep"]},
+        ],
+    })
+    assert reg.state_of("a") is TaskState.BLOCKED, "the trap this guard walks into"
+    assert reg.get("a").status == "in_progress", "but it IS still running"
+    expect_code(lambda: reg.set_description("a", "rewritten"), "task_in_progress")
+
+
+@pytest.mark.parametrize("method,value", CONTENT_MUTATIONS)
+def test_terminal_records_are_not_editable(method, value):
+    """Completed and retired tasks are records, not queue. Rewriting the scope
+    a finished commit was checked against, or the description of work that
+    shipped under a successor's id, edits history."""
+    reg = registry(task("done"), task("gone"))
+    reg.mark_completed("done")
+    reg.retire("gone", superseded_by=["done"])
+    expect_code(lambda: getattr(reg, method)("done", value), "task_completed")
+    expect_code(lambda: getattr(reg, method)("gone", value), "task_retired")
+
+
+@pytest.mark.parametrize("method,value", CONTENT_MUTATIONS)
+def test_a_quarantined_task_stays_editable(method, value):
+    """`blocked` is mutable and that is the point: correcting a description or
+    widening a scope is what a quarantined task usually needs BEFORE its
+    blocker can be answered. A guard that refused every non-pending status
+    would make the fix unreachable."""
+    reg = registry(task("a"))
+    reg.block("a", "the executor could not find the file")
+    getattr(reg, method)("a", value)
+    assert reg.state_of("a") is TaskState.BLOCKED_BY_OPERATOR, "still quarantined"
+
+
+def test_priority_is_still_editable_on_a_running_task():
+    """Not an oversight. Priority only orders `next_ready()`, so it cannot
+    strand anything — and it is the one mutation the dashboard already
+    queues, so narrowing it here would break a shipped route."""
+    reg = registry(task("a"))
+    reg.mark_in_progress("a")
+    assert reg.set_priority("a", 1).priority == 1
+
+
+# ---- operator holds ---------------------------------------------------------
+
+
+def test_an_operator_hold_is_reversible_through_its_own_pair():
+    """The whole reason `operator_block`/`operator_unblock` exist. A hold
+    placed through the inbox writes no `blockers.Blocker` record, and
+    `python -m autoloop answer` — the only route out of `blocked` — takes a
+    blocker id. Without the reverse, holding a task would be a one-way door."""
+    from autoloop.tasks import OPERATOR_HOLD_PREFIX
+
+    reg = registry(task("a"))
+    held = reg.operator_block("a", "waiting on the API key")
+    assert reg.state_of("a") is TaskState.BLOCKED_BY_OPERATOR
+    assert held.blocked_reason == OPERATOR_HOLD_PREFIX + "waiting on the API key"
+
+    reg.operator_unblock("a")
+    assert reg.state_of("a") is TaskState.READY
+    assert reg.get("a").blocked_reason == ""
+
+
+def test_the_operator_reverse_will_not_release_a_loop_raised_quarantine():
+    """Narrowed by provenance, not by trust. A `task_fatal` park is resolved by
+    `answer`, which resolves the blocker record and unblocks the task together.
+    If this reverse released it too, anything able to write to the inbox could
+    put a quarantined task straight back into `ready_tasks()` with its blocker
+    still open and unanswered."""
+    reg = registry(task("a"))
+    reg.block("a", "validation failed three times")
+    expect_code(lambda: reg.operator_unblock("a"), "task_blocked_by_operator")
+    assert reg.state_of("a") is TaskState.BLOCKED_BY_OPERATOR
+    assert reg.get("a").blocked_reason == "validation failed three times"
+    # `answer`'s route is unaffected — it calls `unblock` directly.
+    reg.unblock("a")
+    assert reg.state_of("a") is TaskState.READY
+
+
+def test_an_operator_hold_never_overwrites_a_recorded_quarantine():
+    """`block` is idempotent and REFRESHES the reason, which is right for a
+    park that re-fires and wrong here: it would replace the account of a real
+    failure with an operator's note AND stamp it as inbox-releasable, which is
+    the previous test's guard laundered away."""
+    reg = registry(task("a"))
+    reg.block("a", "validation failed three times")
+    expect_code(
+        lambda: reg.operator_block("a", "actually let us pause this"),
+        "task_blocked_by_operator",
+    )
+    assert reg.get("a").blocked_reason == "validation failed three times"
+
+
+def test_an_operator_hold_is_refused_on_a_running_task():
+    """Holding a running round strands it: the round finishes and pushes, and
+    then `mark_completed` refuses it as quarantined (the B10 failure, which is
+    deliberate there and must not be reachable on purpose from here)."""
+    reg = registry(task("a"))
+    reg.mark_in_progress("a")
+    expect_code(lambda: reg.operator_block("a", "pause this"), "task_in_progress")
+    assert reg.get("a").status == "in_progress"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", None])
+def test_an_operator_hold_needs_a_reason(bad):
+    """A hold with no account of why is the free-text blocker problem, not a
+    fix for it — and the refusal must come before anything is written."""
+    reg = registry(task("a"))
+    expect_code(lambda: reg.operator_block("a", bad), "empty_task_field")
+    assert reg.get("a").status == "pending"
+
+
+def test_the_operator_pair_delegates_the_terminal_refusals():
+    """`operator_block` adds guards, it does not re-implement `block`'s — and
+    `block` itself is left untouched because its own caller
+    (`cli._handle_parked_task`) blocks a task that is by definition
+    in_progress, and fail-closes to loop_fatal on any refusal."""
+    reg = registry(task("done"), task("gone"))
+    reg.mark_completed("done")
+    reg.retire("gone")
+    expect_code(lambda: reg.operator_block("done", "why"), "task_completed")
+    expect_code(lambda: reg.operator_block("gone", "why"), "task_retired")
+    expect_code(lambda: reg.operator_unblock("gone"), "task_retired")
+    expect_code(lambda: reg.operator_unblock("done"), "task_not_blocked")
+
+
+def test_an_operator_hold_survives_persistence(tmp_path):
+    """The marker lives in `blocked_reason`, which round-trips like any other
+    field — so a hold placed before a restart is still releasable after one."""
+    from autoloop.tasks import OPERATOR_HOLD_PREFIX
+
+    store = TaskStore(tmp_path / "tasks.json")
+    reg = registry(task("a"))
+    reg.operator_block("a", "waiting on review")
+    store.save(reg)
+
+    loaded = store.load()
+    assert loaded.get("a").blocked_reason.startswith(OPERATOR_HOLD_PREFIX)
+    loaded.operator_unblock("a")
+    assert loaded.state_of("a") is TaskState.READY
+
+
 # ---- persistence ------------------------------------------------------------
 
 

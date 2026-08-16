@@ -39,6 +39,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S22 | INFO | `commit_adopted` is sound but has no production call site (tracked, not a vulnerability) | `autoloop/git_gateway.py`, `autoloop/manifest.py` |
 | S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered. Amended 2026-08-16: derived bytecode (`__pycache__/*.pyc` whose sibling `.py` is a regular file in the same snapshot side(s) — never `.pyo`, never a symlinked source) is exempt from the snapshot diff after three false loop-fatal parks — a forged cache entry whose header matches its source is the new, named residual | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
+| S30 | MEDIUM | The inbox vocabulary grew from create+priority to six mutation kinds, so a queued request can now rewrite an EXISTING task's `approved_paths` and `description` — falsifying S28's "it creates, never widens" bound. Guarded: nothing `in_progress`/`completed`/`retired` is editable, mutations share creation's validators, `block`/`unblock` cannot launder a loop-raised quarantine, `retire` is excluded, and no dashboard endpoint reaches any of it | `autoloop/inbox.py`, `autoloop/tasks.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -398,9 +399,11 @@ What bounds it, stated rather than assumed:
   `_validate_approved_path` refuses globs, `..`, absolute and `~` paths, and
   backslashes; `escape_detector.find_symlink_traversal` re-checks symlink
   traversal at dispatch. None of that asks whether the path was *wanted*.
-- **It creates, never widens.** There is deliberately no request kind that
-  edits an existing task's `approved_paths` — `inbox.KINDS` is
-  `("task", "priority")` and the priority branch refuses every other field.
+- ~~**It creates, never widens.**~~ **No longer true — see S30.** This bullet
+  said `inbox.KINDS` was `("task", "priority")` and that no request kind could
+  edit an existing task's `approved_paths`. Since 2026-08-16 one can. Kept
+  struck through rather than deleted: it is the assumption the rest of this
+  finding's blast-radius argument was sized against.
 - **Visible before it runs.** `_pending_inbox` carries the paths and the page
   prints them per queued request, and the loop's drain reports each merge.
 - **Same trust boundary as the rest.** Anything that can post here can also
@@ -422,8 +425,9 @@ rg -n 'write_text|mkdir|open\(|subprocess\.run' autoloop/dashboard.py
 rg -n '_validate_approved_path|APPROVED_PATH|glob|fnmatch' autoloop/dashboard.py
 # Expect: creation cannot smuggle validation commands or dependencies
 rg -n 'TASK_REQUEST_FIELDS' autoloop/dashboard.py
-# Expect: no request kind edits an existing task's scope
-rg -n 'KINDS = ' autoloop/inbox.py
+# Expect: the page still posts ONLY /api/priority and /api/task — no endpoint
+# reaches the mutation kinds S30 added (no _submit_mutation, no submit_mutation)
+rg -n 'submit_mutation|/api/(description|approved|depends|block|unblock)' autoloop/dashboard.py
 ```
 **Suggested fix (if the page ever leaves a single-operator machine):** require
 a per-process token printed by `main()` and sent as a header — cheap, and it
@@ -431,6 +435,104 @@ distinguishes "the operator's tab" from "a local process". Do NOT fix it by
 validating paths inside `dashboard.py`: a second rule set would drift from
 `add_many`, which is the failure S25 closed. Binding anything other than
 `127.0.0.1` must stay out of the question.
+
+### S30 — An inbox request can now rewrite an existing task's `approved_paths` — MEDIUM — OPEN (bounded, accepted)
+
+**What:** the task inbox vocabulary was `task` (create) + `priority` (a task id
+and an integer). Since 2026-08-16 it also carries `description`,
+`approved_paths`, `depends_on`, `block` and `unblock`, each mutating an
+EXISTING task (`autoloop/inbox.py` `MUTATION_PAYLOAD`, applied by
+`apply_requests` through the matching `TaskRegistry` mutator).
+
+That directly falsifies S28's "it creates, never widens" bullet, which is why
+this is a new finding rather than an edit to that one. **Anything that can
+write a file into the inbox directory can now widen the scope a write-capable
+agent is authorized against**, where before it could only propose a new task
+carrying a new scope. The inbox is a plain directory beside `workers_root`,
+readable and writable by the operator's own user — so the actor is the same
+local user S28 already assumes, and what changed is what that actor can
+express, not who they are.
+
+Two capabilities are worth naming separately, because neither existed before:
+
+- **Widening in place.** A queued `approved_paths` mutation against a task the
+  reviewer has already looked at replaces its scope without the task appearing
+  as new anywhere. A creation request at least shows up as a new row.
+- **Rewriting instructions.** A `description` mutation rewrites what the
+  write-capable agent is told to do, on a task that has already been planned.
+
+What bounds it, stated rather than assumed:
+- **Nothing in flight can be touched.** `TaskRegistry._refuse_immutable`
+  refuses `description`, `approved_paths` and `depends_on` on an `in_progress`
+  task — so a scope cannot be swapped underneath a dispatch that is already
+  being judged against it — and on `completed`/`retired` tasks, so a finished
+  commit's authorization record cannot be rewritten after the fact.
+- **Same validator as creation.** `_validate_approved_paths` /
+  `_validate_depends_on` / `_validate_description` are called by BOTH
+  `add_many` and the mutators, so a mutation cannot express a scope creation
+  would refuse; `escape_detector.find_symlink_traversal` still re-checks
+  traversal at dispatch. As with S28 this is well-formedness, not intent.
+- **Blocking is reversible and cannot launder a quarantine.**
+  `operator_block` stamps `tasks.OPERATOR_HOLD_PREFIX` onto the reason and
+  refuses a task that is already `blocked`; `operator_unblock` releases only
+  what carries that stamp. So an inbox request can neither overwrite the
+  recorded reason of a real `task_fatal` quarantine nor return a quarantined
+  task to `ready_tasks()` with its blocker still open and unanswered — those
+  still go through `python -m autoloop answer`, which resolves both halves.
+- **`retire` is not in the vocabulary** and must not be added: it is
+  written-once with no reverse, so reaching it from here would create a state
+  the inbox cannot undo.
+- **Visible before it runs.** Every applied mutation is reported in the drain
+  output (`task_inbox_drained` in the loop's log, printed by `drain-inbox`),
+  and the queued request is a readable JSON file until then.
+- **No new route to it.** Nothing in `dashboard.py` or the `add-task` CLI
+  submits a mutation kind; today the only way to queue one is to write the
+  file, which is the same capability as editing the inbox directory directly.
+  **Wiring a dashboard endpoint to these kinds is the change that would make
+  this finding materially worse** — it would put scope rewriting behind an
+  unauthenticated localhost POST, which is exactly the step S28 flags.
+
+**Known gap in the visibility bound, stated rather than left to be found.** The
+dashboard's queued-request line branches on `kind === "priority"` versus
+everything else, so a queued mutation of any other kind renders as
+`new task <id> (priority 100) may write: nothing — undispatchable`. That is
+reachable by the exact route this finding documents as the intended one
+(hand-writing the file), not a theoretical case — and it misreads in the
+unhelpful direction: a queued `approved_paths` rewrite displays as a harmless
+undispatchable new task. `_pending_inbox` already carries the fields, so this
+is a renderer fix, not a data one; it is deliberately out of scope for
+inbox-02 (registry + vocabulary only) and is the first thing the follow-up
+task that adds routes should close. Until then the drain output — which does
+report every applied mutation correctly — is the reliable record, and the page
+is not.
+
+**file:line** — `autoloop/inbox.py` `MUTATION_PAYLOAD` / `TaskInbox.submit` /
+`_apply_mutation`; `autoloop/tasks.py` `_refuse_immutable`,
+`set_approved_paths`, `set_depends_on`, `operator_block`, `operator_unblock`,
+`OPERATOR_HOLD_PREFIX`.
+**Severity:** MEDIUM — same actor and same trust boundary as S28 (local write
+access as the operator), and the concrete gain is that a widened scope can be
+made to look like an untouched, already-reviewed task.
+**Verification check:**
+```bash
+# Expect: exactly the six mutation kinds, and NO 'retire' among them
+rg -n 'MUTATION_PAYLOAD|KIND_' autoloop/inbox.py
+# Expect: the strand/terminal guard is on all three content mutators
+rg -n '_refuse_immutable' autoloop/tasks.py
+# Expect: the inbox reverse releases only what operator_block stamped
+rg -n 'OPERATOR_HOLD_PREFIX' autoloop/tasks.py
+# Expect: no second validator — the mutators call what add_many calls
+rg -n '_validate_approved_paths|_validate_depends_on|_validate_description' autoloop/tasks.py
+# Expect: EMPTY — no unauthenticated endpoint reaches a mutation kind
+rg -n 'submit_mutation' autoloop/dashboard.py
+```
+**Suggested fix (if a route to these is ever added to the dashboard):** gate
+the mutation kinds behind the per-process token S28 already proposes, and do
+NOT let `approved_paths` be one of the fields the page can post — the priority
+form's original argument ("priority decides what runs next, `approved_paths`
+decides what an agent may touch, and only the first belongs on a form") is
+still the right line for an unauthenticated page, even though it is no longer
+the right line for the inbox file format.
 
 ### S29 — `merge` is on the git whitelist, and the loop now pushes the BASE branch — LOW — OPEN (deliberate, gated, accepted)
 
