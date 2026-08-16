@@ -261,6 +261,48 @@ validation_commands = [
   ["python3", "-m", "pytest", "autoloop/tests", "-q", "-m", "isolated", "-p", "no:cacheprovider"],
 ]
 
+[repo]
+# What the loop cannot infer about the repository it is pointed at. Every value
+# below defaults to the constant that used to be hardcoded for this repository,
+# so omitting the whole section behaves exactly as the loop did before it
+# existed — and filling it in is what lets the loop run against a different
+# repository at all.
+#
+# NOTHING HERE GRANTS AUTHORITY. Each setting says WHERE to read something the
+# repository itself states; none of them decides what an agent may write. That
+# line is deliberate, and it is why the always-approved documentation trackers
+# are NOT a key here: a tracker is granted to every scoped task without being
+# named in its approved_paths, and this file lives under the gitignored state
+# dir — so an edit here would widen every task's write scope with no diff anyone
+# reviews. The list is the fixed TRACKER_PATHS constant in autoloop/tasks.py;
+# change it for your repository by editing that constant, which is a reviewed
+# commit in your repository's own history (the package is vendored into the repo
+# it operates on). `tracker_paths = [...]` was briefly a setting on 2026-08-16
+# and was withdrawn in review — a config that still names it LOADS, prints a
+# notice saying the value was dropped, and is not affected by it. See
+# docs/SECURITY.md S31.
+#
+# Where this repo declares its APPLICATION database, and the key inside that
+# file. Used for exactly one refusal: a paths.validation_env_file below whose
+# DB_NAME equals the name declared here — i.e. validation pointed at the real
+# database, which the test suite would create and delete rows in.
+#
+# WHERE to look, never WHAT to refuse: the forbidden name is still read out of
+# the repository, so this cannot be used to forbid a name the repo does not
+# actually declare. Set env_example_file = "" if your repo declares no such
+# name anywhere; the refusal then does not apply (same as the file being
+# absent), and a dedicated throwaway database is entirely your responsibility.
+# That opt-out is the EXACT empty string only — a blank-looking "   " is refused
+# at load rather than read as one, so the guard is never switched off by a typo.
+env_example_file = ".env.example"
+env_example_db_key = "DB_NAME"
+# Where the dashboard's "Language-app tasks" panel reads the proposed backlog
+# from. A glob relative to the repo root; the NEWEST match by name wins, which
+# works because these reports are date-stamped. The exact empty string leaves
+# the panel empty, which is the right reading for a repo that files no audit
+# reports; padding is refused here too, for the same reason.
+audit_report_glob = "docs/AUDIT_*.md"
+
 [paths]
 # Runtime state (state.json, tasks.json, transcript.jsonl, diagnostics/, PAUSE).
 state_dir = ".autoloop"
@@ -293,7 +335,8 @@ workers_root = "~/.autoloop/workers"
 # missing key, a malformed line, an empty value, a symlink, a file not owned
 # by you, any group/world permission bit (`chmod 600`), a path inside this
 # checkout / the state dir / workers_root / the publisher dirs, and a DB_NAME
-# equal to the application database name this repo declares in `.env.example`.
+# equal to the application database name this repo declares (read from
+# [repo].env_example_file / env_example_db_key above).
 #
 # The database is created, written to and deleted from by the test suite. Use
 # a throwaway database, NOT the one the app runs on, and do NOT point this at

@@ -129,6 +129,64 @@ class ExecutorConfig:
     kind: str = "audit"  # audit | null (null = record-only dry run)
 
 
+#: This repository's own audit-report location, and the default for
+#: `RepoConfig.audit_report_glob`. Relative to the repo root, newest-by-NAME
+#: (the reports are date-stamped, `docs/AUDIT_<date>.md`), which is why the
+#: dashboard sorts them as strings rather than by mtime.
+DEFAULT_AUDIT_REPORT_GLOB = "docs/AUDIT_*.md"
+#: This repository's own declaration of its application database: the
+#: git-tracked example env file, and the key inside it. Defaults for
+#: `RepoConfig.env_example_file` / `env_example_db_key`; see
+#: `validation_env.repo_declared_db_name` for what that marker is and, more
+#: importantly, what it is not.
+DEFAULT_ENV_EXAMPLE_FILE = ".env.example"
+DEFAULT_ENV_EXAMPLE_DB_KEY = "DB_NAME"
+
+
+@dataclass(frozen=True)
+class RepoConfig:
+    """What the loop cannot infer about the TARGET REPOSITORY, minus anything
+    that grants authority.
+
+    Each setting here was a hardcoded constant naming this repository's own
+    conventions, which is the reason the loop could not be pointed at anything
+    else. Each default is the exact value that was hardcoded, so a config that
+    omits this section behaves identically to the code before the section
+    existed — that equivalence is what `test_config_repo_section.py` pins, and
+    it is the property to preserve if these ever change.
+
+    **Deliberately NOT a general escape hatch, and specifically not an
+    authorization surface.** Every setting below says WHERE to read something
+    the repository itself states; none of them decides what an agent may write.
+    The always-approved tracker list does decide that, and it is therefore NOT
+    here: it stays the fixed `tasks.TRACKER_PATHS` constant, because this file
+    lives under the gitignored state directory and an edit to it is not a
+    reviewed diff. That distinction is the whole shape of this section — see
+    `tasks.TRACKER_PATHS` and `docs/SECURITY.md` S31 for the design that was
+    tried and withdrawn, and `_migrate_retired_tracker_paths` below for what
+    happens to a config that still names the withdrawn key.
+    """
+
+    #: The git-tracked example env file that declares the APPLICATION database
+    #: name, and the key inside it. Used for exactly one refusal: a validation
+    #: env file pointed at that same database (`validation_env.
+    #: repo_declared_db_name`). Exactly `""` disables the refusal — honest for
+    #: a repository that declares no such name anywhere, and no worse than the
+    #: pre-existing behaviour when the file is simply absent. Only that exact
+    #: value: a blank-looking `"   "` is refused at load, so the disable is
+    #: always something the operator wrote on purpose.
+    env_example_file: str = DEFAULT_ENV_EXAMPLE_FILE
+    env_example_db_key: str = DEFAULT_ENV_EXAMPLE_DB_KEY
+    #: Where the dashboard reads the application backlog from — the newest
+    #: audit report, by name. A glob relative to the repo root; metacharacters
+    #: are the point here, unlike in `env_example_file`, so it is checked only
+    #: for being relative and traversal-free. Exactly `""` means the dashboard's
+    #: "Language-app tasks" panel stays empty, which is the correct reading for
+    #: a repository that files no audit reports — and, as above, only that exact
+    #: value; padding is refused rather than read as the opt-out.
+    audit_report_glob: str = DEFAULT_AUDIT_REPORT_GLOB
+
+
 #: The key retired on 2026-08-14. An existing config may still name it, and
 #: naming it still loads — but it is handled EXPLICITLY, never ignored: it is
 #: migrated onto `audit_agent_timeout_seconds` (see `_migrate_retired_timeout`)
@@ -220,6 +278,12 @@ class AutoloopConfig:
     codex: CodexConfig = CodexConfig()
     executor: ExecutorConfig = ExecutorConfig()
     audit: AuditConfig = AuditConfig()
+    #: What the TARGET repository declares about itself. Defaulted, and last
+    #: but one for the same reason `migration_notices` is last: every direct
+    #: `AutoloopConfig(...)` construction across the test suite predates it,
+    #: and each default is the constant that used to be hardcoded — so an
+    #: unaware caller gets exactly the previous behaviour.
+    repo: RepoConfig = RepoConfig()
     #: Operator-facing messages about retired keys this config still names —
     #: DATA, not a side effect. `load_config` stays pure: it never writes to a
     #: stream and holds no "already warned" global, so the notice text can be
@@ -388,7 +452,7 @@ class AutoloopConfig:
         return self.state_dir / "continuous_fingerprint.json"
 
 
-_SECTIONS = {"browser", "policy", "paths", "conversation", "codex", "executor", "audit"}
+_SECTIONS = {"browser", "policy", "paths", "conversation", "codex", "executor", "audit", "repo"}
 
 
 def _check_keys(section: str, data: dict, allowed: set[str]) -> None:
@@ -484,6 +548,164 @@ def _migrate_retired_timeout(audit_data: dict) -> tuple[str, ...]:
             ]
         ),
     )
+
+
+#: The `[repo]` key that existed for one unshipped round on 2026-08-16 and was
+#: withdrawn in review (port-02, `docs/SECURITY.md` S31). A config may still
+#: name it — `config.example.toml` advertised it — and naming it still loads,
+#: but it is handled EXPLICITLY and never applied. Same treatment, and the same
+#: reasoning, as `RETIRED_AGENT_TIMEOUT_KEY`.
+RETIRED_TRACKER_PATHS_KEY = "tracker_paths"
+
+
+def _migrate_retired_tracker_paths(repo_data: dict) -> tuple[str, ...]:
+    """Handle a config that still names `repo.tracker_paths`.
+
+    The key is CONSUMED (so it cannot reach `RepoConfig`) and its value is
+    DISCARDED (so it cannot authorize anything), and the operator is told both
+    facts. Three properties, all deliberate:
+
+    * **Never applied.** The always-approved tracker list is
+      `tasks.TRACKER_PATHS`, a constant in reviewed source, because this file
+      is gitignored and an edit to it is not a diff anyone reads. Honouring the
+      key is exactly the control that was withdrawn.
+    * **Not silently ignored.** A setting that loads and does nothing is worse
+      than a constant — it reads as configured while behaving otherwise — so
+      the notice says the value was dropped and names where the real list
+      lives. An operator who wanted those paths granted learns it here rather
+      than from a task parking on an unauthorized-path refusal.
+    * **Not a hard refusal.** Same call as `RETIRED_RESTART_SCRIPT`: the live
+      `.autoloop/config.toml` is not in this repository, so refusing at load
+      would make every command — `status`, `doctor`, the recovery commands —
+      fail on an unmigrated deployment the moment this landed, taking away the
+      tooling needed to fix it. The direction is safe either way: discarding
+      grants FEWER paths than the operator may believe, so the failure mode is
+      a refused task, never an over-authorized one.
+    """
+    if RETIRED_TRACKER_PATHS_KEY not in repo_data:
+        return ()
+    dropped = repo_data.pop(RETIRED_TRACKER_PATHS_KEY)
+    return (
+        "\n".join(
+            [
+                f"autoloop: NOTICE — repo.{RETIRED_TRACKER_PATHS_KEY} is NOT a "
+                "setting and its value was DROPPED, not applied. The "
+                "always-approved documentation trackers are the fixed "
+                "`TRACKER_PATHS` constant in autoloop/tasks.py.",
+                f"  Dropped: {dropped!r}.",
+                "  Why: a tracker is granted to EVERY scoped task without being "
+                "named in it, and this config file lives under the gitignored "
+                "state directory — so an edit here would widen every task's "
+                "write authorization without a diff anyone reviews. It was "
+                "briefly configurable on 2026-08-16 and withdrawn in review; "
+                "see docs/SECURITY.md S31.",
+                "  To change the list for this repository, edit TRACKER_PATHS in "
+                "autoloop/tasks.py — the package is vendored into the repository "
+                "it operates on, so that edit is a reviewed commit in this "
+                "repository's own history.",
+                f"  Silence this by deleting repo.{RETIRED_TRACKER_PATHS_KEY} "
+                "from your config.",
+            ]
+        ),
+    )
+
+
+def _repo_relative(section_key: str, value: str, *, allow_globs: bool) -> str:
+    """Raise `ConfigError` unless `value` is a plain repository-relative path.
+
+    Both `[repo]` path settings are joined onto a repo root the loop is handed,
+    so an absolute path or a `..` would read a file the operator did not point
+    the loop at — and the audit glob is passed to `Path.glob`, which raises
+    outright on an absolute pattern. `allow_globs` is the one difference:
+    `audit_report_glob` is a pattern by definition, while `env_example_file`
+    names one file and must not quietly match several.
+    """
+    if value.strip() != value or "\\" in value:
+        raise ConfigError(
+            f"repo.{section_key} must be a repository-relative path with no padding "
+            f"and '/' separators, got {value!r}"
+        )
+    if value.startswith(("/", "~")):
+        raise ConfigError(
+            f"repo.{section_key} must be relative to the repository root, got {value!r} "
+            "— it is resolved against a checkout the loop is pointed at, so an "
+            "absolute path would read something else entirely"
+        )
+    segments = value.split("/")
+    if any(seg in ("", ".", "..") for seg in segments):
+        raise ConfigError(
+            f"repo.{section_key} must not contain '..', '.', or an empty segment, "
+            f"got {value!r}"
+        )
+    if not allow_globs and any(ch in value for ch in "*?[]"):
+        raise ConfigError(
+            f"repo.{section_key} names one exact file and may not contain glob "
+            f"metacharacters, got {value!r}"
+        )
+    return value
+
+
+def _load_repo_section(data: dict) -> tuple[RepoConfig, tuple[str, ...]]:
+    """`[repo]`, validated, plus any operator notices it produced. Absent means
+    `RepoConfig()` — i.e. this repository's own constants, which is the
+    pre-configuration behaviour."""
+    raw = data.get("repo", {})
+    # Shape first, so `repo = "docs"` gets this loader's own error rather than
+    # `dict()`'s raw conversion complaint. Strict config means a malformed
+    # section is REPORTED as one; a `ValueError` about dictionary update
+    # sequences names neither the section nor what it should have been.
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"[repo] must be a table, got {raw!r} — write it as a section header "
+            '(`[repo]` followed by `key = "value"` lines), not as a bare key'
+        )
+    repo_data = dict(raw)
+    # BEFORE `_check_keys`, exactly like `_migrate_retired_timeout`: the key is
+    # consumed here, so it can never reach `RepoConfig`, and the operator gets
+    # the reason instead of a generic "unknown key".
+    notices = _migrate_retired_tracker_paths(repo_data)
+    _check_keys("repo", repo_data, {f.name for f in dataclasses.fields(RepoConfig)})
+
+    for key in ("env_example_file", "audit_report_glob"):
+        if key not in repo_data:
+            continue
+        value = repo_data[key]
+        if not isinstance(value, str):
+            raise ConfigError(f"repo.{key} must be a string, got {value!r}")
+        # EXACTLY empty is the documented opt-out; everything else is validated,
+        # including `"   "`. The test is `!= ""` rather than `.strip()` because
+        # the two are not the same refusal: blank-but-not-empty reaches
+        # `repo_declared_db_name`, which reads any non-declaring value as "this
+        # repository declares no application database" and returns `""` — so a
+        # stray space in `env_example_file` would turn the validation-database
+        # guard OFF while reading as configured. `_repo_relative` refuses
+        # padding, so routing every non-empty value through it is the whole fix;
+        # `""` is skipped rather than passed in because it would fail that
+        # function's empty-segment check.
+        if value != "":
+            _repo_relative(key, value, allow_globs=(key == "audit_report_glob"))
+
+    if "env_example_db_key" in repo_data:
+        key_name = repo_data["env_example_db_key"]
+        # `_KEY_RE`'s shape, spelled here rather than imported: this is the key
+        # LOOKED UP in the repository's example env file, and a value with
+        # spaces or an '=' in it could never match a parsed line anyway — so it
+        # is a silent no-match rather than a refusal, which is the failure mode
+        # this whole section exists to avoid.
+        if not isinstance(key_name, str) or not key_name.strip():
+            raise ConfigError(
+                f"repo.env_example_db_key must be a non-empty string, got {key_name!r} "
+                '— to turn the refusal off entirely, set env_example_file = "" instead, '
+                "so the intent is stated in one place rather than inferred from a "
+                "blank key"
+            )
+        if key_name.strip() != key_name or any(ch in key_name for ch in "= \t"):
+            raise ConfigError(
+                "repo.env_example_db_key must be a plain environment-variable name "
+                f"(no padding, no '=', no whitespace), got {key_name!r}"
+            )
+
+    return RepoConfig(**repo_data), notices
 
 
 def load_config(path: Path) -> AutoloopConfig:
@@ -643,6 +865,8 @@ def load_config(path: Path) -> AutoloopConfig:
             "detector never runs, while still reading as configured"
         )
 
+    repo, repo_notices = _load_repo_section(data)
+
     return AutoloopConfig(
         browser=browser,
         policy=policy,
@@ -653,5 +877,6 @@ def load_config(path: Path) -> AutoloopConfig:
         codex=codex,
         executor=executor,
         audit=audit,
-        migration_notices=migration_notices,
+        repo=repo,
+        migration_notices=migration_notices + repo_notices,
     )

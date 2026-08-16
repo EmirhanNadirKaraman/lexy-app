@@ -233,6 +233,11 @@ def run_doctor(
                     repo_root=repo_root,
                     state_dir=config.state_dir,
                     workers_root=config.workers_root,
+                    # Same `[repo]` values `cli._load_validation_env` passes.
+                    # Defaulting either of them here would reintroduce exactly
+                    # the doctor/run divergence this block's comment forbids.
+                    env_example_file=config.repo.env_example_file,
+                    env_example_db_key=config.repo.env_example_db_key,
                 )
             except AutoloopError as exc:
                 add("validation_env", "fail", str(exc))
