@@ -259,6 +259,202 @@ def test_success_is_ok_with_changed_paths_and_validation(main_repo, worker_repo)
     assert outcome.validation.startswith("ruff check .: PASS")
 
 
+# ---- assumptions: the disclosure that replaced asking a human --------------
+#
+# `ask_user` is retired, so an ambiguous task cannot be escalated mid-run. The
+# agent is told to take the smallest reversible reading and to write an
+# `ASSUMPTION:` line per choice; these pin that the instruction is actually
+# given and that the lines are actually collected — the two halves are useless
+# apart.
+
+
+def test_the_prompt_tells_the_agent_to_take_the_smallest_reversible_reading(
+    main_repo, worker_repo
+):
+    factory_runners = []
+
+    def factory(root):
+        runner = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        factory_runners.append(runner)
+        return runner
+
+    executor = build_executor(main_repo, worker_repo, factory)
+    executor.execute(implement_directive(), make_task())
+
+    prompt = factory_runners[0].specs[0].prompt
+    assert "SMALLEST REVERSIBLE READING" in prompt
+    assert "ASSUMPTION:" in prompt
+    # An instruction to take a reading without one to disclose it would be
+    # strictly worse than the question it replaced.
+    assert "shown to the reviewer" in prompt
+    # And it must not send the agent looking for a human that is not there.
+    assert "do NOT stop to ask" in prompt
+
+
+def test_assumption_lines_are_collected_from_the_agents_own_output(
+    main_repo, worker_repo
+):
+    raw = (
+        "I looked at the task.\n"
+        "ASSUMPTION: read 'recent' as the last 30 days, not since the last release\n"
+        "Then I wrote the code.\n"
+        "  assumption:   kept the existing default rather than changing it\n"
+    )
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert outcome.assumptions == (
+        "read 'recent' as the last 30 days, not since the last release",
+        "kept the existing default rather than changing it",
+    )
+
+
+def test_prose_about_the_convention_is_not_harvested_as_an_assumption(
+    main_repo, worker_repo
+):
+    """Anchored at the start of a line for exactly this: an agent that
+    explains what it was told ("...write an ASSUMPTION: line when...") must
+    not have its own instructions read back as disclosures — the reviewer
+    would be shown assumptions nobody made."""
+    raw = "I was told to write an ASSUMPTION: line for each choice, and I made none.\n"
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert outcome.assumptions == ()
+
+
+def test_quoted_or_bulleted_echoes_of_the_instruction_are_not_disclosures(
+    main_repo, worker_repo
+):
+    """The tightening of `_ASSUMPTION_RE` (2026-08-16).
+
+    The anchor alone stops prose that mentions the convention mid-sentence, but
+    it does not stop an agent that QUOTES the instruction it was given —
+    `> ASSUMPTION: <what you assumed...>` is verbatim from the prompt, and a
+    bulleted restatement of the rule is the same thing with `-`. Either one
+    would fabricate a deliberate choice the agent never made, in the section a
+    reviewer is most likely to read on its own.
+
+    Both directions are pinned in ONE raw text on purpose: `assumptions == ()`
+    against the echoes alone passes just as well against extraction that is
+    broken outright, so a real declaration sits among them and the assertion is
+    an exact-tuple equality."""
+    raw = (
+        "The instructions told me:\n"
+        "> ASSUMPTION: <what you assumed, and what you would have asked>\n"
+        "which I read as a rule about disclosure. Restating it for myself:\n"
+        "- ASSUMPTION: one line per choice\n"
+        "* ASSUMPTION: naming the reading I did not take\n"
+        "> - ASSUMPTION: never a summary of the work\n"
+        "Here is the one choice I actually made:\n"
+        "ASSUMPTION: read 'recent' as the last 30 days, not since the last release\n"
+    )
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert outcome.assumptions == (
+        "read 'recent' as the last 30 days, not since the last release",
+    )
+
+
+def test_the_prompt_tells_the_agent_that_a_prefixed_line_is_not_collected(
+    main_repo, worker_repo
+):
+    """The other half of the tightening. Refusing the bulleted form silently
+    would trade a fabricated disclosure for a missed one; the instruction has
+    to state the shape it actually accepts."""
+    factory_runners = []
+
+    def factory(root):
+        runner = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        factory_runners.append(runner)
+        return runner
+
+    executor = build_executor(main_repo, worker_repo, factory)
+    executor.execute(implement_directive(), make_task())
+
+    prompt = factory_runners[0].specs[0].prompt
+    assert "must come FIRST on its line" in prompt
+    assert "NOT collected" in prompt
+
+
+def test_every_assumption_reaches_the_record_however_many_the_round_wrote(
+    main_repo, worker_repo
+):
+    """No per-round count cap, deliberately (the caps were removed 2026-08-16).
+
+    `TaskExecution.assumptions` is the DURABLE record and the only copy that
+    survives the next round — `report_details`, where these lines also appear,
+    is replaced every round. Dropping the twentieth-and-later lines here made
+    them unrecoverable the moment round 2 committed, which is exactly the
+    cross-round persistence the record exists to provide. The chat-message
+    bound lives in `packet._format_assumptions` instead."""
+    raw = "\n".join(f"ASSUMPTION: choice number {i}" for i in range(40))
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert len(outcome.assumptions) == 40
+    assert outcome.assumptions[0] == "choice number 0"
+    assert outcome.assumptions[-1] == "choice number 39"
+    # And no overflow notice stands in for the entries that used to be cut.
+    assert not any("dropped" in text for text in outcome.assumptions)
+
+
+def test_a_long_assumption_reaches_the_record_in_full(main_repo, worker_repo):
+    """Same rule per LINE. A 500-character cut here deleted the end of a
+    sentence permanently; the packet shortens what it renders instead, and says
+    where the whole line is."""
+    body = "x" * 2_000
+    raw = f"ASSUMPTION: {body}\n"
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    [only] = outcome.assumptions
+    assert only == body
+    assert not only.endswith("…")
+
+
+def test_a_failed_round_reports_no_assumptions(main_repo, worker_repo):
+    """A failed round is never committed (`_dispatch_task_postcommit` returns
+    on a non-ok status), so an assumption from it would describe code that is
+    not in the candidate the reviewer is shown."""
+    raw = "ASSUMPTION: assumed something on my way to failing\n"
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+        validation=(("ruff", "check", "."),),
+        command_runner=fail_command,
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "error"
+    assert outcome.assumptions == ()
+
+
 # ---- 10: nothing written outside the worker repo ---------------------------
 
 

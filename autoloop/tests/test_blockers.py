@@ -393,6 +393,195 @@ def test_missing_or_unrecognised_park_kind_is_treated_as_loop_fatal_by_cli(tmp_p
 
 
 # =============================================================================
+# 3b. a FAULT STOP ends the run without parking, and still leaves a record
+#
+# The terminal the exhausted policy-denial budget reaches since `ask_user`'s
+# retirement was completed. It is `stopped`, not `needs_user` — there is no
+# question for an operator, because the only thing that could produce a
+# different directive is the reviewer that just spent the budget — but it is
+# NOT the reviewer's own `stop`, and everything downstream has to be able to
+# tell the two apart.
+# =============================================================================
+
+
+def test_fault_stop_records_a_loop_fatal_blocker_without_parking(tmp_path):
+    blocker_store = BlockerStore(tmp_path / ".al" / "blockers")
+    orch, config, store, task_store, registry = minimal_orchestrator(
+        tmp_path, blocker_store=blocker_store
+    )
+    orch.state.phase = Phase.EXECUTING.value
+
+    orch._to_fault_stop(
+        "the reviewer kept proposing refused directives",
+        code="policy_denial_budget_exhausted",
+        task_id="t1",
+        detail="decision=ask_user verdict_code=legacy_ask_user_retired",
+    )
+
+    # Terminal, and terminal as a STOP: nothing parked, nothing resumable.
+    assert orch.state.phase == Phase.STOPPED.value
+    assert orch.state.stop_kind == "fault"
+    assert orch.state.stop_reason == "the reviewer kept proposing refused directives"
+    assert orch.state.question is None
+    assert orch.state.resume_phase is None
+    assert orch.state.park_kind is None and orch.state.park_blocker_id is None
+
+    # Ending is not forgetting: the operator-facing record is the same one a
+    # park would have written, so `blockers` / `answer` behave unchanged.
+    blocker = blocker_store.load(orch.state.stop_blocker_id)
+    assert blocker is not None
+    assert blocker.kind == "loop_fatal"
+    assert blocker.code == "policy_denial_budget_exhausted"
+    assert blocker.question == orch.state.stop_reason
+    assert blocker.phase == Phase.EXECUTING.value  # where it happened, not "stopped"
+
+    # And it survives the process: a reload sees the same classification.
+    reloaded = store.load()
+    assert reloaded.stop_kind == "fault"
+    assert reloaded.stop_blocker_id == blocker.id
+
+
+def test_contract_stop_is_classified_and_is_not_a_fault(tmp_path):
+    """The other half of the discriminator. Without this, `stop_kind` could
+    default its way to correctness in the fault test above while every real
+    `stop` stayed unclassified — and an unclassified stop is the one that
+    `cli._cmd_smoke_browser` must NOT report as PASS."""
+    orch, config, store, task_store, registry = minimal_orchestrator(tmp_path)
+
+    orch._dispatch(Directive(decision=Decision.STOP, reason="all done"))
+
+    assert orch.state.phase == Phase.STOPPED.value
+    assert orch.state.stop_kind == "contract"
+    assert cli._is_fault_stop(orch.state) is False
+    assert cli._is_fault_stop(store.load()) is False
+
+
+def test_fault_stop_ends_continuous_mode_instead_of_starting_a_fresh_session(
+    tmp_path, capsys
+):
+    """The reason a fault stop is distinguishable from a contract stop at all.
+
+    Continuous mode treats `stopped` as a clean boundary and runs the
+    selection policy — correct for a reviewer that decided the round was
+    finished, and a churn machine for a run that died on the denial budget:
+    the same READY task would be picked, a fresh session kicked off, the same
+    reviewer would deny again, and the loop would burn a full round per
+    iteration while looking like progress."""
+    config = make_config(tmp_path)
+    registry = TaskRegistry([ready_task("t1")])
+    task_store = TaskStore(config.tasks_file)
+    task_store.save(registry)
+
+    store = StateStore(config.state_file)
+    state = LoopState.new(URL)
+    state.phase = Phase.STOPPED.value
+    state.stop_kind = "fault"
+    state.stop_reason = "more than 0 policy-denied directives in a row"
+    store.save(state)
+
+    args = Namespace(
+        config=tmp_path / "unused.toml",
+        continuous=True,
+        kickoff=None,
+        kickoff_audit=False,
+        answer=None,
+        retry=False,
+        resubmit=False,
+        max_steps=None,
+        null_executor=True,
+    )
+    rc = cli._run_continuous(args, config)
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "stop_kind=fault" in out
+    # No fresh session was started over the top of the stopped one — the task
+    # is still READY and waiting, not consumed by a round nobody asked for.
+    assert store.load().session_id == state.session_id
+    assert TaskStore(config.tasks_file).load().state_of("t1") is TaskState.READY
+
+
+def test_plain_run_on_a_fault_stopped_session_names_a_recovery_that_works(
+    tmp_path, capsys
+):
+    """The parked branch offers `--answer` / `--retry`, and BOTH raise for a
+    fault stop: `--answer` requires `needs_user`, `--retry` requires the
+    `resume_phase` a fault stop deliberately clears. Printing them would send
+    the operator to two commands that error — a terminal telling someone to do
+    something impossible is worse than one that says nothing."""
+    config = make_config(tmp_path)
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
+
+    store = StateStore(config.state_file)
+    state = LoopState.new(URL)
+    state.phase = Phase.STOPPED.value
+    state.stop_kind = "fault"
+    state.stop_reason = "more than 0 policy-denied directives in a row"
+    store.save(state)
+
+    args = Namespace(
+        config=tmp_path / "unused.toml",
+        continuous=False,
+        kickoff=None,
+        kickoff_audit=False,
+        answer=None,
+        retry=False,
+        resubmit=False,
+        max_steps=None,
+        null_executor=True,
+    )
+    # `_run_locked`, not `_cmd_run`: the branch under test is here, and going
+    # through the outer command would take the lock, run the startup backlog
+    # sweep and publish a heartbeat — none of which this is about.
+    rc = cli._run_locked(args, config)
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "stop_kind=fault" in out
+    assert "blockers" in out  # the recovery that does work
+    assert "Loop is parked. Use --answer / --retry" not in out
+    # Nothing was run: the session is exactly as the fault stop left it.
+    assert store.load().session_id == state.session_id
+
+
+def test_a_contract_stop_is_still_a_clean_boundary_for_continuous_mode(tmp_path):
+    """Guards the fix above against over-reach: the fault check must not turn
+    every completed session into a halt. With a ready task waiting, a
+    `contract` stop still starts the next round."""
+    config = make_config(tmp_path)
+    registry = TaskRegistry([ready_task("t1")])
+    TaskStore(config.tasks_file).save(registry)
+
+    store = StateStore(config.state_file)
+    state = LoopState.new(URL)
+    state.phase = Phase.STOPPED.value
+    state.stop_kind = "contract"
+    state.stop_reason = "done"
+    store.save(state)
+
+    assert cli._is_fault_stop(state) is False
+    started = cli._select_and_kickoff(config, store, registry)
+    assert started is True
+    assert store.load().session_id != state.session_id  # a NEW session
+
+
+def test_a_legacy_unclassified_stop_is_treated_as_a_clean_boundary(tmp_path):
+    """A state file written before `stop_kind` existed carries `""`. It is
+    read as a clean boundary (the behaviour every `stopped` session had before
+    fault stops existed), NOT as a fault: being wrong that way costs one extra
+    round, while the other direction would halt a healthy loop on every
+    session it ever completed."""
+    config = make_config(tmp_path)
+    store = StateStore(config.state_file)
+    state = LoopState.new(URL)
+    state.phase = Phase.STOPPED.value
+    store.save(state)
+
+    assert state.stop_kind == ""
+    assert cli._is_fault_stop(store.load()) is False
+
+
+# =============================================================================
 # 4. blocker records persist with the operator question text and survive
 #    reload
 # =============================================================================

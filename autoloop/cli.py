@@ -643,12 +643,28 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
         state.browser_restart_skips = 0
         store.save(state)
     elif Phase(state.phase) in (Phase.NEEDS_USER, Phase.FAILED, Phase.STOPPED):
+        # A fault stop takes its own branch, because BOTH suggestions below are
+        # impossible for one: `--answer` requires `needs_user` and `--retry`
+        # requires a `resume_phase` a fault stop deliberately clears. Printing
+        # them would send the operator to two commands that raise.
+        if _is_fault_stop(state):
+            return _report_fault_stop(config, state, registry)
         print(_summary(config, state, registry))
         print("\nLoop is parked. Use --answer / --retry, or `reset` to start over.")
         return 2
 
     orchestrator = _build_orchestrator(config, args, store, state, task_store, registry)
     outcome = orchestrator.run(max_steps=args.max_steps)
+    # Checked BEFORE the ordinary ending, and it exits non-zero even though the
+    # PHASE is the one a healthy run ends in: `stopped` stopped meaning
+    # "finished" the moment the loop could end itself on a wall
+    # (`orchestrator._to_fault_stop`), and a wrapper script or cron job reading
+    # the exit code must not be told a run that died on the denial budget
+    # succeeded. Same reasoning as `_cmd_smoke_browser`'s positive `stop_kind`
+    # gate; `_report_fault_stop` prints the summary itself, so this returns
+    # rather than falling through to a second one.
+    if _is_fault_stop(orchestrator.state):
+        return _report_fault_stop(config, orchestrator.state, registry)
     print(_summary(config, orchestrator.state, registry))
     print(f"\nLoop ended: {outcome}")
     return 2 if outcome in (Phase.NEEDS_USER.value, Phase.FAILED.value) else 0
@@ -684,6 +700,14 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
     separate phase, never routed through `_to_needs_user`, so never
     classified) always stops the loop too — resolve either with a plain
     `run --retry`/`--answer` (WITHOUT `--continuous`), then restart.
+
+    **A `stopped` session is split too**, and this is the one place the split
+    matters most: `stop_kind="contract"` (the reviewer decided the round was
+    done) is the clean boundary it has always been, while `stop_kind="fault"`
+    (`orchestrator._to_fault_stop` — today, the exhausted policy-denial budget)
+    stops the continuous loop like a `loop_fatal` park. Treating a fault stop
+    as a boundary would kick off a fresh session into the identical wall on the
+    very next iteration; see `_report_fault_stop`.
 
     **EXHAUSTION.** Once a clean boundary finds no READY task AND the
     repository fingerprint is unchanged, that used to always mean "sleep and
@@ -734,7 +758,9 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
                     "--retry` (WITHOUT --continuous), then restart `run --continuous`."
                 )
                 return 2
-            continue  # STOPPED -> reassess at the top of the loop
+            if _is_fault_stop(orchestrator.state):
+                return _report_fault_stop(config, orchestrator.state, registry)
+            continue  # a CONTRACT stop -> reassess at the top of the loop
 
         if state is not None and Phase(state.phase) is Phase.NEEDS_USER:
             # Found already-parked at the top of an iteration (e.g. a
@@ -755,7 +781,16 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
             )
             return 2
 
-        # Clean boundary: no session yet, or the last one ended STOPPED.
+        if state is not None and _is_fault_stop(state):
+            # The same check as the freshly-stopped case above, for a session
+            # found already fault-stopped at the top of an iteration (a
+            # restart after the earlier process exited). Without it, a restart
+            # would read `stopped` as a clean boundary and kick straight back
+            # into the wall the previous process just died on.
+            return _report_fault_stop(config, state, registry)
+
+        # Clean boundary: no session yet, or the last one ended in a CONTRACT
+        # stop — the reviewer's own decision that the round was finished.
         if _select_and_kickoff(config, store, registry):
             continue
         # Already reconciled at the top of this iteration, so what is left here
@@ -767,6 +802,61 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
             _print_blocker_summary(open_blockers)
             return 0
         time.sleep(CONTINUOUS_POLL_SECONDS)
+
+
+def _is_fault_stop(state: LoopState) -> bool:
+    """Did the LOOP end this session on a wall, rather than the reviewer
+    ending it with `stop`?
+
+    Reads `stop_kind` positively (`== "fault"`) rather than "not contract", so
+    the ambiguous values fall on the harmless side: a state file written before
+    the classification existed, or one hand-built by a test, carries `""` and is
+    treated as an ordinary clean boundary — which is exactly how continuous
+    mode treated every `stopped` session before fault stops existed. The cost
+    of being wrong that way is one extra round; being wrong the other way would
+    halt a healthy loop on every completed session.
+    """
+    return Phase(state.phase) is Phase.STOPPED and state.stop_kind == "fault"
+
+
+def _report_fault_stop(
+    config: AutoloopConfig, state: LoopState, registry: TaskRegistry
+) -> int:
+    """Print why the loop stopped itself and exit 2 — the fault-stop
+    counterpart to `_handle_parked_task`'s loop_fatal branch.
+
+    Continuous mode MUST end here rather than fall through to
+    `_select_and_kickoff`. A fault stop means the reviewer spent the denial
+    budget proposing directives policy refuses; the selection policy would see
+    a terminal phase, find the same READY task, and start a fresh session
+    straight back into the same wall — burning a full Claude/ChatGPT round per
+    iteration while looking like progress. That churn is the reason this
+    terminal is distinguishable from a contract stop at all.
+
+    Shared with plain `run` (both its pre-flight branch and its ending) rather
+    than continuous-mode-only, which is why the wording names no mode. Both
+    callers otherwise reach a message that is wrong for this terminal: the
+    parked branch offers `--answer`/`--retry`, and BOTH raise for a fault stop
+    — `--answer` requires `needs_user`, `--retry` requires the `resume_phase`
+    a fault stop deliberately clears. The recovery named here is the one that
+    works, and it is a real one: the blocker record carries the question, and
+    `reset` is what makes a new session possible.
+
+    The session file is deliberately left in place (unlike the task_fatal park,
+    which removes it): there is no task to quarantine and nothing to resume, so
+    what remains is evidence, and `status` should still be able to show it.
+    """
+    print(_summary(config, state, registry))
+    print(
+        "\nthe loop ended itself on a fault it cannot ask about "
+        "(stop_kind=fault) — the reviewer kept proposing directives policy "
+        "refuses, so no answer from you would change the next one.\n"
+        "See `python -m autoloop blockers` for the recorded reason; resolve it "
+        "with `answer <blocker-id> \"<text>\"`, then `reset --yes` to begin a "
+        "new session. `run --answer` / `run --retry` do not apply to this "
+        "terminal and will refuse."
+    )
+    return 2
 
 
 #: Ids minted by `Orchestrator._resolve_audit_task` (`audit-<iteration>`).
@@ -1563,14 +1653,28 @@ def _cmd_smoke_browser(args: argparse.Namespace) -> int:
             manifest_store=ManifestStore(config.smoke_dir / "manifests"),
         )
         outcome = orchestrator.run()
-    if outcome == Phase.STOPPED.value:
+    # BOTH conditions, and the second is load-bearing rather than belt-and-
+    # braces: `stopped` is reachable two ways since the policy-denial budget
+    # started ending the run instead of parking (`orchestrator._to_fault_stop`),
+    # and the smoke policy sets `max_policy_denials=0`, so the FIRST denied
+    # reply reaches that terminal. Phase alone would therefore report PASS —
+    # "received a valid contract stop" — for a reviewer that answered
+    # `ask_user`, `implement`, or a commit approval, which is the exact
+    # misbehaviour this command exists to catch. Gated on the POSITIVE value so
+    # an unclassified stop (a legacy state file, a future fault site nobody
+    # classified) reads as a failure.
+    if outcome == Phase.STOPPED.value and state.stop_kind == "contract":
         print(
             "smoke-browser: PASS — submitted one request through the real "
             f"conversation and received a valid contract stop ({state.stop_reason!r})"
         )
         return 0
+    # Named in the failure line because "ended in 'stopped'" is otherwise the
+    # same words a PASS would print, and the operator's next question is
+    # exactly which kind it was.
+    kind = f" ({state.stop_kind} stop)" if state.stop_kind else ""
     print(
-        f"smoke-browser: FAIL — loop ended in '{outcome}' "
+        f"smoke-browser: FAIL — loop ended in '{outcome}'{kind} "
         f"(question: {state.question!r}, stop_reason: {state.stop_reason!r}). "
         f"Diagnostics (if any) under {config.diagnostics_dir}."
     )

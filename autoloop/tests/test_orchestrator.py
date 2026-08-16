@@ -934,22 +934,33 @@ def test_ask_user_dispatch_can_neither_park_nor_reach_the_executor(tmp_path):
     assert "retired" in orch.state.outbox
 
 
-def test_repeated_ask_user_exhausts_the_denial_budget(tmp_path):
+def test_repeated_ask_user_stops_the_run_and_never_parks(tmp_path):
     """The corrective reprompt is budget-capped like every other denial, so a
     reviewer that keeps answering `ask_user` terminates the run instead of
-    trading messages forever."""
+    trading messages forever.
+
+    It terminates by STOPPING, and that is the last half of retiring
+    `ask_user`. The decision itself stopped being able to park the loop when
+    the policy gate began denying it; the exhausted denial budget was the one
+    path by which a reviewer could still park an autonomous run on the retired
+    question — by answering it until the budget ran out. A park asks a human
+    something, and there is nothing here for a human to answer: the only thing
+    that could produce a different directive is the reviewer that just spent
+    the budget."""
     orch, _, _, executor, _, _, _ = build(
         tmp_path,
         responses=[ask_user_block(), ask_user_block()],
         policy=PolicyConfig(max_policy_denials=1),
     )
-    assert orch.run() == Phase.NEEDS_USER.value
-    # parked on the BUDGET, not on the reviewer's question
-    assert "policy-denied directives in a row" in orch.state.question
-    assert "which DB?" not in orch.state.question
-    assert orch.state.park_kind == "loop_fatal"
-    # terminal, not retryable — the property the retired ask_user park test
-    # asserted, carried onto the park that replaced it
+    assert orch.run() == Phase.STOPPED.value
+    assert orch.state.stop_kind == "fault"  # NOT the reviewer's own `stop`
+    # ended on the BUDGET, not on the reviewer's question
+    assert "policy-denied directives in a row" in orch.state.stop_reason
+    assert "which DB?" not in orch.state.stop_reason
+    # never parked: no question was posed, and nothing is resumable
+    assert orch.state.phase != Phase.NEEDS_USER.value
+    assert orch.state.question is None
+    assert orch.state.park_kind is None
     assert orch.state.resume_phase is None
     assert executor.calls == []
 

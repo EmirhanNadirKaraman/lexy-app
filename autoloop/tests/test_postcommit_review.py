@@ -1013,6 +1013,171 @@ def test_a_record_with_no_report_says_so_rather_than_going_blank(tmp_path):
     assert "predates report capture" in text
 
 
+def test_recorded_assumptions_reach_the_reviewer_labelled_as_claims(tmp_path):
+    """The point of persisting them at all.
+
+    `ask_user` is retired, so an ambiguous task can no longer be escalated
+    mid-run — the executor takes the smallest reversible reading instead. That
+    trade is only safe if the reading reaches the human who authorizes the
+    result, and this packet is the only place a human reads. Labelled a CLAIM
+    for the same reason the report is: it is the executor's word, and it sits
+    among sections that are read from git."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    execution = execution_store.load(task.id)
+    execution.assumptions = (
+        "'recent' was read as the last 30 days; the alternative reading was "
+        "'since the last release'",
+    )
+    execution_store.save(execution)
+
+    text = build_review_packet(execution, worktree_git_for(worktrees, task.id), task)
+
+    assert "since the last release" in text  # shown, verbatim
+    assert "CLAIMED" in text.split("Assumptions the executor took")[0]
+    # Inside the executor's own section, never among the git-read facts above it.
+    assert "Assumptions the executor took" in text.split("Executor report")[1]
+
+
+def test_the_rendered_assumptions_are_bounded_however_many_rounds_accumulated(tmp_path):
+    """Nothing upstream bounds the PACKET, so this is where it is bounded.
+
+    `TaskExecution.assumptions` accumulates, the executor records every line at
+    full length (deliberately — it is the only copy that survives the round
+    which replaces `report_details`), and `policy.max_review_rounds` defaults to
+    unlimited. Twenty rounds of twenty long lines is ~200 KB inside a chat
+    message — five times the 40,056-character send that actually broke this
+    loop, and the oversize fallback would not save it because that replaces the
+    DIFF, not this section."""
+    from autoloop import packet as packet_mod
+
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    execution = execution_store.load(task.id)
+    execution.assumptions = tuple(
+        f"assumption {i}: " + "x" * 400 for i in range(400)
+    )
+    execution_store.save(execution)
+
+    text = build_review_packet(execution, worktree_git_for(worktrees, task.id), task)
+    # Cut at the diff header, or this would measure the patch too and pass for
+    # a reason that has nothing to do with the bound under test.
+    section = text.split("Assumptions the executor took")[1].split("Full diff:")[0]
+
+    # Bounded, with room for the heading and the withheld-count line.
+    assert len(section) < packet_mod.ASSUMPTIONS_MAX_CHARS + 1_000
+    # The NEWEST are what a reviewer needs — they describe the code under
+    # review now; the oldest were shown in the packet for the round that made
+    # them (and all 400 are still in the record either way).
+    assert "assumption 399:" in section
+    assert "assumption 0:" not in section
+    # Never silently: a shortened list that does not say so reads as complete.
+    assert "are not shown here" in section
+    assert execution_store.load(task.id).assumptions == execution.assumptions
+
+
+def test_one_enormous_assumption_is_shortened_here_and_kept_whole_on_the_record(
+    tmp_path,
+):
+    """The per-LINE render bound (`ASSUMPTION_MAX_CHARS_EACH`), and the reason
+    it is not a record bound.
+
+    The section budget alone degrades badly at the top end: entries render
+    newest-first and the loop stops at the first one that does not fit, so a
+    single enormous line — an agent that pasted its reasoning after
+    `ASSUMPTION:` — would render nothing but a withheld count and hide every
+    real disclosure behind it. Shortening that one line keeps the rest visible.
+
+    Both halves are asserted together, because either alone is the bug the
+    other prevents: the packet must be shortened AND the record must still hold
+    every character, since `report_details` is replaced each round and nothing
+    else keeps a copy."""
+    from autoloop import packet as packet_mod
+
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    huge = "pasted reasoning " * 500  # ~8,500 characters, one line
+    execution = execution_store.load(task.id)
+    execution.assumptions = ("read 'recent' as the last 30 days", huge)
+    execution_store.save(execution)
+
+    text = build_review_packet(execution, worktree_git_for(worktrees, task.id), task)
+    section = text.split("Assumptions the executor took")[1].split("Full diff:")[0]
+
+    # `line[4:]` — the two-space section indent AND the bullet come off, because
+    # `ASSUMPTION_MAX_CHARS_EACH` bounds the ENTRY text, not the rendered line.
+    # A shortened entry lands exactly on the bound, so measuring `"- " + text`
+    # would fail this by two characters against a correct implementation.
+    rendered = [line[4:] for line in section.splitlines() if line.startswith("  - ")]
+    assert all(
+        len(line) <= packet_mod.ASSUMPTION_MAX_CHARS_EACH for line in rendered
+    ), "a rendered line must never exceed the per-entry bound"
+    # Shortened, and it says so — a bare ellipsis would read as the executor
+    # trailing off rather than as this rendering ending the line for it.
+    assert "the full line is in the execution record" in section
+    # The other entry is still there: the whole point of shortening rather than
+    # dropping is that one oversized line cannot hide the disclosures with it.
+    assert "read 'recent' as the last 30 days" in section
+    assert "are not shown here" not in section
+
+    # And the record is untouched — every character, on disk, after a reload.
+    assert execution_store.load(task.id).assumptions == (
+        "read 'recent' as the last 30 days",
+        huge,
+    )
+
+
+def test_an_ordinary_assumption_list_carries_no_withheld_note(tmp_path):
+    """The negative control for the bound above: it must not fire on the
+    ordinary case, or every packet would report a drop that never happened."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    execution = execution_store.load(task.id)
+    execution.assumptions = ("read 'recent' as 30 days", "assumed UTC for the cutoff")
+
+    text = build_review_packet(execution, worktree_git_for(worktrees, task.id), task)
+
+    assert "read 'recent' as 30 days" in text
+    assert "assumed UTC for the cutoff" in text
+    assert "are not shown here" not in text
+
+
+def test_a_record_with_no_assumptions_renders_no_assumptions_section(tmp_path):
+    """Deliberately unlike the empty REPORT, which announces itself as absent.
+
+    "No assumption lines" is not a claim the executor made — it is simply the
+    absence of one — so printing "none recorded" would invite a reviewer to
+    read it as a certification that the task was unambiguous. Silence here is
+    the honest rendering; the report's own "(none recorded)" line is what
+    tells a reviewer whether this candidate predates capture entirely."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+    execution = execution_store.load(task.id)
+
+    assert execution.assumptions == ()
+    text = build_review_packet(execution, worktree_git_for(worktrees, task.id), task)
+    assert "Assumptions the executor took" not in text
+
+
 def test_the_report_never_widens_scope(tmp_path):
     """The guarantee that makes including it safe at all: path ownership is
     checked against git's own range, never against what the executor wrote.

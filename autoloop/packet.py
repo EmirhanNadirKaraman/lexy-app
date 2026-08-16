@@ -83,6 +83,42 @@ DIFF_INCLUDE_MAX_CHARS = 30_000
 #: it, and record the size here.
 DIFF_MAX_PARTS = 6
 
+#: How much of the ACCUMULATED assumption list (`TaskExecution.assumptions`)
+#: one packet may render — see `_format_assumptions`.
+#:
+#: Lives here, with the other message-size budgets, because that is what it is:
+#: the record itself stays complete on disk. Sized as a small fraction (~13%)
+#: of `DIFF_INCLUDE_MAX_CHARS` deliberately — this section is the one thing in
+#: the packet nothing computes with, so it must never crowd out the diff, which
+#: is what the review is actually about. Roughly eight full-length assumptions,
+#: or many more short ones.
+ASSUMPTIONS_MAX_CHARS = 4_000
+
+#: How much of ONE assumption a packet may render — a different bound from the
+#: section budget above, which is why the name is singular and suffixed rather
+#: than a near-twin of it.
+#:
+#: Without it the section budget alone degrades badly at the top end: the render
+#: loop takes entries newest-first and stops at the first one that does not fit,
+#: so a single 200 KB line (an agent that pasted its reasoning after
+#: `ASSUMPTION:`) would render NOTHING but a withheld count, hiding every real
+#: disclosure behind it. Shortening that one line instead costs the tail of a
+#: line nobody was going to read and keeps the rest of the list visible. The
+#: record is untouched either way — `_ENTRY_TRUNCATED` says where the whole line
+#: is.
+ASSUMPTION_MAX_CHARS_EACH = 500
+
+#: What replaces the tail of an over-long assumption, and it must NAME the
+#: record: a line shortened with a bare ellipsis reads as the executor trailing
+#: off, which is a different claim from "there is more of this sentence, and it
+#: is on disk". Counted inside `ASSUMPTION_MAX_CHARS_EACH`, so the marker can
+#: never push a rendered line past the bound it exists to enforce.
+_ENTRY_TRUNCATED = "… [shortened for this packet; the full line is in the execution record]"
+
+#: The bullet each rendered assumption carries. Named so `_format_assumptions`
+#: can charge its cost against the budget above rather than guessing at it.
+_BULLET = "- "
+
 #: The literal line the inline diff section starts with. `plan_chunked_delivery`
 #: locates `_INLINE_DIFF_HEADER + diff` inside the rendered payload and swaps it
 #: for a delivery notice, which is what lets the *sent* message stay small while
@@ -293,14 +329,26 @@ def _format_executor_report(execution: TaskExecution) -> str:
     Empty for any record written before these fields existed (a candidate
     committed by an older build, or crash-recovery adoption of one). Saying so
     is better than an unexplained blank: an absent report is not a silent one.
+
+    `assumptions` is appended to this section rather than given its own,
+    because it is the same KIND of thing — the executor's word — and splitting
+    it out would put an unread claim next to the git-read sections, where it
+    would read with their authority. It is appended only when non-empty, and
+    that is a deliberate asymmetry with the report above: an absent report is
+    ambiguous (a candidate from an older build reports nothing, and so does a
+    crash-adopted one), whereas "no assumption lines" is not a claim about the
+    executor at all and printing "none recorded" would invite reading it as one
+    — as though the executor had certified that the task was unambiguous.
     """
     summary = (execution.report_summary or "").strip()
     details = (execution.report_details or "").strip()
+    assumptions = _format_assumptions(execution)
     if not summary and not details:
         return (
             "Executor report (CLAIMED by the executor, not read from git):\n"
             "  (none recorded — this candidate predates report capture, or was\n"
             "   adopted after a crash. Judge from the git-read sections above.)"
+            + assumptions
         )
     body = "\n".join(part for part in (summary, details) if part)
     return (
@@ -308,6 +356,94 @@ def _format_executor_report(execution: TaskExecution) -> str:
         "other section is read. Treat this as intent, and check it against the\n"
         "changed paths and diff stat above rather than trusting it):\n"
         + textwrap.indent(body, "  ")
+        + assumptions
+    )
+
+
+def _shorten_entry(text: str) -> str:
+    """One assumption, cut to `ASSUMPTION_MAX_CHARS_EACH` INCLUDING the marker
+    that says it was cut — so the returned string is never longer than the
+    bound, whatever came in. Anything at or under the bound is returned exactly
+    as recorded, marker and all absent: a reviewer must be able to tell a line
+    the executor ended from one this rendering ended for it."""
+    if len(text) <= ASSUMPTION_MAX_CHARS_EACH:
+        return text
+    keep = max(0, ASSUMPTION_MAX_CHARS_EACH - len(_ENTRY_TRUNCATED))
+    return text[:keep].rstrip() + _ENTRY_TRUNCATED
+
+
+def _format_assumptions(execution: TaskExecution) -> str:
+    """The readings the executor CHOSE where the task did not say — "" when it
+    recorded none.
+
+    This section is why `ask_user`'s retirement did not simply delete the
+    ability to raise an ambiguity: it moved it from a mid-run question nobody
+    was there to answer to a disclosure attached to the work, read at the one
+    moment a human IS in the loop. A reviewer who disagrees with a reading has
+    the ordinary answer available — `revise` with the other reading spelled
+    out — which is strictly more actionable than the question would have been,
+    because the code implementing the assumption is right there in the diff.
+
+    **It is NOT first-time visibility, and claiming that would overstate it:**
+    `report_details` is the agent's whole transcript, so these lines are
+    already somewhere in the section above. What this adds is the two things
+    that make them usable — a LABEL, so a reviewer skimming a long transcript
+    cannot miss the choices that most need judging, and ACCUMULATION, since
+    `report_details` is REPLACED every round while these are unioned. Round 2's
+    transcript says nothing about what round 1 assumed and shipped, and round 1's
+    assumption still describes code inside the range being authorized.
+
+    Rendered as a bulleted list under its own heading INSIDE the executor
+    report, and labelled a claim again rather than relying on the enclosing
+    heading: this list is the part of the packet a hurried reviewer is most
+    likely to read on its own.
+
+    **Bounded HERE — in BOTH directions — and never on the record.**
+    `TaskExecution.assumptions` accumulates across rounds and
+    `policy.max_review_rounds` defaults to unlimited, so nothing upstream bounds
+    what would end up in a message: the executor records every line it is given,
+    at full length, and a hundred rounds of them is far past the
+    40,056-character send that broke this loop (and the oversize fallback would
+    not save it — that replaces the DIFF). So the section is capped
+    (`ASSUMPTIONS_MAX_CHARS`) by dropping the OLDEST entries, each of which was
+    already shown in the packet for the round that made it while the newest
+    describe the code under review now; and ONE over-long entry is shortened
+    (`ASSUMPTION_MAX_CHARS_EACH`) rather than allowed to consume the budget on
+    its own. Both are stated in the rendering — a silently shortened list, or
+    line, reads as complete — and both leave the record untouched, which is the
+    point: it is the only copy of these lines that survives the next round.
+    """
+    if not execution.assumptions:
+        return ""
+    shown: list[str] = []
+    used = 0
+    for text in reversed(execution.assumptions):
+        entry = _shorten_entry(text)
+        # `+ len(_BULLET) + 1` — the rendered cost of the line, and computed
+        # from the SHORTENED text, so the budget bounds what is actually sent
+        # (charging the original would under-fill the section by whatever a
+        # shortened line saved).
+        cost = len(entry) + len(_BULLET) + 1
+        if used + cost > ASSUMPTIONS_MAX_CHARS:
+            break
+        used += cost
+        shown.append(entry)
+    shown.reverse()
+    withheld = len(execution.assumptions) - len(shown)
+    lines = [f"{_BULLET}{text}" for text in shown]
+    if withheld:
+        lines.insert(
+            0,
+            f"({withheld} earlier assumption(s) are not shown here, to keep this "
+            "packet deliverable — each appeared in the packet for the round that "
+            "made it, and all of them are in the execution record)",
+        )
+    return (
+        "\n\n"
+        "Assumptions the executor took where the task did not say (CLAIMED,\n"
+        "not read from git — each is a choice it made instead of asking, and\n"
+        "the code implementing it is in the diff below):\n"
+        + textwrap.indent("\n".join(lines), "  ")
     )
 
 

@@ -81,6 +81,15 @@ if TYPE_CHECKING:
 # session written before this existed has no in-flight changeset review to
 # backfill — `None` is exactly correct for it.
 #
+# NOT bumped for the fault-stop classification either (`LoopState.stop_kind` /
+# `stop_blocker_id`). Both default to the empty/None value, and — unlike most of
+# the additions above — the default here is deliberately NOT one of the two real
+# classifications: a session written before this existed ended in `stopped` for
+# a reason nobody recorded, and every reader must treat that as "unclassified"
+# rather than guessing "contract". `cli._cmd_smoke_browser` gates PASS on the
+# POSITIVE value (`stop_kind == "contract"`), so an unclassified stop reads as a
+# failure, which is the fail-closed direction.
+#
 # NOT bumped for chunked packet delivery either (`LoopState.outbox_diff`,
 # `PendingRequest.delivery`, and the new `Phase.DELIVERING` member). The two
 # fields default to `None`, which is exactly right for a state file written
@@ -136,7 +145,10 @@ class Phase(str, Enum):
     AWAITING = "awaiting"      # submission confirmed, waiting for the reply
     EXECUTING = "executing"    # raw response captured; parse -> policy -> dispatch
     NEEDS_USER = "needs_user"  # human input required (question / retry)
-    STOPPED = "stopped"        # ChatGPT decided stop
+    # The reviewer decided stop, OR the loop ended itself on a fault it cannot
+    # ask anyone about (see `LoopState.stop_kind` — the two are the SAME phase
+    # and are told apart only by that field, never by the phase alone).
+    STOPPED = "stopped"
     FAILED = "failed"          # failure budget exhausted
 
 
@@ -531,6 +543,30 @@ class LoopState:
     question: str | None = None
     resume_phase: str | None = None
     stop_reason: str | None = None
+    #: WHY the loop is in `stopped` — the field that keeps one phase from
+    #: meaning two opposite things:
+    #:
+    #: * `"contract"` — the reviewer answered `stop`. The run finished the way
+    #:   it is supposed to; `stop_reason` is the reviewer's own words.
+    #: * `"fault"` — the LOOP ended itself because it hit a wall no further
+    #:   message could get past (today: the policy-denial budget, see
+    #:   `orchestrator._to_fault_stop`). `stop_reason` describes the wall, a
+    #:   `blockers.Blocker` records it for `python -m autoloop blockers`, and
+    #:   `stop_blocker_id` below names that record.
+    #: * `""` — unclassified: a state file written before this field existed,
+    #:   or any phase other than `stopped`.
+    #:
+    #: Every reader must gate on the POSITIVE value it wants rather than
+    #: treating "not fault" as clean — `cli._cmd_smoke_browser` reports PASS
+    #: only for `"contract"`, so an unclassified or newly added fault stop
+    #: fails closed instead of being announced as a healthy round-trip.
+    stop_kind: str = ""
+    #: The `blockers.Blocker.id` a `"fault"` stop was recorded under, if a
+    #: `BlockerStore` was configured. The counterpart to `park_blocker_id`
+    #: below, deliberately a separate field: a fault stop is not a park, and
+    #: nothing that reads a park (`cli._handle_parked_task`, `--answer`'s
+    #: `needs_user` gate) should be able to pick this up by accident.
+    stop_blocker_id: str | None = None
     #: Classification of the CURRENT `needs_user` park (see
     #: `orchestrator._to_needs_user`'s `kind` parameter and
     #: `docs/AUTOLOOP.md`'s blockers section): `"task_fatal"` (one task was
