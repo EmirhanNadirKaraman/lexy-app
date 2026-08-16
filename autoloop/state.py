@@ -460,6 +460,23 @@ class LoopState:
     #: a park naming the cooldown rather than an unbounded retry — see
     #: `orchestrator._handle_browser_failure`.
     browser_restart_skips: int = 0
+    #: Consecutive back-offs taken because ChatGPT is throttling the ACCOUNT
+    #: (`errors.RateLimitedError` — its "Too many requests" overlay). Its own
+    #: counter for the same reason `browser_restart_skips` is: the loop cannot
+    #: recover from a server-side limit, only outlast it, so these are not
+    #: evidence that the transport is hopeless and must never spend
+    #: `consecutive_failures`. Charging them there is what turned one overnight
+    #: throttle into a restart-and-retry storm that deepened the limit it was
+    #: failing on (2026-08-14/15). Reset the moment a re-probe finds the
+    #: overlay gone, and bounded by `policy.max_rate_limit_backoffs` so the
+    #: exemption ends in a park NAMING the throttle rather than an unbounded
+    #: wait — see `orchestrator._handle_rate_limited`.
+    rate_limit_backoffs: int = 0
+    #: Seconds ACTUALLY slept across those back-offs, accumulated as they are
+    #: taken rather than derived from the configured schedule — so the park
+    #: message states a wait that was really observed. Same distinction as
+    #: `PendingRequest.start_timeout_wait_seconds`. Reset with the counter.
+    rate_limit_wait_seconds: float = 0.0
     parse_retries: int = 0
     policy_denials: int = 0
     outbox: str | None = None

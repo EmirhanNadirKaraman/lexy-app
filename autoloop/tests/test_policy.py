@@ -233,6 +233,20 @@ def test_browser_restart_skip_budget_is_separate_from_the_failure_budget():
     assert eng.check_failure_budget(3).allowed
 
 
+def test_rate_limit_backoff_budget_is_separate_from_the_failure_budget():
+    """Waits taken against ChatGPT's account throttle are counted here, not on
+    `check_failure_budget`: neither restarting nor retrying could have cleared
+    a server-side limit, and both add a request to the window that caused it."""
+    eng = engine(max_consecutive_failures=3, max_rate_limit_backoffs=2)
+    assert eng.check_rate_limit_backoff_budget(2).allowed
+    verdict = eng.check_rate_limit_backoff_budget(3)
+    assert not verdict.allowed and verdict.code == "rate_limit_backoff_budget"
+    assert "rate limit" in verdict.reason
+    # Spending one never spends the other — nor the restart-skip budget.
+    assert eng.check_failure_budget(3).allowed
+    assert eng.check_browser_restart_skip_budget(3).allowed
+
+
 def test_parse_budget():
     eng = engine(max_parse_retries=1)
     assert eng.check_parse_budget(1).allowed

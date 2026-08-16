@@ -70,6 +70,19 @@ class BrowserConfig:
     #: Minimum seconds between restart attempts. Without it a genuinely
     #: dead transport becomes a restart loop.
     restart_cooldown_seconds: float = 120.0
+    #: First wait after ChatGPT reports its account-level throttle
+    #: (`errors.RateLimitedError`), doubling on each consecutive occurrence up
+    #: to `rate_limit_backoff_max_seconds`. Waiting is the entire remedy: the
+    #: limit is server-side, so the loop cannot recover from it, only outlast
+    #: it — and every retry it makes meanwhile is another request into the
+    #: window that produced it.
+    rate_limit_backoff_seconds: float = 60.0
+    #: Ceiling on one such wait. Kept under the heartbeat monitor's staleness
+    #: threshold (45 minutes, `scripts/check_heartbeat.py`) on purpose: the
+    #: loop publishes a heartbeat BETWEEN steps, so a single sleep inside one
+    #: is a gap in the record. Ten minutes leaves that alarm meaning what it
+    #: says while still being a real wait.
+    rate_limit_backoff_max_seconds: float = 600.0
 
 
 @dataclass(frozen=True)

@@ -43,6 +43,16 @@ synchronisation, Send readiness, submission confirmation, response start,
 response completion, reconciliation), and every timeout writes a structured,
 secret-free diagnostic snapshot.
 
+**A throttled account is not a broken browser.** ChatGPT answers too many
+requests with a full-screen overlay ("Too many requests… please wait a few
+minutes") that intercepts pointer events while changing nothing else: the page
+loads, the messages list, and the composer reports present and enabled. Every
+wait above therefore fails on it as a plain timeout, which the loop used to
+report as a lost session and answer by restarting Chrome — the one response
+that makes an account-level limit worse. `_check_throttled` tests for the
+overlay's `data-testid` at every polling site and raises `RateLimitedError`,
+which is not a `BrowserError` precisely so it cannot reach that recovery.
+
 Two further OPTIONAL capabilities the orchestrator probes with `getattr`:
 
 * `supports_chunked_delivery` (declared below) — this transport keeps one
@@ -74,6 +84,7 @@ from ..errors import (
     ConversationSearchInconclusive,
     ConversationUnusableError,
     LoginExpiredError,
+    RateLimitedError,
     ResponseTimeoutError,
     SubmissionError,
 )
@@ -152,6 +163,11 @@ class TransportDiagnostics:
     send_attempted: bool
     reconciled: bool
     retry_prohibited: bool
+    #: Whether ChatGPT's account-throttle overlay was up when this was taken.
+    #: Recorded next to `composer_present` on purpose: while the modal is up
+    #: that field reads True and the page is nonetheless unusable, so a dump
+    #: showing only the composer is the misleading half of the picture.
+    rate_limit_modal_present: bool = False
     note: str = ""
     #: Verdict from the optional network observation ("unknown" when the
     #: session does not implement it) and the raw observations behind it.
@@ -278,6 +294,7 @@ class BrowserChatGPT:
         deadline = self._monotonic() + self._reconcile_timeout
         while True:
             self._check_logged_in(request_id=request_id, stage="reconcile")
+            self._check_throttled(request_id=request_id, stage="reconcile")
             if self.has_request(request_id):
                 return True
             if self._monotonic() >= deadline:
@@ -312,6 +329,7 @@ class BrowserChatGPT:
         self._reconciled = True
         self._await_composer("reconcile-no-response", request_id=request_id)
         self._check_logged_in(request_id=request_id, stage="reconcile-no-response")
+        self._check_throttled(request_id=request_id, stage="reconcile-no-response")
         return not self._response_started(self.messages(), request_id)
 
     def close(self) -> None:
@@ -653,20 +671,35 @@ class BrowserChatGPT:
             # Only trustworthy because callers attach/reconcile first.
             return SubmitResult.ALREADY_PERSISTED
         self._wait_not_generating(request_id)
-        if attachment is not None:
-            self._attach_file(request_id, attachment)
-        self._enter_prompt(request_id, prompt)
-        self._await_send_ready(request_id)
-        # Open the observation window immediately before the click, so nothing
-        # the page did earlier can be attributed to this turn.
-        self._start_observation()
-        self._session.click(self._sel.send_button)
+        try:
+            if attachment is not None:
+                self._attach_file(request_id, attachment)
+            self._enter_prompt(request_id, prompt)
+            self._await_send_ready(request_id)
+            # Open the observation window immediately before the click, so
+            # nothing the page did earlier can be attributed to this turn.
+            self._start_observation()
+            self._session.click(self._sel.send_button)
+        except BrowserError:
+            # The throttle overlay arriving mid-turn is what this catches. It
+            # removes nothing and disables nothing — it merely intercepts
+            # pointer events — so driving the composer fails as a plain click
+            # timeout (`Locator.click: Timeout 30000ms exceeded. waiting for
+            # locator("#prompt-textarea")`, the whole of what the loop saw all
+            # night on 2026-08-14/15) while every DOM reading still says the
+            # page is fine. Re-read the one thing that separates them before
+            # letting a generic transport fault stand; if the overlay is not
+            # there, this is an ordinary composer failure and passes through
+            # untouched.
+            self._check_throttled(request_id=request_id, stage="submit-input")
+            raise
         self._send_attempted = True
 
         deadline = self._monotonic() + self._submit_timeout
         first_observation_at: float | None = None
         while True:
             self._check_logged_in(request_id=request_id, stage="submit-confirm")
+            self._check_throttled(request_id=request_id, stage="submit-confirm")
             self._collect_observations()
             if first_observation_at is None and self._observations:
                 first_observation_at = self._monotonic()
@@ -732,6 +765,7 @@ class BrowserChatGPT:
 
         while True:
             self._check_logged_in(request_id=request_id, stage="await")
+            self._check_throttled(request_id=request_id, stage="await")
             self._require_on_conversation(request_id)
             msgs = self.messages()
 
@@ -1180,6 +1214,10 @@ class BrowserChatGPT:
         deadline = self._monotonic() + self._composer_timeout
         while True:
             self._check_logged_in(request_id=request_id, stage=stage)
+            # BEFORE the composer probe below, never after: the composer is
+            # present and enabled throughout a throttle, so the probe would
+            # return success onto a page nothing can be clicked on.
+            self._check_throttled(request_id=request_id, stage=stage)
             if any(
                 self._session.exists(marker) for marker in self._sel.conversation_error_markers
             ):
@@ -1225,6 +1263,91 @@ class BrowserChatGPT:
                     "changed (see autoloop/browser/selectors.py)"
                 )
             self._sleep(self._poll_interval)
+
+    # ---- account throttle ---------------------------------------------------
+
+    def is_rate_limited(self) -> bool:
+        """Is ChatGPT's account-throttle overlay up right now?
+
+        A single element test, and the ONLY reliable one. Everything else the
+        page offers reads healthy while the account is throttled: it loads, it
+        lists its messages, it shows a composer that reports visible and
+        enabled, and its `inner_text` does not contain "Too many requests"
+        (2026-08-15, three separate passive checks, all wrong).
+
+        Public because the orchestrator re-probes through it after a back-off:
+        the wait is over when this says so, not when a dismiss click returned.
+        """
+        return self._session.exists(self._sel.rate_limit_modal)
+
+    def dismiss_rate_limit_modal(self) -> bool:
+        """Best-effort "Got it", then report whether the overlay is GONE.
+
+        Dismissal matters beyond tidiness: the modal hides the composer even
+        after the server-side limit expires, so a stale one left up reads as a
+        throttle that never clears — the loop would keep backing off against
+        nothing until its budget parked it.
+
+        Never raises and never trusts the click. The element carrying the
+        testid is the full-screen overlay, so the button may not be a
+        descendant of it and the first candidate selector may match nothing;
+        the return value is a fresh existence probe either way. True when
+        nothing (any longer) covers the page.
+        """
+        try:
+            if not self.is_rate_limited():
+                return True
+            for candidate in self._sel.rate_limit_dismiss:
+                if self._session.exists(candidate):
+                    self._session.click(candidate)
+                    break
+            self._sleep(self._poll_interval)
+            return not self.is_rate_limited()
+        except Exception:
+            # A failed dismissal must never become a second fault on top of
+            # the throttle. "Could not prove it cleared" is the honest answer
+            # and the safe one: the caller waits again.
+            return False
+
+    def _check_throttled(self, request_id: str | None = None, stage: str = "") -> None:
+        """Raise `RateLimitedError` if the account-throttle overlay is up.
+
+        Called at every site `_check_logged_in` is, and always AFTER it — a
+        logged-out page has no conversation to throttle. Inside
+        `_await_composer` it deliberately runs BEFORE the composer probe: the
+        composer exists while throttled, so a check placed after it would
+        return success and hand the caller a page that intercepts every click.
+
+        A probe that cannot run is NOT a throttle. That matters at the one
+        call site inside an `except` block (`submit`): raising from here on a
+        failed read would replace the fault actually being handled with a
+        second one, and misattribute a dead session to a rate limit.
+        """
+        try:
+            present = self._session.exists(self._sel.rate_limit_modal)
+        except Exception:
+            return
+        if not present:
+            return
+        self.save_diagnostics(
+            "rate-limited",
+            request_id=request_id,
+            stage=stage,
+            retry_prohibited=self._send_attempted,
+            note=(
+                "ChatGPT is rate-limiting this ACCOUNT — its 'Too many requests' "
+                "overlay covers the page. Nothing is wrong with the browser; "
+                "restarting it would add another request to the window that "
+                "caused this."
+            ),
+        )
+        raise RateLimitedError(
+            "ChatGPT is rate-limiting this account ('Too many requests — please "
+            "wait a few minutes before trying again'). The composer is still "
+            "present but a full-screen overlay intercepts every click, so this "
+            "is not a browser fault and a restart cannot help.",
+            stage=stage,
+        )
 
     def _check_logged_in(self, request_id: str | None = None, stage: str = "") -> None:
         url = self._session.url()
@@ -1291,6 +1414,7 @@ class BrowserChatGPT:
             send_attempted=self._send_attempted,
             reconciled=self._reconciled,
             retry_prohibited=retry_prohibited,
+            rate_limit_modal_present=safe(self.is_rate_limited, False),
             note=note,
             send_outcome=self._send_outcome.value,
             send_observations=tuple(asdict(obs) for obs in self._observations),

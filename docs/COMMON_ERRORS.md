@@ -751,6 +751,76 @@ the captured `page.html`). `innerText` then contains none of it, so
 prompts do not hit this — `keyboard.insert_text` fires no paste event — but a
 human paste into the same conversation does.
 
+### `browser session lost: Locator.click: Timeout 30000ms exceeded. waiting for locator("#prompt-textarea")` — repeating for hours
+**Symptom:** every turn fails the same way, from one moment onward (07:56, on
+2026-08-14/15), with nothing else in the transcript. The words **rate**,
+**limit** and **throttle** appear nowhere in it. The loop restarts Chrome,
+retries, fails identically, and keeps going until a task burns its attempt
+ceiling (`blk-pkt-03-001`, `attempt_count_ceiling`) without ever reaching a
+review. The state file and the diagnostics dumps say `composer_present: true`.
+
+**Cause:** ChatGPT is **rate limiting the account** and has put up a modal:
+
+> **Too many requests**
+> You are making requests too quickly. We have temporarily limited access to
+> your conversations to protect your data.
+> Please wait a few minutes before trying again.  `[ Got it ]`
+
+It is a full-screen overlay (`class="absolute inset-0"`, z-50) that **intercepts
+pointer events**. Nothing is removed and nothing is disabled, so every click
+into the composer times out while the page keeps reporting itself healthy.
+
+**The restart is not the recovery — it is the mechanism.** Restarting and
+retrying is what generates requests too quickly, so the loop deepened the exact
+condition it was failing on and reported the deepening as further browser
+failures. The limit is account-level and server-side; a fresh browser meets the
+same wall and adds one more request.
+
+**THE TRAP THAT COST AN HOUR:** the composer still EXISTS and reports
+visible/enabled throughout. Three separate passive checks — page loads, message
+count, composer presence — and a search for `Too many requests` in the page's
+`inner_text` **all reported healthy** against a firmly limited account. Presence
+of the composer is not evidence the page is usable. Only attempting an
+interaction, or testing for the modal directly, tells them apart. Any readiness
+probe written against composer presence alone reports a false all-clear.
+
+**Detector — use the stable hook, not the prose.** Captured live 2026-08-15 by
+attempting a click while throttled; Playwright named the element that
+intercepted it:
+
+```
+id="modal-conversation-history-rate-limit"
+data-testid="modal-conversation-history-rate-limit"
+class="absolute inset-0"
+```
+
+Match on `data-testid`: it is stable across wording and locale, and the visible
+text is neither (nor even findable — see the trap above).
+
+**Fix (in the code since 2026-08-16, brw-09):**
+`browser/selectors.py::rate_limit_modal` + `rate_limit_dismiss`;
+`browser/chatgpt.py::_check_throttled` runs at every polling site (and re-reads
+after any composer failure in `submit`), raising `errors.RateLimitedError` —
+deliberately **not** a `BrowserError`, so it can never reach the restart-and-
+retry recovery. `orchestrator._handle_rate_limited` waits instead: escalating
+back-off (`browser.rate_limit_backoff_seconds`, doubling to
+`rate_limit_backoff_max_seconds`), no restart, no client drop, and **not**
+charged to `max_consecutive_failures` — it has its own
+`policy.max_rate_limit_backoffs`, which ends in a `needs_user` park with
+`code="rate_limited"` naming the throttle and the measured total wait. The modal
+is dismissed after each wait, because it hides the composer even after the
+server-side limit expires and a stale one would read as a continuing throttle —
+but the dismissal is **not** read as the limit lifting. The re-probe is the next
+step, and only a step that COMPLETES clears the streak: the overlay is gone
+because the loop closed it, so resetting on a dismissal would reset on every
+occurrence and turn the back-off into a fixed-interval retry that never
+escalates and never parks.
+
+**If you are reading an OLD transcript:** a run of identical
+`Locator.click: Timeout … #prompt-textarea` errors with `browser_restarted`
+between them is this, before the fix. A run that says `rate_limited` is this,
+after it — leave the account idle and `run --retry`.
+
 ---
 
 ## 7. Autoloop worker/publisher separation (M2)

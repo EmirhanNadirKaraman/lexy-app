@@ -121,6 +121,40 @@ class ResponseTimeoutError(BrowserError):
         super().__init__(message)
 
 
+class RateLimitedError(AutoloopError):
+    """ChatGPT is throttling the ACCOUNT and has covered the page with its
+    "Too many requests" modal.
+
+    Deliberately NOT a `BrowserError`. Nothing about the browser is broken, and
+    the ordinary browser recovery — drop the client, restart Chrome, retry —
+    is the one response that provably makes this worse: the limit is
+    account-level and server-side, so a fresh browser meets the same wall while
+    adding another request to the window that produced it. Overnight on
+    2026-08-14/15 the loop did exactly that, reported each round as
+    `browser session lost: Locator.click: Timeout 30000ms exceeded. waiting for
+    locator("#prompt-textarea")`, and burned pkt-03 through its attempt ceiling
+    without ever reaching a review. Routing it here instead means it never
+    reaches `_handle_browser_failure` at all.
+
+    Not `QuotaExhaustedError` either, though that one's docstring notes the web
+    UI rate-limits too. That error means the plan ALLOWANCE is spent, and its
+    handler answers by switching to the fallback provider or parking — neither
+    of which addresses a temporary throttle that clears on a server-side timer
+    with no operator action at all. The remedy here is to WAIT, so it has its
+    own handler (`orchestrator._handle_rate_limited`) and its own bounded
+    budget (`policy.max_rate_limit_backoffs`), on the same principle as the
+    cooldown-skipped restart exemption: a failure nobody could have recovered
+    from must not be charged to the budget that decides recovery is hopeless.
+
+    `stage` names where the throttle was seen (`"attach"`, `"submit-confirm"`,
+    `"await"`, ...) purely for diagnostics.
+    """
+
+    def __init__(self, message: str, *, stage: str = ""):
+        self.stage = stage
+        super().__init__(message)
+
+
 class QuotaExhaustedError(AutoloopError):
     """The reviewer's plan allowance is spent — an account condition, not a
     transport fault.

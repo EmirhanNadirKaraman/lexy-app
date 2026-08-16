@@ -2435,9 +2435,77 @@ Exhausting the skip budget **parks** `loop_fatal` with
 `code="browser_restart_cooldown_blocked"`, naming
 `browser.restart_cooldown_seconds` and its value in the question, so
 `python -m autoloop blockers` shows the operator what stopped the session and
-`run --retry` resumes it (that path clears both fault counts). It deliberately
+`run --retry` resumes it (that path clears every fault count). It deliberately
 does not enter `failed`: a terminal state whose cause is recoverable only by
 reading the transcript is the defect underneath this one.
+
+**A throttled account is not a broken browser — and the browser recovery makes
+it worse.** ChatGPT rate-limits the ACCOUNT when it sees too many requests, and
+says so with a full-screen modal ("Too many requests… please wait a few minutes
+before trying again", `[Got it]`). The modal is an `absolute inset-0` overlay
+that intercepts pointer events; it removes nothing, so every wait in the
+transport fails on it as a plain click timeout. Overnight on 2026-08-14/15 the
+loop reported that, from 07:56 onward, as
+
+```
+browser session lost: Locator.click: Timeout 30000ms exceeded.
+  waiting for locator("#prompt-textarea")
+```
+
+and answered each one by restarting Chrome and retrying. **Restarting and
+retrying is what generates requests too quickly**, so the loop deepened the
+exact condition it was failing on and reported the deepening as further browser
+failures. pkt-03 burned through its five-attempt ceiling
+(`blk-pkt-03-001`, `attempt_count_ceiling`) without ever reaching an approved
+review, and the words *rate*, *limit* and *throttle* appear nowhere in the
+transcript for that period. An operator found it by opening the browser and
+reading the screen.
+
+*Detection is by `data-testid`, never by the prose* — `[data-testid=
+"modal-conversation-history-rate-limit"]`, captured live by attempting a click
+while throttled and reading which element Playwright said intercepted it. The
+wording and the locale both move; the testid does not. And the visible text is
+not even a fallback: a search for "Too many requests" in the page's
+`inner_text` reported healthy against a firmly limited account, alongside three
+other passive checks. **The composer is present and enabled the whole time** —
+any readiness probe written against composer presence alone reports a false
+all-clear.
+
+`errors.RateLimitedError` is deliberately NOT a `BrowserError`, so it cannot
+reach that recovery at all. `orchestrator._handle_rate_limited` waits instead:
+
+| | |
+|---|---|
+| restart the browser | **never** — a fresh browser meets the same server-side wall and adds a request |
+| drop the client | **never** — re-attaching navigates, and a navigation is another request |
+| `max_consecutive_failures` | **never charged** — same principle as the row above about skipped restarts |
+| what it does | wait `browser.rate_limit_backoff_seconds` (doubling per consecutive occurrence to `rate_limit_backoff_max_seconds`), dismiss the modal in place, leave the phase untouched so the loop re-enters the step |
+| bounded by | `policy.max_rate_limit_backoffs` (default 6 ≈ 27 minutes of measured wait) |
+| streak reset by | a step that COMPLETES — nothing else |
+
+**The re-probe is the next step, and only a step that completes ends the
+streak.** Dismissal is still required — the modal hides the composer even
+after the server-side limit expires, so a stale one left standing would read
+as a throttle that never lifts — but it is *not evidence the limit lifted*.
+The overlay is gone because the loop closed it; the limit is server-side and
+answers to a timer, not to a click. Resetting the count on a successful
+dismissal would reset it on every single occurrence: the delay would never
+double, `max_rate_limit_backoffs` would never accumulate, and the park would
+be unreachable — a fixed-interval retry loop wearing the shape of a back-off,
+which is a slower version of the incident this replaces. So the reset lives on
+`run()`'s success path, where it costs no request and cannot be faked.
+
+Exhausting the back-off budget parks `loop_fatal` with `code="rate_limited"`,
+naming the throttle and the total wait actually measured (not the configured
+schedule), so `python -m autoloop blockers` says **rate limited** where it used
+to say **browser session lost**. Leave the account idle, then `run --retry`.
+
+It has no `cli._RESOLUTION_PRECONDITIONS` entry, deliberately and for the same
+reason `browser_restart_cooldown_blocked` has none: the only recheck that could
+establish whether the limit is still in force is *another request against the
+limit*, which is the behaviour this whole path exists to stop. The condition
+also clears on a server-side timer with no operator action, so refusing the
+answer would gate a blocker on something the operator cannot demonstrate.
 
 ---
 
@@ -3268,6 +3336,7 @@ dependent against the successor `superseded_by` names.
 | Browser dead / CDP unreachable | `python3 -m autoloop.browser.chrome_restart` from the checkout (§8a) — or relaunch the profile by hand (§8) — then `run --retry` (or just `run` if not parked). |
 | `restart FAILED: … restart_autoloop_chrome.sh was RETIRED` | Your `.autoloop/config.toml` still names the shell helper retired 2026-08-16. Nothing else is broken — the config loads and every other command works — but no browser restart will succeed until you set `restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]` (§8a). The loop's live config is not in this repo, so nothing could have done it for you; the failing tombstone carries that exact line on stderr. |
 | Parked `browser_restart_cooldown_blocked` | Repeated browser failures whose restart `browser.restart_cooldown_seconds` refused, so none was ever attempted (§5c). Restart the browser by hand (`python3 -m autoloop.browser.chrome_restart`, §8a) — or lower that cooldown if it is set too high for this machine. Then close the blocker it recorded (`python -m autoloop blockers`, then `answer <id> "..."`) and `run --retry`: an open blocker stops `start` and ends a `--continuous` pass, so retrying without it just parks again. Those failures never spent the failure budget, so nothing else needs resetting. |
+| Parked `rate_limited` | ChatGPT is rate-limiting the ACCOUNT ("Too many requests…"), and it did not lift across the loop's whole back-off budget (§5c). **Do not restart the browser** — the limit is server-side and a restart adds another request; that reflex is what caused the incident this park exists to replace. Leave the account idle for a while (an hour is usually plenty), close the blocker (`python -m autoloop blockers`, then `answer <id> "..."`), and `run --retry`. If it recurs, raise `browser.rate_limit_backoff_seconds` so the loop waits longer before re-probing. The back-offs never spent the failure budget, so nothing else needs resetting. |
 | Repeated malformed replies / denials | Loop parks with the reason; talk to the conversation manually if needed, then `run --answer "..."`. |
 | **Ambiguous submission** (`needs_user`, "submission … is AMBIGUOUS") | The by-content search already ran and did not prove the request present — the park text says what it found (nothing, a different chat, or that it refused to conclude), so read that line first. Open the conversation and look. If the request is there, `run --retry` (reconciles and continues). If it is genuinely absent, `run --resubmit` authorizes exactly one more send of the same id. Autoloop resolves this by itself only when it can PROVE the request is in this request's own conversation; it never decides the absent direction for you — see §5b. |
 | `send-not-ready` / `composer-not-synchronised` diagnostics | The editor never accepted the input, so **nothing was sent**: safe to `run --retry`. If it repeats, the composer selectors or the input method need attention (`browser/selectors.py`, `browser/chatgpt.py::_enter_prompt`). |

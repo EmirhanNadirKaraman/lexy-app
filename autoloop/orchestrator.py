@@ -87,6 +87,16 @@ code — no new taxonomy is invented here.
 Failure routing:
 
 * LoginExpiredError            → needs_user, resume_phase preserved (--retry)
+* RateLimitedError             → BACK OFF and re-probe, phase unchanged: an
+                                 account-level throttle is not a transport
+                                 fault and no restart can clear it. Never
+                                 restarts the browser, never spends
+                                 `max_consecutive_failures`, never drops the
+                                 client (each of those is another request into
+                                 the window that caused the limit). Charged to
+                                 `policy.max_rate_limit_backoffs`, which ends
+                                 in a needs_user park naming the throttle
+                                 (`rate_limited`)
 * ResponseTimeoutError(start)  → ordinary budget as below, PLUS: 3rd
                                  consecutive one for the same request may
                                  rotate (see "silent conversation" above)
@@ -194,6 +204,7 @@ from .errors import (
     GitError,
     LoginExpiredError,
     QuotaExhaustedError,
+    RateLimitedError,
     ResponseTimeoutError,
     StateError,
     TaskGraphError,
@@ -344,6 +355,7 @@ class Orchestrator:
         publisher_url_snapshot: str | None = None,
         config_path: Path | None = None,
         provider_factory=None,
+        sleep=time.sleep,
     ):
         self._config = config
         self._store = store
@@ -445,6 +457,10 @@ class Orchestrator:
         #: second store constructed at the other site would be the same
         #: directory, but the coupling is deliberate enough to make explicit.
         self._merge_deferrals = MergeDeferralStore(config.merge_deferrals_dir)
+        #: Injected so a rate-limit back-off can be tested without waiting out
+        #: a real one. The ONLY thing in this class that blocks deliberately;
+        #: every other wait belongs to the transport or to a subprocess.
+        self._sleep = sleep
         self._client = None
 
     # ---- main loop ----------------------------------------------------------
@@ -496,6 +512,15 @@ class Orchestrator:
                     kind="loop_fatal",
                     code="login_expired",
                 )
+            except RateLimitedError as exc:
+                # Neighbour of the clause below, and distinct from it for one
+                # reason: an exhausted ALLOWANCE is answered by changing
+                # provider, while a temporary account THROTTLE is answered by
+                # waiting. Neither is a BrowserError, and this one especially
+                # must not become one — the browser recovery is restart and
+                # retry, and both are additional requests into the window that
+                # caused the limit.
+                self._handle_rate_limited(phase, exc)
             except QuotaExhaustedError as exc:
                 # Not a BrowserError, and caught explicitly: an exhausted plan
                 # allowance is an account condition. Routed through the failure
@@ -534,6 +559,19 @@ class Orchestrator:
                     kind="loop_fatal",
                     code="state_inconsistent",
                 )
+            else:
+                # A step that COMPLETED is the only honest evidence that
+                # ChatGPT's account throttle has lifted, and it is free — no
+                # extra request, no probe. Dismissing the modal proves nothing:
+                # it is gone because the loop closed it, not because the
+                # server-side limit expired, so resetting on that would make
+                # the back-off a fixed-interval retry that never escalates,
+                # never reaches `max_rate_limit_backoffs` and never parks —
+                # a slower version of the hammering this exists to stop.
+                if self.state.rate_limit_backoffs:
+                    self.state.rate_limit_backoffs = 0
+                    self.state.rate_limit_wait_seconds = 0.0
+                    self._store.save(self.state)
 
     def _step(self, phase: Phase) -> None:
         if phase is Phase.READY:
@@ -1267,6 +1305,139 @@ class Orchestrator:
         # disproving both sends. The chat itself is the suspect now.
         self._attempt_rotation(req, reason="send_rejected_twice")
 
+    def _rate_limit_delay(self, backoffs: int) -> float:
+        """The wait for the `backoffs`-th consecutive throttle, doubling from
+        `browser.rate_limit_backoff_seconds` up to
+        `rate_limit_backoff_max_seconds`.
+
+        Escalating rather than fixed because a limit still up after the first
+        wait is a limit the first wait was too short for, and re-probing on a
+        fixed short interval is itself a request stream — a slower version of
+        the hammering this exists to stop.
+        """
+        base = max(0.0, float(self._config.browser.rate_limit_backoff_seconds))
+        ceiling = max(0.0, float(self._config.browser.rate_limit_backoff_max_seconds))
+        delay = base * (2 ** max(0, backoffs - 1))
+        return min(delay, ceiling) if ceiling else delay
+
+    def _dismiss_rate_limit_modal(self) -> None:
+        """Close the throttle overlay, if this transport can, so the next step
+        meets the page rather than the modal.
+
+        Necessary because the modal hides the composer even after the
+        server-side limit expires: left standing, a stale one would read as a
+        throttle that never lifts and spend the whole back-off budget against
+        nothing.
+
+        **Its result is deliberately not returned, because it means nothing.**
+        The overlay being gone afterwards says only that the loop closed it —
+        the limit is server-side and answers to a timer, not to a click. The
+        one honest signal that it lifted is a STEP that completes, which is
+        where the streak is reset (see `run`). Treating a dismissal as
+        evidence made the back-off a fixed-interval retry that never
+        escalated and could never park.
+
+        Reads `self._client` directly rather than `_get_client()`: that would
+        CONSTRUCT a client when none is held, and constructing the Playwright
+        one binds to the configured conversation and can navigate — the extra
+        request this whole path exists to avoid. No client held means nothing
+        to dismiss; the next step's own `attach` sees the modal and raises,
+        which is the correct outcome.
+        """
+        client = self._client
+        if client is None:
+            return
+        dismiss = getattr(client, "dismiss_rate_limit_modal", None)
+        if dismiss is None:
+            return
+        try:
+            dismiss()
+        except Exception:
+            # Best-effort throughout. A failed dismissal costs one more
+            # occurrence of an already-bounded wait, never a second fault on
+            # top of the throttle.
+            pass
+
+    def _handle_rate_limited(self, phase: Phase, exc: RateLimitedError) -> None:
+        """ChatGPT is throttling the account. Wait it out; do not fight it.
+
+        Three things this must NOT do, each of them the reflex of every other
+        browser-fault handler here:
+
+        * **No restart.** The limit is account-level and server-side, so a
+          fresh browser meets the same wall while adding another request. On
+          2026-08-14/15 the loop restarted and retried from 07:56 onward,
+          deepening the very condition it was failing on and reporting each
+          round as `browser session lost`.
+        * **No `consecutive_failures`.** Same principle the cooldown-skipped
+          restart established (`_handle_browser_failure`): a failure nobody
+          could have recovered from must not be charged to the budget that
+          decides recovery is hopeless. These get
+          `policy.max_rate_limit_backoffs` instead, so the exemption still
+          ends somewhere an operator can see.
+        * **No `_drop_client`.** Re-attaching navigates, and a navigation is
+          another request. The page stays exactly where it is; the modal is
+          dismissed in place and re-probed there.
+
+        The phase is left untouched, so the loop re-enters the step it was in
+        and republishes its heartbeat. **That re-entry IS the re-probe**, and
+        the streak is reset only when it completes (`run`'s `else` branch).
+        Nothing here may reset it: after the sleep the overlay is dismissed,
+        and a dismissed overlay is gone because the loop closed it, not
+        because the server-side limit expired. Reading that as "cleared" made
+        every occurrence reset the count, so the delay never doubled, the
+        budget never accumulated and the park was unreachable — a 60-second
+        retry loop wearing the shape of a back-off.
+        """
+        state = self.state
+        state.rate_limit_backoffs += 1
+        verdict = self._policy.check_rate_limit_backoff_budget(state.rate_limit_backoffs)
+        delay = self._rate_limit_delay(state.rate_limit_backoffs)
+        self._log(
+            "rate_limited",
+            data={
+                "phase": phase.value,
+                "error": str(exc),
+                "reason_code": "rate_limited",
+                "stage": getattr(exc, "stage", ""),
+                "backoffs": state.rate_limit_backoffs,
+                "backoff_seconds": delay,
+                "waited_seconds": state.rate_limit_wait_seconds,
+            },
+        )
+        if not verdict.allowed:
+            waited = state.rate_limit_wait_seconds
+            self._to_needs_user(
+                f"{verdict.reason}: ChatGPT has rate limited this account "
+                f"('Too many requests — please wait a few minutes before trying "
+                f"again') and it has not lifted after {state.rate_limit_backoffs} "
+                f"waits totalling {waited:g}s. This is NOT a browser fault — the "
+                "composer is present the whole time and a restart cannot help, "
+                "because the limit is server-side. Leave the account idle for a "
+                "while (an hour is usually more than enough), then resume with "
+                "`python -m autoloop run --retry`. If it keeps happening, raise "
+                "browser.rate_limit_backoff_seconds so the loop waits longer "
+                f"before re-probing. Last error: {exc}",
+                resume_phase=phase.value,
+                kind="loop_fatal",
+                code="rate_limited",
+                detail=(
+                    f"phase={phase.value} backoffs={state.rate_limit_backoffs} "
+                    f"waited_seconds={waited:g} next_backoff_seconds={delay:g}"
+                ),
+            )
+            return
+        # Persisted BEFORE the sleep: a crash during the wait must resume with
+        # the count and the measured total intact, not reset to zero and ready
+        # to start hammering again.
+        state.rate_limit_wait_seconds += delay
+        self._store.save(state)
+        self._sleep(delay)
+        # Clear the overlay so the next step meets the page. This is NOT a
+        # verdict on the limit — see `_dismiss_rate_limit_modal`. The streak
+        # ends where a step completes (`run`), not here.
+        self._dismiss_rate_limit_modal()
+
     def _handle_quota_exhausted(self, phase: Phase, exc: QuotaExhaustedError) -> None:
         """Hand the reviewer role to the fallback provider, or park saying why.
 
@@ -1549,6 +1720,32 @@ class Orchestrator:
             new_url, sent_prompt = self._rotate_conversation(req, project_url)
         except LoginExpiredError:
             raise
+        except RateLimitedError as exc:
+            # Caught ahead of the generic clause so the park says THROTTLE
+            # rather than "opening a replacement chat failed", which would
+            # send the operator looking at the conversation. Parked rather
+            # than backed off: the rotation budget is already spent and the
+            # attempt may have posted, so this is not a step that can simply
+            # be re-entered after a wait. Not re-raised either — this method
+            # is reached from inside `run()`'s own except clauses, where a
+            # raise would leave the try entirely and end the process.
+            self._log(
+                "rate_limited",
+                request_id=req.request_id,
+                data={"reason_code": "rate_limited", "context": "rotation",
+                      "error": str(exc)},
+            )
+            self._drop_client()
+            self._park_rotation(
+                req,
+                "rate_limited",
+                "ChatGPT rate limited this account while a replacement chat "
+                f"was being opened: {exc}. The rotation attempt is spent — it "
+                "may have posted before the throttle bit, so autoloop will not "
+                "try again on its own. Leave the account idle for a while, "
+                "check whether the replacement chat exists, then resume.",
+            )
+            return
         except (BrowserError, AutoloopError) as exc:
             self._log(
                 "rotation_failed",
