@@ -249,6 +249,7 @@ from .state import (
 )
 from .inbox import apply_requests
 from .tasks import (
+    TRACKER_PATHS,
     Task,
     TaskRegistry,
     TaskState,
@@ -3076,17 +3077,26 @@ class Orchestrator:
     # ONE produce-then-review commit path, audit included.
 
     def _tracker_paths(self) -> tuple[str, ...]:
-        """The target repository's implicitly-approved documentation trackers
-        (`config.RepoConfig.tracker_paths`, defaulting to `tasks.TRACKER_PATHS`
-        — this repository's own list).
+        """The repository's implicitly-approved documentation trackers:
+        `tasks.TRACKER_PATHS`, and nothing else.
 
         Read through ONE accessor so every `effective_approved_paths` call in
         this file passes the same list. The dispatch-time seed and the
         every-dispatch re-sync below COMPARE against it and ASSIGN from it: if
         those two ever read different values, the execution record reads dirty
         on every dispatch and is rewritten forever.
+
+        **It returns a reviewed CONSTANT, deliberately — not `self._config`.**
+        A tracker is granted to every scoped task without being named in it, so
+        the list is authorization surface, and `.autoloop/config.toml` is
+        gitignored: sourcing it from there would let an unreviewed edit widen
+        every task at once. Reading any config value here reopens
+        `docs/SECURITY.md` S31 and must not be done without revisiting it. The
+        accessor stays (rather than inlining the constant at the three call
+        sites) because it is the one place a test can pin that property —
+        `test_config_repo_section.py` scans this file for both halves.
         """
-        return self._config.repo.tracker_paths
+        return TRACKER_PATHS
 
     def _dispatch_task_postcommit(self, directive: Directive, task: Task, state: LoopState) -> None:
         if (self._worktrees is None and self._worker_repos is None) or (

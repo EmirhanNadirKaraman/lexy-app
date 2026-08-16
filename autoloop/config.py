@@ -13,10 +13,9 @@ from pathlib import Path
 
 import tomllib
 
-from .errors import ConfigError, TaskGraphError
+from .errors import ConfigError
 from .policy import PolicyConfig
 from .stall import DEFAULT_CEILING_SECONDS, DEFAULT_STALL_SECONDS
-from .tasks import TRACKER_PATHS, validate_tracker_paths
 
 
 @dataclass(frozen=True)
@@ -146,30 +145,28 @@ DEFAULT_ENV_EXAMPLE_DB_KEY = "DB_NAME"
 
 @dataclass(frozen=True)
 class RepoConfig:
-    """The three things about the TARGET REPOSITORY the loop cannot infer.
+    """What the loop cannot infer about the TARGET REPOSITORY, minus anything
+    that grants authority.
 
-    Everything here was a hardcoded constant naming this repository's own
-    conventions, which is the whole reason the loop could not be pointed at
-    anything else. Each default is the exact value that was hardcoded, so a
-    config that omits this section behaves identically to the code before the
-    section existed — that equivalence is what `test_config_repo_section.py`
-    pins, and it is the property to preserve if these ever change.
+    Each setting here was a hardcoded constant naming this repository's own
+    conventions, which is the reason the loop could not be pointed at anything
+    else. Each default is the exact value that was hardcoded, so a config that
+    omits this section behaves identically to the code before the section
+    existed — that equivalence is what `test_config_repo_section.py` pins, and
+    it is the property to preserve if these ever change.
 
-    Deliberately NOT a general escape hatch. Two of the three are validated as
-    strictly as the values they replaced (see `load_config`), and the one that
-    grants authority — `tracker_paths` — is validated harder than it was as a
-    constant, because a constant was at least a reviewed diff.
+    **Deliberately NOT a general escape hatch, and specifically not an
+    authorization surface.** Every setting below says WHERE to read something
+    the repository itself states; none of them decides what an agent may write.
+    The always-approved tracker list does decide that, and it is therefore NOT
+    here: it stays the fixed `tasks.TRACKER_PATHS` constant, because this file
+    lives under the gitignored state directory and an edit to it is not a
+    reviewed diff. That distinction is the whole shape of this section — see
+    `tasks.TRACKER_PATHS` and `docs/SECURITY.md` S31 for the design that was
+    tried and withdrawn, and `_migrate_retired_tracker_paths` below for what
+    happens to a config that still names the withdrawn key.
     """
 
-    #: Documentation the repository's own rules oblige a task to update, which
-    #: every scoped task may therefore write WITHOUT naming it in its
-    #: `approved_paths` (`tasks.effective_approved_paths`). Validated by
-    #: `tasks.validate_tracker_paths`: exact repository-relative documentation
-    #: paths only — no globs, no traversal, no directory prefixes, nothing that
-    #: looks like code or configuration. An EMPTY list is legal and means "this
-    #: repository imposes no implicit obligations"; every task then gets
-    #: exactly what it declares and nothing more.
-    tracker_paths: tuple[str, ...] = TRACKER_PATHS
     #: The git-tracked example env file that declares the APPLICATION database
     #: name, and the key inside it. Used for exactly one refusal: a validation
     #: env file pointed at that same database (`validation_env.
@@ -180,8 +177,8 @@ class RepoConfig:
     env_example_db_key: str = DEFAULT_ENV_EXAMPLE_DB_KEY
     #: Where the dashboard reads the application backlog from — the newest
     #: audit report, by name. A glob relative to the repo root; metacharacters
-    #: are the point here, unlike in `tracker_paths`, so it is checked only for
-    #: being relative and traversal-free. Empty means the dashboard's
+    #: are the point here, unlike in `env_example_file`, so it is checked only
+    #: for being relative and traversal-free. Empty means the dashboard's
     #: "Language-app tasks" panel stays empty, which is the correct reading for
     #: a repository that files no audit reports.
     audit_report_glob: str = DEFAULT_AUDIT_REPORT_GLOB
@@ -550,6 +547,66 @@ def _migrate_retired_timeout(audit_data: dict) -> tuple[str, ...]:
     )
 
 
+#: The `[repo]` key that existed for one unshipped round on 2026-08-16 and was
+#: withdrawn in review (port-02, `docs/SECURITY.md` S31). A config may still
+#: name it — `config.example.toml` advertised it — and naming it still loads,
+#: but it is handled EXPLICITLY and never applied. Same treatment, and the same
+#: reasoning, as `RETIRED_AGENT_TIMEOUT_KEY`.
+RETIRED_TRACKER_PATHS_KEY = "tracker_paths"
+
+
+def _migrate_retired_tracker_paths(repo_data: dict) -> tuple[str, ...]:
+    """Handle a config that still names `repo.tracker_paths`.
+
+    The key is CONSUMED (so it cannot reach `RepoConfig`) and its value is
+    DISCARDED (so it cannot authorize anything), and the operator is told both
+    facts. Three properties, all deliberate:
+
+    * **Never applied.** The always-approved tracker list is
+      `tasks.TRACKER_PATHS`, a constant in reviewed source, because this file
+      is gitignored and an edit to it is not a diff anyone reads. Honouring the
+      key is exactly the control that was withdrawn.
+    * **Not silently ignored.** A setting that loads and does nothing is worse
+      than a constant — it reads as configured while behaving otherwise — so
+      the notice says the value was dropped and names where the real list
+      lives. An operator who wanted those paths granted learns it here rather
+      than from a task parking on an unauthorized-path refusal.
+    * **Not a hard refusal.** Same call as `RETIRED_RESTART_SCRIPT`: the live
+      `.autoloop/config.toml` is not in this repository, so refusing at load
+      would make every command — `status`, `doctor`, the recovery commands —
+      fail on an unmigrated deployment the moment this landed, taking away the
+      tooling needed to fix it. The direction is safe either way: discarding
+      grants FEWER paths than the operator may believe, so the failure mode is
+      a refused task, never an over-authorized one.
+    """
+    if RETIRED_TRACKER_PATHS_KEY not in repo_data:
+        return ()
+    dropped = repo_data.pop(RETIRED_TRACKER_PATHS_KEY)
+    return (
+        "\n".join(
+            [
+                f"autoloop: NOTICE — repo.{RETIRED_TRACKER_PATHS_KEY} is NOT a "
+                "setting and its value was DROPPED, not applied. The "
+                "always-approved documentation trackers are the fixed "
+                "`TRACKER_PATHS` constant in autoloop/tasks.py.",
+                f"  Dropped: {dropped!r}.",
+                "  Why: a tracker is granted to EVERY scoped task without being "
+                "named in it, and this config file lives under the gitignored "
+                "state directory — so an edit here would widen every task's "
+                "write authorization without a diff anyone reviews. It was "
+                "briefly configurable on 2026-08-16 and withdrawn in review; "
+                "see docs/SECURITY.md S31.",
+                "  To change the list for this repository, edit TRACKER_PATHS in "
+                "autoloop/tasks.py — the package is vendored into the repository "
+                "it operates on, so that edit is a reviewed commit in this "
+                "repository's own history.",
+                f"  Silence this by deleting repo.{RETIRED_TRACKER_PATHS_KEY} "
+                "from your config.",
+            ]
+        ),
+    )
+
+
 def _repo_relative(section_key: str, value: str, *, allow_globs: bool) -> str:
     """Raise `ConfigError` unless `value` is a plain repository-relative path.
 
@@ -585,26 +642,16 @@ def _repo_relative(section_key: str, value: str, *, allow_globs: bool) -> str:
     return value
 
 
-def _load_repo_section(data: dict) -> RepoConfig:
-    """`[repo]`, validated. Absent means `RepoConfig()` — i.e. this
-    repository's own constants, which is the pre-configuration behaviour."""
+def _load_repo_section(data: dict) -> tuple[RepoConfig, tuple[str, ...]]:
+    """`[repo]`, validated, plus any operator notices it produced. Absent means
+    `RepoConfig()` — i.e. this repository's own constants, which is the
+    pre-configuration behaviour."""
     repo_data = dict(data.get("repo", {}))
+    # BEFORE `_check_keys`, exactly like `_migrate_retired_timeout`: the key is
+    # consumed here, so it can never reach `RepoConfig`, and the operator gets
+    # the reason instead of a generic "unknown key".
+    notices = _migrate_retired_tracker_paths(repo_data)
     _check_keys("repo", repo_data, {f.name for f in dataclasses.fields(RepoConfig)})
-
-    if "tracker_paths" in repo_data:
-        trackers = repo_data["tracker_paths"]
-        if not isinstance(trackers, list) or not all(isinstance(t, str) for t in trackers):
-            raise ConfigError(
-                'repo.tracker_paths must be a list of strings, e.g. ["docs/SUMMARY.md"]'
-            )
-        try:
-            # The same validator the registry would apply, so a tracker list
-            # the loop refuses to authorize cannot be loaded in the first
-            # place — refused at startup, by name, rather than at the first
-            # dispatch that tried to use it.
-            repo_data["tracker_paths"] = validate_tracker_paths(trackers)
-        except TaskGraphError as exc:
-            raise ConfigError(f"repo.tracker_paths is not usable: {exc}") from exc
 
     for key in ("env_example_file", "audit_report_glob"):
         if key not in repo_data:
@@ -635,7 +682,7 @@ def _load_repo_section(data: dict) -> RepoConfig:
                 f"(no padding, no '=', no whitespace), got {key_name!r}"
             )
 
-    return RepoConfig(**repo_data)
+    return RepoConfig(**repo_data), notices
 
 
 def load_config(path: Path) -> AutoloopConfig:
@@ -795,6 +842,8 @@ def load_config(path: Path) -> AutoloopConfig:
             "detector never runs, while still reading as configured"
         )
 
+    repo, repo_notices = _load_repo_section(data)
+
     return AutoloopConfig(
         browser=browser,
         policy=policy,
@@ -805,6 +854,6 @@ def load_config(path: Path) -> AutoloopConfig:
         codex=codex,
         executor=executor,
         audit=audit,
-        repo=_load_repo_section(data),
-        migration_notices=migration_notices,
+        repo=repo,
+        migration_notices=migration_notices + repo_notices,
     )

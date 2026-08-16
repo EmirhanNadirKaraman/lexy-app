@@ -40,7 +40,6 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered. Amended 2026-08-16: derived bytecode (`__pycache__/*.pyc` whose sibling `.py` is a regular file in the same snapshot side(s) — never `.pyo`, never a symlinked source) is exempt from the snapshot diff after three false loop-fatal parks — a forged cache entry whose header matches its source is the new, named residual | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
 | S30 | MEDIUM | The inbox vocabulary grew from create+priority to six mutation kinds, so a queued request can now rewrite an EXISTING task's `approved_paths` and `description` — falsifying S28's "it creates, never widens" bound. Guarded: nothing `in_progress`/`completed`/`retired` is editable, mutations share creation's validators, `block`/`unblock` cannot launder a loop-raised quarantine, `retire` is excluded, and no dashboard endpoint reaches any of it | `autoloop/inbox.py`, `autoloop/tasks.py` |
-| S31 | LOW | The always-approved documentation trackers moved from a fixed constant to `[repo].tracker_paths`, so a gitignored config edit — not a reviewed diff — can now add a path to every scoped task's authorization at once. Bounded by a load-time refusal: same validator as a task's own scope, plus no directory prefixes and no code/config extensions, so the widest thing an edit buys is another document | `autoloop/tasks.py`, `autoloop/config.py`, `autoloop/orchestrator.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -577,76 +576,6 @@ form's original argument ("priority decides what runs next, `approved_paths`
 decides what an agent may touch, and only the first belongs on a form") is
 still the right line for an unauthenticated page, even though it is no longer
 the right line for the inbox file format.
-
-### S31 — The always-approved tracker list is now a config value, not a constant — LOW — OPEN (bounded, accepted)
-
-**What:** `tasks.TRACKER_PATHS` is the set of documentation files EVERY scoped
-task may write without naming them in its `approved_paths`
-(`tasks.effective_approved_paths`, `docs/AUTOLOOP.md` §4f-bis). Until
-2026-08-16 it was a fixed constant, and its own comment named that as the
-control: *"Fixed constant, deliberately NOT configurable — widening the scope
-of every task must be a diff someone reviews, not a TOML edit."*
-
-Since 2026-08-16 the active list is `[repo].tracker_paths`
-(`config.RepoConfig`), defaulting to that same constant. **That bound is gone
-and is not being replaced by an equivalent one:** `.autoloop/config.toml` lives
-under the gitignored state directory, so an edit to it is genuinely not a
-reviewed diff. Anything that can write that file can add a path to every
-scoped task's authorization at once. The actor is the same local user S28/S30
-already assume — the inbox and the config file sit in the same trust domain —
-and what changed is what that actor can express without review.
-
-Why it was given up rather than kept: the constant encoded THIS repository's
-documentation obligations *by filename*, which made the loop unusable against
-any other repository. The obligations are real everywhere; `docs/SUMMARY.md`
-is not.
-
-What bounds it instead, enforced at load time rather than by convention:
-
-- **Documentation only, refused not asserted.** `tasks.validate_tracker_paths`
-  runs each entry through `_validate_approved_path` — the same validator a
-  task's own scope gets, so no glob metacharacter, no `..`, no absolute or `~`
-  path, no `\` — then refuses two more things a task's own scope is allowed:
-  a **directory prefix** (`docs/`, which would grant a whole tree to every
-  task) and any **code/config extension** (`.py .pyi .sh .bash .zsh .toml
-  .json .yml .yaml .cfg .ini .js .ts .tsx .jsx .sql`, matched
-  case-insensitively). So the widest thing a config edit buys is another
-  document.
-- **It is a blocklist, deliberately.** The property is "a document, not code",
-  and documentation extensions are open-ended across repositories (`.md`,
-  `.rst`, `.txt`, `.adoc`, none at all) while the things that must never be
-  implicitly writable are a short nameable set. Requiring `.md` would have
-  re-encoded the hardcoding this change exists to remove. The residual is the
-  usual blocklist residual: an executable extension nobody listed.
-- **Refused at startup, by key name.** `load_config` validates the list, so a
-  bad one makes the loop refuse to start rather than refusing every task later.
-- **An unscoped task still gains nothing.** Empty `approved_paths` still
-  returns `()` for any tracker list, including a long one — finding #2's
-  circular-ownership bound is a property of the task, not of the trackers.
-- **Visibility is unchanged.** Tracker edits still appear in
-  `commit_range_paths` and in the review packet.
-
-**file:line** — `autoloop/tasks.py` (`TRACKER_PATHS`,
-`validate_tracker_paths`, `effective_approved_paths`); `autoloop/config.py`
-(`RepoConfig.tracker_paths`, `_load_repo_section`); `autoloop/orchestrator.py`
-(`_tracker_paths`).
-
-**Verification check:**
-```bash
-# Expect: the loader validates the list — never a bare tuple() coercion
-rg -n 'validate_tracker_paths' autoloop/config.py autoloop/tasks.py
-# Expect: every effective_approved_paths call in the orchestrator reads the
-# ONE accessor, so the seed and the re-sync cannot use different lists
-rg -n 'effective_approved_paths|_tracker_paths' autoloop/orchestrator.py
-# Expect: the refusals are pinned by tests, not just by the docstring
-rg -n 'not an exact document|_NON_TRACKER_SUFFIXES' autoloop
-```
-**Suggested fix (if this trust boundary ever stops holding):** require the
-tracker list to come from a git-TRACKED file in the target repository (e.g. a
-key in a committed `.autoloop.toml` at the repo root) rather than from the
-gitignored runtime config, so declaring an implicit grant is once again a diff
-someone reviews — while staying per-repository, which is the property this
-change bought.
 
 ### S29 — `merge` is on the git whitelist, and the loop now pushes the BASE branch — LOW — OPEN (deliberate, gated, accepted)
 
@@ -1196,6 +1125,80 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 ---
 
 ## Resolved findings
+
+### S31 — Making the always-approved tracker list a config value — LOW — WITHDRAWN 2026-08-16, never shipped
+
+**Filed here rather than under *Open findings*, and kept rather than deleted.**
+Nothing described below is live: the design was written, reviewed, rejected and
+reverted inside one task (port-02), so this entry records a boundary that was
+tested, not a weakness that exists. It stays for the same reason every resolved
+finding does — the next person who wants per-repository trackers needs the
+argument that killed this version.
+
+**What was proposed:** `tasks.TRACKER_PATHS` is the set of documentation files
+EVERY scoped task may write without naming them in its `approved_paths`
+(`tasks.effective_approved_paths`, `docs/AUTOLOOP.md` §4f-bis). It encoded THIS
+repository's documentation obligations *by filename*, which blocks reuse
+against any other repository — the obligations are real everywhere,
+`docs/SUMMARY.md` is not. The proposal moved the active list to
+`[repo].tracker_paths` in `.autoloop/config.toml`, defaulting to the constant.
+
+**Why it was rejected.** `.autoloop/config.toml` lives under the gitignored
+state directory, so an edit to it is not a reviewed diff — anything that can
+write that file could add a path to every scoped task's authorization at once.
+The offered bound was a load-time refusal (`validate_tracker_paths`: the same
+validator a task's own scope gets, plus no directory prefixes, plus a blocklist
+of code/config extensions), advertised as "the widest thing a config edit buys
+is another document". **That claim was false, and not repairable by extending
+the blocklist:** `.env`, `.gitignore`, `Makefile`, `Dockerfile`, `Gemfile` and
+any extensionless script carry no refused suffix and change behaviour. The set
+of behaviour-changing filenames is open-ended, so a suffix heuristic cannot
+enforce "documentation only". A hard control (a reviewed diff) was being traded
+for an unenforceable one.
+
+**What shipped instead.** `TRACKER_PATHS` stays a fixed constant and `[repo]`
+carries only non-authority settings — `env_example_file` /
+`env_example_db_key` (where the repo declares its application database) and
+`audit_report_glob` (where the dashboard reads the backlog). Each says WHERE to
+read something the repository states; none decides what an agent may write.
+Portability for the tracker list comes from the constant itself: `autoloop/` is
+vendored into the repository it operates on, so editing `TRACKER_PATHS` in a
+target repo is a commit in that repo's reviewed history — the property a
+gitignored config edit lacks. `validate_tracker_paths` and
+`_NON_TRACKER_SUFFIXES` were deleted rather than left caller-less, so the
+disproven claim is not sitting in the tree for a future caller to trust.
+
+A config that still names `repo.tracker_paths` (the unshipped
+`config.example.toml` advertised it) LOADS and is handled explicitly by
+`config._migrate_retired_tracker_paths`: the key is consumed, the value is
+DROPPED, and an operator notice says so and names `autoloop/tasks.py`.
+Discarding grants fewer paths than the operator may believe, so the failure
+mode is a task refused for an unauthorized path — never an over-authorized one.
+
+**file:line** — `autoloop/tasks.py` (`TRACKER_PATHS`,
+`effective_approved_paths`); `autoloop/config.py` (`RepoConfig`,
+`RETIRED_TRACKER_PATHS_KEY`, `_migrate_retired_tracker_paths`);
+`autoloop/orchestrator.py` (`_tracker_paths`).
+
+**Verification check:**
+```bash
+# Expect: EMPTY — the suffix heuristic and its validator are gone, not unused
+rg -n 'validate_tracker_paths|_NON_TRACKER_SUFFIXES' autoloop --glob '!**/tests/**'
+# Expect: EMPTY — no config read supplies the tracker list. `config.py` (the
+# consume-and-drop handler) and the tests that pin it are the only mentions
+rg -n 'repo\.tracker_paths|config\.repo\.tracker' autoloop --glob '!**/config.py' --glob '!**/tests/**'
+# Expect: the accessor returns the reviewed constant, and all three call sites
+# read that one accessor (so the seed and the re-sync cannot diverge)
+rg -n 'return TRACKER_PATHS|effective_approved_paths\(' autoloop/orchestrator.py
+# Expect: hits — the regressions that pin it, including .env / Makefile
+rg -n 'BEHAVIOUR_CHANGING_FILES|cannot_newly_authorize' autoloop/tests
+```
+**Suggested fix (only if per-repository trackers are wanted again):** source
+the declaration from git-TRACKED repository metadata — a committed
+`.autoloop.toml` at the repo root — so that declaring an implicit grant is once
+again a change that appears in the repository's reviewed history. The
+requirement is that property, not per-repository-ness on its own; a runtime
+config file cannot satisfy it however it is validated.
 
 ### S28 — Document-package ingestion endpoints were auth-gated but not admin-gated — MEDIUM — RESOLVED 2026-08-01
 

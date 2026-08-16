@@ -1667,41 +1667,38 @@ hypothetical: the first version of this change patched three of the four sites,
 and the pre-commit gate then refused a tracker edit the post-commit check would
 have allowed.
 
-**Where the list comes from (changed 2026-08-16).** It is `[repo].tracker_paths`
-in the loop's config, defaulting to `tasks.TRACKER_PATHS` — this repository's own
-six. `Orchestrator._tracker_paths()` is the single accessor every call site reads
-it through, because a seed and a re-sync reading different lists would rewrite the
-execution record on every dispatch, forever.
+**Where the list comes from.** `tasks.TRACKER_PATHS` — a fixed constant in
+reviewed source, read through the single accessor `Orchestrator._tracker_paths()`
+(a seed and a re-sync reading different lists would rewrite the execution record
+on every dispatch, forever).
 
-This bullet used to read "**Fixed constant, not configurable.** Widening every
-task's scope must be a reviewed diff, never a TOML edit", and that bound is
-genuinely gone: `.autoloop/config.toml` lives under the gitignored state dir, so
-an edit to it is *not* a reviewed diff. It was given up because the list encodes
-this repository's documentation obligations *by filename*, which makes the loop
-unusable against any other repository — the obligations are real everywhere, the
-names are not. See `docs/SECURITY.md` S31 for the finding record.
-
-Still bounded, and now by a load-time refusal rather than by convention:
-
-* **Documentation only, enforced.** `tasks.validate_tracker_paths` runs each
-  entry through the same validator a task's own `approved_paths` get, then
-  refuses a directory prefix (a tracker is granted to *every* task, so it must
-  name one exact file) and every code/config extension (`.py`, `.sh`, `.toml`,
-  `.json`, `.yml`, …). It is a blocklist by necessity: documentation extensions
-  are open-ended across repositories, while the things that must never be
-  implicitly writable are a short nameable set. A bad list refuses the whole
-  config at startup, by key name, rather than at the first dispatch.
+* **Fixed constant, deliberately not runtime configuration.** Widening every
+  task's scope at once must be a diff someone reviews, never an edit to a file
+  nobody reviews — and `.autoloop/config.toml` is exactly that, since it lives
+  under the gitignored state dir.
+* **Ported by editing the constant.** The list names *this* repository's
+  documentation obligations, and the obligations are real everywhere while the
+  filenames are not. `autoloop/` is vendored into the repository it operates on,
+  so the constant already is per-repository metadata in git-tracked source:
+  changing it in a target repo is a commit in that repo's reviewed history.
+* **A `[repo].tracker_paths` setting was tried on 2026-08-16 and withdrawn in
+  review.** Its bound — a suffix blocklist refusing "anything that looks like
+  code or configuration" — cannot enforce "documentation only": `.env`,
+  `.gitignore`, `Makefile`, `Dockerfile` and extensionless scripts all pass it,
+  and the set of such names is open-ended. A config that still names the key
+  loads, prints a notice that the value was DROPPED, and is not affected by it
+  (`config._migrate_retired_tracker_paths`). See `docs/SECURITY.md` S31.
 * **An unscoped task stays unscoped.** Empty `approved_paths` still means "no
   scope authorized yet" and still refuses dispatch (`docs/SECURITY.md` finding
   #2); it does not become a task that may write documentation. That holds for
   any tracker list, including an empty one.
-* **Visibility is unchanged.** Tracker edits still appear in
-  `commit_range_paths` and in the review packet — this removes a refusal, not
-  the reviewer's sight of it.
+* **Every tracker edit stays visible** in `commit_range_paths` and in the
+  review packet — implicit approval removes a refusal, not the reviewer's sight
+  of it.
 
 Residual risk, stated rather than hidden: `docs/SECURITY.md` is the security
-tracker, so an agent can now edit the record of a finding without that being
-named in its task. It is documentation, not a control — but a weakened finding
+tracker, so an agent can edit the record of a finding without that being named
+in its task. It is documentation, not a control — but a weakened finding
 misleads a later reader, and it is why this list stays short.
 
 ## 4f-ter. Operator task inbox and priorities

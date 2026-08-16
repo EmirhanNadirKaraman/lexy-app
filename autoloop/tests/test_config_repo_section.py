@@ -1,39 +1,43 @@
-"""`[repo]` — the three things about the TARGET repository the loop cannot
-infer, which used to be constants naming this repository by name.
+"""`[repo]` — what the loop cannot infer about the TARGET repository, which
+used to be constants naming this repository by name.
 
-The load-bearing test in this file is the FIRST one: every default must equal
-the constant that was hardcoded, because "behaviour here is unchanged" is the
-entire premise under which the hardcoding was allowed to become configuration.
-Everything after it proves the configured value actually reaches the consumer —
-a setting that loads and is then ignored is worse than a constant, since it
-reads as configured while behaving as before.
+Two claims, and the second is why this file is longer than the section:
 
-The one that needed the most care is `tracker_paths`: it grants every scoped
-task write access to files it never names, so the tests below spend most of
-their length on what a config edit may NOT buy.
+1. **Every default equals the constant it replaced.** "Behaviour here is
+   unchanged" is the entire premise under which a hardcoded value was allowed
+   to become configuration, so the first test pins it. Everything after it
+   proves the configured value actually reaches its consumer — a setting that
+   loads and is then ignored is worse than a constant, since it reads as
+   configured while behaving as before.
+2. **The section holds no authorization surface.** The always-approved tracker
+   list was configurable for one unshipped round and was withdrawn in review
+   (`docs/SECURITY.md` S31): `.autoloop/config.toml` is gitignored, so a
+   `[repo].tracker_paths` edit could widen every scoped task's write scope
+   with no diff anyone reads, and the "documentation only" suffix blocklist
+   that was supposed to bound it does not — `.env`, `Makefile`, `Dockerfile`
+   and any extensionless script carry no refused suffix. Section 2 below is
+   what stops that design coming back by accident.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
 import pytest
 
-from autoloop import dashboard
+from autoloop import dashboard, tasks
 from autoloop.config import (
     DEFAULT_AUDIT_REPORT_GLOB,
     DEFAULT_ENV_EXAMPLE_DB_KEY,
     DEFAULT_ENV_EXAMPLE_FILE,
+    RETIRED_TRACKER_PATHS_KEY,
     RepoConfig,
     load_config,
 )
-from autoloop.errors import ConfigError, TaskGraphError
-from autoloop.tasks import (
-    TRACKER_PATHS,
-    effective_approved_paths,
-    validate_tracker_paths,
-)
+from autoloop.errors import ConfigError
+from autoloop.tasks import TRACKER_PATHS, effective_approved_paths
 from autoloop.validation_env import load_validation_env, repo_declared_db_name
 
 CONFIG_HEAD = '[browser]\nconversation_url = "https://chatgpt.com/c/x"\n\n'
@@ -51,6 +55,22 @@ def write_config(tmp_path: Path, repo_section: str = "") -> Path:
     return path
 
 
+def _accessor_for(config):
+    """`Orchestrator._tracker_paths` bound to a loop carrying `config`.
+
+    Built with `__new__` because the accessor reads no collaborator — which is
+    itself the property under test: the list must not be a function of anything
+    an operator can edit at runtime. Going through the real accessor (rather
+    than asserting on `TRACKER_PATHS` directly) is what makes these tests fail
+    if a future edit wires it back to `self._config`.
+    """
+    from autoloop.orchestrator import Orchestrator
+
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator._config = config
+    return orchestrator._tracker_paths
+
+
 # ---- 1. the defaults ARE the constants they replaced -------------------------
 
 
@@ -60,7 +80,6 @@ def test_defaults_are_exactly_the_previously_hardcoded_constants():
     outcome turning constants into configuration was not allowed to have."""
     defaults = RepoConfig()
 
-    assert defaults.tracker_paths == TRACKER_PATHS
     assert defaults.env_example_file == ".env.example"
     assert defaults.env_example_db_key == "DB_NAME"
     assert defaults.audit_report_glob == "docs/AUDIT_*.md"
@@ -84,24 +103,87 @@ def test_a_config_with_no_repo_section_loads_the_defaults(tmp_path):
     assert config.repo == RepoConfig()
 
 
-# ---- 2. tracker_paths --------------------------------------------------------
+# ---- 2. the tracker list is NOT in this section, and cannot get back in ------
+#
+# The withdrawn design (`docs/SECURITY.md` S31) and why these tests exist: a
+# tracker is granted to EVERY scoped task without appearing in its
+# `approved_paths`, so the list is authorization surface. Sourcing it from
+# `.autoloop/config.toml` — gitignored, under the state directory — means an
+# edit nobody reviews can widen every task at once. The bound offered for that
+# was a filename-suffix blocklist, which cannot hold: the set of
+# behaviour-changing filenames is open-ended.
 
 
-def test_configured_trackers_replace_this_repos_own(tmp_path):
+#: Files that change behaviour and carry NO suffix the withdrawn blocklist
+#: refused. Each one would have been accepted as "documentation" and handed to
+#: every scoped task. This list is the argument against the heuristic, kept as
+#: test data so it cannot be forgotten and reintroduced.
+BEHAVIOUR_CHANGING_FILES = [
+    ".env",                    # credentials the whole validation boundary exists to contain
+    "Makefile",                # runs arbitrary commands
+    "Dockerfile",              # defines the runtime image
+    "Gemfile",                 # dependency set
+    ".gitignore",              # decides what the escape detector and reviewers see
+    "scripts/deploy",          # an extensionless executable
+]
+
+
+def test_tracker_paths_is_not_a_repo_config_field():
+    """The structural pin. Every behavioural test below could be satisfied by a
+    field that merely happens to be unread today; this one fails the moment the
+    key is reintroduced, which is the event the review objected to."""
+    assert RETIRED_TRACKER_PATHS_KEY not in {
+        f.name for f in dataclasses.fields(RepoConfig)
+    }
+    assert not hasattr(RepoConfig(), "tracker_paths")
+
+
+def test_the_suffix_blocklist_and_its_validator_are_gone():
+    """Deleted rather than left caller-less. A blocklist still sitting in
+    `tasks.py` keeps the disproven claim ("refusing these extensions makes the
+    grant documentation-only") available for the next caller to trust."""
+    assert not hasattr(tasks, "validate_tracker_paths")
+    assert not hasattr(tasks, "_NON_TRACKER_SUFFIXES")
+
+
+@pytest.mark.parametrize("dangerous", BEHAVIOUR_CHANGING_FILES)
+def test_a_config_edit_cannot_newly_authorize_a_behaviour_changing_file(
+    tmp_path, dangerous
+):
+    """THE regression the review asked for, end to end.
+
+    A config naming these still LOADS — refusing would make every command fail
+    on a deployment whose config predates this decision — but the value is
+    discarded, so no scoped task gains write access to `.env` or `Makefile`
+    without the reviewed diff that naming it in `approved_paths` requires.
+    """
     config = load_config(
-        write_config(tmp_path, '[repo]\ntracker_paths = ["HANDBOOK.md", "doc/notes.rst"]\n')
+        write_config(tmp_path, f'[repo]\ntracker_paths = ["{dangerous}"]\n')
     )
 
-    assert config.repo.tracker_paths == ("HANDBOOK.md", "doc/notes.rst")
-    effective = effective_approved_paths(("src/thing.py",), config.repo.tracker_paths)
-    assert set(effective) == {"src/thing.py", "HANDBOOK.md", "doc/notes.rst"}
-    # REPLACED, not merged: this repository's own trackers mean nothing to
-    # another repository, and carrying them along would authorize paths the
-    # operator never declared.
-    assert "docs/SUMMARY.md" not in effective
+    assert not hasattr(config.repo, "tracker_paths")
+    granted = effective_approved_paths(("src/thing.py",), _accessor_for(config)())
+    assert dangerous not in granted
+    assert set(granted) == {"src/thing.py"} | set(TRACKER_PATHS)
 
 
-def test_an_unscoped_task_gains_nothing_however_the_trackers_are_configured():
+def test_the_dropped_key_is_reported_rather_than_silently_ignored(tmp_path):
+    """A setting that loads and does nothing reads as configured while behaving
+    otherwise — the exact failure `_check_keys` exists to prevent. The operator
+    is told the value was dropped and where the real list lives, so they learn
+    it at startup rather than from a task parking on an unauthorized path."""
+    config = load_config(
+        write_config(tmp_path, '[repo]\ntracker_paths = ["HANDBOOK.md"]\n')
+    )
+
+    notice = "\n".join(config.migration_notices)
+    assert "repo.tracker_paths" in notice
+    assert "DROPPED" in notice
+    assert "HANDBOOK.md" in notice, "the discarded value is quoted back"
+    assert "autoloop/tasks.py" in notice, "and the real source of the list is named"
+
+
+def test_an_unscoped_task_gains_nothing_whatever_the_trackers_are():
     """docs/SECURITY.md finding #2 (circular ownership): an empty
     `approved_paths` means "no scope authorized yet" and must keep refusing
     dispatch. That is a property of the TASK, so no tracker list can change
@@ -109,75 +191,19 @@ def test_an_unscoped_task_gains_nothing_however_the_trackers_are_configured():
     assert effective_approved_paths((), ("a.md", "b.md", "c.md")) == ()
 
 
-def test_configuring_no_trackers_at_all_is_legal_and_grants_nothing_extra():
-    """An honest reading for a repository that imposes no doc obligations: the
-    task gets exactly what it declared. It must not fall back to this
-    repository's list, which would be the hardcoding all over again."""
+def test_no_trackers_at_all_is_legal_and_grants_nothing_extra():
+    """The `trackers` parameter still means what it says, which is what lets a
+    ported copy of this package declare a different list (or none) by editing
+    `TRACKER_PATHS` — a reviewed commit in that repository's own history."""
     assert effective_approved_paths(("src/thing.py",), ()) == ("src/thing.py",)
 
 
-def test_the_default_argument_preserves_every_pre_existing_caller():
-    """Callers written before the parameter existed keep their exact meaning —
-    this is what lets the change be behaviour-preserving without editing every
-    test that pins tracker behaviour."""
+def test_the_default_argument_is_this_repositorys_own_list():
+    """Callers that pass no `trackers` get the constant, so the parameter can
+    never quietly mean something else for a subset of call sites."""
     assert effective_approved_paths(("src/thing.py",)) == effective_approved_paths(
         ("src/thing.py",), TRACKER_PATHS
     )
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [
-        "docs/*.md",             # a glob would grant an open-ended set
-        "../outside.md",         # traversal
-        "/etc/notes.md",         # absolute
-        "~/notes.md",            # home-relative
-        "docs/",                 # a directory prefix grants a whole tree
-        "src/thing.py",          # code
-        "pyproject.toml",        # configuration
-        "ci/deploy.sh",          # executable
-        "app/state.JSON",        # extension check is case-insensitive
-    ],
-)
-def test_a_tracker_that_is_not_an_exact_document_is_refused(bad):
-    """The replacement for the bound that was given up. `tracker_paths` widens
-    EVERY scoped task at once, and the config file is gitignored — so unlike
-    the constant it replaced, an edit here is not a reviewed diff. These
-    refusals are what stands in its place."""
-    with pytest.raises(TaskGraphError):
-        validate_tracker_paths([bad])
-
-
-def test_a_bad_tracker_refuses_the_whole_config_by_name(tmp_path):
-    """At load time, not at the first dispatch that tried to use it: a loop
-    that starts and then refuses every task is much harder to diagnose than one
-    that will not start and says which key is wrong."""
-    with pytest.raises(ConfigError) as exc:
-        load_config(write_config(tmp_path, '[repo]\ntracker_paths = ["src/thing.py"]\n'))
-
-    assert "repo.tracker_paths" in str(exc.value)
-
-
-def test_a_bare_string_tracker_list_is_refused(tmp_path):
-    """The per-character split `_validate_superseded_by` documents: iterating
-    `"a.md"` yields five one-character "trackers", each of which would then be
-    granted to every task."""
-    with pytest.raises(TaskGraphError):
-        validate_tracker_paths("a.md")
-    with pytest.raises(ConfigError):
-        load_config(write_config(tmp_path, '[repo]\ntracker_paths = "a.md"\n'))
-
-
-def test_a_duplicate_tracker_is_refused():
-    with pytest.raises(TaskGraphError):
-        validate_tracker_paths(["a.md", "a.md"])
-
-
-def test_this_repos_own_trackers_pass_their_own_validator():
-    """The default must survive the check applied to a configured value —
-    otherwise the loop would refuse a config that merely spells out what it
-    already does."""
-    assert validate_tracker_paths(list(TRACKER_PATHS)) == TRACKER_PATHS
 
 
 # ---- 3. the production-database marker ---------------------------------------
@@ -334,34 +360,37 @@ def test_an_unparseable_config_falls_back_instead_of_taking_the_page_down(tmp_pa
     assert dashboard._inbox_dir(repo) == Path.home() / ".autoloop" / "inbox"
 
 
-# ---- 5. the orchestrator reads the configured trackers -----------------------
+# ---- 5. the orchestrator's tracker list comes from the reviewed source -------
 
 
-def test_every_orchestrator_call_site_passes_the_configured_trackers():
-    """The claim the test below CANNOT make on its own.
+def orchestrator_source() -> str:
+    return (Path(__file__).resolve().parents[1] / "orchestrator.py").read_text(
+        encoding="utf-8"
+    )
 
-    Asserting that `_tracker_paths()` returns the config value proves the
-    accessor works, not that anything calls it — reverting a single
+
+def test_every_orchestrator_call_site_reads_the_one_accessor():
+    """The claim the behavioural tests CANNOT make on their own.
+
+    Asserting what `_tracker_paths()` returns proves the accessor is right, not
+    that anything calls it — reverting a single
     `effective_approved_paths(task.approved_paths, self._tracker_paths())` to
-    its one-argument form leaves every behavioural test green while that site
-    silently falls back to this repository's constant. And a site that
-    disagreed with its neighbour would be worse than one that lagged: the
-    dispatch seed and the every-dispatch re-sync compare and assign the same
-    value, so two different lists rewrite the execution record forever.
+    some other list leaves every behavioural test green while that site
+    authorizes something different. And a site disagreeing with its neighbour
+    is worse than one that lags: the dispatch seed and the every-dispatch
+    re-sync compare and assign the same value, so two lists rewrite the
+    execution record forever.
 
     A source scan, in the same spirit as `test_dashboard.py`'s `PAGE`
     interpolation checks and the verification greps in `docs/SECURITY.md` S31 —
     the property is "no call site was missed", which is about the file, not
     about one call's return value.
     """
-    source = (Path(__file__).resolve().parents[1] / "orchestrator.py").read_text(
-        encoding="utf-8"
-    )
     # The `from .tasks import` line names the function without a '(', so it is
     # not picked up here; every remaining occurrence is a call.
     calls = [
         line.strip()
-        for line in source.splitlines()
+        for line in orchestrator_source().splitlines()
         if "effective_approved_paths(" in line and not line.lstrip().startswith("#")
     ]
     assert len(calls) == 3, (
@@ -370,17 +399,21 @@ def test_every_orchestrator_call_site_passes_the_configured_trackers():
     )
     for line in calls:
         assert "self._tracker_paths()" in line, (
-            f"call site does not pass the configured trackers: {line!r}"
+            f"call site does not read the one accessor: {line!r}"
         )
 
 
-def test_the_orchestrator_seeds_and_resyncs_from_the_configured_trackers(tmp_path):
-    """Both `effective_approved_paths` call sites in `_dispatch_task_postcommit`
-    go through `_tracker_paths`. If the seed and the re-sync ever read different
-    lists, the execution record reads dirty on every dispatch and is rewritten
-    forever — so the accessor, not the constant, is what they must share."""
+def test_the_accessor_returns_the_reviewed_constant_and_reads_no_config(tmp_path):
+    """Where the per-repository tracker declaration comes from, stated as a
+    test: `tasks.TRACKER_PATHS`, which lives in git-tracked source, so changing
+    it for a target repository is a commit in that repository's history.
+
+    Both halves matter. The value pin alone would still pass if the accessor
+    read a config field that happened to default to the constant — which is
+    precisely the withdrawn design — so the source of the accessor's body is
+    scanned for a config read as well.
+    """
     from autoloop.config import AutoloopConfig, BrowserConfig
-    from autoloop.orchestrator import Orchestrator
     from autoloop.policy import PolicyConfig
 
     config = AutoloopConfig(
@@ -388,34 +421,17 @@ def test_the_orchestrator_seeds_and_resyncs_from_the_configured_trackers(tmp_pat
         policy=PolicyConfig(),
         state_dir=tmp_path / ".autoloop",
         workers_root=tmp_path / "w",
-        repo=RepoConfig(tracker_paths=("HANDBOOK.md",)),
+        repo=RepoConfig(env_example_file="env.sample"),
     )
-    orchestrator = Orchestrator.__new__(Orchestrator)
-    orchestrator._config = config
 
-    assert orchestrator._tracker_paths() == ("HANDBOOK.md",)
-    assert set(effective_approved_paths(("src/a.py",), orchestrator._tracker_paths())) == {
-        "src/a.py",
-        "HANDBOOK.md",
-    }
+    assert _accessor_for(config)() == TRACKER_PATHS
 
-
-def test_the_default_config_still_seeds_this_repos_own_trackers(tmp_path):
-    """The unchanged-behaviour half of the test above."""
-    from autoloop.config import AutoloopConfig, BrowserConfig
-    from autoloop.orchestrator import Orchestrator
-    from autoloop.policy import PolicyConfig
-
-    config = AutoloopConfig(
-        browser=BrowserConfig(conversation_url="https://chatgpt.com/c/x"),
-        policy=PolicyConfig(),
-        state_dir=tmp_path / ".autoloop",
-        workers_root=tmp_path / "w",
+    body = orchestrator_source().split("def _tracker_paths(")[1].split("\n    def ")[0]
+    statement = [line.strip() for line in body.splitlines() if line.strip()][-1]
+    assert statement == "return TRACKER_PATHS", (
+        f"_tracker_paths must return the reviewed constant, found {statement!r} — "
+        "a config read here reopens docs/SECURITY.md S31"
     )
-    orchestrator = Orchestrator.__new__(Orchestrator)
-    orchestrator._config = config
-
-    assert orchestrator._tracker_paths() == TRACKER_PATHS
 
 
 # ---- 6. the section is still strict ------------------------------------------
@@ -423,8 +439,10 @@ def test_the_default_config_still_seeds_this_repos_own_trackers(tmp_path):
 
 def test_an_unknown_repo_key_is_refused_not_ignored(tmp_path):
     """The whole config loader's rule (`_check_keys`): a typo'd setting must
-    never silently fall back to a default. That applies to the section whose
-    settings decide authorization more than to any other."""
+    never silently fall back to a default. `tracker_paths` is the one key
+    handled ahead of this check rather than by it — consumed, reported and
+    discarded (see section 2) — and a near miss like `tracker_path` must still
+    be refused outright rather than reading as that key."""
     with pytest.raises(ConfigError) as exc:
         load_config(write_config(tmp_path, '[repo]\ntracker_path = ["a.md"]\n'))
 
@@ -433,12 +451,9 @@ def test_an_unknown_repo_key_is_refused_not_ignored(tmp_path):
 
 def test_json_serialisable_defaults_survive_a_round_trip():
     """`RepoConfig` values reach `state.json` / the review packet through
-    `asdict`-shaped payloads; a tuple that is not JSON-safe would fail there
+    `asdict`-shaped payloads; a value that is not JSON-safe would fail there
     rather than here."""
-    payload = json.dumps(
-        {
-            "tracker_paths": list(RepoConfig().tracker_paths),
-            "audit_report_glob": RepoConfig().audit_report_glob,
-        }
-    )
-    assert json.loads(payload)["tracker_paths"] == list(TRACKER_PATHS)
+    payload = json.dumps(dataclasses.asdict(RepoConfig()))
+
+    assert json.loads(payload)["audit_report_glob"] == DEFAULT_AUDIT_REPORT_GLOB
+    assert json.loads(payload)["env_example_file"] == DEFAULT_ENV_EXAMPLE_FILE

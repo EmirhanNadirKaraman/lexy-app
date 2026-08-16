@@ -1416,8 +1416,9 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       list every file, or a directory with a trailing <code>/</code>. Each one is
       validated by the registry on merge, so a bad path is refused there and
       reported, not silently accepted here. The repository's doc trackers
-      (<code>[repo].tracker_paths</code> in the loop's config) are always
-      allowed and need not be listed.</p>
+      (<code>TRACKER_PATHS</code> in <code>autoloop/tasks.py</code> — a fixed
+      constant, not a config value) are always allowed and need not be
+      listed.</p>
   </section>
   <section><h2>Language-app tasks</h2><div id="apptasks" class="scroll"></div></section>
   <section><h2>Blockers</h2><div id="blockers"></div></section>

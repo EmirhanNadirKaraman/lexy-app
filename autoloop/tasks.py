@@ -509,11 +509,11 @@ class Task:
     approved_paths: tuple[str, ...] = ()
 
 
-#: The DEFAULT repository trackers every task may update, WITHOUT naming them
-#: in its own `approved_paths` — this repository's own list, and the fallback
-#: when a config declares none. The ACTIVE list is `[repo].tracker_paths`
-#: (`config.RepoConfig`), which defaults to exactly this tuple; the value
-#: reaches `effective_approved_paths` as its `trackers` argument.
+#: The repository trackers every task may update, WITHOUT naming them in its
+#: own `approved_paths`. THE list — not a default that something else can
+#: override at runtime. It reaches `effective_approved_paths` as its `trackers`
+#: argument, and the only value any production caller passes is this constant
+#: (`Orchestrator._tracker_paths`).
 #:
 #: Not a convenience. `CLAUDE.md` makes updating these a CONDITION of doing the
 #: work: §12 requires `docs/SUMMARY.md` whenever a file is added, removed or
@@ -527,28 +527,33 @@ class Task:
 #: `docs/SUMMARY.md`, because enumerating obligations by hand per task does
 #: not converge.
 #:
-#: **Configurable since 2026-08-16, and that is a deliberate reversal.** This
-#: comment used to read "Fixed constant, deliberately NOT configurable —
-#: widening the scope of every task must be a diff someone reviews, not a TOML
-#: edit", and that bound is genuinely gone: `.autoloop/config.toml` lives under
-#: the gitignored state directory, so an edit to it is NOT a reviewed diff. It
-#: was given up because the list encodes THIS repository's documentation
-#: obligations by name, which makes the loop unusable against any other
-#: repository — the obligations are real everywhere, the filenames are not.
-#: What replaced the lost bound is a load-time refusal rather than trust:
-#: `validate_tracker_paths` below rejects anything that is not an exact,
-#: repository-relative documentation path, so the widest thing a config edit
-#: can buy is another document. Record: `docs/SECURITY.md` S31.
+#: **Fixed constant, deliberately NOT runtime configuration.** Widening the
+#: scope of every task at once must be a diff someone reviews, never an edit to
+#: a file nobody reviews. `.autoloop/config.toml` is exactly such a file — it
+#: lives under the gitignored state directory — so this list is not read from
+#: it, and `[repo]` has no key that can supply one.
 #:
-#: Why this is a narrow widening and not a hole:
-#:   * Documentation only, enforced rather than asserted. `validate_tracker_
-#:     paths` refuses every code/config extension (`.py`, `.sh`, `.toml`,
-#:     `.json`, `.yml`, …), every glob metacharacter, every `..`/absolute path,
-#:     and every directory prefix — so no configured entry can name a source
-#:     file, a whole tree, or anything outside the checkout.
-#:   * The paths still appear in `commit_range_paths` and in the review
-#:     packet, so a reviewer sees every tracker edit; this removes a REFUSAL,
-#:     not visibility.
+#: **That was tried, on 2026-08-16, and withdrawn before shipping** (port-02,
+#: `docs/SECURITY.md` S31). The rejected design was `[repo].tracker_paths`
+#: bounded by a filename-suffix blocklist ("nothing that looks like code or
+#: configuration"). The blocklist cannot carry that weight: `.env`,
+#: `.gitignore`, `Makefile`, `Dockerfile`, `Gemfile` and any extensionless
+#: script are all behaviour-changing files with no refused suffix, and the set
+#: of such names is open-ended, so extending the list is not a fix. A hard
+#: control was being swapped for an unenforceable heuristic.
+#:
+#: **How another repository declares its own trackers, then.** By editing this
+#: constant — which is not a workaround, because `autoloop/` is VENDORED into
+#: the repository it operates on (this package sits at the root of the app it
+#: audits). So the constant already is per-repository metadata living in
+#: git-tracked source: changing it in a target repo is a commit in that repo's
+#: reviewed history, which is precisely the property a config edit lacks. The
+#: obligations are real everywhere and the filenames are not, so the filenames
+#: belong in the checkout that has them — just not in a file outside review.
+#: If a declaration in tracked repository DATA (a committed `.autoloop.toml`
+#: at the repo root) is ever wanted instead, that is the recorded forward path
+#: in S31; the requirement it must meet is that changing it appears in the
+#: repository's history, not that it is merely per-repository.
 #:
 #: The residual risk, stated rather than hidden: `docs/SECURITY.md` is the
 #: security tracker, so an agent can now edit the record of a finding without
@@ -597,76 +602,6 @@ TRACKER_PATHS: tuple[str, ...] = (
 )
 
 
-#: Extensions a tracker path may never carry. A blocklist rather than an
-#: allowlist BY NECESSITY: the property being defended is "a document, not
-#: code", and documentation extensions are open-ended across repositories
-#: (`.md`, `.rst`, `.txt`, `.adoc`, `.org`, no extension at all), while the
-#: things that must never be implicitly writable are a short, nameable set.
-#: Requiring `.md` — this repository's own convention — would have re-encoded
-#: exactly the hardcoding this configuration exists to remove.
-_NON_TRACKER_SUFFIXES = (
-    ".py", ".pyi", ".sh", ".bash", ".zsh", ".toml", ".json", ".yml", ".yaml",
-    ".cfg", ".ini", ".js", ".ts", ".tsx", ".jsx", ".sql",
-)
-
-
-def validate_tracker_paths(paths: object) -> tuple[str, ...]:
-    """Return `paths` as a tuple of tracker paths, or raise `TaskGraphError`.
-
-    THE check on a CONFIGURED tracker list (`config.RepoConfig.tracker_paths`),
-    and the replacement for the bound that was given up when this stopped being
-    a fixed constant — see `TRACKER_PATHS` above. Every entry here is granted
-    implicitly to every scoped task in the repository, so this is the only
-    thing standing between a config typo and a repo-wide authorization change.
-
-    Three refusals, narrowest first:
-
-      * `_validate_approved_path` — the SAME validator a task's own
-        `approved_paths` go through, so a tracker cannot be an absolute path, a
-        `~` path, a `..` traversal, a Windows path, or anything containing a
-        glob metacharacter. Reusing it is the point: a tracker is an approved
-        path with a wider grant, not a different kind of string.
-      * No DIRECTORY PREFIX. `is_directory_prefix` entries are legal in a
-        task's own scope, where an operator chose them for one task; as a
-        tracker, `docs/` would hand every task in the repository write access
-        to a whole tree at once, which is not a documentation obligation.
-      * No code/config extension (`_NON_TRACKER_SUFFIXES`). Matched
-        case-insensitively, because a `.PY` that slipped through would be the
-        same file.
-
-    Duplicates are refused for the same reason `_validate_approved_paths`
-    refuses them: a repeated entry is a mistake, and silently collapsing it
-    hides which of the two the operator meant.
-    """
-    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
-        raise TaskGraphError(
-            "bad_tracker_path",
-            f"tracker_paths must be a list of repository-relative paths, got {paths!r}",
-        )
-    seen: set[str] = set()
-    for tracker in paths:
-        _validate_approved_path(tracker)
-        if is_directory_prefix(tracker):
-            raise TaskGraphError(
-                "bad_tracker_path",
-                f"tracker path {tracker!r} is a directory prefix — a tracker is "
-                "granted to EVERY scoped task, so it must name one exact file",
-            )
-        if tracker.lower().endswith(_NON_TRACKER_SUFFIXES):
-            raise TaskGraphError(
-                "bad_tracker_path",
-                f"tracker path {tracker!r} looks like code or configuration — "
-                "trackers are granted to every scoped task without being named "
-                "in it, so they may only be documentation",
-            )
-        if tracker in seen:
-            raise TaskGraphError(
-                "bad_tracker_path", f"tracker path {tracker!r} is listed more than once"
-            )
-        seen.add(tracker)
-    return tuple(paths)
-
-
 def effective_approved_paths(
     approved: tuple[str, ...], trackers: tuple[str, ...] = TRACKER_PATHS
 ) -> tuple[str, ...]:
@@ -679,17 +614,20 @@ def effective_approved_paths(
     the same reason: a re-sync comparing against a different list than it
     assigns would report the record dirty on every dispatch, forever.
 
-    `trackers` is the repository's configured list (`[repo].tracker_paths`),
-    defaulted to this repository's own `TRACKER_PATHS` so every caller written
-    before the setting existed — and every test that pins the tracker
-    behaviour — keeps its exact previous meaning.
+    `trackers` is a PARAMETER so tests can state a list explicitly, and it is
+    fed from reviewed source in production and from nowhere else: the only
+    caller is `Orchestrator._tracker_paths()`, which returns `TRACKER_PATHS`.
+    Nothing reads it out of the loop's runtime config, deliberately — see
+    `TRACKER_PATHS` above and `docs/SECURITY.md` S31. A repository declares its
+    own list by editing that constant in its own vendored copy, which is a
+    reviewed commit.
 
     An EMPTY `approved` stays empty. "No scope authorized yet" must keep
     refusing dispatch (`docs/SECURITY.md` finding #2, circular ownership);
     returning just the trackers would turn an unscoped task into a dispatchable
     one that may write documentation, which is not what "unscoped" means. That
     is a property of `approved`, never of `trackers`: a repository that
-    configures NO trackers at all still authorizes exactly what each task
+    declares NO trackers at all still authorizes exactly what each task
     declares, and an unscoped task still gets nothing.
     """
     if not approved:

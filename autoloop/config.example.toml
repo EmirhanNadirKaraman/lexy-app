@@ -268,30 +268,20 @@ validation_commands = [
 # existed — and filling it in is what lets the loop run against a different
 # repository at all.
 #
-# Documentation this repo's own rules oblige a task to update, and which every
-# SCOPED task may therefore write without naming it in approved_paths. CLAUDE.md
-# §12/§14 make these a condition of doing the work, so a task that adds a file
-# and cannot touch SUMMARY.md must break one rule or the other — enumerating the
-# obligation per task does not converge, which is why it lives here once.
+# NOTHING HERE GRANTS AUTHORITY. Each setting says WHERE to read something the
+# repository itself states; none of them decides what an agent may write. That
+# line is deliberate, and it is why the always-approved documentation trackers
+# are NOT a key here: a tracker is granted to every scoped task without being
+# named in its approved_paths, and this file lives under the gitignored state
+# dir — so an edit here would widen every task's write scope with no diff anyone
+# reviews. The list is the fixed TRACKER_PATHS constant in autoloop/tasks.py;
+# change it for your repository by editing that constant, which is a reviewed
+# commit in your repository's own history (the package is vendored into the repo
+# it operates on). `tracker_paths = [...]` was briefly a setting on 2026-08-16
+# and was withdrawn in review — a config that still names it LOADS, prints a
+# notice saying the value was dropped, and is not affected by it. See
+# docs/SECURITY.md S31.
 #
-# Refused, deliberately: a glob, an absolute or `..` path, a directory prefix
-# (a tracker is granted to EVERY scoped task, so it must name one exact file),
-# and anything that looks like code or configuration (.py .sh .toml .json .yml
-# …). The widest thing an edit here can buy is another document.
-#
-# An empty list is legal and means "no implicit obligations" — every task then
-# gets exactly what it declares. Note the honest limit: this file lives under
-# the gitignored state dir, so unlike the constant it replaced, a change here is
-# not a diff anyone reviews. That is why the refusals above are enforced at load
-# time rather than left to convention.
-tracker_paths = [
-  "CLAUDE.md",
-  "docs/COMMON_ERRORS.md",
-  "docs/SCHEMA.md",
-  "docs/SECURITY.md",
-  "docs/SUMMARY.md",
-  "docs/TESTS.md",
-]
 # Where this repo declares its APPLICATION database, and the key inside that
 # file. Used for exactly one refusal: a paths.validation_env_file below whose
 # DB_NAME equals the name declared here — i.e. validation pointed at the real

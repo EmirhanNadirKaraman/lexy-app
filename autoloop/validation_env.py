@@ -197,10 +197,12 @@ def redact_with(env: "ValidationEnv | None", text: str) -> str:
 #: Where THIS repository declares its application database, and the default
 #: for every caller below. The canonical spelling lives in
 #: `config.DEFAULT_ENV_EXAMPLE_FILE` / `DEFAULT_ENV_EXAMPLE_DB_KEY` and is
-#: repeated here rather than imported: `config` imports `tasks`, and this
-#: module is imported by `cli`/`doctor` alongside `config`, so a back-import
-#: would tie the credential boundary to the config loader for two string
-#: constants. `test_config_repo_section.py` pins the two spellings equal.
+#: repeated here rather than imported: this module is the credential boundary
+#: and is deliberately importable on its own — tying it to the config loader
+#: for two string constants would mean a parse error in a TOML file could
+#: break the module that decides what a validation subprocess may see.
+#: `test_config_repo_section.py` pins the two spellings equal, which is the
+#: only thing that makes duplication safe.
 DEFAULT_ENV_EXAMPLE_FILE = ".env.example"
 DEFAULT_ENV_EXAMPLE_DB_KEY = "DB_NAME"
 
