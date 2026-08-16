@@ -1886,12 +1886,21 @@ def test_security_and_environment_codes_all_have_a_precondition():
     assert not missing, f"security/environment codes with no precondition at all: {sorted(missing)}"
 
 
+#: The helpers that mint a `blockers.Blocker`. BOTH, since 2026-08-16
+#: (auto-04): `_to_fault_stop` records the same `loop_fatal` blocker as a park
+#: but ends the run in `stopped` instead — so a code emitted only from there is
+#: every bit as real to `answer`, and a walk that knew only about parks would
+#: report a legitimate precondition key for one as "matching no emitted code"
+#: and push whoever hit it into deleting the key.
+_BLOCKER_EMITTERS = ("_to_needs_user", "_to_fault_stop")
+
+
 def _emitted_blocker_codes() -> set[str]:
     """Every string literal that can appear as the `code=` argument of a
-    `self._to_needs_user(...)` call in `orchestrator.py`, AST-walked rather
-    than regex-matched so a `code=` built from a conditional expression
-    (e.g. `"push_refused_protected" if ... else "push_refused"`) still
-    yields every branch's literal, not just whichever one happens to sit
+    blocker-emitting call (`_BLOCKER_EMITTERS`) in `orchestrator.py`,
+    AST-walked rather than regex-matched so a `code=` built from a conditional
+    expression (e.g. `"push_refused_protected" if ... else "push_refused"`)
+    still yields every branch's literal, not just whichever one happens to sit
     immediately after `code=`."""
     from autoloop import orchestrator as orchestrator_module
 
@@ -1903,7 +1912,7 @@ def _emitted_blocker_codes() -> set[str]:
             continue
         func = node.func
         name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-        if name != "_to_needs_user":
+        if name not in _BLOCKER_EMITTERS:
             continue
         for kw in node.keywords:
             if kw.arg != "code":
@@ -1912,6 +1921,21 @@ def _emitted_blocker_codes() -> set[str]:
                 if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
                     codes.add(sub.value)
     return codes
+
+
+def test_the_blocker_code_walk_covers_every_emitter_including_fault_stops():
+    """Guards the walk above against the mutation it cannot see in itself.
+
+    `_emitted_blocker_codes` is the input to two exhaustiveness tests, so a
+    silently NARROWED walk weakens both while every assertion still passes —
+    the failure mode is a test that stops testing. `policy_denial_budget_
+    exhausted` moved from a park to a fault stop, so it is the concrete case:
+    it must still be found, and `_to_fault_stop` must still be a name the walk
+    actually looks for."""
+    assert "_to_fault_stop" in _BLOCKER_EMITTERS
+    codes = _emitted_blocker_codes()
+    assert "policy_denial_budget_exhausted" in codes  # emitted from a fault stop
+    assert "login_expired" in codes  # ...and the park-emitted ones still are too
 
 
 def test_every_precondition_key_matches_a_real_emitted_code():

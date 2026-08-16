@@ -16,6 +16,7 @@ from autoloop.git_gateway import GitGateway
 from autoloop.implement_executor import ImplementExecutor, implement_agent_runner
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.tasks import Task
+from autoloop.worktask import MAX_ASSUMPTION_CHARS, MAX_ASSUMPTIONS_PER_ROUND
 
 
 def run_git(cwd, *args):
@@ -257,6 +258,131 @@ def test_success_is_ok_with_changed_paths_and_validation(main_repo, worker_repo)
     assert outcome.status == "ok"
     assert outcome.changed_paths == ("feature.py",)
     assert outcome.validation.startswith("ruff check .: PASS")
+
+
+# ---- assumptions: the disclosure that replaced asking a human --------------
+#
+# `ask_user` is retired, so an ambiguous task cannot be escalated mid-run. The
+# agent is told to take the smallest reversible reading and to write an
+# `ASSUMPTION:` line per choice; these pin that the instruction is actually
+# given and that the lines are actually collected — the two halves are useless
+# apart.
+
+
+def test_the_prompt_tells_the_agent_to_take_the_smallest_reversible_reading(
+    main_repo, worker_repo
+):
+    factory_runners = []
+
+    def factory(root):
+        runner = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        factory_runners.append(runner)
+        return runner
+
+    executor = build_executor(main_repo, worker_repo, factory)
+    executor.execute(implement_directive(), make_task())
+
+    prompt = factory_runners[0].specs[0].prompt
+    assert "SMALLEST REVERSIBLE READING" in prompt
+    assert "ASSUMPTION:" in prompt
+    # An instruction to take a reading without one to disclose it would be
+    # strictly worse than the question it replaced.
+    assert "shown to the reviewer" in prompt
+    # And it must not send the agent looking for a human that is not there.
+    assert "do NOT stop to ask" in prompt
+
+
+def test_assumption_lines_are_collected_from_the_agents_own_output(
+    main_repo, worker_repo
+):
+    raw = (
+        "I looked at the task.\n"
+        "ASSUMPTION: read 'recent' as the last 30 days, not since the last release\n"
+        "Then I wrote the code.\n"
+        "  assumption:   kept the existing default rather than changing it\n"
+    )
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert outcome.assumptions == (
+        "read 'recent' as the last 30 days, not since the last release",
+        "kept the existing default rather than changing it",
+    )
+
+
+def test_prose_about_the_convention_is_not_harvested_as_an_assumption(
+    main_repo, worker_repo
+):
+    """Anchored at the start of a line for exactly this: an agent that
+    explains what it was told ("...write an ASSUMPTION: line when...") must
+    not have its own instructions read back as disclosures — the reviewer
+    would be shown assumptions nobody made."""
+    raw = "I was told to write an ASSUMPTION: line for each choice, and I made none.\n"
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert outcome.assumptions == ()
+
+
+def test_an_overlong_assumption_list_is_truncated_but_says_so(main_repo, worker_repo):
+    """The list rides inside a chat message, and an oversized message is the
+    one failure that has actually broken this loop (see
+    `packet._format_diff_section`). Bounded — but never silently, or a
+    reviewer would read a cut-off list as complete."""
+    raw = "\n".join(f"ASSUMPTION: choice number {i}" for i in range(40))
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert len(outcome.assumptions) == MAX_ASSUMPTIONS_PER_ROUND
+    assert outcome.assumptions[0] == "choice number 0"
+    assert "dropped" in outcome.assumptions[-1]
+    assert "21" in outcome.assumptions[-1]  # 40 - (20 - 1) really were dropped
+
+
+def test_a_single_overlong_assumption_is_cut_with_an_ellipsis(main_repo, worker_repo):
+    raw = "ASSUMPTION: " + ("x" * (MAX_ASSUMPTION_CHARS + 200))
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    [only] = outcome.assumptions
+    assert len(only) <= MAX_ASSUMPTION_CHARS
+    assert only.endswith("…")
+
+
+def test_a_failed_round_reports_no_assumptions(main_repo, worker_repo):
+    """A failed round is never committed (`_dispatch_task_postcommit` returns
+    on a non-ok status), so an assumption from it would describe code that is
+    not in the candidate the reviewer is shown."""
+    raw = "ASSUMPTION: assumed something on my way to failing\n"
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+        validation=(("ruff", "check", "."),),
+        command_runner=fail_command,
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "error"
+    assert outcome.assumptions == ()
 
 
 # ---- 10: nothing written outside the worker repo ---------------------------

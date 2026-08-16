@@ -895,6 +895,39 @@ DELIVERY: a patch too large for one message is sent as numbered parts before
 the message asking for a verdict, and omitted (loudly, never truncated) only
 when that cannot be done. See §5d-bis.
 
+**The one unread section, and the assumptions inside it.** `packet.
+_format_executor_report` renders what the executor SAID about the round
+(`TaskExecution.report_summary` / `report_details`), labelled a CLAIM in the
+heading because every other section is read from git. Since `ask_user` was
+retired it also renders `TaskExecution.assumptions` — the readings the executor
+CHOSE where the task did not say. An ambiguous task can no longer stop the run
+to ask, so `implement_executor` instructs the agent to take the **smallest
+reversible reading** and to write one `ASSUMPTION:` line per choice; those
+lines are collected from the agent's own output, accumulated across rounds
+(union, first-seen order — a round-2 executor assuming nothing must not erase
+what round 1 assumed and shipped) and shown here. **This is not first-time
+visibility** — `report_details` is the whole agent transcript, so the lines
+were already in the packet somewhere. What the section adds is the LABEL (a
+reviewer skimming a transcript cannot miss the choices that most need judging)
+and the ACCUMULATION (`report_details` is replaced every round; these are
+unioned, so round 1's assumption survives into the review of a range that still
+contains its code). Bounded in two places, for two different
+reasons: the EXECUTOR caps one round's contribution (20 lines of 500
+characters), and the PACKET caps what one message renders
+(`packet.ASSUMPTIONS_MAX_CHARS`, 4,000 — `policy.max_review_rounds` defaults to
+unlimited, so the per-round cap alone bounds nothing). The RECORD is never
+truncated: that would delete evidence out of the file crash-recovery reads, to
+solve a problem that only exists at render time. Rendering drops the OLDEST
+(each was shown in the packet for the round that made it) and says how many it
+withheld, never silently. They inform the
+reviewer's judgement and nothing else: scope is still checked with
+`commit_range_paths` against `allowed_paths`, and validation by re-running it —
+a sentence here cannot widen either. A record written before this field existed loads as "none
+recorded", and an EMPTY list renders no section at all (unlike an empty
+report, which says so): the absence of assumption lines is not a claim that
+the task was unambiguous, and printing "none recorded" would invite reading it
+as one.
+
 **Request/response binding (`state.PostcommitBinding`).** A dedicated field
 on `PendingRequest`/`LastResponse` — never `last_manifest_id`, which belongs
 to the §4 manifest path and means something different — captured once, when
@@ -3017,14 +3050,38 @@ could have kept going. Every park is now classified with a `kind`:
 * **`loop_fatal`** — the problem is about the ENVIRONMENT or the operator:
   browser/login failures, response timeouts, submission ambiguity,
   publisher URL drift, a protected-branch refusal / `allow_push` disabled,
-  a policy-denial or parse/iteration budget exhausted, or anything not
+  a parse/iteration budget exhausted, a plan rejected or a review stamp
+  mismatched until the shared denial budget ran out, or anything not
   confidently classifiable. The whole loop stops, exactly as every park did
-  before this split existed. **`ask_user` is no longer among these causes:**
-  it is retired, and a legacy one is denied
-  (`legacy_ask_user_retired`) and corrected like any other policy denial, so
-  the only park it can still reach is the exhausted-denial-budget one above —
-  reached by a reviewer that keeps re-answering it, not by the question
-  itself.
+  before this split existed. **`ask_user` cannot reach a park at all:** it is
+  retired, a legacy one is denied (`legacy_ask_user_retired`) and corrected
+  like any other policy denial, and the one path that used to remain — a
+  reviewer answering it until the denial budget ran out — now ends the run
+  instead of parking it (see the fault stop below).
+
+**Fault stop: the terminal that is not a park and not a `stop`.** An
+exhausted POLICY-DENIAL budget (`orchestrator._handle_policy_denial` →
+`_to_fault_stop`) ends the run in `stopped` with `stop_kind="fault"` rather
+than parking on `needs_user`. A park asks a human a question; there is no
+question here, because the only thing that could produce a directive policy
+accepts is the reviewer that just spent the budget. Three consequences worth
+knowing:
+
+* it still records a `loop_fatal` `blockers.Blocker` under the same code
+  (`policy_denial_budget_exhausted`), so `blockers`/`answer` are unchanged;
+* `run --continuous` STOPS on it (exit 2) instead of treating `stopped` as a
+  clean boundary — otherwise the selection policy would start a fresh session
+  into the identical wall on the next pass;
+* `smoke-browser` and plain `run` both read `stop_kind` rather than the phase,
+  so a run that died this way is never reported as a completed one. A
+  reviewer's own `stop` carries `stop_kind="contract"`; a state file written
+  before this existed carries `""` and is read as an ordinary clean boundary.
+
+  The sibling budgets deliberately still PARK, though all three spend the same
+  `state.policy_denials` counter: a rejected plan is about an operator-owned
+  roadmap they can repair, and a repeated review mismatch can mean the
+  repository moved under the loop. Both have a human-side explanation; a policy
+  denial does not.
 * **The default is `loop_fatal`.** `orchestrator._to_needs_user(question,
   ..., kind="loop_fatal", code="unclassified")` — an unclassified or newly
   added park site fails closed: it stops the loop rather than silently

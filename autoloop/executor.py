@@ -29,6 +29,12 @@ in ways pre-commit validation never saw. `ExecutionOutcome` is frozen, so a
 caller that only learns `candidate_sha` after committing (the orchestrator)
 never mutates an outcome in place — it tracks that on `TaskExecution`
 (`worktask.py`) instead, or via `dataclasses.replace`.
+
+`assumptions` is the sixth such field and the one that is not about git: it
+carries the readings the executor had to CHOOSE because the task did not say.
+See its own comment below — it exists because `ask_user` is retired, so an
+ambiguity that used to stop the loop and ask now has to reach the reviewer as
+a disclosure attached to the work instead.
 """
 
 from __future__ import annotations
@@ -52,6 +58,22 @@ class ExecutionOutcome:
     candidate_sha: str = ""
     changed_paths: tuple[str, ...] = ()
     post_commit_validation: str = ""
+    #: Readings the executor CHOSE where the task did not say — the disclosure
+    #: half of the rule that replaced asking a human.
+    #:
+    #: `ask_user` is retired (`contract.RETIRED_DECISIONS`), so an ambiguous
+    #: task can no longer be escalated mid-run: the executor takes the
+    #: smallest reversible reading and carries on. That is only safe if the
+    #: choice is visible to the reviewer who authorizes the result — an
+    #: assumption nobody is told about is indistinguishable from a
+    #: misunderstanding, and the review is the last point at which either can
+    #: be caught.
+    #:
+    #: CLAIMS, exactly like `summary`/`details`: the executor authors this text
+    #: and nothing downstream may treat it as authorization. It is accumulated
+    #: onto `worktask.TaskExecution.assumptions` and rendered inside the
+    #: packet's clearly-labelled executor-report section.
+    assumptions: tuple[str, ...] = ()
 
 
 class TaskExecutor(Protocol):

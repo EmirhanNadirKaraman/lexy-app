@@ -10,7 +10,10 @@ work started, and — filled in only after a real `git commit` returns — the
 resulting candidate sha. It also carries the review round and the stamps
 (`presented_report_sha256`, `review_request_id`) that bind a later approval to
 the exact report that was reviewed, mirroring the naming already used for the
-authorize-then-produce path's `reviewed` stamp (see `contract.py`).
+authorize-then-produce path's `reviewed` stamp (see `contract.py`), plus the
+executor's own CLAIMED account of the work — `report_summary` / `report_details`
+and `assumptions`, the last of which is where a task's ambiguities go now that
+`ask_user` is retired and nothing can stop mid-run to ask about one.
 
 **`CommitIntent`** is a durable marker written to disk BEFORE `git commit`
 runs and cleared only after the resulting candidate sha has been persisted
@@ -227,6 +230,96 @@ class TaskExecution:
     #: that declared no scope is refused dispatch outright and never reaches
     #: either comparison.
     out_of_scope_paths: tuple[str, ...] = ()
+    #: Readings the executor CHOSE where the task did not say, one string each
+    #: (`ExecutionOutcome.assumptions`, produced per round).
+    #:
+    #: This field is the durable half of retiring `ask_user`. An ambiguous task
+    #: used to be escalatable mid-run; it is not any more, so the executor
+    #: takes the SMALLEST REVERSIBLE READING and records what it took. Durable
+    #: rather than passed along for the same reason `report_summary` above is:
+    #: the packet is rendered by `_finish_postcommit`, which crash-recovery
+    #: adoption also reaches with no `ExecutionOutcome` in the process — an
+    #: assumption that lived only in the outcome object would silently vanish
+    #: from exactly the review that most needed it.
+    #:
+    #: ACCUMULATED across rounds, like `out_of_scope_paths` and for the same
+    #: reason: a round-2 executor that assumed nothing must not erase what
+    #: round 1 assumed and shipped — those lines still describe code inside
+    #: `task_base_sha..candidate_sha`, which is the range the reviewer is
+    #: authorizing. Duplicates are dropped (the same assumption restated in a
+    #: later round is one assumption).
+    #:
+    #: Stored in FIRST-SEEN order, deliberately unlike the sorted path tuples
+    #: above: a path set has no meaningful order so sorting buys a stable
+    #: representation for free, whereas these are prose whose order carries
+    #: which round chose what. The order is still deterministic — it is the
+    #: order the rounds ran in — so the on-disk form is stable for a given
+    #: history.
+    #:
+    #: COMPLETE on disk, and bounded only when RENDERED. With unlimited review
+    #: rounds this list can outgrow a chat message, but that is a constraint on
+    #: the packet, not on the record — `packet._format_assumptions` shows the
+    #: newest entries that fit and says how many it withheld, while every entry
+    #: stays here for a crash-recovery adoption or an after-the-fact read.
+    #: Truncating the record instead would delete evidence permanently to solve
+    #: a problem that only exists at render time.
+    #:
+    #: CLAIMS, never authorization. Same rule as `report_summary`: an executor
+    #: cannot widen its scope, pass its validation, or license a push by
+    #: writing a sentence here. The only thing this can do is inform the
+    #: reviewer's judgement, which is precisely what it is for.
+    assumptions: tuple[str, ...] = ()
+
+
+#: How many assumptions one round may contribute, and how long each may be.
+#:
+#: Not a policy about how much a task is allowed to assume — it is a bound on a
+#: string the EXECUTOR authors that ends up inside a chat message. The review
+#: packet is the one payload whose size has already broken this loop once (see
+#: `packet._format_diff_section`: a 38 KB message that could not be delivered at
+#: all, three blockers, one cause), and an agent that emits its whole reasoning
+#: transcript one `ASSUMPTION:` line at a time would push the packet toward that
+#: wall while looking like disclosure. Anything past the cap is dropped rather
+#: than truncated silently — `implement_executor` records the drop as its own
+#: final assumption line, so the reviewer is told the list is incomplete.
+MAX_ASSUMPTIONS_PER_ROUND = 20
+MAX_ASSUMPTION_CHARS = 500
+
+
+def accumulate_assumptions(
+    existing: Sequence[str], incoming: Sequence[str]
+) -> tuple[str, ...]:
+    """`existing` plus whatever in `incoming` is new, in first-seen order.
+
+    The one place `TaskExecution.assumptions` grows, so the union rule lives
+    here rather than being restated at the call site (`orchestrator.
+    _dispatch_task_postcommit`) where a later round could quietly get it wrong
+    by assigning instead of merging.
+
+    Blank and whitespace-only entries are dropped — an empty assumption
+    discloses nothing and would render as a stray bullet in the packet — and
+    each entry is compared after stripping, so the same sentence with trailing
+    whitespace does not appear twice.
+
+    **Deliberately UNBOUNDED, and the bound lives in `packet.
+    _format_assumptions` instead.** `policy.max_review_rounds` defaults to
+    unlimited, so this list really can grow past what one chat message can
+    carry — but that is a MESSAGE constraint, and this is a durable record.
+    Truncating here would destroy evidence permanently to solve a problem that
+    only exists at render time, and it would do so in the file a crash-recovery
+    adoption or an after-the-fact investigation reads. The packet renders the
+    newest entries that fit and says how many it did not show; the record keeps
+    all of them.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in list(existing) + list(incoming):
+        text = (item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        merged.append(text)
+    return tuple(merged)
 
 
 @dataclass
@@ -312,6 +405,11 @@ class TaskExecutionStore:
         data["allowed_paths"] = sorted(execution.allowed_paths)
         data["out_of_scope_paths"] = sorted(execution.out_of_scope_paths)
         data["validation_commands"] = [list(c) for c in execution.validation_commands]
+        # NOT sorted, unlike the two path sets above — see
+        # `TaskExecution.assumptions`: accumulation order is which round chose
+        # what, and sorting prose alphabetically would destroy that while
+        # buying nothing (the order is already deterministic).
+        data["assumptions"] = list(execution.assumptions)
         _atomic_write_json(self._path(execution.task_id), data)
 
     def load(self, task_id: str) -> TaskExecution | None:
@@ -332,6 +430,13 @@ class TaskExecutionStore:
             data["validation_commands"] = tuple(
                 tuple(c) for c in data.get("validation_commands", ())
             )
+            # Same `.get` default as the three above, and it is the whole of
+            # the backward compatibility: a record written before assumptions
+            # were captured has no key, and loads as "none recorded" — which
+            # is the truth about it, not a guess. (It is NOT the same claim as
+            # "the executor assumed nothing"; `packet._format_executor_report`
+            # is what keeps those two readings apart for a reviewer.)
+            data["assumptions"] = tuple(data.get("assumptions", ()))
             return TaskExecution(**data)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise StateCorruptError(

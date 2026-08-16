@@ -37,6 +37,16 @@ compares against LITERAL file paths (`services/new/` is not a match for
 `services/new/foo.py`) — see `GitGateway.dirty_entries_all`'s docstring for
 the reproduced failure mode this avoids.
 
+**An ambiguity is resolved, not escalated** (see `_SMALLEST_REVERSIBLE_READING`).
+`ask_user` is retired, so there is no way for this executor to stop mid-run and
+ask about a task that does not say what it wants. The agent is instructed to
+take the smallest reversible reading and to write an `ASSUMPTION:` line for each
+choice; `_extract_assumptions` collects those lines and they ride the outcome to
+`TaskExecution.assumptions`, which is what puts them in front of the reviewer who
+authorizes the result. Unlike `changed_paths`, this IS the agent's own word —
+safely so, because nothing computes with it (see `packet._format_executor_report`
+for the same argument about the report text).
+
 **Model selection is automatic, deliberately.** `AgentSpec.model` is left at
 its default (`""`), so `ClaudeCliRunner.build_argv` omits `--model` entirely
 — no model table lives here or should be added; whatever the `claude` CLI
@@ -57,6 +67,7 @@ nothing.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Callable
@@ -72,6 +83,7 @@ from .tasks import Task
 from .validation import run_validation_commands
 from .validation_env import ValidationEnv
 from .worker_env import worker_env
+from .worktask import MAX_ASSUMPTION_CHARS, MAX_ASSUMPTIONS_PER_ROUND
 
 #: Read/Grep/Glob for context, Edit/Write to make the change. `Bash` and
 #: `Task`/`Agent` stay disallowed even though the agent can now write files:
@@ -146,6 +158,36 @@ def implement_agent_runner(
     )
 
 
+#: The line shape an assumption is reported on, anchored at the start of a
+#: line so prose ABOUT the convention ("write an ASSUMPTION: line when...")
+#: cannot be harvested as an assumption. Case-insensitive because the agent
+#: writes this by hand.
+_ASSUMPTION_RE = re.compile(r"^[ \t>*-]*assumption:[ \t]*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+#: What the agent is told to do with an ambiguity, and how to disclose it.
+#:
+#: This is the executor-side half of retiring `ask_user`. The loop cannot stop
+#: and ask a human mid-run any more, so the instruction has to say what to do
+#: INSTEAD — and "use your judgement" is not that. Two rules, both narrow:
+#: prefer the reading that is smallest and easiest to undo, and write down the
+#: reading you took. The second is what keeps the first honest; an undisclosed
+#: assumption looks exactly like a misunderstanding by the time a reviewer sees
+#: the diff, and the review is the last point at which either can be caught.
+_SMALLEST_REVERSIBLE_READING = (
+    "If the task is ambiguous, do NOT stop to ask — this loop has no human in "
+    "it to answer, and a question here would just stall the run. Take the "
+    "SMALLEST REVERSIBLE READING: the narrowest interpretation that satisfies "
+    "the task as written, preferring a change that is easy to undo or extend "
+    "over one that forecloses the other reading. Then disclose it: write one "
+    "line per choice, at the start of a line, in the exact form\n"
+    "  ASSUMPTION: <what you assumed, and what you would have asked>\n"
+    "These lines are collected verbatim and shown to the reviewer who "
+    "authorizes your work, so write them for that reader — one sentence, "
+    "concrete, naming the alternative reading you did not take. Do not use "
+    "them for a summary of what you did; that goes in your normal report."
+)
+
+
 def _agent_prompt(task: Task, feedback: str | None) -> str:
     parts = [
         "You are a write-capable coding subagent inside an automated "
@@ -161,10 +203,49 @@ def _agent_prompt(task: Task, feedback: str | None) -> str:
         "attempt to run `git` or any other command: committing is not your "
         "job, the orchestrator commits your changes after you finish and "
         "after validation passes. Do not delegate to another agent.",
+        _SMALLEST_REVERSIBLE_READING,
     ]
     if feedback:
         parts.append(f"Revision feedback from the previous review round: {feedback}")
     return "\n\n".join(parts)
+
+
+def _extract_assumptions(raw_text: str) -> tuple[str, ...]:
+    """The `ASSUMPTION:` lines in an agent's own output, in the order written.
+
+    Read out of the transcript rather than asked for as structured output for
+    the same reason `changed_paths` is read from `git status` rather than
+    taken from the agent's word: this executor runs ONE `claude -p` call and
+    gets back text, so a separate structured channel would be a second call to
+    keep in sync with the first. The difference is that this text is only ever
+    SHOWN to a reviewer — nothing computes with it — so text is a sufficient
+    carrier here in a way it explicitly is not for a path set.
+
+    Bounded on both axes (`MAX_ASSUMPTIONS_PER_ROUND`, `MAX_ASSUMPTION_CHARS`)
+    because the result travels inside a chat message. An over-long line is
+    truncated with an ellipsis and an over-long LIST is cut off, but never
+    silently: the overflow is replaced by a line saying how many were dropped,
+    so a reviewer sees "there was more" instead of a list that looks complete.
+    """
+    found: list[str] = []
+    for match in _ASSUMPTION_RE.finditer(raw_text or ""):
+        text = match.group(1).strip()
+        if not text:
+            continue
+        if len(text) > MAX_ASSUMPTION_CHARS:
+            text = text[: MAX_ASSUMPTION_CHARS - 1].rstrip() + "…"
+        found.append(text)
+    if len(found) <= MAX_ASSUMPTIONS_PER_ROUND:
+        return tuple(found)
+    dropped = len(found) - (MAX_ASSUMPTIONS_PER_ROUND - 1)
+    return tuple(
+        found[: MAX_ASSUMPTIONS_PER_ROUND - 1]
+        + [
+            f"({dropped} further assumption(s) recorded by the executor were "
+            "dropped to keep the review packet deliverable — read the diff "
+            "rather than treating this list as complete)"
+        ]
+    )
 
 
 class ImplementExecutor:
@@ -398,4 +479,12 @@ class ImplementExecutor:
             details=result.raw_text,
             validation=validation_summary,
             changed_paths=tuple(changed),
+            # Only on the SUCCESS path, and only because nothing else can use
+            # them: every failure branch above returns before a commit exists,
+            # and `orchestrator._dispatch_task_postcommit` stops at
+            # `outcome.status != "ok"` without ever reaching the record these
+            # accumulate onto. An assumption about work that was thrown away
+            # would be carried into the next round's packet describing code
+            # that is not in it.
+            assumptions=_extract_assumptions(result.raw_text),
         )

@@ -113,6 +113,39 @@ def test_smoke_never_invokes_executor(tmp_path):
     assert code == 2  # parked, not crashed — executor was never reached
 
 
+def test_a_refused_smoke_reply_fault_stops_and_is_never_reported_as_a_pass(tmp_path):
+    """WHY the two tests above still exit 2, now that a denied directive ends
+    the loop in `stopped` rather than parking it.
+
+    The smoke policy sets `max_policy_denials=0`, so the very first refused
+    reply exhausts the denial budget, and an exhausted denial budget stops the
+    loop (`orchestrator._to_fault_stop`) instead of parking it. That puts a
+    MISBEHAVING reply in the same phase as a well-behaved one — `stopped` —
+    and phase alone would have `smoke-browser` announce PASS for a reviewer
+    that answered `ask_user`. `stop_kind` is what keeps them apart, and this
+    test pins the distinction at the state level rather than only through the
+    exit code, so a future change that reintroduced the collapse would fail
+    here with a readable reason."""
+    reply = '```json\n{"version": 3, "decision": "ask_user", "reason": "r", "question": "why?"}\n```'
+    assert run_smoke(tmp_path, FakeSmokeConversation(reply)) == 2
+
+    state = json.loads((tmp_path / ".al" / "smoke" / "state.json").read_text())
+    assert state["phase"] == "stopped"  # the loop ended itself...
+    assert state["stop_kind"] == "fault"  # ...but NOT the way a PASS ends
+    assert state["question"] is None  # never parked: no human was asked anything
+    assert state["resume_phase"] is None  # and nothing is resumable
+    assert "policy-denied" in state["stop_reason"]
+
+
+def test_a_passing_smoke_reply_is_classified_as_a_contract_stop(tmp_path):
+    """The positive half: `smoke-browser` gates PASS on `stop_kind ==
+    "contract"`, so a reviewer's real `stop` has to actually carry that value
+    — otherwise the gate would fail closed on every healthy run."""
+    assert run_smoke(tmp_path, FakeSmokeConversation(STOP_REPLY)) == 0
+    state = json.loads((tmp_path / ".al" / "smoke" / "state.json").read_text())
+    assert state["stop_kind"] == "contract"
+
+
 def test_parked_smoke_state_is_archived(tmp_path):
     """A previous smoke session left parked in `awaiting` must be archived, not
     resumed — every smoke run starts clean."""

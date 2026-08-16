@@ -3,7 +3,10 @@
 Phases (see state.Phase):
 
     ready ──► submitting ──► awaiting ──► executing ─┬─► ready        (loop)
-                   │                                 ├─► stopped      (stop)
+                   │                                 ├─► stopped      (stop,
+                   │                                 │   or a fault the loop
+                   │                                 │   cannot ask about —
+                   │                                 │   see stop_kind)
                    │ send attempted,                  └─► needs_user  (budgets)
                    │ acceptance unknown
                    ▼
@@ -101,7 +104,18 @@ Failure routing:
                                  the outbox preserved
 * ContractError (parse)        → corrective re-prompt; budget-capped
 * review-integrity mismatch    → failure_recovery re-prompt; denial budget
-* policy denial / plan reject  → failure_recovery re-prompt; denial budget
+                                 exhausted → needs_user (the repository may
+                                 have moved under the loop — a human-side
+                                 explanation exists, so it asks)
+* plan reject                  → failure_recovery re-prompt; denial budget
+                                 exhausted → needs_user (the roadmap is an
+                                 operator-owned artefact they can repair)
+* policy denial                → failure_recovery re-prompt; denial budget
+                                 exhausted → STOPPED with `stop_kind="fault"`
+                                 (`_to_fault_stop`). Not a park: only the
+                                 reviewer could produce a different directive,
+                                 so there is no question for a human to answer.
+                                 A blocker record is still written.
 
 This routing is only as good as the transport's promise to raise inside the
 hierarchy, and on 2026-08-15 that promise broke: a Playwright driver-channel
@@ -129,6 +143,11 @@ section for the full table):
   that construct a minimal `Orchestrator`) carrying the exact question text
   the operator would have seen, so `python -m autoloop blockers`/`answer`
   can list and resolve it even after the session that recorded it is gone.
+* A FAULT STOP (`_to_fault_stop`) records the same `loop_fatal` blocker
+  without parking: the run ends in `stopped` with `stop_kind="fault"`. Use it
+  where the cause is the reviewer's own behaviour, so no operator answer could
+  change what happens next; use `_to_needs_user` wherever a human doing
+  something makes the SAME session resumable.
 """
 
 from __future__ import annotations
@@ -233,6 +252,7 @@ from .worktask import (
     Reconciliation,
     TaskExecution,
     TaskExecutionStore,
+    accumulate_assumptions,
     reconcile_after_crash,
     retire_execution,
 )
@@ -2356,7 +2376,12 @@ class Orchestrator:
             state.stop_reason = directive.reason
             state.last_response = None
             state.phase = Phase.STOPPED.value
-            self._log("stopped", data={"reason": directive.reason})
+            # Classified explicitly, not left at the default: `stopped` is now
+            # reached two ways (here, and `_to_fault_stop`), and a reader that
+            # inferred "clean" from the phase alone would announce a run that
+            # died on a wall as a healthy finish. See `LoopState.stop_kind`.
+            state.stop_kind = "contract"
+            self._log("stopped", data={"reason": directive.reason, "kind": "contract"})
             self._store.save(state)
         elif decision in RETIRED_DECISIONS:
             # Retired 2026-08-06, mirroring the retired legacy git path below.
@@ -2444,6 +2469,15 @@ class Orchestrator:
             budget = self._policy.check_denial_budget(state.policy_denials)
             state.last_response = None
             if not budget.allowed:
+                # PARKS, where `_handle_policy_denial`'s exhaustion of the same
+                # `state.policy_denials` counter now STOPS. Deliberate, and the
+                # divergence is the interesting part: a rejected plan is a
+                # task-GRAPH fault (a cycle, a dependency on an id that does
+                # not exist, a duplicate), and the roadmap it is about is an
+                # artefact an operator owns and can repair between runs — so
+                # there is a real question to hold the session open for. A
+                # policy denial has no such external repair: the only thing
+                # that could produce a different directive is the reviewer.
                 self._to_needs_user(
                     f"{budget.reason} — last plan rejection: {exc}",
                     kind="loop_fatal",
@@ -3014,6 +3048,16 @@ class Orchestrator:
         # at all on the success path.
         execution.report_summary = outcome.summary or ""
         execution.report_details = outcome.details or ""
+        # ACCUMULATED, where the two report fields above are REPLACED, and the
+        # asymmetry is deliberate. A report describes the round that produced
+        # the current candidate. An assumption describes a choice baked into
+        # code that is still in `task_base_sha..candidate_sha` — the range the
+        # reviewer is being asked to authorize — so a later round assuming
+        # nothing must not erase it. `accumulate_assumptions` owns the union
+        # rule so this cannot drift into an assignment.
+        execution.assumptions = accumulate_assumptions(
+            execution.assumptions, outcome.assumptions
+        )
         self._execution_store.save(execution)
 
         message = f"{task.title}\n\n{outcome.summary}".strip()
@@ -4142,9 +4186,18 @@ class Orchestrator:
         budget = self._policy.check_denial_budget(state.policy_denials)
         if not budget.allowed:
             state.last_response = None
-            self._to_needs_user(
+            # STOPS, it does not park (see `_to_fault_stop`). The reviewer has
+            # now proposed refused directives more times than the budget
+            # allows; there is no question for a human here, because the only
+            # thing that could change the next directive is the reviewer, and
+            # the reviewer is what ran out of budget. Parking held the session
+            # open for an answer nobody could give — the exact stall that
+            # retiring `ask_user` set out to remove, reached by the reviewer
+            # ANSWERING `ask_user` repeatedly instead of by the decision
+            # parking directly. The blocker record and the operator-facing
+            # text are unchanged; only the terminal is.
+            self._to_fault_stop(
                 f"{budget.reason} — last denial: {verdict.reason}",
-                kind="loop_fatal",
                 code="policy_denial_budget_exhausted",
                 task_id=directive.task_id,
                 detail=f"decision={directive.decision.value} verdict_code={verdict.code}",
@@ -4162,6 +4215,15 @@ class Orchestrator:
         budget = self._policy.check_denial_budget(state.policy_denials)
         if not budget.allowed:
             state.last_response = None
+            # PARKS, like the plan-rejection site above and unlike
+            # `_handle_policy_denial`, though all three spend the same
+            # `state.policy_denials` counter. A repeated review mismatch means
+            # approvals keep arriving stamped for a tree that has since moved —
+            # which can equally be the REPOSITORY moving under the loop (a
+            # concurrent checkout, a hook, an operator committing in the same
+            # worktree), not just a reviewer echoing a stale stamp. That is an
+            # integrity signal with a human-side explanation, so it keeps the
+            # terminal that holds the session open and asks.
             self._to_needs_user(
                 f"{budget.reason} — last review mismatch: {exc}",
                 kind="loop_fatal",
@@ -4418,6 +4480,7 @@ class Orchestrator:
         state.question = question
         state.resume_phase = resume_phase
         state.phase = Phase.NEEDS_USER.value
+        state.stop_kind = ""
         state.park_kind = kind
         state.park_task_id = task_id
         state.park_blocker_id = None
@@ -4449,6 +4512,87 @@ class Orchestrator:
                 session_id=state.session_id or "",
             )
             state.park_blocker_id = blocker.id
+        self._store.save(state)
+
+    def _to_fault_stop(
+        self,
+        reason: str,
+        *,
+        code: str,
+        task_id: str | None = None,
+        detail: str = "",
+    ) -> None:
+        """End the run on `stopped` because the loop hit a wall no further
+        message can get past — the terminal that REPLACES a park for causes
+        only the reviewer could have avoided.
+
+        The distinction against `_to_needs_user` is the whole point. A park
+        asks a question and holds the session open for the answer; that is the
+        right shape for an environmental fault (a logged-out browser, a
+        publisher url that drifted, a dirty checkout) where a human doing
+        something makes the very same session resumable. It is the WRONG shape
+        for "the reviewer kept proposing directives policy refuses": there is
+        no answer to give — the session's next step would be to ask the same
+        reviewer the same thing again — so parking left an autonomous run
+        waiting on a human who has nothing to decide. That was the last park
+        `ask_user`'s retirement could still reach (a reviewer that answers
+        `ask_user` until the denial budget runs out), which is why retiring the
+        decision was only half the job.
+
+        Ending is not the same as forgetting. Everything the park recorded is
+        still recorded here:
+
+        * `stop_reason` carries the exact text the park's `question` would
+          have, so `status` / `_summary` read the same;
+        * a `blockers.Blocker` is still written (`kind="loop_fatal"`, the same
+          `code`), so `python -m autoloop blockers` / `answer` show and resolve
+          it exactly as before — `stop_blocker_id` names the record;
+        * `stop_kind="fault"` is what tells this apart from a reviewer's own
+          `stop`. Continuous mode reads it to STOP rather than treat the
+          terminal as a clean boundary and kick off a fresh session into the
+          same wall (`cli._run_continuous`), and `smoke-browser` reads it to
+          keep reporting FAIL for a misbehaving reply.
+
+        `resume_phase` is cleared unconditionally: a fault stop is terminal,
+        and leaving a resumable phase behind would advertise a `run --retry`
+        that re-enters the phase that just failed.
+        """
+        state = self.state
+        originating_phase = state.phase
+        state.stop_reason = reason
+        state.stop_kind = "fault"
+        state.question = None
+        state.resume_phase = None
+        state.phase = Phase.STOPPED.value
+        state.stop_blocker_id = None
+        # The SAME event type a contract stop logs, with the classification
+        # alongside it: everything that greps the transcript for `stopped`
+        # keeps working, and anything that cares which kind it was can read
+        # `kind` rather than inferring it from the reason's prose.
+        self._log(
+            "stopped",
+            data={
+                "reason": reason,
+                "kind": "fault",
+                "code": code,
+                "task_id": task_id,
+            },
+        )
+        if self._blocker_store is not None:
+            blocker = self._blocker_store.record(
+                task_id=task_id or NO_TASK,
+                # `loop_fatal`, never `task_fatal`: quarantining one task would
+                # imply the rest of the roadmap can proceed, and a reviewer that
+                # spent the denial budget is not a per-task condition.
+                kind="loop_fatal",
+                code=code,
+                question=reason,
+                detail=detail,
+                phase=originating_phase,
+                now=utcnow_iso(),
+                session_id=state.session_id or "",
+            )
+            state.stop_blocker_id = blocker.id
         self._store.save(state)
 
     def active_provider(self) -> str:

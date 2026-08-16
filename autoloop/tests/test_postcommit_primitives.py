@@ -9,6 +9,7 @@ helpers rather than importing them, matching that file's own self-contained
 style.
 """
 
+import json
 import subprocess
 
 import pytest
@@ -23,6 +24,7 @@ from autoloop.worktask import (
     Reconciliation,
     TaskExecution,
     TaskExecutionStore,
+    accumulate_assumptions,
     reconcile_after_crash,
 )
 
@@ -618,6 +620,96 @@ def test_task_execution_store_round_trip(tmp_path):
     execution.candidate_sha = "b" * 40
     store.save(execution)
     assert store.load("t1").candidate_sha == "b" * 40
+
+
+def test_task_execution_store_round_trips_assumptions_in_written_order(tmp_path):
+    """Prose, not a path set: the order these are stored in is which round
+    chose what, so — unlike `allowed_paths` / `out_of_scope_paths` — `save`
+    must NOT sort them."""
+    store = TaskExecutionStore(tmp_path / "tasks")
+    execution = TaskExecution(
+        task_id="t1",
+        task_branch="autoloop/t1",
+        worktree_path="/tmp/wt",
+        task_base_sha="a" * 40,
+        assumptions=("z: took the narrow reading", "a: kept the old default"),
+    )
+    store.save(execution)
+    loaded = store.load("t1")
+
+    assert loaded == execution
+    assert isinstance(loaded.assumptions, tuple)
+    assert loaded.assumptions == ("z: took the narrow reading", "a: kept the old default")
+
+
+def test_a_record_written_before_assumptions_existed_still_loads(tmp_path):
+    """Backward compatibility, and the reason it is a `.get` default rather
+    than a migration: a record from an older build has no `assumptions` key at
+    all, and "none recorded" is the truth about it — not a guess, and not the
+    same claim as "the executor assumed nothing"."""
+    store = TaskExecutionStore(tmp_path / "tasks")
+    path = store._path("t1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "task_id": "t1",
+                "task_branch": "autoloop/t1",
+                "worktree_path": "/tmp/wt",
+                "task_base_sha": "a" * 40,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = store.load("t1")
+    assert loaded is not None
+    assert loaded.assumptions == ()
+    # And it stays loadable after being written back out by the new build.
+    store.save(loaded)
+    assert store.load("t1").assumptions == ()
+
+
+def test_assumptions_accumulate_across_rounds_without_duplicating(tmp_path):
+    """Round 2 assuming nothing must not erase what round 1 assumed and
+    shipped: those lines describe code still inside
+    `task_base_sha..candidate_sha`, which is the range being authorized."""
+    round1 = accumulate_assumptions((), ("took the narrow reading of 'recent'",))
+    round2 = accumulate_assumptions(round1, ())
+    round3 = accumulate_assumptions(
+        round2,
+        (
+            "took the narrow reading of 'recent'  ",  # the same one, restated
+            "assumed UTC for the cutoff",
+            "   ",  # blank: discloses nothing, must not become a bullet
+        ),
+    )
+
+    assert round2 == ("took the narrow reading of 'recent'",)
+    assert round3 == (
+        "took the narrow reading of 'recent'",
+        "assumed UTC for the cutoff",
+    )
+
+
+def test_the_record_keeps_every_assumption_however_many_rounds_run():
+    """The record is COMPLETE; the packet is what is bounded (see
+    `packet._format_assumptions`).
+
+    `policy.max_review_rounds` defaults to unlimited, so this list really can
+    outgrow a chat message — but truncating HERE would delete evidence
+    permanently, out of the file crash-recovery adoption and any after-the-fact
+    read depend on, to solve a problem that only exists at render time."""
+    accumulated: tuple[str, ...] = ()
+    for round_number in range(30):
+        accumulated = accumulate_assumptions(
+            accumulated,
+            [f"round {round_number} assumption {i}" for i in range(20)],
+        )
+
+    assert len(accumulated) == 600
+    assert accumulated[0] == "round 0 assumption 0"  # the oldest survives
+    assert accumulated[-1] == "round 29 assumption 19"
 
 
 def test_commit_and_capture_refuses_when_head_moved_after_the_intent(tmp_path, repo):
