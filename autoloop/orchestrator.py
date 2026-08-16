@@ -3906,8 +3906,10 @@ class Orchestrator:
         Declared rather than inferred: the loop knows a `cdp_url`, not which
         Chrome owns it, and pattern-matching process lists to decide what to
         kill is how an automation takes down someone's everyday browser. The
-        shipped `scripts/restart_autoloop_chrome.sh` targets one profile by its
-        `--user-data-dir` and reports CDP readiness before returning.
+        shipped implementation — `python3 -m autoloop.browser.chrome_restart`,
+        the value `config.example.toml` ships since 2026-08-16 — matches one
+        profile by its `--user-data-dir` EXACTLY, stops every instance on it,
+        and confirms the CDP endpoint answers before reporting success.
 
         The cooldown matters as much as the restart: without it a genuinely
         dead transport becomes a restart loop, thrashing the browser instead of
@@ -3990,7 +3992,8 @@ class Orchestrator:
                 "unrecovered because browser.restart_cooldown_seconds "
                 f"({cooldown:g}s) had not elapsed since the previous restart, "
                 "so no restart was attempted for any of them. Restart the "
-                "browser by hand (scripts/restart_autoloop_chrome.sh), or "
+                "browser by hand (python3 -m autoloop.browser.chrome_restart, "
+                "run from the checkout), or "
                 "lower browser.restart_cooldown_seconds, then resume. "
                 f"Last error: {exc}",
                 resume_phase=phase.value,

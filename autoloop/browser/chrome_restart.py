@@ -33,8 +33,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-#: Defaults mirror the env vars the shell helper honoured. Wiring this into
-#: `browser.restart_command` is brw-08's job; nothing here reads the config.
+#: Defaults mirror the env vars the shell helper honoured. `browser.restart_command`
+#: points here since 2026-08-16 (brw-08); nothing in this module reads the config.
 DEFAULT_PROFILE = "~/.autoloop-chrome"
 DEFAULT_PORT = 9222
 DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
