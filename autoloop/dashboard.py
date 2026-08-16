@@ -1036,35 +1036,48 @@ def task_groups(tasks_data: dict, executions: dict) -> list[dict]:
 # completed, 23 in progress, 18 pending, 8 blocked — and the flat list is still
 # what shipped.
 #
-# Everything here is derived from `GROUPS`, i.e. from `TaskRegistry.state_of()`
-# and nothing else. Not "also from state_of" — from the SAME `groups` payload
-# the roadmap panel below renders, computed once in `collect()` and passed to
-# both. A second `TaskRegistry.from_dict` here would be correct-by-test rather
-# than correct-by-construction, and the requirement is that the summary cannot
-# disagree with what actually dispatches.
+# The TASK-STATE counts are derived from `GROUPS`, i.e. from
+# `TaskRegistry.state_of()` and nothing else. Not "also from state_of" — from
+# the SAME `groups` payload the roadmap panel below renders, computed once in
+# `collect()` and passed to both. A second `TaskRegistry.from_dict` here would
+# be correct-by-test rather than correct-by-construction, and the requirement is
+# that the summary cannot disagree with what actually dispatches.
+#
+# The in-progress PUBLICATION breakdown is a different question with a different
+# source, and saying otherwise is how a claim rots: `state_of()` knows a task is
+# IN_PROGRESS and cannot know whether its candidate reached a branch. That comes
+# from the task's execution record (`candidate_sha`, `intended_remote*`) plus the
+# one cached `git ls-remote` — evidence, not registry state — which is exactly
+# why an unreadable remote there renders `unknown` rather than a verdict.
 
 
-#: How the six group keys roll up into the counts the summary shows, and why
-#: these five buckets rather than the six states.
+#: One count per `TaskState`, in the order the tiles are read: `(count key,
+#: tile label, GROUPS key)`. The GROUPS key is what pins each row to a state —
+#: the summary counts what the Roadmap panel groups, never a rollup of its own.
 #:
-#: The 2026-08-06 hand count read STORED STATUS STRINGS (`RETIRED` did not exist
-#: yet), so "18 pending" meant the `pending` rows and "8 blocked" meant the
-#: `blocked` ones. Translated into `state_of` terms: stored `pending` is exactly
-#: READY ∪ BLOCKED — the split between them is derived from dependencies and is
-#: never stored — and stored `blocked` is BLOCKED_BY_OPERATOR, i.e. the tasks
-#: waiting on a human. Retirements are broken out rather than folded into
-#: `blocked`, for the reason `TaskState.RETIRED` exists at all: they wait on
-#: nobody.
+#: ONE STATE PER COUNT, and the count key IS `TaskState.value`. The previous
+#: shape folded READY ∪ BLOCKED into `pending` and then spent the freed name on
+#: BLOCKED_BY_OPERATOR, so the word `blocked` meant the quarantine up here and
+#: "waiting on a dependency" in the Roadmap panel below and in the per-state
+#: dict carried beside it — two states under one word, on one page, which is
+#: the exact confusion `TaskState` was split up to end. It came from the 2026-08-06 hand count, which read STORED
+#: STATUS STRINGS (`RETIRED` did not exist yet): stored `pending` really is
+#: READY ∪ BLOCKED and stored `blocked` really is BLOCKED_BY_OPERATOR. That is a
+#: fact about the FILE FORMAT, not a vocabulary the page should adopt — the
+#: derived split is the whole reason `state_of()` exists.
 #:
-#: Nothing is lost by the roll-up — `by_state` beside it carries all six counts,
-#: so ready-vs-blocked-by-a-dependency is still readable, and the Roadmap panel
-#: lists both groups by name.
-STAT_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("completed", ("done",)),
-    ("in_progress", ("in_progress",)),
-    ("pending", ("ready", "blocked")),
-    ("blocked", ("needs_human",)),
-    ("retired", ("retired",)),
+#: The vocabulary is `TaskRegistry.summary()`'s, which the loop already puts in
+#: front of the reviewer every round: ready / blocked / quarantined / retired.
+#: The labels only ever WIDEN a word ("blocked on a dependency", and the
+#: quarantine takes the Roadmap group's own "needs a human"); none of them
+#: renames a state or covers two.
+STAT_BUCKETS: tuple[tuple[str, str, str], ...] = (
+    ("completed", "completed", "done"),
+    ("in_progress", "in progress", "in_progress"),
+    ("ready", "ready", "ready"),
+    ("blocked", "blocked on a dependency", "blocked"),
+    ("blocked_by_operator", "needs a human", "needs_human"),
+    ("retired", "retired", "retired"),
 )
 
 #: The groups whose tasks count as OPEN work — everything that is neither
@@ -1191,9 +1204,14 @@ def roadmap_stats(groups: list[dict], executions: dict, remote_ok: bool,
                   refs: dict, remote_name: str = "origin") -> dict:
     """The counts, the in-progress breakdown, and the two open-work splits.
 
-    `groups` is the payload `task_groups()` already produced, so every state
-    here came from `TaskRegistry.state_of()` by construction. An EMPTY
-    `groups` means the task graph would not load as a registry (see
+    `groups` is the payload `task_groups()` already produced, so every TASK
+    STATE here came from `TaskRegistry.state_of()` by construction, one count
+    per state, keyed by `TaskState.value`. The in-progress publication
+    breakdown is the one thing that does NOT come from `state_of()` — see
+    `in_progress_rows`, which reads execution records against the cached remote
+    refs and reports `unknown` when that remote could not be read.
+
+    An EMPTY `groups` means the task graph would not load as a registry (see
     `task_groups`), and this reports `readable: False` rather than a confident
     row of zeros — "no tasks" and "unreadable" call for opposite reactions, and
     a summary is exactly the panel where a fabricated zero would be believed.
@@ -1204,8 +1222,8 @@ def roadmap_stats(groups: list[dict], executions: dict, remote_ok: bool,
         return {
             "readable": False,
             "total": 0,
-            "counts": {name: 0 for name, _keys in STAT_BUCKETS},
-            "by_state": {},
+            "counts": {name: 0 for name, _label, _key in STAT_BUCKETS},
+            "tiles": [],
             "open": 0,
             "denominator": 0,
             "percent_done": None,
@@ -1217,8 +1235,8 @@ def roadmap_stats(groups: list[dict], executions: dict, remote_ok: bool,
 
     by_key = {g["key"]: g for g in groups}
     counts = {
-        name: sum(int(by_key.get(k, {}).get("count", 0)) for k in keys)
-        for name, keys in STAT_BUCKETS
+        name: int(by_key.get(key, {}).get("count", 0))
+        for name, _label, key in STAT_BUCKETS
     }
     total = sum(int(g["count"]) for g in groups)
     open_tasks = [t for g in groups if g["key"] in OPEN_GROUPS for t in g["tasks"]]
@@ -1232,10 +1250,19 @@ def roadmap_stats(groups: list[dict], executions: dict, remote_ok: bool,
     return {
         "readable": True,
         "total": total,
+        # Keyed by `TaskState.value`, one entry per state. There is no separate
+        # `by_state` any more BECAUSE there is no roll-up left to compensate
+        # for: two dicts of the same numbers under different names is how the
+        # page came to have two words for one state in the first place.
         "counts": counts,
-        # All six states, so the roll-up above loses nothing: READY vs BLOCKED
-        # is a real distinction (one is dispatchable now) that `pending` folds.
-        "by_state": {g["state"]: int(g["count"]) for g in groups},
+        # The same counts as an ordered list carrying the LABEL each state is
+        # rendered under, so the page never spells a state itself. Each row
+        # names its state AND the `GROUPS` key it was counted from, so
+        # label-to-state is assertable directly rather than by position.
+        "tiles": [
+            {"state": name, "group": key, "label": label, "count": counts[name]}
+            for name, label, key in STAT_BUCKETS
+        ],
         "open": len(open_tasks),
         "denominator": denominator,
         # `None`, never 0, when there is nothing to be a fraction of: 0% of an
@@ -1249,14 +1276,17 @@ def roadmap_stats(groups: list[dict], executions: dict, remote_ok: bool,
         },
         "open_by_priority": _tally(open_tasks, lambda t: t.get("priority", 100), True),
         "open_by_area": _tally(open_tasks, lambda t: _area_of(t.get("id") or ""), False),
-        # One line, in the vocabulary `TaskRegistry.summary()` already uses for
-        # exactly this sentence — the loop puts that string in front of the
-        # reviewer on every round, so the page saying it differently would make
-        # two authorities out of one fact.
+        # `TaskRegistry.summary()`'s own sentence, state for state and word for
+        # word — the loop puts that string in front of the reviewer on every
+        # round, so the page must not make a second authority out of one fact.
+        # It omits only what belongs to a dispatch decision rather than to a
+        # count: summary()'s priority-1 breakdown and its `next ready:` tail.
         "line": (
             f"{total} tasks: {counts['completed']} completed, "
-            f"{counts['in_progress']} in progress, {counts['pending']} pending, "
-            f"{counts['blocked']} blocked, {counts['retired']} retired"
+            f"{counts['in_progress']} in progress, {counts['ready']} ready, "
+            f"{counts['blocked']} blocked, "
+            f"{counts['blocked_by_operator']} quarantined, "
+            f"{counts['retired']} retired"
         ),
     }
 
@@ -1641,9 +1671,13 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
        first and it was not on the page at all. Counting 66 tasks by hand took a
        script (2026-08-06); the answer belongs here.
 
-       Everything in this section is derived from `TaskRegistry.state_of()` via
-       the same `groups` payload the Roadmap panel below renders, so the numbers
-       up here cannot disagree with the rows down there. -->
+       The task-state counts are derived from `TaskRegistry.state_of()` via the
+       same `groups` payload the Roadmap panel below renders — one count per
+       state, under the state's own name — so the numbers up here cannot
+       disagree with the rows down there, and no word up here can mean a
+       different state down there. The in-progress publication breakdown is the
+       one part that is NOT state_of(): it reads execution records against the
+       cached remote refs. -->
   <section id="summary">
     <h2>Roadmap — how much is done, how much is moving, is it converging</h2>
     <div id="statline" style="font-size:13px;margin-bottom:11px"></div>
@@ -1652,12 +1686,20 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
     <div id="statwip" class="scroll"></div>
     <div class="cols" id="statopen" style="margin-top:16px"></div>
     <p class="muted" style="font-size:12px;margin:12px 0 0">
-      Every count comes from <code>TaskRegistry.state_of()</code> — the function
-      the loop dispatches on — never from the stored status string, which cannot
-      tell Ready from Blocked and spells a quarantine and a retirement the same
-      way. <b>Pending</b> is Ready plus Blocked-on-a-dependency; <b>blocked</b>
-      is the quarantine that needs you. Retired tasks are left out of the
-      percentage on BOTH sides: counting a deliberately dropped task as
+      The task counts come from <code>TaskRegistry.state_of()</code> — the
+      function the loop dispatches on — never from the stored status string,
+      which cannot tell Ready from Blocked and spells a quarantine and a
+      retirement the same way. Each word means here exactly what it means in
+      the Roadmap panel below and in <code>autoloop next-task</code>:
+      <b>blocked</b> is waiting on an incomplete dependency and resolves itself,
+      <b>needs a human</b> is the quarantine that waits on you, <b>retired</b>
+      waits on nobody. The in-progress breakdown is NOT from
+      <code>state_of()</code> — a registry knows a task is in progress and
+      cannot know where its commit went. The candidate comes from the task's
+      execution record and publication from one cached
+      <code>git ls-remote</code>, so a remote that could not be read reads
+      <b>unknown</b> rather than not-published. Retired tasks are left out of
+      the percentage on BOTH sides: counting a deliberately dropped task as
       outstanding understates progress, counting it as done overstates it.</p>
   </section>
 
@@ -1893,9 +1935,12 @@ function renderProgress(p){
 // ---- the summary, at the top -------------------------------------------------
 // The three questions an operator arrives with — how much is done, how much is
 // moving, is the queue converging — answered before anything they have to
-// scroll for. Every figure here was computed on the backend from
-// `TaskRegistry.state_of()`; this function does no arithmetic of its own, so it
-// cannot drift from the Roadmap panel below.
+// scroll for. Every figure here was computed on the backend and this function
+// does no arithmetic of its own, so it cannot drift from the Roadmap panel
+// below. The state counts came from `TaskRegistry.state_of()` and carry their
+// LABELS with them, so this template never spells a state itself; the
+// in-progress breakdown came from the execution records plus one cached
+// `ls-remote`, which is why `unknown` is one of its states and not an error.
 //
 // The in-progress breakdown is the part that carries information: `in progress:
 // 23` says nothing, `twelve holding unpublished candidates` says the loop is
@@ -1931,10 +1976,16 @@ function renderStats(s){
     + `${esc(c.retired)} retired task(s) are excluded from both sides.</span>`;
   const w = (s.in_progress || {}).counts || {};
   const nUnpub = w.unpublished_candidate || 0;
+  // One tile per TaskState, LABEL AND ALL from the payload: the backend pins
+  // each label to a `GROUPS` state, so this template cannot invent a word for a
+  // state or quietly put two states under one tile. The pct tile is labelled
+  // "% done" rather than "done", because Done is already the completed group's
+  // name below and a tile reading `done 41%` beside a group reading `Done 17`
+  // is the same two-meanings problem in a smaller place.
   tiles.innerHTML = [
-    ["tasks", s.total], ["completed", c.completed], ["done", pct],
-    ["in progress", c.in_progress], ["pending", c.pending],
-    ["blocked", c.blocked], ["retired", c.retired],
+    ["tasks", s.total],
+    ...(s.tiles || []).map(t => [t.label, t.count]),
+    ["% done (retired excluded)", pct],
     // The one tile allowed a status role here, and only when it is non-zero:
     // an unpublished candidate IS a health verdict — it pins a task_base_sha.
     ["unpublished candidates", (nUnpub ? "▲ " : "✓ ") + nUnpub, nUnpub ? "warn" : ""],

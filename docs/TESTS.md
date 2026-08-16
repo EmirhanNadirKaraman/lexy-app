@@ -1674,24 +1674,42 @@ chain ending at the bytes on disk — without that, a path-spelling or phase
 mismatch would make it pass for a reason that says nothing about
 `priority_only_change`, i.e. the byte-level half would go vacuous.
 
-**Roadmap throughput on the dashboard (2026-08-16, `dash-05`; +13 functions in
+**Roadmap throughput on the dashboard (2026-08-16, `dash-05`; +14 functions in
 `test_dashboard.py`. Hand-counted, no shell in the worker; that is what this
 change added, not a re-audit of the file's total.)** The page listed tasks and
 answered none of the three questions an operator arrives with — how much is
 done, how much is moving, is the queue converging. Counting it took a script
 (2026-08-06: 66 tasks, 17 completed, 23 in progress, 18 pending, 8 blocked).
-`roadmap_stats` now derives all of that from the `groups` payload `collect()`
-already builds, i.e. from `TaskRegistry.state_of()` and nothing else, and the
-summary renders above every list on the page. Four properties carry it:
+`roadmap_stats` now derives the task-state counts from the `groups` payload
+`collect()` already builds, i.e. from `TaskRegistry.state_of()` and nothing
+else, and the summary renders above every list on the page. The in-progress
+PUBLICATION subcategories beside them are a different question with a different
+source — execution records plus one cached `ls-remote` — and are not claimed to
+come from `state_of()`, which knows a task is in progress and cannot know where
+its commit went. Four properties carry it:
 
-* **The counts cannot disagree with what dispatches.**
-  `test_the_counts_are_what_state_of_reports_and_nothing_else` runs `state_of()`
-  directly over the same rows and compares bucket by bucket, and
-  `test_the_summary_is_wired_from_the_same_groups_the_roadmap_renders` asserts
-  end-to-end (real checkout, real `origin`) that each count equals the group
-  count rendered below it. `test_every_task_state_is_claimed_by_exactly_one_bucket`
-  keeps the five buckets a partition of the six `TaskState`s, so a state added
-  later cannot silently render nowhere.
+* **The counts cannot disagree with what dispatches, and no word means two
+  states.** One count per `TaskState`, keyed by `TaskState.value`, labelled in
+  `TaskRegistry.summary()`'s own vocabulary (ready / blocked / quarantined /
+  retired). `test_the_counts_are_what_state_of_reports_and_nothing_else` runs
+  `state_of()` directly over the same rows, compares state by state, and pins
+  the one-line summary string; `test_the_summary_is_wired_from_the_same_groups_the_roadmap_renders`
+  asserts end-to-end (real checkout, real `origin`) that EVERY count equals the
+  group count rendered below it, walking `STAT_BUCKETS` rather than spot-checking.
+  `test_every_task_state_is_claimed_by_exactly_one_bucket` keeps the buckets a
+  bijection onto the six `TaskState`s and pins each bucket's count key to its
+  state's value. `test_no_word_in_the_summary_names_two_different_states` is the
+  regression the first version needed: it rolled READY ∪ BLOCKED into `pending`
+  and spent the freed name on BLOCKED_BY_OPERATOR, so `blocked` meant the
+  quarantine at the top of the page and "waiting on a dependency" in the Roadmap
+  panel below — opposite calls to action under one word. That test asserts the
+  quarantine tile carries the Roadmap group's own label ("needs a human", never
+  containing "blocked"), the dependency tile keeps `blocked` and names the
+  dependency, each tile counts exactly its group, and `open` is the sum of the
+  four non-terminal counts. `test_the_summary_renders_at_the_top_of_the_page`
+  additionally asserts the template renders labels FROM the payload and spells
+  no `TaskState` value itself — a hard-coded tile list is the shape that let the
+  word drift in the first place.
 * **The in-progress breakdown is the part that carries information.** A flat
   "23 in progress" hid twelve tasks holding unpublished candidates, each pinning
   a `task_base_sha` and so each a `task_base_behind_head` park waiting to happen

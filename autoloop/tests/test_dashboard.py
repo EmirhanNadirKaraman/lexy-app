@@ -1564,12 +1564,19 @@ def test_the_page_renders_every_group_with_its_heading_and_count():
 # Two properties carry the feature, and both are asserted below rather than
 # described:
 #
-# * every count is derived from `TaskRegistry.state_of()` (through the same
-#   `groups` payload the Roadmap panel renders), so the summary cannot disagree
-#   with what actually dispatches; and
+# * every TASK-STATE count is derived from `TaskRegistry.state_of()` (through
+#   the same `groups` payload the Roadmap panel renders), one count per state
+#   under the state's own name, so the summary cannot disagree with what
+#   actually dispatches — and no word up there can mean a different state down
+#   here; and
 # * an unreachable remote reads UNKNOWN, never "not published". That is the
 #   mutation test: twelve unpublished candidates is a real alarm, and inventing
 #   it out of a network failure would make the number worthless.
+#
+# The in-progress publication breakdown is deliberately NOT claimed to come from
+# `state_of()`: a registry knows a task is IN_PROGRESS and cannot know where its
+# commit went. It reads the execution record's `candidate_sha` against the
+# cached `ls-remote`, which is exactly why `unknown` is one of its states.
 
 
 def stats_for(rows, executions=None, remote_ok=True, refs=None, remote_name="origin"):
@@ -1582,9 +1589,10 @@ def stats_for(rows, executions=None, remote_ok=True, refs=None, remote_name="ori
 
 
 def test_the_counts_are_what_state_of_reports_and_nothing_else():
-    """The load-bearing property. `status` cannot answer this: `pending` covers
-    Ready and Blocked alike and `blocked` means quarantined, so the counts are
-    compared against `state_of()` run directly on the same rows."""
+    """The load-bearing property. `status` cannot answer this: stored `pending`
+    covers Ready and Blocked alike and stored `blocked` means quarantined, so
+    the counts are compared against `state_of()` run directly on the same rows —
+    one count per state, keyed by `TaskState.value`."""
     rows = [
         roadmap_task("done-1", status="completed"),
         roadmap_task("done-2", status="completed"),
@@ -1602,34 +1610,93 @@ def test_the_counts_are_what_state_of_reports_and_nothing_else():
     stats = stats_for(rows)
 
     assert stats["total"] == len(rows) == 7
-    assert stats["counts"] == {
-        "completed": seen[TaskState.COMPLETED],
-        "in_progress": seen[TaskState.IN_PROGRESS],
-        # Stored `pending` is exactly READY ∪ BLOCKED — the split between them
-        # is derived from dependencies and never stored, which is why the hand
-        # count read one number for both.
-        "pending": seen[TaskState.READY] + seen[TaskState.BLOCKED],
-        "blocked": seen[TaskState.BLOCKED_BY_OPERATOR],
-        "retired": seen[TaskState.RETIRED],
-    }
+    assert stats["counts"] == {state.value: seen[state] for state in TaskState}
     # Spelled out too, so a bug that moved a task between states consistently in
-    # both halves of the comparison above still fails here.
-    assert stats["counts"] == {"completed": 2, "in_progress": 1, "pending": 2,
-                               "blocked": 1, "retired": 1}
-    # And the roll-up loses nothing: dispatchable-now vs waiting-on-a-dependency
-    # is still readable beside it.
-    assert stats["by_state"] == {state.value: seen[state] for state in TaskState}
+    # both halves of the comparison above still fails here. Note what the two
+    # `blocked*` counts are: dep-1 waits on wip-1 (resolves itself), q-1 waits
+    # on an operator. Folding them — or spending the name `blocked` on the
+    # quarantine, as the first version of this summary did — is the regression.
+    assert stats["counts"] == {"completed": 2, "in_progress": 1, "ready": 1,
+                               "blocked": 1, "blocked_by_operator": 1, "retired": 1}
+    # And the one-line summary says the same thing in `TaskRegistry.summary()`'s
+    # own words, so the page and the review packet cannot report two roadmaps.
+    # Asserted as an EXACT string because the vocabulary is the point, not the
+    # arithmetic: this sentence is copied from `TaskRegistry.summary()` (minus
+    # its priority-1 breakdown and `next ready:` tail, which are dispatch advice
+    # rather than counts). If this fails, the fix is to change both or neither —
+    # `summary()` is the authority, this is the copy.
+    assert stats["line"] == ("7 tasks: 2 completed, 1 in progress, 1 ready, "
+                             "1 blocked, 1 quarantined, 1 retired")
 
 
 def test_every_task_state_is_claimed_by_exactly_one_bucket():
-    """A state added to the registry must not vanish from the summary. The
-    buckets are spelled in GROUP KEYS, and `GROUPS` pins each key to its state,
-    so this asks whether the five buckets partition all six states."""
+    """A state added to the registry must not vanish from the summary, and no
+    state may be counted twice. The buckets name a GROUP KEY, and `GROUPS` pins
+    each key to its state, so this asks whether the six buckets are a bijection
+    onto the six `TaskState`s — and whether each bucket's own count key is that
+    state's value, which is what stops a name drifting off its state."""
     key_to_state = {key: state for key, _label, state in GROUPS}
-    claimed = [key_to_state[key] for _name, keys in STAT_BUCKETS for key in keys]
+    claimed = [key_to_state[group_key] for _name, _label, group_key in STAT_BUCKETS]
 
     assert len(claimed) == len(set(claimed)), "a state is counted in two buckets"
     assert {state.value for state in claimed} == {state.value for state in TaskState}
+    for (name, _label, group_key), state in zip(STAT_BUCKETS, claimed):
+        assert name == state.value, f"count key {name!r} is not {state.value!r}"
+        assert key_to_state[group_key] is state
+
+
+def test_no_word_in_the_summary_names_two_different_states():
+    """The revision that produced this test. The first version rolled READY ∪
+    BLOCKED into `pending` and spent the freed name on BLOCKED_BY_OPERATOR, so
+    `blocked` meant the quarantine in the top summary and "waiting on a
+    dependency" in the Roadmap panel eight inches below — on the same page, in
+    the same operator's eye, with opposite calls to action (answer a blocker vs
+    wait for a dependency).
+
+    So: every tile carries the label the page renders, and the mapping from
+    label to state is asserted here rather than trusted to the template."""
+    rows = [
+        roadmap_task("wip-1", status="in_progress"),
+        roadmap_task("ready-1"),
+        roadmap_task("dep-1", depends_on=["wip-1"]),
+        roadmap_task("q-1", status="blocked", blocked_reason="answer me"),
+    ]
+    groups = task_groups({"tasks": rows}, {})
+    stats = roadmap_stats(groups, {}, True, {})
+    group_labels = {g["key"]: g["label"] for g in groups}
+    group_counts = {g["state"]: g["count"] for g in groups}
+
+    tiles = {tile["state"]: tile for tile in stats["tiles"]}
+    assert [tile["state"] for tile in stats["tiles"]] == [
+        name for name, _label, _key in STAT_BUCKETS
+    ]
+    # Each tile counts exactly the group it names, so the number beside a label
+    # is the number of rows listed under that label below.
+    for tile in stats["tiles"]:
+        assert tile["count"] == stats["counts"][tile["state"]]
+        assert tile["count"] == group_counts[tile["state"]]
+
+    # The quarantine borrows the Roadmap group's own words and never the word
+    # `blocked`; the dependency wait keeps `blocked` and says what it waits on.
+    quarantine = tiles[TaskState.BLOCKED_BY_OPERATOR.value]
+    assert quarantine["label"] == group_labels["needs_human"].lower() == "needs a human"
+    assert "blocked" not in quarantine["label"]
+    assert quarantine["count"] == 1
+
+    dependency = tiles[TaskState.BLOCKED.value]
+    assert dependency["label"].startswith("blocked") and "dependenc" in dependency["label"]
+    assert dependency["count"] == 1
+
+    # Ready is its own count rather than half of a `pending` bucket: it is the
+    # one state that is dispatchable right now, which is the difference the
+    # roll-up erased.
+    assert tiles[TaskState.READY.value]["count"] == 1
+    # And the open figure is exactly the four non-terminal states, so the two
+    # halves of the summary cannot describe different sets of tasks.
+    assert stats["open"] == sum(
+        stats["counts"][state] for state in
+        ("in_progress", "ready", "blocked", "blocked_by_operator")
+    ) == 4
 
 
 def test_retired_tasks_leave_the_percentage_denominator_on_both_sides():
@@ -1839,7 +1906,12 @@ def test_the_summary_is_wired_from_the_same_groups_the_roadmap_renders(tmp_path)
     assert stats["readable"] is True
     assert stats["counts"]["in_progress"] == groups["in_progress"]["count"] == 2
     assert stats["counts"]["completed"] == groups["done"]["count"] == 1
-    assert stats["counts"]["pending"] == groups["ready"]["count"] + groups["blocked"]["count"]
+    # Every top-level count against the group it renders above, by GROUPS key —
+    # not a spot check, because a summary that agrees with the list on five
+    # states out of six is exactly as misleading as one that agrees on none.
+    for name, _label, group_key in STAT_BUCKETS:
+        assert stats["counts"][name] == groups[group_key]["count"], name
+    assert stats["counts"]["ready"] == groups["ready"]["count"] == 1
     assert stats["total"] == len(payload["roadmap"]) == 4
     kinds = {row["id"]: row["kind"] for row in stats["in_progress"]["rows"]}
     assert kinds == {"t-merged": "published", "t-ghost": "unpublished_candidate"}
@@ -1878,10 +1950,19 @@ def test_the_summary_renders_at_the_top_of_the_page():
 
     assert "renderStats(d.stats)" in script
     for field in ("s.line", "s.total", "s.open", "s.denominator", "s.percent_done",
-                  "s.open_by_priority", "s.open_by_area", "c.completed",
-                  "c.in_progress", "c.pending", "c.blocked", "c.retired",
+                  "s.tiles", "t.label", "t.count", "s.open_by_priority",
+                  "s.open_by_area", "c.completed", "c.retired",
                   "w.unpublished_candidate", "r.detail"):
         assert field in script, f"{field} never reaches the DOM"
+
+    # The state tiles are rendered FROM the payload's labels, so the template
+    # cannot spell a state itself and cannot put two states under one word. A
+    # hard-coded tile list is the shape that let `blocked` mean the quarantine
+    # up here while the Roadmap group below meant a dependency.
+    block = script.split("function renderStats(s){", 1)[1].split("\nfunction ", 1)[0]
+    assert "(s.tiles || []).map(t => [t.label, t.count])" in block
+    for state in TaskState:
+        assert f'"{state.value}"' not in block, f"{state.value} is spelled in the template"
 
     # Identity is never colour-alone on this page: every in-progress state ships
     # an icon and a word, and the table below repeats all of it as text.
