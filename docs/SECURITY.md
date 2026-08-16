@@ -37,7 +37,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
 | S18 | LOW | Self-hosted model server has no auth; `LLM_BASE_URL` egress is operator-controlled (opt-in, unset by default) | `services/llm_provider.py` |
 | S22 | INFO | `commit_adopted` is sound but has no production call site (tracked, not a vulnerability) | `autoloop/git_gateway.py`, `autoloop/manifest.py` |
-| S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
+| S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered. Amended 2026-08-16: derived bytecode (`__pycache__` entries with a live sibling source) is exempt from the snapshot diff after three false loop-fatal parks — a forged cache entry whose header matches its source is the new, named residual | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
@@ -276,6 +276,63 @@ reminder that something was never actually resolved, surfaced only when
 there is otherwise nothing productive to report, rather than a hard block
 on all future work. Does not change anything above: the OS-sandbox
 gap is unaffected either way.
+
+**Addendum, 2026-08-16 (esc-01) — one class narrowed out of the snapshot,
+and the residual that creates.** The unconditional refusal above is what
+made three FALSE parks expensive: on 2026-08-15/16, `checkout_escape_
+detected` fired three times on CPython bytecode caches inside the primary
+checkout, none of them caused by an agent (a dashboard restart importing
+`autoloop.dashboard`; two `python3 -m autoloop health --json` polls after the
+loop merged a source change). `__pycache__/` is gitignored and the detector
+covers ignored paths on purpose, so an out-of-band import is
+indistinguishable from tampering. Each cost a `reset --yes` and the in-flight
+round; one stranded five tasks `in_progress`.
+
+`escape_detector.is_derived_bytecode` now exempts exactly one class from
+`diff_snapshots`: a `.pyc`/`.pyo` directly inside a `__pycache__/` directory
+whose sibling `.py` source is itself in the snapshot. The distinction being
+drawn is AUTHORED vs DERIVED — `state.json` and a blocker record hold the
+only copy of a claim, while a cache entry is written from a source this same
+snapshot still tracks byte for byte. Nothing else was excluded: a `.pyc`
+outside `__pycache__` (the pre-PEP-3147 layout, which imports with no source
+beside it), an orphan cache entry with no sibling `.py`, and any symlink or
+directory appearing at a cache path all still park. `.so`/`.pyd` are NOT
+covered and must never be added — those are authored build outputs.
+
+**Two things this changes elsewhere, stated rather than left to be
+discovered.** (1) The same rule reaches `diff_worker_tree`, the validation
+mutation guard (S27), because it delegates to `diff_snapshots` — a
+validation `pytest` run's own bytecode no longer reads as "validation
+MUTATED the worker tree"; that message now says "beyond its own bytecode
+cache". (2) A NEW residual: "the next import regenerates it" holds only
+while the cached header is stale. An agent that writes a `.pyc` can also
+write the `(mtime, size)` / PEP 552 source-hash header that makes the
+interpreter accept it, so a forged cache entry whose header matches its
+source would be loaded and is NOT reported. Header verification was
+considered and rejected: it costs an attacker one `os.stat` to defeat, while
+failing closed on an unreadable or foreign-magic header would manufacture
+exactly the spurious loop-fatal parks this exists to stop. The residual
+needs the OS-level sandbox this finding already tracks, not a wider
+snapshot, and it is strictly smaller than the `.git/hooks/` gap above.
+`PYTHONDONTWRITEBYTECODE`/`-B` is REPORTED (esc-01 brief) as already applied
+to the loop, supervisor, deadman and dashboard wrappers, which live outside
+this checkout — nothing in this repository sets it, so do not record it here
+as a verified control. It would in any case not be the fix: it depends on
+every future caller remembering, which is the failure that produced all
+three incidents.
+
+**Verification check:**
+```bash
+# The exemption exists, is keyed on the cache DIRECTORY, and is not widened:
+rg -n 'is_derived_bytecode|BYTECODE_CACHE_DIR' autoloop/escape_detector.py
+rg -n '\.so|\.pyd' autoloop/escape_detector.py      # expect: only the "never add these" comments
+# The `-B` stopgap is operator-side, not in this checkout — expect NO match,
+# and do not "fix" the docs by claiming the control lives here:
+rg -n 'PYTHONDONTWRITEBYTECODE' .
+# A genuine ignored-path escape is still detected, including alongside
+# bytecode churn in the same window:
+pytest autoloop/tests/test_m1_hardening.py -k 'escape_detector or bytecode' -q
+```
 
 ### S28 — The dashboard's localhost POST can now queue authorization, not just a priority — MEDIUM — OPEN (bounded, accepted)
 

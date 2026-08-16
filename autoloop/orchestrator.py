@@ -3225,7 +3225,11 @@ class Orchestrator:
         makes an explicit exclusion list for Autoloop's own volatile files
         (state.json, the blocker/execution/intent stores, ...) unnecessary:
         nothing in this orchestrator writes any of them between the two
-        snapshots below.
+        snapshots below. The single exemption that DOES exist —
+        `escape_detector.is_derived_bytecode`, for `__pycache__` entries
+        whose `.py` source is itself snapshotted — is argued there too; it is
+        what stops an out-of-band `import autoloop.…` (a dashboard restart, a
+        `health --json` poll) from parking this round as tampering.
 
         Returns the outcome, or `None` if an escape was detected — already
         parked (loop_fatal: the isolation mechanism itself may be
@@ -3406,6 +3410,12 @@ class Orchestrator:
         # the tree" is a concrete leak path, and it stays a refusal even when
         # the file it wrote is one the task was approved to touch: approval
         # authorises the AGENT to edit a path, never validation to mutate one.
+        # One class is exempt on both sides, via the same
+        # `escape_detector.is_derived_bytecode` rule the checkout detector
+        # uses: the `__pycache__` entries any `pytest` run compiles from
+        # sources already in the tree. Nothing here declares them harmless —
+        # their `.py` sources are still diffed byte for byte — and the wording
+        # below says so rather than claiming validation wrote nothing at all.
         tree_before = escape_detector.snapshot_worker_tree(worktree_git)
         validation_ok, validation_summary = self._run_post_commit_validation(execution)
         mutations = escape_detector.diff_worker_tree(
@@ -3419,9 +3429,10 @@ class Orchestrator:
             # The mutated files are left on disk, uncommitted: the candidate is
             # refused, and the worker repo is the evidence.
             failures.append(
-                "validation MUTATED the worker tree (validation must read, "
-                "never write; the candidate is refused and the worker repo is "
-                "preserved uncommitted as evidence): " + "; ".join(sorted(mutations))
+                "validation MUTATED the worker tree beyond its own bytecode "
+                "cache (validation must read, never write; the candidate is "
+                "refused and the worker repo is preserved uncommitted as "
+                "evidence): " + "; ".join(sorted(mutations))
             )
         return failures, validation_summary
 

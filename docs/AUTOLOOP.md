@@ -1229,6 +1229,38 @@ does writes any of those files between the "before" and "after" snapshots
 remove real detection capability for no gain; the enumerated exclusion set
 the brief for this pass asked for is empty BY MEASUREMENT.
 
+*The one exemption, added 2026-08-16 (esc-01), and why it does not reopen
+the paragraph above.* `escape_detector.is_derived_bytecode` reports nothing
+for a `.pyc`/`.pyo` directly inside a `__pycache__/` directory whose sibling
+`.py` source is itself in the snapshot. The line being drawn is AUTHORED vs
+DERIVED, not noisy vs quiet: `state.json` and a blocker record hold the only
+copy of a claim, whereas a cache entry is written by the interpreter from a
+source this same snapshot still tracks byte for byte. It was needed because
+any out-of-band `import autoloop.<x>` against the primary checkout — a
+dashboard restart, a `health --json` poll — recompiles a stale cache entry
+mid-round, and `__pycache__/` is gitignored, so the detector saw it. That
+produced three loop-fatal `checkout_escape_detected` parks on 2026-08-15/16,
+none caused by an agent, each costing a `reset --yes` and the in-flight round
+(one stranded five tasks `in_progress`). Note the timing before proposing
+anything narrower: the recompile fires because the source changed BEFORE the
+window (a merge the loop itself made), so a rule of "flag a `.pyc` only when
+its source did not change in the window" would have flagged all three.
+Deliberately still reported: a `.pyc` OUTSIDE `__pycache__` (the legacy
+layout — it imports with no source beside it), an orphan cache entry with no
+sibling `.py`, and any symlink or directory appearing at a cache path.
+Deliberately NOT covered: `.so`/`.pyd`, which are authored build outputs.
+The same rule reaches the validation mutation guard below, since that
+delegates to `diff_snapshots`. Residual, recorded in `docs/SECURITY.md` S24
+rather than argued away: a forged cache entry whose `(mtime, size)` or
+PEP 552 header matches its source would be loaded by the interpreter and is
+not reported — header verification costs an attacker one `os.stat` to
+defeat, while failing closed on an unreadable header would manufacture the
+very parks this removes. `PYTHONDONTWRITEBYTECODE`/`-B` was reported (esc-01
+brief) as already applied to the loop, supervisor, deadman and dashboard
+wrappers, which live outside this checkout — nothing here sets it, so it is
+not a control this repository can claim. It would not be the fix anyway: it
+depends on every future caller remembering.
+
 Also new: `Orchestrator._prepare_write_capable_worker` requires the PRIMARY
 checkout's index and working tree to be clean (`primary_checkout_dirty`,
 loop_fatal) before every write-capable dispatch — a dirty baseline cannot be
@@ -1818,7 +1850,12 @@ its config would land) is invisible to it. The refusal holds even when the
 mutated file is one the task was approved to touch — approval authorises the
 AGENT to edit a path, never validation to mutate one. Messages name PATHS
 ONLY, so a park message is safe even when what was written was a credential;
-the mutated files stay on disk uncommitted, as evidence.
+the mutated files stay on disk uncommitted, as evidence. **One exemption,
+inherited (2026-08-16, esc-01):** this delegates to `diff_snapshots`, so a
+validation `pytest` run's own `__pycache__` entries — derived from sources
+already in the tree — are silent, and the refusal message says "MUTATED the
+worker tree beyond its own bytecode cache" rather than claiming validation
+wrote nothing at all. See §4e for what stays in scope.
 
 **What the mutation guard is NOT** (reviewer's wording, kept because it is
 exactly right): it detects **persistent net changes** to the snapshotted worker

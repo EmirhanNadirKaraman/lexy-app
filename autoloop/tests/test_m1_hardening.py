@@ -32,9 +32,12 @@ from autoloop.contract import Decision, Directive
 from autoloop.errors import ConfigError, TaskGraphError
 from autoloop.escape_detector import (
     diff_snapshots,
+    diff_worker_tree,
     enumerate_checkout_paths,
     find_symlink_traversal,
+    is_derived_bytecode,
     snapshot_checkout,
+    snapshot_worker_tree,
 )
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
@@ -344,6 +347,260 @@ def test_escape_detector_clean_run_reports_no_violations(tmp_path):
 
 
 # =============================================================================
+# 2b. derived bytecode is the ONE exempt class (esc-01, 2026-08-16)
+#
+# Three loop-fatal `checkout_escape_detected` parks on 2026-08-15/16 were
+# caused by nothing an agent did: an out-of-band `import autoloop.<x>` against
+# the primary checkout (a dashboard restart, a `health --json` poll) recompiled
+# a `__pycache__` entry mid-round. `escape_detector.is_derived_bytecode` now
+# exempts exactly that class. Everything here exists to hold the exemption to
+# its narrow shape — and `test_escape_detector_detects_ignored_content_change`
+# above is deliberately untouched, plus re-proved BELOW in the same window as
+# a bytecode write, which is the stronger claim.
+# =============================================================================
+
+
+def _python_repo(tmp_path, name="repo") -> Path:
+    """`real_repo` plus this repository's own Python ignore rules and one real
+    package, so every bytecode scenario below is modelled the way production
+    sees it: `__pycache__/` and `*.py[cod]` are GITIGNORED, which is precisely
+    why `git status` never noticed them and `enumerate_checkout_paths` (which
+    covers ignored paths on purpose) did."""
+    repo_root = real_repo(tmp_path, name)
+    (repo_root / ".gitignore").write_text("__pycache__/\n*.py[cod]\n", encoding="utf-8")
+    pkg = repo_root / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    run_git(repo_root, "add", "-A")
+    run_git(repo_root, "commit", "-q", "-m", "package + python ignores")
+    return repo_root
+
+
+def test_escape_detector_ignores_a_recompiled_bytecode_cache_file(tmp_path):
+    """The exact incident: the `.pyc` is rewritten while `pkg/mod.py` is
+    untouched, which is what an import does after a source change landed
+    BEFORE the window (a merge) — so this is also why "only flag a `.pyc`
+    whose source did not change in the window" would have flagged all three
+    real incidents."""
+    repo_root = _python_repo(tmp_path)
+    cache = repo_root / "pkg" / "__pycache__"
+    cache.mkdir()
+    pyc = cache / "mod.cpython-312.pyc"
+    pyc.write_bytes(b"stale bytecode")
+    rel = "pkg/__pycache__/mod.cpython-312.pyc"
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths = enumerate_checkout_paths(git)
+    assert rel in paths, "the cache file must still be ENUMERATED — only its diff is silent"
+    assert git.dirty_files() == []  # ignored, exactly as in production
+
+    before = snapshot_checkout(repo_root, paths)
+    assert rel in before, "the snapshot itself is unchanged; the exemption lives in the diff"
+    pyc.write_bytes(b"recompiled by an out-of-band import")
+    after = snapshot_checkout(repo_root, paths)
+
+    assert diff_snapshots(before, after) == []
+
+
+def test_escape_detector_ignores_bytecode_cache_files_appearing_and_vanishing(tmp_path):
+    """Creation (a first import) and deletion (a `find -name __pycache__ -delete`)
+    are the same derived class as a rewrite. Covers every name CPython
+    actually produces: the plain cache file, an optimised one, a `.pyo`, and
+    the `<name>.<pid>` temp file `_write_atomic` leaves visible for the
+    instant between writing and `os.replace`."""
+    repo_root = _python_repo(tmp_path)
+    cache = repo_root / "pkg" / "__pycache__"
+    cache.mkdir()
+    # A cache entry from an older interpreter, swept and never replaced — a
+    # real deletion, not a delete-then-rewrite of the same path.
+    doomed = cache / "mod.cpython-311.pyc"
+    doomed.write_bytes(b"about to be swept")
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths_before = enumerate_checkout_paths(git)
+    before = snapshot_checkout(repo_root, paths_before)
+    assert "pkg/__pycache__/mod.cpython-311.pyc" in before
+
+    doomed.unlink()
+    for name in (
+        "mod.cpython-312.pyc",
+        "mod.cpython-312.opt-1.pyc",
+        "mod.cpython-313.pyo",
+        "mod.cpython-312.pyc.98765",
+    ):
+        (cache / name).write_bytes(b"fresh bytecode")
+
+    paths_after = enumerate_checkout_paths(git)
+    after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
+    assert diff_snapshots(before, after) == []
+
+
+def test_escape_detector_still_detects_an_orphan_bytecode_cache_file(tmp_path):
+    """No `pkg/ghost.py` anywhere in the checkout, so nothing regenerates
+    this and there is no source to compare it against — a planted orphan,
+    which is authored code wearing a derived name."""
+    repo_root = _python_repo(tmp_path)
+    cache = repo_root / "pkg" / "__pycache__"
+    cache.mkdir()
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths_before = enumerate_checkout_paths(git)
+    before = snapshot_checkout(repo_root, paths_before)
+
+    (cache / "ghost.cpython-312.pyc").write_bytes(b"planted")
+
+    paths_after = enumerate_checkout_paths(git)
+    after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
+    violations = diff_snapshots(before, after)
+    assert any("ghost.cpython-312.pyc" in v and "created" in v for v in violations), violations
+
+
+def test_escape_detector_still_detects_a_sourceless_pyc_outside_pycache(tmp_path):
+    """The pre-PEP-3147 layout — `pkg/evil.pyc` sitting where a module would,
+    with no `.py` beside it. That one IS importable with no source at all,
+    which is the whole reason the exemption is keyed on the `__pycache__`
+    directory rather than on the `.pyc` extension."""
+    repo_root = _python_repo(tmp_path)
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths_before = enumerate_checkout_paths(git)
+    before = snapshot_checkout(repo_root, paths_before)
+
+    (repo_root / "pkg" / "evil.pyc").write_bytes(b"planted sourceless module")
+
+    paths_after = enumerate_checkout_paths(git)
+    after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
+    violations = diff_snapshots(before, after)
+    assert any("pkg/evil.pyc" in v and "created" in v for v in violations), violations
+
+
+def test_escape_detector_still_detects_a_shape_change_at_a_bytecode_cache_path(tmp_path):
+    """A compile writes a plain file. A symlink appearing at a cache path —
+    whether replacing a cache file or created fresh — is not something a
+    compile produces, so the exemption does not reach it."""
+    repo_root = _python_repo(tmp_path)
+    cache = repo_root / "pkg" / "__pycache__"
+    cache.mkdir()
+    pyc = cache / "mod.cpython-312.pyc"
+    pyc.write_bytes(b"real bytecode")
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths_before = enumerate_checkout_paths(git)
+    before = snapshot_checkout(repo_root, paths_before)
+
+    pyc.unlink()
+    pyc.symlink_to("/etc/passwd")
+    (cache / "mod.cpython-311.pyc").symlink_to("../mod.py")
+
+    paths_after = enumerate_checkout_paths(git)
+    after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
+    violations = diff_snapshots(before, after)
+    assert any(
+        "mod.cpython-312.pyc" in v and "type changed" in v for v in violations
+    ), violations
+    assert any(
+        "mod.cpython-311.pyc" in v and "created" in v and "symlink" in v for v in violations
+    ), violations
+
+
+def test_a_real_ignored_path_escape_is_still_reported_when_bytecode_churns_beside_it(tmp_path):
+    """The regression the exemption has to survive, in its strongest form:
+    the genuine ignored-path tampering that
+    `test_escape_detector_detects_ignored_content_change` pins happens in the
+    SAME window as the bytecode writes that used to be indistinguishable from
+    it. The escape is reported; the derived churn contributes nothing."""
+    repo_root = _python_repo(tmp_path)
+    (repo_root / ".gitignore").write_text(
+        "__pycache__/\n*.py[cod]\nstate.json\n", encoding="utf-8"
+    )
+    run_git(repo_root, "add", ".gitignore")
+    run_git(repo_root, "commit", "-q", "-m", "ignore the state file too")
+    forged = repo_root / "state.json"
+    forged.write_text('{"tampered": false}', encoding="utf-8")
+    cache = repo_root / "pkg" / "__pycache__"
+    cache.mkdir()
+    (cache / "mod.cpython-312.pyc").write_bytes(b"stale bytecode")
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    paths_before = enumerate_checkout_paths(git)
+    assert "state.json" in paths_before
+    assert git.dirty_files() == []  # as in production: both are invisible to `git status`
+    before = snapshot_checkout(repo_root, paths_before)
+
+    # An import recompiles the cache while the agent forges the ignored file.
+    (cache / "mod.cpython-312.pyc").write_bytes(b"recompiled")
+    (cache / "mod.cpython-312.opt-1.pyc").write_bytes(b"also recompiled")
+    forged.write_text('{"tampered": true}', encoding="utf-8")
+
+    paths_after = enumerate_checkout_paths(git)
+    after = snapshot_checkout(repo_root, sorted(set(paths_before) | set(paths_after)))
+    violations = diff_snapshots(before, after)
+
+    assert [v for v in violations if "state.json" in v and "content changed" in v], violations
+    assert not [v for v in violations if ".pyc" in v], violations
+
+
+def test_is_derived_bytecode_is_keyed_on_the_cache_directory_and_a_live_source():
+    """The predicate on its own, so the boundary is stated once in one place
+    rather than inferred from the scenarios above. `source_paths` is the
+    snapshot's own key set."""
+    sources = {"pkg/mod.py", "pkg/sub/mod.py", "top.py", "pkg/dotted.name.py", "pkg/native.so"}
+    exempt = (
+        "pkg/__pycache__/mod.cpython-312.pyc",
+        "pkg/__pycache__/mod.cpython-312.opt-2.pyc",
+        "pkg/__pycache__/mod.cpython-312.pyc.4242",  # atomic-write temp file
+        "pkg/__pycache__/mod.cpython-311.pyo",
+        "pkg/sub/__pycache__/mod.cpython-312.pyc",
+        "__pycache__/top.cpython-312.pyc",
+        "pkg/__pycache__/dotted.name.cpython-312.pyc",  # non-greedy stem
+    )
+    in_scope = (
+        "pkg/__pycache__/ghost.cpython-312.pyc",  # no `pkg/ghost.py`
+        "pkg/mod.pyc",  # legacy layout: importable with no source
+        "pkg/evil.pyo",
+        "__pycache__/mod.cpython-312.pyc",  # source is `pkg/mod.py`, not `mod.py`
+        "pkg/__pycache__/mod.py",  # a `.py` hidden in the cache dir is not derived
+        "pkg/__pycache__/native.so",  # authored build output — never exempt
+        "pkg/__pycache__/notes.txt",
+        "pkg/mod.py",
+    )
+    for rel in exempt:
+        assert is_derived_bytecode(rel, sources) is True, rel
+    for rel in in_scope:
+        assert is_derived_bytecode(rel, sources) is False, rel
+
+
+def test_validation_mutation_guard_shares_the_same_bytecode_exemption(tmp_path):
+    """`diff_worker_tree` runs the same rule (it calls `diff_snapshots`), which
+    is what stops a validation run's own `pytest` bytecode from reading as
+    "validation MUTATED the worker tree" — while a real write in the same run
+    still does."""
+    repo_root = _python_repo(tmp_path)
+    cache = repo_root / "pkg" / "__pycache__"
+    cache.mkdir()
+    (cache / "mod.cpython-312.pyc").write_bytes(b"stale bytecode")
+    (repo_root / "secrets.log").write_text("v1\n", encoding="utf-8")
+    run_git(repo_root, "add", "-A")  # tracked, so `secrets.log` is unambiguous
+    run_git(repo_root, "commit", "-q", "-m", "log file")
+
+    git = GitGateway(repo_root, PolicyEngine(PolicyConfig()))
+    before = snapshot_worker_tree(git)
+    (cache / "mod.cpython-312.pyc").write_bytes(b"compiled during validation")
+    (cache / "mod.cpython-312.opt-1.pyc").write_bytes(b"and an optimised one")
+    mutations = diff_worker_tree(before, snapshot_worker_tree(git))
+    # The index line is a separate claim of this guard's (a staged change) and
+    # is not filtered here for its own sake — this assertion is about paths.
+    assert [m for m in mutations if "index" not in m] == [], mutations
+
+    before = snapshot_worker_tree(git)
+    (repo_root / "secrets.log").write_text("DB_PASSWORD leaked here\n", encoding="utf-8")
+    (cache / "mod.cpython-312.pyc").write_bytes(b"compiled again")
+    mutations = diff_worker_tree(before, snapshot_worker_tree(git))
+    assert any("secrets.log" in m and "content changed" in m for m in mutations), mutations
+    assert not [m for m in mutations if ".pyc" in m], mutations
+
+
+# =============================================================================
 # 3. end-to-end: an executor that escapes its worker repo is caught before
 #    anything is committed (findings #1/#2, adversarial test 4)
 # =============================================================================
@@ -356,7 +613,12 @@ def _build_worker_repos_orchestrator(tmp_path, executor_factory, approved_paths=
     # dirty path the moment it is written below, which would trip the
     # "primary checkout must be clean" precondition for a reason that has
     # nothing to do with what any of these tests are actually checking.
-    (repo_root / ".gitignore").write_text(".al/\n", encoding="utf-8")
+    # `__pycache__/` + `*.py[cod]` are here for the same fidelity reason
+    # (the real `.gitignore` carries both): a bytecode cache entry in the
+    # primary checkout is an IGNORED path in production, which is the state
+    # `test_bytecode_written_into_the_primary_checkout_is_not_an_escape`
+    # needs to model.
+    (repo_root / ".gitignore").write_text(".al/\n__pycache__/\n*.py[cod]\n", encoding="utf-8")
     run_git(repo_root, "add", ".gitignore")
     run_git(repo_root, "commit", "-q", "-m", "gitignore state dir")
     workers_root = tmp_path / "workers_root"
@@ -523,6 +785,44 @@ def test_agent_tampering_with_a_blocker_record_is_detected(tmp_path):
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert orch.state.park_kind == "loop_fatal"
     assert "blk-other-001.json" in (orch.state.question or "")
+
+
+def test_bytecode_written_into_the_primary_checkout_is_not_an_escape(tmp_path):
+    """End-to-end, at the level the three 2026-08-15/16 incidents actually
+    happened: something imports a module out of the primary checkout while a
+    write-capable round is in flight, CPython rewrites the `__pycache__`
+    entry, and the round must finish normally rather than park loop_fatal and
+    cost a `reset --yes`. The companion negative controls are the four tests
+    above, which still park on a real escape."""
+    stale = b"stale bytecode, as an out-of-band import would find it"
+
+    def tamper(repo_root):
+        # Exactly what an interpreter does: rewrite the cache entry for a
+        # source it just imported. Nothing here touches `pkg/mod.py`.
+        cache = repo_root / "pkg" / "__pycache__"
+        (cache / "mod.cpython-312.pyc").write_bytes(b"recompiled mid-round")
+
+    orch, repo_root, _store, task, executor = _build_worker_repos_orchestrator(
+        tmp_path, lambda wr, rr: _TamperingExecutor(wr, rr, tamper)
+    )
+    pkg = repo_root / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    run_git(repo_root, "add", "pkg/mod.py")
+    run_git(repo_root, "commit", "-q", "-m", "a module the loop imports")
+    (pkg / "__pycache__").mkdir()
+    (pkg / "__pycache__" / "mod.cpython-312.pyc").write_bytes(stale)
+
+    orch._dispatch_executor(implement(task.id))
+
+    assert orch.state.phase != Phase.NEEDS_USER.value, orch.state.question
+    assert "escape" not in (orch.state.question or "").lower()
+    # Not vacuous: the executor ran and the rewrite really happened. Asserted
+    # here rather than through `execution_store` — a `candidate_sha` assertion
+    # would stake this test on the whole post-commit pipeline, which is not
+    # what it is about.
+    assert executor.calls == 1
+    assert (pkg / "__pycache__" / "mod.cpython-312.pyc").read_bytes() != stale
 
 
 def test_audit_dispatch_is_not_wrapped_by_the_escape_detector(tmp_path, monkeypatch):

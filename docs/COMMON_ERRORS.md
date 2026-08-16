@@ -1134,6 +1134,54 @@ inspect the reported paths, confirm `.autoloop/PAUSE` is the only one, then
 archive the session (`reset --yes` keeps the task registry) and close the
 record with `archive-blocker <id> --reason "..."`.
 
+### `checkout_escape_detected` naming a `__pycache__/*.pyc` nobody wrote
+**Symptom:** the loop parks `loop_fatal` mid-round with
+`content changed outside the worker repo: autoloop/__pycache__/orchestrator.cpython-312.pyc`
+(or `dashboard.cpython-312.pyc`, or a `created …` line for one). No agent
+touched it, no `.py` changed in that window, and `git status` is clean.
+Because `checkout_escape_detected` refuses every `answer` by design, and
+`archive-blocker` refuses while the session is live, the only way out is
+`reset --yes` — which discards the in-flight round. **Three of these on
+2026-08-15/16**: one from restarting the read-only dashboard while a round
+held the lock (importing `autoloop.dashboard` rewrote its cache entry), two
+from a supervisor polling `python3 -m autoloop health --json` every two
+minutes (the first poll after the loop merged a source change recompiled
+`orchestrator.cpython-312.pyc`). One of those resets left five tasks stranded
+`in_progress`.
+**Cause:** `__pycache__/` is gitignored, and `escape_detector.
+enumerate_checkout_paths` covers ignored paths *on purpose* (the canonical
+escape it exists to catch — an agent forging `.autoloop/state.json` — happens
+with a clean working tree). So any out-of-band `import autoloop.<x>` against
+the primary checkout writes into the snapshotted tree. Note the timing, which
+rules out the obvious narrower fix: the recompile fires because the source
+changed BEFORE the window (the merge), so "flag a `.pyc` only when its source
+did not change in the window" would have flagged all three.
+**Fix:** applied repo-side 2026-08-16 (esc-01) — `escape_detector.
+is_derived_bytecode` exempts a `.pyc`/`.pyo` sitting directly inside a
+`__pycache__/` directory whose sibling `.py` is itself in the snapshot.
+Derived, not authored: the interpreter writes it from a source that stays
+fully in scope. Still reported, deliberately: a `.pyc` OUTSIDE `__pycache__`
+(the legacy layout, importable with no source), an orphan cache entry with no
+sibling `.py`, and any symlink/directory appearing at a cache path. Contrast
+the `autoloop pause` entry above, where exempting the path was the WRONG fix
+— `PAUSE` is authored, its bytes are the only copy of the claim, and it moved
+outside the tree instead.
+**Also fixed by the same rule:** the validation mutation guard
+(`diff_worker_tree`), which brackets the post-commit validation run and would
+otherwise read every `.pyc` a `pytest` run compiles as "validation MUTATED the
+worker tree".
+**Still worth doing on the operator side:** run out-of-band autoloop commands
+with `python3 -B` / `PYTHONDONTWRITEBYTECODE=1`. Per the esc-01 brief this was
+applied as a stopgap to the loop, supervisor, deadman and dashboard
+*wrappers*, which live outside this checkout — `rg -n
+'PYTHONDONTWRITEBYTECODE|python3? -B' .` comes back empty here, so treat it as
+reported, not as verified from this repository. Either way it is a stopgap and
+not the fix: it depends on every future caller remembering, which is exactly
+what failed three times here.
+**If you hit it on an older build:** inspect the reported paths, confirm they
+are all bytecode, then `reset --yes` (it keeps the task registry) and re-open
+any task the reset left `in_progress`.
+
 ### The loop runs forever without progressing — same `audit` decision, same park, every cycle
 **Symptom:** `run --continuous` is alive and healthy (no crash, no blocker you
 can act on), but the transcript repeats one cycle: `directive {"decision":
