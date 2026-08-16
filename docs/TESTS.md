@@ -1674,6 +1674,87 @@ chain ending at the bytes on disk — without that, a path-spelling or phase
 mismatch would make it pass for a reason that says nothing about
 `priority_only_change`, i.e. the byte-level half would go vacuous.
 
+**Roadmap throughput on the dashboard (2026-08-16, `dash-05`; +14 functions in
+`test_dashboard.py`. Hand-counted, no shell in the worker; that is what this
+change added, not a re-audit of the file's total.)** The page listed tasks and
+answered none of the three questions an operator arrives with — how much is
+done, how much is moving, is the queue converging. Counting it took a script
+(2026-08-06: 66 tasks, 17 completed, 23 in progress, 18 pending, 8 blocked).
+`roadmap_stats` now derives the task-state counts from the `groups` payload
+`collect()` already builds, i.e. from `TaskRegistry.state_of()` and nothing
+else, and the summary renders above every list on the page. The in-progress
+PUBLICATION subcategories beside them are a different question with a different
+source — execution records plus one cached `ls-remote` — and are not claimed to
+come from `state_of()`, which knows a task is in progress and cannot know where
+its commit went. Four properties carry it:
+
+* **The counts cannot disagree with what dispatches, and no word means two
+  states.** One count per `TaskState`, keyed by `TaskState.value`, labelled in
+  `TaskRegistry.summary()`'s own vocabulary (ready / blocked / quarantined /
+  retired). `test_the_counts_are_what_state_of_reports_and_nothing_else` runs
+  `state_of()` directly over the same rows, compares state by state, and pins
+  the one-line summary string; `test_the_summary_is_wired_from_the_same_groups_the_roadmap_renders`
+  asserts end-to-end (real checkout, real `origin`) that EVERY count equals the
+  group count rendered below it, walking `STAT_BUCKETS` rather than spot-checking.
+  `test_every_task_state_is_claimed_by_exactly_one_bucket` keeps the buckets a
+  bijection onto the six `TaskState`s and pins each bucket's count key to its
+  state's value. `test_no_word_in_the_summary_names_two_different_states` is the
+  regression the first version needed: it rolled READY ∪ BLOCKED into `pending`
+  and spent the freed name on BLOCKED_BY_OPERATOR, so `blocked` meant the
+  quarantine at the top of the page and "waiting on a dependency" in the Roadmap
+  panel below — opposite calls to action under one word. That test asserts the
+  quarantine tile carries the Roadmap group's own label ("needs a human", never
+  containing "blocked"), the dependency tile keeps `blocked` and names the
+  dependency, each tile counts exactly its group, and `open` is the sum of the
+  four non-terminal counts. `test_the_summary_renders_at_the_top_of_the_page`
+  additionally asserts the template renders labels FROM the payload and spells
+  no `TaskState` value itself — a hard-coded tile list is the shape that let the
+  word drift in the first place.
+* **The in-progress breakdown is the part that carries information.** A flat
+  "23 in progress" hid twelve tasks holding unpublished candidates, each pinning
+  a `task_base_sha` and so each a `task_base_behind_head` park waiting to happen
+  — the failure that stopped the loop twice on 2026-08-04.
+  `test_each_in_progress_sub_category_is_classified_including_a_published_one`
+  drives all three (published to its side branch / holding an unpublished
+  candidate / no candidate at all) and asserts the sub-counts SUM to the flat
+  count, so the two cannot tell the operator different things.
+* **An unreachable remote is unknown, never not-published.** The mutation test
+  is `test_an_unreachable_remote_is_unknown_never_not_published`: a failed
+  `ls-remote` and a remote with no such branch both produce an empty ref map, and
+  reading them alike would manufacture the alarming state out of a network
+  hiccup. `test_an_unreachable_origin_leaves_the_breakdown_unknown_end_to_end`
+  repeats it over a real checkout whose `origin` was re-pointed at a path that is
+  not a repository (fails instantly; an unroutable URL would sit on the 15s
+  `ls-remote` timeout and stall the suite). The related trap has its own test —
+  `test_a_record_naming_no_remote_is_read_against_the_one_that_was_polled`: most
+  records carry no `intended_remote`, and reading that absence as "some other
+  remote" would make the whole breakdown read `unknown` against live data while
+  every other test still passed.
+* **Retired tasks leave the percentage on BOTH sides.**
+  `test_retired_tasks_leave_the_percentage_denominator_on_both_sides` pins
+  `denominator == completed + open == total - retired` and asserts the figure is
+  neither of the two wrong readings (retired-as-outstanding understates,
+  retired-as-done overstates), and
+  `test_a_roadmap_with_nothing_to_divide_by_reports_no_percentage` keeps 0% from
+  being invented where nothing was measured.
+
+Plus `test_the_open_work_is_broken_down_by_priority_and_by_area` (both splits
+cover exactly the open tasks and exclude completed + retired; priority keeps its
+own ascending order, areas lead with the biggest),
+`test_the_branch_comes_from_the_record_before_the_naming_convention` (the
+extracted `branch_for` helper the merge panel now shares, so the two panels
+cannot name different branches for one task),
+`test_an_unreadable_graph_reports_unknown_rather_than_a_row_of_zeros` (a summary
+is the one panel where a fabricated zero would be believed), and
+`test_the_summary_renders_at_the_top_of_the_page` — placement was the operator's
+actual request, so it is asserted rather than described: the section indexes
+before `#tiles`, `#progressbox`, `#merged` and `#roadmap`, every field reaches
+the DOM, each in-progress state ships an icon + a word, and `renderStats` sits
+INSIDE the re-render guard (unlike `renderProgress`, whose clock ticks every
+poll). The served script is still parsed by the existing
+`test_the_served_javascript_actually_parses`, which globs every `<script>` block
+and runs `node --check` over it, so no second parse test was added.
+
 Run: `pytest autoloop/tests` from the repo root to run only this tree.
 
 **Included in a bare `pytest` since 2026-08-04 (rt-05).** Root `testpaths` is

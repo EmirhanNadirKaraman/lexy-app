@@ -715,6 +715,21 @@ def is_ancestor(repo: Path, sha: str, head: str) -> str:
     return verdict
 
 
+def branch_for(task_id: str, record: dict) -> str:
+    """The side branch a task's work belongs on, from the loop's own record.
+
+    Evidence order, best first: the ref the publisher INTENDED to write, then
+    the branch the worker checked out, and only then `BRANCH_PREFIX + id` —
+    which is a lookup key, never evidence. Shared by the merge panel and the
+    in-progress breakdown so the two cannot name different branches for the
+    same task and then disagree about whether it was published.
+    """
+    ref = str(record.get("intended_remote_ref") or "")
+    if ref.startswith("refs/heads/"):
+        return ref[len("refs/heads/"):]
+    return str(record.get("task_branch") or "") or f"{BRANCH_PREFIX}{task_id}"
+
+
 def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
                  refs: dict, ancestor) -> list[dict]:
     """One row per completed task: which of `MERGE_STATES` it is in, and why.
@@ -740,11 +755,7 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
     for task in completed:
         task_id = task.get("id") or ""
         record = executions.get(task_id) or {}
-        ref = str(record.get("intended_remote_ref") or "")
-        branch = (
-            ref[len("refs/heads/"):] if ref.startswith("refs/heads/")
-            else str(record.get("task_branch") or "") or f"{BRANCH_PREFIX}{task_id}"
-        )
+        branch = branch_for(task_id, record)
         published = refs.get(branch) or ""
         candidate = str(record.get("candidate_sha") or "")
         state, detail = "unknown", "origin unreachable — merged-ness unverified"
@@ -1017,6 +1028,269 @@ def task_groups(tasks_data: dict, executions: dict) -> list[dict]:
         return []
 
 
+# ---- the summary an operator reads first --------------------------------------
+#
+# The page listed tasks and answered none of the three questions the operator
+# actually arrives with: how much is done, how much is moving, and is the queue
+# converging. On 2026-08-06 that took a script to answer by hand — 66 tasks, 17
+# completed, 23 in progress, 18 pending, 8 blocked — and the flat list is still
+# what shipped.
+#
+# The TASK-STATE counts are derived from `GROUPS`, i.e. from
+# `TaskRegistry.state_of()` and nothing else. Not "also from state_of" — from
+# the SAME `groups` payload the roadmap panel below renders, computed once in
+# `collect()` and passed to both. A second `TaskRegistry.from_dict` here would
+# be correct-by-test rather than correct-by-construction, and the requirement is
+# that the summary cannot disagree with what actually dispatches.
+#
+# The in-progress PUBLICATION breakdown is a different question with a different
+# source, and saying otherwise is how a claim rots: `state_of()` knows a task is
+# IN_PROGRESS and cannot know whether its candidate reached a branch. That comes
+# from the task's execution record (`candidate_sha`, `intended_remote*`) plus the
+# one cached `git ls-remote` — evidence, not registry state — which is exactly
+# why an unreadable remote there renders `unknown` rather than a verdict.
+
+
+#: One count per `TaskState`, in the order the tiles are read: `(count key,
+#: tile label, GROUPS key)`. The GROUPS key is what pins each row to a state —
+#: the summary counts what the Roadmap panel groups, never a rollup of its own.
+#:
+#: ONE STATE PER COUNT, and the count key IS `TaskState.value`. The previous
+#: shape folded READY ∪ BLOCKED into `pending` and then spent the freed name on
+#: BLOCKED_BY_OPERATOR, so the word `blocked` meant the quarantine up here and
+#: "waiting on a dependency" in the Roadmap panel below and in the per-state
+#: dict carried beside it — two states under one word, on one page, which is
+#: the exact confusion `TaskState` was split up to end. It came from the 2026-08-06 hand count, which read STORED
+#: STATUS STRINGS (`RETIRED` did not exist yet): stored `pending` really is
+#: READY ∪ BLOCKED and stored `blocked` really is BLOCKED_BY_OPERATOR. That is a
+#: fact about the FILE FORMAT, not a vocabulary the page should adopt — the
+#: derived split is the whole reason `state_of()` exists.
+#:
+#: The vocabulary is `TaskRegistry.summary()`'s, which the loop already puts in
+#: front of the reviewer every round: ready / blocked / quarantined / retired.
+#: The labels only ever WIDEN a word ("blocked on a dependency", and the
+#: quarantine takes the Roadmap group's own "needs a human"); none of them
+#: renames a state or covers two.
+STAT_BUCKETS: tuple[tuple[str, str, str], ...] = (
+    ("completed", "completed", "done"),
+    ("in_progress", "in progress", "in_progress"),
+    ("ready", "ready", "ready"),
+    ("blocked", "blocked on a dependency", "blocked"),
+    ("blocked_by_operator", "needs a human", "needs_human"),
+    ("retired", "retired", "retired"),
+)
+
+#: The groups whose tasks count as OPEN work — everything that is neither
+#: finished nor deliberately dropped. This is the denominator's other half:
+#: `open + completed == total - retired`, which is what makes the percentage
+#: mean anything.
+#:
+#: RETIRED is excluded from BOTH sides on purpose. Counting a retirement as
+#: outstanding understates progress (nobody will ever do it), and counting it as
+#: done overstates it (nobody ever did it); the honest move is to take it out of
+#: the fraction entirely and report the denominator alongside the percentage so
+#: the exclusion is visible rather than assumed.
+OPEN_GROUPS = frozenset({"in_progress", "ready", "blocked", "needs_human"})
+
+#: The three things `in_progress` actually means, plus the one honest non-answer.
+#: This breakdown is the part of the summary that carries information: a flat
+#: "in progress: 23" hides that twelve of those tasks were holding unpublished
+#: candidates on 2026-08-06, each pinning a `task_base_sha` and so each a
+#: `task_base_behind_head` park waiting for the next branch move — the failure
+#: that stopped the loop twice on 2026-08-04.
+IN_PROGRESS_KINDS = ("published", "unpublished_candidate", "no_candidate", "unknown")
+
+
+def in_progress_rows(tasks: list[dict], executions: dict, remote_ok: bool,
+                     refs: dict, remote_name: str = "origin") -> list[dict]:
+    """Classify each in-progress task into one of `IN_PROGRESS_KINDS`.
+
+    Pure: `refs` is `{branch: sha}` as already read by `_remote_refs`, and
+    `remote_ok` is whether that read succeeded. No git, no network, no lock.
+
+    The rules, and the reason each is the safe direction:
+
+    * **No `candidate_sha` in the record → `no_candidate`**, decided from the
+      record alone and REGARDLESS of whether the remote answered. There is
+      nothing to publish, so reachability cannot change the answer, and routing
+      it through `unknown` would hide the "dispatched, nothing committed" count
+      behind a network failure.
+    * **Candidate, and the branch on the remote is AT that sha → `published`.**
+      B10 should then have completed the task, so a non-zero count here means
+      something is not retiring.
+    * **Candidate, remote readable, branch absent or at a DIFFERENT sha →
+      `unpublished_candidate`.** A branch head that is not this commit does not
+      carry this commit; the detail names both shas so the verdict is
+      inspectable rather than asserted.
+    * **Candidate, and the remote could not be read → `unknown`.** An
+      unreachable remote must never render as "not published": it cannot tell
+      "no such branch" from "the branch is right there", and inventing the
+      alarming one out of a network hiccup is the failure `_remote_refs`
+      already returns a `(reachable, refs)` PAIR to prevent.
+
+    `intended_remote` is the remote the RECORD names. A record that names one
+    we did not read is `unknown` for the same reason — but a record that names
+    NOTHING is the ordinary shape, not a foreign remote, so it defaults to
+    `remote_name`, the remote `_remote_refs` actually polled. Reading absence as
+    "some other remote" would make the whole breakdown read `unknown` against
+    live data while every test still passed.
+    """
+    out = []
+    for task in tasks:
+        task_id = task.get("id") or ""
+        record = executions.get(task_id) or {}
+        candidate = str(record.get("candidate_sha") or "")
+        branch = branch_for(task_id, record)
+        named = str(record.get("intended_remote") or "").strip() or remote_name
+        published = refs.get(branch) or ""
+        if not candidate:
+            kind = "no_candidate"
+            detail = ("dispatched, nothing committed — a timeout, a refusal, or "
+                      "an abandoned round")
+        elif not remote_ok:
+            kind = "unknown"
+            detail = (f"{named} could not be read, so whether {candidate[:12]} was "
+                      f"published is unknown — never reported as not published")
+        elif named != remote_name:
+            kind = "unknown"
+            detail = (f"the record names remote {named}, which was not read — "
+                      f"whether {candidate[:12]} was published is unknown")
+        elif published == candidate:
+            kind = "published"
+            detail = (f"{candidate[:12]} is on {named}/{branch} — B10 should have "
+                      f"completed this task, so it is retireable")
+        else:
+            kind = "unpublished_candidate"
+            where = f"that branch is at {published[:12]}" if published else "no such branch"
+            detail = (f"{candidate[:12]} is not on {named}/{branch} ({where}) — it "
+                      f"pins task_base_sha, so the next branch move parks it")
+        out.append({"id": task_id, "title": task.get("title") or "",
+                    "branch": branch, "sha": candidate[:12],
+                    "kind": kind, "detail": detail})
+    return out
+
+
+def _area_of(task_id: str) -> str:
+    """The family a task belongs to: the id prefix before the first `-`.
+
+    `inbox-03` → `inbox`, `dash-05` → `dash`. Not a stored field and not a
+    lookup table — an area is invented by whoever names a task, so deriving it
+    from the id is the only reading that stays true when a new family appears.
+    An id with no separator is its own area; an empty id says so rather than
+    creating a blank row.
+    """
+    head = str(task_id or "").split("-")[0].strip()
+    return head or "(unnamed)"
+
+
+def _tally(tasks: list[dict], key, sort_by_key: bool) -> list[dict]:
+    """`[{"key": …, "count": n}, …]`, ordered so the answer is readable.
+
+    `sort_by_key` is the priority case: 1 outranks 2 outranks the default 100,
+    so the natural order IS the answer and re-sorting by count would scramble
+    it. Areas have no order of their own, so they lead with the biggest.
+    """
+    counts: dict = {}
+    for task in tasks:
+        bucket = key(task)
+        counts[bucket] = counts.get(bucket, 0) + 1
+    items = sorted(counts.items()) if sort_by_key else sorted(
+        counts.items(), key=lambda kv: (-kv[1], str(kv[0]))
+    )
+    return [{"key": k, "count": n} for k, n in items]
+
+
+def roadmap_stats(groups: list[dict], executions: dict, remote_ok: bool,
+                  refs: dict, remote_name: str = "origin") -> dict:
+    """The counts, the in-progress breakdown, and the two open-work splits.
+
+    `groups` is the payload `task_groups()` already produced, so every TASK
+    STATE here came from `TaskRegistry.state_of()` by construction, one count
+    per state, keyed by `TaskState.value`. The in-progress publication
+    breakdown is the one thing that does NOT come from `state_of()` — see
+    `in_progress_rows`, which reads execution records against the cached remote
+    refs and reports `unknown` when that remote could not be read.
+
+    An EMPTY `groups` means the task graph would not load as a registry (see
+    `task_groups`), and this reports `readable: False` rather than a confident
+    row of zeros — "no tasks" and "unreadable" call for opposite reactions, and
+    a summary is exactly the panel where a fabricated zero would be believed.
+
+    Read-only and lock-free: it takes already-read values and does arithmetic.
+    """
+    if not groups:
+        return {
+            "readable": False,
+            "total": 0,
+            "counts": {name: 0 for name, _label, _key in STAT_BUCKETS},
+            "tiles": [],
+            "open": 0,
+            "denominator": 0,
+            "percent_done": None,
+            "in_progress": {"counts": {k: 0 for k in IN_PROGRESS_KINDS}, "rows": []},
+            "open_by_priority": [],
+            "open_by_area": [],
+            "line": "the task graph could not be read — no counts",
+        }
+
+    by_key = {g["key"]: g for g in groups}
+    counts = {
+        name: int(by_key.get(key, {}).get("count", 0))
+        for name, _label, key in STAT_BUCKETS
+    }
+    total = sum(int(g["count"]) for g in groups)
+    open_tasks = [t for g in groups if g["key"] in OPEN_GROUPS for t in g["tasks"]]
+    # `total - retired`, spelled from the buckets rather than recomputed, so the
+    # figure under the percentage is the same number the retired count shows.
+    denominator = total - counts["retired"]
+    rows = in_progress_rows(
+        by_key.get("in_progress", {}).get("tasks", []),
+        executions, remote_ok, refs, remote_name,
+    )
+    return {
+        "readable": True,
+        "total": total,
+        # Keyed by `TaskState.value`, one entry per state. There is no separate
+        # `by_state` any more BECAUSE there is no roll-up left to compensate
+        # for: two dicts of the same numbers under different names is how the
+        # page came to have two words for one state in the first place.
+        "counts": counts,
+        # The same counts as an ordered list carrying the LABEL each state is
+        # rendered under, so the page never spells a state itself. Each row
+        # names its state AND the `GROUPS` key it was counted from, so
+        # label-to-state is assertable directly rather than by position.
+        "tiles": [
+            {"state": name, "group": key, "label": label, "count": counts[name]}
+            for name, label, key in STAT_BUCKETS
+        ],
+        "open": len(open_tasks),
+        "denominator": denominator,
+        # `None`, never 0, when there is nothing to be a fraction of: 0% of an
+        # empty roadmap is a verdict nobody measured.
+        "percent_done": (
+            round(100.0 * counts["completed"] / denominator, 1) if denominator else None
+        ),
+        "in_progress": {
+            "counts": {k: sum(1 for r in rows if r["kind"] == k) for k in IN_PROGRESS_KINDS},
+            "rows": rows,
+        },
+        "open_by_priority": _tally(open_tasks, lambda t: t.get("priority", 100), True),
+        "open_by_area": _tally(open_tasks, lambda t: _area_of(t.get("id") or ""), False),
+        # `TaskRegistry.summary()`'s own sentence, state for state and word for
+        # word — the loop puts that string in front of the reviewer on every
+        # round, so the page must not make a second authority out of one fact.
+        # It omits only what belongs to a dispatch decision rather than to a
+        # count: summary()'s priority-1 breakdown and its `next ready:` tail.
+        "line": (
+            f"{total} tasks: {counts['completed']} completed, "
+            f"{counts['in_progress']} in progress, {counts['ready']} ready, "
+            f"{counts['blocked']} blocked, "
+            f"{counts['blocked_by_operator']} quarantined, "
+            f"{counts['retired']} retired"
+        ),
+    }
+
+
 def pipeline(state: dict, agents: list, blockers: list) -> list[dict]:
     """The loop's stages, each with a state the page can render.
 
@@ -1209,6 +1483,10 @@ def collect(repo: Path) -> dict:
     head = _run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
     dirty = len([x for x in _run(["git", "status", "--porcelain"], cwd=repo).splitlines() if x])
     remote_ok, remote_refs = _remote_refs(repo)
+    # `{branch: full sha}` from that ONE cached `ls-remote`. The merge panel and
+    # the in-progress breakdown both ask what a branch is at; they must ask the
+    # same read, not the network twice.
+    ref_shas = {r["ref"]: r.get("full") or r.get("sha") or "" for r in remote_refs}
 
     live_agents_cache = live_agents()
     ex = state.get("task_execution") or {}
@@ -1241,6 +1519,13 @@ def collect(repo: Path) -> dict:
         # the flat, tolerant read of the raw JSON — the app-task panel joins
         # against it, and it still renders when the graph itself does not load.
         "groups": groups,
+        # The top-of-page counts, derived from `groups` — the SAME payload the
+        # roadmap panel renders, so the summary cannot disagree with the list
+        # under it or with what the loop dispatches. `remote_ok` / `ref_shas`
+        # are the cached `_remote_refs` read above, reused rather than
+        # re-polled: this is the only network call on the page and it must
+        # never be made twice per request.
+        "stats": roadmap_stats(groups, executions, remote_ok, ref_shas),
         "inbox": _pending_inbox(repo),
         "app_tasks": app_tasks(repo, report_glob=_audit_report_glob(repo)),
         "pipeline": pipeline(state, live_agents_cache, blockers),
@@ -1298,6 +1583,10 @@ section{background:var(--card);border:1px solid var(--line);border-radius:10px;p
    never the only thing saying it. */
 .tile.warn{border-color:var(--warning)}
 .k{font-size:11px;color:var(--ink2);text-transform:uppercase;letter-spacing:.06em}
+/* Two open-work breakdowns side by side on a wide screen, stacked when there is
+   no room. No new colours: the tables are the same `table` rule as everywhere
+   else, and the headings the same h2. */
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}
 /* Proportional figures on standalone values — tabular-nums makes `121` look
    loose at display sizes. It belongs on columns that align vertically, which is
    `code` in the tables below, not here. */
@@ -1377,6 +1666,43 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
 
   <div id="stale" style="display:none;border:1px solid var(--warning);border-radius:8px;
        padding:9px 12px;margin-bottom:14px;font-size:13px"></div>
+
+  <!-- FIRST on the page, above every list, because it is what an operator reads
+       first and it was not on the page at all. Counting 66 tasks by hand took a
+       script (2026-08-06); the answer belongs here.
+
+       The task-state counts are derived from `TaskRegistry.state_of()` via the
+       same `groups` payload the Roadmap panel below renders — one count per
+       state, under the state's own name — so the numbers up here cannot
+       disagree with the rows down there, and no word up here can mean a
+       different state down there. The in-progress publication breakdown is the
+       one part that is NOT state_of(): it reads execution records against the
+       cached remote refs. -->
+  <section id="summary">
+    <h2>Roadmap — how much is done, how much is moving, is it converging</h2>
+    <div id="statline" style="font-size:13px;margin-bottom:11px"></div>
+    <div class="grid" id="stattiles"></div>
+    <div id="statwiphead" style="font-size:13px;margin:4px 0 9px"></div>
+    <div id="statwip" class="scroll"></div>
+    <div class="cols" id="statopen" style="margin-top:16px"></div>
+    <p class="muted" style="font-size:12px;margin:12px 0 0">
+      The task counts come from <code>TaskRegistry.state_of()</code> — the
+      function the loop dispatches on — never from the stored status string,
+      which cannot tell Ready from Blocked and spells a quarantine and a
+      retirement the same way. Each word means here exactly what it means in
+      the Roadmap panel below and in <code>autoloop next-task</code>:
+      <b>blocked</b> is waiting on an incomplete dependency and resolves itself,
+      <b>needs a human</b> is the quarantine that waits on you, <b>retired</b>
+      waits on nobody. The in-progress breakdown is NOT from
+      <code>state_of()</code> — a registry knows a task is in progress and
+      cannot know where its commit went. The candidate comes from the task's
+      execution record and publication from one cached
+      <code>git ls-remote</code>, so a remote that could not be read reads
+      <b>unknown</b> rather than not-published. Retired tasks are left out of
+      the percentage on BOTH sides: counting a deliberately dropped task as
+      outstanding understates progress, counting it as done overstates it.</p>
+  </section>
+
   <div class="grid" id="tiles"></div>
 
   <!-- Live progress for the task executing NOW. STATIC markup, and outside
@@ -1606,6 +1932,99 @@ function renderProgress(p){
     + `<p class="muted" style="font-size:12px;margin:6px 0 0">${why}</p>`;
 }
 
+// ---- the summary, at the top -------------------------------------------------
+// The three questions an operator arrives with — how much is done, how much is
+// moving, is the queue converging — answered before anything they have to
+// scroll for. Every figure here was computed on the backend and this function
+// does no arithmetic of its own, so it cannot drift from the Roadmap panel
+// below. The state counts came from `TaskRegistry.state_of()` and carry their
+// LABELS with them, so this template never spells a state itself; the
+// in-progress breakdown came from the execution records plus one cached
+// `ls-remote`, which is why `unknown` is one of its states and not an error.
+//
+// The in-progress breakdown is the part that carries information: `in progress:
+// 23` says nothing, `twelve holding unpublished candidates` says the loop is
+// about to park on task_base_behind_head. Each state ships an icon and a word —
+// colour never carries meaning alone on this page.
+const WIP = {published:["✓","published to its side branch"],
+             unpublished_candidate:["▲","holding an unpublished candidate"],
+             no_candidate:["·","no candidate committed"],
+             unknown:["?","publication unknown"]};
+
+function renderStats(s){
+  const line = document.getElementById("statline");
+  const tiles = document.getElementById("stattiles");
+  const wiphead = document.getElementById("statwiphead");
+  const wip = document.getElementById("statwip");
+  const open = document.getElementById("statopen");
+  // Unreadable is not zero. A summary is the one panel where a fabricated 0
+  // would be believed, so an unloadable graph says so and shows nothing else.
+  if (!s || !s.readable) {
+    line.innerHTML = `<p class="empty">the task graph could not be read — `
+      + `tasks.json did not load as a registry, so there are no counts.</p>`;
+    tiles.innerHTML = ""; wiphead.innerHTML = ""; wip.innerHTML = ""; open.innerHTML = "";
+    return;
+  }
+  const c = s.counts || {};
+  const pct = typeof s.percent_done === "number" ? `${s.percent_done}%` : "—";
+  // Completed against not-completed is the convergence number. The denominator
+  // is spelled out beside it so the retired exclusion is visible rather than an
+  // assumption the reader has to make.
+  line.innerHTML = `<b>${esc(s.line)}</b><br><span class="muted">`
+    + `${esc(pct)} done — ${esc(c.completed)} completed against ${esc(s.open)} still `
+    + `open, out of ${esc(s.denominator)} tasks that are not retired. `
+    + `${esc(c.retired)} retired task(s) are excluded from both sides.</span>`;
+  const w = (s.in_progress || {}).counts || {};
+  const nUnpub = w.unpublished_candidate || 0;
+  // One tile per TaskState, LABEL AND ALL from the payload: the backend pins
+  // each label to a `GROUPS` state, so this template cannot invent a word for a
+  // state or quietly put two states under one tile. The pct tile is labelled
+  // "% done" rather than "done", because Done is already the completed group's
+  // name below and a tile reading `done 41%` beside a group reading `Done 17`
+  // is the same two-meanings problem in a smaller place.
+  tiles.innerHTML = [
+    ["tasks", s.total],
+    ...(s.tiles || []).map(t => [t.label, t.count]),
+    ["% done (retired excluded)", pct],
+    // The one tile allowed a status role here, and only when it is non-zero:
+    // an unpublished candidate IS a health verdict — it pins a task_base_sha.
+    ["unpublished candidates", (nUnpub ? "▲ " : "✓ ") + nUnpub, nUnpub ? "warn" : ""],
+  ].map(([k, v, cls]) => `<div class="tile ${cls || ""}"><div class="k">${esc(k)}</div>`
+      + `<div class="v">${esc(v ?? "—")}</div></div>`).join("");
+
+  wiphead.innerHTML = (nUnpub
+      ? `<b>▲ ${nUnpub} in-progress task(s) hold a candidate that is NOT published.</b> `
+        + `Each pins a task_base_sha, so each is a task_base_behind_head park waiting `
+        + `to happen the next time the branch moves.`
+      : `✓ no in-progress task is holding an unpublished candidate.`)
+    + ((w.published || 0) ? ` <span class="muted">✓ ${w.published} already published to `
+        + `a side branch — B10 should have completed those, so a non-zero count means `
+        + `something is not retiring.</span>` : "")
+    + ((w.no_candidate || 0) ? ` <span class="muted">· ${w.no_candidate} dispatched with `
+        + `nothing committed.</span>` : "")
+    + ((w.unknown || 0) ? ` <span class="muted">? ${w.unknown} unknown — the remote could `
+        + `not be read, so publication is unverified rather than absent.</span>` : "");
+  wip.innerHTML = rows(["task","branch","candidate","state","why"],
+    ((s.in_progress || {}).rows || []).map(r => {
+      const [ic, word] = WIP[r.kind] || WIP.unknown;
+      return `<tr class="${r.kind === "unpublished_candidate" ? "row-active" : ""}">
+        <td><code>${esc(r.id)}</code></td><td><code>${esc(r.branch)}</code></td>
+        <td><code>${esc(r.sha || "—")}</code></td><td>${esc(ic)} ${esc(word)}</td>
+        <td class="muted">${esc(r.detail)}</td></tr>`;
+    }).join(""));
+
+  // The open work, twice. The counts say how much is left; these say whether
+  // what is left is worth doing next — 31 open reads differently once eleven of
+  // them are p2, and once eight turn out to be one over-split family.
+  const tally = (label, col, list, fmt) => `<div><h2>${esc(label)}</h2>`
+    + rows([col, "open"], (list || []).map(r =>
+        `<tr><td>${esc(fmt(r.key))}</td><td><code>${esc(r.count)}</code></td></tr>`).join(""))
+    + `</div>`;
+  open.innerHTML =
+      tally(`Open by priority (${s.open})`, "priority", s.open_by_priority, k => `p${k}`)
+    + tally(`Open by area (${s.open})`, "area", s.open_by_area, k => k);
+}
+
 function render(d, force){
   if (!d) return;
   // No skeleton flash on refetch: a 2s poll that rebuilt identical DOM threw
@@ -1636,6 +2055,11 @@ function render(d, force){
   const hi = {good:"●",warning:"◐",serious:"◑",critical:"■"}[d.health.role] || "●";
   document.getElementById("hlabel").textContent =
     `${hi} ${d.health.label}` + (d.health.pids.length ? ` · pid ${d.health.pids.join(", ")}` : "");
+
+  // Inside the change guard, unlike `renderProgress`: nothing here ticks on a
+  // clock, so rebuilding it every 2s would throw away text selection for
+  // nothing.
+  renderStats(d.stats);
 
   const t = d.task;
   // Completed-but-not-in-the-branch, above the fold. The tile carries the icon
