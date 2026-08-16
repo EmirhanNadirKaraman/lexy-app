@@ -903,7 +903,10 @@ retired it also renders `TaskExecution.assumptions` — the readings the executo
 CHOSE where the task did not say. An ambiguous task can no longer stop the run
 to ask, so `implement_executor` instructs the agent to take the **smallest
 reversible reading** and to write one `ASSUMPTION:` line per choice; those
-lines are collected from the agent's own output, accumulated across rounds
+lines are collected from the agent's own output — the declaration form only,
+first on its line, so neither prose about the convention nor a quoted or
+bulleted echo of the instruction itself becomes a disclosure nobody made —
+accumulated across rounds
 (union, first-seen order — a round-2 executor assuming nothing must not erase
 what round 1 assumed and shipped) and shown here. **This is not first-time
 visibility** — `report_details` is the whole agent transcript, so the lines
@@ -911,15 +914,19 @@ were already in the packet somewhere. What the section adds is the LABEL (a
 reviewer skimming a transcript cannot miss the choices that most need judging)
 and the ACCUMULATION (`report_details` is replaced every round; these are
 unioned, so round 1's assumption survives into the review of a range that still
-contains its code). Bounded in two places, for two different
-reasons: the EXECUTOR caps one round's contribution (20 lines of 500
-characters), and the PACKET caps what one message renders
-(`packet.ASSUMPTIONS_MAX_CHARS`, 4,000 — `policy.max_review_rounds` defaults to
-unlimited, so the per-round cap alone bounds nothing). The RECORD is never
-truncated: that would delete evidence out of the file crash-recovery reads, to
-solve a problem that only exists at render time. Rendering drops the OLDEST
-(each was shown in the packet for the round that made it) and says how many it
-withheld, never silently. They inform the
+contains its code). **Bounded only when RENDERED**, on two axes and both in the
+PACKET: `packet.ASSUMPTIONS_MAX_CHARS` (4,000) caps the section, dropping the
+OLDEST entries — each was shown in the packet for the round that made it — and
+`packet.ASSUMPTION_MAX_CHARS_EACH` (500) shortens a single over-long line,
+without which one pasted-reasoning entry would consume the section budget and
+hide every real disclosure behind a withheld count. Both say what they did,
+never silently. The RECORD is never truncated: that would delete evidence out
+of the file crash-recovery reads, to solve a problem that only exists at render
+time — and because `report_details` is REPLACED every round, a line dropped on
+the way to the record has no other copy left once the next round commits. (This
+is the shape after review on 2026-08-16; the first cut also capped what one
+round could contribute, 20 lines of 500 characters, which bounded a chat
+message by editing the durable record.) They inform the
 reviewer's judgement and nothing else: scope is still checked with
 `commit_range_paths` against `allowed_paths`, and validation by re-running it —
 a sentence here cannot widen either. A record written before this field existed loads as "none

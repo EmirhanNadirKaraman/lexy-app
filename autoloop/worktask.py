@@ -256,13 +256,16 @@ class TaskExecution:
     #: order the rounds ran in — so the on-disk form is stable for a given
     #: history.
     #:
-    #: COMPLETE on disk, and bounded only when RENDERED. With unlimited review
-    #: rounds this list can outgrow a chat message, but that is a constraint on
-    #: the packet, not on the record — `packet._format_assumptions` shows the
-    #: newest entries that fit and says how many it withheld, while every entry
-    #: stays here for a crash-recovery adoption or an after-the-fact read.
-    #: Truncating the record instead would delete evidence permanently to solve
-    #: a problem that only exists at render time.
+    #: COMPLETE on disk, and bounded only when RENDERED — every line the
+    #: executor wrote, at the length it wrote it. With unlimited review rounds
+    #: this list can outgrow a chat message, but that is a constraint on the
+    #: packet, not on the record: `packet._format_assumptions` shows the newest
+    #: entries that fit (shortening any single over-long one, and saying so),
+    #: while every entry stays here in full for a crash-recovery adoption or an
+    #: after-the-fact read. Truncating the record instead would delete evidence
+    #: permanently to solve a problem that only exists at render time — and
+    #: because `report_details` is replaced each round, "permanently" is
+    #: literal: no other copy of a dropped line survives the next round.
     #:
     #: CLAIMS, never authorization. Same rule as `report_summary`: an executor
     #: cannot widen its scope, pass its validation, or license a push by
@@ -271,19 +274,16 @@ class TaskExecution:
     assumptions: tuple[str, ...] = ()
 
 
-#: How many assumptions one round may contribute, and how long each may be.
-#:
-#: Not a policy about how much a task is allowed to assume — it is a bound on a
-#: string the EXECUTOR authors that ends up inside a chat message. The review
-#: packet is the one payload whose size has already broken this loop once (see
-#: `packet._format_diff_section`: a 38 KB message that could not be delivered at
-#: all, three blockers, one cause), and an agent that emits its whole reasoning
-#: transcript one `ASSUMPTION:` line at a time would push the packet toward that
-#: wall while looking like disclosure. Anything past the cap is dropped rather
-#: than truncated silently — `implement_executor` records the drop as its own
-#: final assumption line, so the reviewer is told the list is incomplete.
-MAX_ASSUMPTIONS_PER_ROUND = 20
-MAX_ASSUMPTION_CHARS = 500
+#: There is deliberately NO per-round cap here, and there was one until
+#: 2026-08-16: `MAX_ASSUMPTIONS_PER_ROUND` (20) / `MAX_ASSUMPTION_CHARS` (500)
+#: bounded what `implement_executor._extract_assumptions` handed over, which
+#: bounded a chat message by editing a durable record. The two are not the same
+#: constraint. `report_details` — the only other place those lines survive — is
+#: REPLACED every round, so the twenty-first line of round 1 was unrecoverable
+#: the moment round 2 committed, and the record's whole reason to exist is that
+#: it is the thing which does NOT get replaced. The packet is bounded instead,
+#: where the size limit actually applies (`packet.ASSUMPTIONS_MAX_CHARS`,
+#: `packet.ASSUMPTION_MAX_CHARS_EACH`), and it states what it withheld.
 
 
 def accumulate_assumptions(

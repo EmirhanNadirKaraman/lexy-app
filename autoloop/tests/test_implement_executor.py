@@ -16,7 +16,6 @@ from autoloop.git_gateway import GitGateway
 from autoloop.implement_executor import ImplementExecutor, implement_agent_runner
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.tasks import Task
-from autoloop.worktask import MAX_ASSUMPTION_CHARS, MAX_ASSUMPTIONS_PER_ROUND
 
 
 def run_git(cwd, *args):
@@ -334,11 +333,77 @@ def test_prose_about_the_convention_is_not_harvested_as_an_assumption(
     assert outcome.assumptions == ()
 
 
-def test_an_overlong_assumption_list_is_truncated_but_says_so(main_repo, worker_repo):
-    """The list rides inside a chat message, and an oversized message is the
-    one failure that has actually broken this loop (see
-    `packet._format_diff_section`). Bounded — but never silently, or a
-    reviewer would read a cut-off list as complete."""
+def test_quoted_or_bulleted_echoes_of_the_instruction_are_not_disclosures(
+    main_repo, worker_repo
+):
+    """The tightening of `_ASSUMPTION_RE` (2026-08-16).
+
+    The anchor alone stops prose that mentions the convention mid-sentence, but
+    it does not stop an agent that QUOTES the instruction it was given —
+    `> ASSUMPTION: <what you assumed...>` is verbatim from the prompt, and a
+    bulleted restatement of the rule is the same thing with `-`. Either one
+    would fabricate a deliberate choice the agent never made, in the section a
+    reviewer is most likely to read on its own.
+
+    Both directions are pinned in ONE raw text on purpose: `assumptions == ()`
+    against the echoes alone passes just as well against extraction that is
+    broken outright, so a real declaration sits among them and the assertion is
+    an exact-tuple equality."""
+    raw = (
+        "The instructions told me:\n"
+        "> ASSUMPTION: <what you assumed, and what you would have asked>\n"
+        "which I read as a rule about disclosure. Restating it for myself:\n"
+        "- ASSUMPTION: one line per choice\n"
+        "* ASSUMPTION: naming the reading I did not take\n"
+        "> - ASSUMPTION: never a summary of the work\n"
+        "Here is the one choice I actually made:\n"
+        "ASSUMPTION: read 'recent' as the last 30 days, not since the last release\n"
+    )
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert outcome.assumptions == (
+        "read 'recent' as the last 30 days, not since the last release",
+    )
+
+
+def test_the_prompt_tells_the_agent_that_a_prefixed_line_is_not_collected(
+    main_repo, worker_repo
+):
+    """The other half of the tightening. Refusing the bulleted form silently
+    would trade a fabricated disclosure for a missed one; the instruction has
+    to state the shape it actually accepts."""
+    factory_runners = []
+
+    def factory(root):
+        runner = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        factory_runners.append(runner)
+        return runner
+
+    executor = build_executor(main_repo, worker_repo, factory)
+    executor.execute(implement_directive(), make_task())
+
+    prompt = factory_runners[0].specs[0].prompt
+    assert "must come FIRST on its line" in prompt
+    assert "NOT collected" in prompt
+
+
+def test_every_assumption_reaches_the_record_however_many_the_round_wrote(
+    main_repo, worker_repo
+):
+    """No per-round count cap, deliberately (the caps were removed 2026-08-16).
+
+    `TaskExecution.assumptions` is the DURABLE record and the only copy that
+    survives the next round — `report_details`, where these lines also appear,
+    is replaced every round. Dropping the twentieth-and-later lines here made
+    them unrecoverable the moment round 2 committed, which is exactly the
+    cross-round persistence the record exists to provide. The chat-message
+    bound lives in `packet._format_assumptions` instead."""
     raw = "\n".join(f"ASSUMPTION: choice number {i}" for i in range(40))
     executor = build_executor(
         main_repo,
@@ -347,14 +412,19 @@ def test_an_overlong_assumption_list_is_truncated_but_says_so(main_repo, worker_
     )
     outcome = executor.execute(implement_directive(), make_task())
 
-    assert len(outcome.assumptions) == MAX_ASSUMPTIONS_PER_ROUND
+    assert len(outcome.assumptions) == 40
     assert outcome.assumptions[0] == "choice number 0"
-    assert "dropped" in outcome.assumptions[-1]
-    assert "21" in outcome.assumptions[-1]  # 40 - (20 - 1) really were dropped
+    assert outcome.assumptions[-1] == "choice number 39"
+    # And no overflow notice stands in for the entries that used to be cut.
+    assert not any("dropped" in text for text in outcome.assumptions)
 
 
-def test_a_single_overlong_assumption_is_cut_with_an_ellipsis(main_repo, worker_repo):
-    raw = "ASSUMPTION: " + ("x" * (MAX_ASSUMPTION_CHARS + 200))
+def test_a_long_assumption_reaches_the_record_in_full(main_repo, worker_repo):
+    """Same rule per LINE. A 500-character cut here deleted the end of a
+    sentence permanently; the packet shortens what it renders instead, and says
+    where the whole line is."""
+    body = "x" * 2_000
+    raw = f"ASSUMPTION: {body}\n"
     executor = build_executor(
         main_repo,
         worker_repo,
@@ -363,8 +433,8 @@ def test_a_single_overlong_assumption_is_cut_with_an_ellipsis(main_repo, worker_
     outcome = executor.execute(implement_directive(), make_task())
 
     [only] = outcome.assumptions
-    assert len(only) <= MAX_ASSUMPTION_CHARS
-    assert only.endswith("…")
+    assert only == body
+    assert not only.endswith("…")
 
 
 def test_a_failed_round_reports_no_assumptions(main_repo, worker_repo):

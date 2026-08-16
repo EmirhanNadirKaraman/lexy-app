@@ -94,6 +94,27 @@ DIFF_MAX_PARTS = 6
 #: or many more short ones.
 ASSUMPTIONS_MAX_CHARS = 4_000
 
+#: How much of ONE assumption a packet may render — a different bound from the
+#: section budget above, which is why the name is singular and suffixed rather
+#: than a near-twin of it.
+#:
+#: Without it the section budget alone degrades badly at the top end: the render
+#: loop takes entries newest-first and stops at the first one that does not fit,
+#: so a single 200 KB line (an agent that pasted its reasoning after
+#: `ASSUMPTION:`) would render NOTHING but a withheld count, hiding every real
+#: disclosure behind it. Shortening that one line instead costs the tail of a
+#: line nobody was going to read and keeps the rest of the list visible. The
+#: record is untouched either way — `_ENTRY_TRUNCATED` says where the whole line
+#: is.
+ASSUMPTION_MAX_CHARS_EACH = 500
+
+#: What replaces the tail of an over-long assumption, and it must NAME the
+#: record: a line shortened with a bare ellipsis reads as the executor trailing
+#: off, which is a different claim from "there is more of this sentence, and it
+#: is on disk". Counted inside `ASSUMPTION_MAX_CHARS_EACH`, so the marker can
+#: never push a rendered line past the bound it exists to enforce.
+_ENTRY_TRUNCATED = "… [shortened for this packet; the full line is in the execution record]"
+
 #: The bullet each rendered assumption carries. Named so `_format_assumptions`
 #: can charge its cost against the budget above rather than guessing at it.
 _BULLET = "- "
@@ -339,6 +360,18 @@ def _format_executor_report(execution: TaskExecution) -> str:
     )
 
 
+def _shorten_entry(text: str) -> str:
+    """One assumption, cut to `ASSUMPTION_MAX_CHARS_EACH` INCLUDING the marker
+    that says it was cut — so the returned string is never longer than the
+    bound, whatever came in. Anything at or under the bound is returned exactly
+    as recorded, marker and all absent: a reviewer must be able to tell a line
+    the executor ended from one this rendering ended for it."""
+    if len(text) <= ASSUMPTION_MAX_CHARS_EACH:
+        return text
+    keep = max(0, ASSUMPTION_MAX_CHARS_EACH - len(_ENTRY_TRUNCATED))
+    return text[:keep].rstrip() + _ENTRY_TRUNCATED
+
+
 def _format_assumptions(execution: TaskExecution) -> str:
     """The readings the executor CHOSE where the task did not say — "" when it
     recorded none.
@@ -365,30 +398,36 @@ def _format_assumptions(execution: TaskExecution) -> str:
     heading: this list is the part of the packet a hurried reviewer is most
     likely to read on its own.
 
-    **Bounded HERE rather than on the record** (`ASSUMPTIONS_MAX_CHARS`).
+    **Bounded HERE — in BOTH directions — and never on the record.**
     `TaskExecution.assumptions` accumulates across rounds and
-    `policy.max_review_rounds` defaults to unlimited, so the executor's own
-    per-round caps do not bound what ends up in a message: twenty rounds of
-    twenty maximum-length lines is ~200 KB, five times the 40,056-character
-    send that broke this loop, and the oversize fallback would not save it
-    (that replaces the DIFF). The record stays complete — truncating it would
-    delete evidence to solve a rendering problem — and the OLDEST entries are
-    what this drops, since each was already shown in the packet for the round
-    that made it while the newest describe the code under review now. The drop
-    is stated, because a silently shortened list reads as complete.
+    `policy.max_review_rounds` defaults to unlimited, so nothing upstream bounds
+    what would end up in a message: the executor records every line it is given,
+    at full length, and a hundred rounds of them is far past the
+    40,056-character send that broke this loop (and the oversize fallback would
+    not save it — that replaces the DIFF). So the section is capped
+    (`ASSUMPTIONS_MAX_CHARS`) by dropping the OLDEST entries, each of which was
+    already shown in the packet for the round that made it while the newest
+    describe the code under review now; and ONE over-long entry is shortened
+    (`ASSUMPTION_MAX_CHARS_EACH`) rather than allowed to consume the budget on
+    its own. Both are stated in the rendering — a silently shortened list, or
+    line, reads as complete — and both leave the record untouched, which is the
+    point: it is the only copy of these lines that survives the next round.
     """
     if not execution.assumptions:
         return ""
     shown: list[str] = []
     used = 0
     for text in reversed(execution.assumptions):
-        # `+ len(_BULLET) + 1` — the rendered cost of the line, not just its
-        # text, so the budget bounds what is actually sent.
-        cost = len(text) + len(_BULLET) + 1
+        entry = _shorten_entry(text)
+        # `+ len(_BULLET) + 1` — the rendered cost of the line, and computed
+        # from the SHORTENED text, so the budget bounds what is actually sent
+        # (charging the original would under-fill the section by whatever a
+        # shortened line saved).
+        cost = len(entry) + len(_BULLET) + 1
         if used + cost > ASSUMPTIONS_MAX_CHARS:
             break
         used += cost
-        shown.append(text)
+        shown.append(entry)
     shown.reverse()
     withheld = len(execution.assumptions) - len(shown)
     lines = [f"{_BULLET}{text}" for text in shown]

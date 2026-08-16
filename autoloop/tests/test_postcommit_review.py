@@ -1044,13 +1044,15 @@ def test_recorded_assumptions_reach_the_reviewer_labelled_as_claims(tmp_path):
 
 
 def test_the_rendered_assumptions_are_bounded_however_many_rounds_accumulated(tmp_path):
-    """The executor's per-round caps do not bound the PACKET.
+    """Nothing upstream bounds the PACKET, so this is where it is bounded.
 
-    `TaskExecution.assumptions` accumulates and `policy.max_review_rounds`
-    defaults to unlimited, so twenty rounds of twenty maximum-length lines is
-    ~200 KB inside a chat message — five times the 40,056-character send that
-    actually broke this loop, and the oversize fallback would not save it
-    because that replaces the DIFF, not this section."""
+    `TaskExecution.assumptions` accumulates, the executor records every line at
+    full length (deliberately — it is the only copy that survives the round
+    which replaces `report_details`), and `policy.max_review_rounds` defaults to
+    unlimited. Twenty rounds of twenty long lines is ~200 KB inside a chat
+    message — five times the 40,056-character send that actually broke this
+    loop, and the oversize fallback would not save it because that replaces the
+    DIFF, not this section."""
     from autoloop import packet as packet_mod
 
     executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
@@ -1080,6 +1082,61 @@ def test_the_rendered_assumptions_are_bounded_however_many_rounds_accumulated(tm
     # Never silently: a shortened list that does not say so reads as complete.
     assert "are not shown here" in section
     assert execution_store.load(task.id).assumptions == execution.assumptions
+
+
+def test_one_enormous_assumption_is_shortened_here_and_kept_whole_on_the_record(
+    tmp_path,
+):
+    """The per-LINE render bound (`ASSUMPTION_MAX_CHARS_EACH`), and the reason
+    it is not a record bound.
+
+    The section budget alone degrades badly at the top end: entries render
+    newest-first and the loop stops at the first one that does not fit, so a
+    single enormous line — an agent that pasted its reasoning after
+    `ASSUMPTION:` — would render nothing but a withheld count and hide every
+    real disclosure behind it. Shortening that one line keeps the rest visible.
+
+    Both halves are asserted together, because either alone is the bug the
+    other prevents: the packet must be shortened AND the record must still hold
+    every character, since `report_details` is replaced each round and nothing
+    else keeps a copy."""
+    from autoloop import packet as packet_mod
+
+    executor = WritingExecutor(tmp_path / "worktrees", {"feature.py": "print('hi')\n"})
+    orch, _root, worktrees, execution_store, _intent, task = build_postcommit(
+        tmp_path, executor
+    )
+    orch._dispatch_executor(implement(task.id))
+
+    huge = "pasted reasoning " * 500  # ~8,500 characters, one line
+    execution = execution_store.load(task.id)
+    execution.assumptions = ("read 'recent' as the last 30 days", huge)
+    execution_store.save(execution)
+
+    text = build_review_packet(execution, worktree_git_for(worktrees, task.id), task)
+    section = text.split("Assumptions the executor took")[1].split("Full diff:")[0]
+
+    # `line[4:]` — the two-space section indent AND the bullet come off, because
+    # `ASSUMPTION_MAX_CHARS_EACH` bounds the ENTRY text, not the rendered line.
+    # A shortened entry lands exactly on the bound, so measuring `"- " + text`
+    # would fail this by two characters against a correct implementation.
+    rendered = [line[4:] for line in section.splitlines() if line.startswith("  - ")]
+    assert all(
+        len(line) <= packet_mod.ASSUMPTION_MAX_CHARS_EACH for line in rendered
+    ), "a rendered line must never exceed the per-entry bound"
+    # Shortened, and it says so — a bare ellipsis would read as the executor
+    # trailing off rather than as this rendering ending the line for it.
+    assert "the full line is in the execution record" in section
+    # The other entry is still there: the whole point of shortening rather than
+    # dropping is that one oversized line cannot hide the disclosures with it.
+    assert "read 'recent' as the last 30 days" in section
+    assert "are not shown here" not in section
+
+    # And the record is untouched — every character, on disk, after a reload.
+    assert execution_store.load(task.id).assumptions == (
+        "read 'recent' as the last 30 days",
+        huge,
+    )
 
 
 def test_an_ordinary_assumption_list_carries_no_withheld_note(tmp_path):
