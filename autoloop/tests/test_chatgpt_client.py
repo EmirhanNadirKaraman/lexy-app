@@ -11,6 +11,7 @@ No playwright, no network, no clock (virtual time throughout).
 """
 
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -18,6 +19,7 @@ from autoloop.browser.chatgpt import BrowserChatGPT, SubmitResult
 from autoloop.browser.selectors import ChatGPTSelectors
 from autoloop.errors import (
     BrowserError,
+    ConversationSearchInconclusive,
     ConversationUnusableError,
     LoginExpiredError,
     ResponseTimeoutError,
@@ -949,3 +951,421 @@ def test_an_upload_that_never_finishes_refuses_to_send(tmp_path):
     assert "did not finish uploading" in str(excinfo.value)
     assert "nothing was sent" in str(excinfo.value)
     assert len(session.persisted) == before
+
+
+# ---------------------------------------------------------------------------
+# Finding a conversation by the request it contains (2026-08-05)
+#
+# `find_conversation_with` identifies a rotated chat by CONTENT when the
+# address bar has not caught up. Two things kept it from being trustworthy
+# enough to decide anything with:
+#
+#   * ChatGPT's message list is VIRTUALIZED. alr-af11e1b3-0006 parked as
+#     `submission_ambiguous` while the chat held the request and its answer;
+#     seeing them by hand took pressing End and scrolling six times before the
+#     tail rendered. A search that reads only the painted window reports "not
+#     in persisted history" about a message that is merely unmounted.
+#   * It concluded from whatever page it was on. A rotation mid-flight moves
+#     that shared page, and a confident answer about the wrong chat is worse in
+#     BOTH directions than the park it would replace: it can name a chat that
+#     never saw the request, or report absent while looking away from the one
+#     that has it.
+#
+# The fake below is purpose-built rather than an extension of `FakeSession`:
+# that one keeps a single flat `persisted` list and an `elements` that ignores
+# its selector, so it can model neither a chat list nor per-conversation
+# history — and ~40 tests depend on its current shape.
+# ---------------------------------------------------------------------------
+
+PROJECT_URL = "https://chatgpt.com/g/g-p-project123/project"
+CHAT_ONE = "https://chatgpt.com/g/g-p-project123/c/chat-one"
+CHAT_TWO = "https://chatgpt.com/g/g-p-project123/c/chat-two"
+STRAY_CHAT = "https://chatgpt.com/g/g-p-project123/c/somewhere-else"
+
+
+def _turns(count, marker="earlier"):
+    """`count` complete user/assistant exchanges — i.e. 2×count messages."""
+    out = []
+    for i in range(count):
+        out.append(("user", f"{marker} question {i}"))
+        out.append(("assistant", f"{marker} answer {i}"))
+    return out
+
+
+def _chat_holding(request_id, before=6):
+    """A conversation whose LAST message carries the request.
+
+    Where a rotation puts it, and exactly where virtualization leaves it
+    unpainted: 13 messages against a 2-message initial window needs six
+    scrolls to reach — the number the human needed on 2026-08-05.
+    """
+    return _turns(before) + [("user", f"[autoloop request {request_id} | iteration 1]")]
+
+
+class FakeProjectSession:
+    """A project chat list plus per-conversation history behind a virtualized
+    message list. Keyboard-only: it does NOT implement the optional
+    `scroll_to_end` capability, so the client falls back to pressing End.
+
+    A fresh load paints only `window` messages, counted from the TOP — the tail
+    is unmounted, which is the 2026-08-05 failure. Each gesture paints `step`
+    more, and nothing else does: a search that skips the mount can only ever
+    see the opening turns.
+    """
+
+    def __init__(self, chats, *, links=None, window=2, step=2, url_suffix="", growing=False):
+        self.chats = {url: list(history) for url, history in chats.items()}
+        # Real hrefs are relative, so the client's urljoin is exercised too.
+        self.links = list(links) if links is not None else [
+            urlsplit(url).path for url in self.chats
+        ]
+        self.window = window
+        self.step = step
+        #: Appended to every URL the page lands on, as ChatGPT appends
+        #: `?model=…` of its own accord.
+        self.url_suffix = url_suffix
+        #: A conversation that keeps producing messages, so the mounted set
+        #: never stops growing and absence is never established.
+        self.growing = growing
+        self.current_url = PROJECT_URL
+        self.present = {SEL.composer}
+        self.mounted = window
+        self.scrolls = 0
+        self.navigations = []
+        self.keys = []
+        self.logged_out = False
+        #: Where a `goto(PROJECT_URL)` actually lands (a slug rewrite, or an
+        #: SPA that restored some other page). None = where it was asked to.
+        self.project_lands_on = None
+        #: ChatGPT's canonical rewrite of a conversation URL: the project
+        #: segment grows the project's name. Same chat, different path.
+        self.slug = None
+        #: Rotation mid-flight: after this many gestures the shared page is on
+        #: `drift_to`, fully painted.
+        self.drift_after_scrolls = None
+        self.drift_to = None
+
+    # -- BrowserSession protocol -------------------------------------------
+    def goto(self, url):
+        self.navigations.append(f"goto:{url}")
+        if self.logged_out:
+            self.current_url = "https://auth.openai.com/authorize"
+            self.present = {SEL.login_markers[0]}
+            return
+        if url == PROJECT_URL and self.project_lands_on:
+            self.current_url = self.project_lands_on
+        else:
+            self.current_url = self._slugged(url) + self.url_suffix
+        self.mounted = self.window  # a fresh load re-virtualizes the list
+
+    def reload(self):
+        self.navigations.append("reload")
+        self.mounted = self.window
+
+    def url(self):
+        return self.current_url
+
+    def exists(self, selector):
+        return selector in self.present
+
+    def is_enabled(self, selector):
+        return selector in self.present
+
+    def click(self, selector):
+        pass
+
+    def focus(self, selector):
+        pass
+
+    def press(self, keys):
+        self.keys.append(keys)
+        if keys == "End":
+            self._paint_more()
+
+    def insert_text(self, text):
+        pass
+
+    def inner_text(self, selector):
+        return ""
+
+    def elements(self, selector, attr):
+        if selector == SEL.conversation_link:
+            if not self._on_project_page():
+                return []  # only a project page lists that project's chats
+            return [(href, f"chat titled {i}") for i, href in enumerate(self.links)]
+        if selector == SEL.message:
+            return list(self._history()[: self.mounted])
+        return []
+
+    def screenshot(self, path):
+        Path(path).write_bytes(b"\x89PNG-fake")
+
+    def html(self):
+        return "<html>fake</html>"
+
+    def close(self):
+        pass
+
+    # -- virtualization ----------------------------------------------------
+    @staticmethod
+    def _same(a, b):
+        pa, pb = urlsplit(a or ""), urlsplit(b or "")
+        return (pa.netloc, pa.path.rstrip("/")) == (pb.netloc, pb.path.rstrip("/"))
+
+    @staticmethod
+    def _chat_id(url):
+        segs = [seg for seg in urlsplit(url or "").path.split("/") if seg]
+        return segs[-1] if len(segs) >= 2 and segs[-2] == "c" else None
+
+    def _slugged(self, url):
+        """`/g/g-p-<id>/c/<chat>` -> `/g/g-p-<id><slug>/c/<chat>`: the same
+        conversation under the path ChatGPT canonicalises it to."""
+        if not self.slug or self._chat_id(url) is None:
+            return url
+        parts = urlsplit(url)
+        segs = parts.path.split("/")
+        segs[2] += self.slug
+        return f"{parts.scheme}://{parts.netloc}{'/'.join(segs)}"
+
+    def _on_project_page(self):
+        """Any project landing page, slug and query included — ChatGPT rewrites
+        `/g/g-p-<id>/project` with the project's name, and the chat list is on
+        the rewritten page just the same."""
+        return urlsplit(self.current_url).path.rstrip("/").endswith("/project")
+
+    def _history(self):
+        for url, history in self.chats.items():
+            same_chat = (
+                self._chat_id(url) is not None
+                and self._chat_id(url) == self._chat_id(self.current_url)
+            )
+            if self._same(url, self.current_url) or same_chat:
+                return history
+        return []
+
+    def _paint_more(self):
+        self.scrolls += 1
+        self.mounted += self.step
+        if self.growing:
+            self._history().extend(_turns(self.step, marker=f"live {self.scrolls}"))
+        if (
+            self.drift_after_scrolls is not None
+            and self.scrolls >= self.drift_after_scrolls
+            and self.drift_to
+        ):
+            self.current_url = self.drift_to
+            self.mounted = 10_000  # the chat we drifted onto is fully painted
+
+
+class FakeScrollingSession(FakeProjectSession):
+    """The same page, with the optional `scroll_to_end` capability a real
+    `PlaywrightSession` provides."""
+
+    def scroll_to_end(self, selector):
+        assert selector == SEL.message  # the list being mounted, not the composer
+        self._paint_more()
+
+
+def test_a_request_in_the_already_mounted_window_is_found(tmp_path):
+    """The cheap case stays cheap: a request already painted needs no scrolling
+    at all, and mounting more could only ever confirm it."""
+    session = FakeScrollingSession({CHAT_ONE: [("user", f"[autoloop request {RID}]")]})
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    assert session.scrolls == 0
+
+
+def test_a_request_only_in_the_unmounted_tail_is_also_found(tmp_path):
+    """THE defect, reproduced: the request is in persisted history and simply
+    not painted. Skipping the mount step fails this test — which is exactly how
+    alr-af11e1b3-0006 was parked as ambiguous while its answer sat in the
+    chat."""
+    session = FakeScrollingSession({CHAT_ONE: _turns(2), CHAT_TWO: _chat_holding(RID)})
+    client = make_client(session, FakeClock(), tmp_path)
+
+    # The window a plain readback sees on a fresh load does NOT contain it.
+    session.goto(CHAT_TWO)
+    assert client.has_request(RID) is False
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_TWO
+    assert session.scrolls >= 6  # the tail was six scrolls down, as observed
+
+
+def test_the_chat_list_is_read_from_the_href_not_the_title(tmp_path):
+    """Regression: `elements` yields (attribute value, inner text), so the href
+    comes FIRST. Unpacking it the other way round read each chat's TITLE as its
+    href — no title contains "/c/", so every candidate was skipped and the
+    search could only return None, whatever the project held."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    assert f"goto:{CHAT_ONE}" in session.navigations
+
+
+def test_a_genuinely_absent_request_is_reported_absent(tmp_path):
+    """The guard must not become "never says no" — a request in none of the
+    chats is absent, and rotation depends on being told so."""
+    session = FakeScrollingSession({CHAT_ONE: _turns(4), CHAT_TWO: _turns(4)})
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) is None
+    # and only after the lists demonstrably finished painting
+    assert session.scrolls > 0
+
+
+def test_a_search_that_drifts_refuses_to_conclude_present(tmp_path):
+    """A rotation mid-flight moves the shared page. Returning the candidate
+    here would bind the loop to a chat that never saw the request — the answer
+    came off a different one."""
+    session = FakeScrollingSession(
+        {CHAT_ONE: _turns(4), STRAY_CHAT: _chat_holding(RID)},
+        links=[urlsplit(CHAT_ONE).path],  # the stray is not in this project
+    )
+    session.drift_after_scrolls, session.drift_to = 1, STRAY_CHAT
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "in either direction" in str(excinfo.value)
+
+
+def test_a_search_that_drifts_refuses_to_conclude_absent(tmp_path):
+    """The other direction of the same fault: the chat we drifted onto does not
+    hold the request, and reporting absent from it would be a verdict about a
+    conversation nobody asked about."""
+    session = FakeScrollingSession(
+        {CHAT_ONE: _chat_holding(RID), STRAY_CHAT: _turns(4)},
+        links=[urlsplit(CHAT_ONE).path],
+    )
+    session.drift_after_scrolls, session.drift_to = 1, STRAY_CHAT
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive):
+        client.find_conversation_with(RID, PROJECT_URL)
+
+
+def test_a_project_page_that_lands_elsewhere_is_refused_before_reading_a_chat(tmp_path):
+    """The chat list of some other page is not this project's, so neither
+    finding nor missing the request in it means anything."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    session.project_lands_on = STRAY_CHAT
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "chat list" in str(excinfo.value)
+    assert session.navigations == [f"goto:{PROJECT_URL}"]  # nothing else opened
+
+
+def test_a_slugged_project_url_is_not_drift(tmp_path):
+    """ChatGPT rewrites `/g/g-p-<id>/project` with the project's name. Refusing
+    that would refuse the page it just loaded, every time."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    session.project_lands_on = "https://chatgpt.com/g/g-p-project123-my-project/project"
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+
+
+def test_a_slugged_conversation_url_is_not_drift(tmp_path):
+    """The sharper half of the same trap: a conversation is identified by its
+    `/c/<id>`, not by the project prefix ChatGPT rewrites in front of it. An
+    exact path compare here would make EVERY search inconclusive in production
+    while passing every test that types its URLs by hand."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    session.slug = "-my-project"
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    assert session.current_url.startswith("https://chatgpt.com/g/g-p-project123-my-project/c/")
+
+
+def test_a_different_chat_id_is_still_drift(tmp_path):
+    """Tolerating the prefix must not tolerate the id — that is the whole
+    identity of a conversation."""
+    session = FakeScrollingSession(
+        {CHAT_ONE: _turns(4), CHAT_TWO: _chat_holding(RID)},
+        links=[urlsplit(CHAT_ONE).path],
+    )
+    session.drift_after_scrolls, session.drift_to = 1, CHAT_TWO
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive):
+        client.find_conversation_with(RID, PROJECT_URL)
+
+
+def test_a_query_string_is_not_drift(tmp_path):
+    """`?model=…` appears on its own; an exact URL compare would refuse every
+    candidate in production while passing every test that omits it."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)}, url_suffix="/?model=gpt-5")
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+
+
+def test_a_list_still_painting_when_the_bound_runs_out_does_not_report_absent(tmp_path):
+    """Unseen and absent are different things in a virtualized list. A chat
+    whose messages never stop arriving has not been ruled out — it has run out
+    of scrolls."""
+    session = FakeScrollingSession({CHAT_ONE: _turns(4)}, growing=True)
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "unseen and absent are not the same thing" in str(excinfo.value)
+
+
+def test_a_session_without_the_scroll_capability_presses_end(tmp_path):
+    """The gesture is an OPTIONAL capability, probed like every other one: a
+    session that cannot scroll programmatically falls back to the key a human
+    presses, and still finds the tail."""
+    session = FakeProjectSession({CHAT_ONE: _chat_holding(RID)})
+    assert not hasattr(session, "scroll_to_end")
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
+    assert session.keys.count("End") >= 6
+
+
+def test_a_logged_out_profile_is_routed_not_demoted_to_inconclusive(tmp_path):
+    """The auth redirect lands the page somewhere that is plainly not the
+    project — and it must still surface as a login expiry, because that is the
+    fault the loop routes. Checking page identity before logging in would turn
+    "log back in" into "cannot tell"."""
+    session = FakeScrollingSession({CHAT_ONE: _chat_holding(RID)})
+    session.logged_out = True
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(LoginExpiredError):
+        client.find_conversation_with(RID, PROJECT_URL)
+
+
+def test_the_walk_is_bounded_by_limit(tmp_path):
+    """A project accumulates chats and each candidate costs a page load. The
+    one we want was just created, so it is at the top or nowhere."""
+    chats = {
+        f"https://chatgpt.com/g/g-p-project123/c/chat-{i}": _turns(2) for i in range(5)
+    }
+    session = FakeScrollingSession(chats)
+    client = make_client(session, FakeClock(), tmp_path)
+
+    assert client.find_conversation_with(RID, PROJECT_URL, limit=2) is None
+    opened = [nav for nav in session.navigations if "/c/" in nav]
+    assert len(opened) == 2
+
+
+def test_an_inconclusive_search_leaves_a_diagnostic(tmp_path):
+    """A refusal is a result, so it is evidenced like every other transport
+    failure — otherwise the operator sees a rotation fail with nothing to
+    read."""
+    session = FakeScrollingSession({CHAT_ONE: _turns(4)})
+    session.project_lands_on = STRAY_CHAT
+    client = make_client(session, FakeClock(), tmp_path)
+
+    with pytest.raises(ConversationSearchInconclusive):
+        client.find_conversation_with(RID, PROJECT_URL)
+    folder = diagnostics(tmp_path)[-1]
+    assert "conversation-search-inconclusive" in folder.name
+    assert PROJECT_URL in read_meta(folder)["note"]

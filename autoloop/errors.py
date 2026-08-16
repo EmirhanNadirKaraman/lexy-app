@@ -66,6 +66,24 @@ class ConversationUnusableError(BrowserError):
     """
 
 
+class ConversationSearchInconclusive(BrowserError):
+    """A by-content conversation search could not rule EITHER way.
+
+    Raised by `BrowserChatGPT.find_conversation_with` when the page it read is
+    not the page it asked for, or when the virtualized message list was still
+    growing when its mount bound ran out. Both mean the same thing: what was
+    read is not evidence about the conversation that was asked about, so
+    "found here" and "not in this project" are equally unsupported.
+
+    Deliberately NOT a `ConversationUnusableError` — that one authorizes
+    spending the run's single rotation, and an inconclusive read says nothing
+    about whether any chat is wedged. An ordinary `BrowserError`, so callers
+    that already catch that keep their current behaviour (the search degrades
+    to "not found", exactly as before this existed) while a caller that wants
+    to tell "no" apart from "cannot tell" can name this type.
+    """
+
+
 class ResponseTimeoutError(BrowserError):
     """No completed assistant response appeared within the timeout.
 

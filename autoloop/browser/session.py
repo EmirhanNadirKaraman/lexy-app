@@ -13,11 +13,19 @@ Two deliberate omissions:
 * **No cookie / storage accessors.** Diagnostics must never be able to capture
   authentication material, so the protocol simply cannot reach it.
 
-Send observation (`start_send_observation` / `take_send_observations`) is an
-**optional** capability, not part of this Protocol: `BrowserChatGPT` probes for
-it with `getattr` and behaves exactly as it did before when it is absent. That
-keeps the in-memory fakes and any future provider adapter valid without
-implementing a network listener. See `observation.py`.
+Two **optional** capabilities are deliberately NOT part of this Protocol.
+`BrowserChatGPT` probes each with `getattr` and behaves exactly as it did
+before when it is absent, so the in-memory fakes and any future provider
+adapter stay valid without implementing either:
+
+* `start_send_observation` / `take_send_observations` — a passive network
+  listener over the send request. See `observation.py`.
+* `scroll_to_end(selector)` — scroll the LAST match of `selector` into view, to
+  paint more of a virtualized list. ChatGPT renders a window of a conversation
+  rather than its history, so a readback that concludes "absent" from what is
+  currently painted is reporting the scroll position (see
+  `BrowserChatGPT._mount_message_tail`). Without the capability the client
+  falls back to pressing the End key.
 """
 
 from __future__ import annotations

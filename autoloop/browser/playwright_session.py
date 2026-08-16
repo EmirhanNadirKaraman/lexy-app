@@ -526,6 +526,42 @@ class PlaywrightSession:
     def html(self) -> str:
         return self._call(lambda: self._page.content())
 
+    # ---- optional tail-mounting capability ----------------------------------
+
+    def scroll_to_end(self, selector: str) -> None:
+        """Move the view to the END of a virtualized list.
+
+        ChatGPT keeps only a window of a conversation in the DOM and mounts
+        more as the viewport moves, so recent turns can be absent from
+        `innerText` purely because nothing scrolled to them: on 2026-08-05 the
+        chat holding `alr-af11e1b3-0006` needed End plus six scrolls before its
+        tail rendered. This is that gesture, programmatically — bring the last
+        mounted node into view AND press End, because either alone can leave
+        the container where it was.
+
+        Best-effort per call: the caller repeats it and watches the mounted
+        count grow, so a gesture that scrolls nothing is not a failure and a
+        node that refuses to scroll is not a dead session. Anything that
+        reaches the driver channel still surfaces as a `BrowserError`, the same
+        as every other call here.
+        """
+
+        def _scroll():
+            loc = self._page.locator(selector)
+            count = loc.count()
+            if count:
+                try:
+                    loc.nth(count - 1).scroll_into_view_if_needed(timeout=5000)
+                except Exception:
+                    # A node that will not scroll into view (detached by the
+                    # virtualizer mid-gesture, covered, zero-sized) says nothing
+                    # about the session's health — the End press below is the
+                    # other half of the gesture and still runs.
+                    pass
+            self._page.keyboard.press("End")
+
+        self._call(_scroll)
+
     # ---- optional send-observation capability -------------------------------
 
     def start_send_observation(self) -> None:

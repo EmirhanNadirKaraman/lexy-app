@@ -3018,5 +3018,14 @@ reports this rather than raising.
   implemented on `BrowserChatGPT` yet, so today a resumed delivery reads only
   what is mounted and falls back to the omission notice if an earlier part is
   no longer rendered — safe, but a re-send of work that did land.
+  The one readback that DOES mount its own tail is the by-content conversation
+  search (`find_conversation_with`, 2026-08-16): it repeats a "go to the end"
+  gesture until the mounted count stops growing, and refuses to answer at all
+  rather than call something absent while the list is still painting. It got
+  that because it is the read a decision is made from — on 2026-08-05
+  `alr-af11e1b3-0006` parked as ambiguous while the chat held the request and
+  its answer, six scrolls below the fold. The mount is deliberately private
+  (`_mount_message_tail`), so the delivery probe above still finds no public
+  capability and keeps its historical behaviour.
 * Selector defaults will drift with ChatGPT's UI eventually
   (`browser/selectors.py` is the fix point).

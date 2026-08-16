@@ -53,6 +53,10 @@ Two further OPTIONAL capabilities the orchestrator probes with `getattr`:
   10-message conversation mounted only the 6 newest nodes). Not implemented
   here yet; `Orchestrator._part_present` calls it when present and reads only
   what is mounted when it is not, which is the historical behaviour.
+  (`find_conversation_with` mounts the tail for its OWN readback through the
+  private `_mount_message_tail`. Private on purpose: publishing the name would
+  silently change how chunked delivery confirms its parts, which is a separate
+  decision from making the search trustworthy.)
 """
 
 from __future__ import annotations
@@ -67,6 +71,7 @@ from urllib.parse import urljoin, urlsplit
 
 from ..errors import (
     BrowserError,
+    ConversationSearchInconclusive,
     ConversationUnusableError,
     LoginExpiredError,
     ResponseTimeoutError,
@@ -152,6 +157,8 @@ class BrowserChatGPT:
         reconcile_timeout: float = 30.0,
         poll_interval: float = 2.0,
         stability_seconds: float = 3.0,
+        tail_mount_attempts: int = 40,
+        tail_mount_settle_reads: int = 2,
         rejection_grace_seconds: float | None = None,
         diagnostics_dir: Path | None = None,
         sleep=time.sleep,
@@ -169,6 +176,20 @@ class BrowserChatGPT:
         self._reconcile_timeout = reconcile_timeout
         self._poll_interval = poll_interval
         self._stability_seconds = stability_seconds
+        # How many "go to the end" gestures a single readback may spend
+        # painting a virtualized message list, and how many consecutive
+        # no-growth reads prove it has finished.
+        #
+        # Deliberately generous. Running out means the list was STILL growing,
+        # which is not a licence to call anything absent — so a bound set too
+        # tight turns an ordinary long conversation into a refusal, and that
+        # failure mode is invisible in tests (every fixture is short). Six
+        # scrolls sufficed by hand on 2026-08-05 and a real gesture mounts a
+        # viewport rather than a node or two, so 40 leaves room for a chat an
+        # order of magnitude longer. The cost is paid only while the list keeps
+        # growing: a settled conversation ends after two no-growth reads.
+        self._tail_mount_attempts = tail_mount_attempts
+        self._tail_mount_settle_reads = tail_mount_settle_reads
         # After the first observed send response arrives, wait this long before
         # ruling on it. The web client can retry a failed request behind our
         # back, and a window holding both a failure and a success must classify
@@ -332,13 +353,49 @@ class BrowserChatGPT:
         Bounded by `limit`: a project accumulates chats, and walking all of
         them costs a page load each. The one we want was just created, so it is
         at the top or nowhere.
+
+        Two things stand between "read the DOM" and an answer worth acting on,
+        both learned from a park that should never have happened:
+
+        * **A DOM read is a WINDOW, not history.** The message list is
+          virtualized. On 2026-08-05 `alr-af11e1b3-0006` parked as
+          `submission_ambiguous`; reading the chat by hand found the request
+          present AND already answered, and seeing it took pressing End and
+          scrolling six times before the tail rendered. So this MOUNTS the tail
+          first (`_mount_message_tail`) and treats absence as concluded only
+          once the mounted set demonstrably stops growing — otherwise "not in
+          persisted history" is a statement about the scroll position.
+        * **It confirms WHICH page it read.** Every navigation here is a page
+          the client shares with everything else; a rotation mid-flight can
+          leave it on a different chat, and a search that reads one
+          conversation while believing it read another is confidently wrong in
+          both directions — it can name a chat that does not hold the request,
+          or report absent while looking away from the one that does. Page
+          identity is therefore checked after each navigation AND again around
+          the conclusive read.
+
+        Returns the conversation URL, or None when the request is in none of
+        the chats examined. Raises `ConversationSearchInconclusive` instead of
+        answering when either guarantee above fails — refusing to conclude is
+        the point, and it is strictly better than a confident wrong answer.
         """
         self._session.goto(project_url)
         self._await_composer("find_conversation", request_id=request_id)
+        if not self._on_project(project_url):
+            self._refuse_search(
+                request_id,
+                "find-conversation-list",
+                f"asked for the chat list of {project_url!r} and landed on "
+                f"{self._safe_url() or '(unavailable)'!r} — the conversations "
+                "listed there are not this project's, so neither finding nor "
+                "missing the request in them means anything",
+            )
         hrefs: list[str] = []
-        for _text, href in self._session.elements(
-            self._sel.conversation_link, "href"
-        ):
+        # `elements` yields (attribute value, inner text) — the href FIRST.
+        # Unpacking it the other way round read each chat's TITLE as its href,
+        # and no title contains "/c/", so every candidate was skipped and the
+        # search could only ever return None.
+        for href, _title in self._session.elements(self._sel.conversation_link, "href"):
             if not href or "/c/" not in href:
                 continue
             full = urljoin(project_url, href)
@@ -347,12 +404,97 @@ class BrowserChatGPT:
             if len(hrefs) >= limit:
                 break
 
+        unsettled: list[str] = []
         for candidate in hrefs:
             self._session.goto(candidate)
             self._await_composer("find_conversation", request_id=request_id)
-            if self.has_request(request_id):
+            self._require_search_page(candidate, request_id, "opened")
+            settled = self._mount_message_tail(request_id)
+            present = self.has_request(request_id)
+            # Bracket the READ, not just the navigation: the drift this guards
+            # against happens while the mount is dwelling, i.e. after the check
+            # above and before this one. Nothing may be concluded from `present`
+            # until the page is confirmed to still be the candidate.
+            self._require_search_page(candidate, request_id, "read")
+            if present:
                 return candidate
+            if not settled:
+                unsettled.append(candidate)
+
+        if unsettled:
+            # A positive hit stands on its own — it was read off a confirmed
+            # page — so only the ABSENT verdict is withheld here, and only
+            # because these chats never finished painting.
+            self._refuse_search(
+                request_id,
+                "find-conversation-unmounted",
+                f"{len(unsettled)} conversation(s) were still painting messages "
+                f"when the mount bound ({self._tail_mount_attempts} scrolls) ran "
+                f"out — {', '.join(unsettled)}; the request was not seen, but "
+                "unseen and absent are not the same thing in a virtualized list",
+            )
         return None
+
+    def _mount_message_tail(self, request_id: str) -> bool:
+        """Paint the newest turns into the virtualized message list.
+
+        ChatGPT mounts a WINDOW of a conversation, never its history, so what
+        `messages()` returns is as much a statement about the scroll position
+        as about the chat. On 2026-08-05 the conversation holding
+        `alr-af11e1b3-0006` needed End plus six scrolls before its tail
+        rendered — and the request was in that tail, already answered, while
+        the loop parked it as `submission_ambiguous`.
+
+        Returns True when the mounted set demonstrably STOPPED GROWING (the
+        only state in which "not here" describes the conversation rather than
+        the viewport), or when the request turned up on the way. Returns False
+        when the attempt bound ran out with the list still growing, or the
+        gesture failed — the caller must not read absence out of either.
+
+        `BrowserError` passes through: its subclasses are the faults the loop
+        routes rather than retries (a logged-out profile, a dead session), and
+        swallowing one here would demote it into "the request is absent".
+        Anything else the gesture raises costs only the settled verdict.
+        """
+        mounted = len(self.messages())
+        settled = 0
+        for _ in range(self._tail_mount_attempts):
+            if self.has_request(request_id):
+                # Positive evidence needs no further painting: mounting more
+                # can add messages, never retract one.
+                return True
+            try:
+                self._scroll_message_tail()
+            except BrowserError:
+                raise
+            except Exception:
+                return False
+            self._sleep(self._poll_interval)
+            painted = len(self.messages())
+            if painted > mounted:
+                mounted = painted
+                settled = 0
+                continue
+            settled += 1
+            if settled >= self._tail_mount_settle_reads:
+                return True
+        return False
+
+    def _scroll_message_tail(self) -> None:
+        """One "go to the end of the conversation" gesture.
+
+        `scroll_to_end` is an OPTIONAL session capability, probed exactly like
+        `start_send_observation`, so an in-memory fake or a future adapter
+        without it stays valid — it falls back to the End key, which is what a
+        human presses. The fallback can legitimately do nothing (End goes to
+        whatever holds focus), which is why the caller judges progress by the
+        mounted count rather than by this returning.
+        """
+        scroll = getattr(self._session, "scroll_to_end", None)
+        if scroll is not None:
+            scroll(self._sel.message)
+            return
+        self._session.press("End")
 
     def is_generating(self) -> bool:
         return self._session.exists(self._sel.stop_button)
@@ -779,15 +921,117 @@ class BrowserChatGPT:
 
     # ---- page identity ------------------------------------------------------
 
-    def _on_conversation(self) -> bool:
+    def _safe_url(self) -> str:
+        """The page's URL, or "" when it cannot be read. Never raises — every
+        caller here is deciding page identity, and a failed read is simply not
+        a match."""
         try:
-            current = self._session.url()
+            return self._session.url() or ""
         except Exception:
-            return False
+            return ""
+
+    def _on_url(self, expected: str) -> bool:
+        """Is the page `expected`, ignoring query, fragment and a trailing slash?
+
+        The one comparison rule for page identity in this client. ChatGPT
+        appends `?model=…` of its own accord, so an exact string compare would
+        refuse the page it just loaded.
+        """
+        current = self._safe_url()
         if not current:
             return False
-        want, have = urlsplit(self._conversation_url), urlsplit(current)
+        want, have = urlsplit(expected), urlsplit(current)
         return (want.netloc, want.path.rstrip("/")) == (have.netloc, have.path.rstrip("/"))
+
+    def _on_project(self, project_url: str) -> bool:
+        """Is the page the project's own landing page?
+
+        Deliberately looser than `_on_url` in one direction and stricter in
+        another. Looser: ChatGPT writes the landing page as
+        `/g/g-p-<id>/project` but rewrites the id segment with a slug
+        (`/g/g-p-<id>-<project-name>/…`), so the last wanted segment may carry
+        a `-<suffix>` — `g-p-abc` matches `g-p-abc-x` and never `g-p-abcdef`,
+        the segment-boundary trap `Orchestrator._url_in_project` documents.
+        Stricter: nothing may follow but the `project` segment itself, so a
+        page that restored a CONVERSATION under the project is refused. Its
+        chat list is not the project's, and reading one would answer a question
+        about the project from a single chat's sidebar.
+        """
+        current = self._safe_url()
+        if not current:
+            return False
+        want, have = urlsplit(project_url), urlsplit(current)
+        if want.netloc != have.netloc:
+            return False
+        want_segs = [seg for seg in want.path.split("/") if seg]
+        if want_segs and want_segs[-1] == "project":
+            want_segs.pop()
+        have_segs = [seg for seg in have.path.split("/") if seg]
+        if len(have_segs) < len(want_segs):
+            return False
+        for index, wanted in enumerate(want_segs):
+            got = have_segs[index]
+            last = index == len(want_segs) - 1
+            if got != wanted and not (last and got.startswith(wanted + "-")):
+                return False
+        return have_segs[len(want_segs):] in ([], ["project"])
+
+    @staticmethod
+    def _conversation_id(url: str) -> str | None:
+        """The id a `/c/<id>` URL ends with, or None for anything else."""
+        segs = [seg for seg in urlsplit(url).path.split("/") if seg]
+        if len(segs) >= 2 and segs[-2] == "c":
+            return segs[-1]
+        return None
+
+    def _is_candidate_page(self, candidate: str) -> bool:
+        """Is the page the conversation `candidate` names?
+
+        A conversation is identified by its `/c/<id>`, NOT by the project
+        prefix in front of it: ChatGPT rewrites that prefix with the project's
+        slug, and refusing the rewrite would refuse the page it just loaded —
+        the trap `_on_project` documents, and the one that would turn this
+        guard into "every search is inconclusive" in production while passing
+        every test that types URLs by hand. A different id, or no id at all (an
+        auth page, the project list), is still a refusal.
+        """
+        wanted = self._conversation_id(candidate)
+        if wanted is None:
+            return self._on_url(candidate)
+        current = self._safe_url()
+        if not current:
+            return False
+        return (
+            urlsplit(candidate).netloc == urlsplit(current).netloc
+            and self._conversation_id(current) == wanted
+        )
+
+    def _require_search_page(self, expected: str, request_id: str, stage: str) -> None:
+        """Refuse to read a page that is not the one the search asked for."""
+        if self._is_candidate_page(expected):
+            return
+        self._refuse_search(
+            request_id,
+            f"find-conversation-{stage}",
+            f"the search asked for {expected!r} and is on "
+            f"{self._safe_url() or '(unavailable)'!r} — whatever it reads there "
+            f"is not evidence about {expected!r}, in either direction",
+        )
+
+    def _refuse_search(self, request_id: str, stage: str, note: str) -> None:
+        """Snapshot and raise. The refusal is the product, so it is evidenced
+        like any other transport failure."""
+        self.save_diagnostics(
+            "conversation-search-inconclusive",
+            request_id=request_id,
+            stage=stage,
+            retry_prohibited=False,
+            note=note,
+        )
+        raise ConversationSearchInconclusive(note)
+
+    def _on_conversation(self) -> bool:
+        return self._on_url(self._conversation_url)
 
     def _require_on_conversation(self, request_id: str) -> None:
         """Awaiting must not silently renavigate; a drifted page is an error the

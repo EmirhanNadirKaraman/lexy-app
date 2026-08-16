@@ -906,6 +906,35 @@ an unbound request refuse to guess.
 the request id from the park message. If it exists, the rotation worked and
 only the detection failed; point `browser.conversation_url` at that chat.
 
+### A readback says a message is not in the conversation, and it plainly is
+**Symptom:** the loop parks `submission_ambiguous` (or drops a chunked part and
+re-sends it) reporting that the request is not in persisted history. Open the
+chat and the request is there — on 2026-08-05 `alr-af11e1b3-0006` was there
+*and already answered with a decision*. Seeing it took pressing End and
+scrolling six times before the tail rendered.
+**Cause:** ChatGPT's message list is VIRTUALIZED. Only a window of the
+conversation is in the DOM, so `[data-message-author-role]` — the selector
+behind `messages()` / `has_request()` — enumerates what is painted, not what
+the conversation contains. A DOM read is therefore never a full history read
+(`docs/AUTOLOOP.md` §11), and "absent" from an unmounted window is a statement
+about the scroll position.
+**Fix:** applied repo-side for the by-content search only.
+`BrowserChatGPT.find_conversation_with` now mounts the tail before concluding:
+it repeats a "go to the end" gesture (`scroll_to_end` when the session offers
+it, otherwise the End key) and treats absence as established only once the
+mounted message count demonstrably stops growing. Running out of scrolls while
+it is still growing raises `ConversationSearchInconclusive` instead of
+answering. The same read also confirms the page is the conversation it asked
+for — a rotation mid-flight moves the shared page, and a confident answer about
+a different chat is wrong in both directions.
+**Still open elsewhere:** every OTHER readback (`reconcile`, `has_request`,
+`Orchestrator._part_present`) reads what is mounted. That is usually fine —
+they check the newest turn — but do not infer "the conversation contains only
+X" from a message count anywhere.
+**Diagnosing one by hand:** open the chat, press End, and scroll to the bottom
+several times before deciding the message is missing. If it appears, the send
+landed and only the detection failed.
+
 ### The loop vanishes mid-run leaving NO blocker, no park and no heartbeat
 **Symptom:** `autoloop health` reports `not_running` with `open_blockers: 0`
 and a phase that was healthy moments earlier. Unlike every other stop, nothing
