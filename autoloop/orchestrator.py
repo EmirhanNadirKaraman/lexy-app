@@ -155,6 +155,7 @@ from .contract import (
     AUDIT_TASK_ID,
     COMMIT_DECISIONS,
     PUSH_DECISIONS,
+    RETIRED_DECISIONS,
     REVIEWED_DECISIONS,
     TASK_DECISIONS,
     Decision,
@@ -190,7 +191,7 @@ from .packet import (
     payload_carries_diff,
     plan_chunked_delivery,
 )
-from .policy import PolicyEngine, Verdict
+from .policy import PolicyEngine, Verdict, retired_decision_verdict
 from .publisher import Publisher, redact_url
 from .worker_env import verify_worker_isolation, worker_env
 from .prompts import (
@@ -2357,27 +2358,22 @@ class Orchestrator:
             state.phase = Phase.STOPPED.value
             self._log("stopped", data={"reason": directive.reason})
             self._store.save(state)
-        elif decision is Decision.ASK_USER:
+        elif decision in RETIRED_DECISIONS:
             # Retired 2026-08-06, mirroring the retired legacy git path below.
-            # `authorize_directive` denies `ask_user` unconditionally, so a
-            # directive normally never reaches this branch at all — which is
-            # exactly why the branch has to STAY. Deleting it would drop
+            # `authorize_directive` denies a retired decision unconditionally,
+            # so a directive normally never reaches this branch at all — which
+            # is exactly why the branch has to STAY. Deleting it would drop
             # `ASK_USER` into the terminal `else` and dispatch it to the
             # executor, which has no task to run and no notion of a question:
             # a retirement that opened a worse hole than it closed. Refused
             # here through the SAME budget-capped corrective-reprompt
             # machinery, so a directive arriving by any path that skipped the
             # policy gate still cannot park the loop or reach the executor.
-            self._handle_policy_denial(
-                directive,
-                Verdict.deny(
-                    "legacy_ask_user_retired",
-                    "`ask_user` is retired — this loop does not pause for a "
-                    "human operator; choose a different course of action, or "
-                    "reply `stop` with the reason describing what a human "
-                    "needs to decide",
-                ),
-            )
+            #
+            # The verdict comes from `policy.retired_decision_verdict`, the
+            # one place the retirement's code and guidance text are written,
+            # so the reviewer is told the same thing whichever site caught it.
+            self._handle_policy_denial(directive, retired_decision_verdict(decision))
         elif decision is Decision.PLAN:
             self._dispatch_plan(directive)
         elif decision is Decision.PUSH and state.last_response is not None and (

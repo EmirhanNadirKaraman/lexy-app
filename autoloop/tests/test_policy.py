@@ -4,8 +4,13 @@ structurally impossible), and budgets."""
 
 import pytest
 
-from autoloop.contract import Decision, Directive
-from autoloop.policy import PolicyConfig, PolicyEngine
+from autoloop.contract import ACTIVE_DECISIONS, RETIRED_DECISIONS, Decision, Directive
+from autoloop.policy import (
+    _RETIRED_DENIALS,
+    PolicyConfig,
+    PolicyEngine,
+    retired_decision_verdict,
+)
 from autoloop.tasks import Task, TaskRegistry
 
 
@@ -279,10 +284,21 @@ def test_phase_gate_reason_does_not_offer_ask_user():
     assert "stop" in verdict.reason  # still names the real alternatives
 
 
-# ---- ask_user retirement -----------------------------------------------------
+# ---- retired decisions (`ask_user`) ------------------------------------------
+#
+# Parametrized over `RETIRED_DECISIONS` rather than naming `ask_user`, so the
+# next retirement inherits these guarantees instead of quietly having none.
+# `ask_user`'s own wire-level specifics — the exact denial code, the exact
+# guidance — are pinned separately below, because those ARE decision-specific.
+
+RETIRED = sorted(RETIRED_DECISIONS, key=lambda d: d.value)
+ACTIVE = sorted(ACTIVE_DECISIONS, key=lambda d: d.value)
+#: Every code a retirement can produce — what an ACTIVE decision must never draw.
+RETIRED_CODES = {retired_decision_verdict(d).code for d in RETIRED}
 
 
-def test_ask_user_denied_under_fully_permissive_config():
+@pytest.mark.parametrize("decision", RETIRED)
+def test_retired_decision_denied_under_fully_permissive_config(decision):
     """Unconditional means no configuration admits it. Everything that could
     plausibly gate a decision is switched to its most permissive setting
     here, on a non-protected branch — if the denial were incidental to any
@@ -294,26 +310,54 @@ def test_ask_user_denied_under_fully_permissive_config():
         allow_protected_push=True,
         protected_branches=(),
     )
-    verdict = auth(eng, directive(Decision.ASK_USER))
+    verdict = auth(eng, directive(decision))
     assert not verdict.allowed
-    assert verdict.code == "legacy_ask_user_retired"
+    assert verdict.code in RETIRED_CODES
 
 
+@pytest.mark.parametrize("decision", RETIRED)
 @pytest.mark.parametrize("task_id", [None, "ready1", "done1", "blocked1", "ghost"])
-def test_ask_user_denied_regardless_of_task_reference(task_id):
+def test_retired_decision_denied_regardless_of_task_reference(decision, task_id):
     """The denial precedes every task-reference check, so the verdict must be
     the retirement one for a known-ready task and an unknown one alike —
     never `task_unknown`/`task_blocked`, which would imply that naming a
-    valid task could make `ask_user` executable."""
-    verdict = auth(task_engine(), directive(Decision.ASK_USER, task_id=task_id))
+    valid task could make a retired decision executable."""
+    verdict = auth(task_engine(), directive(decision, task_id=task_id))
     assert not verdict.allowed
-    assert verdict.code == "legacy_ask_user_retired"
+    assert verdict.code in RETIRED_CODES
 
 
+@pytest.mark.parametrize("decision", RETIRED)
 @pytest.mark.parametrize("branch", ["main", "master", "feature/x"])
-def test_ask_user_denied_on_every_branch(branch):
-    verdict = auth(engine(), directive(Decision.ASK_USER), branch=branch)
-    assert not verdict.allowed and verdict.code == "legacy_ask_user_retired"
+def test_retired_decision_denied_on_every_branch(decision, branch):
+    verdict = auth(engine(), directive(decision), branch=branch)
+    assert not verdict.allowed and verdict.code in RETIRED_CODES
+
+
+@pytest.mark.parametrize("decision", RETIRED)
+def test_retired_decision_denial_comes_from_the_shared_helper(decision):
+    """One retirement, one text. `policy.retired_decision_verdict` is also
+    what `orchestrator._dispatch`'s retired branch emits, so a reviewer gets
+    identical guidance whichever of the two sites caught the directive — they
+    each carried their own near-identical copy before, differing by a
+    semicolon, which is how the two would have drifted apart."""
+    assert auth(engine(), directive(decision)) == retired_decision_verdict(decision)
+
+
+def test_every_retired_decision_has_an_explicit_denial_entry():
+    """`retired_decision_verdict` falls back to a generated code/reason so a
+    missing table row denies rather than raising KeyError mid-loop. That
+    fallback is a safety net, not the intended path: a retirement ships with
+    its own guidance, and this is what keeps the net unused."""
+    assert set(_RETIRED_DENIALS) == set(RETIRED_DECISIONS)
+
+
+def test_ask_user_denial_code_is_the_stable_wire_string():
+    """`legacy_ask_user_retired` is what lands in the loop log and in the
+    corrective reprompt, and docs/AUTOLOOP.md refers to it by name. The tests
+    above deliberately assert set membership so a future retirement is covered
+    by them; this one pins the actual string for the retirement we have."""
+    assert auth(engine(), directive(Decision.ASK_USER)).code == "legacy_ask_user_retired"
 
 
 def test_ask_user_denial_reason_does_not_recommend_ask_user():
@@ -323,3 +367,57 @@ def test_ask_user_denial_reason_does_not_recommend_ask_user():
     assert verdict.reason.count("ask_user") == 1  # names itself, once, as retired
     assert "retired" in verdict.reason
     assert "stop" in verdict.reason
+
+
+# ---- the retirement changes nothing for any other decision -------------------
+
+
+def _configs():
+    """The gate settings a verdict can turn on, each paired with a branch."""
+    return [
+        (engine(), "feature/x"),
+        (engine(), "main"),
+        (task_engine(), "feature/x"),
+        (
+            engine(
+                implement_enabled=True,
+                allow_commit=True,
+                allow_push=True,
+                allow_protected_push=True,
+                protected_branches=(),
+            ),
+            "main",
+        ),
+        (engine(allow_commit=False, allow_push=False), "feature/x"),
+    ]
+
+
+@pytest.mark.parametrize("decision", ACTIVE)
+def test_no_active_decision_is_ever_denied_as_retired(decision):
+    """The other half of the retirement: it must be surgical. Whatever an
+    active decision's verdict is under a given config — allowed, phase-gated,
+    push-disabled — it is never the retirement denial, which would mean the
+    membership test above had swallowed a decision still in service."""
+    for eng, branch in _configs():
+        for task_id in (None, "ready1", "done1"):
+            verdict = eng.authorize_directive(
+                directive(decision, task_id=task_id), branch, make_registry()
+            )
+            assert verdict.code not in RETIRED_CODES
+
+
+@pytest.mark.parametrize("decision", ACTIVE)
+def test_no_denial_reason_offers_a_retired_decision(decision):
+    """A denial tells the reviewer what to do instead. Naming a retired
+    decision there hands back the one answer policy refuses unconditionally —
+    the reviewer would spend the denial budget rediscovering that. Generalizes
+    `test_phase_gate_reason_does_not_offer_ask_user`, which pins one reason
+    under one config, to every reason `authorize_directive` can emit."""
+    retired_values = [d.value for d in RETIRED]
+    for eng, branch in _configs():
+        for task_id in (None, "ready1", "blocked1", "ghost"):
+            verdict = eng.authorize_directive(
+                directive(decision, task_id=task_id), branch, make_registry()
+            )
+            for value in retired_values:
+                assert value not in verdict.reason

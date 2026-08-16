@@ -139,6 +139,21 @@ def test_legacy_ask_user_without_a_question_parses():
     assert directive.question is None
 
 
+@pytest.mark.parametrize("decision", sorted(d.value for d in RETIRED_DECISIONS))
+def test_every_retired_decision_still_parses(decision):
+    """Backward parsing is what retirement means here, and it is load-bearing
+    rather than courtesy: a live conversation that already read the old
+    instructions can answer a retired decision at any time, and the parser
+    accepting it is what routes that reply to the policy layer's denial —
+    which says WHY the decision is gone — instead of a `unknown_decision`
+    contract violation that spends the parse-retry budget saying nothing.
+
+    Parametrized over the set so a later retirement cannot be implemented as
+    "delete the enum member", which would break exactly those in-flight
+    conversations the retirement is supposed to absorb."""
+    assert parse_response(block(base(decision))).decision.value == decision
+
+
 def test_notes_accepted():
     assert parse_response(block(base("stop", notes="fyi"))).notes == "fyi"
 

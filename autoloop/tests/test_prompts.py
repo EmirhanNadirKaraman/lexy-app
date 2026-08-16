@@ -4,7 +4,7 @@ sections."""
 
 import pytest
 
-from autoloop.contract import CONTRACT_INSTRUCTIONS
+from autoloop.contract import CONTRACT_INSTRUCTIONS, RETIRED_DECISIONS
 from autoloop.errors import TemplateError
 from autoloop.prompts import (
     TEMPLATES,
@@ -107,3 +107,19 @@ def test_user_answer_payload():
     payload = user_answer_payload("Which DB?", "Postgres")
     assert "Which DB?" in payload
     assert "Postgres" in payload
+
+
+@pytest.mark.parametrize("decision", sorted(d.value for d in RETIRED_DECISIONS))
+def test_no_template_offers_a_retired_decision(decision):
+    """`CONTRACT_INSTRUCTIONS` is not the only reviewer-visible text: every
+    payload template ships in the same prompt, and several name decisions
+    outright ("reply `commit`...", "reply `revise` with feedback"). A retired
+    decision surviving in one of those is the same failure as leaving it in
+    the instructions — the reviewer is invited to choose the one directive
+    policy refuses unconditionally.
+
+    Template BODIES only, deliberately: `policy_denied_payload` renders a
+    verdict reason, and the retirement's own denial names the retired
+    decision on purpose."""
+    offenders = [name for name, t in TEMPLATES.items() if decision in t.body]
+    assert not offenders, f"'{decision}' is retired but still offered by: {sorted(offenders)}"
