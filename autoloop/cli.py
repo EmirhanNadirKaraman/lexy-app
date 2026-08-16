@@ -612,8 +612,9 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
     if args.answer is not None:
         if Phase(state.phase) is not Phase.NEEDS_USER or state.resume_phase is not None:
             raise StateError(
-                "--answer is only valid when the loop is parked on an ask_user "
-                "question (phase=needs_user without a retryable phase)"
+                "--answer is only valid when the loop is parked on a question "
+                "it raised for the operator (phase=needs_user without a "
+                "retryable phase)"
             )
         state.outbox = user_answer_payload(
             state.question or "(question unavailable)", args.answer
@@ -1448,7 +1449,7 @@ def _precondition_checkout_escape_detected(config) -> str:
 
 
 #: code -> precondition. Anything NOT listed resolves by answer text alone
-#: (ask_user and every task_fatal code), which is the intended behaviour.
+#: (every task_fatal code), which is the intended behaviour.
 #: KEEP EVERY KEY HERE MATCHED TO A REAL, EMITTED `code=` LITERAL —
 #: `test_m1_hardening.py::test_every_precondition_key_matches_a_real_emitted_code`
 #: AST-walks `orchestrator.py` for every `code=` argument passed to
@@ -2761,7 +2762,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="start a new session that offers ChatGPT the first repository audit",
     )
-    run.add_argument("--answer", help="answer to a pending ask_user question")
+    run.add_argument(
+        "--answer", help="answer to the operator question this run parked on"
+    )
     run.add_argument("--retry", action="store_true", help="retry after a recoverable failure")
     run.add_argument(
         "--resubmit",

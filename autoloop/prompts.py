@@ -115,11 +115,19 @@ TEMPLATES: dict[str, PromptTemplate] = {
                 "Kind: {failure_kind}\nDetail: {detail}\n\n{guidance}"
             ),
         ),
+        # The question here is the loop's own — `state.question`, written by
+        # `orchestrator._to_needs_user` when a park needs an operator — never
+        # one the reviewer raised: the decision that let it raise one is
+        # retired, so "your question" would misattribute every reachable case.
+        # The retired decision is deliberately NOT named (a template body that
+        # names it offers it; see `test_no_template_offers_a_retired_decision`).
         PromptTemplate(
             name="clarification",
             body=(
-                "The human operator answered your question.\n\nQuestion: "
-                "{question}\nAnswer: {answer}\n\nContinue with your next directive."
+                "The run parked on a question for the human operator, who "
+                "answered it. The question is the loop's own, not one you "
+                "raised.\n\nQuestion: {question}\nAnswer: {answer}\n\nContinue "
+                "with your next directive."
             ),
         ),
         PromptTemplate(
