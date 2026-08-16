@@ -114,9 +114,10 @@ mid-round. Priority is the one field an operator must be able to change
 while a round is in flight — it steers what runs next, and a value that
 lands minutes later has missed the decision it was for — and it is safe to
 change mid-flight precisely because nothing already dispatched depends on
-it. The predicate proves BOTH halves before it silences anything: WHO (a
-chain of attestation records in a ledger beside `workers_root`, outside the
-checkout, which a write inside the checkout cannot produce) and WHAT (the
+it. The predicate proves BOTH halves before it silences anything: WHO (the
+COMPLETED mutations recorded in this window, in a ledger beside `workers_root`
+outside the checkout, chaining from the before-state to exactly the observed
+after-state — a write inside the checkout cannot produce one) and WHAT (the
 two file states differ only in `priority` values, read from the bytes rather
 than taken from the record's own claim). So an agent editing that file — to
 widen its own `approved_paths`, flip a status, or even just to change a
@@ -398,9 +399,10 @@ def diff_snapshots(
         nothing about which paths are special — a deployment that passes
         nothing gets exactly the behaviour it had before this parameter
         existed, including a loop-fatal park for any write to `tasks.json`;
-      * the predicate it is given proves BOTH who wrote the change (a chain of
-        records in a ledger outside the checkout, which a write into the
-        checkout cannot forge into existence) and what it changed (only
+      * the predicate it is given proves BOTH who wrote the change (an unbroken
+        chain of COMPLETED records, in a ledger outside the checkout that a
+        write into the checkout cannot forge into existence, ending at exactly
+        the state the "after" snapshot observed) and what it changed (only
         `priority` values, verified against the bytes). An agent widening its
         own `approved_paths` in that same file is still reported — see
         `tasks.MutationLedger` and `tasks.priority_only_change`.

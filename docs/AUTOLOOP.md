@@ -1318,12 +1318,26 @@ immediately (§4f-ter): that is the field an operator steers the queue with, so
 a routine priority edit that parked the loop would make steering it a way to
 stop it — the same shape of false loop-fatal the bytecode exemption above
 removes. The predicate is not "this path is fine". It silences a change only
-when BOTH hold: the digest the snapshot saw AFTER is reachable from the digest
-it saw BEFORE through a chain of records in `~/.autoloop/task-mutations.jsonl`
-— a ledger beside `workers_root`, OUTSIDE the checkout, so a write inside the
-checkout cannot produce one — and the two file states differ in nothing but
+when BOTH hold: the COMPLETED mutation records in `~/.autoloop/task-mutations.
+jsonl` — a ledger beside `workers_root`, OUTSIDE the checkout, so a write inside
+the checkout cannot produce one — form one unbroken chain, for THIS task file
+and since the watermark captured before the agent started, that leaves the
+digest the snapshot saw BEFORE and TERMINATES at the digest it saw AFTER; and
+the two file states differ in nothing but
 `priority` values, read from the bytes rather than taken from any record's own
-claim (`tasks.priority_only_change`). A creation, a deletion, a shape change or
+claim (`tasks.priority_only_change`).
+
+*Why a chain and not reachability* (tightened 2026-08-16 after review). The
+first version asked only whether the after-digest was REACHABLE from the
+before-digest across the whole ledger, and that is a weaker claim than "this is
+what happened". Two ways it was weaker, both now closed: a legitimate round trip
+(priority 3 → 2 → 3) left the intermediate digest reachable forever, so an agent
+that later wrote that exact state was exempted for a change no operator made;
+and a record written BEFORE the file write meant an announced-then-failed write
+left an edge to a state that never existed on disk. Records therefore carry a
+`phase`, and only `complete` — appended after the bytes land — is an edge; the
+`intent` written first still exists, because it is what makes a ledger that
+cannot be appended to leave the task file untouched. A creation, a deletion, a shape change or
 an executable-bit change at that path is never exempt. So an agent editing that
 file to widen its own `approved_paths` still parks the loop, which is the
 property finding #3 below rests on, and so does an agent that merely writes a
@@ -1831,16 +1845,31 @@ is trusted":
    coverage stays (point 1 at the top of this section). Each immediate write is
    recorded in `~/.autoloop/task-mutations.jsonl` — beside `workers_root`,
    outside the checkout, where the inbox and the PAUSE flag already live — as a
-   `before -> after` content-digest hop. The loop's exemption
+   `before -> after` content-digest hop, in two phases: an `intent` before the
+   write and a `complete` after it. The loop's exemption
    (`orchestrator._operator_priority_exemption`) silences a change to that file
-   only when a chain of such records leads from the digest it saw before to the
-   one it saw after AND the two file states differ in nothing but `priority`
+   only when the `complete` records for that exact task file, written since the
+   watermark it captured before the agent started, form one unbroken chain
+   leaving the digest it saw before and TERMINATING at the digest it saw after,
+   AND the two file states differ in nothing but `priority`
    values, read from the bytes rather than taken from the record's claim. An
    agent writing that file — to widen `approved_paths`, flip a `status`, or
    even just to set a priority without going through `apply_priority` — still
-   parks the loop LOOP-FATAL. The lock file needs no exemption at all: it is
-   created before the "before" snapshot and never written to, so it is
-   byte-identical on both sides.
+   parks the loop LOOP-FATAL, and so does one that reproduces a state some
+   earlier legitimate edit passed through or merely announced. The lock file
+   needs no exemption at all: it is created before the "before" snapshot and
+   never written to, so it is byte-identical on both sides.
+
+   *Why two phases and a terminal state.* Both come from the same weakness: a
+   reachability question ("could the file have got here?") is not the question
+   the detector needs answered ("is this what happened?"). A round trip
+   (3 → 2 → 3) leaves the intermediate digest reachable forever, and a record
+   written before the file write leaves an edge even when that write FAILED. So
+   only a `complete` record is an edge, and the observed after-state has to be
+   where the window's chain ENDED, not somewhere it passed through. The `intent`
+   is still written first, and is load-bearing for a different reason: it is why
+   a ledger that cannot be appended to leaves the task file untouched instead of
+   producing a change nothing can attest.
 
 Nothing else about the endpoint widened. It still carries an id and a number
 and nothing else — a request naming `approved_paths` is refused

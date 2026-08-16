@@ -3791,12 +3791,23 @@ class Orchestrator:
         store, or a task file that is not inside the observed checkout, in which
         case a change to it is not this detector's business anyway.
 
-        Captures the task file's BYTES up front, before the agent runs. They are
-        the "what changed" evidence: the snapshot records only a digest, and a
-        digest cannot answer "did this differ in nothing but `priority`". They
-        are checked against the snapshot's own `content_sha256` before being
-        used, so a file that changed between this read and the snapshot cannot
-        be compared against the wrong baseline.
+        Captures the task file's BYTES and the mutation ledger's WATERMARK up
+        front, before the agent runs, and does so under the task file's own
+        mutex so the pair describes one instant.
+
+        The bytes are the "what changed" evidence: the snapshot records only a
+        digest, and a digest cannot answer "did this differ in nothing but
+        `priority`". They are checked against the snapshot's own
+        `content_sha256` before being used, so a file that changed between this
+        read and the snapshot cannot be compared against the wrong baseline.
+
+        The watermark is what makes the attestation about THIS window: only
+        completed mutations recorded after it can authorize anything, so a
+        priority edit from an earlier round — including one whose intermediate
+        state a later direct edit might reproduce — proves nothing here. Read
+        under the same lock as the bytes for the reason `capture_priority_window`
+        gives: taken separately they can straddle an in-flight edit and turn a
+        benign operator write into a loop-fatal park.
 
         Deliberately narrow, item by item:
           * one path — the task file, spelled as the snapshot spells it;
@@ -3818,9 +3829,12 @@ class Orchestrator:
         except (ValueError, OSError):
             return None  # task file outside the checkout: not snapshotted
         try:
-            baseline = Path(store.path).read_bytes()
-        except OSError:
-            return None  # nothing to compare against; report any change
+            baseline, watermark = store.capture_priority_window()
+        except (OSError, StateError):
+            # No baseline, or the mutex could not be taken: there is no
+            # exemption to offer, so every change to the file is reported. Same
+            # direction as no ledger at all.
+            return None
 
         def exempt(path: str, prior, current) -> bool:
             if path != relative or prior is None or current is None:
@@ -3830,7 +3844,8 @@ class Orchestrator:
             if prior.executable != current.executable:
                 return False
             return store.attested_priority_edit(
-                baseline, prior.content_sha256 or "", current.content_sha256 or ""
+                baseline, prior.content_sha256 or "", current.content_sha256 or "",
+                watermark,
             )
 
         return exempt

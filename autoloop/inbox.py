@@ -33,10 +33,14 @@ of the two reasons above was waved away to get there; each was answered:
 1. The detector still snapshots `tasks.json`, and `.autoloop/` is still not
    excluded. The immediate write is ATTESTED in a ledger beside `workers_root`
    — outside the checkout, exactly where this inbox lives and for exactly the
-   same reason — and the loop's exemption additionally verifies from the bytes
-   that nothing but `priority` moved. An agent editing that file still parks the
-   loop loop-fatal, so the circular-ownership property is intact
-   (`tasks.MutationLedger`, `orchestrator._operator_priority_exemption`).
+   same reason — as an INTENT before the write and a COMPLETE after it, and the
+   loop's exemption silences the change only when this window's COMPLETE records
+   for that file chain unbroken to exactly the state it observed, and the bytes
+   say nothing but `priority` moved. An agent editing that file still parks the
+   loop loop-fatal — including one that reproduces a state an earlier legitimate
+   edit merely passed through or announced — so the circular-ownership property
+   is intact (`tasks.MutationLedger`,
+   `orchestrator._operator_priority_exemption`).
 2. Lost updates are answered by a lock, just not the run-level one. A
    fine-grained mutex (`tasks.task_file_mutex`) serialises load/mutate/save for
    BOTH writers, and `TaskStore.save` reconciles the on-disk priority into the

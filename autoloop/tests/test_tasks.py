@@ -1,6 +1,7 @@
 """Task registry / graph: ids, dependencies, derived ready/blocked states,
 lifecycle transitions, cycle detection, batch atomicity, persistence."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -12,7 +13,14 @@ import pytest
 
 import autoloop
 from autoloop.errors import LockHeldError, StateCorruptError, StateError, TaskGraphError
-from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
+from autoloop.tasks import (
+    LEDGER_PHASE_COMPLETE,
+    LEDGER_PHASE_INTENT,
+    Task,
+    TaskRegistry,
+    TaskState,
+    TaskStore,
+)
 
 #: The directory the `autoloop` package lives in, handed to child processes as
 #: `PYTHONPATH` so they import the SAME source this test does regardless of
@@ -931,6 +939,228 @@ def test_reconciliation_fails_open_on_an_unreadable_task_file(tmp_path):
     reg = registry(task("t1"))
     store.save(reg)  # must not raise
     assert TaskStore(store.path).load().get("t1").id == "t1"
+
+
+# ---- what the attestation actually proves ------------------------------------
+#
+# The escape detector silences ONE change to `.autoloop/tasks.json`: an operator
+# priority edit this store applied. The first version of that proof asked
+# whether the observed after-digest was REACHABLE from the before-digest through
+# ledger records, and reachability is a strictly weaker claim than "this is what
+# happened". These pin the two gaps that opened — an intent from a failed write
+# standing in for an outcome, and an intermediate state from a round trip
+# staying attested forever — plus the path and window bindings that keep the
+# chain about this file and this round.
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class FailingWriteStore(TaskStore):
+    """Ledger works, task-file write does not — the shape of a disk that fills
+    between the two. Leaves a real intent on record for a write that never
+    landed."""
+
+    def _write_bytes(self, data):
+        raise OSError("simulated task-file write failure")
+
+
+def priority_payload(path, task_id, priority) -> bytes:
+    """The exact bytes the store would have written for this priority — what an
+    agent reproducing a state has to produce for any of these tests to be about
+    the attestation rather than about a formatting difference."""
+    registry_ = TaskStore(path).load()
+    registry_.set_priority(task_id, priority)
+    return TaskStore._serialize(registry_)
+
+
+def test_a_successful_priority_write_attests_itself(tmp_path):
+    """The positive control every negative below is measured against."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    before_bytes = store.path.read_bytes()
+    watermark = store.priority_edit_watermark()
+
+    store.apply_priority("t1", 1)
+
+    after = store.path.read_bytes()
+    assert store.attested_priority_edit(
+        before_bytes, sha(before_bytes), sha(after), watermark
+    )
+
+
+def test_a_priority_write_records_an_intent_and_then_a_completion(tmp_path):
+    """Both phases, in that order. The intent first is what makes an unwritable
+    ledger leave the task file alone; the completion after is what keeps that
+    intent from becoming a licence."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    before_bytes = store.path.read_bytes()
+    watermark = store.priority_edit_watermark()
+
+    store.apply_priority("t1", 1)
+
+    written = store.ledger.read()[watermark:]
+    assert [r["phase"] for r in written] == [LEDGER_PHASE_INTENT, LEDGER_PHASE_COMPLETE]
+    # Same hop, announced and then confirmed: from the state the file was in to
+    # the state it is in now.
+    assert all(r["before"] == sha(before_bytes) for r in written)
+    assert all(r["after"] == sha(store.path.read_bytes()) for r in written)
+    assert all(r["ids"] == ["t1"] and r["kind"] == "priority" for r in written)
+
+
+def test_an_intent_from_a_failed_write_is_not_an_edge(tmp_path):
+    """The write was announced and then failed, so the state it named never
+    existed on disk. An agent that writes exactly that state must not inherit
+    the announcement."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    before_bytes = store.path.read_bytes()
+    watermark = store.priority_edit_watermark()
+
+    failing = FailingWriteStore(store.path, ledger=store.ledger.path)
+    with pytest.raises(OSError):
+        failing.apply_priority("t1", 1)
+
+    announced = store.ledger.read()[watermark:]
+    assert [r["phase"] for r in announced] == [LEDGER_PHASE_INTENT]
+    payload = priority_payload(store.path, "t1", 1)
+    # Not vacuous: the agent's bytes are exactly the state the intent named.
+    assert sha(payload) == announced[0]["after"]
+    store.path.write_bytes(payload)
+
+    assert not store.attested_priority_edit(
+        before_bytes, sha(before_bytes), sha(payload), watermark
+    )
+
+
+def test_a_round_trip_leaves_no_intermediate_state_attested(tmp_path):
+    """Two real edits that return the file to its baseline. The state in the
+    middle is on record as a completed hop, and under a reachability test it
+    stays authorized forever — so an agent writing it later is silently
+    exempted. The chain says the window ended where it began."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    baseline = store.path.read_bytes()
+    watermark = store.priority_edit_watermark()
+
+    store.apply_priority("t1", 1)
+    intermediate = store.path.read_bytes()
+    store.apply_priority("t1", 3)
+    assert store.path.read_bytes() == baseline, "the round trip did not return the file"
+
+    store.path.write_bytes(intermediate)  # the agent reproduces it
+
+    assert not store.attested_priority_edit(
+        baseline, sha(baseline), sha(intermediate), watermark
+    )
+    # And the chain itself says why: it is A -> B -> A, so B is a state passed
+    # THROUGH rather than the state the window ended at.
+    chain = store.ledger.completed_chain(
+        sha(baseline), since=watermark, tasks_path=store.path
+    )
+    assert chain == [sha(baseline), sha(intermediate), sha(baseline)]
+
+
+def test_a_completed_record_for_another_task_file_does_not_attest_this_one(tmp_path):
+    """One ledger can serve more than one checkout (it lives beside
+    `workers_root`). A record naming a different task file must not authorize a
+    change to this one — and the second half of this test is what proves the
+    refusal is the path binding rather than something else."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    before_bytes = store.path.read_bytes()
+    watermark = store.priority_edit_watermark()
+    payload = priority_payload(store.path, "t1", 1)
+    store.path.write_bytes(payload)
+
+    store.ledger.record_complete(
+        tasks_path=tmp_path / "elsewhere" / "tasks.json",
+        before=sha(before_bytes), after=sha(payload), ids=("t1",),
+    )
+    assert not store.attested_priority_edit(
+        before_bytes, sha(before_bytes), sha(payload), watermark
+    )
+
+    store.ledger.record_complete(
+        tasks_path=store.path, before=sha(before_bytes), after=sha(payload), ids=("t1",),
+    )
+    assert store.attested_priority_edit(
+        before_bytes, sha(before_bytes), sha(payload), watermark
+    )
+
+
+def test_the_same_task_file_spelled_differently_is_the_same_file(tmp_path):
+    """Path binding must not become an accidental refusal. The dashboard builds
+    its own store per request and may reach the file through a symlinked path —
+    macOS resolves `/var` to `/private/var` for exactly this shape — and a
+    record filed under one spelling but looked up under another proves nothing.
+    `canonical_task_path` is what makes both sides agree."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    before_bytes = store.path.read_bytes()
+    watermark = store.priority_edit_watermark()
+
+    link = tmp_path / "state-by-another-name"
+    link.symlink_to(store.path.parent, target_is_directory=True)
+    TaskStore(link / store.path.name, ledger=store.ledger.path).apply_priority("t1", 1)
+
+    after = store.path.read_bytes()
+    assert store.attested_priority_edit(
+        before_bytes, sha(before_bytes), sha(after), watermark
+    )
+
+
+def test_the_watermark_keeps_an_earlier_edit_out_of_this_window(tmp_path):
+    """The ledger is append-only and never pruned, so by the second round it
+    already holds hops between states the file has since left. Those must not be
+    part of this round's chain — walking from record 0 breaks on the first one
+    and reports an ordinary operator edit as an escape."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    store.apply_priority("t1", 5)  # an earlier window
+
+    before_bytes = store.path.read_bytes()
+    watermark = store.priority_edit_watermark()
+    store.apply_priority("t1", 2)
+    after = store.path.read_bytes()
+
+    assert store.attested_priority_edit(
+        before_bytes, sha(before_bytes), sha(after), watermark
+    )
+    assert store.ledger.completed_chain(
+        sha(before_bytes), since=0, tasks_path=store.path
+    ) is None
+
+
+def test_a_state_later_than_the_observed_one_is_not_attested(tmp_path):
+    """The residual of requiring the chain's TERMINAL state, pinned rather than
+    left to be discovered. A second legitimate edit landing between the
+    detector's after-snapshot and this check makes the round park. That is a
+    spurious loop-fatal park an operator can read and recover from, traded for
+    closing a laundering path that is silent by construction."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+    before_bytes = store.path.read_bytes()
+    watermark = store.priority_edit_watermark()
+
+    store.apply_priority("t1", 1)
+    observed = sha(store.path.read_bytes())
+    store.apply_priority("t1", 2)  # lands after the snapshot was taken
+
+    assert not store.attested_priority_edit(
+        before_bytes, sha(before_bytes), observed, watermark
+    )
+
+
+def test_the_window_is_captured_as_one_observation(tmp_path):
+    """`capture_priority_window` reads the bytes and the watermark under a
+    single mutex hold. Read separately they can straddle an in-flight edit —
+    baseline from before it, watermark from after it — and the chain then finds
+    an empty window and parks a benign operator write."""
+    store = store_with_ledger(tmp_path, task("t1", priority=3))
+
+    baseline, watermark = store.capture_priority_window()
+
+    assert baseline == store.path.read_bytes()
+    assert watermark == store.priority_edit_watermark()
+    store.apply_priority("t1", 1)
+    assert store.attested_priority_edit(
+        baseline, sha(baseline), sha(store.path.read_bytes()), watermark
+    )
 
 
 # ---- two real processes, one task file --------------------------------------

@@ -2003,7 +2003,11 @@ class Handler(BaseHTTPRequestHandler):
             see `tasks.MutationLedger` and
             `orchestrator._operator_priority_exemption`. Without it a routine
             priority edit during a round would park the loop loop-fatal, which
-            would make steering the loop a way to stop it.
+            would make steering the loop a way to stop it. Two records per
+            write: an INTENT before it (so a ledger that cannot be appended to
+            leaves `tasks.json` untouched, and this endpoint reports the failure
+            rather than showing a value that never landed) and a COMPLETE after
+            it (the only one that ever silences the detector).
 
         Everything else this page does is still reads.
 

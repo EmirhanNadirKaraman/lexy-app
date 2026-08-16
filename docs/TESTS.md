@@ -1638,6 +1638,42 @@ widened `approved_paths` carrying a FORGED ledger record still parks, which is
 what proves the exemption checks the bytes and not the record's claim; and the
 mutex file is never reported as a created path.
 
+**The attestation became a CHAIN rather than reachability (2026-08-16 revision
+round, `dash-04`; +3 functions in `test_m1_hardening.py` (7 in that group), +9
+in `test_tasks.py`, and one REWRITTEN — `test_a_forged_attestation_cannot_widen_
+authorization` — so it is in neither figure. Hand-counted, no shell in the
+worker.)** Review found the first cut's "is the after-digest REACHABLE from the
+before-digest" question strictly weaker than the one the detector needs
+answered, and two end-to-end regressions name the gap:
+
+* `test_an_in_window_round_trip_does_not_authorize_a_direct_edit` — an operator
+  moves a priority and moves it back, so the file ends at its baseline but the
+  intermediate digest is reachable forever. The agent then writes that exact
+  state. Under reachability the escape is silent; under a chain the window's
+  completed mutations read A → B → A, whose TERMINAL state is A, so an observed
+  after-state of B parks the round.
+* `test_an_intent_from_a_failed_write_does_not_authorize_a_direct_edit` — a
+  ledger record is written BEFORE the file write (that ordering is what makes an
+  unwritable ledger leave the task file untouched, and the "Failures report"
+  bullet above still depends on it). A write that then FAILS therefore leaves a
+  record naming a state that never existed on disk. Only a `complete` record —
+  appended after the bytes land — is an edge, so the agent reproducing that
+  state parks the round.
+
+Three more controls came with them, each failing if its binding is removed:
+`test_records_from_an_earlier_window_do_not_break_an_in_window_edit` (the
+watermark is a CORRECTNESS control, not only a tightening — without it, an
+earlier round's record breaks the chain and an ordinary operator edit parks),
+`test_the_same_task_file_spelled_differently_is_the_same_file` (path binding via
+a symlinked spelling, so `canonical_task_path` is exercised rather than
+assumed), and `test_a_state_later_than_the_observed_one_is_not_attested`, which
+PINS the residual the terminal-state rule buys: a second legitimate edit landing
+between the after-snapshot and the check now parks. The rewritten forged-record
+test additionally asserts that its forged record really is a valid completed
+chain ending at the bytes on disk — without that, a path-spelling or phase
+mismatch would make it pass for a reason that says nothing about
+`priority_only_change`, i.e. the byte-level half would go vacuous.
+
 Run: `pytest autoloop/tests` from the repo root to run only this tree.
 
 **Included in a bare `pytest` since 2026-08-04 (rt-05).** Root `testpaths` is

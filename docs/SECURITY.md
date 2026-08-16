@@ -228,7 +228,8 @@ reviewed — not prevention. Residual, explicitly still open:
     orchestrator supplies for an operator's immediate `tasks.json` priority
     edit (**S32**). Neither is a path exclusion — the first requires the `.py`
     source to be watched byte for byte in the same snapshot, the second
-    requires an attestation outside the checkout AND a byte-level check that
+    requires an attested chain of COMPLETED mutations outside the checkout,
+    ending at exactly the observed after-state, AND a byte-level check that
     nothing but `priority` moved.
 
 **file:line** — `autoloop/escape_detector.py` (new); wired in
@@ -619,13 +620,27 @@ authorization.
 
 What bounds it, stated rather than assumed:
 - **The exemption proves WHO, from outside the checkout.** Each immediate write
-  appends a `before -> after` content-digest record to
+  appends `before -> after` content-digest records to
   `~/.autoloop/task-mutations.jsonl` (`tasks.MutationLedger`), beside
   `workers_root` — the placement the inbox, PAUSE flag and heartbeat already
   use because it is required to be outside the checkout. A change to
-  `tasks.json` is silenced only if a chain of such records leads from the digest
-  the snapshot saw before to the one it saw after. An agent writing that file
+  `tasks.json` is silenced only if the COMPLETED records for THAT task file,
+  written since the watermark captured before the agent started, form one
+  unbroken chain whose first hop leaves the digest the snapshot saw before and
+  whose TERMINAL state is the digest it saw after. An agent writing that file
   from inside the checkout produces no record and still parks the loop.
+- **A chain, deliberately not a reachability set** (tightened 2026-08-16, after
+  review). "Is the after-digest reachable from the before-digest" is a weaker
+  claim than "this is what happened", and the gap was exploitable twice over:
+  a legitimate round trip (3 -> 2 -> 3) left its intermediate digest reachable
+  forever, so an agent writing that state was exempted for a change no operator
+  made; and a record written before the file write meant an ANNOUNCED-then-
+  FAILED write left an edge to a state that never existed on disk. Both are
+  closed by the same three bindings — `phase == "complete"` (written only after
+  the bytes land, so an intent is never an edge), the canonical task-file path
+  on the record, and the caller's watermark — plus the terminal-state rule.
+  Pinned by `test_an_in_window_round_trip_does_not_authorize_a_direct_edit` and
+  `test_an_intent_from_a_failed_write_does_not_authorize_a_direct_edit`.
 - **The exemption independently proves WHAT, from the bytes.** Even given a
   matching chain, the two file states must differ in nothing but `priority`
   values (`tasks.priority_only_change`, which re-reads the file and ignores the
@@ -653,11 +668,18 @@ nothing signs a record, so an agent that writes outside its worker repo AND
 knows the format can append one. What that buys is bounded by the second half
 of the check — the bytes must still differ in nothing but `priority`, which the
 task graph already treats as safe to change mid-flight because nothing already
-dispatched depends on it. A second, smaller residual: the exemption re-reads
-the file under the mutex, so a write still in flight at snapshot time is
-resolved rather than raced, but a write that begins AFTER that read and lands
-before the digests are compared falls outside the attested chain and parks the
-loop. A third of the same shape: `TaskStore._write_bytes` writes
+dispatched depends on it. A second, smaller residual, WIDENED DELIBERATELY on
+2026-08-16 and named here because it is a behaviour reversal: the predicate now
+requires the file on disk to hash to exactly the digest the "after" snapshot
+observed, and to be the terminal state of the window's chain. The previous
+version explicitly allowed the file to have moved on to a LATER attested state,
+and that allowance is what made the check "reachable from" rather than "is the
+outcome of" — the round-trip hole above lived in it. The cost is that a SECOND
+legitimate operator edit landing between the after-snapshot and the comparison
+now parks the round, and the gap is the remainder of `snapshot_checkout`'s walk
+over the checkout rather than microseconds. A spurious park an operator can read
+and recover from was preferred to a laundering path that is silent by
+construction. A third residual of the same shape: `TaskStore._write_bytes` writes
 `.autoloop/tasks.json.tmp` and `os.replace`s it away, so an "after" enumeration
 AND its hashing pass both landing inside that microsecond window would report
 `created outside the worker repo: .autoloop/tasks.json.tmp`. (The mutex file
@@ -683,9 +705,14 @@ to one scheduling integer.
 # Expect: the ONE exemption call site, in the orchestrator, and nothing in the
 # detector that names a path of its own
 rg -n 'exempt' autoloop/escape_detector.py autoloop/orchestrator.py
-# Expect: both halves of the check in one place — chain reachability AND
-# priority_only_change — never one without the other
-rg -n 'attested_priority_edit|priority_only_change|reachable' autoloop/tasks.py
+# Expect: both halves of the check in one place — the completed CHAIN (never a
+# reachability set) AND priority_only_change — never one without the other
+rg -n 'attested_priority_edit|priority_only_change|completed_chain' autoloop/tasks.py
+# Expect: NO hits — reachability was the weaker claim the round-trip hole lived
+# in, and it must not come back
+rg -n 'def reachable' autoloop/tasks.py
+# Expect: only a COMPLETE record is an edge, and it is written after the bytes
+rg -n 'LEDGER_PHASE_COMPLETE|record_complete|record_intent' autoloop/tasks.py
 # Expect: the ledger resolves BESIDE workers_root, never inside the state dir
 # for a configured run
 rg -n 'def mutation_ledger_for' -A 12 autoloop/tasks.py

@@ -1659,10 +1659,46 @@ LEDGER_FILENAME = "task-mutations.jsonl"
 #: general "I edited the task file" claim.
 LEDGER_KIND_PRIORITY = "priority"
 
-#: Bound on the chain walk in `MutationLedger.reachable`. A ledger is appended
-#: to once per operator priority edit and never pruned, so this is a runaway
-#: guard, not a policy: no real window contains thousands of edits.
-_LEDGER_MAX_HOPS = 4096
+#: A record's `phase`, and the distinction the whole attestation now turns on.
+#:
+#: `apply_priority` writes an INTENT before it touches the task file and a
+#: COMPLETE only after the bytes have landed. Only COMPLETE authorizes anything.
+#:
+#: Why both, rather than one record: they answer opposite failure modes and
+#: neither covers the other.
+#:   * The INTENT is what makes a ledger that cannot be appended to leave the
+#:     task file UNTOUCHED. The append is attempted first, so a broken ledger
+#:     directory aborts the edit before any write instead of producing a change
+#:     nothing can attest — which would park the loop the moment it landed
+#:     inside a detection window.
+#:   * The COMPLETE is what keeps that same intent from becoming a licence. A
+#:     write that was announced and then FAILED still leaves its intent on
+#:     record; if an intent contributed an edge, an agent could write exactly
+#:     the state that intent named and be exempted for a change no operator
+#:     ever made. So an intent is a note about a write that was about to be
+#:     attempted, never evidence that one happened.
+LEDGER_PHASE_INTENT = "intent"
+LEDGER_PHASE_COMPLETE = "complete"
+
+
+def canonical_task_path(path) -> str:
+    """The one spelling of a task file's path that a ledger record carries and
+    that `completed_chain` compares against.
+
+    Symlinks resolved, so `/x/./tasks.json`, a relative spelling, and macOS's
+    `/var` -> `/private/var` all reduce to one string. Both sides of the
+    attestation go through this function for the same reason `_mutex_entry`
+    resolves its key: a record filed under one spelling and looked up under
+    another is a record that silently proves nothing.
+
+    Falls back to an absolute (unresolved) path if the filesystem refuses to
+    resolve it — that keeps two callers on the same machine agreeing rather
+    than raising in the middle of a detection window.
+    """
+    try:
+        return str(Path(path).resolve())
+    except OSError:  # pragma: no cover - resolve() is non-strict; needs a hostile fs
+        return str(Path(path).absolute())
 
 
 def mutation_ledger_for(workers_root: Path | None, state_dir: Path) -> Path:
@@ -1698,16 +1734,43 @@ class MutationLedger:
     So the detector's exemption asks TWO independent questions, and both must
     answer yes (`TaskStore.attested_priority_edit`):
 
-      1. **Who** — is there a chain of records here leading from the content
-         digest the snapshot saw BEFORE to the one it saw AFTER, every hop
-         written by `TaskStore.apply_priority`? This file is outside the
-         checkout, so a write into the checkout alone cannot produce one. An
-         agent that edits `tasks.json` directly is unattested and is reported.
+      1. **Who** — do the COMPLETED mutations recorded here DURING THIS
+         DETECTION WINDOW, for THIS task file, form one sequential chain that
+         starts at the digest the snapshot saw BEFORE and ends at the one it saw
+         AFTER? This file is outside the checkout, so a write into the checkout
+         alone cannot produce a record. An agent that edits `tasks.json`
+         directly is unattested and is reported.
       2. **What** — do the two file states differ ONLY in `priority` values
          (`priority_only_change`, which reads the actual bytes rather than
          trusting this record's `kind`)? So even a forged record cannot launder
          a widened `approved_paths`, a flipped `status` or a rewritten
          `depends_on`.
+
+    **WHY A CHAIN AND NOT REACHABILITY.** Question 1 was originally "is the
+    after-digest REACHABLE from the before-digest by any sequence of hops",
+    over the whole ledger. Reachability is a strictly weaker claim than "this
+    is what happened", and the gap is exploitable in two ways that a chain
+    closes:
+
+      * **The round trip.** An operator moves a priority 3 -> 2 and back to 3.
+        The file ends where it began, but the intermediate digest B is now
+        reachable from A forever. An agent that later writes exactly state B
+        into the checkout — which it can, B being an ordinary priority-only
+        state — is then "attested" for a change no operator made. Read as a
+        chain, the same two records say A -> B -> A, whose terminal state is A;
+        an observed after-state of B is not that terminal state, so it is
+        reported.
+      * **The announced-but-failed write.** A reachability walk cannot tell an
+        intent from an outcome, so a write that was recorded and then failed
+        left a usable edge to a state that never existed on disk. Hence
+        `LEDGER_PHASE_COMPLETE`: only records written AFTER the bytes landed
+        are edges at all.
+
+    Two more bindings keep the chain about THIS window and THIS file: records
+    below the caller's watermark (`TaskStore.priority_edit_watermark`, captured
+    before the agent starts) are not part of it, and neither are records naming
+    another task file (`canonical_task_path`) — a second loop sharing a ledger
+    must not be able to attest edits to a checkout it does not own.
 
     Honest residual, recorded rather than argued away: this is an attestation,
     not an authenticator. Nothing signs a record, so an agent that writes
@@ -1721,23 +1784,21 @@ class MutationLedger:
     def __init__(self, path: Path):
         self.path = Path(path)
 
-    def record(self, *, tasks_path: Path, before: str, after: str,
-               kind: str = LEDGER_KIND_PRIORITY, ids: tuple[str, ...] = ()) -> None:
+    def _append(self, *, tasks_path: Path, before: str, after: str, phase: str,
+                kind: str, ids: tuple[str, ...]) -> None:
         """Append one record. Raises `OSError` if it cannot be written.
 
-        Deliberately NOT best-effort. `TaskStore.apply_priority` records BEFORE
-        it writes the task file, so a ledger that cannot be appended to means
-        nothing was written at all — better than a write nobody can attest,
-        which would park the loop the moment it landed inside a detection
-        window. The reverse ordering (write, then attest) has no such recovery.
+        Deliberately NOT best-effort, in either phase. See `record_intent` and
+        `record_complete` for what each failure means.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(
             {
                 "at": utcnow_iso(),
                 "pid": os.getpid(),
-                "path": str(tasks_path),
+                "path": canonical_task_path(tasks_path),
                 "kind": kind,
+                "phase": phase,
                 "ids": list(ids),
                 "before": before,
                 "after": after,
@@ -1746,6 +1807,28 @@ class MutationLedger:
         )
         with open(self.path, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
+
+    def record_intent(self, *, tasks_path: Path, before: str, after: str,
+                      kind: str = LEDGER_KIND_PRIORITY, ids: tuple[str, ...] = ()) -> None:
+        """Announce a write that is about to be attempted. Authorizes NOTHING.
+
+        Load-bearing despite that: `apply_priority` appends this BEFORE it
+        touches the task file, so a ledger that cannot be written leaves the
+        task file exactly as it was. The alternative ordering (write, then
+        attest) has no such recovery — it produces a change nothing can attest,
+        which parks the loop the moment it lands inside a detection window.
+        """
+        self._append(tasks_path=tasks_path, before=before, after=after,
+                     phase=LEDGER_PHASE_INTENT, kind=kind, ids=ids)
+
+    def record_complete(self, *, tasks_path: Path, before: str, after: str,
+                        kind: str = LEDGER_KIND_PRIORITY,
+                        ids: tuple[str, ...] = ()) -> None:
+        """Record that the bytes really landed. The ONLY thing that becomes an
+        edge in `completed_chain`, and therefore the only thing that can silence
+        the escape detector."""
+        self._append(tasks_path=tasks_path, before=before, after=after,
+                     phase=LEDGER_PHASE_COMPLETE, kind=kind, ids=ids)
 
     def read(self) -> list[dict]:
         """Every readable record, oldest first. A missing ledger is `[]`, and a
@@ -1768,32 +1851,71 @@ class MutationLedger:
                 records.append(record)
         return records
 
-    def reachable(self, start: str, kind: str = LEDGER_KIND_PRIORITY) -> set[str]:
-        """Every content digest reachable from `start` by attested `kind` hops,
-        `start` included.
+    def count(self) -> int:
+        """How many readable records exist right now — the watermark a detection
+        window is opened with.
 
-        A SET rather than a single before/after match, because one detection
-        window can contain several edits: two saves in a row leave the snapshot
-        comparing A against C while the ledger holds A->B and B->C.
+        A COUNT over `read()` rather than a byte offset, because `read()` is
+        what the window is later sliced out of and the two must agree about
+        which records are "already there". The ledger is append-only and never
+        pruned, so a record's index is stable: a line skipped as malformed
+        before the window opens is skipped identically afterwards.
         """
-        edges: dict[str, list[str]] = {}
-        for record in self.read():
+        return len(self.read())
+
+    def completed_chain(
+        self,
+        start: str,
+        *,
+        since: int,
+        tasks_path,
+        kind: str = LEDGER_KIND_PRIORITY,
+    ) -> list[str] | None:
+        """The sequence of file states that COMPLETED mutations of `tasks_path`
+        walked through since record index `since`, beginning at `start` —
+        `[start]` when the window is empty, or `None` when the records do not
+        describe one unbroken chain from `start`.
+
+        The proof `attested_priority_edit` needs, and deliberately not a
+        reachability set (see the class docstring for the two holes that
+        closes). Three filters decide what is even looked at, and each is a
+        binding rather than a convenience:
+
+          * `since` — the caller's watermark, captured before the agent it is
+            judging began. An edit from an EARLIER window says nothing about
+            this one, and leaving old edges in scope is what let a long-dead
+            round trip keep authorizing.
+          * `tasks_path` — canonicalised on both sides. A second loop appending
+            to a shared ledger must not attest a change to a checkout it does
+            not own.
+          * `phase == LEDGER_PHASE_COMPLETE` — an intent is a note about a write
+            that was about to be attempted. A record from a write that FAILED
+            must not become a licence to reproduce the state it named. A record
+            written before this field existed carries no phase and is therefore
+            not a completion either, which is the safe direction.
+
+        Records that pass those filters must chain EXACTLY: the first one's
+        `before` is `start`, each subsequent one's `before` is its predecessor's
+        `after`. A gap means something other than `apply_priority` wrote the
+        file in between, and there is no honest way to describe that as an
+        operator priority edit — so it is `None`, not a shorter chain.
+        """
+        wanted = canonical_task_path(tasks_path)
+        chain = [start]
+        for record in self.read()[max(0, since):]:
             if record.get("kind") != kind:
                 continue
+            if record.get("phase") != LEDGER_PHASE_COMPLETE:
+                continue
+            if record.get("path") != wanted:
+                continue
             before, after = record.get("before"), record.get("after")
-            if isinstance(before, str) and isinstance(after, str) and before and after:
-                edges.setdefault(before, []).append(after)
-        seen = {start}
-        frontier = [start]
-        hops = 0
-        while frontier and hops < _LEDGER_MAX_HOPS:
-            digest = frontier.pop()
-            for nxt in edges.get(digest, ()):
-                hops += 1
-                if nxt not in seen:
-                    seen.add(nxt)
-                    frontier.append(nxt)
-        return seen
+            if not isinstance(before, str) or not isinstance(after, str):
+                return None
+            if not before or not after or before != chain[-1]:
+                return None
+            chain.append(after)
+        return chain
 
 
 def _comparable_without_priority(data: object):
@@ -2026,6 +2148,12 @@ class TaskStore:
             `MutationLedger`.
           * unknown task, or a non-integer priority — `TaskRegistry.set_priority`
             raises `TaskGraphError`, unchanged.
+
+        Two ledger records, not one, and the order is the design (see
+        `MutationLedger.record_intent` / `record_complete`): the INTENT goes
+        first so an unwritable ledger aborts before anything is written, and the
+        COMPLETE goes after the bytes land so a failed write leaves behind a
+        note rather than a licence.
         """
         if self.ledger is None:
             raise StateError(
@@ -2046,14 +2174,30 @@ class TaskStore:
             payload = self._serialize(registry)
             before = self._digest()
             after = hashlib.sha256(payload).hexdigest()
-            # Recorded BEFORE the write: a ledger that cannot be appended to
+            # Announced BEFORE the write: a ledger that cannot be appended to
             # must leave the task file untouched rather than produce a change
-            # nothing can attest.
-            self.ledger.record(
+            # nothing can attest. This record authorizes nothing by itself.
+            self.ledger.record_intent(
                 tasks_path=self.path, before=before, after=after,
                 kind=LEDGER_KIND_PRIORITY, ids=(task_id,),
             )
             self._write_bytes(payload)
+            try:
+                # Only now is there an outcome to attest. If THIS append fails
+                # the change has already persisted, so the error has to say so:
+                # re-raising the bare OSError would read as "nothing happened",
+                # which is precisely the defect this whole path exists to fix.
+                self.ledger.record_complete(
+                    tasks_path=self.path, before=before, after=after,
+                    kind=LEDGER_KIND_PRIORITY, ids=(task_id,),
+                )
+            except OSError as exc:  # pragma: no cover - the intent just succeeded here
+                raise StateError(
+                    f"priority for {task_id!r} WAS written to {self.path}, but "
+                    f"the completion could not be recorded in {self.ledger.path} "
+                    f"({exc}) — the change is live and unattested, so a round in "
+                    "flight may report it as a checkout escape"
+                ) from exc
             persisted = self.load()
             if persisted is None or not persisted.has(task_id):  # pragma: no cover
                 raise StateError(
@@ -2062,28 +2206,76 @@ class TaskStore:
                 )
             return persisted.get(task_id)
 
+    def priority_edit_watermark(self) -> int:
+        """How many ledger records exist right now — the mark that opens a
+        detection window.
+
+        Captured by `orchestrator._operator_priority_exemption` before the
+        write-capable agent starts, and passed back to `attested_priority_edit`
+        afterwards, so the attestation describes mutations from THIS window and
+        not from the loop's whole history. `0` when no ledger is configured; the
+        predicate refuses outright in that case anyway.
+
+        Take it under the same `lock()` hold as the baseline bytes it will be
+        compared against — the two are one observation, and a record appended
+        between them would be attributed to the wrong side of the window.
+        """
+        return 0 if self.ledger is None else self.ledger.count()
+
+    def capture_priority_window(self) -> tuple[bytes, int]:
+        """The (task-file bytes, ledger watermark) pair that opens a detection
+        window, read as ONE instant under the mutex.
+
+        Read separately, they can straddle an in-flight `apply_priority`: the
+        bytes come out as state A while the watermark is taken after the A -> B
+        completion was appended, so the chain walk later finds an empty window,
+        concludes nothing legitimate happened, and parks the loop on a perfectly
+        benign operator edit. That is the same read-modify-write race this whole
+        change exists to close, so it is closed on the reading side too.
+
+        Raises `OSError` if the task file cannot be read, and `TaskStoreBusy` if
+        the mutex cannot be taken — both leave the caller to decide, which it
+        does by declining to offer an exemption at all.
+        """
+        with self.lock():
+            return self.path.read_bytes(), self.priority_edit_watermark()
+
     def attested_priority_edit(self, before_bytes: bytes, before_sha: str,
-                               after_sha: str) -> bool:
+                               after_sha: str, watermark: int) -> bool:
         """Is the change from `before_sha` to `after_sha` an operator priority
-        edit this store applied — and nothing more?
+        edit this store applied during this detection window — and nothing more?
 
         The predicate behind the escape detector's one exemption for this file.
         Both halves must hold (see `MutationLedger` for why either alone is
         insufficient):
 
-          * WHO — `after_sha` is reachable from `before_sha` through ledger
-            records, each written by `apply_priority`, in a file outside the
-            checkout. An agent editing `tasks.json` from inside the checkout
-            produces no record and is reported.
-          * WHAT — the file as it stands now differs from `before_bytes` only
-            in `priority` values, checked against the actual bytes rather than
-            against the ledger's own claim about itself.
+          * WHO — the COMPLETED priority mutations recorded since `watermark`
+            for THIS task file form one unbroken chain that starts at
+            `before_sha` and whose TERMINAL state is `after_sha`
+            (`MutationLedger.completed_chain`). The ledger is outside the
+            checkout, so an agent editing `tasks.json` from inside it produces
+            no record and is reported. An intent from a failed write is not a
+            hop, and an intermediate state from an earlier round trip is not a
+            terminal one.
+          * WHAT — the file differs from `before_bytes` only in `priority`
+            values, checked against the actual bytes rather than against the
+            ledger's own claim about itself.
 
-        The bytes are re-read under the mutex, so a mutation still in flight
-        when the detector's snapshot was taken has finished by the time this
-        reads. The state read now may therefore be LATER than the snapshot's
-        `after_sha`; both must be attested-reachable, so a later legitimate
-        edit cannot launder an unattested one in between.
+        THE OBSERVED AFTER-STATE IS EXACTLY WHAT IS ON DISK NOW, and both the
+        chain and the byte comparison are held to it: the current bytes are
+        re-read under the mutex and must hash to `after_sha`. That is a
+        deliberate reversal of the previous behaviour, which allowed the file to
+        have moved on to a LATER attested state since the snapshot. Allowing
+        that is what made "reachable from" the test instead of "is the outcome
+        of", and reachability is the weaker claim the round-trip hole lived in.
+
+        The residual that reversal buys, stated rather than hidden: a SECOND
+        legitimate operator edit landing between the after-snapshot and this
+        call is now reported as an escape, and the gap is the remainder of
+        `snapshot_checkout`'s walk over the checkout rather than microseconds.
+        That is a spurious loop-fatal park an operator can read and recover from
+        (`reset --yes`), traded for closing a laundering path that is silent by
+        construction — the safe direction of the two.
         """
         if self.ledger is None or not before_sha or not after_sha:
             return False
@@ -2094,9 +2286,13 @@ class TaskStore:
                 current_bytes = self.path.read_bytes()
             except OSError:
                 return False
-            reachable = self.ledger.reachable(before_sha, LEDGER_KIND_PRIORITY)
-            current_sha = hashlib.sha256(current_bytes).hexdigest()
-            if after_sha not in reachable or current_sha not in reachable:
+            if hashlib.sha256(current_bytes).hexdigest() != after_sha:
+                return False
+            chain = self.ledger.completed_chain(
+                before_sha, since=watermark, tasks_path=self.path,
+                kind=LEDGER_KIND_PRIORITY,
+            )
+            if chain is None or chain[-1] != after_sha:
                 return False
             return priority_only_change(before_bytes, current_bytes)
 
