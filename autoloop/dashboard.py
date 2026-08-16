@@ -38,6 +38,13 @@ a stored `status="blocked"` means QUARANTINED — so a page that read the status
 string would disagree with the code that dispatches, in both directions at
 once. Constructing a registry is a pure read; no mutating registry method is
 called from here, and no lock is taken.
+
+Three of those groups are the three ways a task can be not-running, and they
+are separated because the operator's question differs: **Blocked** waits on a
+dependency (nothing to do), **Needs a human** waits on you, **Retired** waits on
+nobody — it was superseded, and its row names the successor rather than asking
+for anything. Six of the seven `blocked` rows on 2026-08-14 were retirements,
+which is what made the blocked count useless as a call to action.
 """
 
 from __future__ import annotations
@@ -685,6 +692,12 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
 # "waiting on a dependency" — one needs an operator answer, the other resolves
 # itself. Sending someone to `autoloop answer` for a task that is merely queued
 # behind another is exactly the confusion this panel exists to remove.
+#
+# RETIRED is the third of those and the reason this panel was still misread
+# after the split: it is not a problem at all. The work shipped (or stopped)
+# under another id, so the row exists to be findable, not to be fixed. Grouping
+# it with either kind of blocked puts a "when will this be done?" next to an
+# answer of "it already was, elsewhere".
 
 #: The groups, in the order the page lists them, each pinned to the `TaskState`
 #: it renders. The order is the order an operator triages in: act on it, decide
@@ -694,6 +707,13 @@ GROUPS: tuple[tuple[str, str, TaskState], ...] = (
     ("needs_human", "Needs a human", TaskState.BLOCKED_BY_OPERATOR),
     ("ready", "Ready", TaskState.READY),
     ("blocked", "Blocked", TaskState.BLOCKED),
+    # Retired sits between "why is this stuck" and history, because that is
+    # where the operator's question actually lands: they read seven blocked
+    # rows, asked when they would be fixed, and for six of them the answer was
+    # "never — they already were, under a different id". A row here is not a
+    # call to action, which is exactly why it may not sit in either Blocked
+    # group.
+    ("retired", "Retired", TaskState.RETIRED),
     ("done", "Done", TaskState.COMPLETED),
 )
 
@@ -703,11 +723,18 @@ GROUPS: tuple[tuple[str, str, TaskState], ...] = (
 #: the one group whose emptiness IS the answer the operator came for.
 ALWAYS_SHOWN = frozenset({"needs_human"})
 
-#: Collapsed behind a `<details>`, with its count in the summary. Only `done`,
-#: which only ever grows — an operator scrolling past 40 finished tasks to
-#: reach the four that matter is the flat list's failure repeated inside the
-#: fix.
-COLLAPSED = frozenset({"done"})
+#: Collapsed behind a `<details>`, with its count in the summary. `done` and
+#: `retired`, the two groups that only ever grow and that nobody has to act on
+#: — an operator scrolling past 40 finished tasks to reach the four that matter
+#: is the flat list's failure repeated inside the fix. Collapsed is not hidden:
+#: each renders its count, and a retirement's whole value is that it stays
+#: findable, so the chain that says brw-07/brw-08 continue brw-02/brw-04
+#: survives.
+#:
+#: Each collapsed group gets its OWN disclosure in the static markup, looked up
+#: by key. `groups.find(g => g.collapsed)` would silently hand the first one to
+#: whichever `<details>` asked.
+COLLAPSED = frozenset({"done", "retired"})
 
 
 def _ready_order(registry: TaskRegistry) -> list:
@@ -760,6 +787,23 @@ def _blocked_detail(registry: TaskRegistry, task) -> str:
     return ("waiting on " + ", ".join(waiting)) if waiting else "waiting on a dependency"
 
 
+def _retired_detail(task) -> str:
+    """What replaced this task — the one thing an operator needs from a row
+    they cannot act on.
+
+    `superseded_by` first, because it is the machine-readable record and it
+    answers "where did this work go" in four characters. `blocked_reason` is
+    the fallback rather than the answer: it is free text, it is why the six
+    retirements were unreadable in the first place, and for `dash-01` — stale
+    at dispatch, superseded by nothing — it is the only account there is. A
+    retirement with neither says so instead of rendering blank, which reads as
+    a broken cell.
+    """
+    if task.superseded_by:
+        return "superseded by " + ", ".join(task.superseded_by)
+    return task.blocked_reason or "retired; no successor recorded"
+
+
 def _group_detail(key: str, task, index: int, registry: TaskRegistry,
                   executions: dict) -> str:
     if key == "in_progress":
@@ -771,6 +815,8 @@ def _group_detail(key: str, task, index: int, registry: TaskRegistry,
         return task.blocked_reason or "no reason recorded"
     if key == "blocked":
         return _blocked_detail(registry, task)
+    if key == "retired":
+        return _retired_detail(task)
     if key == "ready" and index == 0:
         return "next to be dispatched"
     return ""
@@ -787,6 +833,11 @@ def _grouped(registry: TaskRegistry, executions: dict) -> list[dict]:
         )
         tasks = [
             {"id": task.id, "title": task.title, "priority": task.priority,
+             # Carried on every row, not just a retired one: the supersession
+             # chain is the reason this field exists, and a consumer of
+             # `/data.json` reading it should not have to know which group a
+             # task landed in first. Empty for everything else.
+             "superseded_by": list(task.superseded_by),
              "detail": _group_detail(key, task, index, registry, executions)}
             for index, task in enumerate(members)
         ]
@@ -812,7 +863,7 @@ def task_groups(tasks_data: dict, executions: dict) -> list[dict]:
     registry method is reachable from here, and nothing is written.
 
     An EMPTY list means the task graph could not be read at all — a roadmap
-    with no tasks in it still returns all five groups, zeroed, so the two
+    with no tasks in it still returns every group in `GROUPS`, zeroed, so the two
     cannot be confused. Anything unparseable lands here: a record shaped for a
     different schema, a dependency naming a task that does not exist (which
     `from_dict` tolerates and `state_of` then raises on). The page says so in
@@ -965,6 +1016,10 @@ def collect(repo: Path) -> dict:
         roadmap.append({
             "id": t.get("id"), "title": t.get("title"),
             "status": t.get("status") or "pending", "reason": (t.get("blocked_reason") or "")[:200],
+            # Read straight off the raw row, like everything else here: this
+            # list stays the tolerant view that renders even when the graph
+            # does not load as a registry.
+            "superseded_by": list(t.get("superseded_by") or ()),
             # Ascending: 1 outranks 2, default 100 sorts last (tasks.Task.priority).
             "priority": t.get("priority", 100),
         })
@@ -974,6 +1029,23 @@ def collect(repo: Path) -> dict:
     # commit landed), and two globs of the same directory could disagree
     # mid-write.
     executions = _executions(repo)
+
+    # The grouped read of the same rows, hoisted out of the payload literal
+    # because the flat list below borrows one answer from it.
+    groups = task_groups(tasks, executions)
+    # A retirement that predates `TaskState.RETIRED` is migrated when the
+    # registry LOADS (`tasks._migrate_retirements`), and only the loop ever
+    # writes `tasks.json` — so between this page reading the file and the loop
+    # next saving it, the raw row still says `blocked` while the grouped read
+    # says retired. Left alone, the app-task panel would mark brw-02 "blocked"
+    # two panels below the Retired group listing it, which is the exact
+    # two-meanings-one-word confusion this change exists to end. The registry's
+    # derived state wins where they disagree; the raw read stays the fallback
+    # for everything else, including a graph that would not load at all.
+    _retired_ids = {t["id"] for g in groups if g["key"] == "retired" for t in g["tasks"]}
+    for row in roadmap:
+        if row["id"] in _retired_ids:
+            row["status"] = "retired"
 
     # --- recent events --------------------------------------------------
     events = []
@@ -1027,7 +1099,7 @@ def collect(repo: Path) -> dict:
         # The same tasks, split by `TaskRegistry.state_of()`. `roadmap` stays
         # the flat, tolerant read of the raw JSON — the app-task panel joins
         # against it, and it still renders when the graph itself does not load.
-        "groups": task_groups(tasks, executions),
+        "groups": groups,
         "inbox": _pending_inbox(repo),
         "app_tasks": app_tasks(repo),
         "pipeline": pipeline(state, live_agents_cache, blockers),
@@ -1208,15 +1280,27 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       the repository would not read); it is never reported as not-merged.</p>
   </section>
 
-  <!-- Grouped by state, in triage order. `Done` is a <details> in STATIC
-       markup rather than inside the container `render()` rebuilds, for the
-       same reason `#flowtable` is: expanding it would otherwise snap shut on
-       the next payload change. Only its summary text and its rows are
-       rewritten, so it starts collapsed on load and stays where the operator
-       put it after that. -->
+  <!-- Grouped by state, in triage order. `Retired` and `Done` are <details>
+       in STATIC markup rather than inside the container `render()` rebuilds,
+       for the same reason `#flowtable` is: expanding one would otherwise snap
+       shut on the next payload change. Only the summary text and the rows are
+       rewritten, so each starts collapsed on load and stays where the operator
+       put it after that. Each is looked up by GROUP KEY, never by "the first
+       collapsed group". -->
   <section>
     <h2>Roadmap — grouped by state; set priority, then Save</h2>
     <div id="roadmap" class="scroll"></div>
+    <details id="retiredbox">
+      <summary id="retiredsum">⊘ Retired</summary>
+      <div id="retired" class="scroll"></div>
+      <p class="muted" style="font-size:12px;margin:9px 0 0">
+        Retired means superseded: the work is not waiting on a dependency and
+        not waiting on you — it happened, or stopped, under another task id.
+        Nothing here is a call to action, and nothing here is ever deleted:
+        the successor column IS the record that (say) brw-07 + brw-08 continue
+        brw-02 / brw-04. A blank successor means the task went stale rather
+        than being replaced.</p>
+    </details>
     <details id="donebox">
       <summary id="donesum">✓ Done</summary>
       <div id="done" class="scroll"></div>
@@ -1460,11 +1544,14 @@ function render(d, force){
   // status string: `blocked` on disk means QUARANTINED, while the Blocked
   // group means "waiting on an incomplete dependency", and a page that mixed
   // those up would send an operator to answer a blocker that does not exist.
+  // Retired is the third of those and needs nobody at all \u2014 its row names the
+  // successor instead of asking for anything.
   //
   // Priority editing is unchanged: writes go to the task INBOX, never to
   // tasks.json \u2014 the loop is the only registry writer, and a write into
   // .autoloop/ mid-run would trip the escape detector. A Save is "queued".
-  const GICON = {in_progress:"\u25b6", needs_human:"\u25a0", ready:"\u25cb", blocked:"\u25cd", done:"\u2713"};
+  const GICON = {in_progress:"\u25b6", needs_human:"\u25a0", ready:"\u25cb", blocked:"\u25cd",
+                 retired:"\u2298", done:"\u2713"};
   const groups = d.groups || [];
   const priCell = t => `<input class="pri" type="number" step="1" value="${esc(t.priority)}"
          data-id="${esc(t.id)}" aria-label="priority for ${esc(t.id)}">
@@ -1476,7 +1563,7 @@ function render(d, force){
       <td class="muted">${esc(t.detail || "\u2014")}</td></tr>`).join(""));
   const board = document.getElementById("roadmap");
   if (!groups.length) {
-    // A roadmap with no tasks still renders five zeroed groups, so an empty
+    // A roadmap with no tasks still renders every group zeroed, so an empty
     // list can only mean the graph itself did not load. Say which: "no tasks"
     // and "unreadable" call for opposite reactions.
     board.innerHTML = `<p class="empty">the task graph could not be read \u2014 `
@@ -1495,8 +1582,30 @@ function render(d, force){
   }
   // Collapsed, counted, and never carrying a priority input: the per-render
   // Save binding below is scoped to #roadmap, so a button here would render
-  // with no listener \u2014 and re-prioritising a finished task means nothing.
-  const gDone = groups.find(g => g.collapsed);
+  // with no listener \u2014 and re-prioritising a finished or retired task means
+  // nothing.
+  //
+  // By KEY, never by scanning for the first group carrying the collapsed flag.
+  // With two collapsed groups that predicate hands both disclosures the same
+  // one, and the failure is silent: the Done box would quietly fill with
+  // retirements. A test asserts the old expression is absent from this script,
+  // so do not quote it back into a comment here.
+  const byKey = k => groups.find(g => g.key === k);
+  const gRetired = byKey("retired");
+  document.getElementById("retiredsum").textContent =
+    gRetired ? `\u2298 Retired (${gRetired.count})` : "\u2298 Retired";
+  // The successor column is the point of this table \u2014 it is the machine
+  // readable half of what used to be prose in `blocked_reason`. A retirement
+  // with no successor says so in words rather than leaving the cell blank.
+  document.getElementById("retired").innerHTML = gRetired
+    ? rows(["task","title","superseded by"], gRetired.tasks.map(t =>
+        `<tr><td><code>${esc(t.id)}</code></td>
+          <td>${esc((t.title||"").slice(0,70))}</td>
+          <td class="muted">${(t.superseded_by||[]).length
+              ? (t.superseded_by||[]).map(s => `<code>${esc(s)}</code>`).join(", ")
+              : esc(t.detail || "no successor recorded")}</td></tr>`).join(""))
+    : `<p class="empty">unknown</p>`;
+  const gDone = byKey("done");
   document.getElementById("donesum").textContent =
     gDone ? `\u2713 Done (${gDone.count})` : "\u2713 Done";
   document.getElementById("done").innerHTML = gDone
@@ -1553,6 +1662,12 @@ function render(d, force){
       const r = (d.roadmap||[]).find(x => x.id === a.id);
       let mark = "· not queued", cls = "";
       if (a.id === activeId) { mark = "▶ in progress"; cls = "row-active"; }
+      // Retired is checked BEFORE blocked. `collect()` overlays the registry's
+      // derived state onto these rows, but a retirement written straight into
+      // tasks.json by a future writer would still arrive as its own status —
+      // and "■ blocked" on a superseded task is the misread this whole change
+      // is about.
+      else if (r && r.status === "retired") mark = "⊘ retired";
       else if (r && r.status === "blocked") mark = "■ blocked";
       else if (r && r.status === "completed") mark = "✓ done";
       else if (r) mark = "○ queued";

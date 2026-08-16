@@ -76,6 +76,23 @@ def test_implement_completed_task_denied():
     assert not verdict.allowed and verdict.code == "task_completed"
 
 
+@pytest.mark.parametrize("decision", [Decision.IMPLEMENT, Decision.REVISE])
+def test_retired_task_denied(decision):
+    """The gate every TASK_DECISIONS directive passes through. These ids used
+    to be stored as `blocked` and were denied as quarantined — giving
+    retirement its own state without restating the denial here would have
+    quietly made six superseded tasks dispatchable, which is worse than the
+    confusing roadmap it replaces. The successor is named so a reviewer that
+    asked for retired work is pointed at its continuation."""
+    registry = make_registry()
+    registry.retire("ready1", superseded_by=["ready2"], reason="superseded")
+
+    verdict = auth(task_engine(), directive(decision, task_id="ready1"), registry=registry)
+
+    assert not verdict.allowed and verdict.code == "task_retired"
+    assert "ready2" in verdict.reason
+
+
 def test_commit_completion_of_completed_task_allowed():
     # Idempotent crash recovery: re-approving a commit that already completed
     # its task must not be denied.

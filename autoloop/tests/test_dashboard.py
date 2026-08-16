@@ -1206,8 +1206,98 @@ def test_the_groups_come_from_state_of_and_never_from_the_status_string():
     assert {g["state"] for g in payload} == {state.value for state in TaskState}
 
 
-def test_an_unreadable_task_graph_says_so_rather_than_rendering_five_empty_groups():
-    """A roadmap with no tasks renders five zeroed groups, so an empty list can
+def test_a_retired_task_is_grouped_apart_from_both_kinds_of_blocked():
+    """The whole point. Three tasks, three different "not running" states, and
+    the operator's question differs for each: `waiting-1` needs nothing,
+    `quarantined-1` needs them, `brw-02` needs nobody — it already shipped
+    under brw-06. Folding the third into either of the first two is what made
+    the blocked count worthless as a call to action."""
+    groups = groups_by_key(task_groups({"tasks": [
+        roadmap_task("open-1"),
+        roadmap_task("waiting-1", depends_on=["open-1"]),
+        roadmap_task("quarantined-1", status="blocked", blocked_reason="answer me"),
+        roadmap_task("brw-02", status="retired", superseded_by=["brw-06"],
+                     blocked_reason="superseded by brw-06"),
+    ]}, {}))
+
+    assert [t["id"] for t in groups["retired"]["tasks"]] == ["brw-02"]
+    assert [t["id"] for t in groups["blocked"]["tasks"]] == ["waiting-1"]
+    assert [t["id"] for t in groups["needs_human"]["tasks"]] == ["quarantined-1"]
+
+
+def test_the_retired_group_names_the_successor_rather_than_the_prose():
+    """`superseded_by` is why this state exists: the chain has to be readable
+    without parsing a sentence. The successor list also reaches the payload, so
+    a consumer of /data.json can follow it."""
+    groups = groups_by_key(task_groups({"tasks": [
+        roadmap_task("brw-06", status="retired", superseded_by=["brw-07", "brw-08"],
+                     blocked_reason="split at the reviewer's request"),
+    ]}, {}))
+
+    row = groups["retired"]["tasks"][0]
+    assert row["detail"] == "superseded by brw-07, brw-08"
+    assert row["superseded_by"] == ["brw-07", "brw-08"]
+
+
+def test_a_retirement_with_no_successor_falls_back_to_its_reason():
+    """`dash-01` went stale rather than being replaced, so the reason is the
+    only account there is — and a blank cell reads as a broken panel."""
+    groups = groups_by_key(task_groups({"tasks": [
+        roadmap_task("dash-01", status="retired",
+                     blocked_reason="stale since 2026-08-03: no candidate, no record"),
+        roadmap_task("bare-1", status="retired"),
+    ]}, {}))
+
+    details = {t["id"]: t["detail"] for t in groups["retired"]["tasks"]}
+    assert details["dash-01"] == "stale since 2026-08-03: no candidate, no record"
+    assert details["bare-1"] == "retired; no successor recorded"
+
+
+def test_the_retired_group_is_counted_and_collapsed_in_its_own_disclosure():
+    """Two collapsed groups now, so each must be looked up by KEY.
+    `groups.find(g => g.collapsed)` would hand both disclosures the same group
+    and quietly fill the Done box with retirements."""
+    groups = groups_by_key(task_groups({"tasks": [
+        roadmap_task("r-1", status="retired", superseded_by=["r-2"]),
+        roadmap_task("d-1", status="completed"),
+    ]}, {}))
+
+    assert groups["retired"]["collapsed"] is True and groups["retired"]["hidden"] is False
+    assert groups["retired"]["count"] == 1
+    static_markup, script = PAGE.split("<script>", 1)
+    assert '<details id="retiredbox">' in static_markup and 'id="retiredsum"' in static_markup
+    assert "groups.find(g => g.collapsed)" not in script, \
+        "with two collapsed groups this predicate returns the wrong one"
+    assert 'byKey("retired")' in script and 'byKey("done")' in script
+    assert "Retired (${gRetired.count})" in script
+    assert "t.superseded_by" in script, "the successor column never reaches the DOM"
+
+
+def test_the_migrated_retirements_reach_the_page_from_a_pre_state_task_file(tmp_path):
+    """End to end on the shape actually on disk: `tasks.json` still says
+    `blocked` with the successor in free text. The migration runs when the
+    registry LOADS, so the page shows the retirement before the loop has
+    written anything — and the flat roadmap row agrees with the group, or the
+    app-task panel would mark brw-02 "blocked" two panels below."""
+    repo = make_repo(tmp_path)
+    write_registry(repo, [
+        roadmap_task("brw-02", status="blocked", blocked_reason="superseded by brw-06"),
+        roadmap_task("audit-0003", status="blocked", blocked_reason="failed its validation"),
+    ])
+
+    payload = collect(repo)
+    groups = groups_by_key(payload["groups"])
+
+    assert [t["id"] for t in groups["retired"]["tasks"]] == ["brw-02"]
+    assert groups["retired"]["tasks"][0]["detail"] == "superseded by brw-06"
+    # The genuine failure still asks for a human.
+    assert [t["id"] for t in groups["needs_human"]["tasks"]] == ["audit-0003"]
+    statuses = {r["id"]: r["status"] for r in payload["roadmap"]}
+    assert statuses == {"brw-02": "retired", "audit-0003": "blocked"}
+
+
+def test_an_unreadable_task_graph_says_so_rather_than_rendering_empty_groups():
+    """A roadmap with no tasks renders every group zeroed, so an empty list can
     only mean the graph itself did not load — and "no tasks" and "unreadable"
     call for opposite reactions. A dependency naming a task that does not exist
     is the real shape of this: `from_dict` accepts it and `state_of` then

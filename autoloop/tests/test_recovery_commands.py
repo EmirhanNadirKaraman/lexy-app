@@ -16,7 +16,7 @@ import json
 import pytest
 
 from autoloop import cli
-from autoloop.blockers import BlockerStore
+from autoloop.blockers import NO_TASK, BlockerStore
 from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
 from autoloop.errors import GitCommandError, TaskGraphError
 from autoloop.state import LoopState, StateStore
@@ -272,6 +272,168 @@ def test_the_record_is_retired_before_the_worker(wired, monkeypatch):
     assert WorkerRepoManager(
         wired.workers_root, wired.worker_hooks_dir
     ).path_for("loop-01").exists()
+
+
+# --- CLI: retire --------------------------------------------------------------
+#
+# The third dead end, and the one that produced a wrong ANSWER rather than a
+# stuck task. Six of the seven `blocked` rows on 2026-08-14 were retirements
+# saying so only in free text, so the dashboard's blocked count meant "needs
+# you" and "needs nobody" at the same time. `tasks._RETIREMENTS` migrates those
+# six on load; this command is the route for every retirement after them, and
+# the fallback when a reason no longer matches that table.
+
+
+def _retire_args(task_id, superseded_by=None, reason=""):
+    return argparse.Namespace(
+        config=None, task_id=task_id, superseded_by=superseded_by, reason=reason
+    )
+
+
+def test_retire_command_records_the_successor_and_keeps_everything_else(wired, capsys):
+    """Deliberately NOT one of the six ids in `tasks._RETIREMENTS` — those are
+    re-filed by the load-time migration, so a test using one would pass
+    without the command doing anything. This is a retirement decided after
+    that table, which is what the command exists for."""
+    store = _seed(wired, _task("old-01"))
+    registry = store.load()
+    registry.block("old-01", "superseded by new-01")
+    store.save(registry)
+
+    code = cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"]))
+
+    assert code == 0
+    reloaded = store.load()
+    assert reloaded.state_of("old-01") is TaskState.RETIRED
+    assert reloaded.get("old-01").superseded_by == ("new-01",)
+    # Nothing is deleted: the task, its reason and its scope all survive.
+    assert reloaded.get("old-01").blocked_reason == "superseded by new-01"
+    assert reloaded.get("old-01").approved_paths == ("docs/A.md",)
+    out = capsys.readouterr().out
+    assert "blocked -> retired" in out and "new-01" in out
+
+
+def test_retire_command_takes_a_task_stranded_in_progress(wired, capsys):
+    """`dash-01`, the task this command was written for: in_progress at
+    dispatch with no candidate and no execution record, so nothing will ever
+    finish it. No successor — it went stale rather than being replaced."""
+    store = _seed(wired, _task("dash-01"))
+    registry = store.load()
+    registry.mark_in_progress("dash-01")
+    store.save(registry)
+
+    assert cli._cmd_retire_task(_retire_args("dash-01", reason="stale since 2026-08-03")) == 0
+
+    reloaded = store.load()
+    assert reloaded.state_of("dash-01") is TaskState.RETIRED
+    assert reloaded.get("dash-01").superseded_by == ()
+    assert "stale, not replaced" in capsys.readouterr().out
+
+
+def test_retire_command_refuses_completed_work_and_a_bad_successor(wired, capsys):
+    store = _seed(wired, _task("t-1"), _task("t-2"))
+    registry = store.load()
+    registry.mark_completed("t-1")
+    store.save(registry)
+
+    assert cli._cmd_retire_task(_retire_args("t-1", superseded_by=["t-2"])) == 1
+    assert "already completed" in capsys.readouterr().out
+
+    # Rejected before anything is written — `retire` validates the successor
+    # shape ahead of the single assignment, like every other mutator here.
+    assert cli._cmd_retire_task(_retire_args("t-2", superseded_by=["not an id"])) == 1
+    assert "not a valid task id" in capsys.readouterr().out
+
+    reloaded = store.load()
+    assert reloaded.state_of("t-1") is TaskState.COMPLETED
+    assert reloaded.state_of("t-2") is TaskState.READY, "a refused retirement writes nothing"
+
+
+def test_retiring_a_quarantined_task_closes_its_blocker(wired, capsys):
+    """The split brain: a retirement lives in `tasks.json`, the quarantine that
+    stopped the task lives in its own record. Moving only the first leaves
+    `start`/`health`/`heartbeat` stopped on a question about work nobody is
+    going to do — a row that says "waits on nobody" beside a loop that waits."""
+    store = _seed(wired, _task("old-01"))
+    registry = store.load()
+    registry.block("old-01", "attempt count ceiling")
+    store.save(registry)
+    blockers = BlockerStore(wired.blockers_dir)
+    blocker = blockers.record(
+        task_id="old-01", kind="task_fatal", code="attempt_count_ceiling",
+        question="old-01 hit the attempt ceiling; what now?", detail="3 attempts",
+        phase="executing", now="2026-08-14T00:00:00+00:00",
+    )
+
+    assert cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"])) == 0
+
+    assert not blockers.open_blockers(), "a retired task cannot still be asking"
+    closed = blockers.load(blocker.id)
+    # Closed, never deleted, and never answered: nobody responded to this
+    # question — the work it belongs to was superseded.
+    assert closed.answer is None
+    assert "retired" in closed.archived_reason and "new-01" in closed.archived_reason
+    assert closed.question == "old-01 hit the attempt ceiling; what now?"
+    assert "closed" in capsys.readouterr().out
+
+
+def test_retiring_one_task_leaves_every_other_blocker_open(wired):
+    """The sweep is per task, and `(loop)` blockers are never in it: a login
+    expiry is a loop-level condition no task retirement answers."""
+    store = _seed(wired, _task("old-01"), _task("audit-0003"))
+    registry = store.load()
+    registry.block("old-01", "superseded")
+    registry.block("audit-0003", "failed its own validation")
+    store.save(registry)
+    blockers = BlockerStore(wired.blockers_dir)
+    for task_id, code in (("old-01", "attempt_count_ceiling"),
+                          ("audit-0003", "validation_failed"),
+                          (NO_TASK, "login_expired")):
+        blockers.record(
+            task_id=task_id, kind="task_fatal", code=code, question="q", detail="",
+            phase="executing", now="2026-08-14T00:00:00+00:00",
+        )
+
+    assert cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"])) == 0
+
+    still_open = {b.task_id for b in blockers.open_blockers()}
+    assert still_open == {"audit-0003", NO_TASK}
+
+
+def test_retiring_a_task_with_no_blocker_is_fine(wired):
+    """Most retirements are of pending work that never parked."""
+    _seed(wired, _task("old-01"))
+    assert cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"])) == 0
+    assert not BlockerStore(wired.blockers_dir).open_blockers()
+
+
+def test_a_second_retire_command_cannot_erase_the_chain(wired, capsys):
+    """`python -m autoloop retire brw-02` with no `--superseded-by`, run twice.
+    The second used to assign `()` over the recorded successor."""
+    store = _seed(wired, _task("old-01"))
+
+    assert cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"])) == 0
+    capsys.readouterr()
+    assert cli._cmd_retire_task(_retire_args("old-01")) == 0
+
+    assert store.load().get("old-01").superseded_by == ("new-01",)
+    out = capsys.readouterr().out
+    assert "already retired" in out and "nothing changed" in out
+
+
+def test_a_retire_command_that_would_rewrite_the_record_is_refused(wired, capsys):
+    store = _seed(wired, _task("old-01"))
+    assert cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"],
+                                             reason="superseded by new-01")) == 0
+    capsys.readouterr()
+
+    assert cli._cmd_retire_task(_retire_args("old-01", superseded_by=["other-01"])) == 1
+    assert "already retired" in capsys.readouterr().out
+    assert cli._cmd_retire_task(_retire_args("old-01", reason="actually it just failed")) == 1
+
+    task = store.load().get("old-01")
+    assert task.superseded_by == ("new-01",)
+    assert task.blocked_reason == "superseded by new-01"
 
 
 # --- CLI: archive-blocker -----------------------------------------------------
