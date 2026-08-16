@@ -921,12 +921,40 @@ about the scroll position.
 **Fix:** applied repo-side for the by-content search only.
 `BrowserChatGPT.find_conversation_with` now mounts the tail before concluding:
 it repeats a "go to the end" gesture (`scroll_to_end` when the session offers
-it, otherwise the End key) and treats absence as established only once the
-mounted message count demonstrably stops growing. Running out of scrolls while
-it is still growing raises `ConversationSearchInconclusive` instead of
-answering. The same read also confirms the page is the conversation it asked
+it, otherwise the End key) and treats absence as established only when **two
+independent things hold** — the session reports the list is AT ITS END, and the
+mounted window then stays byte-identical across consecutive reads. Either alone
+is a false-absence generator:
+
+* *Count stopped growing* proves nothing at all. A virtualizer may slide a
+  constant-size window, mounting newer nodes as it drops older ones, so the
+  count reads 6 before and after while six different messages go past. (This
+  was the first version of this fix, and it reproduced the very park it was
+  written for.)
+* *Window stopped changing* is ambiguous. It says the GESTURE stopped mounting
+  — which is the tail when the gesture works, and the OPENING window when it
+  silently missed. End goes to whatever holds focus, so a misfocused gesture on
+  a short or initially stable list gives two identical reads and a confident
+  wrong "absent".
+* *At the end of the list* is ambiguous too: ChatGPT follows a streaming answer
+  down, so the view sits at the bottom while the content underneath it is still
+  arriving.
+
+`scroll_to_end` therefore RETURNS a position — True (the scroll container is at
+its end; a chat too short to scroll counts), False (more below), None (cannot
+measure). `PlaywrightSession` computes it from the actual container by walking
+out from the last mounted node. An adapter that answers None — the End-key
+fallback included — keeps every SIGHTING it makes and simply cannot establish
+absence; it raises `ConversationSearchInconclusive` instead. So does running out
+of scrolls. The same read also confirms the page is the conversation it asked
 for — a rotation mid-flight moves the shared page, and a confident answer about
 a different chat is wrong in both directions.
+**Reading the refusal:** the note names each chat with the gestures spent and
+why it was not concluded — `still changing at the end of the list` is a long or
+streaming conversation (retry), `never reached its end` is a gesture that is not
+driving the scroller (a selector or focus problem), and `cannot report a scroll
+position` is a session without the signal at all (expected for the End-key
+fallback; on a real `PlaywrightSession` it means the measurement kept failing).
 **Still open elsewhere:** every OTHER readback (`reconcile`, `has_request`,
 `Orchestrator._part_present`) reads what is mounted. That is usually fine —
 they check the newest turn — but do not infer "the conversation contains only

@@ -69,11 +69,23 @@ class ConversationUnusableError(BrowserError):
 class ConversationSearchInconclusive(BrowserError):
     """A by-content conversation search could not rule EITHER way.
 
-    Raised by `BrowserChatGPT.find_conversation_with` when the page it read is
-    not the page it asked for, or when the virtualized message list was still
-    CHANGING under the mount gesture when its bound ran out. Both mean the same
-    thing: what was read is not evidence about the conversation that was asked
-    about, so "found here" and "not in this project" are equally unsupported.
+    Raised by `BrowserChatGPT.find_conversation_with` for four faults, which
+    all mean the same thing — what was read is not evidence about the
+    conversation that was asked about, so "found here" and "not in this
+    project" are equally unsupported:
+
+    * the page it read is not the page it asked for (a rotation mid-flight
+      moves the shared page);
+    * the virtualized message list was still CHANGING at the end of the list
+      when the mount bound ran out (a long or streaming conversation);
+    * the mount never reached the END of that list (a gesture that is not
+      driving the scroller);
+    * the session cannot report a scroll position at all, so an unchanged
+      window proves only that the gesture stopped mounting — the tail when the
+      gesture works, the opening window when it silently missed.
+
+    Only ABSENCE needs all of that. A SIGHTING is direct evidence and is
+    returned by any session, position signal or not.
 
     Deliberately NOT a `ConversationUnusableError` — that one authorizes
     spending the run's single rotation, and an inconclusive read says nothing

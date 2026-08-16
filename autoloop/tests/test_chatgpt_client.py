@@ -1024,8 +1024,9 @@ class FakeProjectSession:
         #: Appended to every URL the page lands on, as ChatGPT appends
         #: `?model=…` of its own accord.
         self.url_suffix = url_suffix
-        #: A conversation that keeps producing messages, so the mounted set
-        #: never stops growing and absence is never established.
+        #: A conversation that keeps producing messages, so the end of the list
+        #: moves away as fast as the gesture reaches it and absence is never
+        #: established.
         self.growing = growing
         self.current_url = PROJECT_URL
         self.present = {SEL.composer}
@@ -1163,6 +1164,15 @@ class FakeProjectSession:
         """What one "go to the end" gesture mounts."""
         self.mounted += self.step
 
+    def _at_list_end(self):
+        """Is the view at the END of the list — the position a real
+        `scroll_to_end` reads off the scroll container?
+
+        Honest about this fake's own geometry rather than about whether a
+        gesture happened: the whole point of the signal is that it comes from
+        the container, not from the gesture claiming success."""
+        return self.mounted >= len(self._history())
+
     def _paint_all(self):
         """Every message at once, for a chat we did not scroll ourselves."""
         self.mounted = 10_000
@@ -1179,15 +1189,18 @@ class FakeProjectSession:
         ):
             self.current_url = self.drift_to
             self._paint_all()  # the chat we drifted onto is fully painted
+        return self._at_list_end()
 
 
 class FakeScrollingSession(FakeProjectSession):
     """The same page, with the optional `scroll_to_end` capability a real
-    `PlaywrightSession` provides."""
+    `PlaywrightSession` provides — gesture AND position, because reporting
+    where the view got to is the half that lets absence be established at
+    all."""
 
     def scroll_to_end(self, selector):
         assert selector == SEL.message  # the list being mounted, not the composer
-        self._paint_more()
+        return self._paint_more()
 
 
 class FakeSlidingWindowSession(FakeScrollingSession):
@@ -1216,9 +1229,19 @@ class FakeSlidingWindowSession(FakeScrollingSession):
     def _window(self, history):
         # Clamped at the end: a gesture cannot scroll past the last message,
         # so the window comes to rest on the tail rather than off it.
-        start = max(0, min(self.offset, len(history) - self.window))
+        start = self._start(history)
         end = start + self.window
         return history[start:end]
+
+    def _start(self, history):
+        return max(0, min(self.offset, len(history) - self.window))
+
+    def _at_list_end(self):
+        # The container is at its end once the mounted window reaches the last
+        # message — the node count is the same 6 either way, which is exactly
+        # why the count is not the signal.
+        history = self._history()
+        return self._start(history) + self.window >= len(history)
 
     def _advance(self):
         self.offset += self.step
@@ -1226,6 +1249,28 @@ class FakeSlidingWindowSession(FakeScrollingSession):
     def _paint_all(self):
         self.window = 10_000
         self.offset = 0
+
+
+class FakeStuckGestureSession(FakeScrollingSession):
+    """A gesture that MOUNTS NOTHING, honestly reported.
+
+    The real shape of this is an End press that went to whatever held focus
+    instead of the scroller, or a scroll container the gesture never found. The
+    view does not move, so the mounted window is byte-identical read after
+    read — indistinguishable, from content alone, from a list that has finished
+    painting. `position` is what the session says about where it got to:
+    False (there is more below) or None (it cannot tell). Neither is a licence
+    to call anything absent.
+    """
+
+    def __init__(self, *args, position=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.position = position
+
+    def scroll_to_end(self, selector):
+        assert selector == SEL.message
+        self.scrolls += 1
+        return self.position
 
 
 def test_a_request_in_the_already_mounted_window_is_found(tmp_path):
@@ -1312,6 +1357,51 @@ def test_a_sliding_window_that_comes_to_rest_still_reports_absent(tmp_path):
     assert client.find_conversation_with(RID, PROJECT_URL) is None
     assert session.scrolls > 0
     assert set(session.window_sizes) == {6}
+
+
+def test_a_gesture_that_mounts_nothing_never_settles_into_a_false_absence(tmp_path):
+    """An unchanged window is not a proof on its own, and this is the shape
+    that shows it: the gesture never moves the view, so the SAME opening window
+    comes back read after read while the request sits eleven messages below it.
+
+    Judged on content alone, that is a settled list — two byte-identical reads,
+    conclude absent, park a request that was delivered and answered. The
+    session reporting it is NOT at the end of the list is the only thing that
+    separates "fully mounted" from "the gesture did nothing"."""
+    session = FakeStuckGestureSession({CHAT_ONE: _chat_holding(RID)}, position=False)
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "never reached its end" in str(excinfo.value)
+    # It really did keep trying — the refusal is about evidence, not effort.
+    assert session.scrolls == 4
+
+
+def test_a_gesture_that_reports_no_position_never_settles_either(tmp_path):
+    """The same fault through the other adapter failure: a session that cannot
+    measure where it got to. `None` is not a quiet `True` — an adapter written
+    before the signal existed, or one whose measurement failed, keeps every
+    sighting it makes and loses only the ability to rule things OUT."""
+    session = FakeStuckGestureSession({CHAT_ONE: _chat_holding(RID)}, position=None)
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "cannot report a scroll position" in str(excinfo.value)
+
+
+def test_a_stuck_gesture_still_reports_a_request_it_can_already_see(tmp_path):
+    """Refusing to conclude ABSENCE must not cost a sighting. The window that
+    never moves is enough when the request is in it — a positive is direct
+    evidence about the conversation and needs no statement about the scroll
+    position at all."""
+    session = FakeStuckGestureSession(
+        {CHAT_ONE: [("user", f"[autoloop request {RID}]")]}, position=None
+    )
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
 
 
 def test_the_chat_list_is_read_from_the_href_not_the_title(tmp_path):
@@ -1437,10 +1527,40 @@ def test_a_list_still_painting_when_the_bound_runs_out_does_not_report_absent(tm
     with pytest.raises(ConversationSearchInconclusive) as excinfo:
         client.find_conversation_with(RID, PROJECT_URL)
     assert "unseen and absent are not the same thing" in str(excinfo.value)
-    # The gestures actually spent separate the two ways to be unsettled: the
-    # whole bound spent still changing (this chat) versus a gesture that failed
-    # early. An operator reading the park needs to know which.
+    # The gestures spent and the reason separate the ways to be unsettled, and
+    # they call for different responses: this list keeps growing under the
+    # gesture, so its end moves away as fast as the view reaches it — not the
+    # same fault as a gesture that never moved, or a session that cannot
+    # measure. An operator reading the park needs to know which.
     assert "(4 gestures)" in str(excinfo.value)
+    assert "never reached its end" in str(excinfo.value)
+
+
+class FakeStreamingTailSession(FakeScrollingSession):
+    """A chat pinned to the BOTTOM while it is still generating: the view is
+    genuinely at the end of the list (ChatGPT follows the answer down) and the
+    window changes on every read as tokens land."""
+
+    def scroll_to_end(self, selector):
+        assert selector == SEL.message
+        self.scrolls += 1
+        self._history().append(("assistant", f"token {self.scrolls}"))
+        self._paint_all()
+        return True
+
+
+def test_a_chat_still_streaming_at_the_end_of_the_list_does_not_report_absent(tmp_path):
+    """Being at the end is not the same as having finished painting it, which
+    is why both proofs are required. A streaming answer keeps the view at the
+    bottom while the content underneath it changes every read — so the end
+    signal alone would settle a list that is still arriving, and conclude
+    absence from a window the next token could have completed."""
+    session = FakeStreamingTailSession({CHAT_ONE: _turns(2)})
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "still changing at the end of the list" in str(excinfo.value)
 
 
 def test_a_session_without_the_scroll_capability_presses_end(tmp_path):
@@ -1453,6 +1573,25 @@ def test_a_session_without_the_scroll_capability_presses_end(tmp_path):
 
     assert client.find_conversation_with(RID, PROJECT_URL) == CHAT_ONE
     assert session.keys.count("End") >= 6
+
+
+def test_a_session_that_cannot_report_a_position_never_reports_absent(tmp_path):
+    """The negative twin of the fallback, and the cost that makes the fallback
+    honest. The End key presses and paints, but nothing about it says whether
+    the view reached the end of the list — and on a real page End goes to
+    whatever holds focus, so a gesture that painted nothing looks exactly like
+    one that reached the tail.
+
+    So a keyboard-only session keeps its sightings and gives up ABSENCE. The
+    request here is in none of these chats, and the honest answer is still "I
+    cannot tell", because this adapter cannot tell."""
+    session = FakeProjectSession({CHAT_ONE: _turns(4), CHAT_TWO: _turns(4)})
+    assert not hasattr(session, "scroll_to_end")
+    client = make_client(session, FakeClock(), tmp_path, tail_mount_attempts=4)
+
+    with pytest.raises(ConversationSearchInconclusive) as excinfo:
+        client.find_conversation_with(RID, PROJECT_URL)
+    assert "cannot report a scroll position" in str(excinfo.value)
 
 
 def test_a_logged_out_profile_is_routed_not_demoted_to_inconclusive(tmp_path):

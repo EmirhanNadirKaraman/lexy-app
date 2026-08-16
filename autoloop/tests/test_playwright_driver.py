@@ -576,13 +576,19 @@ def test_an_operation_raising_an_autoloop_error_passes_through(fake_playwright):
 
 
 class _FakeLocator:
-    """Enough of a Playwright locator for the tail-mount gesture: a node count
-    and a `scroll_into_view_if_needed` that fails the way a test asks it to."""
+    """Enough of a Playwright locator for the tail-mount gesture: a node count,
+    a `scroll_into_view_if_needed` that fails the way a test asks it to, and an
+    `evaluate` standing in for the scroll container's own arithmetic —
+    `remaining` is how many pixels lie below the viewport, which is what
+    decides whether the gesture may claim the list's end."""
 
-    def __init__(self, count, fault=None):
+    def __init__(self, count, fault=None, remaining=0, evaluate_fault=None):
         self._count = count
         self._fault = fault
+        self._remaining = remaining
+        self._evaluate_fault = evaluate_fault
         self.scrolls = 0
+        self.evaluations = 0
 
     def count(self):
         return self._count
@@ -594,6 +600,12 @@ class _FakeLocator:
         self.scrolls += 1
         if self._fault is not None:
             raise self._fault
+
+    def evaluate(self, expression):
+        self.evaluations += 1
+        if self._evaluate_fault is not None:
+            raise self._evaluate_fault
+        return self._remaining
 
 
 class _FakeKeyboard:
@@ -611,9 +623,9 @@ class _FakeKeyboard:
 _FakeTimeoutError = type("TimeoutError", (Exception,), {})
 
 
-def _scrolling_session(fault):
+def _scrolling_session(fault=None, **locator_kwargs):
     session = ps.PlaywrightSession.connect("http://127.0.0.1:9222")
-    locator = _FakeLocator(3, fault)
+    locator = _FakeLocator(3, fault, **locator_kwargs)
     keyboard = _FakeKeyboard()
     session._page.locator = lambda selector: locator
     session._page.keyboard = keyboard
@@ -673,15 +685,85 @@ def test_a_detached_node_message_is_forgiven_too(fake_playwright):
 
 def test_an_empty_list_still_presses_end(fake_playwright):
     """Nothing mounted yet is the normal state of a freshly loaded chat, not a
-    failure — there is no last node to scroll to, and End is what paints one."""
+    failure — there is no last node to scroll to, and End is what paints one.
+    There is also nothing to measure, so it claims no position."""
     session = ps.PlaywrightSession.connect("http://127.0.0.1:9222")
     keyboard = _FakeKeyboard()
     session._page.locator = lambda selector: _FakeLocator(0)
     session._page.keyboard = keyboard
 
-    session.scroll_to_end("main div")
+    assert session.scroll_to_end("main div") is None
 
     assert keyboard.pressed == ["End"]
+
+
+# ---- the gesture reports WHERE it got to ------------------------------------
+#
+# The caller cannot tell "the list is fully mounted" from "the gesture went to
+# the wrong element" by watching the window it paints: both leave it unchanged.
+# The scroll container can tell, and this is the only place that reads it. A
+# `None` here costs the caller the ability to conclude ABSENCE, so the one
+# thing this must never do is report a position it did not measure.
+
+
+def test_a_container_scrolled_to_its_bottom_reports_the_end_of_the_list(fake_playwright):
+    """Nothing below the viewport — the gesture arrived, and an unchanged window
+    after this is evidence about the conversation."""
+    session, locator, _keyboard = _scrolling_session(remaining=0)
+
+    assert session.scroll_to_end("main div") is True
+    assert locator.evaluations == 1
+
+
+def test_a_container_with_more_below_reports_it_is_not_at_the_end(fake_playwright):
+    """The gesture ran and the list did not get there. Reported honestly, this
+    is what stops a stuck gesture from settling into a false absence."""
+    session, _locator, _keyboard = _scrolling_session(remaining=1800)
+
+    assert session.scroll_to_end("main div") is False
+
+
+def test_a_hair_short_of_the_bottom_still_counts_as_the_end(fake_playwright):
+    """Fractional device-pixel ratios and sub-pixel layout leave a container a
+    little short of its own maximum even when the browser considers it fully
+    scrolled. An exact comparison would report "more to paint" forever and turn
+    every absence into a refusal."""
+    session, _locator, _keyboard = _scrolling_session(remaining=0.5)
+
+    assert session.scroll_to_end("main div") is True
+
+
+def test_a_measurement_that_fails_locally_reports_no_position(fake_playwright):
+    """Measuring is the same element-local risk as scrolling to the node, and
+    fails the same ways. Unmeasured must arrive as unmeasured: reported as
+    `True` it would license exactly the confident absence this signal exists to
+    prevent."""
+    session, _locator, keyboard = _scrolling_session(
+        evaluate_fault=FakeError("Element is not attached to the DOM")
+    )
+
+    assert session.scroll_to_end("main div") is None
+    assert keyboard.pressed == ["End"]  # the gesture itself still ran
+
+
+def test_a_dead_driver_channel_during_the_measurement_is_not_swallowed(fake_playwright):
+    """Same contract as the scroll half: a lost browser is a lost browser, not
+    "the position is unknown". Demoted to None it would look like an adapter
+    without the capability, and the search would park instead of restarting."""
+    session, _locator, _keyboard = _scrolling_session(
+        evaluate_fault=Exception(DRIVER_DEAD)
+    )
+
+    with pytest.raises(SessionLostError, match="Connection closed"):
+        session.scroll_to_end("main div")
+
+
+def test_a_measurement_that_is_not_a_number_reports_no_position(fake_playwright):
+    """The JS returns `null` when it cannot find anything to measure. Truthiness
+    is not the test — anything that is not a distance is no evidence."""
+    session, _locator, _keyboard = _scrolling_session(remaining=None)
+
+    assert session.scroll_to_end("main div") is None
 
 
 def test_a_listener_that_cannot_attach_never_ends_the_process(fake_playwright):

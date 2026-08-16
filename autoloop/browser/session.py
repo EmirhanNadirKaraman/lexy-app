@@ -20,12 +20,24 @@ adapter stay valid without implementing either:
 
 * `start_send_observation` / `take_send_observations` — a passive network
   listener over the send request. See `observation.py`.
-* `scroll_to_end(selector)` — scroll the LAST match of `selector` into view, to
-  paint more of a virtualized list. ChatGPT renders a window of a conversation
-  rather than its history, so a readback that concludes "absent" from what is
-  currently painted is reporting the scroll position (see
-  `BrowserChatGPT._mount_message_tail`). Without the capability the client
-  falls back to pressing the End key.
+* `scroll_to_end(selector) -> bool | None` — scroll the LAST match of
+  `selector` into view, to paint more of a virtualized list, and report the
+  position it reached. ChatGPT renders a window of a conversation rather than
+  its history, so a readback that concludes "absent" from what is currently
+  painted is reporting the scroll position (see
+  `BrowserChatGPT._mount_message_tail`).
+
+  Return **True** when the list's own scroll container is demonstrably at its
+  end after the gesture (a list short enough that nothing scrolls counts: all
+  of it is in view), **False** when there is more below, and **None** when the
+  position cannot be measured. An adapter that returns None — including one
+  written before this capability reported anything, and the End-key fallback
+  the client uses when the capability is absent entirely — is not penalised for
+  a SIGHTING, but it can never establish ABSENCE: an unchanged window means
+  "the gesture stopped mounting", which is the tail when the gesture works and
+  the opening window when it silently missed (End goes to whatever holds
+  focus). Without a position signal those two are the same observation, and the
+  client answers `ConversationSearchInconclusive` rather than picking one.
 """
 
 from __future__ import annotations
