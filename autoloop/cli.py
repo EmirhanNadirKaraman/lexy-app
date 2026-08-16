@@ -275,6 +275,12 @@ def _load_validation_env(config: AutoloopConfig, repo_root: Path):
         repo_root=repo_root,
         state_dir=config.state_dir,
         workers_root=config.workers_root,
+        # Where the TARGET repository declares its application database. Passed
+        # here AND in `doctor.py`, never defaulted in one of the two: doctor
+        # exists to report exactly what a real run enforces, so a divergence
+        # would let it come back clean on a config this refuses.
+        env_example_file=config.repo.env_example_file,
+        env_example_db_key=config.repo.env_example_db_key,
     )
 
 

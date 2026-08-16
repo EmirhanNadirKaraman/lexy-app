@@ -1659,23 +1659,42 @@ its path scope. rt-01 hit exactly that twice: after the first refusal the scope
 was widened by four paths, and the next attempt was refused again for
 `docs/SUMMARY.md`. Enumerating obligations by hand per task does not converge.
 
-`tasks.TRACKER_PATHS` is therefore implicitly approved for every scoped task,
-combined in exactly one place (`effective_approved_paths`) so the dispatch-time
-seed, the every-dispatch re-sync, the PRE-commit gate and the POST-commit
-path-ownership check cannot disagree. That last one is not hypothetical: the
-first version of this change patched three of the four sites, and the
-pre-commit gate then refused a tracker edit the post-commit check would have
-allowed.
+The repository's tracker list is therefore implicitly approved for every scoped
+task, combined in exactly one place (`effective_approved_paths`) so the
+dispatch-time seed, the every-dispatch re-sync, the PRE-commit gate and the
+POST-commit path-ownership check cannot disagree. That last one is not
+hypothetical: the first version of this change patched three of the four sites,
+and the pre-commit gate then refused a tracker edit the post-commit check would
+have allowed.
 
-Bounded on purpose:
+**Where the list comes from (changed 2026-08-16).** It is `[repo].tracker_paths`
+in the loop's config, defaulting to `tasks.TRACKER_PATHS` — this repository's own
+six. `Orchestrator._tracker_paths()` is the single accessor every call site reads
+it through, because a seed and a re-sync reading different lists would rewrite the
+execution record on every dispatch, forever.
 
-* **Fixed constant, not configurable.** Widening every task's scope must be a
-  reviewed diff, never a TOML edit.
-* **Markdown trackers only** — no code, no config, no test file, nothing
-  executable.
+This bullet used to read "**Fixed constant, not configurable.** Widening every
+task's scope must be a reviewed diff, never a TOML edit", and that bound is
+genuinely gone: `.autoloop/config.toml` lives under the gitignored state dir, so
+an edit to it is *not* a reviewed diff. It was given up because the list encodes
+this repository's documentation obligations *by filename*, which makes the loop
+unusable against any other repository — the obligations are real everywhere, the
+names are not. See `docs/SECURITY.md` S31 for the finding record.
+
+Still bounded, and now by a load-time refusal rather than by convention:
+
+* **Documentation only, enforced.** `tasks.validate_tracker_paths` runs each
+  entry through the same validator a task's own `approved_paths` get, then
+  refuses a directory prefix (a tracker is granted to *every* task, so it must
+  name one exact file) and every code/config extension (`.py`, `.sh`, `.toml`,
+  `.json`, `.yml`, …). It is a blocklist by necessity: documentation extensions
+  are open-ended across repositories, while the things that must never be
+  implicitly writable are a short nameable set. A bad list refuses the whole
+  config at startup, by key name, rather than at the first dispatch.
 * **An unscoped task stays unscoped.** Empty `approved_paths` still means "no
   scope authorized yet" and still refuses dispatch (`docs/SECURITY.md` finding
-  #2); it does not become a task that may write documentation.
+  #2); it does not become a task that may write documentation. That holds for
+  any tracker list, including an empty one.
 * **Visibility is unchanged.** Tracker edits still appear in
   `commit_range_paths` and in the review packet — this removes a refusal, not
   the reviewer's sight of it.
@@ -1683,7 +1702,7 @@ Bounded on purpose:
 Residual risk, stated rather than hidden: `docs/SECURITY.md` is the security
 tracker, so an agent can now edit the record of a finding without that being
 named in its task. It is documentation, not a control — but a weakened finding
-misleads a later reader, and it is why this list stays four entries long.
+misleads a later reader, and it is why this list stays short.
 
 ## 4f-ter. Operator task inbox and priorities
 
@@ -2052,9 +2071,12 @@ built from one that already works. What actually worked, in order:
    chosen to satisfy specific guards: a lemma with two surface forms in one
    video, a word whose lemma differs from its surface, a non-ASCII surface,
    and a `word_id` that collides with a real `phrase_id`. It refuses to run
-   against the database name `.env.example` declares, reusing
-   `validation_env.repo_declared_db_name`. `--verify` re-checks every guard
-   without writing.
+   against the database name the repository declares, reusing
+   `validation_env.repo_declared_db_name` — which since 2026-08-16 reads its
+   file and key from `[repo].env_example_file` / `env_example_db_key`,
+   defaulting to this repo's `.env.example` / `DB_NAME` (the script itself
+   calls it with those defaults). `--verify` re-checks every guard without
+   writing.
 
 Result: **1259 passed, 1 skipped, 0 failed** — against a documented baseline of
 1258 passed / 2 skipped, so one MORE test runs than on the dev database.

@@ -194,17 +194,42 @@ def redact_with(env: "ValidationEnv | None", text: str) -> str:
 # ---- the repository's own production marker ---------------------------------
 
 
-def repo_declared_db_name(repo_root: Path) -> str:
+#: Where THIS repository declares its application database, and the default
+#: for every caller below. The canonical spelling lives in
+#: `config.DEFAULT_ENV_EXAMPLE_FILE` / `DEFAULT_ENV_EXAMPLE_DB_KEY` and is
+#: repeated here rather than imported: `config` imports `tasks`, and this
+#: module is imported by `cli`/`doctor` alongside `config`, so a back-import
+#: would tie the credential boundary to the config loader for two string
+#: constants. `test_config_repo_section.py` pins the two spellings equal.
+DEFAULT_ENV_EXAMPLE_FILE = ".env.example"
+DEFAULT_ENV_EXAMPLE_DB_KEY = "DB_NAME"
+
+
+def repo_declared_db_name(
+    repo_root: Path,
+    example_file: str = DEFAULT_ENV_EXAMPLE_FILE,
+    db_key: str = DEFAULT_ENV_EXAMPLE_DB_KEY,
+) -> str:
     """The database name this repository declares as its application database,
-    read from the git-tracked `.env.example`, or `""` if it cannot be
+    read from the git-tracked example env file, or `""` if it cannot be
     determined.
 
-    This is the ONE production marker the repository actually defines. It is
-    an exact string the repo ships (`DB_NAME=german_vocabulary`, echoed by
-    `postprocessing/db_config.py`'s fallback and `postprocessing/README.md`),
-    not a pattern — there is deliberately no "contains prod / ends with _prod"
-    heuristic here, because such a rule refuses correct setups and passes
-    dangerous ones with equal confidence.
+    This is the ONE production marker a repository actually defines. It is an
+    exact string the repo ships (here: `DB_NAME=german_vocabulary` in
+    `.env.example`, echoed by `postprocessing/db_config.py`'s fallback and
+    `postprocessing/README.md`), not a pattern — there is deliberately no
+    "contains prod / ends with _prod" heuristic here, because such a rule
+    refuses correct setups and passes dangerous ones with equal confidence.
+
+    `example_file` and `db_key` are `[repo].env_example_file` /
+    `env_example_db_key`, defaulted to this repository's spelling so every
+    caller written before the setting existed keeps its exact behaviour. They
+    are WHERE to look, never WHAT to refuse: the value is still read out of the
+    repository, so a target repo cannot be handed a forbidden name it does not
+    actually declare. An empty `example_file` means "this repository declares
+    no such name" and returns `""` — the same answer as a missing file, and
+    with the same consequence (no refusal), which is why it is honest rather
+    than a silent disable.
 
     Two limits, written down so nobody "improves" this later:
 
@@ -216,7 +241,9 @@ def repo_declared_db_name(repo_root: Path) -> str:
         `localhost`, which is exactly where a legitimate dedicated test
         database lives — refusing it would refuse the intended configuration.
     """
-    example = Path(repo_root) / ".env.example"
+    if not example_file or not example_file.strip() or not db_key.strip():
+        return ""
+    example = Path(repo_root) / example_file
     try:
         text = example.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -226,7 +253,7 @@ def repo_declared_db_name(repo_root: Path) -> str:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        if key.strip() == "DB_NAME":
+        if key.strip() == db_key.strip():
             return value.strip().strip("\"'")
     return ""
 
@@ -393,6 +420,8 @@ def load_validation_env(
     state_dir: Path,
     workers_root: Path | None = None,
     forbidden_db_names: Iterable[str] = (),
+    env_example_file: str = DEFAULT_ENV_EXAMPLE_FILE,
+    env_example_db_key: str = DEFAULT_ENV_EXAMPLE_DB_KEY,
 ) -> ValidationEnv:
     """Load and validate the file at `path`. Raises `ConfigError` on any
     violation; the message never contains a value.
@@ -400,6 +429,10 @@ def load_validation_env(
     `forbidden_db_names` defaults to the repository's own declared database
     name (`repo_declared_db_name`) when left empty — see that function for
     exactly what that marker is and, more importantly, what it is not.
+    `env_example_file` / `env_example_db_key` are where that name is read from
+    (`[repo].env_example_file` / `env_example_db_key`), defaulted to this
+    repository's spelling. They are consulted ONLY on the default path: an
+    explicit `forbidden_db_names` still wins outright, exactly as before.
     """
     violations = validate_validation_env_path(path, repo_root, state_dir, workers_root)
     if violations:
@@ -410,13 +443,14 @@ def load_validation_env(
 
     forbidden = {n.strip().lower() for n in forbidden_db_names if n and n.strip()}
     if not forbidden:
-        declared = repo_declared_db_name(repo_root)
+        declared = repo_declared_db_name(repo_root, env_example_file, env_example_db_key)
         if declared:
             forbidden = {declared.lower()}
     if values["DB_NAME"].strip().lower() in forbidden:
         raise ConfigError(
             f"{resolved}: DB_NAME is the database name this repository declares "
-            "in .env.example as its application database. Validation runs the "
+            f"in {env_example_file or 'its example env file'} as its application "
+            "database. Validation runs the "
             "real backend suite, which creates and deletes rows — point it at a "
             "dedicated throwaway database instead. (This check refuses one exact "
             "known name; it cannot tell a test database from a production one in "

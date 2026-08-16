@@ -3075,6 +3075,19 @@ class Orchestrator:
     # stable per-run id, so `task` below is never `None` — there is exactly
     # ONE produce-then-review commit path, audit included.
 
+    def _tracker_paths(self) -> tuple[str, ...]:
+        """The target repository's implicitly-approved documentation trackers
+        (`config.RepoConfig.tracker_paths`, defaulting to `tasks.TRACKER_PATHS`
+        — this repository's own list).
+
+        Read through ONE accessor so every `effective_approved_paths` call in
+        this file passes the same list. The dispatch-time seed and the
+        every-dispatch re-sync below COMPARE against it and ASSIGN from it: if
+        those two ever read different values, the execution record reads dirty
+        on every dispatch and is rewritten forever.
+        """
+        return self._config.repo.tracker_paths
+
     def _dispatch_task_postcommit(self, directive: Directive, task: Task, state: LoopState) -> None:
         if (self._worktrees is None and self._worker_repos is None) or (
             self._execution_store is None or self._intent_store is None
@@ -3166,7 +3179,9 @@ class Orchestrator:
             # accumulate-from-`changed_paths` behaviour, unchanged.
             base_sha = self._git.head_sha()
             allowed_paths = (
-                () if is_audit else effective_approved_paths(task.approved_paths)
+                ()
+                if is_audit
+                else effective_approved_paths(task.approved_paths, self._tracker_paths())
             )
             if self._worker_repos is not None:
                 repo = self._worker_repos.create(task.id, self._git.repo_root, base_sha)
@@ -3187,11 +3202,15 @@ class Orchestrator:
             self._execution_store.save(execution)
         elif not is_audit:
             dirty = False
-            if execution.allowed_paths != effective_approved_paths(task.approved_paths):
+            # Computed ONCE and both compared against and assigned from, so the
+            # two can never read a different tracker list (see
+            # `_tracker_paths`).
+            resynced = effective_approved_paths(task.approved_paths, self._tracker_paths())
+            if execution.allowed_paths != resynced:
                 # Re-synced every dispatch: `task.approved_paths` is the single
                 # source of truth for a real task's authorization, and is never
                 # derived from `execution` state, only ever written INTO it.
-                execution.allowed_paths = effective_approved_paths(task.approved_paths)
+                execution.allowed_paths = resynced
                 dirty = True
             if not execution.validation_commands and declared_validation:
                 # Backfill ONLY — an unbound record adopts the Task's value
@@ -3437,7 +3456,8 @@ class Orchestrator:
             # (`_execute_with_escape_detection`), which is about confinement,
             # not scope.
             outside = unauthorized_paths(
-                outcome.changed_paths, effective_approved_paths(task.approved_paths)
+                outcome.changed_paths,
+                effective_approved_paths(task.approved_paths, self._tracker_paths()),
             )
             if outside:
                 # Union, not replace — see `TaskExecution.out_of_scope_paths`.

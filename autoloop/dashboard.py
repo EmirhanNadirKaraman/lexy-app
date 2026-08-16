@@ -100,6 +100,30 @@ MARKS = {
 
 _DOMAIN = re.compile(r"Your domain:\s*(.+?)\.")
 
+#: This repository's own audit-report location, and the fallback whenever
+#: `[repo].audit_report_glob` cannot be read (no config yet, unparseable TOML,
+#: a value this module refuses). Spelled here rather than imported from
+#: `config`: `load_config` is strict and would raise on a checkout with no
+#: `browser.conversation_url`, and this page must render against any checkout —
+#: the same reason `_inbox_dir` below reads the TOML directly. The two
+#: spellings are pinned equal by `test_config_repo_section.py`.
+DEFAULT_AUDIT_REPORT_GLOB = "docs/AUDIT_*.md"
+
+
+def _is_safe_glob(pattern: str) -> bool:
+    """Is `pattern` a plain repository-relative glob?
+
+    `load_config` refuses an unsafe one at startup, but this module reads the
+    raw TOML (see `DEFAULT_AUDIT_REPORT_GLOB`), so it never gets that check —
+    and `Path.glob` raises outright on an absolute pattern, which would 500 the
+    page rather than degrade it. Traversal is refused for the obvious reason: a
+    read-only tracker has no business rendering files from outside the checkout
+    it was pointed at.
+    """
+    if pattern.startswith(("/", "~")) or "\\" in pattern:
+        return False
+    return not any(seg in ("", ".", "..") for seg in pattern.split("/"))
+
 #: This module's content hash, frozen at IMPORT. `PAGE` is a module-level
 #: string, so a process started before an edit serves the old HTML for as long
 #: as it lives — a stale tracker is indistinguishable from a missing feature,
@@ -218,14 +242,26 @@ _SEVERITY = re.compile(r"severity\s+\*{0,2}(critical|high|medium|low)\*{0,2}", r
 _RT_ROW = re.compile(r"^\|\s*\*{0,2}(rt-\d+|hb-\d+)\*{0,2}\s*\|\s*\*{0,2}(P\d)\*{0,2}\s*\|\s*(.+?)\s*\|", re.M)
 
 
-def app_tasks(repo: Path, limit: int = 40) -> list[dict]:
-    """The language-app backlog, read from the newest committed audit report.
+def app_tasks(repo: Path, limit: int = 40,
+              report_glob: str = DEFAULT_AUDIT_REPORT_GLOB) -> list[dict]:
+    """The application backlog, read from the newest committed audit report.
 
     The loop's own registry holds only what has been seeded; the audit report is
     where the proposed work actually lives, so a tracker that showed the
     registry alone would claim there is one task when there are fifteen.
+
+    `report_glob` is `[repo].audit_report_glob` — where THIS target repository
+    files those reports — defaulted to this one's `docs/AUDIT_*.md` so a caller
+    that does not pass it behaves exactly as before the setting existed. Newest
+    is newest BY NAME (`reverse=True` on the sorted paths), which works because
+    the reports are date-stamped; that is a property of the naming convention,
+    not of the glob, so a repository whose reports are not date-sortable gets
+    the last one alphabetically rather than a wrong-but-confident "newest".
     """
-    reports = sorted((repo / "docs").glob("AUDIT_*.md"), reverse=True)
+    report_glob = (report_glob or "").strip()
+    if not report_glob or not _is_safe_glob(report_glob):
+        return []
+    reports = sorted(repo.glob(report_glob), reverse=True)
     if not reports:
         return []
     try:
@@ -471,19 +507,58 @@ def worker_progress(state: dict, now: float | None = None) -> dict | None:
     return progress
 
 
-def _inbox_dir(repo: Path) -> Path:
-    """Where task requests go. Resolved through the loop's own config so the
-    dashboard and `add-task` always agree, with the documented default as the
-    fallback for a dashboard pointed at a checkout that has no config yet."""
+def _config_toml(repo: Path) -> dict:
+    """The loop's own `config.toml` as a plain dict, `{}` when it cannot be
+    read.
+
+    Read RAW rather than through `config.load_config`, which is strict and
+    raises on a checkout with no `browser.conversation_url` — this page must
+    render against any checkout, including one that has never been configured.
+    That is the pre-existing bargain `_inbox_dir` struck; it is factored out
+    here so the settings this module reads all fail the same way (silently,
+    onto their documented default) instead of each inventing its own.
+    """
     try:
         import tomllib
 
         data = tomllib.loads((repo / ".autoloop" / "config.toml").read_text(encoding="utf-8"))
-        workers_root = (data.get("paths") or {}).get("workers_root")
-        if workers_root:
-            return Path(workers_root).expanduser().parent / "inbox"
     except (OSError, ValueError, KeyError):
-        pass
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _config_section(repo: Path, name: str) -> dict:
+    """One `[section]` of the config as a dict, `{}` when it is missing or is
+    not a table.
+
+    The `isinstance` is not decoration. `data.get(name) or {}` raises
+    `AttributeError` on the next `.get` if the key holds a scalar
+    (`repo = "docs"`), which would 500 the page — contradicting the whole
+    reason `_config_toml` swallows its errors. Reached by both settings this
+    module reads, so neither can regrow its own version of that bug.
+    """
+    section = _config_toml(repo).get(name)
+    return section if isinstance(section, dict) else {}
+
+
+def _audit_report_glob(repo: Path) -> str:
+    """`[repo].audit_report_glob`, or this repository's own default.
+
+    A non-string value falls back rather than raising: the whole point of
+    reading the TOML directly is that a malformed config must not take the
+    tracker down with it.
+    """
+    value = _config_section(repo, "repo").get("audit_report_glob")
+    return value if isinstance(value, str) else DEFAULT_AUDIT_REPORT_GLOB
+
+
+def _inbox_dir(repo: Path) -> Path:
+    """Where task requests go. Resolved through the loop's own config so the
+    dashboard and `add-task` always agree, with the documented default as the
+    fallback for a dashboard pointed at a checkout that has no config yet."""
+    workers_root = _config_section(repo, "paths").get("workers_root")
+    if workers_root and isinstance(workers_root, str):
+        return Path(workers_root).expanduser().parent / "inbox"
     return Path.home() / ".autoloop" / "inbox"
 
 
@@ -1101,7 +1176,7 @@ def collect(repo: Path) -> dict:
         # against it, and it still renders when the graph itself does not load.
         "groups": groups,
         "inbox": _pending_inbox(repo),
-        "app_tasks": app_tasks(repo),
+        "app_tasks": app_tasks(repo, report_glob=_audit_report_glob(repo)),
         "pipeline": pipeline(state, live_agents_cache, blockers),
         # Completed is not integrated: which finished tasks are actually in the
         # branch, decided by git ancestry rather than by their status.
@@ -1340,10 +1415,9 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       nothing else. Nothing is inferred from the title and there is no wildcard —
       list every file, or a directory with a trailing <code>/</code>. Each one is
       validated by the registry on merge, so a bad path is refused there and
-      reported, not silently accepted here. The doc trackers
-      (<code>docs/SUMMARY.md</code>, <code>docs/TESTS.md</code>,
-      <code>docs/SECURITY.md</code>, <code>docs/COMMON_ERRORS.md</code>) are
-      always allowed and need not be listed.</p>
+      reported, not silently accepted here. The repository's doc trackers
+      (<code>[repo].tracker_paths</code> in the loop's config) are always
+      allowed and need not be listed.</p>
   </section>
   <section><h2>Language-app tasks</h2><div id="apptasks" class="scroll"></div></section>
   <section><h2>Blockers</h2><div id="blockers"></div></section>

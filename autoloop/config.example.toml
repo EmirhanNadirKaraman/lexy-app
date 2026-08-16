@@ -261,6 +261,55 @@ validation_commands = [
   ["python3", "-m", "pytest", "autoloop/tests", "-q", "-m", "isolated", "-p", "no:cacheprovider"],
 ]
 
+[repo]
+# What the loop cannot infer about the repository it is pointed at. Every value
+# below defaults to the constant that used to be hardcoded for this repository,
+# so omitting the whole section behaves exactly as the loop did before it
+# existed — and filling it in is what lets the loop run against a different
+# repository at all.
+#
+# Documentation this repo's own rules oblige a task to update, and which every
+# SCOPED task may therefore write without naming it in approved_paths. CLAUDE.md
+# §12/§14 make these a condition of doing the work, so a task that adds a file
+# and cannot touch SUMMARY.md must break one rule or the other — enumerating the
+# obligation per task does not converge, which is why it lives here once.
+#
+# Refused, deliberately: a glob, an absolute or `..` path, a directory prefix
+# (a tracker is granted to EVERY scoped task, so it must name one exact file),
+# and anything that looks like code or configuration (.py .sh .toml .json .yml
+# …). The widest thing an edit here can buy is another document.
+#
+# An empty list is legal and means "no implicit obligations" — every task then
+# gets exactly what it declares. Note the honest limit: this file lives under
+# the gitignored state dir, so unlike the constant it replaced, a change here is
+# not a diff anyone reviews. That is why the refusals above are enforced at load
+# time rather than left to convention.
+tracker_paths = [
+  "CLAUDE.md",
+  "docs/COMMON_ERRORS.md",
+  "docs/SCHEMA.md",
+  "docs/SECURITY.md",
+  "docs/SUMMARY.md",
+  "docs/TESTS.md",
+]
+# Where this repo declares its APPLICATION database, and the key inside that
+# file. Used for exactly one refusal: a paths.validation_env_file below whose
+# DB_NAME equals the name declared here — i.e. validation pointed at the real
+# database, which the test suite would create and delete rows in.
+#
+# WHERE to look, never WHAT to refuse: the forbidden name is still read out of
+# the repository, so this cannot be used to forbid a name the repo does not
+# actually declare. Set env_example_file = "" if your repo declares no such
+# name anywhere; the refusal then does not apply (same as the file being
+# absent), and a dedicated throwaway database is entirely your responsibility.
+env_example_file = ".env.example"
+env_example_db_key = "DB_NAME"
+# Where the dashboard's "Language-app tasks" panel reads the proposed backlog
+# from. A glob relative to the repo root; the NEWEST match by name wins, which
+# works because these reports are date-stamped. Empty leaves the panel empty,
+# which is the right reading for a repo that files no audit reports.
+audit_report_glob = "docs/AUDIT_*.md"
+
 [paths]
 # Runtime state (state.json, tasks.json, transcript.jsonl, diagnostics/, PAUSE).
 state_dir = ".autoloop"
@@ -293,7 +342,8 @@ workers_root = "~/.autoloop/workers"
 # missing key, a malformed line, an empty value, a symlink, a file not owned
 # by you, any group/world permission bit (`chmod 600`), a path inside this
 # checkout / the state dir / workers_root / the publisher dirs, and a DB_NAME
-# equal to the application database name this repo declares in `.env.example`.
+# equal to the application database name this repo declares (read from
+# [repo].env_example_file / env_example_db_key above).
 #
 # The database is created, written to and deleted from by the test suite. Use
 # a throwaway database, NOT the one the app runs on, and do NOT point this at
