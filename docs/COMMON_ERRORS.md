@@ -1134,6 +1134,87 @@ inspect the reported paths, confirm `.autoloop/PAUSE` is the only one, then
 archive the session (`reset --yes` keeps the task registry) and close the
 record with `archive-blocker <id> --reason "..."`.
 
+### `checkout_escape_detected` naming a `__pycache__/*.pyc` nobody wrote
+**Symptom:** the loop parks `loop_fatal` mid-round with
+`content changed outside the worker repo: autoloop/__pycache__/orchestrator.cpython-312.pyc`
+(or `dashboard.cpython-312.pyc`, or a `created …` line for one). No agent
+touched it, no `.py` changed in that window, and `git status` is clean.
+Because `checkout_escape_detected` refuses every `answer` by design, and
+`archive-blocker` refuses while the session is live, the only way out is
+`reset --yes` — which discards the in-flight round. **Three of these on
+2026-08-15/16**: one from restarting the read-only dashboard while a round
+held the lock (importing `autoloop.dashboard` rewrote its cache entry), two
+from a supervisor polling `python3 -m autoloop health --json` every two
+minutes (the first poll after the loop merged a source change recompiled
+`orchestrator.cpython-312.pyc`). One of those resets left five tasks stranded
+`in_progress`.
+**Cause:** `__pycache__/` is gitignored, and `escape_detector.
+enumerate_checkout_paths` covers ignored paths *on purpose* (the canonical
+escape it exists to catch — an agent forging `.autoloop/state.json` — happens
+with a clean working tree). So any out-of-band `import autoloop.<x>` against
+the primary checkout writes into the snapshotted tree. Note the timing, which
+rules out the obvious narrower fix: the recompile fires because the source
+changed BEFORE the window (the merge), so "flag a `.pyc` only when its source
+did not change in the window" would have flagged all three.
+**Fix:** applied repo-side 2026-08-16 (esc-01) — `escape_detector.
+is_derived_bytecode` exempts a `.pyc` sitting directly inside a
+`__pycache__/` directory, **whose tag is one an interpreter actually emits**,
+whose sibling `.py` is in the snapshot **as a regular file**, on every side the
+cache entry itself exists. Derived, not
+authored: the interpreter writes it from a source that stays fully in scope,
+hashed by the same snapshot. Still reported, deliberately: a `.pyc` OUTSIDE
+`__pycache__` (the legacy layout, importable with no source); a **`.pyo`
+anywhere, `__pycache__` included** — no supported CPython emits that name
+(PEP 488 replaced it with the `.opt-N` infix of a `.pyc`), so one is an
+authored file borrowing a derived-looking extension; **a `.pyc` whose TAG is
+not a real cache tag** (`mod.attacker.pyc`, `mod.cpython312.pyc`) — the tag is
+the one part of the name a writer does not choose freely, and accepting any
+dot-free tag would have granted a silent write beside every sourced module in
+the tree, the same hole as the `.pyo` case one level down the name; an orphan
+cache entry
+with no sibling `.py`; a cache entry whose sibling `.py` is a SYMLINK (the
+snapshot watches a symlink as a target string, never its bytes, so it vouches
+for nothing) or whose source is missing on one side of the window; and any
+symlink/directory appearing at a cache path. Contrast the `autoloop pause`
+entry above, where exempting the path was the WRONG fix — `PAUSE` is
+authored, its bytes are the only copy of the claim, and it moved outside the
+tree instead.
+**Which tags count:** `cpython-<digits>[t]` (the CPython family shape, `t`
+being the free-threaded ABI flag) plus this runtime's own
+`sys.implementation.cache_tag` as a literal. The family shape is the
+load-bearing half, not the runtime tag: all three incidents were written by a
+*different* process than the loop (a dashboard restart, `health --json`
+polls), which need not run the loop's interpreter or even its version — pinning
+to `sys.implementation.cache_tag` alone would reproduce the parks the first
+time someone polls with another `python3`. A cache file from a genuine but
+foreign interpreter (a `pypy39` tag, say) is still reported; that is a
+readable spurious park rather than a silent write, and nothing imports this
+checkout under one today.
+**Also fixed by the same rule:** the validation mutation guard
+(`diff_worker_tree`), which brackets the post-commit validation run and would
+otherwise read every `.pyc` a `pytest` run compiles as "validation MUTATED the
+worker tree". **Not all the way, though** — if you see that refusal naming
+something like `tests/__pycache__/test_x.cpython-312-pytest-8.3.4.pyc`, that
+is this same class hitting a stated limit, not a new bug: pytest's assertion
+rewriter interposes its own version into the TAG position, so the name does
+not carry a tag any interpreter emits and is reported. Ordinary
+`<mod>.cpython-3XX[.opt-N].pyc` names are covered. Run validation with `-B` /
+`PYTHONDONTWRITEBYTECODE=1` to avoid it; loosening the tag rule to cover it
+was deliberately not done — a tag pattern wide enough for
+`cpython-312-pytest-8.3.4` is wide enough for `attacker`.
+**Still worth doing on the operator side:** run out-of-band autoloop commands
+with `python3 -B` / `PYTHONDONTWRITEBYTECODE=1`. Per the esc-01 brief this was
+applied as a stopgap to the loop, supervisor, deadman and dashboard
+*wrappers*, which live outside this checkout — `rg -n
+'PYTHONDONTWRITEBYTECODE|python3? -B' autoloop -g '*.py'` comes back empty
+(only docs prose, including this entry, mentions the flag), so treat it as
+reported, not as verified from this repository. Either way it is a stopgap and
+not the fix: it depends on every future caller remembering, which is exactly
+what failed three times here.
+**If you hit it on an older build:** inspect the reported paths, confirm they
+are all bytecode, then `reset --yes` (it keeps the task registry) and re-open
+any task the reset left `in_progress`.
+
 ### The loop runs forever without progressing — same `audit` decision, same park, every cycle
 **Symptom:** `run --continuous` is alive and healthy (no crash, no blocker you
 can act on), but the transcript repeats one cycle: `directive {"decision":

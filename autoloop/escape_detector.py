@@ -38,6 +38,72 @@ its run is caught, which a wide-window exclusion-list design could not do.
 see `orchestrator.py`'s call site, which applies it only to the non-audit
 (write-capable) dispatch path.
 
+THE ONE EXEMPTION, AND WHY IT IS NOT A CRACK IN THE PARAGRAPH ABOVE.
+`is_derived_bytecode` exempts CPython's own bytecode cache — a `.pyc`
+sitting directly inside a `__pycache__/` directory, CARRYING A TAG SOME
+INTERPRETER REALLY EMITS (`_CACHE_FILE_RE`), whose sibling `.py` source
+is a REGULAR FILE in the same snapshot side(s). That is a different class
+from the volatile files the paragraph above refuses to exclude, and the
+distinction is authorship: `state.json` and a blocker record are AUTHORED
+(their bytes are the only copy of a claim, so tampering with them is
+undetectable anywhere else), while a `__pycache__` entry is DERIVED — the
+interpreter writes it from the `.py` next to it, and that `.py` stays fully
+in scope, tracked byte for byte by this same snapshot. Nothing was excluded
+because it is noisy; one class was excluded because its authoritative source
+is still watched. "Still watched" is checked, not assumed: the source has to
+be present as `kind="file"` (the only kind this snapshot hashes) on every
+side the cache entry exists on, so a `.py` that is a symlink — watched as a
+target string, with its bytes free to change underneath — does not qualify
+its neighbours for the exemption.
+
+Why it was needed: any out-of-band `import autoloop.<anything>` against the
+primary checkout — a read-only dashboard restarting, a supervisor polling
+`python3 -m autoloop health` — recompiles a stale `.pyc` mid-round, and
+`__pycache__/` is gitignored, so `enumerate_checkout_paths` sees it and the
+diff read as tampering. Three loop-fatal `checkout_escape_detected` parks on
+2026-08-15/16, none caused by an agent, each costing a `reset --yes` and the
+in-flight round (once, five tasks stranded `in_progress`). See
+`docs/COMMON_ERRORS.md` and `docs/SECURITY.md` S24's 2026-08-16 addendum.
+
+What the exemption deliberately does NOT cover, because each is a way
+bytecode stops being merely derived:
+  * a `.pyc` OUTSIDE `__pycache__` (the legacy, pre-PEP-3147 layout, e.g.
+    `pkg/evil.pyc`). Those load with NO `.py` beside them, so a planted one
+    is authored code with no source to compare it against.
+  * a `.pyo` ANYWHERE, `__pycache__` included. No supported CPython emits
+    that name — PEP 488 replaced it with the `.opt-N` infix of a `.pyc` — so
+    `__pycache__/mod.cpython-312.pyo` is not a compile product; it is an
+    authored file borrowing a derived-looking extension, and exempting it
+    would grant a silent write beside every sourced module in the tree.
+  * a `.pyc` inside `__pycache__` whose TAG is not one an interpreter
+    generates (`mod.attacker.pyc`, `mod.cpython312.pyc`). The tag is the only
+    part of the name the writer does not get to choose freely, so accepting
+    an arbitrary dot-free tag would have handed back the same silent write
+    per sourced module that the `.pyo` rule above refuses — see
+    `_CACHE_FILE_RE` for the two tag shapes that are accepted and why the
+    family pattern, not this runtime's own tag, is the load-bearing one.
+  * a `__pycache__` entry whose sibling source is missing, or is not a plain
+    file, on any side the entry exists — an orphan nothing regenerates, or a
+    "source" that is itself a symlink and so watched only as a target string
+    while its bytes move freely. Both are the planted-code shape by another
+    route. PEP 3147's cache layout is only ever consulted on behalf of the
+    source next to it, so a normal package import will not load an orphan;
+    that is a reason not to *trust* it, not a reason to stop reporting it.
+  * any change of SHAPE at such a path — a symlink or a directory appearing
+    where a cache file was, or vice versa. A compile never produces that.
+
+Honest residual, recorded rather than argued away: "the next import
+regenerates it" holds only while the cached header is STALE. An agent that
+writes a `.pyc` can also write the `(mtime, size)` or PEP 552 source-hash
+header that makes the interpreter accept it, so a forged cache entry whose
+header matches its source would be loaded and would not be reported here.
+Header verification is deliberately NOT attempted: it costs an attacker one
+`os.stat` to defeat, while failing closed on an unreadable or foreign-magic
+header would manufacture exactly the spurious loop-fatal parks this
+exemption exists to stop. The residual is the same shape as, and strictly
+smaller than, the `.git/hooks/` gap below — both need the OS-level sandbox
+S24 tracks, not a wider snapshot.
+
 SCOPE: the checkout's WORKING TREE, not `.git/` internals. "Tracked,
 untracked and ignored" is exactly the three categories `git status`
 enumerates over the working tree; a write into `.git/hooks/`, `.git/config`,
@@ -58,6 +124,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,6 +150,132 @@ class PathState:
 #: at snapshot time" — plain Python dict identity/equality is all `diff`
 #: needs, so this is intentionally not its own class.
 CheckoutSnapshot = dict[str, PathState]
+
+
+#: The directory CPython writes its bytecode cache into (PEP 3147). A cache
+#: file must be DIRECTLY inside one of these to qualify for the exemption —
+#: `pkg/evil.pyc`, the pre-PEP-3147 layout, is importable with no source
+#: beside it and stays in scope (see the module docstring).
+BYTECODE_CACHE_DIR = "__pycache__"
+
+#: A cache file's name, as `importlib.util.cache_from_source` builds it:
+#: `<stem>.<tag>[.opt-N].pyc`, e.g. `orchestrator.cpython-312.pyc` or
+#: `orchestrator.cpython-312.opt-1.pyc`. The trailing `.<digits>` group is
+#: CPython's atomic-write temp file (`_bootstrap_external._write_atomic`
+#: writes `<name>.<pid>` and then `os.replace`s it into place) — a snapshot
+#: that lands mid-write sees that name and nothing else, so it is the same
+#: derived artifact under a transient name, not a separate path class.
+#: `stem` is non-greedy so a source whose own name contains a dot
+#: (`foo.bar.py` -> `foo.bar.cpython-312.pyc`) resolves back to `foo.bar`.
+#:
+#: `.pyc` ONLY, deliberately: no supported CPython writes a `.pyo` — PEP 488
+#: folded the optimisation level into the `.opt-N` infix of a `.pyc` — so a
+#: `__pycache__/mod.<tag>.pyo` is not a compile product at all. It is an
+#: authored file wearing a derived-looking extension, and accepting it would
+#: hand an attacker a silent write for every module in the tree that happens
+#: to have a source beside it. It stays in scope and is reported.
+#:
+#: THE TAG IS CONSTRAINED, and this is the same argument one level down. A
+#: dot-free-anything tag (`[^.]+`, the first version of this regex) made
+#: `pkg/__pycache__/mod.attacker.pyc` "derived" beside any live `pkg/mod.py` —
+#: one silent write per sourced module, i.e. exactly what the `.pyo` rule
+#: refuses, reintroduced through the middle of the name. A cache entry is only
+#: derived if some interpreter would have written that name; a tag no
+#: interpreter emits is authored.
+#:
+#: Two alternatives are accepted, and the asymmetry between them is the point:
+#:   * `cpython-<digits>[t]` — the FAMILY shape, and the load-bearing half.
+#:     The writes behind the incidents came from a DIFFERENT process than the
+#:     one importing this module (a dashboard restart; `python3 -m autoloop
+#:     health --json` polls), so the writing interpreter need not be the loop's
+#:     venv python, or even its version. Pinning to this runtime's tag ALONE
+#:     would recreate the parks the first time an operator polls with another
+#:     `python3`. The optional trailing `t` is the ABI-flag suffix CPython
+#:     folds into the tag for free-threaded builds (PEP 703, 3.13+), which is
+#:     simply the next interpreter likely to poll a checkout out of band; it
+#:     widens the accepted set by one name shape that a non-free-threaded
+#:     import will never load — the same size of residual as the `.<pid>` temp
+#:     suffix above, not a new class.
+#:   * this runtime's own `sys.implementation.cache_tag`, as a LITERAL — the
+#:     backstop for a build whose tag the family shape does not anticipate (a
+#:     debug build, or a non-CPython implementation running the loop itself).
+#:     Exactly one extra string, and only ever a tag something on this machine
+#:     genuinely writes.
+#: Everything else is REPORTED, including a cache file from a foreign
+#: interpreter that is not the one running here (a `pypy39` tag, say). For a
+#: genuine-but-foreign interpreter that is the safe direction — a spurious
+#: park, which an operator can read, rather than a silent write — and no such
+#: interpreter imports this checkout today.
+_CPYTHON_CACHE_TAG = r"cpython-\d{2,}t?"
+_RUNTIME_CACHE_TAG = getattr(sys.implementation, "cache_tag", None)
+_CACHE_TAG_ALTERNATIVES = [_CPYTHON_CACHE_TAG]
+if _RUNTIME_CACHE_TAG:
+    # `cache_tag` is None on an implementation that does not cache bytecode at
+    # all (`importlib.util.cache_from_source` raises there) — nothing to add.
+    _CACHE_TAG_ALTERNATIVES.append(re.escape(_RUNTIME_CACHE_TAG))
+_CACHE_FILE_RE = re.compile(
+    r"^(?P<stem>.+?)\.(?:"
+    + "|".join(_CACHE_TAG_ALTERNATIVES)
+    + r")(?:\.opt-\d+)?\.pyc(?:\.\d+)?$"
+)
+
+
+def is_derived_bytecode(rel: str, *sides: CheckoutSnapshot) -> bool:
+    """True when `rel` (repo-relative, as git reports it) is a CPython
+    bytecode cache entry — cache directory, real cache tag, `.pyc` — whose
+    `.py` source is a REGULAR FILE in every one of `sides`: the one class of
+    path `diff_snapshots` reports nothing for.
+
+    `sides` are the snapshot sides on which the cache entry itself exists
+    (before, after, or both — `diff_snapshots` passes exactly those). The
+    source is checked per side rather than against the union of both key
+    sets, because the whole justification for the exemption is that the
+    authoritative source is watched BYTE FOR BYTE across the same window:
+      * a source that exists only on one side (created or deleted mid-window)
+        leaves the cache entry underived on the other, so the exemption does
+        not apply there; the `.py`'s own creation/deletion is reported on its
+        own path regardless.
+      * `kind == "file"` is the byte-for-byte claim itself —
+        `snapshot_checkout` only records `kind="file"` after hashing the
+        contents. A `.py` that is a SYMLINK is watched only as a target
+        string, so its bytes could change with nothing in the snapshot
+        moving; a cache entry beside such a source is therefore NOT exempt.
+        Same for a `dir_boundary` (a nested repo where the source should be).
+    An orphan cache entry — no `.py` beside it, nothing that would ever
+    regenerate it — fails this check too and is reported like any other path,
+    which is what catches a cache file planted where no module exists. So does
+    a name no interpreter would have written: the tag between stem and `.pyc`
+    has to be a real cache tag (`_CACHE_FILE_RE`), because a live source next
+    to `mod.attacker.pyc` explains nothing about how that file got there.
+
+    Called with no `sides` at all, this is False: a path nothing claims to
+    have seen cannot have a verified source, and defaulting the other way
+    would silently re-open everything above.
+
+    Read the module docstring before widening this. In particular it must
+    never grow to `.so`/`.pyd`: those are authored build outputs, and one
+    dropped next to a module is a direct execution vector with no source in
+    the checkout to compare it against.
+    """
+    if not sides:
+        return False
+    parts = rel.split("/")
+    if len(parts) < 2 or parts[-2] != BYTECODE_CACHE_DIR:
+        return False
+    match = _CACHE_FILE_RE.match(parts[-1])
+    if match is None:
+        return False
+    package_dir = parts[:-2]
+    # `.py` only. `cache_from_source` maps a Windows-only `.pyw` onto the
+    # same cache name, so such a module's cache is simply not exempt here —
+    # a spurious park nobody on this platform can hit, versus guessing at
+    # which of several sources a cache entry belongs to.
+    source = "/".join([*package_dir, f"{match.group('stem')}.py"])
+    for side in sides:
+        state = side.get(source)
+        if state is None or state.kind != "file":
+            return False
+    return True
 
 
 def _hash_file(path: Path) -> str:
@@ -167,11 +361,53 @@ def diff_snapshots(before: CheckoutSnapshot, after: CheckoutSnapshot) -> list[st
     symlink-target change, or executable-bit change for any path. PATHS
     ONLY — content is never included, so this is safe to put in a blocker
     record or an operator-facing message even if the changed file held a
-    secret."""
+    secret.
+
+    Exactly one class of path is silent: a CPython bytecode cache entry
+    (`is_derived_bytecode` — the module docstring argues why, and what stays
+    in scope) that was a plain file on every side it existed, whose `.py`
+    source is a plain file on those same sides. A cache entry that appears,
+    changes, or vanishes as some import's side effect says nothing an agent
+    could not equally say through the `.py` next to it, which this same diff
+    still reports byte for byte.
+
+    Known narrowness, stated rather than papered over: the exemption only
+    recognises a cache name whose TAG is one an interpreter actually emits
+    (`_CACHE_FILE_RE` — the CPython family shape, or this runtime's own
+    `cache_tag`). `pytest`'s assertion rewriter writes a name that is neither,
+    interposing its own version into the tag position
+    (`<mod>.<cache_tag>-pytest-<version>.pyc`), so a validation run's rewritten
+    TEST-module caches are still reported by `diff_worker_tree` even though the
+    ordinary `<mod>.cpython-3XX.pyc` written for every non-test module it
+    imports is not. Erring toward reporting is the safe direction here: the
+    alternative is a tag pattern loose enough that an authored file can wear
+    it, which is precisely the hole the tag constraint closes. Validation is
+    expected to run with `-B`/`PYTHONDONTWRITEBYTECODE` for that reason.
+    """
     violations: list[str] = []
-    for path in sorted(set(before) | set(after)):
+    known = set(before) | set(after)
+    for path in sorted(known):
         prior = before.get(path)
         current = after.get(path)
+        # The sides the cache entry EXISTS on are the sides its source has to
+        # be watched on — passing the union of both key sets instead would
+        # accept a source that is only half in scope (see
+        # `is_derived_bytecode`).
+        sides = [snap for snap, state in ((before, prior), (after, current)) if state is not None]
+        if (
+            is_derived_bytecode(path, *sides)
+            and (prior is None or prior.kind == "file")
+            and (current is None or current.kind == "file")
+        ):
+            # Created / rewritten / removed / re-moded by a compile. The mode
+            # is checked in only as far as "still a plain file": CPython copies
+            # a cache file's permission bits from its source
+            # (`_bootstrap_external._calc_mode`), so an executable-bit change
+            # here is an echo of one on the `.py` — which is reported on its
+            # own path — and an exec bit means nothing to `import` anyway. A
+            # symlink or directory appearing at this path is NOT a compile
+            # product and falls through to the ordinary reporting below.
+            continue
         if prior is None and current is not None:
             violations.append(f"created outside the worker repo: {path} ({current.kind})")
         elif prior is not None and current is None:

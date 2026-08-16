@@ -37,7 +37,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S14 | INFO | LLM prompt injection from user content | `services/llm_service.py` |
 | S18 | LOW | Self-hosted model server has no auth; `LLM_BASE_URL` egress is operator-controlled (opt-in, unset by default) | `services/llm_provider.py` |
 | S22 | INFO | `commit_adopted` is sound but has no production call site (tracked, not a vulnerability) | `autoloop/git_gateway.py`, `autoloop/manifest.py` |
-| S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
+| S24 | HIGH | Write-capable agent isolation is DETECTED (checkout snapshot diff), not PREVENTED (no OS-level sandbox); `.git/` internals not covered. Amended 2026-08-16: derived bytecode (`__pycache__/*.pyc` whose sibling `.py` is a regular file in the same snapshot side(s) — never `.pyo`, never a symlinked source) is exempt from the snapshot diff after three false loop-fatal parks — a forged cache entry whose header matches its source is the new, named residual | `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
@@ -276,6 +276,105 @@ reminder that something was never actually resolved, surfaced only when
 there is otherwise nothing productive to report, rather than a hard block
 on all future work. Does not change anything above: the OS-sandbox
 gap is unaffected either way.
+
+**Addendum, 2026-08-16 (esc-01) — one class narrowed out of the snapshot,
+and the residual that creates.** The unconditional refusal above is what
+made three FALSE parks expensive: on 2026-08-15/16, `checkout_escape_
+detected` fired three times on CPython bytecode caches inside the primary
+checkout, none of them caused by an agent (a dashboard restart importing
+`autoloop.dashboard`; two `python3 -m autoloop health --json` polls after the
+loop merged a source change). `__pycache__/` is gitignored and the detector
+covers ignored paths on purpose, so an out-of-band import is
+indistinguishable from tampering. Each cost a `reset --yes` and the in-flight
+round; one stranded five tasks `in_progress`.
+
+`escape_detector.is_derived_bytecode` now exempts exactly one class from
+`diff_snapshots`: a `.pyc` directly inside a `__pycache__/` directory whose
+sibling `.py` source is present **as a regular file** in every snapshot side
+on which the cache entry itself exists. The distinction being drawn is
+AUTHORED vs DERIVED — `state.json` and a blocker record hold the only copy of
+a claim, while a cache entry is written from a source this same snapshot
+still tracks byte for byte. That last clause is enforced, not assumed, which
+is why every clause of the rule is narrow:
+
+* **`.pyc` only, never `.pyo`.** No supported CPython writes a `.pyo` (PEP 488
+  folded the optimisation level into a `.pyc`'s `.opt-N` infix), so
+  `__pycache__/mod.cpython-312.pyo` is not a compile product — it is an
+  authored file borrowing a derived-looking extension. Accepting the whole
+  `py[co]` family would have granted a silent write beside every sourced
+  module in the tree.
+* **The tag must be one an interpreter really emits.** Accepted:
+  `cpython-<digits>[t]` (the CPython family shape; `t` is the free-threaded ABI
+  flag) and this runtime's own `sys.implementation.cache_tag` as a literal.
+  Everything else — `mod.attacker.pyc`, `mod.cpython312.pyc`, pytest's
+  assertion-rewriter name — is reported. The first version of the rule accepted
+  any dot-free tag, which satisfied every other clause beside a live source and
+  so amounted to one silent write per sourced module in the tree; that is the
+  `.pyo` hole again, one level down the name. The family shape carries the
+  weight, not the runtime tag: the three incidents were written by a DIFFERENT
+  process than the loop (a dashboard restart, `health --json` polls), which
+  need not run the loop's interpreter or version, so keying on
+  `sys.implementation.cache_tag` alone would recreate the parks; the runtime
+  tag is only a backstop for a build (debug, non-CPython) the family shape does
+  not anticipate. A cache file from a genuine but foreign interpreter is
+  reported — a readable park, not a silent write.
+* **The source must be `kind="file"`, per side.** `snapshot_checkout` records
+  a symlink as a target STRING and never hashes it, so a `.py` symlink's bytes
+  could change with the snapshot unmoved — it vouches for nothing, and a cache
+  entry beside it is not exempt. Checking each side separately (rather than
+  the union of both key sets) also refuses a cache entry created in the same
+  window that deletes its source.
+
+Nothing else was excluded: a `.pyc` outside `__pycache__` (the pre-PEP-3147
+layout, which imports with no source beside it), a `.pyc` wearing a tag no
+interpreter emits, an orphan cache entry with no sibling `.py`, and any
+symlink or directory appearing at a cache path all still park. `.so`/`.pyd` are NOT covered and must never be added — those are
+authored build outputs.
+
+**Two things this changes elsewhere, stated rather than left to be
+discovered.** (1) The same rule reaches `diff_worker_tree`, the validation
+mutation guard (S27), because it delegates to `diff_snapshots` — a
+validation `pytest` run's own bytecode no longer reads as "validation
+MUTATED the worker tree"; that message now says "beyond its own bytecode
+cache". (2) A NEW residual: "the next import regenerates it" holds only
+while the cached header is stale. An agent that writes a `.pyc` can also
+write the `(mtime, size)` / PEP 552 source-hash header that makes the
+interpreter accept it, so a forged cache entry whose header matches its
+source would be loaded and is NOT reported. Header verification was
+considered and rejected: it costs an attacker one `os.stat` to defeat, while
+failing closed on an unreadable or foreign-magic header would manufacture
+exactly the spurious loop-fatal parks this exists to stop. The residual
+needs the OS-level sandbox this finding already tracks, not a wider
+snapshot, and it is strictly smaller than the `.git/hooks/` gap above.
+`PYTHONDONTWRITEBYTECODE`/`-B` is REPORTED (esc-01 brief) as already applied
+to the loop, supervisor, deadman and dashboard wrappers, which live outside
+this checkout — nothing in this repository sets it, so do not record it here
+as a verified control. It would in any case not be the fix: it depends on
+every future caller remembering, which is the failure that produced all
+three incidents.
+
+**Verification check:**
+```bash
+# The exemption exists, is keyed on the cache DIRECTORY, and is not widened:
+rg -n 'is_derived_bytecode|BYTECODE_CACHE_DIR' autoloop/escape_detector.py
+rg -n '\.so|\.pyd' autoloop/escape_detector.py      # expect: only the "never add these" comments
+# `.pyc` only — the regex must NOT match a `.pyo` (expect no `py[co]` hit;
+# every `.pyo` mention should be prose saying it is deliberately in scope):
+rg -n 'py\[co\]|pyo' autoloop/escape_detector.py
+# The TAG is constrained to shapes an interpreter emits — expect the family
+# pattern plus the runtime literal, and NO bare `[^.]+`/`.+` in the tag slot:
+rg -n '_CPYTHON_CACHE_TAG|_CACHE_TAG_ALTERNATIVES|cache_tag' autoloop/escape_detector.py
+# The source must be verified as a regular file, per side — not merely present
+# in a key set (expect the `state.kind == "file"` check and the `sides` fan-in):
+rg -n 'state\.kind != "file"|\*sides' autoloop/escape_detector.py
+# The `-B` stopgap is operator-side, not in this checkout — expect NO match in
+# CODE (the docs discuss it in prose, which is why this is scoped to `autoloop/`
+# and `*.py`), and do not "fix" the docs by claiming the control lives here:
+rg -n 'PYTHONDONTWRITEBYTECODE' autoloop -g '*.py'
+# A genuine ignored-path escape is still detected, including alongside
+# bytecode churn in the same window:
+pytest autoloop/tests/test_m1_hardening.py -k 'escape_detector or bytecode' -q
+```
 
 ### S28 — The dashboard's localhost POST can now queue authorization, not just a priority — MEDIUM — OPEN (bounded, accepted)
 

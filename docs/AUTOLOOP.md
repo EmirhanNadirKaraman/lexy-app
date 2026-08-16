@@ -1229,6 +1229,52 @@ does writes any of those files between the "before" and "after" snapshots
 remove real detection capability for no gain; the enumerated exclusion set
 the brief for this pass asked for is empty BY MEASUREMENT.
 
+*The one exemption, added 2026-08-16 (esc-01), and why it does not reopen
+the paragraph above.* `escape_detector.is_derived_bytecode` reports nothing
+for a `.pyc` directly inside a `__pycache__/` directory, carrying a tag some
+interpreter really emits, whose sibling `.py` source is present AS A REGULAR
+FILE on every snapshot side the cache entry exists on. The line being drawn is AUTHORED vs DERIVED, not noisy vs quiet:
+`state.json` and a blocker record hold the only copy of a claim, whereas a
+cache entry is written by the interpreter from a source this same snapshot
+still tracks byte for byte — a claim the predicate checks rather than assumes
+(a `.py` that is a SYMLINK is watched as a target string, never hashed, so it
+qualifies nothing). It was needed because
+any out-of-band `import autoloop.<x>` against the primary checkout — a
+dashboard restart, a `health --json` poll — recompiles a stale cache entry
+mid-round, and `__pycache__/` is gitignored, so the detector saw it. That
+produced three loop-fatal `checkout_escape_detected` parks on 2026-08-15/16,
+none caused by an agent, each costing a `reset --yes` and the in-flight round
+(one stranded five tasks `in_progress`). Note the timing before proposing
+anything narrower: the recompile fires because the source changed BEFORE the
+window (a merge the loop itself made), so a rule of "flag a `.pyc` only when
+its source did not change in the window" would have flagged all three.
+Deliberately still reported: a `.pyc` OUTSIDE `__pycache__` (the legacy
+layout — it imports with no source beside it); a `.pyo` ANYWHERE, including
+inside `__pycache__`, since no supported CPython emits that name (PEP 488
+replaced it with a `.pyc`'s `.opt-N` infix) and so one is authored, not
+compiled; a `.pyc` whose TAG is not one an interpreter emits
+(`mod.attacker.pyc`) — accepted tags are `cpython-<digits>[t]` plus this
+runtime's own `sys.implementation.cache_tag`, and the family shape is the
+load-bearing half because the incidents' writer was a different process than
+the loop, so keying on the runtime tag alone would recreate the parks; an
+orphan cache entry with no sibling `.py`; a cache entry whose
+sibling `.py` is a symlink, or is missing on one side of the window (the
+per-side check, rather than a union of both key sets, is what refuses a cache
+entry planted in the same window that deletes its source); and any symlink or
+directory appearing at a cache path.
+Deliberately NOT covered: `.so`/`.pyd`, which are authored build outputs.
+The same rule reaches the validation mutation guard below, since that
+delegates to `diff_snapshots`. Residual, recorded in `docs/SECURITY.md` S24
+rather than argued away: a forged cache entry whose `(mtime, size)` or
+PEP 552 header matches its source would be loaded by the interpreter and is
+not reported — header verification costs an attacker one `os.stat` to
+defeat, while failing closed on an unreadable header would manufacture the
+very parks this removes. `PYTHONDONTWRITEBYTECODE`/`-B` was reported (esc-01
+brief) as already applied to the loop, supervisor, deadman and dashboard
+wrappers, which live outside this checkout — nothing here sets it, so it is
+not a control this repository can claim. It would not be the fix anyway: it
+depends on every future caller remembering.
+
 Also new: `Orchestrator._prepare_write_capable_worker` requires the PRIMARY
 checkout's index and working tree to be clean (`primary_checkout_dirty`,
 loop_fatal) before every write-capable dispatch — a dirty baseline cannot be
@@ -1818,7 +1864,22 @@ its config would land) is invisible to it. The refusal holds even when the
 mutated file is one the task was approved to touch — approval authorises the
 AGENT to edit a path, never validation to mutate one. Messages name PATHS
 ONLY, so a park message is safe even when what was written was a credential;
-the mutated files stay on disk uncommitted, as evidence.
+the mutated files stay on disk uncommitted, as evidence. **One exemption,
+inherited (2026-08-16, esc-01):** this delegates to `diff_snapshots`, so a
+validation `pytest` run's own `__pycache__` entries — derived from sources
+already in the tree — are silent, and the refusal message says "MUTATED the
+worker tree beyond its own bytecode cache" rather than claiming validation
+wrote nothing at all. See §4e for what stays in scope. **Precisely how far
+that reaches:** the exemption only recognises a cache name whose tag is one an
+interpreter emits, so it covers the ordinary
+`<mod>.cpython-3XX[.opt-N].pyc` a run writes for every non-test module it
+imports, but NOT `pytest`'s assertion-rewriter name
+(`<mod>.<cache_tag>-pytest-<version>.pyc`), which interposes its own version
+into the tag position — a rewritten TEST-module cache is still reported.
+Erring toward reporting is the right direction for a guard; a tag rule loose
+enough to accept `cpython-312-pytest-8.3.4` is loose enough to accept
+`attacker`. Run validation with `-B`/`PYTHONDONTWRITEBYTECODE` and the
+question does not arise.
 
 **What the mutation guard is NOT** (reviewer's wording, kept because it is
 exactly right): it detects **persistent net changes** to the snapshotted worker
