@@ -1530,6 +1530,15 @@ def _cmd_answer(args: argparse.Namespace) -> int:
         if blocker.kind != "task_fatal" or blocker.task_id == NO_TASK:
             print("(not tied to a quarantined task — nothing else to do.)")
             return 0
+        # BEFORE the unblock, deliberately. `registry.unblock` raises
+        # `TaskGraphError` for a task that is not BLOCKED_BY_OPERATOR, and plain
+        # `run` (unlike `--continuous`) parks task_fatal without ever going
+        # through `cli._handle_parked_task`, so that is a live shape — the early
+        # return below would skip the budget reset in precisely the case it
+        # exists for, leaving the operator editing the record by hand again.
+        # Harmless for a RETIRED task: one that never dispatches never reads
+        # either counter.
+        _clear_fault_budget_on_answer(config, blocker)
         task_store, registry = _load_tasks(config)
         try:
             registry.unblock(blocker.task_id)
@@ -1542,6 +1551,52 @@ def _cmd_answer(args: argparse.Namespace) -> int:
         task_store.save(registry)
         print(f"task {blocker.task_id} is ready again.")
     return 0
+
+
+def _clear_fault_budget_on_answer(config: AutoloopConfig, blocker: Blocker) -> None:
+    """Reset the FAULT attempt budget when an operator answers the park it
+    caused, and only then.
+
+    Without this, answering a `fault_attempt_ceiling` blocker unblocks the task
+    and achieves nothing: `fault_attempt_count` is still at the cap, so the very
+    next dispatch parks on the identical wall. That is precisely the mechanical
+    hand-repair budget-01 exists to remove — an operator editing the execution
+    record to put a counter back, the same edit every time.
+
+    Deliberately narrow in three ways:
+
+    * only for `code == "fault_attempt_ceiling"`. Answering an
+      `attempt_count_ceiling` does NOT touch `attempt_count`: that budget bounds
+      the task's own unproductive churn, and silently refilling it would hand
+      a task five more rounds of the same failure on a keystroke.
+    * only the `fault_attempt_count` COUNTER. `candidate_sha`, `review_round`,
+      `last_revise_feedback` and every `attempt_ledger` entry are preserved, so
+      the history of which rounds were faults survives the reset — this grants
+      a fresh allowance, it does not erase what was spent. Nothing is appended
+      to the ledger either: entries are per-dispatch, and an operator decision
+      is not a dispatch. The resolved `Blocker` record is where that decision
+      is written down.
+    * best-effort. An unreadable or missing execution record must not turn a
+      successful `answer` into a failure; the blocker is already resolved and
+      the task already unblocked by the time this runs.
+    """
+    if blocker.code != "fault_attempt_ceiling":
+        return
+    try:
+        store = TaskExecutionStore(config.executions_dir)
+        execution = store.load(blocker.task_id)
+        if execution is None or not execution.fault_attempt_count:
+            return
+        cleared = execution.fault_attempt_count
+        execution.fault_attempt_count = 0
+        store.save(execution)
+        print(
+            f"fault attempt budget for {blocker.task_id} reset "
+            f"({cleared} -> 0); its own attempt budget "
+            f"({execution.attempt_count}) is unchanged."
+        )
+    except (StateError, OSError) as exc:
+        print(f"(could not reset the fault attempt budget: {exc})")
 
 
 def _cmd_reprovision_publisher(args: argparse.Namespace) -> int:

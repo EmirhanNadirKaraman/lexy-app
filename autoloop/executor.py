@@ -74,6 +74,22 @@ class ExecutionOutcome:
     #: onto `worktask.TaskExecution.assumptions` and rendered inside the
     #: packet's clearly-labelled executor-report section.
     assumptions: tuple[str, ...] = ()
+    #: Why `status="error"` happened, when — and ONLY when — the cause was
+    #: environmental rather than the task's own work: a provider 429 or API
+    #: error that stopped the agent before it produced anything, or the stall
+    #: supervisor killing it. A short machine slug; empty means "not a fault".
+    #:
+    #: `status="error"` covers four different things in
+    #: `implement_executor._run_implementation` (the agent did not complete, a
+    #: git read failed, the agent changed no files, validation failed) and only
+    #: the first can be a fault. This field is how the orchestrator tells them
+    #: apart WITHOUT reading `summary` prose, which is exactly the kind of
+    #: inference the attempt ledger exists to replace.
+    #:
+    #: FAIL CLOSED: anything an executor cannot positively name is left empty
+    #: and charged to the task's own attempt budget. A wrongly-blank fault
+    #: costs one attempt; a wrongly-set one would excuse a genuine failure.
+    fault_kind: str = ""
 
 
 class TaskExecutor(Protocol):

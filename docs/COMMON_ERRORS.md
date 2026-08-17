@@ -910,6 +910,115 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### A task parks on `attempt_count_ceiling` with a `review_round` far below it — and an operator has to reset the counter by hand
+**Symptom:** `python -m autoloop blockers` shows `attempt_count_ceiling` for a
+task that was never failing review. Measured 2026-08-15..17 and reported at the
+time as **five** hand repairs; the table below enumerates six.
+
+| task | attempts | review_round | what actually happened |
+|---|---|---|---|
+| brw-09  | 5 | 1 | four STRUCTURAL refusals (paths outside `approved_paths`) — the reviewer saw none of them |
+| exec-01 | 5 | 1 | two rounds died to the agent provider's session-limit 429; the reviewer's own words: "produced no work" |
+| port-01 | 5 | 3 | one rate-limit round plus browser churn |
+| brw-11  | 4 | 0–1 | three rounds lost to faults (incl. an agent-level API error at 368s) while its lint fix was already committed and passing |
+| dash-04 | — | — | same shape |
+| hlth-01 | — | — | same shape |
+
+Each was repaired the same way: edit `.autoloop/executions/<task>.json`, set
+`attempt_count` back to 0, leave `candidate_sha` / `review_round` /
+`last_revise_feedback` alone. `~/.autoloop/afk-worker.sh` was written to
+automate it and had to GUESS with a heuristic (`attempt_count - review_round
+>= 2`), because the record did not say why any attempt had been spent.
+**Cause:** ONE counter was paying for two unrelated things. `attempt_count` is
+incremented in `orchestrator._dispatch_task_postcommit` before the executor
+runs — deliberately, so a crash or a validation failure that never reaches a
+commit still consumes an attempt (M1 finding #3), which is the only bound on a
+task that dies every round without ever reaching a reviewer. But that same
+increment also charged rounds destroyed by a provider throttle, a killed agent
+or a process that did not survive, so a task converging through real review
+rounds could be killed by rounds it did not cause.
+**Fix:** applied repo-side 2026-08-17 (task budget-01) — two budgets, not one.
+`attempt_count` keeps bounding the task's own work (validation failures,
+structural refusals, rounds that reached the reviewer); `fault_attempt_count`
+bounds rounds lost to faults, with its own ceiling and its own park code
+`fault_attempt_ceiling`. `TaskExecution.attempt_ledger` records, per attempt,
+`"<ordinal>|<budget>|<reason>"` — so the answer is read, never inferred. **Both
+budgets still terminate**, so nothing here removes a bound: a task that faults
+every round parks on `fault_attempt_ceiling` instead of churning. If you are
+looking at this because a task parked anyway, read its `attempt_ledger` first —
+it names each round's cause. The watcher script is now redundant and should be
+deleted; it can only ever re-derive, badly, what the ledger states.
+
+**Reading a ledger entry.** `budget` is `pending` / `pending_fault` while the
+round is OPEN and `task` / `fault` once it has settled, so an entry still
+reading either open label means one thing only: the round never reached one of
+its own exits. Two ways that happens, both environmental — the process died
+mid-round, or a `GitError` escaped the dispatch to `_handle_git_failure` (which
+charges `consecutive_failures`, not the task). Either way the next dispatch
+settles it onto the fault budget. `reason` is a bare outcome slug
+(`sent_for_review`, `post_commit_verification_failed`,
+`executor_reported_failure`, `interrupted_mid_round`, an
+`audit.agents.AGENT_FAULT_*` code) — or `"<origin>><outcome>"` for a round a
+fault forced the loop to redo, where the origin is the fault code that destroyed
+the earlier review. `3|fault|browser_session_lost>sent_for_review` reads: the
+third dispatch happened because a browser session loss killed a review, it was
+charged to the fault budget, and it reached the reviewer.
+
+### A task's `attempt_count` grows anyway, every SECOND fault, with a ledger full of `fault` entries
+**Symptom:** the split above is in place, but a task alternating
+review → fault → redo → review → fault still creeps up `attempt_count`. One
+fault is absorbed, the next is not. Found in review of `budget-01` itself
+before it landed.
+**Cause:** a redo was written into the ledger as an already-SETTLED
+`fault|<code>` entry at dispatch, which conflated "which counter is this
+charged to" with "has this round finished". When the redo reached the reviewer,
+`_finalise_attempt` correctly refused to re-stamp a settled entry — so the
+ledger never recorded that a review was in flight — and `_note_round_fault`,
+which matched the literal pair `(task, "sent_for_review")`, saw
+`(fault, "<code>")` and declined to mark the second lost review. The next
+dispatch found no `pending_fault_code` and billed the task.
+**Fix:** a redo is opened OPEN like every other round (`pending_fault`), so its
+own exit still stamps it; `_settle_attempt` is the single rule both
+`_finalise_attempt` and `_reconcile_unfinished_attempts` go through; and
+`_note_round_fault` keys on the OUTCOME segment (`worktask.attempt_outcome`) on
+either budget. **The generalisable trap:** if one field answers both "what state
+is this in" and "what did it cost", the transition that writes the cost early
+erases the state, and every check downstream that keyed on the state goes
+quietly false. Pinned by
+`test_consecutive_session_ending_faults_never_fall_back_onto_the_task_budget`.
+
+### A task's `attempt_count` grows on the round AFTER a redo the environment interrupted
+**Symptom:** the two fixes above are in place and a review really was lost to a
+fault, but the recovery is interrupted a second time — the loop is restarted
+mid-redo, or the redo's agent hits the provider — and the dispatch that follows
+is billed to `attempt_count`. The ledger shows a `fault` entry whose outcome is
+NOT `sent_for_review`, immediately followed by a `task` entry. Found in review
+of `budget-01` before it landed, and initially documented rather than fixed.
+**Cause:** `pending_fault_code` is consumed by `_open_attempt` and was only ever
+re-armed by `_note_round_fault`, which requires the last ledger entry to be a
+SETTLED round that reached the reviewer. A redo taken by the environment
+satisfies neither: while it is open the entry reads `pending_fault`, and once
+settled its outcome is `interrupted_mid_round` (or an `AGENT_FAULT_*` code), not
+`sent_for_review`. So the marker was gone while the lost review was still lost,
+and the loop treated the next recovery dispatch as the task's own next try.
+**Fix:** `_settle_attempt` rule 4 — a round OPENED on the fault budget that
+STAYS on it without reaching a review re-arms `pending_fault_code` from its own
+origin. It lives in `_settle_attempt` because all three ways this happens pass
+through that one method: `_reconcile_unfinished_attempts` (the process died
+mid-redo), and `_finalise_attempt` with either an `ExecutionOutcome.fault_kind`
+or `worker_environment_drift`. **Still bounded** — each carried-forward dispatch
+pays a `fault_attempt_count` charge, so a chain interrupted every time parks on
+`fault_attempt_ceiling` like any other run of faults, and the marker clears for
+good as soon as a round reaches a reviewer or fails on the task's own merits (a
+structural refusal, a failed validation, an escape — those move the charge back
+to `attempt_count` and end the chain). **The generalisable trap:** a
+consume-once marker describes an EVENT, but what this needed to describe was a
+STATE that outlives the event — "this task is still recovering a review it
+earned". A single fault re-armed it; the second one had no event left to fire
+on. Pinned by
+`test_a_recovery_chain_interrupted_twice_never_reaches_the_task_budget` and
+`test_a_recovery_chain_interrupted_forever_still_hits_the_fault_ceiling`.
+
 ### An autoloop commit is refused by a test that passes when you re-run it
 **Symptom:** post-commit validation refuses a commit with exactly one failing
 test out of ~1000. Re-running the identical worker tree passes. Happened three

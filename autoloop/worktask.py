@@ -116,11 +116,89 @@ class TaskExecution:
     #: round cannot change its own outcome. This is what makes an
     #: unlimited round budget safe.
     last_revise_feedback: str = ""
-    #: Every commit/packet attempt for this task, INCLUDING ones that never
-    #: produced a review. `review_round` deliberately counts only dispatched
-    #: reviews, so on its own it would let structural refusals churn locally
-    #: without bound. This is the independent ceiling on that.
+    #: Every commit/packet attempt for this task that is the TASK's own —
+    #: INCLUDING ones that never produced a review. `review_round`
+    #: deliberately counts only dispatched reviews, so on its own it would let
+    #: structural refusals churn locally without bound. This is the
+    #: independent ceiling on that, and it still is: a validation failure, a
+    #: structural refusal, a post-commit refusal and a round that reached the
+    #: reviewer all land here.
+    #:
+    #: What does NOT land here, since 2026-08-17, is a round destroyed by
+    #: something the task could not have avoided — a provider 429, an agent
+    #: killed by the stall supervisor, a process that died mid-round. Those go
+    #: to `fault_attempt_count` below. Both budgets are bounded; neither is
+    #: spent by the other. See `attempt_ledger` for the per-attempt record of
+    #: which one was charged and why.
     attempt_count: int = 0
+    #: Attempts charged to the FAULT budget instead of `attempt_count`.
+    #:
+    #: Why a SECOND budget rather than an exemption. `attempt_count` is
+    #: incremented before the executor runs precisely so a crash, a restart or
+    #: a validation failure that never reaches a commit still consumes an
+    #: attempt — that is the only bound on a task that dies every round
+    #: without ever reaching a reviewer, and simply exempting faults would
+    #: delete it. So faults keep a ceiling; they just keep their OWN, and a
+    #: task converging through real review rounds is no longer killed by
+    #: rounds it did not cause.
+    #:
+    #: The total number of dispatches for one task stays deterministically
+    #: bounded: every dispatch appends exactly one `attempt_ledger` entry and
+    #: charges exactly one of the two counters, so
+    #: `attempt_count + fault_attempt_count == len(attempt_ledger)` holds
+    #: (reclassification MOVES a charge, it never drops one). Since a dispatch
+    #: requires both counters to be strictly under their ceilings, the ledger
+    #: can never grow past `MAX_TASK_ATTEMPTS + MAX_TASK_FAULT_ATTEMPTS - 1`
+    #: without an operator intervening. The one thing that resets this counter
+    #: is an operator answering the `fault_attempt_ceiling` blocker it produced
+    #: (`cli._clear_fault_budget_on_answer`) — an explicit, recorded decision
+    #: to grant a fresh allowance, never something the loop does to itself.
+    fault_attempt_count: int = 0
+    #: One entry per dispatched attempt, in dispatch order, saying WHICH budget
+    #: that attempt was charged to and WHY: `"<ordinal>|<budget>|<reason>"`
+    #: with `budget` one of `ATTEMPT_PENDING` / `ATTEMPT_PENDING_FAULT` (open) or
+    #: `ATTEMPT_TASK` / `ATTEMPT_FAULT` (settled), and `reason` either a bare
+    #: outcome slug or `"<origin>><outcome>"` for a round a fault forced the loop
+    #: to redo (see `format_attempt` / `split_attempt` / `attempt_outcome`).
+    #:
+    #: This exists because the record did not say. An operator repaired six
+    #: tasks by hand between 2026-08-15 and 08-17 (brw-09, exec-01, port-01,
+    #: brw-11, dash-04, hlth-01), and an external watcher script had to GUESS
+    #: which attempts were faults by comparing `attempt_count` against
+    #: `review_round` — a heuristic, because nothing recorded the reason. Now
+    #: it is recorded, per attempt, at the moment the attempt ends.
+    #:
+    #: A preformatted string rather than a nested dataclass on purpose:
+    #: `TaskExecutionStore.load` does `TaskExecution(**data)` and does not
+    #: rehydrate nested dataclasses, so a dataclass here would silently load
+    #: back as a dict. Same idiom, and same first-seen ordering rule, as
+    #: `assumptions` below.
+    attempt_ledger: tuple[str, ...] = ()
+    #: Set when a session-ending fault (a rate limit that outlasted its
+    #: back-off budget, an exhausted provider allowance, a browser failure that
+    #: spent the failure budget) killed the loop while THIS task had a
+    #: committed candidate waiting to be reviewed. The work survived; the
+    #: review did not, so the round has to be redone — and that redo is charged
+    #: to the fault budget rather than the task's.
+    #:
+    #: Consumed exactly once per dispatch, which clears it — and RE-ARMED, from
+    #: the same fault code, if that dispatch was itself taken by the environment
+    #: without reaching a review (`orchestrator._settle_attempt` rule 4). The
+    #: review is still lost while that is true, so the round after it is still
+    #: recovery rather than the task's own next try; carrying the marker forward
+    #: is what stops a chain of interruptions falling back onto `attempt_count`
+    #: at its second link.
+    #:
+    #: Not a standing exemption: every dispatch it excuses pays a
+    #: `fault_attempt_count` charge, so an unbroken chain of interruptions ends
+    #: at `MAX_TASK_FAULT_ATTEMPTS` like any other run of faults. It clears for
+    #: good the moment a round either reaches a reviewer or fails on the task's
+    #: own merits.
+    #:
+    #: A positive marker written at the fault, not a condition inferred
+    #: afterwards: that is what keeps this from becoming the same guess the
+    #: watcher script was making.
+    pending_fault_code: str = ""
     presented_report_sha256: str = ""
     review_request_id: str = ""
     intended_remote: str = ""
@@ -286,6 +364,107 @@ class TaskExecution:
 #: `packet.ASSUMPTION_MAX_CHARS_EACH`), and it states what it withheld.
 
 
+#: `attempt_ledger` budget labels, in two groups.
+#:
+#: OPEN — written at dispatch, replaced when the round reaches one of its exits.
+#: There are two of them because a ledger entry has to answer two independent
+#: questions and one field cannot answer both: *which counter is this dispatch
+#: currently charged to* and *has the round finished yet*. `ATTEMPT_PENDING`
+#: means "open, charged to `attempt_count`"; `ATTEMPT_PENDING_FAULT` means
+#: "open, charged to `fault_attempt_count`" — a redo the loop already knew was
+#: forced by a fault (`TaskExecution.pending_fault_code`).
+#:
+#: Collapsing the second one into `ATTEMPT_FAULT` at dispatch, which is what the
+#: first cut of this did, is exactly how a review reached by a fault-charged
+#: redo stopped being recognisable as a review at all: the entry already read
+#: `fault`, so the round's own exit had nothing left to stamp, and the next
+#: session-ending fault could not tell that a review had been in flight. It then
+#: charged the redo to `attempt_count` — the one thing this whole split exists to
+#: prevent. An entry still reading either OPEN label therefore means exactly one
+#: thing, and it is the same thing for both: the round never reached one of its
+#: own exits between the dispatch and the reconciliation that reads it. Two ways
+#: that happens, both environmental — the process did not survive, or a
+#: `GitError` escaped the dispatch to `orchestrator._handle_git_failure`, which
+#: the loop already charges to `consecutive_failures` rather than to the task.
+#: Both settle onto the fault budget; see `_reconcile_unfinished_attempts`.
+ATTEMPT_PENDING = "pending"
+ATTEMPT_PENDING_FAULT = "pending_fault"
+#: SETTLED — the round finished and this is the budget it spent.
+ATTEMPT_TASK = "task"
+ATTEMPT_FAULT = "fault"
+
+#: The OPEN labels, as a set, so callers ask "is this round still in flight?"
+#: rather than restating the pair (and getting it wrong for one of them).
+ATTEMPT_OPEN = (ATTEMPT_PENDING, ATTEMPT_PENDING_FAULT)
+
+#: The one outcome slug the accounting itself keys on, so the string is written
+#: down once. A round that produced this reached the reviewer; a session-ending
+#: fault after it destroyed a review the task had already earned.
+REASON_SENT_FOR_REVIEW = "sent_for_review"
+
+#: Separator for a ledger entry. Chosen because no reason slug or ordinal
+#: contains it, so `split_attempt` never has to guess.
+_LEDGER_SEP = "|"
+
+#: Separator INSIDE a reason, between a fault-opened round's origin (the fault
+#: code that forced the redo) and its own outcome. A redo has two facts worth
+#: recording and they are not interchangeable: `browser_session_lost` says why
+#: the round had to happen at all, `sent_for_review` says what it achieved.
+#: Written `origin>outcome` so the outcome is always the last segment, which is
+#: what `attempt_outcome` reads.
+_REASON_SEP = ">"
+
+
+def format_attempt(ordinal: int, budget: str, reason: str) -> str:
+    """One `attempt_ledger` entry. `reason` is a short machine slug (the same
+    vocabulary as a `blockers.Blocker.code`), never free prose — an operator
+    greps these."""
+    return f"{ordinal}{_LEDGER_SEP}{budget}{_LEDGER_SEP}{reason}"
+
+
+def split_attempt(entry: str) -> tuple[int, str, str]:
+    """`(ordinal, budget, reason)` for one `attempt_ledger` entry.
+
+    Tolerant on the way IN so a hand-edited or truncated record cannot crash a
+    dispatch: an unparseable ordinal reads as 0 and a missing field as `""`.
+    An entry that does not name a known budget therefore reads as neither OPEN
+    nor a charge, which is the fail-closed direction — the reconciliation in
+    `orchestrator` only ever touches entries that positively say they are open,
+    and `_note_round_fault` only ever credits ones that positively say they are
+    settled.
+    """
+    parts = entry.split(_LEDGER_SEP, 2)
+    while len(parts) < 3:
+        parts.append("")
+    try:
+        ordinal = int(parts[0])
+    except ValueError:
+        ordinal = 0
+    return ordinal, parts[1], parts[2]
+
+
+def compose_reason(origin: str, outcome: str) -> str:
+    """`origin>outcome`, or just `outcome` when there is no origin.
+
+    Only a round opened on the fault budget has an origin — the fault code that
+    forced the redo. An ordinary round's open reason is the placeholder
+    `"dispatched"`, which is not an origin and is deliberately dropped rather
+    than composed, so `task|sent_for_review` keeps reading exactly as it did.
+    """
+    return f"{origin}{_REASON_SEP}{outcome}" if origin else outcome
+
+
+def attempt_outcome(reason: str) -> str:
+    """What the round ENDED as, whether or not the reason also carries an origin.
+
+    The accounting keys on the outcome and nothing else, so every reader goes
+    through this rather than comparing the whole field — a comparison that
+    silently stopped matching the moment redo reasons gained an origin, which is
+    the bug this helper exists to make unrepeatable.
+    """
+    return reason.rsplit(_REASON_SEP, 1)[-1]
+
+
 def accumulate_assumptions(
     existing: Sequence[str], incoming: Sequence[str]
 ) -> tuple[str, ...]:
@@ -410,6 +589,10 @@ class TaskExecutionStore:
         # what, and sorting prose alphabetically would destroy that while
         # buying nothing (the order is already deterministic).
         data["assumptions"] = list(execution.assumptions)
+        # Dispatch order, like `assumptions` and for the same reason: the
+        # ordinal in each entry IS which round it describes, so sorting would
+        # destroy the one thing the ledger is for.
+        data["attempt_ledger"] = list(execution.attempt_ledger)
         _atomic_write_json(self._path(execution.task_id), data)
 
     def load(self, task_id: str) -> TaskExecution | None:
@@ -437,6 +620,12 @@ class TaskExecutionStore:
             # "the executor assumed nothing"; `packet._format_executor_report`
             # is what keeps those two readings apart for a reviewer.)
             data["assumptions"] = tuple(data.get("assumptions", ()))
+            # Same `.get` default again: a record written before the attempt
+            # ledger existed has no key, and loads as "no per-attempt reasons
+            # recorded". Its `attempt_count` is still honoured as-is — the
+            # missing ledger is NOT read as "those attempts were faults", which
+            # would retroactively refund a budget nobody can audit.
+            data["attempt_ledger"] = tuple(data.get("attempt_ledger", ()))
             return TaskExecution(**data)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise StateCorruptError(

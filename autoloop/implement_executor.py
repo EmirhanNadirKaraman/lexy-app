@@ -78,7 +78,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
-from .audit.agents import AgentRunner, AgentSpec, ClaudeCliRunner
+from .audit.agents import AgentRunner, AgentSpec, ClaudeCliRunner, classify_agent_fault
 from .contract import AUDIT_TASK_ID, TASK_DECISIONS, Decision, Directive
 from .errors import GitError
 from .executor import ExecutionOutcome
@@ -429,6 +429,14 @@ class ImplementExecutor:
                 details=result.raw_text,
                 validation="not run",
                 changed_paths=changed,
+                # The ONE branch here that can be environmental. Computed from
+                # `result.stall` and `result.error` — structured signals this
+                # method already holds — never from the summary text above.
+                # Every other `status="error"` return in this method leaves it
+                # empty, because a failed validation, an unreadable worker repo
+                # and an agent that changed nothing are all the task's own
+                # problem and must keep consuming the task's attempt budget.
+                fault_kind=classify_agent_fault(result),
             )
 
         try:
