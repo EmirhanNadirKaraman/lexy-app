@@ -260,14 +260,19 @@ from .tasks import (
 from .transcript import TranscriptLogger
 from .validation import run_validation_commands
 from .worktask import (
+    ATTEMPT_FAULT,
+    ATTEMPT_PENDING,
+    ATTEMPT_TASK,
     CommitIntent,
     IntentStore,
     Reconciliation,
     TaskExecution,
     TaskExecutionStore,
     accumulate_assumptions,
+    format_attempt,
     reconcile_after_crash,
     retire_execution,
+    split_attempt,
 )
 from .worktree import WorktreeManager
 
@@ -276,7 +281,52 @@ from .worktree import WorktreeManager
 #: that never produced a review. `review_round` counts only dispatched reviews,
 #: so on its own it would let repeated structural refusals churn locally
 #: without bound.
+#:
+#: A STRUCTURAL REFUSAL IS CHARGED HERE, deliberately, and that decision is the
+#: whole reason this constant is not simply "rounds the reviewer judged". A
+#: refusal for touching files outside `approved_paths`, a failing validation, a
+#: post-commit verification failure — the reviewer never saw any of them, but
+#: every one is a genuine defect in the candidate, produced by the task's own
+#: work, and repeating it is exactly the unbounded local churn this ceiling
+#: exists to stop. Giving refusals a separate, smaller allowance was the
+#: alternative considered; it was rejected because it splits one kind of
+#: failure across two counters while solving nothing — a refusal-heavy task and
+#: a revise-heavy task are both the task failing to converge, and they belong
+#: in the same budget.
 MAX_TASK_ATTEMPTS = 5
+
+#: The SECOND budget, and the one that answers "a fault must not spend a task's
+#: attempt budget" (task budget-01, 2026-08-17) without removing the bound that
+#: charging faults was providing.
+#:
+#: Measured 2026-08-15..17: brw-09 reached 5 attempts with review_round 1 (four
+#: structural refusals), exec-01 reached 5 with review_round 1 after two rounds
+#: died to a provider 429 that "produced no work", brw-11 reached 4 with an
+#: agent-level API error at 368 seconds, and port-01, dash-04 and hlth-01 had
+#: the same shape. All six were repaired by an operator editing the execution
+#: record by hand. Two unrelated things were sharing one counter.
+#:
+#: They no longer do: a round destroyed by a provider throttle, a supervisor
+#: kill, a session-ending browser fault or a process that died mid-round is
+#: charged HERE, and a task converging through real review rounds is no longer
+#: killed by rounds it did not cause. What has NOT changed is that faults still
+#: cost something and still terminate — a task that dies to a fault every
+#: single round exhausts this budget in `MAX_TASK_FAULT_ATTEMPTS` dispatches and
+#: parks on `fault_attempt_ceiling`, which is the bound the pre-executor
+#: increment used to supply on its own.
+#:
+#: TOTAL BOUND, stated rather than derived: every dispatch appends exactly one
+#: `TaskExecution.attempt_ledger` entry and charges exactly one of the two
+#: counters, so `attempt_count + fault_attempt_count == len(attempt_ledger)`
+#: is an invariant (reclassification MOVES a charge, never drops one), and a
+#: dispatch requires BOTH counters to be strictly under their ceilings.
+#: One task can therefore never dispatch more than
+#: `MAX_TASK_ATTEMPTS + MAX_TASK_FAULT_ATTEMPTS - 1` = 9 times without an
+#: operator intervening — and the only intervention that grants more is
+#: answering the `fault_attempt_ceiling` blocker, which resets the fault
+#: counter alone and leaves `attempt_count` exactly where it was
+#: (`cli._clear_fault_budget_on_answer`).
+MAX_TASK_FAULT_ATTEMPTS = 5
 
 #: Appended to a request that is being re-sent into a replacement conversation.
 #: One line, because the payload it follows is already self-contained — every
@@ -1549,6 +1599,12 @@ class Orchestrator:
         )
         if not verdict.allowed:
             waited = state.rate_limit_wait_seconds
+            # The session ends here. If a task had a candidate out for review,
+            # that review is lost with it — see `_note_round_fault`, and the
+            # third bullet above for why the same principle already applies to
+            # `consecutive_failures`. This extends it to the one budget still
+            # charged for faults.
+            self._note_round_fault("provider_rate_limited")
             self._to_needs_user(
                 f"{verdict.reason}: ChatGPT has rate limited this account "
                 f"('Too many requests — please wait a few minutes before trying "
@@ -1612,6 +1668,11 @@ class Orchestrator:
         fallback = self._config.conversation.fallback_provider
 
         def park(code: str, extra: str) -> None:
+            # Every exit from this handler that parks ends the session, so a
+            # review a task had already earned dies with it. Same rule as the
+            # rate-limit handler; `_note_round_fault` is a no-op unless a
+            # candidate was genuinely out for review.
+            self._note_round_fault("provider_quota_exhausted")
             self._to_needs_user(
                 f"{exc} {extra}",
                 resume_phase=phase.value,
@@ -3098,6 +3159,170 @@ class Orchestrator:
         """
         return TRACKER_PATHS
 
+    def _open_attempt(self, execution: TaskExecution) -> None:
+        """Charge one dispatch and record it as OPEN.
+
+        First of the four operations over `TaskExecution.attempt_ledger`, and
+        the order they run in is the whole design:
+
+          `_reconcile_unfinished_attempts`  at dispatch, BEFORE the ceilings
+          `_open_attempt`                   at dispatch, just before the executor
+          `_finalise_attempt`               on EVERY exit of the dispatched round
+          `_note_round_fault`               at a session-ending fault handler
+
+        The invariant they maintain: at most one entry is ever `pending`, it is
+        always the last one, and it exists only between this method and the
+        round's exit. Everything else here follows from that.
+
+        Charged BEFORE the executor runs and persisted immediately — the M1
+        finding #3 property this must not lose. A crash, a restart or a
+        validation failure that never reaches `commit_and_capture` has already
+        consumed something by the time it happens; which budget it consumed is
+        settled afterwards, but that it consumed one is settled here.
+
+        The one case that skips the task budget is a round the loop already
+        knows is a redo: `pending_fault_code` is set only by
+        `_note_round_fault`, only when a session-ending fault destroyed a
+        review this task had already earned, and it is consumed exactly once —
+        cleared here, in the same save.
+        """
+        ordinal = len(execution.attempt_ledger) + 1
+        fault_code = execution.pending_fault_code
+        if fault_code:
+            execution.fault_attempt_count += 1
+            budget, reason = ATTEMPT_FAULT, fault_code
+            execution.pending_fault_code = ""
+        else:
+            execution.attempt_count += 1
+            budget, reason = ATTEMPT_PENDING, "dispatched"
+        execution.attempt_ledger += (format_attempt(ordinal, budget, reason),)
+        self._execution_store.save(execution)
+
+    def _finalise_attempt(
+        self, execution: TaskExecution, budget: str, reason: str
+    ) -> None:
+        """Stamp the open attempt with the budget it is charged to and why.
+
+        Called on every exit path of a dispatched round, which is what makes a
+        still-`pending` entry mean one specific thing rather than being a
+        guess: the process died before the round finished. Nothing else can
+        leave one behind.
+
+        Idempotent and one-way. An entry that has already been stamped is left
+        exactly as it is — a later call cannot re-charge it, cannot move it
+        between budgets, and cannot rewrite the reason. That is the direct
+        guard against a genuine task failure being quietly relabelled a fault
+        by anything downstream of the round that produced it.
+        """
+        if not execution.attempt_ledger:
+            return
+        ordinal, current, _ = split_attempt(execution.attempt_ledger[-1])
+        if current != ATTEMPT_PENDING:
+            return
+        if budget == ATTEMPT_FAULT:
+            # MOVE, never drop: the two counters together always equal
+            # `len(attempt_ledger)`, which is what keeps the combined bound
+            # (see `MAX_TASK_FAULT_ATTEMPTS`) exact rather than approximate.
+            execution.attempt_count -= 1
+            execution.fault_attempt_count += 1
+        execution.attempt_ledger = execution.attempt_ledger[:-1] + (
+            format_attempt(ordinal, budget, reason),
+        )
+        self._execution_store.save(execution)
+
+    def _reconcile_unfinished_attempts(self, execution: TaskExecution) -> None:
+        """Move any attempt still recorded as OPEN onto the fault budget.
+
+        Reached only at the start of a dispatch, so every entry it can see
+        belongs to an EARLIER round — and an earlier round that never stamped
+        itself is a round the process did not survive: an operator pause or
+        restart mid-round, a kill, a crash inside the agent. Those are faults
+        by the definition this task is built on (the round produced no
+        reviewable outcome), and they are charged accordingly.
+
+        **This cannot silently reclassify a genuine task failure.** The only
+        entries it touches are ones that positively read `pending`, and a
+        failure that actually happened — validation failed, the commit was
+        refused, the paths were outside scope, the reviewer said revise — went
+        through `_finalise_attempt` and reads `task`. `_finalise_attempt`
+        refuses to re-stamp, so there is no path by which a stamped entry can
+        become `pending` again. An unparseable or hand-edited entry reads as
+        neither (see `worktask.split_attempt`) and is left alone.
+
+        Still bounded: these charges land in `fault_attempt_count`, so a task
+        whose process dies every single round parks on `fault_attempt_ceiling`
+        rather than churning forever.
+        """
+        entries: list[str] = []
+        reclaimed = 0
+        for entry in execution.attempt_ledger:
+            ordinal, budget, _ = split_attempt(entry)
+            if budget == ATTEMPT_PENDING:
+                execution.attempt_count -= 1
+                execution.fault_attempt_count += 1
+                entry = format_attempt(ordinal, ATTEMPT_FAULT, "interrupted_mid_round")
+                reclaimed += 1
+            entries.append(entry)
+        if not reclaimed:
+            return
+        execution.attempt_ledger = tuple(entries)
+        self._execution_store.save(execution)
+        self._log(
+            "attempt_reclassified",
+            data={
+                "task_id": execution.task_id,
+                "reason": "interrupted_mid_round",
+                "attempts": reclaimed,
+                "attempt_count": execution.attempt_count,
+                "fault_attempt_count": execution.fault_attempt_count,
+            },
+        )
+
+    def _note_round_fault(self, code: str) -> None:
+        """Record that a session-ending fault destroyed a review this task had
+        already earned, so the redo is charged to the fault budget.
+
+        The narrow case `_finalise_attempt` cannot cover. When a round commits
+        and hands its packet to the reviewer, that round is a real task attempt
+        and is charged as one — it produced work. But if the SESSION then dies
+        on a rate limit, an exhausted allowance or a browser failure that spent
+        its budget, the review never arrives and the whole round has to be
+        performed again. brw-11 lost three rounds that way with its fix already
+        committed and passing.
+
+        Deliberately conditional on the last entry being exactly that shape — a
+        finished round whose packet went out. A fault at any other moment either
+        left an open entry (which `_reconcile_unfinished_attempts` owns) or
+        interrupted nothing this task can be credited for, and marking those
+        would hand out free attempts on a condition nobody checked.
+
+        Best-effort throughout: this runs inside a failure handler, and a
+        bookkeeping write that could itself raise would turn one fault into two.
+        """
+        if self._execution_store is None:
+            return
+        try:
+            record = self.state.task_execution or {}
+            task_id = record.get("task_id") or ""
+            if not task_id:
+                return
+            execution = self._execution_store.load(task_id)
+            if execution is None or not execution.attempt_ledger:
+                return
+            _, budget, reason = split_attempt(execution.attempt_ledger[-1])
+            if (budget, reason) != (ATTEMPT_TASK, "sent_for_review"):
+                return
+            if execution.pending_fault_code:
+                return          # already marked by an earlier fault in this episode
+            execution.pending_fault_code = code
+            self._execution_store.save(execution)
+            self._log(
+                "round_fault_noted",
+                data={"task_id": task_id, "code": code},
+            )
+        except Exception:
+            return
+
     def _dispatch_task_postcommit(self, directive: Directive, task: Task, state: LoopState) -> None:
         if (self._worktrees is None and self._worker_repos is None) or (
             self._execution_store is None or self._intent_store is None
@@ -3318,11 +3543,23 @@ class Orchestrator:
                 self._intent_store.clear(task.id)
                 state.task_execution = asdict(execution)
                 self._store.save(state)
+                # `_finish_postcommit` stamps the attempt the CRASHED process
+                # opened — and it stamps it `task`, because the commit really
+                # did happen. Reaching the reconciliation below instead would
+                # have refunded a successful round as an interruption, which is
+                # precisely the reclassification that must never occur; the
+                # early return here is what prevents it.
                 self._finish_postcommit(execution, worktree_git, state, task)
                 return
             # NO_COMMIT: the commit this intent describes never happened.
             # Clear the stale intent and fall through to attempt it fresh.
             self._intent_store.clear(task.id)
+
+        # Settle what earlier rounds actually spent BEFORE either ceiling is
+        # read, so a task whose process was killed mid-round is judged against
+        # the budget that failure really belongs to. Nothing here can touch a
+        # round that finished — see the method's own docstring.
+        self._reconcile_unfinished_attempts(execution)
 
         if execution.attempt_count >= MAX_TASK_ATTEMPTS:
             self._to_needs_user(
@@ -3336,7 +3573,36 @@ class Orchestrator:
                 task_id=task.id,
                 detail=(
                     f"attempt_count={execution.attempt_count} cap={MAX_TASK_ATTEMPTS} "
-                    f"branch={execution.task_branch}"
+                    f"branch={execution.task_branch} "
+                    f"ledger={','.join(execution.attempt_ledger)}"
+                ),
+            )
+            return
+        if execution.fault_attempt_count >= MAX_TASK_FAULT_ATTEMPTS:
+            # The other half of the split, and the reason faults can be spared
+            # the task budget at all: they are not spared a budget. A task that
+            # loses every round to a provider throttle, a killed agent or a
+            # process that dies mid-round ends HERE instead of churning on
+            # forever, and the blocker says which of the two walls it hit.
+            self._to_needs_user(
+                f"task {task.id}: {execution.fault_attempt_count} rounds on "
+                f"{execution.task_branch} were lost to faults rather than to "
+                f"the work itself (cap {MAX_TASK_FAULT_ATTEMPTS}) — provider "
+                "throttles, killed agents, or rounds the process did not "
+                "survive. The task's own attempt budget is untouched "
+                f"({execution.attempt_count}/{MAX_TASK_ATTEMPTS}); what keeps "
+                "failing is the environment around it. Nothing was rolled back "
+                "or pushed. The per-attempt record is in the execution's "
+                "`attempt_ledger`.",
+                kind="task_fatal",
+                code="fault_attempt_ceiling",
+                task_id=task.id,
+                detail=(
+                    f"fault_attempt_count={execution.fault_attempt_count} "
+                    f"cap={MAX_TASK_FAULT_ATTEMPTS} "
+                    f"attempt_count={execution.attempt_count} "
+                    f"branch={execution.task_branch} "
+                    f"ledger={','.join(execution.attempt_ledger)}"
                 ),
             )
             return
@@ -3364,14 +3630,18 @@ class Orchestrator:
                 return  # already parked
             worktree_git = refreshed
 
-        # M1 finding #3 (bounded attempts): incremented and PERSISTED before
-        # the executor ever runs, not after a commit — so a crash, a restart,
-        # or a validation failure that never reaches `commit_and_capture` all
-        # consume an attempt exactly like a successful one does. (The
-        # corresponding increment used to live in `_finish_postcommit`,
-        # reached only after a commit; it is gone from there now — see that
-        # method.)
-        execution.attempt_count += 1
+        # M1 finding #3 (bounded attempts): charged and PERSISTED before the
+        # executor ever runs, not after a commit — so a crash, a restart, or a
+        # validation failure that never reaches `commit_and_capture` all consume
+        # an attempt exactly like a successful one does. (The corresponding
+        # increment used to live in `_finish_postcommit`, reached only after a
+        # commit; it is gone from there now — see that method.)
+        #
+        # What `_open_attempt` adds on top of the bare `attempt_count += 1` it
+        # replaced is the RECORD: the attempt is written down as open, and the
+        # round's own exit says which budget it spent and why (budget-01,
+        # 2026-08-17). The charge itself still lands here, before any work.
+        self._open_attempt(execution)
         # Remember what this round was asked to change, so the NEXT round can
         # tell "the reviewer wants something new" from "the reviewer is
         # repeating itself". Recorded HERE, at the point the round is actually
@@ -3396,7 +3666,11 @@ class Orchestrator:
             # never prevention.
             outcome = self._execute_with_escape_detection(directive, task)
             if outcome is None:
-                return  # escape detected, already parked
+                # Escape detected, already parked. A TASK attempt: the agent
+                # wrote outside its worker repository, which is the work
+                # misbehaving, not the environment failing it.
+                self._finalise_attempt(execution, ATTEMPT_TASK, "checkout_escape_detected")
+                return
         else:
             outcome = self._executor.execute(directive, task)
         state.last_validation = outcome.validation or "(none)"
@@ -3411,6 +3685,20 @@ class Orchestrator:
             },
         )
         if outcome.status != "ok":
+            # THE measured case (exec-01, brw-11): the executor came back
+            # having produced nothing because the agent provider threw a
+            # session-limit 429, or because the stall supervisor killed it.
+            # The reviewer never saw a candidate, and nothing about the task
+            # could have prevented it — so that round is charged to the fault
+            # budget, and only when the executor POSITIVELY named the cause
+            # (`ExecutionOutcome.fault_kind`). A failed validation, an
+            # unreadable worker repo and an agent that changed no files all
+            # leave it empty and stay task attempts, which is what keeps a
+            # task that simply cannot pass its own tests bounded.
+            if outcome.fault_kind:
+                self._finalise_attempt(execution, ATTEMPT_FAULT, outcome.fault_kind)
+            else:
+                self._finalise_attempt(execution, ATTEMPT_TASK, "executor_reported_failure")
             state.outbox = TEMPLATES["implementation_review"].render(
                 task_id=task.id,
                 task_title=task.title,
@@ -3526,6 +3814,19 @@ class Orchestrator:
             # condition in place for every task after it, and the loop would
             # march through the whole backlog blocking each one in turn. So this
             # is loop_fatal even though it surfaced inside a task.
+            #
+            # Charged to the FAULT budget for the same reason it is loop_fatal:
+            # the environment moved under the round, the round produced no
+            # reviewable outcome, and nothing about this task's work could have
+            # avoided it. Note the contrast with the generic handler directly
+            # below, which stamps ATTEMPT_TASK: HEAD drift and an empty path
+            # list are this unit of work getting it wrong, so they keep spending
+            # the task's own budget. The two classifications differ because the
+            # two causes do — the same reason the two `except` clauses are
+            # separate and ordered, which `test_blockers.py::test_environment_
+            # drift_is_loop_fatal_not_a_task_refusal` pins by reading this
+            # method's source.
+            self._finalise_attempt(execution, ATTEMPT_FAULT, "worker_environment_drift")
             self._intent_store.clear(task.id)
             state.last_response = None
             self._to_needs_user(
@@ -3545,6 +3846,7 @@ class Orchestrator:
             # operator, so this one does too rather than escaping as a raw
             # error: the commit did not happen, nothing was rolled back, and a
             # human needs to look at why the task's environment moved.
+            self._finalise_attempt(execution, ATTEMPT_TASK, "commit_refused")
             self._intent_store.clear(task.id)
             state.last_response = None
             self._to_needs_user(
@@ -4077,6 +4379,26 @@ class Orchestrator:
         # crash-recovery adoption (the increment happened in the EARLIER,
         # crashed process, before ITS executor call) — either way the count
         # on disk is already correct and must not be bumped again here.
+        #
+        # What this method DOES do to the attempt record is STAMP it. All three
+        # of its exits are task attempts, and every one of them is charged that
+        # way on purpose:
+        #
+        #   * post-commit verification failed — a structural refusal. The
+        #     reviewer never saw it, and it is charged anyway: it is a genuine
+        #     defect in the candidate this task produced, and repeating it is
+        #     exactly the local churn `MAX_TASK_ATTEMPTS` bounds.
+        #   * the review packet could not be built — a git failure, but scoped
+        #     to this candidate (an oversized range-diff is a property of what
+        #     was committed). Fail closed: not positively an environmental
+        #     fault, so the task's own budget pays.
+        #   * the packet went out — the round produced work and reached the
+        #     reviewer. This is the case `attempt_count` was invented for.
+        #
+        # The crash-recovery adoption path lands here too, and that matters:
+        # the attempt the DEAD process opened is stamped `task` here, so the
+        # reconciliation in `_dispatch_task_postcommit` can never later see it
+        # as unfinished and refund a round that genuinely committed.
         failures, validation_summary = self._verify_committed(execution, worktree_git)
         state.last_validation = validation_summary
         # `review_round` counts REVIEWS, not commit attempts. It is incremented
@@ -4108,6 +4430,9 @@ class Orchestrator:
         )
         state.last_response = None
         if failures:
+            self._finalise_attempt(
+                execution, ATTEMPT_TASK, "post_commit_verification_failed"
+            )
             self._to_needs_user(
                 f"task {task.id}: commit {execution.candidate_sha[:12]} on "
                 f"{execution.task_branch} (round {execution.review_round}) was "
@@ -4131,6 +4456,7 @@ class Orchestrator:
                 execution, worktree_git, task
             )
         except GitCommandError as exc:
+            self._finalise_attempt(execution, ATTEMPT_TASK, "review_packet_build_failed")
             self._to_needs_user(
                 f"task {task.id}: commit {execution.candidate_sha[:12]} on "
                 f"{execution.task_branch} (round {execution.review_round + 1}) "
@@ -4146,6 +4472,11 @@ class Orchestrator:
         # Only here — a packet exists and is about to become `outbox`. A packet
         # that could not be built consumed no review round either.
         execution.review_round += 1
+        # Stamped BEFORE the save below, so the round's classification and the
+        # review round it earned reach disk together. `sent_for_review` is also
+        # the exact entry `_note_round_fault` looks for: a session that then
+        # dies on a fault destroyed a review this task had already earned.
+        self._finalise_attempt(execution, ATTEMPT_TASK, "sent_for_review")
         self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         state.outbox = TEMPLATES["postcommit_review"].render(
@@ -4887,6 +5218,7 @@ class Orchestrator:
                 self._store.save(state)
                 return
             cooldown = self._config.browser.restart_cooldown_seconds
+            self._note_round_fault("browser_restart_cooldown_blocked")
             self._to_needs_user(
                 f"{skip_verdict.reason}: each of the last "
                 f"{state.browser_restart_skips} browser failures was left "
@@ -4927,6 +5259,11 @@ class Orchestrator:
         )
         verdict = self._policy.check_failure_budget(state.consecutive_failures)
         if not verdict.allowed:
+            # The run is over. A candidate that was out for review when the
+            # browser gave up will have to be re-produced by a later session,
+            # and that redo is a fault's cost, not the task's — brw-11 lost
+            # three rounds exactly this way with its fix already committed.
+            self._note_round_fault("browser_session_lost")
             state.resume_phase = phase.value
             state.stop_reason = f"{verdict.reason} — last error: {exc}"
             state.phase = Phase.FAILED.value
@@ -5395,6 +5732,11 @@ class Orchestrator:
                 "new_base": head,
                 "quarantined": str(quarantined) if quarantined else None,
                 "attempt_count": execution.attempt_count,
+                # Preserved by the same rule and for the same reason: a moving
+                # base must not refill EITHER budget. The ledger rides along
+                # untouched (it is on this same record), so the per-attempt
+                # reasons survive a re-base too.
+                "fault_attempt_count": execution.fault_attempt_count,
             },
         )
         return execution

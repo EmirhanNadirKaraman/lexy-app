@@ -1755,6 +1755,74 @@ poll). The served script is still parsed by the existing
 `test_the_served_javascript_actually_parses`, which globs every `<script>` block
 and runs `node --check` over it, so no second parse test was added.
 
+**A fault must not spend a task's attempt budget (2026-08-17, `budget-01`; new
+`test_attempt_budget.py`, 22 tests — hand-counted, no shell in the worker).** `attempt_count` was one counter paying
+for two unrelated things. It is incremented before the executor runs — the M1
+finding #3 property that bounds a task which dies every round without ever
+reaching a reviewer — so it also charged rounds destroyed by a provider 429, a
+stall-killed agent, or a process that did not survive. Six tasks reached the
+ceiling on rounds nobody reviewed (brw-09 5/1, exec-01 5/1, port-01 5/3,
+brw-11 4/0-1, dash-04, hlth-01), each repaired by an operator editing the
+execution record by hand, and `~/.autoloop/afk-worker.sh` had to guess which
+attempts were faults from `attempt_count - review_round >= 2`.
+
+Now two budgets. `attempt_count` keeps the task's own work
+(`MAX_TASK_ATTEMPTS`); `fault_attempt_count` takes rounds lost to faults, with
+its own ceiling and park code `fault_attempt_ceiling`. `TaskExecution.
+attempt_ledger` records `"<ordinal>|<budget>|<reason>"` per attempt, so the
+reason is READ rather than inferred. Four properties carry it:
+
+* **The split is decided from structured signals, never prose.**
+  `ExecutionOutcome.fault_kind` is set only in `implement_executor`'s
+  agent-did-not-complete branch, from `AgentResult.stall` and a narrow phrase
+  list over `AgentResult.error` (`audit.agents.classify_agent_fault`). A bare
+  HTTP status is deliberately not enough on its own —
+  `test_classify_agent_fault_defaults_to_the_task_owning_its_own_failure`
+  drives "AssertionError at line 429 of test_thing.py" and "502 tests
+  collected" through it and pins the empty answer, because a wrongly-set fault
+  would excuse a genuine failure forever while a wrongly-blank one costs a
+  single attempt.
+* **A structural refusal is CHARGED, and pinned to that rule.**
+  `test_a_structural_refusal_spends_the_task_attempt_budget` is the decision
+  this task had to make and defend: the reviewer never judged the round, which
+  is the argument for exempting it, but it is a real defect the task's own work
+  produced and repeating it is exactly the churn `MAX_TASK_ATTEMPTS` bounds.
+  Exempting it would have removed the only ceiling on that case.
+* **Reconciliation cannot relabel a finished round.** Every exit of a
+  dispatched round stamps its ledger entry, so an entry still reading `pending`
+  can only be a round the process did not survive.
+  `test_reconciliation_never_reclassifies_a_finished_task_attempt` runs a
+  failure, a fault and a review through, then re-runs the reconciliation and
+  asserts both counters and all three classifications are untouched;
+  `test_finalising_an_attempt_is_one_way_and_cannot_be_re_stamped` pins the
+  same guard at the unit level. Without it, five validation failures could be
+  refunded on the next restart and churn forever.
+* **Both budgets terminate.**
+  `test_the_fault_budget_terminates_a_task_that_faults_every_round` and
+  `test_a_task_whose_process_dies_every_round_still_terminates` reach
+  `fault_attempt_ceiling` with the executor NOT called on the parking dispatch;
+  `test_the_task_budget_still_terminates_a_task_that_fails_its_own_work`
+  re-checks the unchanged `attempt_count_ceiling` path against the ledger. An
+  `assert_books_balance` helper pins `attempt_count + fault_attempt_count ==
+  len(attempt_ledger)` at each step, which is what makes the combined bound
+  (`MAX_TASK_ATTEMPTS + MAX_TASK_FAULT_ATTEMPTS - 1` dispatches) exact.
+
+Plus: the three not-chargeable shapes end-to-end (a rate-limited round that
+produced no work, a supervisor-killed agent, a round interrupted mid-flight),
+the chargeable control (a completed validation failure), a round that reached
+the reviewer and came back `revise`,
+`test_a_session_ending_browser_fault_charges_the_redo_to_the_fault_budget` with
+its narrowing partner `..._marks_nothing_when_no_review_was_in_flight`,
+on-disk ledger round-trip + a pre-ledger record loading with its
+`attempt_count` honoured as-is, `split_attempt` tolerance for a hand-edited
+entry, and the two `answer` tests proving a `fault_attempt_ceiling` answer
+resets ONLY the fault counter (preserving `candidate_sha`, `review_round`,
+`last_revise_feedback` and every ledger entry) while an `attempt_count_ceiling`
+answer refills nothing — the second of those runs against a task that was never
+quarantined, because plain `run` parks task_fatal without
+`cli._handle_parked_task`, so `registry.unblock` raises and a reset placed after
+it would be skipped in exactly the case it exists for.
+
 Run: `pytest autoloop/tests` from the repo root to run only this tree.
 
 **Included in a bare `pytest` since 2026-08-04 (rt-05).** Root `testpaths` is

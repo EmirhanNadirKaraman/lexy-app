@@ -910,6 +910,44 @@ not a build failure.
 
 ## 8. Autoloop M1 hardening (external workers, escape detection, non-circular task scope)
 
+### A task parks on `attempt_count_ceiling` with a `review_round` far below it — and an operator has to reset the counter by hand
+**Symptom:** `python -m autoloop blockers` shows `attempt_count_ceiling` for a
+task that was never failing review. Measured 2026-08-15..17, six times:
+
+| task | attempts | review_round | what actually happened |
+|---|---|---|---|
+| brw-09  | 5 | 1 | four STRUCTURAL refusals (paths outside `approved_paths`) — the reviewer saw none of them |
+| exec-01 | 5 | 1 | two rounds died to the agent provider's session-limit 429; the reviewer's own words: "produced no work" |
+| port-01 | 5 | 3 | one rate-limit round plus browser churn |
+| brw-11  | 4 | 0–1 | three rounds lost to faults (incl. an agent-level API error at 368s) while its lint fix was already committed and passing |
+| dash-04 | — | — | same shape |
+| hlth-01 | — | — | same shape |
+
+Each was repaired the same way: edit `.autoloop/executions/<task>.json`, set
+`attempt_count` back to 0, leave `candidate_sha` / `review_round` /
+`last_revise_feedback` alone. `~/.autoloop/afk-worker.sh` was written to
+automate it and had to GUESS with a heuristic (`attempt_count - review_round
+>= 2`), because the record did not say why any attempt had been spent.
+**Cause:** ONE counter was paying for two unrelated things. `attempt_count` is
+incremented in `orchestrator._dispatch_task_postcommit` before the executor
+runs — deliberately, so a crash or a validation failure that never reaches a
+commit still consumes an attempt (M1 finding #3), which is the only bound on a
+task that dies every round without ever reaching a reviewer. But that same
+increment also charged rounds destroyed by a provider throttle, a killed agent
+or a process that did not survive, so a task converging through real review
+rounds could be killed by rounds it did not cause.
+**Fix:** applied repo-side 2026-08-17 (task budget-01) — two budgets, not one.
+`attempt_count` keeps bounding the task's own work (validation failures,
+structural refusals, rounds that reached the reviewer); `fault_attempt_count`
+bounds rounds lost to faults, with its own ceiling and its own park code
+`fault_attempt_ceiling`. `TaskExecution.attempt_ledger` records, per attempt,
+`"<ordinal>|<budget>|<reason>"` — so the answer is read, never inferred. **Both
+budgets still terminate**, so nothing here removes a bound: a task that faults
+every round parks on `fault_attempt_ceiling` instead of churning. If you are
+looking at this because a task parked anyway, read its `attempt_ledger` first —
+it names each round's cause. The watcher script is now redundant and should be
+deleted; it can only ever re-derive, badly, what the ledger states.
+
 ### An autoloop commit is refused by a test that passes when you re-run it
 **Symptom:** post-commit validation refuses a commit with exactly one failing
 test out of ~1000. Re-running the identical worker tree passes. Happened three

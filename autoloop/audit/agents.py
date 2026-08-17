@@ -375,6 +375,81 @@ def summarize_failure(stderr: str | None, stdout: str | None, returncode: int) -
     )
 
 
+#: Phrases that identify an agent run stopped by the PROVIDER rather than by
+#: anything in the repository — a throttle, an exhausted allowance, or the API
+#: being unavailable. Deliberately narrow and lowercase-matched: this list is
+#: the difference between "the round was destroyed by something nobody could
+#: have recovered from" and "the work was wrong", and the second reading is the
+#: safe default (see `classify_agent_fault`).
+_PROVIDER_FAULT_PHRASES = (
+    "rate limit",
+    "rate_limit",
+    "rate-limit",
+    "too many requests",
+    "overloaded",
+    "usage limit",
+    "quota",
+    "session limit",
+    "insufficient credit",
+    "service unavailable",
+)
+
+#: HTTP statuses that mean the same thing, paired with a context requirement.
+#: A bare "429" is NOT enough on its own: `result.error` is an excerpt of the
+#: agent's own output, which can quote a line number, a byte count or a test
+#: name. Requiring one of `_PROVIDER_FAULT_CONTEXT` alongside the code keeps a
+#: coincidental three-digit number from excusing a genuine failure.
+_PROVIDER_FAULT_STATUSES = ("429", "502", "503", "529")
+_PROVIDER_FAULT_CONTEXT = ("api", "http", "status", "request", "error code")
+
+#: Reason slugs `classify_agent_fault` can return. They travel to
+#: `executor.ExecutionOutcome.fault_kind` and end up in a
+#: `worktask.TaskExecution.attempt_ledger` entry, so they are stable strings an
+#: operator greps, not prose.
+AGENT_FAULT_STALL = "agent_killed_by_supervisor"
+AGENT_FAULT_PROVIDER = "agent_provider_unavailable"
+
+
+def classify_agent_fault(result: "AgentResult") -> str:
+    """Which ENVIRONMENTAL fault stopped this agent, or `""` for none.
+
+    Two positively-identified causes, both read from structured signals rather
+    than from the summary prose:
+
+      * the supervisor killed the run — `result.stall` is present, which
+        `_run_supervised` sets only for a stall or the absolute ceiling;
+      * the provider refused to serve it — `result.error` names a throttle, an
+        exhausted allowance or an API outage.
+
+    Everything else returns `""` and is charged to the task's own attempt
+    budget. That default is the load-bearing part: an agent that exits non-zero
+    because it wrote broken code, ran out of context reasoning in circles, or
+    simply failed, IS the task's problem, and misreading one of those as a
+    fault would remove the bound on a task that fails every single round.
+
+    The one FALSE-POSITIVE direction, stated rather than left implicit: on the
+    `not result.ok` path `result.error` is `summarize_failure(stderr, stdout,
+    returncode)` — an excerpt of the agent process's own output. An agent
+    working on this repository's `services/rate_limiter.py` that exits non-zero
+    can therefore put "rate limit" into that excerpt and have a genuine failure
+    read as a fault. The consequence is bounded to one charge on the fault
+    budget, which still terminates (`MAX_TASK_FAULT_ATTEMPTS`), and the
+    `attempt_ledger` entry names the classification so it is visible rather
+    than silent. Narrowing the phrases further would trade that for the far
+    worse direction — a real 429 charged to a converging task.
+    """
+    if result.stall is not None:
+        return AGENT_FAULT_STALL
+    error = (result.error or "").lower()
+    if any(phrase in error for phrase in _PROVIDER_FAULT_PHRASES):
+        return AGENT_FAULT_PROVIDER
+    if any(code in error for code in _PROVIDER_FAULT_STATUSES) and any(
+        word in error for word in _PROVIDER_FAULT_CONTEXT
+    ):
+        return AGENT_FAULT_PROVIDER
+    return ""
+
+
 def _extract_result_text(stdout: str) -> str:
     """`--output-format json` wraps the reply; unwrap `result` when present,
     fall back to the raw stdout otherwise."""

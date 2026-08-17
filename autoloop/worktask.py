@@ -116,11 +116,74 @@ class TaskExecution:
     #: round cannot change its own outcome. This is what makes an
     #: unlimited round budget safe.
     last_revise_feedback: str = ""
-    #: Every commit/packet attempt for this task, INCLUDING ones that never
-    #: produced a review. `review_round` deliberately counts only dispatched
-    #: reviews, so on its own it would let structural refusals churn locally
-    #: without bound. This is the independent ceiling on that.
+    #: Every commit/packet attempt for this task that is the TASK's own —
+    #: INCLUDING ones that never produced a review. `review_round`
+    #: deliberately counts only dispatched reviews, so on its own it would let
+    #: structural refusals churn locally without bound. This is the
+    #: independent ceiling on that, and it still is: a validation failure, a
+    #: structural refusal, a post-commit refusal and a round that reached the
+    #: reviewer all land here.
+    #:
+    #: What does NOT land here, since 2026-08-17, is a round destroyed by
+    #: something the task could not have avoided — a provider 429, an agent
+    #: killed by the stall supervisor, a process that died mid-round. Those go
+    #: to `fault_attempt_count` below. Both budgets are bounded; neither is
+    #: spent by the other. See `attempt_ledger` for the per-attempt record of
+    #: which one was charged and why.
     attempt_count: int = 0
+    #: Attempts charged to the FAULT budget instead of `attempt_count`.
+    #:
+    #: Why a SECOND budget rather than an exemption. `attempt_count` is
+    #: incremented before the executor runs precisely so a crash, a restart or
+    #: a validation failure that never reaches a commit still consumes an
+    #: attempt — that is the only bound on a task that dies every round
+    #: without ever reaching a reviewer, and simply exempting faults would
+    #: delete it. So faults keep a ceiling; they just keep their OWN, and a
+    #: task converging through real review rounds is no longer killed by
+    #: rounds it did not cause.
+    #:
+    #: The total number of dispatches for one task stays deterministically
+    #: bounded: every dispatch appends exactly one `attempt_ledger` entry and
+    #: charges exactly one of the two counters, so
+    #: `attempt_count + fault_attempt_count == len(attempt_ledger)` holds
+    #: (reclassification MOVES a charge, it never drops one). Since a dispatch
+    #: requires both counters to be strictly under their ceilings, the ledger
+    #: can never grow past `MAX_TASK_ATTEMPTS + MAX_TASK_FAULT_ATTEMPTS - 1`
+    #: without an operator intervening. The one thing that resets this counter
+    #: is an operator answering the `fault_attempt_ceiling` blocker it produced
+    #: (`cli._clear_fault_budget_on_answer`) — an explicit, recorded decision
+    #: to grant a fresh allowance, never something the loop does to itself.
+    fault_attempt_count: int = 0
+    #: One entry per dispatched attempt, in dispatch order, saying WHICH budget
+    #: that attempt was charged to and WHY: `"<ordinal>|<budget>|<reason>"`
+    #: with `budget` one of `ATTEMPT_PENDING` / `ATTEMPT_TASK` /
+    #: `ATTEMPT_FAULT` (see `format_attempt` / `split_attempt`).
+    #:
+    #: This exists because the record did not say. An operator repaired six
+    #: tasks by hand between 2026-08-15 and 08-17 (brw-09, exec-01, port-01,
+    #: brw-11, dash-04, hlth-01), and an external watcher script had to GUESS
+    #: which attempts were faults by comparing `attempt_count` against
+    #: `review_round` — a heuristic, because nothing recorded the reason. Now
+    #: it is recorded, per attempt, at the moment the attempt ends.
+    #:
+    #: A preformatted string rather than a nested dataclass on purpose:
+    #: `TaskExecutionStore.load` does `TaskExecution(**data)` and does not
+    #: rehydrate nested dataclasses, so a dataclass here would silently load
+    #: back as a dict. Same idiom, and same first-seen ordering rule, as
+    #: `assumptions` below.
+    attempt_ledger: tuple[str, ...] = ()
+    #: Set when a session-ending fault (a rate limit that outlasted its
+    #: back-off budget, an exhausted provider allowance, a browser failure that
+    #: spent the failure budget) killed the loop while THIS task had a
+    #: committed candidate waiting to be reviewed. The work survived; the
+    #: review did not, so the round has to be redone — and that redo is charged
+    #: to the fault budget rather than the task's.
+    #:
+    #: Consumed exactly once, by the next dispatch, which clears it. A positive
+    #: marker written at the fault, not a condition inferred afterwards: that
+    #: is what keeps this from becoming the same guess the watcher script was
+    #: making.
+    pending_fault_code: str = ""
     presented_report_sha256: str = ""
     review_request_id: str = ""
     intended_remote: str = ""
@@ -286,6 +349,46 @@ class TaskExecution:
 #: `packet.ASSUMPTION_MAX_CHARS_EACH`), and it states what it withheld.
 
 
+#: `attempt_ledger` budget labels. `ATTEMPT_PENDING` is the OPEN state written
+#: at dispatch and replaced by one of the other two when the round ends; an
+#: entry still reading `pending` therefore means exactly one thing — the
+#: process died between the dispatch and the round's own exit.
+ATTEMPT_PENDING = "pending"
+ATTEMPT_TASK = "task"
+ATTEMPT_FAULT = "fault"
+
+#: Separator for a ledger entry. Chosen because no reason slug or ordinal
+#: contains it, so `split_attempt` never has to guess.
+_LEDGER_SEP = "|"
+
+
+def format_attempt(ordinal: int, budget: str, reason: str) -> str:
+    """One `attempt_ledger` entry. `reason` is a short machine slug (the same
+    vocabulary as a `blockers.Blocker.code`), never free prose — an operator
+    greps these."""
+    return f"{ordinal}{_LEDGER_SEP}{budget}{_LEDGER_SEP}{reason}"
+
+
+def split_attempt(entry: str) -> tuple[int, str, str]:
+    """`(ordinal, budget, reason)` for one `attempt_ledger` entry.
+
+    Tolerant on the way IN so a hand-edited or truncated record cannot crash a
+    dispatch: an unparseable ordinal reads as 0 and a missing field as `""`.
+    An entry that does not name a known budget therefore reads as neither
+    `ATTEMPT_PENDING` nor a charge, which is the fail-closed direction — the
+    reconciliation below only ever touches entries that positively say
+    `pending`.
+    """
+    parts = entry.split(_LEDGER_SEP, 2)
+    while len(parts) < 3:
+        parts.append("")
+    try:
+        ordinal = int(parts[0])
+    except ValueError:
+        ordinal = 0
+    return ordinal, parts[1], parts[2]
+
+
 def accumulate_assumptions(
     existing: Sequence[str], incoming: Sequence[str]
 ) -> tuple[str, ...]:
@@ -410,6 +513,10 @@ class TaskExecutionStore:
         # what, and sorting prose alphabetically would destroy that while
         # buying nothing (the order is already deterministic).
         data["assumptions"] = list(execution.assumptions)
+        # Dispatch order, like `assumptions` and for the same reason: the
+        # ordinal in each entry IS which round it describes, so sorting would
+        # destroy the one thing the ledger is for.
+        data["attempt_ledger"] = list(execution.attempt_ledger)
         _atomic_write_json(self._path(execution.task_id), data)
 
     def load(self, task_id: str) -> TaskExecution | None:
@@ -437,6 +544,12 @@ class TaskExecutionStore:
             # "the executor assumed nothing"; `packet._format_executor_report`
             # is what keeps those two readings apart for a reviewer.)
             data["assumptions"] = tuple(data.get("assumptions", ()))
+            # Same `.get` default again: a record written before the attempt
+            # ledger existed has no key, and loads as "no per-attempt reasons
+            # recorded". Its `attempt_count` is still honoured as-is — the
+            # missing ledger is NOT read as "those attempts were faults", which
+            # would retroactively refund a budget nobody can audit.
+            data["attempt_ledger"] = tuple(data.get("attempt_ledger", ()))
             return TaskExecution(**data)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise StateCorruptError(
