@@ -1503,6 +1503,73 @@ validation, validation mutating the tree — still parks; and candidates still g
 to their own side branch for an operator to merge. See `docs/SECURITY.md` S25's
 amendment for the security accounting.
 
+**Amendment, 2026-08-17 — the bound on attempts is now TWO budgets, not one
+(task `budget-01`).** The bullet above is still true and still load-bearing: the
+charge is taken and persisted BEFORE the executor runs, which is the only reason
+a crash, a restart, or a validation failure that never reaches a commit consumes
+anything at all. What changed is WHICH counter it lands in.
+
+One counter was paying for two unrelated things. `attempt_count` exists to bound
+unproductive local churn — five commit attempts without an approved review — but
+the pre-executor increment also charged rounds destroyed by something no
+candidate could have avoided: an agent-provider 429 that produced no work, an
+agent the stall supervisor killed, a browser session lost mid-round, an operator
+pause. Six tasks parked on `attempt_count_ceiling` between 2026-08-15 and 08-17
+with `review_round` far below it (brw-09 5/1, exec-01 5/1, port-01 5/3, brw-11
+4/0–1, dash-04, hlth-01); two had never been reviewed at all. Each was repaired
+by an operator editing `attempt_count` back to 0 by hand, and an external watcher
+(`~/.autoloop/afk-worker.sh`) was written to automate the repair — which it could
+only do by GUESSING (`attempt_count - review_round >= 2`), because nothing in the
+record said why any attempt had been spent.
+
+Exempting faults was considered and REJECTED: it would delete the bound the
+bullet above exists to supply — a task that crashes every round would churn
+forever. So faults keep a ceiling; they just keep their own.
+
+* `attempt_count` / `MAX_TASK_ATTEMPTS` (5) keeps the task's OWN work: a failed
+  validation, a refused commit, a structural refusal, a round that reached the
+  reviewer.
+* `fault_attempt_count` / `MAX_TASK_FAULT_ATTEMPTS` (5) takes rounds lost to the
+  environment and parks on its own code `fault_attempt_ceiling` — so a task that
+  faults every single round still terminates rather than churning.
+* `TaskExecution.attempt_ledger` records, per dispatch,
+  `"<ordinal>|<budget>|<reason>"`, so the reason is READ rather than inferred.
+  The watcher is now redundant: it can only ever re-derive, badly, what the
+  ledger states.
+
+**A structural refusal is CHARGED to the task budget, deliberately.** This is the
+judgement call the change had to make and defend. The reviewer never saw it,
+which is the argument for calling it a fault — but it is a genuine defect in the
+candidate the task's own work produced, and repeating it is precisely the local
+churn `MAX_TASK_ATTEMPTS` exists to bound. Exempting it would leave that case
+with no ceiling at all, since `review_round` counts only dispatched reviews and
+so cannot bound a refusal that never reached one. Pinned by
+`test_a_structural_refusal_spends_the_task_attempt_budget`.
+
+**The combined bound is stated, not derived.** Every dispatch appends exactly one
+ledger entry and charges exactly one counter, so
+`attempt_count + fault_attempt_count == len(attempt_ledger)` is an invariant
+(reclassification MOVES a charge, it never drops one), and a dispatch requires
+BOTH counters to be strictly under their ceilings. One task therefore never
+dispatches more than `MAX_TASK_ATTEMPTS + MAX_TASK_FAULT_ATTEMPTS - 1` = 9 times
+without an operator intervening. The only intervention granting more is answering
+the `fault_attempt_ceiling` blocker, which resets the fault counter alone and
+leaves `attempt_count` exactly where it was
+(`cli._clear_fault_budget_on_answer`); answering an `attempt_count_ceiling`
+refills nothing.
+
+**An OPEN ledger entry means the round never reached one of its own exits.**
+Every exit of a dispatched round stamps its entry (`_finalise_attempt`), so an
+entry still reading `pending` / `pending_fault` when the next dispatch reconciles
+it is either a round the process did not survive, or one whose `GitError` escaped
+the dispatch to `_handle_git_failure` — which the loop already treats as
+environmental, charging `consecutive_failures` rather than the task. Both are
+faults by this section's definition, so `_reconcile_unfinished_attempts` settles
+them onto the fault budget; it can never touch an entry that already settled.
+
+Per-test accounting is in `docs/TESTS.md`; the operator-facing symptom and the
+six hand repairs are in `docs/COMMON_ERRORS.md` §8.
+
 **Finding #7 — blocker preconditions that could not do what their comment
 claimed.** `cli._RESOLUTION_PRECONDITIONS` maps a blocker `code` to a
 function RE-CHECKED at `answer` time, specifically so environmental

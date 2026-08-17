@@ -912,7 +912,8 @@ not a build failure.
 
 ### A task parks on `attempt_count_ceiling` with a `review_round` far below it — and an operator has to reset the counter by hand
 **Symptom:** `python -m autoloop blockers` shows `attempt_count_ceiling` for a
-task that was never failing review. Measured 2026-08-15..17, six times:
+task that was never failing review. Measured 2026-08-15..17 and reported at the
+time as **five** hand repairs; the table below enumerates six.
 
 | task | attempts | review_round | what actually happened |
 |---|---|---|---|
@@ -950,8 +951,11 @@ deleted; it can only ever re-derive, badly, what the ledger states.
 
 **Reading a ledger entry.** `budget` is `pending` / `pending_fault` while the
 round is OPEN and `task` / `fault` once it has settled, so an entry still
-reading either open label means one thing only: the process died between the
-dispatch and the round's exit. `reason` is a bare outcome slug
+reading either open label means one thing only: the round never reached one of
+its own exits. Two ways that happens, both environmental — the process died
+mid-round, or a `GitError` escaped the dispatch to `_handle_git_failure` (which
+charges `consecutive_failures`, not the task). Either way the next dispatch
+settles it onto the fault budget. `reason` is a bare outcome slug
 (`sent_for_review`, `post_commit_verification_failed`,
 `executor_reported_failure`, `interrupted_mid_round`, an
 `audit.agents.AGENT_FAULT_*` code) — or `"<origin>><outcome>"` for a round a

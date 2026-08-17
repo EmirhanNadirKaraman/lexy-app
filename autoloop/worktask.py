@@ -381,8 +381,12 @@ class TaskExecution:
 #: session-ending fault could not tell that a review had been in flight. It then
 #: charged the redo to `attempt_count` — the one thing this whole split exists to
 #: prevent. An entry still reading either OPEN label therefore means exactly one
-#: thing, and it is the same thing for both: the process died between the
-#: dispatch and the round's own exit.
+#: thing, and it is the same thing for both: the round never reached one of its
+#: own exits between the dispatch and the reconciliation that reads it. Two ways
+#: that happens, both environmental — the process did not survive, or a
+#: `GitError` escaped the dispatch to `orchestrator._handle_git_failure`, which
+#: the loop already charges to `consecutive_failures` rather than to the task.
+#: Both settle onto the fault budget; see `_reconcile_unfinished_attempts`.
 ATTEMPT_PENDING = "pending"
 ATTEMPT_PENDING_FAULT = "pending_fault"
 #: SETTLED — the round finished and this is the budget it spent.

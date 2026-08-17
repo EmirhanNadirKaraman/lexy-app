@@ -3333,9 +3333,16 @@ class Orchestrator:
 
         Reached only at the start of a dispatch, so every entry it can see
         belongs to an EARLIER round — and an earlier round that never stamped
-        itself is a round the process did not survive: an operator pause or
-        restart mid-round, a kill, a crash inside the agent. Those are faults
-        by the definition this task is built on (the round produced no
+        itself is a round that never reached one of its own exits. Two ways that
+        happens, and both are environmental. The process did not survive: an
+        operator pause or restart mid-round, a kill, a crash inside the agent.
+        Or a `GitError` escaped `_dispatch_task_postcommit` to
+        `_handle_git_failure` — git unreadable while verifying the commit or
+        listing its range — which the loop already treats as an environment
+        failure, charging `consecutive_failures` and returning to `ready` rather
+        than blaming the task. Every failure the ROUND itself decided stamps
+        before it returns, so neither shape can be the work being wrong. Both are
+        faults by the definition this task is built on (the round produced no
         reviewable outcome), and they are charged accordingly. A round that was
         already on the fault budget (a redo) simply stays there; the charge does
         not move, only the stamp is added.

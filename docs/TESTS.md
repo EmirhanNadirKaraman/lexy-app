@@ -1793,7 +1793,10 @@ Six properties carry it:
   Exempting it would have removed the only ceiling on that case.
 * **Reconciliation cannot relabel a finished round.** Every exit of a
   dispatched round stamps its ledger entry, so an entry still reading `pending`
-  can only be a round the process did not survive.
+  can only be a round that never reached one of its own exits — the process died
+  mid-round, or a `GitError` escaped the dispatch to `_handle_git_failure`, which
+  the loop already charges to `consecutive_failures` rather than to the task.
+  Both are environmental, which is why either settles onto the fault budget.
   `test_reconciliation_never_reclassifies_a_finished_task_attempt` runs a
   failure, a fault and a review through, then re-runs the reconciliation and
   asserts both counters and all three classifications are untouched;
