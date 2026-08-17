@@ -1756,7 +1756,7 @@ poll). The served script is still parsed by the existing
 and runs `node --check` over it, so no second parse test was added.
 
 **A fault must not spend a task's attempt budget (2026-08-17, `budget-01`; new
-`test_attempt_budget.py`, 26 tests — hand-counted, no shell in the worker).** `attempt_count` was one counter paying
+`test_attempt_budget.py`, 28 tests — hand-counted, no shell in the worker).** `attempt_count` was one counter paying
 for two unrelated things. It is incremented before the executor runs — the M1
 finding #3 property that bounds a task which dies every round without ever
 reaching a reviewer — so it also charged rounds destroyed by a provider 429, a
@@ -1773,7 +1773,7 @@ attempt_ledger` records `"<ordinal>|<budget>|<reason>"` per attempt — `budget`
 one of `pending` / `pending_fault` (open) or `task` / `fault` (settled), and
 `reason` either a bare outcome slug or `"<origin>><outcome>"` for a round a
 fault forced the loop to redo — so the reason is READ rather than inferred.
-Five properties carry it:
+Six properties carry it:
 
 * **The split is decided from structured signals, never prose.**
   `ExecutionOutcome.fault_kind` is set only in `implement_executor`'s
@@ -1817,10 +1817,31 @@ Five properties carry it:
   `test_a_redo_that_fails_on_its_own_merits_goes_back_onto_the_task_budget`
   (a redo that ends in a structural refusal moves its charge BACK to the task —
   a redo must not launder a fresh defect into a fault) and
-  `test_a_redo_the_process_does_not_survive_stays_on_the_fault_budget`
+  `test_a_redo_the_process_does_not_survive_keeps_its_replacement_on_the_fault_budget`
   (reconciliation adds the stamp without moving a charge that was already
-  correct). `test_a_reason_carries_a_redos_origin_without_hiding_its_outcome`
-  pins `compose_reason` / `attempt_outcome` at the unit level.
+  correct, AND carries the recovery forward).
+  `test_a_reason_carries_a_redos_origin_without_hiding_its_outcome` pins
+  `compose_reason` / `attempt_outcome` at the unit level.
+* **A recovery chain interrupted repeatedly stays on the fault budget, and
+  still ends.** The second defect found in review: `pending_fault_code` was
+  consumed by `_open_attempt` and re-armed only by `_note_round_fault`, which
+  needs a SETTLED round that reached the reviewer — so a redo the environment
+  took (process dead mid-round, or the agent's provider gone) left the marker
+  cleared while the review was still lost, and the dispatch after it was billed
+  to `attempt_count`. `_settle_attempt` rule 4 re-arms from the redo's own
+  origin whenever a fault-opened round stays on the fault budget without
+  reaching a review; it sits in `_settle_attempt` because all three arrival
+  paths (`_reconcile_unfinished_attempts`' `interrupted_mid_round`,
+  `_finalise_attempt`'s `fault_kind` and `worker_environment_drift`) share it.
+  `test_a_recovery_chain_interrupted_twice_never_reaches_the_task_budget` runs
+  the full shape — review → session fault → redo killed mid-round → restart →
+  redo hit by a provider outage → redo reaches review — and asserts
+  `attempt_count == 1` across all four dispatches, `fault_attempt_count == 3`,
+  no surviving marker, and the on-disk ledger reading one origin with four
+  outcomes. `test_a_recovery_chain_interrupted_forever_still_hits_the_fault_ceiling`
+  is the bound: `MAX_TASK_FAULT_ATTEMPTS` interrupted redos in a row park on
+  `fault_attempt_ceiling` with the executor not called, because every
+  carried-forward dispatch is charged.
 * **Both budgets terminate.**
   `test_the_fault_budget_terminates_a_task_that_faults_every_round` and
   `test_a_task_whose_process_dies_every_round_still_terminates` reach

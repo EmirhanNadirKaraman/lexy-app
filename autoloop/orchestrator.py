@@ -3186,10 +3186,14 @@ class Orchestrator:
         settled afterwards, but that it consumed one is settled here.
 
         The one case that skips the task budget is a round the loop already
-        knows is a redo: `pending_fault_code` is set only by
-        `_note_round_fault`, only when a session-ending fault destroyed a
-        review this task had already earned, and it is consumed exactly once —
-        cleared here, in the same save.
+        knows is a redo: `pending_fault_code` is set when a fault destroyed a
+        review this task had already earned (`_note_round_fault`) or when the
+        redo of such a review was itself taken by the environment
+        (`_settle_attempt` rule 4), and it is consumed exactly once per
+        dispatch — cleared here, in the same save. Consumed once, but possibly
+        re-armed afterwards: a recovery chain that keeps being interrupted keeps
+        its replacement dispatches on the fault budget, and pays a
+        `fault_attempt_count` charge for each one, so it still ends.
 
         A redo is still opened OPEN (as `ATTEMPT_PENDING_FAULT`, carrying the
         fault code as its origin), never straight to `ATTEMPT_FAULT`. Writing
@@ -3235,6 +3239,23 @@ class Orchestrator:
            refusal, an escape — is a genuine new defect no reviewer has seen, so
            the charge moves BACK to the task budget. A redo does not launder a
            task failure into a fault.
+        4. A redo that STAYS on the fault budget without reaching a review
+           re-arms `pending_fault_code` with its own origin, because the review
+           that fault destroyed is still destroyed and the next dispatch is
+           still the recovery of it, not the task's own next try. Without this
+           the chain silently fell back onto `attempt_count` at its second
+           interruption — the defect this rule closes.
+
+        Rule 4 lands here rather than at any one caller BECAUSE this method is
+        the shared one: the three ways a redo can be interrupted without
+        producing a review all arrive through it, and only one of them was ever
+        named. `_reconcile_unfinished_attempts` brings the process that died
+        mid-redo (`interrupted_mid_round`); `_finalise_attempt` brings the redo
+        whose agent hit a provider throttle or a stall kill
+        (`ExecutionOutcome.fault_kind`) and the one that found its worker repo
+        drifted (`worker_environment_drift`). They are the same event to this
+        accounting — the environment took the round — so they get the same
+        answer, in one place, instead of three call sites each remembering.
 
         Returns whether an open entry was actually settled. Never drops a
         charge: the counters always still sum to `len(attempt_ledger)`.
@@ -3248,6 +3269,26 @@ class Orchestrator:
         target = ATTEMPT_FAULT if budget == ATTEMPT_FAULT else ATTEMPT_TASK
         if opened_on_fault and reason == REASON_SENT_FOR_REVIEW:
             target = ATTEMPT_FAULT
+        if opened_on_fault and target == ATTEMPT_FAULT and reason != REASON_SENT_FOR_REVIEW:
+            # Rule 4. All three clauses carry weight. `opened_on_fault`: only a
+            # redo has a lost review to still be recovering. `target`: a redo
+            # that failed on its OWN merits has just moved back to the task
+            # budget, and the task now owes a fix rather than a retry, so the
+            # chain ends there. `reason`: a redo that REACHED the reviewer must
+            # not arm a recovery for a review that is not lost — if that review
+            # dies too, `_note_round_fault` arms it then, on evidence.
+            #
+            # The ORIGIN is carried forward, not this round's own fault code, so
+            # a chain reads as one chain — `browser_session_lost>...` on every
+            # entry, each with its own outcome — rather than as a fresh incident
+            # per interruption.
+            #
+            # Bounded, which is the whole reason this is safe: re-arming costs a
+            # `fault_attempt_count` charge (`_open_attempt` increments it when it
+            # consumes the marker), so a chain interrupted forever walks into
+            # `fault_attempt_ceiling` and parks. It is a carried-forward
+            # allowance, never an exemption.
+            execution.pending_fault_code = opened_reason
         if target != charged:
             # MOVE, never drop: the two counters together always equal
             # `len(attempt_ledger)`, which is what keeps the combined bound
@@ -3312,18 +3353,15 @@ class Orchestrator:
         whose process dies every single round parks on `fault_attempt_ceiling`
         rather than churning forever.
 
-        **It settles the past and deliberately does not plan the next dispatch.**
-        One case falls out of that and is worth naming rather than leaving to be
-        rediscovered: a session-ending fault while a REDO was still open. The
-        redo's own entry is settled here onto the fault budget, correctly, but
-        `pending_fault_code` was consumed at `_open_attempt` and is not re-armed,
-        so the round after it is charged to `attempt_count` even though the
-        review is still lost. Re-arming from here would be two lines and would
-        stay bounded, but it would turn this method from "classify what already
-        happened" into "authorize what happens next" — a much larger claim for a
-        method that runs before the ceilings are read. The cost of leaving it is
-        one task attempt in a shape nobody has measured; the cost of getting the
-        larger claim wrong is a task that never runs out of redos.
+        One case deserves naming because it used to leak. A process that dies
+        while a REDO is open settles that redo onto the fault budget here — and
+        the review the redo existed to recover is still lost, so the dispatch
+        after it is still recovery work. `_settle_attempt` rule 4 re-arms
+        `pending_fault_code` from the redo's own origin for exactly that reason,
+        which is why this method runs BEFORE `_open_attempt` reads the marker.
+        It is still classification, not authorization: the fact that carries
+        forward is one the settled entry already states, the ceilings below are
+        read after it, and every replacement dispatch is charged.
         """
         reclaimed = 0
         for index in range(len(execution.attempt_ledger)):
@@ -3342,6 +3380,12 @@ class Orchestrator:
                 "attempts": reclaimed,
                 "attempt_count": execution.attempt_count,
                 "fault_attempt_count": execution.fault_attempt_count,
+                # Non-empty when one of the settled rounds was a redo the
+                # environment took: the recovery is still open and the NEXT
+                # dispatch is charged to the fault budget. Logged so that
+                # carry-forward is visible in the transcript rather than only
+                # inferable from the ledger two entries later.
+                "pending_fault_code": execution.pending_fault_code,
             },
         )
 
@@ -3362,9 +3406,11 @@ class Orchestrator:
         round spent. Both halves matter:
 
         * settled, because a fault at any other moment either left an open entry
-          (which `_reconcile_unfinished_attempts` owns) or interrupted nothing
-          this task can be credited for, and marking those would hand out free
-          attempts on a condition nobody checked;
+          (which `_reconcile_unfinished_attempts` settles, and whose recovery
+          chain `_settle_attempt` rule 4 carries forward without needing this
+          method) or interrupted nothing this task can be credited for, and
+          marking the latter would hand out free attempts on a condition nobody
+          checked;
         * outcome rather than the whole reason, and either budget, because a
           redo that reaches review is recorded as
           `fault|<origin>>sent_for_review`. Matching the literal pair
@@ -3623,11 +3669,14 @@ class Orchestrator:
                 state.task_execution = asdict(execution)
                 self._store.save(state)
                 # `_finish_postcommit` stamps the attempt the CRASHED process
-                # opened — and it stamps it `task`, because the commit really
-                # did happen. Reaching the reconciliation below instead would
-                # have refunded a successful round as an interruption, which is
-                # precisely the reclassification that must never occur; the
-                # early return here is what prevents it.
+                # opened, as the round it really was: the commit happened, so
+                # its outcome is the one it earned — `sent_for_review` on the
+                # budget it was dispatched against (`task`, or `fault` for a
+                # redo, which `_settle_attempt` keeps there). Reaching the
+                # reconciliation below instead would have refunded a successful
+                # round as an interruption, which is precisely the
+                # reclassification that must never occur; the early return here
+                # is what prevents it.
                 self._finish_postcommit(execution, worktree_git, state, task)
                 return
             # NO_COMMIT: the commit this intent describes never happened.

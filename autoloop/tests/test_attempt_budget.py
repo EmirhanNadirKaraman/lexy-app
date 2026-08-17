@@ -21,6 +21,10 @@ What this file pins:
     budget — the defect the first cut of this shipped with, where a redo was
     written into the ledger as already-settled and so stopped being
     recognisable as a round with a review in flight;
+  * a recovery chain the environment interrupts REPEATEDLY stays on the fault
+    budget for as long as it is still recovering the same lost review, however
+    the interruption arrives — and ends the moment a round reaches a reviewer
+    or fails on the task's own merits;
   * BOTH budgets terminate, so nothing here removes a bound;
   * the record says, per attempt, which budget was charged and why.
 
@@ -674,14 +678,31 @@ def test_a_redo_that_fails_on_its_own_merits_goes_back_onto_the_task_budget(tmp_
         # but the budget it spent is the task's, because of how it ended.
         (ATTEMPT_TASK, "browser_session_lost>post_commit_verification_failed"),
     ]
+    assert refused.pending_fault_code == "", (
+        "and the recovery chain ENDS here. A redo that produced a real defect "
+        "hands the task something to fix, so the next round is the task's own "
+        "work — carrying the marker past it would excuse rounds nothing "
+        "environmental ever touched"
+    )
     assert_books_balance(refused)
 
 
-def test_a_redo_the_process_does_not_survive_stays_on_the_fault_budget(tmp_path):
-    """Reconciliation settles a redo without moving its charge. The dispatch
-    already put it on the fault budget; dying mid-round is another fault, so
-    there is nothing to move — only a stamp to add, so the entry stops reading
-    as in-flight."""
+def test_a_redo_the_process_does_not_survive_keeps_its_replacement_on_the_fault_budget(
+    tmp_path,
+):
+    """Reconciliation settles a redo without moving its charge, AND carries the
+    recovery forward.
+
+    The dispatch already put the redo on the fault budget; dying mid-round is
+    another fault, so there is nothing to move — only a stamp to add, so the
+    entry stops reading as in-flight. What used to be missing is the other half:
+    the review that redo existed to recover is STILL lost, so the dispatch after
+    it is still recovery work. This test asserted the opposite in budget-01's
+    first cut ("only the fresh round is the task's own", `attempt_count == 2`) —
+    the gap written down rather than closed, so one environmental interruption
+    was absorbed and the next one billed the task. `_settle_attempt` rule 4
+    re-arms `pending_fault_code` from the redo's own origin, so the replacement
+    dispatch stays on the fault budget."""
     orch, execution_store, _blockers, task, _config = build(
         tmp_path,
         lambda wr, rr: ScriptedExecutor(
@@ -712,14 +733,180 @@ def test_a_redo_the_process_does_not_survive_stays_on_the_fault_budget(tmp_path)
     orch._dispatch_executor(implement(task.id))
 
     settled = execution_store.load(task.id)
-    assert settled.attempt_count == 2, "only the fresh round is the task's own"
-    assert settled.fault_attempt_count == 1, "the redo's charge did not move"
+    assert settled.attempt_count == 1, (
+        "the task's own budget still holds only the one round it really spent — "
+        "the replacement for an interrupted redo is still the fault's cost"
+    )
+    assert settled.fault_attempt_count == 2, (
+        "the redo's charge did not move, and its replacement added one"
+    )
     assert ledger(settled) == [
         (ATTEMPT_TASK, "sent_for_review"),
         (ATTEMPT_FAULT, "provider_quota_exhausted>interrupted_mid_round"),
-        (ATTEMPT_TASK, "sent_for_review"),
+        # Same origin, so the two entries read as one recovery chain rather than
+        # as two unrelated incidents; the outcomes are what differ.
+        (ATTEMPT_FAULT, "provider_quota_exhausted>sent_for_review"),
     ]
+    assert settled.pending_fault_code == "", (
+        "the chain ends when a round finally reaches the reviewer — no marker "
+        "survives to excuse the round after it"
+    )
     assert_books_balance(settled)
+
+
+def test_a_recovery_chain_interrupted_twice_never_reaches_the_task_budget(tmp_path):
+    """THE end-to-end shape, with BOTH ways an environment can take a redo.
+
+    One review earned, then nothing but interruptions until a round finally
+    gets through:
+
+      1. round 1 commits and reaches the reviewer            → `task`
+      2. the session dies with that review in flight         → redo armed
+      3. the redo's process dies mid-round                   → `fault`, still armed
+      4. the next redo's agent hits a provider outage        → `fault`, still armed
+      5. the redo after that reaches the reviewer            → `fault`, disarmed
+
+    Steps 3 and 4 arrive at `_settle_attempt` from DIFFERENT callers —
+    `_reconcile_unfinished_attempts` after a restart, `_finalise_attempt` on the
+    round's own exit — which is why the rule lives in the one method they share
+    rather than at either call site. Both are the same event to this accounting:
+    the environment took the round, the review is still lost, the next dispatch
+    is still recovering it.
+
+    `attempt_count` must be 1 at every step. Round 1 is the only work this task
+    has ever been asked to account for.
+    """
+    orch, execution_store, _blockers, task, _config = build(
+        tmp_path,
+        lambda wr, rr: ScriptedExecutor(
+            wr,
+            [
+                writes("A.py", "round 1\n"),
+                RuntimeError("the loop was restarted mid-redo"),
+                ExecutionOutcome(
+                    status="error",
+                    summary="task 't1': implementation agent failed — API error 429",
+                    validation="not run",
+                    fault_kind=AGENT_FAULT_PROVIDER,
+                ),
+                writes("A.py", "round 4\n"),
+            ],
+        ),
+    )
+
+    # 1 — a real round, reviewed.
+    orch._dispatch_executor(implement(task.id))
+    assert execution_store.load(task.id).review_round == 1
+
+    # 2 — the session dies before the verdict comes back.
+    orch._note_round_fault("browser_session_lost")
+
+    # 3 — the redo's own process does not survive.
+    orch.state.phase = Phase.READY.value
+    with pytest.raises(RuntimeError):
+        orch._dispatch_executor(implement(task.id))
+    crashed = execution_store.load(task.id)
+    assert (crashed.attempt_count, crashed.fault_attempt_count) == (1, 1)
+
+    # 4 — a restart reconciles that round, and the replacement is dispatched on
+    # the fault budget (the gap this closes: it used to be dispatched on the
+    # task's). Its agent then hits the provider.
+    orch.state.phase = Phase.READY.value
+    orch.state.last_response = None
+    orch._dispatch_executor(implement(task.id))
+    throttled = execution_store.load(task.id)
+    assert throttled.attempt_count == 1, (
+        "a redo the process did not survive must not bill the task for its "
+        "replacement — the review it was recovering is still lost"
+    )
+    assert throttled.fault_attempt_count == 2
+    assert throttled.pending_fault_code == "browser_session_lost", (
+        "and the chain is STILL armed: the second interruption did not produce "
+        "a review either"
+    )
+
+    # 5 — the next dispatch finally gets through to the reviewer.
+    orch.state.phase = Phase.READY.value
+    orch.state.last_response = None
+    orch._dispatch_executor(implement(task.id))
+
+    final = execution_store.load(task.id)
+    assert final.attempt_count == 1, (
+        "unchanged from step 1 through four dispatches — the task budget paid "
+        "for exactly the one round the task itself ran"
+    )
+    assert final.fault_attempt_count == 3
+    assert final.fault_attempt_count < MAX_TASK_FAULT_ATTEMPTS, (
+        "bounded, and visibly so: every excused dispatch was charged somewhere"
+    )
+    assert final.review_round == 2, "one lost review, recovered once"
+    assert final.pending_fault_code == "", (
+        "no stale recovery marker survives a successful review — the next "
+        "round after this one is the task's own again"
+    )
+    assert_books_balance(final)
+
+    # Auditable, from disk, without inferring anything from a counter gap: one
+    # origin, four outcomes, in dispatch order.
+    on_disk = json.loads(execution_store._path(task.id).read_text(encoding="utf-8"))
+    assert on_disk["attempt_ledger"] == [
+        f"1|{ATTEMPT_TASK}|sent_for_review",
+        f"2|{ATTEMPT_FAULT}|browser_session_lost>interrupted_mid_round",
+        f"3|{ATTEMPT_FAULT}|browser_session_lost>{AGENT_FAULT_PROVIDER}",
+        f"4|{ATTEMPT_FAULT}|browser_session_lost>sent_for_review",
+    ]
+
+
+def test_a_recovery_chain_interrupted_forever_still_hits_the_fault_ceiling(tmp_path):
+    """The bound on the rule above, and the direct answer to "do not solve this
+    with an unbounded sticky exemption".
+
+    Carrying `pending_fault_code` forward spares the TASK budget; it spares no
+    budget at all. Each replacement dispatch consumes a `fault_attempt_count`
+    charge exactly like the fault that started the chain, so a recovery
+    interrupted every single time walks into `fault_attempt_ceiling` and parks
+    for an operator instead of redoing itself forever.
+    """
+    orch, execution_store, blocker_store, task, _config = build(
+        tmp_path,
+        lambda wr, rr: ScriptedExecutor(
+            wr, [writes("A.py", "round 1\n"), RuntimeError("died mid-redo, again")]
+        ),
+    )
+    orch._dispatch_executor(implement(task.id))
+    orch._note_round_fault("browser_session_lost")
+
+    # Every one of these is a redo of the SAME lost review, and every one dies.
+    for expected in range(1, MAX_TASK_FAULT_ATTEMPTS + 1):
+        orch.state.phase = Phase.READY.value
+        orch.state.last_response = None
+        with pytest.raises(RuntimeError):
+            orch._dispatch_executor(implement(task.id))
+        assert execution_store.load(task.id).fault_attempt_count == expected
+
+    orch.state.phase = Phase.READY.value
+    orch.state.last_response = None
+    calls_before = orch._executor.calls
+    orch._dispatch_executor(implement(task.id))
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "task_fatal"
+    assert blocker_store.load(orch.state.park_blocker_id).code == "fault_attempt_ceiling"
+    assert orch._executor.calls == calls_before, (
+        "the ceiling fired before dispatch — the chain terminates rather than "
+        "granting itself one more round"
+    )
+
+    parked = execution_store.load(task.id)
+    assert parked.attempt_count == 1, "still only round 1"
+    assert parked.fault_attempt_count == MAX_TASK_FAULT_ATTEMPTS
+    assert len(parked.attempt_ledger) <= MAX_TASK_ATTEMPTS + MAX_TASK_FAULT_ATTEMPTS - 1
+    assert parked.pending_fault_code == "browser_session_lost", (
+        "the marker outlives the park on purpose: that review is still lost, so "
+        "if an operator grants a fresh fault allowance the recovery resumes on "
+        "the fault budget rather than starting to bill the task"
+    )
+    assert_books_balance(parked)
 
 
 def test_a_session_ending_fault_marks_nothing_when_no_review_was_in_flight(tmp_path):

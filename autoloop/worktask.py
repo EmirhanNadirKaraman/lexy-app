@@ -181,10 +181,23 @@ class TaskExecution:
     #: review did not, so the round has to be redone — and that redo is charged
     #: to the fault budget rather than the task's.
     #:
-    #: Consumed exactly once, by the next dispatch, which clears it. A positive
-    #: marker written at the fault, not a condition inferred afterwards: that
-    #: is what keeps this from becoming the same guess the watcher script was
-    #: making.
+    #: Consumed exactly once per dispatch, which clears it — and RE-ARMED, from
+    #: the same fault code, if that dispatch was itself taken by the environment
+    #: without reaching a review (`orchestrator._settle_attempt` rule 4). The
+    #: review is still lost while that is true, so the round after it is still
+    #: recovery rather than the task's own next try; carrying the marker forward
+    #: is what stops a chain of interruptions falling back onto `attempt_count`
+    #: at its second link.
+    #:
+    #: Not a standing exemption: every dispatch it excuses pays a
+    #: `fault_attempt_count` charge, so an unbroken chain of interruptions ends
+    #: at `MAX_TASK_FAULT_ATTEMPTS` like any other run of faults. It clears for
+    #: good the moment a round either reaches a reviewer or fails on the task's
+    #: own merits.
+    #:
+    #: A positive marker written at the fault, not a condition inferred
+    #: afterwards: that is what keeps this from becoming the same guess the
+    #: watcher script was making.
     pending_fault_code: str = ""
     presented_report_sha256: str = ""
     review_request_id: str = ""

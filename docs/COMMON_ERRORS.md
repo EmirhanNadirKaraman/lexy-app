@@ -983,6 +983,38 @@ erases the state, and every check downstream that keyed on the state goes
 quietly false. Pinned by
 `test_consecutive_session_ending_faults_never_fall_back_onto_the_task_budget`.
 
+### A task's `attempt_count` grows on the round AFTER a redo the environment interrupted
+**Symptom:** the two fixes above are in place and a review really was lost to a
+fault, but the recovery is interrupted a second time — the loop is restarted
+mid-redo, or the redo's agent hits the provider — and the dispatch that follows
+is billed to `attempt_count`. The ledger shows a `fault` entry whose outcome is
+NOT `sent_for_review`, immediately followed by a `task` entry. Found in review
+of `budget-01` before it landed, and initially documented rather than fixed.
+**Cause:** `pending_fault_code` is consumed by `_open_attempt` and was only ever
+re-armed by `_note_round_fault`, which requires the last ledger entry to be a
+SETTLED round that reached the reviewer. A redo taken by the environment
+satisfies neither: while it is open the entry reads `pending_fault`, and once
+settled its outcome is `interrupted_mid_round` (or an `AGENT_FAULT_*` code), not
+`sent_for_review`. So the marker was gone while the lost review was still lost,
+and the loop treated the next recovery dispatch as the task's own next try.
+**Fix:** `_settle_attempt` rule 4 — a round OPENED on the fault budget that
+STAYS on it without reaching a review re-arms `pending_fault_code` from its own
+origin. It lives in `_settle_attempt` because all three ways this happens pass
+through that one method: `_reconcile_unfinished_attempts` (the process died
+mid-redo), and `_finalise_attempt` with either an `ExecutionOutcome.fault_kind`
+or `worker_environment_drift`. **Still bounded** — each carried-forward dispatch
+pays a `fault_attempt_count` charge, so a chain interrupted every time parks on
+`fault_attempt_ceiling` like any other run of faults, and the marker clears for
+good as soon as a round reaches a reviewer or fails on the task's own merits (a
+structural refusal, a failed validation, an escape — those move the charge back
+to `attempt_count` and end the chain). **The generalisable trap:** a
+consume-once marker describes an EVENT, but what this needed to describe was a
+STATE that outlives the event — "this task is still recovering a review it
+earned". A single fault re-armed it; the second one had no event left to fire
+on. Pinned by
+`test_a_recovery_chain_interrupted_twice_never_reaches_the_task_budget` and
+`test_a_recovery_chain_interrupted_forever_still_hits_the_fault_ceiling`.
+
 ### An autoloop commit is refused by a test that passes when you re-run it
 **Symptom:** post-commit validation refuses a commit with exactly one failing
 test out of ~1000. Re-running the identical worker tree passes. Happened three
