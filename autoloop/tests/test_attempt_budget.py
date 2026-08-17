@@ -17,6 +17,10 @@ What this file pins:
     defend (see `MAX_TASK_ATTEMPTS`' comment);
   * reconciliation after a restart cannot turn a finished task attempt into a
     fault — only a round nothing ever stamped;
+  * CONSECUTIVE session-ending faults never alternate back into the task
+    budget — the defect the first cut of this shipped with, where a redo was
+    written into the ledger as already-settled and so stopped being
+    recognisable as a round with a review in flight;
   * BOTH budgets terminate, so nothing here removes a bound;
   * the record says, per attempt, which budget was charged and why.
 
@@ -60,10 +64,13 @@ from autoloop.worker_env import WorkerRepoManager
 from autoloop.worktask import (
     ATTEMPT_FAULT,
     ATTEMPT_PENDING,
+    ATTEMPT_PENDING_FAULT,
     ATTEMPT_TASK,
     IntentStore,
     TaskExecution,
     TaskExecutionStore,
+    attempt_outcome,
+    compose_reason,
     format_attempt,
     split_attempt,
 )
@@ -545,10 +552,174 @@ def test_a_session_ending_browser_fault_charges_the_redo_to_the_fault_budget(tmp
     assert redone.fault_attempt_count == 1
     assert ledger(redone) == [
         (ATTEMPT_TASK, "sent_for_review"),
-        (ATTEMPT_FAULT, "browser_session_lost"),
+        # Both halves are recorded: WHY the round had to be redone, and WHAT the
+        # redo achieved. The second half is what a later fault reads.
+        (ATTEMPT_FAULT, "browser_session_lost>sent_for_review"),
     ]
     assert redone.pending_fault_code == "", "consumed exactly once"
     assert_books_balance(redone)
+
+
+def test_consecutive_session_ending_faults_never_fall_back_onto_the_task_budget(tmp_path):
+    """THE regression this section exists for, and the defect the first cut of
+    budget-01 shipped with.
+
+    A redo used to be written straight into the ledger as a SETTLED
+    `fault|<code>` entry. When that redo went on to reach the reviewer, the
+    round's own exit had nothing left to stamp, so the entry never said a review
+    had been in flight — and the NEXT session-ending fault, which recognised
+    only the literal pair `(task, "sent_for_review")`, silently declined to mark
+    it. Its redo was then charged to `attempt_count`. Two faults in a row
+    alternated straight back into the budget this whole task exists to protect.
+
+    Three dispatches, two session-ending faults between them, and `attempt_count`
+    must be 1 throughout: only the first round was ever the task's own work.
+    """
+    orch, execution_store, _blockers, task, _config = build(
+        tmp_path,
+        lambda wr, rr: ScriptedExecutor(
+            wr,
+            [
+                writes("A.py", "round 1\n"),
+                writes("A.py", "round 2\n"),
+                writes("A.py", "round 3\n"),
+            ],
+        ),
+    )
+
+    orch._dispatch_executor(implement(task.id))
+    first = execution_store.load(task.id)
+    assert (first.attempt_count, first.fault_attempt_count) == (1, 0)
+    assert ledger(first) == [(ATTEMPT_TASK, "sent_for_review")]
+
+    # Fault #1 kills the session with that review in flight.
+    orch._note_round_fault("browser_session_lost")
+    assert execution_store.load(task.id).pending_fault_code == "browser_session_lost"
+
+    orch.state.phase = Phase.READY.value
+    orch._dispatch_executor(implement(task.id))
+    second = execution_store.load(task.id)
+    assert second.attempt_count == 1, "the first redo did not spend the task's budget"
+    assert second.fault_attempt_count == 1
+    assert ledger(second)[-1] == (ATTEMPT_FAULT, "browser_session_lost>sent_for_review")
+    assert_books_balance(second)
+
+    # Fault #2, with the redo's own review in flight. The last ledger entry is
+    # on the FAULT budget this time — recognising it anyway is the fix.
+    orch._note_round_fault("provider_rate_limited")
+    marked = execution_store.load(task.id)
+    assert marked.pending_fault_code == "provider_rate_limited", (
+        "a review reached by a fault-charged redo is still a review in flight"
+    )
+
+    orch.state.phase = Phase.READY.value
+    orch._dispatch_executor(implement(task.id))
+
+    third = execution_store.load(task.id)
+    assert third.attempt_count == 1, (
+        "neither fault touched the task's budget — the round that reached "
+        "review on its own merits is still the only thing charged to it"
+    )
+    assert third.fault_attempt_count == 2
+    assert ledger(third) == [
+        (ATTEMPT_TASK, "sent_for_review"),
+        (ATTEMPT_FAULT, "browser_session_lost>sent_for_review"),
+        (ATTEMPT_FAULT, "provider_rate_limited>sent_for_review"),
+    ], "the ledger still names every round's origin and outcome"
+    assert third.pending_fault_code == ""
+    assert third.review_round == 3
+    assert_books_balance(third)
+
+
+def test_a_redo_that_fails_on_its_own_merits_goes_back_onto_the_task_budget(tmp_path):
+    """The narrowing that keeps the redo exemption from laundering failures.
+
+    A round opened on the fault budget stays there only when it achieves what
+    the fault destroyed — it reaches the reviewer. If it instead comes back
+    structurally refused, that is a fresh defect no reviewer has seen, and it is
+    charged to the task exactly as the same refusal would be on any other round.
+    Without this, a task could keep failing post-commit verification for free as
+    long as a fault had preceded it.
+    """
+    def failing_validation(argv, **kwargs):
+        class Proc:
+            returncode = 1
+            stdout = "1 failed"
+            stderr = ""
+
+        return Proc()
+
+    orch, execution_store, blocker_store, task, _config = build(
+        tmp_path,
+        lambda wr, rr: ScriptedExecutor(
+            wr, [writes("A.py", "round 1\n"), writes("A.py", "round 2\n")]
+        ),
+    )
+    orch._dispatch_executor(implement(task.id))
+    orch._note_round_fault("browser_session_lost")
+
+    orch._validation_runner = failing_validation
+    orch.state.phase = Phase.READY.value
+    orch._dispatch_executor(implement(task.id))
+
+    refused = execution_store.load(task.id)
+    assert blocker_store.load(orch.state.park_blocker_id).code == (
+        "post_commit_verification_failed"
+    )
+    assert refused.attempt_count == 2, "the refusal is the task's own cost"
+    assert refused.fault_attempt_count == 0, "the provisional fault charge moved back"
+    assert ledger(refused) == [
+        (ATTEMPT_TASK, "sent_for_review"),
+        # The origin is still recorded — the round happened because of a fault —
+        # but the budget it spent is the task's, because of how it ended.
+        (ATTEMPT_TASK, "browser_session_lost>post_commit_verification_failed"),
+    ]
+    assert_books_balance(refused)
+
+
+def test_a_redo_the_process_does_not_survive_stays_on_the_fault_budget(tmp_path):
+    """Reconciliation settles a redo without moving its charge. The dispatch
+    already put it on the fault budget; dying mid-round is another fault, so
+    there is nothing to move — only a stamp to add, so the entry stops reading
+    as in-flight."""
+    orch, execution_store, _blockers, task, _config = build(
+        tmp_path,
+        lambda wr, rr: ScriptedExecutor(
+            wr,
+            [
+                writes("A.py", "round 1\n"),
+                RuntimeError("died mid-redo"),
+                writes("A.py", "round 3\n"),
+            ],
+        ),
+    )
+    orch._dispatch_executor(implement(task.id))
+    orch._note_round_fault("provider_quota_exhausted")
+
+    orch.state.phase = Phase.READY.value
+    with pytest.raises(RuntimeError):
+        orch._dispatch_executor(implement(task.id))
+
+    unfinished = execution_store.load(task.id)
+    assert ledger(unfinished)[-1] == (
+        ATTEMPT_PENDING_FAULT,
+        "provider_quota_exhausted",
+    ), "a redo is OPEN while it runs, exactly like any other round"
+    assert (unfinished.attempt_count, unfinished.fault_attempt_count) == (1, 1)
+
+    orch.state.phase = Phase.READY.value
+    orch.state.last_response = None
+    orch._dispatch_executor(implement(task.id))
+
+    settled = execution_store.load(task.id)
+    assert settled.attempt_count == 2, "only the fresh round is the task's own"
+    assert settled.fault_attempt_count == 1, "the redo's charge did not move"
+    assert ledger(settled) == [
+        (ATTEMPT_TASK, "sent_for_review"),
+        (ATTEMPT_FAULT, "provider_quota_exhausted>interrupted_mid_round"),
+        (ATTEMPT_TASK, "sent_for_review"),
+    ]
+    assert_books_balance(settled)
 
 
 def test_a_session_ending_fault_marks_nothing_when_no_review_was_in_flight(tmp_path):
@@ -774,6 +945,27 @@ def test_split_attempt_is_tolerant_of_a_hand_edited_entry():
     assert (ordinal, budget, reason) == (0, ATTEMPT_FAULT, "why")
     # Reasons keep any interior text after the second separator intact.
     assert split_attempt("1|task|a|b")[2] == "a|b"
+
+
+def test_a_reason_carries_a_redos_origin_without_hiding_its_outcome():
+    """The accounting keys on the OUTCOME, so a reason that also names why the
+    round had to happen must still read back to the same outcome. Getting this
+    wrong is what let a second consecutive fault go unnoticed."""
+    assert compose_reason("browser_session_lost", "sent_for_review") == (
+        "browser_session_lost>sent_for_review"
+    )
+    # No origin — an ordinary round's entry is unchanged, byte for byte.
+    assert compose_reason("", "sent_for_review") == "sent_for_review"
+
+    assert attempt_outcome("sent_for_review") == "sent_for_review"
+    assert attempt_outcome("browser_session_lost>sent_for_review") == "sent_for_review"
+    # A composed reason survives a round-trip through the entry format.
+    entry = format_attempt(2, ATTEMPT_FAULT, compose_reason("x", "sent_for_review"))
+    assert attempt_outcome(split_attempt(entry)[2]) == "sent_for_review"
+    # Nothing to split reads as itself, which is the fail-closed direction: it
+    # matches no outcome the accounting acts on.
+    assert attempt_outcome("") == ""
+    assert attempt_outcome("garbage") == "garbage"
 
 
 # =============================================================================

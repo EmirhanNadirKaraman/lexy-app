@@ -1756,7 +1756,7 @@ poll). The served script is still parsed by the existing
 and runs `node --check` over it, so no second parse test was added.
 
 **A fault must not spend a task's attempt budget (2026-08-17, `budget-01`; new
-`test_attempt_budget.py`, 22 tests — hand-counted, no shell in the worker).** `attempt_count` was one counter paying
+`test_attempt_budget.py`, 26 tests — hand-counted, no shell in the worker).** `attempt_count` was one counter paying
 for two unrelated things. It is incremented before the executor runs — the M1
 finding #3 property that bounds a task which dies every round without ever
 reaching a reviewer — so it also charged rounds destroyed by a provider 429, a
@@ -1769,8 +1769,11 @@ attempts were faults from `attempt_count - review_round >= 2`.
 Now two budgets. `attempt_count` keeps the task's own work
 (`MAX_TASK_ATTEMPTS`); `fault_attempt_count` takes rounds lost to faults, with
 its own ceiling and park code `fault_attempt_ceiling`. `TaskExecution.
-attempt_ledger` records `"<ordinal>|<budget>|<reason>"` per attempt, so the
-reason is READ rather than inferred. Four properties carry it:
+attempt_ledger` records `"<ordinal>|<budget>|<reason>"` per attempt — `budget`
+one of `pending` / `pending_fault` (open) or `task` / `fault` (settled), and
+`reason` either a bare outcome slug or `"<origin>><outcome>"` for a round a
+fault forced the loop to redo — so the reason is READ rather than inferred.
+Five properties carry it:
 
 * **The split is decided from structured signals, never prose.**
   `ExecutionOutcome.fault_kind` is set only in `implement_executor`'s
@@ -1797,6 +1800,27 @@ reason is READ rather than inferred. Four properties carry it:
   `test_finalising_an_attempt_is_one_way_and_cannot_be_re_stamped` pins the
   same guard at the unit level. Without it, five validation failures could be
   refunded on the next restart and churn forever.
+* **Consecutive faults never alternate back into the task budget.**
+  `test_consecutive_session_ending_faults_never_fall_back_onto_the_task_budget`
+  runs three dispatches with a session-ending fault between each and asserts
+  `attempt_count == 1` throughout. It pins the defect this feature shipped with
+  on its first cut: a redo was written into the ledger as an already-SETTLED
+  `fault|<code>` entry, so when that redo reached the reviewer the round's own
+  exit had nothing to stamp, the entry never recorded a review in flight, and
+  the next fault — which matched only the literal pair `(task,
+  "sent_for_review")` — declined to mark it. Its redo was then charged to
+  `attempt_count`. A redo is now opened OPEN like any other round
+  (`pending_fault`), `_settle_attempt` stamps it `fault|<origin>>sent_for_review`
+  when it reaches review, and `_note_round_fault` keys on the OUTCOME
+  (`attempt_outcome`) rather than the whole reason, on either budget. Its two
+  partners keep the exemption narrow:
+  `test_a_redo_that_fails_on_its_own_merits_goes_back_onto_the_task_budget`
+  (a redo that ends in a structural refusal moves its charge BACK to the task —
+  a redo must not launder a fresh defect into a fault) and
+  `test_a_redo_the_process_does_not_survive_stays_on_the_fault_budget`
+  (reconciliation adds the stamp without moving a charge that was already
+  correct). `test_a_reason_carries_a_redos_origin_without_hiding_its_outcome`
+  pins `compose_reason` / `attempt_outcome` at the unit level.
 * **Both budgets terminate.**
   `test_the_fault_budget_terminates_a_task_that_faults_every_round` and
   `test_a_task_whose_process_dies_every_round_still_terminates` reach

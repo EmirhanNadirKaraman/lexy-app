@@ -1505,14 +1505,6 @@ def collect(repo: Path) -> dict:
             "worker": ex.get("worktree_path"),
             "base": (ex.get("task_base_sha") or "")[:12],
             "candidate": (ex.get("candidate_sha") or "")[:12],
-            # `attempts` is `attempt_count` alone — the task's OWN budget since
-            # budget-01 (2026-08-17). Rounds a fault destroyed live in
-            # `fault_attempt_count` and are deliberately NOT summed in here: one
-            # number covering both is what made the two indistinguishable in the
-            # first place. They are not surfaced on this panel at all rather than
-            # added as a field nothing renders; the per-attempt reasons are in
-            # the execution record's `attempt_ledger` and in the
-            # `fault_attempt_ceiling` blocker's `detail`.
             "round": ex.get("review_round"), "attempts": ex.get("attempt_count"),
         },
         "agents": live_agents_cache,

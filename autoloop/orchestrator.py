@@ -261,14 +261,19 @@ from .transcript import TranscriptLogger
 from .validation import run_validation_commands
 from .worktask import (
     ATTEMPT_FAULT,
+    ATTEMPT_OPEN,
     ATTEMPT_PENDING,
+    ATTEMPT_PENDING_FAULT,
     ATTEMPT_TASK,
+    REASON_SENT_FOR_REVIEW,
     CommitIntent,
     IntentStore,
     Reconciliation,
     TaskExecution,
     TaskExecutionStore,
     accumulate_assumptions,
+    attempt_outcome,
+    compose_reason,
     format_attempt,
     reconcile_after_crash,
     retire_execution,
@@ -3170,7 +3175,7 @@ class Orchestrator:
           `_finalise_attempt`               on EVERY exit of the dispatched round
           `_note_round_fault`               at a session-ending fault handler
 
-        The invariant they maintain: at most one entry is ever `pending`, it is
+        The invariant they maintain: at most one entry is ever OPEN, it is
         always the last one, and it exists only between this method and the
         round's exit. Everything else here follows from that.
 
@@ -3185,12 +3190,18 @@ class Orchestrator:
         `_note_round_fault`, only when a session-ending fault destroyed a
         review this task had already earned, and it is consumed exactly once —
         cleared here, in the same save.
+
+        A redo is still opened OPEN (as `ATTEMPT_PENDING_FAULT`, carrying the
+        fault code as its origin), never straight to `ATTEMPT_FAULT`. Writing
+        the settled label here would say "this round has finished" before it has
+        started, and the round's own exit would then have nothing to stamp — see
+        `worktask.ATTEMPT_PENDING_FAULT` for the accounting bug that produced.
         """
         ordinal = len(execution.attempt_ledger) + 1
         fault_code = execution.pending_fault_code
         if fault_code:
             execution.fault_attempt_count += 1
-            budget, reason = ATTEMPT_FAULT, fault_code
+            budget, reason = ATTEMPT_PENDING_FAULT, fault_code
             execution.pending_fault_code = ""
         else:
             execution.attempt_count += 1
@@ -3198,17 +3209,73 @@ class Orchestrator:
         execution.attempt_ledger += (format_attempt(ordinal, budget, reason),)
         self._execution_store.save(execution)
 
+    def _settle_attempt(
+        self, execution: TaskExecution, index: int, budget: str, reason: str
+    ) -> bool:
+        """Stamp the OPEN ledger entry at `index` with the budget it really
+        spent and why, moving the charge between counters if the round's outcome
+        disagrees with what its dispatch provisionally charged.
+
+        Shared by `_finalise_attempt` and `_reconcile_unfinished_attempts` so
+        the two cannot drift: settling a round is one rule, applied in one
+        place, whether the round reached an exit or the process died in it.
+
+        THE RULE, in the order it is applied:
+
+        1. The outcome decides. `budget` is what the CALLER observed — a fault
+           the round could not have avoided, or the task's own work being wrong
+           — and that is normally the budget charged, whichever one the dispatch
+           provisionally picked.
+        2. One exception, and only one: a round OPENED on the fault budget that
+           ends `sent_for_review` STAYS on the fault budget. It exists purely to
+           redo a review a fault destroyed, and it achieved exactly that;
+           charging it to `attempt_count` would bill the task twice for one
+           review, which is the whole defect budget-01 is about.
+        3. Anything else a redo ends as — a failed validation, a structural
+           refusal, an escape — is a genuine new defect no reviewer has seen, so
+           the charge moves BACK to the task budget. A redo does not launder a
+           task failure into a fault.
+
+        Returns whether an open entry was actually settled. Never drops a
+        charge: the counters always still sum to `len(attempt_ledger)`.
+        """
+        entries = list(execution.attempt_ledger)
+        ordinal, opened_as, opened_reason = split_attempt(entries[index])
+        if opened_as not in ATTEMPT_OPEN:
+            return False
+        opened_on_fault = opened_as == ATTEMPT_PENDING_FAULT
+        charged = ATTEMPT_FAULT if opened_on_fault else ATTEMPT_TASK
+        target = ATTEMPT_FAULT if budget == ATTEMPT_FAULT else ATTEMPT_TASK
+        if opened_on_fault and reason == REASON_SENT_FOR_REVIEW:
+            target = ATTEMPT_FAULT
+        if target != charged:
+            # MOVE, never drop: the two counters together always equal
+            # `len(attempt_ledger)`, which is what keeps the combined bound
+            # (see `MAX_TASK_FAULT_ATTEMPTS`) exact rather than approximate.
+            delta = 1 if target == ATTEMPT_FAULT else -1
+            execution.fault_attempt_count += delta
+            execution.attempt_count -= delta
+        entries[index] = format_attempt(
+            ordinal,
+            target,
+            # The origin survives only for a redo. An ordinary round's open
+            # reason is the `"dispatched"` placeholder, which says nothing.
+            compose_reason(opened_reason if opened_on_fault else "", reason),
+        )
+        execution.attempt_ledger = tuple(entries)
+        return True
+
     def _finalise_attempt(
         self, execution: TaskExecution, budget: str, reason: str
     ) -> None:
         """Stamp the open attempt with the budget it is charged to and why.
 
         Called on every exit path of a dispatched round, which is what makes a
-        still-`pending` entry mean one specific thing rather than being a
-        guess: the process died before the round finished. Nothing else can
-        leave one behind.
+        still-OPEN entry mean one specific thing rather than being a guess: the
+        process died before the round finished. Nothing else can leave one
+        behind — including a redo, which is why a redo is opened OPEN too.
 
-        Idempotent and one-way. An entry that has already been stamped is left
+        Idempotent and one-way. An entry that has already been settled is left
         exactly as it is — a later call cannot re-charge it, cannot move it
         between budgets, and cannot rewrite the reason. That is the direct
         guard against a genuine task failure being quietly relabelled a fault
@@ -3216,56 +3283,56 @@ class Orchestrator:
         """
         if not execution.attempt_ledger:
             return
-        ordinal, current, _ = split_attempt(execution.attempt_ledger[-1])
-        if current != ATTEMPT_PENDING:
+        if not self._settle_attempt(execution, -1, budget, reason):
             return
-        if budget == ATTEMPT_FAULT:
-            # MOVE, never drop: the two counters together always equal
-            # `len(attempt_ledger)`, which is what keeps the combined bound
-            # (see `MAX_TASK_FAULT_ATTEMPTS`) exact rather than approximate.
-            execution.attempt_count -= 1
-            execution.fault_attempt_count += 1
-        execution.attempt_ledger = execution.attempt_ledger[:-1] + (
-            format_attempt(ordinal, budget, reason),
-        )
         self._execution_store.save(execution)
 
     def _reconcile_unfinished_attempts(self, execution: TaskExecution) -> None:
-        """Move any attempt still recorded as OPEN onto the fault budget.
+        """Settle any attempt still recorded as OPEN, as the fault it was.
 
         Reached only at the start of a dispatch, so every entry it can see
         belongs to an EARLIER round — and an earlier round that never stamped
         itself is a round the process did not survive: an operator pause or
         restart mid-round, a kill, a crash inside the agent. Those are faults
         by the definition this task is built on (the round produced no
-        reviewable outcome), and they are charged accordingly.
+        reviewable outcome), and they are charged accordingly. A round that was
+        already on the fault budget (a redo) simply stays there; the charge does
+        not move, only the stamp is added.
 
         **This cannot silently reclassify a genuine task failure.** The only
-        entries it touches are ones that positively read `pending`, and a
-        failure that actually happened — validation failed, the commit was
-        refused, the paths were outside scope, the reviewer said revise — went
-        through `_finalise_attempt` and reads `task`. `_finalise_attempt`
-        refuses to re-stamp, so there is no path by which a stamped entry can
-        become `pending` again. An unparseable or hand-edited entry reads as
-        neither (see `worktask.split_attempt`) and is left alone.
+        entries it touches are ones that positively read as OPEN, and a failure
+        that actually happened — validation failed, the commit was refused, the
+        paths were outside scope, the reviewer said revise — went through
+        `_finalise_attempt` and reads `task`. `_settle_attempt` refuses to
+        re-stamp, so there is no path by which a settled entry can become open
+        again. An unparseable or hand-edited entry reads as neither (see
+        `worktask.split_attempt`) and is left alone.
 
         Still bounded: these charges land in `fault_attempt_count`, so a task
         whose process dies every single round parks on `fault_attempt_ceiling`
         rather than churning forever.
+
+        **It settles the past and deliberately does not plan the next dispatch.**
+        One case falls out of that and is worth naming rather than leaving to be
+        rediscovered: a session-ending fault while a REDO was still open. The
+        redo's own entry is settled here onto the fault budget, correctly, but
+        `pending_fault_code` was consumed at `_open_attempt` and is not re-armed,
+        so the round after it is charged to `attempt_count` even though the
+        review is still lost. Re-arming from here would be two lines and would
+        stay bounded, but it would turn this method from "classify what already
+        happened" into "authorize what happens next" — a much larger claim for a
+        method that runs before the ceilings are read. The cost of leaving it is
+        one task attempt in a shape nobody has measured; the cost of getting the
+        larger claim wrong is a task that never runs out of redos.
         """
-        entries: list[str] = []
         reclaimed = 0
-        for entry in execution.attempt_ledger:
-            ordinal, budget, _ = split_attempt(entry)
-            if budget == ATTEMPT_PENDING:
-                execution.attempt_count -= 1
-                execution.fault_attempt_count += 1
-                entry = format_attempt(ordinal, ATTEMPT_FAULT, "interrupted_mid_round")
+        for index in range(len(execution.attempt_ledger)):
+            if self._settle_attempt(
+                execution, index, ATTEMPT_FAULT, "interrupted_mid_round"
+            ):
                 reclaimed += 1
-            entries.append(entry)
         if not reclaimed:
             return
-        execution.attempt_ledger = tuple(entries)
         self._execution_store.save(execution)
         self._log(
             "attempt_reclassified",
@@ -3283,18 +3350,28 @@ class Orchestrator:
         already earned, so the redo is charged to the fault budget.
 
         The narrow case `_finalise_attempt` cannot cover. When a round commits
-        and hands its packet to the reviewer, that round is a real task attempt
-        and is charged as one — it produced work. But if the SESSION then dies
-        on a rate limit, an exhausted allowance or a browser failure that spent
-        its budget, the review never arrives and the whole round has to be
-        performed again. brw-11 lost three rounds that way with its fix already
-        committed and passing.
+        and hands its packet to the reviewer, that round is a real attempt and
+        is charged as one — it produced work. But if the SESSION then dies on a
+        rate limit, an exhausted allowance or a browser failure that spent its
+        budget, the review never arrives and the whole round has to be performed
+        again. brw-11 lost three rounds that way with its fix already committed
+        and passing.
 
-        Deliberately conditional on the last entry being exactly that shape — a
-        finished round whose packet went out. A fault at any other moment either
-        left an open entry (which `_reconcile_unfinished_attempts` owns) or
-        interrupted nothing this task can be credited for, and marking those
-        would hand out free attempts on a condition nobody checked.
+        Conditional on the last entry being a SETTLED round whose OUTCOME was
+        `sent_for_review`, and deliberately indifferent to which budget that
+        round spent. Both halves matter:
+
+        * settled, because a fault at any other moment either left an open entry
+          (which `_reconcile_unfinished_attempts` owns) or interrupted nothing
+          this task can be credited for, and marking those would hand out free
+          attempts on a condition nobody checked;
+        * outcome rather than the whole reason, and either budget, because a
+          redo that reaches review is recorded as
+          `fault|<origin>>sent_for_review`. Matching the literal pair
+          `(task, "sent_for_review")` — which this did until the composed reason
+          existed — missed exactly that entry, so a SECOND session-ending fault
+          went unmarked and its redo was charged to `attempt_count`. Consecutive
+          faults must not alternate back into the task's budget.
 
         Best-effort throughout: this runs inside a failure handler, and a
         bookkeeping write that could itself raise would turn one fault into two.
@@ -3310,7 +3387,9 @@ class Orchestrator:
             if execution is None or not execution.attempt_ledger:
                 return
             _, budget, reason = split_attempt(execution.attempt_ledger[-1])
-            if (budget, reason) != (ATTEMPT_TASK, "sent_for_review"):
+            if budget not in (ATTEMPT_TASK, ATTEMPT_FAULT):
+                return
+            if attempt_outcome(reason) != REASON_SENT_FOR_REVIEW:
                 return
             if execution.pending_fault_code:
                 return          # already marked by an earlier fault in this episode
@@ -3589,8 +3668,8 @@ class Orchestrator:
                 f"{execution.task_branch} were lost to faults rather than to "
                 f"the work itself (cap {MAX_TASK_FAULT_ATTEMPTS}) — provider "
                 "throttles, killed agents, or rounds the process did not "
-                "survive. The task's own attempt budget is untouched "
-                f"({execution.attempt_count}/{MAX_TASK_ATTEMPTS}); what keeps "
+                "survive. None of them was spent from the task's own attempt "
+                f"budget ({execution.attempt_count}/{MAX_TASK_ATTEMPTS}); what keeps "
                 "failing is the environment around it. Nothing was rolled back "
                 "or pushed. The per-attempt record is in the execution's "
                 "`attempt_ledger`.",
@@ -4381,8 +4460,8 @@ class Orchestrator:
         # on disk is already correct and must not be bumped again here.
         #
         # What this method DOES do to the attempt record is STAMP it. All three
-        # of its exits are task attempts, and every one of them is charged that
-        # way on purpose:
+        # of its exits report a TASK outcome, and every one of them does so on
+        # purpose:
         #
         #   * post-commit verification failed — a structural refusal. The
         #     reviewer never saw it, and it is charged anyway: it is a genuine
@@ -4394,6 +4473,13 @@ class Orchestrator:
         #     fault, so the task's own budget pays.
         #   * the packet went out — the round produced work and reached the
         #     reviewer. This is the case `attempt_count` was invented for.
+        #
+        # A round the loop opened on the FAULT budget (a redo of a review some
+        # session-ending fault destroyed) reports the same three outcomes and is
+        # settled by the same rule in `_settle_attempt`: reaching the reviewer
+        # keeps it on the fault budget, because that is the review it was sent
+        # to recover; either refusal moves it back onto the task's, because a
+        # refusal is a fresh defect and a redo must not launder one.
         #
         # The crash-recovery adoption path lands here too, and that matters:
         # the attempt the DEAD process opened is stamped `task` here, so the
@@ -4474,9 +4560,12 @@ class Orchestrator:
         execution.review_round += 1
         # Stamped BEFORE the save below, so the round's classification and the
         # review round it earned reach disk together. `sent_for_review` is also
-        # the exact entry `_note_round_fault` looks for: a session that then
-        # dies on a fault destroyed a review this task had already earned.
-        self._finalise_attempt(execution, ATTEMPT_TASK, "sent_for_review")
+        # the outcome `_note_round_fault` looks for: a session that then dies on
+        # a fault destroyed a review this task had already earned. That holds
+        # whichever budget this round was charged to — a redo of a lost review
+        # settles as `fault|<origin>>sent_for_review` and is recognised the
+        # same, so consecutive faults keep landing on the fault budget.
+        self._finalise_attempt(execution, ATTEMPT_TASK, REASON_SENT_FOR_REVIEW)
         self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         state.outbox = TEMPLATES["postcommit_review"].render(

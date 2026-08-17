@@ -156,8 +156,10 @@ class TaskExecution:
     fault_attempt_count: int = 0
     #: One entry per dispatched attempt, in dispatch order, saying WHICH budget
     #: that attempt was charged to and WHY: `"<ordinal>|<budget>|<reason>"`
-    #: with `budget` one of `ATTEMPT_PENDING` / `ATTEMPT_TASK` /
-    #: `ATTEMPT_FAULT` (see `format_attempt` / `split_attempt`).
+    #: with `budget` one of `ATTEMPT_PENDING` / `ATTEMPT_PENDING_FAULT` (open) or
+    #: `ATTEMPT_TASK` / `ATTEMPT_FAULT` (settled), and `reason` either a bare
+    #: outcome slug or `"<origin>><outcome>"` for a round a fault forced the loop
+    #: to redo (see `format_attempt` / `split_attempt` / `attempt_outcome`).
     #:
     #: This exists because the record did not say. An operator repaired six
     #: tasks by hand between 2026-08-15 and 08-17 (brw-09, exec-01, port-01,
@@ -349,17 +351,51 @@ class TaskExecution:
 #: `packet.ASSUMPTION_MAX_CHARS_EACH`), and it states what it withheld.
 
 
-#: `attempt_ledger` budget labels. `ATTEMPT_PENDING` is the OPEN state written
-#: at dispatch and replaced by one of the other two when the round ends; an
-#: entry still reading `pending` therefore means exactly one thing — the
-#: process died between the dispatch and the round's own exit.
+#: `attempt_ledger` budget labels, in two groups.
+#:
+#: OPEN — written at dispatch, replaced when the round reaches one of its exits.
+#: There are two of them because a ledger entry has to answer two independent
+#: questions and one field cannot answer both: *which counter is this dispatch
+#: currently charged to* and *has the round finished yet*. `ATTEMPT_PENDING`
+#: means "open, charged to `attempt_count`"; `ATTEMPT_PENDING_FAULT` means
+#: "open, charged to `fault_attempt_count`" — a redo the loop already knew was
+#: forced by a fault (`TaskExecution.pending_fault_code`).
+#:
+#: Collapsing the second one into `ATTEMPT_FAULT` at dispatch, which is what the
+#: first cut of this did, is exactly how a review reached by a fault-charged
+#: redo stopped being recognisable as a review at all: the entry already read
+#: `fault`, so the round's own exit had nothing left to stamp, and the next
+#: session-ending fault could not tell that a review had been in flight. It then
+#: charged the redo to `attempt_count` — the one thing this whole split exists to
+#: prevent. An entry still reading either OPEN label therefore means exactly one
+#: thing, and it is the same thing for both: the process died between the
+#: dispatch and the round's own exit.
 ATTEMPT_PENDING = "pending"
+ATTEMPT_PENDING_FAULT = "pending_fault"
+#: SETTLED — the round finished and this is the budget it spent.
 ATTEMPT_TASK = "task"
 ATTEMPT_FAULT = "fault"
+
+#: The OPEN labels, as a set, so callers ask "is this round still in flight?"
+#: rather than restating the pair (and getting it wrong for one of them).
+ATTEMPT_OPEN = (ATTEMPT_PENDING, ATTEMPT_PENDING_FAULT)
+
+#: The one outcome slug the accounting itself keys on, so the string is written
+#: down once. A round that produced this reached the reviewer; a session-ending
+#: fault after it destroyed a review the task had already earned.
+REASON_SENT_FOR_REVIEW = "sent_for_review"
 
 #: Separator for a ledger entry. Chosen because no reason slug or ordinal
 #: contains it, so `split_attempt` never has to guess.
 _LEDGER_SEP = "|"
+
+#: Separator INSIDE a reason, between a fault-opened round's origin (the fault
+#: code that forced the redo) and its own outcome. A redo has two facts worth
+#: recording and they are not interchangeable: `browser_session_lost` says why
+#: the round had to happen at all, `sent_for_review` says what it achieved.
+#: Written `origin>outcome` so the outcome is always the last segment, which is
+#: what `attempt_outcome` reads.
+_REASON_SEP = ">"
 
 
 def format_attempt(ordinal: int, budget: str, reason: str) -> str:
@@ -374,10 +410,11 @@ def split_attempt(entry: str) -> tuple[int, str, str]:
 
     Tolerant on the way IN so a hand-edited or truncated record cannot crash a
     dispatch: an unparseable ordinal reads as 0 and a missing field as `""`.
-    An entry that does not name a known budget therefore reads as neither
-    `ATTEMPT_PENDING` nor a charge, which is the fail-closed direction — the
-    reconciliation below only ever touches entries that positively say
-    `pending`.
+    An entry that does not name a known budget therefore reads as neither OPEN
+    nor a charge, which is the fail-closed direction — the reconciliation in
+    `orchestrator` only ever touches entries that positively say they are open,
+    and `_note_round_fault` only ever credits ones that positively say they are
+    settled.
     """
     parts = entry.split(_LEDGER_SEP, 2)
     while len(parts) < 3:
@@ -387,6 +424,28 @@ def split_attempt(entry: str) -> tuple[int, str, str]:
     except ValueError:
         ordinal = 0
     return ordinal, parts[1], parts[2]
+
+
+def compose_reason(origin: str, outcome: str) -> str:
+    """`origin>outcome`, or just `outcome` when there is no origin.
+
+    Only a round opened on the fault budget has an origin — the fault code that
+    forced the redo. An ordinary round's open reason is the placeholder
+    `"dispatched"`, which is not an origin and is deliberately dropped rather
+    than composed, so `task|sent_for_review` keeps reading exactly as it did.
+    """
+    return f"{origin}{_REASON_SEP}{outcome}" if origin else outcome
+
+
+def attempt_outcome(reason: str) -> str:
+    """What the round ENDED as, whether or not the reason also carries an origin.
+
+    The accounting keys on the outcome and nothing else, so every reader goes
+    through this rather than comparing the whole field — a comparison that
+    silently stopped matching the moment redo reasons gained an origin, which is
+    the bug this helper exists to make unrepeatable.
+    """
+    return reason.rsplit(_REASON_SEP, 1)[-1]
 
 
 def accumulate_assumptions(

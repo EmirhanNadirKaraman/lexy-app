@@ -948,6 +948,41 @@ looking at this because a task parked anyway, read its `attempt_ledger` first �
 it names each round's cause. The watcher script is now redundant and should be
 deleted; it can only ever re-derive, badly, what the ledger states.
 
+**Reading a ledger entry.** `budget` is `pending` / `pending_fault` while the
+round is OPEN and `task` / `fault` once it has settled, so an entry still
+reading either open label means one thing only: the process died between the
+dispatch and the round's exit. `reason` is a bare outcome slug
+(`sent_for_review`, `post_commit_verification_failed`,
+`executor_reported_failure`, `interrupted_mid_round`, an
+`audit.agents.AGENT_FAULT_*` code) — or `"<origin>><outcome>"` for a round a
+fault forced the loop to redo, where the origin is the fault code that destroyed
+the earlier review. `3|fault|browser_session_lost>sent_for_review` reads: the
+third dispatch happened because a browser session loss killed a review, it was
+charged to the fault budget, and it reached the reviewer.
+
+### A task's `attempt_count` grows anyway, every SECOND fault, with a ledger full of `fault` entries
+**Symptom:** the split above is in place, but a task alternating
+review → fault → redo → review → fault still creeps up `attempt_count`. One
+fault is absorbed, the next is not. Found in review of `budget-01` itself
+before it landed.
+**Cause:** a redo was written into the ledger as an already-SETTLED
+`fault|<code>` entry at dispatch, which conflated "which counter is this
+charged to" with "has this round finished". When the redo reached the reviewer,
+`_finalise_attempt` correctly refused to re-stamp a settled entry — so the
+ledger never recorded that a review was in flight — and `_note_round_fault`,
+which matched the literal pair `(task, "sent_for_review")`, saw
+`(fault, "<code>")` and declined to mark the second lost review. The next
+dispatch found no `pending_fault_code` and billed the task.
+**Fix:** a redo is opened OPEN like every other round (`pending_fault`), so its
+own exit still stamps it; `_settle_attempt` is the single rule both
+`_finalise_attempt` and `_reconcile_unfinished_attempts` go through; and
+`_note_round_fault` keys on the OUTCOME segment (`worktask.attempt_outcome`) on
+either budget. **The generalisable trap:** if one field answers both "what state
+is this in" and "what did it cost", the transition that writes the cost early
+erases the state, and every check downstream that keyed on the state goes
+quietly false. Pinned by
+`test_consecutive_session_ending_faults_never_fall_back_onto_the_task_budget`.
+
 ### An autoloop commit is refused by a test that passes when you re-run it
 **Symptom:** post-commit validation refuses a commit with exactly one failing
 test out of ~1000. Re-running the identical worker tree passes. Happened three
