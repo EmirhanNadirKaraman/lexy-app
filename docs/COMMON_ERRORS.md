@@ -1161,6 +1161,35 @@ token exists to deny.
 **What is NOT this:** a refusal *before* any `self_upgrade_exec` entry is a
 plain second instance, and the recovery is the same but the diagnosis is not.
 
+### The transcript says `self_upgrade_confirmed`, but the loop is still running the old code
+**Symptom:** `self_upgrade_exec` is followed a little later by
+`self_upgrade_confirmed` ("one full iteration completed under the merged
+code"), `.autoloop/pending_upgrade.json` is gone, and the loop is still
+behaving exactly as it did before the merge, and nothing a fresh process prints
+on startup appears after the "restarting into …" line.
+**Cause:** `os.execv` **can return** — by raising `OSError` (`Exec format
+error`, `ENOMEM`, a `sys.executable` that has been replaced mid-run). The
+record is flipped to `execed` *before* the call, because it has to be durable
+across a replacement that never returns; when the call raises instead, that
+status is a lie in the one place that reads it. `_run_continuous` carries on
+with the old image, and the top of its next iteration is where
+`_confirm_self_upgrade` retires an `execed` record and logs the confirmation —
+crediting the old process's own iteration to a replacement that did not happen.
+**Fix:** applied 2026-08-18 (loop-02, review round 2). An `execv` that raises
+now settles the record to `exec_failed` after disarming the lock handoff, so
+the confirmation finds nothing to retire. The one shot is unchanged: the record
+has left `pending`, and only `pending` is ever acted on, so the sha is still
+spent. Pinned by
+`test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened`.
+**How to tell the two apart if you see this shape again:** a genuine upgrade
+changes what `python -m autoloop` is running but NOT the pid (`execv` preserves
+it), so the pid is no evidence either way — read `self_upgrade_exec_failed` in
+the transcript instead, and `status` in `pending_upgrade.json` before it is
+cleared.
+**The generalisable trap:** a status written before an operation as "this is
+about to happen" is read afterwards as "this happened". Any call that can both
+not-return and fail needs its optimistic marker settled on the failure path.
+
 ### The pytest session vanishes with no report, no failure and no summary line
 **Symptom:** a test run ends mid-file. No traceback, no `FAILED`, no counts —
 sometimes the output of something else entirely.

@@ -131,10 +131,10 @@ LOOP_CODE_PREFIX = "autoloop/"
 #: record only ever leaves `pending` by being SETTLED (or cleared), which is
 #: what makes the exec one-shot — see `UpgradeStore`.
 UPGRADE_PENDING = "pending"            # a merge changed loop code; not acted on yet
-UPGRADE_EXECED = "execed"              # `os.execv` was called for this sha
+UPGRADE_EXECED = "execed"              # the `os.execv` did not return: a successor is running
 UPGRADE_PREFLIGHT_FAILED = "preflight_failed"   # the merged tree does not import
 UPGRADE_UNAPPLICABLE = "unapplicable"  # the merged checkout is not the running tree
-UPGRADE_EXEC_FAILED = "exec_failed"    # `os.execv` itself refused
+UPGRADE_EXEC_FAILED = "exec_failed"    # nothing was replaced; this process carries on
 
 
 @dataclass

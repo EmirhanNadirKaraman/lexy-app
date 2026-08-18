@@ -499,11 +499,15 @@ def test_a_parked_loop_reports_the_park_not_the_upgrade(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "status", [UPGRADE_EXECED, UPGRADE_PREFLIGHT_FAILED, UPGRADE_UNAPPLICABLE]
+    "status",
+    [UPGRADE_EXECED, UPGRADE_PREFLIGHT_FAILED, UPGRADE_UNAPPLICABLE, UPGRADE_EXEC_FAILED],
 )
 def test_a_settled_record_is_never_offered_again(tmp_path, status):
     """The one-shot, seen from the boundary: only `pending` is offered, so a
-    sha that has been tried once cannot come back round."""
+    sha that has been tried once cannot come back round. Every settled status
+    is here, `exec_failed` included — it is the one a refused `execv` settles
+    to, so leaving it out would leave the mainline refusal unpinned at this
+    level."""
     orch, config = orchestrator_at(tmp_path, Phase.READY)
     UpgradeStore(config.pending_upgrade_file).save(pending_record(status=status))
 
@@ -696,7 +700,10 @@ def test_the_replacement_is_refused_when_the_lock_cannot_be_armed(tmp_path, monk
 def test_an_exec_that_is_refused_disarms_the_lock_again(tmp_path, monkeypatch):
     """`execv` raising means the process is still here, still holding the lock,
     and no successor is coming — so the marker has to go, or the NEXT acquire
-    in this pid would adopt a handoff that never happened."""
+    in this pid would adopt a handoff that never happened, and the RECORD has
+    to be settled, or the confirmation one iteration later reports a
+    replacement that did not happen (the loop-level half is
+    `test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened`)."""
     config = make_config(tmp_path)
     store = UpgradeStore(config.pending_upgrade_file)
     store.save(pending_record())
@@ -715,7 +722,14 @@ def test_an_exec_that_is_refused_disarms_the_lock_again(tmp_path, monkeypatch):
         "cannot need it, and the subprocesses this run keeps spawning would "
         "otherwise inherit it"
     )
-    assert store.load().status == UPGRADE_EXECED, (
+    settled = store.load()
+    assert settled.status == UPGRADE_EXEC_FAILED, (
+        "the record is SETTLED, not left saying `execed`: `execed` means a "
+        "successor is running, and `_confirm_self_upgrade` retires it one "
+        "iteration later — but this process never went anywhere"
+    )
+    assert "Exec format error" in settled.detail
+    assert cli._self_upgrade_at_boundary(config, lock) == "none", (
         "still one-shot: a refused exec is not a licence to try the same sha again"
     )
 
@@ -810,6 +824,74 @@ def test_one_completed_iteration_retires_the_one_shot(tmp_path, monkeypatch):
     assert observed[0] is not None and observed[0].status == UPGRADE_EXECED
     assert observed[1] is None, "one full iteration under the merged code retires it"
     assert entries(config, "self_upgrade_confirmed")
+
+
+def test_a_refused_exec_is_never_confirmed_as_a_replacement_that_happened(
+    tmp_path, monkeypatch
+):
+    """The refusal, driven through the ITERATION that follows it.
+
+    `os.execv` raising leaves this process running the code it started with, so
+    `_run_continuous` carries on and reaches the top of the next iteration —
+    the one place `_confirm_self_upgrade` fires. A record still saying `execed`
+    there is retired with a `self_upgrade_confirmed` entry claiming an
+    iteration completed under the merged code, when no replacement ever
+    happened and that iteration was the OLD image's own. So the refusal settles
+    the record itself, and the confirmation at the top of iteration two finds
+    nothing to retire.
+    """
+    config = make_config(tmp_path)
+    store = UpgradeStore(config.pending_upgrade_file)
+    store.save(pending_record())
+    state = LoopState.new(URL)
+    state.phase = Phase.READY.value
+    StateStore(config.state_file).save(state)
+    lock = held_lock(config)
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+
+    def refuse(path, argv):
+        raise OSError("Exec format error")
+
+    monkeypatch.setattr(os, "execv", refuse)
+    rounds: list = []
+
+    class BoundaryThenStop:
+        """The orchestrator's part, and only that: round one is the boundary
+        that offers the upgrade, round two ends the test from inside iteration
+        two — after the confirmation check at its top has already run, which is
+        what makes `rounds[1]` evidence about that check."""
+
+        def __init__(self, state):
+            self.state = state
+
+        def run(self, *_args, **_kwargs):
+            rounds.append(store.load())
+            if len(rounds) >= 2:
+                raise StopLoop()
+            return SELF_UPGRADE
+
+    monkeypatch.setattr(
+        cli,
+        "_build_orchestrator",
+        lambda config_, args_, store_, state_, task_store_, registry_: BoundaryThenStop(state_),
+    )
+    args = argparse.Namespace(config=None, continuous=True, null_executor=True)
+
+    with pytest.raises(StopLoop):
+        cli._run_continuous(args, config, lock)
+
+    assert len(rounds) == 2, "the process is still here — it ran a second iteration"
+    assert entries(config, "self_upgrade_exec"), "the replacement was really attempted"
+    assert rounds[1] is not None, (
+        "the confirmation at the top of iteration two must not have cleared it: "
+        "there was no replacement to confirm"
+    )
+    assert rounds[1].status == UPGRADE_EXEC_FAILED
+    assert store.load().status == UPGRADE_EXEC_FAILED, "and it stays settled"
+    assert entries(config, "self_upgrade_confirmed") == [], (
+        "an entry here would record a replacement that did not happen"
+    )
+    assert entries(config, f"self_upgrade_{UPGRADE_EXEC_FAILED}"), "reported instead"
 
 
 def test_confirmation_leaves_a_pending_record_alone(tmp_path):

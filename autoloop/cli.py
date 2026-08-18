@@ -681,7 +681,12 @@ def _self_upgrade_at_boundary(config: AutoloopConfig, lock: LoopLock | None) -> 
       is refused rather than risked: the successor would find a live lock (its
       own pid), fail closed and end the run. Either way the sha is spent — a
       replacement that was attempted and did not happen is not a licence to try
-      the same one again.
+      the same one again. In none of the three is the record left saying
+      `execed`: it is settled `exec_failed`, or cleared outright when it cannot
+      be written at all (`_settle_upgrade`). `execed` means "a successor is
+      running", and it is what `_confirm_self_upgrade` retires one iteration
+      later — but here there is no successor, so the iterations that follow are
+      this same old process's.
 
     The caller reaches here only at `Orchestrator.run`'s boundary, so "never
     mid-round, and never while an agent holds a worker" is established there,
@@ -773,11 +778,24 @@ def _self_upgrade_at_boundary(config: AutoloopConfig, lock: LoopLock | None) -> 
         # token would hand an authorization to every subprocess this run spawns
         # afterwards.
         lock.clear_exec_handoff()
-        log(
-            "self_upgrade_exec_failed",
-            data={"base_sha": record.base_sha, "error": f"{type(exc).__name__}: {exc}"},
+        # And the record is SETTLED, not left saying `execed`. It was written
+        # as `execed` a few lines up because it has to be durable BEFORE the
+        # call — but that status now means "a replacement is running", and
+        # `_confirm_self_upgrade` retires it after one iteration and logs
+        # `self_upgrade_confirmed`. This process never went anywhere: the next
+        # iteration of `run --continuous` is the OLD code's, and confirming
+        # there would record a replacement that did not happen. Settling keeps
+        # the one shot exactly as it was — the record has left `pending`, so no
+        # boundary will offer this sha again.
+        return _settle_upgrade(
+            store,
+            record,
+            UPGRADE_EXEC_FAILED,
+            f"os.execv refused the replacement ({type(exc).__name__}: {exc}), so "
+            "this process is still running the code it started with — the sha is "
+            "spent all the same",
+            log,
         )
-        return UPGRADE_EXEC_FAILED
     return UPGRADE_EXECED      # pragma: no cover - execv does not return
 
 
@@ -793,6 +811,13 @@ def _confirm_self_upgrade(config: AutoloopConfig) -> bool:
 
     Until this runs, the record says `execed` and no boundary will act on that
     sha again — so a replacement that dies early is never retried.
+
+    `execed` is the ONLY status this confirms, and that is what keeps the
+    entry honest: it says a replacement completed an iteration, so a status
+    that means "the replacement did not happen" must not reach here. An
+    `os.execv` that raises settles the record to `exec_failed` for exactly
+    that reason (`_self_upgrade_at_boundary`) — the process carries on, the
+    next iteration is the OLD code's, and nothing is confirmed.
     """
     store = UpgradeStore(config.pending_upgrade_file)
     record = store.load()
@@ -1089,9 +1114,11 @@ def _run_continuous(
                 # the pid and the lock intact, and comes back at the top of
                 # `_cmd_run` running the merged code. When it DOES return —
                 # preflight failed, the merge is not this tree, the lock could
-                # not be armed — the record has been settled, so the next round
-                # will not offer the same sha again, and the loop simply carries
-                # on with the code it has.
+                # not be armed, `os.execv` itself raised — the record has been
+                # settled, so the next round will not offer the same sha again,
+                # AND it no longer says `execed`, so the confirmation at the top
+                # of the next iteration has nothing to retire. The loop simply
+                # carries on with the code it has.
                 _self_upgrade_at_boundary(config, lock)
                 continue
             if outcome == Phase.NEEDS_USER.value:

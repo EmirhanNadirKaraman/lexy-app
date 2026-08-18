@@ -519,7 +519,13 @@ loads the same state file and prepares the same request. A merge touching only
   a restart loop. The marker is retired only after one full `run --continuous`
   iteration completes under the new code (which may be an idle poll: that
   still proves the replacement imported the tree, read its config, state and
-  registry, and came back).
+  registry, and came back). **`execed` means "a successor is running", so an
+  `execv` that RAISES settles the record to `exec_failed` instead of leaving
+  it there**: this process is still the old image, the next iteration is its
+  own, and a record left saying `execed` would be retired at the top of that
+  iteration with a `self_upgrade_confirmed` entry claiming a replacement that
+  never happened. The one shot is unaffected either way — the record has left
+  `pending`, and only `pending` is ever acted on.
 * **Never mid-round, never while an agent holds a worker.** Enforced by the
   phase, above, not re-derived at the exec site.
 * **The lock is handed over, not released and re-taken.** Immediately before
@@ -555,7 +561,7 @@ upgrade counts as a new run, because it is one.
 | The merged tree imports | process replaced, same pid, same lock | `self_upgrade_exec` |
 | It does not import | nothing replaced; loop carries on with the old code | `self_upgrade_preflight_failed` |
 | The merge was in another checkout | nothing replaced | `self_upgrade_unapplicable` |
-| The lock could not be armed, or `execv` refused | nothing replaced; the sha is still spent | `self_upgrade_exec_failed` |
+| The lock could not be armed, or `execv` refused | nothing replaced; the record is settled `exec_failed` (never confirmed) and the sha is still spent | `self_upgrade_exec_failed` |
 | One full iteration completed under the new code | the one-shot marker is retired | `self_upgrade_confirmed` |
 | The merge landed but could not be inspected/recorded | no restart offered; the merge is unaffected | `self_upgrade_error` |
 
