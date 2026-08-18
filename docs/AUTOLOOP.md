@@ -837,6 +837,23 @@ never "undo".
 
 1. First dispatch: `task_base_sha` = the MAIN checkout's HEAD, worktree +
    branch created off it (`TaskExecution`, `worktask.py`).
+1b. **Resumed dispatch reuses the recorded worker** (wrk-01, 2026-08-18).
+   When an execution record already exists, `worker_env.
+   worker_repo_is_reusable` probes the recorded `worktree_path`: it must
+   exist, be the top level of a git repository in its own right, and have
+   exactly the recorded `task_branch` checked out. All three true → the
+   worker is used AS IT STANDS — no clone, no branch switch, no rewrite of
+   the record. Anything else falls back to the SAME
+   `WorkerRepoManager.create` call a first dispatch makes (recorded base
+   fetched from the primary checkout onto the recorded branch): a missing
+   directory is recreated (transcript event `worker_recreated`), while a
+   path that exists but is not a git repo, or is on the wrong branch, makes
+   `create()` refuse with its usual "already exists" error — fail closed,
+   no repair, no deletion. Salvaging a half-broken worker is an operator's
+   decision, not this dispatch's. This is a REUSE gate only: a valid-but-
+   dirty worker still passes it and is then handled by
+   `_prepare_write_capable_worker`'s residue quarantine (§ M1 finding #3),
+   exactly as before.
 2. A pending `CommitIntent` from a previous crash is reconciled FIRST
    (`reconcile_after_crash`, F8 — see `worktask.py`'s module docstring) —
    `RECOVERABLE` adopts the branch tip without re-committing, `AMBIGUOUS`

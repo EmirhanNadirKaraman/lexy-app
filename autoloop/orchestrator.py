@@ -238,7 +238,7 @@ from .packet import (
 )
 from .policy import PolicyEngine, Verdict, retired_decision_verdict
 from .publisher import Publisher, redact_url
-from .worker_env import verify_worker_isolation, worker_env
+from .worker_env import verify_worker_isolation, worker_env, worker_repo_is_reusable
 from .prompts import (
     TEMPLATES,
     build_prompt,
@@ -3906,6 +3906,7 @@ class Orchestrator:
         declared_validation_cwd = "" if is_audit else (task.validation_cwd or "")
 
         execution = self._execution_store.load(task.id)
+        resumed = execution is not None
         if execution is not None and self._worker_repos is not None:
             execution = self._rebase_execution_if_stale(execution, task)
             if execution is None:
@@ -3966,6 +3967,39 @@ class Orchestrator:
                 self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         self._store.save(state)
+
+        # A resumed round REUSES the worker its execution record names,
+        # whenever that worker is still exactly what the record says it is:
+        # present on disk, a git repository in its own right, and checked out
+        # on the recorded `task_branch` (`worker_repo_is_reusable` — those
+        # three facts and nothing more). Reuse touches nothing: no clone, no
+        # branch switch, no rewrite of the record. Anything else falls back
+        # to the SAME creation call a first dispatch makes — the recorded
+        # base fetched from the primary checkout onto the recorded branch —
+        # so a missing directory is simply recreated, while a path that
+        # exists but is not a git repository (or is on the wrong branch)
+        # makes `WorkerRepoManager.create` refuse with its usual actionable
+        # error. No repair and no deletion: salvaging a half-broken worker
+        # is an operator's decision, not this dispatch's.
+        if resumed and self._worker_repos is not None:
+            if not worker_repo_is_reusable(
+                Path(execution.worktree_path), execution.task_branch
+            ):
+                self._worker_repos.create(
+                    task.id,
+                    self._git.repo_root,
+                    execution.task_base_sha,
+                    branch=execution.task_branch,
+                )
+                self._log(
+                    "worker_recreated",
+                    data={
+                        "task_id": task.id,
+                        "worktree_path": execution.worktree_path,
+                        "task_branch": execution.task_branch,
+                        "task_base_sha": execution.task_base_sha,
+                    },
+                )
 
         if self._worker_repos is not None:
             # The scrubbed env is not decoration: a GitGateway with no explicit

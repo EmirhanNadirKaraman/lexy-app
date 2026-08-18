@@ -1871,6 +1871,30 @@ quarantined, because plain `run` parks task_fatal without
 `cli._handle_parked_task`, so `registry.unblock` raises and a reset placed after
 it would be skipped in exactly the case it exists for.
 
+**Worker reuse at dispatch (wrk-01, 2026-08-18; new `test_worker_env.py`, 11
+tests — hand-counted, no shell in the worker).** A resumed round must reuse
+its worker repository, not recreate it. Seven unit tests pin the probe
+(`worker_env.worker_repo_is_reusable`): True only for an existing directory
+that is itself the top level of a git repository with exactly the recorded
+branch checked out — a missing directory, a plain directory, a subdirectory
+inside someone else's repo (`--show-toplevel` compared back against the
+path), the wrong branch, a detached HEAD, and an empty recorded branch are
+all False. Four dispatch tests pin the guard in
+`_dispatch_task_postcommit`:
+`test_a_second_dispatch_reuses_the_existing_worker_with_no_new_clone`
+(one `WorkerRepoManager.create` across two dispatches — counted by
+shadowing the method — same path, same branch, nothing quarantined, round
+2's candidate contains both rounds' files);
+`test_a_missing_worker_directory_is_recreated_by_the_existing_creation_path`
+(fallback is the SAME `create()` call, at the RECORDED base onto the
+RECORDED branch, `worker_recreated` in the transcript, record not
+rewritten); and the two bounds tests (wrong branch / non-git directory):
+not reuse cases, the fallback `create()` refuses with its existing
+"already exists" error, and the path is left byte-for-byte as found — no
+repair, no deletion, no branch switch, no attempt charged. The dirty-worker
+quarantine (`_prepare_write_capable_worker`, M1 finding #3) is untouched:
+reuse gates only on the three recorded facts, never on cleanliness.
+
 Run: `pytest autoloop/tests` from the repo root to run only this tree.
 
 **Included in a bare `pytest` since 2026-08-04 (rt-05).** Root `testpaths` is

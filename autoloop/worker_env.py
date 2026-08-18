@@ -272,6 +272,52 @@ def validate_workers_root(
     return violations
 
 
+def worker_repo_is_reusable(path: Path, branch: str) -> bool:
+    """True only when the worker at `path` can be resumed AS IS for a round
+    recorded against `branch`: the directory exists, it is itself the top
+    level of a git repository (`--show-toplevel` is compared back against
+    `path`, so a plain directory that merely sits INSIDE some other repo
+    does not pass as one), and `branch` is exactly the checked-out branch.
+
+    Everything else — a missing directory, a non-repo, a detached HEAD, a
+    different branch, any probe failure — is False, and the caller falls
+    back to its ordinary creation path. Deliberately NOT a repair helper:
+    this function never mutates anything, and False never means "fix it",
+    only "do not reuse it". Salvaging a half-broken worker is an operator's
+    decision, not this probe's.
+
+    The probes run under `worker_env()` like every other worker-side git
+    invocation in this module — a read-only probe has no business resolving
+    the calling process's ambient system/global git config either.
+    """
+    if not branch:
+        return False        # a record with no branch can never match one
+    path = Path(path)
+    if not path.is_dir():
+        return False
+    env = worker_env()
+
+    def probe(*args: str) -> str | None:
+        try:
+            proc = subprocess.run(
+                ["git", *args], cwd=str(path), env=env,
+                capture_output=True, text=True,
+            )
+        except OSError:
+            return None
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    toplevel = probe("rev-parse", "--show-toplevel")
+    if toplevel is None:
+        return False
+    try:
+        if Path(toplevel).resolve() != path.resolve():
+            return False
+    except OSError:
+        return False
+    return probe("branch", "--show-current") == branch
+
+
 class WorkerRepoManager:
     """Creates one isolated, no-remote repository per task.
 
