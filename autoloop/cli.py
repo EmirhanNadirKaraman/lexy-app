@@ -75,10 +75,19 @@ from .executor import ExecutionOutcome, NullExecutor, TaskExecutor
 from .git_gateway import GitGateway
 from .implement_executor import ImplementExecutor, implement_agent_runner
 from .inbox import InboxError, TaskInbox, apply_requests, inbox_dir_for
+from .auto_merge import (
+    UPGRADE_EXEC_FAILED,
+    UPGRADE_EXECED,
+    UPGRADE_PENDING,
+    UPGRADE_PREFLIGHT_FAILED,
+    UPGRADE_UNAPPLICABLE,
+    PendingUpgrade,
+    UpgradeStore,
+)
 from .lock import LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
 from . import merge_sweep
-from .orchestrator import Orchestrator
+from .orchestrator import SELF_UPGRADE, Orchestrator
 from .policy import PolicyConfig, PolicyEngine
 from .prompts import TEMPLATES, kickoff_payload, user_answer_payload
 from .publisher import (
@@ -89,7 +98,7 @@ from .publisher import (
     reprovision_publisher as _reprovision_publisher_snapshot,
 )
 from .stall import StallPolicy
-from .state import TERMINAL_PHASES, LoopState, Phase, StateStore
+from .state import TERMINAL_PHASES, LoopState, Phase, StateStore, utcnow_iso
 from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from .transcript import TranscriptLogger
 from .validation_env import load_validation_env
@@ -440,6 +449,11 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         # build an args namespace without it (tests, embedders) fall back to
         # the default, which is where `DEFAULT_CONFIG` points.
         config_path=Path(getattr(args, "config", None) or DEFAULT_CONFIG),
+        # The ONE construction allowed to end a round for a self-upgrade, and
+        # it covers both `run` paths. `smoke-browser` builds its own
+        # orchestrator against the same state dir and would otherwise report a
+        # false failure over an upgrade it cannot perform — see the constructor.
+        self_upgrade_enabled=True,
     )
 
 
@@ -538,9 +552,295 @@ def _sweep_backlog_on_startup(config: AutoloopConfig) -> bool:
     return True
 
 
+# ---- running the code the loop just merged -----------------------------------
+#
+# A merge into the checkout does not reload a live Python process. Measured
+# 2026-08-18: plan-01's hard gate merged at 06:23:59 into a loop started at
+# 04:07:03, and dash-10 started AFTER the merge without it; brw-11's browser fix
+# was inert the same way all night. So the loop replaces its own interpreter,
+# and everything below exists to bound WHEN.
+#
+# `os.execv`, never `importlib.reload`: reloading modules in a running
+# orchestrator leaves half-reloaded modules and live objects holding the old
+# classes, in a process that authorizes git pushes. `execv` replaces the image
+# wholesale and PRESERVES THE PID, which is also what keeps `LoopLock` valid
+# across the replacement (see `lock.py`'s handoff section).
+
+#: What the preflight subprocess imports. Deliberately the modules a fresh
+#: `python -m autoloop` loads on the way to its first decision — `policy` is the
+#: one the 2026-08-18 measurement names — and deliberately NOT a walk of the
+#: whole package: `browser.playwright_session` and the codex client have
+#: optional third-party dependencies, so a machine without them would fail
+#: every preflight and silently disable this feature for good.
+PREFLIGHT_MODULES = (
+    "autoloop",
+    "autoloop.policy",
+    "autoloop.auto_merge",
+    "autoloop.merge_sweep",
+    "autoloop.orchestrator",
+    "autoloop.cli",
+)
+
+#: Long enough for a cold interpreter importing spaCy-free pure-Python modules
+#: on a loaded machine; a timeout counts as a FAILED preflight, which keeps the
+#: old code running rather than replacing it on an unanswered question.
+PREFLIGHT_TIMEOUT_SECONDS = 120.0
+
+
+def _package_root() -> Path:
+    """The directory holding the `autoloop` package this process imported —
+    i.e. the tree a fresh interpreter would load from."""
+    return Path(__file__).resolve().parent.parent
+
+
+def _preflight_import(root: Path) -> tuple[bool, str]:
+    """Does the merged tree import? `(True, "")` only when it demonstrably does.
+
+    In a SUBPROCESS, because that is the only way to answer the question at all:
+    this process already holds the old modules, and importing again would either
+    hit `sys.modules` or (with a reload) produce exactly the half-swapped state
+    `execv` exists to avoid.
+
+    `-c` puts the cwd at `sys.path[0]`, so running it in `root` imports the
+    checkout rather than any installed copy — the same tree the replacement will
+    load, since `_self_upgrade_at_boundary` has already required that the merged
+    checkout IS this package's root.
+
+    A failure is a report, never a fault: the loop keeps running the code it has,
+    which works.
+    """
+    script = "\n".join(f"import {name}" for name in PREFLIGHT_MODULES)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, f"rc={proc.returncode} {detail[-2000:]}"
+    return True, ""
+
+
+def _settle_upgrade(
+    store: UpgradeStore,
+    record: PendingUpgrade,
+    status: str,
+    detail: str,
+    log,
+) -> str:
+    """Move the record out of `pending` and say why. Returns `status`.
+
+    Every carry-on path goes through here, and that is what keeps the boundary
+    from becoming a spin: while the record says `pending`, `Orchestrator.run`
+    keeps handing the process back at every round. A record that cannot be
+    WRITTEN is therefore cleared instead — losing the marker costs at most one
+    delayed restart (the merged code is on disk and the next process start runs
+    it), while leaving it costs the loop its ability to make progress.
+    """
+    record.status = status
+    record.detail = detail
+    record.settled_at = utcnow_iso()
+    try:
+        store.save(record)
+    except OSError as exc:
+        detail = f"{detail} (and the record could not be written: {exc})"
+        try:
+            store.clear()
+        except OSError:
+            pass
+    log(
+        f"self_upgrade_{status}",
+        data={"base_sha": record.base_sha, "task_id": record.task_id, "detail": detail},
+    )
+    return status
+
+
+def _self_upgrade_at_boundary(config: AutoloopConfig, lock: LoopLock | None) -> str:
+    """Replace this process with a fresh interpreter running the merged tree.
+
+    **Does not return on success** — `os.execv` never returns. A return value is
+    therefore always "carry on in this process", and names why:
+
+    * `none` — nothing pending (a docs-only merge leaves no record at all), or
+      the record has already been settled. The `execed` case is the one-shot:
+      a merge that imports and then fails at runtime must not produce a restart
+      loop, so a sha that has been exec'd for once is never exec'd for again,
+      whatever happened to the process that tried.
+    * `unapplicable` — the merged checkout is not the tree this process imported
+      from. Replacing would load the same code again.
+    * `preflight_failed` — the merged tree does not import. The loop keeps
+      running the OLD code, which works, and the failure is reported. A bad
+      merge must be reported, not fatal.
+    * `exec_failed` — the one-shot marker could not be written, the lock could
+      not be armed for the handoff, or `os.execv` itself refused. The lock case
+      is refused rather than risked: the successor would find a live lock (its
+      own pid), fail closed and end the run. Either way the sha is spent — a
+      replacement that was attempted and did not happen is not a licence to try
+      the same one again. In none of the three is the record left saying
+      `execed`: it is settled `exec_failed`, or cleared outright when it cannot
+      be written at all (`_settle_upgrade`). `execed` means "a successor is
+      running", and it is what `_confirm_self_upgrade` retires one iteration
+      later — but here there is no successor, so the iterations that follow are
+      this same old process's.
+
+    The caller reaches here only at `Orchestrator.run`'s boundary, so "never
+    mid-round, and never while an agent holds a worker" is established there,
+    by the phase, not re-derived here.
+    """
+    store = UpgradeStore(config.pending_upgrade_file)
+    log = TranscriptLogger(config.transcript_file).append
+    record = store.load()
+    if record is None or record.status != UPGRADE_PENDING:
+        return "none"
+
+    running = _package_root()
+    merged = Path(record.repo_root).resolve() if record.repo_root else running
+    if merged != running:
+        return _settle_upgrade(
+            store,
+            record,
+            UPGRADE_UNAPPLICABLE,
+            f"the merge moved {merged}, but this process imports autoloop from "
+            f"{running} — replacing it would load the same code again",
+            log,
+        )
+
+    ok, detail = _preflight_import(running)
+    if not ok:
+        return _settle_upgrade(store, record, UPGRADE_PREFLIGHT_FAILED, detail, log)
+
+    # ONE SHOT, recorded BEFORE the replacement and durable across it. If the
+    # write fails the exec does not happen: an un-recorded exec is exactly the
+    # restart loop this rule exists to prevent.
+    record.status = UPGRADE_EXECED
+    record.settled_at = utcnow_iso()
+    try:
+        store.save(record)
+    except OSError as exc:
+        return _settle_upgrade(
+            store,
+            record,
+            UPGRADE_EXEC_FAILED,
+            f"the one-shot marker could not be written ({exc}), so the "
+            "replacement was not attempted",
+            log,
+        )
+
+    # Arming mints a one-use token into this process's environment and writes
+    # it into the lock file; `os.execv` inherits the environment, so ONLY the
+    # image this call is about to be replaced by can present it. Nothing
+    # between here and the exec may spawn a child — a token in the environment
+    # is inherited by every subprocess started while it is set, and the
+    # preflight (the one subprocess on this path) has already run.
+    if lock is None or not lock.mark_exec_handoff(f"self_upgrade {record.base_sha[:12]}"):
+        return _settle_upgrade(
+            store,
+            record,
+            UPGRADE_EXEC_FAILED,
+            "the state-dir lock could not be armed for the handoff, so the "
+            "replacement was not attempted — its successor would have found a "
+            "live lock and refused to start",
+            log,
+        )
+
+    # The documented launch shape (`python -m autoloop ...`), rebuilt rather
+    # than reused: `sys.argv[0]` under `-m` is the path to `__main__.py`, and
+    # re-running THAT as a script breaks its relative imports.
+    argv = [sys.executable, "-m", "autoloop", *sys.argv[1:]]
+    log(
+        "self_upgrade_exec",
+        data={
+            "base_sha": record.base_sha,
+            "task_id": record.task_id,
+            "paths": list(record.paths)[:20],
+            "pid": os.getpid(),
+            "argv": argv,
+        },
+    )
+    print(
+        f"\nrestarting into {record.base_sha[:12]} — the merge for task "
+        f"{record.task_id} changed the loop's own code (same pid, lock held).\n"
+    )
+    # There is no "after" to flush in: `execv` replaces the image, so anything
+    # still buffered is simply lost.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as exc:
+        # No successor is coming, so both halves of the handoff go: the marker
+        # on disk and the token in this process's environment. Leaving the
+        # token would hand an authorization to every subprocess this run spawns
+        # afterwards.
+        lock.clear_exec_handoff()
+        # And the record is SETTLED, not left saying `execed`. It was written
+        # as `execed` a few lines up because it has to be durable BEFORE the
+        # call — but that status now means "a replacement is running", and
+        # `_confirm_self_upgrade` retires it after one iteration and logs
+        # `self_upgrade_confirmed`. This process never went anywhere: the next
+        # iteration of `run --continuous` is the OLD code's, and confirming
+        # there would record a replacement that did not happen. Settling keeps
+        # the one shot exactly as it was — the record has left `pending`, so no
+        # boundary will offer this sha again.
+        return _settle_upgrade(
+            store,
+            record,
+            UPGRADE_EXEC_FAILED,
+            f"os.execv refused the replacement ({type(exc).__name__}: {exc}), so "
+            "this process is still running the code it started with — the sha is "
+            "spent all the same",
+            log,
+        )
+    return UPGRADE_EXECED      # pragma: no cover - execv does not return
+
+
+def _confirm_self_upgrade(config: AutoloopConfig) -> bool:
+    """One completed iteration under the new code retires the one-shot marker.
+
+    "Completed" deliberately means one full pass of `_run_continuous` — which
+    may be a poll that found nothing to do. That still proves what the marker
+    guards against: the replacement imported the merged tree, read its config,
+    state and registry, ran the selection policy and came back. A stricter
+    definition (a finished task) would leave the marker armed for hours on an
+    idle loop and block the next upgrade behind work that may never arrive.
+
+    Until this runs, the record says `execed` and no boundary will act on that
+    sha again — so a replacement that dies early is never retried.
+
+    `execed` is the ONLY status this confirms, and that is what keeps the
+    entry honest: it says a replacement completed an iteration, so a status
+    that means "the replacement did not happen" must not reach here. An
+    `os.execv` that raises settles the record to `exec_failed` for exactly
+    that reason (`_self_upgrade_at_boundary`) — the process carries on, the
+    next iteration is the OLD code's, and nothing is confirmed.
+    """
+    store = UpgradeStore(config.pending_upgrade_file)
+    record = store.load()
+    if record is None or record.status != UPGRADE_EXECED:
+        return False
+    try:
+        store.clear()
+    except OSError:
+        return False
+    TranscriptLogger(config.transcript_file).append(
+        "self_upgrade_confirmed",
+        data={
+            "base_sha": record.base_sha,
+            "task_id": record.task_id,
+            "note": "one full iteration completed under the merged code",
+        },
+    )
+    return True
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    with LoopLock(config.state_dir):
+    with LoopLock(config.state_dir) as lock:
         _reset_run_scoped_budgets(config)
         if not _sweep_backlog_on_startup(config):
             # Returned BEFORE the try, so the `finally` below never runs and
@@ -563,7 +863,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         try:
             if getattr(args, "continuous", False):
                 _validate_continuous_args(args)
-                return _run_continuous(args, config)
+                # The lock travels with it: `_run_continuous` is where the
+                # process may replace itself, and the handoff has to be armed
+                # on the lock this `with` block actually holds.
+                return _run_continuous(args, config, lock)
             return _run_locked(args, config)
         finally:
             # A CLEAN exit publishes `stopped`, which is how the monitor tells
@@ -690,6 +993,20 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
     # rather than falling through to a second one.
     if _is_fault_stop(orchestrator.state):
         return _report_fault_stop(config, orchestrator.state, registry)
+    if outcome == SELF_UPGRADE:
+        # Reported, not performed. A single-round `run` carries flags that are
+        # not safe to re-run — `--kickoff` refuses a session that now exists,
+        # `--answer` refuses a phase that is no longer `needs_user` — so
+        # re-execing this argv would end the process on a StateError. The
+        # record stays `pending`; the session is mid-flight and untouched, so
+        # the next start picks up both.
+        print(_summary(config, orchestrator.state, registry))
+        print(
+            "\nA merge changed the loop's own code, so this process is running "
+            "a stale copy. Nothing was lost — the session is exactly where it "
+            "was. Start it again (`run --continuous` restarts itself for this)."
+        )
+        return 0
     print(_summary(config, orchestrator.state, registry))
     print(f"\nLoop ended: {outcome}")
     return 2 if outcome in (Phase.NEEDS_USER.value, Phase.FAILED.value) else 0
@@ -702,7 +1019,9 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
 CONTINUOUS_POLL_SECONDS = 30.0
 
 
-def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
+def _run_continuous(
+    args: argparse.Namespace, config: AutoloopConfig, lock: LoopLock | None = None
+) -> int:
     """`run --continuous`: loop the existing phase machine indefinitely,
     working around task-scoped blockers instead of halting on them.
 
@@ -734,6 +1053,13 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
     as a boundary would kick off a fresh session into the identical wall on the
     very next iteration; see `_report_fault_stop`.
 
+    **SELF-UPGRADE.** `Orchestrator.run` can also return `SELF_UPGRADE`: a
+    merge has changed the loop's own code and the session has reached a round
+    boundary. This is the ONLY place the process replaces itself, and the
+    replacement is `os.execv` in the same pid holding the same lock — see
+    `_self_upgrade_at_boundary`, which preflights the merged tree first and
+    keeps running the old code if it does not import.
+
     **EXHAUSTION.** Once a clean boundary finds no READY task AND the
     repository fingerprint is unchanged, that used to always mean "sleep and
     poll again" — and still does, UNLESS there is at least one OPEN blocker
@@ -748,10 +1074,21 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
     guarantee that function provides is exactly as before).
     """
     blocker_store = BlockerStore(config.blockers_dir)
+    iterations = 0
+    upgrade_checked = False
     while True:
         if pause_requested(config):
             print("paused")
             return 0
+        # One completed iteration is what retires a self-upgrade's one-shot
+        # marker (`_confirm_self_upgrade`). Checked at the TOP of the second
+        # iteration rather than at the bottom of the first: every branch below
+        # ends the iteration with its own `continue`, and a bottom-of-loop
+        # confirmation would be skipped by whichever one somebody forgot.
+        if iterations and not upgrade_checked:
+            upgrade_checked = True
+            _confirm_self_upgrade(config)
+        iterations += 1
         store, state = _load_state(config)
         task_store, registry = _load_tasks(config)
         # At the TOP of the iteration, not down at the exhaustion check: the
@@ -772,6 +1109,18 @@ def _run_continuous(args: argparse.Namespace, config: AutoloopConfig) -> int:
             outcome = orchestrator.run()
             if outcome == "paused":
                 return 0
+            if outcome == SELF_UPGRADE:
+                # Normally does not return: the process is replaced here, with
+                # the pid and the lock intact, and comes back at the top of
+                # `_cmd_run` running the merged code. When it DOES return —
+                # preflight failed, the merge is not this tree, the lock could
+                # not be armed, `os.execv` itself raised — the record has been
+                # settled, so the next round will not offer the same sha again,
+                # AND it no longer says `execed`, so the confirmation at the top
+                # of the next iteration has nothing to retire. The loop simply
+                # carries on with the code it has.
+                _self_upgrade_at_boundary(config, lock)
+                continue
             if outcome == Phase.NEEDS_USER.value:
                 if _handle_parked_task(config, store, task_store, registry, orchestrator.state) == "task_fatal":
                     continue

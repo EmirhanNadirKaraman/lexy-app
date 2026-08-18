@@ -434,6 +434,19 @@ class AutoloopConfig:
         return self.state_dir / "merge-deferrals"
 
     @property
+    def pending_upgrade_file(self) -> Path:
+        """The one `auto_merge.PendingUpgrade` record: a merge that changed the
+        loop's own code, and what became of it (`auto_merge.UpgradeStore`).
+
+        Durable, and outside the session lifecycle for the same reason
+        `blockers_dir` is: it is the one-shot marker that keeps a merge which
+        imports but fails at runtime from producing a restart loop, so a
+        `task_fatal` park or a `reset` clearing it would take exactly the
+        guard off. Absent means "nothing to upgrade to", which is also what an
+        unreadable one means — see `UpgradeStore`."""
+        return self.state_dir / "pending_upgrade.json"
+
+    @property
     def seed_tasks_file(self) -> Path:
         """Git-tracked seed file (`autoloop/seed_tasks.json`, alongside this
         module) — NOT under `state_dir`. `cli.py`'s `next-task` command loads

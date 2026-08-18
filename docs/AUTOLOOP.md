@@ -125,6 +125,35 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   LIVE lock stale. When boot time is unreadable, or the stamp is
   unparseable or timezone-naive, the pid probe decides exactly as before —
   the check can only ever make MORE locks recoverable, never fewer.
+* **One exception, and it is not a stolen lock: a handoff this very process
+  wrote for itself.** When the loop replaces its own interpreter to run code
+  it just merged (§3f-quater), `os.execv` preserves the pid and runs no
+  `finally`, so the lock file is never released — from outside, one live pid
+  holds one lock file across the whole replacement, with no instant another
+  process could take it. The successor image would otherwise fail closed on
+  its own pid, so `acquire` adopts a lock that (a) carries an `exec_handoff`
+  marker written immediately before the `execv`, (b) names this host and THIS
+  pid both as the owner and inside the marker, (c) names the run the lock
+  itself records, (d) carries a **token this process INHERITED** in
+  `AUTOLOOP_EXEC_HANDOFF_TOKEN`, and (e) has not been adopted already —
+  adoption clears the marker and consumes the token. A live lock without the
+  marker, or one whose marker names a different pid, host or run, or one whose
+  token this process did not inherit, is still refused. `started_at` survives
+  the adoption, because the lock really has been held continuously since then.
+
+  **Why the token, when (a)–(c) already look specific.** Every other fact in
+  the marker is forgeable from outside: the hostname is public, the run id sits
+  in the lock file beside the marker, and pids are small integers the kernel
+  reuses within a boot. So a marker left behind by a run that died — or written
+  by anything that can write the state dir — plus that pid coming round again
+  would be a complete handoff. The token is 32 random bytes minted immediately
+  before the `execv`, written only into the lock file, and reaching the
+  successor ONLY because `os.execv` inherits the environment of the process it
+  replaces. A process that did not receive it cannot produce it, whatever the
+  file says. It is consumed on adoption and dropped when `execv` is refused, so
+  it is never inherited by anything the run spawns afterwards; a malformed or
+  non-ASCII value is a refusal, never a raise, because that comparison happens
+  in the successor's very first act after the exec.
 
 ### 3g. Detecting a task's scope (propose, never authorize)
 
@@ -438,6 +467,103 @@ re-enumerates what is left next time.
 | A completed task it could not judge (ref gone, remote unreachable, record unreadable/absent/candidate-less, archive unorderable or superseded) | named, not merged, run does NOT count as clear (exit 1), and the whole sweep is held | `merge_sweep_unresolved` |
 | A ref that changed DURING the sweep | that branch and the rest are left alone; the sweep stops | `merge_sweep_publication_changed` |
 | Backlog cleared | — | `merge_sweep_completed` |
+
+---
+
+### 3f-quater. Running the code it just merged
+
+Merging into the checkout does not reload a live Python process. Measured
+2026-08-18: the loop started 04:07:03; plan-01 merged a hard gate at 06:23:59
+("no task starts without an approved decomposition"); at 09:00 the registry
+held 0 decompositions across 102 tasks, dash-10 among them — a task that
+STARTED after the merge. `policy.py` was loaded at 04:07 and stayed loaded.
+brw-11's throttle-vs-unattachable fix, merged 00:58, was inert the same way
+for the whole night: every browser fault after it was handled by the code it
+replaced. **The loop could ship improvements to itself that it then could not
+use.**
+
+So after a merge that changes any file under `autoloop/`, the loop replaces
+its own process — but only at a boundary, and only after proving the merged
+tree loads.
+
+**`os.execv`, never `importlib.reload`.** Reloading modules in a running
+orchestrator leaves partially reloaded modules and live objects holding
+references to the old classes, in a process that authorizes git pushes.
+`execv` replaces the image wholesale, and it PRESERVES THE PID — which is also
+what keeps `.autoloop/LOCK` valid across the replacement (§3, last bullet).
+
+**Where.** `AutoMerger.attempt` already returns `merged`, so the trigger is
+that return value, not a filesystem watcher. The merge records one
+`PendingUpgrade` in `.autoloop/pending_upgrade.json`; nothing happens then —
+that moment is mid-round by construction. The replacement happens at the next
+`Orchestrator.run()` boundary that is **`ready` with no pending request**, i.e.
+immediately before the next request is prepared: no packet outstanding, no
+agent writing (a write-capable agent runs in the `executing` phase,
+synchronously), the payload already durable in `state.outbox`, execution
+records already written. A replacement there loses nothing — the successor
+loads the same state file and prepares the same request. A merge touching only
+`docs/` records nothing and changes nothing.
+
+**Bounds, all load-bearing.**
+
+* **Preflight.** A subprocess imports the merged tree first
+  (`python -c "import autoloop, autoloop.policy, …"` in the merged checkout).
+  If it fails, nothing is replaced: the failure is reported and the loop keeps
+  running the old code, which works. A bad merge must be reported, not fatal.
+  The module list is deliberately not the whole package — `browser.
+  playwright_session` and the codex client have optional third-party deps, and
+  a machine without them would fail every preflight and disable this for good.
+* **One shot.** The sha being upgraded to is recorded, and flipped to `execed`
+  **before** the `execv`. A sha that has been exec'd for once is never exec'd
+  for again — so a merge that imports and then fails at runtime cannot produce
+  a restart loop. The marker is retired only after one full `run --continuous`
+  iteration completes under the new code (which may be an idle poll: that
+  still proves the replacement imported the tree, read its config, state and
+  registry, and came back). **`execed` means "a successor is running", so an
+  `execv` that RAISES settles the record to `exec_failed` instead of leaving
+  it there**: this process is still the old image, the next iteration is its
+  own, and a record left saying `execed` would be retired at the top of that
+  iteration with a `self_upgrade_confirmed` entry claiming a replacement that
+  never happened. The one shot is unaffected either way — the record has left
+  `pending`, and only `pending` is ever acted on.
+* **Never mid-round, never while an agent holds a worker.** Enforced by the
+  phase, above, not re-derived at the exec site.
+* **The lock is handed over, not released and re-taken.** Immediately before
+  the exec, `LoopLock.mark_exec_handoff` mints a one-use token into the
+  environment and writes it into the lock file (environment first, so a marker
+  never reaches disk without an inheritable token behind it). A `False` from
+  that call refuses the replacement outright — a successor that could not
+  acquire the lock would end the run — and an `execv` that raises clears both
+  halves again. Nothing between the arming and the exec may spawn a child: a
+  token in the environment is inherited by every subprocess started while it is
+  set, which is why the preflight runs before the arming and not after.
+* **Continuous mode only.** A single-round `run` reports the pending upgrade
+  and exits 0 without replacing anything: its argv carries flags that are not
+  safe to re-run (`--kickoff` refuses an existing session, `--answer` refuses a
+  phase that is no longer `needs_user`). The record and the session both
+  survive for the next start.
+* **Only the `run` paths are offered the boundary at all.** The record lives
+  under `state_dir`, so any orchestrator built against that directory could
+  see it; `Orchestrator(self_upgrade_enabled=…)` defaults OFF and is enabled in
+  exactly one place, `cli._build_orchestrator`. `smoke-browser` builds its own
+  orchestrator, starts it at `ready` with no pending request — the boundary
+  shape exactly — and reports PASS only for a clean contract stop, so an
+  unrelated pending upgrade would fail a diagnostic while diagnosing nothing.
+
+The replacement re-runs `python -m autoloop <same args>`, so per-run budgets
+(`state.rotations`, cleared by `_reset_run_scoped_budgets`) start fresh — an
+upgrade counts as a new run, because it is one.
+
+| Situation | What happens | Transcript entry |
+|---|---|---|
+| A merge touched `autoloop/` | one record written, naming the merged base sha | `self_upgrade_pending` |
+| The boundary is reached | the round ends without preparing a request | `self_upgrade_boundary` |
+| The merged tree imports | process replaced, same pid, same lock | `self_upgrade_exec` |
+| It does not import | nothing replaced; loop carries on with the old code | `self_upgrade_preflight_failed` |
+| The merge was in another checkout | nothing replaced | `self_upgrade_unapplicable` |
+| The lock could not be armed, or `execv` refused | nothing replaced; the record is settled `exec_failed` (never confirmed) and the sha is still spent | `self_upgrade_exec_failed` |
+| One full iteration completed under the new code | the one-shot marker is retired | `self_upgrade_confirmed` |
+| The merge landed but could not be inspected/recorded | no restart offered; the merge is unaffected | `self_upgrade_error` |
 
 ---
 
