@@ -55,15 +55,38 @@ class ConversationUnusableError(BrowserError):
     """The configured conversation loaded but cannot be used at all.
 
     Narrow on purpose: this is the one browser failure that authorizes
-    rotating to a fresh conversation, and a run gets a single rotation. It
-    means the page demonstrably reached the conversation URL, is not an auth
-    page, and still has no composer (or shows an explicit conversation-error
-    marker) — i.e. *this chat* is wedged. A page that never loaded, a dropped
+    rotating to a fresh conversation, and a run gets a single rotation. Two
+    shapes qualify, and `code` names which so the transcript and the
+    rotation record can tell them apart:
+
+    * ``"conversation_unusable"`` (the default) — the page demonstrably
+      reached the conversation URL, is not an auth page, and still has no
+      composer (or shows an explicit conversation-error marker).
+    * ``"submission_never_appeared"`` — a submission THIS loop made is
+      provably not in the conversation: the page is attachable and
+      un-throttled, and the message list was mounted to its END without the
+      message appearing (the same two proofs `find_conversation_with`
+      requires before it may call anything absent). Raised from both
+      surfaces that fault wears while awaiting — the response-start bound
+      expiring cleanly, and the awaiting read itself dying with a
+      lost-session label (`BrowserChatGPT._classify_awaiting_read_failure`),
+      which is how the incident actually presented. The browser is
+      demonstrably fine — every read that established this went through it —
+      so the THREAD is wedged and restarting Chrome cannot help (2026-08-17:
+      ten minutes of 45-second restarts against a chat that had silently
+      stopped taking the loop's messages, while the same account posted by
+      hand in a different conversation).
+
+    Either way *this chat* is wedged. A page that never loaded, a dropped
     CDP connection, or a logged-out profile are ordinary `BrowserError` /
     `SessionLostError` / `LoginExpiredError` on the normal failure budget:
     rotating for those would spend the one rotation on a network blip and
     leave none for the real thing.
     """
+
+    def __init__(self, message: str, *, code: str = "conversation_unusable"):
+        self.code = code
+        super().__init__(message)
 
 
 class ConversationSearchInconclusive(BrowserError):
@@ -93,6 +116,14 @@ class ConversationSearchInconclusive(BrowserError):
     that already catch that keep their current behaviour (the search degrades
     to "not found", exactly as before this existed) while a caller that wants
     to tell "no" apart from "cannot tell" can name this type.
+
+    Since the missing-submission check reuses the same tail mount
+    (`BrowserChatGPT._rule_out_missing_submission`), `await_response` can
+    surface the page-identity fault too; it routes as an ordinary browser
+    fault there, exactly as the page-drifted error always has. On the
+    read-failure entry (`_classify_awaiting_read_failure`) it never escapes
+    at all: an inconclusive probe re-raises the original lost-session fault,
+    which carries the same routing.
     """
 
 

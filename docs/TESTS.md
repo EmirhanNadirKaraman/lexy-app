@@ -1871,6 +1871,52 @@ quarantined, because plain `run` parks task_fatal without
 `cli._handle_parked_task`, so `registry.unblock` raises and a reset placed after
 it would be skipped in exactly the case it exists for.
 
+**A send that never appears is a wedged conversation, not a browser fault
+(2026-08-18, brw-12; new `test_conversation_retirement.py`, 14 tests).**
+Observed 2026-08-17: a submission the loop believed sent (`submitted=True`,
+`send_attempted=True`) never appeared, the conversation sat at 33 messages for
+ten minutes, and the symptom surfaced as a locator timeout on the loop's own
+message — read as a lost session, answered with a Chrome restart every 45
+seconds, which cannot help because the browser was fine (12 CDP targets, an
+operator posting by hand in another chat). The classification fires from BOTH
+surfaces the fault wears. `BrowserChatGPT._rule_out_missing_submission` runs
+when the response-START bound expires with the request absent from the
+mounted window, and it is ALSO reached when a mid-await DOM read dies with
+the lost-session label itself — `_classify_awaiting_read_failure` catches the
+`SessionLostError` inside `await_response`, re-probes through the same
+session (a fresh read succeeding is the attachability proof), and only then
+rules. Either way the tail is mounted with the SAME two proofs
+`find_conversation_with` requires (list demonstrably at its end, window then
+unchanged), and only settled absence on an attachable, un-throttled,
+logged-in page raises
+`ConversationUnusableError(code="submission_never_appeared")` — which the
+existing `_handle_conversation_unusable` answers with rotation, no restart,
+no `consecutive_failures` charge (the rotation `reason` carries the error's
+`code`, so the record distinguishes a vanished submission from a chat that
+would not load). Ten client-level tests: proven bounded absence raises with
+the new code and a `submission-never-appeared` diagnostic, from the clean
+timeout AND from the exact reported locator-timeout read failure; a read
+failure whose probe SIGHTS the request re-raises the original
+`SessionLostError` (transient fault, restart path intact); a browser whose
+probe cannot read the page at all re-raises it too (brw-11's state 3); a
+read failure whose absence cannot settle (no position signal) re-raises it as
+well; a request hidden by the unmounted tail is SIGHTED by the mount and
+falls back to the ordinary `stage="start"` timeout (no rotation); an adapter
+that cannot report a scroll position can never establish absence and also
+falls back; a request visible in the window spends no gestures at all (the
+silent-conversation trigger's case, untouched); a throttle overlay arriving
+mid-mount — or discovered by the read-failure probe — is still routed as
+`RateLimitedError`. Four orchestrator-level tests: the fault rotates without
+restarting (a restart command IS configured, so one would be visible) and
+without touching `consecutive_failures`/`browser_restart_skips`; the exact
+reported shape runs END-TO-END through the real `await_response` code over a
+scripted page (`IncidentAwaitClient`) and rotates with no restart and no
+budget increment; the rebinding survives a process restart with
+`last_rotation.reason == "submission_never_appeared"`; and a
+`SessionLostError` that ESCAPES the client still takes the restart-and-budget
+path — which after this change can only mean the client's own probe could do
+no better (brw-11's dead-browser boundary is not swallowed).
+
 Run: `pytest autoloop/tests` from the repo root to run only this tree.
 
 **Included in a bare `pytest` since 2026-08-04 (rt-05).** Root `testpaths` is
