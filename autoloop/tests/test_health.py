@@ -65,6 +65,19 @@ def _asleep_for(minutes):
     return lambda start, end: health.SleepEvidence(minutes * 60.0, "test sleep window")
 
 
+def _darwin_history(monkeypatch, *, boot, sleeptime=0.0, waketime=0.0):
+    """Give `machine_sleep_in_window` a synthetic darwin wake history, so the
+    REAL evidence-boundary logic runs against known facts instead of the test
+    host's own sysctls. 0.0/0.0 is macOS for 'no sleep this boot'."""
+    monkeypatch.setattr(health.sys, "platform", "darwin")
+    monkeypatch.setattr(health, "boot_time_epoch", lambda: boot)
+    monkeypatch.setattr(
+        health,
+        "_sysctl_timeval_epoch",
+        {"kern.sleeptime": sleeptime, "kern.waketime": waketime}.get,
+    )
+
+
 def _check(config, **kw):
     kw.setdefault("now", NOW)
     kw.setdefault("agent_probe", lambda: False)
@@ -171,7 +184,7 @@ def test_sleep_short_of_explaining_the_silence_is_still_stuck(config):
 
     assert verdict.code == health.STUCK_SILENT
     assert verdict.silent_minutes == pytest.approx(70, abs=1)
-    assert "30m of machine sleep discounted" in verdict.detail
+    assert "30m not provably awake discounted" in verdict.detail
 
 
 def test_unavailable_wake_history_fails_toward_quiet_and_says_why(config):
@@ -208,17 +221,123 @@ def test_a_live_agent_wins_before_wake_history_is_consulted(config):
     assert "agent running" in verdict.summary
 
 
+def test_multiple_sleeps_in_one_window_cannot_be_read_as_awake_silence(
+    config, monkeypatch
+):
+    """100 minutes of silence holding TWO 30-minute sleeps: actual awake
+    silence is 40 minutes, but kern.sleeptime/kern.waketime carry only the
+    second sleep. Crediting the invisible 40 pre-pair minutes as awake would
+    report 70 awake minutes => falsely stuck. Partial history must not
+    authorize the alarm — only the tail since the last wake is proven."""
+    _state(config, phase=Phase.AWAITING.value)
+    _transcript(config, minutes_ago=100)
+    _darwin_history(
+        monkeypatch,
+        boot=(NOW - timedelta(hours=20)).timestamp(),
+        sleeptime=(NOW - timedelta(minutes=40)).timestamp(),
+        waketime=(NOW - timedelta(minutes=10)).timestamp(),
+    )
+    with LoopLock(config.state_dir):
+        verdict = _check(config, sleep_probe=health.machine_sleep_in_window)
+
+    assert verdict.code == health.OK_RUNNING
+    assert verdict.needs_attention is False
+    assert verdict.silent_minutes == pytest.approx(10, abs=1)
+
+
+def test_a_transcript_predating_the_current_boot_is_not_awake_silence(
+    config, monkeypatch
+):
+    """A reboot inside the silence window: the machine was off, and 'no sleep
+    recorded this boot' is true — but reading it as 224 awake minutes would
+    be the same false alarm as the slept laptop. `lock.boot_time_epoch` is
+    the shared boundary; time before it joins the discount."""
+    _state(config, phase=Phase.AWAITING.value)
+    _transcript(config, minutes_ago=224)
+    _darwin_history(monkeypatch, boot=(NOW - timedelta(minutes=5)).timestamp())
+    with LoopLock(config.state_dir):
+        verdict = _check(config, sleep_probe=health.machine_sleep_in_window)
+
+    assert verdict.code == health.OK_RUNNING
+    assert verdict.needs_attention is False
+    assert verdict.silent_minutes == pytest.approx(5, abs=1)
+
+
+def test_partial_history_still_surfaces_a_hang_via_the_proven_awake_tail(
+    config, monkeypatch
+):
+    """Failing quiet on the unprovable head must not blind the monitor: the
+    tail since the last wake IS proven awake, and a hang keeps growing it.
+    An hour of proven awake silence with no agent is stuck, whatever may
+    hide before the last sleep — the mutation guard against a version that
+    goes blanket-quiet whenever history is partial."""
+    _state(config, phase=Phase.EXECUTING.value)
+    _transcript(config, minutes_ago=200)
+    _darwin_history(
+        monkeypatch,
+        boot=(NOW - timedelta(hours=20)).timestamp(),
+        sleeptime=(NOW - timedelta(minutes=190)).timestamp(),
+        waketime=(NOW - timedelta(minutes=60)).timestamp(),
+    )
+    with LoopLock(config.state_dir):
+        verdict = _check(config, sleep_probe=health.machine_sleep_in_window)
+
+    assert verdict.code == health.STUCK_SILENT
+    assert verdict.needs_attention is True
+    assert verdict.silent_minutes == pytest.approx(60, abs=1)
+    assert "not provably awake discounted" in verdict.detail
+
+
 # --- the platform evidence itself ---------------------------------------------
 
 
 def test_the_darwin_evidence_is_the_last_sleeps_overlap_with_the_window(monkeypatch):
+    """Windows starting at or after kern.sleeptime are COMPLETELY characterised
+    by the pair (no sleep postdates kern.waketime while we run), so they get
+    the exact overlap — awake-throughout included."""
     values = {"kern.sleeptime": 100.0, "kern.waketime": 400.0}
     monkeypatch.setattr(health, "_sysctl_timeval_epoch", values.get)
 
     assert health._darwin_sleep_evidence(200.0, 500.0).asleep_seconds == 200.0
-    assert health._darwin_sleep_evidence(0.0, 1000.0).asleep_seconds == 300.0
-    # A sleep entirely outside the window discounts nothing.
+    # A window entirely after the wake is provably awake — a real zero.
     assert health._darwin_sleep_evidence(400.0, 1000.0).asleep_seconds == 0.0
+
+
+def test_a_darwin_window_predating_the_last_sleep_credits_only_the_proven_tail(
+    monkeypatch,
+):
+    """The sysctls carry ONE pair, so a window starting before that sleep
+    reaches time they cannot see — earlier finished sleeps hide there. Only
+    the tail since the wake counts as awake; the rest joins the discount
+    rather than authorizing a stuck verdict on unproven wakefulness."""
+    values = {"kern.sleeptime": 400.0, "kern.waketime": 700.0}
+    monkeypatch.setattr(health, "_sysctl_timeval_epoch", values.get)
+    evidence = health._darwin_sleep_evidence(0.0, 800.0)
+
+    # 100s provably awake since the wake; the other 700 are the 300s sleep
+    # plus 400 unprovable pre-pair seconds, discounted alike.
+    assert evidence.asleep_seconds == 700.0
+    assert "predates the last sleep" in evidence.note
+
+
+def test_an_unreadable_boot_time_makes_wake_history_unavailable(monkeypatch):
+    """Sleep evidence describes one boot; without knowing when that boot was,
+    the window cannot be tied to it. Honest unavailability, not a zero."""
+    monkeypatch.setattr(health, "boot_time_epoch", lambda: None)
+    evidence = health.machine_sleep_in_window(0.0, 1000.0)
+
+    assert evidence.asleep_seconds is None
+    assert "boot time unreadable" in evidence.note
+
+
+def test_pre_boot_time_joins_the_discount(monkeypatch):
+    """The off/reboot stretch before this boot could not have run the loop —
+    it is discounted with the sleep, and the note says why."""
+    _darwin_history(monkeypatch, boot=600.0)  # no sleep recorded this boot
+    evidence = health.machine_sleep_in_window(0.0, 1000.0)
+
+    assert evidence.asleep_seconds == 600.0
+    assert "pre-boot" in evidence.note
 
 
 def test_darwin_never_slept_this_boot_is_a_real_zero(monkeypatch):

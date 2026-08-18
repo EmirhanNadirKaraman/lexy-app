@@ -33,12 +33,19 @@ Signals, and why these rather than the obvious ones:
   This is the SAME wrong assumption `lock.boot_time_epoch` already corrects
   for locks (kern.boottime / /proc/stat btime, deliberately never a
   monotonic clock — macOS stops the monotonic clock during sleep, the exact
-  case in question), so the same evidence family is used here:
-  kern.sleeptime/kern.waketime on darwin, CLOCK_BOOTTIME−CLOCK_MONOTONIC on
-  linux. Proven sleep is subtracted from the silence before it is judged,
-  and when wake history cannot be established the check FAILS TOWARD QUIET
-  on this one axis — a false "stuck" trains a human to ignore the monitor,
-  while a missed detection is retried by the next check minutes later.
+  case in question), so the same evidence family is used here — and
+  `boot_time_epoch` itself is the shared boundary: wake history read from a
+  running kernel describes THIS boot only, so any part of the window before
+  boot (an off or rebooting machine) can no more accuse the loop than sleep
+  can. Within the boot, kern.sleeptime/kern.waketime on darwin and
+  CLOCK_BOOTTIME−CLOCK_MONOTONIC on linux fill in the sleep. Only time the
+  machine PROVABLY spent awake counts against the loop: proven sleep and
+  any stretch the history cannot vouch for (before boot, or before darwin's
+  last recorded sleep — those sysctls carry exactly one pair) are
+  discounted alike, and when wake history cannot be established at all the
+  check FAILS TOWARD QUIET on this one axis — a false "stuck" trains a
+  human to ignore the monitor, while a missed detection is retried by the
+  next check minutes later.
 
 Verdicts are advisory. Nothing here writes, locks, or touches the loop's
 state — it is safe to run on any schedule, including while the loop is
@@ -56,7 +63,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .blockers import BlockerStore
-from .lock import LoopLock
+from .lock import LoopLock, boot_time_epoch
 from .state import Phase, StateStore
 
 #: How long a live loop may write nothing before it is called stuck. Generous
@@ -115,9 +122,14 @@ class SleepEvidence:
 
     `asleep_seconds is None` means wake history could not be established —
     the caller must then fail toward quiet, and `note` says why so the
-    verdict's detail can explain itself. When it is a number, it is seconds
-    of the window the machine PROVABLY did not spend awake (0.0 is a real
-    answer: awake throughout).
+    verdict's detail can explain itself. When it is a number, it is the
+    seconds of the window that CANNOT be credited as awake: proven sleep,
+    plus any stretch the available history does not vouch for (time before
+    the current boot, or before darwin's last recorded sleep). Subtracting
+    it therefore leaves a proven LOWER BOUND on awake silence — a stuck
+    verdict is only ever built on time the machine is known to have been
+    awake, while unprovable time quietly counts as sleep. 0.0 stays a real
+    answer: provably awake throughout.
     """
 
     asleep_seconds: float | None
@@ -153,10 +165,18 @@ def _sysctl_timeval_epoch(name: str) -> float | None:
 
 
 def _darwin_sleep_evidence(window_start: float, window_end: float) -> SleepEvidence:
-    """Sleep overlap from kern.sleeptime/kern.waketime — the last sleep→wake
-    pair, which is exactly the incident shape (a long sleep, the check
-    running right after wake). Earlier sleeps in a long window are invisible
-    to these sysctls, so this can under-discount, never over-discount.
+    """Not-awake seconds from kern.sleeptime/kern.waketime — the LAST
+    sleep→wake pair, which bounds what these sysctls can prove. While we are
+    running no sleep postdates `waketime`, so the pair characterises
+    [sleeptime, now] COMPLETELY: a window starting at or after `sleeptime`
+    gets its exact sleep overlap, awake-throughout included. A window
+    starting earlier reaches time the pair cannot see — any number of
+    finished sleeps may hide before the last one — so there only the tail
+    since `waketime` is credited as awake and everything before it joins the
+    discount. That under-counts awake silence (the quiet direction, per the
+    SleepEvidence contract) without going blind: a hung loop keeps growing
+    that proven-awake tail and still crosses the threshold within one
+    silence window of the last wake.
     """
     slept = _sysctl_timeval_epoch("kern.sleeptime")
     woke = _sysctl_timeval_epoch("kern.waketime")
@@ -168,8 +188,16 @@ def _darwin_sleep_evidence(window_start: float, window_end: float) -> SleepEvide
         # A wake without its sleep (or the reverse) is not a window we can
         # subtract; guessing here is how a hung loop gets excused.
         return SleepEvidence(None, "kern.sleeptime/kern.waketime inconsistent")
-    overlap = min(woke, window_end) - max(slept, window_start)
-    return SleepEvidence(max(0.0, overlap), "kern.sleeptime/kern.waketime")
+    if window_start >= slept:
+        overlap = min(woke, window_end) - max(slept, window_start)
+        return SleepEvidence(max(0.0, overlap), "kern.sleeptime/kern.waketime")
+    proven_awake = max(0.0, window_end - woke)
+    not_awake = max(0.0, (window_end - window_start) - proven_awake)
+    return SleepEvidence(
+        not_awake,
+        "kern.sleeptime/kern.waketime; window predates the last sleep, so only "
+        "the tail since the last wake counts as awake",
+    )
 
 
 def _linux_sleep_evidence(window_start: float, window_end: float) -> SleepEvidence:
@@ -190,13 +218,35 @@ def _linux_sleep_evidence(window_start: float, window_end: float) -> SleepEviden
 
 
 def machine_sleep_in_window(window_start: float, window_end: float) -> SleepEvidence:
-    """Proven machine sleep (seconds) inside [window_start, window_end] epoch
-    seconds, or an unavailable verdict the caller must treat as quiet."""
+    """Not-awake seconds inside [window_start, window_end] epoch seconds, or
+    an unavailable verdict the caller must treat as quiet.
+
+    `lock.boot_time_epoch` is the shared boot boundary: sleep evidence read
+    from a running kernel describes THIS boot only, so any part of the
+    window before boot — an off or rebooting machine — joins the discount
+    rather than being mistaken for awake silence. Without a readable boot
+    time the window cannot be tied to the boot the evidence describes, and
+    the honest answer is unavailable, not a guess.
+    """
+    boot = boot_time_epoch()
+    if boot is None:
+        return SleepEvidence(
+            None, "boot time unreadable — wake history cannot be bounded to this boot"
+        )
+    pre_boot = max(0.0, min(boot, window_end) - window_start)
+    start = max(window_start, boot)
     if sys.platform == "darwin":
-        return _darwin_sleep_evidence(window_start, window_end)
-    if sys.platform.startswith("linux"):
-        return _linux_sleep_evidence(window_start, window_end)
-    return SleepEvidence(None, f"no wake-history source on {sys.platform}")
+        evidence = _darwin_sleep_evidence(start, window_end)
+    elif sys.platform.startswith("linux"):
+        evidence = _linux_sleep_evidence(start, window_end)
+    else:
+        return SleepEvidence(None, f"no wake-history source on {sys.platform}")
+    if evidence.asleep_seconds is None or pre_boot <= 0.0:
+        return evidence
+    return SleepEvidence(
+        evidence.asleep_seconds + pre_boot,
+        f"{evidence.note}; pre-boot time discounted (window predates this boot)",
+    )
 
 
 def last_transcript_event(path: Path) -> datetime | None:
@@ -352,7 +402,7 @@ def check(
         asleep = evidence.asleep_seconds / 60.0
         awake_silent = max(0.0, silent - asleep)
         if awake_silent > silence_minutes:
-            discount = f", {asleep:.0f}m of machine sleep discounted" if asleep > 0 else ""
+            discount = f", {asleep:.0f}m not provably awake discounted" if asleep > 0 else ""
             return Health(
                 code=STUCK_SILENT,
                 needs_attention=True,
@@ -366,7 +416,7 @@ def check(
             needs_attention=False,
             summary=(
                 f"autoloop is running (quiet {silent:.0f}m, "
-                f"{asleep:.0f}m of it machine sleep)"
+                f"{asleep:.0f}m of it not provably awake)"
             ),
             phase=phase,
             silent_minutes=awake_silent,
