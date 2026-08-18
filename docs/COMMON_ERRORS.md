@@ -1948,6 +1948,36 @@ clause placed above them swallows the specific one.
 
 ---
 
+## 9. Autoloop monitoring (health)
+
+### health says stuck for N minutes but the loop is fine — the laptop was asleep
+**Symptom:** `autoloop health` reports `autoloop looks stuck — no activity for
+224 minutes, phase=awaiting, no subagent running` while the loop is perfectly
+healthy: the transcript and state file were both written 69 seconds after the
+alert, and the loop went on to restart its browser, rotate the conversation
+and continue. (Observed 2026-08-05.)
+**Cause:** `health.check` measured silence as wall-clock time since the last
+transcript write, so hours of machine sleep read exactly like a hung loop —
+nothing could possibly have run during them. This is the same wrong
+assumption `lock.boot_time_epoch` already corrects for locks: wall-clock
+arithmetic (and equally a monotonic clock, which macOS STOPS during sleep)
+cannot tell "quiet" from "off".
+**Fix:** applied repo-side in `autoloop/health.py` (2026-08-18, hlth-01).
+Silence is now judged in awake minutes: `machine_sleep_in_window` reads
+`sysctl kern.sleeptime`/`kern.waketime` on darwin (the same sysctl-timeval
+evidence family `lock.boot_time_epoch` uses for kern.boottime) and
+CLOCK_BOOTTIME−CLOCK_MONOTONIC on linux, and the proven sleep is subtracted
+before the threshold is applied. When wake history cannot be read the check
+reports not-stuck and says why in the detail — fail toward quiet, because a
+false "stuck" trains a human to ignore the monitor, while a missed detection
+is retried by the next scheduled check. Do NOT "fix" this by raising
+`DEFAULT_SILENCE_MINUTES`: that trades a wrong answer for a slower wrong
+answer and delays the alert for a genuinely hung loop. A live subagent still
+suppresses the alarm regardless of transcript age or wake history — that
+rule is load-bearing and evaluated first.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found

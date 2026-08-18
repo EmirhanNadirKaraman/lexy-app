@@ -57,9 +57,20 @@ def _blocker(config, code="approved_paths_missing"):
     )
 
 
+def _awake_throughout(start, end):
+    return health.SleepEvidence(0.0, "awake throughout (test)")
+
+
+def _asleep_for(minutes):
+    return lambda start, end: health.SleepEvidence(minutes * 60.0, "test sleep window")
+
+
 def _check(config, **kw):
     kw.setdefault("now", NOW)
     kw.setdefault("agent_probe", lambda: False)
+    # Deterministic default: the real probe reads this machine's sysctls, and a
+    # test's verdict must not depend on when the test host last slept.
+    kw.setdefault("sleep_probe", _awake_throughout)
     return health.check(config, **kw)
 
 
@@ -108,6 +119,151 @@ def test_a_task_fatal_park_on_a_live_loop_is_not_escalated(config):
         verdict = _check(config)
 
     assert verdict.needs_attention is False
+
+
+# --- machine sleep must not read as silence (the 2026-08-05 false alarm) ------
+
+
+def test_a_transcript_aged_only_by_machine_sleep_is_not_stuck(config):
+    """The incident: 224 wall-clock minutes, all but a sliver of them a
+    laptop asleep. Sleep is not silence — nothing could possibly have run."""
+    _state(config, phase=Phase.AWAITING.value)
+    _transcript(config, minutes_ago=224)
+    windows = []
+
+    def probe(start, end):
+        windows.append((start, end))
+        return health.SleepEvidence(220 * 60.0, "test sleep window")
+
+    with LoopLock(config.state_dir):
+        verdict = _check(config, sleep_probe=probe)
+
+    assert verdict.code == health.OK_RUNNING
+    assert verdict.needs_attention is False
+    assert verdict.silent_minutes == pytest.approx(4, abs=1)
+    # The probe is asked about exactly the transcript-to-now interval.
+    assert windows == [
+        ((NOW - timedelta(minutes=224)).timestamp(), NOW.timestamp())
+    ]
+
+
+def test_the_same_age_awake_throughout_is_stuck(config):
+    """The mutation guard: a version that discounts ALL silence — instead of
+    only proven sleep — must fail here."""
+    _state(config, phase=Phase.AWAITING.value)
+    _transcript(config, minutes_ago=224)
+    with LoopLock(config.state_dir):
+        verdict = _check(config, sleep_probe=_awake_throughout)
+
+    assert verdict.code == health.STUCK_SILENT
+    assert verdict.needs_attention is True
+    assert verdict.silent_minutes == pytest.approx(224, abs=1)
+    assert "no subagent running" in verdict.detail
+
+
+def test_sleep_short_of_explaining_the_silence_is_still_stuck(config):
+    """A partial discount must not excuse the remainder: 100m wall-clock with
+    30m asleep is 70 awake minutes — over the threshold."""
+    _state(config, phase=Phase.AWAITING.value)
+    _transcript(config, minutes_ago=100)
+    with LoopLock(config.state_dir):
+        verdict = _check(config, sleep_probe=_asleep_for(30))
+
+    assert verdict.code == health.STUCK_SILENT
+    assert verdict.silent_minutes == pytest.approx(70, abs=1)
+    assert "30m of machine sleep discounted" in verdict.detail
+
+
+def test_unavailable_wake_history_fails_toward_quiet_and_says_why(config):
+    """No wake history means a slept laptop and a hung loop cannot be told
+    apart — and a false 'stuck' is what discredits the monitor."""
+    _state(config, phase=Phase.AWAITING.value)
+    _transcript(config, minutes_ago=90)
+
+    def probe(start, end):
+        return health.SleepEvidence(None, "kern.sleeptime/kern.waketime unreadable")
+
+    with LoopLock(config.state_dir):
+        verdict = _check(config, sleep_probe=probe)
+
+    assert verdict.needs_attention is False
+    assert verdict.code == health.OK_RUNNING
+    assert "wake history" in verdict.summary
+    assert "kern.sleeptime/kern.waketime unreadable" in verdict.detail
+
+
+def test_a_live_agent_wins_before_wake_history_is_consulted(config):
+    """The existing proof-of-work rule stays load-bearing: a live agent
+    suppresses the alarm whatever the wake history would have said."""
+    _state(config, phase=Phase.EXECUTING.value)
+    _transcript(config, minutes_ago=90)
+
+    def probe(start, end):  # pragma: no cover - reaching it IS the failure
+        raise AssertionError("sleep evidence must not be needed while an agent runs")
+
+    with LoopLock(config.state_dir):
+        verdict = _check(config, agent_probe=lambda: True, sleep_probe=probe)
+
+    assert verdict.needs_attention is False
+    assert "agent running" in verdict.summary
+
+
+# --- the platform evidence itself ---------------------------------------------
+
+
+def test_the_darwin_evidence_is_the_last_sleeps_overlap_with_the_window(monkeypatch):
+    values = {"kern.sleeptime": 100.0, "kern.waketime": 400.0}
+    monkeypatch.setattr(health, "_sysctl_timeval_epoch", values.get)
+
+    assert health._darwin_sleep_evidence(200.0, 500.0).asleep_seconds == 200.0
+    assert health._darwin_sleep_evidence(0.0, 1000.0).asleep_seconds == 300.0
+    # A sleep entirely outside the window discounts nothing.
+    assert health._darwin_sleep_evidence(400.0, 1000.0).asleep_seconds == 0.0
+
+
+def test_darwin_never_slept_this_boot_is_a_real_zero(monkeypatch):
+    """0/0 is macOS for 'no sleep since boot' — established history, not a
+    failure to read it, so a stuck verdict stays reachable."""
+    monkeypatch.setattr(health, "_sysctl_timeval_epoch", lambda name: 0.0)
+    evidence = health._darwin_sleep_evidence(0.0, 1000.0)
+
+    assert evidence.asleep_seconds == 0.0
+
+
+def test_darwin_unreadable_or_inconsistent_sysctls_are_unavailable(monkeypatch):
+    monkeypatch.setattr(health, "_sysctl_timeval_epoch", lambda name: None)
+    assert health._darwin_sleep_evidence(0.0, 1000.0).asleep_seconds is None
+
+    # A wake stamped before its sleep is not a window anyone can subtract.
+    values = {"kern.sleeptime": 500.0, "kern.waketime": 200.0}
+    monkeypatch.setattr(health, "_sysctl_timeval_epoch", values.get)
+    evidence = health._darwin_sleep_evidence(0.0, 1000.0)
+    assert evidence.asleep_seconds is None
+    assert "inconsistent" in evidence.note
+
+
+def test_the_timeval_parse_matches_locks_boottime_format():
+    out = "{ sec = 1754126400, usec = 837291 } Sat Aug  2 12:00:00 2026\n"
+    assert health._parse_timeval_sec(out) == 1754126400.0
+
+
+def test_linux_suspend_total_is_clamped_to_the_window(monkeypatch):
+    monkeypatch.setattr(health.time, "CLOCK_BOOTTIME", 7, raising=False)
+    monkeypatch.setattr(health.time, "clock_gettime", lambda clk: 5000.0)
+    monkeypatch.setattr(health.time, "monotonic", lambda: 2000.0)
+
+    # 3000s suspended since boot, but only a 1000s window to explain.
+    assert health._linux_sleep_evidence(0.0, 1000.0).asleep_seconds == 1000.0
+    # A window wider than the total gets the whole total, no more.
+    assert health._linux_sleep_evidence(0.0, 10000.0).asleep_seconds == 3000.0
+
+
+def test_linux_zero_suspend_is_a_real_zero(monkeypatch):
+    monkeypatch.setattr(health.time, "CLOCK_BOOTTIME", 7, raising=False)
+    monkeypatch.setattr(health.time, "clock_gettime", lambda clk: 2000.0)
+    monkeypatch.setattr(health.time, "monotonic", lambda: 2000.0)
+
+    assert health._linux_sleep_evidence(0.0, 1000.0).asleep_seconds == 0.0
 
 
 # --- the things worth waking someone for --------------------------------------
