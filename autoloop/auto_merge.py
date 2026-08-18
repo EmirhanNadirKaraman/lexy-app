@@ -71,6 +71,25 @@ re-reads the head and requires all of: it moved, it contains the candidate, it
 contains the old head, and the tree is clean. Only then does it push, and the
 push's own confirmation is `push_exact`'s fresh `ls-remote`, never the push's
 exit status.
+
+## A merge can change the code doing the merging
+
+Merging into the checkout does not reload a live Python process. Measured
+2026-08-18: plan-01 merged a hard gate at 06:23:59 into a loop that started at
+04:07:03, and dash-10 STARTED after that merge without the gate ever applying;
+brw-11's browser fix, merged 00:58, was inert the same way all night. The loop
+can ship improvements to itself that it then cannot use.
+
+This module contributes exactly the SIGNAL for that, and nothing else. When a
+verified merge touches any path under `autoloop/`, `_note_loop_code_merge`
+writes one `PendingUpgrade` record naming the sha the process would have to be
+running. It does not preflight anything, and it emphatically does not replace
+the process: this code runs mid-round, with a task just published and the
+session about to prepare its next request. Deciding, and the `os.execv` itself,
+belong to the between-round boundary — `orchestrator.run` offers it,
+`cli._self_upgrade_at_boundary` performs it. Recording is a bookkeeping step
+under the same discipline as everything else here: it can log, it can decline,
+it can never turn a real merge into a reported failure.
 """
 
 from __future__ import annotations
@@ -98,6 +117,24 @@ CONFLICT = "conflict"                # aborted cleanly, base unchanged
 FAILED = "failed"                    # something went wrong; nothing was pushed
 SKIPPED = "skipped"                  # not applicable (no record, not completed, ...)
 DISABLED = "disabled"                # policy.auto_merge_enabled is false
+
+#: Everything under here is the loop's OWN code. A merge that touches one of
+#: these paths changed the program this process is running, and a running
+#: Python process does not notice: modules were loaded at startup and merging
+#: into the checkout does not reload them. Measured 2026-08-18 — plan-01's hard
+#: gate merged at 06:23:59 into a process started at 04:07:03, and dash-10
+#: started AFTER the merge without it; brw-11's browser fix, merged 00:58, was
+#: inert for the whole night the same way.
+LOOP_CODE_PREFIX = "autoloop/"
+
+#: `PendingUpgrade.status`, in the order one record moves through them. A
+#: record only ever leaves `pending` by being SETTLED (or cleared), which is
+#: what makes the exec one-shot — see `UpgradeStore`.
+UPGRADE_PENDING = "pending"            # a merge changed loop code; not acted on yet
+UPGRADE_EXECED = "execed"              # `os.execv` was called for this sha
+UPGRADE_PREFLIGHT_FAILED = "preflight_failed"   # the merged tree does not import
+UPGRADE_UNAPPLICABLE = "unapplicable"  # the merged checkout is not the running tree
+UPGRADE_EXEC_FAILED = "exec_failed"    # `os.execv` itself refused
 
 
 @dataclass
@@ -196,6 +233,90 @@ class MergeDeferralStore:
         self._path(task_id).unlink(missing_ok=True)
 
 
+@dataclass
+class PendingUpgrade:
+    """One merge that changed the loop's own code, and what became of it.
+
+    ONE record, not one per task: the question it answers is "is the process
+    running the code in this checkout", which has a single answer at a time.
+    A later merge overwrites it, because that later merge is a DIFFERENT
+    upgrade rather than a retry of the earlier one.
+    """
+
+    #: The base head AFTER the merge — the exact commit whose code a fresh
+    #: interpreter would load. Recorded because the one-shot rule is keyed on
+    #: it: a sha that has already been exec'd for is never exec'd for again.
+    base_sha: str
+    #: The base head before the merge, so a transcript reader can see the move.
+    previous_base_sha: str
+    #: The task's reviewed candidate that was merged.
+    candidate_sha: str
+    task_id: str
+    #: The checkout the merge moved (`GitGateway.repo_root`). Compared against
+    #: the package root this process actually imported from before anything is
+    #: replaced: if they differ, the merge changed code this process does not
+    #: run, and re-execing would accomplish nothing.
+    repo_root: str
+    #: The `autoloop/` paths the merge touched, capped for the record's sake.
+    #: Evidence for the operator, never re-derived from.
+    paths: list
+    status: str
+    recorded_at: str
+    #: When the record left `pending`, and why. `detail` carries the preflight
+    #: error when there is one — the whole point of a failed preflight is that
+    #: it is REPORTED rather than fatal.
+    settled_at: str = ""
+    detail: str = ""
+
+
+class UpgradeStore:
+    """The single `pending_upgrade.json`, written atomically (temp +
+    `os.replace`) like every other store here.
+
+    **A record that cannot be read is NO record**, which is the opposite of
+    `MergeDeferralStore`'s rule and deliberately so. There, absent means a
+    dropped retry — the invisibility the module exists to end — so a corrupt
+    file has to raise. Here, absent means "do not replace the process", and
+    refusing to act is the safe direction for an unreadable marker: the merged
+    code is on disk either way and the next process start picks it up. Raising
+    instead would take a bookkeeping file and park a loop that is working.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def save(self, record: PendingUpgrade) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(asdict(record), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp, self.path)
+
+    def load(self) -> PendingUpgrade | None:
+        if not self.path.exists():
+            return None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return PendingUpgrade(**data)
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+    def clear(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+def loop_code_paths(paths) -> list:
+    """The subset of `paths` that is the loop's own code.
+
+    Literal prefix match on `autoloop/`, tests included: the claim is "any file
+    under `autoloop/`", and a merge that only changes this package's tests
+    still changes what `python -m autoloop` imports. Narrowing it to
+    "non-test" would narrow the claim.
+    """
+    return sorted(p for p in paths if p == "autoloop" or p.startswith(LOOP_CODE_PREFIX))
+
+
 class AutoMerger:
     """Merges completed tasks into the base. One instance per completion
     event; `after_completion` is the only entry point the orchestrator uses.
@@ -216,6 +337,7 @@ class AutoMerger:
         registry: TaskRegistry,
         log,
         deferrals: MergeDeferralStore | None = None,
+        upgrades: "UpgradeStore | None" = None,
     ):
         self._config = config
         self._git = git
@@ -224,6 +346,11 @@ class AutoMerger:
         self._registry = registry
         self._log = log
         self._deferrals = deferrals or MergeDeferralStore(config.merge_deferrals_dir)
+        #: Where a merge that changed the loop's own code is recorded. Written
+        #: here and read at the restart boundary (`orchestrator.run`), never
+        #: acted on inside this module: merging and replacing the process are
+        #: two different moments, and this one is mid-round by construction.
+        self._upgrades = upgrades or UpgradeStore(config.pending_upgrade_file)
 
     # ---- entry point --------------------------------------------------------
 
@@ -387,7 +514,17 @@ class AutoMerger:
             outcome = self._merge(execution, candidate, base_branch, head)
             if outcome != MERGED:
                 return outcome      # CONFLICT (aborted) or FAILED (unverified)
-            head = self._git.head_sha()
+            merged_head = self._git.head_sha()
+            # Recorded off the VERIFIED merge, before the push. The push
+            # publishes the base; it does not decide what code is in this
+            # checkout, and a push that is refused (a protected base branch,
+            # every time) still leaves the process running code the working
+            # tree no longer holds. The `already_merged` branch above records
+            # nothing on purpose: the invocation that actually merged it
+            # already did, and re-recording would re-offer a sha whose one-shot
+            # may already be spent.
+            self._note_loop_code_merge(task_id, candidate, head, merged_head)
+            head = merged_head
 
         # 8. Push. The merge is worthless until the base is published.
         if remote_base == head:
@@ -451,6 +588,73 @@ class AutoMerger:
             },
         )
         return MERGED
+
+    def _note_loop_code_merge(
+        self, task_id: str, candidate: str, pre_head: str, new_head: str
+    ) -> None:
+        """Record that this merge changed the loop's own code, if it did.
+
+        **Nothing here may change the merge's outcome.** By the time this runs
+        the merge is verified and the push is next; a raise would reach
+        `_guarded_attempt` and report a real integration as `failed`. So every
+        failure — a git that will not diff, a state dir that will not take the
+        write — swallows to a transcript entry, exactly as the rest of this
+        module does, and the loop simply keeps running the old code (which is
+        what it was doing anyway).
+
+        A docs-only merge is silent: no record, and therefore nothing at the
+        restart boundary to act on.
+        """
+        try:
+            changed = self._git.changed_paths(pre_head, new_head)
+        except Exception as exc:      # noqa: BLE001 - deliberate; see the docstring
+            self._log(
+                "self_upgrade_error",
+                data={
+                    "task_id": task_id,
+                    "base_sha": new_head,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "note": "could not read what the merge changed — no restart offered",
+                },
+            )
+            return
+        loop_paths = loop_code_paths(changed)
+        if not loop_paths:
+            return
+        record = PendingUpgrade(
+            base_sha=new_head,
+            previous_base_sha=pre_head,
+            candidate_sha=candidate,
+            task_id=task_id,
+            repo_root=str(self._git.repo_root),
+            paths=loop_paths[:50],
+            status=UPGRADE_PENDING,
+            recorded_at=utcnow_iso(),
+        )
+        try:
+            self._upgrades.save(record)
+        except OSError as exc:
+            self._log(
+                "self_upgrade_error",
+                data={
+                    "task_id": task_id,
+                    "base_sha": new_head,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "note": "could not record the upgrade — no restart offered",
+                },
+            )
+            return
+        self._log(
+            "self_upgrade_pending",
+            data={
+                "task_id": task_id,
+                "candidate_sha": candidate,
+                "base_sha_before": pre_head,
+                "base_sha": new_head,
+                "paths": loop_paths[:50],
+                "path_count": len(loop_paths),
+            },
+        )
 
     def _verify_merge(self, new_head: str, pre_head: str, candidate: str) -> str:
         """An empty string when the merge demonstrably happened, else why not.

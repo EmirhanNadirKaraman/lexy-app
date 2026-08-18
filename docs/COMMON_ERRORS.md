@@ -1102,6 +1102,51 @@ on. Pinned by
 `test_a_recovery_chain_interrupted_twice_never_reaches_the_task_budget` and
 `test_a_recovery_chain_interrupted_forever_still_hits_the_fault_ceiling`.
 
+### A merged fix has no effect on the running loop, and re-reading the code shows it IS merged
+**Symptom:** a change lands on the base branch and the loop keeps behaving as
+it did before. `git log` shows the merge, the file on disk holds the new code,
+and the loop is not doing what the new code says. Measured 2026-08-18: the loop
+process started 04:07:03; plan-01 merged a hard gate at 06:23:59 ("no task
+starts without an approved decomposition"); by 09:00 the registry held 0
+decompositions across 102 tasks — including dash-10, a task that STARTED after
+the merge. brw-11's browser fix, merged 00:58, was inert the same way for the
+whole night.
+**Cause:** merging into a checkout does not reload a live Python process.
+`policy.py` was imported at 04:07 and stayed imported; every module the loop
+uses is the version that existed when the process started. Nothing about this
+is visible in the repository — the diff is right, the tests pass, and the file
+on disk agrees with both.
+**Fix:** applied 2026-08-18 (loop-02). The loop replaces its own interpreter
+(`os.execv`, same pid, same lock) at the next round boundary after a merge that
+touched `autoloop/`, having first proved the merged tree imports — see
+`docs/AUTOLOOP.md` §3f-quater. **If you hit this shape again, check in this
+order:** `.autoloop/pending_upgrade.json` (absent = nothing was offered;
+`status` says what became of one that was), then the transcript for
+`self_upgrade_pending` / `self_upgrade_boundary` / `self_upgrade_exec` /
+`self_upgrade_preflight_failed`. Three states are working-as-intended rather
+than bugs — a docs-only merge offers nothing, a merged tree that does not
+import is reported and NOT run, and a sha already exec'd for is never retried
+(that one-shot is what stops a merge which imports and then dies at runtime
+from becoming a restart loop). Plain `run` never replaces itself at all: its
+argv carries flags that are not safe to re-run, so it reports and exits 0.
+**The generalisable trap:** "the code says X" and "the process is running X"
+are different claims, and every long-lived process that can modify its own
+source can hold them apart indefinitely.
+
+### The pytest session vanishes with no report, no failure and no summary line
+**Symptom:** a test run ends mid-file. No traceback, no `FAILED`, no counts —
+sometimes the output of something else entirely.
+**Cause:** a test reached `os.execv`. It does not raise and it does not return:
+it replaces the pytest process image, so the session is simply gone. Anything
+exercising `cli._self_upgrade_at_boundary` without stubbing the exec does this.
+**Fix:** `autoloop/tests/test_self_upgrade.py` has an autouse fixture making
+`os.execv` raise `AssertionError`, so a test that reaches a real exec FAILS
+instead of ending the run. A test that needs to observe the call installs its
+own recorder over it — raising something that is **not** an `OSError`, because
+the production code catches `OSError` as "the exec was refused" and would
+swallow a sentinel that inherits from it. Same pattern, same reason, as
+`test_restart_wiring.py`'s `no_machine_access`.
+
 ### An autoloop commit is refused by a test that passes when you re-run it
 **Symptom:** post-commit validation refuses a commit with exactly one failing
 test out of ~1000. Re-running the identical worker tree passes. Happened three

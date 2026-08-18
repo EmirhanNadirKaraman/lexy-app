@@ -186,7 +186,13 @@ from urllib.parse import urlsplit
 
 from . import environment
 from . import escape_detector
-from .auto_merge import AutoMerger, MergeDeferral, MergeDeferralStore
+from .auto_merge import (
+    UPGRADE_PENDING,
+    AutoMerger,
+    MergeDeferral,
+    MergeDeferralStore,
+    UpgradeStore,
+)
 from .blockers import NO_TASK, BlockerStore
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
@@ -313,6 +319,15 @@ from .worktree import WorktreeManager
 #: a revise-heavy task are both the task failing to converge, and they belong
 #: in the same budget.
 MAX_TASK_ATTEMPTS = 5
+
+#: `run()`'s outcome when a merge has changed the loop's own code and the loop
+#: has reached a boundary at which its process may be replaced. NOT a phase:
+#: the session is mid-flight and untouched — the outbox is durable, no packet
+#: has been prepared, nothing is parked — so the caller either performs the
+#: replacement (`cli._self_upgrade_at_boundary`, continuous mode) or reports it
+#: and leaves the record for the next run. Resuming after either is the
+#: ordinary "state is non-terminal, keep going" path, with no special case.
+SELF_UPGRADE = "self_upgrade"
 
 #: The SECOND budget, and the one that answers "a fault must not spend a task's
 #: attempt budget" (task budget-01, 2026-08-17) without removing the bound that
@@ -477,6 +492,7 @@ class Orchestrator:
         config_path: Path | None = None,
         provider_factory=None,
         sleep=time.sleep,
+        self_upgrade_enabled: bool = False,
     ):
         self._config = config
         self._store = store
@@ -596,6 +612,23 @@ class Orchestrator:
         #: second store constructed at the other site would be the same
         #: directory, but the coupling is deliberate enough to make explicit.
         self._merge_deferrals = MergeDeferralStore(config.merge_deferrals_dir)
+        #: The one `PendingUpgrade` record (`auto_merge.UpgradeStore`). WRITTEN
+        #: by the merger after a merge that touched `autoloop/`; READ here, at
+        #: the between-round boundary, to decide whether to hand the process
+        #: back to the caller for replacement. Nothing in this class execs.
+        self._upgrades = UpgradeStore(config.pending_upgrade_file)
+        #: May this orchestrator end a round with `SELF_UPGRADE` at all?
+        #:
+        #: Default OFF, and enabled in exactly one place — `cli.
+        #: _build_orchestrator`, which is what both `run` paths use. The record
+        #: lives under `state_dir`, so every orchestrator sharing that directory
+        #: would otherwise see it, including `smoke-browser`'s: that command
+        #: builds its own, starts it at `ready` with no pending request (the
+        #: boundary shape exactly), and reports PASS only for a clean contract
+        #: stop — so an unrelated pending upgrade would make a diagnostic
+        #: command fail while diagnosing nothing. A caller that cannot act on
+        #: the boundary should not be offered it.
+        self._self_upgrade_enabled = bool(self_upgrade_enabled)
         #: Injected so a rate-limit back-off can be tested without waiting out
         #: a real one. The ONLY thing in this class that blocks deliberately;
         #: every other wait belongs to the transport or to a subprocess.
@@ -633,6 +666,11 @@ class Orchestrator:
             phase = Phase(self.state.phase)
             if phase in TERMINAL_PHASES:
                 return phase.value
+            # After the terminal check, so a parked loop reports what it is
+            # parked on rather than a restart nobody can act on, and before the
+            # step budget, so `--max-steps` cannot hide the boundary.
+            if self._self_upgrade_due(phase):
+                return SELF_UPGRADE
             if max_steps is not None and steps >= max_steps:
                 return phase.value
             steps += 1
@@ -752,6 +790,55 @@ class Orchestrator:
             self._step_executing()
         else:  # pragma: no cover - terminal phases filtered in run()
             raise StateError(f"cannot step from phase {phase.value}")
+
+    # ---- the restart boundary ------------------------------------------------
+
+    def _self_upgrade_due(self, phase: Phase) -> bool:
+        """Is this the moment at which the process may be replaced?
+
+        **`READY` with no pending request, and nothing else.** That is the
+        instant BEFORE the next request is prepared: `_step_ready` is what
+        builds a packet, so nothing has been sent and nothing is awaited; the
+        payload lives in `state.outbox`, already saved; the executor is not
+        running (a write-capable agent runs inside `_step_executing`, a
+        different phase, synchronously — reaching here means it returned); and
+        every `TaskExecution` was written by whoever last touched it, since
+        this class saves records as it goes rather than at an exit. A
+        replacement here loses nothing: the successor loads the same state file
+        and prepares the same request from the same outbox.
+
+        Every other phase is mid-round by construction and is refused —
+        `submitting` and `submission_unconfirmed` have a packet in flight,
+        `awaiting` has a reviewer holding one, `executing` has an agent writing
+        into a worker repo. `pending_request` is checked SEPARATELY from the
+        phase because it outlives its own phase: a request answered and not yet
+        consumed is still a packet this loop owes something to.
+
+        Reads the record, never writes it. An unreadable or already-settled
+        record answers False — the fail-closed direction here is to keep
+        running the code that works. So does an orchestrator whose caller never
+        asked for the boundary (`self_upgrade_enabled`, see the constructor).
+        """
+        if not self._self_upgrade_enabled:
+            return False
+        if phase is not Phase.READY or self.state.pending_request is not None:
+            return False
+        try:
+            record = self._upgrades.load()
+        except OSError:
+            return False
+        if record is None or record.status != UPGRADE_PENDING:
+            return False
+        self._log(
+            "self_upgrade_boundary",
+            data={
+                "base_sha": record.base_sha,
+                "task_id": record.task_id,
+                "paths": list(record.paths)[:20],
+                "phase": phase.value,
+            },
+        )
+        return True
 
     # ---- phases -------------------------------------------------------------
 

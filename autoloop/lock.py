@@ -24,6 +24,32 @@ Semantics — deliberately fail-closed:
   recovery is `python -m autoloop unlock`, which itself refuses live locks.
 * Clean exit releases the lock (context-manager), and only if we still own it
   (run id match), so `unlock` + a new run can never be un-done by a zombie.
+
+## The one exception: a lock this very process handed to itself
+
+`cli._self_upgrade_at_boundary` replaces the loop's interpreter with
+`os.execv` so a merge that changed `autoloop/` actually runs. `execv` REPLACES
+the process image — the pid survives, no `finally` runs, so the lock file is
+never released and never has to be: from outside, one live pid holds one lock
+file across the whole replacement, with no instant at which another process
+could take it. That is the point of `execv` rather than spawn-and-exit.
+
+But the new image re-runs `_cmd_run`, which acquires the lock again with a
+fresh run id — and would find a lock naming a LIVE pid (its own) and fail
+closed. So `acquire` adopts, on evidence and only on evidence:
+
+* the lock must carry an `exec_handoff` marker, written by
+  `mark_exec_handoff` immediately before `execv`,
+* naming this hostname and THIS pid, twice — as the lock's owner and inside
+  the marker,
+* and the adoption CLEARS the marker, so it can be used exactly once.
+
+A live lock without that marker is still `LockHeldError`, and so is one whose
+marker names a different pid. Both matter: pids are reused, and a general
+"same pid may take the lock" rule would be a lock-stealing hole rather than a
+handoff. `started_at` is preserved across the adoption because the lock really
+has been held continuously since then — which also keeps the predates-boot
+check honest.
 """
 
 from __future__ import annotations
@@ -60,6 +86,13 @@ class LockInfo:
     started_at: str
     run_id: str
     state_dir: str
+    #: Set ONLY between `mark_exec_handoff` and the `os.execv` that follows it
+    #: — `{"pid", "run_id", "at", "reason"}`. Its presence is what lets the
+    #: replacement image adopt this lock instead of failing closed on its own
+    #: live pid; adopting clears it. Absent (the normal state) for every lock
+    #: this package has ever written, which is why `read` defaults it rather
+    #: than requiring it.
+    exec_handoff: dict | None = None
 
     def describe(self) -> str:
         return (
@@ -137,6 +170,10 @@ class LoopLock:
         self.run_id = uuid.uuid4().hex
         self._owned = False
         self._prev_handlers: list[tuple[int, object]] = []
+        #: The run id this lock was ADOPTED from, when `acquire` took over a
+        #: lock this same pid handed to itself across `os.execv`. Empty for an
+        #: ordinary acquisition, so a caller can report the continuity.
+        self.adopted_run_id = ""
 
     # ---- inspection ---------------------------------------------------------
 
@@ -147,12 +184,14 @@ class LoopLock:
             return None
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
+            handoff = data.get("exec_handoff")
             return LockInfo(
                 pid=int(data["pid"]),
                 hostname=str(data["hostname"]),
                 started_at=str(data["started_at"]),
                 run_id=str(data["run_id"]),
                 state_dir=str(data["state_dir"]),
+                exec_handoff=handoff if isinstance(handoff, dict) else None,
             )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             return LockInfo(
@@ -235,6 +274,8 @@ class LoopLock:
             existing = self.read()
             if existing is None:  # raced with a release; one retry
                 return self.acquire()
+            if self._is_handoff_to_this_process(existing):
+                return self._adopt(existing)
             if self.is_live(existing):
                 raise LockHeldError(
                     f"another autoloop process holds {self.path} "
@@ -254,6 +295,124 @@ class LoopLock:
         self._owned = True
         self._install_termination_handlers()
         return self
+
+    # ---- self-upgrade handoff (`os.execv`, same pid) ------------------------
+
+    def _write(self, info: LockInfo) -> None:
+        """Replace the lock file's contents in one step — temp file in the same
+        directory, fsync, `os.replace`.
+
+        Never unlink-then-recreate. An unlink would open a window in which the
+        lock does not exist, which is exactly the window "the lock stays valid
+        across the replacement" denies; `os.replace` is atomic on POSIX, so a
+        concurrent `read()` sees the old bytes or the new ones and never
+        nothing.
+        """
+        tmp = self.path.with_name(self.path.name + f".tmp.{os.getpid()}")
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, json.dumps(asdict(info), indent=2).encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, self.path)
+
+    def _is_handoff_to_this_process(self, info: LockInfo) -> bool:
+        """Is this lock one THIS process handed to itself across `os.execv`?
+
+        Three independent facts, all required: the marker exists, the lock is
+        ours by host and pid, and the marker names the same pid. Asked this
+        narrowly because the weaker rule — "the lock's pid is my pid, so it is
+        mine" — is a lock-stealing hole: pids are reused within a boot, so a
+        dead run's lock plus an unlucky pid assignment would let an unrelated
+        process walk past a refusal the rest of this module exists to make.
+        """
+        handoff = info.exec_handoff
+        if not isinstance(handoff, dict):
+            return False
+        if info.hostname != socket.gethostname():
+            return False
+        me = os.getpid()
+        return info.pid == me and handoff.get("pid") == me
+
+    def _adopt(self, existing: LockInfo) -> "LoopLock":
+        """Take over the lock this process left for itself, under a new run id.
+
+        `started_at` is carried over: the lock genuinely has been held since
+        then (same pid, no gap), and rewriting it to now would misreport how
+        long this state dir has been locked and weaken the predates-boot check.
+        The marker is dropped, so the adoption cannot happen twice.
+        """
+        self._write(
+            LockInfo(
+                pid=os.getpid(),
+                hostname=existing.hostname,
+                started_at=existing.started_at,
+                run_id=self.run_id,
+                state_dir=str(self.state_dir),
+            )
+        )
+        self.adopted_run_id = existing.run_id
+        self._owned = True
+        self._install_termination_handlers()
+        return self
+
+    def mark_exec_handoff(self, reason: str = "") -> bool:
+        """Arm the lock for an `os.execv` in THIS process. Returns whether it
+        was armed.
+
+        Called immediately before the exec and nowhere else. Refuses unless we
+        own the lock and the file still names our run — the caller treats a
+        `False` here as "do not replace the process", because a replacement
+        whose successor cannot acquire the lock would end the run.
+        """
+        if not self._owned:
+            return False
+        current = self.read()
+        if current is None or current.run_id != self.run_id:
+            return False
+        try:
+            self._write(
+                LockInfo(
+                    pid=current.pid,
+                    hostname=current.hostname,
+                    started_at=current.started_at,
+                    run_id=current.run_id,
+                    state_dir=current.state_dir,
+                    exec_handoff={
+                        "pid": os.getpid(),
+                        "run_id": self.run_id,
+                        "at": utcnow_iso(),
+                        "reason": reason,
+                    },
+                )
+            )
+        except OSError:
+            return False
+        return True
+
+    def clear_exec_handoff(self) -> None:
+        """Disarm it again — the exec did not happen (`os.execv` itself
+        refused). Best effort: a marker left behind is harmless (only this pid
+        could ever use it, and this pid already owns the lock), so a failure
+        here must not propagate into a run that is otherwise fine."""
+        if not self._owned:
+            return
+        current = self.read()
+        if current is None or current.run_id != self.run_id:
+            return
+        try:
+            self._write(
+                LockInfo(
+                    pid=current.pid,
+                    hostname=current.hostname,
+                    started_at=current.started_at,
+                    run_id=current.run_id,
+                    state_dir=current.state_dir,
+                )
+            )
+        except OSError:
+            pass
 
     def release(self) -> None:
         if not self._owned:
