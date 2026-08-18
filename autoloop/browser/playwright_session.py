@@ -44,7 +44,9 @@ recovery (restart → failure budget → a park that names the cause) sees it.
 
 from __future__ import annotations
 
+import json
 import os
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -152,6 +154,12 @@ def _endpoint_ready(port: int) -> bool:
 
 def _list_processes() -> list[tuple[int, str]]:
     return chrome_restart._default_list_processes()
+
+
+def _urlopen(url: str, timeout: float):
+    """Thin seam over the one HTTP call this module makes, so a test can
+    describe a CDP endpoint without a socket."""
+    return urllib.request.urlopen(url, timeout=timeout)  # noqa: S310 - CDP endpoint
 
 
 def _endpoint_host_port(cdp_url: str) -> tuple[str, int | None]:
@@ -297,6 +305,70 @@ def _diagnose(cdp_url: str) -> str:
         f"cdp_answering={answering} chrome_on_profile={_format_pids(on_profile)} "
         f"chrome_on_port={_format_pids(on_port)} profile={profile}]"
     )
+
+
+def json_list_url(cdp_url: str) -> str:
+    """`<cdp endpoint>/json/list`, or "" for an endpoint with no authority at
+    all. A bare `host:port` is assumed to be http, the same assumption
+    `doctor` makes when it builds `/json/version`."""
+    base = (cdp_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if "://" not in base:
+        base = f"http://{base}"
+    return f"{base}/json/list"
+
+
+def count_page_targets(body: str) -> int | None:
+    """Page targets in a `/json/list` payload, or None when the payload is not
+    one. Only `type == "page"` counts: a service worker or a background page is
+    not something Playwright can drive a conversation on."""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, list):
+        return None
+    return sum(
+        1 for target in payload if isinstance(target, dict) and target.get("type") == "page"
+    )
+
+
+def attachable_page_targets(cdp_url: str, timeout: float = 2.0) -> int | None:
+    """How many pages the CDP endpoint says it has, or None when that could not
+    be measured.
+
+    The state `/json/version` cannot see. On 2026-08-17 the operator closed the
+    browser window: Chrome stayed alive, `/json/version` kept answering with a
+    valid `webSocketDebuggerUrl` — so every probe built on it, `doctor`
+    included, reported a healthy browser — and `/json/list` returned ZERO
+    targets. Playwright could not attach at all, so there was no page to read a
+    modal on and nothing to click. Restarting the profile restored 11 targets.
+
+    **Zero and unmeasurable are deliberately different answers.** A 0 means the
+    endpoint answered and named no page; anything else that goes wrong (no
+    answer, a non-200, a body that is not a JSON array) is None, because the
+    caller acts on 0 by restarting the browser and an unreachable endpoint is
+    already the ordinary `BrowserError` path — one that diagnoses itself
+    through `describe_cdp_endpoint` and restarts on its own budget.
+
+    Never raises, for the same reason `describe_cdp_endpoint` does not: it is
+    called while a fault is already being handled.
+    """
+    url = json_list_url(cdp_url)
+    if not url:
+        return None
+    try:
+        with _urlopen(url, timeout) as response:
+            if response.status != 200:
+                return None
+            # Bounded: a profile with many tabs still lists far less than this,
+            # and an endpoint answering with something else must not be read
+            # into memory unbounded.
+            body = response.read(2_000_000).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    return count_page_targets(body)
 
 
 def _driver():

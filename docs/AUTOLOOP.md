@@ -2787,6 +2787,45 @@ reach that recovery at all. `orchestrator._handle_rate_limited` waits instead:
 | streak reset by | a step that COMPLETES — nothing else |
 | survives a crash | the wait is a persisted DEADLINE, served by whichever process is running when it expires |
 
+**Every row above describes a THROTTLE, and the whole table assumes something
+it did not check until 2026-08-17: that the browser is usable and merely being
+refused.** On that day the operator closed the browser window. Chrome stayed
+alive, `/json/version` kept answering with a valid `webSocketDebuggerUrl`, and
+`/json/list` returned ZERO targets — Playwright could not attach at all. With no
+page there is no modal to read and nothing to re-probe, so the loop fell back to
+"the limit still holds", spent its whole budget waiting, and parked saying
+*rate_limited* while the real cause was that it had no browser. A probe agreed
+with it for four hours. Restarting the profile restored 11 targets at once.
+
+So `_handle_rate_limited` now **classifies before it waits, and before it
+concludes the limit still holds** (`_classify_rate_limit_state`):
+
+| state | evidence | what happens |
+|---|---|---|
+| **throttled** | the modal's `data-testid` is present on a page the loop can drive | the table above, unchanged in every respect |
+| **cleared** | no modal AND a real click on the composer LANDS (`chatgpt.composer_interactive`) | resume immediately — no wait. The occurrence is still counted, so a page that keeps clearing between the raise and the check escalates instead of becoming an immediate-retry loop |
+| **unattachable** | the CDP endpoint answers and lists **zero** `type: "page"` targets (`playwright_session.attachable_page_targets`) | **not a rate limit.** Drop the client, restart the profile via `browser.restart_command` ONCE, re-probe once; recovered → carry on (`browser_reattached`), still nothing → park `code="browser_unattachable"` naming the BROWSER |
+
+Three properties hold that table together:
+
+* **The modal is asked FIRST.** A page that can show it is a page the loop can
+  drive, whatever the endpoint says a moment later — so a genuine throttle can
+  never be answered by the restart that deepens it.
+* **A state-3 restart does not touch `rate_limit_backoffs`.** That budget bounds
+  waiting on the SERVER; this is a local recovery making no request at all.
+  `consecutive_failures` and `browser_restart_skips` are untouched too.
+* **Zero is not the same answer as unmeasurable.** Zero means the endpoint
+  answered and named no page. An endpoint answering nothing is the ordinary
+  `BrowserError` path, which diagnoses itself through `describe_cdp_endpoint`
+  and restarts on its own budget — so an unmeasurable probe leaves this handler
+  behaving exactly as it did before the probe existed.
+
+The `rate_limited` transcript entry and the `rate_limited` park both carry the
+`classification` and the `evidence` behind them, because "this is NOT a browser
+fault" is a strong claim and an operator has to be able to see whether a modal
+was really observed. See docs/COMMON_ERRORS.md §6 for the hand-check
+(`/json/list`, not `/json/version`).
+
 **The wait is durable, not just its counter.** `rate_limit_backoffs` records that
 a back-off was *entered*; `rate_limit_retry_not_before` records the instant it
 runs *to*. Both are saved before the sleep. Without the second, a process killed
@@ -2832,6 +2871,11 @@ establish whether the limit is still in force is *another request against the
 limit*, which is the behaviour this whole path exists to stop. The condition
 also clears on a server-side timer with no operator action, so refusing the
 answer would gate a blocker on something the operator cannot demonstrate.
+
+`browser_unattachable` is the opposite case and DOES have one
+(`_precondition_browser`): "can anything attach to this endpoint" is answerable
+locally, for free, without a single request against the account — and an answer
+given while the window is still closed would just re-park.
 
 ---
 
@@ -3662,7 +3706,8 @@ dependent against the successor `superseded_by` names.
 | Browser dead / CDP unreachable | `python3 -m autoloop.browser.chrome_restart` from the checkout (§8a) — or relaunch the profile by hand (§8) — then `run --retry` (or just `run` if not parked). |
 | `restart FAILED: … restart_autoloop_chrome.sh was RETIRED` | Your `.autoloop/config.toml` still names the shell helper retired 2026-08-16. Nothing else is broken — the config loads and every other command works — but no browser restart will succeed until you set `restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]` (§8a). The loop's live config is not in this repo, so nothing could have done it for you; the failing tombstone carries that exact line on stderr. |
 | Parked `browser_restart_cooldown_blocked` | Repeated browser failures whose restart `browser.restart_cooldown_seconds` refused, so none was ever attempted (§5c). Restart the browser by hand (`python3 -m autoloop.browser.chrome_restart`, §8a) — or lower that cooldown if it is set too high for this machine. Then close the blocker it recorded (`python -m autoloop blockers`, then `answer <id> "..."`) and `run --retry`: an open blocker stops `start` and ends a `--continuous` pass, so retrying without it just parks again. Those failures never spent the failure budget, so nothing else needs resetting. |
-| Parked `rate_limited` | ChatGPT is rate-limiting the ACCOUNT ("Too many requests…"), and it did not lift across the loop's whole back-off budget (§5c). **Do not restart the browser** — the limit is server-side and a restart adds another request; that reflex is what caused the incident this park exists to replace. Leave the account idle for a while (an hour is usually plenty), close the blocker (`python -m autoloop blockers`, then `answer <id> "..."`), and `run --retry`. If it recurs, raise `browser.rate_limit_backoff_seconds` so the loop waits longer before re-probing. The back-offs never spent the failure budget, so nothing else needs resetting. |
+| Parked `rate_limited` | ChatGPT is rate-limiting the ACCOUNT ("Too many requests…"), and it did not lift across the loop's whole back-off budget (§5c). **Do not restart the browser** — the limit is server-side and a restart adds another request; that reflex is what caused the incident this park exists to replace. Leave the account idle for a while (an hour is usually plenty), close the blocker (`python -m autoloop blockers`, then `answer <id> "..."`), and `run --retry`. If it recurs, raise `browser.rate_limit_backoff_seconds` so the loop waits longer before re-probing. The back-offs never spent the failure budget, so nothing else needs resetting. The park quotes the EVIDENCE it classified from — if that line says the modal was seen, this really is the account; if it says the page could not be probed, read the `browser_unattachable` row below and check `/json/list` before waiting anything out. |
+| Parked `browser_unattachable` | **The browser, not the account.** The CDP endpoint answers but lists no attachable page, so there was nothing a rate limit could even cover — the classic cause is a CLOSED WINDOW (Chrome keeps running and `/json/version` keeps answering, so every check built on it says healthy; `curl http://127.0.0.1:9222/json/list` returns `[]`). The loop already restarted the profile once and it did not help. Open the dedicated profile's window, or run `python3 -m autoloop.browser.chrome_restart` (§8a) and confirm `/json/list` lists pages; then close the blocker and `run --retry`. No budget was spent — not the failure budget, not the rate-limit back-offs (§5c). |
 | Repeated malformed replies / denials | Loop parks with the reason; talk to the conversation manually if needed, then `run --answer "..."`. |
 | **Ambiguous submission** (`needs_user`, "submission … is AMBIGUOUS") | The by-content search already ran and did not prove the request present — the park text says what it found (nothing, a different chat, or that it refused to conclude), so read that line first. Open the conversation and look. If the request is there, `run --retry` (reconciles and continues). If it is genuinely absent, `run --resubmit` authorizes exactly one more send of the same id. Autoloop resolves this by itself only when it can PROVE the request is in this request's own conversation; it never decides the absent direction for you — see §5b. |
 | `send-not-ready` / `composer-not-synchronised` diagnostics | The editor never accepted the input, so **nothing was sent**: safe to `run --retry`. If it repeats, the composer selectors or the input method need attention (`browser/selectors.py`, `browser/chatgpt.py::_enter_prompt`). |

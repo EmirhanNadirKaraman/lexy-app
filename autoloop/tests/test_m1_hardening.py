@@ -2156,6 +2156,13 @@ def test_security_and_environment_codes_all_have_a_precondition():
         "publisher_url_drift",
         "worker_environment_drift",
         "worker_isolation_violation",
+        # `browser_unattachable` (brw-11, 2026-08-17): the CDP endpoint answers
+        # but lists no page, so the loop had no browser. Environmental in the
+        # strictest sense — no answer text opens a browser window — and unlike
+        # its sibling `rate_limited` it is recheckable without making a single
+        # request against the account, which is why that one stays out of the
+        # mapping and this one belongs in it.
+        "browser_unattachable",
         # `push_refused` was RETIRED, not renamed: the orchestrator now emits
         # `push_refused_protected` for the protected-branch case. Its old
         # precondition only rechecked `allow_push`, a flag necessarily already
