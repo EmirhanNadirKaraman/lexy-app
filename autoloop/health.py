@@ -26,6 +26,27 @@ Signals, and why these rather than the obvious ones:
   process being alive is treated as proof of work even when everything else
   is quiet.
 
+* **Silence is awake time, not wall-clock.** A laptop that sleeps for hours
+  is indistinguishable from a hung loop if silence is measured on the wall
+  clock — observed 2026-08-05: "no activity for 224 minutes" over a machine
+  that had been asleep, with the loop writing again 69 seconds after wake.
+  This is the SAME wrong assumption `lock.boot_time_epoch` already corrects
+  for locks (kern.boottime / /proc/stat btime, deliberately never a
+  monotonic clock — macOS stops the monotonic clock during sleep, the exact
+  case in question), so the same evidence family is used here — and
+  `boot_time_epoch` itself is the shared boundary: wake history read from a
+  running kernel describes THIS boot only, so any part of the window before
+  boot (an off or rebooting machine) can no more accuse the loop than sleep
+  can. Within the boot, kern.sleeptime/kern.waketime on darwin and
+  CLOCK_BOOTTIME−CLOCK_MONOTONIC on linux fill in the sleep. Only time the
+  machine PROVABLY spent awake counts against the loop: proven sleep and
+  any stretch the history cannot vouch for (before boot, or before darwin's
+  last recorded sleep — those sysctls carry exactly one pair) are
+  discounted alike, and when wake history cannot be established at all the
+  check FAILS TOWARD QUIET on this one axis — a false "stuck" trains a
+  human to ignore the monitor, while a missed detection is retried by the
+  next check minutes later.
+
 Verdicts are advisory. Nothing here writes, locks, or touches the loop's
 state — it is safe to run on any schedule, including while the loop is
 mid-round.
@@ -35,18 +56,23 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .blockers import BlockerStore
-from .lock import LoopLock
+from .lock import LoopLock, boot_time_epoch
 from .state import Phase, StateStore
 
 #: How long a live loop may write nothing before it is called stuck. Generous
 #: on purpose: an audit fan-out is quiet for fifteen-plus minutes, and a
 #: review round can wait on a human-speed reviewer. Tightening this trades a
 #: faster alert for false alarms, which is the wrong trade for a monitor.
+#: Do NOT raise it to accommodate laptop sleep either — sleep is discounted
+#: from the measured silence instead (`machine_sleep_in_window`); a bigger
+#: threshold would only make a genuinely hung loop slower to surface.
 DEFAULT_SILENCE_MINUTES = 45.0
 
 #: Verdict codes. `needs_attention` is what a scheduler acts on.
@@ -90,6 +116,139 @@ def _agent_running(pattern: str = "claude -p") -> bool:
     return bool(result.stdout.strip())
 
 
+@dataclass(frozen=True)
+class SleepEvidence:
+    """What the platform can prove about machine sleep inside a time window.
+
+    `asleep_seconds is None` means wake history could not be established —
+    the caller must then fail toward quiet, and `note` says why so the
+    verdict's detail can explain itself. When it is a number, it is the
+    seconds of the window that CANNOT be credited as awake: proven sleep,
+    plus any stretch the available history does not vouch for (time before
+    the current boot, or before darwin's last recorded sleep). Subtracting
+    it therefore leaves a proven LOWER BOUND on awake silence — a stuck
+    verdict is only ever built on time the machine is known to have been
+    awake, while unprovable time quietly counts as sleep. 0.0 stays a real
+    answer: provably awake throughout.
+    """
+
+    asleep_seconds: float | None
+    note: str
+
+
+def _parse_timeval_sec(out: str) -> float:
+    """`{ sec = 1754126400, usec = 837291 } Sat Aug  2 ...` → 1754126400.0.
+
+    The same output shape — and the same parse — as `lock.boot_time_epoch`
+    uses for kern.boottime, so the two modules read one family of evidence.
+    """
+    marker = "sec = "
+    start = out.index(marker) + len(marker)
+    end = start
+    while end < len(out) and out[end].isdigit():
+        end += 1
+    return float(out[start:end])
+
+
+def _sysctl_timeval_epoch(name: str) -> float | None:
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout
+        return _parse_timeval_sec(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _darwin_sleep_evidence(window_start: float, window_end: float) -> SleepEvidence:
+    """Not-awake seconds from kern.sleeptime/kern.waketime — the LAST
+    sleep→wake pair, which bounds what these sysctls can prove. While we are
+    running no sleep postdates `waketime`, so the pair characterises
+    [sleeptime, now] COMPLETELY: a window starting at or after `sleeptime`
+    gets its exact sleep overlap, awake-throughout included. A window
+    starting earlier reaches time the pair cannot see — any number of
+    finished sleeps may hide before the last one — so there only the tail
+    since `waketime` is credited as awake and everything before it joins the
+    discount. That under-counts awake silence (the quiet direction, per the
+    SleepEvidence contract) without going blind: a hung loop keeps growing
+    that proven-awake tail and still crosses the threshold within one
+    silence window of the last wake.
+    """
+    slept = _sysctl_timeval_epoch("kern.sleeptime")
+    woke = _sysctl_timeval_epoch("kern.waketime")
+    if slept is None or woke is None:
+        return SleepEvidence(None, "kern.sleeptime/kern.waketime unreadable")
+    if slept <= 0 and woke <= 0:
+        return SleepEvidence(0.0, "no sleep recorded this boot")
+    if slept <= 0 or woke < slept:
+        # A wake without its sleep (or the reverse) is not a window we can
+        # subtract; guessing here is how a hung loop gets excused.
+        return SleepEvidence(None, "kern.sleeptime/kern.waketime inconsistent")
+    if window_start >= slept:
+        overlap = min(woke, window_end) - max(slept, window_start)
+        return SleepEvidence(max(0.0, overlap), "kern.sleeptime/kern.waketime")
+    proven_awake = max(0.0, window_end - woke)
+    not_awake = max(0.0, (window_end - window_start) - proven_awake)
+    return SleepEvidence(
+        not_awake,
+        "kern.sleeptime/kern.waketime; window predates the last sleep, so only "
+        "the tail since the last wake counts as awake",
+    )
+
+
+def _linux_sleep_evidence(window_start: float, window_end: float) -> SleepEvidence:
+    """CLOCK_BOOTTIME advances during suspend, CLOCK_MONOTONIC does not (on
+    linux), so their difference is total suspend since boot. It carries no
+    placement, so the whole amount is credited to the window (clamped):
+    over-crediting can only miss a detection, never fabricate one — the
+    direction this monitor is built to fail toward.
+    """
+    try:
+        total = time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+    except (AttributeError, OSError):
+        return SleepEvidence(None, "CLOCK_BOOTTIME unavailable")
+    if total <= 0:
+        return SleepEvidence(0.0, "no suspend recorded this boot")
+    window = max(0.0, window_end - window_start)
+    return SleepEvidence(min(total, window), "CLOCK_BOOTTIME-CLOCK_MONOTONIC")
+
+
+def machine_sleep_in_window(window_start: float, window_end: float) -> SleepEvidence:
+    """Not-awake seconds inside [window_start, window_end] epoch seconds, or
+    an unavailable verdict the caller must treat as quiet.
+
+    `lock.boot_time_epoch` is the shared boot boundary: sleep evidence read
+    from a running kernel describes THIS boot only, so any part of the
+    window before boot — an off or rebooting machine — joins the discount
+    rather than being mistaken for awake silence. Without a readable boot
+    time the window cannot be tied to the boot the evidence describes, and
+    the honest answer is unavailable, not a guess.
+    """
+    boot = boot_time_epoch()
+    if boot is None:
+        return SleepEvidence(
+            None, "boot time unreadable — wake history cannot be bounded to this boot"
+        )
+    pre_boot = max(0.0, min(boot, window_end) - window_start)
+    start = max(window_start, boot)
+    if sys.platform == "darwin":
+        evidence = _darwin_sleep_evidence(start, window_end)
+    elif sys.platform.startswith("linux"):
+        evidence = _linux_sleep_evidence(start, window_end)
+    else:
+        return SleepEvidence(None, f"no wake-history source on {sys.platform}")
+    if evidence.asleep_seconds is None or pre_boot <= 0.0:
+        return evidence
+    return SleepEvidence(
+        evidence.asleep_seconds + pre_boot,
+        f"{evidence.note}; pre-boot time discounted (window predates this boot)",
+    )
+
+
 def last_transcript_event(path: Path) -> datetime | None:
     """Timestamp of the newest transcript entry, or None.
 
@@ -131,6 +290,7 @@ def check(
     now: datetime | None = None,
     silence_minutes: float = DEFAULT_SILENCE_MINUTES,
     agent_probe=_agent_running,
+    sleep_probe=machine_sleep_in_window,
 ) -> Health:
     """Judge the loop. Read-only, and safe to run mid-round."""
     now = now or datetime.now(timezone.utc)
@@ -210,7 +370,9 @@ def check(
     if silent is not None and silent > silence_minutes:
         if agent_probe():
             # The commonest false alarm: an audit fan-out is quiet for
-            # fifteen-plus minutes while six subagents work.
+            # fifteen-plus minutes while six subagents work. Checked before
+            # sleep evidence on purpose — a live agent is proof of work
+            # whatever the wall clock or the wake history says.
             return Health(
                 code=OK_RUNNING,
                 needs_attention=False,
@@ -218,13 +380,46 @@ def check(
                 phase=phase,
                 silent_minutes=silent,
             )
+        evidence = sleep_probe(last.timestamp(), now.timestamp())
+        if evidence.asleep_seconds is None:
+            # Fail toward quiet: without wake history a slept laptop and a
+            # hung loop are indistinguishable, and a false "stuck" is the
+            # alarm that teaches a human to ignore this monitor.
+            return Health(
+                code=OK_RUNNING,
+                needs_attention=False,
+                summary=(
+                    f"autoloop is quiet ({silent:.0f}m) but wake history is "
+                    "unavailable — not calling it stuck"
+                ),
+                detail=(
+                    f"{evidence.note}; the machine may have been asleep, "
+                    "and the next check re-judges in minutes"
+                ),
+                phase=phase,
+                silent_minutes=silent,
+            )
+        asleep = evidence.asleep_seconds / 60.0
+        awake_silent = max(0.0, silent - asleep)
+        if awake_silent > silence_minutes:
+            discount = f", {asleep:.0f}m not provably awake discounted" if asleep > 0 else ""
+            return Health(
+                code=STUCK_SILENT,
+                needs_attention=True,
+                summary=f"autoloop looks stuck — no activity for {awake_silent:.0f} minutes",
+                detail=f"phase={phase}, no subagent running{discount}",
+                phase=phase,
+                silent_minutes=awake_silent,
+            )
         return Health(
-            code=STUCK_SILENT,
-            needs_attention=True,
-            summary=f"autoloop looks stuck — no activity for {silent:.0f} minutes",
-            detail=f"phase={phase}, no subagent running",
+            code=OK_RUNNING,
+            needs_attention=False,
+            summary=(
+                f"autoloop is running (quiet {silent:.0f}m, "
+                f"{asleep:.0f}m of it not provably awake)"
+            ),
             phase=phase,
-            silent_minutes=silent,
+            silent_minutes=awake_silent,
         )
 
     return Health(
