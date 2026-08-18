@@ -133,10 +133,27 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   process could take it. The successor image would otherwise fail closed on
   its own pid, so `acquire` adopts a lock that (a) carries an `exec_handoff`
   marker written immediately before the `execv`, (b) names this host and THIS
-  pid both as the owner and inside the marker, and (c) has not been adopted
-  already — adoption clears the marker. A live lock without the marker, or one
-  whose marker names a different pid, is still refused. `started_at` survives
+  pid both as the owner and inside the marker, (c) names the run the lock
+  itself records, (d) carries a **token this process INHERITED** in
+  `AUTOLOOP_EXEC_HANDOFF_TOKEN`, and (e) has not been adopted already —
+  adoption clears the marker and consumes the token. A live lock without the
+  marker, or one whose marker names a different pid, host or run, or one whose
+  token this process did not inherit, is still refused. `started_at` survives
   the adoption, because the lock really has been held continuously since then.
+
+  **Why the token, when (a)–(c) already look specific.** Every other fact in
+  the marker is forgeable from outside: the hostname is public, the run id sits
+  in the lock file beside the marker, and pids are small integers the kernel
+  reuses within a boot. So a marker left behind by a run that died — or written
+  by anything that can write the state dir — plus that pid coming round again
+  would be a complete handoff. The token is 32 random bytes minted immediately
+  before the `execv`, written only into the lock file, and reaching the
+  successor ONLY because `os.execv` inherits the environment of the process it
+  replaces. A process that did not receive it cannot produce it, whatever the
+  file says. It is consumed on adoption and dropped when `execv` is refused, so
+  it is never inherited by anything the run spawns afterwards; a malformed or
+  non-ASCII value is a refusal, never a raise, because that comparison happens
+  in the successor's very first act after the exec.
 
 ### 3g. Detecting a task's scope (propose, never authorize)
 
@@ -505,6 +522,15 @@ loads the same state file and prepares the same request. A merge touching only
   registry, and came back).
 * **Never mid-round, never while an agent holds a worker.** Enforced by the
   phase, above, not re-derived at the exec site.
+* **The lock is handed over, not released and re-taken.** Immediately before
+  the exec, `LoopLock.mark_exec_handoff` mints a one-use token into the
+  environment and writes it into the lock file (environment first, so a marker
+  never reaches disk without an inheritable token behind it). A `False` from
+  that call refuses the replacement outright — a successor that could not
+  acquire the lock would end the run — and an `execv` that raises clears both
+  halves again. Nothing between the arming and the exec may spawn a child: a
+  token in the environment is inherited by every subprocess started while it is
+  set, which is why the preflight runs before the arming and not after.
 * **Continuous mode only.** A single-round `run` reports the pending upgrade
   and exits 0 without replacing anything: its argv carries flags that are not
   safe to re-run (`--kickoff` refuses an existing session, `--answer` refuses a

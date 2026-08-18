@@ -726,6 +726,12 @@ def _self_upgrade_at_boundary(config: AutoloopConfig, lock: LoopLock | None) -> 
             log,
         )
 
+    # Arming mints a one-use token into this process's environment and writes
+    # it into the lock file; `os.execv` inherits the environment, so ONLY the
+    # image this call is about to be replaced by can present it. Nothing
+    # between here and the exec may spawn a child — a token in the environment
+    # is inherited by every subprocess started while it is set, and the
+    # preflight (the one subprocess on this path) has already run.
     if lock is None or not lock.mark_exec_handoff(f"self_upgrade {record.base_sha[:12]}"):
         return _settle_upgrade(
             store,
@@ -762,6 +768,10 @@ def _self_upgrade_at_boundary(config: AutoloopConfig, lock: LoopLock | None) -> 
     try:
         os.execv(sys.executable, argv)
     except OSError as exc:
+        # No successor is coming, so both halves of the handoff go: the marker
+        # on disk and the token in this process's environment. Leaving the
+        # token would hand an authorization to every subprocess this run spawns
+        # afterwards.
         lock.clear_exec_handoff()
         log(
             "self_upgrade_exec_failed",

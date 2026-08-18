@@ -42,20 +42,36 @@ closed. So `acquire` adopts, on evidence and only on evidence:
   `mark_exec_handoff` immediately before `execv`,
 * naming this hostname and THIS pid, twice — as the lock's owner and inside
   the marker,
-* and the adoption CLEARS the marker, so it can be used exactly once.
+* naming the run the lock itself records, so a marker cannot describe a
+  handoff of some other run's lock,
+* carrying a TOKEN that matches the one this process inherited in its
+  environment (`AUTOLOOP_EXEC_HANDOFF_TOKEN`),
+* and the adoption CLEARS the marker and CONSUMES the environment token, so
+  it can be used exactly once.
+
+The token is what makes the marker's other three facts unforgeable. Everything
+else in it is guessable or reproducible from outside: pids are small integers
+that get reused within a boot, the hostname is public, and the lock file's own
+run id is readable by anything that can read the lock. So a marker left on disk
+by a run that died — or written by any process that can write the state dir —
+plus an unlucky pid reassignment would otherwise be enough to walk past a live
+lock. The token is 32 random bytes minted immediately before the `execv`, never
+written anywhere but the lock file, and reaches the successor ONLY because
+`os.execv` inherits this process's environment. A process that did not receive
+it cannot produce it, whatever the lock file says.
 
 A live lock without that marker is still `LockHeldError`, and so is one whose
-marker names a different pid. Both matter: pids are reused, and a general
-"same pid may take the lock" rule would be a lock-stealing hole rather than a
-handoff. `started_at` is preserved across the adoption because the lock really
-has been held continuously since then — which also keeps the predates-boot
-check honest.
+marker names a different pid, a different host, a different run, or a token
+this process did not inherit. `started_at` is preserved across the adoption
+because the lock really has been held continuously since then — which also
+keeps the predates-boot check honest.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -69,6 +85,19 @@ from .errors import LockHeldError, StaleLockError
 from .state import utcnow_iso
 
 LOCK_FILENAME = "LOCK"
+
+#: Where the exec-handoff token travels. `os.execv` inherits the environment of
+#: the process it replaces, and nothing else does — the successor image reads
+#: this variable, matches it against the token in the lock file, and adopts the
+#: lock only if the two agree. Deliberately NOT a second file: a file is
+#: readable by whatever can read the lock, which is exactly the property the
+#: token exists to deny.
+EXEC_HANDOFF_TOKEN_ENV = "AUTOLOOP_EXEC_HANDOFF_TOKEN"
+
+#: Bytes of randomness per handoff token (`secrets.token_hex` doubles this in
+#: characters). One token authorizes one adoption of one live lock, so it is
+#: sized to be unguessable rather than to be typed.
+EXEC_HANDOFF_TOKEN_BYTES = 32
 
 #: How far a lock's `started_at` must predate boot before we call it stale.
 #: `started_at` has one-second resolution and wall clocks get adjusted (NTP
@@ -87,11 +116,12 @@ class LockInfo:
     run_id: str
     state_dir: str
     #: Set ONLY between `mark_exec_handoff` and the `os.execv` that follows it
-    #: — `{"pid", "run_id", "at", "reason"}`. Its presence is what lets the
-    #: replacement image adopt this lock instead of failing closed on its own
-    #: live pid; adopting clears it. Absent (the normal state) for every lock
-    #: this package has ever written, which is why `read` defaults it rather
-    #: than requiring it.
+    #: — `{"pid", "run_id", "at", "reason", "token"}`. Its presence is what
+    #: lets the replacement image adopt this lock instead of failing closed on
+    #: its own live pid, but only together with the matching `token` inherited
+    #: through `EXEC_HANDOFF_TOKEN_ENV`; adopting clears both. Absent (the
+    #: normal state) for every lock this package has ever written, which is why
+    #: `read` defaults it rather than requiring it.
     exec_handoff: dict | None = None
 
     def describe(self) -> str:
@@ -151,6 +181,27 @@ def _predates_boot(started_at: str) -> bool:
         # lock. `utcnow_iso` is always tz-aware; anything else is foreign.
         return False
     return started.timestamp() < boot - BOOT_CLOCK_SLACK_SECONDS
+
+
+def _token_matches(recorded: object, inherited: object) -> bool:
+    """Constant-time equality for two handoff tokens — and False, never a
+    raise, for anything that is not a token at all.
+
+    Both sides come from outside this function's control: one off the lock
+    file, one out of the environment. `secrets.compare_digest` raises
+    `TypeError` on a non-`str` and on a `str` with any non-ASCII character, and
+    a raise here would surface inside `acquire` — the successor's FIRST act
+    after `execv`, with no `finally` behind it. That is a crash, not a
+    refusal, and this module's whole discipline is that anything it cannot
+    verify is refused.
+    """
+    if not isinstance(recorded, str) or not isinstance(inherited, str):
+        return False
+    if not recorded or not inherited:
+        return False
+    if not recorded.isascii() or not inherited.isascii():
+        return False
+    return secrets.compare_digest(recorded, inherited)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -320,12 +371,20 @@ class LoopLock:
     def _is_handoff_to_this_process(self, info: LockInfo) -> bool:
         """Is this lock one THIS process handed to itself across `os.execv`?
 
-        Three independent facts, all required: the marker exists, the lock is
-        ours by host and pid, and the marker names the same pid. Asked this
-        narrowly because the weaker rule — "the lock's pid is my pid, so it is
-        mine" — is a lock-stealing hole: pids are reused within a boot, so a
-        dead run's lock plus an unlucky pid assignment would let an unrelated
-        process walk past a refusal the rest of this module exists to make.
+        Five independent facts, all required: the marker exists; the lock is
+        ours by host; it names THIS pid, both as the lock's owner and inside
+        the marker; the marker names the run the lock itself records; and its
+        token matches the one this process INHERITED in its environment.
+
+        Asked this narrowly because the weaker rule — "the lock's pid is my
+        pid, so it is mine" — is a lock-stealing hole: pids are reused within a
+        boot, so a dead run's lock plus an unlucky pid assignment would let an
+        unrelated process walk past a refusal the rest of this module exists to
+        make. The token is what closes the remaining gap in the marker itself:
+        pid, host and run id are all readable or reproducible from outside, so
+        a stale-but-valid-looking marker on disk is not evidence of a handoff.
+        The token was minted for one `execv` and reached here only by being
+        inherited across it.
         """
         handoff = info.exec_handoff
         if not isinstance(handoff, dict):
@@ -333,7 +392,11 @@ class LoopLock:
         if info.hostname != socket.gethostname():
             return False
         me = os.getpid()
-        return info.pid == me and handoff.get("pid") == me
+        if info.pid != me or handoff.get("pid") != me:
+            return False
+        if handoff.get("run_id") != info.run_id:
+            return False
+        return _token_matches(handoff.get("token"), os.environ.get(EXEC_HANDOFF_TOKEN_ENV))
 
     def _adopt(self, existing: LockInfo) -> "LoopLock":
         """Take over the lock this process left for itself, under a new run id.
@@ -341,7 +404,9 @@ class LoopLock:
         `started_at` is carried over: the lock genuinely has been held since
         then (same pid, no gap), and rewriting it to now would misreport how
         long this state dir has been locked and weaken the predates-boot check.
-        The marker is dropped, so the adoption cannot happen twice.
+        The marker is dropped AND the inherited token is consumed out of the
+        environment, so the adoption cannot happen twice — and so nothing this
+        process later spawns inherits an authorization it has already spent.
         """
         self._write(
             LockInfo(
@@ -352,6 +417,7 @@ class LoopLock:
                 state_dir=str(self.state_dir),
             )
         )
+        os.environ.pop(EXEC_HANDOFF_TOKEN_ENV, None)
         self.adopted_run_id = existing.run_id
         self._owned = True
         self._install_termination_handlers()
@@ -365,12 +431,23 @@ class LoopLock:
         own the lock and the file still names our run — the caller treats a
         `False` here as "do not replace the process", because a replacement
         whose successor cannot acquire the lock would end the run.
+
+        Arming is two writes that must not come apart: a fresh unguessable
+        token into the environment (which `os.execv` inherits and nothing else
+        does) and the same token into the lock file. The environment goes
+        FIRST, so there is no instant at which the marker is on disk without
+        its token being inheritable — that marker could never be adopted, and
+        the caller has by then already spent the upgrade's one shot. The
+        reverse leftover is inert: an environment token with no marker on disk
+        authorizes nothing, since adoption requires both.
         """
         if not self._owned:
             return False
         current = self.read()
         if current is None or current.run_id != self.run_id:
             return False
+        token = secrets.token_hex(EXEC_HANDOFF_TOKEN_BYTES)
+        os.environ[EXEC_HANDOFF_TOKEN_ENV] = token
         try:
             self._write(
                 LockInfo(
@@ -384,18 +461,27 @@ class LoopLock:
                         "run_id": self.run_id,
                         "at": utcnow_iso(),
                         "reason": reason,
+                        "token": token,
                     },
                 )
             )
         except OSError:
+            os.environ.pop(EXEC_HANDOFF_TOKEN_ENV, None)
             return False
         return True
 
     def clear_exec_handoff(self) -> None:
         """Disarm it again — the exec did not happen (`os.execv` itself
-        refused). Best effort: a marker left behind is harmless (only this pid
-        could ever use it, and this pid already owns the lock), so a failure
-        here must not propagate into a run that is otherwise fine."""
+        refused). Best effort on the FILE: a marker left behind is inert once
+        the token is gone, so a failure here must not propagate into a run that
+        is otherwise fine.
+
+        The environment token is dropped first and unconditionally. It is the
+        half that would otherwise be inherited by every subprocess this run
+        goes on to spawn, and it is the half whose removal alone already makes
+        the marker unusable.
+        """
+        os.environ.pop(EXEC_HANDOFF_TOKEN_ENV, None)
         if not self._owned:
             return
         current = self.read()

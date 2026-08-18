@@ -1133,6 +1133,34 @@ argv carries flags that are not safe to re-run, so it reports and exits 0.
 are different claims, and every long-lived process that can modify its own
 source can hold them apart indefinitely.
 
+### The loop dies right after a self-upgrade, refusing a lock held by its own pid
+**Symptom:** the transcript shows `self_upgrade_exec`, the console shows the
+"restarting into …" line, and the very next thing is
+`another autoloop process holds …/LOCK (pid=<this pid> host=<this host> …)`.
+The pid it names is the pid that just printed the message, and `ps` confirms
+nothing else is running.
+**Cause:** the successor could not ADOPT the lock, so it fell through to the
+ordinary live-lock refusal — which is correct behaviour, not a bug in the lock.
+Adoption needs five things (`autoloop/lock.py`, handoff section): the
+`exec_handoff` marker, this hostname, this pid named twice, the lock's own run
+id, **and a token matching `AUTOLOOP_EXEC_HANDOFF_TOKEN` in the environment**.
+The last one is the one that goes missing in practice, because it is the only
+one that has to survive the `os.execv` rather than being read off disk.
+**Check, in this order:** `cat .autoloop/LOCK` — no `exec_handoff` key means the
+marker was already spent or cleared (a second start of the same image, or an
+`execv` that was refused and disarmed); a marker present means the token side
+failed. Then check whether the process was launched through anything that
+sanitises the environment (a wrapper, a supervisor with a fixed env, a `sudo`
+without `-E`) — `os.execv` inherits this process's environment and nothing
+else carries the token.
+**Recovery is the documented one and nothing special:** the loop is not
+running, so the lock is stale in the ordinary sense once the pid is gone —
+`python -m autoloop unlock`, then start again. Never hand-edit a token into the
+lock file; it would authorize whatever reads it next, which is the property the
+token exists to deny.
+**What is NOT this:** a refusal *before* any `self_upgrade_exec` entry is a
+plain second instance, and the recovery is the same but the diagnosis is not.
+
 ### The pytest session vanishes with no report, no failure and no summary line
 **Symptom:** a test run ends mid-file. No traceback, no `FAILED`, no counts —
 sometimes the output of something else entirely.

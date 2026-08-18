@@ -15,7 +15,9 @@ The claim under test, in five parts, one per bound the design carries:
 * a merged tree that fails the preflight import does not exec, and the loop
   keeps running the old code,
 * a re-exec that dies before one completed iteration is not retried,
-* the LOCK is continuously valid across the replacement.
+* the LOCK is continuously valid across the replacement — and adoption is
+  authorized by a token minted for that one `execv` and inherited only across
+  it, so a marker left on disk proves nothing on its own.
 
 **No test here replaces the pytest process.** `no_process_replacement` is
 autouse and makes `os.execv` raise, so a test that reaches a real exec fails
@@ -56,7 +58,12 @@ from autoloop.contract import Decision, Directive
 from autoloop.errors import LockHeldError
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
-from autoloop.lock import LOCK_FILENAME, LockInfo, LoopLock
+from autoloop.lock import (
+    EXEC_HANDOFF_TOKEN_ENV,
+    LOCK_FILENAME,
+    LockInfo,
+    LoopLock,
+)
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import SELF_UPGRADE, Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
@@ -98,6 +105,42 @@ def no_process_replacement(monkeypatch):
         raise AssertionError("this file must never replace the pytest process")
 
     monkeypatch.setattr(os, "execv", refuse)
+
+
+@pytest.fixture(autouse=True)
+def no_inherited_handoff_token():
+    """The pytest process inherited no handoff, and must not leave one behind.
+
+    `mark_exec_handoff` writes a real environment variable in THIS process —
+    that is how the token reaches the successor across `os.execv` — so a token
+    minted by one test would otherwise still be set for the next, and a test
+    asserting a refusal could pass on a leftover. Popped on both sides rather
+    than via `monkeypatch.delenv`, which records nothing when the variable is
+    absent (the usual case here) and so would not undo a token a test then set
+    through the production path.
+    """
+    os.environ.pop(EXEC_HANDOFF_TOKEN_ENV, None)
+    yield
+    os.environ.pop(EXEC_HANDOFF_TOKEN_ENV, None)
+
+
+def inherited_token() -> str | None:
+    return os.environ.get(EXEC_HANDOFF_TOKEN_ENV)
+
+
+def write_lock(tmp_path: Path, info: LockInfo, handoff: dict | None) -> None:
+    """A lock file written by hand — the shape an attacker, a dead run or a
+    stale state dir could leave behind, as opposed to one this process armed."""
+    data = {
+        "pid": info.pid,
+        "hostname": info.hostname,
+        "started_at": info.started_at,
+        "run_id": info.run_id,
+        "state_dir": info.state_dir,
+    }
+    if handoff is not None:
+        data["exec_handoff"] = handoff
+    (tmp_path / LOCK_FILENAME).write_text(json.dumps(data), encoding="utf-8")
 
 
 def recording_execv(monkeypatch) -> list:
@@ -521,6 +564,37 @@ def test_the_boundary_replaces_the_process_with_a_fresh_interpreter(tmp_path, mo
     assert store.load().status == UPGRADE_EXECED, "the one-shot, recorded BEFORE the exec"
 
 
+def test_the_handoff_token_is_armed_in_the_environment_at_the_moment_of_the_exec(
+    tmp_path, monkeypatch
+):
+    """The successor is authorized by something it INHERITS, so the token has
+    to be set in this process's environment at the instant `os.execv` is
+    called — that call is the only thing that carries it across. Observed at
+    the call itself rather than before it, because "armed at some point" and
+    "armed when the image is replaced" are different claims."""
+    config = make_config(tmp_path)
+    UpgradeStore(config.pending_upgrade_file).save(pending_record())
+    lock = held_lock(config)
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+    at_exec: list = []
+
+    def record(path, argv):
+        at_exec.append((inherited_token(), lock.read().exec_handoff))
+        raise Execed(argv)
+
+    monkeypatch.setattr(os, "execv", record)
+
+    with pytest.raises(Execed):
+        cli._self_upgrade_at_boundary(config, lock)
+
+    assert len(at_exec) == 1
+    token, marker = at_exec[0]
+    assert token and marker and marker["token"] == token, (
+        "the lock file and the environment carry the same one-use token"
+    )
+    assert marker["pid"] == os.getpid() and marker["run_id"] == lock.run_id
+
+
 def test_the_preflight_runs_before_anything_is_replaced(tmp_path, monkeypatch):
     """Order matters: a tree that does not import must be found out while this
     process is still the one running."""
@@ -636,6 +710,11 @@ def test_an_exec_that_is_refused_disarms_the_lock_again(tmp_path, monkeypatch):
 
     assert cli._self_upgrade_at_boundary(config, lock) == UPGRADE_EXEC_FAILED
     assert lock.read().exec_handoff is None
+    assert inherited_token() is None, (
+        "the token goes with the marker — a successor that never started "
+        "cannot need it, and the subprocesses this run keeps spawning would "
+        "otherwise inherit it"
+    )
     assert store.load().status == UPGRADE_EXECED, (
         "still one-shot: a refused exec is not a licence to try the same sha again"
     )
@@ -764,6 +843,9 @@ def test_the_lock_never_lapses_across_the_replacement(tmp_path):
     armed = first.read()
     assert lock_file(tmp_path).exists() and LoopLock.is_live(armed)
     assert armed.pid == os.getpid() and armed.run_id == first.run_id
+    # The token is armed in the environment too — that is what `os.execv`
+    # carries to the successor, and it is the half no file can substitute for.
+    assert inherited_token() == armed.exec_handoff["token"]
 
     # ---- os.execv happens here: same pid, new interpreter, new LoopLock ----
     successor = LoopLock(tmp_path).acquire()
@@ -777,7 +859,37 @@ def test_the_lock_never_lapses_across_the_replacement(tmp_path):
         "the lock really has been held since then — same pid, no gap"
     )
     assert after.exec_handoff is None, "one-shot: the marker is spent on adoption"
+    assert inherited_token() is None, (
+        "and so is the token: adoption consumes it, so nothing this process "
+        "later spawns inherits an authorization that has already been used"
+    )
     assert successor.adopted_run_id == original.run_id
+    successor.release()
+
+
+def test_the_successor_adopts_the_lock_the_boundary_armed(tmp_path, monkeypatch):
+    """The same continuity, driven through the production arming site rather
+    than by calling `mark_exec_handoff` directly — `cli._self_upgrade_at_
+    boundary` is the only caller, so a handoff it arms is the only one that
+    ever exists. The exec is recorded instead of taken; everything after it is
+    what the replacement image does on its way to its first round."""
+    config = make_config(tmp_path)
+    UpgradeStore(config.pending_upgrade_file).save(pending_record())
+    first = held_lock(config)
+    monkeypatch.setattr(cli, "_preflight_import", lambda root: (True, ""))
+    recording_execv(monkeypatch)
+
+    with pytest.raises(Execed):
+        cli._self_upgrade_at_boundary(config, first)
+
+    # ---- os.execv happens here: same pid, new interpreter, new LoopLock ----
+    successor = LoopLock(config.state_dir).acquire()
+
+    assert successor.adopted_run_id == first.run_id
+    assert (config.state_dir / LOCK_FILENAME).exists()
+    assert successor.read().exec_handoff is None and inherited_token() is None
+    with pytest.raises(LockHeldError):
+        LoopLock(config.state_dir).acquire()
     successor.release()
 
 
@@ -801,60 +913,214 @@ def test_a_live_lock_without_a_handoff_is_still_refused(tmp_path):
         LoopLock(tmp_path).acquire()
 
 
-def test_a_handoff_naming_another_pid_is_refused(tmp_path):
+def test_a_handoff_naming_another_pid_is_refused(tmp_path, monkeypatch):
     """Pids are reused. A marker that does not name THIS process is not this
-    process's handoff, whoever wrote it."""
+    process's handoff, whoever wrote it.
+
+    Everything else here is correct — host, run id, and a token this process
+    really did inherit — so the refusal is attributable to the pid alone."""
     lock = LoopLock(tmp_path).acquire()
     info = lock.read()
-    lock_file(tmp_path).write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "hostname": info.hostname,
-                "started_at": info.started_at,
-                "run_id": info.run_id,
-                "state_dir": info.state_dir,
-                "exec_handoff": {"pid": os.getpid() + 1, "run_id": "other", "at": "now"},
-            }
-        ),
-        encoding="utf-8",
+    monkeypatch.setenv(EXEC_HANDOFF_TOKEN_ENV, "t" * 64)
+    write_lock(
+        tmp_path,
+        info,
+        {
+            "pid": os.getpid() + 1,
+            "run_id": info.run_id,
+            "at": "now",
+            "token": "t" * 64,
+        },
     )
 
     with pytest.raises(LockHeldError):
         LoopLock(tmp_path).acquire()
 
 
-def test_a_foreign_hosts_handoff_is_refused(tmp_path):
+def test_a_foreign_hosts_handoff_is_refused(tmp_path, monkeypatch):
     """A pid means nothing across machines, and a lock we cannot verify is
-    treated as live — the module's existing fail-closed rule, unchanged."""
+    treated as live — the module's existing fail-closed rule, unchanged. Again
+    the token matches, so the hostname is the only thing under test."""
     lock = LoopLock(tmp_path).acquire()
     info = lock.read()
-    lock_file(tmp_path).write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "hostname": "some-other-host",
-                "started_at": info.started_at,
-                "run_id": info.run_id,
-                "state_dir": info.state_dir,
-                "exec_handoff": {"pid": os.getpid(), "run_id": info.run_id, "at": "now"},
-            }
+    monkeypatch.setenv(EXEC_HANDOFF_TOKEN_ENV, "t" * 64)
+    write_lock(
+        tmp_path,
+        LockInfo(
+            pid=info.pid,
+            hostname="some-other-host",
+            started_at=info.started_at,
+            run_id=info.run_id,
+            state_dir=info.state_dir,
         ),
-        encoding="utf-8",
+        {"pid": os.getpid(), "run_id": info.run_id, "at": "now", "token": "t" * 64},
     )
 
     with pytest.raises(LockHeldError):
         LoopLock(tmp_path).acquire()
+
+
+def test_a_handoff_naming_another_run_is_refused(tmp_path, monkeypatch):
+    """The marker describes a handoff OF THIS LOCK, so it has to name the run
+    the lock itself records. A marker copied from an older lock — or written
+    against a run that has since released and re-acquired — describes something
+    that is not the lock in front of us."""
+    lock = LoopLock(tmp_path).acquire()
+    info = lock.read()
+    monkeypatch.setenv(EXEC_HANDOFF_TOKEN_ENV, "t" * 64)
+    write_lock(
+        tmp_path,
+        info,
+        {
+            "pid": os.getpid(),
+            "run_id": "a-different-run",
+            "at": "now",
+            "token": "t" * 64,
+        },
+    )
+
+    with pytest.raises(LockHeldError):
+        LoopLock(tmp_path).acquire()
+
+
+# --- the token: the marker's other facts are all forgeable -------------------
+
+
+def test_a_valid_looking_marker_this_process_inherited_no_token_for_is_refused(tmp_path):
+    """**The hardening, stated as its own claim.** Everything the marker can
+    assert about itself is readable or reproducible from outside: the hostname
+    is public, the run id is in the lock file next to it, and the pid is a
+    small integer the kernel reuses within a boot. So a marker left on disk by
+    a run that died — or written by anything that can write the state dir —
+    plus that pid coming round again would be a complete handoff on the old
+    rule. It is refused here because this process inherited no token, which is
+    the one thing a stale file cannot supply, and it is refused as
+    `LockHeldError`: the pid really is alive (it is ours), so the lock is live,
+    and a live lock is never stolen."""
+    lock = LoopLock(tmp_path).acquire()
+    info = lock.read()
+    assert inherited_token() is None, "no handoff was armed in this process"
+    write_lock(
+        tmp_path,
+        info,
+        {
+            "pid": os.getpid(),
+            "run_id": info.run_id,
+            "at": utcnow_iso(),
+            "reason": "self_upgrade deadbeef1234",
+            "token": "the-token-this-marker-claims",
+        },
+    )
+
+    with pytest.raises(LockHeldError):
+        LoopLock(tmp_path).acquire()
+    assert lock.read().exec_handoff is not None, "and nothing was consumed"
+
+
+def test_a_handoff_whose_token_is_not_the_inherited_one_is_refused(tmp_path, monkeypatch):
+    """A real armed handoff, and a process holding some OTHER token. Guessing
+    is the attack this closes, so a near miss has to be a miss."""
+    lock = LoopLock(tmp_path).acquire()
+    assert lock.mark_exec_handoff("armed") is True
+    real = lock.read().exec_handoff["token"]
+    monkeypatch.setenv(EXEC_HANDOFF_TOKEN_ENV, "0" * len(real))
+
+    with pytest.raises(LockHeldError):
+        LoopLock(tmp_path).acquire()
+
+
+def test_the_token_is_unguessable_and_travels_only_in_the_environment(tmp_path):
+    """32 random bytes, minted per arming, and identical in exactly two places:
+    the lock file and this process's environment.
+
+    The second half is what pins "not derived": the two armings below share a
+    lock, a pid, a run id and a reason, so a token computed from any of those
+    would come out the same both times. Anything derivable is reproducible by
+    whoever can read the lock, which is the whole point of not doing that."""
+    lock = LoopLock(tmp_path).acquire()
+    assert lock.mark_exec_handoff("self_upgrade abc123") is True
+    first = lock.read().exec_handoff["token"]
+
+    assert len(first) == 64 and all(c in "0123456789abcdef" for c in first)
+    assert inherited_token() == first
+
+    lock.clear_exec_handoff()
+    assert lock.mark_exec_handoff("self_upgrade abc123") is True
+    assert lock.read().exec_handoff["token"] != first, (
+        "a fresh token per arming — a reused one would make the previous "
+        "handoff's environment usable against this lock, and a derived one "
+        "would be reproducible by anything that can read the lock file"
+    )
+
+
+@pytest.mark.parametrize(
+    "recorded, inherited",
+    [
+        (42, "t" * 64),                 # not a string at all
+        (None, "t" * 64),
+        ({"token": "t"}, "t" * 64),
+        # The sharpest case: `compare_digest("", "")` is a MATCH, so without
+        # the emptiness guard an unset-looking token would adopt the lock.
+        ("", ""),
+        ("tökén-with-non-ascii", "tökén-with-non-ascii"),
+    ],
+)
+def test_a_malformed_token_is_a_refusal_not_a_crash(tmp_path, monkeypatch, recorded, inherited):
+    """`secrets.compare_digest` raises `TypeError` on a non-`str` and on any
+    non-ASCII `str`, and both sides of this comparison come from outside the
+    process — one off disk, one out of the environment. A raise would surface
+    inside `acquire`, which in production is the successor's FIRST act after
+    `execv`: a crash with no `finally` behind it, in place of the refusal this
+    module answers everything it cannot verify with."""
+    lock = LoopLock(tmp_path).acquire()
+    info = lock.read()
+    monkeypatch.setenv(EXEC_HANDOFF_TOKEN_ENV, inherited)
+    write_lock(
+        tmp_path,
+        info,
+        {"pid": os.getpid(), "run_id": info.run_id, "at": "now", "token": recorded},
+    )
+
+    with pytest.raises(LockHeldError):
+        LoopLock(tmp_path).acquire()
+
+
+def test_arming_that_cannot_write_the_lock_leaves_no_token_behind(tmp_path, monkeypatch):
+    """The environment is written first, so that a marker never reaches disk
+    without its token being inheritable. The failing direction has to be tidied
+    up by hand: a token left set would be inherited by every subprocess this
+    run goes on to spawn, authorizing nothing today but outliving the reason it
+    existed."""
+    lock = LoopLock(tmp_path).acquire()
+    reached: list = []
+
+    def refuse(_self, _info):
+        reached.append("write")
+        raise OSError("read-only state dir")
+
+    monkeypatch.setattr(LoopLock, "_write", refuse)
+
+    assert lock.mark_exec_handoff("armed") is False
+    assert reached == ["write"], (
+        "the refusal has to come from the WRITE. `mark_exec_handoff` returns "
+        "False from two guards above it as well, and either one would satisfy "
+        "the assertions below while never minting a token at all"
+    )
+    assert inherited_token() is None
+    assert lock.read().exec_handoff is None
 
 
 def test_disarming_the_handoff_restores_the_ordinary_refusal(tmp_path):
     """The `execv`-was-refused path: no successor is coming, so nothing may
-    adopt this lock afterwards."""
+    adopt this lock afterwards. BOTH halves go — the marker on disk and the
+    token in the environment, the latter because it would otherwise be
+    inherited by every subprocess this run spawns from here on."""
     lock = LoopLock(tmp_path).acquire()
     lock.mark_exec_handoff("armed")
     lock.clear_exec_handoff()
 
     assert lock.read().exec_handoff is None
+    assert inherited_token() is None
     with pytest.raises(LockHeldError):
         LoopLock(tmp_path).acquire()
 
