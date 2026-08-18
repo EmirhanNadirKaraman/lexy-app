@@ -2131,11 +2131,25 @@ class Orchestrator:
         Accounting is deliberately NOT shared — a rotation attempt does not
         also increment `consecutive_failures`, or one fault would be charged to
         two budgets and the loop would fail earlier than either one describes.
+        For the same reason this handler never touches the browser restart
+        machinery: both shapes of the error (an attach that found no composer,
+        and a submission this loop made that provably never appeared — see
+        `ConversationUnusableError.code`) were established THROUGH a working,
+        un-throttled page, so a restart could not possibly help and would only
+        spend recovery on a fault it cannot fix. The 2026-08-17 incident is
+        the second shape misrouted: a missing submission surfaced as a locator
+        timeout, read as a lost session, and bought ten minutes of 45-second
+        Chrome restarts against a chat only rotation could fix.
+
+        `reason` carries the error's own code into the transcript and the
+        `RotationRecord`, so a rotation forced by a vanished submission stays
+        distinguishable from one forced by a chat that would not load.
         """
         state = self.state
+        reason = getattr(exc, "code", "") or "conversation_unusable"
         self._log(
             "conversation_unusable",
-            data={"phase": phase.value, "error": str(exc), "reason_code": "conversation_unusable"},
+            data={"phase": phase.value, "error": str(exc), "reason_code": reason},
         )
         self._drop_client()
         req = state.pending_request
@@ -2147,7 +2161,7 @@ class Orchestrator:
         # `resume_phase` is not set here: every park below routes through
         # `_park_rotation` -> `_to_needs_user`, which sets it from the live
         # phase. Assigning it here too would just be overwritten.
-        self._attempt_rotation(req, reason="conversation_unusable")
+        self._attempt_rotation(req, reason=reason)
 
     def _handle_response_start_timeout(
         self, phase: Phase, exc: ResponseTimeoutError

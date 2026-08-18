@@ -64,9 +64,12 @@ Two further OPTIONAL capabilities the orchestrator probes with `getattr`:
   here yet; `Orchestrator._part_present` calls it when present and reads only
   what is mounted when it is not, which is the historical behaviour.
   (`find_conversation_with` mounts the tail for its OWN readback through the
-  private `_mount_message_tail`. Private on purpose: publishing the name would
-  silently change how chunked delivery confirms its parts, which is a separate
-  decision from making the search trustworthy.)
+  private `_mount_message_tail`, and `await_response` reuses the same mount —
+  with the same two absence proofs — before it may conclude the loop's own
+  submission never appeared (`_rule_out_missing_submission`). Private on
+  purpose: publishing the name would silently change how chunked delivery
+  confirms its parts, which is a separate decision from making the search
+  trustworthy.)
 """
 
 from __future__ import annotations
@@ -774,6 +777,7 @@ class BrowserChatGPT:
                     started = True
                     complete_deadline = self._monotonic() + self._response_timeout
                 elif self._monotonic() >= start_deadline:
+                    self._rule_out_missing_submission(request_id, msgs)
                     self.save_diagnostics(
                         "response-not-started",
                         request_id=request_id,
@@ -819,6 +823,78 @@ class BrowserChatGPT:
                         stage="complete",
                     )
             self._sleep(self._poll_interval)
+
+    def _rule_out_missing_submission(self, request_id: str, msgs: list[Message]) -> None:
+        """The response-START bound just expired. Before that is reported as a
+        timeout, rule out the sharper fault a start timeout can hide: OUR OWN
+        submission not being in this conversation at all.
+
+        A submission the loop believes it sent, which never appears, means the
+        CONVERSATION is wedged — not the browser. Observed 2026-08-17,
+        09:05–09:15: the composer was clickable, no throttle modal was up,
+        Chrome was healthy with 12 CDP targets, and the account was
+        demonstrably writing (an operator posted by hand in a DIFFERENT chat)
+        — while this conversation sat at 33 messages for ten minutes with
+        `submitted=True`. The symptom surfaced as a locator timeout on the
+        message the loop was waiting for, which reads as a browser fault, so
+        the loop restarted Chrome every 45 seconds — the one recovery that
+        could not possibly help. Rotation fixed it in seconds, by hand,
+        because nothing classified the state; this is that classification.
+
+        Absence is concluded EXACTLY as `find_conversation_with` concludes it,
+        because the trap is the same: `msgs` is a mounted WINDOW of a
+        virtualized list, so "not in the window" is a statement about the
+        scroll position until the tail has demonstrably been mounted. Both of
+        `_mount_message_tail`'s proofs — the list reached its END and the
+        mounted window then stopped changing — are required here too; a
+        message absent only because the tail is unmounted must NOT condemn
+        the chat.
+
+        The other worlds keep their own routes, by construction and by two
+        final checks:
+
+        * the mount's reads all going through the live session ARE the
+          attachability proof — a browser with no attachable page at all
+          (brw-11's state 3, a dead browser) raises out of the first read as
+          an ordinary `BrowserError` and keeps the restart recovery built
+          for it;
+        * `_check_logged_in` / `_check_throttled` run again at the moment of
+          conclusion, so an auth redirect or a throttle overlay that arrived
+          while the mount was dwelling is still routed as itself, never
+          relabelled a wedged chat.
+
+        Returns quietly — letting the ordinary `stage="start"` timeout fire —
+        when the request IS on the page (the model is merely silent, which is
+        the silent-conversation trigger's case) and when the mount could not
+        settle, because unproven absence licenses nothing.
+        """
+        if self._request_index(msgs, request_id) is not None:
+            return
+        mount = self._mount_message_tail(request_id, self._conversation_url)
+        if mount.found or not mount.settled:
+            return
+        self._check_logged_in(request_id=request_id, stage="submission-absent")
+        self._check_throttled(request_id=request_id, stage="submission-absent")
+        self.save_diagnostics(
+            "submission-never-appeared",
+            request_id=request_id,
+            stage="submission-absent",
+            retry_prohibited=False,
+            note=(
+                "a submission this loop made is not in the conversation after "
+                "its tail was mounted to the end, on an attachable, "
+                "un-throttled page — the conversation is wedged; rotate, do "
+                "not restart the browser"
+            ),
+        )
+        raise ConversationUnusableError(
+            f"the submission this loop made ({request_id}) never appeared: the "
+            "conversation was read to its end without finding it while the "
+            "page stayed attachable and un-throttled, so this chat has "
+            "stopped taking the loop's messages — a wedged conversation, not "
+            "a browser fault; restarting Chrome cannot help",
+            code="submission_never_appeared",
+        )
 
     # ---- network observation (optional capability) --------------------------
 

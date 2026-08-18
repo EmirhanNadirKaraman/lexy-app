@@ -913,6 +913,59 @@ curl -s http://127.0.0.1:9222/json/list | python3 -c \
 # 0 → open the profile window, or: python3 -m autoloop.browser.chrome_restart
 ```
 
+### `browser session lost (TimeoutError: Locator.get_attribute … waiting for locator '[data-message-author-role]')` — while the loop waits for its OWN sent message
+
+**Symptom (2026-08-17, 09:05–09:15):** the loop is in `awaiting` with
+`submitted: true` and `send_attempted: true`, and every round dies with a
+locator timeout on the message list — it is waiting for the message it
+believes it sent. Every check that exists passes: the composer is clickable,
+no throttle modal is present, Chrome is healthy with 12 CDP targets, and the
+ACCOUNT is demonstrably writing — an operator posted by hand in a DIFFERENT
+conversation and it persisted. Yet this conversation stays pinned at the same
+message count (33, for ten minutes) while the loop reads each timeout as a
+lost session, restarts Chrome every 45 seconds, and gets nowhere.
+
+**Cause: the CONVERSATION is wedged, not the browser.** The chat has silently
+stopped taking this loop's messages, so the submission the loop is waiting
+for never appeared and never will. **A locator timeout on one's own sent
+message READS as a browser fault and is not one** — the browser is fine, so
+restarting Chrome cannot possibly help. The recovery that fixes it is
+rotation (`ConversationUnusableError` → `_attempt_rotation`), which fixed
+this same conversation in seconds, twice, by hand: c/6a8038a8 had already
+degraded once before, reaching 90+ packets and eventually refusing to load at
+all.
+
+**Tell it apart from the two faults it mimics before acting:**
+
+* **A dead browser (brw-11's state 3) DOES want a restart.** That one has no
+  attachable target at all — `curl -s http://127.0.0.1:9222/json/list`
+  reports zero `"type": "page"` targets and every DOM read fails. Here the
+  page answers every read; the reads are themselves the attachability proof.
+* **An unmounted tail is not absence.** ChatGPT mounts a WINDOW of a
+  conversation, so "my message is not in the DOM" can mean only "nothing
+  scrolled to it" (the 2026-08-05 false park). Real absence needs the two
+  mounted-tail proofs `find_conversation_with` already requires: the list
+  demonstrably reached its END, and the mounted window then stopped changing.
+* And a throttle is still a throttle: if the rate-limit overlay is up, that
+  routing (`RateLimitedError`, wait — never restart, never rotate) wins.
+
+**Fix (2026-08-18, brw-12):** `BrowserChatGPT._rule_out_missing_submission`
+(`browser/chatgpt.py`) runs when the response-START bound expires with the
+request absent from the mounted window. It mounts the tail with the same two
+proofs the by-content search uses; only settled absence on an attachable,
+un-throttled, logged-in page raises
+`ConversationUnusableError(code="submission_never_appeared")`, which the
+orchestrator answers with rotation — no Chrome restart, and **no charge to
+`consecutive_failures`** (the brw-03 rule: the budget that decides recovery
+is hopeless must not be spent on a fault no restart could fix). A sighted or
+unprovable absence falls back to the ordinary `stage="start"` timeout and its
+existing three-strike silence rotation.
+
+**Reading an old transcript:** repeated `browser_restarted` entries while one
+conversation's message count never moves, with `submitted: true`, is this,
+before the fix. After it, look for `conversation_unusable` with
+`reason_code: submission_never_appeared` followed by `conversation_rotated`.
+
 ---
 
 ## 7. Autoloop worker/publisher separation (M2)
