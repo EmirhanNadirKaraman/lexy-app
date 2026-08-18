@@ -538,13 +538,23 @@ class Orchestrator:
         self._task_inbox = task_inbox
         #: monotonic timestamp of the last browser restart, for the cooldown.
         self._last_browser_restart = None
-        #: True once this throttle episode has already spent its ONE restart on
-        #: an unattachable browser (`_recover_unattachable_browser`). The
-        #: restart cooldown normally bounds that on its own, but a deployment
-        #: running `restart_cooldown_seconds = 0` would otherwise get a restart
-        #: loop: each attempt "succeeds", each re-probe still finds no page.
-        #: Cleared where the throttle streak is (a step that COMPLETES) and
-        #: whenever the browser turns out to be usable after all.
+        #: True once this episode has already spent its ONE restart on an
+        #: unattachable browser (`_recover_unattachable_browser`). The restart
+        #: cooldown normally bounds that on its own, but a deployment running
+        #: `restart_cooldown_seconds = 0` would otherwise get a restart loop:
+        #: each attempt "succeeds", each re-probe still finds no page.
+        #:
+        #: An EPISODE ends in two places. A step that COMPLETES (`run`'s
+        #: `else` branch, UNCONDITIONALLY: state 3 never increments
+        #: `rate_limit_backoffs`, so a clear nested inside that counter would
+        #: never fire for the very fault this bounds) — that one is evidence.
+        #: And any `RateLimitedError` classified as something OTHER than
+        #: unattachable (`_handle_rate_limited`), which includes the default
+        #: reached when nothing could be probed at all; see that site for why
+        #: that is deliberate rather than evidence. Neither is a successful
+        #: re-probe after the restart: targets that exist at probe time and
+        #: are gone at attach time would then restart, clear, restart — the
+        #: loop the bound exists to stop.
         self._rate_limit_browser_restarted = False
         # Autoloop M2 (`publisher.py`). Optional and independently gated from
         # the `worktrees`/`execution_store`/`intent_store` triple above: when
@@ -703,14 +713,21 @@ class Orchestrator:
                 # the back-off a fixed-interval retry that never escalates,
                 # never reaches `max_rate_limit_backoffs` and never parks —
                 # a slower version of the hammering this exists to stop.
+                #
+                # The same completed step also ends any UNATTACHABLE-BROWSER
+                # episode, and that clear sits OUTSIDE the counter check below
+                # on purpose: state 3 deliberately never increments
+                # `rate_limit_backoffs`, so nested inside it the common
+                # sequence (zero targets → restart → ordinary step completes)
+                # skipped the reset entirely and left the guard true for the
+                # rest of the process — parking the next, unrelated incident
+                # as `skipped_already_spent` instead of giving it the one
+                # restart it is owed. In-memory only, so no save is owed for
+                # it.
+                self._rate_limit_browser_restarted = False
                 if self.state.rate_limit_backoffs:
                     self.state.rate_limit_backoffs = 0
                     self.state.rate_limit_wait_seconds = 0.0
-                    # The episode's one browser restart goes with it: a step
-                    # that completed is proof the browser works now, so a
-                    # LATER unattachable browser is a new fault and gets its
-                    # own recovery rather than inheriting a spent one.
-                    self._rate_limit_browser_restarted = False
                     # The episode is over, so any deadline it left is stale.
                     # Normally already `None` (the wait cleared it when it
                     # finished); belt and braces for the step that completes
@@ -1716,6 +1733,14 @@ class Orchestrator:
         deployment running `restart_cooldown_seconds = 0` has disabled the
         time bound, and every attempt here "succeeds" while the re-probe still
         finds no page — a restart loop by another door.
+
+        A recovered re-probe does NOT end the episode; a step that COMPLETES
+        does (`run`). Targets can exist at probe time and be gone at attach
+        time, and clearing the bound here would answer that with restart →
+        probe OK → clear → restart, unbounded and never parking. Ending it on
+        a completed step keeps the bound per-episode in both directions: this
+        recovery cannot repeat inside one episode, and an episode that really
+        ended cannot leave the next fault with a spent restart.
         """
         state = self.state
         self._log(
@@ -1860,9 +1885,15 @@ class Orchestrator:
         if classification == RL_BROWSER_UNATTACHABLE:
             self._recover_unattachable_browser(phase, exc, evidence)
             return
-        # A page that can be probed at all is a usable browser, so whatever
-        # recovery an earlier occurrence spent is settled — the next
-        # unattachable one is a new fault and gets its own restart.
+        # Everything that reaches here is classified as something other than
+        # unattachable, so this episode's spent restart is settled and the next
+        # unattachable browser is a new fault with its own recovery. That
+        # INCLUDES the default `RL_THROTTLED` reached when nothing could be
+        # probed — deliberately, and it is the safe direction: a browser that
+        # genuinely cannot be reached raises `BrowserError` from the next step
+        # and gets the restart path built for it on its own budget, whereas
+        # holding the guard on unprobed evidence would refuse a real
+        # zero-target fault hours later the recovery it is owed.
         self._rate_limit_browser_restarted = False
         state.rate_limit_backoffs += 1
         verdict = self._policy.check_rate_limit_backoff_budget(state.rate_limit_backoffs)

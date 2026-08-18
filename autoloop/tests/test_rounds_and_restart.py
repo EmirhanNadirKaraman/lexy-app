@@ -1020,6 +1020,61 @@ def test_the_episode_gets_ONE_restart_even_with_the_cooldown_disabled(tmp_path, 
     assert [entry["restart_already_spent"] for entry in spent] == [False, True]
 
 
+def test_a_completed_step_ends_the_episode_so_a_LATER_dead_browser_gets_its_own_restart(
+    tmp_path, monkeypatch
+):
+    """The other half of the per-episode bound, and the one that was missing.
+
+    State 3 deliberately does not increment `rate_limit_backoffs`, so the
+    ordinary sequence — zero targets, restart, a normal step that completes —
+    ends with that counter still 0. While the one-restart guard was cleared
+    only inside `if rate_limit_backoffs:` it therefore stayed true for the rest
+    of the process, and the NEXT unattachable browser, hours later and
+    unrelated, was refused its own restart and parked
+    `skipped_already_spent` — a working recovery spent once per process
+    instead of once per fault.
+
+    A step that COMPLETED is proof the browser works, which is exactly what
+    ends an episode."""
+    orch = _browser_orch(
+        tmp_path, restart_command=("true",), restart_cooldown_seconds=0.0
+    )
+    orch.state.phase = Phase.AWAITING.value
+    orch._client = _UnattachableClient()
+    probes = [0, 11]  # dead, then alive once the profile has been restarted
+    orch._attachable_page_targets = lambda: probes.pop(0)
+    calls = _fake_restart(monkeypatch, returncode=0)
+    _sleeps(orch)
+
+    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+    assert len(calls) == 1
+    assert probes == [], "the restart genuinely restored a page"
+
+    # An ordinary step now completes. The phase was left untouched by the
+    # recovery, so this is the step the loop was already in — and the counter
+    # is ZERO, which is the whole point: the old reset site never ran here.
+    assert orch.state.rate_limit_backoffs == 0
+    orch._step = lambda _phase: None
+    orch.run(max_steps=1)
+
+    # A second, independent fault much later. Same browser config, fresh dead
+    # client, nothing to attach to again.
+    orch.state.phase = Phase.AWAITING.value
+    orch._client = _UnattachableClient()
+    orch._attachable_page_targets = lambda: 0
+    orch._handle_rate_limited(Phase.AWAITING, RateLimitedError("throttled"))
+
+    assert len(calls) == 2, "a new episode gets its own restart, not a spent one"
+    assert orch.state.rate_limit_backoffs == 0, (
+        "and it is still a local recovery — brw-03's rule holds for the second "
+        "episode as much as the first"
+    )
+    spent = [
+        data for event, data in _transcript(orch) if event == "browser_unattachable"
+    ]
+    assert [entry["restart_already_spent"] for entry in spent] == [False, False]
+
+
 def test_a_cleared_modal_resumes_instead_of_waiting(tmp_path, monkeypatch):
     """State 2. The overlay is gone AND a real click lands, so the limit has
     lifted and a wait would be a delay against nothing.

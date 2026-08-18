@@ -881,6 +881,18 @@ waits, and before it concludes the limit still holds
    `rate_limit_backoffs`: that budget bounds waiting on the *server*, and this
    is a local recovery that makes no request at all.
 
+**What bounds that restart, and what lifts the bound:** ONE per *episode*, and
+an episode ends when a step COMPLETES — not when the re-probe finds pages. So
+the ordinary recovery (zero targets → restart → the next step runs normally)
+leaves the next unattachable browser, hours later, free to restart again; two
+zero-target faults with no completed step between them get one restart and then
+a park. Deliberately not reset on a successful re-probe: targets can exist at
+probe time and be gone at attach time, and clearing it there would give
+restart → probe OK → clear → restart with nothing stopping it. If you see
+`browser_unattachable` with `restart_already_spent: true`, that is the second
+fault of one episode, and the browser really did come back with nothing to
+attach to.
+
 `attachable_page_targets` (`browser/playwright_session.py`) distinguishes **zero
 from unmeasurable** on purpose: 0 means the endpoint answered and named no page,
 which authorises the restart; an endpoint that answers nothing is the ordinary
