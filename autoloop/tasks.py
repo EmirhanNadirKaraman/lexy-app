@@ -519,6 +519,24 @@ class Task:
     #: (`Task(**raw)` falls back to `()`), same backward-compatible pattern as
     #: `blocked_reason`/`validation` above.
     approved_paths: tuple[str, ...] = ()
+    #: The approved decomposition this task is implemented from, as the text
+    #: `contract.Decomposition.render()` produced — approach, expected files,
+    #: and either one step or an ordered list of independently reviewable ones.
+    #: Empty means "no plan approved yet", and
+    #: `policy.authorize_directive` refuses an `implement` in that state unless
+    #: the directive itself carries one (see `contract.Decomposition`).
+    #:
+    #: TEXT rather than a list of step records, deliberately. It is agent
+    #: instructions in the same category as `description`, nothing schedules or
+    #: dispatches per step, and a machine-actionable step list here would be a
+    #: second way to split a task — which `split-01` already does atomically
+    #: across the registry, the execution record and the worker repo.
+    #:
+    #: Written only by `set_decomposition`, from the dispatch path, before the
+    #: executor for that round starts. New field with a default, so a
+    #: `tasks.json` written before it existed loads unchanged — same
+    #: backward-compatible pattern as `approved_paths` above.
+    decomposition: str = ""
 
 
 #: The repository trackers every task may update, WITHOUT naming them in its
@@ -1139,6 +1157,59 @@ class TaskRegistry:
         task.description = description
         return task
 
+    def set_decomposition(self, task_id: str, decomposition: str) -> Task:
+        """Record the plan a reviewer approved for this task.
+
+        Called from the dispatch path (`orchestrator._dispatch_executor`) with
+        `contract.Decomposition.render()`'s text, for an `implement` that
+        carries one and for a `revise` that reshapes one. There is deliberately
+        no operator route and no inbox kind: this field is the record of a
+        REVIEWER's approval, and a second author for it would make "approved"
+        mean two different things.
+
+        REPLACES, like `set_approved_paths`. A reshape has to be able to remove
+        a step, and a merging setter could only ever add.
+
+        **Accepts `in_progress`, where `_refuse_immutable` refuses
+        `description`.** Not an oversight in the strand guard, and the
+        difference is the timing rather than the field: `description` is
+        rewritten by an OPERATOR at an arbitrary moment, so it can land in the
+        middle of a dispatch that is already being judged against it. This is
+        written by the dispatch itself, before that round's executor starts,
+        and is then read by the prompt built after it — a revise round
+        reshaping the plan is exactly the moment the reviewer is entitled to,
+        and refusing it would leave the only route to a reshaped plan being a
+        task nobody can revise. Nothing downstream judges the commit against
+        this field (`approved_paths` is what bounds the writes), so a change
+        here cannot strand a round the way the three guarded fields can.
+
+        Terminal records are still refused: rewriting the plan of work that
+        already shipped, or of a retirement, edits history rather than steering
+        the queue — the same reasoning `_refuse_immutable` applies to
+        `completed` and `retired`.
+
+        Blank is refused rather than treated as "clear it". An empty
+        decomposition is the state that means "no plan approved yet", and
+        arriving there by writing one would let a reshape silently un-approve
+        the task.
+        """
+        task = self.get(task_id)
+        if task.status in ("completed", "retired"):
+            raise TaskGraphError(
+                "task_completed" if task.status == "completed" else "task_retired",
+                f"task '{task_id}' is {task.status}{_successor_hint(task)} — its "
+                "decomposition is the record of what was approved and is not "
+                "rewritten; plan a new task",
+            )
+        if not isinstance(decomposition, str) or not decomposition.strip():
+            raise TaskGraphError(
+                "empty_task_field",
+                f"task '{task_id}' needs a non-empty decomposition — an empty one "
+                "means no plan has been approved",
+            )
+        task.decomposition = decomposition
+        return task
+
     def set_approved_paths(self, task_id: str, paths) -> Task:
         """Replace an existing task's authorization scope.
 
@@ -1371,6 +1442,12 @@ class TaskRegistry:
                     # normalising here would ACCEPT near-misses, and this field
                     # decides whether a quarantine can be released.
                     "hold_origin": str(raw.get("hold_origin", "") or ""),
+                    # Same coercion, same reason: a missing key is a
+                    # `tasks.json` written before this field existed and loads
+                    # as "no plan approved yet", while a hand-edited `null`
+                    # must become `""` rather than `None` (which would blow up
+                    # on the next `strip`). See `Task.decomposition`.
+                    "decomposition": str(raw.get("decomposition", "") or ""),
                     # VALIDATED, not just tuple()-converted — this path never
                     # reaches `add_many` (see the bypass below), so it is the
                     # only gate a stored row passes. See

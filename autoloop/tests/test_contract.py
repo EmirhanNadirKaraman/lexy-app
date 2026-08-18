@@ -13,12 +13,21 @@ from autoloop.contract import (
     RETIRED_DECISIONS,
     NEXT_WORK_PREFERENCE,
     Decision,
+    Decomposition,
+    _DECOMPOSITION_KEYS,
     parse_response,
     verify_review,
 )
 from autoloop.errors import ContractError
 
 REVIEWED = {"request_id": "alr-x-0003", "head_sha": "a" * 40, "report_sha256": "b" * 64}
+
+#: A well-formed decomposition, as a reviewer sends it on `implement`.
+DECOMP = {
+    "approach": "add the field, gate it in policy, render it into the prompt",
+    "files": ["autoloop/contract.py", "autoloop/policy.py"],
+    "steps": ["parse and store the field", "refuse an implement without one"],
+}
 
 
 def block(obj, prose="Sure, here is my decision.") -> str:
@@ -77,6 +86,151 @@ def test_revise_parses_with_task_id_and_feedback():
     )
     assert directive.task_id == "t1"
     assert directive.feedback == "tests missing for the error path"
+
+
+# ---- the decomposition that rides on the directive --------------------------
+#
+# Every task is decomposed and the decomposition approved before any code is
+# written (operator decision, 2026-08-17). It rides on the `implement` directive
+# the loop ALREADY exchanges, so it costs no extra round; the parser's job is
+# only shape, and whether a directive needed one is `policy`'s call — pinned in
+# `test_policy.py`, not here.
+
+
+def test_implement_parses_with_a_decomposition():
+    directive = parse_response(
+        block(base("implement", task_id="t1", decomposition=DECOMP))
+    )
+    assert directive.decomposition.approach.startswith("add the field")
+    assert directive.decomposition.files == (
+        "autoloop/contract.py",
+        "autoloop/policy.py",
+    )
+    assert len(directive.decomposition.steps) == 2
+
+
+def test_a_one_step_decomposition_parses():
+    """"This is one step" must be an acceptable answer at every layer. Most
+    work that lands is a single reviewable commit, and a parser that demanded
+    two steps would force a split the reviewer did not want."""
+    one = {**DECOMP, "steps": ["one commit: the field, its gate and its tests"]}
+    directive = parse_response(block(base("implement", task_id="t1", decomposition=one)))
+    assert directive.decomposition.steps == (
+        "one commit: the field, its gate and its tests",
+    )
+
+
+def test_implement_without_a_decomposition_still_parses():
+    """Optional at THIS layer, on purpose (see `contract.Decomposition`):
+    requiring it here would be a breaking wire change, and it would answer a
+    missing plan with `missing_field:decomposition` out of the small
+    parse-retry budget instead of the policy denial that states the rule."""
+    directive = parse_response(block(base("implement", task_id="t1")))
+    assert directive.decomposition is None
+
+
+def test_revise_may_carry_a_reshaped_decomposition():
+    directive = parse_response(
+        block(base("revise", task_id="t1", feedback="split step 2", decomposition=DECOMP))
+    )
+    assert directive.decomposition is not None
+
+
+def test_a_plan_for_the_audit_pseudo_task_is_refused_rather_than_dropped():
+    """The audit is not a roadmap task — `_resolve_audit_task` mints a
+    synthetic `Task` the registry never sees — so nothing would store or apply
+    a decomposition sent with `revise task_id="audit"`. Accepting and dropping
+    it would be a field that reads as configured while behaving as if it were
+    not; `scope` on `audit` is the way to narrow that work."""
+    expect_code(
+        block(base("revise", task_id="audit", feedback="dig deeper", decomposition=DECOMP)),
+        "unexpected_field",
+    )
+    # ...and the same directive without one is still perfectly valid.
+    assert parse_response(
+        block(base("revise", task_id="audit", feedback="dig deeper"))
+    ).decomposition is None
+
+
+@pytest.mark.parametrize(
+    "bad,code",
+    [
+        ("not an object", "bad_type:decomposition"),
+        ({**DECOMP, "steps": []}, "bad_type:decomposition.steps"),
+        ({**DECOMP, "files": []}, "bad_type:decomposition.files"),
+        ({**DECOMP, "files": [1]}, "bad_type:decomposition.files"),
+        ({**DECOMP, "approach": "  "}, "missing_field:decomposition.approach"),
+        ({"files": ["a.py"], "steps": ["s"]}, "missing_field:decomposition.approach"),
+        ({**DECOMP, "owner": "me"}, "unknown_keys"),
+    ],
+)
+def test_a_malformed_decomposition_is_rejected(bad, code):
+    """Present but empty is not a smaller plan — it is a plan that answers none
+    of the question. Each part is required once the key is sent at all."""
+    expect_code(block(base("implement", task_id="t1", decomposition=bad)), code)
+
+
+def test_the_documented_key_set_is_the_accepted_key_set():
+    """The schema line must name the keys the parser actually takes.
+
+    It documented `{approach, files, ordered steps}` while the accepted key was
+    literally `steps`, which is the worst shape a contract error can have: a
+    reviewer that copies the documentation sends `ordered steps`, draws
+    `unknown_keys`, and spends the small parse-retry budget on a correction the
+    instructions caused — on a field that is now MANDATORY, so the cost lands on
+    every task. Asserted against `_DECOMPOSITION_KEYS` rather than as a literal
+    substring, so a future reword cannot pass this vacuously."""
+    documented = "{" + ", ".join(sorted(_DECOMPOSITION_KEYS)) + "}"
+    assert documented == "{approach, files, steps}"
+    # Whitespace-normalised: the schema line wraps, and where it wraps is
+    # formatting rather than contract.
+    flat = " ".join(CONTRACT_INSTRUCTIONS.split())
+    assert documented in flat
+    # ...and the ordering rule survives as prose ABOUT the steps, which is what
+    # it always was — the requirement is that they are worked in order, not that
+    # the key has a longer name.
+    assert f"{documented}; steps are worked in order" in flat
+
+
+def test_the_documented_key_is_the_key_that_parses():
+    """The other half of the pin: the documented spelling parses, and the
+    spelling the old text implied does not."""
+    assert parse_response(
+        block(base("implement", task_id="t1", decomposition=DECOMP))
+    ).decomposition.steps == tuple(DECOMP["steps"])
+    expect_code(
+        block(
+            base(
+                "implement",
+                task_id="t1",
+                decomposition={
+                    "approach": DECOMP["approach"],
+                    "files": DECOMP["files"],
+                    "ordered steps": DECOMP["steps"],
+                },
+            )
+        ),
+        "unknown_keys",
+    )
+
+
+def test_render_is_the_one_text_the_task_and_the_agent_both_read():
+    """`Decomposition.render` is what `Task.decomposition` stores and what the
+    implementing agent is shown, so the reviewer's plan and the agent's
+    instructions cannot drift. A one-step plan reads back as one step rather
+    than as a list of one."""
+    rendered = Decomposition(
+        approach="do it in one commit", files=("a.py",), steps=("the whole thing",)
+    ).render()
+    assert "do it in one commit" in rendered
+    assert "a.py" in rendered
+    assert "This is one step:" in rendered
+
+    many = Decomposition(
+        approach="two commits", files=("a.py",), steps=("first", "second")
+    ).render()
+    assert "Steps, in order:" in many
+    assert "1. first" in many and "2. second" in many
 
 
 def test_commit_parses_with_reviewed_stamp():
@@ -335,6 +489,19 @@ def test_question_forbidden_for_every_active_decision(decision):
     property is pinned for each decision rather than for the one that happens
     to need no other fields."""
     payload = base(decision, **_COMPLETE_PAYLOADS[decision], question="which DB?")
+    expect_code(block(payload), "unexpected_field")
+
+
+@pytest.mark.parametrize(
+    "decision", sorted(set(_COMPLETE_PAYLOADS) - {"implement", "revise"})
+)
+def test_decomposition_forbidden_outside_the_task_decisions(decision):
+    """A plan attached to `stop`, `audit`, `plan` or a git approval is a plan
+    nothing could ever apply, and a second undocumented place to put one. Same
+    complete-payload treatment as the `question` test above, and for the same
+    reason: `decomposition` is checked after task_id/feedback, so an incomplete
+    payload would fail earlier under another field's code."""
+    payload = base(decision, **_COMPLETE_PAYLOADS[decision], decomposition=DECOMP)
     expect_code(block(payload), "unexpected_field")
 
 
@@ -614,11 +781,21 @@ def test_contract_does_not_document_the_legacy_question_field():
     "field",
     [
         "version", "decision", "reason", "scope", "tasks", "task_id",
-        "feedback", "commit", "reviewed", "notes",
+        "feedback", "decomposition", "commit", "reviewed", "notes",
     ],
 )
 def test_contract_documents_every_top_level_field(field):
     assert field in CONTRACT_INSTRUCTIONS
+
+
+def test_contract_states_that_one_step_is_a_valid_decomposition():
+    """The constraint most easily lost to a trim, and the one whose loss is
+    silent: a reviewer who is told to decompose but not that one step counts
+    over-splits, which is how one capability became ten tasks with four of them
+    already implemented. The rule has to be in the text the model reads."""
+    text = CONTRACT_INSTRUCTIONS.lower()
+    assert "one step" in text
+    assert "decomposition" in text
 
 
 @pytest.mark.parametrize(
@@ -858,7 +1035,31 @@ def test_contract_stays_within_its_budget():
     from failing if the old count was itself off by its own margin, with no
     shell available to diagnose it. The extra ~9 buys the whole risk out; it is
     not room to write in. Raising this ceiling is fine when a genuine new
-    requirement lands; raising it to make room for explanation is not."""
+    requirement lands; raising it to make room for explanation is not.
+
+    The decomposition requirement (2026-08-18) IS a genuine new requirement and
+    the ceiling still did not move, because the clause was paid for rather than
+    added: two lines documenting the key cost a measured 137 characters and the
+    reworded `implement` decision 3, against 150 freed by compressing prose
+    that states the same rules in fewer words — the envelope paragraph (-49),
+    the `reviewed` and `commit.paths` sentences (-28, -8), `approved_paths`
+    (-11), the `plan` and `revise` decision lines (-13, -27) and two key
+    headers (-7, -7). Net -10. Every content test above still passes, which is
+    what "compressed, not deleted" has to mean: no rule was dropped, and the
+    one edit that would have CHANGED a rule rather than shortening it — the
+    `push` line, whose "the current branch" is what a reader checks a refspec
+    against — was reverted for its 18 characters rather than kept for the
+    headroom. Hand-summed line by line, like the counts above, because this
+    executor had no shell either.
+
+    The same day's follow-up spent a further measured +3: `ordered steps` in the
+    schema line became the key that is actually parsed (`steps`, -8) and the
+    ordering rule moved into prose about them (+11). The ceiling did NOT move
+    for it, and the pointer that would have named the CONTEXT sections the plan
+    is authored from — worth ~45 characters — was deliberately not written here:
+    those sections label themselves in every request, so paying a per-turn tax
+    to restate them is the "room for explanation" this ceiling refuses. Hand
+    count, no shell."""
     assert len(CONTRACT_INSTRUCTIONS) <= 3700
 
 

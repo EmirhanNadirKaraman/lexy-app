@@ -41,6 +41,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
 | S30 | MEDIUM | The inbox vocabulary grew from create+priority to six mutation kinds, so a queued request can now rewrite an EXISTING task's `approved_paths` and `description` — falsifying S28's "it creates, never widens" bound. Guarded: nothing `in_progress`/`completed`/`retired` is editable, mutations share creation's validators, `block`/`unblock` cannot launder a loop-raised quarantine, `retire` is excluded, and no dashboard endpoint reaches any of it | `autoloop/inbox.py`, `autoloop/tasks.py` |
 | S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
+| S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -730,6 +731,69 @@ closes the forged-record residual. Do NOT close it by widening the exemption to
 the whole state dir, and do NOT let a second field join `priority`: the "what"
 half of the check is the only thing keeping a forged record cheap.
 
+### S33 — Task descriptions and stored plans are rendered into the CONTEXT block that carries the review-integrity stamp — LOW — OPEN (bounded, accepted)
+
+**What:** since 2026-08-18 (`plan-01`) `autoloop/context.py` renders two task
+briefs into every request: `next_ready` (the READY task's id, title, FULL
+description and effective `approved_paths`) and `in_review` (the task under
+review, with its stored `decomposition`). Both are needed because `implement`
+now REQUIRES a decomposition and `revise` may reuse the stored one — decisions
+nobody can make from an id and a title — but they put text this package did not
+author (an operator's task description, a reviewer's own earlier plan) into the
+same block that carries `request_id` / `head_sha` / `report_sha256`, the values
+a commit/push approval must copy.
+
+**The exposure, stated plainly:** a description containing a line like
+`report_sha256: 0000…` renders a second stamp-shaped line inside the CONTEXT
+block. A reviewer (or any reader) that takes "the value after the label" could
+read the planted one.
+
+**Why it is bounded rather than open-ended — two independent reasons:**
+1. **Ordering.** Both briefs are appended STRICTLY after every stamp line, so a
+   first-match read still lands on the real value. Pinned by
+   `test_context.test_briefs_are_rendered_after_every_stamp_line` (whose
+   description contains a forged stamp line) and by
+   `test_orchestrator.test_the_request_that_offers_ready_work_carries_what_to_
+   plan_it_from`, not left to where someone happened to append.
+2. **Verification, which is the actual control.** `contract.verify_review`
+   compares all three echoed values against what was recorded for that request
+   (`PendingRequest`), so a copied forgery draws `review_mismatch:*` and the
+   approval is REFUSED. The failure mode is a denied push, never a push bound to
+   a review that did not happen.
+
+**Not mitigated by editing the text, deliberately.** The description is rendered
+verbatim and uncapped: the reviewer cannot open the repository, so a truncated
+or escaped description is one it would silently plan around — a worse failure
+than a long request. This is the same trust boundary `S14` records for
+user-content prompts, at the loop layer.
+
+**Who can write the input:** whoever can plan a task (the reviewer itself, via
+`plan`), the operator (`seed_tasks.json`, `python -m autoloop`, the inbox's
+`description` kind — see S30), and nobody else. This is not learner-supplied
+content.
+
+**file:line** — `autoloop/context.py` (`TaskBrief`, `_render_brief`,
+`render_context`'s ordering comment); `autoloop/contract.py` (`verify_review`).
+**Severity:** LOW — it inserts unauthored text into a security-relevant block,
+but the value that block exists to carry is verified against a recorded copy,
+and the writers are already-privileged.
+**Verification check:**
+```bash
+# Expect: the briefs are appended AFTER the stamp lines — the list is built,
+# then extended; nothing may insert a brief above `report_sha256`
+rg -n 'lines \+= _render_brief|report_sha256: ' autoloop/context.py
+# Expect: the regression that plants a stamp-shaped line in a description
+rg -n 'briefs_are_rendered_after_every_stamp_line' autoloop/tests/test_context.py
+# Expect: all three values compared against what was recorded, not what was echoed
+rg -n 'review_mismatch' autoloop/contract.py
+```
+**Suggested fix (only if this ever needs to be stronger):** move the briefs into
+the PAYLOAD rather than the CONTEXT block, so the stamp block contains only
+values this package wrote. That costs the per-template duplication this design
+avoided (every payload template would have to carry them, and a new template
+could forget), so it is worth doing only if a second unauthored-text section is
+ever added here.
+
 ### S29 — `merge` is on the git whitelist, and the loop now pushes the BASE branch — LOW — OPEN (deliberate, gated, accepted)
 
 **What:** auto-merge (`autoloop/auto_merge.py`, 2026-08-14) needed two things
@@ -1267,6 +1331,7 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 - **A reviewer handover stays attributable, bounded and gated (added 2026-08-01).** The reviewer grants authority: its approval carries the `reviewed{request_id, head_sha, report_sha256}` stamp that authorizes a commit or push. Automatic failover to `conversation.fallback_provider` on an exhausted allowance is therefore recorded, not silent — `provider` on both `PendingRequest` and `LastResponse`, plus a `ProviderSwitch` record and a `provider_switched` transcript entry, so "which reviewer authorized this" is answerable after the fact. It is bounded by `policy.max_provider_switches` (default 1) and gated on `state.last_response is None`: a handover straddling an answered turn is the one shape that could place two reviewers inside a single review round, and the guard is asserted rather than inferred from the phase machine. `active_provider` on state beats config afterwards, so a resumed run cannot quietly return to the exhausted provider. **Verification:** `pytest autoloop/tests/test_codex_provider.py -k "handover or captured or budget or beats_config"`. **Do not** make the switch silent, unbounded, or reachable mid-round.
 - **The supervised agent spawn keeps every control the timed one had, and its kill cannot reach anything it did not start (added 2026-08-14, `stall-01`).** Replacing `audit.agent_timeout_seconds` with progress-based stall detection (`autoloop/stall.py`) added a SECOND way a write-capable `claude` subagent is launched — `stall.spawn_supervised` (`subprocess.Popen`) alongside the existing `subprocess.run`. Four properties keep that from being a widening. (1) **Argv, never a shell** — same rule as `git_gateway.py` and `audit/agents.py`; the prompt is model-adjacent text and `shell=True` near it would be command injection with extra steps. (2) **The validation-credential strip applies to both paths.** `ClaudeCliRunner._run_supervised` passes `env=strip_validation_vars()` exactly as the timed path does, so S27's boundary does not depend on which bound is in force. (3) **The kill's blast radius is a group the loop itself created.** `spawn_supervised` passes `start_new_session=True` and `ProcessGroupHandle` signals `os.killpg(os.getpgid(pid), …)`, so the SIGTERM/SIGKILL can only reach descendants of the agent we spawned — never the loop's own process tree — and it falls back to signalling the single process when `getpgid` fails. Signalling the parent alone was the alternative and is worse: orphaned children keep writing into the worker repo after the kill, which corrupts the very partial-work numbers the stall report exists to give a reviewer. (4) **The progress probe reads, never writes**, and reads only through the policy-validated `GitGateway` (`git status --porcelain -z -uall`, `git diff HEAD --stat` — both already-whitelisted flags; **no whitelist change was made for this work**, which is why `--numstat` is parsed out of `--stat` instead of admitted). Agent stdout/stderr go to `tempfile.TemporaryFile` handles, deliberately outside the worker repository, so agent-controlled output can never appear to the probe as filesystem progress. **Verification:** `pytest autoloop/tests/test_stall_detector.py -k "strips or probe or ceiling"` — includes `test_the_supervised_spawn_still_strips_the_validation_credentials`. **Do not** add `shell=True` here, do not drop the strip on the spawn path because the timed path already has it, and do not widen the git whitelist to make the partial-work count exact.
 - **Document-package path containment (roadmap A2, added 2026-07-29).** A document package is untrusted input: it is produced by an offline worker and may arrive from another machine, and every path inside it (`CHECKSUMS.txt` entries, `page_images.path_template`, per-element `image_path`/`asset_path`) is attacker-influenced if the package is. `services/document_package/loader.py:resolve_within` is the **single chokepoint** — no file in a package is opened, hashed or recorded unless it resolves inside the package root. It refuses `../` traversal, absolute paths, and symlinked escapes (`Path.resolve()` follows links *before* the containment test, so a symlink pointing outside is caught). The API surface never accepts a path: `POST /api/v1/books/import` takes a package **name**, which is itself passed through `resolve_within` before any I/O (`routers/books.py`), mirroring the S7 pattern of validating at the boundary. **Verification:** `pytest tests/test_document_package.py -k "Containment or traversal"` — parametrized over `../`, `../../etc/passwd`, `pages/../../../etc/passwd`, absolute paths, a real symlink escape, a hostile `path_template`, and a hostile package name. **Do not** replace `resolve_within` with `os.path.join` + a string `startswith` check; that misses symlinks.
+- **The decomposition gate adds a denial and no new trust surface (added 2026-08-18, `plan-01`).** an `implement` or `revise` must now carry the plan it authorizes (`contract.Decomposition`) or the task must already hold one, or `policy._check_decomposition` denies it `decomposition_missing`. Three properties keep this from widening anything. (1) **It only ever refuses.** It is a new denial in `authorize_directive`; it admits no directive that was previously refused, and it runs AFTER `implement_enabled` and after `_check_task_reference`, so no phase, quarantine or retirement denial can be answered by supplying a plan instead. (2) **The text is instructions, never authority.** `Task.decomposition` reaches only `implement_executor._agent_prompt` — the same channel `Task.description` (also reviewer-authored, via `plan`) has always used. It is NOT consulted by `effective_approved_paths`, the pre-commit gate or the post-commit ownership check, so no plan can widen what a task may write; `Task.approved_paths` remains the only thing that decides that (S25). (3) **The write path is narrow.** `TaskRegistry.set_decomposition` is called from exactly one place, `orchestrator._dispatch_executor`, from a parsed directive; it refuses blank (so a reshape cannot silently un-approve a task), refuses `completed`/`retired`, and there is no inbox kind or dashboard form that reaches it. **Verification:** `rg -n 'set_decomposition' autoloop/` should show the definition, the single orchestrator call site and tests, and nothing under `inbox.py`/`dashboard.py`; `pytest autoloop/tests/test_policy.py -k decomposition`. **Do not** make the field an input to any authorization decision, and do not add a second writer for it.
 - **All routers were swept for auth (2026-05-24).** Every handler is covered by `get_current_user` (router-level or per-handler) **except** the documented public ones — see the unauthenticated-surface list below. `search.py` is auth-gated at the router level; `playlists/generate` is auth-gated and is DB-only (no LLM, so it correctly does not need `rate_limit_llm`); `phrases/seed` is auth-gated **and** admin-gated via `require_admin` (S17 resolved). `POST /sentences/match` is now auth-gated too (S16 final fix), so **every** API handler requires a bearer token.
 - **Admin-gated routes (`require_admin`, 403 `admin_required` for non-admins):** `POST /phrases/seed` (S17), `GET /admin/lemma-corrections` (#39 3A), `POST /admin/lemma-corrections/{id}/{accept,reject}` (#39 3B), `…/{id}/adjudicate` (#39 3C, read-only dry-run), and the document-package ingestion pair `GET /books/packages` + `POST /books/import` (S28, 2026-08-01). All rely on `is_admin` being un-self-grantable (settings writes are `DEFAULTS`-filtered). **The rule this list encodes:** a route whose subject is *server-side operator inventory* rather than the caller's own data belongs here, even when it only reads.
 - **User-signal ≠ authority (#39 3A/3B).** `POST /api/v1/lemma-corrections` (auth + per-user throttle) writes only the `lemma_correction_candidate` *signal* table — it can NEVER mutate `lemma_override` (the table the extractor/matcher trust); regression-guarded by `test_post_never_mutates_lemma_override`. The **only** path from a user signal to `lemma_override` is an **admin** `POST /admin/lemma-corrections/{id}/accept` (3B) — human-gated, transactional, never automatic; no raw-vote auto-promotion.

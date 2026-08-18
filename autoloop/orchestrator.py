@@ -3363,6 +3363,17 @@ class Orchestrator:
         )
         if not is_audit and directive.decision in TASK_DECISIONS:
             task = self._registry.get(directive.task_id)
+            if directive.decomposition is not None:
+                # The approved plan, made durable BEFORE the executor runs, in
+                # the same save as `mark_in_progress` — so a task can never be
+                # in progress against a plan nothing recorded. `implement`
+                # cannot get this far without one (policy's
+                # `_check_decomposition`); `revise` reaching here with one is a
+                # deliberate reshape, and reaching here without one leaves the
+                # stored plan exactly as it was.
+                self._registry.set_decomposition(
+                    task.id, directive.decomposition.render()
+                )
             self._registry.mark_in_progress(task.id)
             self._task_store.save(self._registry)
             state.current_task = {

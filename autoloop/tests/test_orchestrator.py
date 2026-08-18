@@ -89,10 +89,20 @@ def plan_block(*ids, approved_paths=("docs/AUDIT_2026-07-29.md",)):
     return block({"version": 3, "decision": "plan", "reason": "roadmap", "tasks": tasks})
 
 
-def implement_block(task_id="t1"):
-    return block(
-        {"version": 3, "decision": "implement", "reason": "next", "task_id": task_id}
-    )
+#: The decomposition an `implement` has carried since 2026-08-17 — approved on
+#: the directive that starts the work, so planning costs no extra round.
+DECOMP = {
+    "approach": "one commit",
+    "files": ["docs/AUDIT_2026-07-29.md"],
+    "steps": ["write the report"],
+}
+
+
+def implement_block(task_id="t1", decomposition=DECOMP):
+    data = {"version": 3, "decision": "implement", "reason": "next", "task_id": task_id}
+    if decomposition is not None:
+        data["decomposition"] = decomposition
+    return block(data)
 
 
 def audit_block(scope=None):
@@ -729,6 +739,118 @@ def test_implement_works_when_phase_gate_lifted(tmp_path):
     directive, task = executor.calls[0]
     assert task.id == "t1"
     assert registry.state_of("t1") is TaskState.IN_PROGRESS
+
+
+# ---- no task starts without an approved decomposition ------------------------
+#
+# Operator decision, 2026-08-17. The approval rides on the `implement` directive
+# the loop already exchanges (`policy._check_decomposition`); these pin what
+# that costs at the loop level — nothing — and that the plan reaches the round
+# that implements it.
+
+
+def test_a_task_begins_with_an_approved_decomposition_on_record(tmp_path):
+    """The plan is durable before the executor is called, and it is the text
+    the reviewer approved rather than a summary of it."""
+    orch, _, _, executor, _, registry, _ = build_postcommit(
+        tmp_path,
+        responses=[implement_block("t1")],
+        tasks=[ready_task("t1")],
+        policy=IMPLEMENT_ON,
+    )
+    orch.run(max_steps=4)
+
+    stored = registry.get("t1").decomposition
+    assert "one commit" in stored
+    assert "docs/AUDIT_2026-07-29.md" in stored
+    assert "This is one step:" in stored, "a one-step plan reads back as one step"
+    # ...and it was on record BEFORE the round ran, not written afterwards: the
+    # task handed to the executor already carried it, and the file on disk holds
+    # it too (the same save as `mark_in_progress`, so a later crash cannot leave
+    # a task in progress against a plan nothing recorded).
+    _, dispatched = executor.calls[0]
+    assert "one commit" in dispatched.decomposition
+    reloaded = TaskStore(orch._config.tasks_file).load()
+    assert reloaded.get("t1").decomposition == stored
+
+
+def test_implement_without_a_decomposition_never_starts_the_task(tmp_path):
+    """Refused before anything is spent. The gate runs in `_step_executing`,
+    upstream of `_dispatch`, so the task is not marked in progress, the
+    executor is never called, and no `TaskExecution` — and therefore no
+    `attempt_count` — is opened. That is the constraint: a plan produces no
+    commit, so it must not consume the budget that bounds commit attempts. The
+    refusal spends `state.policy_denials`, a different budget entirely, and
+    re-prompts on the SAME round rather than adding one."""
+    orch, _, _, executor, clients, registry, execution_store = build_postcommit(
+        tmp_path,
+        responses=[implement_block("t1", decomposition=None), stop_block()],
+        tasks=[ready_task("t1")],
+        policy=IMPLEMENT_ON,
+    )
+    orch.run(max_steps=8)
+
+    assert executor.calls == []
+    assert registry.state_of("t1") is TaskState.READY
+    assert execution_store.load("t1") is None
+    assert registry.get("t1").decomposition == ""
+    reprompt = clients[0].submitted[1][1]
+    assert "policy_denied" in reprompt
+    assert "no approved decomposition" in reprompt
+
+
+def test_the_request_that_offers_ready_work_carries_what_to_plan_it_from(tmp_path):
+    """The gate is only answerable if the request carrying it is
+    self-contained. `roadmap` names the next ready task by id and title, which
+    is not enough to author `approach`/`files`/`steps` — so the prompt that
+    offers the work carries the task's full description and the exact paths it
+    may write (`context.NEXT_READY_LABEL`). A reviewer with no memory of this
+    roadmap — a rotated conversation, a switched provider, a fresh session —
+    must not have to guess either."""
+    orch, _, _, _, clients, _, _ = build_postcommit(
+        tmp_path,
+        responses=[stop_block()],
+        tasks=[
+            Task(
+                id="t1",
+                title="Title t1",
+                description="the whole task, stated at length\nwith a second line",
+                approved_paths=("docs/AUDIT_2026-07-29.md",),
+            )
+        ],
+        policy=IMPLEMENT_ON,
+    )
+    orch.run(max_steps=4)
+
+    prompt = clients[0].submitted[0][1]
+    assert "next_ready: t1 — Title t1" in prompt
+    assert "the whole task, stated at length\nwith a second line" in prompt
+    assert "docs/AUDIT_2026-07-29.md" in prompt
+    assert "CLAUDE.md" in prompt, "the always-allowed trackers are part of the scope"
+    assert "approved decomposition: (none on record" in prompt
+    # ...and the brief is rendered after the whole stamp, so a description that
+    # happens to contain a stamp-shaped line cannot displace the real one for a
+    # reader (`extract_stamp` included) that takes the first match.
+    assert prompt.index("report_sha256:") < prompt.index("next_ready:")
+
+
+def test_the_review_request_carries_the_exact_stored_decomposition(tmp_path):
+    """The revise side of the same rule. Policy lets a `revise` omit the plan
+    and the stored one then stands — a decision the reviewer can only make
+    knowingly if the review request shows the plan it would be reusing."""
+    orch, _, _, _, clients, registry, _ = build_postcommit(
+        tmp_path,
+        responses=[implement_block("t1"), stop_block()],
+        tasks=[ready_task("t1")],
+        policy=IMPLEMENT_ON,
+    )
+    orch.run(max_steps=8)
+
+    stored = registry.get("t1").decomposition
+    assert stored, "the round stored the approved plan"
+    review = clients[0].submitted[1][1]
+    assert "in_review: t1 — Title t1" in review
+    assert stored in review, "verbatim, so 'fits the plan' is distinguishable from 'reshape it'"
 
 
 # ---- task flow (gate lifted) ------------------------------------------------
