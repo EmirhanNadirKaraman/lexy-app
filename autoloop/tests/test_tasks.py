@@ -518,6 +518,96 @@ def test_a_quarantined_task_stays_editable(method, value):
     assert reg.state_of("a") is TaskState.BLOCKED_BY_OPERATOR, "still quarantined"
 
 
+# ---- the approved decomposition ---------------------------------------------
+#
+# Every task is decomposed and the decomposition approved before any code is
+# written (operator decision, 2026-08-17). The registry is where the approval
+# becomes durable: policy reads it to authorize `implement`, and the
+# implementing agent is shown it.
+
+
+DECOMP_TEXT = "Approach: one commit\nFiles expected to change:\n  - a.py\nThis is one step:\n  1. go"
+
+
+def test_an_approved_decomposition_is_durable_across_a_save_and_load(tmp_path):
+    """THE durability claim. The plan is approved on one directive and read by
+    a later round — possibly in a different process — so it has to survive the
+    task file, not just the registry that is in memory right now."""
+    store = TaskStore(tmp_path / "tasks.json")
+    reg = registry(task("a"))
+    reg.set_decomposition("a", DECOMP_TEXT)
+    store.save(reg)
+
+    assert store.load().get("a").decomposition == DECOMP_TEXT
+
+
+def test_a_task_file_written_before_the_field_existed_still_loads():
+    """Backward compatibility, same pattern as `approved_paths`/`hold_origin`:
+    a missing key loads as "no plan approved yet" rather than corrupting, and a
+    hand-edited `null` is coerced instead of becoming `None`."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "old", "title": "T", "description": "d"},
+            {"id": "edited", "title": "T", "description": "d", "decomposition": None},
+        ],
+    })
+    assert reg.get("old").decomposition == ""
+    assert reg.get("edited").decomposition == ""
+
+
+def test_a_reshape_replaces_the_stored_plan_rather_than_appending():
+    """REPLACES, like `set_approved_paths`: a reviewer reshaping a plan has to
+    be able to drop a step, and a merging setter could only ever add."""
+    reg = registry(task("a"))
+    reg.set_decomposition("a", DECOMP_TEXT)
+    reg.set_decomposition("a", "Approach: two commits\nSteps, in order:\n  1. x\n  2. y")
+    assert "two commits" in reg.get("a").decomposition
+    assert "one commit" not in reg.get("a").decomposition
+
+
+def test_a_running_task_can_still_have_its_plan_reshaped():
+    """Deliberately unlike `set_description`, which `_refuse_immutable` blocks
+    on an in-progress task. The difference is the author and the timing: a
+    description is rewritten by an operator at an arbitrary moment, while this
+    is written by the dispatch itself, before that round's executor starts, and
+    a `revise` reshaping the plan is exactly when a reviewer is entitled to.
+    Refusing here would leave a reshaped plan unreachable, since a task under
+    review is in progress by definition."""
+    reg = registry(task("a"))
+    reg.set_decomposition("a", DECOMP_TEXT)
+    reg.mark_in_progress("a")
+    reg.set_decomposition("a", "Approach: reshaped\nSteps, in order:\n  1. x\n  2. y")
+    assert "reshaped" in reg.get("a").decomposition
+
+
+def test_a_blank_plan_is_refused_rather_than_clearing_the_approval():
+    """Empty means "nothing approved yet", the state policy refuses to dispatch
+    from. Reaching it by writing would let a reshape silently un-approve a task
+    that a reviewer had already approved."""
+    reg = registry(task("a"))
+    reg.set_decomposition("a", DECOMP_TEXT)
+    for bad in ("", "   ", None):
+        expect_code(lambda: reg.set_decomposition("a", bad), "empty_task_field")
+    assert reg.get("a").decomposition == DECOMP_TEXT
+
+
+def test_a_terminal_records_plan_is_not_rewritten():
+    """Same reasoning as the other terminal-record refusals: the decomposition
+    of completed or superseded work is the record of what was approved."""
+    reg = registry(task("done"), task("gone"))
+    reg.mark_completed("done")
+    reg.retire("gone", superseded_by=["done"])
+    expect_code(lambda: reg.set_decomposition("done", DECOMP_TEXT), "task_completed")
+    expect_code(lambda: reg.set_decomposition("gone", DECOMP_TEXT), "task_retired")
+
+
+def test_setting_a_plan_on_an_unknown_task_is_refused_and_creates_nothing():
+    reg = registry(task("a"))
+    expect_code(lambda: reg.set_decomposition("ghost", DECOMP_TEXT), "task_unknown")
+    assert not reg.has("ghost")
+
+
 def test_priority_is_still_editable_on_a_running_task():
     """Not an oversight. Priority only orders `next_ready()`, so it cannot
     strand anything — and it is the one mutation the dashboard already

@@ -291,6 +291,55 @@ def test_the_prompt_tells_the_agent_to_take_the_smallest_reversible_reading(
     assert "do NOT stop to ask" in prompt
 
 
+def test_the_approved_decomposition_reaches_the_implementing_agent(
+    main_repo, worker_repo
+):
+    """The other half of "approved before any code is written": a plan the
+    implementing round cannot read is a record, not an instruction. The stored
+    text is passed through verbatim, and it is labelled as approved — an agent
+    that read it as a suggestion would be free to implement something else."""
+    factory_runners = []
+
+    def factory(root):
+        runner = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        factory_runners.append(runner)
+        return runner
+
+    task = make_task()
+    task.decomposition = (
+        "Approach: one commit\nFiles expected to change:\n  - feature.py\n"
+        "This is one step:\n  1. add the widget and its test"
+    )
+    executor = build_executor(main_repo, worker_repo, factory)
+    executor.execute(implement_directive(), task)
+
+    prompt = factory_runners[0].specs[0].prompt
+    assert "add the widget and its test" in prompt
+    assert "Approved decomposition" in prompt
+    assert "BEFORE any code was written" in prompt
+    # The task's own description is still there — the plan adds to it.
+    assert task.description in prompt
+
+
+def test_a_task_with_no_stored_plan_gets_no_decomposition_section(
+    main_repo, worker_repo
+):
+    """Nothing is fabricated for a task that predates the field or was
+    dispatched by a path that carries no plan: the agent sees no heading rather
+    than an empty one it might try to satisfy."""
+    factory_runners = []
+
+    def factory(root):
+        runner = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        factory_runners.append(runner)
+        return runner
+
+    executor = build_executor(main_repo, worker_repo, factory)
+    executor.execute(implement_directive(), make_task())
+
+    assert "Approved decomposition" not in factory_runners[0].specs[0].prompt
+
+
 def test_assumption_lines_are_collected_from_the_agents_own_output(
     main_repo, worker_repo
 ):

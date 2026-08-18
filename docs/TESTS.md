@@ -1902,6 +1902,82 @@ That 790 is a MEASURED figure from 2026-08-01 and is now behind: the
 Deliberately not replaced with an arithmetic guess — re-run the suite and
 record what it actually reports rather than trusting a summed total.
 
+**Every task is decomposed and the decomposition approved before any code is
+written (2026-08-18, `plan-01`; +9 functions / 20 collected in
+`test_contract.py`, +6 / 8 in `test_policy.py`, +7 in `test_tasks.py`, +2 in
+`test_orchestrator.py`, +2 in `test_implement_executor.py`. Hand-counted, no
+shell in the worker; these are what this change added, not a re-audit of any
+row's total.)** Operator decision
+of 2026-08-17, unconditional: the tasks that failed were not obviously large
+when filed (prov-01 arrived at 12,020 characters asking for five things;
+brw-11 was amended from 2,900 to 6,505 mid-flight and then took five revise
+verdicts), so a rule that depends on the author noticing size is the rule that
+already failed.
+
+**The approval rides on the `implement` directive the loop already exchanges,
+and costs no extra round.** That is the design decision, and it is why there is
+no new phase, no new request kind and no new state: the loop already asks what
+to work on and already receives `implement` before any agent runs. A dedicated
+plan round would add one round to EVERY task, against the one to three that
+tasks currently take — a 30-100% tax on the common case, paid to catch the
+occasional oversized one.
+
+Five properties carry it, each with tests that fail when it is removed:
+
+* **Shape is the parser's job, requirement is policy's.** `contract`
+  parses `decomposition` (approach, files, steps) when it is present and
+  forbids it on every decision that is not implement/revise; it never
+  REQUIRES it. Same layering `TaskSpec.approved_paths` already uses, for two
+  reasons the tests state: requiring it in the parser would be a breaking
+  wire change (PROTOCOL_VERSION stays 3), and it would answer a missing plan
+  out of the small parse-retry budget instead of the denial that explains
+  the rule.
+* **One step is an accepted outcome, pinned at all three layers** — parser,
+  policy and the rendered text, which reads back "This is one step:" rather
+  than a list of one. Over-splitting is what turned one capability into ten
+  tasks with four already implemented, so "this is one step" being refusable
+  anywhere would cost more than the rule buys.
+* **Refusal happens before anything is spent.** `_step_executing` authorizes
+  before `_dispatch`, so `test_implement_without_a_decomposition_never_starts_
+  the_task` asserts the task is still READY, the executor was never called and
+  no `TaskExecution` — hence no `attempt_count` — exists. A plan produces no
+  commit, so it must not consume the budget that bounds commit attempts; the
+  refusal spends `state.policy_denials` instead.
+* **The approved plan is durable and readable by the round that implements
+  it.** `TaskRegistry.set_decomposition` writes it in the same save as
+  `mark_in_progress` (so a task is never in progress against an unrecorded
+  plan), it survives a `TaskStore` save/load, and
+  `implement_executor._agent_prompt` shows it to the agent labelled as
+  approved. A `tasks.json` written before the field existed still loads.
+* **`revise` reuses the stored plan, but is not exempt from the gate.** It
+  names a task exactly as `implement` does, and `_check_task_reference` admits
+  one on a task that was never implemented — after which `_dispatch_executor`
+  marks it in progress and runs a write-capable agent, so exempting `revise`
+  left a route to starting a task with no plan that a reviewer never had to
+  notice. The rule is therefore "the directive carries one OR the task already
+  holds one", for both decisions: the ordinary revise-after-implement passes
+  carrying nothing, only revise-before-any-plan is refused, and demanding the
+  plan again every round would tax the rounds that are already going well. A
+  reshape replaces rather than merges and is allowed on an in-progress task,
+  precisely because a task under review is in progress by definition; blank is
+  refused rather than treated as "clear it", so a reshape cannot silently
+  un-approve a task. A `decomposition` sent with `revise task_id="audit"` is
+  REFUSED rather than accepted and dropped — the audit is not a roadmap task,
+  so nothing would store or apply one.
+
+No second split mechanism was added: the steps are prose in the same category
+as `Task.description`, nothing dispatches per step, and splitting a task
+remains `split-01`'s atomic mechanism across the registry, the execution record
+and the worker repo.
+
+The contract text grew by a measured 140 characters and was paid for with 150
+freed by compressing prose that states the same rules in fewer words, so
+`test_contract_stays_within_its_budget` keeps its 3,700 ceiling untouched (net
+-10) and every content test above it still passes. The arithmetic is recorded
+in that test's own docstring, including the one compression that was reverted
+rather than kept for its 18 characters, because it would have changed a rule
+instead of shortening it.
+
 | File | Count | Covers |
 |---|---|---|
 | `test_contract.py` | 80 | Contract v3 parsing: valid form for every decision (plan batches, task-id work, `reviewed` stamps, **required non-empty `commit.paths`**); strict rejection codes; last-json-block-wins; `verify_review` accept + all three mismatch codes. **Strict envelope (2026-07-30):** the byte-exact live-captured `'JSON\\n{...}'` form parses (rendered fences carry no backticks in `innerText`), as do plain/lowercase/mixed-case labels, whitespace, canonical fences, prose *around a fence*, escaped quotes/backslashes and braces inside strings. **Rejected, never positionally resolved:** two fenced blocks, two bare objects, two contradictory directives, noise-then-approval and approval-then-noise, trailing instructions, prose around a bare object, arrays, schema-invalid objects, malformed JSON, prose-only. **+9 on 2026-08-14 for `NEXT_WORK_PREFERENCE`** — the finish-before-start scheduling preference, the first of the two advisory paragraphs in the instructions (the second landed 2026-08-15, below). Its content is pinned the way the other prompt-text tests pin theirs: it states the preference and which decisions it ranks; it keeps all three start-anyway conditions (nothing in flight / blocked on something external / the operator asks — parametrized, so losing any one fails on its own); it reads as advisory, not a refusal; it cites the `in_flight` counts (the mutation guard — drop the counts and the rule points at numbers that are not in the block); it does NOT restate the separate audit-vs-ready-work rule; and it is actually shipped inside `CONTRACT_INSTRUCTIONS`. **Budget re-measured rather than derived:** the clause is 400 chars (own ceiling 420) and the whole text 3,214 (ceiling 3,240, replacing 2,850) — hand-summed line lengths, the method first validated by reproducing the recorded 2,812 for the unchanged part exactly. **+11 collected on 2026-08-15 for `AUDIT_VS_READY_PREFERENCE`** (9 functions, one parametrized over the three conditions) — the second advisory clause: prefer ready roadmap work over a fresh audit. Same pinning shape as the clause above, and it exists because the reviewer kept choosing an audit while the queue had work in it (observed 2026-08-05: a synthetic audit unit running with 15 ready tasks, six at priority 1), which grows the backlog because an audit ADDS findings. Pinned: the rule is stated as a rule ("While any task is ready", `implement` "over `audit`") with its reason; all three audit-anyway conditions survive (no task ready / every ready task blocked on something outside the roadmap / the operator asks — parametrized, so losing one fails on its own, and each fragment sits inside one line of the shipped text so a re-flow cannot break the pin for a reason unrelated to the rule); it reads as advisory, not a refusal — **the preference is deliberately NOT encoded as a `policy.py` denial**, which would park the loop instead of redirecting it, so there is no policy test to pair with these; it cites the `roadmap` line and both counts (the mutation guard — drop the ready/priority-1 counts and the rule points at numbers that are not in the block); it does not restate the in-flight rule; and it ships inside `CONTRACT_INSTRUCTIONS`. **The two functions added by the same-day revision are lifecycle guards on the clause's own wording**, each pairing an absence check with a positive anchor so it cannot pass vacuously against an empty string: the clause recommends `implement` and never `revise` (the protocol's directive for a READY task is `implement`; `revise` targets already-started work and is phase-gated, so recommending it would name a directive invalid for exactly the tasks the READY count describes), and it never calls a READY task dependency-blocked (`TaskRegistry.state_of` returns BLOCKED until every `depends_on` is complete, so the audit-anyway escape hatch has to name the unmodelled/external blocker instead — "outside the roadmap"). **Budget re-measured the same way:** the clause is 438 chars (own ceiling 470), hand-summed again (no shell in the worker) — 449 as first written, 11 fewer after that revision. The total ceiling moves 3,240 → 3,700 and stays there, derived from the previous assertion's GUARANTEED bound plus the 451 the clause and its join added when first written (440 now) — deliberately not from the recorded 3,214, which is a hand count nothing re-verified: trusting it would land on 3,690 and leave the suite one character from failing if that record was off by its own margin. Count documented as 80 before this row was touched and known to trail the collected figure (see the staleness note above the table); the `+N` figures in this row are what each change added, not a re-audit of the total, and no total was guessed at here. **+1 on 2026-08-16 (auto-03):** every decision in `RETIRED_DECISIONS` still PARSES, parametrized over the set rather than naming `ask_user`. The existing pair of legacy-`ask_user` parse tests pin that one shape (with and without `question`); this pins the rule they are instances of, so a later retirement cannot be implemented as "delete the enum member" — which would answer an in-flight conversation still holding the old instructions with `unknown_decision`, spending the parse-retry budget on a correction that never says the decision was retired, instead of the policy denial that does. **+4 functions / +18 collected on 2026-08-16 (auto-06) — the `question` FIELD, which the decision-level retirement tests do not reach.** `question` survives in `_TOP_LEVEL_KEYS` for one reason only: a legacy `ask_user` carrying one must reach the policy denial rather than die at `unknown_keys`. Two new pins keep that tolerance from leaking. (1) The instructions must not document `question` — a re-added `question (optional) ...` line names no retired *decision*, so `test_contract_never_offers_a_retired_decision` passes straight through it, yet it would advertise a field no advertised decision accepts; paired with a positive anchor (`notes`, the optional field that IS documented) so it cannot pass vacuously against a truncated text. (2) `question` draws `unexpected_field` on every ACTIVE decision, generalizing the pre-existing `stop`-only case to the whole set. The payload table those two parametrize over is deliberately COMPLETE per decision — `question` is the LAST field `parse_response` checks, so an under-specified payload would fail earlier on `missing_field:task_id`/`:tasks`/`:reviewed` and pin the wrong rule — which is why the third and fourth functions exist: one asserts the table covers `ACTIVE_DECISIONS` (a new decision cannot be silently unexercised), the other is the positive control that each payload parses cleanly on its own, so the rejection above is attributable to the added `question` and nothing else. Counts are hand-counted (no shell in the worker) and are what this change added, not a re-audit of the row's total. |

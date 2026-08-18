@@ -4,7 +4,13 @@ structurally impossible), and budgets."""
 
 import pytest
 
-from autoloop.contract import ACTIVE_DECISIONS, RETIRED_DECISIONS, Decision, Directive
+from autoloop.contract import (
+    ACTIVE_DECISIONS,
+    RETIRED_DECISIONS,
+    Decision,
+    Decomposition,
+    Directive,
+)
 from autoloop.policy import (
     _RETIRED_DENIALS,
     PolicyConfig,
@@ -14,10 +20,27 @@ from autoloop.policy import (
 from autoloop.tasks import Task, TaskRegistry
 
 
-def directive(decision: Decision, task_id=None) -> Directive:
+def directive(decision: Decision, task_id=None, decomposition=None) -> Directive:
     return Directive(
-        decision=decision, reason="r", task_id=task_id, commit_message="m"
+        decision=decision,
+        reason="r",
+        task_id=task_id,
+        commit_message="m",
+        decomposition=decomposition,
     )
+
+
+#: The plan an `implement` must carry since 2026-08-17 (see `_check_decomposition`).
+DECOMP = Decomposition(
+    approach="one commit", files=("a.py",), steps=("do the whole thing",)
+)
+
+
+def task_directive(decision: Decision, task_id=None) -> Directive:
+    """A directive carrying a plan, so it is authorized (or refused) for the
+    reason under test rather than for a missing decomposition. Used by the
+    task-reference tests, which are about the graph."""
+    return directive(decision, task_id=task_id, decomposition=DECOMP)
 
 
 def engine(**overrides) -> PolicyEngine:
@@ -59,11 +82,11 @@ def test_non_git_non_task_decisions_always_allowed(decision):
 
 @pytest.mark.parametrize("decision", [Decision.IMPLEMENT, Decision.REVISE])
 def test_task_decisions_allowed_on_ready_task(decision):
-    assert auth(task_engine(), directive(decision, task_id="ready1")).allowed
+    assert auth(task_engine(), task_directive(decision, task_id="ready1")).allowed
 
 
 def test_implement_allowed_on_in_progress_task():
-    assert auth(task_engine(), directive(Decision.IMPLEMENT, task_id="wip1")).allowed
+    assert auth(task_engine(), task_directive(Decision.IMPLEMENT, task_id="wip1")).allowed
 
 
 def test_implement_unknown_task_denied():
@@ -92,10 +115,100 @@ def test_retired_task_denied(decision):
     registry = make_registry()
     registry.retire("ready1", superseded_by=["ready2"], reason="superseded")
 
-    verdict = auth(task_engine(), directive(decision, task_id="ready1"), registry=registry)
+    verdict = auth(
+        task_engine(), task_directive(decision, task_id="ready1"), registry=registry
+    )
 
     assert not verdict.allowed and verdict.code == "task_retired"
     assert "ready2" in verdict.reason
+
+
+# ---- no task starts without an approved decomposition ------------------------
+#
+# Operator decision, 2026-08-17: every task is decomposed and the decomposition
+# approved BEFORE any code is written. The approval rides on the `implement`
+# directive the loop already exchanges, so it costs no extra round — this is
+# the gate that makes it real, and `test_orchestrator.py` pins that a refusal
+# here spends no attempt.
+
+
+@pytest.mark.parametrize("decision", [Decision.IMPLEMENT, Decision.REVISE])
+def test_a_task_decision_on_a_never_planned_task_is_denied(decision):
+    """BOTH task decisions, and `revise` is the one that matters. It names a
+    task exactly as `implement` does, and `_check_task_reference` admits one on
+    a task that was never implemented at all — after which `_dispatch_executor`
+    marks it in progress and runs a write-capable agent. Exempting `revise`
+    would leave a route to starting a task with no approved plan that a
+    reviewer never had to notice."""
+    verdict = auth(task_engine(), directive(decision, task_id="ready1"))
+
+    assert not verdict.allowed and verdict.code == "decomposition_missing"
+    assert decision.value in verdict.reason, "the correction names what was sent"
+    # The correction has to state the rule, since it is the whole of what the
+    # reviewer sees before answering again.
+    assert "approach" in verdict.reason and "files" in verdict.reason
+    assert "steps" in verdict.reason
+    assert "One step is a valid answer" in verdict.reason
+
+
+def test_a_one_step_decomposition_is_accepted_and_proceeds():
+    """"This is one step" is an outcome, not a failure to decompose. Most work
+    that lands here is one reviewable commit; a gate that refused it would make
+    the rule cost more than the problem it solves."""
+    one_step = Decomposition(
+        approach="a single commit", files=("a.py",), steps=("the whole change",)
+    )
+
+    assert auth(
+        task_engine(), directive(Decision.IMPLEMENT, task_id="ready1", decomposition=one_step)
+    ).allowed
+
+
+def test_revise_reuses_the_stored_plan_and_may_reshape_it():
+    """The ordinary case, and why the gate above costs no per-round tax: a
+    revise follows an implement that already stored a plan, so it passes
+    carrying none of its own. "The error path is untested" corrects the work,
+    not the plan. A reshape is still allowed when the reviewer sends one."""
+    registry = make_registry()
+    registry.set_decomposition("ready1", "Approach: one commit\nThis is one step:\n  1. go")
+
+    assert auth(
+        task_engine(), directive(Decision.REVISE, task_id="ready1"), registry=registry
+    ).allowed
+    assert auth(
+        task_engine(),
+        directive(Decision.REVISE, task_id="ready1", decomposition=DECOMP),
+        registry=registry,
+    ).allowed
+
+
+@pytest.mark.parametrize("decision", [Decision.IMPLEMENT, Decision.REVISE])
+def test_a_stored_decomposition_satisfies_a_later_directive(decision):
+    """Approved once, on record thereafter: a re-dispatch after a crash, or a
+    second directive on the same task, is not a second thing to approve."""
+    registry = make_registry()
+    registry.set_decomposition("ready1", "Approach: one commit\nThis is one step:\n  1. go")
+
+    assert auth(
+        task_engine(), directive(decision, task_id="ready1"), registry=registry
+    ).allowed
+
+
+def test_the_missing_plan_denial_never_precedes_the_task_graph_denials():
+    """Ordering, pinned: a task that is unknown, blocked, quarantined or
+    retired keeps its own specific refusal. Told "you forgot the plan" for a
+    task that does not exist, a reviewer would send the plan again."""
+    for task_id, code in (("ghost", "task_unknown"), ("blocked1", "task_blocked")):
+        verdict = auth(task_engine(), directive(Decision.IMPLEMENT, task_id=task_id))
+        assert not verdict.allowed and verdict.code == code
+
+
+def test_the_phase_gate_still_answers_first():
+    """`implement_enabled=False` denies before the plan is ever looked at — so
+    a phase-gated loop reports the phase, not a missing decomposition."""
+    verdict = auth(engine(), directive(Decision.IMPLEMENT, task_id="ready1"))
+
+    assert not verdict.allowed and verdict.code == "phase_gate"
 
 
 def test_commit_completion_of_completed_task_allowed():

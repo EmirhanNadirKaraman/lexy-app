@@ -392,6 +392,9 @@ class PolicyEngine:
                 verdict = self._check_task_reference(directive.task_id, registry)
                 if not verdict.allowed:
                     return verdict
+                verdict = self._check_decomposition(directive, registry)
+                if not verdict.allowed:
+                    return verdict
         elif decision in COMMIT_DECISIONS and directive.task_id is not None:
             # Completing an already-completed task is an idempotent no-op
             # (crash recovery re-dispatches the same approval), so it is
@@ -419,6 +422,78 @@ class PolicyEngine:
                     f"direct push to protected branch '{current_branch}' is not allowed",
                 )
         return Verdict.ok()
+
+    def _check_decomposition(
+        self, directive: Directive, registry: TaskRegistry
+    ) -> Verdict:
+        """No task starts without an approved decomposition.
+
+        THE gate, and it covers BOTH task decisions: a directive must carry
+        `decomposition`, or the task must already hold one approved earlier.
+
+        **`revise` is not exempt, and exempting it was a hole.** A `revise`
+        names a task the same way `implement` does, and `_check_task_reference`
+        admits one on a task that has never been implemented at all — after
+        which `_dispatch_executor` marks it in progress and runs a
+        write-capable agent. Skipping the check for `revise` therefore left a
+        route to starting a task with no plan that a reviewer never had to
+        notice, which is the failure the rule exists to close.
+
+        **Reuse still costs nothing.** A `revise` in the ordinary case follows
+        an `implement` that already stored a plan, so it passes with no
+        `decomposition` of its own: the stored plan stands until the reviewer
+        explicitly reshapes it. "The error path is untested" corrects the work,
+        not the plan, and demanding the plan again every round would tax the
+        rounds that are already going well. Only revise-before-any-plan is
+        refused. The migration cost is one denial per task that happens to be
+        mid-review when this lands, answerable on the same round from the
+        denial text — a chosen cost, not an oversight.
+
+        **Here, rather than in a round of its own.** The loop already asks what
+        to work on and already receives `implement` before any agent runs, so
+        approving the plan on that directive costs nothing: no extra request,
+        no extra reply, no extra provider round trip. A dedicated plan round
+        would add one to EVERY task, and tasks that land take one to three
+        rounds — a 30-100% tax on the common case, spent on every task to catch
+        the occasional oversized one.
+
+        **Here, rather than in the parser.** A missing decomposition is a
+        well-formed directive that is not authorized, which is what this layer
+        is for. It also picks the right budget and the right correction: a
+        denial re-prompts with the full rule (`policy_denied_payload`) and is
+        bounded by `check_denial_budget`, where a contract error would spend the
+        much smaller parse-retry budget saying "field missing".
+
+        **Before anything is spent.** `_step_executing` authorizes before
+        `_dispatch`, so a refusal here happens before `mark_in_progress` and
+        before `_open_attempt`: planning never consumes an attempt from the
+        budget that bounds COMMIT attempts, which is the point — a plan
+        produces no commit.
+        """
+        if directive.decision not in TASK_DECISIONS:  # pragma: no cover - guard
+            return Verdict.ok()
+        if directive.decomposition is not None:
+            return Verdict.ok()
+        # `_check_task_reference` ran first, so the task exists.
+        if registry.get(directive.task_id).decomposition:
+            # Approved on an earlier directive and still on record — a revise
+            # of work already under way, a re-dispatch after a crash, or a
+            # second implement on the same task is not a second thing to
+            # approve.
+            return Verdict.ok()
+        return Verdict.deny(
+            "decomposition_missing",
+            f"task '{directive.task_id}' has no approved decomposition, so "
+            f"`{directive.decision.value}` cannot start it. Send it again with "
+            "a `decomposition` object: `approach` (how you will do it), "
+            "`files` (the repo-relative files you expect to change), and "
+            "`steps` — either ONE step, whose text says why the work is one "
+            "step, or an ordered list in which each step stands alone as a "
+            "diff someone can review by itself. One step is a valid answer and "
+            "is usually the right one; two names for a single change is not a "
+            "decomposition. A task that already has a plan on record needs no "
+            "new one. Nothing was executed and no attempt was spent.",
+        )
 
     def _check_task_reference(
         self, task_id: str | None, registry: TaskRegistry, allow_completed: bool = False

@@ -11,6 +11,12 @@ Protocol v2. Two structural rules distinguish it from v1:
   report_sha256}` copied from the CONTEXT block of the request being answered.
   `verify_review` checks the stamp against what was actually sent, so an
   approval can never be applied to a state ChatGPT did not review.
+* **`implement` carries the decomposition it authorizes.** `Decomposition`
+  below — approach, expected files, ordered steps — rides on the directive
+  that already starts the work, so planning costs no extra round. It is
+  OPTIONAL at this layer and required by `policy.authorize_directive`, exactly
+  like `TaskSpec.approved_paths`: see `Decomposition` for why the enforcement
+  lives there and not here.
 
 Every prompt embeds CONTRACT_INSTRUCTIONS, which is the response format plus
 two advisory clauses: NEXT_WORK_PREFERENCE (which decision to prefer when work
@@ -79,6 +85,7 @@ _TOP_LEVEL_KEYS = {
     "tasks",
     "task_id",
     "feedback",
+    "decomposition",
     "commit",
     "reviewed",
     # Legacy: no longer documented in CONTRACT_INSTRUCTIONS, but still an
@@ -89,6 +96,7 @@ _TOP_LEVEL_KEYS = {
 }
 _COMMIT_KEYS = {"message", "paths"}
 _REVIEWED_KEYS = {"request_id", "head_sha", "report_sha256"}
+_DECOMPOSITION_KEYS = {"approach", "files", "steps"}
 _TASK_SPEC_KEYS = {"id", "title", "description", "depends_on", "approved_paths"}
 
 _JSON_BLOCK = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -151,6 +159,72 @@ class TaskSpec:
 
 
 @dataclass(frozen=True)
+class Decomposition:
+    """The plan a task is implemented from, approved BEFORE any code is written.
+
+    **Why it rides on `implement` rather than costing its own round.** The loop
+    already asks the reviewer what to work on and already receives `implement`
+    before any agent runs, so a decomposition carried by that directive is
+    approved at the moment the work is authorized — no extra round trip, and
+    nothing else in the protocol moves. A separate plan round would add one
+    round to EVERY task; tasks that land today take one to three, so that is a
+    30-100% tax on the common case, paid on every task to catch the occasional
+    oversized one. This field is that decision, written down.
+
+    **One step is a first-class answer.** `steps` of length one is accepted
+    everywhere, deliberately: most work that lands here is 500-2,000 lines in a
+    single commit, and forcing it apart is what turned one capability into ten
+    tasks of which four were already implemented. The REASON a plan is one step
+    belongs in that step's own text — a separate field for it would invite two
+    answers to one question.
+
+    **Prose, never a schedule.** Nothing dispatches per step, and nothing here
+    splits a task into several: that is `split-01`'s mechanism, which applies a
+    split atomically across the registry, the execution record and the worker
+    repo. These steps are instructions for the implementing agent, in the same
+    category as `tasks.Task.description`, and keeping them prose is what stops
+    this becoming the second split mechanism the design forbids.
+
+    **Optional here, required by `policy.authorize_directive` — for `revise`
+    too.** The same layering `TaskSpec.approved_paths` already uses: requiring
+    it in the parser
+    would be a breaking wire change to every existing directive (and
+    PROTOCOL_VERSION stays 3), and a missing decomposition is a well-formed
+    directive that is not authorized rather than a malformed one — so it draws
+    a policy denial, which explains itself and is bounded by the denial budget,
+    instead of spending the much smaller parse-retry budget on a correction
+    that says "field missing". The refusal happens before dispatch, so it costs
+    no `TaskExecution.attempt_count`. The gate covers `revise` as well as
+    `implement` — a revise names a task the same way, and one on a task never
+    implemented would otherwise start it with no plan — but the ordinary
+    revise-after-implement finds the plan already on the task and carries
+    nothing, so reuse stays free.
+    """
+
+    approach: str
+    files: tuple[str, ...]
+    steps: tuple[str, ...]
+
+    def render(self) -> str:
+        """The durable text stored on the task and shown to the implementing
+        agent (`tasks.Task.decomposition`, `implement_executor._agent_prompt`).
+
+        ONE rendering, in one place, so the plan the reviewer approved and the
+        instructions the agent is given cannot drift apart. A one-step plan
+        says so in its heading rather than being silently numbered "1." on its
+        own — the reviewer is allowed to answer "this is one step", and the
+        record should read back as that answer.
+        """
+        lines = [f"Approach: {self.approach}", "Files expected to change:"]
+        lines += [f"  - {path}" for path in self.files]
+        lines.append(
+            "This is one step:" if len(self.steps) == 1 else "Steps, in order:"
+        )
+        lines += [f"  {i}. {step}" for i, step in enumerate(self.steps, 1)]
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class ReviewRef:
     """The stamp inside a git approval — must match the request it answers."""
 
@@ -169,6 +243,12 @@ class Directive:
     tasks: tuple[TaskSpec, ...] | None = None
     task_id: str | None = None
     feedback: str | None = None
+    #: The plan this directive authorizes, when it carries one. Accepted on
+    #: `implement` and `revise` only — see `Decomposition` for why `implement`
+    #: without one is refused by policy rather than by the parser, and why
+    #: `revise` may omit it (the stored plan stands unless the reviewer
+    #: reshapes it).
+    decomposition: Decomposition | None = None
     commit_message: str | None = None
     commit_paths: tuple[str, ...] | None = None
     reviewed: ReviewRef | None = None
@@ -180,10 +260,9 @@ class Directive:
 
 _RESPONSE_FORMAT = """\
 RESPONSE FORMAT — mandatory.
-Your ENTIRE reply must be exactly one fenced JSON code block (```json ... ```)
-and nothing else: no sentence before it, no sentence after it. Two blocks, a
-second object, or trailing text is REJECTED, never guessed at. The block is one
-object with these keys and no others:
+Your ENTIRE reply is exactly one fenced JSON block (```json ... ```) and
+nothing else: no sentence before or after it. Two blocks, a second object, or
+trailing text is REJECTED, never guessed at. One object, these keys only:
 
   version    (required) always 3
   decision   (required) one of: audit | plan | implement | revise | commit |
@@ -191,34 +270,36 @@ object with these keys and no others:
   reason     (required) one short sentence explaining the decision
   scope      (audit only, optional) what the audit should focus on
   tasks      (required for plan) list of {id, title, description, depends_on?,
-             approved_paths?}. id: a stable slug ([A-Za-z0-9._-], max 64).
+             approved_paths?}. id: a slug ([A-Za-z0-9._-], max 64).
              depends_on: ids of existing tasks or tasks in this same batch.
              approved_paths: the EXACT repo-relative files this task may touch
-             — no globs, no "..", no absolute paths; name new files
-             explicitly. A task with no approved path cannot be implemented.
+             — no globs, no "..", no absolute paths; name new files. A task
+             with no approved path cannot be implemented.
   task_id    (required for implement/revise; optional for commit /
-             commit_and_push, where it marks that task completed)
+             commit_and_push, marking that task completed)
+  decomposition (required for implement) {approach, files, ordered steps};
+             one step with a reason is a valid decomposition.
   feedback   (required for revise) what is wrong and must change
   commit     (required for commit/commit_and_push) an object:
                message (required) the full commit message
                paths   (required) NON-EMPTY list of repo-relative paths to
-                       stage. There is no "stage everything"; every path must
-                       be one the task actually changed.
+                       stage — no "stage everything"; every path must be one
+                       the task actually changed.
   reviewed   (required for commit/push/commit_and_push) an object:
                {request_id, head_sha, report_sha256}
-             Copy all three EXACTLY from the CONTEXT block of the request you
-             are answering; never approve from memory. A stamp that does not
-             match the reviewed state is rejected.
+             Copy all three EXACTLY from the CONTEXT block of the request
+             you are answering; never approve from memory. A mismatched stamp
+             is rejected.
   notes      (optional) anything else worth recording
 
 Decisions:
   audit — the executor audits the repository and reports back.
-  plan — add tasks to the roadmap; nothing is executed by plan itself. Work is
-    authorized ONLY by task id, so plan before you implement.
-  implement — the executor performs the referenced READY task and reports back
-    with validation results. No free-form instructions.
-  revise — send the referenced task back to the executor with feedback.
-    task_id "audit" sends the AUDIT itself back for another pass.
+  plan — add tasks to the roadmap; plan executes nothing. Work is authorized
+    ONLY by task id, so plan before you implement.
+  implement — the executor performs the referenced READY task, one approved
+    step at a time, and reports back with validation results.
+  revise — send the referenced task back to the executor with feedback;
+    task_id "audit" re-runs the AUDIT.
   commit — commit the reviewed work; no push. task_id marks the task completed.
   push — push the current branch (the reviewed commit); no new commit.
   commit_and_push — commit, then push.
@@ -380,6 +461,52 @@ def _parse_task_specs(raw: object) -> tuple[TaskSpec, ...]:
     return tuple(specs)
 
 
+def _require_str_list(field: str, value: object) -> tuple[str, ...]:
+    """A non-empty list of non-empty strings, stripped, or `ContractError`.
+
+    Entries ARE stripped here, unlike `TaskSpec.approved_paths` — nothing
+    compares these strings against a git pathspec or a stored scope, they are
+    read by a human and by the implementing agent, so padding is noise rather
+    than meaning.
+    """
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) and item.strip() for item in value)
+    ):
+        raise ContractError(
+            f"bad_type:{field}",
+            f"'{field}' must be a non-empty list of non-empty strings",
+        )
+    return tuple(item.strip() for item in value)
+
+
+def _parse_decomposition(raw: object) -> Decomposition:
+    """The `decomposition` object, validated. See `Decomposition`.
+
+    SHAPE only, and every part is required once the key is present at all: a
+    decomposition with no steps, or with no files, is not a smaller plan — it
+    is a plan that answers none of the question it was asked. Whether a
+    directive needed one in the first place is `policy.authorize_directive`'s
+    call, not this function's.
+    """
+    if not isinstance(raw, dict):
+        raise ContractError(
+            "bad_type:decomposition",
+            "'decomposition' must be an object with 'approach', 'files' and 'steps'",
+        )
+    unknown = set(raw) - _DECOMPOSITION_KEYS
+    if unknown:
+        raise ContractError(
+            "unknown_keys", f"unknown keys in 'decomposition': {sorted(unknown)}"
+        )
+    return Decomposition(
+        approach=_require_str("decomposition.approach", raw.get("approach")),
+        files=_require_str_list("decomposition.files", raw.get("files")),
+        steps=_require_str_list("decomposition.steps", raw.get("steps")),
+    )
+
+
 def _parse_reviewed(raw: object, decision: Decision) -> ReviewRef:
     if not isinstance(raw, dict):
         raise ContractError(
@@ -472,6 +599,7 @@ def parse_response(text: str) -> Directive:
     commit_raw = data.get("commit")
     reviewed_raw = data.get("reviewed")
     question_raw = data.get("question")
+    decomposition_raw = data.get("decomposition")
 
     scope = None
     if decision is Decision.AUDIT:
@@ -500,6 +628,31 @@ def parse_response(text: str) -> Directive:
         feedback = _require_str("feedback", feedback_raw)
     else:
         _forbid("feedback", feedback_raw, decision)
+
+    # Accepted on the two decisions that authorize executor work on a real
+    # task, and forbidden everywhere else — a plan attached to `stop` or to an
+    # approval would be a plan nothing could ever apply. Never REQUIRED here,
+    # including for `implement`: see `Decomposition` for why that gate is
+    # policy's.
+    decomposition = None
+    if decision in TASK_DECISIONS and task_id != AUDIT_TASK_ID:
+        if decomposition_raw is not None:
+            decomposition = _parse_decomposition(decomposition_raw)
+    elif decision in TASK_DECISIONS and decomposition_raw is not None:
+        # A revise of the audit pseudo-task. Refused with its own reason
+        # rather than silently accepted: the audit is not a roadmap task, so
+        # nothing stores or applies a plan for it (`_resolve_audit_task` mints
+        # a synthetic Task the registry never sees), and its write surface is
+        # bounded by `scope` + MarkdownPolicy instead. A field that parses and
+        # is then dropped reads as configured while behaving as if it were not.
+        raise ContractError(
+            "unexpected_field",
+            "'decomposition' is not allowed for the audit pseudo-task — the "
+            "audit is not a roadmap task, so nothing would store or apply a "
+            "plan for it; use 'scope' on `audit` to narrow it",
+        )
+    else:
+        _forbid("decomposition", decomposition_raw, decision)
 
     commit_message = None
     commit_paths: tuple[str, ...] | None = None
@@ -562,6 +715,7 @@ def parse_response(text: str) -> Directive:
         tasks=tasks,
         task_id=task_id,
         feedback=feedback,
+        decomposition=decomposition,
         commit_message=commit_message,
         commit_paths=commit_paths,
         reviewed=reviewed,

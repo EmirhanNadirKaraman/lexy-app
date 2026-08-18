@@ -175,7 +175,20 @@ def audit_block(scope=None):
 
 
 def implement_block(task_id="t1"):
-    return block({"version": 3, "decision": "implement", "reason": "next", "task_id": task_id})
+    # `implement` carries the decomposition it authorizes (2026-08-17): policy
+    # refuses one without a plan, and the plan rides on this directive rather
+    # than on a round of its own.
+    return block({
+        "version": 3,
+        "decision": "implement",
+        "reason": "next",
+        "task_id": task_id,
+        "decomposition": {
+            "approach": "one commit",
+            "files": ["docs/AUDIT_2026-07-29.md"],
+            "steps": ["write the report"],
+        },
+    })
 
 
 def revise_block(task_id="t1", feedback="please fix it"):

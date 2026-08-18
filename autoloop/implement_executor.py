@@ -220,6 +220,23 @@ _SMALLEST_REVERSIBLE_READING = (
 )
 
 
+#: Introduces `tasks.Task.decomposition` in the agent's prompt.
+#:
+#: The reviewer approved this plan before any code was written, so it is the
+#: shape of the work rather than a suggestion — but it is still PROSE, and the
+#: agent implements it in one dispatch: nothing here schedules a step, and the
+#: orchestrator does not dispatch per step (splitting a task is `split-01`'s
+#: mechanism). The instruction is "work them in order and do not widen the
+#: plan", which is what makes each step reviewable in the diff a reviewer
+#: eventually reads.
+_DECOMPOSITION_HEADER = (
+    "Approved decomposition — agreed with the reviewer BEFORE any code was "
+    "written. Work the steps in order and keep to their scope; if the plan "
+    "turns out to be wrong, say so in your report rather than quietly "
+    "implementing a different one.\n"
+)
+
+
 def _agent_prompt(task: Task, feedback: str | None) -> str:
     parts = [
         "You are a write-capable coding subagent inside an automated "
@@ -228,6 +245,10 @@ def _agent_prompt(task: Task, feedback: str | None) -> str:
         f"Task id: {task.id}",
         f"Title: {task.title}",
         task.description,
+    ]
+    if task.decomposition:
+        parts.append(_DECOMPOSITION_HEADER + task.decomposition)
+    parts += [
         "Ground rules: you may Read, Grep, Glob, Edit and Write. You may "
         "ONLY modify files inside your current working directory — this "
         "task's own isolated worker repository — and must never attempt to "
