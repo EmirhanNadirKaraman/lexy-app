@@ -56,6 +56,16 @@ string would disagree with the code that dispatches, in both directions at
 once. Constructing a registry is a pure read; no mutating registry method is
 called from here, and no lock is taken.
 
+Each live row carries its WHOLE description and opens to show it (2026-08-18).
+The panel used to send `id`, `title` and `priority` and nothing else, so the one
+question an operator has about a queued task — what does it actually say — could
+only be answered by opening `.autoloop/tasks.json` by hand, and that file is
+what the entire roadmap is steered from. The row's left rail carries the
+EXECUTION ORDINAL from `_grouped`'s `ordinals` map, which is the ready set in
+`next_ready()`'s own order; a task that cannot be picked has no number and says
+what it waits on instead. Descriptions are untrusted text going into HTML and
+are escaped by the page's `esc()` at every interpolation.
+
 Three of those groups are the three ways a task can be not-running, and they
 are separated because the operator's question differs: **Blocked** waits on a
 dependency (nothing to do), **Needs a human** waits on you, **Retired** waits on
@@ -919,19 +929,29 @@ def _in_progress_detail(record: dict) -> str:
     return " · ".join(bits) or "no candidate committed yet"
 
 
-def _blocked_detail(registry: TaskRegistry, task) -> str:
-    """Which dependency is holding this task up. "Blocked" without saying by
-    what is not actionable — it is the difference between a fact and a chore.
+def _waiting_on(registry: TaskRegistry, task) -> list[str]:
+    """The dependencies that are NOT yet completed, in declared order.
 
     Incompleteness is asked of `state_of` rather than of the dependency's
     status string, for the same reason the groups are: a dependency that is
     itself quarantined is not completed either, and only one of those two
     readings survives a task being blocked behind a blocked task.
+
+    One function, two consumers — the prose `detail` below and the row's
+    "waits on" chip — so the sentence an operator reads and the chip beside it
+    can never name different dependencies.
     """
-    waiting = [
+    return [
         dep for dep in task.depends_on
         if registry.state_of(dep) is not TaskState.COMPLETED
     ]
+
+
+def _blocked_detail(registry: TaskRegistry, task) -> str:
+    """Which dependency is holding this task up. "Blocked" without saying by
+    what is not actionable — it is the difference between a fact and a chore.
+    """
+    waiting = _waiting_on(registry, task)
     return ("waiting on " + ", ".join(waiting)) if waiting else "waiting on a dependency"
 
 
@@ -973,6 +993,15 @@ def _group_detail(key: str, task, index: int, registry: TaskRegistry,
 def _grouped(registry: TaskRegistry, executions: dict) -> list[dict]:
     states = {task.id: registry.state_of(task.id) for task in registry.all_tasks()}
     ready = _ready_order(registry)
+    # THE EXECUTION ORDINAL, built once from the ready set and looked up per row
+    # rather than recomputed per group. That is what makes "the position
+    # `next_ready()` will select from" structural instead of a coincidence: it
+    # is the same list, in the same `(priority, id)` order, and every task that
+    # is not in it gets `None` — in progress, quarantined, dependency-blocked,
+    # retired and done alike, none of which `next_ready()` can pick whatever
+    # their priority. A number beside a row that cannot run would be a claim
+    # about dispatch order that the loop does not honour.
+    ordinals = {task.id: index for index, task in enumerate(ready, 1)}
     groups = []
     for key, label, state in GROUPS:
         members = ready if key == "ready" else sorted(
@@ -986,6 +1015,33 @@ def _grouped(registry: TaskRegistry, executions: dict) -> list[dict]:
              # `/data.json` reading it should not have to know which group a
              # task landed in first. Empty for everything else.
              "superseded_by": list(task.superseded_by),
+             # THE WHOLE DESCRIPTION, never a slice. This is the field the
+             # roadmap is steered from and the page sent none of it, so an
+             # operator asking what a queued task actually says had to open
+             # `.autoloop/tasks.json` by hand. A truncation here would be
+             # indistinguishable on the page from a task that really is that
+             # short, which is the failure being fixed rather than a smaller
+             # version of it. `chars` travels with it so the row can show the
+             # size without the page measuring a string the backend already
+             # has.
+             #
+             # It does widen `/api/state`: descriptions are the largest thing
+             # in `tasks.json` and this payload is polled every 2s, so both the
+             # response and the page's `JSON.stringify(rest)` re-render
+             # signature grow with the roadmap. Bounded by the roadmap's own
+             # size, on a localhost socket, and the signature comparison is a
+             # string compare — but it is a real cost, recorded here rather
+             # than left for a reader to discover.
+             "description": str(task.description or ""),
+             "chars": len(str(task.description or "")),
+             "ordinal": ordinals.get(task.id),
+             # ONLY for the group that is actually waiting on a dependency.
+             # `state_of` says in as many words that a retired task usually
+             # still declares the dependencies it was planned with, so filling
+             # this in unconditionally would hang a "waits on brw-01" chip on a
+             # retirement — the exact misread `TaskState.RETIRED` was added to
+             # end. Empty everywhere else, and the page renders no chip for it.
+             "waits_on": _waiting_on(registry, task) if key == "blocked" else [],
              "detail": _group_detail(key, task, index, registry, executions)}
             for index, task in enumerate(members)
         ]
@@ -1553,23 +1609,54 @@ PAGE = """<!doctype html>
       --surface:#f9f9f7;--card:#fcfcfb;--soft:#f4f3f0;
       --ink:#0b0b0b;--ink2:#52514e;--muted:#898781;--line:#e1e0d9;--axis:#c3c2b7;
       --mark-active:#2a78d6;--mark-done:#52514e;--mark-idle:#c3c2b7;
-      --good:#0ca30c;--warning:#fab219;--serious:#ec835a;--critical:#d03b3b}
+      --good:#0ca30c;--warning:#fab219;--serious:#ec835a;--critical:#d03b3b;
+      /* The roadmap docket's own ramp, `--rm-` prefixed and declared in all
+         three theme scopes below. Neutrals biased toward verdigris: this panel
+         is an instrument you steer the loop with, so it reads as one surface
+         rather than as another table. The BAND ramp is deliberately separate
+         from --rm-accent — priority decides execution order, which is a
+         different axis from "this is the roadmap", and folding the two into one
+         hue leaves nothing to encode order with. Never a --good/--warning/
+         --critical: a p0 is not a health verdict. */
+      --rm-ground:#F2F6F5;--rm-surface:#FFFFFF;--rm-surface-2:#F7FAF9;
+      --rm-ink:#141D1B;--rm-ink-soft:#3C4B48;--rm-muted:#5B6B68;
+      --rm-line:#DBE5E2;--rm-line-soft:#E8EFED;
+      --rm-accent:#2F7268;--rm-accent-soft:#E2EFEC;
+      --rm-band-urgent:#A83C2A;--rm-band-active:#966C15;
+      --rm-band-queued:#3B6096;--rm-band-parked:#6C7A77}
 /* Dark is SELECTED, not flipped: its own steps, validated against #2a2a27.
    Declared under both scopes so the toggle wins either way — the :not() guard
    lets an explicit light stamp beat OS-dark. */
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;
       --surface:#0d0d0d;--card:#1a1a19;--soft:#2a2a27;
       --ink:#fff;--ink2:#c3c2b7;--muted:#898781;--line:#2c2c2a;--axis:#383835;
-      --mark-active:#3987e5;--mark-done:#c3c2b7;--mark-idle:#383835}}
+      --mark-active:#3987e5;--mark-done:#c3c2b7;--mark-idle:#383835;
+      --rm-ground:#0E1413;--rm-surface:#151E1C;--rm-surface-2:#111917;
+      --rm-ink:#E2EBE8;--rm-ink-soft:#C0CDC9;--rm-muted:#8FA09C;
+      --rm-line:#243130;--rm-line-soft:#1C2726;
+      --rm-accent:#63B9A8;--rm-accent-soft:#172A27;
+      --rm-band-urgent:#E0866F;--rm-band-active:#D3A44E;
+      --rm-band-queued:#84A9DB;--rm-band-parked:#8B9895}}
 :root[data-theme="dark"]{color-scheme:dark;
       --surface:#0d0d0d;--card:#1a1a19;--soft:#2a2a27;
       --ink:#fff;--ink2:#c3c2b7;--muted:#898781;--line:#2c2c2a;--axis:#383835;
-      --mark-active:#3987e5;--mark-done:#c3c2b7;--mark-idle:#383835}
+      --mark-active:#3987e5;--mark-done:#c3c2b7;--mark-idle:#383835;
+      --rm-ground:#0E1413;--rm-surface:#151E1C;--rm-surface-2:#111917;
+      --rm-ink:#E2EBE8;--rm-ink-soft:#C0CDC9;--rm-muted:#8FA09C;
+      --rm-line:#243130;--rm-line-soft:#1C2726;
+      --rm-accent:#63B9A8;--rm-accent-soft:#172A27;
+      --rm-band-urgent:#E0866F;--rm-band-active:#D3A44E;
+      --rm-band-queued:#84A9DB;--rm-band-parked:#8B9895}
 *{box-sizing:border-box}
 body{margin:0;background:var(--surface);color:var(--ink);font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",sans-serif}
 .wrap{max-width:1180px;margin:0 auto;padding:22px 20px 72px}
 header{display:flex;align-items:center;gap:12px;margin-bottom:18px;flex-wrap:wrap}
-h1{font-size:15px;margin:0;letter-spacing:.02em}
+/* The page name and the task titles are the two editorial voices on a page
+   otherwise made of machine data, so both take ui-serif; ids, ordinals, counts
+   and the descriptions themselves take ui-monospace; every other piece of
+   chrome stays on the system sans set on `body`. */
+h1{font-size:15px;margin:0;letter-spacing:.02em;
+   font-family:ui-serif,"New York","Iowan Old Style",Georgia,serif}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink2);margin:0 0 10px}
 .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
 .pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:12.5px;background:var(--card)}
@@ -1629,6 +1716,81 @@ h3.gh:first-child{margin-top:0}
 details{margin-top:10px}
 summary{font-size:12px;color:var(--ink2);cursor:pointer}
 summary:hover{color:var(--ink)}
+/* ---- the roadmap docket -------------------------------------------------
+   A row is a <details>: the summary is the docket line an operator scans and
+   the body is the task's COMPLETE description, so the answer to "what does
+   this queued task actually say" is on the page instead of in tasks.json.
+   Every colour here is an --rm- token declared in all three theme scopes, so
+   the panel survives with no reference file to copy from, and none of them is
+   a status role. Sizes are in the roadmap's own scale rather than the page's
+   because the description is the content here, not a cell in a table. */
+#rmbar{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-bottom:11px}
+#rmq{flex:1 1 260px;min-width:0;padding:8px 11px;border-radius:8px;
+     border:1px solid var(--rm-line);background:var(--rm-surface);color:var(--rm-ink);
+     font:inherit;font-size:13.5px}
+#rmq::placeholder{color:var(--rm-muted)}
+#rmq:focus-visible,#rmexpand:focus-visible,#roadmap summary:focus-visible{
+     outline:2px solid var(--rm-accent);outline-offset:2px}
+#rmcount{font-size:12.5px;color:var(--rm-muted);font-variant-numeric:tabular-nums}
+#roadmap{background:var(--rm-ground);border:1px solid var(--rm-line);
+     border-radius:11px;padding:13px 13px 4px}
+#roadmap h3.gh{color:var(--rm-ink)}
+#roadmap .gc{color:var(--rm-muted)}
+#roadmap .empty,#roadmap .muted{color:var(--rm-muted)}
+#roadmap details.task{margin:0 0 9px;background:var(--rm-surface);
+     border:1px solid var(--rm-line);border-radius:10px;overflow:hidden}
+/* The band is the priority ramp, never the accent: it encodes the order these
+   rows are selected in, which the accent does not say anything about. */
+#roadmap details.task[data-band="urgent"]{border-left:3px solid var(--rm-band-urgent)}
+#roadmap details.task[data-band="active"]{border-left:3px solid var(--rm-band-active)}
+#roadmap details.task[data-band="queued"]{border-left:3px solid var(--rm-band-queued)}
+#roadmap details.task[data-band="parked"]{border-left:3px solid var(--rm-band-parked)}
+#roadmap details.task>summary{display:grid;grid-template-columns:46px 1fr auto;gap:13px;
+     align-items:baseline;padding:11px 14px;cursor:pointer;list-style:none;
+     font-size:14px;color:var(--rm-ink)}
+#roadmap details.task>summary::-webkit-details-marker{display:none}
+#roadmap details.task>summary:hover .ttl{color:var(--rm-accent)}
+/* The left rail. It is the position next_ready() picks from, which is why a
+   row that cannot be picked shows a dash at chrome size instead of a number:
+   an ordinal on an unpickable row would be a claim about dispatch order. */
+#roadmap .ord{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+     font-variant-numeric:tabular-nums;font-size:20px;font-weight:600;
+     color:var(--rm-muted);text-align:right;line-height:1.15}
+#roadmap .ord.none{font-size:12.5px;font-weight:400;opacity:.65}
+#roadmap .mid{min-width:0}
+#roadmap .tid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+     font-size:11.5px;color:var(--rm-accent)}
+#roadmap .ttl{font-family:ui-serif,"New York","Iowan Old Style",Georgia,serif;
+     font-size:16px;line-height:1.3;margin-top:2px;color:var(--rm-ink)}
+#roadmap .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+#roadmap .chip{font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;
+     padding:2px 7px;border-radius:5px;border:1px solid var(--rm-line);
+     color:var(--rm-muted);background:var(--rm-surface-2);white-space:nowrap}
+#roadmap .chip.p{border-color:transparent;color:var(--rm-surface);font-weight:600}
+#roadmap .chip.p[data-band="urgent"]{background:var(--rm-band-urgent)}
+#roadmap .chip.p[data-band="active"]{background:var(--rm-band-active)}
+#roadmap .chip.p[data-band="queued"]{background:var(--rm-band-queued)}
+#roadmap .chip.p[data-band="parked"]{background:var(--rm-band-parked)}
+#roadmap .chip.wait{border-color:var(--rm-band-active);color:var(--rm-band-active)}
+#roadmap .size{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;
+     color:var(--rm-muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+#roadmap .body{border-top:1px solid var(--rm-line-soft);padding:14px 14px 16px;
+     background:var(--rm-surface-2)}
+/* pre-wrap, not a clamp: these are hard-wrapped plain text with ALL-CAPS heads
+   and indented lists, so the shape carries meaning a reflow would destroy. */
+#roadmap pre.desc{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;max-width:92ch;
+     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+     line-height:1.62;color:var(--rm-ink-soft)}
+#roadmap .meta{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px;
+     padding-top:11px;border-top:1px dashed var(--rm-line);font-size:12px;color:var(--rm-muted)}
+#roadmap .meta input.pri{background:var(--rm-surface);color:var(--rm-ink);
+     border-color:var(--rm-line)}
+#roadmap .meta button.save{background:var(--rm-surface);color:var(--rm-ink-soft);
+     border-color:var(--rm-line)}
+#roadmap .meta button.save:hover{color:var(--rm-accent);border-color:var(--rm-accent)}
+@media (max-width:560px){
+  #roadmap details.task>summary{grid-template-columns:34px 1fr}
+  #roadmap .size{grid-column:2}}
 .themetog{margin-left:auto;font-size:12px;background:var(--card);color:var(--ink2);
           border:1px solid var(--line);border-radius:999px;padding:4px 11px;cursor:pointer}
 .themetog:hover{color:var(--ink)}
@@ -1755,7 +1917,18 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
        put it after that. Each is looked up by GROUP KEY, never by "the first
        collapsed group". -->
   <section>
-    <h2>Roadmap — grouped by state; set priority, then Save</h2>
+    <h2>Roadmap — grouped by state; open a row for its full description</h2>
+    <!-- STATIC, like the new-task form and for the same reason: `renderRoadmap`
+         rewrites `#roadmap` on every payload change, so a search box living
+         inside it would have its half-typed text erased every 2s and would
+         rebind its listener each time. The filter reads this field's CURRENT
+         value on every render, so a search survives the poll. -->
+    <div id="rmbar">
+      <input type="search" id="rmq" aria-label="Search tasks"
+             placeholder="Search ids, titles, and full descriptions…">
+      <button class="save" type="button" id="rmexpand">Expand all</button>
+      <span id="rmcount"></span>
+    </div>
     <div id="roadmap" class="scroll"></div>
     <details id="retiredbox">
       <summary id="retiredsum">⊘ Retired</summary>
@@ -2025,6 +2198,186 @@ function renderStats(s){
     + tally(`Open by area (${s.open})`, "area", s.open_by_area, k => k);
 }
 
+// ---- the roadmap docket ------------------------------------------------------
+//
+// One <details> per live task: the summary is the docket line, the body is the
+// task's COMPLETE description. The panel used to send id/title/priority and
+// nothing else, so the operator's actual question about a queued task — what
+// does it say — could only be answered by opening `.autoloop/tasks.json`, which
+// is the file the whole roadmap is steered from.
+//
+// Every group here was still decided by `TaskRegistry.state_of()` on the
+// backend — the same function the loop dispatches on. NOTHING in this block
+// reads a status string: `blocked` on disk means QUARANTINED, while the Blocked
+// group means "waiting on an incomplete dependency", and a page that mixed
+// those up would send an operator to answer a blocker that does not exist.
+// Retired is the third of those and needs nobody at all — its row names the
+// successor instead of asking for anything.
+//
+// Priority editing is unchanged and lives in the opened body. It writes
+// tasks.json IMMEDIATELY (2026-08-16), under the fine-grained mutex the loop's
+// own saves take, and the row then shows the value the server read BACK from
+// the file. A Save is "saved", not "queued": an operator steers with priority,
+// so a change that lands on the loop's next drain has missed the decision it
+// was for. Creation is still queued to the inbox — that one carries
+// authorization.
+const GICON = {in_progress:"▶", needs_human:"■", ready:"○", blocked:"◍",
+               retired:"⊘", done:"✓"};
+// Which rows the operator has opened, by task id. Rebuilt DOM loses the `open`
+// attribute, and a successful priority save clears LASTJSON to force exactly
+// that rebuild — so without this, editing a priority would snap the row you
+// were reading shut. Restored in the same pass that binds the buttons.
+const RMOPEN = new Set();
+
+// Everything between the two markers below is PURE — payload in, HTML or a
+// boolean out — and is lifted verbatim by the tests, which run it under node
+// against a hostile description. Keep it free of the DOM and of module state,
+// or those tests stop being able to reach it, and keep each marker alone on
+// its line: the tests split on it, so trailing prose would land in the
+// extracted script as a syntax error.
+// PURE_ROADMAP_START
+// The priority BAND, kept separate from the accent because it encodes a
+// different axis: which rows run first. A missing/non-numeric priority parks,
+// which is where the registry's own default (100) lands anyway.
+const rmBand = p => typeof p !== "number" ? "parked"
+  : p <= 2 ? "urgent" : p <= 5 ? "active" : p <= 8 ? "queued" : "parked";
+// The filter matches DESCRIPTION TEXT as well as id and title. Half of what an
+// operator is looking for ("which task mentioned tasks.json?") is only in the
+// description, and a search that read titles alone would answer "no results"
+// for a task that is right there.
+const rmMatch = (t, f) => !f
+  || String(t.id || "").toLowerCase().includes(f)
+  || String(t.title || "").toLowerCase().includes(f)
+  || String(t.description || "").toLowerCase().includes(f);
+const priCell = t => `<input class="pri" type="number" step="1" value="${esc(t.priority)}"
+         data-id="${esc(t.id)}" aria-label="priority for ${esc(t.id)}">
+        <button class="save" data-id="${esc(t.id)}">Save</button>
+        <span class="note" data-id="${esc(t.id)}"></span>`;
+// EVERY interpolation goes through esc(). A description is untrusted text out
+// of tasks.json — anyone who can write that file can write `<script>` — and it
+// is the one field on this page long enough that nobody would notice it had
+// been read as markup rather than shown as text.
+const rmRow = t => {
+  const band = rmBand(t.priority);
+  const desc = String(t.description || "");
+  const waits = t.waits_on || [];
+  const chars = typeof t.chars === "number" ? t.chars : desc.length;
+  // No ordinal means the loop cannot pick this row at all — it is in progress,
+  // quarantined, waiting on a dependency, retired or done. A number there
+  // would claim a place in an order it is not in.
+  const ord = typeof t.ordinal === "number"
+    ? `<span class="ord">${esc(t.ordinal)}</span>`
+    : `<span class="ord none" title="not in the ready order">—</span>`;
+  const chips = [
+    `<span class="chip p" data-band="${band}">p${esc(t.priority)}</span>`,
+    waits.length ? `<span class="chip wait">waits on ${esc(waits.join(", "))}</span>` : "",
+    (t.superseded_by || []).length
+      ? `<span class="chip">superseded by ${esc((t.superseded_by || []).join(", "))}</span>` : "",
+  ].filter(Boolean).join("");
+  return `<details class="task" data-band="${band}" data-id="${esc(t.id)}">
+      <summary>${ord}<span class="mid"><span class="tid">${esc(t.id)}</span>
+        <div class="ttl">${esc(t.title)}</div>
+        <div class="chips">${chips}</div></span>
+      <span class="size">${esc(chars)} ch</span></summary>
+      <div class="body">
+        <pre class="desc">${desc ? esc(desc) : "no description recorded"}</pre>
+        <div class="meta"><span>${esc(t.detail || "—")}</span>
+          <span>priority ${priCell(t)}</span></div>
+      </div></details>`;
+};
+// PURE_ROADMAP_END
+
+function renderRoadmap(d){
+  const groups = d.groups || [];
+  const board = document.getElementById("roadmap");
+  const countEl = document.getElementById("rmcount");
+  if (!groups.length) {
+    // A roadmap with no tasks still renders every group zeroed, so an empty
+    // list can only mean the graph itself did not load. Say which: "no tasks"
+    // and "unreadable" call for opposite reactions.
+    board.innerHTML = `<p class="empty">the task graph could not be read — `
+      + `tasks.json did not load as a registry, so nothing here is grouped. `
+      + `The tasks themselves are still listed by the loop's own commands.</p>`;
+    countEl.textContent = "";
+    return;
+  }
+  const f = (document.getElementById("rmq").value || "").trim().toLowerCase();
+  // `hidden` is the backend's call, not this template's: an empty group is
+  // dropped EXCEPT "Needs a human", which renders and says none. Silence and
+  // "nothing needs you" must not look the same.
+  const shown = groups.filter(g => !g.collapsed && !g.hidden);
+  let total = 0, matched = 0;
+  const body = shown.map(g => {
+    const hits = g.tasks.filter(t => rmMatch(t, f));
+    total += g.tasks.length; matched += hits.length;
+    // The heading count stays the STATE count, never the filtered one: the
+    // summary tiles at the top are derived from this same payload, and a
+    // heading that shrank as you typed would disagree with them.
+    return `<h3 class="gh">${esc(GICON[g.key] || "·")} ${esc(g.label)} `
+      + `<span class="gc">${esc(g.count)}</span></h3>`
+      + (hits.length ? hits.map(rmRow).join("")
+         : `<p class="empty">${g.tasks.length ? "nothing here matches that" : "none"}</p>`);
+  }).join("");
+  board.innerHTML = body
+    + `<p class="muted" style="font-size:12px;margin:5px 0 12px">Open a row for the `
+    + `task's complete description, exactly as tasks.json holds it. The number on `
+    + `the left is execution order, not an index: it is the position `
+    + `next_ready() will select from, so a task waiting on a dependency has none `
+    + `— it cannot be picked whatever its priority. Lower priority runs first; `
+    + `100 is the default. Save writes tasks.json straight away — the number that `
+    + `appears beside the field is read back from the file, so it is what the loop `
+    + `will read. Only priority is editable here.</p>`;
+  countEl.textContent = f ? `${matched} of ${total} shown` : `${total} live task(s)`;
+
+  // Open state is restored HERE rather than in `rmRow`, which keeps that
+  // function pure. `toggle` does not bubble, so it is bound per row: a
+  // delegated listener on #roadmap would simply never fire.
+  board.querySelectorAll("details.task").forEach(el => {
+    const id = el.dataset.id;
+    if (RMOPEN.has(id)) el.open = true;
+    el.addEventListener("toggle", () => {
+      if (el.open) RMOPEN.add(id); else RMOPEN.delete(id);
+    });
+  });
+
+  // SCOPED to #roadmap on purpose. These rows are rebuilt as fresh DOM on every
+  // render, so rebinding them each time is free — but the new-task form's
+  // button and this panel's Expand-all share the `save` class for styling and
+  // are STATIC, so an unscoped `button.save` would hand each of them one extra
+  // click listener per poll, each looking up an `input.pri[data-id="undefined"]`
+  // that does not exist.
+  document.querySelectorAll("#roadmap button.save").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id;
+      const input = document.querySelector(`input.pri[data-id="${CSS.escape(id)}"]`);
+      const note = document.querySelector(`span.note[data-id="${CSS.escape(id)}"]`);
+      const value = parseInt(input.value, 10);
+      if (!Number.isInteger(value)) { note.className = "note savefail"; note.textContent = " ✗ not a number"; return; }
+      btn.disabled = true; note.className = "note"; note.textContent = " …";
+      try {
+        const r = await fetch("/api/priority", {
+          method: "POST",
+          headers: {"Content-Type": "application/json", "X-Autoloop": "1"},
+          body: JSON.stringify({id, priority: value}),
+        });
+        const body = await r.json();
+        // The number shown back is the server's READ-BACK from tasks.json, not
+        // the one that was typed, and the input is set to it: if the two ever
+        // disagree the field says what actually persisted rather than what was
+        // asked for. A failure says so and leaves the typed value alone — a row
+        // that silently snapped back is the bug this endpoint exists to fix.
+        if (r.ok) {
+          input.value = body.priority;
+          note.className = "note saved"; note.textContent = ` ✓ saved (${esc(body.priority)})`;
+        }
+        else { note.className = "note savefail"; note.textContent = " ✗ " + (body.error || r.status); }
+      } catch (e) {
+        note.className = "note savefail"; note.textContent = " ✗ " + e;
+      } finally { btn.disabled = false; LASTJSON = null; }
+    });
+  });
+}
+
 function render(d, force){
   if (!d) return;
   // No skeleton flash on refetch: a 2s poll that rebuilt identical DOM threw
@@ -2104,54 +2457,15 @@ function render(d, force){
     }).join(""));
 
   // ---- roadmap, grouped by state ----------------------------------------
-  // Every group here was decided by `TaskRegistry.state_of()` on the backend \u2014
-  // the same function the loop dispatches on. NOTHING in this block reads a
-  // status string: `blocked` on disk means QUARANTINED, while the Blocked
-  // group means "waiting on an incomplete dependency", and a page that mixed
-  // those up would send an operator to answer a blocker that does not exist.
-  // Retired is the third of those and needs nobody at all \u2014 its row names the
-  // successor instead of asking for anything.
-  //
-  // Priority editing writes tasks.json IMMEDIATELY (2026-08-16), under the
-  // fine-grained mutex the loop's own saves take, and the row then shows the
-  // value the server read BACK from the file. A Save is "saved", not "queued":
-  // an operator steers with priority, so a change that lands on the loop's next
-  // drain has missed the decision it was for. Creation is still queued to the
-  // inbox \u2014 that one carries authorization.
-  const GICON = {in_progress:"\u25b6", needs_human:"\u25a0", ready:"\u25cb", blocked:"\u25cd",
-                 retired:"\u2298", done:"\u2713"};
+  // Built by `renderRoadmap` above \u2014 the same function the search box calls, so
+  // typing a filter cannot produce a different panel from the one a poll
+  // builds, and the rows an operator opened survive both. Its comment block
+  // carries the rules (state_of, never the status string; priority applied
+  // immediately, creation still queued) that used to sit here.
   const groups = d.groups || [];
-  const priCell = t => `<input class="pri" type="number" step="1" value="${esc(t.priority)}"
-         data-id="${esc(t.id)}" aria-label="priority for ${esc(t.id)}">
-        <button class="save" data-id="${esc(t.id)}">Save</button>
-        <span class="note" data-id="${esc(t.id)}"></span>`;
-  const groupRows = g => rows(["task","priority","title","detail"], g.tasks.map(t =>
-    `<tr><td><code>${esc(t.id)}</code></td><td>${priCell(t)}</td>
-      <td>${esc((t.title||"").slice(0,70))}</td>
-      <td class="muted">${esc(t.detail || "\u2014")}</td></tr>`).join(""));
-  const board = document.getElementById("roadmap");
-  if (!groups.length) {
-    // A roadmap with no tasks still renders every group zeroed, so an empty
-    // list can only mean the graph itself did not load. Say which: "no tasks"
-    // and "unreadable" call for opposite reactions.
-    board.innerHTML = `<p class="empty">the task graph could not be read \u2014 `
-      + `tasks.json did not load as a registry, so nothing here is grouped. `
-      + `The tasks themselves are still listed by the loop's own commands.</p>`;
-  } else {
-    // `hidden` is the backend's call, not this template's: an empty group is
-    // dropped EXCEPT "Needs a human", which renders and says none. Silence and
-    // "nothing needs you" must not look the same.
-    board.innerHTML = groups.filter(g => !g.collapsed && !g.hidden).map(g =>
-      `<h3 class="gh">${esc(GICON[g.key] || "\u00b7")} ${esc(g.label)} `
-      + `<span class="gc">${esc(g.count)}</span></h3>` + groupRows(g)).join("")
-      + `<p class="muted" style="font-size:12px;margin:9px 0 0">Lower number runs `
-      + `first; 100 is the default. Ready is listed in the order the loop would `
-      + `pick it. Save writes tasks.json straight away — the number that appears `
-      + `beside the field is read back from the file, so it is what the loop will `
-      + `read. Only priority is editable here.</p>`;
-  }
-  // Collapsed, counted, and never carrying a priority input: the per-render
-  // Save binding below is scoped to #roadmap, so a button here would render
+  renderRoadmap(d);
+  // Collapsed, counted, and never carrying a priority input: the Save binding
+  // in `renderRoadmap` is scoped to #roadmap, so a button here would render
   // with no listener \u2014 and re-prioritising a finished or retired task means
   // nothing.
   //
@@ -2183,42 +2497,6 @@ function render(d, force){
         `<tr><td><code>${esc(t.id)}</code></td>
           <td>${esc((t.title||"").slice(0,70))}</td></tr>`).join(""))
     : `<p class="empty">unknown</p>`;
-
-  // SCOPED to #roadmap on purpose. These rows are rebuilt as fresh DOM on every
-  // render, so rebinding them each time is free — but the new-task form's
-  // button shares the `save` class for styling and is STATIC, so an unscoped
-  // `button.save` would hand it one extra click listener per poll, each looking
-  // up an `input.pri[data-id="undefined"]` that does not exist.
-  document.querySelectorAll("#roadmap button.save").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.id;
-      const input = document.querySelector(`input.pri[data-id="${CSS.escape(id)}"]`);
-      const note = document.querySelector(`span.note[data-id="${CSS.escape(id)}"]`);
-      const value = parseInt(input.value, 10);
-      if (!Number.isInteger(value)) { note.className = "note savefail"; note.textContent = " ✗ not a number"; return; }
-      btn.disabled = true; note.className = "note"; note.textContent = " …";
-      try {
-        const r = await fetch("/api/priority", {
-          method: "POST",
-          headers: {"Content-Type": "application/json", "X-Autoloop": "1"},
-          body: JSON.stringify({id, priority: value}),
-        });
-        const body = await r.json();
-        // The number shown back is the server's READ-BACK from tasks.json, not
-        // the one that was typed, and the input is set to it: if the two ever
-        // disagree the field says what actually persisted rather than what was
-        // asked for. A failure says so and leaves the typed value alone — a row
-        // that silently snapped back is the bug this endpoint exists to fix.
-        if (r.ok) {
-          input.value = body.priority;
-          note.className = "note saved"; note.textContent = ` ✓ saved (${esc(body.priority)})`;
-        }
-        else { note.className = "note savefail"; note.textContent = " ✗ " + (body.error || r.status); }
-      } catch (e) {
-        note.className = "note savefail"; note.textContent = " ✗ " + e;
-      } finally { btn.disabled = false; LASTJSON = null; }
-    });
-  });
 
   // A queued creation request carries approved_paths, and the loop merges it
   // without asking again — so the paths are spelled out here rather than
@@ -2357,6 +2635,30 @@ ntform.addEventListener("submit", async e => {
     } else { fail(body.error || r.status); }
   } catch (err) { fail(err); }
   finally { btn.disabled = false; LASTJSON = null; }
+});
+
+// ---- roadmap search + expand-all ---------------------------------------
+// Bound ONCE, here, because both controls are static markup — inside
+// `renderRoadmap` they would gain a duplicate listener on every 2s poll.
+//
+// The filter re-renders from LAST rather than refetching: it is a view of the
+// payload already on the page, so typing must not wait on a round trip, and
+// `renderRoadmap` reads the field's current value on every poll so a search
+// survives the refresh instead of being wiped by it.
+document.getElementById("rmq").addEventListener("input", () => {
+  if (LAST) renderRoadmap(LAST);
+});
+document.getElementById("rmexpand").addEventListener("click", () => {
+  const btn = document.getElementById("rmexpand");
+  const els = [...document.querySelectorAll("#roadmap details.task")];
+  // Open everything unless everything is already open, then collapse — one
+  // button, and its label says which it will do next.
+  const open = els.some(el => !el.open);
+  els.forEach(el => {
+    el.open = open;
+    if (open) RMOPEN.add(el.dataset.id); else RMOPEN.delete(el.dataset.id);
+  });
+  btn.textContent = open ? "Collapse all" : "Expand all";
 });
 
 // Theme toggle. The stamp goes on <html>, which both dark scopes key off, so

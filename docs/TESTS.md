@@ -1997,6 +1997,59 @@ as `Task.description`, nothing dispatches per step, and splitting a task
 remains `split-01`'s atomic mechanism across the registry, the execution record
 and the worker repo.
 
+**A task's full description on the dashboard, expandable (2026-08-18,
+`dash-10`; +8 functions in `test_dashboard.py`, plus two helpers
+(`pure_roadmap_js`, `run_js`) that are in neither figure. Hand-counted, no
+shell in the worker; that is what this change added, not a re-audit of the
+file's total.)** The roadmap panel sent `id`, `title` and `priority` and
+nothing else, so the one question an operator has about a queued task — what
+does it actually say — could only be answered by opening `.autoloop/tasks.json`
+by hand, and that is the file the whole roadmap is steered from. Each live row
+is now a `<details>`: ordinal, id, title, priority chip, "waits on" chip, char
+count, and the complete description in a `pre` with `white-space:pre-wrap`.
+
+Four properties carry it, and each is asserted rather than described:
+
+* **The description is carried WHOLE.** `test_a_tasks_full_description_reaches_
+  the_page_untruncated` drives a >5,000-character description through
+  `collect()` and asserts EQUALITY, not a prefix: a truncation is invisible on
+  the page, because a cut description reads exactly like a task that really is
+  that short — which is the failure being fixed, not a smaller version of it.
+* **It is ESCAPED, and the test RUNS the escaping** rather than grepping the
+  template for `esc(`. `tasks.json` is untrusted input to this page (anyone who
+  can write that file can write `<script>`), and a template that escapes the
+  title and forgets the description passes every string check. The page's pure
+  row helpers sit between `PURE_ROADMAP_START`/`PURE_ROADMAP_END` markers,
+  `pure_roadmap_js()` lifts them verbatim, and `run_js` executes them under node
+  against a hostile description — skipping, never faking, when node is absent,
+  for the same reason `test_the_served_javascript_actually_parses` does.
+* **The ordinal is pinned against the real `next_ready()`**, not against a
+  repeat of its sort key: `test_the_ordinal_is_the_position_next_ready_would_
+  pick` runs the actual `next_ready()`/`mark_completed()` loop on a registry of
+  its own and demands the same sequence, the same shape
+  `test_the_ready_group_is_in_next_ready_order` already uses.
+* **A task that cannot be picked has NO ordinal** and names what it waits on.
+  The blocked fixture gives `b-1` the BEST priority in the roadmap, so a number
+  beside it would claim the loop picks it first; `waits_on` lists only the
+  INCOMPLETE dependencies and comes from the same `_waiting_on` the prose
+  `detail` is formatted from, so the chip and the sentence cannot disagree. It
+  is populated for the BLOCKED group only — `state_of` says in as many words
+  that a retirement usually still declares the dependencies it was planned
+  with, so filling it in unconditionally would hang a "waits on" chip on a task
+  that waits on nobody, which is the misread `TaskState.RETIRED` exists to end.
+
+Two more pin the parts a screenshot would otherwise be the only record of: the
+`--rm-*` tokens are declared on bare `:root`, under the guarded dark media
+query and under `:root[data-theme="dark"]` (so the toggle beats the OS setting
+in both directions), the priority BAND is its own ramp and never a
+`--good`/`--warning`/`--critical` role (a p0 is urgent, not broken), and the
+page stays self-contained — no `<link`, `@import` or external `src`. The search
+box is static markup re-rendering through the SAME function a poll uses, so a
+filtered panel and a polled one cannot disagree, and open rows are restored
+from `RMOPEN` because a successful priority save clears `LASTJSON` to force a
+rebuild — without it, editing a priority would snap shut the row being read.
+`/api/priority` and its handler are untouched; this change is display only.
+
 The contract text grew by a measured 140 characters and was paid for with 150
 freed by compressing prose that states the same rules in fewer words, so
 `test_contract_stays_within_its_budget` keeps its 3,700 ceiling untouched (net

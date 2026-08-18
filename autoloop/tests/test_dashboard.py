@@ -1975,3 +1975,318 @@ def test_the_summary_renders_at_the_top_of_the_page():
     # selection for nothing.
     body = script.split("function render(d, force){", 1)[1]
     assert body.index("sig === LASTJSON") < body.index("renderStats(d.stats)")
+
+
+# ---- the roadmap docket: full descriptions, expandable (2026-08-18) -----------
+#
+# The panel sent `id`, `title` and `priority` and nothing else, so the one
+# question an operator actually has about a queued task — what does it say —
+# could only be answered by opening `.autoloop/tasks.json` by hand, and that is
+# the file the whole roadmap is steered from.
+#
+# Four properties carry the feature, and each is asserted rather than described:
+#
+# * the WHOLE description reaches the page (a truncation is invisible on the
+#   page — it reads exactly like a task that really is that short);
+# * it is ESCAPED, because it is untrusted text from a file going into HTML;
+# * the ORDINAL is the position `next_ready()` selects from, pinned against the
+#   real method rather than against a repeat of its sort key; and
+# * a task that cannot be picked has NO ordinal and names what it waits on.
+#
+# The escaping and the filter are asserted by RUNNING the page's own helpers
+# under node rather than by grepping for `esc(`. A template that interpolates
+# `esc(t.description)` into the wrong place, or a filter that reads `t.title`
+# twice, passes every string check and fails these.
+
+
+def pure_roadmap_js() -> str:
+    """The roadmap panel's pure helpers, lifted verbatim out of the served page.
+
+    Everything between the markers is payload-in / string-out, with no DOM and
+    no module state, so it can be executed directly. `esc` comes along because
+    every helper in there depends on it — and it is the function under test in
+    the escaping case.
+    """
+    script = PAGE.split("<script>", 1)[1]
+    esc_line = next(
+        line for line in script.splitlines() if line.startswith("const esc =")
+    )
+    region = script.split("// PURE_ROADMAP_START", 1)[1].split("// PURE_ROADMAP_END", 1)[0]
+    return esc_line + "\n" + region
+
+
+def run_js(source: str) -> str:
+    """Run `source` under node and return its stdout.
+
+    Skipped rather than faked when node is absent, exactly as the syntax check
+    above is: a hand-rolled JS interpreter would be testing the interpreter.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    node = shutil.which("node")
+    if node is None:  # pragma: no cover - environment without node
+        pytest.skip("node is required to run the page's own helpers")
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".js", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(source)
+        path = handle.name
+    result = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"the page's helpers threw:\n{result.stderr[:800]}"
+    return result.stdout
+
+
+def test_a_tasks_full_description_reaches_the_page_untruncated(tmp_path):
+    """The whole point of the change. A slice would be indistinguishable on the
+    page from a task that really is that short — which is the failure being
+    fixed, not a smaller version of it — so this asserts EQUALITY against a
+    description far longer than any cap the file has ever applied (`title` is
+    still cut to 180 in the audit-report panel next door).
+
+    Driven through `collect()` because the panel renders `groups`, so a field
+    added to `_grouped` and dropped on the way out would still fail here.
+    """
+    repo = make_repo(tmp_path)
+    long_desc = "WHAT IS MISSING.\n\n" + ("the roadmap is steered from this file. " * 130)
+    assert len(long_desc) > 5000
+    write_registry(repo, [roadmap_task("dash-10", description=long_desc)])
+
+    row = groups_by_key(collect(repo)["groups"])["ready"]["tasks"][0]
+
+    assert row["description"] == long_desc
+    assert row["chars"] == len(long_desc)
+    # …and the page puts it in the DOM, in a pre that keeps its shape: these
+    # are hard-wrapped plain text with ALL-CAPS heads, so a reflow would
+    # destroy information the description carries in its layout.
+    static_markup, script = PAGE.split("<script>", 1)
+    assert '<pre class="desc">' in script
+    # pre-wrap, not a clamp and not a truncation: the descriptions are
+    # hard-wrapped plain text with ALL-CAPS heads and indented lists, so their
+    # shape carries meaning a reflow would destroy.
+    assert "white-space:pre-wrap" in static_markup
+
+
+def test_a_description_full_of_html_is_shown_as_text_not_run_as_markup():
+    """`tasks.json` is untrusted input to this page: anyone who can write that
+    file can write `<script>`, and the description is the one field long enough
+    that nobody would notice it had been parsed rather than displayed.
+
+    This RUNS the page's own row template rather than grepping it for `esc(`.
+    A template that escapes the title and forgets the description passes every
+    string check and fails here.
+    """
+    hostile = '<script>alert("x")</script> & <img src=x onerror=1> a < b'
+    out = run_js(pure_roadmap_js() + """
+const row = rmRow({id: "x-1", title: "T & <b>", description: HOSTILE,
+                   priority: 1, ordinal: 1, detail: "d", waits_on: [],
+                   superseded_by: [], chars: HOSTILE.length});
+process.stdout.write(row);
+""".replace("HOSTILE", json.dumps(hostile)))
+
+    assert "<script>" not in out and "<img" not in out
+    assert "&lt;script&gt;" in out and "&lt;img src=x onerror=1&gt;" in out
+    # `&` too, not only the angle brackets: `a &amp; b` must render as the
+    # ampersand the task wrote, never as the head of an entity.
+    assert "&amp;" in out
+    # The title is escaped by the same pass, and nothing has been dropped: the
+    # visible text is all still there, just as text.
+    assert "a &lt; b" in out
+
+
+def test_the_ordinal_is_the_position_next_ready_would_pick():
+    """The number in the left rail is information, not decoration: it is the
+    position `next_ready()` selects from, so it must survive the same pin the
+    Ready group's ORDER already has — the real `next_ready()`/`mark_completed()`
+    loop, run here on a registry of its own.
+
+    The fixture makes insertion order differ from priority order and ties
+    `r-a`/`r-b` so the id tiebreak is exercised.
+    """
+    rows = [
+        roadmap_task("r-c", priority=5),
+        roadmap_task("r-b", priority=1),
+        roadmap_task("r-a", priority=1),
+        roadmap_task("wip-1", status="in_progress"),
+        roadmap_task("b-1", depends_on=["wip-1"]),
+    ]
+    groups = groups_by_key(task_groups({"tasks": rows}, {}))
+
+    ordered = [(t["ordinal"], t["id"]) for t in groups["ready"]["tasks"]]
+
+    registry = TaskRegistry.from_dict({"tasks": [dict(row) for row in rows]})
+    picks = []
+    while (nxt := registry.next_ready()) is not None:
+        picks.append(nxt.id)
+        registry.mark_completed(nxt.id)
+
+    assert picks == ["r-a", "r-b", "r-c"], "the fixture must exercise both keys"
+    assert ordered == [(1, "r-a"), (2, "r-b"), (3, "r-c")]
+    # Nothing outside the ready set is numbered — none of it can be picked,
+    # whatever its priority, and an ordinal there would be a claim about
+    # dispatch order that the loop does not honour.
+    assert groups["in_progress"]["tasks"][0]["ordinal"] is None
+    assert groups["blocked"]["tasks"][0]["ordinal"] is None
+
+
+def test_a_dependency_blocked_task_has_no_ordinal_and_names_what_it_waits_on():
+    """Blocked is the case the ordinal exists to exclude: `b-1` here outranks
+    every ready task on priority and still cannot run, so a number beside it
+    would say the loop will pick it first. It carries the dependency instead —
+    and only the INCOMPLETE ones, since a finished dependency is not why
+    anything is waiting.
+    """
+    groups = groups_by_key(task_groups({"tasks": [
+        roadmap_task("done-1", status="completed"),
+        roadmap_task("wip-1", status="in_progress"),
+        roadmap_task("r-1", priority=9),
+        roadmap_task("b-1", priority=1, depends_on=["done-1", "wip-1"]),
+    ]}, {}))
+
+    blocked = groups["blocked"]["tasks"][0]
+    assert blocked["id"] == "b-1"
+    assert blocked["ordinal"] is None
+    assert blocked["waits_on"] == ["wip-1"]
+    # The chip and the prose sentence come from one function, so they can never
+    # name different dependencies.
+    assert blocked["detail"] == "waiting on wip-1"
+    # A ready task waits on nothing and says so with an empty list rather than
+    # with a chip reading "waits on".
+    assert groups["ready"]["tasks"][0]["waits_on"] == []
+
+    # A retirement usually still declares the dependencies it was planned with
+    # (`state_of` says so in as many words), so filling this in for every state
+    # would hang a "waits on" chip on a task that waits on nobody — the exact
+    # misread `TaskState.RETIRED` was added to end.
+    retired = groups_by_key(task_groups({"tasks": [
+        roadmap_task("wip-1", status="in_progress"),
+        roadmap_task("rt-1", status="retired", depends_on=["wip-1"],
+                     superseded_by=["wip-1"]),
+    ]}, {}))["retired"]["tasks"][0]
+    assert retired["waits_on"] == [] and retired["ordinal"] is None
+
+
+def test_the_search_matches_description_text_not_only_titles():
+    """Half of what an operator searches for is only in the description — the
+    file a task touches, the constraint it was given — so a filter reading ids
+    and titles alone would answer "nothing matches" for a task that is on the
+    page. Run, not grepped, for the same reason the escaping test is."""
+    out = run_js(pure_roadmap_js() + """
+const t = {id: "dash-10", title: "Show a task's full description",
+           description: "the roadmap is steered from .autoloop/tasks.json"};
+process.stdout.write(JSON.stringify({
+  byDescription: rmMatch(t, "steered"),
+  byPathInDescription: rmMatch(t, "tasks.json"),
+  byId: rmMatch(t, "dash-1"),
+  byTitle: rmMatch(t, "full description"),
+  noMatch: rmMatch(t, "postgres"),
+  emptyFilterKeepsEverything: rmMatch(t, ""),
+  missingDescriptionIsNotAThrow: rmMatch({id: "x", title: "y"}, "y"),
+}));
+""")
+
+    assert json.loads(out) == {
+        "byDescription": True,
+        "byPathInDescription": True,
+        "byId": True,
+        "byTitle": True,
+        "noMatch": False,
+        "emptyFilterKeepsEverything": True,
+        "missingDescriptionIsNotAThrow": True,
+    }
+
+
+def test_the_priority_band_is_its_own_ramp_and_never_a_status_colour():
+    """Priority decides execution order, which is a different axis from health:
+    a p0 is urgent, not broken. So the bands are their own `--rm-band-*` tokens
+    and none of them is `--good`/`--warning`/`--critical`, the roles reserved
+    for verdicts everywhere else on this page."""
+    out = json.loads(run_js(pure_roadmap_js() + """
+process.stdout.write(JSON.stringify([0, 2, 3, 5, 6, 8, 9, 100].map(rmBand)
+  .concat([rmBand(null), rmBand(undefined)])));
+"""))
+    assert out == ["urgent", "urgent", "active", "active", "queued", "queued",
+                   "parked", "parked", "parked", "parked"]
+
+    for band, light, dark in (("urgent", "#A83C2A", "#E0866F"),
+                              ("active", "#966C15", "#D3A44E"),
+                              ("queued", "#3B6096", "#84A9DB"),
+                              ("parked", "#6C7A77", "#8B9895")):
+        assert f"--rm-band-{band}:{light}" in PAGE
+        # Declared in BOTH dark scopes: the media query (guarded so an explicit
+        # light stamp still wins) and the explicit `data-theme="dark"`.
+        assert PAGE.count(f"--rm-band-{band}:{dark}") == 2
+    band_rules = "".join(
+        line for line in PAGE.splitlines() if "--rm-band-" in line
+    )
+    for reserved in ("--good", "--warning", "--serious", "--critical"):
+        assert reserved not in band_rules
+
+
+def test_every_docket_colour_is_a_token_declared_in_all_three_theme_scopes():
+    """So the panel survives with no reference file to copy from. Each colour is
+    a token on bare `:root`, redefined under the dark media query — guarded with
+    `:root:not([data-theme="light"])` so an explicit light choice still wins —
+    and again under `:root[data-theme="dark"]` so the toggle beats an OS
+    setting in both directions."""
+    light, rest = PAGE.split('@media (prefers-color-scheme:dark)', 1)
+    media, explicit = rest.split(':root[data-theme="dark"]', 1)
+    for token, value in (("ground", "#F2F6F5"), ("surface", "#FFFFFF"),
+                         ("ink", "#141D1B"), ("muted", "#5B6B68"),
+                         ("line", "#DBE5E2"), ("accent", "#2F7268")):
+        assert f"--rm-{token}:{value}" in light, f"--rm-{token} is not a light token"
+    for token, value in (("ground", "#0E1413"), ("surface", "#151E1C"),
+                         ("ink", "#E2EBE8"), ("muted", "#8FA09C"),
+                         ("line", "#243130"), ("accent", "#63B9A8")):
+        assert f"--rm-{token}:{value}" in media, f"--rm-{token} has no dark value"
+        assert f"--rm-{token}:{value}" in explicit, f"--rm-{token} ignores the toggle"
+    assert ':root:not([data-theme="light"])' in media
+
+    # Type roles: serif for the page name and the task titles, monospace for
+    # ids, ordinals, counts and the descriptions, system sans (from `body`) for
+    # everything else.
+    for rule in ("#roadmap .ttl{font-family:ui-serif", "#roadmap .ord{font-family:ui-monospace",
+                 "#roadmap .tid{font-family:ui-monospace", "#roadmap .size{font-family:ui-monospace",
+                 "#roadmap pre.desc{"):
+        assert rule in PAGE, f"{rule} is missing"
+    assert "font-family:ui-serif" in PAGE.split("h1{", 1)[1].split("}", 1)[0]
+
+    # Self-contained: no stylesheet, font or script fetched from anywhere.
+    for external in ("<link", "@import", "src=\"http", "fonts.googleapis"):
+        assert external not in PAGE, f"{external} makes the page non-self-contained"
+
+
+def test_the_docket_is_rendered_by_one_function_the_search_box_also_calls():
+    """A payload carrying the descriptions is not a page showing them.
+
+    The shape matters as much as the strings: the search box is STATIC markup
+    (inside `#roadmap` its half-typed text would be erased by the 2s poll) and
+    it re-renders through the SAME function a poll uses, so a filtered panel and
+    a polled one cannot disagree. Open rows are restored from `RMOPEN` because a
+    successful priority save clears `LASTJSON` to force a rebuild — without it,
+    editing a priority would snap shut the row being read.
+    """
+    static_markup, script = PAGE.split("<script>", 1)
+
+    assert '<div id="roadmap" class="scroll"></div>' in static_markup
+    assert 'id="rmq"' in static_markup and 'id="rmexpand"' in static_markup
+    assert static_markup.index('id="rmq"') < static_markup.index('id="roadmap"')
+
+    for field in ("t.description", "t.ordinal", "t.waits_on", "t.chars", "t.detail",
+                  "t.priority", "g.label", "g.count"):
+        assert field in script, f"{field} never reaches the DOM"
+    assert "function renderRoadmap(d){" in script
+    assert "renderRoadmap(d);" in script and "renderRoadmap(LAST)" in script
+    # Open state survives the rebuild, and `toggle` is bound per row because it
+    # does not bubble — a delegated listener on #roadmap would never fire.
+    assert 'addEventListener("toggle"' in script and "RMOPEN" in script
+    # The heading count stays the STATE count under an active filter: the
+    # summary tiles above are derived from this same payload, and a heading
+    # that shrank as you typed would disagree with them.
+    body = script.split("function renderRoadmap(d){", 1)[1].split("\nfunction ", 1)[0]
+    assert "esc(g.count)" in body and "matched" in body
+    # Priority editing is untouched, still applied immediately and still read
+    # back from tasks.json — this change is display only.
+    assert 'querySelectorAll("#roadmap button.save")' in script
+    assert '"/api/priority"' in script
