@@ -12,8 +12,11 @@ Protocol v2. Two structural rules distinguish it from v1:
   `verify_review` checks the stamp against what was actually sent, so an
   approval can never be applied to a state ChatGPT did not review.
 * **`implement` carries the decomposition it authorizes.** `Decomposition`
-  below — approach, expected files, ordered steps — rides on the directive
-  that already starts the work, so planning costs no extra round. It is
+  below — approach, expected files, and the steps to work in order (the key is
+  literally `steps`; the ordering is a rule about them, not part of the key
+  name, and the documented spelling is pinned to the parsed one by test) —
+  rides on the directive that already starts the work, so planning costs no
+  extra round. It is
   OPTIONAL at this layer and required by `policy.authorize_directive`, exactly
   like `TaskSpec.approved_paths`: see `Decomposition` for why the enforcement
   lives there and not here.
@@ -277,8 +280,8 @@ trailing text is REJECTED, never guessed at. One object, these keys only:
              with no approved path cannot be implemented.
   task_id    (required for implement/revise; optional for commit /
              commit_and_push, marking that task completed)
-  decomposition (required for implement) {approach, files, ordered steps};
-             one step with a reason is a valid decomposition.
+  decomposition (required for implement) {approach, files, steps}; steps are
+             worked in order; one step with a reason is valid.
   feedback   (required for revise) what is wrong and must change
   commit     (required for commit/commit_and_push) an object:
                message (required) the full commit message

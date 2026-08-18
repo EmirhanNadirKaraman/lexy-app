@@ -1903,9 +1903,10 @@ Deliberately not replaced with an arithmetic guess — re-run the suite and
 record what it actually reports rather than trusting a summed total.
 
 **Every task is decomposed and the decomposition approved before any code is
-written (2026-08-18, `plan-01`; +9 functions / 20 collected in
-`test_contract.py`, +6 / 8 in `test_policy.py`, +7 in `test_tasks.py`, +2 in
-`test_orchestrator.py`, +2 in `test_implement_executor.py`. Hand-counted, no
+written (2026-08-18, `plan-01`; +11 functions / 22 collected in
+`test_contract.py`, +6 / 8 in `test_policy.py`, +7 in `test_tasks.py`, +4 in
+`test_orchestrator.py`, +2 in `test_implement_executor.py`, +11 in
+`test_context.py`. Hand-counted, no
 shell in the worker; these are what this change added, not a re-audit of any
 row's total.)** Operator decision
 of 2026-08-17, unconditional: the tasks that failed were not obviously large
@@ -1922,7 +1923,7 @@ plan round would add one round to EVERY task, against the one to three that
 tasks currently take — a 30-100% tax on the common case, paid to catch the
 occasional oversized one.
 
-Five properties carry it, each with tests that fail when it is removed:
+Six properties carry it, each with tests that fail when it is removed:
 
 * **Shape is the parser's job, requirement is policy's.** `contract`
   parses `decomposition` (approach, files, steps) when it is present and
@@ -1964,6 +1965,32 @@ Five properties carry it, each with tests that fail when it is removed:
   un-approve a task. A `decomposition` sent with `revise task_id="audit"` is
   REFUSED rather than accepted and dropped — the audit is not a roadmap task,
   so nothing would store or apply one.
+* **Every actionable request carries what the decision needs** (added by the
+  first revision round). The gate is only answerable if the request carrying it
+  is self-contained, and it was not: `roadmap` offered the next READY task as an
+  id and a title, and no review packet showed the stored plan — so a reviewer
+  that is fresh, rotated onto a new conversation or switched to the fallback
+  provider had to guess a task's files and steps before the first dispatch, and
+  on a later `revise` could not tell whether its feedback fitted the approved
+  plan. `context.py` now renders both briefs into the block every request
+  already carries (`test_context.py`'s brief section, plus two end-to-end pins
+  in `test_orchestrator.py`): `next_ready` with the task's FULL description and
+  its effective scope including trackers, and `in_review` with the stored
+  decomposition VERBATIM — a paraphrase would make "fits the plan" and "needs a
+  reshape" indistinguishable, which is the decision the section exists to
+  support. Rendered in the shared CONTEXT block rather than per payload
+  template, so no template can forget it, and appended strictly after the stamp
+  lines because a description is text this package did not author
+  (`docs/SECURITY.md` S33). The description is carried on the READY side only:
+  CONTEXT is not chunked, a review request already holds a diff, and restating
+  it there would double the largest requests. **The schema is pinned to the key
+  that actually parses** — the response format documented `{approach, files,
+  ordered steps}` while the accepted key was literally `steps`, so a reviewer
+  copying the documentation would have spent the small parse-retry budget on a
+  correction the instructions caused, on a field that is now mandatory. The
+  pin asserts the documented set equals `contract._DECOMPOSITION_KEYS` and that
+  `ordered steps` draws `unknown_keys`, rather than a substring a reword could
+  satisfy vacuously.
 
 No second split mechanism was added: the steps are prose in the same category
 as `Task.description`, nothing dispatches per step, and splitting a task

@@ -41,6 +41,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S28 | MEDIUM | The dashboard's unauthenticated localhost POST can now queue a task CREATION request, which carries `approved_paths` — so its blast radius is a future agent's write scope, not just a priority number | `autoloop/dashboard.py` |
 | S30 | MEDIUM | The inbox vocabulary grew from create+priority to six mutation kinds, so a queued request can now rewrite an EXISTING task's `approved_paths` and `description` — falsifying S28's "it creates, never widens" bound. Guarded: nothing `in_progress`/`completed`/`retired` is editable, mutations share creation's validators, `block`/`unblock` cannot launder a loop-raised quarantine, `retire` is excluded, and no dashboard endpoint reaches any of it | `autoloop/inbox.py`, `autoloop/tasks.py` |
 | S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
+| S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -729,6 +730,69 @@ and the dashboard reads — that turns the attestation into an authentication an
 closes the forged-record residual. Do NOT close it by widening the exemption to
 the whole state dir, and do NOT let a second field join `priority`: the "what"
 half of the check is the only thing keeping a forged record cheap.
+
+### S33 — Task descriptions and stored plans are rendered into the CONTEXT block that carries the review-integrity stamp — LOW — OPEN (bounded, accepted)
+
+**What:** since 2026-08-18 (`plan-01`) `autoloop/context.py` renders two task
+briefs into every request: `next_ready` (the READY task's id, title, FULL
+description and effective `approved_paths`) and `in_review` (the task under
+review, with its stored `decomposition`). Both are needed because `implement`
+now REQUIRES a decomposition and `revise` may reuse the stored one — decisions
+nobody can make from an id and a title — but they put text this package did not
+author (an operator's task description, a reviewer's own earlier plan) into the
+same block that carries `request_id` / `head_sha` / `report_sha256`, the values
+a commit/push approval must copy.
+
+**The exposure, stated plainly:** a description containing a line like
+`report_sha256: 0000…` renders a second stamp-shaped line inside the CONTEXT
+block. A reviewer (or any reader) that takes "the value after the label" could
+read the planted one.
+
+**Why it is bounded rather than open-ended — two independent reasons:**
+1. **Ordering.** Both briefs are appended STRICTLY after every stamp line, so a
+   first-match read still lands on the real value. Pinned by
+   `test_context.test_briefs_are_rendered_after_every_stamp_line` (whose
+   description contains a forged stamp line) and by
+   `test_orchestrator.test_the_request_that_offers_ready_work_carries_what_to_
+   plan_it_from`, not left to where someone happened to append.
+2. **Verification, which is the actual control.** `contract.verify_review`
+   compares all three echoed values against what was recorded for that request
+   (`PendingRequest`), so a copied forgery draws `review_mismatch:*` and the
+   approval is REFUSED. The failure mode is a denied push, never a push bound to
+   a review that did not happen.
+
+**Not mitigated by editing the text, deliberately.** The description is rendered
+verbatim and uncapped: the reviewer cannot open the repository, so a truncated
+or escaped description is one it would silently plan around — a worse failure
+than a long request. This is the same trust boundary `S14` records for
+user-content prompts, at the loop layer.
+
+**Who can write the input:** whoever can plan a task (the reviewer itself, via
+`plan`), the operator (`seed_tasks.json`, `python -m autoloop`, the inbox's
+`description` kind — see S30), and nobody else. This is not learner-supplied
+content.
+
+**file:line** — `autoloop/context.py` (`TaskBrief`, `_render_brief`,
+`render_context`'s ordering comment); `autoloop/contract.py` (`verify_review`).
+**Severity:** LOW — it inserts unauthored text into a security-relevant block,
+but the value that block exists to carry is verified against a recorded copy,
+and the writers are already-privileged.
+**Verification check:**
+```bash
+# Expect: the briefs are appended AFTER the stamp lines — the list is built,
+# then extended; nothing may insert a brief above `report_sha256`
+rg -n 'lines \+= _render_brief|report_sha256: ' autoloop/context.py
+# Expect: the regression that plants a stamp-shaped line in a description
+rg -n 'briefs_are_rendered_after_every_stamp_line' autoloop/tests/test_context.py
+# Expect: all three values compared against what was recorded, not what was echoed
+rg -n 'review_mismatch' autoloop/contract.py
+```
+**Suggested fix (only if this ever needs to be stronger):** move the briefs into
+the PAYLOAD rather than the CONTEXT block, so the stamp block contains only
+values this package wrote. That costs the per-template duplication this design
+avoided (every payload template would have to carry them, and a new template
+could forget), so it is worth doing only if a second unauthored-text section is
+ever added here.
 
 ### S29 — `merge` is on the git whitelist, and the loop now pushes the BASE branch — LOW — OPEN (deliberate, gated, accepted)
 

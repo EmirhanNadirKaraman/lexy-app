@@ -14,6 +14,7 @@ from autoloop.contract import (
     NEXT_WORK_PREFERENCE,
     Decision,
     Decomposition,
+    _DECOMPOSITION_KEYS,
     parse_response,
     verify_review,
 )
@@ -167,6 +168,50 @@ def test_a_malformed_decomposition_is_rejected(bad, code):
     """Present but empty is not a smaller plan — it is a plan that answers none
     of the question. Each part is required once the key is sent at all."""
     expect_code(block(base("implement", task_id="t1", decomposition=bad)), code)
+
+
+def test_the_documented_key_set_is_the_accepted_key_set():
+    """The schema line must name the keys the parser actually takes.
+
+    It documented `{approach, files, ordered steps}` while the accepted key was
+    literally `steps`, which is the worst shape a contract error can have: a
+    reviewer that copies the documentation sends `ordered steps`, draws
+    `unknown_keys`, and spends the small parse-retry budget on a correction the
+    instructions caused — on a field that is now MANDATORY, so the cost lands on
+    every task. Asserted against `_DECOMPOSITION_KEYS` rather than as a literal
+    substring, so a future reword cannot pass this vacuously."""
+    documented = "{" + ", ".join(sorted(_DECOMPOSITION_KEYS)) + "}"
+    assert documented == "{approach, files, steps}"
+    # Whitespace-normalised: the schema line wraps, and where it wraps is
+    # formatting rather than contract.
+    flat = " ".join(CONTRACT_INSTRUCTIONS.split())
+    assert documented in flat
+    # ...and the ordering rule survives as prose ABOUT the steps, which is what
+    # it always was — the requirement is that they are worked in order, not that
+    # the key has a longer name.
+    assert f"{documented}; steps are worked in order" in flat
+
+
+def test_the_documented_key_is_the_key_that_parses():
+    """The other half of the pin: the documented spelling parses, and the
+    spelling the old text implied does not."""
+    assert parse_response(
+        block(base("implement", task_id="t1", decomposition=DECOMP))
+    ).decomposition.steps == tuple(DECOMP["steps"])
+    expect_code(
+        block(
+            base(
+                "implement",
+                task_id="t1",
+                decomposition={
+                    "approach": DECOMP["approach"],
+                    "files": DECOMP["files"],
+                    "ordered steps": DECOMP["steps"],
+                },
+            )
+        ),
+        "unknown_keys",
+    )
 
 
 def test_render_is_the_one_text_the_task_and_the_agent_both_read():
@@ -1005,7 +1050,16 @@ def test_contract_stays_within_its_budget():
     `push` line, whose "the current branch" is what a reader checks a refspec
     against — was reverted for its 18 characters rather than kept for the
     headroom. Hand-summed line by line, like the counts above, because this
-    executor had no shell either."""
+    executor had no shell either.
+
+    The same day's follow-up spent a further measured +3: `ordered steps` in the
+    schema line became the key that is actually parsed (`steps`, -8) and the
+    ordering rule moved into prose about them (+11). The ceiling did NOT move
+    for it, and the pointer that would have named the CONTEXT sections the plan
+    is authored from — worth ~45 characters — was deliberately not written here:
+    those sections label themselves in every request, so paying a per-turn tax
+    to restate them is the "room for explanation" this ceiling refuses. Hand
+    count, no shell."""
     assert len(CONTRACT_INSTRUCTIONS) <= 3700
 
 

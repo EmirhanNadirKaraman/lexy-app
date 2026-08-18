@@ -799,6 +799,60 @@ def test_implement_without_a_decomposition_never_starts_the_task(tmp_path):
     assert "no approved decomposition" in reprompt
 
 
+def test_the_request_that_offers_ready_work_carries_what_to_plan_it_from(tmp_path):
+    """The gate is only answerable if the request carrying it is
+    self-contained. `roadmap` names the next ready task by id and title, which
+    is not enough to author `approach`/`files`/`steps` — so the prompt that
+    offers the work carries the task's full description and the exact paths it
+    may write (`context.NEXT_READY_LABEL`). A reviewer with no memory of this
+    roadmap — a rotated conversation, a switched provider, a fresh session —
+    must not have to guess either."""
+    orch, _, _, _, clients, _, _ = build_postcommit(
+        tmp_path,
+        responses=[stop_block()],
+        tasks=[
+            Task(
+                id="t1",
+                title="Title t1",
+                description="the whole task, stated at length\nwith a second line",
+                approved_paths=("docs/AUDIT_2026-07-29.md",),
+            )
+        ],
+        policy=IMPLEMENT_ON,
+    )
+    orch.run(max_steps=4)
+
+    prompt = clients[0].submitted[0][1]
+    assert "next_ready: t1 — Title t1" in prompt
+    assert "the whole task, stated at length\nwith a second line" in prompt
+    assert "docs/AUDIT_2026-07-29.md" in prompt
+    assert "CLAUDE.md" in prompt, "the always-allowed trackers are part of the scope"
+    assert "approved decomposition: (none on record" in prompt
+    # ...and the brief is rendered after the whole stamp, so a description that
+    # happens to contain a stamp-shaped line cannot displace the real one for a
+    # reader (`extract_stamp` included) that takes the first match.
+    assert prompt.index("report_sha256:") < prompt.index("next_ready:")
+
+
+def test_the_review_request_carries_the_exact_stored_decomposition(tmp_path):
+    """The revise side of the same rule. Policy lets a `revise` omit the plan
+    and the stored one then stands — a decision the reviewer can only make
+    knowingly if the review request shows the plan it would be reusing."""
+    orch, _, _, _, clients, registry, _ = build_postcommit(
+        tmp_path,
+        responses=[implement_block("t1"), stop_block()],
+        tasks=[ready_task("t1")],
+        policy=IMPLEMENT_ON,
+    )
+    orch.run(max_steps=8)
+
+    stored = registry.get("t1").decomposition
+    assert stored, "the round stored the approved plan"
+    review = clients[0].submitted[1][1]
+    assert "in_review: t1 — Title t1" in review
+    assert stored in review, "verbatim, so 'fits the plan' is distinguishable from 'reshape it'"
+
+
 # ---- task flow (gate lifted) ------------------------------------------------
 
 
