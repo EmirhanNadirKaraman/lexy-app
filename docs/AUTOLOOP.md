@@ -843,7 +843,14 @@ never "undo".
    exist, be the top level of a git repository in its own right, and have
    exactly the recorded `task_branch` checked out. All three true → the
    worker is used AS IT STANDS — no clone, no branch switch, no rewrite of
-   the record. Anything else falls back to the SAME
+   the record. The decision is made BEFORE the stale-base re-base
+   (`_rebase_execution_if_stale`, B9), so a reusable worker whose recorded
+   `task_base_sha` is merely behind the branch head is NOT quarantined and
+   rebuilt at the new head: the re-base's nothing-reviewed-yet branch is
+   skipped (transcript event `execution_rebase_skipped_worker_reused`) and
+   the record keeps its stale base, unrewritten. Only that one branch is
+   skipped — a record with `review_round > 0` still reconciles a published
+   candidate or parks exactly as before. Anything else falls back to the SAME
    `WorkerRepoManager.create` call a first dispatch makes (recorded base
    fetched from the primary checkout onto the recorded branch): a missing
    directory is recreated (transcript event `worker_recreated`), while a

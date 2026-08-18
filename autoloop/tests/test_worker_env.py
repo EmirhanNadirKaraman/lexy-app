@@ -8,7 +8,11 @@ path, same branch, no new clone — AS IT STANDS: uncommitted partial work
 left by an interrupted round is neither quarantined nor recreated away, it
 is what the resumed executor picks back up (the reuse decision is carried
 into `_prepare_write_capable_worker`, whose dirty-residue quarantine is
-skipped for exactly this gate and nothing else). Anything else (missing
+skipped for exactly this gate and nothing else). The decision is made
+BEFORE stale-base reconciliation ever runs, so a recorded base that is
+merely behind current mainline does not send a reusable worker down
+`_rebase_execution_if_stale`'s quarantine-and-rebuild path either — the
+record keeps its stale base, unrewritten. Anything else (missing
 directory, plain non-git directory, wrong branch) is NOT reuse and falls back to the SAME
 `WorkerRepoManager.create` call a first dispatch makes: a missing directory
 is recreated at the recorded base/branch, while a path that exists but
@@ -365,6 +369,91 @@ def test_partial_uncommitted_work_in_the_reused_worker_survives_a_resumed_dispat
     )
     assert run_git(worker_path, "show", f"{second.candidate_sha}:round2.py") == (
         "partial untracked work\nresumed and finished\n"
+    )
+
+
+def test_a_reusable_worker_with_a_stale_base_is_kept_not_rebuilt(tmp_path):
+    """A valid recorded worker on the correct branch whose `task_base_sha`
+    is behind current mainline. The three-fact reuse decision is made
+    BEFORE `_rebase_execution_if_stale` runs, so the interrupted round's
+    worker is neither quarantined nor rebuilt at the new head: one create
+    across both dispatches, same path, same branch, the record keeps its
+    original (stale) base, and the partial work rides into the resumed
+    round's candidate."""
+
+    class InterruptedThenFinishes:
+        """Call 1 writes partial work and reports failure WITHOUT
+        committing — the shape of a round the process lost, which leaves
+        `review_round` at 0 (the branch of `_rebase_execution_if_stale`
+        that would rebuild the worker). Call 2 finds that work on entry,
+        finishes it, and reports it."""
+
+        def __init__(self, workers_root):
+            self.workers_root = Path(workers_root)
+            self.calls = 0
+            self.seen_on_entry = None
+
+        def execute(self, directive, task):
+            self.calls += 1
+            wt = self.workers_root / task.id
+            if self.calls == 1:
+                (wt / "round1.py").write_text("partial work\n", encoding="utf-8")
+                return ExecutionOutcome(
+                    status="error", summary="lost mid-round",
+                    validation="(none)", changed_paths=(),
+                )
+            self.seen_on_entry = (wt / "round1.py").read_text(encoding="utf-8")
+            (wt / "round1.py").write_text(
+                self.seen_on_entry + "finished\n", encoding="utf-8"
+            )
+            return ExecutionOutcome(
+                status="ok", summary="resumed", validation="ok",
+                changed_paths=("round1.py",),
+            )
+
+    executor = InterruptedThenFinishes(tmp_path / "workers_root")
+    orch, config, execution_store, task = build_orchestrator(tmp_path, executor=executor)
+    creates = count_creates(orch)
+
+    orch._dispatch_executor(implement(task.id))
+    first = execution_store.load(task.id)
+    assert len(creates) == 1
+    assert first.review_round == 0, "the interrupted round never reached review"
+    assert first.candidate_sha == ""
+    worker_path = Path(first.worktree_path)
+    assert (worker_path / "round1.py").exists()
+
+    # Mainline moves on underneath the record — the situation that used to
+    # send this record down the quarantine-and-rebuild re-base.
+    repo_root = orch._git.repo_root
+    (repo_root / "elsewhere.txt").write_text("someone else's merge\n", encoding="utf-8")
+    run_git(repo_root, "add", "-A")
+    run_git(repo_root, "commit", "-q", "-m", "the base moves on")
+    assert run_git(repo_root, "rev-parse", "HEAD").strip() != first.task_base_sha
+
+    orch.state.phase = Phase.READY.value
+    orch._dispatch_executor(implement(task.id))
+
+    assert len(creates) == 1, "a stale base must not clone a replacement worker"
+    second = execution_store.load(task.id)
+    assert second.worktree_path == first.worktree_path
+    assert second.task_branch == first.task_branch
+    assert second.task_base_sha == first.task_base_sha, "nothing recorded changed"
+    assert run_git(worker_path, "branch", "--show-current").strip() == first.task_branch
+    assert not (orch._worker_repos.root_dir.parent / "quarantine").exists()
+    assert entries(config, "execution_rebased") == []
+    assert entries(config, "worker_recreated") == []
+    assert entries(config, "worker_quarantined") == []
+    assert [
+        e["data"]["task_id"]
+        for e in entries(config, "execution_rebase_skipped_worker_reused")
+    ] == [task.id]
+
+    # The resumed round really ran in the KEPT worker, on the partial work.
+    assert executor.seen_on_entry == "partial work\n"
+    assert second.candidate_sha != ""
+    assert run_git(worker_path, "show", f"{second.candidate_sha}:round1.py") == (
+        "partial work\nfinished\n"
     )
 
 

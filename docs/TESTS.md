@@ -1871,7 +1871,7 @@ quarantined, because plain `run` parks task_fatal without
 `cli._handle_parked_task`, so `registry.unblock` raises and a reset placed after
 it would be skipped in exactly the case it exists for.
 
-**Worker reuse at dispatch (wrk-01, 2026-08-18; new `test_worker_env.py`, 12
+**Worker reuse at dispatch (wrk-01, 2026-08-18; new `test_worker_env.py`, 13
 tests — hand-counted, no shell in the worker).** A resumed round must reuse
 its worker repository, not recreate it. Seven unit tests pin the probe
 (`worker_env.worker_repo_is_reusable`): True only for an existing directory
@@ -1879,7 +1879,7 @@ that is itself the top level of a git repository with exactly the recorded
 branch checked out — a missing directory, a plain directory, a subdirectory
 inside someone else's repo (`--show-toplevel` compared back against the
 path), the wrong branch, a detached HEAD, and an empty recorded branch are
-all False. Five dispatch tests pin the guard in
+all False. Six dispatch tests pin the guard in
 `_dispatch_task_postcommit`:
 `test_a_second_dispatch_reuses_the_existing_worker_with_no_new_clone`
 (one `WorkerRepoManager.create` across two dispatches — counted by
@@ -1895,6 +1895,18 @@ with the partial work carried into the new candidate; the reuse decision
 is passed to `_prepare_write_capable_worker` as
 `reused_recorded_worker=True`, which skips ONLY the dirty-residue
 quarantine and only for this gate);
+`test_a_reusable_worker_with_a_stale_base_is_kept_not_rebuilt`
+(the decision is made BEFORE `_rebase_execution_if_stale`: an interrupted
+round — `review_round` 0, no candidate — whose recorded `task_base_sha`
+falls behind mainline between dispatches keeps its valid worker, still one
+`create` total, no `execution_rebased`/`worker_quarantined`/
+`worker_recreated` entries, the record's base unrewritten, the skip logged
+as `execution_rebase_skipped_worker_reused`, and the partial work carried
+into the resumed round's candidate; `_rebase_execution_if_stale`'s
+reviewed-record reconcile/park branches are untouched, and
+`test_a_pending_retry_survives_the_reconciliation_of_its_own_record` plus
+all of `test_rebase_stale_base.py` — which call the method directly, where
+`worker_reusable` defaults to False — pass unchanged);
 `test_a_missing_worker_directory_is_recreated_by_the_existing_creation_path`
 (fallback is the SAME `create()` call, at the RECORDED base onto the
 RECORDED branch, `worker_recreated` in the transcript, record not
