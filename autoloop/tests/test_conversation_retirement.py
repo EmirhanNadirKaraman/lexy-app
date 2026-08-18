@@ -15,17 +15,23 @@ What these tests pin, in order:
 
 * proven bounded absence of the loop's own submission — on an attachable,
   un-throttled page, with the message tail mounted to its END — raises
-  `ConversationUnusableError(code="submission_never_appeared")`;
+  `ConversationUnusableError(code="submission_never_appeared")`, from BOTH
+  surfaces the fault wears: the response-start bound expiring cleanly, and
+  the incident's actual shape — the awaiting read itself dying with a
+  locator timeout already labelled a lost session
+  (`_classify_awaiting_read_failure`);
 * a message absent only because the virtualized tail is unmounted does NOT
   condemn the chat: a mount that sights it, and a mount that cannot settle,
-  both fall back to the ordinary `stage="start"` timeout;
+  both leave the caller's own fault standing (the ordinary `stage="start"`
+  timeout, or the original read failure);
 * a throttle discovered at the moment of conclusion is still routed as a
-  throttle, and a dead session still takes the restart path — the two worlds
-  this classification must not swallow;
+  throttle, and a browser whose probe cannot read the page keeps the
+  lost-session fault — the two worlds this classification must not swallow;
 * at the orchestrator, the fault rotates WITHOUT restarting Chrome and
   WITHOUT charging the browser failure budget (`consecutive_failures`) — the
   brw-03 rule: a budget that decides recovery is hopeless must not be spent
-  on a fault no restart could fix.
+  on a fault no restart could fix — including end-to-end through the REAL
+  client code for the exact reported locator-timeout shape.
 """
 
 import pytest
@@ -79,7 +85,9 @@ class WedgedPageSession:
     establish absence, which is one of the guards under test.
     """
 
-    def __init__(self, history, *, window=2, step=2, throttle_after_scrolls=None):
+    def __init__(
+        self, history, *, window=2, step=2, throttle_after_scrolls=None, read_faults=()
+    ):
         self.history = list(history)
         self.window = window
         self.step = step
@@ -88,6 +96,13 @@ class WedgedPageSession:
         #: After this many gestures the account-throttle overlay goes up —
         #: mid-mount, past every per-iteration check the await loop ran.
         self.throttle_after_scrolls = throttle_after_scrolls
+        #: Exceptions to raise from message-list reads, consumed one per read.
+        #: How the incident actually surfaced: the read waiting for the loop's
+        #: own message died with a locator timeout (a `SessionLostError` once
+        #: `PlaywrightSession._call` labels it), while every LATER read of the
+        #: same page answered fine.
+        self.read_faults = list(read_faults)
+        self.message_reads = 0
         self.current_url = CLIENT_CONV_URL
         self.present = {SEL.composer}
         self.keys = []
@@ -131,6 +146,9 @@ class WedgedPageSession:
 
     def elements(self, selector, attr):
         if selector == SEL.message:
+            self.message_reads += 1
+            if self.read_faults:
+                raise self.read_faults.pop(0)
             return self.history[: self.mounted]
         return []
 
@@ -168,6 +186,41 @@ class NoPositionSession(WedgedPageSession):
     scroll_to_end = None
 
 
+#: The lost-session label the incident actually wore: `PlaywrightSession._call`
+#: wrapping the locator timeout on the message the loop was waiting for —
+#: `.nth(33)`, the message after the 33 the wedged chat was pinned at.
+LOCATOR_TIMEOUT = (
+    "browser session lost (TimeoutError: Locator.get_attribute: Timeout "
+    "30000ms exceeded. waiting for locator(\"[data-message-author-role]\")"
+    ".nth(33))"
+)
+
+
+def _locator_timeout():
+    return SessionLostError(LOCATOR_TIMEOUT)
+
+
+class DeadReadsSession(WedgedPageSession):
+    """brw-11's state 3, as `await_response` meets it: a browser nothing can
+    attach to, so EVERY read dies — the classification probe included. With no
+    page to gather evidence from, the lost-session fault must stand and keep
+    its restart recovery."""
+
+    def _dead(self):
+        raise SessionLostError(
+            "browser session lost (Connection closed while reading from the driver)"
+        )
+
+    def url(self):
+        self._dead()
+
+    def exists(self, selector):
+        self._dead()
+
+    def elements(self, selector, attr):
+        self._dead()
+
+
 # ---- 1. proven bounded absence condemns the CONVERSATION --------------------
 
 
@@ -188,6 +241,99 @@ def test_a_submission_that_never_appears_is_the_conversation_not_the_browser(tmp
     meta = read_meta(diagnostics(tmp_path)[-1])
     assert meta["tag"] == "submission-never-appeared"
     assert meta["stage"] == "submission-absent"
+
+
+# ---- 1b. the incident's actual surface: the read itself dies ----------------
+
+
+def test_the_locator_timeout_on_the_missing_message_is_probed_not_restarted(tmp_path):
+    """THE reported shape, at the client: the read waiting for the loop's own
+    message dies with a locator timeout (already labelled a lost session),
+    every LATER read of the same page answers, the tail mounts to its
+    demonstrable END, and the message is provably absent. What must leave
+    `await_response` is the wedged-conversation classification — never the
+    browser fault the label claims, which is what bought ten minutes of
+    45-second Chrome restarts on 2026-08-17."""
+    session = WedgedPageSession(_filler(3), read_faults=[_locator_timeout()])
+    client = make_client(session, FakeClock(), tmp_path, response_start_timeout=5.0)
+
+    with pytest.raises(ConversationUnusableError) as excinfo:
+        client.await_response(RID)
+
+    assert excinfo.value.code == "submission_never_appeared"
+    # The failed read really happened, and absence was then concluded from a
+    # mounted tail read off the same, demonstrably attachable page.
+    assert session.message_reads > 1
+    assert session.scrolls >= 2
+    meta = read_meta(diagnostics(tmp_path)[-1])
+    assert meta["tag"] == "submission-never-appeared"
+    assert meta["stage"] == "submission-absent"
+
+
+def test_a_read_failure_with_the_request_present_keeps_the_browser_fault(tmp_path):
+    """The transient world: the read died, but the probe finds the chat
+    demonstrably HOLDING the loop's message. Nothing is wedged, so nothing may
+    authorize a rotation — the original lost-session fault stands and takes
+    the restart recovery it always had."""
+    history = _filler(1) + [("user", f"[autoloop request {RID} | iteration 1]")]
+    session = WedgedPageSession(
+        history, window=len(history), read_faults=[_locator_timeout()]
+    )
+    client = make_client(session, FakeClock(), tmp_path, response_start_timeout=5.0)
+
+    with pytest.raises(SessionLostError) as excinfo:
+        client.await_response(RID)
+
+    assert "nth(33)" in str(excinfo.value)  # the original fault, not a relabel
+    assert session.scrolls == 0  # the sighting needed no gestures
+
+
+def test_a_dead_browser_still_takes_the_lost_session_route(tmp_path):
+    """brw-11's state 3: EVERY read dies, the classification probe included.
+    No attachable page means no evidence, and no evidence licenses nothing —
+    the original fault leaves `await_response` unrelabelled, so the
+    orchestrator's restart-and-budget recovery still owns it."""
+    session = DeadReadsSession(_filler(3))
+    client = make_client(session, FakeClock(), tmp_path, response_start_timeout=5.0)
+
+    with pytest.raises(SessionLostError) as excinfo:
+        client.await_response(RID)
+
+    assert "Connection closed" in str(excinfo.value)
+    assert session.scrolls == 0  # the probe never got as far as a gesture
+
+
+def test_an_unsettleable_probe_keeps_the_browser_fault(tmp_path):
+    """The read died AND absence cannot be proven: an adapter with no position
+    signal mounts forever without ruling anything out. Unproven absence
+    licenses nothing — the original fault stands, exactly as it does when the
+    clean-timeout path cannot settle."""
+    session = NoPositionSession(_filler(3), read_faults=[_locator_timeout()])
+    client = make_client(
+        session, FakeClock(), tmp_path, response_start_timeout=5.0, tail_mount_attempts=4
+    )
+
+    with pytest.raises(SessionLostError) as excinfo:
+        client.await_response(RID)
+
+    assert "nth(33)" in str(excinfo.value)
+    assert session.keys.count("End") == 4  # it tried; it could not prove
+
+
+def test_a_throttle_discovered_by_the_probe_is_still_a_throttle(tmp_path):
+    """The probe's conclusion checks outrank BOTH labels: an overlay up at the
+    moment absence settles routes as the account limit — never left as a lost
+    session (a restart adds a request to the window that caused it), and never
+    relabelled a wedged chat (a rotation SENDS into the throttled account)."""
+    session = WedgedPageSession(
+        _filler(3), throttle_after_scrolls=1, read_faults=[_locator_timeout()]
+    )
+    client = make_client(
+        session, FakeClock(), tmp_path, response_start_timeout=5.0, tail_mount_attempts=8
+    )
+
+    with pytest.raises(RateLimitedError):
+        client.await_response(RID)
 
 
 # ---- 2. an unmounted tail is not absence ------------------------------------
@@ -330,10 +476,63 @@ def test_the_rotation_survives_a_restart_of_the_process(tmp_path):
     assert reloaded.last_rotation["reason"] == "submission_never_appeared"
 
 
+class IncidentAwaitClient(RotatingFakeClient):
+    """`RotatingFakeClient` whose awaiting runs the REAL
+    `BrowserChatGPT.await_response` over a scripted page — so an orchestrator
+    test exercises the actual classification code rather than a stand-in that
+    raises the right error by fiat — while rotation keeps the fake's own
+    machinery."""
+
+    def __init__(self, browser_client, **kwargs):
+        super().__init__(**kwargs)
+        self._browser = browser_client
+
+    def await_response(self, request_id):
+        self.awaited.append((self.conversation_url, request_id))
+        return self._browser.await_response(request_id)
+
+
+def test_the_reported_locator_timeout_rotates_without_restart_or_budget(tmp_path):
+    """The full reported shape, through the orchestrator and the REAL client
+    code: a locator/read timeout while waiting for the loop's own submitted
+    message (`submitted=True`, `send_attempted=True`), then healthy-page and
+    mounted-tail evidence showing that message absent. The loop must rotate —
+    no Chrome restart (a restart command IS configured, so one would log
+    `browser_restarted`), and no browser-budget increment. This is the exact
+    path that spent 2026-08-17 restarting a healthy browser."""
+    session = WedgedPageSession(_filler(3), read_faults=[_locator_timeout()])
+    browser_client = make_client(
+        session, FakeClock(), tmp_path, response_start_timeout=5.0
+    )
+    client = IncidentAwaitClient(browser_client)
+    state = LoopState.new(CONV_URL)
+    state.phase = Phase.AWAITING.value
+    state.pending_request = pending(submitted=True, send_attempted=True)
+    orch, store, config = build(tmp_path, client, state=state)
+    object.__setattr__(config.browser, "restart_command", ("true",))
+
+    orch.run(max_steps=1)
+
+    assert orch.state.rotations == 1
+    assert orch.state.conversation_url == NEW_CONV_URL
+    assert orch.state.phase == Phase.AWAITING.value
+    assert orch.state.consecutive_failures == 0
+    assert orch.state.browser_restart_skips == 0
+    assert transcript_entries(config, "browser_restarted") == []
+    assert transcript_entries(config, "browser_error") == []
+    rotated = transcript_entries(config, "conversation_rotated")
+    assert len(rotated) == 1
+    assert rotated[0]["data"]["reason"] == "submission_never_appeared"
+    unusable = transcript_entries(config, "conversation_unusable")
+    assert unusable and unusable[0]["data"]["reason_code"] == "submission_never_appeared"
+
+
 def test_a_dead_session_in_awaiting_still_takes_the_restart_path(tmp_path):
-    """brw-11's state 3 boundary, from this phase: no attachable page at all
-    is a DEAD BROWSER, and it keeps the restart-and-budget recovery. The
-    missing-submission classification must never swallow it — a fresh chat
+    """brw-11's state 3 boundary, from this phase: a `SessionLostError` that
+    ESCAPES the client is one the client's own probe could not do better
+    than — no attachable page, a sighted request, or unprovable absence (see
+    the section-1b tests for which is which). At the orchestrator that is a
+    browser fault and keeps the restart-and-budget recovery: a fresh chat
     cannot fix a browser nothing can attach to."""
 
     def _dead(client):

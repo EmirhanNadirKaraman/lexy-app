@@ -949,17 +949,28 @@ all.
 * And a throttle is still a throttle: if the rate-limit overlay is up, that
   routing (`RateLimitedError`, wait — never restart, never rotate) wins.
 
-**Fix (2026-08-18, brw-12):** `BrowserChatGPT._rule_out_missing_submission`
-(`browser/chatgpt.py`) runs when the response-START bound expires with the
-request absent from the mounted window. It mounts the tail with the same two
-proofs the by-content search uses; only settled absence on an attachable,
-un-throttled, logged-in page raises
+**Fix (2026-08-18, brw-12):** the classification fires from BOTH surfaces the
+fault wears, and the second is the one the incident actually wore.
+`BrowserChatGPT._rule_out_missing_submission` (`browser/chatgpt.py`) runs when
+the response-START bound expires cleanly with the request absent from the
+mounted window — and it is ALSO reached when a mid-await DOM read dies with
+the lost-session label itself (`_classify_awaiting_read_failure`): the exact
+`Locator.get_attribute` timeout above is caught inside `await_response`,
+re-probed through the same session (a fresh read succeeding IS the
+attachability proof), and only then classified. Either way the tail is
+mounted with the same two proofs the by-content search uses; only settled
+absence on an attachable, un-throttled, logged-in page raises
 `ConversationUnusableError(code="submission_never_appeared")`, which the
 orchestrator answers with rotation — no Chrome restart, and **no charge to
 `consecutive_failures`** (the brw-03 rule: the budget that decides recovery
-is hopeless must not be spent on a fault no restart could fix). A sighted or
-unprovable absence falls back to the ordinary `stage="start"` timeout and its
-existing three-strike silence rotation.
+is hopeless must not be spent on a fault no restart could fix). Everything
+short of that proof keeps its old route: a probe that cannot read the page
+(brw-11's dead browser), a request the probe SIGHTS, and an absence that
+cannot settle all re-raise the original `SessionLostError` onto the ordinary
+restart-and-budget path, and a clean timeout with unproven absence falls back
+to the `stage="start"` timeout and its existing three-strike silence
+rotation. A throttle or auth redirect discovered by the probe still routes as
+itself.
 
 **Reading an old transcript:** repeated `browser_restarted` entries while one
 conversation's message count never moves, with `submitted: true`, is this,

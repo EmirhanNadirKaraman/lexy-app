@@ -66,7 +66,11 @@ Two further OPTIONAL capabilities the orchestrator probes with `getattr`:
   (`find_conversation_with` mounts the tail for its OWN readback through the
   private `_mount_message_tail`, and `await_response` reuses the same mount —
   with the same two absence proofs — before it may conclude the loop's own
-  submission never appeared (`_rule_out_missing_submission`). Private on
+  submission never appeared (`_rule_out_missing_submission`). That conclusion
+  is reachable from BOTH shapes the fault wears: the response-start bound
+  expiring cleanly, and a mid-await read dying as a `SessionLostError`
+  (`_classify_awaiting_read_failure`) — the 2026-08-17 incident's actual
+  surface, which used to be charged to the browser unexamined. Private on
   purpose: publishing the name would silently change how chunked delivery
   confirms its parts, which is a separate decision from making the search
   trustworthy.)
@@ -89,6 +93,7 @@ from ..errors import (
     LoginExpiredError,
     RateLimitedError,
     ResponseTimeoutError,
+    SessionLostError,
     SubmissionError,
 )
 from .observation import SendObservation, SendOutcome, classify_submission
@@ -767,10 +772,26 @@ class BrowserChatGPT:
         complete_deadline = self._monotonic() + self._response_timeout
 
         while True:
-            self._check_logged_in(request_id=request_id, stage="await")
-            self._check_throttled(request_id=request_id, stage="await")
-            self._require_on_conversation(request_id)
-            msgs = self.messages()
+            try:
+                self._check_logged_in(request_id=request_id, stage="await")
+                self._check_throttled(request_id=request_id, stage="await")
+                self._require_on_conversation(request_id)
+                msgs = self.messages()
+            except SessionLostError as exc:
+                # THE 2026-08-17 shape. The wedged-conversation fault does not
+                # arrive as a clean timeout: it arrives as a DOM read dying
+                # while the loop waits for the message it believes it sent
+                # (`Locator.get_attribute … waiting for locator
+                # '[data-message-author-role]'.nth(33)`), which `_call` labels
+                # a lost session. Letting that label stand unexamined is what
+                # bought ten minutes of 45-second Chrome restarts against a
+                # healthy browser. A response that already STARTED is direct
+                # evidence the submission appeared, so only the not-started
+                # case has a sharper fault to rule out.
+                if started:
+                    raise
+                self._classify_awaiting_read_failure(request_id, exc)
+                raise  # unreachable: the classifier always raises
 
             if not started:
                 if self._response_started(msgs, request_id):
@@ -825,9 +846,12 @@ class BrowserChatGPT:
             self._sleep(self._poll_interval)
 
     def _rule_out_missing_submission(self, request_id: str, msgs: list[Message]) -> None:
-        """The response-START bound just expired. Before that is reported as a
-        timeout, rule out the sharper fault a start timeout can hide: OUR OWN
-        submission not being in this conversation at all.
+        """Rule out the sharper fault an awaiting failure can hide: OUR OWN
+        submission not being in this conversation at all. Reached from BOTH
+        ways that fault surfaces — the response-START bound expiring cleanly,
+        and a mid-await DOM read dying with a lost-session label
+        (`_classify_awaiting_read_failure`, the shape the incident actually
+        wore).
 
         A submission the loop believes it sent, which never appears, means the
         CONVERSATION is wedged — not the browser. Observed 2026-08-17,
@@ -863,9 +887,10 @@ class BrowserChatGPT:
           while the mount was dwelling is still routed as itself, never
           relabelled a wedged chat.
 
-        Returns quietly — letting the ordinary `stage="start"` timeout fire —
-        when the request IS on the page (the model is merely silent, which is
-        the silent-conversation trigger's case) and when the mount could not
+        Returns quietly — letting the caller's own fault stand, the ordinary
+        `stage="start"` timeout or the original read failure — when the
+        request IS on the page (the model is merely silent, which is the
+        silent-conversation trigger's case) and when the mount could not
         settle, because unproven absence licenses nothing.
         """
         if self._request_index(msgs, request_id) is not None:
@@ -895,6 +920,58 @@ class BrowserChatGPT:
             "a browser fault; restarting Chrome cannot help",
             code="submission_never_appeared",
         )
+
+    def _classify_awaiting_read_failure(
+        self, request_id: str, exc: SessionLostError
+    ) -> None:
+        """A DOM read died while awaiting the loop's own submission. ALWAYS
+        raises — the only question is which fault stands.
+
+        This is the incident's actual surface (2026-08-17): the wedged
+        conversation did not announce itself as a clean start timeout, it
+        killed the read that was waiting for the loop's own message, and the
+        resulting `SessionLostError` was charged to the browser — restart
+        after restart against a page every one of those reads could have
+        proven healthy. So before the lost-session label may stand, gather
+        the evidence the wedged-conversation classification requires, through
+        the SAME session that just failed:
+
+        * a fresh `messages()` read — succeeding is the attachability proof
+          (a browser with no attachable target fails it, and the original
+          fault stands with its restart recovery intact);
+        * `_rule_out_missing_submission` — the same mounted-tail absence
+          proofs, throttle check and login check as the clean-timeout path,
+          raising `ConversationUnusableError(code="submission_never_appeared")`
+          only on settled absence.
+
+        Nothing here is a blanket translation of read failures into
+        conversation faults. The original `exc` is re-raised — preserving the
+        existing browser-error routing, restart and budget — whenever the
+        probe itself fails, the request turns out to be PRESENT (the read
+        fault was transient; the chat holds the message), or absence cannot
+        be settled. A throttle or an auth redirect discovered by the probe
+        outranks the transport label the same way `submit`'s except-path
+        `_check_throttled` does: it is the sharper diagnosis of the same
+        moment, and routing it as a lost session is the exact misrouting
+        this method exists to stop.
+        """
+        try:
+            window = self.messages()
+        except Exception:
+            # The probe cannot read the page at all — brw-11's state 3, a
+            # browser nothing can attach to. The dead-session fault stands.
+            raise exc
+        try:
+            self._rule_out_missing_submission(request_id, window)
+        except (ConversationUnusableError, RateLimitedError, LoginExpiredError):
+            raise
+        except Exception:
+            # The mount could not run to a verdict (page drifted mid-probe,
+            # session died mid-mount, ...). Unproven absence licenses
+            # nothing; the original fault stands.
+            raise exc
+        # Request present, or absence not settled: no sharper classification.
+        raise exc
 
     # ---- network observation (optional capability) --------------------------
 
