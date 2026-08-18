@@ -57,7 +57,7 @@ from autoloop.tasks import (
     mutation_ledger_for,
 )
 from autoloop.transcript import TranscriptLogger
-from autoloop.worker_env import WorkerRepoManager, validate_workers_root
+from autoloop.worker_env import WorkerRepoManager, validate_workers_root, worker_env
 from autoloop.worktask import IntentStore, TaskExecutionStore
 
 URL = "https://chatgpt.com/c/m1-hardening-test"
@@ -1666,10 +1666,19 @@ def test_task_with_no_approved_paths_cannot_be_dispatched(tmp_path):
 
 
 def test_failed_attempt_residue_absent_from_the_next_candidate(tmp_path):
-    """Adversarial test 8: attempt 1 writes A and FAILS validation; attempt
-    2 writes B and passes. The resulting commit must contain ONLY B — A
-    must never ride along, and its evidence must be preserved (quarantined)
-    rather than silently vanished."""
+    """Adversarial test 8, updated for wrk-01 (resumed-worker reuse): attempt
+    1 writes A and FAILS validation; attempt 2 writes B and passes,
+    reporting only B. Since wrk-01, attempt 2 REUSES the recorded worker as
+    it stands — A is not quarantined and the worker is not recreated,
+    because a valid recorded worker's uncommitted residue is resumable work
+    (the real `ImplementExecutor` derives `changed_paths` from
+    `dirty_entries_all()`, so it adopts residue into its own commit). This
+    executor deliberately does NOT adopt it, which pins the fail-closed
+    remainder of M1 finding #3: `commit_and_capture` stages exactly the
+    reported paths, so A still never rides along into the candidate — and
+    the round is then REFUSED at post-commit review ("worktree is not clean
+    after commit") rather than accepted with unaccounted content, with A
+    preserved on disk in the worker, not quarantined, not deleted."""
 
     class FailThenSucceedExecutor:
         def __init__(self, workers_root, repo_root):
@@ -1706,17 +1715,26 @@ def test_failed_attempt_residue_absent_from_the_next_candidate(tmp_path):
     assert execution.candidate_sha != ""
     assert execution.attempt_count == 2
 
-    worker_git = GitGateway(orch._worker_repos.path_for(task.id), PolicyEngine(PolicyConfig()))
+    worker_repo_path = orch._worker_repos.path_for(task.id)
+    worker_git = GitGateway(worker_repo_path, PolicyEngine(PolicyConfig()))
     touched = worker_git.commit_range_paths(execution.task_base_sha, execution.candidate_sha)
     assert touched == {"B.py"}
     assert "A.py" not in touched
 
-    # Evidence preserved (never deleted), but no longer reachable by create().
+    # wrk-01: the valid recorded worker was reused as it stands — no
+    # quarantine, evidence preserved IN PLACE, still uncommitted.
     quarantine_root = workers_root.parent / "quarantine"
-    assert quarantine_root.is_dir()
-    quarantined = list(quarantine_root.iterdir())
-    assert len(quarantined) == 1
-    assert (quarantined[0] / "A.py").exists()
+    assert not quarantine_root.exists()
+    assert (worker_repo_path / "A.py").read_text(encoding="utf-8") == (
+        "attempt 1 — must never be committed\n"
+    )
+
+    # And the unadopted residue still cannot slip through silently: the
+    # round fails closed at post-commit review instead.
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert orch.state.park_kind == "task_fatal"
+    assert "REFUSED at post-commit review" in (orch.state.question or "")
+    assert "not clean" in (orch.state.question or "")
 
 
 def test_quarantine_recreate_resumes_from_a_candidate_sha_that_only_exists_in_the_quarantined_repo(
@@ -1729,16 +1747,17 @@ def test_quarantine_recreate_resumes_from_a_candidate_sha_that_only_exists_in_th
     `candidate_sha` names a commit made INSIDE the worker repo being
     quarantined — its own local git object database, never pushed anywhere
     — so the primary checkout never has that object and the recreate's
-    `git fetch` fails outright. `test_failed_attempt_residue_absent_from_
-    the_next_candidate` above never exercises this: its quarantine happens
-    before ANY commit, so it only ever resumes from `task_base_sha`.
+    `git fetch` fails outright.
 
-    Reachable path modelled here: round 1 succeeds and commits
-    (`candidate_sha` set); round 2 writes residue into the SAME worker repo
-    and FAILS validation (never commits) — the worktree is left dirty;
-    round 3's dispatch finds that dirty worktree, quarantines it, and must
-    recreate the worker repo resuming from round 1's `candidate_sha`, which
-    now exists ONLY in the directory just moved into quarantine."""
+    Since wrk-01 (resumed-worker reuse), a DISPATCH no longer routes a
+    valid recorded worker into this branch at all: the reuse decision is
+    carried into `_prepare_write_capable_worker` as
+    `reused_recorded_worker=True`, and the dirty worker is resumed as it
+    stands. The quarantine branch is retained, unchanged, for preparations
+    that did NOT pass that gate — so this test now pins its fetch-source
+    behaviour by calling the method directly with the flag left at its
+    default (False), on the same worker state as before: round 1 committed
+    (`candidate_sha` set), round 2 left uncommitted residue."""
 
     class RoundExecutor:
         def __init__(self, workers_root, repo_root):
@@ -1753,17 +1772,12 @@ def test_quarantine_recreate_resumes_from_a_candidate_sha_that_only_exists_in_th
                 return ExecutionOutcome(
                     status="ok", summary="round 1", validation="ok", changed_paths=("A.py",)
                 )
-            if self.calls == 2:
-                (wt / "B.py").write_text("round 2 — must never be committed\n", encoding="utf-8")
-                return ExecutionOutcome(
-                    status="error",
-                    summary="round 2 validation failed",
-                    validation="ruff: E501",
-                    changed_paths=(),
-                )
-            (wt / "C.py").write_text("round 3 — the real fix\n", encoding="utf-8")
+            (wt / "B.py").write_text("round 2 — must never be committed\n", encoding="utf-8")
             return ExecutionOutcome(
-                status="ok", summary="round 3", validation="ok", changed_paths=("C.py",)
+                status="error",
+                summary="round 2 validation failed",
+                validation="ruff: E501",
+                changed_paths=(),
             )
 
     orch, repo_root, execution_store, task, executor = _build_worker_repos_orchestrator(
@@ -1787,24 +1801,18 @@ def test_quarantine_recreate_resumes_from_a_candidate_sha_that_only_exists_in_th
     worker_repo_path = orch._worker_repos.path_for(task.id)
     assert (worker_repo_path / "B.py").exists()  # residue really is on disk
 
-    # Round 3: the dirty worktree from round 2 must be quarantined and a
-    # fresh worker repo recreated resuming from `candidate_1`. Before the
+    # A preparation WITHOUT the reuse gate must quarantine the dirty worker
+    # and recreate it resuming from `candidate_1`. Before the fetch-source
     # fix, `create()` tried to fetch `candidate_1` from the PRIMARY
     # checkout, which never received it, and raised `GitCommandError`.
-    orch.state.phase = Phase.READY.value
-    orch._dispatch_executor(implement(task.id))
+    dirty_git = GitGateway(worker_repo_path, PolicyEngine(PolicyConfig()), env=worker_env())
+    refreshed = orch._prepare_write_capable_worker(task, execution2, dirty_git)
 
-    assert orch.state.phase != Phase.NEEDS_USER.value, (
-        f"round 3 unexpectedly parked: {orch.state.question}"
-    )
-    execution3 = execution_store.load(task.id)
-    assert execution3.candidate_sha != candidate_1
-    assert execution3.candidate_sha != ""
-
-    new_worker_git = GitGateway(orch._worker_repos.path_for(task.id), PolicyEngine(PolicyConfig()))
-    touched = new_worker_git.commit_range_paths(execution3.task_base_sha, execution3.candidate_sha)
-    assert touched == {"A.py", "C.py"}
-    assert "B.py" not in touched  # round 2's residue never rode along
+    assert refreshed is not None, f"preparation unexpectedly parked: {orch.state.question}"
+    assert orch.state.phase != Phase.NEEDS_USER.value
+    assert refreshed.head_sha() == candidate_1  # resumed from the committed round
+    assert (worker_repo_path / "A.py").exists()  # round 1's commit is checked out
+    assert not (worker_repo_path / "B.py").exists()  # residue did not ride along
 
     # And round 2's residue is preserved, quarantined, not silently gone.
     quarantine_root = workers_root.parent / "quarantine"

@@ -1920,7 +1920,12 @@ so the object is still there and reachable via a local-path fetch);
 `execution.task_base_sha` still fetches from `self._git.repo_root` as
 before. See `orchestrator.py`'s `_prepare_write_capable_worker` and the
 regression test `test_quarantine_recreate_resumes_from_a_candidate_sha_
-that_only_exists_in_the_quarantined_repo`.
+that_only_exists_in_the_quarantined_repo`. (Since wrk-01, 2026-08-18, a
+dispatch whose recorded worker passes the resumed-worker reuse gate no
+longer quarantines it at all — the worker is resumed as it stands — so the
+regression test now exercises this branch by calling
+`_prepare_write_capable_worker` directly with the reuse flag left False;
+the branch and its fetch-source fix are unchanged.)
 
 ### A test for a "generic exception" handler passes against code that has no generic handler
 **Symptom:** a test written to prove `except Exception` was added — a stub

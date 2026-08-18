@@ -217,8 +217,12 @@ which is environmental and could not be fixed by retrying.
 
 Each failure left the worker dirty, so the next round quarantined it as
 "residual uncommitted state from a prior attempt" and started over — correct
-per M1 finding #3, but it means the loop redid the same work three times and
-spent three of its attempts on a condition no amount of retrying could clear.
+per M1 finding #3 as it stood, but it means the loop redid the same work three
+times and spent three of its attempts on a condition no amount of retrying
+could clear. (Historical: since wrk-01, 2026-08-18, a resumed dispatch whose
+recorded worker passes the reuse gate keeps that worker dirty-as-is instead of
+quarantining it, so this specific redo-from-scratch churn no longer occurs;
+the environmental-failure parking below is still the open fix.)
 
 The blocker taxonomy already distinguishes `task_fatal` from `loop_fatal`, but
 a validation failure is always charged to the task. **Fix:** when N

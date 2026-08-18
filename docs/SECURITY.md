@@ -1165,12 +1165,27 @@ control exists.
 before every write-capable dispatch; residue is QUARANTINED (moved, never
 deleted — `WorkerRepoManager.quarantine`) rather than reused, and a fresh
 repo is created from the last committed round (or the task base if none).
+**Scoped 2026-08-18 (wrk-01):** a resumed dispatch whose recorded worker
+passes the reuse gate (`worker_repo_is_reusable` — exists, is a git repo,
+on the recorded branch) is EXEMPT from that residue quarantine
+(`reused_recorded_worker=True`): its uncommitted residue is the
+interrupted round's own partial work, which the resumed executor picks
+back up. This is a deliberate narrowing, not a silent regression of this
+finding: what the quarantine protected against — content that failed its
+own validation slipping unreviewed into a later candidate — is still held
+by two unchanged controls, `commit_and_capture` staging exactly the
+reported `changed_paths` and `_verify_committed` refusing any candidate
+whose worktree is not clean after commit (everything committed is in the
+reviewed diff; anything uncommitted refuses the round). The quarantine
+itself is unchanged for every preparation that did not pass the gate.
 `attempt_count` now increments and persists BEFORE the executor is ever
 called, so it is durable across a crash, a restart, or a validation
 failure. See `docs/AUTOLOOP.md` §4e for the full design and
 `autoloop/tests/test_m1_hardening.py` for the adversarial tests (agent
-self-report cannot widen scope; a failed attempt's files never reach a
-later commit; the attempt budget survives a simulated restart).
+self-report cannot widen scope; a failed attempt's UNREPORTED files never
+reach a later commit — since wrk-01 proven via exact staging plus the
+post-commit residual-dirty refusal rather than via quarantine; the attempt
+budget survives a simulated restart).
 
 **file:line** — `autoloop/tasks.py` (`Task.approved_paths`,
 `_validate_approved_path`); `autoloop/orchestrator.py`

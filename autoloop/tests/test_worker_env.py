@@ -4,8 +4,12 @@ resumed-record guard in `Orchestrator._dispatch_task_postcommit`).
 ONE claim, pinned from both sides: when an execution record names a
 `worktree_path` that exists, is a git repository, and is already checked out
 on the recorded `task_branch`, dispatching that task again REUSES it — same
-path, same branch, no new clone. Anything else (missing directory, plain
-non-git directory, wrong branch) is NOT reuse and falls back to the SAME
+path, same branch, no new clone — AS IT STANDS: uncommitted partial work
+left by an interrupted round is neither quarantined nor recreated away, it
+is what the resumed executor picks back up (the reuse decision is carried
+into `_prepare_write_capable_worker`, whose dirty-residue quarantine is
+skipped for exactly this gate and nothing else). Anything else (missing
+directory, plain non-git directory, wrong branch) is NOT reuse and falls back to the SAME
 `WorkerRepoManager.create` call a first dispatch makes: a missing directory
 is recreated at the recorded base/branch, while a path that exists but
 fails the probe makes `create()` refuse with its usual "already exists"
@@ -155,7 +159,7 @@ class ScriptedWriter:
         )
 
 
-def build_orchestrator(tmp_path, task_id="t1"):
+def build_orchestrator(tmp_path, task_id="t1", executor=None):
     repo_root = real_repo(tmp_path)
     # Mirrors the real repo's own `.gitignore` — without it, `.al/state.json`
     # dirties the primary checkout and trips a precondition unrelated to
@@ -200,7 +204,7 @@ def build_orchestrator(tmp_path, task_id="t1"):
         state=state,
         policy=PolicyEngine(config.policy),
         git=git,
-        executor=ScriptedWriter(workers_root),
+        executor=executor if executor is not None else ScriptedWriter(workers_root),
         transcript=TranscriptLogger(config.transcript_file),
         client_factory=no_client,
         registry=registry,
@@ -268,6 +272,100 @@ def test_a_second_dispatch_reuses_the_existing_worker_with_no_new_clone(tmp_path
     worker_git = GitGateway(worker_path, PolicyEngine(PolicyConfig()))
     touched = worker_git.commit_range_paths(second.task_base_sha, second.candidate_sha)
     assert touched == {"round1.py", "round2.py"}
+
+
+def test_partial_uncommitted_work_in_the_reused_worker_survives_a_resumed_dispatch(tmp_path):
+    """THE incident wrk-01 exists for: an interrupted round leaves partial
+    uncommitted work — a tracked edit and an untracked file — in a worker
+    that still passes every reuse predicate (recorded path, a git repo, on
+    the recorded branch). Dispatching again must resume THAT worker as it
+    stands: one create across both dispatches, same path, same branch,
+    nothing quarantined, and the partial edits still on disk, byte for
+    byte, when the resumed executor starts. The executor here mirrors the
+    real `ImplementExecutor` by reporting every dirty path (it derives
+    `changed_paths` from `dirty_entries_all()`), so the resumed round's
+    commit carries the partial work forward and the round completes."""
+
+    class ResumingWriter:
+        """Call 1 commits round1.py. Call 2 records exactly what it finds
+        on entry (the interrupted round's partial work), finishes it, and
+        reports every dirty path."""
+
+        def __init__(self, workers_root):
+            self.workers_root = Path(workers_root)
+            self.calls = 0
+            self.seen_on_entry = {}
+
+        def execute(self, directive, task):
+            self.calls += 1
+            wt = self.workers_root / task.id
+            if self.calls == 1:
+                (wt / "round1.py").write_text("round 1\n", encoding="utf-8")
+                return ExecutionOutcome(
+                    status="ok", summary="round 1", validation="ok",
+                    changed_paths=("round1.py",),
+                )
+            for name in ("round1.py", "round2.py"):
+                p = wt / name
+                self.seen_on_entry[name] = (
+                    p.read_text(encoding="utf-8") if p.exists() else None
+                )
+            (wt / "round2.py").write_text(
+                self.seen_on_entry["round2.py"] + "resumed and finished\n",
+                encoding="utf-8",
+            )
+            return ExecutionOutcome(
+                status="ok", summary="round 2 resumed", validation="ok",
+                changed_paths=("round1.py", "round2.py"),
+            )
+
+    executor = ResumingWriter(tmp_path / "workers_root")
+    orch, config, execution_store, task = build_orchestrator(tmp_path, executor=executor)
+    creates = count_creates(orch)
+
+    orch._dispatch_executor(implement(task.id))
+    first = execution_store.load(task.id)
+    assert len(creates) == 1
+    assert first.candidate_sha != ""
+    worker_path = Path(first.worktree_path)
+
+    # The interrupted round's residue: a TRACKED partial edit and an
+    # UNTRACKED partial file, left uncommitted between dispatches.
+    (worker_path / "round1.py").write_text(
+        "round 1\npartial tracked edit\n", encoding="utf-8"
+    )
+    (worker_path / "round2.py").write_text(
+        "partial untracked work\n", encoding="utf-8"
+    )
+
+    orch.state.phase = Phase.READY.value
+    orch._dispatch_executor(implement(task.id))
+
+    assert len(creates) == 1, "the resumed dispatch cloned a new worker"
+    second = execution_store.load(task.id)
+    assert second.worktree_path == first.worktree_path
+    assert second.task_branch == first.task_branch
+    assert run_git(worker_path, "branch", "--show-current").strip() == first.task_branch
+    assert not (orch._worker_repos.root_dir.parent / "quarantine").exists()
+    assert entries(config, "worker_quarantined") == []
+    assert entries(config, "worker_recreated") == []
+
+    # The resumed executor really saw the partial work, byte for byte.
+    assert executor.seen_on_entry == {
+        "round1.py": "round 1\npartial tracked edit\n",
+        "round2.py": "partial untracked work\n",
+    }
+
+    # And the round completed ON TOP of it: the partial edits are in the
+    # new candidate — not reverted, not quarantined, not parked.
+    assert orch.state.phase == Phase.READY.value
+    assert second.candidate_sha not in ("", first.candidate_sha)
+    assert run_git(worker_path, "show", f"{second.candidate_sha}:round1.py") == (
+        "round 1\npartial tracked edit\n"
+    )
+    assert run_git(worker_path, "show", f"{second.candidate_sha}:round2.py") == (
+        "partial untracked work\nresumed and finished\n"
+    )
 
 
 def test_a_missing_worker_directory_is_recreated_by_the_existing_creation_path(tmp_path):

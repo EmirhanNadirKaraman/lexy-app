@@ -850,10 +850,19 @@ never "undo".
    path that exists but is not a git repo, or is on the wrong branch, makes
    `create()` refuse with its usual "already exists" error — fail closed,
    no repair, no deletion. Salvaging a half-broken worker is an operator's
-   decision, not this dispatch's. This is a REUSE gate only: a valid-but-
-   dirty worker still passes it and is then handled by
-   `_prepare_write_capable_worker`'s residue quarantine (§ M1 finding #3),
-   exactly as before.
+   decision, not this dispatch's. The reuse decision is CARRIED THROUGH
+   preparation: `_prepare_write_capable_worker` receives
+   `reused_recorded_worker=True` and skips its dirty-residue quarantine for
+   exactly this case — a valid recorded worker's uncommitted residue is the
+   interrupted round's own partial work, which the resumed executor picks
+   back up (the incident wrk-01 fixes: quarantining it recreated the repo
+   and discarded the resumable work). The quarantine branch itself is
+   unchanged for every preparation that did NOT pass this gate, and the
+   primary-checkout-clean and symlink checks still run either way. What
+   still guards against unaccounted residue riding along silently:
+   `commit_and_capture` stages exactly the reported `changed_paths`, and
+   `_verify_committed` refuses a candidate whose worktree is not clean
+   after commit.
 2. A pending `CommitIntent` from a previous crash is reconciled FIRST
    (`reconcile_after_crash`, F8 — see `worktask.py`'s module docstring) —
    `RECOVERABLE` adopts the branch tip without re-committing, `AMBIGUOUS`
@@ -1439,8 +1448,16 @@ review path (§4b):
   failed round's files too, and a round that later passed committed them
   alongside its own legitimate change. Fix:
   `Orchestrator._prepare_write_capable_worker` requires the worker repo
-  clean (`dirty_entries_all()` empty) before every write-capable dispatch;
-  if not, `WorkerRepoManager.quarantine(task_id, label)` MOVES (never
+  clean (`dirty_entries_all()` empty) before every write-capable dispatch —
+  **except when the dispatch already passed the wrk-01 reuse gate**
+  (2026-08-18): a resumed execution whose recorded worker exists, is a git
+  repo, and is on the recorded branch is used AS IT STANDS, residue
+  included, because that residue is the interrupted round's own resumable
+  work (see step 1b of the dispatch sequence above; the residual-dirty
+  refusal in `_verify_committed` still stops unreported content from
+  slipping into a candidate silently). For every preparation that did NOT
+  pass that gate the original behaviour is unchanged:
+  if not clean, `WorkerRepoManager.quarantine(task_id, label)` MOVES (never
   deletes) the dirty repo to a sibling `quarantine/<task_id>-<label>`
   directory — preserved for diagnosis, but no longer reachable by a later
   `create()` for the same task id, which `create()` already refuses if

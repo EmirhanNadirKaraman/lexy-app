@@ -3973,7 +3973,12 @@ class Orchestrator:
         # present on disk, a git repository in its own right, and checked out
         # on the recorded `task_branch` (`worker_repo_is_reusable` — those
         # three facts and nothing more). Reuse touches nothing: no clone, no
-        # branch switch, no rewrite of the record. Anything else falls back
+        # branch switch, no rewrite of the record — and the decision is
+        # CARRIED THROUGH preparation (`reused_recorded_worker` below), so a
+        # reused worker is used exactly as it stands: uncommitted residue
+        # from the interrupted round it is resuming is the work being
+        # resumed, not grounds for `_prepare_write_capable_worker` to
+        # quarantine it and start over. Anything else falls back
         # to the SAME creation call a first dispatch makes — the recorded
         # base fetched from the primary checkout onto the recorded branch —
         # so a missing directory is simply recreated, while a path that
@@ -3981,10 +3986,13 @@ class Orchestrator:
         # makes `WorkerRepoManager.create` refuse with its usual actionable
         # error. No repair and no deletion: salvaging a half-broken worker
         # is an operator's decision, not this dispatch's.
+        reused_recorded_worker = False
         if resumed and self._worker_repos is not None:
-            if not worker_repo_is_reusable(
+            if worker_repo_is_reusable(
                 Path(execution.worktree_path), execution.task_branch
             ):
+                reused_recorded_worker = True
+            else:
                 self._worker_repos.create(
                     task.id,
                     self._git.repo_root,
@@ -4165,11 +4173,18 @@ class Orchestrator:
         # M1 finding #3 (failed-round isolation): a write-capable attempt
         # never starts from a dirty primary checkout, and never resumes a
         # worker repo left dirty by a previous attempt that crashed or failed
-        # validation without committing. Audit-exempt (see `is_audit` above)
+        # validation without committing — UNLESS this dispatch already
+        # decided, above, to reuse the recorded worker (wrk-01): a resumed
+        # round's own uncommitted partial work is what it is resuming, so the
+        # reuse decision is passed through and the dirty-residue quarantine
+        # does not run for it. Audit-exempt (see `is_audit` above)
         # and worktrees-fallback-exempt (see `_prepare_write_capable_worker`'s
         # own docstring) — scoped to the path production actually uses.
         if self._worker_repos is not None and not is_audit:
-            refreshed = self._prepare_write_capable_worker(task, execution, worktree_git)
+            refreshed = self._prepare_write_capable_worker(
+                task, execution, worktree_git,
+                reused_recorded_worker=reused_recorded_worker,
+            )
             if refreshed is None:
                 return  # already parked
             worktree_git = refreshed
@@ -4427,7 +4442,12 @@ class Orchestrator:
         self._finish_postcommit(execution, worktree_git, state, task)
 
     def _prepare_write_capable_worker(
-        self, task: Task, execution: TaskExecution, worktree_git: GitGateway
+        self,
+        task: Task,
+        execution: TaskExecution,
+        worktree_git: GitGateway,
+        *,
+        reused_recorded_worker: bool = False,
     ) -> GitGateway | None:
         """Preflight for a write-capable (non-audit) dispatch through
         `self._worker_repos`, run once the pending-intent crash check in
@@ -4461,11 +4481,25 @@ class Orchestrator:
             the primary checkout, so that recreation fetches from there as
             usual.
 
+        The ONE exemption from the second gate is
+        `reused_recorded_worker=True` (wrk-01): the caller already decided,
+        via `worker_repo_is_reusable`, to resume the exact worker the
+        execution record names — right path, a git repository, checked out
+        on the recorded `task_branch`. That decision means the worker is
+        used AS IT STANDS: uncommitted residue there is the interrupted
+        round's own partial work being resumed, so quarantining it and
+        recreating the repo would discard precisely what the resume exists
+        to keep. The flag changes nothing else — the primary-checkout gate
+        and the symlink re-check below still run, and a dispatch whose
+        recorded worker did NOT pass the reuse probe (or a first dispatch,
+        which has no record at all) keeps the quarantine behaviour exactly
+        as before.
+
         Returns the `GitGateway` to actually use — `worktree_git` unchanged
-        when it was already clean, or a fresh one rooted at the recreated
-        repo — or `None` if this already parked (`_to_needs_user` was
-        called); the caller must return immediately without dispatching the
-        executor.
+        when it was already clean (or reused as-is), or a fresh one rooted
+        at the recreated repo — or `None` if this already parked
+        (`_to_needs_user` was called); the caller must return immediately
+        without dispatching the executor.
         """
         if self._git.is_dirty():
             self._to_needs_user(
@@ -4482,7 +4516,7 @@ class Orchestrator:
             )
             return None
 
-        if worktree_git.dirty_entries_all():
+        if not reused_recorded_worker and worktree_git.dirty_entries_all():
             label = f"attempt{execution.attempt_count + 1}-{utcnow_iso().replace(':', '')}"
             quarantined_at = self._worker_repos.quarantine(task.id, label)
             self._log(
