@@ -244,7 +244,7 @@ from .packet import (
 )
 from .policy import PolicyEngine, Verdict, retired_decision_verdict
 from .publisher import Publisher, redact_url
-from .worker_env import verify_worker_isolation, worker_env
+from .worker_env import verify_worker_isolation, worker_env, worker_repo_is_reusable
 from .prompts import (
     TEMPLATES,
     build_prompt,
@@ -4007,8 +4007,26 @@ class Orchestrator:
         declared_validation_cwd = "" if is_audit else (task.validation_cwd or "")
 
         execution = self._execution_store.load(task.id)
+        resumed = execution is not None
+        # The three-fact reuse decision (wrk-01) is made HERE, before the
+        # stale-base reconciliation below ever runs — that path would
+        # otherwise quarantine and rebuild a perfectly valid worker solely
+        # because the recorded base is behind the branch head, evicting the
+        # very round being resumed. The probe asks exactly what the record
+        # claims and nothing more: the recorded `worktree_path` exists, is a
+        # git repository in its own right, and is checked out on the
+        # recorded `task_branch`. When it passes, the decision is passed
+        # into `_rebase_execution_if_stale` (which then skips its
+        # nothing-reviewed-yet re-base) and carried through the rest of the
+        # dispatch (`reused_recorded_worker` below).
+        recorded_worker_reusable = False
         if execution is not None and self._worker_repos is not None:
-            execution = self._rebase_execution_if_stale(execution, task)
+            recorded_worker_reusable = worker_repo_is_reusable(
+                Path(execution.worktree_path), execution.task_branch
+            )
+            execution = self._rebase_execution_if_stale(
+                execution, task, worker_reusable=recorded_worker_reusable
+            )
             if execution is None:
                 return          # parked; _rebase_execution_if_stale explained why
         if execution is None:
@@ -4067,6 +4085,52 @@ class Orchestrator:
                 self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         self._store.save(state)
+
+        # A resumed round REUSES the worker its execution record names,
+        # whenever that worker is still exactly what the record says it is:
+        # present on disk, a git repository in its own right, and checked out
+        # on the recorded `task_branch` (`worker_repo_is_reusable` — those
+        # three facts and nothing more, decided ABOVE, before stale-base
+        # reconciliation could touch the worker). Reuse touches nothing: no
+        # clone, no branch switch, no rewrite of the record — and the
+        # decision is CARRIED THROUGH preparation (`reused_recorded_worker`
+        # below), so a reused worker is used exactly as it stands:
+        # uncommitted residue from the interrupted round it is resuming is
+        # the work being resumed, not grounds for
+        # `_prepare_write_capable_worker` to quarantine it and start over.
+        # Anything else falls back to the SAME creation call a first
+        # dispatch makes — the recorded base fetched from the primary
+        # checkout onto the recorded branch — so a missing directory is
+        # simply recreated, while a path that exists but is not a git
+        # repository (or is on the wrong branch) makes
+        # `WorkerRepoManager.create` refuse with its usual actionable error.
+        # No repair and no deletion: salvaging a half-broken worker is an
+        # operator's decision, not this dispatch's. The re-probe on the
+        # not-reusable side is for one case only: the stale-base re-base
+        # above may have just rebuilt the worker at the recorded path, and
+        # that fresh worker must not be handed to `create()` a second time.
+        reused_recorded_worker = False
+        if resumed and self._worker_repos is not None:
+            if recorded_worker_reusable or worker_repo_is_reusable(
+                Path(execution.worktree_path), execution.task_branch
+            ):
+                reused_recorded_worker = True
+            else:
+                self._worker_repos.create(
+                    task.id,
+                    self._git.repo_root,
+                    execution.task_base_sha,
+                    branch=execution.task_branch,
+                )
+                self._log(
+                    "worker_recreated",
+                    data={
+                        "task_id": task.id,
+                        "worktree_path": execution.worktree_path,
+                        "task_branch": execution.task_branch,
+                        "task_base_sha": execution.task_base_sha,
+                    },
+                )
 
         if self._worker_repos is not None:
             # The scrubbed env is not decoration: a GitGateway with no explicit
@@ -4232,11 +4296,18 @@ class Orchestrator:
         # M1 finding #3 (failed-round isolation): a write-capable attempt
         # never starts from a dirty primary checkout, and never resumes a
         # worker repo left dirty by a previous attempt that crashed or failed
-        # validation without committing. Audit-exempt (see `is_audit` above)
+        # validation without committing — UNLESS this dispatch already
+        # decided, above, to reuse the recorded worker (wrk-01): a resumed
+        # round's own uncommitted partial work is what it is resuming, so the
+        # reuse decision is passed through and the dirty-residue quarantine
+        # does not run for it. Audit-exempt (see `is_audit` above)
         # and worktrees-fallback-exempt (see `_prepare_write_capable_worker`'s
         # own docstring) — scoped to the path production actually uses.
         if self._worker_repos is not None and not is_audit:
-            refreshed = self._prepare_write_capable_worker(task, execution, worktree_git)
+            refreshed = self._prepare_write_capable_worker(
+                task, execution, worktree_git,
+                reused_recorded_worker=reused_recorded_worker,
+            )
             if refreshed is None:
                 return  # already parked
             worktree_git = refreshed
@@ -4494,7 +4565,12 @@ class Orchestrator:
         self._finish_postcommit(execution, worktree_git, state, task)
 
     def _prepare_write_capable_worker(
-        self, task: Task, execution: TaskExecution, worktree_git: GitGateway
+        self,
+        task: Task,
+        execution: TaskExecution,
+        worktree_git: GitGateway,
+        *,
+        reused_recorded_worker: bool = False,
     ) -> GitGateway | None:
         """Preflight for a write-capable (non-audit) dispatch through
         `self._worker_repos`, run once the pending-intent crash check in
@@ -4528,11 +4604,25 @@ class Orchestrator:
             the primary checkout, so that recreation fetches from there as
             usual.
 
+        The ONE exemption from the second gate is
+        `reused_recorded_worker=True` (wrk-01): the caller already decided,
+        via `worker_repo_is_reusable`, to resume the exact worker the
+        execution record names — right path, a git repository, checked out
+        on the recorded `task_branch`. That decision means the worker is
+        used AS IT STANDS: uncommitted residue there is the interrupted
+        round's own partial work being resumed, so quarantining it and
+        recreating the repo would discard precisely what the resume exists
+        to keep. The flag changes nothing else — the primary-checkout gate
+        and the symlink re-check below still run, and a dispatch whose
+        recorded worker did NOT pass the reuse probe (or a first dispatch,
+        which has no record at all) keeps the quarantine behaviour exactly
+        as before.
+
         Returns the `GitGateway` to actually use — `worktree_git` unchanged
-        when it was already clean, or a fresh one rooted at the recreated
-        repo — or `None` if this already parked (`_to_needs_user` was
-        called); the caller must return immediately without dispatching the
-        executor.
+        when it was already clean (or reused as-is), or a fresh one rooted
+        at the recreated repo — or `None` if this already parked
+        (`_to_needs_user` was called); the caller must return immediately
+        without dispatching the executor.
         """
         if self._git.is_dirty():
             self._to_needs_user(
@@ -4549,7 +4639,7 @@ class Orchestrator:
             )
             return None
 
-        if worktree_git.dirty_entries_all():
+        if not reused_recorded_worker and worktree_git.dirty_entries_all():
             label = f"attempt{execution.attempt_count + 1}-{utcnow_iso().replace(':', '')}"
             quarantined_at = self._worker_repos.quarantine(task.id, label)
             self._log(
@@ -6274,7 +6364,9 @@ class Orchestrator:
         self._mark_task_completed(task.id)
         return True
 
-    def _rebase_execution_if_stale(self, execution: TaskExecution, task: Task):
+    def _rebase_execution_if_stale(
+        self, execution: TaskExecution, task: Task, *, worker_reusable: bool = False
+    ):
         """Re-point a retry at the CURRENT branch head when its pinned base has
         been left behind (docs/AUTOLOOP_TODO.md B9).
 
@@ -6295,7 +6387,16 @@ class Orchestrator:
           QUARANTINED rather than deleted, so a refused candidate stays on disk
           as evidence, and attempt_count is PRESERVED: a moving base must not
           silently refill the retry budget, or a task could churn forever by
-          re-basing.
+          re-basing. The ONE exemption is `worker_reusable=True` (wrk-01):
+          the caller already established, BEFORE calling here, that the
+          recorded worker passes the three-fact reuse probe — the recorded
+          `worktree_path` exists, is a git repository, and is checked out on
+          the recorded `task_branch` — so the round it holds is resumed on
+          that worker as it stands, and a base that merely moved on is not
+          grounds to quarantine and rebuild it. Nothing recorded changes
+          (the stale base included). Only this nothing-reviewed-yet re-base
+          is skipped by the flag: a reviewed record still reconciles or
+          parks exactly as below.
         * A review already happened AND the candidate is confirmed published --
           RECONCILE, do not park (`_reconcile_published_execution`). Nothing
           would be discarded: the reviewed object is durable on its own branch.
@@ -6330,6 +6431,22 @@ class Orchestrator:
                 detail=f"base={base} head={head} review_round={execution.review_round}",
             )
             return None
+
+        if worker_reusable:
+            # wrk-01: reuse wins over the re-base. See the docstring — the
+            # record is returned exactly as loaded, so the resumed round
+            # continues in the recorded worker at the recorded (stale) base.
+            self._log(
+                "execution_rebase_skipped_worker_reused",
+                data={
+                    "task_id": task.id,
+                    "task_base_sha": base,
+                    "head": head,
+                    "worktree_path": execution.worktree_path,
+                    "task_branch": execution.task_branch,
+                },
+            )
+            return execution
 
         stamp = utcnow_iso().replace(":", "").replace("-", "")
         try:
