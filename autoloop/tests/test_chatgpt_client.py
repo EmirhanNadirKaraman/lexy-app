@@ -1818,6 +1818,43 @@ def test_dismissing_when_nothing_is_up_is_a_no_op(tmp_path):
     assert session.clicks == [], "nothing to dismiss, nothing clicked"
 
 
+def test_a_throttled_composer_is_not_interactive_however_present_it_looks(tmp_path):
+    """The distinction the orchestrator's back-off classification turns on:
+    a throttled page HAS a composer, so only an attempted interaction can tell
+    "the account is limited" from "the browser is fine"."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    session.throttle()
+    client = make_client(session, clock, tmp_path)
+
+    assert session.exists(SEL.composer), "present, as it always is"
+    assert client.composer_interactive() is False, "and unusable, which presence hides"
+
+
+def test_an_unthrottled_composer_reports_interactive_after_a_real_click(tmp_path):
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    client = make_client(session, clock, tmp_path)
+
+    assert client.composer_interactive() is True
+    assert session.focused == [SEL.composer], "proven by the interaction itself"
+
+
+def test_a_dead_page_reports_not_interactive_rather_than_raising(tmp_path):
+    """The caller is choosing between three states while a fault is already in
+    flight; an exception here would be a fourth answer."""
+    session, clock = FakeSession(), FakeClock()
+    session.seed(OLD_TURN)
+    client = make_client(session, clock, tmp_path)
+
+    def gone(_selector):
+        raise RuntimeError("Target page, context or browser has been closed")
+
+    session.exists = gone
+
+    assert client.composer_interactive() is False
+
+
 def test_a_logged_out_profile_still_wins_over_the_throttle_check(tmp_path):
     """Ordered deliberately: a logged-out page has no conversation to
     throttle, and answering an auth prompt with a back-off would wait out a

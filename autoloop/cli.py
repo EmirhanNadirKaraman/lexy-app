@@ -1496,6 +1496,15 @@ _RESOLUTION_PRECONDITIONS = {
     # real publisher url snapshot exists and matches the live remote — the
     # closest existing recheck to "a publisher is actually configured".
     "changeset_publisher_required": _precondition_publisher_url,
+    # `browser_unattachable` (brw-11): the CDP endpoint answers but there is no
+    # page to attach to, so the loop had no browser at all. Unlike its sibling
+    # `rate_limited` — which deliberately has NO entry, because the only recheck
+    # that could establish whether a server-side limit still holds is another
+    # request against it — this one is recheckable locally and for free, and an
+    # answer given while the window is still closed just re-parks. Reuses the
+    # browser check: its `cdp`/`browser_live` probes are exactly "can something
+    # attach to this endpoint".
+    "browser_unattachable": _precondition_browser,
     "worker_environment_drift": _precondition_worker_environment_drift,
     "worker_isolation_violation": _precondition_worker_environment_drift,
     "push_refused_protected": _precondition_protected,

@@ -13,6 +13,7 @@ code survives repeated connect/teardown cycles and leaves the human's browser
 running on the same pid.
 """
 
+import json
 import sys
 import types
 
@@ -1012,3 +1013,101 @@ def test_a_diagnosis_that_throws_never_becomes_the_failure(fake_playwright, monk
     message = str(caught.value)
     assert "diagnosis=unavailable" in message
     assert "Connection closed while reading from the driver" in message
+
+
+# ---- the state /json/version cannot see --------------------------------------
+#
+# 2026-08-17: the operator closed the browser WINDOW. Chrome stayed alive,
+# `/json/version` kept answering with a valid `webSocketDebuggerUrl` — so every
+# check built on it called the browser healthy — and `/json/list` returned ZERO
+# targets. Playwright could not attach at all. Restarting restored 11 targets.
+
+
+def _json_list(monkeypatch, body, status=200):
+    """Answer `/json/list` with `body`, and record which URL was asked."""
+    asked = []
+
+    class _Response:
+        def __init__(self):
+            self.status = status
+
+        def read(self, _limit=None):
+            return body.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def urlopen(url, timeout):
+        asked.append(url)
+        return _Response()
+
+    monkeypatch.setattr(ps, "_urlopen", urlopen)
+    return asked
+
+
+def test_a_browser_with_no_page_targets_reports_zero(monkeypatch):
+    """The window-closed state, and the whole reason this probe exists: nothing
+    about `/json/version` distinguishes it from a working browser."""
+    asked = _json_list(monkeypatch, "[]")
+
+    assert ps.attachable_page_targets("http://127.0.0.1:9222") == 0
+    assert asked == ["http://127.0.0.1:9222/json/list"]
+
+
+def test_only_page_targets_count(monkeypatch):
+    """A service worker is not somewhere a conversation can be driven, so a
+    browser holding nothing else is still unattachable for this purpose."""
+    body = (
+        '[{"type": "page", "id": "1"}, {"type": "service_worker", "id": "2"}, '
+        '{"type": "iframe", "id": "3"}]'
+    )
+    _json_list(monkeypatch, body)
+
+    assert ps.attachable_page_targets("http://127.0.0.1:9222") == 1
+
+
+def test_a_healthy_browser_reports_its_pages(monkeypatch):
+    _json_list(monkeypatch, json.dumps([{"type": "page"} for _ in range(11)]))
+
+    assert ps.attachable_page_targets("http://127.0.0.1:9222") == 11
+
+
+def test_an_unreachable_endpoint_is_unmeasurable_not_zero(monkeypatch):
+    """The distinction the caller acts on. Zero means "the browser answered and
+    named no page", which authorises a restart; an endpoint that answers
+    nothing is the ORDINARY browser fault, which already diagnoses and
+    restarts itself on its own budget — reporting it as zero here would move
+    that decision into the rate-limit path."""
+
+    def refused(url, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(ps, "_urlopen", refused)
+
+    assert ps.attachable_page_targets("http://127.0.0.1:9222") is None
+
+
+def test_a_non_200_or_unparseable_answer_is_unmeasurable(monkeypatch):
+    _json_list(monkeypatch, "[]", status=500)
+    assert ps.attachable_page_targets("http://127.0.0.1:9222") is None
+
+    _json_list(monkeypatch, "<html>not the CDP endpoint</html>")
+    assert ps.attachable_page_targets("http://127.0.0.1:9222") is None
+
+    # A dict is what /json/version answers with — right endpoint, wrong path.
+    assert ps.count_page_targets('{"webSocketDebuggerUrl": "ws://x"}') is None
+
+
+def test_the_probe_is_built_for_the_endpoint_it_is_given(monkeypatch):
+    """A remote CDP endpoint is asked about ITSELF — unlike the local port/`ps`
+    probes, an HTTP GET to `/json/list` describes the browser at the other end
+    rather than this machine."""
+    asked = _json_list(monkeypatch, "[]")
+
+    ps.attachable_page_targets("gpu-box:9222")
+
+    assert asked == ["http://gpu-box:9222/json/list"]
+    assert ps.attachable_page_targets("") is None, "and an empty endpoint asks nothing"

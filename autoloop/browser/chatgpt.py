@@ -1280,6 +1280,37 @@ class BrowserChatGPT:
         """
         return self._session.exists(self._sel.rate_limit_modal)
 
+    def composer_interactive(self) -> bool:
+        """Did a REAL click on the composer land? The only positive evidence
+        that this page can be driven.
+
+        Presence proves nothing here — that is the whole trap of the throttle
+        overlay (see `selectors.rate_limit_modal`): the composer still reports
+        visible AND enabled while an `inset-0` overlay swallows every pointer
+        event, and three passive checks built on presence reported a false
+        all-clear on 2026-08-15. So this tests the modal first, then attempts
+        the interaction, then tests the modal AGAIN — an overlay that appeared
+        during the click is exactly the case a single check misses.
+
+        `focus()` is a genuine click in the Playwright transport (it has to be:
+        ProseMirror builds its selection state from the pointer interaction),
+        which is what makes it evidence rather than another passive probe. It
+        types nothing and sends nothing.
+
+        Never raises: the caller uses this to tell a throttled account from an
+        unusable browser, and an exception here would be a third answer to a
+        question that has exactly three.
+        """
+        try:
+            if self.is_rate_limited():
+                return False
+            if not self._session.exists(self._sel.composer):
+                return False
+            self._session.focus(self._sel.composer)
+            return not self.is_rate_limited()
+        except Exception:
+            return False
+
     def dismiss_rate_limit_modal(self) -> bool:
         """Best-effort "Got it", then report whether the overlay is GONE.
 

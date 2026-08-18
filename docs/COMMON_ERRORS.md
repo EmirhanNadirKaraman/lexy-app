@@ -830,6 +830,77 @@ starts — so if the park message says 30s, 30s of waiting really happened.
 between them is this, before the fix. A run that says `rate_limited` is this,
 after it — leave the account idle and `run --retry`.
 
+**But confirm it IS a throttle before you wait it out** — a browser with no
+attachable page produces the same park. See the entry below.
+
+### The loop reports `rate_limited` for hours and the account is NOT limited — `/json/list` returns `[]`
+**Symptom (2026-08-17):** the loop backs off, escalates, spends its whole
+`max_rate_limit_backoffs` budget and parks saying `rate_limited`. A probe run by
+hand agrees: "still rate limited", repeatedly, for **four hours**. Meanwhile
+ChatGPT in a normal browser is perfectly responsive, and nothing on the account
+is throttled. Every health check says the browser is fine:
+
+```bash
+curl -s http://127.0.0.1:9222/json/version   # 200, with a valid webSocketDebuggerUrl
+pgrep -f -- '--user-data-dir=.*autoloop-chrome'   # Chrome is running
+```
+
+**Cause:** the operator had closed the browser **window**. On macOS that leaves
+Chrome running: the process survives, it keeps the debug port, and
+`/json/version` keeps answering with a valid `webSocketDebuggerUrl` — so every
+check built on that endpoint reports a healthy browser. What it does not have is
+any target to attach to:
+
+```bash
+curl -s http://127.0.0.1:9222/json/list      # []  ← the whole fault, in one line
+```
+
+Playwright could not attach at all. With no page there was no modal to read, no
+composer to click and nothing to re-probe — so the loop fell back to its
+default, which is "assume the limit still holds", and waited out a limit that
+never existed. **A live CDP endpoint with no attachable target looks like a
+healthy browser to every check that only curls `/json/version`.** Restarting the
+profile restored 11 targets immediately.
+
+**Fix (2026-08-17, brw-11):** `_handle_rate_limited` now classifies before it
+waits, and before it concludes the limit still holds
+(`orchestrator._classify_rate_limit_state`):
+
+1. **throttle modal present on an attachable page** → genuinely rate limited.
+   Waits exactly as before: no restart, no client drop, no
+   `consecutive_failures`. Asked FIRST, so a page that can show the modal is
+   never restarted on the strength of an odd target count.
+2. **no modal and a real click on the composer LANDS** → the limit cleared;
+   resume without waiting. Presence proves nothing here (see the entry above);
+   only the click does.
+3. **nothing to attach to** (`/json/list` reports zero `type: "page"` targets)
+   → **not a rate limit.** Drops the client, restarts the profile via
+   `browser.restart_command` ONCE, re-probes once. Recovered → carry on;
+   still nothing → park `code="browser_unattachable"` with a question that
+   names the BROWSER. That restart does **not** increment
+   `rate_limit_backoffs`: that budget bounds waiting on the *server*, and this
+   is a local recovery that makes no request at all.
+
+`attachable_page_targets` (`browser/playwright_session.py`) distinguishes **zero
+from unmeasurable** on purpose: 0 means the endpoint answered and named no page,
+which authorises the restart; an endpoint that answers nothing is the ordinary
+`BrowserError` path, which already diagnoses itself (`describe_cdp_endpoint`)
+and restarts on its own budget.
+
+**Reading a transcript:** `browser_unattachable` → the browser, not the account.
+`browser_reattached` after it → one restart fixed it. A `rate_limited` entry now
+carries `classification` and `evidence`, so you can tell a modal that was really
+observed from a default reached because nothing could be asked.
+
+**Verify by hand, in this order** — `/json/list` is the question, `/json/version`
+is not:
+
+```bash
+curl -s http://127.0.0.1:9222/json/list | python3 -c \
+  'import json,sys; t=json.load(sys.stdin); print(sum(1 for x in t if x.get("type")=="page"), "page target(s)")'
+# 0 → open the profile window, or: python3 -m autoloop.browser.chrome_restart
+```
+
 ---
 
 ## 7. Autoloop worker/publisher separation (M2)
