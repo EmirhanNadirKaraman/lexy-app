@@ -141,6 +141,13 @@ DEFAULT_AUDIT_REPORT_GLOB = "docs/AUDIT_*.md"
 #: importantly, what it is not.
 DEFAULT_ENV_EXAMPLE_FILE = ".env.example"
 DEFAULT_ENV_EXAMPLE_DB_KEY = "DB_NAME"
+#: Where the TARGET repository ships the per-domain charters its audit agents
+#: are briefed with, and the default for `RepoConfig.audit_charters_file`.
+#: Relative to the repo root. The file is OPTIONAL: absent means the built-in
+#: charters in `audit/executor.py` (`DEFAULT_DOMAINS`), which is exactly the
+#: behaviour that existed before the file could be read at all — see
+#: `audit.executor.load_charter_domains`.
+DEFAULT_AUDIT_CHARTERS_FILE = "docs/audit_charters.toml"
 
 
 @dataclass(frozen=True)
@@ -185,6 +192,21 @@ class RepoConfig:
     #: a repository that files no audit reports — and, as above, only that exact
     #: value; padding is refused rather than read as the opt-out.
     audit_report_glob: str = DEFAULT_AUDIT_REPORT_GLOB
+    #: Where the repository ships its own AUDIT CHARTERS — the per-domain
+    #: briefs the read-only audit subagents are given (`audit/executor.py`).
+    #: A repository-relative path to one file; absent on disk means the
+    #: built-in charters, which is what makes this compatible rather than a
+    #: new requirement. Exactly `""` means "never look", for an operator who
+    #: wants the built-ins whatever the checkout happens to contain; padding
+    #: is refused rather than read as that opt-out, exactly as above.
+    #:
+    #: Same rule as the two settings above — this says WHERE the repository
+    #: states something about itself, and grants nothing. The charters are
+    #: prose handed to agents that are confined at argv level
+    #: (`agents.py`'s `--allowedTools`/`--disallowedTools`); a charter cannot
+    #: widen what an agent may do any more than a reviewer's scope can. See
+    #: `docs/SECURITY.md` S24.
+    audit_charters_file: str = DEFAULT_AUDIT_CHARTERS_FILE
 
 
 #: The key retired on 2026-08-14. An existing config may still name it, and
@@ -626,12 +648,13 @@ def _migrate_retired_tracker_paths(repo_data: dict) -> tuple[str, ...]:
 def _repo_relative(section_key: str, value: str, *, allow_globs: bool) -> str:
     """Raise `ConfigError` unless `value` is a plain repository-relative path.
 
-    Both `[repo]` path settings are joined onto a repo root the loop is handed,
+    Every `[repo]` path setting is joined onto a repo root the loop is handed,
     so an absolute path or a `..` would read a file the operator did not point
     the loop at — and the audit glob is passed to `Path.glob`, which raises
     outright on an absolute pattern. `allow_globs` is the one difference:
     `audit_report_glob` is a pattern by definition, while `env_example_file`
-    names one file and must not quietly match several.
+    and `audit_charters_file` each name one file and must not quietly match
+    several.
     """
     if value.strip() != value or "\\" in value:
         raise ConfigError(
@@ -679,7 +702,7 @@ def _load_repo_section(data: dict) -> tuple[RepoConfig, tuple[str, ...]]:
     notices = _migrate_retired_tracker_paths(repo_data)
     _check_keys("repo", repo_data, {f.name for f in dataclasses.fields(RepoConfig)})
 
-    for key in ("env_example_file", "audit_report_glob"):
+    for key in ("env_example_file", "audit_report_glob", "audit_charters_file"):
         if key not in repo_data:
             continue
         value = repo_data[key]

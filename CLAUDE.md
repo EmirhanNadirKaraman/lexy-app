@@ -329,6 +329,7 @@ not boot. Two things to know before switching:
 - **Migrations are append-only** — never edit an existing migration once it's been run anywhere.
 - **Tests live next to the layer they test** (backend tests under `lexy-app/backend/tests/`, pipeline tests under `tests/`).
 - **No new top-level Python files** without a reason — root is already crowded with the pipeline modules. (The `src/app/` refactor that used to sit alongside them was deleted 2026-07-27; don't start a replacement without a plan to finish it.)
+- **The audit's domain charters describe THIS repository, and can live in it.** The per-domain briefs the loop's read-only audit agents get (the two-backend split above, the ingestion pipeline, which docs are canonical) are `DEFAULT_DOMAINS` in `autoloop/audit/executor.py`. Since port-03 (2026-08-19) a repository may instead ship them as `docs/audit_charters.toml` — path configurable via `[repo].audit_charters_file`, format and rules in `docs/AUTOLOOP.md` §7 ("Domain charters"). **This repository ships no such file today and uses the built-ins**, so if you change what §2's layer table says, update `DEFAULT_DOMAINS` in the same commit or the next audit will brief its agents on a repo layout that no longer exists. Only ONE source is ever read per run: a file that exists wins outright, and a file that exists but is malformed aborts the audit rather than falling back.
 
 ---
 

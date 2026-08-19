@@ -350,6 +350,10 @@ def _build_executor(
             command=config.audit.agent_command,
             timeout_seconds=config.audit.audit_agent_timeout_seconds,
         ),
+        # Where the repository being audited may ship its OWN domain charters.
+        # Read per call from that call's repo root; absent means the built-in
+        # charters, which is what every deployment that predates the file gets.
+        charters_file=config.repo.audit_charters_file,
     )
     implement_executor = ImplementExecutor(
         git=git,

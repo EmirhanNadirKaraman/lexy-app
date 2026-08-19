@@ -302,6 +302,28 @@ env_example_db_key = "DB_NAME"
 # the panel empty, which is the right reading for a repo that files no audit
 # reports; padding is refused here too, for the same reason.
 audit_report_glob = "docs/AUDIT_*.md"
+# Where THIS repository ships the per-domain charters its audit agents are
+# briefed with — the brief that names your architecture, your trackers, your
+# known traps, which is the difference between findings worth reading and
+# generic advice. Relative to the repo root, one file, no globs.
+#
+# OPTIONAL, and absent is not an error: with no file there, the audit uses the
+# built-in charters in autoloop/audit/executor.py (DEFAULT_DOMAINS), exactly as
+# it did before this setting existed. Pointing the loop at a DIFFERENT
+# repository is the case this exists for — those built-ins describe the
+# language-learning app, so auditing anything else with them produces a report
+# that reads as complete and describes the wrong codebase.
+#
+# Format (docs/AUTOLOOP.md §7, "Domain charters"): one [[domain]] table per domain, in wave
+# order, each with slug/title/charter/model and nothing else. `model` is
+# "haiku", "sonnet" or "" (the CLI default) — the lead's tier is deliberately
+# not delegated to. The file is read READ-ONLY, once per run, from the root of
+# the checkout being audited, and a file that exists but does not parse ABORTS
+# the audit rather than quietly falling back to the built-ins.
+#
+# The exact empty string means "never look, always use the built-ins"; padding
+# is refused rather than read as that opt-out, as above.
+audit_charters_file = "docs/audit_charters.toml"
 
 [paths]
 # Runtime state (state.json, tasks.json, transcript.jsonl, diagnostics/, PAUSE).

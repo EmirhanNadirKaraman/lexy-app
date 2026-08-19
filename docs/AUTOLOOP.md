@@ -3414,6 +3414,56 @@ writes land in the change manifest.
 `push`, or `stop`. `implement` is rejected in this phase, and so is
 `ask_user` — retired, see §9c.
 
+**Domain charters — shipped by the repository under audit** (port-03,
+2026-08-19). Step 3's per-domain briefs are the reason the audit produces
+findings worth reading rather than generic advice: they name this repository's
+two-backend split, its ingestion pipeline, which docs are canonical. That
+knowledge belongs beside the code it describes, so a target repository may ship
+it as a file, and `DEFAULT_DOMAINS` in `audit/executor.py` is the fallback.
+
+* **Where.** `[repo].audit_charters_file`, default `docs/audit_charters.toml`,
+  resolved relative to the ROOT OF THE CHECKOUT BEING AUDITED — in production
+  the audit's own worker repo, not the main checkout and never the loop's
+  source tree. Same path rules as the other `[repo]` settings: relative, no
+  padding, no `..`, no globs, one file. The exact empty string means "never
+  look".
+* **Absent is compatibility, not an error.** No file (or the empty opt-out)
+  means the built-in charters, byte for byte the behaviour that existed before
+  the file could be read — pinned by `test_audit_charters.py`'s prompt-identity
+  test, which compares whole prompts rather than counting domains.
+* **Format.** TOML: one `[[domain]]` table per domain, IN WAVE ORDER (the first
+  `max_parallel_agents` run concurrently), each carrying exactly `slug`,
+  `title`, `charter` and `model`. Charters go in `'''` literal strings — `"""`
+  processes escapes. `model` is `"haiku"`, `"sonnet"` or `""` (the CLI
+  default); `opus` is refused, because `DEFAULT_DOMAINS` deliberately never
+  delegates to the lead's tier and a file the operator does not own is not
+  where that gets reversed. `render_charter_file(DEFAULT_DOMAINS)` emits a
+  valid starting point, and the round trip through `parse_charter_domains` is
+  exact — nothing is normalized, re-wrapped or reordered.
+* **Fails closed.** A file that exists but does not parse — unknown key,
+  missing field, blank charter, duplicate slug, unusable model — ABORTS the run
+  with an `ExecutionOutcome(status="error")` naming the file and the fault,
+  before a run directory exists or an agent is launched. It never degrades to
+  the built-ins: those describe the language-learning app, and a report
+  produced from them inside another repository would read as complete while
+  describing the wrong codebase. The failure is an outcome rather than a raised
+  `AuditError` on purpose — `Orchestrator.run` catches browser/git/state
+  faults, so a raise here would end the process with a traceback instead of
+  reaching the reviewer.
+* **Portability boundary.** The charter file says WHAT to look at; it grants
+  nothing. Read-only confinement stays argv-level (`agents.py`'s
+  `--allowedTools`/`--disallowedTools`), the always-approved tracker list stays
+  the `tasks.TRACKER_PATHS` constant (see §31 in `docs/SECURITY.md`), and the
+  ground rules, the reviewer-scope framing and the findings schema are added by
+  `_agent_prompt` around whatever the file says — a charter cannot drop them by
+  omission. Loading is read-only, resolved once per `execute()` call, cached
+  nowhere: one process auditing two repositories uses each one's charters.
+* **Still in code**, and the next thing to move if this is taken further: the
+  prompt's opening line still describes the audited codebase as "a German
+  language-learning app; see CLAUDE.md" (`_agent_prompt`). A target repository
+  can restate its own framing inside its charters, but the sentence itself is
+  not yet repository-supplied.
+
 ---
 
 ## 7b. The implement executor

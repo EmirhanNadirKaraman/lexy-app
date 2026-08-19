@@ -2220,6 +2220,40 @@ a sentence in half, and it is still there.
 
 ---
 
+## 11. Autoloop audit charters (target-repository portability)
+
+### `audit not run — the repository's audit charters could not be loaded: …`
+**Symptom:** an `audit` round comes back `status: error` with that summary and
+nothing else — no `docs/AUDIT_<date>.md`, no `.autoloop/audit/<run-id>/`
+directory, no agent output, `validation: not run`. The rest of the message
+names a file and a fault, e.g. `… docs/audit_charters.toml [[domain]] #2:
+duplicate slug 'security_paths'`.
+**Cause:** the repository being audited ships an audit-charter file
+(`[repo].audit_charters_file`, default `docs/audit_charters.toml`) that exists
+but does not parse. This is a deliberate refusal, not a crash: the alternative
+— falling back to the built-in `DEFAULT_DOMAINS` — would brief the agents on
+THIS repository's architecture inside whatever checkout is under audit and file
+a report that reads as complete while describing the wrong codebase. It is
+checked before the run directory is created, so a failed round costs nothing.
+Note the file is read from the root of the checkout the call is rooted at — in
+production the audit's own worker repo, not the main checkout — so a fix in the
+main checkout only takes effect for a round dispatched after it is committed.
+**Fix:** repair the file the message names (format and rules in
+`docs/AUTOLOOP.md` §7, "Domain charters": one `[[domain]]` table per domain in
+wave order, exactly `slug`/`title`/`charter`/`model`, `model` limited to
+`haiku`/`sonnet`/`""`, charters in `'''` literal strings because `"""`
+processes escapes). Two escape hatches, both deliberate: delete the file and
+the built-in charters are used again, or set `audit_charters_file = ""` in
+`.autoloop/config.toml` to stop looking for one at all. Do NOT "fix" this by
+making the loader fall back on a parse error — the refusal is the feature, and
+`autoloop/tests/test_audit_charters.py::test_a_malformed_file_never_degrades_to_the_built_in_charters`
+is what stops it coming back. If instead the audit RAN but reported domains you
+did not expect (check the summary's "Domain charters came from …" clause and
+the coverage table), that is the same setting working: some checkout in the
+chain ships a charter file.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found
