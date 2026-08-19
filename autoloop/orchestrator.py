@@ -4435,6 +4435,52 @@ class Orchestrator:
             # repository entirely is still loop-fatal escape detection
             # (`_execute_with_escape_detection`), which is about confinement,
             # not scope.
+
+            # The cleanup rule's record (scope-04, 2026-08-19). Read FIRST,
+            # against `execution.out_of_scope_paths` as it stands BEFORE this
+            # round's own overrun is unioned in below — a path this round both
+            # created and deleted was never previously recorded, so it is not
+            # cleanup and must not be recorded as such.
+            #
+            # Sourced from git, not from the executor: `dirty_entries_all()` is
+            # the same uncommitted status the round is about to stage, so a
+            # deletion is git's own account of the tree. The executor DOES
+            # report removals in its summary, and that report is a claim like
+            # every other one — this is the fact.
+            #
+            # The status test matches the unmerged `DD`/`AD` shapes too, which
+            # cannot occur here (nothing merges into a worker repo mid-round)
+            # and would cost nothing if they did: the intersection below is the
+            # gate, so the widest a loose status match can be wrong is to
+            # under- or over-report the RECORD. It can never authorize a
+            # deletion — the deletion has already happened, by an executor that
+            # checked the same recorded set before making it.
+            #
+            # Guarded on the record being non-empty, so the ordinary round —
+            # every task that never overran its scope — pays nothing for this:
+            # `-uall` is a materially more expensive stat walk (see
+            # `GitGateway.dirty_entries_all`), and with nothing recorded there
+            # is by definition nothing a deletion could be cleanup OF.
+            cleaned: set[str] = set()
+            if execution.out_of_scope_paths:
+                deleted = {
+                    path
+                    for status, path in worktree_git.dirty_entries_all()
+                    if "D" in status
+                }
+                cleaned = deleted & set(execution.out_of_scope_paths)
+            if cleaned:
+                # Union, never a replacement, and `out_of_scope_paths` is
+                # deliberately left intact — see
+                # `TaskExecution.removed_out_of_scope_paths` for why the two
+                # sets overlap on purpose.
+                execution.removed_out_of_scope_paths = tuple(
+                    sorted(set(execution.removed_out_of_scope_paths) | cleaned)
+                )
+                self._log(
+                    "out_of_scope_paths_removed",
+                    data={"task_id": task.id, "removed": sorted(cleaned)},
+                )
             outside = unauthorized_paths(
                 outcome.changed_paths,
                 effective_approved_paths(task.approved_paths, self._tracker_paths()),

@@ -1229,6 +1229,93 @@ there); `task_base_sha` still fetches from the primary checkout. See
 `test_quarantine_recreate_resumes_from_a_candidate_sha_that_only_exists_in_
 the_quarantined_repo` for the regression test.
 
+**Amended 2026-08-19 (scope-04) — a task may DELETE what the loop recorded it
+created out of scope, and only that.** The 2026-08-05 amendment above made
+advisory scope asymmetric without anyone intending it: creating a file outside
+`approved_paths` was permitted and recorded, but removing that same file again
+was not, so "delete the residue you added" — a correct review — was
+unperformable. Observed on roadmap-01 (2026-08-18): the reviewer asked twice,
+verbatim, that `autoloop/obsolete.py` be absent from the candidate rather than
+committed as a zero-byte addition; the identical feedback tripped
+`review_feedback_unchanged` and the task parked after 8 rounds with its
+implementation already accepted. Every component behaved correctly and the task
+still deadlocked.
+
+**The rule.** A later round of the SAME execution may delete a path that is
+already in that execution's `TaskExecution.out_of_scope_paths`. Nothing else
+changes: the path is not added to `approved_paths` or to
+`allowed_paths`, and creating, editing, recreating or renaming into it stays
+exactly as unauthorized as before (it lands, it is recorded, the reviewer
+judges it — the 2026-08-05 behaviour, untouched).
+
+**Why this does not widen scope.** The authorizing set is the loop's own record,
+written by the two path comparisons from `outcome.changed_paths` and git's
+`commit_range_paths` and never from an agent claim — so a task can only clean up
+what the loop itself DEMONSTRATED it wrote out of scope. Three properties bound
+it:
+
+* **Exact match only** (`tasks.authorized_cleanup_paths`), deliberately unlike
+  `unauthorized_paths`: no directory-prefix rule, so a recorded file never
+  authorizes a sibling, a near-miss spelling, or its directory.
+* **Deletion only.** The capability is one `unlink` in
+  `implement_executor._remove_recorded_file`, which refuses an absolute path, any
+  `..` segment, a parent that does not resolve inside the worker repo, and
+  anything that is not a regular file or symlink — so no directory and no
+  recursive delete is reachable, and a symlink is removed as the link, never
+  followed.
+* **The agent selects, it never authorizes.** The write-capable agent has no
+  delete tool at all (`WRITE_ALLOWED_TOOLS`, `Bash` disallowed), so it asks with
+  a `REMOVE-OUT-OF-SCOPE: <path>` line and the executor performs the unlink only
+  after `authorized_cleanup_paths` matches it against the persisted record. A
+  request for anything else deletes nothing and is reported as ignored (counted,
+  never quoted — the round summary becomes the commit message). An agent echoing
+  its own instruction emits the placeholder `<repository-relative path>`, which
+  no record can contain.
+
+**What is unchanged.** The empty-`approved_paths` dispatch refusal, escape
+detection, and every post-commit check (ancestry, empty range, dirty worktree,
+failing validation, validation mutating the tree) are all untouched. The
+`cleanup_paths_for` reader is injected in `cli._build_executor`; absent it —
+any embedder that does not wire it — there is no cleanup authority at all.
+
+**Residual exposure, stated plainly.** A round can now delete an out-of-scope
+file the reviewer wanted KEPT. Bounded by the same control as the rest of this
+amendment: the deletion is staged and committed like any other change, so it is
+in the diff the reviewer reads, and `TaskExecution.removed_out_of_scope_paths`
+records it durably — needed because `commit_range_paths` is a tree-to-tree diff,
+so a file created in round 1 and deleted in round 2 is absent from the reviewed
+range entirely. `out_of_scope_paths` is NEVER pruned when a path is cleaned up:
+the record that authorization was exceeded is regression history.
+
+**Not addressed, and worth naming.** This closes out-of-scope cleanup only. A
+task still cannot delete a file INSIDE its `approved_paths` — the missing
+capability is the agent's, not the authorization's — so a review asking for the
+removal of an in-scope file remains unperformable. roadmap-01's second file,
+`autoloop/tests/test_obsolete.py`, was exactly that case.
+
+**file:line** — `autoloop/tasks.py` (`authorized_cleanup_paths`);
+`autoloop/implement_executor.py` (`_CLEANUP_RE`, `_cleanup_instruction`,
+`_apply_recorded_cleanup`, `_remove_recorded_file`); `autoloop/orchestrator.py`
+(`_dispatch_task_postcommit`, the `removed_out_of_scope_paths` union);
+`autoloop/worktask.py` (`TaskExecution.removed_out_of_scope_paths`);
+`autoloop/cli.py` (`_recorded_out_of_scope_paths`).
+
+**Verification check:**
+```bash
+# The gate: the ONLY caller of the matcher is the executor's cleanup, and the
+# matcher is exact-match — no `is_directory_prefix`, no `startswith`:
+rg -n 'authorized_cleanup_paths' autoloop/                  # tasks.py def + implement_executor.py call
+rg -n 'REMOVE-OUT-OF-SCOPE' autoloop/implement_executor.py  # the request literal, prompt + regex
+# Cleanup must never widen either authorization field — expect NO hit:
+rg -n 'allowed_paths.*cleanup|approved_paths.*cleanup' autoloop/
+pytest autoloop/tests/test_scope_cleanup.py -q
+```
+
+**Suggested fix:** none outstanding. If a future change ever populates the
+cleanup set from an agent's report, admits a prefix match, or lets a cleanup
+path reach `allowed_paths`/`approved_paths`, that is a regression of this
+finding, not a refactor.
+
 ### S26 — Two `answer`-precondition keys were dead or mismapped, letting environmental blockers clear on text alone — MEDIUM — RESOLVED 2026-07-31
 
 **What it was:** `cli._RESOLUTION_PRECONDITIONS` maps a blocker `code` to a

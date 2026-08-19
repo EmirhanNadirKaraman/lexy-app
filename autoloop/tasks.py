@@ -399,6 +399,48 @@ def unauthorized_paths(changed, approved) -> set[str]:
         if path not in exact and not any(path.startswith(pre) for pre in prefixes)
     }
 
+
+def authorized_cleanup_paths(requested, recorded) -> tuple[set[str], set[str]]:
+    """Split `requested` into `(authorized, refused)` against `recorded`.
+
+    The cleanup rule, and the ONLY matcher for it (scope-04, 2026-08-19). A
+    task that DEMONSTRABLY created a file outside its scope must be able to
+    delete it again — `recorded` is that demonstration, and nothing else is:
+    it is `TaskExecution.out_of_scope_paths`, which the loop writes from its
+    own two path comparisons (`unauthorized_paths` against
+    `outcome.changed_paths` before the commit, and against git's
+    `commit_range_paths` after it) and never from anything an agent asserts.
+    `requested` is the opposite kind of input — an agent asking for something —
+    and this function is the whole of what stands between the two.
+
+    EXACT MATCH ONLY, deliberately unlike `unauthorized_paths` above. That one
+    answers "does this scope AUTHORIZE this path", where a trailing '/' is a
+    deliberate grant over a subtree. This one answers "did the loop see this
+    exact path written out of scope", which is a statement about one file. So
+    no prefix rule of any kind: a recorded `autoloop/obsolete.py` authorizes
+    deleting `autoloop/obsolete.py` and nothing else — not a sibling, not
+    `autoloop/obsolete.py.bak`, and not its directory. A recorded entry cannot
+    be a directory prefix in the first place (both comparisons feed it literal
+    file paths), and if one ever appeared it would still authorize only a file
+    literally named with the trailing slash, i.e. nothing.
+
+    This grants DELETION and grants nothing else. It never reaches
+    `Task.approved_paths` or `TaskExecution.allowed_paths`, so editing,
+    recreating or renaming into an authorized path remains exactly as
+    unauthorized as it was before the file was ever recorded — see
+    `implement_executor._apply_recorded_cleanup`, the one caller, which acts on
+    the `authorized` half by unlinking and does nothing else with it.
+
+    `refused` is returned rather than dropped so the caller can report what it
+    ignored. A silently ignored request looks identical to a satisfied one in
+    the round's outcome, and the reviewer who asked for the removal is the
+    person who most needs to know it did not happen.
+    """
+    recorded_set = set(recorded)
+    authorized = {p for p in requested if p in recorded_set}
+    return authorized, set(requested) - authorized
+
+
 class TaskState(str, Enum):
     READY = "ready"            # pending, all dependencies completed
     BLOCKED = "blocked"        # pending, at least one dependency incomplete

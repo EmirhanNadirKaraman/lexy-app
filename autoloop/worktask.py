@@ -350,6 +350,44 @@ class TaskExecution:
     #: writing a sentence here. The only thing this can do is inform the
     #: reviewer's judgement, which is precisely what it is for.
     assumptions: tuple[str, ...] = ()
+    #: Recorded out-of-scope paths a LATER round of this task deleted again
+    #: (scope-04, 2026-08-19). The other half of `out_of_scope_paths` above:
+    #: that field records what a round wrote outside its authorization, this one
+    #: records what a round took back.
+    #:
+    #: It exists because the packet cannot show this. Every path section a
+    #: reviewer reads is computed from `commit_range_paths(task_base_sha,
+    #: candidate_sha)`, which is a TREE-to-TREE diff — so a file created in
+    #: round 1 and deleted in round 2 is absent from the range entirely, and the
+    #: cleanup is invisible precisely because it worked. That absence is the
+    #: right thing for the reviewer to see (the residue really is gone from the
+    #: candidate), but "a round removed a file" and "no round ever wrote it"
+    #: must not be the same record. Without this field they are.
+    #:
+    #: Written by `orchestrator._dispatch_task_postcommit` from git's OWN
+    #: `dirty_entries_all()` deletion entries, intersected with
+    #: `out_of_scope_paths` as it stood before this round — never from the
+    #: executor's report and never from anything an agent wrote. The
+    #: intersection is what keeps this a record of the cleanup rule rather than
+    #: a list of everything a round happened to delete.
+    #:
+    #: Consequently this records the removal of TRACKED residue only. A recorded
+    #: path that was never committed — a round whose commit was refused after
+    #: the pre-commit gate had already recorded its overrun — is untracked, so
+    #: unlinking it leaves no `git status` entry at all and nothing lands here.
+    #: That is the honest answer rather than a gap: there is no committed file
+    #: for a reviewer to have seen, so there is nothing about its absence to
+    #: explain.
+    #:
+    #: ACCUMULATED (union), sorted, like the two path tuples above.
+    #:
+    #: `out_of_scope_paths` is NEVER pruned when a path lands here, and the two
+    #: sets deliberately overlap. The record that authorization was exceeded is
+    #: regression history — the same reason `docs/SECURITY.md` moves a finding
+    #: to *Resolved* instead of deleting it — and a round that cleaned up after
+    #: itself must not end up with a record indistinguishable from a round that
+    #: never overran at all.
+    removed_out_of_scope_paths: tuple[str, ...] = ()
 
 
 #: There is deliberately NO per-round cap here, and there was one until
@@ -583,6 +621,7 @@ class TaskExecutionStore:
         data = asdict(execution)
         data["allowed_paths"] = sorted(execution.allowed_paths)
         data["out_of_scope_paths"] = sorted(execution.out_of_scope_paths)
+        data["removed_out_of_scope_paths"] = sorted(execution.removed_out_of_scope_paths)
         data["validation_commands"] = [list(c) for c in execution.validation_commands]
         # NOT sorted, unlike the two path sets above — see
         # `TaskExecution.assumptions`: accumulation order is which round chose
@@ -606,6 +645,13 @@ class TaskExecutionStore:
             # record written before the scope check became advisory has no key
             # at all and loads as "nothing recorded out of scope".
             data["out_of_scope_paths"] = tuple(data.get("out_of_scope_paths", ()))
+            # Same coercion, same `.get` default: a record written before the
+            # cleanup rule existed has no key and loads as "no round has
+            # removed anything" — which is true of every such record, since
+            # nothing could delete an out-of-scope path before then.
+            data["removed_out_of_scope_paths"] = tuple(
+                data.get("removed_out_of_scope_paths", ())
+            )
             # JSON has no tuples: a record written before this field existed
             # has no key at all, and one written after has lists-of-lists.
             # Both normalise to the same shape, so an older record loads as

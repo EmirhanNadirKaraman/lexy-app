@@ -53,6 +53,20 @@ executor withheld would be gone for good the moment the next round ran. The
 size bounds live at render time, where the constraint actually is
 (`packet.ASSUMPTIONS_MAX_CHARS`, `packet.ASSUMPTION_MAX_CHARS_EACH`).
 
+**A round can delete what an earlier round of the same task created out of
+scope** (scope-04, 2026-08-19), and that is the ONLY deletion this executor
+performs. The agent cannot delete anything itself — `WRITE_ALLOWED_TOOLS` is
+Read/Grep/Glob/Edit/Write, `Bash` is disallowed — so "remove the residue you
+added", a correct review, used to be literally unperformable and produced a
+committed zero-byte file instead of an absent one (roadmap-01, 2026-08-18). The
+agent now writes a `REMOVE-OUT-OF-SCOPE: <path>` line and this executor unlinks
+the file, but ONLY when that exact path is already in the loop's own
+`TaskExecution.out_of_scope_paths` record (`_cleanup_instruction`,
+`_apply_recorded_cleanup`, `tasks.authorized_cleanup_paths`). The agent's line
+selects from that record; it can never add to it. Nothing about scope changes:
+`approved_paths` and `allowed_paths` are neither read nor written here, so an
+EDIT to the same path is as unauthorized as it ever was.
+
 **Model selection is automatic, deliberately.** `AgentSpec.model` is left at
 its default (`""`), so `ClaudeCliRunner.build_argv` omits `--model` entirely
 — no model table lives here or should be added; whatever the `claude` CLI
@@ -85,7 +99,7 @@ from .executor import ExecutionOutcome
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .stall import DEFAULT_CEILING_SECONDS, PartialWork, StallPolicy, WorkerTreeProbe
-from .tasks import Task
+from .tasks import Task, authorized_cleanup_paths
 from .validation import run_validation_commands
 from .validation_env import ValidationEnv
 from .worker_env import worker_env
@@ -220,6 +234,72 @@ _SMALLEST_REVERSIBLE_READING = (
 )
 
 
+#: The line shape a CLEANUP REQUEST is written on — `REMOVE-OUT-OF-SCOPE:`
+#: first on its line, optionally indented, nothing else in front of it.
+#: Deliberately the same anchoring discipline as `_ASSUMPTION_RE` above,
+#: including the refusal of `-`/`*`/`>` prefixes, so an agent summarising the
+#: instruction as a bullet is reporting, not requesting.
+#:
+#: The agent has no way to delete a file itself: `WRITE_ALLOWED_TOOLS` is
+#: Read/Grep/Glob/Edit/Write and `Bash` is disallowed, so "remove the residue
+#: you added" — a correct and common review — was literally unperformable, and
+#: the observed result was a zero-byte file committed in place of an absent one
+#: (roadmap-01, 2026-08-18). This line is how the agent asks the executor to do
+#: the one thing it cannot; `_apply_recorded_cleanup` is what decides whether
+#: the request is authorized.
+#:
+#: **Echo-safety is structural here, not textual** — a stronger property than
+#: `_ASSUMPTION_RE` has, and the reason this can afford to be a plain-text
+#: channel at all. An agent that quotes this instruction verbatim emits the
+#: placeholder `<repository-relative path>`, which is not a path the loop ever
+#: recorded, so `authorized_cleanup_paths` refuses it and nothing is deleted.
+#: A fabricated request cannot delete anything either: the authority is the
+#: persisted record, and this line only ever SELECTS from it.
+_CLEANUP_RE = re.compile(
+    r"^[ \t]*remove-out-of-scope:[ \t]*(.+)$", re.IGNORECASE | re.MULTILINE
+)
+
+
+def _cleanup_instruction(paths: tuple[str, ...]) -> str:
+    """The cleanup section of the agent prompt, or "" when there is nothing to
+    clean up.
+
+    Rendered ONLY when the loop has actually recorded out-of-scope residue for
+    this execution, so the ordinary round's prompt is unchanged and no agent is
+    told about a capability it has no occasion to use. The paths are listed
+    literally because the match is exact: an agent that retypes a path
+    approximately gets a refusal, not a near-miss deletion.
+
+    The wording is doing one specific job beyond describing the mechanism — it
+    has to stop the capability being read as scope. "You may remove this file"
+    is one sentence away from "this file is mine to edit", and the second
+    reading is the one that would quietly undo the never-widened
+    `allowed_paths` rule this whole mechanism is built to preserve.
+    """
+    if not paths:
+        return ""
+    listed = "\n".join(f"  {p}" for p in paths)
+    return (
+        "Out-of-scope residue from an earlier round of THIS task — the loop "
+        "recorded these paths itself, from its own diff of what your earlier "
+        "rounds committed, because your approved scope did not cover them:\n"
+        f"{listed}\n"
+        "You may ask for any of them to be DELETED. You have no Bash access "
+        "and no delete tool, so write one line per path, at the start of a "
+        "line, in the exact form\n"
+        "  REMOVE-OUT-OF-SCOPE: <repository-relative path>\n"
+        "copying the path exactly as listed above — no quotes, no backticks, "
+        "no leading './'. A path that does not match one of the lines above "
+        "exactly is ignored and reported as ignored. The executor performs the "
+        "deletion after you finish and before validation runs.\n"
+        "This is permission to REMOVE, and nothing else. It does not authorize "
+        "you to edit, recreate, rename into, or otherwise write these paths, "
+        "and it says nothing at all about their directories or any other file. "
+        "Remove only what the review actually asks you to remove; residue a "
+        "reviewer has not objected to is work, not litter."
+    )
+
+
 #: Introduces `tasks.Task.decomposition` in the agent's prompt.
 #:
 #: The reviewer approved this plan before any code was written, so it is the
@@ -237,7 +317,9 @@ _DECOMPOSITION_HEADER = (
 )
 
 
-def _agent_prompt(task: Task, feedback: str | None) -> str:
+def _agent_prompt(
+    task: Task, feedback: str | None, cleanup_paths: tuple[str, ...] = ()
+) -> str:
     parts = [
         "You are a write-capable coding subagent inside an automated "
         "repository task-implementation loop (a German language-learning "
@@ -258,9 +340,99 @@ def _agent_prompt(task: Task, feedback: str | None) -> str:
         "after validation passes. Do not delegate to another agent.",
         _SMALLEST_REVERSIBLE_READING,
     ]
+    cleanup = _cleanup_instruction(cleanup_paths)
+    if cleanup:
+        # After the ground rules, which say the agent cannot run commands, and
+        # before the feedback that is usually what asks for the removal.
+        parts.append(cleanup)
     if feedback:
         parts.append(f"Revision feedback from the previous review round: {feedback}")
     return "\n\n".join(parts)
+
+
+def _extract_cleanup_requests(raw_text: str) -> tuple[str, ...]:
+    """The paths an agent's output ASKED to have deleted, in the order written.
+
+    Deduplicated (a path requested twice is one request) and stripped of
+    surrounding whitespace, and normalised no further than that. No quote,
+    backtick or `./` stripping, deliberately: every normalisation step is a
+    place where a string the agent controls gets closer to a path the loop
+    recorded, and a non-match here is FAIL-CLOSED — it deletes nothing, and the
+    round reports the request as ignored. The prompt states the exact form and
+    says to copy the path literally, so a near-miss is an agent that did not
+    follow a stated instruction, not a case worth guessing at.
+    """
+    seen: list[str] = []
+    for match in _CLEANUP_RE.finditer(raw_text or ""):
+        text = match.group(1).strip()
+        if text and text not in seen:
+            seen.append(text)
+    return tuple(seen)
+
+
+def _cleanup_note(removed: tuple[str, ...], ignored: tuple[str, ...]) -> str:
+    """The sentence the round's summary carries about cleanup, or "".
+
+    Asymmetric on purpose. REMOVED paths are named in full: every one of them
+    came out of the loop's own record (`authorized_cleanup_paths` returns a
+    subset of it), so the text is bounded by a set the loop wrote and cannot be
+    grown by the agent. IGNORED paths are COUNTED and never named: those are
+    strings the agent chose, of any length and any content, and this summary
+    becomes the commit message (`orchestrator._dispatch_task_postcommit` builds
+    `title\\n\\nsummary`). A refused request must be visible — a silently
+    dropped one reads exactly like a satisfied one to the reviewer who asked
+    for the removal — but it does not need to be quoted to be visible, and the
+    agent's own output is already carried verbatim in `report_details`.
+    """
+    parts = []
+    if removed:
+        parts.append(
+            f" Removed {len(removed)} recorded out-of-scope path(s): "
+            + ", ".join(removed)
+            + "."
+        )
+    if ignored:
+        parts.append(
+            f" Ignored {len(ignored)} removal request(s) for path(s) this task "
+            "has no recorded out-of-scope write to (nothing was deleted for "
+            "them; the requests are in the executor report below)."
+        )
+    return "".join(parts)
+
+
+def _remove_recorded_file(root: Path, rel: str) -> bool:
+    """Unlink `rel` inside `root`. True only when a file was actually removed.
+
+    Called ONLY for a path `authorized_cleanup_paths` has already matched
+    against the loop's own record, so every check here is defence in depth
+    against a record that has been tampered with rather than a real
+    expectation. It refuses an absolute path, any `..` segment, anything whose
+    parent does not resolve inside `root`, and anything that is not a regular
+    file or a symlink — a directory is never removed, so no recursive delete
+    exists on this path at all.
+
+    A symlink is unlinked as the LINK, never followed: `Path.unlink` removes
+    the entry, so a recorded path that is somehow a symlink to something
+    outside the worker repo costs the link and leaves its target alone.
+
+    False for a path that is already absent, which is a no-op rather than a
+    failure: the end state the request asked for (the file is not in the tree)
+    already holds, and there is nothing to report to a reviewer about it.
+    """
+    if not rel.strip() or rel.startswith("/") or ".." in Path(rel).parts:
+        return False
+    target = root / rel
+    try:
+        if not target.is_symlink() and not target.is_file():
+            return False
+        base = root.resolve()
+        parent = target.parent.resolve()
+        if parent != base and base not in parent.parents:
+            return False
+        target.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def _extract_assumptions(raw_text: str) -> tuple[str, ...]:
@@ -309,6 +481,7 @@ class ImplementExecutor:
         policy: PolicyEngine | None = None,
         agent_runner_factory: Callable[[Path], AgentRunner] | None = None,
         validation_env: ValidationEnv | None = None,
+        cleanup_paths_for: Callable[[str], tuple[str, ...]] | None = None,
     ):
         """`git` / `agent_runner` are the STANDALONE bindings — used verbatim
         whenever `worker_repo_root_for` is not supplied (every direct
@@ -346,6 +519,17 @@ class ImplementExecutor:
         # agent runner, which runs under `strip_validation_vars()` (see
         # `audit/agents.py`) precisely so the writer cannot read them.
         self._validation_env = validation_env
+        # Reads THIS task's persisted `TaskExecution.out_of_scope_paths` — the
+        # loop's own record of what earlier rounds demonstrably wrote outside
+        # their scope, and the sole authority for the cleanup exception (see
+        # `_cleanup_instruction` / `tasks.authorized_cleanup_paths`). Injected
+        # as a callable, exactly like `worker_repo_root_for` above, so this
+        # module keeps knowing nothing about where executions are stored;
+        # `cli._build_executor` binds it to the same `TaskExecutionStore` the
+        # orchestrator writes those records with. None — every direct
+        # `execute()` test, and any embedder that does not wire it — means NO
+        # cleanup authority at all, which is the fail-closed default.
+        self._cleanup_paths_for = cleanup_paths_for
 
     # ---- TaskExecutor -------------------------------------------------------
 
@@ -409,6 +593,53 @@ class ImplementExecutor:
                 measured=False, note=f"{type(exc).__name__} reading the worker repository"
             )
 
+    def _recorded_cleanup_paths(self, task: Task) -> tuple[str, ...]:
+        """What the loop has recorded as this task's own out-of-scope residue.
+
+        Fail-closed at both ends: no injected reader means no cleanup authority
+        (an embedder that has not wired one is not silently granted the
+        exception), and a reader that raises — a missing record, an unreadable
+        or corrupt execution file — yields an empty set rather than propagating.
+        The consequence of an empty answer is only that a removal cannot be
+        requested this round; the consequence of guessing at one would be a
+        deletion nothing authorized.
+        """
+        if self._cleanup_paths_for is None:
+            return ()
+        try:
+            return tuple(self._cleanup_paths_for(task.id) or ())
+        except Exception:
+            return ()
+
+    @staticmethod
+    def _apply_recorded_cleanup(
+        git: GitGateway, recorded: tuple[str, ...], raw_text: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Perform the deletions this round asked for AND is authorized to make.
+
+        Returns `(removed, ignored)`: the paths actually unlinked, and the
+        requested paths `recorded` does not cover. The gate is
+        `tasks.authorized_cleanup_paths` and nothing else — the agent's line
+        selects from the loop's record, it never adds to it, so a request for a
+        path no round was ever recorded as writing out of scope deletes nothing
+        no matter how it is phrased.
+
+        Nothing here touches scope. `Task.approved_paths` and
+        `TaskExecution.allowed_paths` are not read, not written and not
+        consulted: this authorizes one unlink of one already-recorded file, and
+        an ordinary edit to that same path stays exactly as unauthorized as it
+        was — it lands, it is recorded out of scope, and the reviewer judges it,
+        which is what the 2026-08-05 advisory-scope amendment already does.
+        """
+        requested = _extract_cleanup_requests(raw_text)
+        if not requested:
+            return (), ()
+        authorized, ignored = authorized_cleanup_paths(requested, recorded)
+        removed = tuple(
+            sorted(p for p in authorized if _remove_recorded_file(git.repo_root, p))
+        )
+        return removed, tuple(sorted(ignored))
+
     def _run_implementation(
         self,
         directive: Directive,
@@ -417,7 +648,15 @@ class ImplementExecutor:
         agent_runner: AgentRunner,
     ) -> ExecutionOutcome:
         feedback = directive.feedback if directive.decision is Decision.REVISE else None
-        spec = AgentSpec(domain=task.id, title=task.title, prompt=_agent_prompt(task, feedback))
+        # Read BEFORE the agent runs, because it is what the prompt has to
+        # state, and read through the callable rather than from anything the
+        # agent or this round produced — see `self._cleanup_paths_for`.
+        cleanup_paths = self._recorded_cleanup_paths(task)
+        spec = AgentSpec(
+            domain=task.id,
+            title=task.title,
+            prompt=_agent_prompt(task, feedback, cleanup_paths),
+        )
         result = agent_runner.run(spec)
         if not result.ok:
             # A failed agent still leaves whatever it had already written in
@@ -459,6 +698,16 @@ class ImplementExecutor:
                 # problem and must keep consuming the task's attempt budget.
                 fault_kind=classify_agent_fault(result),
             )
+
+        # BEFORE the status read below and BEFORE validation, both on purpose.
+        # Before the status read, so the deletion is part of `changed_paths` and
+        # therefore of what gets staged and committed — a cleanup-only round
+        # that changed nothing else would otherwise fall into the "changed no
+        # files in its worker repo" refusal with the removal sitting on disk,
+        # uncommitted. Before validation, so the suite runs against the tree
+        # that is actually going to be committed rather than against one that
+        # still contains the file being removed.
+        removed, ignored = self._apply_recorded_cleanup(git, cleanup_paths, result.raw_text)
 
         try:
             changed = sorted(git.dirty_paths_all())
@@ -532,7 +781,7 @@ class ImplementExecutor:
             status="ok",
             summary=(
                 f"task '{task.id}' implemented: {len(changed)} file(s) changed; "
-                "validation passed."
+                "validation passed." + _cleanup_note(removed, ignored)
             ),
             details=result.raw_text,
             validation=validation_summary,
