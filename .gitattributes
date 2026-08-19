@@ -1,0 +1,29 @@
+# Merge behaviour for the two documentation trackers EVERY task appends to.
+#
+# The problem this solves, measured 2026-08-18: every task records a change
+# note in `docs/SUMMARY.md` and `docs/TESTS.md`, so any two parallel branches
+# touch the same region of the same two files and the merge sweep stops on a
+# conflict. It halted three times in one evening and left five reviewed,
+# published tasks unmerged for a day (dash-10, loop-02, brw-12, hlth-01,
+# wrk-01), each resolved by hand.
+#
+# `merge=union` keeps BOTH sides of a conflicting hunk instead of writing
+# conflict markers, so two branches that each append their own note line both
+# land and neither note is lost.
+#
+# WHAT UNION CANNOT DO, and why the note shape matters more than this file:
+# union resolves per LINE. Two branches that each grow the SAME line — the old
+# habit of appending a sentence to a module's table row, where the longest row
+# was 19,410 characters — do not get their two additions merged; they get the
+# whole row duplicated. So this attribute is only half the fix. The other half
+# is the rule in CLAUDE.md §12: a change note is ONE NEW LINE, and an existing
+# line is never grown to record one. `autoloop/tests/test_docs_merge.py` pins
+# both halves, including a test that demonstrates the duplication above.
+#
+# Deliberately exactly two paths. No wildcard, no `docs/*`, no source file:
+# union never reports a conflict, so anything listed here loses genuine
+# edit/edit conflict detection. That trade is acceptable for an append-only
+# note ledger and is NOT acceptable for code — a real source conflict must
+# still stop the sweep.
+docs/SUMMARY.md merge=union
+docs/TESTS.md merge=union

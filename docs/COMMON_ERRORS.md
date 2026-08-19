@@ -2160,6 +2160,37 @@ rule is load-bearing and evaluated first.
 
 ---
 
+## 10. Autoloop merge sweep (documentation trackers)
+
+### CONFLICT (content): Merge conflict in docs/SUMMARY.md — two tasks recorded a change note
+**Symptom:** the merge sweep aborts on `docs/SUMMARY.md` (or `docs/TESTS.md`)
+for two branches that changed nothing in common. It halted three times in one
+evening on 2026-08-18 and left five reviewed, published tasks unmerged for a
+full day (dash-10, loop-02, brw-12, hlth-01, wrk-01), each resolved by hand.
+14 merge commits already touched `SUMMARY.md`, so it had been recurring quietly.
+**Cause:** every task records a change note in those two files, and the note
+used to be appended INSIDE an existing table row — one row per module, the
+longest 19,410 characters in `SUMMARY.md` and 15,729 in `TESTS.md`. Two
+branches touching the same module therefore edit the same LINE, which is the
+granularity git merges at, so nothing can reconcile them automatically.
+**Fix:** applied repo-side (2026-08-19, docs-01) in two halves, both required.
+`.gitattributes` gives exactly those two paths `merge=union`, so concurrent
+appends keep both sides instead of conflicting; and `CLAUDE.md` §12 makes a
+change note ONE NEW LINE — a new table row, or a line appended to the
+"Change notes" section each tracker now ends with. The attribute alone is NOT
+a fix and must not be treated as one: union resolves per line, so two branches
+that grow the SAME line duplicate the whole row rather than merging the two
+additions (demonstrated by
+`autoloop/tests/test_docs_merge.py::test_growing_the_same_giant_row_on_both_branches_duplicates_it`).
+Do not extend the attribute to a source file or to `docs/` as a wildcard:
+union never reports a conflict, so anything listed there loses genuine
+conflict detection, and a real source conflict must still stop the sweep. If
+you hand-resolve one of these anyway, re-read the result — the 2026-08-18
+splice into `SUMMARY.md`'s `orchestrator.py` row duplicated ~4,500 characters
+and cut a sentence in half, and it is still there.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found

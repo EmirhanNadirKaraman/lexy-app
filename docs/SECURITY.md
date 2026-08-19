@@ -42,6 +42,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S30 | MEDIUM | The inbox vocabulary grew from create+priority to six mutation kinds, so a queued request can now rewrite an EXISTING task's `approved_paths` and `description` — falsifying S28's "it creates, never widens" bound. Guarded: nothing `in_progress`/`completed`/`retired` is editable, mutations share creation's validators, `block`/`unblock` cannot launder a loop-raised quarantine, `retire` is excluded, and no dashboard endpoint reaches any of it | `autoloop/inbox.py`, `autoloop/tasks.py` |
 | S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
+| S34 | INFO | `docs/SUMMARY.md` and `docs/TESTS.md` carry `merge=union` (2026-08-19, docs-01), so an edit/edit inside those two files concatenates both sides instead of stopping the merge sweep. Bounded: exactly two paths, no wildcard, no source file, and deliberately not `CLAUDE.md` / `docs/SECURITY.md` / `docs/SCHEMA.md` / `docs/COMMON_ERRORS.md`, which all still conflict | `/.gitattributes`, `autoloop/auto_merge.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -1317,6 +1318,51 @@ just present, in the SAME change that adds it — "is this recheck actually
 re-verifying the condition that fired the park, or just checking something
 correlated with it" is exactly what the second round caught, and it is a
 design question no automated test in this codebase can fully answer.
+
+### S34 — `merge=union` disables conflict detection on two documentation trackers — INFO — OPEN (deliberate, narrow, accepted)
+
+**Location:** `/.gitattributes:28-29` (the two rules), `autoloop/auto_merge.py:547`
+(`_merge`, the conflict abort this bypasses for those paths).
+
+**Severity:** INFO. No runtime behaviour and no control is reached: the two
+files are documentation, and nothing reads them at run time.
+
+**What it is.** `docs/SUMMARY.md` and `docs/TESTS.md` carry `merge=union` since
+2026-08-19 (docs-01), so two branches that each record a change note both land
+instead of stopping the merge sweep. The property being traded away is real:
+union NEVER reports a conflict, so an edit/edit inside those two files is
+resolved by concatenating both sides rather than by aborting. A branch that
+rewrote a line another branch also rewrote produces a duplicate, not a stop —
+including a line that WEAKENS a claim, which is the same shape as the residual
+recorded against `docs/SECURITY.md` in `tasks.TRACKER_PATHS`.
+
+**Why it is accepted, and what bounds it.** The rule is exactly two paths — no
+wildcard, no source file, and deliberately NOT `CLAUDE.md` (agent
+instructions), `docs/SECURITY.md` (this file), `docs/SCHEMA.md` or
+`docs/COMMON_ERRORS.md`, all of which still conflict and still stop the sweep.
+Every tracker edit remains visible in `commit_range_paths` and in the reviewed
+diff, so this changes what git resolves automatically, not what a reviewer
+sees. A duplicated documentation line is recoverable prose; an unmerged
+reviewed task was costing a day (2026-08-18).
+
+**Verification check:**
+```bash
+# Must print exactly these two rules and nothing else:
+grep -v '^\s*#' .gitattributes | grep -v '^\s*$'
+#   docs/SUMMARY.md merge=union
+#   docs/TESTS.md merge=union
+```
+Pinned by `autoloop/tests/test_docs_merge.py::test_the_repo_ships_a_union_rule_for_exactly_the_two_note_trackers`
+(the rule set is exact, and no rule may contain `*`), and by
+`..._a_real_conflict_in_a_source_file_still_stops_the_merge`.
+
+**Suggested fix if it ever needs one:** move the append-only note ledger into
+its own file and drop the attribute from the two docs — the trackers then
+conflict normally again. Not done now because a task's write scope is a list
+of exact paths (`tasks.unauthorized_paths`), so a new ledger file cannot be
+written by the tasks that would need to append to it. Do NOT "fix" it by
+widening the attribute to `docs/*`; that extends the trade to files nobody
+decided about.
 
 ---
 
