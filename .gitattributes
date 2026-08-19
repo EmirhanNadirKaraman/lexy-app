@@ -1,0 +1,40 @@
+# Merge behaviour for the two documentation trackers EVERY task appends to.
+#
+# THIS FILE DELIBERATELY DECLARES NO MERGE ATTRIBUTE. It is kept, and it is
+# kept empty of rules, so that the next person to reach for `merge=union` finds
+# out here why it was tried, measured and removed.
+#
+# The problem, measured 2026-08-18: every task records a change note in
+# `docs/SUMMARY.md` and `docs/TESTS.md`, so any two parallel branches touch the
+# same region of the same two files and the merge sweep stops on a conflict. It
+# halted three times in one evening and left five reviewed, published tasks
+# unmerged for a day (dash-10, loop-02, brw-12, hlth-01, wrk-01), each resolved
+# by hand.
+#
+# WHY NOT `docs/SUMMARY.md merge=union` (shipped 2026-08-19, removed the same
+# day, once the trade was stated plainly):
+#
+#   1. Union NEVER reports a conflict, and git has no way to scope a merge
+#      attribute to a REGION of a file. So union does not mean "combine the
+#      appended notes" — it means "this file can no longer conflict at all".
+#      Two branches rewriting the same sentence of tracker PROSE got both
+#      versions concatenated, silently. A real content conflict in these files
+#      has to keep stopping the sweep.
+#   2. Union is not even sufficient for the notes: it resolves per LINE, so two
+#      branches that each GREW the same table row — the longest was 19,410
+#      characters — duplicated the whole row rather than merging the two
+#      additions.
+#
+# WHAT REPLACED IT: a section-aware resolver, `autoloop/note_merge.py`, wired
+# into the loop's own merge path at `auto_merge.AutoMerger._merge`. It combines
+# two branches' appended change-note lines ONLY when each side left every
+# pre-existing line untouched and added nothing outside the append-only
+# `<!-- CHANGE-NOTES: ... -->` section each tracker ends with; in every other
+# case it declines and the merge aborts exactly as it always did. See that
+# module's docstring for why a custom `merge.<name>.driver` was rejected too
+# (it lives in `.git/config`, outside the repository, and the loop's git
+# whitelist admits no config WRITE with which to install it).
+#
+# Both halves are pinned by `autoloop/tests/test_docs_merge.py`, including the
+# real-git demonstrations that union duplicates a grown row and that union
+# would have swallowed a genuine prose conflict.

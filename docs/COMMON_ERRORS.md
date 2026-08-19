@@ -2160,6 +2160,66 @@ rule is load-bearing and evaluated first.
 
 ---
 
+## 10. Autoloop merge sweep (documentation trackers)
+
+### AssertionError: docs/SUMMARY.md must carry exactly one notes marker
+**Symptom:** `autoloop/tests/test_docs_merge.py::test_both_trackers_end_with_an_append_only_change_note_section`
+and `::test_every_change_note_line_is_short_enough_to_merge_by_line` both fail on
+one tracker while the file looks correct — its change-note section is last in the
+file, nothing follows it, and every note row is short.
+**Cause:** a table row ABOVE the section quoted the marker comment in FULL while
+documenting how the resolver works, so the file carried the marker twice. This is
+not a formatting nit: `note_merge.resolve_note_append` begins with
+`count(NOTES_MARKER) != 1 → None` (with two copies it cannot tell which one opens
+the append-only section), so a duplicate switches auto-resolution off for that
+tracker and every parallel note merge halts again — silently, with no symptom
+except the 2026-08-18 failure returning. Hit 2026-08-19 in docs-01's own first
+round, in `SUMMARY.md`'s `note_merge.py` row.
+**Fix:** in those two files, refer to the marker as `CHANGE-NOTES` and never write
+the comment out a second time; quoting it in `CLAUDE.md` or here is fine, since
+neither is a tracker. Rule 5 of each tracker's change-note section and `CLAUDE.md`
+§12 now say so, and the assertion message above names the consequence.
+
+### CONFLICT (content): Merge conflict in docs/SUMMARY.md — two tasks recorded a change note
+**Symptom:** the merge sweep aborts on `docs/SUMMARY.md` (or `docs/TESTS.md`)
+for two branches that changed nothing in common. It halted three times in one
+evening on 2026-08-18 and left five reviewed, published tasks unmerged for a
+full day (dash-10, loop-02, brw-12, hlth-01, wrk-01), each resolved by hand.
+14 merge commits already touched `SUMMARY.md`, so it had been recurring quietly.
+**Cause:** every task records a change note in those two files, and the note
+used to be appended INSIDE an existing table row — one row per module, the
+longest 19,410 characters in `SUMMARY.md` and 15,729 in `TESTS.md`. Two
+branches touching the same module therefore edit the same LINE, which is the
+granularity git merges at, so nothing can reconcile them automatically.
+**Fix:** applied repo-side (2026-08-19, docs-01) in two halves, both required.
+Each tracker now ends with an append-only **"Change notes"** section opened by
+a `<!-- CHANGE-NOTES: ... -->` comment, and `CLAUDE.md` §12 makes a change note
+ONE NEW LINE — a new table row, or a line appended below that comment. The
+other half is `autoloop/note_merge.py`, called from
+`auto_merge.AutoMerger._merge`: when a merge conflicts ONLY in that section and
+both sides left every pre-existing line byte-identical, the two branches'
+appended lines are combined and the merge is committed. Anything else — a
+conflict in the prose above the section, an edited/deleted/reordered existing
+note line, a conflicted path outside the two trackers — is refused and the
+merge aborts exactly as before, with `auto_merge_notes_refused` in the
+transcript saying which and why.
+
+**Do not "simplify" this to `merge=union`.** It was shipped that way for a few
+hours on 2026-08-19 and removed after review (`docs/SECURITY.md` S34). Git
+cannot scope a merge attribute to a REGION, and union never reports a conflict
+at all, so the attribute silently concatenated genuine prose conflicts in those
+files instead of stopping the sweep; it also resolves per LINE, so two branches
+that grew the SAME row duplicated the whole row rather than merging the two
+additions. Both failures are demonstrated against real git in
+`autoloop/tests/test_docs_merge.py` (`test_union_would_have_swallowed_a_genuine_prose_conflict`,
+`test_union_duplicates_a_grown_row_instead_of_merging_the_two_additions`), and
+`.gitattributes` is kept rule-free with the argument in it. If you
+hand-resolve one of these anyway, re-read the result — the 2026-08-18 splice
+into `SUMMARY.md`'s `orchestrator.py` row duplicated ~4,500 characters and cut
+a sentence in half, and it is still there.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found
