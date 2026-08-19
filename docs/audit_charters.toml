@@ -1,0 +1,86 @@
+# Domain charters for this repository's automated audit.
+#
+# The loop's read-only audit subagents get one of these tables each: `title` is
+# the domain they own, `charter` is the whole brief they are given. The briefs
+# name THIS repository — its two-backend split, its ingestion pipeline, which
+# docs are canonical — and that specificity is the difference between findings
+# worth reading and generic advice. They live here, beside the code they
+# describe, rather than in `autoloop/audit/executor.py`, so that changing what
+# the repository IS and changing what the audit is TOLD about it are the same
+# commit. Until 2026-08-19 (port-03) they were only in that module, which is
+# also why the loop could not usefully be pointed at any other repository.
+#
+# HOW IT IS READ (docs/AUTOLOOP.md §7, "Domain charters"):
+#
+#   * Read-only, once per audit run, from the root of the checkout being audited
+#     — in production the audit's own worker repo. Nothing ever writes here.
+#   * Located by `[repo].audit_charters_file` in `.autoloop/config.toml`, whose
+#     default is this path. The exact empty string means "never look".
+#   * Deleting this file is a supported state, not a break: the audit falls back
+#     to `DEFAULT_DOMAINS` in `autoloop/audit/executor.py`, which is this same
+#     set. That fallback exists for repositories that ship no charters at all.
+#     A directory or an unreadable entry at this path is NOT deletion and is
+#     refused by name — only genuine absence selects the fallback.
+#   * A file that exists but does NOT parse ABORTS the audit, naming the fault.
+#     It never degrades to the built-ins — see docs/COMMON_ERRORS.md §11.
+#
+# EDITING RULES:
+#
+#   * One `[[domain]]` table per domain, IN WAVE ORDER: the first
+#     `audit.max_parallel_agents` (default 3) run concurrently, then the rest.
+#     Today that is two Haiku inventory domains plus one Sonnet reader, then
+#     three Sonnet judgement domains.
+#   * Exactly four fields — `slug`, `title`, `charter`, `model` — and nothing
+#     else. All four are required; a missing or misspelled one is refused rather
+#     than defaulted, because an omitted field cannot be told from a forgotten
+#     one. `slug` names this domain's raw-output file and its row in the report's
+#     coverage table, so it is restricted to letters, digits, `_` and `-`.
+#   * `model` is "haiku", "sonnet", or "" for the CLI default. The lead's tier is
+#     deliberately not delegated to; see `CHARTER_MODELS` in
+#     `autoloop/audit/executor.py` for why that is a code-side decision.
+#   * Charter prose goes in a ''' literal string on ONE line. `"""` would process
+#     escape sequences, and a wrapped line would put newlines inside the brief.
+#   * EDIT `DEFAULT_DOMAINS` IN `autoloop/audit/executor.py` IN THE SAME COMMIT.
+#     `autoloop/tests/test_audit_charters.py` parses this file and requires it to
+#     equal that tuple exactly — same slugs, same order, same models, same prose
+#     — so changing one alone fails the suite. That is the intended friction: the
+#     fallback a charter-less repository gets must not quietly rot while this
+#     file moves on.
+#   * Keep these in step with CLAUDE.md §2. A charter that describes a layout the
+#     repository no longer has briefs six agents on a codebase that is not there.
+
+[[domain]]
+slug = "docs_drift"
+title = "Documentation drift"
+model = "haiku"
+charter = '''Compare CLAUDE.md, docs/SUMMARY.md, docs/TESTS.md, docs/ROADMAP.md and docs/TODO.md against the code. Report claims that are demonstrably stale (files that moved/died, counts that changed, commands that no longer work). Cite the exact doc line and the contradicting code.'''
+
+[[domain]]
+slug = "tests_ci"
+title = "Tests, linting, CI and validation"
+model = "haiku"
+charter = '''Assess test coverage honestly against docs/TESTS.md. Look for: suites not run by any documented command, tests that can never fail, xdist isolation hazards, the pytest-vs-python-m-pytest sys.path trap, ruff scope gaps, CI workflows that don't run what the docs claim.'''
+
+[[domain]]
+slug = "repo_structure"
+title = "Architecture & repository structure"
+model = "sonnet"
+charter = '''Map the actual architecture against what CLAUDE.md and docs/SUMMARY.md claim. Look for: dead or orphaned modules, duplicated responsibilities, layering violations (routers writing state directly, services importing routers), the two-backend split (lexy-app/backend vs root pipeline modules), and import-time side effects.'''
+
+[[domain]]
+slug = "security_paths"
+title = "Security, path handling and data integrity"
+model = "sonnet"
+charter = '''Read docs/SECURITY.md first; verify open findings and 'verified strengths' still hold. Look for: raw SQL, path traversal around uploads/document packages, subprocess call sites, auth/ownership filters on routers with path params, JSONB settings whitelist, LLM prompt-injection surfaces.'''
+
+[[domain]]
+slug = "db_migrations"
+title = "Database and migration safety"
+model = "sonnet"
+charter = '''Review alembic migrations for: edited-after-merge migrations, destructive operations without guards, drift between models/schemas.py and the migration chain, missing indexes implied by hot queries, and irreversible data transformations.'''
+
+[[domain]]
+slug = "ingestion_pipeline"
+title = "Document-ingestion pipeline and A1/A2 status"
+model = "sonnet"
+charter = '''Review docs/INGESTION_PIPELINE.md and the shipped A1 (evaluation/) and A2 (services/document_package/, book_import_service) work. Look for: contract mismatches between the offline worker design and the import path, coordinate-space errors, validation gaps, and the import-path convention issue in test_document_package.py.'''

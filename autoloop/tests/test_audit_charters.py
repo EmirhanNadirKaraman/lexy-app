@@ -8,20 +8,28 @@ loop's source instead of beside the code it describes. A target repository may
 now ship `docs/audit_charters.toml` (path configurable, `[repo]
 audit_charters_file`) and the built-in `DEFAULT_DOMAINS` is the fallback.
 
-Four claims, in the order this file makes them:
+Five claims, in the order this file makes them:
 
 1. **A repository that ships no file behaves exactly as before.** That
    equivalence is the premise under which built-in charters were allowed to
    become a file at all, so it is pinned first — as an identity between the
    prompts, not merely as "six domains ran".
-2. **The move is lossless.** `render_charter_file` → `parse_charter_domains`
-   returns `DEFAULT_DOMAINS` byte for byte, which is what makes "the two-backend
-   wording can live in the repository rather than in executable code" a fact
-   rather than an intention.
-3. **A malformed file fails closed.** It must not degrade to the built-ins:
-   auditing this repository's domains inside somebody else's checkout would
-   produce a report that looks complete and describes the wrong codebase.
-4. **Loading is read-only and repository-scoped.** Per call, from the root of
+2. **The move is lossless, and THIS repository has made it.** The round trip
+   `render_charter_file` → `parse_charter_domains` returns `DEFAULT_DOMAINS`
+   exactly, and `docs/audit_charters.toml` — shipped here, selected by the
+   default configuration — parses to that same set. Without the second half the
+   loader is a capability nobody uses and the two-backend wording still lives in
+   executable code, which is the coupling this task exists to remove.
+3. **A malformed or unusable file fails closed.** It must not degrade to the
+   built-ins: auditing this repository's domains inside somebody else's checkout
+   would produce a report that looks complete and describes the wrong codebase.
+   "Unusable" includes a wrong-type entry — a directory at the charter path is
+   not absence.
+4. **The prompt asserts nothing the charters contradict.** The opening framing
+   names this repository only on the built-in path, where it is true; charters
+   that came from a file are introduced by framing that names no project, since
+   the file is where a repository now states what it is.
+5. **Loading is read-only and repository-scoped.** Per call, from the root of
    the checkout being audited — so one process auditing two repositories uses
    each one's charters and neither leaks into the other.
 """
@@ -36,8 +44,10 @@ import pytest
 
 from autoloop.audit.agents import AgentResult
 from autoloop.audit.executor import (
+    BUILT_IN_FRAMING,
     CHARTER_MODELS,
     DEFAULT_DOMAINS,
+    REPO_SUPPLIED_FRAMING,
     AuditExecutor,
     _agent_prompt,
     load_charter_domains,
@@ -233,7 +243,15 @@ def test_a_repository_shipping_the_built_in_charters_produces_identical_prompts(
     repo, tmp_path
 ):
     """End to end: with this repository's own charters moved into the file, the
-    audit is the same audit. That is what "moved verbatim" has to mean."""
+    audit is the same audit BELOW THE FRAMING LINE. That is what "moved
+    verbatim" has to mean — every domain, its title, its brief, the ground
+    rules and the schema, unchanged.
+
+    The opening sentence is the one deliberate difference and is asserted
+    separately below: charters that came out of a file must not be introduced by
+    a sentence asserting what the codebase is, because the file is where that is
+    now stated. Comparing the remainder is what keeps this a real identity test
+    rather than one weakened until it passes."""
     ship_charters(repo, render_charter_file(DEFAULT_DOMAINS))
     from_file, built_in = FakeRunner(), FakeRunner()
 
@@ -242,7 +260,89 @@ def test_a_repository_shipping_the_built_in_charters_produces_identical_prompts(
         audit_directive(), None
     )
 
-    assert [s.prompt for s in from_file.specs] == [s.prompt for s in built_in.specs]
+    def body(spec):
+        """Everything after the opening framing paragraph."""
+        return spec.prompt.split("\n\n", 1)[1]
+
+    assert [body(s) for s in from_file.specs] == [body(s) for s in built_in.specs]
+    assert [s.model for s in from_file.specs] == [s.model for s in built_in.specs]
+    assert all(s.prompt.startswith(BUILT_IN_FRAMING) for s in built_in.specs)
+    assert all(s.prompt.startswith(REPO_SUPPLIED_FRAMING) for s in from_file.specs)
+
+
+#: This checkout's own root — `autoloop/tests/` up two levels. The autoloop
+#: package is VENDORED into the repository it operates on (see `CLAUDE.md` §12
+#: on `TRACKER_PATHS`), so this is the repository whose charters the tests below
+#: are about, not an arbitrary install location.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_this_repository_ships_its_own_charters_at_the_default_path():
+    """The claim port-03 exists to make TRUE, not merely possible.
+
+    A loader that CAN read repository-supplied charters, in a repository that
+    ships none, leaves the knowledge exactly where it was: in executable code,
+    changed by editing `DEFAULT_DOMAINS`. So this asserts the file is here, and
+    that it parses to the built-in set exactly — same domains, same order, same
+    models, same prose. Parse equality rather than byte equality with
+    `render_charter_file`: the load-bearing claim is what the audit is briefed
+    with, and pinning the renderer's blank lines and trailing newline instead
+    would fail on formatting that changes nothing.
+    """
+    shipped = REPO_ROOT / DEFAULT_AUDIT_CHARTERS_FILE
+
+    assert shipped.is_file(), (
+        f"{DEFAULT_AUDIT_CHARTERS_FILE} is missing. This repository ships its own "
+        "audit charters; deleting the file silently moves its audit back onto the "
+        "built-in DEFAULT_DOMAINS fallback."
+    )
+    assert parse_charter_domains(shipped.read_text(encoding="utf-8"), str(shipped)) == (
+        DEFAULT_DOMAINS
+    )
+
+
+def test_this_repositorys_default_configuration_selects_the_shipped_file():
+    """The file is not just present — it is the source the normal default
+    configuration resolves to. A shipped file at a path nothing consults would
+    be documentation pretending to be wiring."""
+    assert RepoConfig().audit_charters_file == DEFAULT_AUDIT_CHARTERS_FILE
+
+    loaded = load_charter_domains(REPO_ROOT, RepoConfig().audit_charters_file)
+
+    assert loaded is not None, "the built-in fallback was selected, not the file"
+    assert loaded == DEFAULT_DOMAINS
+
+
+def test_the_shipped_charters_drive_a_real_run_end_to_end(tmp_path):
+    """The shipped BYTES through the whole executor, into the agent specs.
+
+    Run against a copy in `tmp_path` rather than against `REPO_ROOT` on purpose:
+    an audit writes `docs/AUDIT_<date>.md`, and a test that files a report into
+    the working checkout would leave residue the post-commit clean-tree check
+    reports as an escape.
+    """
+    target = make_repo(tmp_path / "copy")
+    ship_charters(
+        target, (REPO_ROOT / DEFAULT_AUDIT_CHARTERS_FILE).read_text(encoding="utf-8")
+    )
+    runner = FakeRunner()
+
+    outcome = build_executor(target, tmp_path, runner).execute(audit_directive(), None)
+
+    assert outcome.status == "ok"
+    assert domain_tuples(runner) == [
+        (slug, title, model) for slug, title, _charter, model in DEFAULT_DOMAINS
+    ]
+    assert f"Domain charters came from {DEFAULT_AUDIT_CHARTERS_FILE}" in outcome.summary
+    # The two-backend knowledge reached its agent OUT OF THE FILE — the whole
+    # point of the move, observed at the far end of the pipeline. Asserted over
+    # the whole set rather than at an index: `_run_agents` appends in COMPLETION
+    # order, so pinning `specs[2]` would make this test's subject depend on how
+    # a thread pool happened to schedule six identical fakes.
+    assert any(
+        "the two-backend split (lexy-app/backend vs root pipeline modules)" in spec.prompt
+        for spec in runner.specs
+    )
 
 
 def test_a_charter_holding_the_literal_delimiter_is_refused_by_the_renderer():
@@ -276,6 +376,48 @@ def test_a_target_file_overrides_the_built_in_domains_text_and_order(repo, tmp_p
     for spec in runner.specs:
         assert "lexy-app/backend" not in spec.prompt
         assert "docs/INGESTION_PIPELINE.md" not in spec.prompt
+
+
+def test_an_unrelated_targets_prompt_carries_its_own_identity_and_not_this_repos(
+    repo, tmp_path
+):
+    """The charter is not the only place the prompt says what the codebase is.
+
+    The opening sentence used to assert it too — "a German language-learning
+    app; see CLAUDE.md" — so an agent auditing the Go service described by
+    `OTHER_REPO_CHARTERS` was told what the repository was BEFORE its own
+    charter arrived to say otherwise, and the two contradicted each other. The
+    charter file is now where a repository states that, so the framing states
+    nothing.
+    """
+    ship_charters(repo, OTHER_REPO_CHARTERS)
+    runner = FakeRunner()
+
+    build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+
+    for spec in runner.specs:
+        assert spec.prompt.startswith(REPO_SUPPLIED_FRAMING)
+        for leaked in ("German language-learning", "language-learning app", "lexy-app"):
+            assert leaked not in spec.prompt, f"{leaked!r} reached an unrelated target"
+    # ...and the identity the FILE states does arrive. Over the whole set, not
+    # at an index: `_run_agents` appends in completion order.
+    prompts = [spec.prompt for spec in runner.specs]
+    assert any("openapi.yaml" in prompt for prompt in prompts)
+    assert any("the Go service in cmd/server" in prompt for prompt in prompts)
+
+
+def test_the_built_in_fallback_keeps_the_historical_opening_sentence(repo, tmp_path):
+    """The other half of the same rule. The built-in charters describe this
+    repository, so on that path the sentence is true and is preserved exactly —
+    a portability change must not quietly reword the prompt of every audit that
+    was already working."""
+    runner = FakeRunner()
+
+    build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+
+    for spec in runner.specs:
+        assert spec.prompt.startswith(BUILT_IN_FRAMING)
+        assert "a German language-learning app; see CLAUDE.md" in spec.prompt
 
 
 def test_the_ground_rules_still_frame_a_repository_supplied_charter(repo, tmp_path):
@@ -430,6 +572,59 @@ def test_an_unreported_failure_is_impossible_because_it_is_an_outcome(repo, tmp_
 
     assert outcome.status == "error"
     assert DEFAULT_AUDIT_CHARTERS_FILE.split("/")[-1] in outcome.summary
+
+
+def test_a_directory_at_the_charter_path_is_refused_rather_than_read_as_absent(tmp_path):
+    """Absence has to mean absence.
+
+    `is_file()` answers False for a directory just as it does for nothing at
+    all, so testing it read every wrong-type entry as "this repository ships no
+    charters" and handed the run the built-ins — silently, in a checkout that
+    plainly meant to ship its own. That is the same degradation the parse path
+    refuses, arriving through the door next to it.
+    """
+    repo = make_repo(tmp_path / "r")
+    path = repo / DEFAULT_AUDIT_CHARTERS_FILE
+    path.mkdir(parents=True)
+
+    with pytest.raises(AuditError) as exc:
+        load_charter_domains(repo, DEFAULT_AUDIT_CHARTERS_FILE)
+
+    message = str(exc.value)
+    assert "not a regular file" in message, message
+    assert str(path) in message, "the refusal must name what it found"
+
+
+def test_a_charter_path_that_cannot_be_examined_is_refused_rather_than_read_as_absent(
+    tmp_path,
+):
+    """`tools` is a file, so `tools/charters.toml` raises `NotADirectoryError`
+    rather than `FileNotFoundError`. Something is there and could not be
+    examined, which is not the same as nothing being there — and a checkout
+    shaped differently from the configuration pointed at it is worth stopping
+    for, not guessing about."""
+    repo = make_repo(tmp_path / "r")
+    (repo / "tools").write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(AuditError) as exc:
+        load_charter_domains(repo, "tools/charters.toml")
+
+    assert "could not be read" in str(exc.value)
+
+
+def test_a_wrong_type_charter_entry_stops_the_run_like_a_malformed_one(repo, tmp_path):
+    """Existence faults reach the reviewer by the same route parse faults do:
+    an error outcome, before any agent runs."""
+    (repo / DEFAULT_AUDIT_CHARTERS_FILE).mkdir(parents=True)
+    runner = FakeRunner()
+
+    outcome = build_executor(repo, tmp_path, runner).execute(audit_directive(), None)
+
+    assert outcome.status == "error"
+    assert "audit charters could not be loaded" in outcome.summary
+    assert "not a regular file" in outcome.summary
+    assert runner.specs == []
+    assert not (tmp_path / "runs").exists()
 
 
 def test_the_model_set_excludes_the_leads_tier(tmp_path):

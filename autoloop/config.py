@@ -143,9 +143,12 @@ DEFAULT_ENV_EXAMPLE_FILE = ".env.example"
 DEFAULT_ENV_EXAMPLE_DB_KEY = "DB_NAME"
 #: Where the TARGET repository ships the per-domain charters its audit agents
 #: are briefed with, and the default for `RepoConfig.audit_charters_file`.
-#: Relative to the repo root. The file is OPTIONAL: absent means the built-in
-#: charters in `audit/executor.py` (`DEFAULT_DOMAINS`), which is exactly the
-#: behaviour that existed before the file could be read at all — see
+#: Relative to the repo root. THIS repository ships that file, so the default is
+#: live wiring rather than a placeholder. It stays OPTIONAL for a repository
+#: that ships nothing: genuine absence means the built-in charters in
+#: `audit/executor.py` (`DEFAULT_DOMAINS`), which is exactly the behaviour that
+#: existed before the file could be read at all. Absence only — a directory or
+#: an unreadable entry at the path is refused; see
 #: `audit.executor.load_charter_domains`.
 DEFAULT_AUDIT_CHARTERS_FILE = "docs/audit_charters.toml"
 

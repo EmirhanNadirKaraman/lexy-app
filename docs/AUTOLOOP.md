@@ -3418,8 +3418,12 @@ writes land in the change manifest.
 2026-08-19). Step 3's per-domain briefs are the reason the audit produces
 findings worth reading rather than generic advice: they name this repository's
 two-backend split, its ingestion pipeline, which docs are canonical. That
-knowledge belongs beside the code it describes, so a target repository may ship
-it as a file, and `DEFAULT_DOMAINS` in `audit/executor.py` is the fallback.
+knowledge belongs beside the code it describes, so **this repository ships it as
+`docs/audit_charters.toml`** and `DEFAULT_DOMAINS` in `audit/executor.py` is the
+fallback for a target repository that ships nothing. Editing that file is how
+you change what this repository's audits are briefed on; the built-in tuple is
+kept in step with it by `test_audit_charters.py`, which parses the shipped file
+and requires the two to be equal.
 
 * **Where.** `[repo].audit_charters_file`, default `docs/audit_charters.toml`,
   resolved relative to the ROOT OF THE CHECKOUT BEING AUDITED — in production
@@ -3449,7 +3453,13 @@ it as a file, and `DEFAULT_DOMAINS` in `audit/executor.py` is the fallback.
   describing the wrong codebase. The failure is an outcome rather than a raised
   `AuditError` on purpose — `Orchestrator.run` catches browser/git/state
   faults, so a raise here would end the process with a traceback instead of
-  reaching the reviewer.
+  reaching the reviewer. **Absence means absence**, and nothing else: only a
+  `FileNotFoundError` from `stat()` selects the fallback. A directory at the
+  charter path, an entry that is not a regular file, a permission error, a path
+  whose parent is itself a file — each is refused by name. `is_file()` would
+  have answered False for every one of them and read them as "ships no
+  charters", which is the same silent degradation arriving through the door next
+  to the parser.
 * **Portability boundary.** The charter file says WHAT to look at; it grants
   nothing. Read-only confinement stays argv-level (`agents.py`'s
   `--allowedTools`/`--disallowedTools`), the always-approved tracker list stays
@@ -3458,11 +3468,16 @@ it as a file, and `DEFAULT_DOMAINS` in `audit/executor.py` is the fallback.
   `_agent_prompt` around whatever the file says — a charter cannot drop them by
   omission. Loading is read-only, resolved once per `execute()` call, cached
   nowhere: one process auditing two repositories uses each one's charters.
-* **Still in code**, and the next thing to move if this is taken further: the
-  prompt's opening line still describes the audited codebase as "a German
-  language-learning app; see CLAUDE.md" (`_agent_prompt`). A target repository
-  can restate its own framing inside its charters, but the sentence itself is
-  not yet repository-supplied.
+* **The framing follows the charters.** `_agent_prompt` opens with one of two
+  sentences. `BUILT_IN_FRAMING` — the historical one, naming a German
+  language-learning app and pointing at `CLAUDE.md` — is used only when the
+  built-in charters are in force, where it is simply true, and is preserved word
+  for word so an unconfigured run produces the prompt it always produced.
+  `REPO_SUPPLIED_FRAMING` is used whenever the domains came out of a file: it
+  names no project and points at "the repository's own root documentation",
+  because the charter file is now where a repository states what it is. Before
+  this split, an agent auditing a Go service was told it was looking at a
+  language-learning app in the sentence before its own charter said otherwise.
 
 ---
 

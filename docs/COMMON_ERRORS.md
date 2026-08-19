@@ -2222,6 +2222,26 @@ a sentence in half, and it is still there.
 
 ## 11. Autoloop audit charters (target-repository portability)
 
+### `audit charter file … exists but is not a regular file (mode drwxr-xr-x)`
+**Symptom:** an `audit` round comes back `status: error`, summary `audit not run
+— the repository's audit charters could not be loaded: …`, with that phrase
+instead of a parse complaint. Also seen as `cannot examine audit charter file …:
+[Errno 20] Not a directory` or `[Errno 13] Permission denied`.
+**Cause:** something occupies `docs/audit_charters.toml` (or whatever
+`[repo].audit_charters_file` names) that is not a readable regular file — most
+often a directory created by a botched checkout or an editor, or a parent path
+component that is itself a file. This is a REFUSAL, deliberately: absence means
+`FileNotFoundError` and nothing else, because `is_file()` answers False for a
+directory exactly as it does for nothing at all, and treating those alike would
+hand the run the built-in `DEFAULT_DOMAINS` inside a checkout that plainly meant
+to ship its own charters — the same silent degradation the parser refuses.
+**Fix:** look at what is actually there (`ls -ld docs/audit_charters.toml`) and
+either put the real file back or remove the wrong-type entry, at which point the
+built-in fallback applies again. `audit_charters_file = ""` in
+`.autoloop/config.toml` is the deliberate opt-out if you want the built-ins
+regardless. Do NOT relax this to `is_file()` — pinned by
+`test_audit_charters.py::test_a_directory_at_the_charter_path_is_refused_rather_than_read_as_absent`.
+
 ### `audit not run — the repository's audit charters could not be loaded: …`
 **Symptom:** an `audit` round comes back `status: error` with that summary and
 nothing else — no `docs/AUDIT_<date>.md`, no `.autoloop/audit/<run-id>/`

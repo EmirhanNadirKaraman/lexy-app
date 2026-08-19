@@ -44,6 +44,7 @@ invisible to the audit — the audit only ever sees committed history.
 from __future__ import annotations
 
 import json
+import stat
 import string
 import subprocess
 import tomllib
@@ -183,12 +184,21 @@ DEFAULT_DOMAINS: tuple[tuple[str, str, str, str], ...] = (
 # audit produce findings worth reading instead of generic advice, and it is
 # also the reason the loop could not usefully be pointed at another repository:
 # the knowledge lived in the loop's source rather than beside the code it
-# describes. A target repository may therefore ship its own charter file
+# describes. A target repository therefore ships its own charter file
 # (`RepoConfig.audit_charters_file`, default `docs/audit_charters.toml`), and
 # `DEFAULT_DOMAINS` stays as the fallback for a repository that ships none —
 # an absent file is compatibility, never an error.
 #
-# Three properties are load-bearing:
+# **THIS repository ships one**, at that default path, holding exactly the set
+# below. So `DEFAULT_DOMAINS` is no longer the live brief for anything: it is
+# the compatibility fallback, and the file is what this repository's own audits
+# read. Keeping both is deliberate — a repository that ships nothing still gets
+# a real audit — but it means the pair can drift, which is why
+# `test_audit_charters.py` pins the shipped file to parse to exactly this tuple.
+# Edit the file; change this tuple only to change what an unconfigured
+# repository gets.
+#
+# Four properties are load-bearing:
 #
 # * **Read-only and repository-scoped.** The file is read from the root of the
 #   checkout being audited (the audit's own worker repo in production), never
@@ -202,7 +212,15 @@ DEFAULT_DOMAINS: tuple[tuple[str, str, str, str], ...] = (
 #   charter set aborts the run with an actionable error rather than quietly
 #   falling back to the built-ins: silently auditing this repository's domains
 #   inside somebody else's checkout is the failure mode worth refusing, since
-#   the report would look complete and describe the wrong codebase.
+#   the report would look complete and describe the wrong codebase. "Exists" is
+#   read strictly — a directory or an unreadable entry at the charter path is a
+#   refusal, not absence (see `load_charter_domains`).
+# * **Says nothing the charters contradict.** The prompt's opening sentence
+#   names this repository only on the FALLBACK path, where the charters are this
+#   repository's and it is true. Charters that came out of a file are introduced
+#   by framing that names no project at all, because the file is now where a
+#   repository states what it is — see `BUILT_IN_FRAMING` /
+#   `REPO_SUPPLIED_FRAMING` above `_agent_prompt`.
 
 #: The array-of-tables key, and the four fields every entry must carry. All
 #: four are REQUIRED even though `model` accepts `""` — an omitted field is
@@ -361,8 +379,17 @@ def load_charter_domains(
 
     `None` — meaning "nothing configured, or nothing there" — is the
     compatibility path and covers exactly two cases: `relative == ""` (the
-    operator's explicit opt-out) and a file that is not present. Everything
-    else that goes wrong raises `AuditError`.
+    operator's explicit opt-out) and a file that is genuinely NOT PRESENT.
+    Everything else that goes wrong raises `AuditError`.
+
+    "Genuinely not present" is narrower than it looks, and the narrowing is the
+    point. `is_file()` answers False for a directory, a socket, a device node
+    and a path whose parent is itself a file, so testing it would read every one
+    of those as absence and quietly hand the run this repository's own charters
+    inside somebody else's checkout — the exact silent degradation the parse
+    path refuses. So absence is `FileNotFoundError` from `stat()` and nothing
+    else: something that IS there but cannot be examined, or is there and is not
+    a regular file, is a refusal naming the path.
 
     The path is re-checked here even though `load_config` already refuses an
     absolute, padded or traversing value: `AuditExecutor` can be constructed
@@ -395,8 +422,31 @@ def load_charter_domains(
             "can point anywhere. Replace it with the file itself, or set "
             'repo.audit_charters_file = "" to use the built-in charters.'
         )
-    if not path.is_file():
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        # The ONE compatibility case: nothing is there. Listed before the
+        # general `OSError` clause because it is a subclass of it.
         return None
+    except OSError as exc:
+        # Permission denied, a parent component that is itself a file, a dead
+        # mount. Something occupies the path and could not be examined, which is
+        # not the same as nothing occupying it.
+        raise AuditError(
+            f"cannot examine audit charter file {path}: {exc}. Something is there "
+            "and could not be read, which is not treated as absence — fix the "
+            'path, or set repo.audit_charters_file = "" to use the built-in '
+            "charters deliberately."
+        ) from exc
+    if not stat.S_ISREG(mode):
+        raise AuditError(
+            f"audit charter file {path} exists but is not a regular file "
+            f"(mode {stat.filemode(mode)}). Refused rather than treated as "
+            "absent: falling back would brief the audit agents on the built-in "
+            "charters inside a checkout that plainly meant to ship its own. "
+            'Replace it with the file itself, or set repo.audit_charters_file = "" '
+            "to use the built-in charters deliberately."
+        )
     try:
         resolved, resolved_root = path.resolve(), root.resolve()
     except OSError as exc:  # pragma: no cover - platform-specific resolution failure
@@ -416,8 +466,48 @@ def load_charter_domains(
     return parse_charter_domains(text, str(path))
 
 
-def _agent_prompt(title: str, charter: str, scope: str | None, feedback: str | None) -> str:
+#: The opening sentence of every audit agent's prompt, in its two forms.
+#:
+#: The BUILT-IN one names this repository, and has since the audit existed. It
+#: belongs with `DEFAULT_DOMAINS`: those charters describe the language-learning
+#: app, so a run using them is a run against this repository and the sentence is
+#: simply true. It is preserved exactly — a run on the fallback path must
+#: produce the prompt it always produced.
+#:
+#: The REPOSITORY-SUPPLIED one is what a target checkout's own charters are
+#: framed with, and it names no project. It has to: the charters say what the
+#: codebase is, and telling an agent auditing a Go service that it is looking at
+#: a German language-learning app contradicts its own brief in the sentence
+#: before it arrives. Pointing at "the repository's own root documentation"
+#: rather than at `CLAUDE.md` keeps even the filename out of it — the agent has
+#: Read/Grep/Glob and can find whatever the checkout actually keeps.
+BUILT_IN_FRAMING = (
+    "You are ONE read-only audit agent inside an automated repository audit "
+    "of this codebase (a German language-learning app; see CLAUDE.md)."
+)
+REPO_SUPPLIED_FRAMING = (
+    "You are ONE read-only audit agent inside an automated repository audit of "
+    "this codebase. The charter below is the repository's own description of "
+    "what to examine; where you need more context about what this project is, "
+    "start from its root documentation rather than from any assumption about "
+    "the kind of software it contains."
+)
+
+
+def _agent_prompt(
+    title: str,
+    charter: str,
+    scope: str | None,
+    feedback: str | None,
+    *,
+    repo_supplied: bool = False,
+) -> str:
     """The prompt for ONE per-domain audit agent.
+
+    `repo_supplied` selects the opening framing (see the two constants above)
+    and is KEYWORD-ONLY, defaulting to the historical sentence: every existing
+    caller passes four positional arguments and must keep the prompt it had, and
+    no future positional caller can flip the framing by accident.
 
     `scope` and `feedback` come from the reviewer's directive and are threaded
     VERBATIM — an agent has to see what was actually asked. Each is introduced
@@ -443,8 +533,7 @@ def _agent_prompt(title: str, charter: str, scope: str | None, feedback: str | N
     docs/SECURITY.md S24 before treating it as a control.
     """
     parts = [
-        "You are ONE read-only audit agent inside an automated repository audit "
-        "of this codebase (a German language-learning app; see CLAUDE.md).",
+        REPO_SUPPLIED_FRAMING if repo_supplied else BUILT_IN_FRAMING,
         f"Your domain: {title}.",
         charter,
         "Ground rules: you have READ-ONLY access (Read/Grep/Glob). Do not "
@@ -667,11 +756,16 @@ class AuditExecutor:
 
         validation_runs = [self._run_validation(git, cmd) for cmd in self._validation_commands]
 
+        # `charter_source` is truthy exactly when the domains came out of the
+        # repository's own file, which is also exactly when the prompt must stop
+        # asserting what this codebase is — see the two framing constants.
         specs = [
             AgentSpec(
                 domain=slug,
                 title=title,
-                prompt=_agent_prompt(title, charter, scope, feedback),
+                prompt=_agent_prompt(
+                    title, charter, scope, feedback, repo_supplied=bool(charter_source)
+                ),
                 model=model,
             )
             for slug, title, charter, model in domains

@@ -1505,9 +1505,21 @@ for an unenforceable one.
 
 **What shipped instead.** `TRACKER_PATHS` stays a fixed constant and `[repo]`
 carries only non-authority settings — `env_example_file` /
-`env_example_db_key` (where the repo declares its application database) and
-`audit_report_glob` (where the dashboard reads the backlog). Each says WHERE to
-read something the repository states; none decides what an agent may write.
+`env_example_db_key` (where the repo declares its application database),
+`audit_report_glob` (where the dashboard reads the backlog) and, since port-03
+(2026-08-19), `audit_charters_file` (where the repository ships the per-domain
+briefs its read-only audit agents get). Each says WHERE to read something the
+repository states; none decides what an agent may write. The charters are the
+case worth stating explicitly, because they are prose that reaches an agent:
+they say what to LOOK AT and grant nothing. Read-only confinement stays
+argv-level (`audit/agents.py`'s `--allowedTools`/`--disallowedTools`), and
+`_agent_prompt` wraps whatever the file says in the standing ground rules and
+the findings schema, so a charter cannot drop them by omission — the same
+containment the reviewer-scope text gets, and subject to the same limit (S24:
+prompt text is guidance, not a control). Loading is read-only, repository-scoped
+and fails closed; a file that exists but does not parse, or is not a readable
+regular file, aborts the audit rather than silently briefing the agents on
+another repository's architecture.
 Portability for the tracker list comes from the constant itself: `autoloop/` is
 vendored into the repository it operates on, so editing `TRACKER_PATHS` in a
 target repo is a commit in that repo's reviewed history — the property a
