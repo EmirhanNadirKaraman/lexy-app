@@ -304,6 +304,29 @@ def _load_validation_env(config: AutoloopConfig, repo_root: Path):
     )
 
 
+def _recorded_out_of_scope_paths(execution_store: TaskExecutionStore):
+    """`cleanup_paths_for` for `ImplementExecutor`: this task's own recorded
+    out-of-scope residue, straight off the execution record.
+
+    The narrow cleanup authority (scope-04) has exactly one source, and this
+    binds it: `TaskExecution.out_of_scope_paths`, which
+    `orchestrator._dispatch_task_postcommit` and `_verify_committed` write from
+    their own path comparisons and nothing else writes at all. Reading it here
+    rather than threading it through `TaskExecutor.execute` keeps the protocol
+    two-argument and keeps the authority on the LOOP's side of the boundary: the
+    executor is handed the record's answer, never asked for one.
+
+    A task with no record yet (its first dispatch) yields the empty tuple, which
+    is the whole of the "an earlier round must have created it" rule.
+    """
+
+    def read(task_id: str) -> tuple[str, ...]:
+        execution = execution_store.load(task_id)
+        return tuple(execution.out_of_scope_paths) if execution is not None else ()
+
+    return read
+
+
 def _build_executor(
     config: AutoloopConfig,
     args,
@@ -312,6 +335,7 @@ def _build_executor(
     worker_repos: WorkerRepoManager,
     policy: PolicyEngine,
     validation_env=None,
+    cleanup_paths_for=None,
 ) -> TaskExecutor:
     if getattr(args, "null_executor", False) or config.executor.kind == "null":
         return NullExecutor()
@@ -388,6 +412,10 @@ def _build_executor(
             policy=policy,
             stall_policy=stall_policy,
         ),
+        # The cleanup exception's only authority (scope-04). Absent — nothing
+        # passes one — the executor grants no cleanup at all, so this wiring is
+        # what turns the capability on for a real run and for nothing else.
+        cleanup_paths_for=cleanup_paths_for,
     )
     return _DispatchingExecutor(audit_executor, implement_executor)
 
@@ -430,7 +458,11 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
         policy=policy,
         git=git,
         executor=_build_executor(
-            config, args, git, registry, worker_repos, policy, validation_env
+            config, args, git, registry, worker_repos, policy, validation_env,
+            # The SAME store the orchestrator below writes execution records
+            # with — the cleanup authority has to read what the loop recorded,
+            # not a second view of it.
+            cleanup_paths_for=_recorded_out_of_scope_paths(execution_store),
         ),
         transcript=TranscriptLogger(config.transcript_file),
         client_factory=lambda: create_conversation(config.conversation.provider, config),

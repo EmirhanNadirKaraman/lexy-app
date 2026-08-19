@@ -2117,6 +2117,35 @@ test asserting the specialization itself — see
 `IsADirectoryError` and friends are all `OSError` subclasses, so a broad
 clause placed above them swallows the specific one.
 
+### A task parks on `review_feedback_unchanged` after the reviewer asked twice for a file to be REMOVED
+**Symptom:** the reviewer's feedback is a removal ("`autoloop/obsolete.py` must
+be absent from the candidate, not committed as a zero-byte addition"), the
+executor runs a full round, changes everything else the review asked for, and
+leaves the file. The next review repeats the same sentence verbatim, the
+convergence guard fires (`task_fatal`, code `review_feedback_unchanged`), and
+the task parks — usually with its actual implementation already accepted, which
+is what makes this read as a mysterious park rather than a failure. Observed on
+roadmap-01, 2026-08-18, after 8 rounds.
+**Cause:** two separate things, and only one of them is scope. First, the
+write-capable agent has NO way to delete a file: `WRITE_ALLOWED_TOOLS` is
+Read/Grep/Glob/Edit/Write and `Bash` is disallowed, so the closest it can get to
+"remove this" is `Write`-ing it empty — which is exactly the zero-byte addition
+the reviewer objected to. Second, if the file is out of scope, `approved_paths`
+does not name it either, so nothing in the round is working towards its removal.
+**Fix (since 2026-08-19, task `scope-04`):** for a path the LOOP recorded in
+`TaskExecution.out_of_scope_paths`, the agent asks and the executor unlinks —
+write `REMOVE-OUT-OF-SCOPE: <path>` at the start of a line, copying the path
+exactly as the prompt lists it. Nothing else is needed and nothing else works: a
+path that is not in that record is ignored (and the round summary says so), the
+grant is DELETION only, and no scope is widened. See `docs/AUTOLOOP.md` §4e's
+2026-08-19 amendment.
+**Still unfixed — check this before assuming the above applies:** a file INSIDE
+`approved_paths` still cannot be deleted, because the missing piece there is the
+agent's tool set rather than its authorization, and `REMOVE-OUT-OF-SCOPE:` will
+refuse it as never recorded. roadmap-01's second file,
+`autoloop/tests/test_obsolete.py`, was in scope and is exactly this case. Today
+that removal needs an operator.
+
 ---
 
 ## 9. Autoloop monitoring (health)

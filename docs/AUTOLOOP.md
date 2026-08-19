@@ -1821,6 +1821,83 @@ follow-up — "does the recheck actually re-verify the condition that fired
 the park" is a design question the exhaustiveness test cannot answer, as
 this section's own history shows.
 
+**Amendment, 2026-08-19 — a task may DELETE what the loop recorded it created
+out of scope (task `scope-04`).** The 2026-08-05 amendment left advisory scope
+ASYMMETRIC, and nobody noticed until it deadlocked a task: creating a file
+outside `approved_paths` was permitted and recorded, but removing that same file
+again was not. Observed on roadmap-01 (2026-08-18) — round 1 created
+`autoloop/obsolete.py`, the record duly listed it under `out_of_scope_paths`, and
+the reviewer then asked twice, verbatim, that it be absent from the candidate
+rather than committed as a zero-byte addition. The executor works to
+`approved_paths`, which does not contain it, so it changed everything else and
+left the file; the identical feedback tripped `review_feedback_unchanged` and the
+task parked after 8 rounds with its implementation already accepted ("the
+ancestry implementation and regressions are now correct"). Every component
+behaved correctly and the task still deadlocked.
+
+**The narrow rule.** What a task DEMONSTRABLY created out of scope — recorded by
+the loop itself from a diff, never from an agent claim — is exactly the set it
+may clean up. A later round of the same execution may delete a path already in
+that execution's `TaskExecution.out_of_scope_paths`, and nothing else widens.
+
+The three obvious fixes are all wrong, and the design avoids each: widening
+`approved_paths` generally would give up the thing that stops a task editing the
+whole repository; re-blocking out-of-scope writes would undo an operator decision
+made because parking mid-round moved the failure downstream rather than
+preventing it; and making the reviewer's request advisory would retire a correct
+review. Only the recorded set moves, and it is not an authorization — it is
+evidence.
+
+How it is built, in the order a round meets it:
+
+* **The set.** `cli._recorded_out_of_scope_paths` reads this task's persisted
+  `out_of_scope_paths` and is injected into `ImplementExecutor` as
+  `cleanup_paths_for` — the same shape as `worker_repo_root_for`. Absent it there
+  is NO cleanup authority, so the capability exists in a wired run and nowhere
+  else. A task on its first dispatch has no record and therefore nothing to
+  clean.
+* **The prompt.** `implement_executor._cleanup_instruction` lists exactly those
+  paths and, only then, tells the agent the request form. It says in its own text
+  that this is permission to remove and not permission to edit, recreate or
+  rename into the path, because "you may delete this file" is one sentence away
+  from "this file is yours".
+* **The request.** The write-capable agent has no delete tool at all
+  (`WRITE_ALLOWED_TOOLS` is Read/Grep/Glob/Edit/Write; `Bash` is disallowed),
+  which is why the deadlock existed in the first place — so it writes
+  `REMOVE-OUT-OF-SCOPE: <path>`, anchored at the start of a line like an
+  `ASSUMPTION:` line and refusing the same `-`/`*`/`>` markup prefixes.
+* **The gate.** `tasks.authorized_cleanup_paths` matches the request against the
+  record, EXACT paths only — deliberately unlike `unauthorized_paths`, where a
+  trailing `/` is a subtree grant. A recorded file authorizes deleting that file
+  and nothing near it. Whatever it does not match is deleted by nobody and
+  reported as ignored.
+* **The unlink.** `_remove_recorded_file`, before the `git status` read (so a
+  cleanup-only round has something to commit rather than dying on "changed no
+  files") and before validation (so the suite grades the tree that is actually
+  committed). It refuses absolute paths, `..`, a parent that does not resolve
+  inside the worker repo, and anything that is not a regular file or symlink.
+* **The record.** `orchestrator._dispatch_task_postcommit` unions the deleted
+  paths into `TaskExecution.removed_out_of_scope_paths`, read from git's own
+  `dirty_entries_all()` and intersected with the recorded set. This exists
+  because the packet structurally cannot show it: every path section is computed
+  from `commit_range_paths`, a TREE-to-tree diff, so a file created in round 1
+  and deleted in round 2 is absent from the reviewed range entirely — which is
+  the right thing for the reviewer to SEE, but must not make the round
+  indistinguishable from one that never overran. `out_of_scope_paths` is never
+  pruned; the two sets overlap on purpose.
+
+NOT relaxed: the empty-`approved_paths` dispatch refusal, escape detection, and
+every post-commit check stay exactly as they are; `allowed_paths` and
+`approved_paths` gain nothing, ever. An EDIT to a recorded path is as
+unauthorized as it was — it lands, it is recorded, the reviewer judges it.
+
+Not addressed, and worth knowing before you read a park as this bug: a task
+still cannot delete a file INSIDE its `approved_paths`, because the missing
+capability there is the agent's tool set, not the authorization. roadmap-01's
+second file, `autoloop/tests/test_obsolete.py`, was that case. See
+`docs/SECURITY.md` S25's 2026-08-19 amendment for the security accounting and
+`autoloop/tests/test_scope_cleanup.py` for the regressions.
+
 ---
 
 ## 4f. Operator-changeset review (publishing a hand-authored commit)
