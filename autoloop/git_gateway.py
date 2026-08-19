@@ -576,6 +576,50 @@ class GitGateway:
             if "U" in status or status in self._CONFLICT_STATUSES
         )
 
+    def merge_stage_blob(self, path: str, stage: int) -> bytes:
+        """The exact bytes of ONE side of an unmerged path, from the index.
+
+        `stage` is git's own numbering: 1 the merge base, 2 ours, 3 theirs.
+        Raises `GitCommandError` when that stage does not exist — which is the
+        normal shape of a delete/modify or add/add conflict, and a refusal the
+        caller wants rather than an empty string it might mistake for content.
+
+        Read from the INDEX, never by parsing the conflict markers git left in
+        the working file: markers say where a region disagreed, not what each
+        side's whole file was, and `note_merge.resolve_note_append` needs the
+        latter to prove a side changed nothing but an append.
+        """
+        return self._git_bytes("cat-file", "blob", f":{stage}:{path}")
+
+    def add_paths(self, paths: Sequence[str]) -> None:
+        """`git add -- <paths>` and nothing else — exact paths, never `-A`
+        (the policy whitelist refuses that flag and requires the `--`).
+
+        Deliberately does not verify the resulting index: the two commit
+        primitives that must (`commit_and_capture`, `commit_adopted`) do their
+        own comparison against an approved set, and this is the plain staging
+        step for a caller that has no such set — resolving an in-progress
+        merge, where the rest of the index is git's own merge result.
+        """
+        approved = sorted({p for p in paths if p and p.strip()})
+        if not approved:
+            raise GitCommandError("add_paths requires an explicit non-empty path list")
+        self._git("add", "--", *approved)
+
+    def commit_staged(self, message: str) -> None:
+        """`git commit -m <message>` — commit exactly what is in the index.
+
+        Used to conclude an in-progress merge whose conflicts have been
+        resolved and staged: with `MERGE_HEAD` present git records the second
+        parent itself, so the merge stays a real merge commit. Hooks run, as
+        they do for `merge_commit`; nothing here bypasses them.
+
+        The caller is expected to re-read `head_sha()` afterwards rather than
+        trust the exit status — `auto_merge._verify_merge` does, and requires
+        the new head to contain both parents and leave a clean tree.
+        """
+        self._git("commit", "-m", message)
+
     # ---- produce-then-review commit path ------------------------------------
     #
     # Unlike `commit_adopted`, hooks are expected to run here — the artifact

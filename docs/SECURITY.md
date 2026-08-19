@@ -42,7 +42,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S30 | MEDIUM | The inbox vocabulary grew from create+priority to six mutation kinds, so a queued request can now rewrite an EXISTING task's `approved_paths` and `description` — falsifying S28's "it creates, never widens" bound. Guarded: nothing `in_progress`/`completed`/`retired` is editable, mutations share creation's validators, `block`/`unblock` cannot launder a loop-raised quarantine, `retire` is excluded, and no dashboard endpoint reaches any of it | `autoloop/inbox.py`, `autoloop/tasks.py` |
 | S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
-| S34 | INFO | `docs/SUMMARY.md` and `docs/TESTS.md` carry `merge=union` (2026-08-19, docs-01), so an edit/edit inside those two files concatenates both sides instead of stopping the merge sweep. Bounded: exactly two paths, no wildcard, no source file, and deliberately not `CLAUDE.md` / `docs/SECURITY.md` / `docs/SCHEMA.md` / `docs/COMMON_ERRORS.md`, which all still conflict | `/.gitattributes`, `autoloop/auto_merge.py` |
+| S35 | INFO | The merge sweep now auto-resolves ONE conflict shape without a human (2026-08-19, docs-01): two branches each appending change-note lines to the terminal append-only section of `docs/SUMMARY.md` / `docs/TESTS.md`. Bounded: two literal paths, each side's section must extend the merge base byte-for-byte, a conflict anywhere else in the file or the merge refuses the whole merge, and every decision is in the transcript. Replaces S34 (`merge=union`), which disabled conflict detection for the whole file | `autoloop/note_merge.py`, `autoloop/auto_merge.py`, `autoloop/git_gateway.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -1319,50 +1319,77 @@ re-verifying the condition that fired the park, or just checking something
 correlated with it" is exactly what the second round caught, and it is a
 design question no automated test in this codebase can fully answer.
 
-### S34 — `merge=union` disables conflict detection on two documentation trackers — INFO — OPEN (deliberate, narrow, accepted)
+### S35 — The merge sweep auto-resolves one conflict shape in two documentation trackers — INFO — OPEN (deliberate, narrow, accepted)
 
-**Location:** `/.gitattributes:28-29` (the two rules), `autoloop/auto_merge.py:547`
-(`_merge`, the conflict abort this bypasses for those paths).
+**Location:** `autoloop/note_merge.py` (`resolve_note_append`, the whole
+decision), `autoloop/auto_merge.py` (`AutoMerger._resolve_note_conflicts`, the
+only caller, reached only from `_merge`'s conflict branch),
+`autoloop/git_gateway.py` (`merge_stage_blob` / `add_paths` / `commit_staged`,
+the three primitives it uses).
 
 **Severity:** INFO. No runtime behaviour and no control is reached: the two
-files are documentation, and nothing reads them at run time.
+files are documentation, and nothing reads them at run time. It is recorded
+because the loop now writes a merge commit that no human approved the CONTENT
+of, which is a class of action worth a tracker entry even when the content is
+prose.
 
-**What it is.** `docs/SUMMARY.md` and `docs/TESTS.md` carry `merge=union` since
-2026-08-19 (docs-01), so two branches that each record a change note both land
-instead of stopping the merge sweep. The property being traded away is real:
-union NEVER reports a conflict, so an edit/edit inside those two files is
-resolved by concatenating both sides rather than by aborting. A branch that
-rewrote a line another branch also rewrote produces a duplicate, not a stop —
-including a line that WEAKENS a claim, which is the same shape as the residual
-recorded against `docs/SECURITY.md` in `tasks.TRACKER_PATHS`.
+**What it is.** Since 2026-08-19 (docs-01), a `git merge` that conflicts ONLY
+in the append-only change-note section of `docs/SUMMARY.md` / `docs/TESTS.md`
+is resolved by the loop instead of aborted: the two branches' appended lines
+are concatenated and the merge is committed. This replaced `merge=union` on the
+same two paths (S34, resolved below), which was strictly worse — it disabled
+conflict detection for the WHOLE file.
 
-**Why it is accepted, and what bounds it.** The rule is exactly two paths — no
-wildcard, no source file, and deliberately NOT `CLAUDE.md` (agent
-instructions), `docs/SECURITY.md` (this file), `docs/SCHEMA.md` or
-`docs/COMMON_ERRORS.md`, all of which still conflict and still stop the sweep.
-Every tracker edit remains visible in `commit_range_paths` and in the reviewed
-diff, so this changes what git resolves automatically, not what a reviewer
-sees. A duplicated documentation line is recoverable prose; an unmerged
-reviewed task was costing a day (2026-08-18).
+**Why it is accepted, and what bounds it.**
+- **Two literal paths**, `note_merge.NOTE_TRACKERS` — no glob, no prefix match,
+  no source file. A conflict on any other path in the same merge refuses the
+  whole merge rather than resolving the trackers partially.
+- **The base must survive byte-for-byte.** Each side's change-note section must
+  hold the merge base's section text as a literal PREFIX, so an edited,
+  deleted, rewritten or reordered pre-existing line disqualifies that side.
+  Nothing already in the ledger can be changed by an auto-resolution.
+- **Everything outside the section is git's own merge, untouched.** The
+  resolver keeps git's half-merged text for the part of the file above the
+  marker and refuses outright if git left a conflict marker there — so a
+  concurrent edit to tracker PROSE still stops the sweep.
+- **Nothing is written until every conflicted path has resolved**, and the
+  result still goes through `_verify_merge` (head moved, contains both parents,
+  tree clean) before anything is pushed.
+- **Every decision is in the transcript** — `auto_merge_notes_resolved` names
+  the paths, `auto_merge_notes_refused` names the reason — and the merge
+  commit's own message says the notes were combined automatically.
+
+**The residual, stated rather than hidden.** A defect in `resolve_note_append`
+could combine tracker content in a case a human should have seen, without
+stopping the sweep. That is bounded to the two paths above and to the strict
+prefix precondition, and every tracker edit remains visible in
+`commit_range_paths` and in the reviewed diff — this changes what git resolves
+automatically, not what a reviewer can see. `docs/SECURITY.md` (this file),
+`CLAUDE.md`, `docs/SCHEMA.md` and `docs/COMMON_ERRORS.md` are deliberately NOT
+in scope and still conflict normally.
 
 **Verification check:**
 ```bash
-# Must print exactly these two rules and nothing else:
+# The scope, and that it is still two literal paths:
+rg -n 'NOTE_TRACKERS' autoloop/note_merge.py autoloop/auto_merge.py
+# No merge attribute may come back alongside it (must print nothing):
 grep -v '^\s*#' .gitattributes | grep -v '^\s*$'
-#   docs/SUMMARY.md merge=union
-#   docs/TESTS.md merge=union
 ```
-Pinned by `autoloop/tests/test_docs_merge.py::test_the_repo_ships_a_union_rule_for_exactly_the_two_note_trackers`
-(the rule set is exact, and no rule may contain `*`), and by
-`..._a_real_conflict_in_a_source_file_still_stops_the_merge`.
+Pinned by `autoloop/tests/test_docs_merge.py` — in particular
+`test_the_resolver_is_scoped_to_exactly_the_two_trackers`,
+`test_a_concurrent_edit_to_tracker_prose_still_conflicts`,
+`test_a_concurrent_edit_to_an_existing_note_line_still_conflicts`,
+`test_one_refusing_tracker_stops_the_whole_merge_even_if_the_other_resolved`
+and `test_a_real_conflict_in_a_source_file_still_stops_the_sweep`.
 
 **Suggested fix if it ever needs one:** move the append-only note ledger into
-its own file and drop the attribute from the two docs — the trackers then
-conflict normally again. Not done now because a task's write scope is a list
-of exact paths (`tasks.unauthorized_paths`), so a new ledger file cannot be
-written by the tasks that would need to append to it. Do NOT "fix" it by
-widening the attribute to `docs/*`; that extends the trade to files nobody
-decided about.
+its own per-task file and drop the resolver — the trackers then conflict
+normally again in every case. Not done now because a task's write scope is a
+list of exact paths (`tasks.unauthorized_paths`), so a new ledger file cannot
+be written by the tasks that would need to append to it, and the trackers stop
+being readable as one document. Do NOT "fix" it by adding paths to
+`NOTE_TRACKERS`; every entry there is a file the loop may merge without a
+human.
 
 ---
 
@@ -1406,6 +1433,45 @@ These were checked in the 2026-05-24 sweep and are working controls. A PR that w
 ---
 
 ## Resolved findings
+
+### S34 — `merge=union` disabled conflict detection on two documentation trackers — INFO — RESOLVED 2026-08-19 (docs-01)
+
+**Kept rather than deleted, per §14's regression-history rule.** This shipped
+and was removed the same day, in the same task, after review; the argument
+below is why the one-line attribute must not come back.
+
+**What it was.** `/.gitattributes` gave `docs/SUMMARY.md` and `docs/TESTS.md`
+`merge=union`, so two branches that each recorded a change note both landed
+instead of stopping the merge sweep. It was accepted at first as a narrow,
+documentation-only trade.
+
+**Why it was not acceptable.** Git has no way to scope a merge attribute to a
+REGION of a file, and union NEVER reports a conflict. So the attribute did not
+mean "combine the appended notes" — it meant those two files could no longer
+conflict at all. Two branches rewriting the same sentence of tracker PROSE, or
+the same existing note line, produced two contradictory copies and no warning,
+including for a line that WEAKENS a claim. Reproduced, and kept as a test:
+`test_docs_merge.py::test_union_would_have_swallowed_a_genuine_prose_conflict`.
+Union was also insufficient for the notes themselves — it resolves per LINE, so
+two branches that grew the same 19,410-character row duplicated the whole row
+(`..._duplicates_a_grown_row_instead_of_merging_the_two_additions`).
+
+**Fix shipped.** The attribute was removed; `.gitattributes` is kept rule-free
+and carries the argument above so it is not reintroduced. Combining the two
+branches' appended notes moved into `autoloop/note_merge.py`, wired into
+`auto_merge.AutoMerger._merge`, which resolves only the append-only section and
+only when each side left every pre-existing line untouched. Its own residual is
+tracked as S35 (open, bounded).
+
+**Verification check:**
+```bash
+# Must print NOTHING — no merge attribute is shipped:
+grep -v '^\s*#' .gitattributes | grep -v '^\s*$'
+```
+Pinned by `autoloop/tests/test_docs_merge.py::test_the_repo_ships_no_merge_attribute_at_all`
+(exact emptiness, so any new rule is a decision that needs its own review) and
+by `..._a_bare_git_merge_of_two_note_appends_still_conflicts`, which proves
+git's own behaviour on these files was not weakened.
 
 ### S31 — Making the always-approved tracker list a config value — LOW — WITHDRAWN 2026-08-16, never shipped
 

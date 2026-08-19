@@ -57,8 +57,23 @@ exists downstream of. Nothing in this module raises into the orchestrator.
 Two things are still refused outright rather than worked around:
 
 * **Conflicts.** `git merge --abort`, verify the head and the tree are exactly
-  what they were, report which files conflicted. Never force, never resolve
-  automatically, never leave a half-merged checkout behind.
+  what they were, report which files conflicted. Never force, never leave a
+  half-merged checkout behind.
+
+  **One conflict shape, and only one, is resolved instead of aborted** (since
+  2026-08-19, docs-01): two branches that each appended their own change-note
+  lines to the terminal append-only section of `docs/SUMMARY.md` /
+  `docs/TESTS.md`. Every task writes those two files, so that collision
+  happened to EVERY pair of parallel branches — it halted the sweep three times
+  in one evening on 2026-08-18 and left five reviewed, published tasks unmerged
+  for a day. `_resolve_note_conflicts` below reads the three sides git recorded
+  in the index and hands them to `note_merge.resolve_note_append`, which
+  returns a combined text only if each side changed nothing but an append to
+  that section. Anything else — a conflict in the prose above it, an edited or
+  reordered existing note line, a conflicted path outside those two files —
+  returns `None` and falls straight through to the same abort as before.
+  Nothing else in this module's conflict handling was weakened, and no other
+  path is auto-resolved.
 * **A remote base that has moved.** Checked BEFORE anything mutates the
   checkout, not left to `push_exact` failing afterwards — a local merge onto a
   base that is already behind the remote produces a head that cannot be
@@ -99,6 +114,7 @@ import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from . import note_merge
 from .config import AutoloopConfig
 from .errors import GitError, StateCorruptError
 from .git_gateway import GitGateway
@@ -556,7 +572,12 @@ class AutoMerger:
                 conflicts = self._git.conflicted_paths()
             except GitError:
                 conflicts = []
-            return self._abort(execution, candidate, pre_head, conflicts, str(exc))
+            # The ONE resolvable shape (see the module docstring): both sides
+            # only appended change-note lines to a tracker's append-only
+            # section. Anything else returns False, having touched nothing, and
+            # falls through to exactly the abort this path always did.
+            if not self._resolve_note_conflicts(task_id, candidate, conflicts, message):
+                return self._abort(execution, candidate, pre_head, conflicts, str(exc))
 
         new_head = self._git.head_sha()
         problem = self._verify_merge(new_head, pre_head, candidate)
@@ -588,6 +609,110 @@ class AutoMerger:
             },
         )
         return MERGED
+
+    # ---- the one auto-resolved conflict shape -------------------------------
+    #
+    # Reachable only from `_merge`'s conflict branch, and only for the two
+    # paths in `note_merge.NOTE_TRACKERS`. Read `note_merge.py`'s module
+    # docstring before changing anything here: the rule it implements is
+    # deliberately narrow, and every widening of it is a case where the sweep
+    # stops asking a human.
+
+    def _resolve_note_conflicts(self, task_id, candidate, conflicts, message) -> bool:
+        """Combine two branches' appended change notes. True ONLY when the
+        merge has been resolved AND committed here; False leaves the checkout
+        exactly as `git merge` left it, for `_abort` to restore.
+
+        **Every conflicted path is resolved into memory before ANY file is
+        written.** A path that resolves followed by one that refuses would
+        otherwise leave a rewritten tracker in a half-merged tree, and the
+        abort that follows would be cleaning up after this method rather than
+        after git.
+        """
+        if not conflicts:
+            return False
+        outside = [path for path in conflicts if path not in note_merge.NOTE_TRACKERS]
+        if outside:
+            # Not even partially: a real conflict anywhere in the merge means
+            # the whole merge needs a human, so nothing is resolved.
+            self._note_refusal(
+                task_id, candidate, conflicts,
+                f"conflicted path(s) outside the change-note trackers: {outside}",
+            )
+            return False
+
+        resolutions: dict[str, str] = {}
+        for path in sorted(conflicts):
+            try:
+                base = self._git.merge_stage_blob(path, 1).decode("utf-8")
+                ours = self._git.merge_stage_blob(path, 2).decode("utf-8")
+                theirs = self._git.merge_stage_blob(path, 3).decode("utf-8")
+                merged = (Path(self._git.repo_root) / path).read_text(encoding="utf-8")
+            except (GitError, OSError, UnicodeDecodeError) as exc:
+                self._note_refusal(
+                    task_id, candidate, conflicts,
+                    f"could not read all three sides of {path}: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+                return False
+            combined = note_merge.resolve_note_append(base, ours, theirs, merged)
+            if combined is None:
+                self._note_refusal(
+                    task_id, candidate, conflicts,
+                    f"{path} is not two branches appending change notes — "
+                    "something outside the append-only section conflicted, or a "
+                    "line that was already there was edited, deleted or reordered",
+                )
+                return False
+            resolutions[path] = combined
+
+        try:
+            for path, text in resolutions.items():
+                (Path(self._git.repo_root) / path).write_text(text, encoding="utf-8")
+            self._git.add_paths(sorted(resolutions))
+            self._git.commit_staged(
+                f"{message}\n\nAppend-only change notes combined automatically in "
+                + ", ".join(sorted(resolutions))
+                + "."
+            )
+        except (GitError, OSError) as exc:
+            # The tree now holds this method's writes on top of git's
+            # half-merged state. `_merge` calls `_abort` next, which restores
+            # both — and verifies that it did.
+            self._note_refusal(
+                task_id, candidate, conflicts,
+                f"combined the change notes but could not commit them: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+
+        self._log(
+            "auto_merge_notes_resolved",
+            data={
+                "task_id": task_id,
+                "candidate_sha": candidate,
+                "paths": sorted(resolutions),
+            },
+        )
+        return True
+
+    def _note_refusal(self, task_id, candidate, conflicts, reason: str) -> None:
+        """Why a conflict was NOT auto-resolved, in the transcript.
+
+        Logged on every refusal, not just the interesting ones: the sweep is
+        about to stop, and "the resolver looked at this and declined, for this
+        reason" is the difference between an operator reading one entry and
+        reconstructing the merge by hand.
+        """
+        self._log(
+            "auto_merge_notes_refused",
+            data={
+                "task_id": task_id,
+                "candidate_sha": candidate,
+                "conflicted_files": sorted(conflicts),
+                "reason": reason,
+            },
+        )
 
     def _note_loop_code_merge(
         self, task_id: str, candidate: str, pre_head: str, new_head: str
