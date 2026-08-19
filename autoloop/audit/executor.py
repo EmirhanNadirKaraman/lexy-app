@@ -16,6 +16,11 @@ Side effects per run:
   the "produce-then-review" note below.
 * `docs/AUDIT_<date>.md` — the ONE new Markdown file (via MarkdownPolicy).
 
+The per-domain charters the subagents are briefed with come from the
+repository under audit when it ships them (`repo.audit_charters_file`, read
+read-only from that checkout's root) and from `DEFAULT_DOMAINS` below when it
+does not — see the charter section above `_agent_prompt`.
+
 **Produce-then-review (2026-07-30).** The audit is dispatched by the
 orchestrator as a task-shaped unit of work (`Orchestrator._dispatch_task_postcommit`
 with a synthetic `Task`, id like `audit-0007`), so it runs, writes its report,
@@ -39,7 +44,10 @@ invisible to the audit — the audit only ever sees committed history.
 from __future__ import annotations
 
 import json
+import stat
+import string
 import subprocess
+import tomllib
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -47,6 +55,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from ..config import DEFAULT_AUDIT_CHARTERS_FILE
 from ..contract import AUDIT_TASK_ID, Decision, Directive
 from ..errors import AuditError
 from ..executor import ExecutionOutcome
@@ -168,8 +177,337 @@ DEFAULT_DOMAINS: tuple[tuple[str, str, str, str], ...] = (
 )
 
 
-def _agent_prompt(title: str, charter: str, scope: str | None, feedback: str | None) -> str:
+# ---- charters shipped by the repository under audit --------------------------
+#
+# The charters above describe THIS repository — its two-backend split, its
+# ingestion pipeline, the docs it keeps. That specificity is what makes the
+# audit produce findings worth reading instead of generic advice, and it is
+# also the reason the loop could not usefully be pointed at another repository:
+# the knowledge lived in the loop's source rather than beside the code it
+# describes. A target repository therefore ships its own charter file
+# (`RepoConfig.audit_charters_file`, default `docs/audit_charters.toml`), and
+# `DEFAULT_DOMAINS` stays as the fallback for a repository that ships none —
+# an absent file is compatibility, never an error.
+#
+# **THIS repository ships one**, at that default path, holding exactly the set
+# below. So `DEFAULT_DOMAINS` is no longer the live brief for anything: it is
+# the compatibility fallback, and the file is what this repository's own audits
+# read. Keeping both is deliberate — a repository that ships nothing still gets
+# a real audit — but it means the pair can drift, which is why
+# `test_audit_charters.py` pins the shipped file to parse to exactly this tuple.
+# Edit the file; change this tuple only to change what an unconfigured
+# repository gets.
+#
+# Four properties are load-bearing:
+#
+# * **Read-only and repository-scoped.** The file is read from the root of the
+#   checkout being audited (the audit's own worker repo in production), never
+#   from the loop's own source tree, the working directory, or anywhere the
+#   configured relative path does not point. Nothing here writes to it.
+# * **Verbatim.** Names, order, model routing and the full prompt text survive
+#   the round trip unchanged — see `render_charter_file`, which is what
+#   `test_audit_charters.py` uses to prove `DEFAULT_DOMAINS` itself can move
+#   into a file with nothing lost.
+# * **Fails closed.** A file that exists but cannot be read as a complete
+#   charter set aborts the run with an actionable error rather than quietly
+#   falling back to the built-ins: silently auditing this repository's domains
+#   inside somebody else's checkout is the failure mode worth refusing, since
+#   the report would look complete and describe the wrong codebase. "Exists" is
+#   read strictly — a directory or an unreadable entry at the charter path is a
+#   refusal, not absence (see `load_charter_domains`).
+# * **Says nothing the charters contradict.** The prompt's opening sentence
+#   names this repository only on the FALLBACK path, where the charters are this
+#   repository's and it is true. Charters that came out of a file are introduced
+#   by framing that names no project at all, because the file is now where a
+#   repository states what it is — see `BUILT_IN_FRAMING` /
+#   `REPO_SUPPLIED_FRAMING` above `_agent_prompt`.
+
+#: The array-of-tables key, and the four fields every entry must carry. All
+#: four are REQUIRED even though `model` accepts `""` — an omitted field is
+#: indistinguishable from a forgotten one, and "incomplete content fails
+#: clearly" is the whole contract of this file.
+CHARTER_TABLE_KEY = "domain"
+CHARTER_FIELDS: tuple[str, ...] = ("slug", "title", "charter", "model")
+#: Model aliases a charter file may name. `""` means "whatever the CLI
+#: defaults to" (`AgentSpec.model`). `opus`/`fable` are deliberately absent:
+#: `DEFAULT_DOMAINS` never delegates to the lead's tier, and the charter file
+#: is not the place to reverse that — it would raise the cost of every audit
+#: from a file the operator paying for the run does not own. Widening this
+#: tuple is a one-line change if a target repository ever has a case for it.
+CHARTER_MODELS: tuple[str, ...] = ("", "haiku", "sonnet")
+#: Slugs become filenames under `<run>/raw/` and a column in the coverage
+#: table, so they are restricted rather than trusted: a slug containing `/` or
+#: `..` would put an agent's raw output somewhere nobody looks for it.
+_SLUG_CHARS = frozenset(string.ascii_letters + string.digits + "_-")
+
+_CHARTER_FORMAT_HINT = (
+    "Expected one `[[domain]]` table per audit domain, in wave order, each "
+    "with exactly slug/title/charter/model, e.g.\n"
+    "  [[domain]]\n"
+    '  slug = "docs_drift"\n'
+    '  title = "Documentation drift"\n'
+    '  model = "haiku"\n'
+    "  charter = '''Compare the docs against the code. …'''\n"
+    "Use ''' literal strings for charter prose: \"\"\" processes escapes."
+)
+
+
+def parse_charter_domains(text: str, source: str) -> tuple[tuple[str, str, str, str], ...]:
+    """`text` as a domain tuple, or `AuditError` naming exactly what is wrong.
+
+    Strict in the same way `config.py` is strict, and for the same reason: a
+    charter set that half-parses produces an audit that reads as complete while
+    covering less than it claims. So an unknown key, a missing key, a
+    non-string value, a blank charter, a duplicate slug and an unusable model
+    alias are all refusals, never repairs. Nothing is normalized — the charter
+    prose is stored exactly as written, since re-wrapping an agent's brief is a
+    silent edit to what was asked of it.
+    """
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise AuditError(f"{source} is not valid TOML: {exc}. {_CHARTER_FORMAT_HINT}") from exc
+
+    stray = sorted(set(data) - {CHARTER_TABLE_KEY})
+    if stray:
+        raise AuditError(
+            f"{source} has unknown top-level key(s) {stray} — the only key this "
+            f"file may define is `[[{CHARTER_TABLE_KEY}]]`. {_CHARTER_FORMAT_HINT}"
+        )
+    raw = data.get(CHARTER_TABLE_KEY)
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        raise AuditError(
+            f"{source} must define `[[{CHARTER_TABLE_KEY}]]` as an array of "
+            f"tables, got {type(raw).__name__}. {_CHARTER_FORMAT_HINT}"
+        )
+    if not raw:
+        raise AuditError(
+            f"{source} defines no domains. An audit with no domains reports "
+            "nothing while looking like a clean run — delete the file to use "
+            f"the built-in charters instead. {_CHARTER_FORMAT_HINT}"
+        )
+
+    domains: list[tuple[str, str, str, str]] = []
+    seen: dict[str, int] = {}
+    for index, item in enumerate(raw, start=1):
+        where = f"{source} [[{CHARTER_TABLE_KEY}]] #{index}"
+        missing = sorted(set(CHARTER_FIELDS) - set(item))
+        if missing:
+            raise AuditError(
+                f"{where} is missing required field(s) {missing}. All of "
+                f"{list(CHARTER_FIELDS)} must be present; write `model = \"\"` "
+                f"for the CLI default. {_CHARTER_FORMAT_HINT}"
+            )
+        unknown = sorted(set(item) - set(CHARTER_FIELDS))
+        if unknown:
+            raise AuditError(
+                f"{where} has unknown field(s) {unknown} — a typo'd field would "
+                "otherwise read as configured while changing nothing. Allowed: "
+                f"{list(CHARTER_FIELDS)}."
+            )
+        for field in CHARTER_FIELDS:
+            if not isinstance(item[field], str):
+                raise AuditError(
+                    f"{where}: `{field}` must be a string, got {item[field]!r}"
+                )
+        slug, title, charter, model = (item[field] for field in CHARTER_FIELDS)
+
+        if not slug or not set(slug) <= _SLUG_CHARS:
+            raise AuditError(
+                f"{where}: `slug` must be non-empty and use only letters, digits, "
+                f"'_' and '-', got {slug!r} — it names this domain's raw-output "
+                "file and its row in the report's coverage table."
+            )
+        if slug in seen:
+            raise AuditError(
+                f"{where}: duplicate slug {slug!r}, already used by "
+                f"[[{CHARTER_TABLE_KEY}]] #{seen[slug]} — the second agent's raw "
+                "output would overwrite the first's and the coverage table would "
+                "count one domain twice."
+            )
+        seen[slug] = index
+        for field, value in (("title", title), ("charter", charter)):
+            if not value.strip():
+                raise AuditError(
+                    f"{where}: `{field}` is empty. A domain with no {field} gives "
+                    "its agent nothing to audit, and the run would still report "
+                    "the domain as covered."
+                )
+        if model not in CHARTER_MODELS:
+            raise AuditError(
+                f"{where}: `model` must be one of {list(CHARTER_MODELS)}, got "
+                f"{model!r} (\"\" means the CLI default). The lead's tier is "
+                "deliberately not delegated to; see CHARTER_MODELS."
+            )
+        domains.append((slug, title, charter, model))
+    return tuple(domains)
+
+
+def render_charter_file(domains: tuple[tuple[str, str, str, str], ...]) -> str:
+    """`domains` as a charter file — the inverse of `parse_charter_domains`.
+
+    Exists so "this repository's charters can move into the file verbatim" is
+    something a test can execute rather than a claim in a doc: render
+    `DEFAULT_DOMAINS`, parse the result, compare. It is also the honest way to
+    hand an operator a starting point for a new target repository.
+
+    Charter prose goes in a `'''` literal string, so nothing in it is read as
+    an escape. A charter containing `'''` itself cannot be written this way and
+    raises rather than emitting a file that would parse as something else.
+    """
+    blocks = []
+    for slug, title, charter, model in domains:
+        if "'''" in charter or "'''" in title:
+            raise AuditError(
+                f"domain {slug!r} contains \"'''\", which cannot be written into a "
+                "literal TOML string — rephrase it, or write the file by hand."
+            )
+        blocks.append(
+            f"[[{CHARTER_TABLE_KEY}]]\n"
+            f"slug = {json.dumps(slug)}\n"
+            f"title = {json.dumps(title)}\n"
+            f"model = {json.dumps(model)}\n"
+            f"charter = '''{charter}'''\n"
+        )
+    return "\n".join(blocks)
+
+
+def load_charter_domains(
+    repo_root: Path, relative: str = DEFAULT_AUDIT_CHARTERS_FILE
+) -> tuple[tuple[str, str, str, str], ...] | None:
+    """The charters `repo_root` ships, or `None` to use the built-ins.
+
+    `None` — meaning "nothing configured, or nothing there" — is the
+    compatibility path and covers exactly two cases: `relative == ""` (the
+    operator's explicit opt-out) and a file that is genuinely NOT PRESENT.
+    Everything else that goes wrong raises `AuditError`.
+
+    "Genuinely not present" is narrower than it looks, and the narrowing is the
+    point. `is_file()` answers False for a directory, a socket, a device node
+    and a path whose parent is itself a file, so testing it would read every one
+    of those as absence and quietly hand the run this repository's own charters
+    inside somebody else's checkout — the exact silent degradation the parse
+    path refuses. So absence is `FileNotFoundError` from `stat()` and nothing
+    else: something that IS there but cannot be examined, or is there and is not
+    a regular file, is a refusal naming the path.
+
+    The path is re-checked here even though `load_config` already refuses an
+    absolute, padded or traversing value: `AuditExecutor` can be constructed
+    directly, and this is the function that turns a string into a filesystem
+    read. Resolution is deliberately dull — join onto the root of the checkout
+    being audited, refuse a symlink, refuse anything that resolves outside that
+    root. There is no search, no upward walk and no fallback location, so an
+    audit of one repository can never pick up another's charters.
+    """
+    if relative == "":
+        return None
+    if (
+        relative.strip() != relative
+        or "\\" in relative
+        or relative.startswith(("/", "~"))
+        or any(seg in ("", ".", "..") for seg in relative.split("/"))
+    ):
+        raise AuditError(
+            f"audit charter path {relative!r} must be a plain path relative to the "
+            "repository root, with no padding, no '..' and '/' separators — it is "
+            "joined onto the checkout being audited, so anything else would read a "
+            "file that repository does not ship."
+        )
+    root = Path(repo_root)
+    path = root / relative
+    if path.is_symlink():
+        raise AuditError(
+            f"audit charter file {path} is a symlink. Refused rather than followed: "
+            "the charters must be part of the repository under audit, and a link "
+            "can point anywhere. Replace it with the file itself, or set "
+            'repo.audit_charters_file = "" to use the built-in charters.'
+        )
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        # The ONE compatibility case: nothing is there. Listed before the
+        # general `OSError` clause because it is a subclass of it.
+        return None
+    except OSError as exc:
+        # Permission denied, a parent component that is itself a file, a dead
+        # mount. Something occupies the path and could not be examined, which is
+        # not the same as nothing occupying it.
+        raise AuditError(
+            f"cannot examine audit charter file {path}: {exc}. Something is there "
+            "and could not be read, which is not treated as absence — fix the "
+            'path, or set repo.audit_charters_file = "" to use the built-in '
+            "charters deliberately."
+        ) from exc
+    if not stat.S_ISREG(mode):
+        raise AuditError(
+            f"audit charter file {path} exists but is not a regular file "
+            f"(mode {stat.filemode(mode)}). Refused rather than treated as "
+            "absent: falling back would brief the audit agents on the built-in "
+            "charters inside a checkout that plainly meant to ship its own. "
+            'Replace it with the file itself, or set repo.audit_charters_file = "" '
+            "to use the built-in charters deliberately."
+        )
+    try:
+        resolved, resolved_root = path.resolve(), root.resolve()
+    except OSError as exc:  # pragma: no cover - platform-specific resolution failure
+        raise AuditError(f"cannot resolve audit charter file {path}: {exc}") from exc
+    if not resolved.is_relative_to(resolved_root):
+        raise AuditError(
+            f"audit charter file {path} resolves to {resolved}, outside the "
+            f"repository being audited ({resolved_root})."
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise AuditError(
+            f"cannot read audit charter file {path}: {exc}. It exists, so it is not "
+            "treated as absent — fix or remove it."
+        ) from exc
+    return parse_charter_domains(text, str(path))
+
+
+#: The opening sentence of every audit agent's prompt, in its two forms.
+#:
+#: The BUILT-IN one names this repository, and has since the audit existed. It
+#: belongs with `DEFAULT_DOMAINS`: those charters describe the language-learning
+#: app, so a run using them is a run against this repository and the sentence is
+#: simply true. It is preserved exactly — a run on the fallback path must
+#: produce the prompt it always produced.
+#:
+#: The REPOSITORY-SUPPLIED one is what a target checkout's own charters are
+#: framed with, and it names no project. It has to: the charters say what the
+#: codebase is, and telling an agent auditing a Go service that it is looking at
+#: a German language-learning app contradicts its own brief in the sentence
+#: before it arrives. Pointing at "the repository's own root documentation"
+#: rather than at `CLAUDE.md` keeps even the filename out of it — the agent has
+#: Read/Grep/Glob and can find whatever the checkout actually keeps.
+BUILT_IN_FRAMING = (
+    "You are ONE read-only audit agent inside an automated repository audit "
+    "of this codebase (a German language-learning app; see CLAUDE.md)."
+)
+REPO_SUPPLIED_FRAMING = (
+    "You are ONE read-only audit agent inside an automated repository audit of "
+    "this codebase. The charter below is the repository's own description of "
+    "what to examine; where you need more context about what this project is, "
+    "start from its root documentation rather than from any assumption about "
+    "the kind of software it contains."
+)
+
+
+def _agent_prompt(
+    title: str,
+    charter: str,
+    scope: str | None,
+    feedback: str | None,
+    *,
+    repo_supplied: bool = False,
+) -> str:
     """The prompt for ONE per-domain audit agent.
+
+    `repo_supplied` selects the opening framing (see the two constants above)
+    and is KEYWORD-ONLY, defaulting to the historical sentence: every existing
+    caller passes four positional arguments and must keep the prompt it had, and
+    no future positional caller can flip the framing by accident.
 
     `scope` and `feedback` come from the reviewer's directive and are threaded
     VERBATIM — an agent has to see what was actually asked. Each is introduced
@@ -195,8 +533,7 @@ def _agent_prompt(title: str, charter: str, scope: str | None, feedback: str | N
     docs/SECURITY.md S24 before treating it as a control.
     """
     parts = [
-        "You are ONE read-only audit agent inside an automated repository audit "
-        "of this codebase (a German language-learning app; see CLAUDE.md).",
+        REPO_SUPPLIED_FRAMING if repo_supplied else BUILT_IN_FRAMING,
         f"Your domain: {title}.",
         charter,
         "Ground rules: you have READ-ONLY access (Read/Grep/Glob). Do not "
@@ -271,11 +608,12 @@ class AuditExecutor:
         run_dir_base: Path,
         validation_commands: tuple[tuple[str, ...], ...] = (("ruff", "check", "."),),
         max_parallel_agents: int = 3,
-        domains: tuple[tuple[str, str, str], ...] = DEFAULT_DOMAINS,
+        domains: tuple[tuple[str, str, str, str], ...] = DEFAULT_DOMAINS,
         command_runner=None,
         worker_repo_root_for: Callable[[str], Path] | None = None,
         policy: PolicyEngine | None = None,
         agent_runner_factory: Callable[[Path], AgentRunner] | None = None,
+        charters_file: str = DEFAULT_AUDIT_CHARTERS_FILE,
     ):
         """`git` / `markdown` / `agent_runner` are the STANDALONE bindings —
         used verbatim whenever `task` is `None` (every direct `execute()` call
@@ -295,6 +633,13 @@ class AuditExecutor:
         read-only subagents inspect the audit's own frozen checkout, not the
         main checkout); when omitted, the construction-time `agent_runner` is
         reused as-is (its own `cwd`, whatever that is).
+
+        `domains` is the FALLBACK charter set — this repository's own, unless a
+        caller passes something else. `charters_file` is where the repository
+        being audited may ship its own, read fresh per `execute()` call from
+        that call's own repo root (see `_resolve_domains`), so one executor
+        pointed at two checkouts uses each one's charters and neither leaks
+        into the other. A file that is absent leaves `domains` in force.
         """
         self._git = git
         self._agent_runner = agent_runner
@@ -308,6 +653,7 @@ class AuditExecutor:
         self._worker_repo_root_for = worker_repo_root_for
         self._policy = policy
         self._agent_runner_factory = agent_runner_factory
+        self._charters_file = charters_file
 
     # ---- TaskExecutor -------------------------------------------------------
 
@@ -350,6 +696,25 @@ class AuditExecutor:
         )
         return git, markdown, agent_runner
 
+    def _resolve_domains(
+        self, repo_root: Path
+    ) -> tuple[tuple[tuple[str, str, str, str], ...], str]:
+        """`(domains, charter_source)` for ONE run, read from `repo_root`.
+
+        `charter_source` is `""` when the built-ins are in force and the
+        configured path otherwise, so the summary can say which charters the
+        report was produced against — a reviewer reading findings needs to know
+        whether the domains were the loop's or the repository's.
+
+        Nothing is cached between calls on purpose: the repo root differs per
+        task (each audit runs in its own worker repo) and a remembered charter
+        set would be this process's first checkout describing every later one.
+        """
+        loaded = load_charter_domains(repo_root, self._charters_file)
+        if loaded is None:
+            return self._domains, ""
+        return loaded, self._charters_file
+
     # ---- audit pipeline -----------------------------------------------------
 
     def _run_audit(
@@ -360,6 +725,25 @@ class AuditExecutor:
         scope: str | None,
         feedback: str | None,
     ) -> ExecutionOutcome:
+        # FIRST, before a run directory exists or a single agent is launched.
+        # A charter file that cannot be read is a configuration fault, and the
+        # cheapest honest answer to one is to have done nothing yet. Reported
+        # as an outcome rather than raised: an `AuditError` escaping here
+        # leaves `Orchestrator.run`'s handler chain (it catches browser/git/
+        # state faults, not this) and takes the process down with a traceback,
+        # while an error outcome reaches the reviewer, who can answer it.
+        try:
+            domains, charter_source = self._resolve_domains(git.repo_root)
+        except AuditError as exc:
+            return ExecutionOutcome(
+                status="error",
+                summary=(
+                    "audit not run — the repository's audit charters could not be "
+                    f"loaded: {exc}"
+                ),
+                validation="not run",
+            )
+
         now = datetime.now(timezone.utc)
         date = now.strftime("%Y-%m-%d")
         run_id = now.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
@@ -372,14 +756,19 @@ class AuditExecutor:
 
         validation_runs = [self._run_validation(git, cmd) for cmd in self._validation_commands]
 
+        # `charter_source` is truthy exactly when the domains came out of the
+        # repository's own file, which is also exactly when the prompt must stop
+        # asserting what this codebase is — see the two framing constants.
         specs = [
             AgentSpec(
                 domain=slug,
                 title=title,
-                prompt=_agent_prompt(title, charter, scope, feedback),
+                prompt=_agent_prompt(
+                    title, charter, scope, feedback, repo_supplied=bool(charter_source)
+                ),
                 model=model,
             )
-            for slug, title, charter, model in self._domains
+            for slug, title, charter, model in domains
         ]
         results = self._run_agents(agent_runner, specs, run_dir)
 
@@ -442,7 +831,7 @@ class AuditExecutor:
             proposal=proposal,
             agent_failures=agent_failures,
             covered_domains=tuple(covered),
-            all_domains=tuple(slug for slug, *_ in self._domains),
+            all_domains=tuple(slug for slug, *_ in domains),
             raw_reports_dir=str(run_dir),
         )
         report_path = f"docs/AUDIT_{date}.md"
@@ -456,11 +845,19 @@ class AuditExecutor:
         summary = (
             f"Audit complete: {accepted} accepted findings "
             f"({len(reconciled.rejected)} rejected, {len(reconciled.duplicates)} deduped) "
-            f"across {len(self._domains)} domains "
+            f"across {len(domains)} domains "
             f"({len(agent_failures)} agent failures); {len(proposal.tasks)} tasks proposed. "
             f"Report written to {report_path} (the only file this audit changed — "
             "committed automatically once validation passes)."
         )
+        if charter_source:
+            # Said only when it is true, so a run against the built-in charters
+            # produces the exact summary it always did. A reviewer judging
+            # coverage needs to know whose domains these were.
+            summary += (
+                f" Domain charters came from {charter_source}, shipped by the "
+                "repository under audit, not from the built-in set."
+            )
         return ExecutionOutcome(
             status="ok" if not agent_failures else "error",
             summary=summary

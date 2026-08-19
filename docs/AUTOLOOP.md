@@ -3414,6 +3414,71 @@ writes land in the change manifest.
 `push`, or `stop`. `implement` is rejected in this phase, and so is
 `ask_user` — retired, see §9c.
 
+**Domain charters — shipped by the repository under audit** (port-03,
+2026-08-19). Step 3's per-domain briefs are the reason the audit produces
+findings worth reading rather than generic advice: they name this repository's
+two-backend split, its ingestion pipeline, which docs are canonical. That
+knowledge belongs beside the code it describes, so **this repository ships it as
+`docs/audit_charters.toml`** and `DEFAULT_DOMAINS` in `audit/executor.py` is the
+fallback for a target repository that ships nothing. Editing that file is how
+you change what this repository's audits are briefed on; the built-in tuple is
+kept in step with it by `test_audit_charters.py`, which parses the shipped file
+and requires the two to be equal.
+
+* **Where.** `[repo].audit_charters_file`, default `docs/audit_charters.toml`,
+  resolved relative to the ROOT OF THE CHECKOUT BEING AUDITED — in production
+  the audit's own worker repo, not the main checkout and never the loop's
+  source tree. Same path rules as the other `[repo]` settings: relative, no
+  padding, no `..`, no globs, one file. The exact empty string means "never
+  look".
+* **Absent is compatibility, not an error.** No file (or the empty opt-out)
+  means the built-in charters, byte for byte the behaviour that existed before
+  the file could be read — pinned by `test_audit_charters.py`'s prompt-identity
+  test, which compares whole prompts rather than counting domains.
+* **Format.** TOML: one `[[domain]]` table per domain, IN WAVE ORDER (the first
+  `max_parallel_agents` run concurrently), each carrying exactly `slug`,
+  `title`, `charter` and `model`. Charters go in `'''` literal strings — `"""`
+  processes escapes. `model` is `"haiku"`, `"sonnet"` or `""` (the CLI
+  default); `opus` is refused, because `DEFAULT_DOMAINS` deliberately never
+  delegates to the lead's tier and a file the operator does not own is not
+  where that gets reversed. `render_charter_file(DEFAULT_DOMAINS)` emits a
+  valid starting point, and the round trip through `parse_charter_domains` is
+  exact — nothing is normalized, re-wrapped or reordered.
+* **Fails closed.** A file that exists but does not parse — unknown key,
+  missing field, blank charter, duplicate slug, unusable model — ABORTS the run
+  with an `ExecutionOutcome(status="error")` naming the file and the fault,
+  before a run directory exists or an agent is launched. It never degrades to
+  the built-ins: those describe the language-learning app, and a report
+  produced from them inside another repository would read as complete while
+  describing the wrong codebase. The failure is an outcome rather than a raised
+  `AuditError` on purpose — `Orchestrator.run` catches browser/git/state
+  faults, so a raise here would end the process with a traceback instead of
+  reaching the reviewer. **Absence means absence**, and nothing else: only a
+  `FileNotFoundError` from `stat()` selects the fallback. A directory at the
+  charter path, an entry that is not a regular file, a permission error, a path
+  whose parent is itself a file — each is refused by name. `is_file()` would
+  have answered False for every one of them and read them as "ships no
+  charters", which is the same silent degradation arriving through the door next
+  to the parser.
+* **Portability boundary.** The charter file says WHAT to look at; it grants
+  nothing. Read-only confinement stays argv-level (`agents.py`'s
+  `--allowedTools`/`--disallowedTools`), the always-approved tracker list stays
+  the `tasks.TRACKER_PATHS` constant (see §31 in `docs/SECURITY.md`), and the
+  ground rules, the reviewer-scope framing and the findings schema are added by
+  `_agent_prompt` around whatever the file says — a charter cannot drop them by
+  omission. Loading is read-only, resolved once per `execute()` call, cached
+  nowhere: one process auditing two repositories uses each one's charters.
+* **The framing follows the charters.** `_agent_prompt` opens with one of two
+  sentences. `BUILT_IN_FRAMING` — the historical one, naming a German
+  language-learning app and pointing at `CLAUDE.md` — is used only when the
+  built-in charters are in force, where it is simply true, and is preserved word
+  for word so an unconfigured run produces the prompt it always produced.
+  `REPO_SUPPLIED_FRAMING` is used whenever the domains came out of a file: it
+  names no project and points at "the repository's own root documentation",
+  because the charter file is now where a repository states what it is. Before
+  this split, an agent auditing a Go service was told it was looking at a
+  language-learning app in the sentence before its own charter said otherwise.
+
 ---
 
 ## 7b. The implement executor
