@@ -664,10 +664,14 @@ def _pending_inbox(repo: Path) -> list[dict]:
 #: it never decides whether that branch is merged.
 BRANCH_PREFIX = "autoloop/"
 
-#: The four states a completed task can be in, in the order the page lists
-#: them. `unpublished` is not a normal state — it means the registry says done
-#: and no side branch exists anywhere — so it is shown rather than folded into
-#: one of the others.
+#: The four states a completed task can be in. `unpublished` is not a normal
+#: state — it means the registry says done and no side branch exists anywhere —
+#: so it is shown rather than folded into one of the others.
+#:
+#: This is the VOCABULARY, not a display order: the page lists these in
+#: `MERGE_GROUPS`'s triage order, which puts the one nobody has to act on last.
+#: `test_the_merge_panel_groups_every_state_exactly_once` pins the two against
+#: each other, so a fifth state cannot render nowhere.
 MERGE_STATES = ("merged", "unmerged", "unpublished", "unknown")
 
 
@@ -813,10 +817,74 @@ def _executions(repo: Path) -> dict:
     return out
 
 
+#: The merge panel's groups, in the order the page lists them: `(state, label,
+#: collapsed)`. Triage order — the three states that need a human first, and
+#: the one nobody has to act on last.
+#:
+#: This is the roadmap panel's `GROUPS` / `COLLAPSED` pattern applied to the
+#: same problem one panel up, deliberately rather than a second mechanism: on
+#: 2026-08-18 this panel rendered 61 rows flat, of which FOUR needed a human and
+#: 57 did not, so the four that mattered were buried under the ones that did
+#: not. The counts were already computed and then thrown away as a display axis.
+#:
+#: COLLAPSED IS NOT HIDDEN, and there is deliberately no `hidden` flag here.
+#: The roadmap has one because it has a hide policy; this panel's rule is that
+#: it has none — every group renders with its count, `unknown (0)` included. An
+#: `unknown` row means the sweep could not judge a branch, which is the state
+#: most worth seeing and the easiest to hide by accident, and an always-false
+#: field would be an invitation to flip it.
+#:
+#: The LABEL travels in the payload for the same reason the roadmap's does: the
+#: backend pins the word for a state, so the template cannot invent one. The
+#: ICON stays in the template's `MS` map, which already carries icon + word for
+#: every state and is what the row cells render.
+MERGE_GROUPS: tuple[tuple[str, str, bool], ...] = (
+    ("unmerged", "NOT merged", False),
+    ("unpublished", "Not published", False),
+    ("unknown", "Unknown", False),
+    # The only collapsed group, and the reason this panel is grouped at all:
+    # merged only ever grows and nobody has to act on it. Collapsed is not
+    # hidden — its count is in the summary, and a merged row's whole value is
+    # that it stays findable when someone asks where a task's work went.
+    ("merged", "Merged", True),
+)
+
+
+def merge_groups(rows: list[dict]) -> list[dict]:
+    """`rows` split by state into `MERGE_GROUPS`, in order, each with its count.
+
+    Pure, display-only, and additive: the flat `rows` list and the `counts`
+    dict are unchanged and still travel beside this, so nothing that reads them
+    has to learn about groups. A row object here IS the row object there — the
+    same fields, never a copy with something dropped.
+
+    EVERY group is emitted, including one with no rows. A group that vanished
+    when it emptied would make "the sweep judged every branch" and "the panel
+    failed to render that section" look identical, which is the failure the
+    roadmap's `ALWAYS_SHOWN` already records one panel down.
+
+    A state no group claims lands in `unknown` rather than disappearing —
+    grouping is a second axis on the same rows, so a completed task that no
+    group claimed would be silently absent from the panel. `merge_states` only
+    ever produces the four, and the page's own `MS[r.state] || MS.unknown`
+    falls back the same way.
+    """
+    grouped: dict[str, list[dict]] = {state: [] for state, _label, _collapsed in MERGE_GROUPS}
+    for row in rows:
+        state = str(row.get("state") or "")
+        grouped[state if state in grouped else "unknown"].append(row)
+    return [
+        {"key": state, "label": label, "collapsed": collapsed,
+         "count": len(grouped[state]), "rows": grouped[state]}
+        for state, label, collapsed in MERGE_GROUPS
+    ]
+
+
 def merge_report(repo: Path, roadmap: list[dict], head: str,
                  remote_ok: bool, refs: list[dict], branch: str,
                  executions: dict) -> dict:
-    """The payload the page renders: rows plus a count per state.
+    """The payload the page renders: rows, a count per state, and the same rows
+    grouped by state for display.
 
     Read-only and lock-free, like everything else here: `executions` is read by
     `_executions` as plain JSON and every git call is a local read.
@@ -833,6 +901,13 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
         "remote_ok": remote_ok,
         "counts": {s: sum(1 for r in rows if r["state"] == s) for s in MERGE_STATES},
         "rows": rows,
+        # The SAME rows on a second axis, so the panel can put the four that
+        # need a human above the fold and the 57 that do not behind a counted
+        # disclosure. The hide/show policy lives here rather than in the
+        # template — exactly as the roadmap's does — so "merged is collapsed and
+        # the other three are not" is a fact a test can assert about the payload
+        # instead of a substring of a script.
+        "groups": merge_groups(rows),
     }
 
 
@@ -1896,17 +1971,36 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
 
   <!-- Directly under the pipeline, and the count is also a tile above it: the
        sentence "N finished tasks are not in your branch" is the point of this
-       panel, and a number nobody scrolls to says nothing. -->
+       panel, and a number nobody scrolls to says nothing.
+
+       Grouped by state, in triage order, the same way the Roadmap panel below
+       is: the three groups that need a human render inline in `#merged`, and
+       `Merged` — the group that only ever grows and that nobody has to act on —
+       is a counted <details> in STATIC markup, for the same reason `#donebox`
+       is. `render()` rewrites only its summary text and the rows inside it, so
+       a disclosure the operator opened stays open across the 2s poll instead of
+       snapping shut. `#mergehead` stays ABOVE the groups: it says which branch
+       "merged" is relative to, and grouping must not push that out of view. -->
   <section>
     <h2>Merged into the branch — completed is published, not integrated</h2>
     <div id="mergehead" style="font-size:13px;margin-bottom:9px"></div>
     <div id="merged" class="scroll"></div>
+    <details id="mgmergedbox">
+      <summary id="mgmergedsum">✓ Merged</summary>
+      <div id="mgmergedrows" class="scroll"></div>
+      <p class="muted" style="font-size:12px;margin:9px 0 0">
+        Merged is the one group here nobody has to act on: the work is in this
+        branch. Collapsed is not hidden — the count is in the summary above, and
+        a merged row's whole value is that it stays findable when someone asks
+        where a task's commit went.</p>
+    </details>
     <p class="muted" style="font-size:12px;margin:9px 0 0">
       Merged means git's own answer: the branch sha is an ancestor of this
       checkout's HEAD. Never the task status, the execution record or a name
       match — those all read "done" for work that was only ever pushed to a side
       branch. <b>unknown</b> means git could not answer (origin unreachable, or
-      the repository would not read); it is never reported as not-merged.</p>
+      the repository would not read); it is never reported as not-merged — which
+      is why that group renders with its count even at zero.</p>
   </section>
 
   <!-- Grouped by state, in triage order. `Retired` and `Done` are <details>
@@ -2378,6 +2472,88 @@ function renderRoadmap(d){
   });
 }
 
+// ---- the merge panel, grouped by state ---------------------------------------
+//
+// The same shape as the roadmap docket below and for the same reason: on
+// 2026-08-18 this panel rendered 61 rows flat, of which four needed a human,
+// and the counts that could have said so were computed and thrown away. The
+// three actionable groups render inline; `Merged` is a counted disclosure in
+// STATIC markup, so an operator who opens it keeps it open across the 2s poll.
+//
+// The hide/show policy is the BACKEND's (`MERGE_GROUPS`), never this template's:
+// every group renders with its count, including `Unknown (0)`. Nothing here
+// filters rows or re-derives a state — `r.state` arrives decided by git.
+//
+// Everything between the markers is lifted verbatim by the tests, which run it
+// under node against a stub document to prove an opened disclosure survives a
+// refresh. Keep each marker alone on its line and keep this region free of
+// module state other than `esc` / `rows`, or those tests stop being able to
+// reach it.
+// MERGE_PANEL_START
+// Three real states plus unknown, every one of them icon + word: a colour
+// alone could not tell "not published" from "not merged", and those need
+// different actions (nothing was ever pushed vs it is pushed and stranded).
+const MS = {merged:["✓","merged"], unmerged:["▲","NOT merged"],
+            unpublished:["○","not published"], unknown:["?","unknown"]};
+const msRow = r => {
+  const [ic, word] = MS[r.state] || MS.unknown;
+  return `<tr class="${r.state === "unmerged" ? "row-active" : ""}">
+    <td><code>${esc(r.id)}</code></td><td><code>${esc(r.branch)}</code></td>
+    <td><code>${esc(r.sha || "—")}</code></td><td>${esc(ic)} ${esc(word)}</td>
+    <td class="muted">${esc(r.detail)}</td></tr>`;
+};
+// The row content is EXACTLY what it was before the grouping — same five
+// columns, same icon + word, same `row-active` on an unmerged row. Grouping is
+// a display axis over the rows, not a new reading of them.
+const msTable = g => rows(["task","branch","sha","state","why"],
+                          (g.rows || []).map(msRow).join(""));
+const msHeading = g => `<h3 class="gh">${esc((MS[g.key] || MS.unknown)[0])} `
+  + `${esc(g.label)} <span class="gc">${esc(g.count)}</span></h3>`;
+function renderMerge(d){
+  const mg = d.merge || {counts:{}, rows:[], groups:[], base_branch:"HEAD", base_head:""};
+  const mc = mg.counts || {};
+  const nUnmerged = mc.unmerged || 0, nUnknown = mc.unknown || 0;
+  const mrows = mg.rows || [];
+  const base = `${esc(mg.base_branch)} (${esc(mg.base_head || "?")})`;
+  // ABOVE the groups and outside every one of them: this line names the branch
+  // "merged" is relative to, and an answer of "merged" is meaningless without
+  // it. Grouping must never push it out of view.
+  document.getElementById("mergehead").innerHTML = (nUnmerged
+      ? `<b>▲ ${nUnmerged} completed task(s) are published but NOT in ${base}.</b> `
+        + `Their code is finished and is not in your branch.`
+      : `✓ none of the ${mrows.length} completed task(s) are missing from ${base}.`)
+    + (nUnknown ? ` <span class="muted">? ${nUnknown} unknown — git could not answer, `
+                  + `so they are not counted either way.</span>` : "")
+    + ((mc.unpublished || 0) ? ` <span class="muted">○ ${mc.unpublished} completed with `
+                               + `no side branch at all.</span>` : "");
+  const groups = mg.groups || [];
+  // Every group the backend did NOT collapse, in the order it sent them, each
+  // with its heading and count — an empty one included. `Unknown (0)` costs one
+  // line, and an unknown row means the sweep could not judge a branch: the
+  // state most worth seeing and the easiest to hide by accident. `rows()`
+  // prints "none" for the body, so an empty group reads as answered rather
+  // than as a section that failed to render.
+  document.getElementById("merged").innerHTML =
+    groups.filter(g => !g.collapsed).map(g => msHeading(g) + msTable(g)).join("")
+    || `<p class="empty">no merge groups in this payload — the panel could not `
+       + `be grouped, and the counts above are all there is.</p>`;
+  // By KEY, never by scanning for the group that carries the collapsed flag.
+  // There is one collapsed group here today and two in the roadmap panel, and
+  // a predicate that finds "the collapsed one" is wrong the moment a second
+  // appears — silently, by filling this disclosure with someone else's rows.
+  const gMerged = groups.find(g => g.key === "merged");
+  // The summary text and the row body, and NOTHING ELSE. The <details> itself
+  // is static markup this function does not rebuild and never writes a
+  // disclosure state to: an operator who opened it keeps it open across every
+  // refresh, and writing the payload's default back here each tick would snap
+  // it shut every 2 seconds, which is exactly what this must not do.
+  document.getElementById("mgmergedsum").textContent =
+    gMerged ? `✓ ${gMerged.label} (${gMerged.count})` : "✓ Merged";
+  document.getElementById("mgmergedrows").innerHTML =
+    gMerged ? msTable(gMerged) : `<p class="empty">unknown</p>`;
+}
+// MERGE_PANEL_END
+
 function render(d, force){
   if (!d) return;
   // No skeleton flash on refetch: a 2s poll that rebuilt identical DOM threw
@@ -2417,9 +2593,10 @@ function render(d, force){
   const t = d.task;
   // Completed-but-not-in-the-branch, above the fold. The tile carries the icon
   // and the word as well as the number, so the border colour is decoration.
-  const mg = d.merge || {counts:{}, rows:[], base_branch:"HEAD", base_head:""};
-  const mc = mg.counts || {};
-  const nUnmerged = mc.unmerged || 0, nUnknown = mc.unknown || 0;
+  // Read here as well as in `renderMerge` on purpose: this tile is the panel's
+  // sentence said above the fold, and a number nobody scrolls to says nothing.
+  const mc = (d.merge || {}).counts || {};
+  const nUnmerged = mc.unmerged || 0;
   document.getElementById("tiles").innerHTML = [
     ["phase", d.session.phase], ["iteration", d.session.iteration],
     ["agents live", d.agents.length], ["open blockers", d.blockers.length],
@@ -2431,30 +2608,9 @@ function render(d, force){
   drawFlow(d);
 
   // ---- merged vs unmerged ------------------------------------------------
-  // Three real states plus unknown, every one of them icon + word: a colour
-  // alone could not tell "not published" from "not merged", and those need
-  // different actions (nothing was ever pushed vs it is pushed and stranded).
-  const MS = {merged:["✓","merged"], unmerged:["▲","NOT merged"],
-              unpublished:["○","not published"], unknown:["?","unknown"]};
-  const mrows = mg.rows || [];
-  const base = `${esc(mg.base_branch)} (${esc(mg.base_head || "?")})`;
-  const mergeHead = document.getElementById("mergehead");
-  mergeHead.innerHTML = (nUnmerged
-      ? `<b>▲ ${nUnmerged} completed task(s) are published but NOT in ${base}.</b> `
-        + `Their code is finished and is not in your branch.`
-      : `✓ none of the ${mrows.length} completed task(s) are missing from ${base}.`)
-    + (nUnknown ? ` <span class="muted">? ${nUnknown} unknown — git could not answer, `
-                  + `so they are not counted either way.</span>` : "")
-    + ((mc.unpublished || 0) ? ` <span class="muted">○ ${mc.unpublished} completed with `
-                               + `no side branch at all.</span>` : "");
-  document.getElementById("merged").innerHTML = rows(["task","branch","sha","state","why"],
-    mrows.map(r => {
-      const [ic, word] = MS[r.state] || MS.unknown;
-      return `<tr class="${r.state === "unmerged" ? "row-active" : ""}">
-        <td><code>${esc(r.id)}</code></td><td><code>${esc(r.branch)}</code></td>
-        <td><code>${esc(r.sha || "—")}</code></td><td>${esc(ic)} ${esc(word)}</td>
-        <td class="muted">${esc(r.detail)}</td></tr>`;
-    }).join(""));
+  // Built by `renderMerge` above, grouped by state — the four rows that need a
+  // human are no longer buried under 57 that do not.
+  renderMerge(d);
 
   // ---- roadmap, grouped by state ----------------------------------------
   // Built by `renderRoadmap` above \u2014 the same function the search box calls, so

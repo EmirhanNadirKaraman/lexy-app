@@ -24,12 +24,15 @@ from autoloop.dashboard import (
     GROUPS,
     IN_PROGRESS_KINDS,
     MARKS,
+    MERGE_GROUPS,
+    MERGE_STATES,
     PAGE,
     STAT_BUCKETS,
     STATUS,
     app_tasks,
     collect,
     is_ancestor,
+    merge_groups,
     merge_states,
     pipeline,
     roadmap_stats,
@@ -1233,6 +1236,230 @@ def test_the_unmerged_count_is_a_stat_tile_not_only_a_table_row():
     merge_marks = PAGE.split("const MS = {", 1)[1].split("};", 1)[0]
     for state in ("merged", "unmerged", "unpublished", "unknown"):
         assert f"{state}:[" in merge_marks.replace(" ", "")
+
+
+# ---- the merge panel, grouped by state (2026-08-19) ---------------------------
+#
+# Measured 2026-08-18: `merge.rows` carried 61 rows and `merge.counts` already
+# said {merged: 57, unpublished: 3, unmerged: 1, unknown: 0}. The panel rendered
+# all 61 flat, so the FOUR rows that needed a human sat under 57 that did not,
+# and the counts were computed and then thrown away as a display axis.
+#
+# The fix is the roadmap panel's own mechanism one section down — an ordered
+# group list carrying the count and an explicit `collapsed` flag, with the
+# hide/show policy in the PAYLOAD rather than the template — not a second one.
+# Two properties carry it, and both are asserted rather than described:
+#
+# * COLLAPSED IS NOT HIDDEN. All four groups render with their counts, including
+#   `Unknown (0)`: an unknown row means the sweep could not judge a branch,
+#   which is the state most worth seeing and the easiest to hide by accident.
+# * An opened disclosure SURVIVES the 2s poll. The <details> is static markup
+#   the render never rebuilds and never writes `.open` to — and that negative is
+#   the load-bearing half, because a `box.open = !g.collapsed` on every tick
+#   would pass every structural check in this file and snap the panel shut every
+#   two seconds.
+
+
+def four_state_rows():
+    """One completed task in each of three states, built by `merge_states`
+    itself so these tests exercise the rows the page really renders.
+
+    `unknown` is deliberately left at zero: that is the ordinary reading (a
+    reachable origin answers every branch) and it is exactly the empty-but-
+    actionable group the panel must still render with its count.
+    """
+    refs = {"autoloop/t-merged": "a" * 40, "autoloop/t-unmerged": "b" * 40}
+    verdict = {"a" * 40: "yes", "b" * 40: "no"}
+    return merge_states(
+        [{"id": "t-merged", "title": "M"}, {"id": "t-unmerged", "title": "U"},
+         {"id": "t-ghost", "title": "G"}],
+        {}, True, refs, lambda sha: verdict.get(sha, "unknown"),
+    )
+
+
+def merge_groups_by_key(groups):
+    return {group["key"]: group for group in groups}
+
+
+def test_the_merge_panel_groups_every_state_exactly_once():
+    """`MERGE_STATES` is the vocabulary and `MERGE_GROUPS` is the display order,
+    so a fifth state added to one and not the other would render nowhere — the
+    same guarantee `test_the_groups_come_from_state_of_and_never_from_the_status_string`
+    makes for the roadmap. The order is triage order: what needs a human first,
+    what nobody has to act on last."""
+    keys = [key for key, _label, _collapsed in MERGE_GROUPS]
+
+    assert keys == ["unmerged", "unpublished", "unknown", "merged"]
+    assert set(keys) == set(MERGE_STATES)
+    assert len(keys) == len(set(keys)) == len(MERGE_STATES)
+    # Exactly one collapsed group, and it is the one nobody has to act on.
+    assert [key for key, _l, collapsed in MERGE_GROUPS if collapsed] == ["merged"]
+    # One group per state in the built payload too, in the same order.
+    assert [g["key"] for g in merge_groups(four_state_rows())] == keys
+
+
+def test_only_the_merged_group_is_collapsed_and_it_still_carries_its_count():
+    """The claim the panel exists to make. `merged` is the group that only ever
+    grows and that nobody has to act on, so it is a counted disclosure; the
+    other three are the ones a human acts on and render open."""
+    groups = merge_groups_by_key(merge_groups(four_state_rows()))
+
+    assert groups["merged"]["collapsed"] is True
+    assert groups["merged"]["count"] == 1
+    for key in ("unmerged", "unpublished", "unknown"):
+        assert groups[key]["collapsed"] is False, f"{key} needs a human — never collapsed"
+    # No `hidden` field anywhere: the roadmap has one because it has a hide
+    # policy, and this panel's rule is that it has none. An always-false flag is
+    # an invitation to flip it.
+    for group in groups.values():
+        assert "hidden" not in group
+
+
+def test_a_merge_group_with_no_rows_still_renders_with_its_count():
+    """`unknown (0)` is the group most worth seeing and the easiest to hide by
+    accident: a row lands there when the sweep could not judge a branch at all.
+    An empty group that vanished would make "every branch was judged" and "that
+    section failed to render" look identical."""
+    groups = merge_groups_by_key(merge_groups(four_state_rows()))
+
+    assert groups["unknown"]["count"] == 0 and groups["unknown"]["rows"] == []
+    assert groups["unknown"]["collapsed"] is False
+    # …and an empty panel is still four groups, not zero.
+    assert [g["count"] for g in merge_groups([])] == [0, 0, 0, 0]
+
+
+def test_grouping_is_display_only_and_changes_no_row_and_no_count(tmp_path):
+    """Display only, said as a property rather than as a promise: the flat
+    `rows` list and the `counts` dict are what they were, every row object
+    appears in exactly one group unaltered, and no row is dropped by grouping."""
+    repo, _, _ = merge_fixture(tmp_path)
+    write_registry(repo, [completed("t-merged"), completed("t-unmerged"),
+                          completed("t-ghost")])
+
+    merge = collect(repo)["merge"]
+    rows = merge["rows"]
+
+    # The flat list is untouched — same roadmap order, same six fields.
+    assert [r["id"] for r in rows] == ["t-ghost", "t-merged", "t-unmerged"]
+    for row in rows:
+        assert set(row) == {"id", "title", "branch", "sha", "state", "detail"}
+    # Every row in exactly one group, unaltered, and nothing invented.
+    grouped = [row for group in merge["groups"] for row in group["rows"]]
+    assert sorted(grouped, key=lambda r: r["id"]) == sorted(rows, key=lambda r: r["id"])
+    assert sum(g["count"] for g in merge["groups"]) == len(rows)
+    # …and each group's count agrees with the per-state count already published.
+    for group in merge["groups"]:
+        assert group["count"] == merge["counts"][group["key"]]
+        assert all(r["state"] == group["key"] for r in group["rows"])
+    # The base branch and base head — what "merged" is relative to — are still
+    # in the payload, outside every group.
+    assert merge["base_branch"] and merge["base_head"]
+
+
+def test_the_merged_disclosure_is_static_markup_the_refresh_never_reopens():
+    """The bound this change is easiest to break silently. The <details> lives
+    in static markup, so a poll cannot rebuild it — and `renderMerge` writes the
+    summary text and the rows and NEVER `.open`, because writing the payload's
+    default back each tick would snap an opened panel shut every two seconds.
+
+    The negative is the load-bearing half: the positive alone passes for a
+    render that reopens the box on every poll."""
+    static_markup, script = PAGE.split("<script>", 1)
+
+    assert '<details id="mgmergedbox">' in static_markup
+    assert 'id="mgmergedsum"' in static_markup and 'id="mgmergedrows"' in static_markup
+    body = script.split("function renderMerge(d){", 1)[1].split("\n}", 1)[0]
+    assert ".open" not in body, "a render that writes .open snaps the panel shut every 2s"
+    assert "mgmergedbox" not in body, "the disclosure element itself is never rebuilt"
+    # By KEY, never "the group carrying the collapsed flag" — that predicate is
+    # wrong the moment a second collapsed group appears, and silently so.
+    assert 'groups.find(g => g.key === "merged")' in body
+    # The base-branch line renders ABOVE the groups and outside all of them.
+    assert static_markup.index('id="mergehead"') < static_markup.index('id="merged"')
+    assert 'getElementById("mergehead")' in body
+
+
+def merge_panel_js() -> str:
+    """The merge panel's own code, lifted verbatim out of the served page.
+
+    `esc` and `rows` come along because every helper in the region depends on
+    them; the region carries no other module state, which is what lets it run
+    against a stub document instead of a browser.
+    """
+    script = PAGE.split("<script>", 1)[1]
+    lines = script.splitlines()
+    esc_line = next(line for line in lines if line.startswith("const esc ="))
+    rows_line = next(line for line in lines if line.startswith("const rows ="))
+    region = script.split("// MERGE_PANEL_START", 1)[1].split("// MERGE_PANEL_END", 1)[0]
+    return "\n".join((esc_line, rows_line, region))
+
+
+def test_the_page_renders_every_merge_group_and_keeps_an_opened_one_open():
+    """A payload carrying the groups is not a page showing them, and a page
+    showing them is not one that survives the poll — so this RUNS the panel's
+    own render twice against a stub document, with the disclosure opened in
+    between, exactly as an operator would.
+
+    A structural check cannot see the second failure: `renderMerge` is called on
+    every payload change, so a line that reset the box would leave every string
+    assertion above green and the panel unusable.
+    """
+    groups = merge_groups(four_state_rows())
+    payload = json.dumps({"merge": {
+        "base_branch": "autoloop/mainline", "base_head": "abc123def456",
+        "counts": {group["key"]: group["count"] for group in groups},
+        "rows": [row for group in groups for row in group["rows"]],
+        "groups": groups,
+    }})
+
+    harness = merge_panel_js() + """
+const NODES = {};
+for (const id of ["mergehead", "merged", "mgmergedsum", "mgmergedrows", "mgmergedbox"])
+  NODES[id] = {innerHTML: "", textContent: "", open: false};
+const document = {getElementById: id => NODES[id]};
+const PAYLOAD = __PAYLOAD__;
+renderMerge(PAYLOAD);
+const firstSummary = NODES.mgmergedsum.textContent;
+// The operator opens the merged group, then the 2s poll fires again.
+NODES.mgmergedbox.open = true;
+renderMerge(PAYLOAD);
+console.log(JSON.stringify({
+  open: NODES.mgmergedbox.open,
+  summary: NODES.mgmergedsum.textContent,
+  firstSummary: firstSummary,
+  inline: NODES.merged.innerHTML,
+  collapsedRows: NODES.mgmergedrows.innerHTML,
+  head: NODES.mergehead.innerHTML,
+}));
+""".replace("__PAYLOAD__", payload)
+    out = json.loads(run_js(harness))
+
+    # The disclosure the operator opened is still open after the refresh.
+    assert out["open"] is True
+    assert out["summary"] == out["firstSummary"] == "✓ Merged (1)"
+    # Every actionable group renders, LABEL AND COUNT TOGETHER — the empty one
+    # included, because `Unknown (0)` is the answer rather than the absence of
+    # one. The count is asserted inside the heading, so a group that rendered
+    # its word and dropped its number fails here.
+    for heading in ('▲ NOT merged <span class="gc">1</span>',
+                    '○ Not published <span class="gc">1</span>',
+                    '? Unknown <span class="gc">0</span>'):
+        assert heading in out["inline"], f"{heading} never reaches the DOM"
+    assert '<p class="empty">none</p>' in out["inline"], "an empty group says so"
+    # The collapsed group's rows are behind the disclosure, not in the inline
+    # list: 57 merged rows above the four that matter is the fault being fixed.
+    assert "<code>t-merged</code>" in out["collapsedRows"]
+    assert "<code>t-merged</code>" not in out["inline"]
+    assert "<code>t-unmerged</code>" in out["inline"]
+    assert "<code>t-ghost</code>" in out["inline"]
+    assert "✓ Merged" not in out["inline"], "the collapsed group has no inline heading"
+    # Row content is what it was before the grouping: the same five columns,
+    # icon + word, and `row-active` on the row that needs a human.
+    assert "<th>task</th>" in out["inline"] and "<th>why</th>" in out["inline"]
+    assert '<tr class="row-active">' in out["inline"]
+    assert "▲ NOT merged" in out["inline"] and "✓ merged" in out["collapsedRows"]
+    # The base branch and base head stay visible above the groups.
+    assert "autoloop/mainline" in out["head"] and "abc123def456" in out["head"]
 
 
 # ---- the roadmap, grouped by state (2026-08-15) -------------------------------
