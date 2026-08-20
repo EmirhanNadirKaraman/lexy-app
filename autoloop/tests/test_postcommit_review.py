@@ -200,6 +200,21 @@ def push_approval_from_last_submitted(client):
     return block({"version": 3, "decision": "push", "reason": "approved", "reviewed": stamp})
 
 
+def commit_and_push_approval_from_last_submitted(client):
+    """A stamped LEGACY approval — `commit_and_push`, the retired
+    authorize-then-produce decision — built off whatever request went out last."""
+    stamp = extract_stamp(client.submitted[-1][1])
+    return block(
+        {
+            "version": 3,
+            "decision": "commit_and_push",
+            "reason": "approved",
+            "commit": {"message": "ship it", "paths": ["a.py"]},
+            "reviewed": stamp,
+        }
+    )
+
+
 class FakeClient:
     """Minimal browser-transport double — server truth (`persisted`) kept
     separate from what was sent, matching `test_orchestrator.py`'s fake."""
@@ -851,26 +866,35 @@ def test_oversized_review_packet_parks_instead_of_raising(tmp_path):
 # The replacement below pins the STRONGER guarantee: a live, unpublished
 # postcommit candidate on record does not change the outcome — the legacy
 # decision is refused either way.
+#
+# 2026-08-21 (bind-01): this test used to reach the refusal a different way —
+# a parse error on the review packet, then a `push` answering the corrective
+# re-prompt, which carried no binding and so fell through. That fall-through
+# WAS the prof-01 defect (an approval that could never be published), and a
+# corrective re-prompt now inherits its packet's binding, so that route
+# publishes as it should. The guarantee this test is actually about is
+# untouched and is now reached directly: a stamped `commit_and_push` — a
+# RETIRED decision however it is stamped — is refused with a live candidate on
+# record. `test_review_binding_carry.py` covers the corrective-re-prompt route.
 # =============================================================================
 
 
 def test_legacy_commit_and_push_is_always_refused_even_with_a_live_candidate(tmp_path):
     """Supersedes the three retired leak-guard tests above (see the block
-    comment). A malformed reply to the review packet triggers a corrective
-    re-prompt (whose payload carries none of the postcommit identifiers); a
-    `push` approval answering THAT request therefore carries no postcommit
-    binding. Previously this fell through to `_dispatch_git`'s fail-closed
-    leak guard specifically because a live candidate was on record; now there
-    is no legacy git path left to fall through to at all — it is refused the
-    same way regardless of whether a candidate exists."""
+    comment). The reviewer answers a perfectly good postcommit review packet
+    with the retired `commit_and_push`, fully stamped, while a live unpublished
+    candidate is on record. Previously the leak guard inside `_dispatch_git`
+    was what stopped that from reaching a bare `push_exact`; now there is no
+    legacy git path left to fall through to at all — the decision is refused
+    before any git write is attempted, regardless of whether a candidate
+    exists."""
     executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
     orch, repo_root, worktrees, execution_store, intent_store, task, client = (
         build_postcommit_with_client(
             tmp_path,
             executor,
             responses=[
-                "not a json directive at all",
-                push_approval_from_last_submitted,
+                commit_and_push_approval_from_last_submitted,
                 stop_block(),
             ],
             policy=PolicyConfig(implement_enabled=True, allow_protected_push=True),
@@ -895,6 +919,60 @@ def test_legacy_commit_and_push_is_always_refused_even_with_a_live_candidate(tmp
     assert any("policy_denied" in p and "no longer supported" in p for p in prompts)
     # the live candidate is unaffected — nothing was published or lost
     assert execution_store.load(task.id).candidate_sha != ""
+
+
+# =============================================================================
+# 18b. THE PROF-01 LIVELOCK (bind-01, 2026-08-21) — end to end through run()
+#
+# A parse error on a postcommit review packet is a FORMATTING failure. The
+# packet has not changed and the candidate has not moved, so the corrective
+# re-prompt is still the same review — and must still carry the same binding,
+# or the stamped approval that answers it can never publish anything.
+#
+# On prof-01 it did not: `-0006` (the correction) went out unbound, the
+# reviewer's fully stamped `push` fell through to `legacy_git_path_retired`,
+# and a candidate that had passed four review rounds became approved and
+# unpublishable with no supported route back.
+# =============================================================================
+
+
+def test_parse_error_correction_keeps_its_binding_and_the_stamped_push_publishes(tmp_path):
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, repo_root, worktrees, execution_store, intent_store, task, client = (
+        build_postcommit_with_client(
+            tmp_path,
+            executor,
+            responses=[
+                "not a json directive at all",         # the whole cause
+                push_approval_from_last_submitted,     # stamped from the CORRECTION
+                stop_block(),
+            ],
+        )
+    )
+    bare = make_bare(tmp_path)
+    run_git(repo_root, "remote", "add", "origin", str(bare))
+
+    orch._dispatch_executor(implement(task.id))
+    execution = execution_store.load(task.id)
+    candidate, branch = execution.candidate_sha, execution.task_branch
+    assert orch.state.phase == Phase.READY.value
+
+    assert orch.run() == Phase.STOPPED.value
+
+    prompts = [p for _, p in client.submitted]
+    # the correction went out, and it names the review it is still part of, so
+    # the reviewer can see the candidate it is being asked to re-approve
+    correction = next(p for p in prompts if "contract_violation" in p)
+    assert candidate[:12] in correction
+    assert task.id in correction
+
+    transcript = orch._config.transcript_file.read_text(encoding="utf-8")
+    assert "legacy_git_path_retired" not in transcript
+    assert "push_missing_review_binding" not in transcript
+
+    # and the approved candidate — that exact object — is published
+    worktree_git = worktree_git_for(worktrees, task.id)
+    assert worktree_git.remote_ref_sha("origin", f"refs/heads/{branch}") == candidate
 
 
 # =============================================================================

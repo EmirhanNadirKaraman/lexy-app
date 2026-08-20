@@ -303,19 +303,28 @@ def test_protected_destination_refuses_and_nothing_is_pushed(tmp_path):
 
 
 # =============================================================================
-# 4. a push response with NO changeset binding still hits
-#    legacy_git_path_retired — the old direct-push path is not reopened
+# 4. a push response with NO changeset binding is still REFUSED — the old
+#    direct-push path is not reopened
+#
+# 2026-08-21 (bind-01): the refusal's CODE changed, not its effect. An unbound
+# `push` now lands on `push_missing_review_binding`, whose message names the
+# request the stamp cited and the directive that gets the candidate presented
+# again, instead of on `legacy_git_path_retired`, whose message describes the
+# retirement of a route the reviewer did not take and leaves it with no next
+# move. `commit` / `commit_and_push` — the actually retired decisions — still
+# get `legacy_git_path_retired` (see `test_review_binding_carry.py`). Nothing
+# is published either way, which is what this test is for.
 # =============================================================================
 
 
-def test_push_without_changeset_binding_still_hits_legacy_refusal(tmp_path):
+def test_push_without_changeset_binding_is_still_refused(tmp_path):
     orch, _repo, upstream, config = build_orchestrator(tmp_path, with_publisher=False)
     orch.state.last_response = LastResponse(request_id="r1", raw="{}", received_at="now")
 
     orch._dispatch(Directive(decision=Decision.PUSH, reason="approved"))
 
     transcript_text = config.transcript_file.read_text(encoding="utf-8")
-    assert "legacy_git_path_retired" in transcript_text
+    assert "push_missing_review_binding" in transcript_text
     assert run_git(upstream, "for-each-ref").strip() == ""
 
 

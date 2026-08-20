@@ -1103,12 +1103,16 @@ unmodified: `task_id`, `task_branch`, `base_sha`, `candidate_sha`,
 tamper check) and `packet_sha256`. `Orchestrator._current_pending_postcommit`
 binds a request ONLY when its payload actually carries all four identifiers
 as literal substrings (mirroring the §4 adoption block's own carries-check) —
-a corrective re-prompt or any other payload legitimately carries none of
-this and must bind nothing. Everything downstream (push routing) reads the
+an arbitrary payload legitimately carries none of this and must bind nothing.
+Everything downstream (push routing) reads the
 candidate sha from this binding alone — never from a fresh
 `TaskExecutionStore` lookup ("latest" state can have moved on to a new round
 by the time an approval arrives) and never from the directive (a `push`
 directive cannot even carry a task_id — see `contract._forbid`).
+
+A CORRECTIVE RE-PROMPT is the one payload that carries no identifiers and
+must still be bound — see §4b-bis, which is where a binding comes from when
+the text cannot supply one.
 
 **Push routing (`Orchestrator._dispatch_task_push`, `GitGateway.push_exact`).**
 There is no ambient `push()` anymore (removed 2026-07-30 — it pushed
@@ -1143,13 +1147,26 @@ nothing new to commit in this path — the commit already exists, made
 automatically once validation passed — so ChatGPT is never expected to send
 these decisions anymore, and if one arrives anyway it is denied through the
 same budget-capped `policy_denied` corrective-reprompt machinery as any
-other policy violation (`_dispatch`'s `legacy_git_path_retired` denial),
-never routed to an executor and never able to publish "whatever the current
-branch is". This supersedes what used to be a narrower, conditional guard
-inside the now-removed `_dispatch_git` (which only refused a *stale or
-unbound* response while a live candidate was on record) — the replacement is
-unconditional, so there is no longer a scenario where a legacy commit/push
-decision succeeds at all, regardless of what `state.task_execution` shows.
+other policy violation, never routed to an executor and never able to publish
+"whatever the current branch is". This supersedes what used to be a narrower,
+conditional guard inside the now-removed `_dispatch_git` (which only refused a
+*stale or unbound* response while a live candidate was on record) — the
+replacement is unconditional, so there is no longer a scenario where a legacy
+commit/push decision succeeds at all, regardless of what
+`state.task_execution` shows.
+
+Since 2026-08-21 the refusal is split in TWO by fault, not by effect — nothing
+publishes in either case:
+
+* `commit` / `commit_and_push` → `legacy_git_path_retired`, unchanged. These
+  are the retired decisions, and the message says so.
+* a `push` that resolved to no binding → `push_missing_review_binding`
+  (`_unbound_push_verdict`). The old message described the retirement of a
+  route the reviewer had not taken and offered no next move; this one names
+  the request id the stamp cited, states that the candidate is committed and
+  untouched, and names the one directive that gets it presented again as a
+  postcommit review packet — see §4b-bis for why a dead-end refusal here cost
+  a full night of quota.
 
 **Revision rounds.** `revise` re-enters the same worktree, keeps the ORIGINAL
 `task_base_sha`, and produces a NEW commit on top of the current candidate —
@@ -1162,6 +1179,103 @@ accumulated diff (`task_base_sha..candidate_sha`) and the latest round's own
 diff (the previous round's tip, derived from `commit_list` since each round
 is exactly one commit — not a separately persisted field), plus the feedback
 that triggered the third attempt.
+
+---
+
+## 4b-bis. A correction is still the same review (bind-01, 2026-08-21)
+
+**The failure.** prof-01, 2026-08-20. A reply to a postcommit review packet
+(`alr-683fbfc7-0005`) failed to parse. The loop queued a corrective re-prompt,
+`-0006`, and sent it — with no `postcommit` binding, because a correction's
+text carries none of the four identifiers `_current_pending_postcommit` binds
+from. The reviewer answered `-0006` with a fully stamped `push`. `_dispatch`
+found `last_response.postcommit is None`, fell through to
+`legacy_git_path_retired`, and a candidate that had passed four review rounds
+and full validation became APPROVED AND UNPUBLISHABLE with no supported route
+back: `review-changeset` refuses executor-produced work whose sha does not
+resolve in the checkout, and a fresh session sends a kickoff rather than
+re-presenting the packet. The reviewer then correctly refused every subsequent
+packet, each refusal was a `stop`, each `stop` ended the session, each new
+session sent a kickoff — one full round every five minutes, indefinitely, with
+`needs_attention` FALSE the whole time because a reviewer-issued `stop` is not
+a failure and nothing counted them. An operator released the task and discarded
+four rounds of approved work to break it. `parse_error` appears 18 times in
+that transcript; every one landing on a postcommit round could strand an
+approval this way. Same class as `AUTOLOOP_TODO` A2 one layer over: there a
+binding was dropped when the response was persisted, here across a re-prompt.
+
+**Rule 1 — a correction inherits the binding of the request it corrects.**
+`Orchestrator._carry_postcommit_binding` copies `last_response.postcommit` onto
+`state.outbox_postcommit` immediately before the handler clears the response;
+`_step_ready` uses it (`_inherited_pending_postcommit`) when the payload cannot
+bind itself, and clears it with the rest of the outbox so it can never outlive
+the one correction it was carried for. The binding is copied VERBATIM —
+`packet_sha256` still names the packet that presented the candidate, because
+the correction presented nothing. For the same reason the correction does NOT
+re-stamp `TaskExecution.presented_report_sha256` / `review_request_id`: those
+point at the request that actually showed the work.
+
+Which corrective re-prompts carry, and why — the test is "is this correction
+still answering the same immutable packet?":
+
+| site | carries | why |
+|---|---|---|
+| `_handle_parse_error` | yes | a formatting failure; the packet, the candidate and the question are unchanged |
+| `_handle_review_mismatch` | yes | re-asks for a correct stamp on the same state — and makes `review_mismatch_payload`'s existing "THIS request if you are approving the state described above" true, which it was not before |
+| `_handle_policy_denial` | yes | refuses the DIRECTIVE, not the packet; the next directive is authorized from scratch, so a denial that still applies simply denies again |
+| `_dispatch_plan`'s plan rejection | no | corrects a `plan`, which never answers a review packet — there is nothing to carry |
+| `_handle_git_failure` | no | the action taken UNDER an approval did not complete, so the state the packet described no longer holds; the next round presents what now exists |
+
+All five write `state.outbox_postcommit` explicitly rather than leaving two of
+them to inherit whatever was there.
+
+The reviewer is told, in the correction's guidance, that it is still the same
+review, which task and candidate it concerns, and to stamp from THIS request's
+CONTEXT (`prompts.same_review_note`). The candidate is named by its 12-character
+prefix only — a correction must not carry the identifiers that would let it
+bind itself as if it were a review packet.
+
+**Rule 2 — an approval is reconciled against the request it NAMES.**
+`LoopState.postcommit_packets` is a bounded (`MAX_POSTCOMMIT_PACKETS`, oldest
+dropped) ledger of every request sent carrying a binding, derived or inherited.
+Each entry holds that request's own CONTEXT stamp (`request_id`, `head_sha`,
+`report_sha256`) AND the binding it carried — two things from different rounds
+after a correction, which is exactly why conflating them is what strands an
+approval. When a `push`'s `reviewed.request_id` names a request that is NOT the
+one the response in hand answers, `_resolve_reviewed_packet` finds that entry;
+`verify_review` is then run against ITS stamp and `_dispatch_task_push`
+publishes from ITS binding.
+
+It **backs up** the `last_response` check rather than replacing it. When the
+stamp names the response in hand — every ordinary approval — the lookup returns
+`None` and dispatch takes exactly the path it always did, from the binding the
+response itself carries; those are the same object, so re-routing them through
+a lookup would buy nothing. The lookup earns its keep only where the old code
+dead-ended: a stamp reaching back past where `last_response` has moved to.
+
+**What this does NOT widen.** The retirement of the legacy authorize-then-
+produce path (`docs/SECURITY.md` S21) stands. Every binding either rule can
+produce is one this loop itself built and sent; neither invents one, and
+neither is derived from the directive. `_dispatch_task_push`'s checks run
+unchanged on both, so a stamp reaching back to a SUPERSEDED packet is refused
+as `push_candidate_stale` — the ledger cannot route around it. A stamp naming
+a request with no entry has no expected values to verify against and is refused
+by the same `review_mismatch:request_id` as before. And the HEAD-moved
+staleness check is deliberately NOT relaxed for a ledger-resolved push: if the
+packet it reaches back to predates a move of the main checkout's HEAD, that
+push refuses as `review_mismatch:head_moved` — a corrective re-prompt the
+reviewer can answer. Extending §4f's changeset exemption here would widen what
+a `push` may publish; restoring a lost binding does not.
+
+**Not addressed.** The second half of the prof-01 livelock — a reviewer-issued
+`stop` ending a session, the next session sending a kickoff, and nothing
+counting the cycle or raising `needs_attention` — is untouched and is a
+separate defect.
+
+Regressions: `autoloop/tests/test_review_binding_carry.py` (mechanism,
+precedence, negatives) and `test_postcommit_review.py`'s
+`test_parse_error_correction_keeps_its_binding_and_the_stamped_push_publishes`
+(the headline case end to end through `run()`).
 
 ---
 
@@ -1937,9 +2051,10 @@ hashed body regardless of where the rest of the packet text came from.
 **Dispatch.** `Orchestrator._dispatch` routes a `push` directive whose
 response carries `resp.changeset` to `_dispatch_changeset_push` — checked
 before the `resp.postcommit` branch (the two are mutually exclusive in
-practice; the order carries no meaning) and before the
-`legacy_git_path_retired` fallback, so a `push` with no changeset binding
-still refuses exactly as before (§4c). `_dispatch_changeset_push` mirrors
+practice; the order carries no meaning) and before the unbound-push refusal,
+so a `push` with no changeset binding still refuses exactly as before — since
+2026-08-21 as `push_missing_review_binding` rather than
+`legacy_git_path_retired`, same effect, an actionable message (§4b-bis). `_dispatch_changeset_push` mirrors
 `_dispatch_task_push`: `resp.changeset.candidate_sha` is the ONLY source of
 what publishes (never `directive`, never a fresh lookup); it re-verifies
 descendant-of-base, that the candidate still resolves, and that its tree
@@ -3247,10 +3362,12 @@ Three rules make this safe rather than merely clever:
    COMPLETE logical packet — `state.outbox`, patch inline — not the abridged
    message that is sent. Every part carries a part id derived from the request
    id, and the verdict message lists all of them. A fallback re-renders the
-   packet and re-stamps all three holders of the digest (the request,
-   `postcommit.packet_sha256`, and `TaskExecution.presented_report_sha256`);
-   missing the third would refuse a legitimate approval at push time, long
-   after the mistake.
+   packet and re-stamps all FOUR holders of the digest (the request,
+   `postcommit.packet_sha256`, `TaskExecution.presented_report_sha256`, and —
+   since 2026-08-21 — this request's entry in `LoopState.postcommit_packets`,
+   the ledger §4b-bis verifies a reaching-back approval against); missing any
+   of them would refuse a legitimate approval at push time, long after the
+   mistake.
 
 **Confirmation is by readback, never by the send.** Each part is confirmed the
 same way a submission is: reload, then look for the id in *persisted* history.

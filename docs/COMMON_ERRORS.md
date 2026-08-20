@@ -2146,6 +2146,45 @@ refuse it as never recorded. roadmap-01's second file,
 `autoloop/tests/test_obsolete.py`, was in scope and is exactly this case. Today
 that removal needs an operator.
 
+### `policy_denied: legacy_git_path_retired` on a fully stamped `push`, right after a `parse_error`
+**Symptom:** the transcript shows a postcommit review packet, a
+`parse_error`, a corrective re-prompt, and then a `push` the reviewer stamped
+correctly — refused. The reviewer starts answering every later packet with
+`stop`, each `stop` ends the session, each new session sends a kickoff, and the
+loop trades a full round every few minutes forever with `needs_attention`
+FALSE, because a reviewer-issued `stop` is not a failure and nothing counted the
+cycles. Observed on prof-01, 2026-08-20; an operator had to release the task and
+discard four rounds of approved work. Trimmed:
+
+```
+19:33:34  request_prepared    alr-683fbfc7-0005   <- the postcommit review packet
+19:42:26  parse_error         unexpected_field    <- the whole cause
+19:42:26  request_prepared    alr-683fbfc7-0006   <- corrective re-prompt, NO binding
+19:46:54  directive           alr-683fbfc7-0006   <- a fully stamped push
+19:46:54  policy_denied       legacy_git_path_retired
+```
+
+**Cause:** the corrective re-prompt was rebuilt from scratch, and a correction's
+TEXT carries none of the four identifiers `_current_pending_postcommit` binds
+from — so it went out with `postcommit=None`, and `_dispatch` had no binding to
+publish from. Nothing was wrong with the reviewer or with the candidate; a
+formatting typo had been converted into unpublishable work.
+**Fixed 2026-08-21 (`bind-01`):** a correction now inherits the binding of the
+request it corrects, and a stamped approval can also be reconciled against the
+request its `reviewed.request_id` names. See `docs/AUTOLOOP.md` §4b-bis.
+**If you see this on an OLD transcript** (or on a session started before the
+fix) there is no supported recovery: `review-changeset` refuses
+executor-produced work whose sha does not resolve in the checkout, and a fresh
+session sends a kickoff rather than re-presenting the packet. Release the task
+and let it re-run.
+**If you see `push_missing_review_binding` instead, that is the new refusal and
+it is working** — a `push` really did resolve to no binding. Its message names
+the request id the stamp cited and the directive that re-presents the
+candidate; nothing was published, and the committed candidate is untouched.
+**Not fixed by the above:** the `stop` → new session → kickoff cycle still
+neither counts itself nor raises `needs_attention`. If a loop is trading rounds
+with nothing changing, look for repeated `stopped` entries and stop it by hand.
+
 ---
 
 ## 9. Autoloop monitoring (health)

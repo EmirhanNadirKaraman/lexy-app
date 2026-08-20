@@ -16,6 +16,7 @@ from autoloop.prompts import (
     plan_rejected_payload,
     policy_denied_payload,
     review_mismatch_payload,
+    same_review_note,
     user_answer_payload,
 )
 
@@ -76,6 +77,33 @@ def test_parse_error_payload_carries_code():
     payload = parse_error_payload("no_json_block", "nothing found")
     assert "no_json_block" in payload
     assert "nothing found" in payload
+    # no note asked for, nothing added — the shape every non-bound correction
+    # still has
+    assert "SAME review" not in payload
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda note: parse_error_payload("no_json_block", "nothing found", note),
+        lambda note: policy_denied_payload("push", "protected branch", note),
+        lambda note: review_mismatch_payload("review_mismatch:head_sha", "drifted", note),
+    ],
+    ids=["parse_error", "policy_denied", "review_mismatch"],
+)
+def test_the_three_carrying_corrections_can_name_the_review_they_continue(build):
+    """The three corrective re-prompts that inherit a postcommit binding
+    (bind-01) each render the note that tells the reviewer the packet has not
+    changed and where to copy the stamp from."""
+    payload = build(same_review_note("t1", "a" * 40))
+    assert "SAME review" in payload
+    assert "t1" in payload
+    assert "a" * 12 in payload
+    # the FULL candidate sha is deliberately absent: a correction must not
+    # carry the identifiers that would let it bind itself as if it were a
+    # review packet (orchestrator._current_pending_postcommit)
+    assert "a" * 40 not in payload
+    assert "THIS request" in payload
 
 
 def test_policy_denied_payload():

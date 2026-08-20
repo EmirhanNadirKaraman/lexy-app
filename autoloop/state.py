@@ -102,7 +102,29 @@ if TYPE_CHECKING:
 # delivery to backfill. The phase is additive — an old state file cannot
 # contain a value that did not exist when it was written, and `Phase(...)`
 # still rejects anything unknown.
+#
+# NOT bumped for the corrective-re-prompt binding carry either
+# (`LoopState.outbox_postcommit` / `LoopState.postcommit_packets`). Both
+# default to the empty value, and empty is the truth rather than a guess for a
+# state file written before they existed: that session queued no correction
+# that inherits a binding, and it kept no ledger of the review packets it sent.
+# An empty ledger is FAIL-CLOSED — `_resolve_postcommit_binding` finds nothing
+# to reconcile a stamped approval against and falls back to exactly the
+# `last_response` check that shipped before, so a resumed old session behaves
+# as it always did rather than resolving an approval from history it does not
+# have.
 SCHEMA_VERSION = 3
+
+#: How many sent postcommit review packets `LoopState.postcommit_packets`
+#: remembers. The ledger exists so a stamped approval can be reconciled against
+#: the exact request that presented the candidate even after `last_response`
+#: has moved on (see `orchestrator._resolve_postcommit_binding`), and a
+#: reviewer never reaches back further than the correction round it is
+#: currently in — three or four requests at the very most. The bound is what
+#: keeps the state file from growing without limit across a long run; dropping
+#: the oldest entry only ever costs a reconciliation that would have been
+#: refused as stale anyway (`_dispatch_task_push`'s `push_candidate_stale`).
+MAX_POSTCOMMIT_PACKETS = 20
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -528,6 +550,25 @@ class LoopState:
     #: `_step_submitting`; cleared with the rest of the outbox once the request
     #: is answered, so a stale path can never be attached to a later packet.
     outbox_attachment: str | None = None
+    #: The `PostcommitBinding` (as a plain dict — same convention as
+    #: `task_execution` below) that the payload queued in `outbox` INHERITS
+    #: from the request it is correcting.
+    #:
+    #: Set only by `orchestrator._carry_postcommit_binding`, and only for a
+    #: corrective re-prompt that is still answering an unchanged review packet
+    #: (a parse error, a review-integrity mismatch, a policy denial). `None`
+    #: for every other payload, which is the ordinary case: a fresh packet
+    #: binds itself from its own text (`_current_pending_postcommit`), and a
+    #: payload that carries no candidate must bind nothing.
+    #:
+    #: It exists because a correction's TEXT cannot bind: the candidate's
+    #: identifiers live in the packet, not in "your last reply did not parse".
+    #: Without it the corrective request went out unbound, and a stamped `push`
+    #: answering it had no binding to publish from — an approval that had
+    #: passed four review rounds became unpublishable on 2026-08-20 (prof-01).
+    #: Cleared with the rest of the outbox in `_step_ready`, so a carried
+    #: binding can never outlive the one correction it was carried for.
+    outbox_postcommit: dict | None = None
     pending_request: PendingRequest | None = None
     last_response: LastResponse | None = None
     current_task: dict | None = None
@@ -542,6 +583,34 @@ class LoopState:
     #: OLD authorize-then-produce/manifest path and means something different
     #: (a `ChangeManifest` id against the main checkout, not a worktree).
     task_execution: dict | None = None
+    #: The postcommit review packets this session has actually SENT, oldest
+    #: first, capped at `MAX_POSTCOMMIT_PACKETS`. Append-only history, written
+    #: by `orchestrator._step_ready` the moment a request is born carrying a
+    #: `PostcommitBinding` — derived from its own packet text or inherited by
+    #: a correction, both are recorded, because either can be the request a
+    #: reviewer's `reviewed` stamp names.
+    #:
+    #: Each entry is a plain dict (same convention as `task_execution` above —
+    #: never a reconstructed dataclass, so a fresh entry and one read back
+    #: from disk are the same type) with exactly these keys:
+    #:
+    #:   `request_id` / `head_sha` / `report_sha256` — the stamp THAT REQUEST
+    #:      put in its CONTEXT block, i.e. the values `contract.verify_review`
+    #:      must match when an approval names this request_id.
+    #:   `binding` — `asdict` of the `PostcommitBinding` that request carried,
+    #:      i.e. WHICH candidate an approval of it publishes.
+    #:
+    #: The two are deliberately distinct: after a correction they come from
+    #: different rounds — the stamp is the correction's own, the binding is the
+    #: unchanged packet's — and conflating them is precisely how an approval
+    #: ends up naming one thing and publishing another.
+    #:
+    #: This is evidence of what was PRESENTED, never of what may be published:
+    #: `_dispatch_task_push` still re-checks the candidate against the live
+    #: `TaskExecutionStore` record, its ancestry and its tree, so a superseded
+    #: candidate found here is refused (`push_candidate_stale`) rather than
+    #: published.
+    postcommit_packets: list[dict] = field(default_factory=list)
     #: Serialised `changeset_review.ChangesetBinding` (a plain dict —
     #: `dataclasses.asdict(binding)`, never a reconstructed dataclass
     #: instance here — same convention as `task_execution` above) for an

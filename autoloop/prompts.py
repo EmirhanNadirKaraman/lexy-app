@@ -210,39 +210,74 @@ def kickoff_payload(report: str) -> str:
     return TEMPLATES["audit"].render(report=report.strip())
 
 
-def parse_error_payload(code: str, message: str) -> str:
+def same_review_note(task_id: str, candidate_sha: str) -> str:
+    """One sentence telling the reviewer that a CORRECTION is still the same
+    review, and where to copy the stamp from.
+
+    Appended to a corrective re-prompt's guidance whenever that correction
+    inherits the postcommit binding of the request it corrects (see
+    `state.LoopState.outbox_postcommit`). Without it the reviewer has no way to
+    tell a correction from a fresh request: the CONTEXT block never names a
+    candidate, and the correction's own body is about the formatting or policy
+    fault, not about the work. Left uninvited, a reviewer that re-copies the
+    ORIGINAL packet's stamp is answering a request the repository HEAD may have
+    moved past — sound, but it takes the narrower reconciliation route and can
+    be refused for staleness. Pointing at THIS request's CONTEXT keeps the
+    ordinary path ordinary.
+
+    Naming the candidate is the load-bearing half: it is what makes "the same
+    review" a checkable claim rather than a reassurance, and it lets a reviewer
+    notice immediately if the sha is not the one it reviewed.
+    """
+    return (
+        f"This correction is still the SAME review of task {task_id}'s "
+        f"candidate commit {candidate_sha[:12]} — that packet has not changed "
+        "and no new work was produced for it. Approving now publishes exactly "
+        "that candidate and nothing else, so copy request_id, head_sha and "
+        "report_sha256 from THIS request's CONTEXT block."
+    )
+
+
+def _with_note(guidance: str, note: str) -> str:
+    return f"{guidance}\n\n{note}" if note else guidance
+
+
+def parse_error_payload(code: str, message: str, note: str = "") -> str:
     return TEMPLATES["failure_recovery"].render(
         failure_kind=f"contract_violation ({code})",
         detail=message,
-        guidance=(
+        guidance=_with_note(
             "Resend the SAME decision as one valid ```json block matching the "
-            "response contract."
+            "response contract.",
+            note,
         ),
     )
 
 
-def policy_denied_payload(decision: str, reason: str) -> str:
+def policy_denied_payload(decision: str, reason: str, note: str = "") -> str:
     return TEMPLATES["failure_recovery"].render(
         failure_kind=f"policy_denied (decision={decision})",
         detail=reason,
-        guidance=(
+        guidance=_with_note(
             "Choose a different course of action. If the policy itself has to "
             "change before this can proceed, reply `stop` with that in the "
-            "reason — this loop does not pause for a human operator mid-run."
+            "reason — this loop does not pause for a human operator mid-run.",
+            note,
         ),
     )
 
 
-def review_mismatch_payload(code: str, message: str) -> str:
+def review_mismatch_payload(code: str, message: str, note: str = "") -> str:
     return TEMPLATES["failure_recovery"].render(
         failure_kind=f"review_integrity ({code})",
         detail=message,
-        guidance=(
+        guidance=_with_note(
             "Approvals must reference the exact reviewed state. Re-issue the "
             "decision copying request_id, head_sha and report_sha256 from the "
             "CONTEXT block of the request that presented the work you approve "
             "— which is THIS request if you are approving the state described "
-            "above."
+            "above.",
+            note,
         ),
     )
 
