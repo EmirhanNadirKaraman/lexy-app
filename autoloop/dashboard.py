@@ -1196,6 +1196,43 @@ DEP_NODE_STATES: tuple[str, ...] = tuple(
     state.value for _key, _label, state in GROUPS
 ) + ("unknown",)
 
+#: The two states an operator can take OUT of the drawing, `(control name,
+#: `TaskState.value`)`. Keyed off `TaskState` rather than spelled as strings,
+#: for the same reason `DEP_NODE_STATES` is derived from `GROUPS`: a state this
+#: page filters on must be a state the registry names.
+#:
+#: These two and no others, because these two are what can never hold anything
+#: up again. Measured 2026-08-20 over 141 tasks: of the 71 nodes in the
+#: connected subgraph, 22 are completed and 6 retired — 39% of the drawing is
+#: settled history sitting on top of the question the panel exists to answer
+#: ("what is held up, and by what"). Hiding both leaves 43 live nodes.
+DEP_FILTERS: tuple[tuple[str, str], ...] = (
+    ("completed", TaskState.COMPLETED.value),
+    ("retired", TaskState.RETIRED.value),
+)
+
+
+def dep_view_key(show_completed: bool, show_retired: bool) -> str:
+    """The `views` key for one combination of the two controls.
+
+    `c1r0` reads "completed shown, retired hidden". The page builds the same
+    string from its two checkboxes, so the four views are addressed by ONE
+    spelling on both sides rather than by two that agree until one is edited —
+    a test pins the two spellings equal.
+    """
+    return f"c{int(bool(show_completed))}r{int(bool(show_retired))}"
+
+
+#: Both controls ON: the whole connected subgraph, exactly the graph dash-14
+#: drew before either filter existed.
+#:
+#: The page opens on it deliberately. A panel that hid 39% of its nodes before
+#: anyone asked would read as tasks having VANISHED — and the operator who wants
+#: the live-only view is one click from it, while the operator who does not know
+#: a filter is on has no way to discover why a task is missing. `views` carries
+#: all four combinations regardless, so moving the default is this one constant.
+DEP_DEFAULT_VIEW = dep_view_key(True, True)
+
 
 def _dep_rows(tasks_data: dict) -> list[dict]:
     """`{id, title, status, depends_on}` per raw row, in file order.
@@ -1357,48 +1394,57 @@ def _dep_cycle_path(members: list[str], deps: dict[str, list[str]]) -> list[str]
     return path[seen[node]:] + [node]
 
 
-def dependency_graph(tasks_data: dict, groups: list[dict] | None = None) -> dict:
-    """The `depends_on` relation as a drawable, cycle-safe layered graph.
+def _dep_node_state(node: str, states: dict[str, str], known: set[str]) -> str:
+    """The state a drawn node carries.
 
-    One edge per declared `(dependency, dependent)` pair, pointing from the
-    dependency to the dependent — the direction work flows, so an arrow into a
-    blocked node is the thing being waited for.
-
-    Only the CONNECTED subgraph is drawn. 91 of the 132 tasks declare no
-    dependency and have none declared on them; rendering them as isolated dots
-    is what makes the 41 that matter unreadable. `omitted` counts them, so the
-    omission is on the page rather than silent, and `omitted + shown == total`
-    holds for every payload.
-
-    Layout is by LAYER: a node's layer is one past the highest layer of anything
-    it depends on, so a task is drawn after everything it depends on. Cycles
-    cannot satisfy that and are not made to: the graph is condensed on its
-    strongly connected components first, the condensation is a DAG by
-    construction, and the layering runs over that — so the members of a cycle
-    share a layer, everything downstream of them still lands after them, and no
-    edge is dropped to make the picture acyclic. Each cycle is reported in
-    `cycles` with a concrete path.
+    A drawn id that is not a task cannot have a state, and inventing one would
+    be the page asserting something the registry refuses to.
     """
-    rows = _dep_rows(tasks_data)
-    states, states_from = _dep_states(rows, groups)
-    known = {row["id"] for row in rows}
-    titles = {row["id"]: row["title"] for row in rows}
+    return states.get(node, "unknown") if node in known else "unknown"
 
-    # ONE edge per pair, in declaration order. A dependency listed twice on the
-    # same task is one relation stated twice, not two edges — and the duplicate
-    # would draw exactly on top of the first, so the drawing could not show it
-    # either way.
-    edges: list[tuple[str, str]] = []
-    pairs: set[tuple[str, str]] = set()
-    for row in rows:
-        for dep in row["depends_on"]:
-            pair = (dep, row["id"])
-            if pair in pairs:
-                continue
-            pairs.add(pair)
-            edges.append(pair)
 
-    drawn = {node for pair in pairs for node in pair}
+def _dep_view(rows: list[dict], states: dict[str, str], states_from: str,
+              titles: dict[str, str], known: set[str],
+              all_edges: list[tuple[str, str]], connected: set[str],
+              hide: frozenset[str]) -> dict:
+    """ONE drawn view of the relation: the connected subgraph minus `hide`.
+
+    `hide` is a set of `TaskState` values (see `DEP_FILTERS`). Filtering happens
+    HERE, before anything is laid out, so the drawing is the layout of the graph
+    that is actually on the page rather than the full graph with pieces punched
+    out of it: components, cycles, layers and rows are all computed from the
+    filtered node and edge sets below.
+
+    Three rules make the filtered picture honest:
+
+      * EVERY EDGE INCIDENT TO A HIDDEN NODE GOES WITH IT. An edge is a claim
+        about two nodes, and half of one is not a smaller claim — it is a line
+        into nothing. A pending task losing its incoming edge from a completed
+        one is the correct reading: that dependency is satisfied.
+      * A NODE THAT LOSES EVERY RELATION IS STILL DRAWN. It lands in its own
+        component with nothing upstream, so it sits at layer 0 alone. Dropping
+        it instead would delete live work from the page for the sole reason that
+        what it was waiting for is finished — the one failure mode of a filter
+        that nobody would notice. `drawn_alone` lists them so the page can say
+        it, and in the unfiltered view it is always empty (a node is in
+        `connected` precisely because an edge touches it).
+      * HIDING IS NOT OMISSION. `omitted` stays dash-14's count of tasks in no
+        relation at all — the same number in all four views — and `hidden`
+        counts what the controls took out. The two are disjoint by construction
+        (`hidden ⊆ connected`, `omitted = known - connected`), and
+        `shown + hidden + omitted == total` holds for every combination.
+    """
+    hidden = {node for node in connected
+              if _dep_node_state(node, states, known) in hide}
+    drawn = connected - hidden
+    # How many DRAWABLE nodes each control governs, in `DEP_FILTERS` order and
+    # independent of `hide`, so the two counts below are one count read twice.
+    governs = [sum(1 for node in connected
+                   if _dep_node_state(node, states, known) == value)
+               for _name, value in DEP_FILTERS]
+    edges = [(dep, dependent) for dep, dependent in all_edges
+             if dep not in hidden and dependent not in hidden]
+
     deps: dict[str, list[str]] = {node: [] for node in drawn}
     dependents: dict[str, list[str]] = {node: [] for node in drawn}
     for dep, dependent in edges:
@@ -1460,13 +1506,15 @@ def dependency_graph(tasks_data: dict, groups: list[dict] | None = None) -> dict
         nodes.append({
             "id": node,
             "title": titles.get(node, ""),
-            # A drawn id that is not a task cannot have a state, and inventing
-            # one would be the page asserting something the registry refuses to.
-            "state": states.get(node, "unknown") if node in known else "unknown",
+            "state": _dep_node_state(node, states, known),
             "known": node in known,
             "layer": layer,
             "row": row_index,
             "cyclic": node in cyclic_members,
+            # The dependencies DRAWN in this view, so the node says what the
+            # picture around it says. A dependency hidden by a control is not
+            # listed here and its edge is not drawn either; `dgNode` already
+            # reads an empty list as "nothing drawn".
             "depends_on": list(deps[node]),
             "dependents": len(dependents[node]),
         })
@@ -1484,15 +1532,106 @@ def dependency_graph(tasks_data: dict, groups: list[dict] | None = None) -> dict
         "total": len(rows),
         "shown": len(known & drawn),
         # Tasks in no relation at all — neither depending on anything nor
-        # depended on. Counted, never drawn.
-        "omitted": len(known - drawn),
+        # depended on. Counted, never drawn. The SAME number in all four views:
+        # a control hides a node, it cannot put a task into a relation or take
+        # one out of it.
+        "omitted": len(known - connected),
+        # What the two controls took out of THIS view, and which control took
+        # each. `sum(hidden_by_state.values()) == hidden` — one state per task,
+        # so the two counts cannot overlap.
+        "hidden": len(hidden),
+        "hidden_by_state": {name: count if value in hide else 0
+                            for (name, value), count in zip(DEP_FILTERS, governs)},
+        # How many nodes EACH control governs, hidden or not — the figure the
+        # control's own label carries, so "show completed (22)" is true before
+        # anyone clicks it. Identical in all four views by construction.
+        "filterable": {name: count
+                       for (name, _value), count in zip(DEP_FILTERS, governs)},
+        # Drawn, and in no drawn relation: everything this task related to is
+        # hidden. Kept rather than dropped — see the rule in the docstring —
+        # and named so the page can say which. Always empty in the unfiltered
+        # view.
+        "drawn_alone": sorted(node for node in drawn
+                              if not deps[node] and not dependents[node]),
         # Ids something depends on that are not tasks. `from_dict` accepts such
         # a row and `state_of` then raises on it, so these are drawn as nodes in
-        # the `unknown` state rather than becoming a missing edge.
+        # the `unknown` state rather than becoming a missing edge. Read off the
+        # DRAWN set rather than off the surviving edges: a phantom whose only
+        # dependent is hidden is still on the page, and a count taken from the
+        # edges would drop it silently.
         "unknown": sorted(drawn - known),
         "layers": max(filled) + 1 if filled else 0,
         "states_from": states_from,
     }
+
+
+def dependency_graph(tasks_data: dict, groups: list[dict] | None = None) -> dict:
+    """The `depends_on` relation as a drawable, cycle-safe layered graph.
+
+    One edge per declared `(dependency, dependent)` pair, pointing from the
+    dependency to the dependent — the direction work flows, so an arrow into a
+    blocked node is the thing being waited for.
+
+    Only the CONNECTED subgraph is drawn. 91 of the 132 tasks declare no
+    dependency and have none declared on them; rendering them as isolated dots
+    is what makes the 41 that matter unreadable. `omitted` counts them, so the
+    omission is on the page rather than silent.
+
+    Layout is by LAYER: a node's layer is one past the highest layer of anything
+    it depends on, so a task is drawn after everything it depends on. Cycles
+    cannot satisfy that and are not made to: the graph is condensed on its
+    strongly connected components first, the condensation is a DAG by
+    construction, and the layering runs over that — so the members of a cycle
+    share a layer, everything downstream of them still lands after them, and no
+    edge is dropped to make the picture acyclic. Each cycle is reported in
+    `cycles` with a concrete path.
+
+    FOUR VIEWS, not one. `views` holds one fully laid-out graph per combination
+    of the two display controls (`DEP_FILTERS`, keyed by `dep_view_key`), and
+    the payload's top level IS `views[DEP_DEFAULT_VIEW]` — the unfiltered graph,
+    so every reader that predates the controls sees exactly what it saw. Each
+    view is filtered BEFORE it is laid out, which is what makes the layering
+    claim above true of the picture actually drawn rather than of a full graph
+    with holes in it; see `_dep_view` for the three rules that keep it honest. The
+    page picks a view from its checkboxes and does no ordering of its own, so
+    "a task is drawn after everything it depends on" stays a property of the
+    payload — assertable in a Python test — under every combination.
+    """
+    rows = _dep_rows(tasks_data)
+    states, states_from = _dep_states(rows, groups)
+    known = {row["id"] for row in rows}
+    titles = {row["id"]: row["title"] for row in rows}
+
+    # ONE edge per pair, in declaration order. A dependency listed twice on the
+    # same task is one relation stated twice, not two edges — and the duplicate
+    # would draw exactly on top of the first, so the drawing could not show it
+    # either way.
+    edges: list[tuple[str, str]] = []
+    pairs: set[tuple[str, str]] = set()
+    for row in rows:
+        for dep in row["depends_on"]:
+            pair = (dep, row["id"])
+            if pair in pairs:
+                continue
+            pairs.add(pair)
+            edges.append(pair)
+
+    connected = {node for pair in pairs for node in pair}
+    views = {}
+    for show_completed in (True, False):
+        for show_retired in (True, False):
+            shown = {"completed": show_completed, "retired": show_retired}
+            hide = frozenset(
+                value for name, value in DEP_FILTERS if not shown[name]
+            )
+            views[dep_view_key(show_completed, show_retired)] = _dep_view(
+                rows, states, states_from, titles, known, edges, connected, hide
+            )
+    # The default view's own keys AT THE TOP LEVEL, not a nested default: this
+    # payload is read by `renderDeps`, by `merge`-style callers and by dash-14's
+    # tests, and burying the graph one level down would have been a rename
+    # dressed as a feature.
+    return {**views[DEP_DEFAULT_VIEW], "views": views, "view": DEP_DEFAULT_VIEW}
 
 
 # ---- the summary an operator reads first --------------------------------------
@@ -2148,6 +2287,11 @@ code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);
 .dedge{stroke:var(--line);stroke-width:1.5;fill:none;marker-end:url(#dar)}
 .dedge.on{stroke:var(--axis);stroke-width:2}
 .dedge.cyc{stroke:var(--critical);marker-end:url(#dcar)}
+/* The two filters. Ordinary checkboxes with visible labels — no new colour and
+   no icon-only control: what is hidden is a claim about the drawing below, so
+   it is spelled out in words there as well as here. */
+.depctl{display:flex;flex-wrap:wrap;gap:16px;margin:0 0 9px;font-size:12.5px;color:var(--ink2)}
+.depctl label{display:inline-flex;align-items:center;cursor:pointer}
 /* Roadmap group headings. The count sits IN the heading rather than under it:
    "Needs a human 0" is the whole sentence an operator came to read, and a
    number one line away from its label is a number nobody reads. */
@@ -2389,6 +2533,18 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
        place to bind the settle listeners once. -->
   <section id="deppanel">
     <h2>Dependency graph — every depends_on, dependency → dependent</h2>
+    <!-- The two display filters, and the reason they are STATIC markup: this is
+         where the operator's choice LIVES. `renderDeps` reads `.checked` and
+         never writes it, so a poll cannot reset a filter — the same rule that
+         keeps `#deptablebox` open, applied to the one control whose silent
+         reset every two seconds would be worse than having no control at all.
+         Both ship `checked`: the panel opens on the whole connected subgraph,
+         and hiding is something an operator asks for.
+         ABOVE the note, because the note's counts describe what these did. -->
+    <div class="depctl">
+      <label><input type="checkbox" id="depshowdone" checked><span id="depshowdonelabel"> show completed</span></label>
+      <label><input type="checkbox" id="depshowretired" checked><span id="depshowretiredlabel"> show retired</span></label>
+    </div>
     <div id="depnote" style="font-size:13px;margin-bottom:9px"></div>
     <div class="scroll">
       <svg id="depsvg" viewBox="0 0 1140 90">
@@ -2416,8 +2572,21 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       up. A cycle cannot be laid out in that order and is not drawn as though it
       could be — its members share a column, they are marked, and the path is
       spelled out above. The number on the right of a node is how many tasks are
-      waiting behind it. Display only: nothing here edits depends_on, and the
-      order the loop dispatches in is still next_ready()'s.</p>
+      waiting behind it.
+      The two boxes at the top take completed and retired tasks out of the
+      drawing — the states that can never hold anything up again. Both start ON,
+      so the panel opens on the whole graph, and each choice sticks until you
+      change it: a poll never resets one. Hiding a task removes every edge
+      touching it, and what is left is laid out AGAIN rather than left with
+      holes where it was, so a task is still drawn after everything it depends
+      on. Hidden is counted separately from not-drawn — they are different
+      reasons — and the line above shows the arithmetic:
+      drawn + hidden + in no relation = every task. A task whose only relations
+      were to hidden tasks is KEPT and drawn alone rather than dropped, and
+      named above, because a finished dependency is no reason to take live work
+      off the page.
+      Display only: nothing here edits depends_on, hiding a task changes nothing
+      about it, and the order the loop dispatches in is still next_ready()'s.</p>
   </section>
 
   <!-- Grouped by state, in triage order. `Retired` and `Done` are <details>
@@ -3014,6 +3183,27 @@ const DORDER = ["in_progress","blocked_by_operator","blocked","ready",
 // `pad` is headroom for the arcs a cycle edge draws OVER the nodes; without it
 // they would be clipped by the viewBox and a cycle would look like a gap.
 const DGEO = {w:126, h:34, gapx:54, gapy:10, pad:48};
+// The two display controls, `[checkbox id, the letter it contributes to the
+// view key]`. Both default CHECKED in the static markup — the panel opens on
+// the whole connected subgraph, and `renderDeps` never writes `.checked`, so an
+// operator's choice survives every 2s poll for the same reason the edge table
+// stays open: nothing rebuilds the element.
+const DFILTERS = [["depshowdone", "c"], ["depshowretired", "r"]];
+// Missing element reads as SHOWN. The region is lifted and run against stub
+// documents that carry no checkboxes at all, and the safe answer there is the
+// unfiltered graph — never a page that quietly hides nodes because a control
+// failed to render.
+const depShown = id => { const box = document.getElementById(id); return !box || box.checked !== false; };
+// `c1r0` — "completed shown, retired hidden". The backend builds the same
+// string in `dep_view_key`, and a test pins the two spellings equal.
+const depViewKey = () => DFILTERS.map(([id, letter]) => letter + (depShown(id) ? 1 : 0)).join("");
+// The graph the controls select, laid out on the backend for exactly this
+// combination. Falls back to the payload's own top level — the unfiltered view
+// — for a payload built before `views` existed.
+const depView = d => {
+  const g = (d || {}).depgraph || {};
+  return (g.views || {})[depViewKey()] || g;
+};
 const dgX = n => n.layer * (DGEO.w + DGEO.gapx);
 const dgY = n => DGEO.pad + n.row * (DGEO.h + DGEO.gapy);
 const dgWord = s => DMARK[s] || DMARK.unknown;
@@ -3057,7 +3247,10 @@ const dgNode = n => {
     <text class="sub" x="8" y="27">${esc(ic)} ${esc(word)}${n.cyclic ? " · in a cycle" : ""}</text></g>`;
 };
 function renderDeps(d){
-  const g = d.depgraph || {};
+  // The view the two controls select, never the payload's top level: every
+  // count, edge and layer below is this view's, so the drawing and the sentence
+  // above it cannot describe different graphs.
+  const g = depView(d);
   const nodes = g.nodes || [], edges = g.edges || [], cycles = g.cycles || [];
   const at = {};
   nodes.forEach(n => { at[n.id] = n; });
@@ -3069,6 +3262,26 @@ function renderDeps(d){
     : `<b>no task declares a dependency</b> — there is no graph to draw.`;
   const left = ` <span class="muted">${esc(g.omitted || 0)} of ${esc(g.total || 0)} task(s) `
     + `are in no dependency relation at all and are not drawn.</span>`;
+  // What the CONTROLS took out, on the same terms and by the same rule: a count
+  // that is spoken whether or not it is zero. Hidden is booked separately from
+  // omitted — isolated and hidden are different reasons — so the arithmetic is
+  // written out rather than left to be inferred from two numbers that do not
+  // add up to the total on their own.
+  const hb = g.hidden_by_state || {};
+  const hid = ` <span class="muted">${esc(g.hidden || 0)} more are hidden by the controls above `
+    + `(${esc(hb.completed || 0)} completed, ${esc(hb.retired || 0)} retired): `
+    + `${esc(g.shown || 0)} drawn + ${esc(g.hidden || 0)} hidden + ${esc(g.omitted || 0)} `
+    + `in no relation = ${esc(g.total || 0)}.</span>`;
+  // The one case a filter can silently delete live work: a task every one of
+  // whose relations was to something now hidden. It is kept and drawn alone,
+  // and the page says which ones and why rather than leaving an operator to
+  // wonder what a lone node at the left edge is doing there.
+  const alone = (g.drawn_alone || []).length
+    ? ` <span class="muted">○ ${esc((g.drawn_alone || []).length)} task(s) are drawn alone `
+      + `because everything they relate to is hidden: `
+      + `${esc((g.drawn_alone || []).join(", "))}. They are kept — a hidden `
+      + `dependency must not take a live task off the page.</span>`
+    : "";
   const ghosts = (g.unknown || []).length
     ? ` <span class="muted">? ${esc((g.unknown || []).length)} id(s) are depended on but are `
       + `not tasks: ${esc((g.unknown || []).join(", "))}.</span>`
@@ -3087,7 +3300,17 @@ function renderDeps(d){
     ? `<div class="muted">The registry would not load, so each state here is derived `
       + `from the stored status field rather than from state_of().</div>`
     : "";
-  document.getElementById("depnote").innerHTML = head + left + ghosts + cyc + src;
+  document.getElementById("depnote").innerHTML = head + left + hid + alone + ghosts + cyc + src;
+  // The label each control carries its own figure on — "show completed (22)" is
+  // true before anyone clicks it, and it is the same number in every view, so
+  // an operator can see what a toggle costs without toggling it.
+  const fl = g.filterable || {};
+  const label = (id, word, count) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = ` show ${word} (${count || 0})`;
+  };
+  label("depshowdonelabel", "completed", fl.completed);
+  label("depshowretiredlabel", "retired", fl.retired);
 
   const svg = document.getElementById("depsvg");
   const columns = Math.max(1, g.layers || 1);
@@ -3173,7 +3396,13 @@ const depSig = p => JSON.stringify((p || {}).depgraph || null);
 // its tooltip), the pointer over one (the tooltip follows the mouse), and a text
 // selection anchored inside the panel (the edge table is there to be copied).
 // An OPEN <details> is not one of them — nothing rebuilds it, and a disclosure
-// left open for an hour must not freeze the graph inside it.
+// left open for an hour must not freeze the graph inside it. Neither is a
+// FOCUSED FILTER CHECKBOX, for exactly the same reason: `renderDeps` never
+// writes `.checked`, so a redraw destroys nothing about it — and a checkbox
+// keeps focus until the operator clicks elsewhere, so counting it would freeze
+// the graph from the moment someone toggles a filter until they think to click
+// the background.
+const depIsFilter = el => !!el && DFILTERS.some(([id]) => id === el.id);
 function depsBusy(){
   const panel = document.getElementById("deppanel");
   if (!panel) return false;
@@ -3181,7 +3410,8 @@ function depsBusy(){
   // freezing until they come back and click would be the worse failure.
   if (document.hasFocus && !document.hasFocus()) return false;
   const active = document.activeElement;
-  if (active && active !== document.body && panel.contains(active)) return true;
+  if (active && active !== document.body && panel.contains(active)
+      && !depIsFilter(active)) return true;
   if (panel.querySelector(".dnode:hover")) return true;
   const picked = typeof window !== "undefined" && window.getSelection
     ? window.getSelection() : null;
@@ -3226,7 +3456,10 @@ function updateDeps(d, force){
 // time — and scoped to #depnodes so the pipeline's own nodes are untouched.
 function bindDeps(d){
   const at = {};
-  ((d.depgraph || {}).nodes || []).forEach(n => { at[n.id] = n; });
+  // The DRAWN view's nodes, the same ones `renderDeps` just put in the DOM: a
+  // tooltip built from the unfiltered payload would count dependents the
+  // drawing does not show.
+  (depView(d).nodes || []).forEach(n => { at[n.id] = n; });
   document.querySelectorAll("#depnodes .dnode").forEach(el => {
     const n = at[el.dataset.id];
     if (!n) return;
@@ -3258,6 +3491,19 @@ function bindDeps(d){
   });
 }
 DEPBIND = bindDeps;
+
+// The two filters, wired here rather than inside the region because the redraw
+// they ask for reaches `LAST`. A toggle changes only WHICH of the four
+// backend-laid-out views is drawn, so it forces a redraw of `DEPDRAWN` — the
+// payload already on screen — exactly as the node picker does, and for the same
+// reason: it must move under the operator's hand without letting a held graph
+// in behind it. Bound ONCE, on static markup nothing rebuilds, which is also
+// what makes the checkbox itself the place the choice lives: there is no filter
+// state anywhere else to keep in step with it, and nothing for a poll to reset.
+DFILTERS.forEach(([id]) => {
+  const box = document.getElementById(id);
+  if (box) box.addEventListener("change", () => updateDeps(DEPDRAWN || LAST, true));
+});
 
 // The held payload lands SOONER than the next tick when a gesture ends inside
 // the panel. Polish, not the mechanism: `render` calls `updateDeps` on every

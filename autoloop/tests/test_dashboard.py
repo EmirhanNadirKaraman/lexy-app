@@ -21,6 +21,8 @@ from pathlib import Path
 import pytest
 
 from autoloop.dashboard import (
+    DEP_DEFAULT_VIEW,
+    DEP_FILTERS,
     DEP_NODE_STATES,
     GROUPS,
     IN_PROGRESS_KINDS,
@@ -32,6 +34,7 @@ from autoloop.dashboard import (
     STATUS,
     app_tasks,
     collect,
+    dep_view_key,
     dependency_graph,
     is_ancestor,
     merge_groups,
@@ -2812,6 +2815,384 @@ def test_the_graph_is_display_only_and_changes_no_dependency(tmp_path):
             for dep in task.depends_on} == stored
 
 
+# ---- the two display filters --------------------------------------------------
+#
+# 39% of the drawing was settled history: measured 2026-08-20 over 141 tasks, 22
+# of the 71 drawn nodes were completed and 6 retired. A node that can never hold
+# anything up again is noise in a panel whose whole question is "what is held up,
+# and by what", so each of those two states gets a control.
+#
+# The claims these tests hold down, and why each is the one that can rot:
+#
+#   * FILTER BEFORE LAYOUT. The filtered graph is laid out AGAIN — hiding a node
+#     must not leave a hole in its layer or strand its dependents at a layer
+#     number derived from something no longer on the page.
+#   * HIDDEN IS NOT OMITTED. dash-14's `omitted` counts tasks in NO relation at
+#     all and its identity is `omitted + shown == total`. Booking a hidden node
+#     there would destroy that claim by making it true of a different set every
+#     time a checkbox moved; `hidden` is its own count and
+#     `shown + hidden + omitted == total` is the generalisation.
+#   * NOTHING LIVE DISAPPEARS. A pending task whose only relations were to
+#     hidden nodes is the one thing a filter can silently delete. It is kept.
+
+
+def dep_view(graph: dict, *, completed: bool, retired: bool) -> dict:
+    """The graph the page draws for one position of the two controls."""
+    return graph["views"][dep_view_key(completed, retired)]
+
+
+def filter_rows() -> list[dict]:
+    """The fixture the filter tests read, built so nothing passes by accident.
+
+    Each control has something ONLY it removes (`z-done`, `y-gone`); `b-live`
+    waits on one of each, so it keeps an edge under either filter alone and is
+    the node whose layer must move; `c-orphan`'s only relation is to a completed
+    task, so it is the live task a filter could silently delete; and
+    `d-done-alone` is completed AND in no relation, which is the row that tells
+    `hidden` and `omitted` apart — it belongs to the second in every view.
+    """
+    return [
+        roadmap_task("z-done", status="completed"),
+        roadmap_task("y-gone", status="retired"),
+        roadmap_task("a-live", depends_on=["z-done"]),
+        roadmap_task("b-live", depends_on=["a-live", "y-gone"]),
+        roadmap_task("c-orphan", depends_on=["z-done"]),
+        roadmap_task("alone-1"),
+        roadmap_task("d-done-alone", status="completed"),
+    ]
+
+
+def assert_layout_is_sound(view: dict, where: str = "") -> None:
+    """dash-14's layout invariant, over whatever this view actually draws.
+
+    Three claims, because the filtered case can break any of them on its own: a
+    node is drawn after everything it depends on, the layers it is placed in are
+    a contiguous run from 0 (a hidden node leaves no empty column), and the rows
+    within each layer are a contiguous run from 0 (it leaves no gap in a column
+    either).
+    """
+    layer = {node["id"]: node["layer"] for node in view["nodes"]}
+    order = [node["id"] for node in view["nodes"]]
+    for edge in view["edges"]:
+        assert edge["from"] in layer and edge["to"] in layer, (where, edge)
+        if edge["cycle"]:
+            continue
+        assert layer[edge["from"]] < layer[edge["to"]], (where, edge)
+        assert order.index(edge["from"]) < order.index(edge["to"]), (where, edge)
+    used = sorted({node["layer"] for node in view["nodes"]})
+    assert used == list(range(view["layers"])), (where, "an empty column")
+    for number in used:
+        rows_here = sorted(node["row"] for node in view["nodes"]
+                           if node["layer"] == number)
+        assert rows_here == list(range(len(rows_here))), (where, "a gap in a column")
+
+
+def test_each_filter_removes_exactly_its_own_state_and_every_edge_touching_it():
+    """The provable claim, one control at a time and then both.
+
+    An edge is a claim about two nodes and half of one is a line into nothing,
+    so hiding a node takes every edge incident to it — in BOTH directions, which
+    is why `y-gone` is a dependency of `b-live` while `z-done` is a dependency of
+    two others. Each toggle is asserted to remove its own state and to leave the
+    other's alone, because a filter that hid both from either checkbox would
+    pass every "is it gone" assertion on its own.
+    """
+    graph = dep_graph(filter_rows())
+    everything = dep_view(graph, completed=True, retired=True)
+    no_done = dep_view(graph, completed=False, retired=True)
+    no_gone = dep_view(graph, completed=True, retired=False)
+    neither = dep_view(graph, completed=False, retired=False)
+
+    assert [node["id"] for node in everything["nodes"]] == [
+        "y-gone", "z-done", "a-live", "c-orphan", "b-live",
+    ]
+    assert sorted(dep_pairs(everything)) == [
+        ("a-live", "b-live"), ("y-gone", "b-live"),
+        ("z-done", "a-live"), ("z-done", "c-orphan"),
+    ]
+
+    # "show completed" off: the completed node and BOTH its edges, and nothing
+    # else — the retired node is still drawn, still with its own edge.
+    assert {node["id"] for node in no_done["nodes"]} == {
+        "y-gone", "a-live", "b-live", "c-orphan"}
+    assert sorted(dep_pairs(no_done)) == [("a-live", "b-live"), ("y-gone", "b-live")]
+    # "show retired" off: the mirror image, asserted from the other side.
+    assert {node["id"] for node in no_gone["nodes"]} == {
+        "z-done", "a-live", "b-live", "c-orphan"}
+    assert sorted(dep_pairs(no_gone)) == [
+        ("a-live", "b-live"), ("z-done", "a-live"), ("z-done", "c-orphan")]
+    # Both off: the 43-live-nodes case the whole feature exists for.
+    assert {node["id"] for node in neither["nodes"]} == {"a-live", "b-live", "c-orphan"}
+    assert sorted(dep_pairs(neither)) == [("a-live", "b-live")]
+
+    # No edge anywhere names a node this view does not draw — the property, not
+    # four hand-written lists of it.
+    for view in graph["views"].values():
+        drawn = {node["id"] for node in view["nodes"]}
+        for edge in view["edges"]:
+            assert edge["from"] in drawn and edge["to"] in drawn, edge
+    # …and a node's own `depends_on` says what the picture says, so a tooltip
+    # cannot name a dependency the drawing has no edge for.
+    assert dep_nodes(no_done)["a-live"]["depends_on"] == []
+    assert dep_nodes(everything)["a-live"]["depends_on"] == ["z-done"]
+
+
+def test_the_filtered_graph_is_laid_out_again_rather_than_left_with_holes():
+    """RE-LAYER, DO NOT PUNCH HOLES. `a-live` sits at layer 1 because it waits on
+    a completed task; with completed hidden it is waiting on nothing DRAWN and
+    belongs at the left edge, and `b-live` behind it must move with it.
+
+    The generic invariant is asserted over all four views as well, since the
+    interesting failure is not this chain moving but some other view keeping a
+    layer number derived from a node no longer on the page.
+    """
+    graph = dep_graph(filter_rows())
+    everything = dep_view(graph, completed=True, retired=True)
+    neither = dep_view(graph, completed=False, retired=False)
+
+    assert {n["id"]: n["layer"] for n in everything["nodes"]} == {
+        "z-done": 0, "y-gone": 0, "a-live": 1, "c-orphan": 1, "b-live": 2}
+    assert everything["layers"] == 3
+    # Both filters on: the chain slides left by one and the column that held the
+    # hidden nodes is gone rather than empty.
+    assert {n["id"]: n["layer"] for n in neither["nodes"]} == {
+        "a-live": 0, "c-orphan": 0, "b-live": 1}
+    assert neither["layers"] == 2
+    # Rows are the position WITHIN a column and are re-packed too: `c-orphan`
+    # takes the row `z-done` used to leave for it.
+    assert {n["id"]: n["row"] for n in neither["nodes"]} == {
+        "a-live": 0, "c-orphan": 1, "b-live": 0}
+
+    for key, view in graph["views"].items():
+        assert_layout_is_sound(view, key)
+
+
+def test_the_hidden_count_is_reported_and_the_accounting_holds_in_every_view():
+    """SAY WHAT IS HIDDEN, and book it apart from what is omitted.
+
+    dash-14's `omitted + shown == total` is a claim about tasks in NO relation at
+    all; a hidden node counted there would silently redefine it. The identity
+    here is the strict generalisation, and the default view is asserted to
+    satisfy dash-14's original as well — that is the no-regression proof.
+
+    `d-done-alone` is the row that makes the disjointness say something: it is
+    completed AND isolated, so a filter that swept "every completed task" into
+    `hidden` rather than only the drawn ones would count it twice — once as
+    hidden and once as omitted — and break the sum in the two views that hide
+    completed while passing the other two.
+    """
+    graph = dep_graph(filter_rows())
+
+    for key, view in graph["views"].items():
+        assert view["total"] == 7, key
+        assert view["shown"] + view["hidden"] + view["omitted"] == view["total"], key
+        # `omitted` is dash-14's number and cannot move: a control hides a node,
+        # it cannot put a task into a relation or take one out of one.
+        assert view["omitted"] == 2, key
+        assert sum(view["hidden_by_state"].values()) == view["hidden"], key
+        assert view["shown"] == len(view["nodes"]) - len(view["unknown"]), key
+
+    everything = dep_view(graph, completed=True, retired=True)
+    assert (everything["hidden"], everything["shown"]) == (0, 5)
+    assert everything["hidden_by_state"] == {"completed": 0, "retired": 0}
+    # dash-14's own identity, unchanged, in the view the page opens on.
+    assert everything["omitted"] + everything["shown"] == everything["total"]
+    assert dep_view(graph, completed=False, retired=True)["hidden_by_state"] == {
+        "completed": 1, "retired": 0}
+    assert dep_view(graph, completed=True, retired=False)["hidden_by_state"] == {
+        "completed": 0, "retired": 1}
+    assert dep_view(graph, completed=False, retired=False)["hidden_by_state"] == {
+        "completed": 1, "retired": 1}
+    assert dep_view(graph, completed=False, retired=False)["shown"] == 3
+
+    # The figure each control's label carries: how many DRAWN nodes it governs,
+    # the same in every view so the label does not move when it is clicked. The
+    # second completed task is not counted — it is not drawn in any view, so no
+    # checkbox can hide it, and claiming otherwise would advertise a change the
+    # click cannot make.
+    for view in graph["views"].values():
+        assert view["filterable"] == {"completed": 1, "retired": 1}
+    assert len([row for row in filter_rows() if row["status"] == "completed"]) == 2
+
+
+def test_a_task_whose_only_relations_are_hidden_is_drawn_alone_not_dropped():
+    """The one way a filter can silently delete live work.
+
+    `c-orphan` is pending and its only relation is to a completed task. With
+    completed hidden it has nothing left to connect to — and dropping it would
+    take a live task off the page for the sole reason that what it was waiting
+    for is finished, which is the opposite of what the panel is for. It is kept,
+    it is listed, and it is counted as SHOWN rather than as either hidden or
+    omitted.
+    """
+    graph = dep_graph(filter_rows())
+    no_done = dep_view(graph, completed=False, retired=True)
+
+    assert no_done["drawn_alone"] == ["c-orphan"]
+    node = dep_nodes(no_done)["c-orphan"]
+    assert node["depends_on"] == [] and node["dependents"] == 0
+    assert node["layer"] == 0, "a node with nothing drawn upstream is at the left edge"
+    assert "c-orphan" in {n["id"] for n in no_done["nodes"]}
+    # Counted as drawn — not quietly moved into either of the two "not on the
+    # page" buckets.
+    assert no_done["shown"] == 4 and no_done["hidden"] == 1 and no_done["omitted"] == 2
+    # In the unfiltered view NOTHING is drawn alone, and that is structural: a
+    # node is in the connected subgraph precisely because an edge touches it.
+    for key, view in graph["views"].items():
+        for task_id in view["drawn_alone"]:
+            assert not [e for e in view["edges"]
+                        if task_id in (e["from"], e["to"])], (key, task_id)
+    assert dep_view(graph, completed=True, retired=True)["drawn_alone"] == []
+    # …and it is not an artefact of hiding completed: with retired hidden
+    # instead, `c-orphan` keeps its edge and no one is left alone.
+    assert dep_view(graph, completed=True, retired=False)["drawn_alone"] == []
+
+
+def test_a_cycle_with_hidden_members_is_still_reported_over_what_remains():
+    """CYCLES SURVIVE FILTERING. Two shapes in one hand-edited file, because
+    they fail in opposite directions:
+
+      * `cyc-a → z-done → cyc-b → cyc-a` is a three-node cycle whose middle
+        member is completed. Hiding it must not hide the cycle — `cyc-a` and
+        `cyc-b` still depend on each other, and a filtered graph that reported
+        "no dependency cycle" would be telling an operator the file is fine.
+      * `p-one ↔ q-done` exists ONLY through a completed node. Its edges are
+        incident to a hidden node, so they go, and with them the cycle: there is
+        no cycle left among the drawn nodes to report, and inventing one would
+        be reporting a relation the drawing does not show.
+
+    That the test RETURNS is the termination assertion — filtering must not hang
+    the walk, and `_dep_cycle_path` walks the FILTERED `deps` map, so a path
+    through a hidden node would be the other way this breaks.
+    """
+    graph = dep_graph([
+        roadmap_task("cyc-a", depends_on=["cyc-b"]),
+        roadmap_task("cyc-b", depends_on=["cyc-a", "z-done"]),
+        roadmap_task("z-done", status="completed", depends_on=["cyc-a"]),
+        roadmap_task("p-one", depends_on=["q-done"]),
+        roadmap_task("q-done", status="completed", depends_on=["p-one"]),
+    ])
+    everything = dep_view(graph, completed=True, retired=True)
+    no_done = dep_view(graph, completed=False, retired=True)
+
+    # The registry refuses a file like this, so the states are the stored ones —
+    # which is exactly the case this panel exists to draw.
+    assert everything["states_from"] == "status"
+    assert [cycle["nodes"] for cycle in everything["cycles"]] == [
+        ["cyc-a", "cyc-b", "z-done"], ["p-one", "q-done"]]
+
+    # The surviving cycle is still reported, with a path over what remains.
+    assert no_done["cycles"] == [
+        {"nodes": ["cyc-a", "cyc-b"], "path": ["cyc-a", "cyc-b", "cyc-a"]}]
+    assert {n["id"]: n["cyclic"] for n in no_done["nodes"]} == {
+        "cyc-a": True, "cyc-b": True, "p-one": False}
+    # No path names a node that is not drawn, and no edge does either.
+    drawn = {node["id"] for node in no_done["nodes"]}
+    for cycle in no_done["cycles"]:
+        assert set(cycle["path"]) <= drawn and set(cycle["nodes"]) <= drawn
+    assert sorted(dep_pairs(no_done)) == [("cyc-a", "cyc-b"), ("cyc-b", "cyc-a")]
+    assert [edge["cycle"] for edge in no_done["edges"]] == [True, True]
+    # The cycle that existed only through the hidden node is gone with its edges,
+    # and the live task it held is drawn alone rather than dropped.
+    assert no_done["drawn_alone"] == ["p-one"]
+    # Members of a cycle still share a column, and the layout still holds.
+    assert len({n["layer"] for n in no_done["nodes"] if n["cyclic"]}) == 1
+    assert_layout_is_sound(no_done)
+
+
+def test_a_phantom_dependency_survives_the_filters_rather_than_vanishing():
+    """The node class that cannot defend itself: an id something depends on that
+    is not a task at all. Its state is `unknown`, so no control governs it — but
+    its only edge here comes from a completed task, and a `unknown` list read off
+    the surviving EDGES rather than off the drawn nodes would drop it the moment
+    that task was hidden. Silently, since it is not a task and appears in none of
+    the three counts.
+    """
+    graph = dep_graph([
+        roadmap_task("z-done", status="completed", depends_on=["ghost-1"]),
+        roadmap_task("a-live", depends_on=["z-done"]),
+    ])
+
+    for key, view in graph["views"].items():
+        assert view["unknown"] == ["ghost-1"], key
+        assert "ghost-1" in {node["id"] for node in view["nodes"]}, key
+        # A phantom is not a task, so it is on neither side of the identity.
+        assert view["total"] == 2, key
+        assert view["shown"] + view["hidden"] + view["omitted"] == 2, key
+
+    no_done = dep_view(graph, completed=False, retired=True)
+    assert no_done["edges"] == [], "both edges were incident to the hidden node"
+    assert no_done["drawn_alone"] == ["a-live", "ghost-1"]
+    assert (no_done["shown"], no_done["hidden"], no_done["omitted"]) == (1, 1, 0)
+    assert dep_nodes(no_done)["ghost-1"]["state"] == "unknown"
+
+
+def test_the_payload_carries_four_laid_out_views_and_opens_on_the_whole_graph():
+    """The shape the page reads, and the default it opens on.
+
+    Both controls start ON: the panel opens on the whole connected subgraph, so
+    a task is never missing for a reason nobody asked for. That the top level IS
+    the default view is what keeps every reader that predates the controls —
+    dash-14's tests among them — reading the same graph as the page.
+    """
+    graph = dep_graph(filter_rows())
+
+    assert DEP_DEFAULT_VIEW == dep_view_key(True, True) == "c1r1"
+    assert set(graph["views"]) == {"c1r1", "c1r0", "c0r1", "c0r0"}
+    assert graph["view"] == DEP_DEFAULT_VIEW
+    default = graph["views"][DEP_DEFAULT_VIEW]
+    assert {key: graph[key] for key in default} == default
+    assert default["hidden"] == 0, "the page opens on the whole graph"
+    # The two states a control governs are `TaskState` values, not strings this
+    # page invented — the same rule `DEP_NODE_STATES` follows.
+    assert DEP_FILTERS == (("completed", TaskState.COMPLETED.value),
+                           ("retired", TaskState.RETIRED.value))
+    assert {value for _name, value in DEP_FILTERS} <= set(DEP_NODE_STATES)
+
+
+def test_filtering_is_display_only_and_moves_no_task(tmp_path):
+    """DISPLAY ONLY, said as a property rather than as a promise. Every view is
+    a reading of the SAME rows: no view invents a relation, none drops one the
+    registry has for a task it draws, and the registry the loop actually
+    dispatches from answers exactly as it did — same states, same `next_ready()`
+    order — no matter which view the page is showing.
+    """
+    repo = make_repo(tmp_path)
+    rows = filter_rows()
+    write_registry(repo, rows)
+    # What the loop would dispatch BEFORE the page has ever drawn the file.
+    before = TaskRegistry.from_dict({"tasks": [dict(row) for row in rows]})
+    picked = before.next_ready().id
+
+    payload = collect(repo)
+    graph = payload["depgraph"]
+    stored = {(dep, row["id"]) for row in rows for dep in row["depends_on"]}
+
+    for key, view in graph["views"].items():
+        drawn = {node["id"] for node in view["nodes"]}
+        pairs = set(dep_pairs(view))
+        assert pairs <= stored, key
+        # Nothing is dropped BETWEEN two drawn nodes either: a filter removes
+        # edges by removing their endpoints and never for any other reason.
+        assert pairs == {(dep, dependent) for dep, dependent in stored
+                         if dep in drawn and dependent in drawn}, key
+
+    # The registry is untouched by having been drawn: same state per task, and
+    # the same task dispatched next.
+    registry = TaskRegistry.from_dict({"tasks": [dict(row) for row in rows]})
+    assert {task.id: registry.state_of(task.id) for task in registry.all_tasks()} == {
+        "z-done": TaskState.COMPLETED, "y-gone": TaskState.RETIRED,
+        "a-live": TaskState.READY, "b-live": TaskState.BLOCKED,
+        "c-orphan": TaskState.READY, "alone-1": TaskState.READY,
+        "d-done-alone": TaskState.COMPLETED,
+    }
+    assert registry.next_ready().id == picked, "drawing the file changed dispatch"
+    # …and the file on disk still says what it said.
+    stored_now = json.loads(
+        (repo / ".autoloop" / "tasks.json").read_text(encoding="utf-8"))
+    assert stored_now["tasks"] == rows
+
+
 def test_every_node_state_has_an_icon_and_a_word_on_the_page():
     """A state with no mark renders a blank node. `DEP_NODE_STATES` is derived
     from `GROUPS`, so a seventh `TaskState` reaches the page automatically — and
@@ -3429,3 +3810,215 @@ console.log(JSON.stringify({backToFirst, settled, landed, drawPath, heldAgain,
     assert out["afterSettle"] is True, (
         "settling after the draw rendered the superseded graph"
     )
+
+
+# ---- the two filters, on the page ---------------------------------------------
+#
+# The backend lays out all four views; what these measure is the half only the
+# browser runs — that the checkboxes SELECT one, that the page says which nodes
+# they took out, and that a poll can neither reset a filter nor be frozen by one.
+
+
+def test_unchecking_a_box_hides_that_state_on_the_page_and_says_what_it_hid():
+    """`renderDeps` itself, run against a stub document with the two controls in
+    it, one position at a time — including each box alone, because a render that
+    read either checkbox for both filters would hide the right nodes whenever
+    both are off and pass a test that only tried that.
+
+    The counts are asserted as the page's own sentence rather than as payload
+    fields: hiding has to be VISIBLE, and the arithmetic is written out because
+    `hidden` and `omitted` are two different reasons a task is not on screen.
+    """
+    graph = dep_graph(filter_rows())
+    payload = json.dumps({"depgraph": graph})
+
+    harness = deps_panel_js() + """
+const NODES = {};
+for (const id of ["depnote","depsvg","depedges","depnodes","deplegend",
+                  "deptablesum","deptable","depdetail","deptablebox",
+                  "depshowdonelabel","depshowretiredlabel"])
+  NODES[id] = {innerHTML:"", textContent:"", open:false, attrs:{},
+               setAttribute(key, value){ this.attrs[key] = value; }};
+// The two controls exactly as the static markup ships them: both CHECKED.
+NODES.depshowdone = {id:"depshowdone", checked:true};
+NODES.depshowretired = {id:"depshowretired", checked:true};
+const document = {getElementById: id => NODES[id]};
+const PAYLOAD = __PAYLOAD__;
+const read = () => ({nodes: NODES.depnodes.innerHTML, note: NODES.depnote.innerHTML,
+                     edges: NODES.depedges.innerHTML, table: NODES.deptable.innerHTML,
+                     legend: NODES.deplegend.innerHTML,
+                     label: NODES.depshowdonelabel.textContent});
+renderDeps(PAYLOAD);
+const all = read();
+NODES.depshowdone.checked = false;          // "show completed" off, alone
+renderDeps(PAYLOAD);
+const noDone = read();
+NODES.depshowdone.checked = true;
+NODES.depshowretired.checked = false;       // "show retired" off, alone
+renderDeps(PAYLOAD);
+const noGone = read();
+NODES.depshowdone.checked = false;          // both off
+renderDeps(PAYLOAD);
+const neither = read();
+console.log(JSON.stringify({all, noDone, noGone, neither,
+  boxes: [NODES.depshowdone.checked, NODES.depshowretired.checked]}));
+""".replace("__PAYLOAD__", payload)
+    out = json.loads(run_js(harness))
+
+    # Both on: the whole connected subgraph, and the page says nothing is hidden
+    # rather than staying quiet about it.
+    for task_id in ("z-done", "y-gone", "a-live", "b-live", "c-orphan"):
+        assert f'data-id="{task_id}"' in out["all"]["nodes"]
+    assert out["all"]["edges"].count('<path class="dedge') == 4
+    assert "0 more are hidden by the controls above (0 completed, 0 retired)" in out["all"]["note"]
+    assert "5 drawn + 0 hidden + 2 in no relation = 7." in out["all"]["note"]
+    # The label carries the figure the box governs before anyone clicks it.
+    assert out["all"]["label"] == " show completed (1)"
+
+    # Completed off: that node and both its edges are gone, the retired one is
+    # untouched, and the live task left with no drawn relation is still there.
+    assert 'data-id="z-done"' not in out["noDone"]["nodes"]
+    assert 'data-id="y-gone"' in out["noDone"]["nodes"]
+    assert 'data-id="c-orphan"' in out["noDone"]["nodes"]
+    assert out["noDone"]["edges"].count('<path class="dedge') == 2
+    assert "z-done" not in out["noDone"]["table"], "the readable twin still lists it"
+    assert "1 more are hidden by the controls above (1 completed, 0 retired)" in out["noDone"]["note"]
+    assert "4 drawn + 1 hidden + 2 in no relation = 7." in out["noDone"]["note"]
+    # …and it SAYS the live task is drawn alone, and why it was kept.
+    assert "1 task(s) are drawn alone" in out["noDone"]["note"]
+    assert "c-orphan" in out["noDone"]["note"]
+    assert "must not take a live task off the page" in out["noDone"]["note"]
+    assert "✓ completed" not in out["noDone"]["legend"]
+
+    # Retired off, alone: the mirror image. Each box governs its own state only.
+    assert 'data-id="y-gone"' not in out["noGone"]["nodes"]
+    assert 'data-id="z-done"' in out["noGone"]["nodes"]
+    assert "0 more are hidden" not in out["noGone"]["note"]
+    assert "(0 completed, 1 retired)" in out["noGone"]["note"]
+
+    assert 'data-id="z-done"' not in out["neither"]["nodes"]
+    assert 'data-id="y-gone"' not in out["neither"]["nodes"]
+    assert 'data-id="b-live"' in out["neither"]["nodes"]
+    assert "3 drawn + 2 hidden + 2 in no relation = 7." in out["neither"]["note"]
+    assert "⊘ retired" not in out["neither"]["legend"]
+    # Four renders and the boxes are where the operator left them: `renderDeps`
+    # reads `.checked` and never writes it, which is the whole persistence
+    # mechanism — the element is static markup nothing rebuilds.
+    assert out["boxes"] == [False, False]
+
+
+def test_a_filter_survives_the_poll_and_a_focused_box_does_not_freeze_the_graph():
+    """dash-12's rule, applied to a control rather than to a node.
+
+    A filter that silently reset every two seconds would be worse than no
+    filter, so the tick must not touch the boxes — and it must not be BLOCKED by
+    them either. `depsBusy` counts keyboard focus inside the panel as an
+    interaction, and a clicked checkbox keeps focus until the operator clicks
+    something else: counting it would freeze the graph from the first toggle
+    until they thought to click the background. It is excluded for the same
+    reason an open `<details>` is — nothing rebuilds it.
+
+    The paired positive is the load-bearing half: a focused NODE still holds the
+    redraw, so this cannot pass by `depsBusy` having been broken outright.
+    """
+    base = [roadmap_task("z-done", status="completed"),
+            roadmap_task("a-live", depends_on=["z-done"])]
+    grown = base + [roadmap_task("b-new", depends_on=["a-live"])]
+    first = dep_graph(base)
+    later = dep_graph(grown)
+    newest = dep_graph(grown + [roadmap_task("c-new", depends_on=["b-new"])])
+
+    harness = deps_gate_js(
+        FIRST=dep_payload(first, 4, []),
+        LATER=dep_payload(later, 5, []),
+        NEWEST=dep_payload(newest, 6, []),
+    ) + """
+NODES.depshowdone = {id:"depshowdone", checked:true, inPanel:true};
+NODES.depshowretired = {id:"depshowretired", checked:true, inPanel:true};
+updateDeps(FIRST);
+const opened = shows("z-done");
+// The operator unchecks "show completed". What the change listener does, spelled
+// out — it is bound outside the region this harness lifts — and the box keeps
+// keyboard focus afterwards, exactly as a real click leaves it.
+NODES.depshowdone.checked = false;
+HOLD.focus = NODES.depshowdone;
+updateDeps(DEPDRAWN, true);
+const filtered = {done: shows("z-done"), live: shows("a-live")};
+// A 2s tick carrying a genuinely changed graph, with that box still focused.
+updateDeps(LATER);
+const ticked = {grew: shows("b-new"), done: shows("z-done"),
+                checked: NODES.depshowdone.checked};
+// The paired positive: focus on a NODE is an interaction, and still holds.
+stamp("HELD");
+HOLD.focus = INSIDE;
+updateDeps(NEWEST);
+const held = intact("HELD");
+HOLD.focus = null;
+updateDeps(NEWEST);
+const released = {redrew: !intact("HELD"), delivered: shows("c-new"),
+                  stillFiltered: !shows("z-done")};
+console.log(JSON.stringify({opened, filtered, ticked, held, released}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["opened"] is True, "the panel must open on the whole graph"
+    assert out["filtered"]["done"] is False, "the toggle did not redraw the graph"
+    assert out["filtered"]["live"] is True, "the toggle took a live task with it"
+    assert out["ticked"]["grew"] is True, (
+        "a focused filter checkbox froze the panel — a real graph change never landed"
+    )
+    assert out["ticked"]["done"] is False, "the poll put the hidden nodes back"
+    assert out["ticked"]["checked"] is False, "the poll reset the operator's filter"
+    assert out["held"] is True, "a focused NODE no longer holds the redraw"
+    assert out["released"]["redrew"] is True and out["released"]["delivered"] is True
+    assert out["released"]["stillFiltered"] is True, (
+        "the filter was lost when the held payload landed"
+    )
+
+
+def test_the_filter_controls_are_static_markup_the_refresh_never_rewrites():
+    """Where the operator's choice LIVES, as wiring. The two boxes are static
+    markup, `renderDeps` reads `.checked` and never writes it, and the redraw a
+    toggle asks for goes through the panel's own gate rather than rebuilding the
+    page. The negatives are the load-bearing half — a render that wrote
+    `.checked` back would reset the filter every two seconds, and a second
+    `renderDeps` call site would be a redraw nothing guards.
+    """
+    static_markup, script = PAGE.split("<script>", 1)
+
+    for marker in ('<input type="checkbox" id="depshowdone" checked>',
+                   '<input type="checkbox" id="depshowretired" checked>',
+                   'id="depshowdonelabel"', 'id="depshowretiredlabel"'):
+        assert marker in static_markup, f"{marker} is not on the page"
+    # Above the note, whose counts describe what these two did.
+    assert static_markup.index('id="depshowdone"') < static_markup.index('id="depnote"')
+
+    region = deps_panel_js()
+    assert ".checked =" not in region, (
+        "a render that writes .checked resets the operator's filter every 2s"
+    )
+    body = script.split("function renderDeps(d){", 1)[1].split("\n}", 1)[0]
+    assert ".checked" not in body, "the draw reads the boxes through depShown, not by hand"
+    assert "depView(d)" in body, "the draw must render the view the boxes select"
+    # ONE redraw path, and it is the panel's own: `DEPDRAWN` is the payload
+    # already on screen, so a toggle cannot let a held graph in behind it.
+    assert 'box.addEventListener("change", () => updateDeps(DEPDRAWN || LAST, true));' in script
+    assert script.count("renderDeps(") == 2, "definition plus the one guarded call"
+    # The gate stops counting the boxes as an interaction — and says so where
+    # the rule is, not somewhere else.
+    busy = script.split("function depsBusy(){", 1)[1].split("\n}", 1)[0]
+    assert "depIsFilter(active)" in busy
+
+    # ONE spelling of the view key, on both sides. A page that built `c1r0` while
+    # the backend built something else would silently fall back to the unfiltered
+    # graph for every position but the default.
+    assert 'const DFILTERS = [["depshowdone", "c"], ["depshowretired", "r"]];' in script
+    assert [dep_view_key(*pair) for pair in
+            ((True, True), (True, False), (False, True), (False, False))] == [
+        "c1r1", "c1r0", "c0r1", "c0r0"]
+    # The page states the three things a filter has to say for itself: what the
+    # default is, how the counts add up, and what happens to a task whose last
+    # relation was hidden.
+    assert "Both start ON" in static_markup
+    assert "drawn + hidden + in no relation = every task" in static_markup
+    assert "KEPT and drawn alone" in static_markup
