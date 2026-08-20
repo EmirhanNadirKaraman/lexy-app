@@ -60,6 +60,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -75,6 +76,39 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 #: class deliberately excludes `+` and does not by itself exclude `..` (a
 #: name like `refs/heads/a/../b` matches it), so `..` is checked separately.
 _BRANCH_REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9._/-]+$")
+
+
+@dataclass(frozen=True)
+class MergeAttempt:
+    """What `GitGateway.merge_foreign_commit` actually did.
+
+    A VALUE rather than an exception, because the interesting failure — the
+    two sides genuinely conflict — is an ordinary answer to the question
+    asked, not a fault in the caller. Reporting it as a return value is what
+    lets a caller route "merged" and "conflicts, a human must look" to two
+    different places without pattern-matching on an error string.
+
+    * `merged` — the only field to branch on. True means the merge (or an
+      already-up-to-date no-op) completed and `head_sha` is this repository's
+      new tip.
+    * `head_sha` — the tip AFTER a successful merge, read fresh from
+      `rev-parse HEAD`, never predicted. Empty when `merged` is False.
+    * `conflicted_paths` — git's unmerged paths, captured BEFORE the abort
+      that clears them. Empty for a failure that was not a content conflict
+      (an unfetchable object, a refused merge).
+    * `error` — git's own message, verbatim, for the caller to quote to an
+      operator. Empty on success.
+    * `restored` — whether the working tree came back CLEAN after the failed
+      merge was aborted, measured with a fresh `is_dirty()`. False means the
+      repository still holds merge residue and needs a human before anything
+      else touches it.
+    """
+
+    merged: bool
+    head_sha: str = ""
+    conflicted_paths: tuple[str, ...] = ()
+    error: str = ""
+    restored: bool = True
 
 
 class GitGateway:
@@ -619,6 +653,80 @@ class GitGateway:
         the new head to contain both parents and leave a clean tree.
         """
         self._git("commit", "-m", message)
+
+    def merge_foreign_commit(
+        self, source_path: str, sha: str, message: str
+    ) -> MergeAttempt:
+        """Bring `sha` in from the repository at `source_path` and merge it
+        into THIS repository's checked-out branch, WITHOUT rewriting anything
+        already on that branch.
+
+        The one primitive a caller needs to move a task branch FORWARD onto a
+        base that has moved, rather than RE-BASING it onto that base. Every
+        commit already on the branch keeps its exact sha and stays reachable —
+        only a merge commit is added — so a reviewer's approval, which binds
+        to a candidate by exact sha, still names an object that exists
+        (`orchestrator._rebase_execution_if_stale`).
+
+        The fetch is required and is not incidental: a worker repository is a
+        SEPARATE repository (`worker_env.WorkerRepoManager` runs `git init` +
+        a one-time local-path fetch, never a linked worktree — see that
+        module's docstring), so the primary checkout's new head commit is not
+        in the worker's object database until it is fetched in. Repeating a
+        fetch of an object already present is a side-effect-free no-op, so
+        this is safe to call again after a failure.
+
+        A CONFLICT IS AN ANSWER, NOT A FAULT, and that is why this returns a
+        `MergeAttempt` value instead of raising: "these two sides genuinely
+        disagree" is the outcome the caller has to route (to an operator,
+        every time — resolving it silently is exactly what re-basing a
+        reviewed candidate would have done). Only a policy refusal
+        (`GitOperationDenied`) still raises, because that is a programming
+        error in the caller, not a fact about the two commits.
+
+        On a failed merge the conflicted paths are read BEFORE `merge_abort()`
+        — the abort clears them (see `merge_commit`) — and `restored` reports
+        whether the tree came back clean afterwards, measured with a fresh
+        `is_dirty()` rather than inferred from the abort's exit status (which
+        is non-zero when there was no merge in progress to abort at all).
+
+        Commit identity is whatever this repository and this gateway's `env`
+        resolve — the SAME identity resolution `commit_and_capture` already
+        depends on in the very same worker repository, deliberately not a
+        second, special-cased one. If a deployment cannot resolve an identity,
+        the merge fails here exactly as an ordinary task commit would, and the
+        caller parks.
+        """
+        try:
+            self.fetch_object(source_path, sha)
+        except GitCommandError as exc:
+            return MergeAttempt(
+                merged=False,
+                error=f"could not fetch {sha[:12]} from {source_path}: {exc}",
+            )
+        try:
+            self.merge_commit(sha, message)
+        except GitCommandError as exc:
+            conflicted: tuple[str, ...] = ()
+            try:
+                conflicted = tuple(self.conflicted_paths())
+            except GitCommandError:  # pragma: no cover - status unreadable
+                conflicted = ()
+            try:
+                self.merge_abort()
+            except GitCommandError:
+                pass        # nothing was in progress, or the abort itself failed
+            try:
+                restored = not self.is_dirty()
+            except GitCommandError:  # pragma: no cover - status unreadable
+                restored = False
+            return MergeAttempt(
+                merged=False,
+                conflicted_paths=conflicted,
+                error=str(exc),
+                restored=restored,
+            )
+        return MergeAttempt(merged=True, head_sha=self.head_sha())
 
     # ---- produce-then-review commit path ------------------------------------
     #

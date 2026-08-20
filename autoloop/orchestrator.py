@@ -5250,6 +5250,46 @@ class Orchestrator:
         state.phase = Phase.READY.value
         self._store.save(state)
 
+    @staticmethod
+    def _candidate_is_on_task_line(
+        worktree_git: GitGateway, candidate: str, execution: TaskExecution
+    ) -> bool:
+        """Is `candidate` a commit on THIS task's own line of history, with the
+        recorded base already integrated into it? The pre-push authorization
+        that stops an approval publishing something built somewhere else.
+
+        The direct form — the base is an ancestor of the candidate — is the
+        answer for every candidate produced by an ordinary round, and is tried
+        first and unchanged.
+
+        The second form exists for a candidate CARRIED PAST a moved base
+        (`_carry_reviewed_candidate_past`). There the recorded base is a
+        mainline head that was merged INTO the task branch, so the reviewed
+        candidate is that merge's first parent rather than its descendant, and
+        the direct question answers "no" for work that is perfectly sound.
+        Asking the branch TIP instead restores exactly the same guarantee from
+        the other side: the tip must contain the candidate (so the approved
+        commit really is on this task's branch) AND contain the base (so the
+        base really was integrated, not bypassed). Both, or this refuses —
+        neither half is sufficient alone, and a tip that contains only one of
+        them is precisely the unrelated-history case the check exists for.
+
+        THE TIP IS READ AT PUSH TIME, WHICH IS LATER THAN APPROVAL TIME, and
+        that is only safe because of a check twenty lines up. A later round
+        commits on top of the merge and the tip advances, so on its own the
+        second form would accept any candidate ever committed on this branch —
+        a SUPERSEDED one included. `_dispatch_task_push` refuses unconditionally
+        before reaching here unless `execution.candidate_sha` is still exactly
+        the approved sha (`push_candidate_stale`), so a superseded candidate
+        never gets this far. Do not reorder those two, and do not reuse this
+        helper anywhere that check has not already run.
+        """
+        base = execution.task_base_sha
+        if worktree_git.is_descendant(candidate, base):
+            return True
+        tip = worktree_git.head_sha()
+        return worktree_git.is_descendant(tip, candidate) and worktree_git.is_descendant(tip, base)
+
     def _dispatch_task_push(self, directive: Directive, resp: LastResponse) -> None:
         """Publish a produce-then-review candidate via `push_exact`.
 
@@ -5338,7 +5378,7 @@ class Orchestrator:
             )
             return
         worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
-        if not worktree_git.is_descendant(binding.candidate_sha, execution.task_base_sha):
+        if not self._candidate_is_on_task_line(worktree_git, binding.candidate_sha, execution):
             self._to_needs_user(
                 f"task {binding.task_id}: push refused — candidate "
                 f"{binding.candidate_sha[:12]} is not a descendant of task base "
@@ -6410,6 +6450,167 @@ class Orchestrator:
         self._mark_task_completed(task.id)
         return True
 
+    def _carry_reviewed_candidate_past(
+        self, execution: TaskExecution, task: Task, head: str
+    ) -> str:
+        """Merge `head` INTO this task's own branch so a REVIEWED candidate
+        survives the branch head moving under it. Returns `""` when the record
+        was carried forward and saved; otherwise the reason the caller must
+        park with, phrased to follow "the head could not be merged … either —".
+
+        MERGE, NOT RE-BASE, and the difference is the whole point. Re-basing
+        rewrites the reviewed commits, changing their shas — and an approval
+        binds to a candidate by exact sha, so the reviewed object would simply
+        cease to exist. A merge adds one commit and rewrites nothing:
+        `candidate_sha` still resolves, still has the tree the reviewer saw,
+        and is still reachable from the branch tip. Only `task_base_sha` moves.
+
+        WHY `task_base_sha` MOVES TO `head` rather than staying put or naming
+        the merge commit. Every review artifact is a DIRECT tree-to-tree diff
+        of `task_base_sha..candidate_sha` (`range_diff`/`commit_range_paths`
+        are `diff-tree`, not a history walk), so:
+          * leaving the old base would put everything mainline added since
+            into the reviewer's diff and into the `out_of_scope_paths`
+            comparison — a diff of someone else's work, attributed to this
+            task, quite possibly over `RANGE_DIFF_MAX_BYTES`;
+          * naming the merge commit would show only the NEXT round's changes
+            and hide every earlier round from the reviewer.
+        The new head is the one value that yields exactly this task's net
+        change, because the merge already put everything up to `head` on the
+        branch. `candidate_sha`, `candidate_commit_count`, `review_round`,
+        `attempt_count`, `fault_attempt_count` and the ledger are all left
+        alone — a moving base must refill no budget and forget no round.
+
+        FIVE PRECONDITIONS, each of which falls back to the park unchanged.
+        This is deliberately conservative: the park it replaces was correct,
+        so anything this cannot establish stays parked rather than guessed.
+
+          1. The record names a worker repository. `Path("")` resolves to the
+             CWD, so an empty `worktree_path` would otherwise send the probe
+             below at the primary checkout.
+          2. The record names a candidate — there is nothing to preserve, and
+             so nothing to prefer over the ordinary re-base, without one.
+          3. That worker still passes `worker_repo_is_reusable` (exists, is a
+             git repository in its own right, checked out on the recorded
+             branch). RE-PROBED here rather than reading the caller's
+             `worker_reusable` flag: that flag carries the round-0 reuse
+             decision, and a record rescued from any other call site must
+             behave identically. `_dispatch_task_implement` re-probes for the
+             same reason.
+          4. The worker is CLEAN. Merging over uncommitted residue is exactly
+             the quiet discard the refusal exists to prevent — and for a
+             resumed round that residue IS the work being resumed.
+          5. The branch tip contains `candidate_sha`. This is what makes "the
+             approval binding survives" a checked fact rather than an
+             assumption about which commit the branch happens to be sitting on.
+
+        A GENUINE CONFLICT PARKS, unchanged. `merge_foreign_commit` aborts and
+        reports the conflicted paths; resolving them here would be the same
+        silent rewrite of reviewed work, one level down.
+
+        NOT gated by `auto_merge_enabled`, deliberately. That flag exists
+        because auto-merge moves the SHARED branch head with no operator in the
+        loop; this merge moves one worker repository's own private branch and
+        touches neither the primary checkout nor any remote. Gating it would
+        mean a deployment with auto-merge off keeps the park this exists to
+        remove — while still getting a head that moves under it, since an
+        operator merging by hand moves it just as well.
+
+        One interaction worth knowing about rather than guarding: a PENDING
+        COMMIT INTENT from a crash mid-commit is classified further down this
+        dispatch by `reconcile_after_crash`, whose sanity gate is "the intent's
+        expected parent is `task_base_sha` or a descendant of it". After a
+        carry-forward that gate answers no, so such a round parks AMBIGUOUS
+        instead of `task_base_behind_head`. Both are parks needing a human and
+        neither destroys anything, so this does not refuse on that account —
+        but the blocker an operator sees for that (rare) overlap changes.
+        """
+        old_base = execution.task_base_sha
+        worktree_path = (execution.worktree_path or "").strip()
+        if not worktree_path:
+            return "the record names no worker repository"
+        candidate = execution.candidate_sha
+        if not candidate:
+            return "the record names no candidate commit to preserve"
+        if not worker_repo_is_reusable(Path(worktree_path), execution.task_branch):
+            return (
+                f"its worker repository {worktree_path} is not a git repository "
+                f"checked out on {execution.task_branch or '(no branch recorded)'}"
+            )
+        # The scrubbed env is not decoration here either (see the same
+        # construction in `_dispatch_task_implement`): a worker-rooted gateway
+        # without it resolves the CALLING process's ambient git config.
+        worker = GitGateway(Path(worktree_path), self._policy, env=worker_env())
+        try:
+            if worker.is_dirty():
+                return (
+                    "its worker repository has uncommitted changes, and merging "
+                    "over them could destroy work no reviewer has seen"
+                )
+            tip = worker.head_sha()
+            if not worker.is_descendant(tip, candidate):
+                return (
+                    f"its worker branch tip {tip[:12]} does not contain the "
+                    f"reviewed candidate {candidate[:12]}"
+                )
+            attempt = worker.merge_foreign_commit(
+                # Absolute, resolved: the policy layer refuses a relative
+                # fetch source outright, and `GitGateway` does not resolve
+                # `repo_root` for itself.
+                str(Path(self._git.repo_root).resolve()),
+                head,
+                f"autoloop: merge branch head {head[:12]} into task {task.id} "
+                f"(reviewed candidate {candidate[:12]} preserved)",
+            )
+        except (GitError, OSError) as exc:
+            return f"its worker repository could not be merged: {type(exc).__name__}: {exc}"
+
+        if not attempt.merged:
+            self._log(
+                "execution_base_carry_forward_refused",
+                data={
+                    "task_id": task.id,
+                    "old_base": old_base,
+                    "head": head,
+                    "candidate_sha": candidate,
+                    "conflicted_paths": list(attempt.conflicted_paths),
+                    "restored": attempt.restored,
+                    "error": attempt.error,
+                },
+            )
+            detail = (
+                "it conflicts at " + ", ".join(attempt.conflicted_paths)
+                if attempt.conflicted_paths
+                else f"git refused: {attempt.error}"
+            )
+            if not attempt.restored:
+                detail += (
+                    " (and the worker repository is NOT clean again — look at "
+                    f"{worktree_path} before anything else touches it)"
+                )
+            return detail
+
+        execution.task_base_sha = head
+        self._execution_store.save(execution)
+        self._log(
+            "execution_base_carried_forward",
+            data={
+                "task_id": task.id,
+                "old_base": old_base,
+                "new_base": head,
+                "merge_sha": attempt.head_sha,
+                # Every one of these is asserted to be UNCHANGED by this path:
+                # the reviewed object still exists, the round count still says
+                # how many reviews happened, and neither budget was refilled.
+                "candidate_sha": candidate,
+                "review_round": execution.review_round,
+                "attempt_count": execution.attempt_count,
+                "fault_attempt_count": execution.fault_attempt_count,
+                "worktree_path": worktree_path,
+            },
+        )
+        return ""
+
     def _rebase_execution_if_stale(
         self, execution: TaskExecution, task: Task, *, worker_reusable: bool = False
     ):
@@ -6447,8 +6648,19 @@ class Orchestrator:
           RECONCILE, do not park (`_reconcile_published_execution`). Nothing
           would be discarded: the reviewed object is durable on its own branch.
         * A review already happened and the candidate is not published --
-          refuse, naming both shas. Discarding a candidate a reviewer has seen
-          is not a decision to make quietly.
+          CARRY IT FORWARD: merge the current head INTO the task branch
+          (`_carry_reviewed_candidate_past`) and continue at the new base.
+          Only when that cannot be done safely does this still park, naming
+          both shas and the reason. Discarding a candidate a reviewer has seen
+          is not a decision to make quietly -- and a merge discards nothing:
+          every reviewed commit keeps its exact sha and stays reachable, so an
+          approval that binds to one by sha still names an object that exists.
+          The old behaviour was to park here unconditionally, which made HUMAN
+          RESPONSE TIME fatal to a candidate: the head walks forward while a
+          task waits for its blocker to be answered (every other task's
+          completion auto-merges), so answering one park caused the next.
+          23 of 108 parks before 2026-08-20 were this one code; roadmap-01 was
+          unstuck and re-parked four minutes later.
         """
         head = self._git.head_sha()
         base = execution.task_base_sha
@@ -6463,18 +6675,26 @@ class Orchestrator:
         if execution.review_round > 0 and self._reconcile_published_execution(execution, task):
             return None
         if execution.review_round > 0:
+            refusal = self._carry_reviewed_candidate_past(execution, task, head)
+            if not refusal:
+                return execution
             self._to_needs_user(
                 f"task {task.id}: its recorded base {base[:12]} is behind the "
                 f"branch head {head[:12]}, but a review round has already run "
                 f"against candidate {(execution.candidate_sha or '(none)')[:12]}. "
-                "Re-basing would discard work a reviewer has already seen, so "
-                "nothing was changed. Either publish or abandon that candidate, "
-                f"or archive .autoloop/executions/{task.id}.json to start fresh "
-                "at the current head.",
+                f"The head could not be merged into the task branch either — "
+                f"{refusal}. Re-basing would discard work a reviewer has "
+                "already seen, so nothing was changed. Either publish or "
+                "abandon that candidate, or archive "
+                f".autoloop/executions/{task.id}.json to start fresh at the "
+                "current head.",
                 kind="task_fatal",
                 code="task_base_behind_head",
                 task_id=task.id,
-                detail=f"base={base} head={head} review_round={execution.review_round}",
+                detail=(
+                    f"base={base} head={head} "
+                    f"review_round={execution.review_round} refusal={refusal}"
+                ),
             )
             return None
 
