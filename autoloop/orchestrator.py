@@ -278,7 +278,7 @@ from .tasks import (
     effective_approved_paths,
     unauthorized_paths,
 )
-from .transcript import TranscriptLogger
+from .transcript import Stopwatch, TranscriptLogger
 from .validation import run_validation_commands, select_validation_commands
 from .worktask import (
     ATTEMPT_FAULT,
@@ -467,6 +467,16 @@ MODAL_SIGHTED = "the throttle modal is up on a page this loop can drive"
 
 
 class Orchestrator:
+    #: The clock every measured stage duration is read from (prof-01,
+    #: 2026-08-20). MONOTONIC, not wall clock: this measures an interval, and
+    #: `utcnow_iso` — the thing the transcript already stamps — is the wall
+    #: clock, which an NTP step or a DST edge can move underneath a running
+    #: operation. Held as a class attribute rather than a constructor
+    #: parameter so no existing construction site changes; a test that needs a
+    #: controlled elapsed time sets `orch._timing_clock = fake`, and the
+    #: instance attribute shadows this.
+    _timing_clock = staticmethod(time.monotonic)
+
     def __init__(
         self,
         config: AutoloopConfig,
@@ -872,6 +882,12 @@ class Orchestrator:
         # names every part id. Hashing the DELIVERED message instead would let
         # an approval bind to a review of less than the whole change — the
         # replay gap `report_sha256` exists to close.
+        #
+        # Measured from here — the first line of packet CONSTRUCTION — to the
+        # `request_prepared` record below. Everything inside is work this step
+        # actually does: planning the delivery, reading the repository for the
+        # context, hashing the payload, rendering the prompt.
+        prepare_watch = self._stopwatch()
         plan = self._plan_delivery(state, request_id)
         ctx = build_context(
             state,
@@ -980,14 +996,14 @@ class Orchestrator:
         self._log(
             "request_prepared",
             request_id=request_id,
-            data={
+            data=prepare_watch.stamp({
                 "head_sha": ctx.head_sha,
                 "base_sha": ctx.base_sha,
                 "report_sha256": ctx.report_sha256,
                 "timestamp": ctx.timestamp,
                 "chars": len(prompt),
                 "diff_parts": len(plan.parts) if plan is not None else 0,
-            },
+            }),
         )
         self._store.save(state)
 
@@ -1408,6 +1424,15 @@ class Orchestrator:
         # unattributable.
         req.provider = self.active_provider()
         self._store.save(state)
+        # Measured around the SEND itself, at its call site — not around the
+        # attach, the controlled reload or the duplicate check above, which are
+        # separate transport work and would inflate this into a second gap
+        # number wearing a measured label. Those stay inside the
+        # `request_prepared` → `request_submitted` gap, where the profiler
+        # already says the window is wider than the work. Every early return
+        # above and below leaves the round unsent, so none of them stamps a
+        # duration — a rejected or unconfirmed send is not a completed submit.
+        submit_watch = self._stopwatch()
         try:
             # The attachment rides with the request it belongs to. Passed
             # positionally-by-name so a provider that does not accept it fails
@@ -1462,7 +1487,7 @@ class Orchestrator:
         self._log(
             "request_submitted",
             request_id=req.request_id,
-            data={"result": result.value, "prompt": req.prompt},
+            data=submit_watch.stamp({"result": result.value, "prompt": req.prompt}),
         )
         self._store.save(state)
 
@@ -4341,6 +4366,14 @@ class Orchestrator:
         # and re-dispatches the same directive (executors must tolerate that;
         # re-entering here re-loads the same `execution` record above).
         self._store.save(state)
+        # THE stage that had no recorded duration at all before prof-01: the
+        # implementation agent, minutes per round, plus the validation run that
+        # follows it. Started BEFORE the branch below, not inside one of its
+        # arms — production always takes the escape-detection path, so a
+        # stopwatch started in the `else` would have measured nothing that
+        # actually runs. The escape snapshots are inside the window on purpose:
+        # they are part of what this round spends to produce a candidate.
+        execute_watch = self._stopwatch()
         if self._worker_repos is not None and not is_audit:
             # M1 finding #1 (escape detection): bracket the write-capable
             # call with a filesystem snapshot of the PRIMARY checkout. See
@@ -4357,15 +4390,25 @@ class Orchestrator:
         else:
             outcome = self._executor.execute(directive, task)
         state.last_validation = outcome.validation or "(none)"
+        # `request_id` at last: the review request whose directive dispatched
+        # this round. Without it `directive` -> `executed` could not be paired
+        # by anything, which is why the loop's single most expensive stage had
+        # no timing of any kind. Read from `state.last_response` rather than
+        # threaded down as a parameter — this method is reached from three
+        # dispatch paths and is re-entered verbatim after a crash in
+        # `executing`, and on that re-entry the response is exactly what the
+        # loop resumed from. Omitted, never invented, when there is none.
+        response = state.last_response
         self._log(
             "executed",
-            data={
+            request_id=response.request_id if response is not None else None,
+            data=execute_watch.stamp({
                 "decision": directive.decision.value,
                 "task_id": task.id,
                 "status": outcome.status,
                 "summary": outcome.summary,
                 "validation": outcome.validation,
-            },
+            }),
         )
         if outcome.status != "ok":
             # THE measured case (exec-01, brw-11): the executor came back
@@ -6928,3 +6971,14 @@ class Orchestrator:
             request_id=request_id,
             data=data,
         )
+
+    def _stopwatch(self) -> Stopwatch:
+        """Start measuring one operation. Total — never raises, never blocks.
+
+        The whole timing path is `Stopwatch(clock)` here and `watch.stamp(...)`
+        at the completion event this method's caller already emits. There is no
+        new event, no second store, and no branch that depends on the result:
+        an operation whose duration could not be read logs exactly the record
+        it logged before this existed.
+        """
+        return Stopwatch(self._timing_clock)

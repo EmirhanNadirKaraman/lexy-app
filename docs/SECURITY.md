@@ -43,6 +43,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
 | S35 | INFO | The merge sweep now auto-resolves ONE conflict shape without a human (2026-08-19, docs-01): two branches each appending change-note lines to the terminal append-only section of `docs/SUMMARY.md` / `docs/TESTS.md`. Bounded: two literal paths, each side's section must extend the merge base byte-for-byte, a conflict anywhere else in the file or the merge refuses the whole merge, and every decision is in the transcript. Replaces S34 (`merge=union`), which disabled conflict detection for the whole file | `autoloop/note_merge.py`, `autoloop/auto_merge.py`, `autoloop/git_gateway.py` |
+| S36 | INFO | `profile` (prof-01, 2026-08-20) is the first command whose whole job is to read `transcript.jsonl`, which holds complete review packets (`request_submitted.data.prompt`) and complete reviewer replies (`response_received.data.raw`). Bounded structurally: the renderer receives only per-stage floats and static stage labels, so no record body can reach stdout — do not add a flag that prints one. `--transcript FILE` changes only WHICH file is read, and the bound is input-independent | `autoloop/cli.py`, `autoloop/transcript.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -1477,6 +1478,76 @@ be written by the tasks that would need to append to it, and the trackers stop
 being readable as one document. Do NOT "fix" it by adding paths to
 `NOTE_TRACKERS`; every entry there is a file the loop may merge without a
 human.
+
+---
+
+### S36 — `profile` reads a transcript that holds whole packets and whole reviewer replies — INFO — OPEN (bounded by design, accepted)
+
+**Location:** `autoloop/cli.py` (`_cmd_profile`), `autoloop/transcript.py`
+(`read_records`, `profile_stages`, `render_profile`).
+
+**Severity:** INFO. No new data is written and no new reader is granted: the
+transcript already sits in `state_dir` at the operator's own permissions, and
+this command reads a file the operator can already `cat`. It is recorded
+because prof-01 (2026-08-20) added the FIRST command whose whole job is to read
+that file and print from it, which makes what it prints a control rather than
+an accident.
+
+**What is in the file.** `transcript.jsonl` carries `request_submitted.data.
+prompt` (the complete review packet, including the diff) and
+`response_received.data.raw` (the complete reviewer reply). Both are logged
+verbatim, deliberately — the transcript is the audit log. Anything that reads
+it and emits somewhere else is a disclosure surface.
+
+**What bounds it today.** `profile` prints AGGREGATES only: per-stage count,
+median, mean, p90 and total, plus stage names and fixed explanatory prose. It
+never renders a record body, a `data` value, a `request_id`, a sha or a task
+id. `render_profile` is a pure function over `StageProfile` objects that hold
+nothing but floats and the static `Stage` descriptions, so there is no path
+from a packet body to stdout — a stronger property than "we remembered not to
+print it".
+
+**`--transcript FILE` does not widen this.** The flag chooses WHICH file the
+reader opens — an archived or rotated transcript instead of the configured one
+— and the structural bound above is input-independent: whatever the file
+contains, the renderer still receives only floats and static stage labels. So
+pointing it at a file that is not a transcript prints "no usable records", not
+the file. It grants no read the operator does not already have (the process
+runs as them, and `open()` is subject to the same permissions as `cat`), and it
+is deliberately a PATH argument, not a glob or a directory walk — one open, one
+report. Pinned by
+`test_transcript_override_of_a_non_transcript_prints_no_content`.
+
+**The residual:** timing itself is information. A reader of the output learns
+how many review rounds ran and how long each stage took. That is the point of
+the command and is not treated as sensitive here.
+
+**Do not** add a `--raw`, `--events`, `--tail` or `--request <id>` flag that
+prints record bodies. If per-request detail is ever genuinely needed, print
+identifiers and durations only, and re-review this entry first.
+
+**Verification check:**
+```bash
+# The renderer must build output only from stats/labels, never from a record's
+# `data` — expect NO hit for a data-body read in the rendering path:
+rg -n 'data\[|\.get\("data"\)' autoloop/transcript.py | rg -n 'render|_stats_line'
+# And the command must not have grown a body-printing flag. Read the flag list
+# ITSELF rather than grepping a fixed window for forbidden words: a window
+# sized to today's block stops covering the flags a later one adds, and the
+# words themselves appear innocently in `_cmd_profile`'s own docstring (it
+# names `response_received.data.raw` to explain what it must never print).
+# EXPECT EXACTLY ONE LINE: `"--transcript",`
+rg -n 'if name == "profile"' -A 8 autoloop/cli.py | rg '"--'
+```
+Pinned by
+`autoloop/tests/test_profile.py::test_profile_prints_only_aggregates_never_a_record_body`,
+which writes a transcript containing a marked packet body and a marked reviewer
+reply and asserts neither reaches stdout.
+
+**Suggested fix if the bound ever breaks:** keep the read/render split — the
+tolerant reader may see everything, the renderer may only receive numbers — and
+extend the test above with the new marker rather than reviewing the output by
+eye.
 
 ---
 

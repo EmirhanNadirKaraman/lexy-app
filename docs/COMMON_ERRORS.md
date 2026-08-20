@@ -2301,6 +2301,64 @@ did not expect (check the summary's "Domain charters came from …" clause and
 the coverage table), that is the same setting working: some checkout in the
 chain ships a charter file.
 
+### A test asserting a phrase in CLI output fails, and the phrase is visibly there when you print it
+**Symptom:** `assert "every record here predates measured durations" in out`
+fails against `autoloop profile`'s output, but the sentence reads correctly on
+screen. Grepping the source finds the string, spelled exactly.
+**Cause:** the renderer word-wraps its explanatory notes
+(`transcript._wrapped_note`, 74 columns), and the wrap fell inside the phrase:
+
+```
+  measured     n=0
+               no record of type 'request_prepared' carries a duration_seconds; every
+               record here predates measured durations
+```
+
+The rendered TEXT contains `"...; every\n               record here..."`, so the
+substring the test looks for does not exist in it. Nothing is wrong with either
+the assertion or the sentence — they simply cannot both be about a string a
+formatter is free to break.
+**Fix:** applied repo-side — the note is emitted as TWO `_wrapped_note` calls,
+so the load-bearing sentence is short enough (45 chars) that no wrap can split
+it. Do NOT fix it by weakening the assertion to a fragment, normalising
+whitespace in the test, or widening the wrap column: each of those leaves the
+next reformat free to break the same test again, and the first also stops the
+test checking the thing it was written for.
+**The general lesson:** if a test asserts on wrapped or formatted output, the
+asserted phrase must be short enough to be unbreakable by the formatter, or the
+formatter must be handed the phrase as its own unit.
+
+### `autoloop profile` reports `execute  measured  n=0` on a live loop while the orchestrator tests all pass
+**Symptom:** the timing instrumentation is committed and green, but a real
+`.autoloop/transcript.jsonl` shows `duration_seconds` on `request_prepared` and
+`request_submitted` and never on `executed`. The `execute` stage reports `n=0`
+measured with a gap-derived row beside it — the exact hole the measurement was
+added to close.
+**Cause:** the executor is dispatched from a BRANCH, and production and half
+the test suite take different arms of it
+(`orchestrator._dispatch_task_postcommit`):
+
+```python
+if self._worker_repos is not None and not is_audit:
+    outcome = self._execute_with_escape_detection(directive, task)   # production
+else:
+    outcome = self._executor.execute(directive, task)                # some tests
+```
+
+A stopwatch started inside the `else` measures only the second arm. Every
+`build()`-based test in `test_orchestrator.py` takes it (no `worker_repos`), so
+they pass — while every real round, and every `build_postcommit()` test, goes
+through the escape-detection arm and records nothing. The failure is silent in
+exactly the place a passing suite is most persuasive.
+**Fix:** applied repo-side — the stopwatch is started BEFORE the `if`, so both
+arms are inside the window, and `test_orchestrator.py::test_executed_carries_
+its_request_id_and_a_measured_duration` uses `build_postcommit` (worker repos
+present) rather than `build`. The escape-detector snapshots are inside the
+measured window deliberately: they are part of what the round spends.
+**The general lesson:** when adding instrumentation around a call that appears
+more than once, check which call site production actually reaches before
+choosing a test harness — and pick the harness that exercises that one.
+
 ---
 
 ## Adding an entry
