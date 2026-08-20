@@ -567,6 +567,81 @@ upgrade counts as a new run, because it is one.
 
 ---
 
+### 3f-quinquies. `shipped-report` — did this completed task's work ever land?
+
+```bash
+python -m autoloop shipped-report [--repo PATH] [--base REV]   # read-only, no lock
+```
+
+`merge-backlog` (§3f-ter) asks whether a completed task's **branch** is in the
+base, which needs the branch to still exist and an execution record to name it.
+On 2026-08-17 four completed tasks had neither and held every sweep, because
+nothing on disk named the work they shipped. All four were resolved by hand with
+one query — find the commits whose SUBJECT names the task id, then ask git
+whether any of them is an ancestor of the base head:
+
+```
+audit-0001 -> 07b659b     dash-02 -> dd28dfa
+pkt-02     -> 95b77a1     pkt-03  -> 0fcc1c6   (shipped as four "pkt-03, part N" commits)
+```
+
+This command is that query, run for every COMPLETED task in the registry. It
+claims **one** thing: *given a completed task id, is there a commit whose subject
+names that id, and is that commit an ancestor of the base head.* Not that the
+capability exists, not that it works, not that the task may be retired.
+
+* **It reports and never acts.** No `tasks.json` write, no execution record, no
+  merge, no ref moved, no priority, status or blocker touched. Nothing is
+  retired, completed, reopened or unblocked on the strength of its output — an
+  operator reads it and decides.
+* **Read-only against a live loop.** Every git call goes through the dashboard's
+  `_run_status`, which injects `--no-optional-locks`, so it can run beside a
+  running loop without dirtying the checkout the escape detector watches.
+* **NO MENTION is not "not shipped".** A task id that appears in no commit
+  subject is `unknown`. The work may have shipped under a subject that never
+  named the id; treating absence of a mention as evidence is the fail-open
+  reading this exists to avoid, and it is the one that would licence redoing
+  work that already landed.
+* **"git could not answer" is a third state.** `unverified` covers both a search
+  that failed and a matching commit git could not resolve against the base head.
+  It is never rounded down to `not-in-base` and never up to `unknown`, and one
+  indeterminate commit does not erase a definite ancestor found on another —
+  a row with one confirmed ancestor and one unreadable match is `shipped`, with
+  both still listed.
+* **Ancestry decides, and only ancestry.** `merge-base --is-ancestor`, through
+  the same `dashboard.is_ancestor` the merge panel uses. A subject mention is
+  the thing to TEST, never the answer.
+* **Whole-token matching.** The boundary is the task-id alphabet itself
+  (`[A-Za-z0-9._-]`, from `tasks._ID_RE`), so `pkt-03` matches `pkt-03, part 1`
+  and `Merge task pkt-03 (0fcc1c6) …` but not `pkt-030`, `x-pkt-03` or
+  `pkt-03.5`. Documented cost: `.` is a legal id character, so a subject ending
+  `…pkt-03.` does not match — a missed mention is `unknown`, which is the safe
+  direction, where widening the class would make a neighbouring id match.
+* **Every match is retained.** `pkt-03`'s four part-commits print as four lines
+  of evidence under one verdict, each with its own `in-base` / `not-in-base` /
+  `unverified` classification. The aggregate is a reading of that list, never a
+  replacement for it.
+* **The search walks every ref** (`git log --all`), not the base head — a commit
+  that is not an ancestor cannot be found by walking the thing it is not an
+  ancestor of. Residual blind spot, stated rather than hidden: a commit on no
+  ref at all is invisible and reads as `unknown`.
+* **Exit codes.** 0 = every completed task got an answer, and "no commit subject
+  names this id" IS an answer. 1 = at least one row could not be judged, or the
+  base head could not be resolved and nothing was reported at all.
+
+| Row | What it means | What it does NOT mean |
+|---|---|---|
+| `SHIPPED` | a commit naming the id is an ancestor of the base head | that the task's capability is complete |
+| `NOT IN BASE` | commits name it; git resolved every one and none is an ancestor | that the work does not exist |
+| `NO MENTION` | the search ran; no subject names the id | that the work never shipped |
+| `UNVERIFIED` | the search failed, or a match could not be resolved | anything at all about the work |
+
+Code: `dashboard.shipped_report` / `shipped_states` / `mentions_task_id` /
+`commit_subjects`, printed by `cli._format_shipped`. Tests:
+`autoloop/tests/test_roadmap_ancestry.py`, against real repositories.
+
+---
+
 ### 3e. Heartbeat + the durable monitor
 
 ```bash

@@ -10,6 +10,7 @@
     python -m autoloop smoke-browser [--config PATH]
     python -m autoloop pause | resume | unlock | reset --yes [--tasks]
     python -m autoloop merge-window [--wait] | merge-backlog
+    python -m autoloop shipped-report [--repo PATH] [--base REV]  (read-only)
     python -m autoloop reprovision-publisher --confirm
     python -m autoloop review-changeset --base <sha> --candidate <sha> [--packet FILE]
 
@@ -17,9 +18,9 @@ Locking: run / resume / reset / smoke-browser / answer / retire / release /
 merge-backlog take
 the single-instance lock on the state directory (fail closed against a live
 process; `unlock` is the only stale-lock recovery, and it refuses live locks).
-status / tasks / doctor / next-task / blockers / pause / merge-window stay
-available while locked — they only report. `merge-backlog` moves the branch
-head, so it does not.
+status / tasks / doctor / next-task / blockers / pause / merge-window /
+shipped-report stay available while locked — they only report. `merge-backlog`
+moves the branch head, so it does not.
 
 **Blockers (`blockers.py`).** `run --continuous` no longer stops on every
 park: a `task_fatal` one (see `orchestrator._to_needs_user`'s classification)
@@ -3145,6 +3146,118 @@ def _cmd_merge_backlog(args: argparse.Namespace) -> int:
     return 0 if result.is_clear else 1
 
 
+#: How a `shipped-report` row's state is labelled for an operator. The words are
+#: pinned here rather than derived from the state slug because two of them carry
+#: the distinction the whole report exists for: NO MENTION is not "not shipped",
+#: and UNVERIFIED is not either.
+SHIPPED_LABELS = {
+    "shipped": "SHIPPED     ",
+    "not-in-base": "NOT IN BASE ",
+    "unverified": "UNVERIFIED  ",
+    "unknown": "NO MENTION  ",
+}
+
+
+def _format_shipped(report: dict) -> list[str]:
+    """One block of operator-facing lines for a finished shipped-report.
+
+    Every matching commit is printed with its OWN ancestry verdict, not just the
+    aggregate: four `pkt-03, part N` commits are four lines of evidence, and a
+    task whose evidence is split (one commit in the base, one not) must show
+    both — the aggregate is a reading of the list, never a replacement for it.
+    """
+    from .dashboard import SHIPPED_STATES
+
+    rows = report.get("rows") or []
+    lines = [
+        f"shipped report — base {report.get('base_branch')} at "
+        f"{report.get('base_head') or '(unreadable)'}"
+    ]
+    if not report.get("searched"):
+        lines.append(
+            "  commit subjects could NOT be searched — every row below is "
+            "unverified for that one reason, and none of them says anything "
+            "about whether the work landed"
+        )
+    else:
+        lines.append(
+            f"  searched {report.get('searched_commits', 0)} commit subject(s) "
+            "on every ref"
+        )
+    counts = report.get("counts") or {}
+    lines.append(
+        "  " + ", ".join(f"{state} {counts.get(state, 0)}" for state in SHIPPED_STATES)
+    )
+    if not rows:
+        lines.append("  no completed task to report on")
+        return lines
+    for row in rows:
+        label = SHIPPED_LABELS.get(row.get("state") or "", "?           ")
+        lines.append(f"  {label} {row.get('id')} — {row.get('title')}")
+        lines.append(f"               {row.get('detail')}")
+        for commit in row.get("commits") or ():
+            lines.append(
+                f"               {commit.get('ancestry') or '':<12} "
+                f"{commit.get('sha')}  {commit.get('subject')}"
+            )
+    lines.append(
+        "  NO MENTION means no commit subject names the id — it is not evidence "
+        "that the work is missing, and this report never acts on any row."
+    )
+    return lines
+
+
+def _cmd_shipped_report(args: argparse.Namespace) -> int:
+    """For every COMPLETED task: which commits name it, and are any in the base?
+
+    Read-only and lock-free, deliberately — it may run alongside a live loop.
+    It answers ONE question and claims nothing else: given a completed task id,
+    is there a commit whose SUBJECT names that id, and is that commit an
+    ancestor of the base head. It reads no source, decides nothing about
+    capabilities, and writes nothing at all: no registry save, no execution
+    record, no merge, no ref, no priority, no status. Nothing here retires,
+    completes, reopens or unblocks a task on the strength of its own output.
+
+    Exists because on 2026-08-17 four completed tasks held every merge sweep
+    with no record naming the work they shipped, and all four were resolved by
+    hand with exactly this query. See `dashboard.shipped_report`.
+
+    The registry is read through the config, like every other read-only command
+    here; the git half reads `--repo` (default: the current checkout), because
+    the commits and the base head are properties of a checkout rather than of
+    the state dir.
+
+    Exit 0 means every completed task got an ANSWER, which includes "no commit
+    subject names this id" — that is a real answer to the question asked. Exit 1
+    means at least one row could not be judged (the search failed, or git could
+    not resolve a matching commit against the base head), because "I could not
+    look" must not read the same as "I looked, and here is the answer".
+    """
+    from . import dashboard
+
+    config = load_config(args.config)
+    _, registry = _load_tasks(config)
+    repo = args.repo or Path.cwd()
+    head = dashboard.resolve_commit(repo, args.base)
+    if not head:
+        print(
+            f"cannot resolve {args.base!r} in {repo} — the base head is what "
+            "every row is judged against, so nothing is reported rather than "
+            "reporting against a head nobody could read"
+        )
+        return 1
+    branch = args.base
+    roadmap = [
+        {"id": task.id, "title": task.title, "status": task.status}
+        for task in registry.all_tasks()
+    ]
+    report = dashboard.shipped_report(repo, roadmap, head, branch)
+    for line in _format_shipped(report):
+        print(line)
+    unjudged = report["counts"].get("unverified", 0)
+    return 1 if unjudged or not report.get("searched") else 0
+
+
 def _cmd_pause(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     config.pause_file.parent.mkdir(parents=True, exist_ok=True)
@@ -3345,6 +3458,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_config(backlog)
     backlog.set_defaults(func=_cmd_merge_backlog)
+
+    shipped = sub.add_parser(
+        "shipped-report",
+        help=(
+            "for every completed task: which commit subjects name it, and is "
+            "any of them an ancestor of the base head? (read-only, no lock, "
+            "never acts)"
+        ),
+    )
+    add_config(shipped)
+    shipped.add_argument(
+        "--repo", type=Path, default=None,
+        help="checkout whose commits are searched (default: cwd)",
+    )
+    shipped.add_argument(
+        "--base", default="HEAD",
+        help=(
+            "the base head every matching commit is judged against "
+            "(default: HEAD)"
+        ),
+    )
+    shipped.set_defaults(func=_cmd_shipped_report)
 
     healthp = sub.add_parser(
         "health",
