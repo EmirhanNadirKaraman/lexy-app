@@ -271,6 +271,21 @@ validation_commands = [
 # which that commit never touched. It imports autoloop.publisher directly, so a
 # reachability model selects it and a name-matching one ships the regression.
 #
+# An import name is read in the importing FILE's context, not only at the repo
+# root. autoloop/tests/ has no __init__.py, so pytest puts that directory on
+# sys.path and its modules import each other by bare name (subtitle-scraper/ does
+# the same through sys.path.insert); resolving only full dotted names dropped
+# those edges silently, and a change to an imported test helper then omitted the
+# untouched modules that run it. When one bare name could mean two files, every
+# candidate gets an edge — over-running a test is recoverable, skipping one is not.
+#
+# A BOUND ON THE SAVING, so the numbers in the summary are not a surprise:
+# autoloop/tests/conftest.py imports autoloop.orchestrator, and a conftest counts
+# as imported by every file beneath it, so a change to almost any autoloop module
+# selects the whole autoloop/tests tree. That is sound — those tests really do
+# execute that conftest — and what such a round saves is the OTHER commands above
+# (the root tests/ suite, the isolated re-run) being skipped as unreachable.
+#
 # Selection only ever narrows when it can prove the narrowing; everything else
 # widens to the whole suite. A commit touching a non-Python file (a .toml a test
 # reads, a fixture, docs), an unparseable module, a checkout too large to parse,

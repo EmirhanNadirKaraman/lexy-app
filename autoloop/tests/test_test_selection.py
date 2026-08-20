@@ -11,6 +11,11 @@ matter more than the rest and are pinned first:
   fixture;
 * every case where reachability cannot be established runs the whole suite.
 
+A block in the middle pins the resolution rule those two properties rest on: an
+import NAME is looked up in the importing file's own directory context, not only
+at the repo root, because `autoloop/tests/` is not a package and its modules
+import each other by bare name — including this one, twice, at the top.
+
 A third block, at the bottom, pins the PHASE this round reached. A loop round
 validates twice — once inside `ImplementExecutor` before the commit, once
 against the committed worktree — and only the second is narrowed here, because
@@ -216,6 +221,155 @@ def test_an_unreachable_test_is_omitted(repo):
     assert chosen.selected == ("suite/test_lonely.py",)
     assert "suite/test_unrelated.py" not in chosen.selected
     assert "suite/test_smoke.py" not in chosen.selected
+
+
+# ---- bare sibling imports are real edges ------------------------------------
+#
+# `autoloop/tests/` has no `__init__.py`, so pytest's prepend import mode puts it
+# on `sys.path` and the files in it import each other by BARE name — this module
+# does it twice, at the top. Resolving an import name only against the repo root
+# made `test_implement_executor` match nothing and dropped the edge silently, so
+# a change to an imported test/helper module selected the changed file and
+# omitted the untouched modules that import and execute it (found in review,
+# 2026-08-20). Both tests below fail on that resolution and pass on the current
+# one.
+
+
+def test_a_bare_sibling_import_is_a_real_edge_in_the_real_repository():
+    """The repository's own pattern, asserted as an EDGE rather than as a
+    selection.
+
+    The selection assertion alone would be vacuous here: this file contains the
+    string `"python3"` (the `SUITE` constant above), which puts it in
+    `graph.opaque` and therefore on the frontier for every change — it would come
+    back "selected" even with the edge missing. The `importers` assertion is the
+    one that can tell the two apart, and it is false unless the bare name
+    resolves in this file's own directory.
+    """
+    graph = build_import_graph(REPO_ROOT)
+    me = "autoloop/tests/test_test_selection.py"
+
+    for imported in (
+        "autoloop/tests/test_implement_executor.py",
+        "autoloop/tests/test_orchestrator.py",
+    ):
+        assert me in graph.importers.get(imported, frozenset()), (
+            f"the bare `from ... import` of {imported} at the top of this module "
+            "is a real import edge and must be in the graph"
+        )
+
+    chosen = selection(
+        REPO_ROOT,
+        ["autoloop/tests/test_implement_executor.py"],
+        commands=(
+            RUFF,
+            ("python3", "-m", "pytest", "autoloop/tests", "-q", "-n", "auto"),
+        ),
+    )
+    assert not chosen.widened
+    assert me in chosen.selected
+
+
+def sibling_tree(root: Path) -> Path:
+    """A non-package test directory whose files import each other by bare name.
+
+    Deliberately free of the literals `_file_is_opaque` watches for — no
+    `"python"`, no `importlib` — so nothing here is opaque and every selection
+    below is carried by an import edge rather than by the frontier.
+
+    The chain is `pkg/core.py` → `suite/helper.py` → `suite/test_middle.py` →
+    `suite/test_outer.py`, and only the FIRST hop is a dotted import; the other
+    two are bare sibling names. `suite/test_apart.py` joins nothing, which is
+    what distinguishes reachability from "everything in the directory".
+    """
+    write(root, "pkg/__init__.py", "")
+    write(root, "pkg/core.py", "def core():\n    return 7\n")
+    write(
+        root,
+        "suite/helper.py",
+        "from pkg.core import core\n\n\ndef helped():\n    return core()\n",
+    )
+    write(
+        root,
+        "suite/test_middle.py",
+        "from helper import helped\n\n\ndef test_middle():\n    assert helped() == 7\n",
+    )
+    write(
+        root,
+        "suite/test_outer.py",
+        "from test_middle import test_middle\n\n\ndef test_outer():\n"
+        "    test_middle()\n",
+    )
+    write(root, "suite/test_apart.py", "def test_apart():\n    assert True\n")
+    return root
+
+
+def test_a_sibling_import_edge_is_transitive_and_deterministic(tmp_path):
+    """Two bare hops away from the changed production module, and still selected.
+
+    `suite/test_outer.py` imports no production code at all — its only route to
+    `pkg/core.py` runs through two sibling test modules — which is the shape the
+    repo-root-only resolution could not see.
+    """
+    root = sibling_tree(tmp_path / "siblings")
+    graph = build_import_graph(root)
+
+    assert not graph.opaque, "an opaque file would make the assertions below vacuous"
+    assert "suite/test_middle.py" in graph.importers["suite/helper.py"]
+    assert "suite/test_outer.py" in graph.importers["suite/test_middle.py"]
+
+    first = select_validation_commands(COMMANDS, ["pkg/core.py"], root)
+    second = select_validation_commands(COMMANDS, ["pkg/core.py"], root)
+
+    assert not first.widened
+    assert first.selected == ("suite/test_middle.py", "suite/test_outer.py")
+    assert "suite/test_apart.py" not in first.selected
+    assert first.selected == second.selected, "same diff, same answer"
+    assert first.commands == second.commands
+    assert first.evidence() == second.evidence()
+
+
+def test_a_changed_sibling_helper_selects_the_modules_that_import_it(tmp_path):
+    """The reviewer's case in miniature: the changed file is itself a module
+    other test files import by bare name, and they run too."""
+    root = sibling_tree(tmp_path / "helper-change")
+
+    chosen = select_validation_commands(COMMANDS, ["suite/helper.py"], root)
+
+    assert not chosen.widened
+    assert chosen.selected == ("suite/test_middle.py", "suite/test_outer.py")
+
+
+def test_an_ambiguous_bare_import_gets_an_edge_to_every_candidate(tmp_path):
+    """Two files can answer to one bare name — one at the repo root, one beside
+    the importer — and which wins depends on `sys.path` order this cannot know.
+    So it does not choose: both get the edge, because an extra edge only runs
+    more tests while a wrong choice drops a test that executes the change."""
+    root = tmp_path / "ambiguous"
+    write(root, "shared.py", "VALUE = 1\n")
+    write(root, "suite/shared.py", "VALUE = 2\n")
+    write(
+        root,
+        "suite/test_uses.py",
+        "from shared import VALUE\n\n\ndef test_value():\n    assert VALUE\n",
+    )
+    graph = build_import_graph(root)
+
+    assert "suite/test_uses.py" in graph.importers["shared.py"]
+    assert "suite/test_uses.py" in graph.importers["suite/shared.py"]
+    for changed in ("shared.py", "suite/shared.py"):
+        chosen = select_validation_commands(COMMANDS, [changed], root)
+        assert chosen.selected == ("suite/test_uses.py",), changed
+
+
+# Nothing here pins the ABSENCE of an edge. `_import_roots` excludes package
+# directories (Python 3 has no implicit relative imports, so a bare name inside
+# `autoloop/` does not reach `autoloop/publisher.py` — `from .publisher import`
+# does, and `_imported_modules` already resolves that), but that is a precision
+# choice, not a guarantee. Asserting it would make an under-selection into a
+# contract, and the direction this model is allowed to be wrong in is the other
+# one: a directory that gains an `__init__.py` while still being imported from by
+# bare name is a reason to widen the rule, not to defend a test of it.
 
 
 # ---- what the graph cannot see is never assumed away ------------------------

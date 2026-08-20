@@ -371,6 +371,30 @@ def run_validation_commands(
 # `publisher.py` under that model, which is the property this whole section
 # exists to have.
 #
+# AN IMPORT NAME IS RESOLVED IN THE IMPORTING FILE'S CONTEXT, NOT ONLY AT THE
+# REPO ROOT. `autoloop/tests/` has no `__init__.py`, so pytest's prepend import
+# mode puts that directory on `sys.path` and its files import each other by BARE
+# name — `from test_implement_executor import ...`, which this very repository's
+# tests really do, and which `subtitle-scraper/`'s `sys.path.insert` siblings do
+# too (CLAUDE.md §10). Indexing every file only by its full dotted path
+# (`autoloop.tests.test_implement_executor`) made those names resolve to nothing
+# and the edges were dropped silently: a change to an imported test/helper module
+# then selected the changed file itself while OMITTING the untouched modules that
+# import and execute it — the exact reachability guarantee this section exists to
+# provide (found in review, 2026-08-20). So each file's imports are resolved
+# against every directory that could plausibly be on `sys.path` when it runs: the
+# repo root, plus each of its own ancestor directories that is NOT a package.
+# Package directories are excluded because Python 3 has no implicit relative
+# imports — inside `autoloop/`, a bare `import publisher` does not find
+# `autoloop/publisher.py` — and a relative `from .publisher import ...` is already
+# resolved by `_imported_modules`.
+#
+# When a name resolves under more than one of those roots, or to more than one
+# file under the same root, EVERY candidate gets an edge. That is what "fail
+# conservatively rather than guessing" means in this direction: an extra edge can
+# only make more tests run, whereas picking one candidate and being wrong drops a
+# test that executes the change.
+#
 # WHAT IT CANNOT SEE, AND WHAT IS DONE ABOUT IT. A static graph misses coupling
 # that is not an import statement: `importlib.import_module`, `__import__`,
 # `pytest.importorskip`, a test that spawns a fresh interpreter, and a file that
@@ -382,6 +406,15 @@ def run_validation_commands(
 # suite. Every judgement in this section resolves the same way — when
 # reachability cannot be established, the answer is "run everything", never
 # "assume unrelated".
+#
+# A KNOWN BOUND ON THE SAVING, stated because it is easy to over-read the
+# feature: `autoloop/tests/conftest.py` imports `autoloop.orchestrator`, which
+# imports most of the package, and a conftest is treated as imported by every
+# file beneath it. So a change to almost any `autoloop/` module selects the whole
+# `autoloop/tests` tree — soundly, since every test in it really does execute
+# that conftest. What such a round saves is the OTHER configured commands (the
+# root `tests/` suite, the `isolated` re-run) being skipped as unreachable, and
+# the counts `evidence()` reports say plainly which case a round is in.
 
 #: The two answers to "which tests does this commit need?", i.e. the accepted
 #: values of `[audit] test_selection`.
@@ -548,6 +581,58 @@ def _module_parts(rel: str) -> tuple[str, ...]:
     return tuple(parts[:-1]) + (parts[-1][:-3],)
 
 
+def _package_dirs(files: Sequence[str]) -> frozenset[str]:
+    """Every directory in the checkout that holds an `__init__.py`.
+
+    The repo root itself can be one (`""`), and that is fine: it is added to
+    `_import_roots` unconditionally, since it is on `sys.path` for any
+    `python3 -m pytest` run started there.
+    """
+    dirs: set[str] = set()
+    for rel in files:
+        if PurePosixPath(rel).name == "__init__.py":
+            parent = PurePosixPath(rel).parent.as_posix()
+            dirs.add("" if parent == "." else parent)
+    return frozenset(dirs)
+
+
+def _import_roots(rel: str, packages: frozenset[str]) -> tuple[str, ...]:
+    """Directories an ABSOLUTE import inside `rel` could resolve against.
+
+    The repo root, plus EVERY ancestor directory of `rel` that is not a package.
+
+    That is deliberately WIDER than Python's own rule, which would stop at the
+    first non-package ancestor (the directory pytest's prepend import mode
+    inserts, and the one `subtitle-scraper/`'s `sys.path.insert` idiom inserts).
+    Stopping there is not enough for this repository: the backend suite runs with
+    a cwd of `lexy-app/backend` (`docs/TESTS.md`), so its tests' bare
+    `from services import ...` resolves under a directory that is NOT their
+    prepend root, and the first-ancestor rule would drop those edges — the same
+    class of silent drop this whole resolution change exists to fix. Taking every
+    non-package ancestor covers "whatever directory this suite is actually
+    launched from" without having to model cwd per command. The cost is extra
+    aliases in deep trees, which can only ADD edges, i.e. run more tests.
+
+    Package directories are excluded because Python 3 has no implicit relative
+    imports, so a bare name inside one does not reach its sibling — the sibling
+    is reached by `from .x import ...`, which `_imported_modules` already
+    resolves. That exclusion is a precision choice, not a guarantee: nothing
+    depends on an edge being ABSENT, and a directory that gains an `__init__.py`
+    while still being imported from by bare name would be a reason to widen this
+    rule rather than to trust it.
+
+    Sorted, so the graph does not depend on iteration order.
+    """
+    parts = list(PurePosixPath(rel).parts[:-1])
+    roots = {""}
+    while parts:
+        candidate = "/".join(parts)
+        if candidate not in packages:
+            roots.add(candidate)
+        parts.pop()
+    return tuple(sorted(roots))
+
+
 def _python_files(root: Path) -> tuple[str, ...]:
     """Every `.py` file in the checkout, repo-relative, sorted.
 
@@ -691,14 +776,36 @@ def build_import_graph(root: Path) -> ImportGraph:
 
     A file that cannot be parsed is recorded as opaque rather than skipped: its
     imports are unknown, so it must be treated as importing everything.
+
+    An import NAME is looked up once per `_import_roots` entry for the importing
+    file — the repo root and its non-package ancestors — and every file the name
+    matches, under any of them, gets an edge. See the "an import name is resolved
+    in the importing file's context" note at the top of this section for why the
+    repo-root-only lookup that preceded this dropped real edges, and why the
+    ambiguous case unions rather than picks.
     """
     files = _python_files(root)
     truncated = len(files) > _GRAPH_MAX_FILES
     if truncated:
         return ImportGraph(frozenset(files), {}, frozenset(files), truncated=True)
-    by_module: dict[str, str] = {}
-    for rel in files:
-        by_module[".".join(_module_parts(rel))] = rel
+    packages = _package_dirs(files)
+    parts_of = {rel: _module_parts(rel) for rel in files}
+    roots_of = {rel: _import_roots(rel, packages) for rel in files}
+    # `by_root[prefix][dotted]` is every file importable as `dotted` when
+    # `prefix` is the `sys.path` entry. A SET, not a single path: two files can
+    # claim one dotted name (`x.py` beside `x/__init__.py`), and the previous
+    # single-valued map resolved that collision by last-write-wins — silently
+    # dropping one of the two files' importers.
+    by_root: dict[str, dict[str, set[str]]] = {}
+    for prefixes in roots_of.values():
+        for prefix in prefixes:
+            by_root.setdefault(prefix, {})
+    for prefix, table in by_root.items():
+        depth_of_prefix = len(prefix.split("/")) if prefix else 0
+        for rel in files:
+            if prefix and not rel.startswith(prefix + "/"):
+                continue
+            table.setdefault(".".join(parts_of[rel][depth_of_prefix:]), set()).add(rel)
     importers: dict[str, set[str]] = {}
     opaque: set[str] = set()
     for rel in files:
@@ -712,10 +819,12 @@ def build_import_graph(root: Path) -> ImportGraph:
             opaque.add(rel)
         for module in _imported_modules(tree, rel):
             segments = module.split(".")
-            for depth in range(1, len(segments) + 1):
-                target = by_module.get(".".join(segments[:depth]))
-                if target is not None and target != rel:
-                    importers.setdefault(target, set()).add(rel)
+            for prefix in roots_of[rel]:
+                table = by_root[prefix]
+                for depth in range(1, len(segments) + 1):
+                    for target in table.get(".".join(segments[:depth]), ()):
+                        if target != rel:
+                            importers.setdefault(target, set()).add(rel)
     for rel in files:
         if PurePosixPath(rel).name != "conftest.py":
             continue
