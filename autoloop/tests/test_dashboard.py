@@ -2834,19 +2834,21 @@ def test_every_node_state_has_an_icon_and_a_word_on_the_page():
 
 
 def test_the_dependency_panel_is_static_markup_the_refresh_never_reopens():
-    """dash-12's rule, kept: an element the operator is interacting with is not
-    replaced by a tick. The edge table is a `<details>` in STATIC markup that
-    `renderDeps` never writes `.open` to, the selected node lives in `DSEL` and
-    is restored by the redraw, and the whole panel is drawn inside the change
-    guard so an unchanged payload rebuilds nothing at all.
+    """dash-12's rule, as wiring: the elements an operator holds are STATIC
+    markup no render rebuilds, and the redraw itself goes through ONE gate that
+    carries this panel's own signature rather than the page-wide one.
 
-    The negatives are the load-bearing half: the positives alone pass for a
-    render that snaps the table shut every two seconds.
+    The negatives are the load-bearing half. The positives alone pass for a
+    render that snaps the table shut every two seconds, for a second `renderDeps`
+    call site that no gate covers, and for a gate that is never reached because
+    the page-wide guard returned first. What the gate DOES — what it redraws and
+    what it holds — is measured under node in the tests below; this pins the
+    wiring those cannot reach.
     """
     static_markup, script = PAGE.split("<script>", 1)
 
-    for marker in ('<svg id="depsvg"', 'id="depedges"', 'id="depnodes"',
-                   '<details id="deptablebox">', 'id="deptablesum"',
+    for marker in ('<section id="deppanel">', '<svg id="depsvg"', 'id="depedges"',
+                   'id="depnodes"', '<details id="deptablebox">', 'id="deptablesum"',
                    'id="deptable"', 'id="depnote"', 'id="deplegend"',
                    'id="depdetail"'):
         assert marker in static_markup, f"{marker} is not on the page"
@@ -2862,14 +2864,41 @@ def test_the_dependency_panel_is_static_markup_the_refresh_never_reopens():
     for external in ("<link", "@import", 'src="http'):
         assert external not in PAGE
 
+    # `renderDeps` has exactly ONE caller — the definition and the call inside
+    # `updateDeps`. A second call site is a redraw nothing guards, which is the
+    # whole failure this panel had.
+    assert script.count("renderDeps(") == 2, "definition plus the one guarded call"
+    assert "renderDeps(d);\n  DEPBIND(d);" in script
+    # The hook defaults to a no-op so the region can be lifted on its own. An
+    # unassigned hook binds no listener on the real page while every node test
+    # below still passes, so the assignment is pinned here instead.
+    assert "DEPBIND = bindDeps;" in script
+
     guarded = script.split("function render(d, force){", 1)[1]
-    assert guarded.index("sig === LASTJSON") < guarded.index("renderDeps(d);")
-    assert "renderDeps(d);" in guarded and "bindDeps(d);" in guarded
-    # Selection survives a rebuild the way the pipeline's does, and the
-    # listeners live OUTSIDE the pure region because they reach `render`, `LAST`
-    # and `showTip` — none of which the node harness below has.
-    assert "let DSEL = null;" in deps_panel_js(), "the region is not self-contained"
-    assert "showTip" not in deps_panel_js()
+    # The INVERSE of the old ordering, deliberately: the panel is updated BEFORE
+    # `sig === LASTJSON` because it carries its own signature. Sitting behind the
+    # page-wide guard meant any unrelated figure moving rebuilt this graph — and
+    # meant a tick that changed nothing else could never deliver a payload held
+    # during a gesture.
+    assert guarded.index("updateDeps(d);") < guarded.index("sig === LASTJSON")
+    assert "renderDeps(" not in guarded and "bindDeps(" not in guarded
+    # …and with NO `force`. `render(LAST, true)` is also raised by a click on a
+    # PIPELINE node, so forwarding it would let an unrelated click replace the
+    # dependency node someone is hovering.
+    assert "updateDeps(d, force)" not in guarded
+
+    binder = script.split("function bindDeps(d){", 1)[1].split("\n}\n", 1)[0]
+    assert "render(LAST, true)" not in binder, "selecting a node rebuilds the page"
+    assert "updateDeps(DEPDRAWN || LAST, true)" in binder
+    # Selection survives a rebuild the way the pipeline's does. The GATE is
+    # lifted with the pure region (the harnesses below run it); the listeners are
+    # not, because they reach `render`, `LAST` and `showTip` — none of which the
+    # node harness has.
+    region = deps_panel_js()
+    assert "let DSEL = null;" in region, "the region is not self-contained"
+    assert "function updateDeps(d, force){" in region
+    assert "function depsBusy(){" in region
+    assert "showTip" not in region and "function bindDeps" not in region
     assert "function bindDeps(d){" in script and "DSEL = DSEL === n.id" in script
 
 
@@ -2891,7 +2920,14 @@ def deps_panel_js() -> str:
 def test_the_page_draws_one_edge_per_pair_and_says_what_it_left_out():
     """A payload carrying the graph is not a page showing it, so this RUNS the
     panel's own render against a stub document — twice, with the edge table
-    opened and a node selected in between, exactly as an operator would.
+    opened and a node selected in between.
+
+    What it tests is `renderDeps` ITSELF: what one draw puts on the page, and
+    that a draw destroys neither the operator's disclosure nor their selection.
+    It is NOT a test of the refresh — two direct calls with the same data cannot
+    show that a poll leaves a panel alone, because the render they call is the
+    thing that would replace it. The gate that decides whether a draw happens at
+    all, and the interaction rule, are measured under "the refresh gate" below.
 
     The fixture is the hard case on purpose: a cycle, a task behind it, a root
     that nothing waits on, and an isolated task that must not be drawn.
@@ -2914,7 +2950,7 @@ for (const id of ["depnote","depsvg","depedges","depnodes","deplegend",
 const document = {getElementById: id => NODES[id]};
 const PAYLOAD = __PAYLOAD__;
 renderDeps(PAYLOAD);
-// The operator opens the edge table and clicks a node, then the 2s poll fires.
+// The operator opens the edge table and clicks a node, then a draw happens.
 NODES.deptablebox.open = true;
 DSEL = "cyc-a";
 renderDeps(PAYLOAD);
@@ -2970,8 +3006,9 @@ console.log(JSON.stringify({
     assert "<th>dependency state</th>" in out["table"]
     assert "<th>waiting-task state</th>" in out["table"]
     assert out["summary"] == "Table view — all 4 edge(s) as text"
-    # The operator's disclosure is still open and their selection still selected
-    # after the refresh — neither is replaced by a tick.
+    # A draw writes neither the disclosure state nor the selection away: the
+    # table is still open and the clicked node is still the selected one. That
+    # a draw does not HAPPEN under an operator is the gate's job, below.
     assert out["open"] is True
     assert '<g class="dnode sel cyc"' in out["nodes"]
     assert out["detail"] == (
@@ -3019,3 +3056,271 @@ console.log(JSON.stringify({note: NODES.depnote.innerHTML,
     assert out["nodes"] == ""
     assert '<p class="empty">none</p>' in out["table"]
     assert out["detail"] == "no task selected"
+
+
+# ---- the refresh gate ---------------------------------------------------------
+#
+# dash-12's rule is that an element the operator is interacting with is not
+# replaced by a tick, and the four tests below are what MEASURE it rather than
+# asserting the shape of the code around it. Two things make them say anything:
+#
+#   * NON-REPLACEMENT IS PROVEN BY A SENTINEL, never by comparing one render's
+#     output with another's. A render that rebuilt everything from an identical
+#     payload produces an identical string — so "the HTML is the same after the
+#     tick" is exactly what the bug looks like too. Here the panel's DOM is
+#     overwritten with a sentinel AFTER a draw; if the tick redraws, the
+#     sentinel is gone.
+#   * EVERY NEGATIVE IS PAIRED WITH ITS POSITIVE. A `depsBusy` wired to return
+#     true forever, or a signature that never changes, passes every "was not
+#     replaced" assertion in this file. So each test also releases the gesture
+#     (or changes the graph) and asserts the redraw DOES land.
+DEPS_STUB_JS = """
+const NODES = {};
+for (const id of ["depnote","depsvg","depedges","depnodes","deplegend",
+                  "deptablesum","deptable","depdetail","deptablebox"])
+  NODES[id] = {innerHTML:"", textContent:"", open:false, attrs:{},
+               setAttribute(key, value){ this.attrs[key] = value; }};
+// The three gestures `depsBusy` asks about, each switchable from a test: a node
+// with keyboard focus, a node under the pointer, and the node a text selection
+// is anchored in. `document.hasFocus` is deliberately absent — the stub is the
+// foreground window.
+const HOLD = {focus:null, hover:null, anchor:null};
+const INSIDE = {inPanel:true};
+NODES.deppanel = {
+  contains: el => !!el && el.inPanel === true,
+  querySelector: sel => (sel.indexOf(":hover") >= 0 ? HOLD.hover : null),
+};
+// Where `document.activeElement` sits when nobody has focused anything. It is
+// not an interaction with anything, and a guard that read it as one would freeze
+// this panel permanently on any page nobody has clicked.
+const BODY = {};
+const document = {getElementById: id => NODES[id] || null, body: BODY,
+                  get activeElement(){ return HOLD.focus; }};
+const window = {getSelection: () => HOLD.anchor
+  ? {rangeCount: 1, isCollapsed: false, anchorNode: HOLD.anchor} : null};
+// Every element `renderDeps` writes. `intact` is ALL of them, because a redraw
+// that touched one of them touched the operator's DOM.
+const OWNED = ["depnote","depedges","depnodes","deplegend","deptablesum",
+               "deptable","depdetail"];
+const stamp = mark => OWNED.forEach(id => {
+  NODES[id].innerHTML = mark; NODES[id].textContent = mark; });
+const intact = mark => OWNED.every(id =>
+  NODES[id].innerHTML === mark && NODES[id].textContent === mark);
+const shows = id => NODES.depnodes.innerHTML.includes('data-id="' + id + '"');
+"""
+
+
+def deps_gate_js(**payloads: str) -> str:
+    """The panel's own code plus the stub, with each payload bound to a const.
+
+    The gate (`updateDeps`/`depsBusy`) lives INSIDE `DEPGRAPH_START`/`END` for
+    this reason: the interaction rule is behaviour, and behaviour that only the
+    browser can run is behaviour nothing in CI checks.
+    """
+    consts = "".join(f"const {name} = {body};\n" for name, body in payloads.items())
+    return deps_panel_js() + DEPS_STUB_JS + consts
+
+
+def dep_payload(graph: dict, iteration: int, agents: list) -> str:
+    """A whole-dashboard payload, not a bare graph: the failure being fixed is a
+    tick in which something ELSE moved, so the fixture has to carry something
+    else that can move."""
+    return json.dumps({"depgraph": graph, "session": {"iteration": iteration},
+                       "agents": agents, "served_at": "12:00:00"})
+
+
+def test_an_unrelated_payload_change_does_not_redraw_the_dependency_panel():
+    """Panel-local change detection. The dependency graph moves when a task is
+    added, merged or retired — minutes or hours apart — while the payload around
+    it moves every two seconds (an agent starts, the iteration counter ticks).
+    Redrawing this panel for those was throwing away a hovered node, a focus ring
+    and any selected text in the edge table, dozens of times an hour, for a graph
+    that had not changed by one edge.
+
+    The opened edge table is here too: a disclosure is NOT an interaction that
+    blocks a redraw — nothing rebuilds it — so a real dependency change must
+    still land while it is open.
+    """
+    same = dependency_graph({"tasks": [
+        roadmap_task("z-root"),
+        roadmap_task("a-leaf", depends_on=["z-root"]),
+    ]})
+    grown = dependency_graph({"tasks": [
+        roadmap_task("z-root"),
+        roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"]),
+    ]})
+
+    harness = deps_gate_js(
+        FIRST=dep_payload(same, 4, []),
+        POLL=dep_payload(same, 5, [{"id": "agent-1"}]),
+        LATER=dep_payload(grown, 6, [{"id": "agent-1"}]),
+    ) + """
+updateDeps(FIRST);
+const drew = shows("a-leaf");
+// The operator's own DOM, and the edge table opened under it.
+stamp("HELD");
+NODES.deptablebox.open = true;
+// A 2s tick in which an agent appeared and the iteration moved. Not one
+// dependency changed.
+updateDeps(POLL);
+const afterUnrelated = intact("HELD");
+// …and a tick in which the graph itself grew, with focus where it sits when
+// nobody has focused anything.
+HOLD.focus = BODY;
+updateDeps(LATER);
+console.log(JSON.stringify({drew, afterUnrelated,
+  redrew: !intact("HELD"), grew: shows("b-new"),
+  open: NODES.deptablebox.open}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["drew"] is True, "the first payload must draw"
+    assert out["afterUnrelated"] is True, "an unrelated change rebuilt the panel"
+    assert out["redrew"] is True, "a real dependency change must land"
+    assert out["grew"] is True
+    assert out["open"] is True, "the redraw closed the operator's edge table"
+
+
+def test_a_focused_dependency_node_is_not_replaced_while_it_is_focused():
+    """The gesture the graph's own keyboard support creates: a node is focused,
+    it carries the focus ring and its tooltip, and `bindDeps` has hung four
+    listeners on that exact element. Replacing it mid-tick drops the operator
+    back to the top of the document.
+
+    Two ticks are held, not one — a guard that only survived the first would
+    still fail anyone reading for longer than two seconds — and the release is
+    asserted, because a guard stuck at "busy" passes the first half alone.
+    """
+    before = dependency_graph({"tasks": [
+        roadmap_task("z-root"),
+        roadmap_task("a-leaf", depends_on=["z-root"]),
+    ]})
+    after = dependency_graph({"tasks": [
+        roadmap_task("z-root"),
+        roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"]),
+    ]})
+
+    harness = deps_gate_js(
+        FIRST=dep_payload(before, 4, []),
+        LATER=dep_payload(after, 5, []),
+    ) + """
+updateDeps(FIRST);
+stamp("HELD");
+// The operator tabs onto a node, and the graph changes underneath them.
+HOLD.focus = INSIDE;
+updateDeps(LATER);
+const tick1 = intact("HELD");
+updateDeps(LATER);
+const tick2 = intact("HELD");
+// They tab away. The next poll is what delivers what was held — no listener
+// needed for it to land.
+HOLD.focus = null;
+updateDeps(LATER);
+console.log(JSON.stringify({tick1, tick2,
+  delivered: shows("b-new"), redrew: !intact("HELD")}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["tick1"] is True, "the focused node was replaced by a tick"
+    assert out["tick2"] is True, "held for one tick only"
+    assert out["redrew"] is True and out["delivered"] is True, (
+        "the held payload never landed after the interaction ended"
+    )
+
+
+def test_a_hovered_node_and_a_selection_in_the_table_hold_the_redraw_too():
+    """The other two gestures, in the order an operator makes them. Hover is the
+    one the tooltip follows, and a selection in the edge table is someone
+    copying a task id out of it — the reason the table exists.
+
+    Chained rather than run as two fixtures on purpose: the second gesture holds
+    a graph that changed AGAIN, so this also shows the gate has no memory of
+    having been released once.
+    """
+    one = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"])]})
+    two = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"])]})
+    three = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"]),
+        roadmap_task("c-new", depends_on=["b-new"])]})
+
+    harness = deps_gate_js(
+        ONE=dep_payload(one, 4, []),
+        TWO=dep_payload(two, 5, []),
+        THREE=dep_payload(three, 6, []),
+    ) + """
+updateDeps(ONE);
+stamp("HOVER");
+HOLD.hover = INSIDE;              // the pointer is over a node
+updateDeps(TWO);
+const hovering = intact("HOVER");
+HOLD.hover = null;                // the pointer leaves
+updateDeps(TWO);
+const afterHover = shows("b-new");
+
+stamp("SELECT");
+// A text selection anchored in a text node inside the panel — the edge table.
+HOLD.anchor = {nodeType: 3, parentNode: INSIDE};
+updateDeps(THREE);
+const selecting = intact("SELECT");
+HOLD.anchor = null;
+updateDeps(THREE);
+console.log(JSON.stringify({hovering, afterHover, selecting,
+                            afterSelect: shows("c-new")}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["hovering"] is True, "a hovered node was replaced by a tick"
+    assert out["afterHover"] is True, "the held payload never landed after hover"
+    assert out["selecting"] is True, "selected table text was replaced by a tick"
+    assert out["afterSelect"] is True, "the held payload never landed after selecting"
+
+
+def test_selecting_a_node_redraws_the_graph_that_is_on_screen_not_the_held_one():
+    """The one caller that forces a redraw: the node picker, which changed `DSEL`
+    and needs the highlight to move under the operator's cursor. It is a gesture,
+    so it must not become the way a held graph slips in underneath — it redraws
+    `DEPDRAWN`, the payload already on screen.
+
+    Then the held one still lands on the following tick, which is the half that
+    would rot silently: swallowing it here would leave the panel permanently one
+    dependency change behind, and nothing would say so.
+    """
+    before = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"])]})
+    after = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"])]})
+
+    harness = deps_gate_js(
+        FIRST=dep_payload(before, 4, []),
+        LATER=dep_payload(after, 5, []),
+    ) + """
+updateDeps(FIRST);
+HOLD.hover = INSIDE;
+updateDeps(LATER);            // held: the pointer is on a node
+stamp("HELD");
+// What `bindDeps`'s picker does, spelled out — the listeners themselves live
+// outside the region this harness runs.
+DSEL = "a-leaf";
+updateDeps(DEPDRAWN, true);
+const picked = {redrew: !intact("HELD"),
+                selected: NODES.depnodes.innerHTML.includes('class="dnode sel"'),
+                slipped: shows("b-new")};
+HOLD.hover = null;
+updateDeps(LATER);
+console.log(JSON.stringify({picked, delivered: shows("b-new")}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["picked"]["redrew"] is True, "the click did not move the selection"
+    assert out["picked"]["selected"] is True
+    assert out["picked"]["slipped"] is False, (
+        "a forced redraw let the held graph in under the operator's cursor"
+    )
+    assert out["delivered"] is True, "the forced redraw swallowed the held payload"

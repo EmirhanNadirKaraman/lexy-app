@@ -2380,8 +2380,14 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
        `renderDeps` writes its summary text and its rows and NEVER its `.open`,
        so an operator reading the edge list keeps it open across the 2s poll.
        The svg lives in a `.scroll` because it is sized in px from its own
-       content — see the CSS note. -->
-  <section>
+       content — see the CSS note.
+
+       The section carries `#deppanel` because `depsBusy` asks "is the operator
+       holding anything in HERE" — a focused node, a hovered node, a text
+       selection anchored inside it — and needs one static ancestor to ask
+       `contains()` of. It is never rebuilt, which is also what makes it the
+       place to bind the settle listeners once. -->
+  <section id="deppanel">
     <h2>Dependency graph — every depends_on, dependency → dependent</h2>
     <div id="depnote" style="font-size:13px;margin-bottom:9px"></div>
     <div class="scroll">
@@ -2969,9 +2975,12 @@ function renderMerge(d){
 //
 // Everything between the markers is lifted verbatim by the tests and run under
 // node against a stub document, so it may reference `esc`, `rows` and its own
-// declarations and NOTHING else on this page — the listener wiring lives in
-// `bindDeps` below the region for exactly that reason. Keep each marker alone
-// on its line.
+// declarations and NOTHING else on this page — the listener wiring itself lives
+// in `bindDeps` below the region for exactly that reason, reached from in here
+// only through the `DEPBIND` hook, which defaults to a no-op. The refresh gate
+// IS in the region, because when this panel may redraw is behaviour and
+// behaviour only a browser can run is behaviour nothing in CI checks. Keep each
+// marker alone on its line.
 // DEPGRAPH_START
 // Layer and row arrive COMPUTED from `dependency_graph` on the backend, and
 // this function does no ordering of its own. That is what keeps "a task is
@@ -3128,6 +3137,79 @@ function renderDeps(d){
       + `${sel.dependents} task(s) depend on it`
     : "no task selected";
 }
+
+// ---- when this panel is allowed to redraw ------------------------------------
+//
+// `renderDeps` above REPLACES every element it writes. Two rules decide when it
+// may, and the panel owns both rather than inheriting the page's:
+//
+//   1. PANEL-LOCAL CHANGE DETECTION. `render`'s `LASTJSON` guard fires on the
+//      whole payload, so an agent starting, a blocker opening or any other
+//      figure moving used to rebuild this graph even though not one dependency
+//      had changed. The signature here is `depgraph` and nothing else.
+//   2. AN INTERACTION GUARD. Even a genuinely changed graph waits while the
+//      operator is holding this panel. The newer payload is HELD, not dropped,
+//      and `render` calls in here on every 2s tick — so it lands within one
+//      tick of the interaction ending whether or not a listener fires.
+//
+// `force` is the panel's OWN concept and is passed by exactly one caller: the
+// node picker in `bindDeps`, which changed `DSEL` and needs the selection to
+// move under the operator's cursor. It is deliberately NOT `render`'s `force` —
+// that one is also raised by a click on a PIPELINE node (`drawFlow`'s picker
+// calls `render(LAST, true)`), and threading it through here would let an
+// unrelated click replace the dep node someone is hovering.
+let DEPJSON = null;   // signature of the graph currently on screen
+let DEPDRAWN = null;  // the payload it was drawn from — what a selection redraws
+let DEPHELD = null;   // a newer payload, held while the operator is mid-gesture
+// The listener wiring, installed from outside this region because it reaches
+// the page's tooltip helpers, `render` and `LAST` — none of which the node
+// harness has. Left at this no-op when the region is lifted on its own; a test
+// pins the real assignment, since an unassigned hook would silently bind
+// nothing on the page while every node test still passed.
+let DEPBIND = () => {};
+const depSig = p => JSON.stringify((p || {}).depgraph || null);
+// Is the operator holding this panel right now? Three ways to be, and each is a
+// gesture a rebuilt DOM destroys: keyboard focus on a node (the focus ring and
+// its tooltip), the pointer over one (the tooltip follows the mouse), and a text
+// selection anchored inside the panel (the edge table is there to be copied).
+// An OPEN <details> is not one of them — nothing rebuilds it, and a disclosure
+// left open for an hour must not freeze the graph inside it.
+function depsBusy(){
+  const panel = document.getElementById("deppanel");
+  if (!panel) return false;
+  // Switched windows: the focus ring is still on a node but nobody is there, and
+  // freezing until they come back and click would be the worse failure.
+  if (document.hasFocus && !document.hasFocus()) return false;
+  const active = document.activeElement;
+  if (active && active !== document.body && panel.contains(active)) return true;
+  if (panel.querySelector(".dnode:hover")) return true;
+  const picked = typeof window !== "undefined" && window.getSelection
+    ? window.getSelection() : null;
+  if (picked && picked.rangeCount && !picked.isCollapsed) {
+    const at = picked.anchorNode;
+    const el = at && (at.nodeType === 1 ? at : at.parentNode);
+    if (el && panel.contains(el)) return true;
+  }
+  return false;
+}
+function updateDeps(d, force){
+  if (!d) return;
+  const sig = depSig(d);
+  // Nothing about the dependencies changed. Whatever else on the page did is
+  // not this panel's business, and rebuilding for it is what threw away a
+  // hovered node every two seconds.
+  if (!force && sig === DEPJSON) { if (depSig(DEPHELD) === sig) DEPHELD = null; return; }
+  if (!force && depsBusy()) { DEPHELD = d; return; }
+  // A forced redraw draws `DEPDRAWN` — the payload already on screen — so a
+  // selection click moves the highlight WITHOUT slipping a held graph in under
+  // the cursor. The held one is therefore only cleared when this draw actually
+  // is it.
+  if (depSig(DEPHELD) === sig) DEPHELD = null;
+  DEPJSON = sig;
+  DEPDRAWN = d;
+  renderDeps(d);
+  DEPBIND(d);
+}
 // DEPGRAPH_END
 
 // The listeners, outside the pure region: they reach `showTip`, `render` and
@@ -3154,12 +3236,37 @@ function bindDeps(d){
       showTip({clientX: r.left, clientY: r.bottom - 8}, body);
     });
     el.addEventListener("blur", hideTip);
-    const pick = () => { DSEL = DSEL === n.id ? null : n.id; render(LAST, true); };
+    // This panel only, and from the payload already drawn: selecting a node is
+    // not a reason to rebuild the roadmap under someone, and it is not a reason
+    // to let a held graph in either.
+    const pick = () => {
+      DSEL = DSEL === n.id ? null : n.id;
+      updateDeps(DEPDRAWN || LAST, true);
+    };
     el.addEventListener("click", pick);
     el.addEventListener("keydown", e => {
       if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); }
     });
   });
+}
+DEPBIND = bindDeps;
+
+// The held payload lands SOONER than the next tick when a gesture ends inside
+// the panel. Polish, not the mechanism: `render` calls `updateDeps` on every
+// 2s tick regardless, which is what actually guarantees a held update is never
+// lost — including for the gesture these miss (a drag-select that starts in the
+// edge table and is released outside the panel). Bound ONCE, on the static
+// section, so they do not accumulate per poll. `settle` never forces: if the
+// operator is still holding something, `updateDeps` simply holds it again.
+const deppanel = document.getElementById("deppanel");
+if (deppanel) {
+  const settle = () => { if (DEPHELD) updateDeps(DEPHELD); };
+  // Deferred by a turn: on `focusout` and `mouseup` the browser has not yet
+  // moved `document.activeElement` / collapsed the selection, so an immediate
+  // read would still see the gesture that just ended.
+  deppanel.addEventListener("focusout", () => setTimeout(settle, 0));
+  deppanel.addEventListener("mouseup", () => setTimeout(settle, 0));
+  deppanel.addEventListener("mouseleave", settle);
 }
 
 function render(d, force){
@@ -3186,6 +3293,16 @@ function render(d, force){
       + `(running ${d.build.running}, on disk ${d.build.on_disk}). `
       + `Restart the dashboard to load it.`;
   } else { stale.style.display = "none"; }
+
+  // ---- the dependency graph ----------------------------------------------
+  // ABOVE the page-wide guard, and with no `force` passed, because this panel
+  // carries its own: `updateDeps` redraws only when the `depgraph` slice itself
+  // changed, and not even then while the operator is holding a node or a
+  // selection. Being called on EVERY tick is the point — it is what lets a held
+  // payload land within one tick of the gesture ending, with no listener
+  // involved. See the rules block above `updateDeps`.
+  updateDeps(d);
+
   if (!force && sig === LASTJSON) return;
   LASTJSON = sig; LAST = d;
   document.getElementById("hdot").style.background = `var(--${d.health.role})`;
@@ -3219,16 +3336,6 @@ function render(d, force){
   // Built by `renderMerge` above, grouped by state — the four rows that need a
   // human are no longer buried under 57 that do not.
   renderMerge(d);
-
-  // ---- the dependency graph ----------------------------------------------
-  // Inside the change guard with everything else: it carries no clock, so a
-  // rebuild on an unchanged payload would throw away hover and text selection
-  // for nothing. The selected node lives in `DSEL` and is restored by the
-  // redraw, the way `SEL` is for the pipeline, and the edge-list disclosure is
-  // static markup this never writes `.open` to — so neither an inspected node
-  // nor an opened table is replaced by a tick.
-  renderDeps(d);
-  bindDeps(d);
 
   // ---- roadmap, grouped by state ----------------------------------------
   // Built by `renderRoadmap` above \u2014 the same function the search box calls, so
