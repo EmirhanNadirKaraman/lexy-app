@@ -1,0 +1,664 @@
+"""Per-commit test selection: which tests a validated commit actually needs.
+
+The thing under test is `validation.select_validation_commands` and its
+integration into `orchestrator._run_post_commit_validation`. Two properties
+matter more than the rest and are pinned first:
+
+* a test file the commit did NOT touch still runs when it can reach the changed
+  code through the import graph — the failure a filename-matching rule shipped
+  on 2026-08-06 (auto-01's f06454b5), reproduced here against the REAL
+  repository rather than a fixture, because a fixture would only prove the
+  fixture;
+* every case where reachability cannot be established runs the whole suite.
+
+A third block, at the bottom, pins the PHASE this round reached. A loop round
+validates twice — once inside `ImplementExecutor` before the commit, once
+against the committed worktree — and only the second is narrowed here, because
+the first one's call site is outside this task's approved paths. That is
+asserted rather than described, so the sentence the review packet carries about
+it (`validation.PRECOMMIT_EVIDENCE`) cannot quietly go stale.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from autoloop.config import AuditConfig, AutoloopConfig, BrowserConfig
+from autoloop.git_gateway import GitGateway
+from autoloop.implement_executor import ImplementExecutor
+from autoloop.policy import PolicyConfig, PolicyEngine
+from autoloop.tasks import Task
+from autoloop.validation import (
+    TEST_SELECTION_FULL,
+    TEST_SELECTION_REACHABLE,
+    build_import_graph,
+    select_validation_commands,
+)
+from autoloop.worktask import TaskExecution
+
+# Sibling test modules, importable because pytest's prepend import mode puts
+# this directory on `sys.path` — the same borrowing `test_rounds_and_restart.py`
+# and `test_codex_provider.py` already do for `build`/`FakeGit`.
+from test_implement_executor import (
+    FakeAgentRunner,
+    implement_directive,
+    make_agent_runner_factory,
+    run_git,
+)
+from test_orchestrator import URL, build_postcommit
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+RUFF = ("ruff", "check", ".")
+SUITE = ("python3", "-m", "pytest", "suite", "-q", "-n", "auto", "-p", "no:cacheprovider")
+OTHER_SUITE = ("python3", "-m", "pytest", "other", "-q", "-p", "no:cacheprovider")
+COMMANDS = (RUFF, SUITE)
+
+
+def write(root: Path, rel: str, body: str) -> None:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+
+
+def scaffold(root: Path) -> Path:
+    """The fixture's file tree, without pytest wiring, so a test that needs the
+    same shape inside a real git repository can build one (see
+    `git_scaffold`)."""
+    write(root, "pkg/__init__.py", "")
+    write(root, "pkg/publisher.py", "def publish():\n    return 1\n")
+    write(
+        root,
+        "pkg/orchestrator.py",
+        "from .publisher import publish\n\n\ndef run():\n    return publish()\n",
+    )
+    write(root, "pkg/lonely.py", "def unused():\n    return 0\n")
+    write(
+        root,
+        "suite/test_lonely.py",
+        "from pkg.lonely import unused\n\n\ndef test_unused():\n"
+        "    assert unused() == 0\n",
+    )
+    write(root, "suite/conftest.py", "import pytest\n")
+    write(
+        root,
+        "suite/test_smoke.py",
+        "from pkg.publisher import publish\n\n\ndef test_publish():\n    assert publish()\n",
+    )
+    write(
+        root,
+        "suite/test_orchestra.py",
+        "from pkg.orchestrator import run\n\n\ndef test_run():\n    assert run()\n",
+    )
+    write(
+        root,
+        "suite/test_unrelated.py",
+        "def test_arithmetic():\n    assert 1 + 1 == 2\n",
+    )
+    write(root, "docs/NOTES.md", "notes\n")
+    return root
+
+
+def git_scaffold(root: Path, branch: str) -> Path:
+    """`scaffold`, committed, in a real git repository — what an executor round
+    needs so `git status` reports only what the agent went on to change."""
+    root.mkdir(parents=True, exist_ok=True)
+    run_git(root, "init", "-q", "-b", branch)
+    run_git(root, "config", "user.email", "t@e.c")
+    run_git(root, "config", "user.name", "T")
+    run_git(root, "config", "commit.gpgsign", "false")
+    scaffold(root)
+    run_git(root, "add", "-A")
+    run_git(root, "commit", "-q", "-m", "init")
+    return root
+
+
+@pytest.fixture
+def repo(tmp_path):
+    """A miniature repository with the shape the selector cares about.
+
+    `suite/test_smoke.py` is the fixture's version of `test_v1_smoke.py`: it
+    imports a production module directly and shares no part of its name with
+    anything, so only reachability can find it.
+
+    `pkg/lonely.py` is the opposite shape — reached by exactly ONE test and by
+    nothing else — which is what makes "an unreachable test is omitted"
+    testable. It deliberately has a test of its own: a module no test reaches at
+    all widens to the full suite (see
+    `test_zero_reachable_tests_runs_the_full_suite`, which pins that on its own
+    fixture), so without `suite/test_lonely.py` a change here would prove the
+    widening rule rather than the omission.
+
+    Named `project/` rather than `repo/` so it cannot collide with the real git
+    checkout `build_postcommit` creates at `tmp_path / "repo"`.
+    """
+    return scaffold(tmp_path / "project")
+
+
+def selection(repo, changed, commands=COMMANDS, **kwargs):
+    return select_validation_commands(commands, changed, repo, **kwargs)
+
+
+# ---- the property the whole feature exists for ------------------------------
+
+
+def test_an_untouched_test_file_runs_when_the_code_it_imports_changed(repo):
+    """The commit touched `pkg/publisher.py` and nothing else. Nothing in the
+    repository is called `test_publisher.py`, so a name-matching rule selects
+    NOTHING here — the exact shape of auto-01's regression."""
+    chosen = selection(repo, ["pkg/publisher.py"])
+
+    assert not chosen.widened
+    assert "suite/test_smoke.py" in chosen.selected, "direct importer"
+    assert "suite/test_orchestra.py" in chosen.selected, "transitive importer"
+    assert "suite/test_unrelated.py" not in chosen.selected
+
+
+def test_the_real_repository_selects_test_v1_smoke_for_a_publisher_change():
+    """The 2026-08-06 case itself, against the real checkout.
+
+    auto-01's f06454b5 changed the publisher and the protected-branch push
+    guards and updated the four test files it touched; all five failures were in
+    `autoloop/tests/test_v1_smoke.py`, which it did not touch. That file imports
+    `autoloop.publisher` directly, so reachability selects it — and the second
+    assertion is what makes the first one mean something: it is selected by an
+    import edge, not because the model gave up and marked it opaque.
+    """
+    graph = build_import_graph(REPO_ROOT)
+    assert "autoloop/tests/test_v1_smoke.py" not in graph.opaque
+
+    chosen = selection(
+        REPO_ROOT,
+        ["autoloop/publisher.py"],
+        commands=(
+            RUFF,
+            ("python3", "-m", "pytest", "autoloop/tests", "-q", "-n", "auto"),
+        ),
+    )
+
+    assert not chosen.widened
+    assert "autoloop/tests/test_v1_smoke.py" in chosen.selected
+    assert len(chosen.selected) < len(graph.test_files), (
+        "a run that selects every test file is not a subset, and the assertion "
+        "above would pass trivially"
+    )
+    narrowed = chosen.commands[1]
+    assert "autoloop/tests" not in narrowed, "the directory is replaced by files"
+    assert "autoloop/tests/test_v1_smoke.py" in narrowed
+
+
+def test_selection_is_deterministic_for_the_same_diff(repo):
+    """Same diff, same answer — including the evidence string, which is what a
+    reviewer compares between rounds. Input ORDER must not matter either: git
+    hands back a set."""
+    first = selection(repo, ["pkg/publisher.py", "pkg/orchestrator.py"])
+    second = selection(repo, ["pkg/orchestrator.py", "pkg/publisher.py"])
+
+    assert first.commands == second.commands
+    assert first.selected == second.selected
+    assert first.evidence() == second.evidence()
+    assert list(first.selected) == sorted(first.selected)
+
+
+def test_an_unreachable_test_is_omitted(repo):
+    """The only permission to skip a test: nothing links it to the change.
+
+    `pkg/lonely.py` is imported by `suite/test_lonely.py` and by nothing else,
+    so exactly one test file is selected and the other three are omitted —
+    each of them because no chain of imports reaches the change, which is the
+    ONE ground this selector ever omits a test on.
+    """
+    chosen = selection(repo, ["pkg/lonely.py"])
+
+    assert not chosen.widened
+    assert chosen.selected == ("suite/test_lonely.py",)
+    assert "suite/test_unrelated.py" not in chosen.selected
+    assert "suite/test_smoke.py" not in chosen.selected
+
+
+# ---- what the graph cannot see is never assumed away ------------------------
+
+
+def test_a_test_using_a_dynamic_import_is_selected_for_every_change(repo):
+    write(
+        repo,
+        "suite/test_dynamic.py",
+        "import importlib\n\n\ndef test_dynamic():\n"
+        "    assert importlib.import_module('pkg.publisher')\n",
+    )
+    graph = build_import_graph(repo)
+    assert "suite/test_dynamic.py" in graph.opaque
+
+    chosen = selection(repo, ["pkg/lonely.py"])
+    assert "suite/test_dynamic.py" in chosen.selected
+
+
+def test_a_test_that_spawns_an_interpreter_is_selected_for_every_change(repo):
+    """Subprocess coupling is invisible to an import graph, so it is not
+    modelled — the file is put on the frontier instead."""
+    write(
+        repo,
+        "suite/test_subprocess.py",
+        "import subprocess\n\n\ndef test_cli():\n"
+        "    subprocess.run(['python3', '-m', 'pkg'], check=False)\n",
+    )
+    chosen = selection(repo, ["pkg/lonely.py"])
+    assert "suite/test_subprocess.py" in chosen.selected
+
+
+def test_a_production_module_naming_an_interpreter_is_not_opaque(repo):
+    """The mirror of the rule above. `run_validation_commands` mentions
+    `python3` because launching one is its job; treating every such module as
+    opaque would put it on every change's frontier and drag in everything that
+    imports it, which is the whole suite by another route."""
+    write(
+        repo,
+        "pkg/runner.py",
+        "import subprocess\n\n\ndef go():\n"
+        "    return subprocess.run(['python3', '-c', 'pass'], check=False)\n",
+    )
+    graph = build_import_graph(repo)
+    assert "pkg/runner.py" not in graph.opaque
+
+
+def test_an_unparseable_module_is_selected_for_every_change(repo):
+    write(repo, "suite/test_broken.py", "def test_x(:\n")
+    graph = build_import_graph(repo)
+    assert "suite/test_broken.py" in graph.opaque
+
+    chosen = selection(repo, ["pkg/lonely.py"])
+    assert "suite/test_broken.py" in chosen.selected
+
+
+def test_a_conftest_change_selects_every_test_it_configures(repo):
+    """pytest applies a conftest to its whole directory tree and no file
+    imports it, so the edge is added explicitly."""
+    chosen = selection(repo, ["suite/conftest.py"])
+
+    assert not chosen.widened
+    assert "suite/test_unrelated.py" in chosen.selected
+    assert "suite/test_smoke.py" in chosen.selected
+
+
+def test_a_package_init_change_selects_everything_that_imports_the_package(repo):
+    chosen = selection(repo, ["pkg/__init__.py"])
+
+    assert not chosen.widened
+    assert "suite/test_smoke.py" in chosen.selected
+
+
+def test_a_changed_test_file_selects_itself(repo):
+    chosen = selection(repo, ["suite/test_unrelated.py"])
+
+    assert not chosen.widened
+    assert chosen.selected == ("suite/test_unrelated.py",)
+
+
+# ---- everything ambiguous widens --------------------------------------------
+
+
+def test_a_non_python_change_runs_the_full_suite(repo):
+    """A `.md`, a `.toml` a test reads, a fixture — the graph models none of
+    them, so nothing is narrowed."""
+    chosen = selection(repo, ["pkg/publisher.py", "docs/NOTES.md"])
+
+    assert chosen.widened
+    assert chosen.commands == COMMANDS
+    assert "docs/NOTES.md" in chosen.reason
+
+
+def test_a_changed_path_absent_from_the_tree_runs_the_full_suite(repo):
+    """A deleted module has no file to parse and no edges to follow."""
+    chosen = selection(repo, ["pkg/deleted.py"])
+
+    assert chosen.widened
+    assert chosen.commands == COMMANDS
+
+
+def test_no_changed_paths_runs_the_full_suite(repo):
+    chosen = selection(repo, [])
+
+    assert chosen.widened
+    assert chosen.commands == COMMANDS
+
+
+def test_zero_reachable_tests_runs_the_full_suite(tmp_path):
+    """A change that reaches no test at all is likelier a gap in the model than
+    a truth about the repository, so it is not treated as licence to run
+    nothing."""
+    root = tmp_path / "bare"
+    write(root, "pkg/__init__.py", "")
+    write(root, "pkg/solo.py", "x = 1\n")
+    write(root, "suite/test_nothing.py", "def test_ok():\n    assert True\n")
+
+    chosen = select_validation_commands(COMMANDS, ["pkg/solo.py"], root)
+
+    assert chosen.widened
+    assert chosen.commands == COMMANDS
+    assert "no test file at all" in chosen.reason
+
+
+# ---- asking for the full suite gets the full suite --------------------------
+
+
+def test_explicit_full_mode_bypasses_selection(repo):
+    chosen = selection(repo, ["pkg/publisher.py"], mode=TEST_SELECTION_FULL)
+
+    assert chosen.widened
+    assert chosen.commands == COMMANDS
+    assert 'test_selection = "full"' in chosen.reason
+
+
+def test_a_caller_supplied_reason_bypasses_selection(repo):
+    chosen = selection(
+        repo, ["pkg/publisher.py"], full_reason="the task declared its own validation"
+    )
+
+    assert chosen.widened
+    assert chosen.commands == COMMANDS
+    assert "declared its own validation" in chosen.evidence()
+
+
+# ---- command rewriting ------------------------------------------------------
+
+
+def test_non_test_commands_are_never_touched(repo):
+    """ruff still lints the whole tree on a narrowed round — selection decides
+    which TESTS run, not which checks."""
+    chosen = selection(repo, ["pkg/publisher.py"])
+
+    assert chosen.commands[0] == RUFF
+
+
+def test_the_narrowed_command_keeps_its_flags_and_names_files(repo):
+    chosen = selection(repo, ["pkg/publisher.py"])
+    pytest_command = chosen.commands[1]
+
+    assert pytest_command[:3] == ("python3", "-m", "pytest")
+    assert "suite" not in pytest_command, "the directory is replaced by files"
+    assert "suite/test_smoke.py" in pytest_command
+    for flag in ("-q", "-n", "auto", "-p", "no:cacheprovider"):
+        assert flag in pytest_command
+
+
+def test_a_marker_value_is_not_mistaken_for_a_test_path(repo):
+    """`-m isolated` selects a marker. Reading `isolated` as a path would make
+    the command collect nothing and pass vacuously."""
+    marked = ("python3", "-m", "pytest", "suite", "-q", "-m", "isolated")
+    chosen = selection(repo, ["pkg/publisher.py"], commands=(marked,))
+
+    assert not chosen.widened
+    rewritten = chosen.commands[0]
+    assert rewritten[-2:] == ("-m", "isolated")
+    assert "suite/test_smoke.py" in rewritten
+
+
+def test_a_command_with_no_reachable_test_is_skipped_and_says_so(repo):
+    write(repo, "other/test_far.py", "def test_far():\n    assert True\n")
+    chosen = selection(repo, ["pkg/publisher.py"], commands=(SUITE, OTHER_SUITE))
+
+    assert not chosen.widened
+    assert OTHER_SUITE not in chosen.commands
+    assert chosen.skipped and chosen.skipped[0][0] == OTHER_SUITE
+    assert "SKIPPED" in chosen.evidence()
+    assert "other" in chosen.evidence()
+
+
+def test_a_command_with_an_unrecognised_flag_is_left_exactly_as_configured(repo):
+    exotic = ("python3", "-m", "pytest", "--nonsense-flag", "suite")
+    chosen = selection(repo, ["pkg/publisher.py"], commands=(exotic,))
+
+    assert chosen.commands == (exotic,), "guessing which token is a path is worse"
+
+
+def test_a_command_declaring_no_paths_is_left_exactly_as_configured(repo):
+    """Its surface comes from `pytest.ini`'s `testpaths`; injecting paths would
+    change what the command means."""
+    bare = ("python3", "-m", "pytest", "-q")
+    chosen = selection(repo, ["pkg/publisher.py"], commands=(bare,))
+
+    assert chosen.commands == (bare,)
+
+
+def test_a_node_id_target_is_left_exactly_as_configured(repo):
+    pinned = ("python3", "-m", "pytest", "suite/test_smoke.py::test_publish")
+    chosen = selection(repo, ["pkg/publisher.py"], commands=(pinned,))
+
+    assert chosen.commands == (pinned,)
+
+
+def test_a_configured_list_without_pytest_reports_nothing(repo):
+    """No pytest command, no selection to make, nothing to say — the summary a
+    ruff-only deployment produces is unchanged."""
+    chosen = selection(repo, ["pkg/publisher.py"], commands=(RUFF,))
+
+    assert chosen.commands == (RUFF,)
+    assert chosen.evidence() == ""
+
+
+# ---- the evidence a reviewer reads ------------------------------------------
+
+
+def test_the_evidence_states_what_was_selected_and_why_it_is_sufficient(repo):
+    chosen = selection(repo, ["pkg/publisher.py"])
+    evidence = chosen.evidence()
+
+    assert "SUBSET" in evidence
+    assert "import-graph reachability" in evidence
+    assert "pkg/publisher.py" in evidence, "the changed input considered"
+    assert "suite/test_smoke.py" in evidence, "a selected file"
+    assert "did not touch" in evidence, "why an untouched file is still covered"
+    assert "dynamic import" in evidence, "what the model cannot see"
+    assert 'test_selection = "full"' in evidence, "how to widen"
+
+
+def test_the_evidence_says_so_when_nothing_was_narrowed(repo):
+    evidence = selection(repo, ["docs/NOTES.md"]).evidence()
+
+    assert "FULL SUITE" in evidence
+    assert "docs/NOTES.md" in evidence
+
+
+def test_the_evidence_is_bounded(repo):
+    """It becomes `state.last_validation` — state.json, the transcript, blocker
+    records and the CONTEXT block of every message — so it cannot grow with the
+    size of the suite."""
+    for index in range(40):
+        write(
+            repo,
+            f"suite/test_generated_{index:02d}.py",
+            f"from pkg.publisher import publish\n\n\ndef test_{index}():\n"
+            "    assert publish()\n",
+        )
+    chosen = selection(repo, ["pkg/publisher.py"])
+
+    assert len(chosen.selected) > 20
+    assert "more)" in chosen.evidence()
+    assert len(chosen.evidence()) < 3000
+
+
+# ---- integration: what the reviewer actually receives ------------------------
+
+
+def postcommit_orchestrator(tmp_path, repo, commands, mode=TEST_SELECTION_REACHABLE):
+    """An Orchestrator whose post-commit validation grades `repo`, with the
+    command list and selection mode under test."""
+    orch, *_ = build_postcommit(tmp_path)
+    config = AutoloopConfig(
+        browser=BrowserConfig(conversation_url=URL),
+        policy=orch._config.policy,
+        state_dir=orch._config.state_dir,
+        audit=AuditConfig(validation_commands=commands, test_selection=mode),
+    )
+    orch._config = config
+    ran = []
+
+    def runner(argv, **kwargs):
+        ran.append(tuple(argv))
+        return _Completed(list(argv))
+
+    orch._validation_runner = runner
+    execution = TaskExecution(
+        task_id="sel-1",
+        task_branch="autoloop/sel-1",
+        worktree_path=str(repo),
+        task_base_sha="0" * 40,
+        candidate_sha="1" * 40,
+    )
+    return orch, execution, ran
+
+
+class _Completed:
+    """The subset of `subprocess.CompletedProcess` `run_validation_commands`
+    reads."""
+
+    def __init__(self, args):
+        self.args = args
+        self.returncode = 0
+        self.stdout = ""
+        self.stderr = ""
+
+
+def test_the_post_commit_summary_carries_the_selection_evidence(tmp_path, repo):
+    orch, execution, ran = postcommit_orchestrator(tmp_path, repo, (RUFF, SUITE))
+
+    ok, summary = orch._run_post_commit_validation(execution, ["pkg/publisher.py"])
+
+    assert ok
+    assert "test selection: SUBSET" in summary
+    assert "suite/test_smoke.py" in summary
+    assert any("suite/test_smoke.py" in argv for argv in ran)
+    assert not any("suite" in argv for argv in ran), "the whole tree did not run"
+
+
+def test_a_full_suite_request_runs_every_configured_command(tmp_path, repo):
+    orch, execution, ran = postcommit_orchestrator(
+        tmp_path, repo, (RUFF, SUITE), mode=TEST_SELECTION_FULL
+    )
+
+    _ok, summary = orch._run_post_commit_validation(execution, ["pkg/publisher.py"])
+
+    assert "test selection: FULL SUITE" in summary
+    assert any("suite" in argv for argv in ran)
+    assert not any(any("test_smoke" in token for token in argv) for argv in ran)
+
+
+def test_a_task_declaring_its_own_validation_is_never_narrowed(tmp_path, repo):
+    orch, execution, ran = postcommit_orchestrator(tmp_path, repo, (RUFF,))
+    execution.validation_commands = (SUITE,)
+
+    _ok, summary = orch._run_post_commit_validation(execution, ["pkg/publisher.py"])
+
+    assert "test selection: FULL SUITE" in summary
+    assert "declares its own validation" in summary
+    assert not any(any("test_smoke" in token for token in argv) for argv in ran)
+
+
+def test_a_declared_validation_cwd_is_never_narrowed(tmp_path, repo):
+    """Selection resolves repo-relative paths against the repo root; a command
+    running from a subdirectory takes paths relative to THAT directory."""
+    orch, execution, _ran = postcommit_orchestrator(tmp_path, repo, (RUFF, SUITE))
+    execution.validation_cwd = "suite"
+
+    _ok, summary = orch._run_post_commit_validation(execution, ["pkg/publisher.py"])
+
+    assert "test selection: FULL SUITE" in summary
+    assert "not the repo" in summary
+
+
+def test_a_task_declaring_the_configured_default_still_runs_it_in_full(tmp_path, repo):
+    """The per-task full-suite lever, exercised as an operator would use it.
+
+    `[audit] test_selection = "full"` is a global switch; declaring the SAME
+    commands the config already sets is how one task — the one under review —
+    demands the whole suite while every other task keeps narrowing. It has to
+    work even though the declared list is byte-identical to the default, which
+    is the case a "did the task override anything?" check by value would get
+    wrong.
+    """
+    orch, execution, ran = postcommit_orchestrator(tmp_path, repo, (RUFF, SUITE))
+    execution.validation_commands = (RUFF, SUITE)
+
+    _ok, summary = orch._run_post_commit_validation(execution, ["pkg/publisher.py"])
+
+    assert "test selection: FULL SUITE" in summary
+    assert "declares its own validation" in summary
+    assert any("suite" in argv for argv in ran), "the whole tree ran"
+    assert not any(any("test_smoke" in token for token in argv) for argv in ran)
+
+
+# ---- the pre-commit phase: what this task could NOT reach --------------------
+
+
+def test_the_pre_commit_run_is_not_narrowed_today(tmp_path):
+    """SCOPE BLOCKER, pinned rather than described.
+
+    `ImplementExecutor` runs the configured commands once BEFORE the commit
+    (`implement_executor.py`, the `run_validation_commands` call after it reads
+    `changed = sorted(git.dirty_paths_all())`). That file is outside val-02's
+    approved paths and its only constructor — `cli.py`'s `ImplementExecutor(...)`,
+    which would have to thread `config.audit.test_selection` through — is too,
+    so this round narrowed the post-commit re-run only.
+
+    Two assertions, and the pair is the point:
+
+    * the executor really does still run the whole configured tree, so
+      `validation.PRECOMMIT_EVIDENCE`'s claim in the review packet is true;
+    * the selector, handed exactly the two values already in scope at that call
+      site, narrows them — so nothing about the mechanism is missing and the
+      outstanding work is authorization, not design.
+
+    When the call site is narrowed, the first assertion fails. That is the
+    intended alarm: `PRECOMMIT_EVIDENCE` must be rewritten in the same change.
+    """
+    main = git_scaffold(tmp_path / "main", "main")
+    worker = git_scaffold(tmp_path / "worker", "autoloop/sel-2")
+    ran: list[tuple[str, ...]] = []
+
+    def recorder(argv, **kwargs):
+        ran.append(tuple(argv))
+        return _Completed(list(argv))
+
+    policy = PolicyEngine(PolicyConfig())
+    executor = ImplementExecutor(
+        git=GitGateway(main, policy),
+        # Standalone binding, never reached: `worker_repo_root_for` + `policy`
+        # win, exactly as in production.
+        agent_runner=FakeAgentRunner(),
+        validation_commands=(RUFF, SUITE),
+        command_runner=recorder,
+        worker_repo_root_for=lambda task_id: worker,
+        policy=policy,
+        agent_runner_factory=make_agent_runner_factory(
+            write_files={"pkg/publisher.py": "def publish():\n    return 2\n"}
+        ),
+    )
+
+    outcome = executor.execute(
+        implement_directive(task_id="sel-2"),
+        Task(id="sel-2", title="publisher", description="change the publisher"),
+    )
+
+    assert outcome.status == "ok"
+    assert outcome.changed_paths == ("pkg/publisher.py",)
+    assert any("suite" in argv for argv in ran), "the whole tree still runs pre-commit"
+    assert not any(any("test_smoke" in token for token in argv) for argv in ran)
+
+    would = select_validation_commands((RUFF, SUITE), outcome.changed_paths, worker)
+    assert not would.widened, "the selector needs no change to serve this phase"
+    assert "suite/test_smoke.py" in would.selected
+    assert "suite/test_unrelated.py" not in would.selected
+
+
+def test_the_evidence_names_the_unnarrowed_pre_commit_run_and_how_to_widen(repo):
+    """What stops a narrowed packet reading as LESS evidence than the round
+    before it: the reviewer is told a full run of the same tree also happened,
+    and told two ways to demand one outright."""
+    evidence = selection(repo, ["pkg/publisher.py"]).evidence()
+
+    assert "PRE-COMMIT" in evidence
+    assert "ADDED to a full-suite run" in evidence
+    assert 'test_selection = "full"' in evidence, "the global lever"
+    assert "task-add --validation" in evidence, "the per-task lever"

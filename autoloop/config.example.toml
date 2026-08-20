@@ -260,6 +260,43 @@ validation_commands = [
   ["python3", "-m", "pytest", "tests/", "-q", "-n", "auto", "-p", "no:cacheprovider"],
   ["python3", "-m", "pytest", "autoloop/tests", "-q", "-m", "isolated", "-p", "no:cacheprovider"],
 ]
+# WHICH of those tests a per-commit run executes. "reachable" (the default)
+# narrows each pytest command above to the test files the commit's own changed
+# paths can reach through the repository's import graph; "full" disables
+# selection and runs every command exactly as written.
+#
+# Not filename similarity, and that distinction is the whole point. On
+# 2026-08-06 auto-01's candidate f06454b5 changed 16 files and updated the four
+# test files it touched — every failure was in autoloop/tests/test_v1_smoke.py,
+# which that commit never touched. It imports autoloop.publisher directly, so a
+# reachability model selects it and a name-matching one ships the regression.
+#
+# Selection only ever narrows when it can prove the narrowing; everything else
+# widens to the whole suite. A commit touching a non-Python file (a .toml a test
+# reads, a fixture, docs), an unparseable module, a checkout too large to parse,
+# or a reachability result of zero test files all run the full list. Test files
+# that reach repository code without importing it — a dynamic import, a spawned
+# interpreter — are selected on EVERY change rather than reasoned about. Non-test
+# commands (`ruff`) are never touched and always run in full.
+#
+# WHICH RUN this governs, as of 2026-08-20: the POST-COMMIT re-run only, the one
+# whose result the reviewer is shown. A round validates twice — once inside
+# ImplementExecutor before the commit, once against the committed worktree — and
+# the pre-commit run still executes every command above in full, so a round costs
+# one full suite plus one narrowed suite rather than two full ones. Narrowing the
+# pre-commit site needs a change in autoloop/implement_executor.py (the inputs are
+# already in hand there) and in cli._build_executor (to thread this setting to it).
+#
+# Whatever it decides is recorded in the validation summary the reviewer reads,
+# naming the selected files, the changed paths they were selected from, and the
+# basis — so a narrower run still has to justify itself. Two ways to force the
+# full suite, and BOTH are operator edits — a `plan` directive can set neither,
+# since `contract._TASK_SPEC_KEYS` carries no `validation` key: set this to
+# "full", or give the task its own `validation` commands in tasks.json (a
+# declared list is run exactly as declared, and a declared `validation_cwd` is
+# never narrowed either). A reviewer who wants a full run therefore has to ask
+# for one; there is no directive field that grants it.
+test_selection = "reachable"
 
 [repo]
 # What the loop cannot infer about the repository it is pointed at. Every value
