@@ -396,37 +396,92 @@ def test_a_marker_value_is_not_mistaken_for_a_test_path(repo):
 
 
 def test_a_command_with_no_reachable_test_is_skipped_and_says_so(repo):
+    """The one case a command is dropped WITHOUT widening the run.
+
+    "No selected test lives under `other/`" is a reachability ANSWER — every
+    changed path resolved, the closure was computed, nothing landed there — not
+    an unknown. So it is dropped and disclosed while the rest of the run still
+    narrows, which is what keeps a repository with more than one test tree from
+    widening on every round. Contrast the `_RETARGET_BLOCKED` cases below, where
+    the selector cannot read the command at all and the whole run widens.
+    """
     write(repo, "other/test_far.py", "def test_far():\n    assert True\n")
     chosen = selection(repo, ["pkg/publisher.py"], commands=(SUITE, OTHER_SUITE))
 
-    assert not chosen.widened
+    assert chosen.widened is False
     assert OTHER_SUITE not in chosen.commands
     assert chosen.skipped and chosen.skipped[0][0] == OTHER_SUITE
+    assert "SUBSET" in chosen.evidence()
     assert "SKIPPED" in chosen.evidence()
     assert "other" in chosen.evidence()
 
 
-def test_a_command_with_an_unrecognised_flag_is_left_exactly_as_configured(repo):
+def assert_full_suite_because(chosen, original, fragment):
+    """A command that could not be retargeted widens the WHOLE run.
+
+    The argv assertion is the weakest one here and used to be the only one:
+    it is not enough for the command to come back unchanged, because the
+    SELECTION must also report itself as a full-suite run. Reporting
+    `widened=False` while handing back a command that narrowed nothing is what
+    made `evidence()` claim "each configured pytest command ran the selected
+    files" about a command that ran the whole tree (found in review,
+    2026-08-20), and a test asserting only the argv passed happily through it.
+    """
+    assert chosen.widened is True
+    assert chosen.commands == (original,), "guessing which token is a path is worse"
+    assert "FULL SUITE" in chosen.evidence()
+    assert "SUBSET" not in chosen.evidence()
+    assert " ".join(original) in chosen.reason, "the reason names the offending command"
+    assert fragment in chosen.reason, "and says what about it could not be read"
+
+
+def test_a_command_with_an_unrecognised_flag_widens_the_whole_run(repo):
     exotic = ("python3", "-m", "pytest", "--nonsense-flag", "suite")
     chosen = selection(repo, ["pkg/publisher.py"], commands=(exotic,))
 
-    assert chosen.commands == (exotic,), "guessing which token is a path is worse"
+    assert_full_suite_because(chosen, exotic, "does not recognise")
 
 
-def test_a_command_declaring_no_paths_is_left_exactly_as_configured(repo):
+def test_a_command_declaring_no_paths_widens_the_whole_run(repo):
     """Its surface comes from `pytest.ini`'s `testpaths`; injecting paths would
-    change what the command means."""
+    change what the command means, and running it whole while calling the round
+    a subset would misdescribe it."""
     bare = ("python3", "-m", "pytest", "-q")
     chosen = selection(repo, ["pkg/publisher.py"], commands=(bare,))
 
-    assert chosen.commands == (bare,)
+    assert_full_suite_because(chosen, bare, "no test paths")
 
 
-def test_a_node_id_target_is_left_exactly_as_configured(repo):
+def test_a_node_id_target_widens_the_whole_run(repo):
     pinned = ("python3", "-m", "pytest", "suite/test_smoke.py::test_publish")
     chosen = selection(repo, ["pkg/publisher.py"], commands=(pinned,))
 
-    assert chosen.commands == (pinned,)
+    assert_full_suite_because(chosen, pinned, "node id")
+
+
+def test_one_unretargetable_command_widens_its_narrowable_neighbours_too(repo):
+    """The blocked command does not just keep itself: the run it is part of is
+    no longer a subset run, so every OTHER command goes back to configured too.
+    A summary saying "SUBSET, these files" beside a command that ran the whole
+    tree is precisely the evidence mismatch this rule removes."""
+    bare = ("python3", "-m", "pytest", "-q")
+    chosen = selection(repo, ["pkg/publisher.py"], commands=(RUFF, SUITE, bare))
+
+    assert chosen.widened is True
+    assert chosen.commands == (RUFF, SUITE, bare)
+    assert chosen.selected == (), "a widened run selected nothing; it ran everything"
+
+
+def test_every_unretargetable_command_is_named_not_just_the_first(repo):
+    """A reviewer reading FULL SUITE is owed the whole cause, so the blocked
+    commands are collected and reported together."""
+    bare = ("python3", "-m", "pytest", "-q")
+    pinned = ("python3", "-m", "pytest", "suite/test_smoke.py::test_publish")
+    chosen = selection(repo, ["pkg/publisher.py"], commands=(bare, pinned))
+
+    assert chosen.widened is True
+    assert "no test paths" in chosen.reason
+    assert "node id" in chosen.reason
 
 
 def test_a_configured_list_without_pytest_reports_nothing(repo):

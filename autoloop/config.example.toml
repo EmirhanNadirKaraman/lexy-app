@@ -279,6 +279,15 @@ validation_commands = [
 # interpreter — are selected on EVERY change rather than reasoned about. Non-test
 # commands (`ruff`) are never touched and always run in full.
 #
+# That rule covers the COMMANDS above as well as the code they run. A pytest
+# command this selector cannot rewrite without guessing which of its tokens are
+# test paths — one carrying a flag it does not know, one declaring no paths at all
+# (its surface then comes from pytest.ini's testpaths), or one aimed at a node id,
+# a glob or an absolute path — widens the WHOLE round back to the list above,
+# rather than running that one command in full while the summary calls the round a
+# subset. The four commands shipped here are all narrowable; a command you add
+# that is not will simply turn selection off, visibly, and say which one did it.
+#
 # WHICH RUN this governs, as of 2026-08-20: the POST-COMMIT re-run only, the one
 # whose result the reviewer is shown. A round validates twice — once inside
 # ImplementExecutor before the commit, once against the committed worktree — and

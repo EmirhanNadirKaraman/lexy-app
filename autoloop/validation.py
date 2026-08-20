@@ -789,8 +789,10 @@ class TestSelection:
             "every import edge in the repository, transitively, so a test file "
             "the commit did not touch is still selected whenever it can reach "
             f"the change: [{', '.join(selected)}]. Each configured pytest command "
-            "ran the selected files under its own declared paths, and every "
-            "non-test command (ruff) ran unmodified. Sufficient because a test "
+            "that ran, ran only the selected files under its own declared paths "
+            "(a command this selector could not retarget widens the whole run "
+            "instead, so none is present here), and every non-test command "
+            "(ruff) ran unmodified. Sufficient because a test "
             "can only exercise changed code by importing it directly or through "
             "another repository module, and the cases where that cannot be read "
             "statically are not assumed away: a file using a dynamic import or "
@@ -868,34 +870,65 @@ def _positional_indices(args: Sequence[str]) -> list[int] | None:
     return indices
 
 
+#: The four things that can happen to one configured command, of which exactly
+#: ONE widens the whole run.
+#:
+#: * `UNCHANGED` — not a pytest command at all (`ruff`). Runs as configured, and
+#:   that is the whole point: selection decides which TESTS run, not which
+#:   checks.
+#: * `NARROWED` — rewritten to name the selected files under its own paths.
+#: * `SKIP` — a pytest command none of the selected files live under. Dropped
+#:   from the run and named in the evidence; the OTHER commands still narrow,
+#:   because "no selected test is under `other/`" is a reachability answer, not
+#:   an unknown.
+#: * `BLOCKED` — a pytest command this selector cannot retarget without
+#:   guessing (an unrecognised flag, no declared paths, a node id/glob/absolute
+#:   target). This is an UNKNOWN, and the rule for an unknown is the same here
+#:   as everywhere else in this section: the whole selection widens back to the
+#:   configured commands. Keeping the command as configured while still
+#:   reporting a subset — what this did until 2026-08-20 — makes `evidence()`
+#:   claim a narrowing that command did not perform.
+_RETARGET_UNCHANGED = "unchanged"
+_RETARGET_NARROWED = "narrowed"
+_RETARGET_SKIP = "skip"
+_RETARGET_BLOCKED = "blocked"
+
+
 def _retarget_pytest(
     argv: Sequence[str], selected: Sequence[str]
-) -> tuple[tuple[str, ...] | None, str]:
-    """`(command, note)` — the command to run in place of `argv`, or `None` when
-    it should be skipped entirely.
+) -> tuple[str, tuple[str, ...] | None, str]:
+    """`(status, command, note)` for one configured command.
 
-    `note` is "" when `argv` is returned unchanged; otherwise it says what
-    happened, for the evidence line. Non-pytest commands (`ruff`) are returned
-    untouched, which is what keeps lint running in full on a narrowed round.
+    `status` is one of the four `_RETARGET_*` constants above and is what the
+    caller branches on — the command alone cannot say which case it is in, since
+    `UNCHANGED` and `BLOCKED` both hand back `argv` untouched and mean opposite
+    things. `note` says what happened, for the evidence line; it is "" only for
+    `UNCHANGED`. `command` is `None` for `SKIP`.
     """
     argv = tuple(argv)
     start = _pytest_index(argv)
     if start is None:
-        return argv, ""
+        return _RETARGET_UNCHANGED, argv, ""
     args = argv[start + 1 :]
     indices = _positional_indices(args)
     if indices is None:
-        return argv, "argv has a flag this selector does not recognise"
+        return _RETARGET_BLOCKED, argv, "it has a flag this selector does not recognise"
     if not indices:
         # No paths at all: the surface is whatever `testpaths` says. Injecting
-        # paths would CHANGE what the command means, so it is left alone.
-        return argv, "command declares no test paths (surface comes from pytest.ini)"
+        # paths would CHANGE what the command means, and running it as
+        # configured while reporting a subset would misdescribe it.
+        return (
+            _RETARGET_BLOCKED,
+            argv,
+            "it declares no test paths, so its surface comes from pytest.ini's "
+            "testpaths and injecting paths would change what it means",
+        )
     roots = [args[i] for i in indices]
     if not all(_root_is_narrowable(root) for root in roots):
-        return argv, "command targets a node id, glob or absolute path"
+        return _RETARGET_BLOCKED, argv, "it targets a node id, glob or absolute path"
     keep = sorted(rel for rel in selected if any(_under_root(rel, root) for root in roots))
     if not keep:
-        return None, f"no selected test file under {', '.join(roots)}"
+        return _RETARGET_SKIP, None, f"no selected test file under {', '.join(roots)}"
     positional = set(indices)
     rest = [token for i, token in enumerate(args) if i not in positional]
     # Paths go back where the FIRST positional token was. Everything before it
@@ -903,7 +936,11 @@ def _retarget_pytest(
     # meaning: the `--` sits in `head` and the paths land after it.
     head = list(args[: indices[0]])
     tail = rest[len(head) :]
-    return argv[: start + 1] + tuple(head) + tuple(keep) + tuple(tail), "narrowed"
+    return (
+        _RETARGET_NARROWED,
+        argv[: start + 1] + tuple(head) + tuple(keep) + tuple(tail),
+        "narrowed",
+    )
 
 
 def select_validation_commands(
@@ -929,9 +966,16 @@ def select_validation_commands(
     Every uncertainty widens. In order: no pytest command to narrow, mode
     `full`, a caller-supplied reason, no changed paths, a graph that could not
     be built or was truncated, a changed path that is not a Python file the
-    graph resolves, and finally a reachability result of zero test files —
-    which is treated as a gap in the model rather than as proof that no test
-    exercises the change.
+    graph resolves, a reachability result of zero test files — which is treated
+    as a gap in the model rather than as proof that no test exercises the change
+    — and finally a configured pytest command that cannot be retargeted safely
+    (`_RETARGET_BLOCKED`), which widens the WHOLE run rather than leaving that
+    one command as configured, because a `TestSelection` reporting a subset must
+    describe every command it returned.
+
+    The one thing that does NOT widen is a pytest command none of the selected
+    files live under: that is a reachability answer rather than an unknown, so
+    the command is dropped, named in `skipped`, and disclosed by `evidence()`.
     """
     commands = tuple(tuple(argv) for argv in commands)
     applicable = any(_pytest_index(argv) is not None for argv in commands)
@@ -991,12 +1035,27 @@ def select_validation_commands(
         )
     kept: list[tuple[str, ...]] = []
     skipped: list[tuple[tuple[str, ...], str]] = []
+    blocked: list[str] = []
     for argv in commands:
-        rewritten, note = _retarget_pytest(argv, selected)
-        if rewritten is None:
+        status, rewritten, note = _retarget_pytest(argv, selected)
+        if status == _RETARGET_BLOCKED:
+            blocked.append(f"`{' '.join(argv)}` ({note})")
+            continue
+        if status == _RETARGET_SKIP:
             skipped.append((argv, note))
             continue
         kept.append(rewritten)
+    # Checked BEFORE `kept`, and after the loop rather than inside it, so the
+    # reason can name every command that could not be narrowed rather than the
+    # first one — a reviewer reading "FULL SUITE" is owed the whole cause.
+    if blocked:
+        return full(
+            f"{len(blocked)} configured pytest command(s) cannot be retargeted "
+            "without guessing which of their tokens are test paths, so the whole "
+            "run widens rather than record a subset they did not execute: "
+            + "; ".join(blocked),
+            total,
+        )
     if not kept:
         return full(
             "every configured command would have been skipped, leaving nothing "
