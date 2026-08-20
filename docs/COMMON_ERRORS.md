@@ -2359,6 +2359,39 @@ measured window deliberately: they are part of what the round spends.
 more than once, check which call site production actually reaches before
 choosing a test harness — and pick the harness that exercises that one.
 
+### A measured duration tracks the gap it was supposed to replace
+**Symptom:** `autoloop profile` shows `measured` and `gap-derived` moving
+together on `submit` or `execute` — the measured number is a little under the
+gap on every round, instead of being a small fraction of it on the bad ones.
+The instrumentation is at the right call site and the tests pass.
+**Cause:** `Stopwatch.stamp()` STOPS a watch that is still running, so the
+boundary of the measurement is wherever `stamp` is called, not where the
+operation ended. Starting a watch at the operation and stamping it at the
+transcript record therefore measures the operation *plus* everything between:
+
+```python
+submit_watch = self._stopwatch()
+result = client.submit(req.request_id, req.prompt)   # the operation
+req.last_send_outcome = self._client_send_outcome(client)
+...                                                  # reconciliation branches
+self._log("request_submitted", data=submit_watch.stamp({...}))  # <- stops HERE
+```
+
+The result is a number labelled `measured` that is really a small gap. It is
+the exact error the measured column exists to remove, and it is invisible in
+the output — a gap wearing a measured label looks like a measurement.
+**Fix:** applied repo-side — every site calls `watch.stop()` on the operation's
+own last line and lets the latched value be stamped later (first stop wins, so
+the later `stamp` writes the frozen reading). Do NOT "fix" a suspicious number
+by subtracting an estimate of the bookkeeping, and do not move the `stamp` call
+closer to the operation instead: the record cannot be written until the payload
+is built, which is why the two are separated in the first place.
+**The general lesson:** when a timing API can stop implicitly, the call that
+stops it IS the boundary. Write the stop where the operation ends, and test it
+by making the code between the boundary and the emit consume clock readings —
+`test_work_after_the_boundary_cannot_inflate_any_measured_duration` does
+exactly that, and it is the only kind of test that can tell the two apart.
+
 ---
 
 ## Adding an entry

@@ -689,9 +689,10 @@ plainly is the point — a fabricated "measurement" of a wait is worse than an
 honest gap.
 
 **Where the gap holds real work, not only faults.** `submit`'s measured window is
-the send itself — `client.submit(...)` at its call site — so the attach, the
-controlled reload and the duplicate check ahead of it are in the gap and in no
-measured column. On a CHUNKED round (§5d-bis) so is the whole `delivering`
+the send itself — `client.submit(...)` at its call site, closed the instant the
+transport returns — so the attach, the controlled reload and the duplicate check
+ahead of it, and the verdict persistence and reconciliation branches after it,
+are all in the gap and in no measured column. On a CHUNKED round (§5d-bis) so is the whole `delivering`
 phase: N part sends, each a browser round trip, all inside the
 `request_prepared` → `request_submitted` window.
 A large gap beside a small measured value there means "six part sends", not
@@ -713,6 +714,28 @@ history: the 7,203 records written before this will never gain a duration
 field, and nothing retrofits one. They still report — degraded to gap-derived
 and labelled as such. A stage with neither source available prints `n/a` with
 the reason, never a blank or a zero.
+
+`measured n=0` therefore says one of two different things, and the report picks
+between them by looking at the WHOLE file rather than at the stage: if no
+record anywhere carries a duration, it says *every record here predates
+measured durations*; if the transcript does carry measured durations elsewhere,
+it says only *this stage has no measured samples* — because on a current
+transcript an empty stage means that stage's timing failed, or that stage has
+not run yet, not that the history is old.
+
+**Each measured window closes at the OPERATION, not at the record.** The
+stopwatch is stopped on the operation's own last line — the moment the packet
+exists, the moment the transport returns, the instant either executor arm
+returns — and the frozen value is stamped onto the event further down. That
+separation is the whole discipline: stamping stops a running watch, so a window
+left open until the record is written would swallow the loop's own bookkeeping
+(persisting a send verdict, reading a request id, building a payload) and print
+it under a MEASURED label — the gap-is-not-the-work error this command exists
+to remove, wearing the wrong name. Pinned from the outside by
+`test_work_after_the_boundary_cannot_inflate_any_measured_duration` (the loop
+burns clock readings after every boundary; every duration is still one step)
+and `test_no_emit_site_stamps_a_watch_that_is_still_running`, which is the rule
+itself and so also covers a measured stage nobody has written yet.
 
 **`--transcript FILE`** points the same reader at an archived transcript — a
 rotated file, or a copy taken off another machine — instead of the configured

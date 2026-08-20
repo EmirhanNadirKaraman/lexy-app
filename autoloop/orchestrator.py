@@ -884,9 +884,16 @@ class Orchestrator:
         # replay gap `report_sha256` exists to close.
         #
         # Measured from here — the first line of packet CONSTRUCTION — to the
-        # `request_prepared` record below. Everything inside is work this step
-        # actually does: planning the delivery, reading the repository for the
-        # context, hashing the payload, rendering the prompt.
+        # line that finishes it, four statements down. Everything inside is
+        # work this step actually does: planning the delivery, reading the
+        # repository for the context, hashing the payload, rendering the
+        # prompt. FROZEN THERE, not at the `request_prepared` record below:
+        # between the two sit the pending-postcommit/changeset lookups, the
+        # binding refusal, the `PendingRequest` construction and an execution
+        # -store round trip, and `stamp()` stops a watch that is still running
+        # — so leaving it going would report that bookkeeping as construction
+        # time under a MEASURED label, which is the gap-is-not-the-work error
+        # this exists to remove.
         prepare_watch = self._stopwatch()
         plan = self._plan_delivery(state, request_id)
         ctx = build_context(
@@ -899,6 +906,7 @@ class Orchestrator:
         )
         sent_payload = plan.final_payload if plan is not None else state.outbox
         prompt = build_prompt(request_id, next_iteration, render_context(ctx), sent_payload)
+        prepare_watch.stop()  # the packet exists — everything below is bookkeeping
         postcommit = self._current_pending_postcommit(state.outbox, ctx.report_sha256)
         changeset = self._current_pending_changeset(state.outbox, ctx.report_sha256)
         if state.changeset and (state.changeset or {}).get("candidate_sha") and changeset is None:
@@ -1432,6 +1440,10 @@ class Orchestrator:
         # already says the window is wider than the work. Every early return
         # above and below leaves the round unsent, so none of them stamps a
         # duration — a rejected or unconfirmed send is not a completed submit.
+        # The window CLOSES on the transport's return (below), not at the
+        # `request_submitted` record: the verdict persistence and the two
+        # reconciliation branches in between are the loop's bookkeeping about
+        # the send, not the send.
         submit_watch = self._stopwatch()
         try:
             # The attachment rides with the request it belongs to. Passed
@@ -1450,6 +1462,10 @@ class Orchestrator:
                 req.send_attempted = False
                 self._store.save(state)
             raise
+        # THE boundary: the transport has answered. Frozen here, stamped onto
+        # `request_submitted` further down (first stop wins, so the later
+        # `stamp` reports this reading and not a fresher one).
+        submit_watch.stop()
         # Persist the transport's verdict before acting on it, so a crash
         # between here and the next step cannot lose the distinction between
         # "disproven" and "unknown".
@@ -4373,6 +4389,10 @@ class Orchestrator:
         # stopwatch started in the `else` would have measured nothing that
         # actually runs. The escape snapshots are inside the window on purpose:
         # they are part of what this round spends to produce a candidate.
+        # It is FROZEN the instant either arm returns, not at the `executed`
+        # record: `state.last_validation`, the request-id lookup and the
+        # payload construction below are the loop writing down what happened,
+        # and folding them in would report bookkeeping as agent time.
         execute_watch = self._stopwatch()
         if self._worker_repos is not None and not is_audit:
             # M1 finding #1 (escape detection): bracket the write-capable
@@ -4381,6 +4401,7 @@ class Orchestrator:
             # model and why this is detection, checked before commit/review,
             # never prevention.
             outcome = self._execute_with_escape_detection(directive, task)
+            execute_watch.stop()
             if outcome is None:
                 # Escape detected, already parked. A TASK attempt: the agent
                 # wrote outside its worker repository, which is the work
@@ -4389,6 +4410,7 @@ class Orchestrator:
                 return
         else:
             outcome = self._executor.execute(directive, task)
+            execute_watch.stop()
         state.last_validation = outcome.validation or "(none)"
         # `request_id` at last: the review request whose directive dispatched
         # this round. Without it `directive` -> `executed` could not be paired

@@ -3,9 +3,14 @@ readers that turn it into per-stage timing.
 
 One entry per event: requests prepared/submitted, raw responses, parsed
 directives, policy verdicts, git actions, executor outcomes, errors,
-diagnostics pointers. The transcript is the audit log — the loop itself never
-reads it back (recovery uses `state.py`), so its format can grow without
-migration concerns. Payload fields live under "data" to avoid key collisions.
+diagnostics pointers. The transcript is the audit log — no loop CONTROL FLOW
+or recovery decision depends on it (recovery reads `state.py`), so its format
+can grow without migration concerns. It IS read back, by readers that only
+ever REPORT: `health.last_transcript_event` tail-reads the newest entry to
+tell a silent loop from a stopped one, and `profile` (below) reads the whole
+file to summarise timing. Neither can change what the loop does, which is the
+invariant that actually matters here. Payload fields live under "data" to
+avoid key collisions.
 
 **Durations are MEASURED, never inferred** (prof-01, 2026-08-20). Every record
 has always carried a `ts`, so a stage could be "timed" by subtracting two of
@@ -21,7 +26,8 @@ metrics store.
 The transcript is APPEND-ONLY history: the 7,203 records written before this
 existed will never gain the field, and nothing here pretends otherwise. The
 profiler keeps measured and gap-derived samples as two INDEPENDENT sets and
-reports them separately (`profile_stages`, `render_profile`), so a mixed
+reports them separately (`profile_stages`, `build_profile`, `render_profile` —
+the first two see records, the renderer only the aggregate), so a mixed
 transcript never presents a measured number and an inferred one as the same
 column. Independent means exactly that: a modern round contributes its measured
 duration to one set AND its timestamp window to the other, because for `submit`
@@ -73,6 +79,15 @@ class Stopwatch:
     `None` — and every later call returns it unchanged. A completion event that
     is stamped twice (a retry path re-rendering the same data) reports the same
     elapsed time both times instead of growing.
+
+    **Stop at the operation's boundary; stamp at the emit site.** `stamp()`
+    stops a watch that is still running, so a caller that leaves it running
+    until the record is built measures everything between the two — the result
+    persistence, the reconciliation, the bookkeeping — and prints it under a
+    MEASURED label. That is precisely the "the gap is not the work" error this
+    module exists to remove, wearing the wrong name. So every call site here
+    calls `stop()` on the operation's own last line and lets the latched value
+    be stamped later; first-stop-wins is what makes the two safe to separate.
     """
 
     __slots__ = ("_clock", "_started", "_stopped", "_elapsed")
@@ -453,6 +468,49 @@ def profile_stages(
     return tuple(profiles)
 
 
+@dataclass(frozen=True)
+class TranscriptProfile:
+    """Everything the renderer is allowed to see: aggregates, nothing else.
+
+    The read side is split in two deliberately. `read_records` and
+    `profile_stages` see whole records — they must, the durations and the
+    timestamps live in them — and `render_profile` sees only THIS: two counts,
+    one flag, and per-stage `Stats` of floats beside static `Stage` labels. No
+    record dict reaches the rendering layer at all, so there is no path from a
+    review packet (`request_submitted.data.prompt`) or a reviewer reply
+    (`response_received.data.raw`) to stdout. A structural bound, not a promise
+    to remember — see docs/SECURITY.md S36.
+    """
+
+    record_count: int
+    skipped: int
+    stages: tuple[StageProfile, ...]
+    #: Does the transcript carry ANY usable measured duration, on any record?
+    #: Whole-file, not per-stage, because it answers a whole-file question:
+    #: "do these records predate durations?" is a claim about the transcript,
+    #: and one empty stage in a modern transcript is not evidence for it.
+    measured_anywhere: bool = False
+
+
+def build_profile(
+    read: TranscriptRead, stages: Sequence[Stage] = STAGES
+) -> TranscriptProfile:
+    """Reduce a read transcript to the aggregates `render_profile` prints.
+
+    `measured_anywhere` is computed over EVERY record, not only the ones the
+    stage table names: the question it answers is whether this file was written
+    by a loop that records durations at all.
+    """
+    return TranscriptProfile(
+        record_count=len(read.records),
+        skipped=read.skipped,
+        stages=profile_stages(read.records, stages),
+        measured_anywhere=any(
+            measured_duration(record) is not None for record in read.records
+        ),
+    )
+
+
 def format_seconds(value: float) -> str:
     """Short, fixed-width-ish rendering. Never negative — callers drop those."""
     if value < 10.0:
@@ -490,22 +548,25 @@ def _wrapped_note(note: str, indent: str = "               ") -> list[str]:
     return lines
 
 
-def render_profile(
-    path: Path, read: TranscriptRead, profiles: Sequence[StageProfile] | None = None
-) -> str:
-    """The `profile` command's whole output. Pure — takes the read, returns text."""
-    profiles = profile_stages(read.records) if profiles is None else profiles
-    header = f"records      {len(read.records)}"
-    if read.skipped:
-        header += f" ({read.skipped} unreadable line(s) skipped)"
+def render_profile(path: Path, profile: TranscriptProfile) -> str:
+    """The `profile` command's whole output. Pure — aggregates in, text out.
+
+    Takes a `TranscriptProfile` and NOT the read itself: the renderer is the
+    layer that writes to stdout, so the records — which hold whole packets and
+    whole reviewer replies — must not be in reach of it. See `TranscriptProfile`
+    and docs/SECURITY.md S36.
+    """
+    header = f"records      {profile.record_count}"
+    if profile.skipped:
+        header += f" ({profile.skipped} unreadable line(s) skipped)"
     lines = [f"transcript   {path}", header, ""]
-    for profile in profiles:
-        stage = profile.stage
+    for stage_profile in profile.stages:
+        stage = stage_profile.stage
         lines.append(f"{stage.name} — {stage.description}")
         if not stage.measured_event:
             lines.append(f"  {MEASURED:<12} n/a")
             lines += _wrapped_note(stage.measured_note)
-        elif profile.measured is None:
+        elif stage_profile.measured is None:
             lines.append(f"  {MEASURED:<12} n=0")
             # Two notes, not one sentence: the second must reach the reader
             # VERBATIM, and folding both into one string lets the word wrap
@@ -513,15 +574,23 @@ def render_profile(
             lines += _wrapped_note(
                 f"no record of type '{stage.measured_event}' carries a {DURATION_KEY}"
             )
-            lines += _wrapped_note("every record here predates measured durations")
+            # WHICH second note is a whole-file question, not a per-stage one.
+            # "these records predate measured durations" is a claim about the
+            # transcript; making it because THIS stage is empty says it of a
+            # current transcript in which other stages are measured and this
+            # one's timing merely failed — or has not happened yet this run.
+            if profile.measured_anywhere:
+                lines += _wrapped_note("this stage has no measured samples")
+            else:
+                lines += _wrapped_note("every record here predates measured durations")
         else:
-            lines.append(_stats_line(MEASURED, profile.measured))
+            lines.append(_stats_line(MEASURED, stage_profile.measured))
         if not (stage.gap_start and stage.gap_end):
             lines.append(f"  {GAP_DERIVED:<12} n/a")
-        elif profile.gap is None:
+        elif stage_profile.gap is None:
             lines.append(f"  {GAP_DERIVED:<12} n=0")
         else:
-            lines.append(_stats_line(GAP_DERIVED, profile.gap))
+            lines.append(_stats_line(GAP_DERIVED, stage_profile.gap))
         # ALWAYS, including under an `n/a` row: a stage with no historical pair
         # has to say why, or a blank reads as "nothing happened here".
         lines += _wrapped_note(stage.gap_note)

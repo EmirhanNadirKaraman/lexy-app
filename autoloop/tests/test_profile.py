@@ -9,14 +9,17 @@ failure — a clock that raises, a clock that runs backwards, a second `stop()`.
 have been, with the duration key simply absent, which is the same shape as
 every record written before durations existed.
 
-The READ half is `profile_stages` / `render_profile`: pure functions over a
-list of records. The transcript they read in production is append-only history
+The READ half is `profile_stages` / `build_profile` / `render_profile`: pure
+functions, and a deliberate split — the first two see records, the renderer
+sees only the aggregate they reduce to (S36).
+The transcript they read in production is append-only history
 with 7,203 records that will never carry a duration, so the tests below assert
 the DEGRADATION explicitly — a legacy transcript still reports, labelled
 gap-derived, and a mixed one never puts a measured number and an inferred one
 in the same column.
 """
 
+import dataclasses
 import json
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
@@ -28,7 +31,13 @@ from autoloop.transcript import (
     DURATION_KEY,
     GAP_DERIVED,
     MEASURED,
+    Stage,
+    StageProfile,
+    Stats,
     Stopwatch,
+    TranscriptProfile,
+    TranscriptRead,
+    build_profile,
     format_seconds,
     measured_duration,
     profile_stages,
@@ -100,6 +109,15 @@ def stage_named(profiles, name):
     return next(p for p in profiles if p.stage.name == name)
 
 
+def rendered(records, path=Path("/tmp/t.jsonl")) -> str:
+    """The report for a list of records, through the production reduction.
+
+    `build_profile` is what stands between the records and the renderer — the
+    renderer itself never sees one (S36) — so the tests go through it rather
+    than hand-assembling a profile the command would never produce."""
+    return render_profile(path, build_profile(TranscriptRead(tuple(records))))
+
+
 # ---- the write half: Stopwatch ---------------------------------------------
 
 
@@ -158,6 +176,19 @@ def test_a_non_finite_reading_records_nothing():
 
 def test_stamp_of_none_data_is_just_the_duration():
     assert Stopwatch(FakeClock(0.0, 1.25)).stamp(None) == {DURATION_KEY: 1.25}
+
+
+def test_a_watch_frozen_at_the_boundary_ignores_everything_after_it():
+    """The production discipline in miniature: `stop()` where the operation
+    ends, `stamp()` where the record is built. Work done in between — the
+    loop's own bookkeeping, which is not what the label claims to measure —
+    cannot reach the number, however much of the clock it consumes."""
+    clock = FakeClock(100.0, 102.0, 500.0, 900.0)
+    watch = Stopwatch(clock)
+    assert watch.stop() == 2.0
+    clock()
+    clock()  # bookkeeping between the boundary and the emit site
+    assert watch.stamp({"result": "ok"}) == {"result": "ok", DURATION_KEY: 2.0}
 
 
 # ---- reading a duration off a record ---------------------------------------
@@ -307,7 +338,7 @@ def test_legacy_records_still_report_and_are_labelled_gap_derived():
     submit = stage_named(profiles, "submit")
     assert submit.measured is None
     assert submit.gap.count == 1 and submit.gap.total == 400.0
-    text = render_profile(Path("/tmp/t.jsonl"), read_records(Path("/nope")), profiles)
+    text = rendered(LEGACY_ROUND)
     assert GAP_DERIVED in text
     assert "browser_error" in text  # the gap note says what is inside the window
 
@@ -335,9 +366,7 @@ def test_prepare_has_no_historical_pair_and_says_so():
 
 
 def test_render_over_legacy_records_never_prints_a_measured_number():
-    text = render_profile(
-        Path("/tmp/t.jsonl"), read_records(Path("/nope")), profile_stages(LEGACY_ROUND)
-    )
+    text = rendered(LEGACY_ROUND)
     for line in text.splitlines():
         if line.strip().startswith(MEASURED) and "median" in line:
             raise AssertionError(f"a measured statistic appeared: {line!r}")
@@ -376,9 +405,7 @@ def test_a_measured_stage_is_never_folded_into_its_own_gap_number():
 
 
 def test_mixed_transcript_never_renders_the_two_sources_as_one_column():
-    text = render_profile(
-        Path("/tmp/t.jsonl"), read_records(Path("/nope")), profile_stages(MIXED)
-    )
+    text = rendered(MIXED)
     stat_lines = [ln for ln in text.splitlines() if "median" in ln and "total" in ln]
     assert stat_lines, "expected at least one statistics line"
     for line in stat_lines:
@@ -392,12 +419,109 @@ def test_the_report_says_not_to_sum_the_two_rows():
     rows, so the one arithmetic that would be wrong has to be named. Printing
     it beats deduplicating: dropping a modern round's window would throw away
     the comparison the pair exists for."""
-    text = render_profile(
-        Path("/tmp/t.jsonl"), read_records(Path("/nope")), profile_stages(MIXED)
-    )
+    text = rendered(MIXED)
     assert "Do not sum them" in text
     assert "independent sample sets" in text
     assert "round can appear in both rows" in text
+
+
+# ---- "these records are old" is a claim about the FILE, not about a stage ---
+
+
+#: A CURRENT round in which one stage's timing FAILED: the clock misbehaved
+#: while the executor ran, so `executed` carries no duration while
+#: `request_prepared` and `request_submitted` carry theirs. Nothing here
+#: predates measured durations — the loop that wrote it records them.
+ONE_TIMING_FAILURE = [
+    rec("request_prepared", 0, "r1", duration=0.5, chars=100),
+    rec("request_submitted", 20, "r1", duration=3.0, result="ok"),
+    rec("response_received", 200, "r1", raw="..."),
+    rec("directive", 201, "r1", decision="implement"),
+    rec("executed", 800, "r1", status="ok"),
+]
+
+
+def test_a_stage_with_no_measured_samples_never_calls_the_transcript_legacy():
+    """`execute` is measured-capable and empty here; `submit` is measured. The
+    report must say the first stage has nothing, NOT that the whole file
+    predates durations — which would be false about every record around it."""
+    profiles = profile_stages(ONE_TIMING_FAILURE)
+    assert stage_named(profiles, "execute").measured is None  # the empty stage
+    assert stage_named(profiles, "submit").measured.count == 1  # measured beside it
+
+    text = rendered(ONE_TIMING_FAILURE)
+    assert "every record here predates measured durations" not in text
+    assert "this stage has no measured samples" in text
+
+
+def test_the_all_legacy_claim_survives_where_it_is_actually_true():
+    """The other half of the same rule: a file in which nothing was measured
+    still gets the sentence that explains WHY every column is gap-derived."""
+    assert "every record here predates measured durations" in rendered(LEGACY_ROUND)
+
+
+def measured_anywhere(records) -> bool:
+    return build_profile(TranscriptRead(tuple(records))).measured_anywhere
+
+
+def test_whether_records_predate_durations_is_asked_of_the_whole_file():
+    assert measured_anywhere(LEGACY_ROUND) is False
+    assert measured_anywhere(MIXED) is True
+    assert measured_anywhere(ONE_TIMING_FAILURE) is True
+    # Even on a record no stage names: the question is whether the loop that
+    # wrote this file records durations at all, not whether this stage did.
+    assert measured_anywhere([rec("audit_finished", 0, duration=12.0)]) is True
+    # And it is the same "usable number" test the stages apply — a string is
+    # not a measurement, so it is not evidence of one either.
+    assert measured_anywhere([rec("audit_finished", 0, duration="12.0")]) is False
+
+
+# ---- the renderer sees aggregates and nothing else (SECURITY.md S36) --------
+
+
+def reachable(value):
+    """Every value reachable from a profile, flattened — dataclasses by field,
+    sequences by item. What the renderer can possibly get its hands on.
+
+    `list` is walked as well as `tuple` even though nothing here holds one: a
+    walk that stopped at a list would let a future `list[dict]` field pass the
+    check that a `tuple[dict, ...]` field fails, which is the sort of asymmetry
+    that makes a structural test quietly weaker than it reads."""
+    yield value
+    if dataclasses.is_dataclass(value):
+        for field in dataclasses.fields(value):
+            yield from reachable(getattr(value, field.name))
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from reachable(item)
+
+
+def test_the_render_layer_receives_no_record_and_so_cannot_print_one(tmp_path):
+    """S36's bound, stated structurally rather than as an output check.
+
+    `render_profile` is the layer that writes to stdout, so the claim worth
+    testing is not "it did not print the packet" — it is that the packet was
+    never in reach. Every value the renderer can reach is a count, a flag, a
+    float or a static stage label; there is no dict, and no `TranscriptRead`,
+    anywhere in the object it is handed."""
+    path = write_transcript(
+        tmp_path / "t.jsonl",
+        [
+            rec("request_prepared", 0, "r1", duration=0.5),
+            rec("request_submitted", 5, "r1", duration=2.0, prompt="SECRET-PACKET-BODY"),
+            rec("response_received", 60, "r1", raw="SECRET-REVIEWER-REPLY"),
+        ],
+    )
+    profile = build_profile(read_records(path))
+    allowed = (TranscriptProfile, StageProfile, Stage, Stats, tuple, bool, int, float, str)
+    for value in reachable(profile):
+        assert not isinstance(value, (dict, list, TranscriptRead)), value
+        assert value is None or isinstance(value, allowed), value
+    # A second, cheaper net over the same claim: nothing that was in the file
+    # survives into the object, so nothing can survive into the output either.
+    for secret in ("SECRET-PACKET-BODY", "SECRET-REVIEWER-REPLY"):
+        assert secret not in repr(profile)
+        assert secret not in render_profile(path, profile)
 
 
 # ---- incomplete, malformed and unrelated records ---------------------------

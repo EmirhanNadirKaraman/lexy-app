@@ -100,7 +100,7 @@ from .publisher import (
 from .stall import StallPolicy
 from .state import TERMINAL_PHASES, LoopState, Phase, StateStore, utcnow_iso
 from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
-from .transcript import TranscriptLogger, read_records, render_profile
+from .transcript import TranscriptLogger, build_profile, read_records, render_profile
 from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
 from .worktask import IntentStore, TaskExecutionStore, retire_execution
@@ -1622,15 +1622,18 @@ def _cmd_profile(args: argparse.Namespace) -> int:
     Only AGGREGATES are printed. The transcript carries full review packets
     (`request_submitted.data.prompt`) and full reviewer responses
     (`response_received.data.raw`); this command must never grow a flag that
-    prints a record body — see docs/SECURITY.md S36.
+    prints a record body — see docs/SECURITY.md S36. The read is reduced to a
+    `TranscriptProfile` — counts, flags and per-stage `Stats` of floats —
+    BEFORE anything renders, so the layer that writes to stdout holds no
+    record at all rather than holding one it is trusted not to print.
 
     `--transcript FILE` points the same reader at an ARCHIVED transcript — a
     rotated file, a copy taken off another machine, the 7,203-record history
     that motivated this. It widens which file is read and nothing else: the
-    renderer still receives only floats and static stage labels, so a file that
-    is not a transcript profiles to "no usable records" rather than putting any
-    of its content on stdout. Read with `getattr` so every caller that builds
-    the namespace without the flag keeps working.
+    renderer still receives only that aggregate, so a file that is not a
+    transcript profiles to "no usable records" rather than putting any of its
+    content on stdout. Read with `getattr` so every caller that builds the
+    namespace without the flag keeps working.
     """
     config = load_config(args.config)
     override = getattr(args, "transcript", None)
@@ -1642,7 +1645,7 @@ def _cmd_profile(args: argparse.Namespace) -> int:
     if not read.records:
         print(f"transcript   {path}\nno usable records")
         return 0
-    print(render_profile(path, read))
+    print(render_profile(path, build_profile(read)))
     return 0
 
 

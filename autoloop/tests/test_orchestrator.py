@@ -46,7 +46,12 @@ from autoloop.state import (
     StateStore,
 )
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
-from autoloop.transcript import DURATION_KEY, TranscriptLogger, profile_stages
+from autoloop.transcript import (
+    DURATION_KEY,
+    Stopwatch,
+    TranscriptLogger,
+    profile_stages,
+)
 from autoloop.worker_env import WorkerRepoManager
 from autoloop.worktask import IntentStore, TaskExecutionStore
 
@@ -1802,3 +1807,109 @@ def test_a_timing_clock_that_raises_leaves_the_round_untouched(tmp_path):
     # And the same for the other two measured stages.
     assert DURATION_KEY not in one_record(broken, "request_prepared")["data"]
     assert DURATION_KEY not in one_record(broken, "request_submitted")["data"]
+
+
+# ---- the measured window closes at the OPERATION, not at the record ---------
+#
+# `stamp()` stops a watch that is still running, so where a caller stamps would
+# otherwise decide what it measured: everything between the operation's last
+# line and the transcript write — persisting a verdict, reading the request id,
+# building the payload — would land inside a MEASURED column. That is the
+# gap-is-not-the-work error this task exists to remove, wearing the wrong
+# label. These pin the freeze from the outside: the loop does clock-consuming
+# work after each boundary and none of it reaches the number.
+
+
+class BurningWatch(Stopwatch):
+    """Consumes clock readings at `stamp()`, standing in for the loop's own
+    bookkeeping between the boundary and the record. A watch frozen at the
+    boundary is immune; one still running when the record is built reports the
+    burn as work — four extra readings, on a clock that only moves forward."""
+
+    BURN = 4
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self._burn_clock = clock
+
+    def stamp(self, data=None):
+        for _ in range(self.BURN):
+            self._burn_clock()
+        return super().stamp(data)
+
+
+class BoundarySpy(Stopwatch):
+    """Remembers whether the watch had already been stopped when it was first
+    stamped — the rule itself, rather than one consequence of it."""
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.stopped_before_stamp = None
+        self._was_stopped = False
+
+    def stop(self):
+        self._was_stopped = True
+        return super().stop()
+
+    def stamp(self, data=None):
+        if self.stopped_before_stamp is None:
+            self.stopped_before_stamp = self._was_stopped
+        return super().stamp(data)
+
+
+def test_work_after_the_boundary_cannot_inflate_any_measured_duration(tmp_path):
+    """Every measured stage at once. Each watch is stopped at its operation's
+    last line, so the four readings burned at the emit site cost nothing: each
+    duration is one step. Were the watch stopped at the record instead, each
+    would read five steps — the shape of the bug, not a rounding difference."""
+    clock = SteppingClock(step=3.0)
+    orch, *_ = build_postcommit(tmp_path, responses=[audit_block()])
+
+    def burning():
+        return BurningWatch(clock)
+
+    orch._stopwatch = burning
+    orch.run(max_steps=4)
+
+    for entry_type in ("request_prepared", "request_submitted", "executed"):
+        measured = one_record(orch, entry_type)["data"][DURATION_KEY]
+        assert measured == 3.0, f"{entry_type} measured {measured}, not the operation"
+
+
+def test_real_post_send_bookkeeping_cannot_inflate_the_submit_duration(tmp_path):
+    """The same claim at a REAL production seam rather than a simulated one:
+    `_client_send_outcome` runs after the transport returned and before
+    `request_submitted` is written. Here reading the verdict costs ten clock
+    readings; the recorded send is still the one step the transport took."""
+    clock = SteppingClock(step=5.0)
+    orch, *_ = build(tmp_path, responses=[stop_block()])
+    orch._timing_clock = clock
+    verdict = orch._client_send_outcome
+
+    def slow_verdict(client):
+        for _ in range(10):
+            clock()
+        return verdict(client)
+
+    orch._client_send_outcome = slow_verdict
+    orch.run(max_steps=4)
+    assert one_record(orch, "request_submitted")["data"][DURATION_KEY] == 5.0
+
+
+def test_no_emit_site_stamps_a_watch_that_is_still_running(tmp_path):
+    """Refactor-proof form of the rule, and the one that covers a stage nobody
+    has written yet: whatever the clock does, a stamped watch must already have
+    been stopped by the operation it measured."""
+    watches = []
+    orch, *_ = build_postcommit(tmp_path, responses=[audit_block()])
+
+    def spy():
+        watches.append(BoundarySpy(orch._timing_clock))
+        return watches[-1]
+
+    orch._stopwatch = spy
+    orch.run(max_steps=4)
+
+    stamped = [w for w in watches if w.stopped_before_stamp is not None]
+    assert len(stamped) >= 3, "expected prepare, submit and execute to be stamped"
+    assert all(w.stopped_before_stamp for w in stamped)
