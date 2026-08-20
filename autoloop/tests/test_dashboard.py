@@ -3324,3 +3324,108 @@ console.log(JSON.stringify({picked, delivered: shows("b-new")}));
         "a forced redraw let the held graph in under the operator's cursor"
     )
     assert out["delivered"] is True, "the forced redraw swallowed the held payload"
+
+
+def test_a_held_graph_the_server_stopped_reporting_is_never_delivered():
+    """A held payload has to be dropped when it goes OBSOLETE, not only when the
+    draw that lands is it. A graph changes mid-gesture (b-new appears) and is
+    held; before the operator lets go, b-new is retired and the next poll carries
+    the graph ALREADY ON SCREEN. Keeping the superseded one meant `settle`
+    rendered it the moment the gesture ended — the panel showing a task the
+    registry no longer has, until the following tick took it away again.
+
+    The rule that fixes it is one rule, and the two halves are chained here
+    because a narrower version passes either half alone: a payload arriving
+    without `force` is the newest the page has, so whatever differs from it is
+    history — whether the screen already shows that payload (first half) or it is
+    about to be drawn (second half, reached by a selection collapsed OUTSIDE the
+    panel, which no listener sees). The paired positive is in both: a gate that
+    simply discarded every held payload would pass every negative on its own.
+    """
+    first = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"])]})
+    grown = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"])]})
+    newer = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("c-new", depends_on=["a-leaf"])]})
+    latest = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("c-new", depends_on=["a-leaf"]),
+        roadmap_task("d-new", depends_on=["c-new"])]})
+
+    harness = deps_gate_js(
+        FIRST=dep_payload(first, 4, []),
+        GROWN=dep_payload(grown, 5, []),
+        NEWER=dep_payload(newer, 6, []),
+        LATEST=dep_payload(latest, 7, []),
+    ) + """
+updateDeps(FIRST);
+HOLD.hover = INSIDE;          // the pointer goes onto a node
+updateDeps(GROWN);            // held: the graph grew mid-gesture
+stamp("HELD");
+// b-new is retired while the operator is still holding the panel, so this poll
+// carries the graph that is already drawn. Nothing to redraw — and nothing left
+// worth delivering either.
+updateDeps(FIRST);
+const backToFirst = {intact: intact("HELD"), cleared: DEPHELD === null};
+// The pointer leaves. What the page's `settle` listener does, spelled out: it is
+// bound outside the region this harness lifts, so nothing here would run it.
+HOLD.hover = null;
+if (DEPHELD) updateDeps(DEPHELD);
+const settled = {intact: intact("HELD"), stale: shows("b-new")};
+// …and a real change still lands on the next tick. `staleAfter` reads a DOM
+// that was actually rendered, unlike the sentinel-stamped one above.
+updateDeps(NEWER);
+const landed = {redrew: !intact("HELD"), delivered: shows("c-new"),
+                staleAfter: shows("b-new")};
+
+// The other half of the same rule: the superseding payload need not be the one
+// already on screen. A selection collapsed OUTSIDE the panel ends the gesture
+// with no listener firing, so the next tick simply draws a further change — and
+// the graph held behind it is just as obsolete.
+stamp("BASE");
+HOLD.anchor = {nodeType: 3, parentNode: INSIDE};
+updateDeps(GROWN);            // held again
+const heldAgain = intact("BASE");
+HOLD.anchor = null;           // collapsed outside the panel; no settle fires
+updateDeps(LATEST);           // draws, and must drop what was held
+const drawPath = {cleared: DEPHELD === null, drew: shows("d-new"),
+                  stale: shows("b-new")};
+stamp("CURRENT");
+if (DEPHELD) updateDeps(DEPHELD);
+console.log(JSON.stringify({backToFirst, settled, landed, drawPath, heldAgain,
+                            afterSettle: intact("CURRENT")}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["backToFirst"]["intact"] is True, (
+        "the graph already on screen was redrawn anyway"
+    )
+    assert out["backToFirst"]["cleared"] is True, (
+        "a payload the server no longer reports stayed held"
+    )
+    assert out["settled"]["intact"] is True, (
+        "the end of the gesture rendered a superseded graph"
+    )
+    assert out["settled"]["stale"] is False, "b-new is gone and must not be drawn"
+    assert out["landed"]["redrew"] is True and out["landed"]["delivered"] is True, (
+        "a real dependency change no longer lands"
+    )
+    assert out["landed"]["staleAfter"] is False, "the retired task was drawn anyway"
+
+    assert out["heldAgain"] is True, (
+        "the gate has memory of having been released once — the selection did "
+        "not hold the redraw"
+    )
+    assert out["drawPath"]["drew"] is True, "the newest graph did not land"
+    assert out["drawPath"]["stale"] is False, (
+        "a graph held during the gesture was drawn instead of the newest one"
+    )
+    assert out["drawPath"]["cleared"] is True, (
+        "a payload superseded by the draw itself stayed held"
+    )
+    assert out["afterSettle"] is True, (
+        "settling after the draw rendered the superseded graph"
+    )

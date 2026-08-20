@@ -3195,16 +3195,24 @@ function depsBusy(){
 function updateDeps(d, force){
   if (!d) return;
   const sig = depSig(d);
+  // A payload arriving WITHOUT `force` is the newest the page has, so it
+  // supersedes anything held — whether the screen already shows it or we are
+  // about to draw it, a held payload that differs is obsolete history now. It
+  // is dropped HERE, before either exit, because the alternative is `settle`
+  // rendering it over the newer graph once the gesture ends: draw A, hold B
+  // mid-gesture, then a later poll returns to A (or straight to C), and the
+  // held B is a graph the server no longer reports. Re-held two lines down if
+  // the operator is still holding the panel.
+  // A FORCED draw is the opposite case and deliberately leaves `DEPHELD`
+  // alone: it redraws `DEPDRAWN`, the payload already on screen, so the node
+  // picker can move the highlight without swallowing a newer graph or slipping
+  // one in under the cursor.
+  if (!force) DEPHELD = null;
   // Nothing about the dependencies changed. Whatever else on the page did is
   // not this panel's business, and rebuilding for it is what threw away a
   // hovered node every two seconds.
-  if (!force && sig === DEPJSON) { if (depSig(DEPHELD) === sig) DEPHELD = null; return; }
+  if (!force && sig === DEPJSON) return;
   if (!force && depsBusy()) { DEPHELD = d; return; }
-  // A forced redraw draws `DEPDRAWN` — the payload already on screen — so a
-  // selection click moves the highlight WITHOUT slipping a held graph in under
-  // the cursor. The held one is therefore only cleared when this draw actually
-  // is it.
-  if (depSig(DEPHELD) === sig) DEPHELD = null;
   DEPJSON = sig;
   DEPDRAWN = d;
   renderDeps(d);
