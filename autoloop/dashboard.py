@@ -1159,6 +1159,342 @@ def task_groups(tasks_data: dict, executions: dict) -> list[dict]:
         return []
 
 
+# ---- the dependency graph -----------------------------------------------------
+#
+# Measured 2026-08-19: 132 tasks, 150 `depends_on` edges, 41 tasks carrying at
+# least one dependency, and the most depended-upon ids are ingest-02 (7
+# dependents), port-01 (6), inbox-03 (5), stream-01 (5), prov-01 (5). None of
+# that was on the page: the roadmap is a flat list grouped by state, so "port-01
+# is blocked and six tasks are waiting behind it" was a fact an operator could
+# only get by reading `tasks.json` by hand. What is held up, and by what, is the
+# one question this panel answers.
+#
+# BUILT FROM THE RAW ROWS, never from a `TaskRegistry`, and that is the
+# load-bearing choice rather than a convenience. `TaskRegistry.from_dict` runs
+# `_check_acyclic` (tasks.py), so a cyclic `tasks.json` raises `TaskGraphError`
+# and `task_groups` returns `[]` — at which point every other panel on the page
+# degrades to "the task graph could not be read". A graph built from a registry
+# would therefore show NOTHING in exactly the case where a cycle is the thing
+# worth showing. Reading the raw rows means a cycle, a dangling `depends_on` and
+# a hand-edited self-edge all render, and each is reported as what it is.
+#
+# (What `from_dict` actually tolerates and `state_of` then rejects is a DANGLING
+# dependency: `_check_acyclic` looks each dep up with `.get`, so an unknown id
+# is not a cycle, and `state_of` later does `self._tasks[dep]` and raises
+# `KeyError`. Cycles are refused at load. Both cases land here as a drawn node.)
+#
+# Display only. Nothing in this section writes anything, and `depends_on`,
+# dependency resolution and `next_ready()` are untouched — the panel reports the
+# graph the loop already has.
+
+#: Every state a drawn node can carry: the `TaskState` vocabulary the Roadmap
+#: panel already groups by, plus `unknown` for an id that is depended ON but is
+#: not a task at all. Derived from `GROUPS` rather than spelled again, so a
+#: seventh state cannot reach the page with no mark against it — the page's
+#: `DMARK` table is pinned to this tuple by a test.
+DEP_NODE_STATES: tuple[str, ...] = tuple(
+    state.value for _key, _label, state in GROUPS
+) + ("unknown",)
+
+
+def _dep_rows(tasks_data: dict) -> list[dict]:
+    """`{id, title, status, depends_on}` per raw row, in file order.
+
+    Tolerant on purpose — this is the read that has to survive a file no
+    registry will load. A row that is not a mapping, or carries no id, is
+    skipped; the FIRST row wins a duplicate id (`from_dict` raises on one, and
+    raising is what this read exists to avoid).
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for raw in (tasks_data or {}).get("tasks") or ():
+        if not isinstance(raw, dict):
+            continue
+        task_id = str(raw.get("id") or "")
+        if not task_id or task_id in seen:
+            continue
+        seen.add(task_id)
+        declared = raw.get("depends_on") or ()
+        # A STRING is not a list of ids. `_validate_depends_on` refuses one on
+        # the way in, but `from_dict` bypasses that gate, and `tuple("ab")`
+        # would silently become two one-character dependencies. A row shaped
+        # wrongly declares none here rather than declaring nonsense.
+        deps = (
+            tuple(dep for dep in declared if isinstance(dep, str) and dep)
+            if isinstance(declared, (list, tuple)) else ()
+        )
+        rows.append({
+            "id": task_id,
+            "title": str(raw.get("title") or ""),
+            "status": str(raw.get("status") or "pending"),
+            "depends_on": deps,
+        })
+    return rows
+
+
+def _dep_states(rows: list[dict], groups: list[dict] | None) -> tuple[dict[str, str], str]:
+    """`({task_id: state}, source)` — the registry's answer where there is one.
+
+    `groups` is the payload `task_groups` already built from
+    `TaskRegistry.state_of()`, so the graph's node states are the SAME states
+    the Roadmap panel groups by and cannot disagree with them.
+
+    The fallback is reached only when that registry did not load at all (a
+    cycle, a shape `Task(**raw)` refuses), which is the case this panel exists
+    to render. It mirrors `state_of`'s branch order exactly, with one deliberate
+    difference: a dependency naming a task that does not exist reads as
+    incomplete (BLOCKED) instead of raising `KeyError`. `source` travels with it
+    so the page can say which of the two an operator is reading.
+    """
+    from_registry: dict[str, str] = {}
+    for group in groups or ():
+        grouped_state = group.get("state")
+        if not grouped_state:
+            continue
+        for task in group.get("tasks") or ():
+            from_registry[task["id"]] = grouped_state
+    if from_registry:
+        return from_registry, "registry"
+    status = {row["id"]: row["status"] for row in rows}
+    states: dict[str, str] = {}
+    for row in rows:
+        stored = row["status"]
+        if stored == "completed":
+            states[row["id"]] = TaskState.COMPLETED.value
+        elif stored == "blocked":
+            states[row["id"]] = TaskState.BLOCKED_BY_OPERATOR.value
+        elif stored == "retired":
+            states[row["id"]] = TaskState.RETIRED.value
+        elif any(status.get(dep) != "completed" for dep in row["depends_on"]):
+            states[row["id"]] = TaskState.BLOCKED.value
+        elif stored == "in_progress":
+            states[row["id"]] = TaskState.IN_PROGRESS.value
+        else:
+            states[row["id"]] = TaskState.READY.value
+    return states, "status"
+
+
+def _dep_sccs(nodes: list[str], deps: dict[str, list[str]]) -> list[list[str]]:
+    """Tarjan's strongly connected components, ITERATIVELY.
+
+    Iterative because "must not hang and must not blow up" is a requirement of
+    this panel rather than a preference: the registry refuses a cycle at load,
+    so the only file that reaches here with one is a hand-edited or corrupt one,
+    and that is precisely when a recursion limit or an unbounded walk would take
+    the whole page down.
+
+    A component of more than one node is a cycle; a single node is one only when
+    it depends on itself. Nodes and each node's dependencies are walked in the
+    order given (the caller sorts both), so the components — and the cycle paths
+    derived from them below — are deterministic.
+    """
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    components: list[list[str]] = []
+    counter = 0
+    for root in nodes:
+        if root in index:
+            continue
+        work: list[tuple[str, int]] = [(root, 0)]
+        while work:
+            node, cursor = work[-1]
+            if cursor == 0:
+                index[node] = low[node] = counter
+                counter += 1
+                stack.append(node)
+                on_stack.add(node)
+            descended = False
+            children = deps[node]
+            while cursor < len(children):
+                child = children[cursor]
+                cursor += 1
+                if child not in index:
+                    work[-1] = (node, cursor)
+                    work.append((child, 0))
+                    descended = True
+                    break
+                if child in on_stack:
+                    low[node] = min(low[node], index[child])
+            if descended:
+                continue
+            work[-1] = (node, cursor)
+            if low[node] == index[node]:
+                component: list[str] = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    component.append(member)
+                    if member == node:
+                        break
+                components.append(component)
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+    return components
+
+
+def _dep_cycle_path(members: list[str], deps: dict[str, list[str]]) -> list[str]:
+    """One concrete cycle inside a cyclic component, as ids.
+
+    In `depends_on` order — `["a", "b", "a"]` reads "a depends on b depends on
+    a" — because that is the direction the file declares and the direction an
+    operator has to edit. Every node of a component this size lies on a cycle,
+    so following the first in-component dependency from the lowest id revisits a
+    node in at most `len(members)` steps; the walk is bounded by that fact, not
+    by a cap.
+    """
+    inside = set(members)
+    node = min(members)
+    seen: dict[str, int] = {}
+    path: list[str] = []
+    while node not in seen:
+        seen[node] = len(path)
+        path.append(node)
+        node = next(dep for dep in deps[node] if dep in inside)
+    return path[seen[node]:] + [node]
+
+
+def dependency_graph(tasks_data: dict, groups: list[dict] | None = None) -> dict:
+    """The `depends_on` relation as a drawable, cycle-safe layered graph.
+
+    One edge per declared `(dependency, dependent)` pair, pointing from the
+    dependency to the dependent — the direction work flows, so an arrow into a
+    blocked node is the thing being waited for.
+
+    Only the CONNECTED subgraph is drawn. 91 of the 132 tasks declare no
+    dependency and have none declared on them; rendering them as isolated dots
+    is what makes the 41 that matter unreadable. `omitted` counts them, so the
+    omission is on the page rather than silent, and `omitted + shown == total`
+    holds for every payload.
+
+    Layout is by LAYER: a node's layer is one past the highest layer of anything
+    it depends on, so a task is drawn after everything it depends on. Cycles
+    cannot satisfy that and are not made to: the graph is condensed on its
+    strongly connected components first, the condensation is a DAG by
+    construction, and the layering runs over that — so the members of a cycle
+    share a layer, everything downstream of them still lands after them, and no
+    edge is dropped to make the picture acyclic. Each cycle is reported in
+    `cycles` with a concrete path.
+    """
+    rows = _dep_rows(tasks_data)
+    states, states_from = _dep_states(rows, groups)
+    known = {row["id"] for row in rows}
+    titles = {row["id"]: row["title"] for row in rows}
+
+    # ONE edge per pair, in declaration order. A dependency listed twice on the
+    # same task is one relation stated twice, not two edges — and the duplicate
+    # would draw exactly on top of the first, so the drawing could not show it
+    # either way.
+    edges: list[tuple[str, str]] = []
+    pairs: set[tuple[str, str]] = set()
+    for row in rows:
+        for dep in row["depends_on"]:
+            pair = (dep, row["id"])
+            if pair in pairs:
+                continue
+            pairs.add(pair)
+            edges.append(pair)
+
+    drawn = {node for pair in pairs for node in pair}
+    deps: dict[str, list[str]] = {node: [] for node in drawn}
+    dependents: dict[str, list[str]] = {node: [] for node in drawn}
+    for dep, dependent in edges:
+        deps[dependent].append(dep)
+        dependents[dep].append(dependent)
+    for node in drawn:
+        deps[node].sort()
+        dependents[node].sort()
+
+    ordered = sorted(drawn)
+    components = _dep_sccs(ordered, deps)
+    component_of = {
+        node: number for number, members in enumerate(components) for node in members
+    }
+    cyclic_members = {
+        node
+        for members in components
+        if len(members) > 1 or members[0] in deps[members[0]]
+        for node in members
+    }
+    cycles = [
+        {"nodes": sorted(members), "path": _dep_cycle_path(members, deps)}
+        for members in components
+        if len(members) > 1 or members[0] in deps[members[0]]
+    ]
+    cycles.sort(key=lambda cycle: cycle["nodes"])
+
+    # Longest-path layering over the CONDENSATION, by Kahn. The condensation of
+    # any directed graph is acyclic, so this terminates on a cyclic input as
+    # readily as on an acyclic one — that is the whole reason the components are
+    # computed first rather than the layering being given a visited set and a
+    # prayer.
+    upstream: dict[int, set[int]] = {number: set() for number in range(len(components))}
+    downstream: dict[int, set[int]] = {number: set() for number in range(len(components))}
+    for dep, dependent in edges:
+        source, target = component_of[dep], component_of[dependent]
+        if source != target:
+            upstream[target].add(source)
+            downstream[source].add(target)
+    remaining = {number: len(items) for number, items in upstream.items()}
+    queue = sorted(number for number, count in remaining.items() if count == 0)
+    depth: dict[int, int] = {}
+    while queue:
+        number = queue.pop(0)
+        depth[number] = 1 + max((depth[up] for up in upstream[number]), default=-1)
+        for down in sorted(downstream[number]):
+            remaining[down] -= 1
+            if remaining[down] == 0:
+                queue.append(down)
+
+    layer_of = {node: depth[component_of[node]] for node in ordered}
+    placed = sorted(ordered, key=lambda node: (layer_of[node], node))
+    filled: dict[int, int] = {}
+    nodes = []
+    for node in placed:
+        layer = layer_of[node]
+        row_index = filled.get(layer, 0)
+        filled[layer] = row_index + 1
+        nodes.append({
+            "id": node,
+            "title": titles.get(node, ""),
+            # A drawn id that is not a task cannot have a state, and inventing
+            # one would be the page asserting something the registry refuses to.
+            "state": states.get(node, "unknown") if node in known else "unknown",
+            "known": node in known,
+            "layer": layer,
+            "row": row_index,
+            "cyclic": node in cyclic_members,
+            "depends_on": list(deps[node]),
+            "dependents": len(dependents[node]),
+        })
+
+    return {
+        "nodes": nodes,
+        "edges": [
+            {"from": dep, "to": dependent,
+             # An edge INSIDE a cycle: the one kind whose dependent cannot be
+             # drawn after its dependency. Marked rather than dropped.
+             "cycle": component_of[dep] == component_of[dependent]}
+            for dep, dependent in edges
+        ],
+        "cycles": cycles,
+        "total": len(rows),
+        "shown": len(known & drawn),
+        # Tasks in no relation at all — neither depending on anything nor
+        # depended on. Counted, never drawn.
+        "omitted": len(known - drawn),
+        # Ids something depends on that are not tasks. `from_dict` accepts such
+        # a row and `state_of` then raises on it, so these are drawn as nodes in
+        # the `unknown` state rather than becoming a missing edge.
+        "unknown": sorted(drawn - known),
+        "layers": max(filled) + 1 if filled else 0,
+        "states_from": states_from,
+    }
+
+
 # ---- the summary an operator reads first --------------------------------------
 #
 # The page listed tasks and answered none of the three questions the operator
@@ -1657,6 +1993,13 @@ def collect(repo: Path) -> dict:
         # re-polled: this is the only network call on the page and it must
         # never be made twice per request.
         "stats": roadmap_stats(groups, executions, remote_ok, ref_shas),
+        # The same rows again, read as a RELATION rather than as a list: one
+        # edge per declared `depends_on`, pointing from the dependency to the
+        # dependent. Built from the raw JSON, not from a registry, so a cyclic
+        # or dangling file still draws — see `dependency_graph`. `groups` is
+        # passed in rather than re-derived so each node's state is the state the
+        # Roadmap panel already shows for it.
+        "depgraph": dependency_graph(tasks, groups),
         "inbox": _pending_inbox(repo),
         "app_tasks": app_tasks(repo, report_glob=_audit_report_glob(repo)),
         "pipeline": pipeline(state, live_agents_cache, blockers),
@@ -1781,6 +2124,30 @@ code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);
 .legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;font-size:12px;color:var(--ink2)}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .legend i{width:10px;height:10px;border-radius:50%;display:inline-block;font-style:normal}
+/* dependency graph — the pipeline's rules at a second scale: hand-built SVG,
+   nothing fetched, and identity carried by icon + word as well as by fill. Its
+   own selectors rather than the pipeline's `.node`/`.edge` because the two
+   graphs answer different questions and must stay restyleable apart. The svg
+   is sized in px from its own content and sits in a `.scroll`: shrinking a
+   40-node graph to the column width would take the labels below reading size,
+   and an unreadable label is the same as no label. --critical is the one
+   status role used here, on the cycle, which IS a health verdict — and the
+   cycle is also named in words above the drawing and marked in the table
+   below, so the colour is never the only thing saying it. */
+#depsvg{display:block}
+.dnode rect{fill:var(--soft);stroke:var(--line);stroke-width:1;rx:7;cursor:pointer}
+.dnode.sel rect{stroke:var(--ink2);stroke-width:2}
+.dnode.cyc rect{stroke:var(--critical);stroke-width:2}
+.dnode:focus{outline:none}
+.dnode:focus rect{stroke:var(--ink);stroke-width:2}
+.dnode text{font-size:11px;fill:var(--ink);pointer-events:none}
+.dnode .tid{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+.dnode .sub{font-size:9.5px;fill:var(--ink2)}
+/* Solid hairlines, like the pipeline's: a dashed back-edge would encode "this
+   is the odd one" in a channel the rest of the page does not use. */
+.dedge{stroke:var(--line);stroke-width:1.5;fill:none;marker-end:url(#dar)}
+.dedge.on{stroke:var(--axis);stroke-width:2}
+.dedge.cyc{stroke:var(--critical);marker-end:url(#dcar)}
 /* Roadmap group headings. The count sits IN the heading rather than under it:
    "Needs a human 0" is the whole sentence an operator came to read, and a
    number one line away from its label is a number nobody reads. */
@@ -2001,6 +2368,56 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       branch. <b>unknown</b> means git could not answer (origin unreachable, or
       the repository would not read); it is never reported as not-merged — which
       is why that group renders with its count even at zero.</p>
+  </section>
+
+  <!-- The roadmap read as a RELATION rather than as a list. A second hand-built
+       SVG and not a replacement for the pipeline flow above: that one is the
+       loop's phase progression, this one is what is waiting on what. Nothing is
+       fetched at runtime and no library is loaded, for the same reason nothing
+       else on this page is.
+
+       `#deptablebox` is STATIC markup, like `#mgmergedbox` and `#donebox`:
+       `renderDeps` writes its summary text and its rows and NEVER its `.open`,
+       so an operator reading the edge list keeps it open across the 2s poll.
+       The svg lives in a `.scroll` because it is sized in px from its own
+       content — see the CSS note.
+
+       The section carries `#deppanel` because `depsBusy` asks "is the operator
+       holding anything in HERE" — a focused node, a hovered node, a text
+       selection anchored inside it — and needs one static ancestor to ask
+       `contains()` of. It is never rebuilt, which is also what makes it the
+       place to bind the settle listeners once. -->
+  <section id="deppanel">
+    <h2>Dependency graph — every depends_on, dependency → dependent</h2>
+    <div id="depnote" style="font-size:13px;margin-bottom:9px"></div>
+    <div class="scroll">
+      <svg id="depsvg" viewBox="0 0 1140 90">
+        <defs>
+          <marker id="dar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--line)"/></marker>
+          <!-- Its own marker rather than one that inherits the stroke: an arrow
+               that stayed line-coloured on a cycle edge would leave the edge
+               half-marked. -->
+          <marker id="dcar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--critical)"/></marker>
+        </defs>
+        <g id="depedges"></g><g id="depnodes"></g>
+      </svg>
+    </div>
+    <div id="depdetail" class="muted" style="font-size:12.5px;margin-top:6px"></div>
+    <div class="legend" id="deplegend"></div>
+    <details id="deptablebox"><summary id="deptablesum">Table view — every edge as text</summary>
+      <div id="deptable" class="scroll"></div></details>
+    <p class="muted" style="font-size:12px;margin:9px 0 0">
+      An arrow points from a dependency to the task waiting on it, and a task is
+      drawn after everything it depends on. Only tasks in at least one
+      dependency relation are drawn: the line above says how many were left out,
+      and a task in no relation at all is held up by nothing and holds nothing
+      up. A cycle cannot be laid out in that order and is not drawn as though it
+      could be — its members share a column, they are marked, and the path is
+      spelled out above. The number on the right of a node is how many tasks are
+      waiting behind it. Display only: nothing here edits depends_on, and the
+      order the loop dispatches in is still next_ready()'s.</p>
   </section>
 
   <!-- Grouped by state, in triage order. `Retired` and `Done` are <details>
@@ -2554,6 +2971,312 @@ function renderMerge(d){
 }
 // MERGE_PANEL_END
 
+// ---- the dependency graph ----------------------------------------------------
+//
+// Everything between the markers is lifted verbatim by the tests and run under
+// node against a stub document, so it may reference `esc`, `rows` and its own
+// declarations and NOTHING else on this page — the listener wiring itself lives
+// in `bindDeps` below the region for exactly that reason, reached from in here
+// only through the `DEPBIND` hook, which defaults to a no-op. The refresh gate
+// IS in the region, because when this panel may redraw is behaviour and
+// behaviour only a browser can run is behaviour nothing in CI checks. Keep each
+// marker alone on its line.
+// DEPGRAPH_START
+// Layer and row arrive COMPUTED from `dependency_graph` on the backend, and
+// this function does no ordering of its own. That is what keeps "a task is
+// drawn after everything it depends on" a property of the payload — assertable
+// in a Python test — rather than of a browser nobody runs in CI.
+let DSEL = null;
+// Icon + word for every state in `DEP_NODE_STATES`. A state missing from here
+// renders an empty node, so the two are pinned equal by a test.
+const DMARK = {completed:["✓","completed"], in_progress:["▶","in progress"],
+               ready:["○","ready"], blocked:["◍","blocked"],
+               blocked_by_operator:["■","needs a human"], retired:["⊘","retired"],
+               unknown:["?","not a task"]};
+// The same tokens the rest of the page uses; no new colours. --critical is the
+// one status role, on the state that genuinely is a verdict, and every node
+// ships its icon and word beside the dot.
+const DFILL = {completed:"var(--mark-done)", in_progress:"var(--mark-active)",
+               ready:"var(--axis)", blocked:"var(--warning)",
+               blocked_by_operator:"var(--critical)", retired:"var(--mark-idle)",
+               unknown:"var(--muted)"};
+// The WIDE spelling, for every place that has room for it. `blocked` ON DISK
+// means quarantined and `blocked` here means waiting on a dependency — two
+// states under one word on one page is the exact confusion `TaskState` was
+// split up to end, and it is why `STAT_BUCKETS` ships "blocked on a dependency"
+// rather than "blocked". A 126px node box cannot hold that, so the short word
+// stays in the box and never travels alone into a context that can hold more:
+// the legend, the edge table and the tooltip all take this one.
+const DLONG = {blocked:"blocked on a dependency",
+               unknown:"depended on, but not a task in the registry"};
+const DORDER = ["in_progress","blocked_by_operator","blocked","ready",
+                "retired","completed","unknown"];
+// `pad` is headroom for the arcs a cycle edge draws OVER the nodes; without it
+// they would be clipped by the viewBox and a cycle would look like a gap.
+const DGEO = {w:126, h:34, gapx:54, gapy:10, pad:48};
+const dgX = n => n.layer * (DGEO.w + DGEO.gapx);
+const dgY = n => DGEO.pad + n.row * (DGEO.h + DGEO.gapy);
+const dgWord = s => DMARK[s] || DMARK.unknown;
+const dgLong = s => DLONG[s] || dgWord(s)[1];
+// One path per edge, and every edge gets one — including the two shapes a
+// straight left-to-right line cannot express.
+const dgPath = (a, b) => {
+  const ax = dgX(a), ay = dgY(a), bx = dgX(b), by = dgY(b);
+  if (a.id === b.id) {
+    // A self-edge is a one-node cycle. A zero-length path would draw nothing
+    // at all, which is the one way a cycle could silently vanish from here.
+    const cx = ax + DGEO.w / 2;
+    return `M${cx - 16},${ay} C${cx - 36},${ay - 42} ${cx + 36},${ay - 42} ${cx + 16},${ay}`;
+  }
+  if (bx > ax) {
+    const x1 = ax + DGEO.w, y1 = ay + DGEO.h / 2, x2 = bx, y2 = by + DGEO.h / 2;
+    const c = Math.max(24, (x2 - x1) * 0.5);
+    return `M${x1},${y1} C${x1 + c},${y1} ${x2 - c},${y2} ${x2},${y2}`;
+  }
+  // Same column or backwards — only an edge inside a cycle can be either, and
+  // it is drawn as an arc over the top rather than dropped to tidy the picture.
+  const c1 = ax + DGEO.w / 2, c2 = bx + DGEO.w / 2;
+  return `M${c1},${ay} C${c1},${ay - 40} ${c2},${by - 40} ${c2},${by}`;
+};
+const dgNode = n => {
+  const [ic, word] = dgWord(n.state);
+  const deps = (n.depends_on || []).join(", ") || "nothing drawn";
+  // The count of tasks waiting BEHIND this one — the figure the panel exists
+  // for ("port-01 is blocked and six tasks are waiting on it"). Absent rather
+  // than 0 when nothing waits: a zero on every leaf is noise.
+  const behind = n.dependents
+    ? `<text class="badge" x="${DGEO.w - 8}" y="14" text-anchor="end">${esc(n.dependents)}↴</text>`
+    : "";
+  return `<g class="dnode${DSEL === n.id ? " sel" : ""}${n.cyclic ? " cyc" : ""}"
+      data-id="${esc(n.id)}" tabindex="0" role="button"
+      aria-label="${esc(n.id)} — ${esc(dgLong(n.state))}${n.cyclic ? ", in a dependency cycle" : ""}. Depends on ${esc(deps)}. ${esc(n.dependents)} task(s) depend on it."
+      transform="translate(${dgX(n)},${dgY(n)})">
+    <rect width="${DGEO.w}" height="${DGEO.h}"/>
+    <circle cx="9" cy="10" r="4" fill="${DFILL[n.state] || DFILL.unknown}"/>
+    <text class="tid" x="18" y="14">${esc(n.id)}</text>${behind}
+    <text class="sub" x="8" y="27">${esc(ic)} ${esc(word)}${n.cyclic ? " · in a cycle" : ""}</text></g>`;
+};
+function renderDeps(d){
+  const g = d.depgraph || {};
+  const nodes = g.nodes || [], edges = g.edges || [], cycles = g.cycles || [];
+  const at = {};
+  nodes.forEach(n => { at[n.id] = n; });
+  // The omitted count is rendered whether or not anything was omitted: "91 were
+  // left out" and "this is the whole graph" are different claims, and a panel
+  // that only spoke up sometimes would leave a reader guessing which they had.
+  const head = nodes.length
+    ? `<b>${esc(edges.length)} dependency edge(s)</b> across ${esc(nodes.length)} node(s).`
+    : `<b>no task declares a dependency</b> — there is no graph to draw.`;
+  const left = ` <span class="muted">${esc(g.omitted || 0)} of ${esc(g.total || 0)} task(s) `
+    + `are in no dependency relation at all and are not drawn.</span>`;
+  const ghosts = (g.unknown || []).length
+    ? ` <span class="muted">? ${esc((g.unknown || []).length)} id(s) are depended on but are `
+      + `not tasks: ${esc((g.unknown || []).join(", "))}.</span>`
+    : "";
+  const cyc = cycles.length
+    ? `<div><b>⚠ ${esc(cycles.length)} dependency cycle(s):</b> `
+      + cycles.map(c => `<code>${esc((c.path || []).join(" → "))}</code>`).join("; ")
+      + ` — each task depends on the next, so nothing in one can ever become ready. `
+      + `The registry refuses to load a file like this, which is why the panels `
+      + `above say the task graph could not be read.</div>`
+    : `<div class="muted">✓ no dependency cycle.</div>`;
+  // Said out loud when it is true, because it changes what the states MEAN: the
+  // registry could not be built, so these came from the stored status fields
+  // rather than from state_of().
+  const src = g.states_from === "status"
+    ? `<div class="muted">The registry would not load, so each state here is derived `
+      + `from the stored status field rather than from state_of().</div>`
+    : "";
+  document.getElementById("depnote").innerHTML = head + left + ghosts + cyc + src;
+
+  const svg = document.getElementById("depsvg");
+  const columns = Math.max(1, g.layers || 1);
+  const deep = nodes.reduce((most, n) => Math.max(most, n.row + 1), 1);
+  const width = columns * (DGEO.w + DGEO.gapx) - DGEO.gapx;
+  const height = DGEO.pad + deep * (DGEO.h + DGEO.gapy);
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("width", width);
+  svg.setAttribute("height", height);
+  // An edge whose endpoints are both drawn — which is every edge, since a node
+  // is drawn precisely because an edge touches it.
+  document.getElementById("depedges").innerHTML = edges.map(e => {
+    const a = at[e.from], b = at[e.to];
+    if (!a || !b) return "";
+    const on = DSEL && (DSEL === e.from || DSEL === e.to);
+    return `<path class="dedge${e.cycle ? " cyc" : ""}${on ? " on" : ""}" d="${dgPath(a, b)}"/>`;
+  }).join("");
+  document.getElementById("depnodes").innerHTML = nodes.map(dgNode).join("");
+
+  const present = DORDER.filter(s => nodes.some(n => n.state === s));
+  document.getElementById("deplegend").innerHTML = present.map(s =>
+    `<span><i style="background:${DFILL[s]}"></i>${esc(dgWord(s)[0])} ${esc(dgLong(s))}</span>`
+  ).join("") + (cycles.length
+    ? `<span><i style="background:var(--critical)"></i>⚠ in a cycle</span>` : "");
+
+  // The WCAG-clean twin, and the place every edge is legible as text: a
+  // drawing is not a reading of the relation for someone who cannot see it.
+  document.getElementById("deptablesum").textContent =
+    `Table view — all ${edges.length} edge(s) as text`;
+  document.getElementById("deptable").innerHTML =
+    // Two state columns, each headed by WHOSE state it is: an ambiguous header
+    // defeats the point of the table, which is to be the readable twin.
+    rows(["dependency", "dependency state", "waiting task", "waiting-task state",
+          "note"], edges.map(e => {
+      const a = at[e.from] || {}, b = at[e.to] || {};
+      return `<tr><td><code>${esc(e.from)}</code></td>
+        <td>${esc(dgWord(a.state)[0])} ${esc(dgLong(a.state))}</td>
+        <td><code>${esc(e.to)}</code></td>
+        <td>${esc(dgWord(b.state)[0])} ${esc(dgLong(b.state))}</td>
+        <td class="muted">${e.cycle ? "⚠ in a dependency cycle" : ""}</td></tr>`;
+    }).join(""));
+
+  const sel = DSEL ? at[DSEL] : null;
+  document.getElementById("depdetail").textContent = sel
+    ? `${sel.id} — ${dgLong(sel.state)}; depends on `
+      + `${(sel.depends_on || []).join(", ") || "nothing"}; `
+      + `${sel.dependents} task(s) depend on it`
+    : "no task selected";
+}
+
+// ---- when this panel is allowed to redraw ------------------------------------
+//
+// `renderDeps` above REPLACES every element it writes. Two rules decide when it
+// may, and the panel owns both rather than inheriting the page's:
+//
+//   1. PANEL-LOCAL CHANGE DETECTION. `render`'s `LASTJSON` guard fires on the
+//      whole payload, so an agent starting, a blocker opening or any other
+//      figure moving used to rebuild this graph even though not one dependency
+//      had changed. The signature here is `depgraph` and nothing else.
+//   2. AN INTERACTION GUARD. Even a genuinely changed graph waits while the
+//      operator is holding this panel. The newer payload is HELD, not dropped,
+//      and `render` calls in here on every 2s tick — so it lands within one
+//      tick of the interaction ending whether or not a listener fires.
+//
+// `force` is the panel's OWN concept and is passed by exactly one caller: the
+// node picker in `bindDeps`, which changed `DSEL` and needs the selection to
+// move under the operator's cursor. It is deliberately NOT `render`'s `force` —
+// that one is also raised by a click on a PIPELINE node (`drawFlow`'s picker
+// calls `render(LAST, true)`), and threading it through here would let an
+// unrelated click replace the dep node someone is hovering.
+let DEPJSON = null;   // signature of the graph currently on screen
+let DEPDRAWN = null;  // the payload it was drawn from — what a selection redraws
+let DEPHELD = null;   // a newer payload, held while the operator is mid-gesture
+// The listener wiring, installed from outside this region because it reaches
+// the page's tooltip helpers, `render` and `LAST` — none of which the node
+// harness has. Left at this no-op when the region is lifted on its own; a test
+// pins the real assignment, since an unassigned hook would silently bind
+// nothing on the page while every node test still passed.
+let DEPBIND = () => {};
+const depSig = p => JSON.stringify((p || {}).depgraph || null);
+// Is the operator holding this panel right now? Three ways to be, and each is a
+// gesture a rebuilt DOM destroys: keyboard focus on a node (the focus ring and
+// its tooltip), the pointer over one (the tooltip follows the mouse), and a text
+// selection anchored inside the panel (the edge table is there to be copied).
+// An OPEN <details> is not one of them — nothing rebuilds it, and a disclosure
+// left open for an hour must not freeze the graph inside it.
+function depsBusy(){
+  const panel = document.getElementById("deppanel");
+  if (!panel) return false;
+  // Switched windows: the focus ring is still on a node but nobody is there, and
+  // freezing until they come back and click would be the worse failure.
+  if (document.hasFocus && !document.hasFocus()) return false;
+  const active = document.activeElement;
+  if (active && active !== document.body && panel.contains(active)) return true;
+  if (panel.querySelector(".dnode:hover")) return true;
+  const picked = typeof window !== "undefined" && window.getSelection
+    ? window.getSelection() : null;
+  if (picked && picked.rangeCount && !picked.isCollapsed) {
+    const at = picked.anchorNode;
+    const el = at && (at.nodeType === 1 ? at : at.parentNode);
+    if (el && panel.contains(el)) return true;
+  }
+  return false;
+}
+function updateDeps(d, force){
+  if (!d) return;
+  const sig = depSig(d);
+  // A payload arriving WITHOUT `force` is the newest the page has, so it
+  // supersedes anything held — whether the screen already shows it or we are
+  // about to draw it, a held payload that differs is obsolete history now. It
+  // is dropped HERE, before either exit, because the alternative is `settle`
+  // rendering it over the newer graph once the gesture ends: draw A, hold B
+  // mid-gesture, then a later poll returns to A (or straight to C), and the
+  // held B is a graph the server no longer reports. Re-held two lines down if
+  // the operator is still holding the panel.
+  // A FORCED draw is the opposite case and deliberately leaves `DEPHELD`
+  // alone: it redraws `DEPDRAWN`, the payload already on screen, so the node
+  // picker can move the highlight without swallowing a newer graph or slipping
+  // one in under the cursor.
+  if (!force) DEPHELD = null;
+  // Nothing about the dependencies changed. Whatever else on the page did is
+  // not this panel's business, and rebuilding for it is what threw away a
+  // hovered node every two seconds.
+  if (!force && sig === DEPJSON) return;
+  if (!force && depsBusy()) { DEPHELD = d; return; }
+  DEPJSON = sig;
+  DEPDRAWN = d;
+  renderDeps(d);
+  DEPBIND(d);
+}
+// DEPGRAPH_END
+
+// The listeners, outside the pure region: they reach `showTip`, `render` and
+// `LAST`, none of which the node harness has. Rebound on every rebuild for the
+// same reason the roadmap's Save buttons are — these nodes are fresh DOM each
+// time — and scoped to #depnodes so the pipeline's own nodes are untouched.
+function bindDeps(d){
+  const at = {};
+  ((d.depgraph || {}).nodes || []).forEach(n => { at[n.id] = n; });
+  document.querySelectorAll("#depnodes .dnode").forEach(el => {
+    const n = at[el.dataset.id];
+    if (!n) return;
+    const body = `<b>${esc(n.id)}</b> — ${esc(dgLong(n.state))}`
+      + (n.title ? `<br>${esc(n.title)}` : "")
+      + `<br><span class="muted">depends on `
+      + `${esc((n.depends_on || []).join(", ") || "nothing")} · `
+      + `${esc(n.dependents)} task(s) depend on it`
+      + `${n.cyclic ? " · in a dependency cycle" : ""}</span>`;
+    el.addEventListener("mousemove", e => showTip(e, body));
+    el.addEventListener("mouseleave", hideTip);
+    // Keyboard parity with hover, exactly as the pipeline's nodes have.
+    el.addEventListener("focus", () => {
+      const r = el.getBoundingClientRect();
+      showTip({clientX: r.left, clientY: r.bottom - 8}, body);
+    });
+    el.addEventListener("blur", hideTip);
+    // This panel only, and from the payload already drawn: selecting a node is
+    // not a reason to rebuild the roadmap under someone, and it is not a reason
+    // to let a held graph in either.
+    const pick = () => {
+      DSEL = DSEL === n.id ? null : n.id;
+      updateDeps(DEPDRAWN || LAST, true);
+    };
+    el.addEventListener("click", pick);
+    el.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); }
+    });
+  });
+}
+DEPBIND = bindDeps;
+
+// The held payload lands SOONER than the next tick when a gesture ends inside
+// the panel. Polish, not the mechanism: `render` calls `updateDeps` on every
+// 2s tick regardless, which is what actually guarantees a held update is never
+// lost — including for the gesture these miss (a drag-select that starts in the
+// edge table and is released outside the panel). Bound ONCE, on the static
+// section, so they do not accumulate per poll. `settle` never forces: if the
+// operator is still holding something, `updateDeps` simply holds it again.
+const deppanel = document.getElementById("deppanel");
+if (deppanel) {
+  const settle = () => { if (DEPHELD) updateDeps(DEPHELD); };
+  // Deferred by a turn: on `focusout` and `mouseup` the browser has not yet
+  // moved `document.activeElement` / collapsed the selection, so an immediate
+  // read would still see the gesture that just ended.
+  deppanel.addEventListener("focusout", () => setTimeout(settle, 0));
+  deppanel.addEventListener("mouseup", () => setTimeout(settle, 0));
+  deppanel.addEventListener("mouseleave", settle);
+}
+
 function render(d, force){
   if (!d) return;
   // No skeleton flash on refetch: a 2s poll that rebuilt identical DOM threw
@@ -2578,6 +3301,16 @@ function render(d, force){
       + `(running ${d.build.running}, on disk ${d.build.on_disk}). `
       + `Restart the dashboard to load it.`;
   } else { stale.style.display = "none"; }
+
+  // ---- the dependency graph ----------------------------------------------
+  // ABOVE the page-wide guard, and with no `force` passed, because this panel
+  // carries its own: `updateDeps` redraws only when the `depgraph` slice itself
+  // changed, and not even then while the operator is holding a node or a
+  // selection. Being called on EVERY tick is the point — it is what lets a held
+  // payload land within one tick of the gesture ending, with no listener
+  // involved. See the rules block above `updateDeps`.
+  updateDeps(d);
+
   if (!force && sig === LASTJSON) return;
   LASTJSON = sig; LAST = d;
   document.getElementById("hdot").style.background = `var(--${d.health.role})`;

@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from autoloop.dashboard import (
+    DEP_NODE_STATES,
     GROUPS,
     IN_PROGRESS_KINDS,
     MARKS,
@@ -31,6 +32,7 @@ from autoloop.dashboard import (
     STATUS,
     app_tasks,
     collect,
+    dependency_graph,
     is_ancestor,
     merge_groups,
     merge_states,
@@ -2517,3 +2519,913 @@ def test_the_docket_is_rendered_by_one_function_the_search_box_also_calls():
     # back from tasks.json — this change is display only.
     assert 'querySelectorAll("#roadmap button.save")' in script
     assert '"/api/priority"' in script
+
+
+# ---- the dependency graph (2026-08-20) ---------------------------------------
+#
+# Measured 2026-08-19: 132 tasks, 150 `depends_on` edges, 41 tasks with at least
+# one dependency. The roadmap is a flat list grouped by state, so "port-01 is
+# blocked and six tasks are waiting behind it" was a fact an operator could only
+# get by reading `tasks.json` by hand.
+#
+# The claim under test: every `depends_on` relation renders as one directed edge
+# from dependency to dependent, laid out so a task appears after everything it
+# depends on, with each node carrying its id and its current state.
+#
+# The traps these tests exist for, each of which a looser test would pass:
+#   * A LAYOUT THAT IS REALLY AN ALPHABETICAL SORT. Every fixture below is built
+#     so alphabetical order CONTRADICTS dependency order (`z-01` before `a-01`),
+#     which is the only way `layer[dep] < layer[dependent]` says anything.
+#   * A GRAPH BUILT FROM A REGISTRY. `TaskRegistry.from_dict` runs
+#     `_check_acyclic`, so a cyclic file raises and `task_groups` returns `[]` —
+#     a registry-derived graph would show nothing in exactly the case a cycle is
+#     worth showing. The cyclic tests drive `collect()` end to end and assert
+#     BOTH that the registry refused the file and that the panel still drew it.
+#   * A CYCLE THAT HANGS. Nothing asserts termination directly; the test
+#     completing is the assertion, which is why the layering runs over the
+#     condensation rather than over a visited set.
+
+
+def dep_graph(tasks: list[dict]) -> dict:
+    """`dependency_graph` over raw rows, grouped the way `collect()` groups.
+
+    `task_groups` is passed in exactly as the payload does it, so these tests
+    exercise the same state source the page reads — including its `[]` answer
+    for a file no registry will load.
+    """
+    data = {"tasks": tasks}
+    return dependency_graph(data, task_groups(data, {}))
+
+
+def dep_nodes(graph: dict) -> dict:
+    return {node["id"]: node for node in graph["nodes"]}
+
+
+def dep_pairs(graph: dict) -> list[tuple[str, str]]:
+    return [(edge["from"], edge["to"]) for edge in graph["edges"]]
+
+
+def test_every_depends_on_pair_becomes_exactly_one_edge():
+    """One edge per relation, pointing from the dependency to the dependent —
+    the direction work flows, so an arrow INTO a node is what it is waiting for.
+
+    A dependency declared twice on the same task is one relation stated twice:
+    the second edge would draw exactly on top of the first, so a duplicate could
+    only ever inflate a count.
+    """
+    graph = dep_graph([
+        roadmap_task("z-root"),
+        roadmap_task("y-root"),
+        roadmap_task("m-mid", depends_on=["z-root", "y-root"]),
+        roadmap_task("a-leaf", depends_on=["m-mid", "m-mid"]),
+    ])
+
+    assert sorted(dep_pairs(graph)) == [
+        ("m-mid", "a-leaf"), ("y-root", "m-mid"), ("z-root", "m-mid"),
+    ]
+    # Exactly one, not at least one: no duplicates and nothing invented.
+    assert len(dep_pairs(graph)) == len(set(dep_pairs(graph))) == 3
+    # Every declared pair is present — asserted from the fixture's own rows
+    # rather than from the list above, so a dropped edge cannot pass by both
+    # sides being wrong together.
+    declared = {(dep, task["id"])
+                for task in graph["nodes"] for dep in task["depends_on"]}
+    assert declared == set(dep_pairs(graph))
+
+
+def test_a_task_is_laid_out_after_everything_it_depends_on():
+    """The layout claim. Alphabetical order contradicts dependency order here on
+    purpose — `a-01` depends on `z-01` — so a layout that merely sorted by id
+    fails, which is the whole reason the fixture reads backwards."""
+    graph = dep_graph([
+        roadmap_task("z-01"),
+        roadmap_task("a-01", depends_on=["z-01"]),
+        roadmap_task("m-01", depends_on=["a-01"]),
+        roadmap_task("b-01", depends_on=["z-01", "m-01"]),
+    ])
+
+    layer = {node["id"]: node["layer"] for node in graph["nodes"]}
+    order = [node["id"] for node in graph["nodes"]]
+    for dep, dependent in dep_pairs(graph):
+        assert layer[dep] < layer[dependent], f"{dependent} is drawn before {dep}"
+        assert order.index(dep) < order.index(dependent)
+    # A node's layer is one past the HIGHEST of its dependencies, so `b-01`
+    # lands past `m-01` rather than beside `a-01` — the longest path, not the
+    # first one found.
+    assert layer == {"z-01": 0, "a-01": 1, "m-01": 2, "b-01": 3}
+    assert order == ["z-01", "a-01", "m-01", "b-01"]
+    assert graph["layers"] == 4
+    # Rows are the position WITHIN a column, so one-per-column here.
+    assert [node["row"] for node in graph["nodes"]] == [0, 0, 0, 0]
+
+
+def test_isolated_tasks_are_omitted_and_the_count_is_reported():
+    """91 of the 132 tasks are in no dependency relation at all; drawing them as
+    isolated dots is what makes the 41 that matter unreadable. The omission is
+    reported rather than silent, and the arithmetic is asserted so a task cannot
+    be dropped from both sides at once."""
+    graph = dep_graph([
+        roadmap_task("alone-1"), roadmap_task("alone-2"), roadmap_task("alone-3"),
+        roadmap_task("z-root"),
+        roadmap_task("a-waits", depends_on=["z-root"]),
+    ])
+
+    assert [node["id"] for node in graph["nodes"]] == ["z-root", "a-waits"]
+    assert graph["omitted"] == 3
+    assert graph["shown"] == 2
+    assert graph["total"] == 5
+    assert graph["omitted"] + graph["shown"] == graph["total"]
+    # ISOLATED means neither direction. A root declaring no dependency of its
+    # own but carrying dependents is the most interesting node on the page —
+    # it is what everything behind it is waiting for — and must never be
+    # mistaken for one of the 91.
+    assert dep_nodes(graph)["z-root"]["depends_on"] == []
+    assert dep_nodes(graph)["z-root"]["dependents"] == 1
+
+
+def test_a_cyclic_registry_renders_and_reports_the_cycle(tmp_path):
+    """The bound the panel is easiest to get wrong. Nothing enforces acyclicity
+    when a `tasks.json` is written by hand, and `TaskRegistry.from_dict` REFUSES
+    such a file (`_check_acyclic`) — so every other panel degrades to "the task
+    graph could not be read" and a registry-derived graph would show nothing at
+    all in the one case a cycle is worth showing.
+
+    Driven through `collect()` end to end, asserting both halves: the registry
+    really did refuse the file, and the panel really did draw it. That the test
+    RETURNS is the termination assertion — there is no timeout to hide behind.
+    """
+    repo = make_repo(tmp_path)
+    write_registry(repo, [
+        roadmap_task("cyc-a", depends_on=["cyc-b"]),
+        roadmap_task("cyc-b", depends_on=["cyc-a"]),
+        roadmap_task("alone-1"),
+        roadmap_task("after-1", depends_on=["cyc-a"]),
+    ])
+
+    payload = collect(repo)
+    graph = payload["depgraph"]
+
+    # The registry refused the whole file — this is the state every other panel
+    # renders as unreadable.
+    assert payload["groups"] == []
+    # NOT ONE EDGE IS DROPPED to make the picture acyclic, the cycle's own edge
+    # included.
+    assert sorted(dep_pairs(graph)) == [
+        ("cyc-a", "after-1"), ("cyc-a", "cyc-b"), ("cyc-b", "cyc-a"),
+    ]
+    # The cycle is reported as a cycle, with a concrete path an operator can
+    # take straight to the file.
+    assert graph["cycles"] == [
+        {"nodes": ["cyc-a", "cyc-b"], "path": ["cyc-a", "cyc-b", "cyc-a"]}
+    ]
+    nodes = dep_nodes(graph)
+    assert nodes["cyc-a"]["cyclic"] is True and nodes["cyc-b"]["cyclic"] is True
+    assert nodes["after-1"]["cyclic"] is False
+    # Members of a cycle cannot be ordered against each other and are not
+    # pretended to be — they share a column. Everything downstream still lands
+    # after them, which is what the condensation buys.
+    assert nodes["cyc-a"]["layer"] == nodes["cyc-b"]["layer"]
+    assert nodes["after-1"]["layer"] > nodes["cyc-a"]["layer"]
+    assert [edge["cycle"] for edge in graph["edges"] if edge["to"] == "after-1"] == [False]
+    assert sorted(edge["cycle"] for edge in graph["edges"]) == [False, True, True]
+    # The rest of the panel still answers: the isolated task is still counted
+    # out, and the states say where they came from because state_of() could not
+    # be asked at all.
+    assert graph["omitted"] == 1 and graph["total"] == 4 and graph["shown"] == 3
+    assert graph["states_from"] == "status"
+    assert {node["id"]: node["state"] for node in graph["nodes"]} == {
+        "cyc-a": "blocked", "cyc-b": "blocked", "after-1": "blocked",
+    }
+
+
+def test_a_self_dependency_is_reported_as_the_one_node_cycle_it_is():
+    """`from_dict` bypasses `_validate_depends_on`, so a hand-edited self-edge
+    reaches this page. It is a cycle of one, and it is the shape that vanishes
+    most quietly: drawn naively it is a zero-length path, i.e. nothing."""
+    graph = dep_graph([
+        roadmap_task("solo-1", depends_on=["solo-1"]),
+        roadmap_task("after-1", depends_on=["solo-1"]),
+    ])
+
+    assert graph["cycles"] == [{"nodes": ["solo-1"], "path": ["solo-1", "solo-1"]}]
+    assert [(e["from"], e["to"], e["cycle"]) for e in graph["edges"]] == [
+        ("solo-1", "solo-1", True), ("solo-1", "after-1", False),
+    ]
+    assert dep_nodes(graph)["solo-1"]["cyclic"] is True
+    assert dep_nodes(graph)["after-1"]["layer"] > dep_nodes(graph)["solo-1"]["layer"]
+
+
+def test_every_node_state_is_the_state_the_registry_reports(tmp_path):
+    """Node state comes from `TaskRegistry.state_of()` — the same payload the
+    Roadmap panel groups by, passed in rather than re-derived — so the graph and
+    the list beside it cannot disagree about what a task is.
+
+    An edge into a BLOCKED node is the interesting case and an edge into a
+    COMPLETED one is satisfied history, so every state here is a distinct
+    reading and each is asserted by name.
+    """
+    repo = make_repo(tmp_path)
+    write_registry(repo, [
+        roadmap_task("z-done", status="completed"),
+        roadmap_task("a-wip", status="in_progress", depends_on=["z-done"]),
+        roadmap_task("b-held", status="blocked", depends_on=["z-done"]),
+        roadmap_task("c-gone", status="retired", depends_on=["z-done"]),
+        roadmap_task("d-ready", depends_on=["z-done"]),
+        roadmap_task("e-waits", depends_on=["d-ready"]),
+    ])
+
+    payload = collect(repo)
+    graph = payload["depgraph"]
+    from_groups = {task["id"]: group["state"]
+                   for group in payload["groups"] for task in group["tasks"]}
+
+    assert graph["states_from"] == "registry"
+    assert {node["id"]: node["state"] for node in graph["nodes"]} == {
+        "z-done": "completed", "a-wip": "in_progress",
+        # `blocked` ON DISK means quarantined, and `blocked` in the graph means
+        # waiting on an incomplete dependency — the two meanings this page must
+        # never fold together.
+        "b-held": "blocked_by_operator", "c-gone": "retired",
+        "d-ready": "ready", "e-waits": "blocked",
+    }
+    for node in graph["nodes"]:
+        assert node["state"] == from_groups[node["id"]], node["id"]
+        assert node["state"] in DEP_NODE_STATES
+    # Every drawn state is a real task's state, and every node carries the id
+    # the registry knows it by.
+    assert all(node["known"] for node in graph["nodes"])
+    assert graph["unknown"] == []
+
+
+def test_a_dependency_naming_no_task_is_drawn_rather_than_dropped(tmp_path):
+    """What `from_dict` really tolerates and `state_of` then rejects: a
+    dangling `depends_on`. `_check_acyclic` looks each dep up with `.get`, so an
+    unknown id is not a cycle, and `state_of` later raises `KeyError` on it.
+
+    The edge is the evidence, so it is kept and its far end is drawn in a state
+    that says the registry cannot answer for it — never dropped to tidy the
+    picture, and never given a state this page invented.
+    """
+    repo = make_repo(tmp_path)
+    write_registry(repo, [roadmap_task("a-real", depends_on=["z-ghost"])])
+
+    payload = collect(repo)
+    graph = payload["depgraph"]
+
+    assert payload["groups"] == [], "state_of raises on a dangling dependency"
+    assert dep_pairs(graph) == [("z-ghost", "a-real")]
+    assert graph["unknown"] == ["z-ghost"]
+    nodes = dep_nodes(graph)
+    assert nodes["z-ghost"]["state"] == "unknown" and nodes["z-ghost"]["known"] is False
+    assert nodes["a-real"]["known"] is True
+    assert nodes["a-real"]["layer"] > nodes["z-ghost"]["layer"]
+    # The omitted/shown identity counts TASKS. A phantom is not one, so it may
+    # not appear on either side of it.
+    assert graph["total"] == 1 and graph["shown"] == 1 and graph["omitted"] == 0
+
+
+def test_the_graph_is_display_only_and_changes_no_dependency(tmp_path):
+    """Display only, said as a property. The rows the graph reads are the rows
+    the roadmap reads, unaltered, and every relation on the page is one the
+    registry already had — nothing here adds, drops or reorders a dependency."""
+    repo = make_repo(tmp_path)
+    rows = [
+        roadmap_task("z-root"),
+        roadmap_task("a-mid", depends_on=["z-root"]),
+        roadmap_task("b-leaf", depends_on=["a-mid"]),
+        roadmap_task("alone-1"),
+    ]
+    write_registry(repo, rows)
+
+    payload = collect(repo)
+
+    stored = {(dep, row["id"]) for row in rows for dep in row["depends_on"]}
+    assert set(dep_pairs(payload["depgraph"])) == stored
+    # The flat roadmap and the grouped read are what they were — this panel is
+    # a third view of the same rows, not a fourth source of truth.
+    assert {row["id"] for row in payload["roadmap"]} == {row["id"] for row in rows}
+    assert sum(group["count"] for group in payload["groups"]) == len(rows)
+    # And the registry the loop dispatches from still reads the file the same
+    # way: the dependencies are exactly as declared.
+    registry = TaskRegistry.from_dict({"tasks": rows})
+    assert {(dep, task.id) for task in registry.all_tasks()
+            for dep in task.depends_on} == stored
+
+
+def test_every_node_state_has_an_icon_and_a_word_on_the_page():
+    """A state with no mark renders a blank node. `DEP_NODE_STATES` is derived
+    from `GROUPS`, so a seventh `TaskState` reaches the page automatically — and
+    this is what stops it reaching the page unlabelled."""
+    assert DEP_NODE_STATES == tuple(state.value for _k, _l, state in GROUPS) + ("unknown",)
+    script = PAGE.split("<script>", 1)[1]
+    marks = script.split("const DMARK = {", 1)[1].split("};", 1)[0]
+    fills = script.split("const DFILL = {", 1)[1].split("};", 1)[0]
+    order = script.split("const DORDER = [", 1)[1].split("];", 1)[0]
+    for state in DEP_NODE_STATES:
+        assert f"{state}:[" in marks, f"{state} has no icon and word"
+        assert f"{state}:" in fills, f"{state} has no fill"
+        assert f'"{state}"' in order, f"{state} would never reach the legend"
+    # `blocked` is the word this page may not leave short anywhere it has room:
+    # on disk it means QUARANTINED, and here it means waiting on a dependency —
+    # the two-states-one-word confusion `TaskState` was split up to end, and the
+    # reason `STAT_BUCKETS` already ships "blocked on a dependency".
+    assert 'blocked:"blocked on a dependency"' in script
+    assert ("blocked", "blocked on a dependency", "blocked") in STAT_BUCKETS
+
+
+def test_the_dependency_panel_is_static_markup_the_refresh_never_reopens():
+    """dash-12's rule, as wiring: the elements an operator holds are STATIC
+    markup no render rebuilds, and the redraw itself goes through ONE gate that
+    carries this panel's own signature rather than the page-wide one.
+
+    The negatives are the load-bearing half. The positives alone pass for a
+    render that snaps the table shut every two seconds, for a second `renderDeps`
+    call site that no gate covers, and for a gate that is never reached because
+    the page-wide guard returned first. What the gate DOES — what it redraws and
+    what it holds — is measured under node in the tests below; this pins the
+    wiring those cannot reach.
+    """
+    static_markup, script = PAGE.split("<script>", 1)
+
+    for marker in ('<section id="deppanel">', '<svg id="depsvg"', 'id="depedges"',
+                   'id="depnodes"', '<details id="deptablebox">', 'id="deptablesum"',
+                   'id="deptable"', 'id="depnote"', 'id="deplegend"',
+                   'id="depdetail"'):
+        assert marker in static_markup, f"{marker} is not on the page"
+    # The count of what was left out renders ABOVE the drawing: an omission
+    # nobody scrolls to is an omission nobody sees.
+    assert static_markup.index('id="depnote"') < static_markup.index('id="depsvg"')
+
+    body = script.split("function renderDeps(d){", 1)[1].split("\n}", 1)[0]
+    assert ".open" not in body, "a render that writes .open snaps the table shut every 2s"
+    assert "deptablebox" not in body, "the disclosure element itself is never rebuilt"
+    # Hand-built SVG, like `drawFlow`: nothing fetched at runtime, no library.
+    assert "fetch(" not in body and "<script" not in body
+    for external in ("<link", "@import", 'src="http'):
+        assert external not in PAGE
+
+    # `renderDeps` has exactly ONE caller — the definition and the call inside
+    # `updateDeps`. A second call site is a redraw nothing guards, which is the
+    # whole failure this panel had.
+    assert script.count("renderDeps(") == 2, "definition plus the one guarded call"
+    assert "renderDeps(d);\n  DEPBIND(d);" in script
+    # The hook defaults to a no-op so the region can be lifted on its own. An
+    # unassigned hook binds no listener on the real page while every node test
+    # below still passes, so the assignment is pinned here instead.
+    assert "DEPBIND = bindDeps;" in script
+
+    guarded = script.split("function render(d, force){", 1)[1]
+    # The INVERSE of the old ordering, deliberately: the panel is updated BEFORE
+    # `sig === LASTJSON` because it carries its own signature. Sitting behind the
+    # page-wide guard meant any unrelated figure moving rebuilt this graph — and
+    # meant a tick that changed nothing else could never deliver a payload held
+    # during a gesture.
+    assert guarded.index("updateDeps(d);") < guarded.index("sig === LASTJSON")
+    assert "renderDeps(" not in guarded and "bindDeps(" not in guarded
+    # …and with NO `force`. `render(LAST, true)` is also raised by a click on a
+    # PIPELINE node, so forwarding it would let an unrelated click replace the
+    # dependency node someone is hovering.
+    assert "updateDeps(d, force)" not in guarded
+
+    binder = script.split("function bindDeps(d){", 1)[1].split("\n}\n", 1)[0]
+    assert "render(LAST, true)" not in binder, "selecting a node rebuilds the page"
+    assert "updateDeps(DEPDRAWN || LAST, true)" in binder
+    # Selection survives a rebuild the way the pipeline's does. The GATE is
+    # lifted with the pure region (the harnesses below run it); the listeners are
+    # not, because they reach `render`, `LAST` and `showTip` — none of which the
+    # node harness has.
+    region = deps_panel_js()
+    assert "let DSEL = null;" in region, "the region is not self-contained"
+    assert "function updateDeps(d, force){" in region
+    assert "function depsBusy(){" in region
+    assert "showTip" not in region and "function bindDeps" not in region
+    assert "function bindDeps(d){" in script and "DSEL = DSEL === n.id" in script
+
+
+def deps_panel_js() -> str:
+    """The dependency panel's own code, lifted verbatim out of the served page.
+
+    `esc` and `rows` come along because the region depends on them; it carries
+    no other module state, which is what lets it run against a stub document
+    instead of a browser.
+    """
+    script = PAGE.split("<script>", 1)[1]
+    lines = script.splitlines()
+    esc_line = next(line for line in lines if line.startswith("const esc ="))
+    rows_line = next(line for line in lines if line.startswith("const rows ="))
+    region = script.split("// DEPGRAPH_START", 1)[1].split("// DEPGRAPH_END", 1)[0]
+    return "\n".join((esc_line, rows_line, region))
+
+
+def test_the_page_draws_one_edge_per_pair_and_says_what_it_left_out():
+    """A payload carrying the graph is not a page showing it, so this RUNS the
+    panel's own render against a stub document — twice, with the edge table
+    opened and a node selected in between.
+
+    What it tests is `renderDeps` ITSELF: what one draw puts on the page, and
+    that a draw destroys neither the operator's disclosure nor their selection.
+    It is NOT a test of the refresh — two direct calls with the same data cannot
+    show that a poll leaves a panel alone, because the render they call is the
+    thing that would replace it. The gate that decides whether a draw happens at
+    all, and the interaction rule, are measured under "the refresh gate" below.
+
+    The fixture is the hard case on purpose: a cycle, a task behind it, a root
+    that nothing waits on, and an isolated task that must not be drawn.
+    """
+    graph = dependency_graph({"tasks": [
+        roadmap_task("z-root"),
+        roadmap_task("cyc-a", depends_on=["cyc-b"]),
+        roadmap_task("cyc-b", depends_on=["cyc-a"]),
+        roadmap_task("a-leaf", depends_on=["z-root", "cyc-a"]),
+        roadmap_task("alone-1"),
+    ]})
+    payload = json.dumps({"depgraph": graph})
+
+    harness = deps_panel_js() + """
+const NODES = {};
+for (const id of ["depnote","depsvg","depedges","depnodes","deplegend",
+                  "deptablesum","deptable","depdetail","deptablebox"])
+  NODES[id] = {innerHTML:"", textContent:"", open:false, attrs:{},
+               setAttribute(key, value){ this.attrs[key] = value; }};
+const document = {getElementById: id => NODES[id]};
+const PAYLOAD = __PAYLOAD__;
+renderDeps(PAYLOAD);
+// The operator opens the edge table and clicks a node, then a draw happens.
+NODES.deptablebox.open = true;
+DSEL = "cyc-a";
+renderDeps(PAYLOAD);
+console.log(JSON.stringify({
+  open: NODES.deptablebox.open,
+  note: NODES.depnote.innerHTML,
+  edges: NODES.depedges.innerHTML,
+  nodes: NODES.depnodes.innerHTML,
+  table: NODES.deptable.innerHTML,
+  summary: NODES.deptablesum.textContent,
+  detail: NODES.depdetail.textContent,
+  legend: NODES.deplegend.innerHTML,
+  box: NODES.depsvg.attrs,
+}));
+""".replace("__PAYLOAD__", payload)
+    out = json.loads(run_js(harness))
+
+    # ONE path per edge, the cycle's own included — four edges, four paths.
+    assert len(graph["edges"]) == 4
+    assert out["edges"].count('<path class="dedge') == 4
+    assert out["edges"].count('dedge cyc') == 2, "a cycle edge is marked, not dropped"
+    # Every drawn node carries its id AND its state as text, never colour alone.
+    for task_id, word in (("z-root", "○ ready"), ("cyc-a", "◍ blocked"),
+                          ("cyc-b", "◍ blocked"), ("a-leaf", "◍ blocked")):
+        assert f'data-id="{task_id}"' in out["nodes"]
+        assert f">{task_id}</text>" in out["nodes"]
+        assert word in out["nodes"]
+    assert "alone-1" not in out["nodes"], "an isolated task is not drawn"
+    # …and the page SAYS it left it out, with the total beside it.
+    assert "1 of 5 task(s) are in no dependency relation at all" in out["note"]
+    assert "4 dependency edge(s)" in out["note"] and "4 node(s)" in out["note"]
+    # The cycle is named, with its path, rather than being a gap in the drawing.
+    assert "1 dependency cycle(s)" in out["note"]
+    assert "cyc-a → cyc-b → cyc-a" in out["note"]
+    assert "in a cycle" in out["nodes"]
+    # The viewBox is written from the payload's OWN layout. The static markup
+    # ships a placeholder, and a graph left on it is clipped or scaled away —
+    # so this asserts the property (it was recomputed, and it is positive on
+    # both axes) rather than a pixel count that would fail on arithmetic the
+    # moment anyone tunes a node's width.
+    assert '<svg id="depsvg" viewBox="0 0 1140 90">' in PAGE
+    assert out["box"]["viewBox"] != "0 0 1140 90"
+    drawn_w, drawn_h = out["box"]["viewBox"].split()[2:]
+    assert float(drawn_w) > 0 and float(drawn_h) > 0
+    # …and the layout it was computed from is the one the fixture describes:
+    # two columns, the taller of them three nodes deep.
+    assert graph["layers"] == 2
+    assert max(node["row"] for node in graph["nodes"]) + 1 == 3
+    # The table view is the readable twin: one row per edge, marked the same
+    # way, and each state column headed by WHOSE state it is.
+    assert out["table"].count("<tr>") == 5, "a header row plus one row per edge"
+    assert out["table"].count("⚠ in a dependency cycle") == 2
+    assert "<th>dependency state</th>" in out["table"]
+    assert "<th>waiting-task state</th>" in out["table"]
+    assert out["summary"] == "Table view — all 4 edge(s) as text"
+    # A draw writes neither the disclosure state nor the selection away: the
+    # table is still open and the clicked node is still the selected one. That
+    # a draw does not HAPPEN under an operator is the gate's job, below.
+    assert out["open"] is True
+    assert '<g class="dnode sel cyc"' in out["nodes"]
+    assert out["detail"] == (
+        "cyc-a — blocked on a dependency; depends on cyc-b; 2 task(s) depend on it"
+    )
+    # The legend names every state that is actually on screen, icon and word —
+    # and it spells `blocked` OUT. `blocked` on disk means quarantined and
+    # `blocked` here means waiting on a dependency; the 126px node box cannot
+    # hold the wide spelling, so every context that can hold it carries it.
+    assert "◍ blocked on a dependency" in out["legend"]
+    assert "○ ready" in out["legend"] and "⚠ in a cycle" in out["legend"]
+    assert "blocked on a dependency" in out["table"]
+    # …while the box itself keeps the short word, because it has room for
+    # nothing else.
+    assert "◍ blocked</text>" in out["nodes"]
+
+
+def test_the_page_says_so_when_no_task_declares_a_dependency():
+    """An empty graph and a broken panel must not look the same — the one panel
+    on this page that could render nothing legitimately."""
+    graph = dependency_graph({"tasks": [roadmap_task("alone-1"),
+                                        roadmap_task("alone-2")]})
+    payload = json.dumps({"depgraph": graph})
+
+    harness = deps_panel_js() + """
+const NODES = {};
+for (const id of ["depnote","depsvg","depedges","depnodes","deplegend",
+                  "deptablesum","deptable","depdetail"])
+  NODES[id] = {innerHTML:"", textContent:"", open:false, attrs:{},
+               setAttribute(key, value){ this.attrs[key] = value; }};
+const document = {getElementById: id => NODES[id]};
+renderDeps(__PAYLOAD__);
+console.log(JSON.stringify({note: NODES.depnote.innerHTML,
+                            nodes: NODES.depnodes.innerHTML,
+                            table: NODES.deptable.innerHTML,
+                            detail: NODES.depdetail.textContent}));
+""".replace("__PAYLOAD__", payload)
+    out = json.loads(run_js(harness))
+
+    assert graph["nodes"] == [] and graph["edges"] == [] and graph["cycles"] == []
+    assert graph["omitted"] == 2 and graph["shown"] == 0
+    assert "no task declares a dependency" in out["note"]
+    assert "2 of 2 task(s) are in no dependency relation at all" in out["note"]
+    assert "✓ no dependency cycle" in out["note"]
+    assert out["nodes"] == ""
+    assert '<p class="empty">none</p>' in out["table"]
+    assert out["detail"] == "no task selected"
+
+
+# ---- the refresh gate ---------------------------------------------------------
+#
+# dash-12's rule is that an element the operator is interacting with is not
+# replaced by a tick, and the four tests below are what MEASURE it rather than
+# asserting the shape of the code around it. Two things make them say anything:
+#
+#   * NON-REPLACEMENT IS PROVEN BY A SENTINEL, never by comparing one render's
+#     output with another's. A render that rebuilt everything from an identical
+#     payload produces an identical string — so "the HTML is the same after the
+#     tick" is exactly what the bug looks like too. Here the panel's DOM is
+#     overwritten with a sentinel AFTER a draw; if the tick redraws, the
+#     sentinel is gone.
+#   * EVERY NEGATIVE IS PAIRED WITH ITS POSITIVE. A `depsBusy` wired to return
+#     true forever, or a signature that never changes, passes every "was not
+#     replaced" assertion in this file. So each test also releases the gesture
+#     (or changes the graph) and asserts the redraw DOES land.
+DEPS_STUB_JS = """
+const NODES = {};
+for (const id of ["depnote","depsvg","depedges","depnodes","deplegend",
+                  "deptablesum","deptable","depdetail","deptablebox"])
+  NODES[id] = {innerHTML:"", textContent:"", open:false, attrs:{},
+               setAttribute(key, value){ this.attrs[key] = value; }};
+// The three gestures `depsBusy` asks about, each switchable from a test: a node
+// with keyboard focus, a node under the pointer, and the node a text selection
+// is anchored in. `document.hasFocus` is deliberately absent — the stub is the
+// foreground window.
+const HOLD = {focus:null, hover:null, anchor:null};
+const INSIDE = {inPanel:true};
+NODES.deppanel = {
+  contains: el => !!el && el.inPanel === true,
+  querySelector: sel => (sel.indexOf(":hover") >= 0 ? HOLD.hover : null),
+};
+// Where `document.activeElement` sits when nobody has focused anything. It is
+// not an interaction with anything, and a guard that read it as one would freeze
+// this panel permanently on any page nobody has clicked.
+const BODY = {};
+const document = {getElementById: id => NODES[id] || null, body: BODY,
+                  get activeElement(){ return HOLD.focus; }};
+const window = {getSelection: () => HOLD.anchor
+  ? {rangeCount: 1, isCollapsed: false, anchorNode: HOLD.anchor} : null};
+// Every element `renderDeps` writes. `intact` is ALL of them, because a redraw
+// that touched one of them touched the operator's DOM.
+const OWNED = ["depnote","depedges","depnodes","deplegend","deptablesum",
+               "deptable","depdetail"];
+const stamp = mark => OWNED.forEach(id => {
+  NODES[id].innerHTML = mark; NODES[id].textContent = mark; });
+const intact = mark => OWNED.every(id =>
+  NODES[id].innerHTML === mark && NODES[id].textContent === mark);
+const shows = id => NODES.depnodes.innerHTML.includes('data-id="' + id + '"');
+"""
+
+
+def deps_gate_js(**payloads: str) -> str:
+    """The panel's own code plus the stub, with each payload bound to a const.
+
+    The gate (`updateDeps`/`depsBusy`) lives INSIDE `DEPGRAPH_START`/`END` for
+    this reason: the interaction rule is behaviour, and behaviour that only the
+    browser can run is behaviour nothing in CI checks.
+    """
+    consts = "".join(f"const {name} = {body};\n" for name, body in payloads.items())
+    return deps_panel_js() + DEPS_STUB_JS + consts
+
+
+def dep_payload(graph: dict, iteration: int, agents: list) -> str:
+    """A whole-dashboard payload, not a bare graph: the failure being fixed is a
+    tick in which something ELSE moved, so the fixture has to carry something
+    else that can move."""
+    return json.dumps({"depgraph": graph, "session": {"iteration": iteration},
+                       "agents": agents, "served_at": "12:00:00"})
+
+
+def test_an_unrelated_payload_change_does_not_redraw_the_dependency_panel():
+    """Panel-local change detection. The dependency graph moves when a task is
+    added, merged or retired — minutes or hours apart — while the payload around
+    it moves every two seconds (an agent starts, the iteration counter ticks).
+    Redrawing this panel for those was throwing away a hovered node, a focus ring
+    and any selected text in the edge table, dozens of times an hour, for a graph
+    that had not changed by one edge.
+
+    The opened edge table is here too: a disclosure is NOT an interaction that
+    blocks a redraw — nothing rebuilds it — so a real dependency change must
+    still land while it is open.
+    """
+    same = dependency_graph({"tasks": [
+        roadmap_task("z-root"),
+        roadmap_task("a-leaf", depends_on=["z-root"]),
+    ]})
+    grown = dependency_graph({"tasks": [
+        roadmap_task("z-root"),
+        roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"]),
+    ]})
+
+    harness = deps_gate_js(
+        FIRST=dep_payload(same, 4, []),
+        POLL=dep_payload(same, 5, [{"id": "agent-1"}]),
+        LATER=dep_payload(grown, 6, [{"id": "agent-1"}]),
+    ) + """
+updateDeps(FIRST);
+const drew = shows("a-leaf");
+// The operator's own DOM, and the edge table opened under it.
+stamp("HELD");
+NODES.deptablebox.open = true;
+// A 2s tick in which an agent appeared and the iteration moved. Not one
+// dependency changed.
+updateDeps(POLL);
+const afterUnrelated = intact("HELD");
+// …and a tick in which the graph itself grew, with focus where it sits when
+// nobody has focused anything.
+HOLD.focus = BODY;
+updateDeps(LATER);
+console.log(JSON.stringify({drew, afterUnrelated,
+  redrew: !intact("HELD"), grew: shows("b-new"),
+  open: NODES.deptablebox.open}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["drew"] is True, "the first payload must draw"
+    assert out["afterUnrelated"] is True, "an unrelated change rebuilt the panel"
+    assert out["redrew"] is True, "a real dependency change must land"
+    assert out["grew"] is True
+    assert out["open"] is True, "the redraw closed the operator's edge table"
+
+
+def test_a_focused_dependency_node_is_not_replaced_while_it_is_focused():
+    """The gesture the graph's own keyboard support creates: a node is focused,
+    it carries the focus ring and its tooltip, and `bindDeps` has hung four
+    listeners on that exact element. Replacing it mid-tick drops the operator
+    back to the top of the document.
+
+    Two ticks are held, not one — a guard that only survived the first would
+    still fail anyone reading for longer than two seconds — and the release is
+    asserted, because a guard stuck at "busy" passes the first half alone.
+    """
+    before = dependency_graph({"tasks": [
+        roadmap_task("z-root"),
+        roadmap_task("a-leaf", depends_on=["z-root"]),
+    ]})
+    after = dependency_graph({"tasks": [
+        roadmap_task("z-root"),
+        roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"]),
+    ]})
+
+    harness = deps_gate_js(
+        FIRST=dep_payload(before, 4, []),
+        LATER=dep_payload(after, 5, []),
+    ) + """
+updateDeps(FIRST);
+stamp("HELD");
+// The operator tabs onto a node, and the graph changes underneath them.
+HOLD.focus = INSIDE;
+updateDeps(LATER);
+const tick1 = intact("HELD");
+updateDeps(LATER);
+const tick2 = intact("HELD");
+// They tab away. The next poll is what delivers what was held — no listener
+// needed for it to land.
+HOLD.focus = null;
+updateDeps(LATER);
+console.log(JSON.stringify({tick1, tick2,
+  delivered: shows("b-new"), redrew: !intact("HELD")}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["tick1"] is True, "the focused node was replaced by a tick"
+    assert out["tick2"] is True, "held for one tick only"
+    assert out["redrew"] is True and out["delivered"] is True, (
+        "the held payload never landed after the interaction ended"
+    )
+
+
+def test_a_hovered_node_and_a_selection_in_the_table_hold_the_redraw_too():
+    """The other two gestures, in the order an operator makes them. Hover is the
+    one the tooltip follows, and a selection in the edge table is someone
+    copying a task id out of it — the reason the table exists.
+
+    Chained rather than run as two fixtures on purpose: the second gesture holds
+    a graph that changed AGAIN, so this also shows the gate has no memory of
+    having been released once.
+    """
+    one = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"])]})
+    two = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"])]})
+    three = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"]),
+        roadmap_task("c-new", depends_on=["b-new"])]})
+
+    harness = deps_gate_js(
+        ONE=dep_payload(one, 4, []),
+        TWO=dep_payload(two, 5, []),
+        THREE=dep_payload(three, 6, []),
+    ) + """
+updateDeps(ONE);
+stamp("HOVER");
+HOLD.hover = INSIDE;              // the pointer is over a node
+updateDeps(TWO);
+const hovering = intact("HOVER");
+HOLD.hover = null;                // the pointer leaves
+updateDeps(TWO);
+const afterHover = shows("b-new");
+
+stamp("SELECT");
+// A text selection anchored in a text node inside the panel — the edge table.
+HOLD.anchor = {nodeType: 3, parentNode: INSIDE};
+updateDeps(THREE);
+const selecting = intact("SELECT");
+HOLD.anchor = null;
+updateDeps(THREE);
+console.log(JSON.stringify({hovering, afterHover, selecting,
+                            afterSelect: shows("c-new")}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["hovering"] is True, "a hovered node was replaced by a tick"
+    assert out["afterHover"] is True, "the held payload never landed after hover"
+    assert out["selecting"] is True, "selected table text was replaced by a tick"
+    assert out["afterSelect"] is True, "the held payload never landed after selecting"
+
+
+def test_selecting_a_node_redraws_the_graph_that_is_on_screen_not_the_held_one():
+    """The one caller that forces a redraw: the node picker, which changed `DSEL`
+    and needs the highlight to move under the operator's cursor. It is a gesture,
+    so it must not become the way a held graph slips in underneath — it redraws
+    `DEPDRAWN`, the payload already on screen.
+
+    Then the held one still lands on the following tick, which is the half that
+    would rot silently: swallowing it here would leave the panel permanently one
+    dependency change behind, and nothing would say so.
+    """
+    before = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"])]})
+    after = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"])]})
+
+    harness = deps_gate_js(
+        FIRST=dep_payload(before, 4, []),
+        LATER=dep_payload(after, 5, []),
+    ) + """
+updateDeps(FIRST);
+HOLD.hover = INSIDE;
+updateDeps(LATER);            // held: the pointer is on a node
+stamp("HELD");
+// What `bindDeps`'s picker does, spelled out — the listeners themselves live
+// outside the region this harness runs.
+DSEL = "a-leaf";
+updateDeps(DEPDRAWN, true);
+const picked = {redrew: !intact("HELD"),
+                selected: NODES.depnodes.innerHTML.includes('class="dnode sel"'),
+                slipped: shows("b-new")};
+HOLD.hover = null;
+updateDeps(LATER);
+console.log(JSON.stringify({picked, delivered: shows("b-new")}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["picked"]["redrew"] is True, "the click did not move the selection"
+    assert out["picked"]["selected"] is True
+    assert out["picked"]["slipped"] is False, (
+        "a forced redraw let the held graph in under the operator's cursor"
+    )
+    assert out["delivered"] is True, "the forced redraw swallowed the held payload"
+
+
+def test_a_held_graph_the_server_stopped_reporting_is_never_delivered():
+    """A held payload has to be dropped when it goes OBSOLETE, not only when the
+    draw that lands is it. A graph changes mid-gesture (b-new appears) and is
+    held; before the operator lets go, b-new is retired and the next poll carries
+    the graph ALREADY ON SCREEN. Keeping the superseded one meant `settle`
+    rendered it the moment the gesture ended — the panel showing a task the
+    registry no longer has, until the following tick took it away again.
+
+    The rule that fixes it is one rule, and the two halves are chained here
+    because a narrower version passes either half alone: a payload arriving
+    without `force` is the newest the page has, so whatever differs from it is
+    history — whether the screen already shows that payload (first half) or it is
+    about to be drawn (second half, reached by a selection collapsed OUTSIDE the
+    panel, which no listener sees). The paired positive is in both: a gate that
+    simply discarded every held payload would pass every negative on its own.
+    """
+    first = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"])]})
+    grown = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("b-new", depends_on=["a-leaf"])]})
+    newer = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("c-new", depends_on=["a-leaf"])]})
+    latest = dependency_graph({"tasks": [
+        roadmap_task("z-root"), roadmap_task("a-leaf", depends_on=["z-root"]),
+        roadmap_task("c-new", depends_on=["a-leaf"]),
+        roadmap_task("d-new", depends_on=["c-new"])]})
+
+    harness = deps_gate_js(
+        FIRST=dep_payload(first, 4, []),
+        GROWN=dep_payload(grown, 5, []),
+        NEWER=dep_payload(newer, 6, []),
+        LATEST=dep_payload(latest, 7, []),
+    ) + """
+updateDeps(FIRST);
+HOLD.hover = INSIDE;          // the pointer goes onto a node
+updateDeps(GROWN);            // held: the graph grew mid-gesture
+stamp("HELD");
+// b-new is retired while the operator is still holding the panel, so this poll
+// carries the graph that is already drawn. Nothing to redraw — and nothing left
+// worth delivering either.
+updateDeps(FIRST);
+const backToFirst = {intact: intact("HELD"), cleared: DEPHELD === null};
+// The pointer leaves. What the page's `settle` listener does, spelled out: it is
+// bound outside the region this harness lifts, so nothing here would run it.
+HOLD.hover = null;
+if (DEPHELD) updateDeps(DEPHELD);
+const settled = {intact: intact("HELD"), stale: shows("b-new")};
+// …and a real change still lands on the next tick. `staleAfter` reads a DOM
+// that was actually rendered, unlike the sentinel-stamped one above.
+updateDeps(NEWER);
+const landed = {redrew: !intact("HELD"), delivered: shows("c-new"),
+                staleAfter: shows("b-new")};
+
+// The other half of the same rule: the superseding payload need not be the one
+// already on screen. A selection collapsed OUTSIDE the panel ends the gesture
+// with no listener firing, so the next tick simply draws a further change — and
+// the graph held behind it is just as obsolete.
+stamp("BASE");
+HOLD.anchor = {nodeType: 3, parentNode: INSIDE};
+updateDeps(GROWN);            // held again
+const heldAgain = intact("BASE");
+HOLD.anchor = null;           // collapsed outside the panel; no settle fires
+updateDeps(LATEST);           // draws, and must drop what was held
+const drawPath = {cleared: DEPHELD === null, drew: shows("d-new"),
+                  stale: shows("b-new")};
+stamp("CURRENT");
+if (DEPHELD) updateDeps(DEPHELD);
+console.log(JSON.stringify({backToFirst, settled, landed, drawPath, heldAgain,
+                            afterSettle: intact("CURRENT")}));
+"""
+    out = json.loads(run_js(harness))
+
+    assert out["backToFirst"]["intact"] is True, (
+        "the graph already on screen was redrawn anyway"
+    )
+    assert out["backToFirst"]["cleared"] is True, (
+        "a payload the server no longer reports stayed held"
+    )
+    assert out["settled"]["intact"] is True, (
+        "the end of the gesture rendered a superseded graph"
+    )
+    assert out["settled"]["stale"] is False, "b-new is gone and must not be drawn"
+    assert out["landed"]["redrew"] is True and out["landed"]["delivered"] is True, (
+        "a real dependency change no longer lands"
+    )
+    assert out["landed"]["staleAfter"] is False, "the retired task was drawn anyway"
+
+    assert out["heldAgain"] is True, (
+        "the gate has memory of having been released once — the selection did "
+        "not hold the redraw"
+    )
+    assert out["drawPath"]["drew"] is True, "the newest graph did not land"
+    assert out["drawPath"]["stale"] is False, (
+        "a graph held during the gesture was drawn instead of the newest one"
+    )
+    assert out["drawPath"]["cleared"] is True, (
+        "a payload superseded by the draw itself stayed held"
+    )
+    assert out["afterSettle"] is True, (
+        "settling after the draw rendered the superseded graph"
+    )
