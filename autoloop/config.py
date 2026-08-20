@@ -16,6 +16,7 @@ import tomllib
 from .errors import ConfigError
 from .policy import PolicyConfig
 from .stall import DEFAULT_CEILING_SECONDS, DEFAULT_STALL_SECONDS
+from .validation import TEST_SELECTION_MODES, TEST_SELECTION_REACHABLE
 
 
 @dataclass(frozen=True)
@@ -269,6 +270,21 @@ class AuditConfig:
     agent_ceiling_seconds: float = DEFAULT_CEILING_SECONDS
     max_parallel_agents: int = 3
     validation_commands: tuple[tuple[str, ...], ...] = (("ruff", "check", "."),)
+    #: How the POST-COMMIT validation re-run decides which tests to run.
+    #:
+    #: `"reachable"` (default) narrows each configured pytest command to the
+    #: test files reachable from the commit's own changed paths through the
+    #: repository's import graph — see `validation.select_validation_commands`
+    #: for the model and for the widening rules that make a narrow run safe.
+    #: `"full"` disables selection entirely and every configured command runs
+    #: exactly as written.
+    #:
+    #: The DEFAULT here is what live deployments get, not the value in
+    #: `config.example.toml`: that template is copied once and never re-read.
+    #: It defaults to `"reachable"` because that is the behaviour that was
+    #: asked for; the safety comes from the widening rules (anything the graph
+    #: cannot resolve runs the full suite), not from leaving the flag off.
+    test_selection: str = TEST_SELECTION_REACHABLE
 
 
 @dataclass(frozen=True)
@@ -887,6 +903,14 @@ def load_config(path: Path) -> AutoloopConfig:
                 'e.g. [["ruff", "check", "."]]'
             )
         audit_data["validation_commands"] = tuple(tuple(c) for c in commands)
+    if "test_selection" in audit_data:
+        selection = audit_data["test_selection"]
+        if selection not in TEST_SELECTION_MODES:
+            raise ConfigError(
+                "audit.test_selection must be one of "
+                + ", ".join(f'"{mode}"' for mode in TEST_SELECTION_MODES)
+                + f", got {selection!r}"
+            )
     audit = AuditConfig(**audit_data)
     # Checked here rather than left to fail at kill time. A stall window at or
     # above the ceiling reads as configured while being unreachable — the

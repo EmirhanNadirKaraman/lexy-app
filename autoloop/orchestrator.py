@@ -182,6 +182,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import tempfile
 from pathlib import Path
+from typing import Iterable
 from urllib.parse import urlsplit
 
 from . import environment
@@ -278,7 +279,7 @@ from .tasks import (
     unauthorized_paths,
 )
 from .transcript import TranscriptLogger
-from .validation import run_validation_commands
+from .validation import run_validation_commands, select_validation_commands
 from .worktask import (
     ATTEMPT_FAULT,
     ATTEMPT_OPEN,
@@ -5051,7 +5052,14 @@ class Orchestrator:
         # their `.py` sources are still diffed byte for byte — and the wording
         # below says so rather than claiming validation wrote nothing at all.
         tree_before = escape_detector.snapshot_worker_tree(worktree_git)
-        validation_ok, validation_summary = self._run_post_commit_validation(execution)
+        # `touched` is git's own account of the commit range — the same value
+        # the scope check above uses, and the only honest input for deciding
+        # which tests this candidate needs. Never `outcome.changed_paths`: a
+        # report naming fewer files than it changed would choose its own
+        # validation.
+        validation_ok, validation_summary = self._run_post_commit_validation(
+            execution, touched
+        )
         mutations = escape_detector.diff_worker_tree(
             tree_before, escape_detector.snapshot_worker_tree(worktree_git)
         )
@@ -5070,7 +5078,9 @@ class Orchestrator:
             )
         return failures, validation_summary
 
-    def _run_post_commit_validation(self, execution: TaskExecution) -> tuple[bool, str]:
+    def _run_post_commit_validation(
+        self, execution: TaskExecution, changed_paths: Iterable[str] = ()
+    ) -> tuple[bool, str]:
         """Re-run the task's OWN declared validation against its worktree,
         AFTER the commit exists.
 
@@ -5090,11 +5100,56 @@ class Orchestrator:
         `tuple(task.validation) or self._validation_commands`, so the two ends
         of the check agree by construction rather than by coincidence. The
         audit path declares none and therefore still runs the default.
+
+        **Which TESTS the configured commands run is narrowed here**, by
+        `validation.select_validation_commands`, from `changed_paths` — git's
+        own account of the commit range, passed in by `_verify_committed`. The
+        model and its widening rules live in that module; what this method owns
+        is the two cases where selection is refused outright, and both are the
+        same principle:
+
+        * **A task that declared its own `validation` is never narrowed.** That
+          list exists because the default does not cover the change, so it is
+          taken literally. It is also the per-task way to demand a full run.
+        * **A declared `validation_cwd` is never narrowed.** Selection resolves
+          repo-relative changed paths against the repo root; a command running
+          from a subdirectory takes paths relative to THAT directory, and the
+          two would not line up. The backend suite is exactly this case.
+
+        **This is the only call site that narrows.** A round validates twice,
+        and the OTHER run — `ImplementExecutor`'s own, before the commit — still
+        executes every configured command in full. That is a scope boundary, not
+        a design one: the selector takes a command list, changed repo-relative
+        paths and a repo root, all three of which that call site already holds
+        (`sorted(git.dirty_paths_all())` and `git.repo_root`, read a few lines
+        above its `run_validation_commands` call); adopting it there is a change
+        to `implement_executor.py` plus one constructor argument threaded from
+        `cli._build_executor`, neither of which was in val-02's approved paths.
+        Until that lands, a round costs one full suite plus one narrowed suite,
+        and `validation.PRECOMMIT_EVIDENCE` tells the reviewer exactly that
+        rather than letting a narrowed summary read as the whole story.
+
+        Whatever it decides is APPENDED to the returned summary, which becomes
+        `state.last_validation` and reaches the reviewer in the CONTEXT block of
+        the review message — the place validation evidence has always been read.
+        A run that narrowed and could not say so is the evidence gap that gets a
+        packet refused; a run with no pytest command to narrow says nothing,
+        because there was no decision to report.
         """
         commands = execution.validation_commands or self._config.audit.validation_commands
         cwd = Path(execution.worktree_path)
+        full_reason = ""
+        if execution.validation_commands:
+            full_reason = (
+                "this task declares its own validation commands, which are run "
+                "exactly as declared and never narrowed"
+            )
         if execution.validation_cwd:
             cwd = cwd / execution.validation_cwd
+            full_reason = (
+                f"validation runs from {execution.validation_cwd!r}, not the repo "
+                "root, so repo-relative reachability does not apply"
+            )
             if not cwd.is_dir():
                 # Refuse rather than silently validating the repo root: the
                 # declared directory not existing in the COMMITTED tree is
@@ -5103,12 +5158,21 @@ class Orchestrator:
                     f"declared validation_cwd {execution.validation_cwd!r} does not "
                     "exist in the committed worker repo"
                 )
-        return run_validation_commands(
+        selection = select_validation_commands(
             commands,
+            tuple(changed_paths),
+            Path(execution.worktree_path),
+            mode=self._config.audit.test_selection,
+            full_reason=full_reason,
+        )
+        passed, summary = run_validation_commands(
+            selection.commands,
             cwd,
             command_runner=self._validation_runner,
             validation_env=self._validation_env,
         )
+        evidence = selection.evidence()
+        return passed, f"{summary}; {evidence}" if evidence else summary
 
     def _finish_postcommit(
         self,
