@@ -1379,14 +1379,42 @@ def test_continuous_mode_reconciles_at_the_top_of_an_iteration(tmp_path, monkeyp
     assert [e["data"]["task_id"] for e in _transcript_entries(config, "task_auto_unblocked")] == ["t1"]
 
 
-def test_archiving_the_last_blocker_requeues_its_task_unless_a_loop_is_live(
-    tmp_path, capsys
-):
-    """`archive-blocker` takes no `LoopLock` by design, and `tasks.json` is
-    inside the tree the escape detector snapshots (ignored paths included), so a
-    write from here mid-round would park the live loop as an agent escaping its
-    worker repo. Deferring costs nothing — the loop reconciles at the top of its
-    next iteration."""
+def test_archiving_the_last_blocker_returns_its_task_to_the_queue(tmp_path, capsys):
+    """The `answer` invariant on the other closing path. `checkout_escape_
+    detected` refuses every answer by design, so archival is the ONLY way its
+    record ever closes — and a task whose last record closes that way is as
+    unjustifiably quarantined as one whose last record was answered."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    stale = _open_blocker(blockers, "t1", "checkout_escape_detected", kind="loop_fatal")
+
+    assert cli._cmd_archive_blocker(
+        Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
+    ) == 0
+
+    assert "t1 returned to the queue" in capsys.readouterr().out
+    closed = blockers.load(stale.id)
+    assert closed.archived_reason and closed.answer is None, "machine reason, not an answer"
+    reloaded = store.load()
+    assert reloaded.state_of("t1") is TaskState.READY
+    assert [t.id for t in reloaded.ready_tasks()] == ["t1"]
+    assert [e["data"]["task_id"] for e in _transcript_entries(config, "task_auto_unblocked")] == [
+        "t1"
+    ]
+
+
+def test_a_live_lock_refuses_the_whole_archival_rather_than_half_of_it(tmp_path, capsys):
+    """The command writes `tasks.json` now, so it takes the loop lock — and
+    when it cannot, NOTHING moves.
+
+    The assertion that matters is on the BLOCKER, not the task: an archival
+    that lands while the requeue is skipped leaves exactly the state this whole
+    mechanism exists to make impossible (`blocked` with no open record), and
+    "the task is still blocked" is equally true of that broken outcome. Holding
+    the lock in-process is a real live lock — same pid, no `exec_handoff`
+    marker, so `acquire` refuses it like any other."""
     config_path = write_config_toml(tmp_path)
     config = load_config(config_path)
     store, _ = _split_brain(config, task_ids=("t1",))
@@ -1396,17 +1424,43 @@ def test_archiving_the_last_blocker_requeues_its_task_unless_a_loop_is_live(
     with LoopLock(config.state_dir):
         assert cli._cmd_archive_blocker(
             Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
-        ) == 0
+        ) == 1
         out = capsys.readouterr().out
-    assert "live loop holds the lock" in out
-    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR, (
-        "deferred, not skipped — the loop's own sweep owns the registry"
-    )
 
-    second = _open_blocker(blockers, "t1", "primary_checkout_dirty", kind="loop_fatal")
+    assert "NOT archived" in out and "nothing changed" in out
+    assert blockers.load(stale.id).resolved_at is None, "the record must still be open"
+    assert [b.id for b in blockers.open_blockers()] == [stale.id]
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+    assert not _transcript_entries(config, "task_auto_unblocked")
+
+    # Released: the same command now moves both halves together.
     assert cli._cmd_archive_blocker(
-        Namespace(config=config_path, blocker_id=second.id, reason="checkout cleaned by hand")
+        Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
     ) == 0
-
     assert "t1 returned to the queue" in capsys.readouterr().out
+    assert blockers.load(stale.id).resolved_at is not None
     assert store.load().state_of("t1") is TaskState.READY
+
+
+def test_a_stale_lock_refuses_it_too_and_names_the_recovery(tmp_path, capsys):
+    """A dead session is exactly what leaves a lock behind, and it is exactly
+    when this command gets used — so the refusal has to name `unlock` rather
+    than read as a bug. Never `break_stale`: locks are not stolen here."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    stale = _open_blocker(blockers, "t1", "checkout_escape_detected", kind="loop_fatal")
+    lock = LoopLock(config.state_dir)
+    lock.state_dir.mkdir(parents=True, exist_ok=True)
+    lock.path.write_text("{ not json", encoding="utf-8")  # unreadable → provably not live
+
+    assert cli._cmd_archive_blocker(
+        Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
+    ) == 1
+
+    out = capsys.readouterr().out
+    assert "unlock" in out and "NOT archived" in out
+    assert lock.path.exists(), "refused, not recovered — `unlock` is the operator's call"
+    assert blockers.load(stale.id).resolved_at is None
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR

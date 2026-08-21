@@ -682,6 +682,14 @@ open blocker, and nothing on the CLI could close it. It writes
 session that is still live — otherwise it would become the "clear the escape
 detection" button the precondition table deliberately withholds.
 
+It takes the **loop lock**, like `answer` and `retire`, because closing the last
+record naming a quarantined task has to requeue that task in the same operation
+(§9c) and that means writing `tasks.json`. When the lock cannot be taken — a
+live loop holds it, or a dead one left it behind — the archival does not happen
+either, and the refusal says so: a half-done archival is precisely the split
+brain §9c exists to make impossible. A stale lock is `unlock`'s job, never this
+command's.
+
 **`retire`** is documented in full in §9d, with the six tasks it was written
 for. In short: it is the only way to say that work is superseded rather than
 stuck, it records the successor id(s) in `Task.superseded_by` so the chain is
@@ -3906,7 +3914,7 @@ blocker names, via `TaskRegistry.unblock`, and runs from five places:
 | where | why |
 |---|---|
 | `answer` | the resolution and the requeue are one operation, or they are the bug |
-| `archive-blocker` | an archival closes records too — **unless a live loop holds the lock** (below) |
+| `archive-blocker` | an archival closes records too, so it takes the same lock and refuses outright when it cannot (below) |
 | `start`'s preflight | a registry that ARRIVED in the split state; nothing else would notice |
 | top of every `run --continuous` iteration | same, for an operator who skips `start` — and on the registry that iteration hands the orchestrator, not a copy |
 | `run` without `--continuous` (`_run_locked`) | the single-round counterpart of the row above, same registry rule; a plain `run` is the other way an operator restarts after answering |
@@ -3943,12 +3951,28 @@ the `blocked_reason` the task was holding: `unblock()` clears that field, so
 afterwards the transcript is the only place the transition stays legible. A task
 that returns to the queue on nobody's authority must not do it silently.
 
-**Why `archive-blocker` defers to a live loop.** It takes no `LoopLock` by
-design, and `.autoloop/tasks.json` sits inside the tree the escape detector
-snapshots (`enumerate_checkout_paths` includes ignored paths), so a write from
-it mid-round reads as a write-capable agent escaping its worker repo and parks
-the loop `loop_fatal`. When the lock is held live it says so and leaves the
-registry alone; the loop reconciles at the top of its next iteration.
+**Why `archive-blocker` takes the lock, and refuses when it cannot.** An
+archival closes a record, and closing the LAST record naming a quarantined task
+has to requeue that task in the same operation — so the command writes
+`tasks.json`, so it needs the lock that owns `tasks.json`. Its first shape (blk-01,
+round 1) tried to have this both ways: archive with no lock, then READ the lock
+and skip the requeue if a loop held it. Two faults. The design one — a
+successful archival could durably leave its task `blocked` with no open blocker,
+which is the exact state this section says cannot exist; "the loop fixes it next
+iteration" can be an hour of it existing. The race — read-then-write is
+check-then-act, so a loop starting in that window got `tasks.json` written
+underneath it anyway, which is the thing the read was there to prevent.
+
+Holding the lock is also the *stronger* form of the escape-detector argument.
+`.autoloop/` sits inside the tree `enumerate_checkout_paths` snapshots (ignored
+paths included), so a write from this command mid-round reads as a write-capable
+agent escaping its worker repo and parks the loop `loop_fatal`. Owning the lock
+is what proves no round is in flight; a read only proves none was, a moment ago.
+So: lock the whole command, and when the lock cannot be taken change nothing at
+all — not the blocker, not the registry — and say which, because "archived but
+not requeued" and "not archived" want different next moves from the operator. A
+stale lock refuses the same way and names `unlock`; this command steals a lock
+no more than any other.
 
 One cost, stated rather than hidden: a task `blocked` with **no** record on disk
 at all — a hand-edited status, or a park written by a build with no blocker

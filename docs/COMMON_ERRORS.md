@@ -2146,6 +2146,32 @@ refuse it as never recorded. roadmap-01's second file,
 `autoloop/tests/test_obsolete.py`, was in scope and is exactly this case. Today
 that removal needs an operator.
 
+### `archive-blocker` refuses with a lock error and archives nothing
+**Symptom:** `python -m autoloop archive-blocker blk-xxx-001 --reason "..."`
+prints `error: another autoloop process holds …/LOCK` or `error: stale lock at
+…/LOCK … recover with: python -m autoloop unlock`, followed by
+`blocker blk-xxx-001 was NOT archived — nothing changed`, and exits 1. The
+command used to work whatever the lock said.
+**Cause:** not a bug — the refusal is the fix for one (blk-01, 2026-08-21).
+Archiving a blocker can close the LAST open record naming a quarantined task,
+and that task then has to return to the queue in the same operation
+(`docs/AUTOLOOP.md` §9c), which writes `.autoloop/tasks.json`. So the command
+now takes the loop lock like `answer` and `retire` do, and when it cannot take
+it, nothing happens at all — because the alternative, archiving anyway and
+leaving the requeue to whoever runs next, produces exactly the `blocked`-with-no-
+open-blocker state the sweep exists to end.
+**Fix:** depends which lock it is.
+- **Live** (`another autoloop process holds …`): a loop really is running. Wait
+  for it, or `python -m autoloop pause` and let the round finish. The blocker is
+  still open, so nothing was lost.
+- **Stale** (`stale lock at … recover with`): the owner is verifiably dead — run
+  `python -m autoloop unlock`, then the same `archive-blocker` command again.
+  This is the common one here, because the dead session that left the lock is
+  usually the same session whose blocker you are archiving.
+Do NOT hand-edit the blocker record or call `BlockerStore.archive_stale` from a
+one-liner to get past this. That is the route the command was written to
+replace, and it skips the requeue the refusal is protecting.
+
 ---
 
 ## 9. Autoloop monitoring (health)

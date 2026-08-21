@@ -67,6 +67,8 @@ from .errors import (
     ConfigError,
     ExecutorError,
     GitError,
+    LockHeldError,
+    StaleLockError,
     StateCorruptError,
     StateError,
     TaskGraphError,
@@ -2823,8 +2825,62 @@ def _cmd_archive_blocker(args: argparse.Namespace) -> int:
     `answer`, and it REFUSES a blocker belonging to the session that is
     still live — otherwise it would become the "clear the escape detection"
     button that `_RESOLUTION_PRECONDITIONS` deliberately withholds.
+
+    **Takes the loop lock, like `answer` and `retire`** (blk-01, review round
+    2). Archiving can close the LAST open record naming a quarantined task, and
+    when it does, that task has to return to the queue in the same operation
+    (`_reconcile_unblocked_tasks`) — otherwise this command is itself a way to
+    manufacture exactly the split brain the sweep exists to end. Requeueing
+    means writing `tasks.json`, so it needs the lock that owns that file.
+
+    The earlier shape archived first, READ the lock afterwards, and skipped the
+    requeue when a live loop held it. Two faults, one design and one race. The
+    design fault: a successful archival could durably leave its task `blocked`
+    with no open blocker — the loop's next iteration would fix it, but "the
+    next iteration" can be an hour of a state the invariant says cannot exist.
+    The race: `read()` + write is check-then-act, so a loop starting in that
+    window got its `tasks.json` written underneath it anyway.
+
+    So the whole command is inside the lock, and when the lock cannot be taken
+    NOTHING happens — not the archival, not the requeue. That is also the
+    stronger version of the escape-detector argument this command used to make:
+    `.autoloop/` sits inside the tree `escape_detector.enumerate_checkout_paths`
+    snapshots (ignored paths included), so a write here mid-round reads as an
+    agent escaping its worker repo; holding the lock is what proves no round is
+    in flight, rather than a read that could go stale a microsecond later.
+
+    A LIVE lock and a STALE one both refuse, and both say the blocker is
+    untouched — an operator who sees a lock error has to know the record is
+    still open, since "archived but not requeued" and "not archived at all" want
+    different next moves. Never `break_stale`: locks are not stolen here any
+    more than anywhere else, and `unlock` is the documented recovery.
     """
     config = load_config(args.config)
+    try:
+        with LoopLock(config.state_dir):
+            return _archive_blocker_locked(config, args)
+    except (LockHeldError, StaleLockError) as exc:
+        # Nothing inside the block raises either of these, so this catch can
+        # only ever be the acquisition failing — i.e. before `archive_stale`
+        # touched anything.
+        print(f"error: {exc}")
+        print(
+            f"blocker {args.blocker_id} was NOT archived — nothing changed. "
+            "Archiving the last blocker of a quarantined task returns that task "
+            "to the queue in the same operation, so this command writes "
+            "`tasks.json` and needs the loop lock."
+        )
+        return 1
+
+
+def _archive_blocker_locked(config: AutoloopConfig, args: argparse.Namespace) -> int:
+    """The body of `archive-blocker`, with the loop lock already held.
+
+    Split out so the lock is a single `with` around every read AND every write:
+    the session check reads `state.json`, the archival writes a blocker record,
+    and the sweep writes `tasks.json`. All three inside, so nothing decided here
+    can be invalidated between the deciding and the writing.
+    """
     store = BlockerStore(config.blockers_dir)
     blocker = store.load(args.blocker_id)
     if blocker is None:
@@ -2847,23 +2903,11 @@ def _cmd_archive_blocker(args: argparse.Namespace) -> int:
         return 1
     print(f"blocker {archived.id} archived at {archived.resolved_at}")
     print("recorded as a machine reason, NOT as an operator answer")
-    # Archiving can close the last record naming a quarantined task, so the
-    # other half has to move with it (`_reconcile_unblocked_tasks`) — but ONLY
-    # when nothing else owns the checkout. Unlike `answer`, this command takes
-    # no `LoopLock` by design, and `tasks.json` is inside the observed tree
-    # (`escape_detector.enumerate_checkout_paths` includes ignored paths), so a
-    # write from here mid-round reads as an agent escaping its worker repo and
-    # parks the loop loop_fatal. Nothing is lost by deferring: the live loop
-    # reconciles at the top of its very next iteration.
-    held = LoopLock(config.state_dir).read()
-    if held is not None and LoopLock.is_live(held):
-        print(
-            f"a live loop holds the lock ({held.describe()}), so the task "
-            "registry is left to it — any task this leaves blocked with no open "
-            "blocker is returned to the queue on its next iteration"
-        )
-    else:
-        _sweep_unblocked_tasks(config)
+    # The other half of the state, moved with the first. An archival that closed
+    # the last record naming a quarantined task leaves that task `blocked` with
+    # nothing left to justify it, which is the split brain blk-01 exists to make
+    # impossible — not a tidiness job for whoever runs next.
+    _sweep_unblocked_tasks(config)
     return 0
 
 
