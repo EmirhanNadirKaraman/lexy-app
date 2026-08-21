@@ -903,6 +903,13 @@ class Orchestrator:
             request_id,
             state.outbox,
             executions=self._execution_store,
+            # `config` is what lets the block carry the merge-window state, and
+            # `self._git` is the gateway that check is asked through — the same
+            # pair `auto_merge` passes to `cli._merge_window_blockers`, for the
+            # reason `cli._candidate_publication` documents: the CLI's own
+            # gateway is rooted at `Path.cwd()`, which is not this process's
+            # checkout.
+            config=self._config,
         )
         sent_payload = plan.final_payload if plan is not None else state.outbox
         prompt = build_prompt(request_id, next_iteration, render_context(ctx), sent_payload)

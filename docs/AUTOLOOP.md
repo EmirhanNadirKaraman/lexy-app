@@ -56,6 +56,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Tasks | `tasks.py` | Task registry/graph (derived ready/blocked, cycles rejected, atomic persistence). `seed_tasks.json` (git-tracked, alongside `tasks.py`) seeds a fresh registry with `rt-01` when `.autoloop/tasks.json` does not exist yet (§9b). **Three states mean "not running", and they are not interchangeable:** the dependency-derived `BLOCKED` resolves itself; `block`/`unblock` quarantine a task after a `task_fatal` park (§9c) via a dedicated `blocked` status/`TaskState.BLOCKED_BY_OPERATOR`, which resolves when an operator answers; and `retire` (§9d) marks work SUPERSEDED via `status="retired"`/`TaskState.RETIRED` + `Task.superseded_by`, which resolves for nobody. |
 | Blockers | `blockers.py` | Persisted operator-facing `Blocker` records (one JSON file per blocker, `.autoloop/blockers/`) for every park, `task_fatal` or `loop_fatal` (§9c) — `python -m autoloop blockers`/`answer`. |
 | Context | `context.py` | Per-request CONTEXT block: integrity stamp + previous decision/task, roadmap, `in_flight` counts (in progress / holding an unpublished candidate), git summary, changed files, validation summary. |
+| Context | `context.py` | **2026-08-21 (ctx-01):** the `in_flight` counts are followed by ONE `in_flight_task` row per in-progress task (id, candidate sha, review round, whether revise feedback is on record) and a `merge_window` line — `open`, `shut — <reasons>`, or `unknown — <why>` — obtained by CALLING `cli._merge_window_blockers`. Facts only; the scheduling preference stays in `CONTRACT_INSTRUCTIONS`, unchanged. See §5f. |
 | Prompts | `prompts.py` | Strict template library (incl. `audit_kickoff`, `smoke_test`, `postcommit_review`). |
 | Git | `git_gateway.py` | Only git runner; exact-path staging; policy-validated per call; `push_exact` is the only way to publish anything (no ambient `push()`); the legacy `commit()` method is **removed** (S21). |
 | Doctor | `doctor.py` | Non-destructive preflight (§6), including worker isolation, controlled hooks directories, publisher configuration, and publisher URL drift. |
@@ -3589,6 +3590,80 @@ from the structural bounds, which is where the measured win actually was.
 **The task graph renders once.** It was emitted as a Markdown table *and* a JSON
 block carrying identical fields. The JSON is the representation that does work
 (a `plan` decision is adopted from it), so the table went.
+
+---
+
+## 5f. The CONTEXT block names what is in flight, and what holds the merge
+
+Added 2026-08-21 (ctx-01).
+
+**The problem.** `CONTRACT_INSTRUCTIONS` states a scheduling preference — while
+any in-flight task holds an unpublished candidate, prefer `revise` or an
+approval on it over `implement` on a fresh task; finish before you start — and
+the CONTEXT block gave the reviewer two integers to apply it against:
+
+```
+in_flight: 2 in progress, 2 holding an unpublished candidate
+```
+
+On 2026-08-21 at 13:19:22 the reviewer answered `implement dash-17`, reasoning
+that "the held candidates are externally blocked". Neither was. `blockers`
+reported none open; auto-02 was at review round 1 with revise feedback on
+record and codex-01 at round 1 with none. Both were simply unfinished — the
+exact condition the preference exists for — and "holding an unpublished
+candidate" means the OPPOSITE of blocked: two committed, validated changes were
+waiting on that reviewer's verdict.
+
+**It could not have known better.** Per-task state — round, feedback, whether
+anything was actually parked — appeared nowhere in the block. The `roadmap`
+line two rows above says "29 blocked", which counts DEPENDENCY-blocked roadmap
+tasks and has nothing to do with the in-flight ones; the block gave no way to
+tell the two populations apart. The packet was also the first of a fresh
+session (`previous_task: (none)`), so there was no history of either task. Six
+completed, reviewed, published branches were unmerged for over 24 hours behind
+that reading, and each fresh start added another holder.
+
+**What the block carries now**, immediately under the unchanged summary line:
+
+```
+in_flight: 2 in progress, 2 holding an unpublished candidate
+  in_flight_task: auto-02 — candidate 1a2b3c4d5e6f, review round 1, revise feedback on record
+  in_flight_task: codex-01 — candidate 9f8e7d6c5b4a, review round 1, no revise feedback on record
+merge_window: shut — task auto-02 has a candidate (1a2b3c4d5e6f) bound to base 0011…
+```
+
+Five rules hold it in shape:
+
+* **The counts stay.** Existing consumers and the preference's own wording read
+  them; the rows ADD detail rather than replacing a summary.
+* **Facts, not advice.** The rows state what is true. What to do about it is
+  `NEXT_WORK_PREFERENCE`'s job, and that text is unchanged — a second
+  instruction channel inside CONTEXT would compete with the first.
+* **Unknown stays unknown.** A task whose execution record will not load is
+  listed as `unknown`, never omitted and never guessed, and the aggregate
+  candidate count still collapses to `None` exactly as it did.
+* **One implementation of the merge window.** The line comes from
+  `cli._merge_window_blockers` — *called*, through the same deferred-import
+  seam `auto_merge` and `merge_sweep` use, and handed the gateway this process
+  already holds. A block that disagreed with the loop about whether a merge is
+  safe would be worse than no line at all. A check that raises renders
+  `unknown — <why>`; it never renders `open`.
+* **One line per task, plus one for the window.** CONTEXT is re-sent every
+  round and is not chunked. `last_revise_feedback` is therefore a BOOLEAN and
+  never its text — reviewer-authored prose of unbounded length would blow the
+  budget and open a second channel of foreign text into a block whose line
+  ordering is load-bearing (§S33 in `docs/SECURITY.md`). Measured cost for the
+  shape above: **437 characters per round**, and nothing at all when nothing is
+  in flight. The other half of the per-round cost is work, not text: the
+  predicate re-reads the task store and the state store, and issues one
+  `ls-remote` per candidate that carries push intent, with no memo across
+  rounds (`seen=None`). Under enough throttling those lookups start failing,
+  and `cli._candidate_publication` is fail-closed — so the line degrades
+  toward `shut`, which is the safe direction.
+
+Both additions are optional and independent: with no execution store there are
+no rows, with no config there is no window line, and a `build_context` call
+that passes neither renders exactly the block it rendered before.
 
 ---
 
