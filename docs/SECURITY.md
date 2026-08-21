@@ -43,6 +43,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
 | S35 | INFO | The merge sweep now auto-resolves ONE conflict shape without a human (2026-08-19, docs-01): two branches each appending change-note lines to the terminal append-only section of `docs/SUMMARY.md` / `docs/TESTS.md`. Bounded: two literal paths, each side's section must extend the merge base byte-for-byte, a conflict anywhere else in the file or the merge refuses the whole merge, and every decision is in the transcript. Replaces S34 (`merge=union`), which disabled conflict detection for the whole file | `autoloop/note_merge.py`, `autoloop/auto_merge.py`, `autoloop/git_gateway.py` |
+| S36 | INFO | Accepting a split RETIRES a task and moves its execution record and worker repository aside, on the strength of a reviewer `plan`. Bounded: WHICH task is retired comes from `LoopState.split_requested_for`, written by the loop from its own stall evidence and never from the directive; nothing is deleted (both halves are moved, under one label recorded in the intent); successors are added through `TaskRegistry.add_many`, the same validator a planned task passes, so a split cannot widen a scope or invent an id the registry would refuse; and the durable intent is cleared only after every store has been inspected | `autoloop/orchestrator.py`, `autoloop/state.py`, `autoloop/tasks.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -1480,6 +1481,85 @@ human.
 
 ---
 
+### S36 — Accepting a split retires a task and files its record and worker repository away — INFO — OPEN (deliberate, narrow, accepted)
+
+**Location:** `autoloop/orchestrator.py` (`_accept_split`,
+`_split_successor_specs`, `_reconcile_split_intent`, `_apply_split_retirement`,
+`_split_retirement_gap`, `_split_request`), `autoloop/state.py`
+(`SplitIntent`, `LoopState.split_requested_for` / `split_intent`),
+`autoloop/tasks.py` (`TaskRegistry.split_applied` / `apply_split`).
+
+**Severity:** INFO. No new external surface and no new authority: everything it
+does was already reachable by an operator (`python -m autoloop retire`,
+`release`), and the two destructive-looking moves are moves, not deletions.
+Recorded because a reviewer `plan` — previously purely additive — can now cause
+a task to be RETIRED and its worker repository to be relocated.
+
+**What it is.** Since 2026-08-21 (split-01) the loop may offer to split a task
+that keeps being cut short by the stall supervisor with work left behind. A
+`plan` answering that offer retires the named task into the successors it lists,
+archives the task's execution record and quarantines its worker repository — all
+three driven from a durable `state.SplitIntent` so a crash mid-acceptance is an
+unfinished intent rather than three stores contradicting each other.
+
+**Why it is accepted, and what bounds it.**
+- **The reviewer does not choose the victim.** The retired task is
+  `LoopState.split_requested_for`, written by `_split_request` from the loop's
+  own evidence (`TaskExecution.cut_short_with_work_count`, and `changed_paths`
+  read from the worker repo's git status, never from anything an agent claims).
+  A directive carries no task id for a plan, so no reply can name a different
+  task to retire.
+- **The reinterpretation cannot outlive its question.** Any decision other than
+  `plan` spends the marker (`_dispatch`), so a plan arriving later is an
+  ordinary, purely additive plan again.
+- **Successors get no laxer route into the registry.** They are added by
+  `TaskRegistry.add_many`, the same validator a planned task passes —
+  `_validate_approved_path`'s exact-path allowlist included — and the whole
+  mutation is rehearsed against a throwaway copy of the registry before anything
+  is written. A split cannot widen a scope, invent an id, or create a cycle.
+- **Nothing is deleted.** `TaskExecutionStore.archive` and
+  `WorkerRepoManager.quarantine` both MOVE, under one label minted once into the
+  intent, so the two halves name each other on disk and remain inspectable.
+- **The intent is discharged only on proof.** `TaskRegistry.split_applied`
+  gates the registry save and raises on contradiction rather than overwriting;
+  `_split_retirement_gap` requires the archived record to exist AND to identify
+  itself as this task's (`worktask.archived_record_is_for`) and the quarantine
+  directory to exist. Any mismatch parks `loop_fatal` with the intent preserved.
+- **Bounded repetition.** One outstanding ask at a time, and
+  `MAX_DERIVATION_DEPTH` stops work being re-decomposed indefinitely.
+
+**The residual, stated rather than hidden.** A reviewer that has been talked
+into splitting a task by content inside the repository (S14/S33's prompt-
+injection surface) can cause a legitimate task to be retired and its unfinished
+work filed away. The cost is bounded to that: the work is still on disk under
+the quarantine label, the retirement is recorded with its reason and its
+successors, and the successors can touch only paths the same validator accepts.
+
+**Verification check:**
+```bash
+# The retired task comes from loop state, never from the directive:
+rg -n 'split_requested_for' autoloop/orchestrator.py autoloop/state.py
+# Successors still go through add_many, and nothing else adds them:
+rg -n 'def apply_split' -A 20 autoloop/tasks.py
+# Neither retirement half may become a delete:
+rg -n '_apply_split_retirement' -A 22 autoloop/orchestrator.py
+```
+Pinned by `autoloop/tests/test_task_split.py` — in particular
+`test_any_decision_other_than_plan_declines_the_split`,
+`test_a_plan_with_no_split_asked_for_is_still_an_ordinary_plan`,
+`test_a_duplicate_successor_id_is_refused_by_the_registrys_own_rules`,
+`test_a_successor_id_that_belongs_to_a_different_task_fails_closed` and the
+crash-boundary tests, which assert exactly one archive and one quarantine
+directory survive any number of recovery passes.
+
+**Suggested fix if it ever needs one:** require an operator to confirm a split
+through the inbox before it is applied. Not done now because the loop is
+designed to run unattended and the offer only fires on evidence the loop
+measured itself; a confirmation step would move the same decision to a channel
+(`autoloop/inbox.py`) that S28/S30 already track as less authenticated, not more.
+
+---
+
 ## Verified strengths (do not regress)
 
 These were checked in the 2026-05-24 sweep and are working controls. A PR that weakens one is a security regression.
@@ -1930,6 +2010,8 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-08-21** — **A reviewer `plan` can now retire a task (new finding S36, INFO).** Accepting a split retires the parent, archives its execution record and quarantines its worker repository — three stores that cannot be written together, so the decision is written first as a durable `state.SplitIntent` and every store is then driven to match it idempotently (`orchestrator._reconcile_split_intent`, run before any step of the next `run()`). Security-relevant because a decision that used to be purely additive now has a destructive-looking half. Bounded, and each bound is a control rather than a convention: the retired task comes from `LoopState.split_requested_for`, which the loop writes from evidence it measured itself (two stall-killed rounds whose `changed_paths` git reported), never from the directive — which carries no task id for a plan at all; any decision other than `plan` spends the marker, so a later plan is additive again; successors enter through `TaskRegistry.add_many`, the same validator a planned task passes, after the whole mutation is rehearsed against a throwaway copy of the registry, so no scope is widened and no malformed graph lands; and nothing is deleted — both retirement halves are MOVED under one label minted once into the intent, so they name each other on disk. The intent is cleared only after `TaskRegistry.split_applied` and `_split_retirement_gap` INSPECT each store (the archived record must identify itself as this task's; the quarantine directory must exist), and any contradiction parks `loop_fatal` with the intent preserved rather than overwriting durable state. Verification check: `rg -n 'split_requested_for' autoloop/orchestrator.py autoloop/state.py` and `pytest autoloop/tests/test_task_split.py`.
 
 - **2026-08-18** — **The loop can now replace its own process, and a live lock has one adoption path (no new findings; two Verified Strengths added).** Security-relevant for two reasons, both recorded above rather than absorbed. (1) `cli._self_upgrade_at_boundary` introduces the package's only `os.execv` plus one `subprocess.run`, so that the loop actually runs code it merged into its own checkout (measured 2026-08-18: a hard decomposition gate merged at 06:23:59 into a process started at 04:07:03 never applied to a task that started after it). Neither call takes a shell, and neither takes anything model- or task-authored: the exec argv is the interpreter plus this process's own `sys.argv[1:]`, and the preflight runs a script built from a module-level tuple of literals. The trigger is a git-observed fact — `diff-tree --name-only` between the pre- and post-merge heads, on a merge this package verified — never an executor report or a directive, and the git whitelist is UNTOUCHED (`changed_paths` was already allowed). (2) `LoopLock.acquire` gains its first path past a live lock, and it is narrow by construction: an `exec_handoff` marker written by that same pid immediately before the exec, matching hostname, the pid named twice, the lock's own run id, **a 32-random-byte token that reaches the successor only by being inherited across `os.execv`**, and all of it cleared on adoption so it works once. The rejected alternative — treating any same-pid lock as ours — would be a lock-stealing hole, since pids are reused within a boot; the four mutation tests that fail against it are in `test_self_upgrade.py`. The token was added the same day, in review, for the residue that argument leaves: host, pid and run id are readable or reproducible from outside, so the marker's own contents are not evidence that a handoff happened — a stale file plus a reused pid would satisfy every one of them. Only the image `execv` produced can present the token, it is consumed on adoption and dropped when `execv` is refused (so nothing spawned afterwards inherits it), and a malformed or non-ASCII value refuses rather than raising `TypeError` inside the successor's first act. Verification check: `rg -n 'EXEC_HANDOFF_TOKEN_ENV' autoloop/` and `pytest autoloop/tests/test_self_upgrade.py -k "token or handoff"`. Every existing refusal (no marker, foreign host, corrupt file, `break_stale` on a live lock) stands, and both lock rewrites are temp-file + `os.replace`, so the file exists at every instant of the handoff. Fail-closed throughout: an unreadable record, a tree that does not import, a `repo_root` that is not this process's package root, and a lock that cannot be armed all mean "keep running the old code", and a sha already exec'd for is never exec'd for again. Verification check: `rg -n 'os\.execv' autoloop/` shows one production call site, `rg -n 'shell=True' autoloop/` stays empty, and `pytest autoloop/tests/test_self_upgrade.py`.
 

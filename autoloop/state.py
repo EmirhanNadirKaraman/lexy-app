@@ -95,6 +95,15 @@ if TYPE_CHECKING:
 # exactly right for a state file written before it existed: that process was not
 # in the middle of a throttle back-off, so there is no wait to resume.
 #
+# NOT bumped for split acceptance either (`LoopState.split_requested_for` /
+# `split_intent`, and the `SplitIntent` record they carry). Both default to the
+# empty/`None` value and the default is the TRUTH about an older state file
+# rather than a guess: a process written before this existed had asked for no
+# split and had none half-applied, so "no ask outstanding" and "no intent to
+# reconcile" describe it exactly. The fail-closed direction matters here more
+# than usual — a wrongly-present intent would drive a retirement nobody asked
+# for — and absence can only ever mean "nothing to do".
+#
 # NOT bumped for chunked packet delivery either (`LoopState.outbox_diff`,
 # `PendingRequest.delivery`, and the new `Phase.DELIVERING` member). The two
 # fields default to `None`, which is exactly right for a state file written
@@ -447,6 +456,175 @@ class RotationRecord:
     at: str = field(default_factory=lambda: utcnow_iso())
 
 
+#: The task-definition fields a `SplitIntent` carries for each successor —
+#: THE list, imported by `tasks.TaskRegistry.apply_split` / `split_applied`
+#: rather than restated there.
+#:
+#: The import direction is deliberate and one-way: `tasks` already imports
+#: `state` (for `utcnow_iso`), so the list lives here and `tasks` reads it.
+#: Restating it on the registry side is how the record written at acceptance
+#: and the comparison run at reconciliation would come to disagree about what
+#: "the same successor" means — and that comparison is the whole of the
+#: fail-closed guarantee.
+#:
+#: `priority` is deliberately ABSENT. It is the one task field an operator may
+#: rewrite at any moment (`TaskStore.apply_priority`), so a successor whose
+#: priority was steered between the crash and the recovery would compare unequal
+#: to the intent and fail closed on a change the loop is supposed to tolerate.
+#: Nothing about a split depends on the ordering of its successors.
+SPLIT_DEFINITION_KEYS: tuple[str, ...] = (
+    "id",
+    "title",
+    "description",
+    "depends_on",
+    "approved_paths",
+)
+
+
+@dataclass
+class SplitIntent:
+    """The durable record of a split that has been ACCEPTED but may not yet be
+    applied to every store it spans.
+
+    Split acceptance touches three things that cannot be written in one atomic
+    operation — the task registry (`tasks.json`), the task's execution record
+    (`executions/<id>.json`) and its worker repository (a directory) — so any
+    crash between two of them leaves the three disagreeing: `tasks.json` says
+    the parent is retired while its record and worker still describe live work.
+
+    This record is the answer, and it is the same shape `publisher.py` already
+    uses for a push that may or may not have landed: write the intent FIRST,
+    then reconcile every store against it, idempotently, until they all agree.
+    A crash is then never a contradiction — it is an unfinished intent, and the
+    next start finishes it (`orchestrator._reconcile_split_intent`).
+
+    Every field is captured at ACCEPTANCE and never recomputed afterwards,
+    because a value re-derived during recovery is a value that can disagree
+    with what was actually undertaken:
+
+      * `label` is minted once and is what BOTH retirement halves are filed
+        under (`executions/archive/<parent>-<label>.json`,
+        `quarantine/<parent>-<label>`), so a re-run finds its own earlier work
+        instead of creating a second copy under a fresh timestamp. This is why
+        `worktask.retire_execution` — which mints its own label per call — is
+        not usable here.
+      * `retire_record` / `retire_worker` say which halves there were anything
+        to undertake for. Without them, "the record is gone" is ambiguous
+        between "this intent archived it" and "there was never one", and the
+        second reading would let a missing archive pass as success.
+      * `successors` carries the FULL definition of each new task, so recovery
+        never has to re-read a directive that is no longer in hand.
+    """
+
+    parent_id: str
+    #: One dict per successor, each carrying exactly `SPLIT_DEFINITION_KEYS`.
+    #: Plain dicts rather than `contract.TaskSpec`, matching the convention
+    #: `LoopState.task_execution` / `changeset` already use: they round-trip
+    #: through the state file's JSON with no custom decoding, and this module
+    #: does not import `contract`.
+    successors: tuple[dict, ...]
+    reason: str
+    label: str
+    #: Was there an execution record to archive when this intent was written?
+    #: REQUIRED on the wire (see `from_dict`) — a default would read a real
+    #: retirement obligation as "nothing to do".
+    retire_record: bool
+    #: Was there a worker repository to quarantine? Same rule.
+    retire_worker: bool
+    created_at: str = field(default_factory=utcnow_iso)
+
+    def successor_ids(self) -> tuple[str, ...]:
+        return tuple(str(spec.get("id", "")) for spec in self.successors)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "SplitIntent":
+        """Rebuild an intent off the state file, or raise `StateCorruptError`.
+
+        FAIL CLOSED on every field, unlike the tolerant `.get(...)` defaults the
+        rest of this module uses for backward compatibility. There is no such
+        thing as an intent written by an older build — the field did not exist —
+        so a missing key here is corruption rather than history, and the two
+        booleans in particular must never default: reading an absent
+        `retire_worker` as `False` would silently discharge a quarantine that
+        never happened.
+        """
+        if not isinstance(raw, dict):
+            raise StateCorruptError(f"split intent is not an object: {raw!r}")
+        missing = [
+            key
+            for key in (
+                "parent_id",
+                "successors",
+                "reason",
+                "label",
+                "retire_record",
+                "retire_worker",
+            )
+            if key not in raw
+        ]
+        if missing:
+            raise StateCorruptError(
+                f"split intent is missing required field(s) {sorted(missing)} — "
+                "it cannot be reconciled, and guessing at either retirement half "
+                "would discharge work that may never have happened"
+            )
+        specs = raw.get("successors")
+        if not isinstance(specs, (list, tuple)) or not specs:
+            raise StateCorruptError(
+                f"split intent for {raw.get('parent_id')!r} carries no successors"
+            )
+        successors = tuple(_load_split_successor(spec) for spec in specs)
+        return cls(
+            parent_id=str(raw["parent_id"]),
+            successors=successors,
+            reason=str(raw.get("reason") or ""),
+            label=str(raw["label"]),
+            retire_record=bool(raw["retire_record"]),
+            retire_worker=bool(raw["retire_worker"]),
+            created_at=str(raw.get("created_at") or ""),
+        )
+
+
+def _load_split_successor(spec: object) -> dict:
+    """One successor definition off the state file, normalised to exactly
+    `SPLIT_DEFINITION_KEYS`.
+
+    The normalisation is what makes the reconciliation comparison meaningful:
+    JSON has no tuples, so a round-tripped `depends_on` comes back as a list and
+    would never compare equal to the registry's tuple. Doing it here — once, on
+    the way in — is what keeps `TaskRegistry.split_applied` a comparison rather
+    than a coercion.
+    """
+    if not isinstance(spec, dict):
+        raise StateCorruptError(f"split intent successor is not an object: {spec!r}")
+    unknown = set(spec) - set(SPLIT_DEFINITION_KEYS)
+    if unknown:
+        raise StateCorruptError(
+            f"split intent successor {spec.get('id')!r} carries unknown "
+            f"field(s) {sorted(unknown)}"
+        )
+    normalised: dict = {}
+    for key in SPLIT_DEFINITION_KEYS:
+        if key not in spec:
+            raise StateCorruptError(
+                f"split intent successor {spec.get('id')!r} is missing {key!r}"
+            )
+        value = spec[key]
+        if key in ("depends_on", "approved_paths"):
+            if isinstance(value, str) or not isinstance(value, (list, tuple)):
+                raise StateCorruptError(
+                    f"split intent successor {spec.get('id')!r} has a malformed "
+                    f"{key!r}: {value!r}"
+                )
+            normalised[key] = tuple(str(item) for item in value)
+        else:
+            normalised[key] = str(value)
+    return normalised
+
+
 @dataclass
 class LoopState:
     session_id: str
@@ -552,6 +730,33 @@ class LoopState:
     #: (`None`) once `Orchestrator._dispatch_changeset_push` actually
     #: publishes it.
     changeset: dict | None = None
+    #: The task the loop has ASKED the reviewer to split, and has not yet had an
+    #: answer about. `""` — the ordinary state — means no ask is outstanding.
+    #:
+    #: An ask, never an authorization: it records that
+    #: `orchestrator._split_request` appended the question to a round's payload,
+    #: and nothing more. It is what makes the reviewer's `plan` reply mean
+    #: "these tasks REPLACE that one" rather than the ordinary "add these to the
+    #: roadmap", so it is spent by ANY other decision (see
+    #: `orchestrator._dispatch`) — a reviewer who answers something else has
+    #: declined, and a marker left standing would silently reinterpret an
+    #: unrelated plan three rounds later as a retirement.
+    split_requested_for: str = ""
+    #: Serialised `SplitIntent` (a plain dict — `SplitIntent.to_dict()`, never a
+    #: reconstructed dataclass instance here, same convention as
+    #: `task_execution` / `changeset` above) for a split that has been accepted
+    #: and may not yet be applied to all three stores it spans.
+    #:
+    #: `None` means there is nothing outstanding. Anything else is an obligation
+    #: the next start must discharge BEFORE it selects or dispatches anything —
+    #: see `orchestrator._reconcile_split_intent`, which is idempotent and is
+    #: what turns a crash mid-acceptance into an unfinished intent rather than a
+    #: registry that describes a task whose execution record and worker repo
+    #: still exist.
+    #:
+    #: Cleared ONLY once every store has been INSPECTED and found to agree with
+    #: it — never merely because the writes were attempted.
+    split_intent: dict | None = None
     #: Current conversation generation. Requests are stamped with it, so a
     #: response captured under an older epoch can be recognised and ignored.
     conversation_epoch: int = 0

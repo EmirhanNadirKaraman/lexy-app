@@ -173,6 +173,41 @@ TEMPLATES: dict[str, PromptTemplate] = {
                 "`stop` with the reason describing what must change."
             ),
         ),
+        # Appended to the round's ordinary payload, never sent on its own: the
+        # reviewer needs the failure it is about in the same message, and a
+        # split ask that arrived as a separate round would cost a round trip on
+        # a task that is already running out of them.
+        PromptTemplate(
+            name="split_request",
+            body=(
+                "SPLIT CANDIDATE. Task {task_id} has now been cut short "
+                "{rounds} times by the agent stall supervisor, and each time it "
+                "left unfinished work behind in its own worker repository "
+                "({paths} path(s) on this round). That is what a task too big "
+                "to finish in one round looks like — not a task that is "
+                "failing.\n\nIf you agree, reply `plan` with the tasks that "
+                "REPLACE it: each with its own id, description and "
+                "approved_paths, and none of them depending on {task_id} "
+                "itself (a dependency on a retired task never resolves). "
+                "Accepting that plan retires {task_id} into exactly those "
+                "successors and files its execution record and worker "
+                "repository away under one label — nothing is deleted, and the "
+                "unfinished work stays inspectable.\n\nAny other directive "
+                "declines this offer and the task continues unchanged; the "
+                "question is only asked again if a later round is cut short the "
+                "same way."
+            ),
+        ),
+        PromptTemplate(
+            name="split_ack",
+            body=(
+                "Split applied. Task {parent_id} is retired and superseded by "
+                "{successor_ids}; its execution record and worker repository "
+                "were filed away together under one label, and nothing was "
+                "deleted.\n\nRoadmap: {roadmap}\n\nAnswer with your next "
+                "directive."
+            ),
+        ),
         PromptTemplate(
             name="smoke_test",
             body=(
@@ -263,6 +298,26 @@ def plan_rejected_payload(code: str, message: str) -> str:
             "No task was added. Fix the task list (stable slug ids, known "
             "dependencies, no cycles) and resend the plan."
         ),
+    )
+
+
+def split_request_payload(task_id: str, rounds: int, paths: int) -> str:
+    """The ask appended to a cut-short round's payload.
+
+    Numbers only — no prose about what the agent was doing. The counters come
+    from `worktask.TaskExecution` and the path count from git's own view of the
+    worker repo, so everything here is measured rather than claimed.
+    """
+    return TEMPLATES["split_request"].render(
+        task_id=task_id, rounds=str(rounds), paths=str(paths)
+    )
+
+
+def split_ack_payload(parent_id: str, successor_ids, roadmap: str) -> str:
+    return TEMPLATES["split_ack"].render(
+        parent_id=parent_id,
+        successor_ids=", ".join(successor_ids) or "(none)",
+        roadmap=roadmap,
     )
 
 

@@ -199,6 +199,29 @@ class TaskExecution:
     #: afterwards: that is what keeps this from becoming the same guess the
     #: watcher script was making.
     pending_fault_code: str = ""
+    #: Rounds of this task the stall supervisor KILLED (`ExecutionOutcome.
+    #: fault_kind == audit.agents.AGENT_FAULT_STALL`), and — of those — how many
+    #: left real work behind in the worker repo (`outcome.changed_paths`
+    #: non-empty, read from git by `implement_executor._partial_work`, never from
+    #: anything the agent claimed).
+    #:
+    #: The evidence the split trigger runs on, and the reason it is TWO counters
+    #: rather than one. A task killed twice having written nothing is a task
+    #: whose agent is wedged before it starts — retrying is the right answer, and
+    #: splitting it would decompose a task nobody has shown to be too big. A task
+    #: killed twice having written hundreds of lines both times is the shape
+    #: exec-01 wore: work is being produced faster than one round can finish it.
+    #: Only the second gates the ask (`orchestrator._split_request`); the first
+    #: exists so the record says which of the two happened.
+    #:
+    #: Counted on the EXECUTION RECORD rather than in `LoopState` because it is a
+    #: property of the task, has to survive the process that observed it, and
+    #: must be retired alongside the rest of the record when the split it
+    #: justifies is accepted. Never decremented; the ask is bounded by
+    #: `LoopState.split_requested_for` (one outstanding ask at a time) and by the
+    #: derivation cap, not by resetting the evidence.
+    cut_short_count: int = 0
+    cut_short_with_work_count: int = 0
     presented_report_sha256: str = ""
     review_request_id: str = ""
     intended_remote: str = ""
@@ -722,6 +745,33 @@ class TaskExecutionStore:
             )
         os.replace(path, dest)
         return dest
+
+
+def archived_record_is_for(path: Path, task_id: str) -> bool:
+    """Is `path` an archived execution record belonging to `task_id`?
+
+    The CONTENT check behind "this record really was retired", used by split
+    reconciliation (`orchestrator._split_retirement_gap`) to prove the archive
+    half of a retirement happened rather than inferring it from the live record
+    being absent. Absence is exactly what a deletion, a half-finished move or a
+    never-existing record all look like, so it proves nothing on its own — and
+    the whole point of a durable intent is that recovery INSPECTS instead of
+    assuming.
+
+    The filename already contains the task id (`<task_id>-<label>.json`), which
+    is deliberately not what this reads: a name is what the mover chose, while
+    `task_id` inside the JSON is what the record itself says it is about. Reading
+    the name would make a stray file dropped at the right path pass as evidence.
+
+    False — never an exception — for a missing, unreadable or non-matching file,
+    because every one of those means the same thing to the caller: this is not
+    proof, so the gap stays open and the intent stays on disk.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("task_id") == task_id
 
 
 @dataclass(frozen=True)

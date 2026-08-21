@@ -38,7 +38,7 @@ from enum import Enum
 from pathlib import Path
 
 from .errors import StateCorruptError, StateError, TaskGraphError
-from .state import utcnow_iso
+from .state import SPLIT_DEFINITION_KEYS, utcnow_iso
 
 try:  # POSIX advisory locking. Absent on Windows, which this loop never runs on.
     import fcntl
@@ -298,6 +298,21 @@ def _persisted_superseded_by(raw: dict) -> tuple[str, ...]:
         return _validate_superseded_by(raw.get("id"), raw.get("superseded_by", ()))
     except TaskGraphError as exc:
         raise StateCorruptError(f"task file has an invalid superseded_by: {exc}") from exc
+
+
+def _same_definition_field(stored: object, wanted: object) -> bool:
+    """Do a stored task field and a split intent's copy of it agree?
+
+    Sequence-aware, because JSON has no tuples: a `depends_on` that round-tripped
+    through the state file comes back as a list and would never compare equal to
+    the registry's tuple. `state._load_split_successor` already normalises the
+    intent side to tuples; this makes the comparison independent of that having
+    happened, so a hand-written intent cannot fail closed on a type nobody meant
+    to assert anything with.
+    """
+    if isinstance(stored, (list, tuple)) and isinstance(wanted, (list, tuple)):
+        return tuple(stored) == tuple(wanted)
+    return stored == wanted
 
 
 def _successor_hint(task: "Task") -> str:
@@ -977,6 +992,123 @@ class TaskRegistry:
         if reason:
             task.blocked_reason = reason
         return task
+
+    def split_applied(self, parent_id: str, successors) -> bool:
+        """Has this registry already had this exact split applied to it?
+
+        An INSPECTION with three answers, and the third is the reason it exists
+        as its own method rather than as a couple of `if`s inside the
+        reconciliation:
+
+          * `True` — every successor is present and matches the intent, and the
+            parent is retired naming exactly those successors. Nothing to do,
+            and — crucially — nothing to REWRITE: the caller skips its
+            `TaskStore.save` entirely, so a registry that is already correct is
+            never overwritten by a recovery pass.
+          * `False` — nothing conflicts, but something is still missing. The
+            caller applies what is missing (`apply_split`) and saves.
+          * raises `StateError` — the durable state CONTRADICTS the intent.
+
+        The third answer is the fail-closed half of split acceptance and is
+        deliberately a `StateError` rather than a `TaskGraphError`: it means the
+        stores disagree about work that has already been undertaken, which is
+        not something the reviewer can be re-prompted about. `orchestrator.run`
+        routes it to a `loop_fatal` park with the intent left on disk, so a human
+        reads the intent and the registry side by side rather than the loop
+        picking one of them to believe.
+
+        Four contradictions, each of which would otherwise be papered over by a
+        recovery pass that only asked "is everything present yet?":
+
+          * the parent is gone from the registry — the record this intent is
+            about no longer exists;
+          * the parent is `completed` — a task that finished was not superseded,
+            and retiring it now would rewrite a real completion;
+          * the parent is `retired` under a DIFFERENT successor list — some other
+            retirement happened here, and this intent is not it;
+          * a successor id exists with a different definition — the id belongs to
+            somebody else's task, and adding this split's work under it would
+            silently reassign that task's scope.
+
+        `SPLIT_DEFINITION_KEYS` is the comparison, imported from `state` rather
+        than restated (see that constant). `priority` is deliberately not in it,
+        so an operator steering the queue between the crash and the recovery does
+        not read as a conflict.
+        """
+        specs = [dict(spec) for spec in successors]
+        ids = tuple(str(spec.get("id", "")) for spec in specs)
+        if not self.has(parent_id):
+            raise StateError(
+                f"split intent names parent '{parent_id}', which is not in the "
+                "task registry — the split cannot be reconciled"
+            )
+        parent = self.get(parent_id)
+        if parent.status == "completed":
+            raise StateError(
+                f"split intent names parent '{parent_id}', which is COMPLETED — "
+                "finished work was not superseded and must not be retired"
+            )
+        if parent.status == "retired" and tuple(parent.superseded_by) != ids:
+            raise StateError(
+                f"split intent names parent '{parent_id}' with successors "
+                f"{list(ids)}, but it is already retired into "
+                f"{list(parent.superseded_by)} — this is a different retirement"
+            )
+        present = 0
+        for spec in specs:
+            task_id = str(spec.get("id", ""))
+            if not self.has(task_id):
+                continue
+            present += 1
+            stored = self.get(task_id)
+            for key in SPLIT_DEFINITION_KEYS:
+                if not _same_definition_field(getattr(stored, key), spec[key]):
+                    raise StateError(
+                        f"split intent successor '{task_id}' disagrees with the "
+                        f"task already in the registry on {key!r} — the id belongs "
+                        "to a different task and this split must not claim it"
+                    )
+        return present == len(specs) and parent.status == "retired"
+
+    def apply_split(self, parent_id: str, successors, reason: str = "") -> tuple[str, ...]:
+        """Add whatever successors are missing and retire the parent into them.
+        Returns the ids actually added.
+
+        IDEMPOTENT by construction, because that is what makes a crash between
+        two of the stores a split plan spans recoverable rather than
+        contradictory: only ids the registry does not already have are added
+        (`add_many` refuses a duplicate outright), and `retire` is already
+        written-once — an exact repeat returns the task untouched.
+
+        Deliberately NOT its own validation path. The successors go through
+        `add_many`, so a split's tasks are checked by exactly the same rules a
+        planned task is: slug ids, known dependencies, no cycle, well-formed
+        `approved_paths`. A second, laxer route into the registry is precisely
+        what a split must not become.
+
+        Call `split_applied` first. This method assumes the conflicts it
+        enumerates have already been ruled out — it is the write half, and
+        keeping the inspection separate is what lets the caller skip the save
+        for a registry that is already correct.
+        """
+        specs = [dict(spec) for spec in successors]
+        ids = tuple(str(spec.get("id", "")) for spec in specs)
+        missing = [spec for spec in specs if not self.has(str(spec.get("id", "")))]
+        if missing:
+            self.add_many(
+                [
+                    Task(
+                        id=str(spec["id"]),
+                        title=str(spec["title"]),
+                        description=str(spec["description"]),
+                        depends_on=tuple(spec["depends_on"]),
+                        approved_paths=tuple(spec["approved_paths"]),
+                    )
+                    for spec in missing
+                ]
+            )
+        self.retire(parent_id, superseded_by=ids, reason=reason)
+        return tuple(str(spec["id"]) for spec in missing)
 
     def unblock(self, task_id: str) -> Task:
         """Reverse of `block`: back to `pending`, i.e. READY again once its
