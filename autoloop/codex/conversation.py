@@ -52,6 +52,10 @@ from ..browser.chatgpt import SubmitResult
 from ..errors import BrowserError, QuotaExhaustedError, ResponseTimeoutError
 from .quota import DEFAULT_QUOTA_PATTERNS, failure_digest, is_quota_exhausted
 
+#: Ceiling on the argv-borne prompt, well under this host's 1 MiB ARG_MAX so
+#: the environment block and the rest of the command line still fit.
+_ARGV_BUDGET_BYTES = 700_000
+
 
 @dataclass(frozen=True)
 class CodexResult:
@@ -184,9 +188,49 @@ class CodexConversation:
 
     # ---- actions ------------------------------------------------------------
 
-    def submit(self, request_id: str, prompt: str) -> SubmitResult:
+    def submit(
+        self, request_id: str, prompt: str, attachment: str | None = None
+    ) -> SubmitResult:
+        """Run one `codex exec` turn.
+
+        `attachment` is an absolute path to an oversized diff the orchestrator
+        could not inline (`orchestrator._write_diff_attachment`). The browser
+        adapter uploads it because its composer cannot be proven to hold a
+        large patch; there is no composer here — the prompt reaches the CLI
+        through argv — so the file is simply appended to the prompt and the
+        reviewer sees the whole diff in one turn.
+
+        Accepting the argument at all is what keeps the call from raising
+        TypeError: `orchestrator._step_submitting` passes it by name precisely
+        so a provider that cannot take it "fails loudly at the call rather
+        than silently sending a review request whose diff never arrived", and
+        this provider previously could not.
+
+        OPERATOR PATCH, 2026-08-21, superseded by codex-01. codex-01's
+        app-server transport carries an oversized diff as numbered parts over
+        a resumable thread, which is strictly better than one enormous argv;
+        this exists so that codex-01's OWN 228 KB candidate could reach a
+        reviewer at all. Remove it once that transport is the configured
+        provider.
+        """
         if request_id in self._responses:
             return SubmitResult.ALREADY_PERSISTED
+
+        if attachment:
+            diff = Path(attachment).read_text(encoding="utf-8")
+            prompt = f"{prompt}\n\n{diff}"
+            # argv is bounded by ARG_MAX (1 MiB on this host). Refusing here
+            # with a named reason beats letting subprocess raise a bare E2BIG
+            # that reads like a crash rather than a size limit.
+            if len(prompt.encode("utf-8")) > _ARGV_BUDGET_BYTES:
+                raise BrowserError(
+                    f"the review prompt for {request_id} is "
+                    f"{len(prompt.encode('utf-8'))} bytes once the "
+                    f"{len(diff)}-character diff is inlined, over the "
+                    f"{_ARGV_BUDGET_BYTES}-byte argv budget. Use a transport "
+                    "that chunks (codex-01's app-server) rather than raising "
+                    "this ceiling."
+                )
 
         result = self._runner.run(prompt)
 
