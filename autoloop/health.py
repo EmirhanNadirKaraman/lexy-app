@@ -307,19 +307,28 @@ def check(
             detail=f"{info.describe()}; recover with `python -m autoloop start`",
         )
 
-    blockers = BlockerStore(config.blockers_dir).open_blockers()
+    blockers = BlockerStore(config.blockers_dir).open_blockers_by_severity()
     state = StateStore(config.state_file).load() if config.state_file.exists() else None
     phase = state.phase if state is not None else ""
 
     # Blockers first: they are the reason a human is needed, and they outlive
     # the session that raised them.
     if blockers:
-        first = blockers[0]
+        # `blockers[0]` is now the PRIMARY one — `blockers.primary_sort_key`,
+        # severity before recency — not whatever the blocker directory happened
+        # to list first. The count is unchanged and the rest are still open, so
+        # the detail says how many else there are rather than implying this is
+        # the only one. With exactly one open (the common case) that suffix is
+        # absent and the line is byte-identical to what it always was.
+        primary, others = blockers[0], len(blockers) - 1
+        detail = f"{primary.id} ({primary.code}): {primary.question[:200]}"
+        if others:
+            detail += f" (+{others} more open)"
         return Health(
             code=STUCK_BLOCKED,
             needs_attention=True,
             summary=f"autoloop needs a decision — {len(blockers)} open blocker(s)",
-            detail=f"{first.id} ({first.code}): {first.question[:200]}",
+            detail=detail,
             phase=phase,
             open_blockers=len(blockers),
         )

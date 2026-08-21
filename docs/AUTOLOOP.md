@@ -4191,6 +4191,47 @@ python -m autoloop blockers --all      # + resolved ones
 python -m autoloop answer <id> "<text>"  # resolve + (if task_fatal) unblock the task
 ```
 
+**Which one is *the* blocker (blk-02).** More than one can be open at once, and
+several readers each need a single answer: `health.check` names one in its
+`detail`, `status` reports the set, `run --continuous` prints them on
+exhaustion, `blockers` lists them. That choice is made in ONE place —
+`blockers.primary_sort_key`, reached through `BlockerStore.primary_blocker()`
+and `BlockerStore.open_blockers_by_severity()`, beside `open_blockers()`. The
+order is:
+
+1. **Severity.** `loop_fatal` before `task_fatal`, whatever the timestamps: a
+   loop_fatal blocker means the loop cannot continue, so it is strictly more
+   urgent than any number of parked tasks. A kind that is neither ranks WITH
+   `loop_fatal`, the same fail-closed direction as `_to_needs_user`'s default
+   above — a severity we cannot read is not evidence of a mild problem.
+2. **Most recent `created_at`** within one severity: the newest record
+   describes the state the loop actually reached. An unparseable stamp reads
+   as the oldest, so a record can never win this on being unreadable.
+3. **Blocker id, ascending** — two blockers written in the same second still
+   order stably. Ids are monotonic per task (`blk-<task>-<NNN>`, zero-padded),
+   matching `all_blockers`' documented "oldest id first".
+
+Three properties this exists to guarantee, all pinned by tests:
+
+* **Never directory order.** On 2026-08-21 a loop_fatal `parse_budget_exhausted`
+  (09:25:18) and a task_fatal `task_base_behind_head` (09:19:26) were open
+  together, and an operator recovery script iterating `blockers/*.json` acted on
+  the second, because that is what the glob returned first. It failed safe —
+  it declined and logged — but for the wrong reason, and with the codes swapped
+  it would have "recovered" the loop-fatal one. Enumeration order is a coin
+  flip, not a decision.
+* **Nothing is hidden.** Ranking picks a reading order, never a shortlist. The
+  count is unchanged, every open blocker is still listed, and any output that
+  names a primary also says how many others are open.
+* **One open blocker behaves exactly as before.** The overwhelmingly common
+  case: with one open it is the primary, and no "+N more" / "primary" text
+  appears anywhere.
+
+`primary_blocker()` chooses WHICH blocker is primary and nothing else — what
+action a given `code` deserves is a separate question, deliberately not
+answered here. `heartbeat.publish` is unaffected: it publishes a COUNT and the
+session's own question, and names no blocker at all.
+
 **Exhaustion.** At a clean boundary, "no ready task and the fingerprint is
 unchanged" used to always mean "sleep and poll again" — and still does,
 UNLESS there is at least one OPEN blocker at that point. With one, "nothing

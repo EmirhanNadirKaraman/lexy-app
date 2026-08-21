@@ -511,8 +511,16 @@ def two_in_flight_registry():
     return reg
 
 
-def detailed_store(tmp_path, *records):
-    """`(task_id, candidate_sha, review_round, feedback)` tuples → a store."""
+def detailed_store(tmp_path, *records, base="0" * 40):
+    """`(task_id, candidate_sha, review_round, feedback)` tuples → a store.
+
+    `base` is what each record records as its `task_base_sha`, and it matters
+    only to the tests that run the REAL merge-window predicate: since merge-04
+    a record holds the window shut on where its base sits relative to the head
+    (`cli._candidate_base_ancestry`), so those tests pass `base=FakeGit.head`
+    to describe the hazard they claim to describe — a candidate bound to the
+    commit a merge would move. Every other caller reads rows rather than the
+    window and keeps the arbitrary default."""
     store = TaskExecutionStore(tmp_path / "executions")
     for task_id, candidate, review_round, feedback in records:
         store.save(
@@ -520,7 +528,7 @@ def detailed_store(tmp_path, *records):
                 task_id=task_id,
                 task_branch=f"autoloop/{task_id}",
                 worktree_path=str(tmp_path / task_id),
-                task_base_sha="0" * 40,
+                task_base_sha=base,
                 candidate_sha=candidate,
                 review_round=review_round,
                 last_revise_feedback=feedback,
@@ -706,8 +714,18 @@ def test_a_held_candidate_renders_the_reason_it_holds_the_merge(window_config):
     """The line the 2026-08-21 packet needed. A record with a candidate and no
     push intent holds the window shut, and the reason names the task, the
     candidate and the base it is bound to — no network is reached, because
-    `never pushed` is decided from the record alone."""
-    detailed_store(window_config.state_dir, ("auto-02", "a" * 40, 1, ""))
+    `never pushed` is decided from the record alone and the base is placed by
+    string equality against the head (`cli._candidate_base_ancestry`'s
+    `BASE_AT_HEAD` branch, which returns before any `is_descendant` call).
+
+    The record's base IS `FakeGit.head`, deliberately: since merge-04 that is
+    what "holds the window shut" MEANS — a candidate bound to the very commit
+    a merge would move, i.e. the `task_base_behind_head` hazard. A base of
+    `0 * 40` against a head of `a * 40` described no such record; it only
+    rendered `shut` while the predicate had no ancestry question in it."""
+    detailed_store(
+        window_config.state_dir, ("auto-02", "c" * 40, 1, ""), base="a" * 40
+    )
     ctx = build_context(
         make_state(), FakeGit(), two_in_flight_registry(), "r", "p", config=window_config
     )
@@ -719,6 +737,11 @@ def test_a_held_candidate_renders_the_reason_it_holds_the_merge(window_config):
     assert len(line) == 1
     assert line[0].startswith(f"{MERGE_WINDOW_LABEL}: shut — ")
     assert "task auto-02 has a candidate" in line[0]
+    # Candidate and base are DIFFERENT shas here, so the docstring's "names the
+    # task, the candidate and the base" is actually discriminated rather than
+    # satisfied twice over by one repeated sha.
+    assert "candidate (cccccccccccc)" in line[0]
+    assert "bound to base aaaaaaaaaaaa" in line[0]
     assert "never pushed" in line[0]
     assert "merging would strand it" in line[0]
 
@@ -781,13 +804,17 @@ def test_the_addition_stays_inside_its_per_round_budget(window_config):
     is one line per in-flight task plus one merge-window line.
 
     Measured for the 2026-08-21 shape — two in-flight tasks, both holding a
-    candidate, both holding the window shut: **437 characters**, being a
-    94-character and a 98-character task row plus a 245-character merge-window
-    line. Capped at 600, not 500: the reasons interpolate task ids and 14%
-    headroom would make an ordinary reword a test failure. The cap is
-    per-CASE rather than absolute — it scales with what is in flight, which is
-    the point (nothing in flight costs nothing — see
-    `test_nothing_in_flight_renders_no_rows_at_all`).
+    candidate, both holding the window shut: **≈528 characters**, being a
+    93-character and a 97-character task row plus a 338-character merge-window
+    line. That line was 245 characters when this test was written; merge-04
+    added the ancestry clause each reason now carries ("that base IS the
+    current head <sha>", `cli._candidate_base_ancestry`), which is where the
+    ~93 characters went. Capped at 600, not 500: the reasons interpolate task
+    ids and 14% headroom would make an ordinary reword a test failure. The cap
+    is per-CASE rather than absolute — it scales with what is in flight, which
+    is the point (nothing in flight costs nothing — see
+    `test_nothing_in_flight_renders_no_rows_at_all`). The character figures are
+    hand-counted, as the original 437 was; only the 600 cap is asserted.
 
     The character count is not the whole per-round cost: `_merge_window` also
     reaches the task store, the state store and — for any candidate carrying
@@ -801,6 +828,7 @@ def test_the_addition_stays_inside_its_per_round_budget(window_config):
         window_config.state_dir,
         ("auto-02", "a" * 40, 1, "split the helper"),
         ("codex-01", "b" * 40, 2, ""),
+        base="a" * 40,          # bound to FakeGit's head: what "shut" means
     )
     ctx = build_context(
         make_state(),
@@ -826,7 +854,9 @@ def test_no_scheduling_advice_moved_into_the_context_block(window_config):
     characters (`test_contract.test_contract_stays_within_its_budget`); these
     rows state what is true and never restate what to do about it, and the
     contract gains no text from them."""
-    store = detailed_store(window_config.state_dir, ("auto-02", "a" * 40, 1, ""))
+    store = detailed_store(
+        window_config.state_dir, ("auto-02", "a" * 40, 1, ""), base="a" * 40
+    )
     block = render_context(
         build_context(
             make_state(),
