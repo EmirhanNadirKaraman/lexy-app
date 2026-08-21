@@ -43,6 +43,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
 | S35 | INFO | The merge sweep now auto-resolves ONE conflict shape without a human (2026-08-19, docs-01): two branches each appending change-note lines to the terminal append-only section of `docs/SUMMARY.md` / `docs/TESTS.md`. Bounded: two literal paths, each side's section must extend the merge base byte-for-byte, a conflict anywhere else in the file or the merge refuses the whole merge, and every decision is in the transcript. Replaces S34 (`merge=union`), which disabled conflict detection for the whole file | `autoloop/note_merge.py`, `autoloop/auto_merge.py`, `autoloop/git_gateway.py` |
+| S36 | INFO | `GET /api/state` now makes UNCACHED outbound `ls-remote` calls (one per in-flight candidate, from the live merge-window check) and renders raw git error text into the unauthenticated localhost page. Bounded: still read-only and lock-free, each call carries its own deadline, and every reason/note is HTML-escaped; the paths it can print were already on the page | `autoloop/dashboard.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -794,6 +795,73 @@ values this package wrote. That costs the per-template duplication this design
 avoided (every payload template would have to carry them, and a new template
 could forget), so it is worth doing only if a second unauthored-text section is
 ever added here.
+
+### S36 — `GET /api/state` makes uncached outbound git calls and renders raw git error text — INFO — OPEN (bounded, accepted)
+
+**What:** since 2026-08-21 (dash-17) the dashboard's state payload carries the
+LIVE merge-window check (`dashboard.merge_window` → `cli._merge_window_blockers`).
+Two small surfaces move with it, and both are recorded rather than left implied:
+
+- **Outbound calls that are no longer cached.** `/api/state` already reached
+  the network — `_remote_refs` runs one `git ls-remote --heads origin` per repo,
+  cached 60s. The window check adds one `ls-remote` per in-flight candidate,
+  **per request**, deliberately uncached: a cached verdict is a stale snapshot,
+  which is the exact defect the panel exists to replace. A local process polling
+  the port therefore drives proportional traffic at the configured remote. It is
+  the same trust boundary as the rest of this page (anything that can reach the
+  port can run `git ls-remote` itself), and every call carries a deadline
+  (`dashboard._WINDOW_GIT_TIMEOUT`, 6s) that `GitGateway` does not otherwise
+  impose, so a hung remote cannot pin the request thread.
+- **Text the page did not author.** A reason can embed a raw `GitCommandError`
+  string, and a note embeds a recorded `worktree_path`. Neither is new
+  information — `/api/state` has carried `task.worker` (the same
+  `worktree_path`) and blocker questions since 2026-08-02 — and both go through
+  the page's `esc()` at every interpolation, asserted by
+  `test_a_reason_full_of_html_is_shown_as_text_not_run_as_markup`.
+
+**Not a new write surface.** The check is read-only and lock-free: no
+`LoopLock`, no mutating registry or execution-store method, `TaskStore.load()` /
+`StateStore.load()` / plain JSON reads, and git calls limited to `rev-parse`,
+`cat-file` and `ls-remote`. The one non-obvious step was checked rather than
+assumed: `_load_tasks` constructs a `TaskStore` wired to the mutation ledger,
+and `MutationLedger.__init__` is a single assignment — the
+`path.parent.mkdir(...)` in that class lives in `_append`, reachable only from
+`record_intent` / `record_complete`, neither of which this path calls. So
+nothing is created beside `workers_root` either, which matters because a write
+there would sit OUTSIDE the checkout and so outside what the test below can
+see. `test_reading_the_window_writes_nothing_and_never_
+waits_for_the_loop_lock` snapshots every file under the checkout (`.git`
+included) while a real other process holds the lock. That test is load-bearing
+here for a specific reason: the gateway does NOT get `dashboard._run_status`'s
+`--no-optional-locks` injection, so a future git call added to the check that
+refreshed the index would have a 2s poll rewriting `.git/index` in the tree the
+escape detector snapshots — the S24 mitigation this page has always respected.
+
+**file:line** — `autoloop/dashboard.py` `merge_window` / `_window_config` /
+`_window_runner` (the check and its deadline), `collect` (`"merge_window"` in
+the payload), the `MERGE_WINDOW_START`/`END` script region (rendering + `esc`).
+**Severity:** INFO — no new capability, no new write, no data on the page that
+was not already there; recorded because "a read-only tracker that touches the
+network only through one 60s cache" was a true statement about this file and is
+no longer.
+**Verification check:**
+```bash
+# Expect: the window is CALLED, never re-implemented — one call site, no local
+# copy of the predicate
+rg -n '_merge_window_blockers' autoloop/dashboard.py
+# Expect: still no lock and nothing mutating reachable from the window path
+rg -n 'LoopLock|apply_priority|\.save\(|archive\(|mark_' autoloop/dashboard.py
+# Expect: every git call the check makes carries a deadline
+rg -n '_WINDOW_GIT_TIMEOUT|TimeoutExpired' autoloop/dashboard.py
+# Expect: reason/note text is escaped at every interpolation
+rg -n 'mwList|esc\(line\)|esc\(w.detail' autoloop/dashboard.py
+```
+**Suggested fix (only if the page ever leaves a single-operator machine):** the
+same per-process token S28 proposes covers this too — it is the same port and
+the same absence of authentication. Do NOT "fix" the traffic by caching the
+verdict: a stale merge-window answer is the defect dash-17 exists to remove, and
+a cached one would be indistinguishable from the log line it replaced. Narrowing
+the deadline is the safe lever.
 
 ### S29 — `merge` is on the git whitelist, and the loop now pushes the BASE branch — LOW — OPEN (deliberate, gated, accepted)
 

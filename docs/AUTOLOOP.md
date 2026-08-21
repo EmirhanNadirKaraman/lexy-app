@@ -250,6 +250,58 @@ Working in a `git worktree` is the companion habit: `git ls-files` never lists
 escape detector, and editing the primary checkout while a write-capable task
 is dispatched is what trips it (§3e).
 
+**The same answer on the dashboard, live (2026-08-21, dash-17).** The tracker's
+`/api/state` carries `merge_window` — `{status, reasons, notes, detail}` — and
+the page renders it in its own section directly above the merged-into-the-branch
+panel, because that panel raises the question this one answers: "six completed
+branches are not in the base" is the outcome, and the reasons are the cause.
+
+It is the SAME predicate, called: `dashboard.merge_window` invokes
+`cli._merge_window_blockers` (a fourth caller, after this command,
+`auto_merge.py` and `merge_sweep.py`) and passes a `GitGateway` rooted at the
+observed checkout through the existing `git=` seam. A page computing its own
+version could tell an operator a merge is safe while the loop's sweep refuses
+it, so there is deliberately no second implementation to drift.
+
+Why it exists at all: the only rendered form of this answer used to be the
+startup sweep's line in `.autoloop/logs/loop-*.log`, and a log line is a
+snapshot taken when a sweep last ran. Over two days an operator repeatedly
+answered "why has nothing merged?" by grepping for it, and on 2026-08-21 that
+produced three wrong conclusions in one session: a task reported as holding the
+window forty minutes after it had published, two records nearly retired as
+"holders" that the live check already exempted as notes, and a round of
+`codex-01` nearly interrupted for a jam that did not exist. Every one would
+have been avoided by reading the live check.
+
+Four properties are worth knowing before changing it:
+
+* **Reasons and notes render as two lists, never one.** A reason shuts the
+  window; a note says a RECORD is wrong and shuts nothing (the two measured on
+  2026-08-21: a candidate whose worker repo is gone and whose record should have
+  been retired, and a published candidate whose record does not say so — a
+  future `task_base_behind_head` park named in advance). Collapsed together, a
+  latent fault either looks like a blocker or disappears.
+* **`served_at` is the computation time, and there is exactly one clock.** The
+  window carries no timestamp of its own: the page's re-render signature is the
+  payload minus `served_at` and `progress`, so a nested clock would rebuild
+  everything every 2s and snap every opened disclosure shut. The "as of" line is
+  written outside that guard, so it still moves each poll.
+* **A git or remote failure is a REASON, not `unknown`.** This command is
+  fail-closed — an unreachable remote becomes `could not verify origin/…` — and
+  the page shows that verdict verbatim, so it cannot disagree with the loop.
+  `unknown` means only that the check could not be RUN (no config file, an
+  unparseable one, a state file the loop itself would refuse), and it is never
+  read as open.
+* **Read-only, lock-free, and NOT cached.** No `LoopLock`, nothing mutating,
+  every git call a read. A cached verdict would be a stale snapshot, i.e. the
+  defect being fixed, so the cost is paid instead: one `ls-remote` per in-flight
+  candidate per poll, each with its own deadline (`GitGateway` imposes none),
+  and a timeout is reported as a failed call so one slow ref costs a per-record
+  reason rather than the whole panel.
+
+Nothing there changes what closes the window. That is `merge-04`'s question;
+this only shows the existing answer.
+
 ---
 
 ### 3f-bis. `policy.auto_merge_enabled` — publication is not integration

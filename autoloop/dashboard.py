@@ -77,6 +77,7 @@ which is what made the blocked count useless as a call to action.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import re
@@ -86,7 +87,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .errors import StateError, TaskGraphError
+from .errors import AutoloopError, StateError, TaskGraphError
 from .tasks import TaskRegistry, TaskState
 
 #: Reserved status roles (dataviz palette). Never reused for anything else, and
@@ -534,6 +535,19 @@ def worker_progress(state: dict, now: float | None = None) -> dict | None:
     return progress
 
 
+def _config_file(repo: Path) -> Path:
+    """The loop's own config for this checkout.
+
+    Spelled once because two readers now need it and they must not disagree:
+    `_config_toml` below reads it RAW (for the handful of settings this page
+    needs from a checkout that may never have been configured), and
+    `_window_config` loads it STRICTLY through `cli.load_config` because
+    `cli._merge_window_blockers` needs the real `AutoloopConfig` — the same
+    object the loop itself checks the merge window with.
+    """
+    return repo / ".autoloop" / "config.toml"
+
+
 def _config_toml(repo: Path) -> dict:
     """The loop's own `config.toml` as a plain dict, `{}` when it cannot be
     read.
@@ -548,7 +562,7 @@ def _config_toml(repo: Path) -> dict:
     try:
         import tomllib
 
-        data = tomllib.loads((repo / ".autoloop" / "config.toml").read_text(encoding="utf-8"))
+        data = tomllib.loads(_config_file(repo).read_text(encoding="utf-8"))
     except (OSError, ValueError, KeyError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -908,6 +922,175 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
         # the other three are not" is a fact a test can assert about the payload
         # instead of a substring of a script.
         "groups": merge_groups(rows),
+    }
+
+
+# ---- the merge WINDOW: why the base branch may not move right now -------------
+#
+# The panel above says six branches have not landed. It cannot say what is
+# stopping them, and for two days the only rendered form of that answer was a
+# line in `.autoloop/logs/loop-*.log` written by the last startup sweep. A log
+# line is a SNAPSHOT and goes stale silently: on 2026-08-21 it named a task as
+# holding the window forty minutes after that task had published, nearly got two
+# records retired as "holders" that the live check already exempted as notes, and
+# nearly caused a running round to be interrupted for a jam that did not exist.
+#
+# So this asks the LIVE question, on the request, and `served_at` is when it was
+# asked. `cli._merge_window_blockers` is CALLED, never copied: it is the single
+# predicate the loop's own `auto_merge` and `merge_sweep` gate on, and a second
+# implementation here that drifted by one case would have the page and the loop
+# disagreeing about whether a merge is safe — the worst thing this panel could
+# do. Nothing here changes what closes the window; that is merge-04's question.
+#
+# COST, stated rather than mitigated away. The check asks the remote about each
+# unpublished candidate (`_candidate_publication` → `ls-remote`), so a poll costs
+# one round-trip per in-flight candidate, bounded by `_WINDOW_GIT_TIMEOUT` each.
+# It is deliberately NOT cached: a cached verdict is a stale snapshot, which is
+# the exact defect being fixed. `seen` is a fresh set per request for the same
+# reason — memoizing a confirmed publication across requests would freeze a
+# positive that a force-push could invalidate.
+
+#: The three answers the panel can carry, and what each means.
+#:
+#: * `open` — no reason to hold the base still. `reasons` is empty.
+#: * `closed` — at least one reason; every one of them renders.
+#: * `unknown` — the check could not be RUN at all (no config, an unparseable
+#:   one, a state file whose conversation url has drifted). Never "probably
+#:   open": an empty reason list that reads as open is precisely the wrong
+#:   answer, so the status word carries the difference and `detail` says why.
+#:
+#: A git or remote failure is NOT `unknown` here, and that is the CLI's
+#: behaviour rather than a choice made on this page: `_merge_window_blockers` is
+#: fail-closed, so an unreachable remote becomes a REASON naming the failure
+#: ("could not verify origin/… ") and the window reads CLOSED. That keeps the
+#: page's verdict identical to the one the loop acts on.
+MERGE_WINDOW_STATUSES = ("open", "closed", "unknown")
+
+#: Seconds one git call made by the window check may take. `GitGateway` passes
+#: no `timeout=` of its own — every other caller is a loop or a CLI command that
+#: may block — but this one sits on a 2s poll, and an `ls-remote` against an
+#: unreachable host would otherwise hang the request thread forever.
+_WINDOW_GIT_TIMEOUT = 6.0
+
+
+def _window_runner(*args, **kwargs):
+    """`subprocess.run` with a deadline, reporting a timeout as a git call that
+    FAILED rather than as an exception.
+
+    The distinction is the whole point. Raising would abandon the entire check
+    on one slow ref and render the window `unknown`; a non-zero
+    `CompletedProcess` makes `GitGateway._git` raise `GitCommandError`, which
+    `cli._candidate_publication` already catches and turns into a per-record
+    reason ("could not verify …"). Fail-closed, per record, and no window logic
+    is re-implemented to get there.
+    """
+    kwargs.setdefault("timeout", _WINDOW_GIT_TIMEOUT)
+    try:
+        return subprocess.run(*args, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        # `exc.timeout` rather than the constant: a caller that passed its own
+        # deadline must not be reported against someone else's number.
+        return subprocess.CompletedProcess(
+            exc.cmd, 1, "", f"timed out after {exc.timeout}s",
+        )
+
+
+def _window_config(repo: Path):
+    """The loop's `AutoloopConfig`, with `state_dir` resolved against `repo`.
+
+    THE load-bearing line is the `dataclasses.replace`. `load_config` keeps
+    `[paths].state_dir` exactly as written (`config.py:816`), and the shipped
+    value is the relative `.autoloop` — so it resolves against the CALLER's cwd.
+    `cli._merge_window_blockers` globs `executions/*.json` under it, and a
+    dashboard started from anywhere but the checkout would find no records at
+    all, which reads as "no in-flight candidate" and renders the window OPEN.
+    That is the single worst output this panel can produce, and it would come
+    from a working directory rather than from anything git said. The CLI hits
+    the same hazard from a sibling worktree and fails closed on it (its own
+    "state directory … does not exist" reason); here the directory is known, so
+    it is simply pointed at.
+
+    Strict on purpose, unlike `_config_toml`: the window check needs the real
+    config the loop uses (its policy, its state dir, its task file), and a
+    checkout with no usable config has no merge window to report — it reports
+    `unknown` through the caller's own error handling instead.
+    """
+    from . import cli
+
+    config = cli.load_config(_config_file(repo))
+    state_dir = Path(config.state_dir).expanduser()
+    if not state_dir.is_absolute():
+        state_dir = repo / state_dir
+    return dataclasses.replace(config, state_dir=state_dir)
+
+
+def merge_window(repo: Path) -> dict:
+    """Why the base branch may not move right now — the LIVE check, not a log.
+
+    `{status, reasons, notes, detail}`. Reasons and notes come back from
+    `cli._merge_window_blockers` verbatim and are kept apart because they mean
+    different things:
+
+    * a REASON closes the window — merging past it strands reviewed work;
+    * a NOTE does not close it, and says a RECORD is wrong in a way worth
+      knowing (a candidate whose worker repo is gone and whose record should
+      have been retired; a published candidate whose record does not say so, so
+      a later `revise` would park on it). Both are latent faults that appear on
+      no other operator surface, and collapsing them into one list would either
+      make a latent fault look like a blocker or hide it.
+
+    READ-ONLY AND LOCK-FREE, checked rather than asserted. No `LoopLock` is
+    taken and nothing mutating is reached: `_load_tasks` is `TaskStore.load()`
+    (a `read_text`, no mutex, no mkdir) plus `mutation_ledger_for` (a pure path
+    computation) and `MutationLedger.__init__` (one assignment — the
+    `parent.mkdir` lives in `_append`, which only `record_intent` /
+    `record_complete` reach, and neither is on this path);
+    `_load_state` is `StateStore.load()`, likewise a plain read;
+    the execution records are read as JSON; and every git call is `rev-parse` /
+    `cat-file` / `ls-remote`, none of which touch the index. The gateway does
+    NOT get this module's `--no-optional-locks` injection — that lives in
+    `_run_status` and nothing routes through it here — which is why the
+    writes-nothing test covers this path with a real config and a real
+    candidate rather than only the panels above.
+    """
+    from . import cli
+    from .git_gateway import GitGateway
+    from .policy import PolicyEngine
+
+    try:
+        config = _window_config(repo)
+        # Rooted at the OBSERVED checkout. `cli._window_git` builds against
+        # `Path.cwd()`, which is right for an operator running `merge-window`
+        # from the checkout and wrong for a server started with `--repo`; the
+        # function already takes the gateway as a parameter for exactly this
+        # (`auto_merge` passes its own), so this is the third caller using the
+        # seam, not a new one.
+        git = GitGateway(repo, PolicyEngine(config.policy), runner=_window_runner)
+        # A FRESH `seen` per request: it memoizes confirmed publications, and
+        # one shared across requests would hold a positive that a force-push
+        # had since invalidated.
+        reasons, notes = cli._merge_window_blockers(config, set(), git)
+    except (AutoloopError, OSError, ImportError, ValueError,
+            TypeError, KeyError, AttributeError) as exc:
+        # `unknown`, never an empty `reasons` list. Everything reachable here is
+        # "the check could not be run": no config file, an unparseable one, a
+        # state file whose schema or conversation url the loop itself would
+        # refuse. Reporting that as `open` would be this panel telling an
+        # operator to merge on the strength of a failure.
+        #
+        # `ImportError` is in the tuple for the lazy `from . import cli` above:
+        # `cli` pulls in the orchestrator, the audit package and the publisher
+        # at module level, so it is the widest import in the package and the one
+        # most able to fail. A 500 here would contradict this module's rule
+        # everywhere else — a tracker that dies because one thing is unreadable
+        # tells the operator nothing.
+        return {"status": "unknown", "reasons": [], "notes": [],
+                "detail": f"the merge window could not be computed: {exc}"}
+    return {
+        "status": "closed" if reasons else "open",
+        "reasons": list(reasons),
+        "notes": list(notes),
+        "detail": "",
     }
 
 
@@ -1957,6 +2140,14 @@ def collect(repo: Path) -> dict:
 
     live_agents_cache = live_agents()
     ex = state.get("task_execution") or {}
+    # Stamped BEFORE the merge-window check rather than inside the literal
+    # below, where dict evaluation order would put it after. Normally that is
+    # microseconds; under the exact failure `_WINDOW_GIT_TIMEOUT` exists for —
+    # an unreachable remote and several in-flight candidates — the literal's
+    # order would label the reading with a time up to N × 6s newer than the
+    # instant it was taken at, and "the window state as of `served_at`" is the
+    # one guarantee this panel is asked for.
+    served_at = time.strftime("%H:%M:%S")
     return {
         "health": {"role": health[0], "label": health[1], "pids": pids,
                    "lock_pid": lock_pid, "lock_alive": lock_alive},
@@ -2007,8 +2198,17 @@ def collect(repo: Path) -> dict:
         # branch, decided by git ancestry rather than by their status.
         "merge": merge_report(repo, roadmap, head, remote_ok, remote_refs, branch,
                               executions),
+        # WHY the base may not move, not only that work has not landed. The
+        # LIVE answer from `cli._merge_window_blockers` — the same predicate the
+        # loop's own sweep gates on — computed on this request, so `served_at`
+        # below is when it was asked. Deliberately carries no timestamp of its
+        # own: `render()` builds its re-render signature from the payload minus
+        # `served_at` and `progress`, so a clock nested in here would make the
+        # signature differ every 2s and rebuild the whole page forever, snapping
+        # every opened disclosure shut.
+        "merge_window": merge_window(repo),
         "git": {"branch": branch, "head": head[:12], "dirty": dirty, "remote": remote_refs},
-        "served_at": time.strftime("%H:%M:%S"),
+        "served_at": served_at,
         # `stale` means the file on disk has changed since this process
         # imported it — restart the dashboard to pick the change up.
         "build": {"running": _IMPORT_STAMP, "on_disk": _source_stamp(),
@@ -2155,6 +2355,22 @@ h3.gh{font-size:11px;margin:16px 0 6px;color:var(--ink);font-weight:600;
       text-transform:uppercase;letter-spacing:.06em}
 h3.gh:first-child{margin-top:0}
 .gc{color:var(--ink2);font-weight:400;font-variant-numeric:tabular-nums}
+/* ---- the merge window ---------------------------------------------------
+   Two lists, never one. A REASON shuts the window; a NOTE says a record is
+   wrong but does not shut anything, and folding them together would either
+   make a latent fault look like a blocker or hide it. Each list carries its
+   own heading, its own icon and its own left rail, so the rail is a third
+   signal rather than the only one.
+   No status role on the verdict itself: a shut window is the loop working
+   normally — "a phase is executing" clears by itself — and painting it red
+   would call for an operator every time an agent writes a file. `--warning` on
+   the reason rail is the strongest thing here, and the prose under the panel
+   says in words that a transient reason needs nobody. */
+.mwlist{list-style:none;margin:0 0 4px;padding:0;font-size:13px}
+.mwlist li{border-left:3px solid var(--axis);padding:5px 0 5px 10px;
+           margin-bottom:5px;overflow-wrap:anywhere}
+.mwlist.reason li{border-left-color:var(--warning)}
+.mwlist.note li{border-left-color:var(--line);color:var(--ink2)}
 details{margin-top:10px}
 summary{font-size:12px;color:var(--ink2);cursor:pointer}
 summary:hover{color:var(--ink)}
@@ -2334,6 +2550,43 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
          dark-mode contrast WARN on `critical` has its required relief. -->
     <details><summary>Table view — all stages as text</summary>
       <div id="flowtable" class="scroll"></div></details>
+  </section>
+
+  <!-- Directly ABOVE the merge panel, because it answers the question that
+       panel raises. "Six branches have not landed" is an outcome; this is the
+       cause, and for two days the only rendered form of it was a line in
+       `.autoloop/logs/loop-*.log` written by the last startup sweep — a
+       snapshot that goes stale silently and produced three wrong conclusions in
+       one session (a task named as a holder forty minutes after it had
+       published; two records nearly retired that the live check already
+       exempted as notes; a running round nearly interrupted for a jam that did
+       not exist).
+
+       `#mwstamp` is updated OUTSIDE the page-wide change guard, next to
+       `#served`, so the "as of" moves every poll — the whole point is that this
+       is a live reading and not a log line. Everything else here is rebuilt
+       inside the guard, so an operator selecting a reason to paste into a
+       terminal does not have it erased every 2 seconds. -->
+  <section>
+    <h2>Merge window — may the branch head move right now?</h2>
+    <div id="mwstamp" class="muted" style="font-size:12px;margin-bottom:7px"></div>
+    <div id="mwstatus" style="font-size:13px;margin-bottom:9px"></div>
+    <div id="mwreasons"></div>
+    <div id="mwnotes"></div>
+    <p class="muted" style="font-size:12px;margin:9px 0 0">
+      The same check the loop's own merge sweep gates on
+      (<code>cli._merge_window_blockers</code>), called rather than re-derived,
+      and asked on this request — the timestamp above is when.
+      A <b>reason</b> shuts the window: merging into the base past it would
+      strand reviewed work a task is still holding. Not every reason asks
+      anything of you — <b>a phase is executing</b> is the loop running
+      normally, and it clears by itself with nobody doing anything.
+      A <b>note</b> does <i>not</i> shut the window; it says a record is wrong
+      in a way worth knowing (a candidate whose worker repo is gone, or a
+      published candidate whose record does not say so, which is a future park
+      named in advance). <b>unknown</b> means the check could not be run at all,
+      and is never read as open. Display only: nothing here merges anything, and
+      what closes the window is unchanged.</p>
   </section>
 
   <!-- Directly under the pipeline, and the count is also a tile above it: the
@@ -2889,6 +3142,76 @@ function renderRoadmap(d){
   });
 }
 
+// ---- the merge window: WHY the base may not move -----------------------------
+//
+// The panel below says what has not landed. This says what is stopping it, from
+// the LIVE check rather than from the last sweep's log line.
+//
+// Everything between the markers is lifted verbatim by the tests and run under
+// node against a stub document, exactly like the merge panel's region below, so
+// it may reference `esc` and its own declarations and NOTHING else on this page.
+// Keep each marker alone on its line.
+// MERGE_WINDOW_START
+// Icon + word for every status — and here, deliberately, no colour at all. A
+// shut merge window is usually the loop working normally, so a status role on
+// the verdict would call for a human every time an agent writes a file. The
+// backend's `MERGE_WINDOW_STATUSES` is this table's key set; a test pins them.
+const MW = {open:["✓","OPEN"], closed:["■","CLOSED"], unknown:["?","UNKNOWN"]};
+// Reasons and notes render through the same list helper with a DIFFERENT class,
+// under different headings: one shuts the window, the other says a record is
+// wrong. Never one list — that would make a latent fault look like a blocker,
+// or hide it. Every line is untrusted text (it carries worktree paths and raw
+// git error strings), so `esc` at every interpolation.
+const mwList = (items, kind) => `<ul class="mwlist ${kind}">`
+  + items.map(line => `<li>${esc(line)}</li>`).join("") + `</ul>`;
+// The "as of", and ONLY the as-of. Called every poll from OUTSIDE the page-wide
+// change guard, like `#served` and for the same reason: this panel exists to
+// replace a stale log line, so a timestamp that froze whenever the payload
+// happened not to change would reintroduce the exact defect.
+function renderMergeWindowStamp(servedAt){
+  document.getElementById("mwstamp").textContent =
+    `live check · computed at ${servedAt || "—"}`;
+}
+function renderMergeWindow(d){
+  const w = d.merge_window || {status:"unknown", reasons:[], notes:[], detail:""};
+  const [ic, word] = MW[w.status] || MW.unknown;
+  const reasons = w.reasons || [], notes = w.notes || [];
+  document.getElementById("mwstatus").innerHTML =
+    (w.status === "open"
+      ? `<b>${esc(ic)} ${esc(word)}</b> — nothing is holding the base branch `
+        + `still. Merging into it now strands no reviewed work.`
+      : w.status === "closed"
+        ? `<b>${esc(ic)} ${esc(word)}</b> — ${esc(reasons.length)} reason(s) `
+          + `below. Moving the branch head now would strand work a task is `
+          + `still holding.`
+        : `<b>${esc(ic)} ${esc(word)}</b> — the check could not be run, so this `
+          + `is NOT an open window. ${esc(w.detail || "no reason recorded")}`);
+  // The reason list renders even when it is empty, and says so in as many
+  // words. An open window and a panel that failed to render must not look
+  // alike — that is the whole failure mode being fixed one layer up. An EMPTY
+  // list under `unknown` says something different again: nothing was assessed,
+  // which is not the same claim as "nothing is holding it".
+  document.getElementById("mwreasons").innerHTML =
+    `<h3 class="gh">■ Reasons the window is shut `
+    + `<span class="gc">${esc(reasons.length)}</span></h3>`
+    + (reasons.length
+        ? mwList(reasons, "reason")
+        : w.status === "open"
+          ? `<p class="empty">none — no reason is holding the base branch `
+            + `still.</p>`
+          : `<p class="empty">nothing was assessed — the check did not run, so `
+            + `an empty list here is not an answer.</p>`);
+  // Notes only when there are any: a note is a defect report about a RECORD,
+  // and "no records are wrong" is not a sentence an operator came for. An
+  // empty reason list IS.
+  document.getElementById("mwnotes").innerHTML = notes.length
+    ? `<h3 class="gh">○ Notes — these do NOT shut the window `
+      + `<span class="gc">${esc(notes.length)}</span></h3>`
+      + mwList(notes, "note")
+    : "";
+}
+// MERGE_WINDOW_END
+
 // ---- the merge panel, grouped by state ---------------------------------------
 //
 // The same shape as the roadmap docket below and for the same reason: on
@@ -3291,6 +3614,12 @@ function render(d, force){
   const {served_at, progress, ...rest} = d;
   const sig = JSON.stringify(rest);
   document.getElementById("served").textContent = `updated ${esc(served_at)}`;
+  // The merge window's "as of", outside the guard for the same reason. The
+  // panel exists to replace a log line that went stale silently, so the one
+  // thing that must never freeze is the instant the window was read at. Its
+  // CONTENT is rendered below, inside the guard — a reason an operator is
+  // selecting to paste into a terminal must not be erased every 2 seconds.
+  renderMergeWindowStamp(served_at);
   renderProgress(progress);
   // A stale process serves the old PAGE forever, which looks exactly like a
   // missing feature. Say so instead of letting someone wonder.
@@ -3340,9 +3669,13 @@ function render(d, force){
 
   drawFlow(d);
 
-  // ---- merged vs unmerged ------------------------------------------------
-  // Built by `renderMerge` above, grouped by state — the four rows that need a
-  // human are no longer buried under 57 that do not.
+  // ---- the merge window, then merged vs unmerged --------------------------
+  // The window first, because it answers the question the panel under it
+  // raises: "six branches have not landed" is the outcome, and the reasons and
+  // notes below are the cause. Both are built by their own function above.
+  renderMergeWindow(d);
+  // Grouped by state — the four rows that need a human are no longer buried
+  // under 57 that do not.
   renderMerge(d);
 
   // ---- roadmap, grouped by state ----------------------------------------
