@@ -17,6 +17,13 @@ loop_fatal one) and can be listed/answered later:
     python -m autoloop blockers            # list open ones (--all for resolved too)
     python -m autoloop answer <id> "..."   # resolve + unblock the task if task_fatal
 
+When more than one is open at once, WHICH of them is "the" blocker is a
+decision this module makes for everyone: `primary_sort_key` (severity, then
+recency, then id) and the `BlockerStore.primary_blocker` /
+`open_blockers_by_severity` pair beside `open_blockers`. Every caller that
+needs a single blocker reads it from here; a second sort anywhere else is
+the bug that rule exists to prevent.
+
 Same crash-safety rule as every other store in this package
 (`worktask.TaskExecutionStore`, `tasks.TaskStore`): a corrupt record RAISES
 (`StateCorruptError`) rather than silently reading as absent. Reading a
@@ -31,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .errors import StateCorruptError, StateError
@@ -74,6 +82,76 @@ class Blocker:
     #: to clear a dead blocker would forge exactly the operator confirmation
     #: `_RESOLUTION_PRECONDITIONS` exists to require.
     archived_reason: str = ""
+
+
+#: Severity rank for primary selection — LOWER is more urgent. `loop_fatal`
+#: means the loop cannot continue at all; `task_fatal` means one task is
+#: parked and the loop works past it, so no number of task_fatal records is
+#: as urgent as a single loop_fatal one, whatever their timestamps.
+#:
+#: An UNRECOGNISED kind ranks with `loop_fatal`, not after `task_fatal` —
+#: same fail-closed direction as `orchestrator._to_needs_user`'s
+#: `kind="loop_fatal"` default (`docs/AUTOLOOP.md` §9c): a record whose
+#: severity we cannot read is treated as the loop-stopping one rather than
+#: quietly sorted below every classified record, where it would be the last
+#: thing an operator saw named as primary.
+_KIND_RANK = {"loop_fatal": 0, "task_fatal": 1}
+_UNCLASSIFIED_KIND_RANK = _KIND_RANK["loop_fatal"]
+
+
+def _created_epoch(blocker: Blocker) -> float:
+    """`created_at` as a comparable instant. An unparseable or empty stamp
+    reads as `-inf`, i.e. the OLDEST possible — so a record we cannot date
+    never wins the "most recent" tiebreak on the strength of being unreadable."""
+    try:
+        parsed = datetime.fromisoformat(blocker.created_at or "")
+    except (TypeError, ValueError):
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def primary_sort_key(blocker: Blocker) -> tuple[int, float, str]:
+    """THE ordering for "which open blocker is *the* one" — severity first,
+    then most recent, then blocker id.
+
+    One implementation on purpose. `health`, `heartbeat`, the CLI's status
+    and exhaustion reports and any future autonomous routing all read the
+    same open set for different reasons, and if each sorted it its own way
+    the loop could describe one situation while acting on another. Ordering
+    by whatever `Path.glob` returned is not a decision at all: `(` sorts
+    before `b`, so `blk-(loop)-038.json` happening to be listed first is a
+    coin flip that has nothing to do with which problem is worse. Observed
+    2026-08-21, when a loop_fatal `parse_budget_exhausted` and a task_fatal
+    `task_base_behind_head` were open together and a recovery script picked
+    the second because the glob did.
+
+    The three keys, in order:
+
+    1. `_KIND_RANK` — loop_fatal (and anything unclassified) before task_fatal.
+    2. Most recent `created_at` first: within one severity, the newest record
+       describes the state the loop actually reached.
+    3. Blocker id ascending, so two records written in the same second still
+       order stably. Ids are monotonic per task (`blk-<task>-<NNN>`, zero
+       padded), and ascending matches `all_blockers`' documented "oldest id
+       first" rather than inventing a second convention.
+
+    This chooses WHICH blocker is primary and nothing else. What action a
+    given `code` deserves is a separate question, deliberately not answered
+    here."""
+    return (
+        _KIND_RANK.get(blocker.kind, _UNCLASSIFIED_KIND_RANK),
+        -_created_epoch(blocker),
+        blocker.id,
+    )
+
+
+def by_severity(blockers: list[Blocker]) -> list[Blocker]:
+    """`blockers` in `primary_sort_key` order — most urgent first, nothing
+    dropped. For callers that already hold a list (e.g. a printer handed the
+    open set); everything else should go through `BlockerStore`."""
+    return sorted(blockers, key=primary_sort_key)
 
 
 class BlockerStore:
@@ -197,6 +275,30 @@ class BlockerStore:
 
     def open_blockers(self) -> list[Blocker]:
         return [b for b in self.all_blockers() if b.resolved_at is None]
+
+    def open_blockers_by_severity(self) -> list[Blocker]:
+        """Every OPEN blocker, most urgent first (`primary_sort_key`).
+
+        Deliberately a SECOND method rather than a reordering of
+        `open_blockers`: callers that want the whole set — `find_open`,
+        `open_task_ids`, `cli._reconcile_retired_blockers` — do not care
+        about order, and changing the order under them would be churn with
+        no reader. Nothing is filtered here; ranking a primary must never
+        cost the operator sight of the rest."""
+        return by_severity(self.open_blockers())
+
+    def primary_blocker(self) -> Blocker | None:
+        """THE open blocker — the most severe, most recent one, or `None`
+        when nothing is open.
+
+        The single answer to "which blocker is this loop stuck on?". With
+        exactly one open it is that one, which is the overwhelmingly common
+        case and identical to reading the set's only element; with several
+        it is decided by `primary_sort_key`, never by directory order.
+        Callers that name it MUST still say how many others are open —
+        selecting a primary is not permission to hide the rest."""
+        ordered = self.open_blockers_by_severity()
+        return ordered[0] if ordered else None
 
     def open_task_ids(self) -> set[str]:
         """Every task id named by at least one OPEN blocker.

@@ -997,7 +997,10 @@ def test_prompt_names_the_in_flight_task_and_what_holds_the_merge(tmp_path):
     The worker repo is created so `cli._candidate_is_retired` answers from the
     filesystem and never reaches git: this asserts what the reviewer is SHOWN,
     and a `FakeGit` without `read_commit` would turn it into an assertion about
-    the fake."""
+    the fake. The record's base is `FakeGit.head` for the same reason — since
+    merge-04 the window is held by a candidate bound to the commit a merge
+    would move (`cli._candidate_base_ancestry`'s `BASE_AT_HEAD`, decided by
+    string equality before any `is_descendant` call)."""
     (tmp_path / ".al" / "executions").mkdir(parents=True)
     (tmp_path / "t0").mkdir()
     store = TaskExecutionStore(tmp_path / ".al" / "executions")
@@ -1006,7 +1009,7 @@ def test_prompt_names_the_in_flight_task_and_what_holds_the_merge(tmp_path):
             task_id="t0",
             task_branch="autoloop/t0",
             worktree_path=str(tmp_path / "t0"),
-            task_base_sha="0" * 40,
+            task_base_sha="a" * 40,
             candidate_sha="c" * 40,
             review_round=1,
             last_revise_feedback="split step 2",

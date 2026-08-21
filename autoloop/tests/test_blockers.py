@@ -24,7 +24,7 @@ import pytest
 
 from autoloop import cli
 from autoloop.audit.agents import ClaudeCliRunner
-from autoloop.blockers import NO_TASK, Blocker, BlockerStore
+from autoloop.blockers import NO_TASK, Blocker, BlockerStore, by_severity
 from autoloop.config import AutoloopConfig, BrowserConfig, load_config
 from autoloop.contract import Decision, Directive
 from autoloop.errors import StateCorruptError, StateError, TaskGraphError
@@ -1709,3 +1709,295 @@ def test_the_startup_sweeps_stay_tolerant_of_an_unreadable_task_graph(
     out = capsys.readouterr().out
     assert "UNREADABLE" in out
     assert "NOT started" in out
+
+
+# =============================================================================
+# blk-02 — with several blockers open, WHICH one is "the" blocker is decided
+# by severity, never by directory order.
+#
+# Observed 2026-08-21: `blk-(loop)-038` (loop_fatal, parse_budget_exhausted,
+# 09:25:18) and `blk-blk-01-003` (task_fatal, task_base_behind_head, 09:19:26)
+# were open together, and an operator recovery script iterating
+# `blockers/*.json` acted on the SECOND because that is what the glob returned
+# first. It failed safe that time; with the codes swapped it would have
+# "recovered" the loop-fatal one.
+#
+# The fixtures below deliberately make filename order AND recency point at the
+# wrong record — `blk-t-a-001.json` sorts before `blk-t-b-001.json` (and is the
+# newer of the two), while the loop_fatal one is `t-b`. Only severity can pick
+# the loop_fatal record, so reverting the ordering fails these rather than
+# passing by coincidence.
+# =============================================================================
+
+
+def _severity_pair(store):
+    """The incident, arranged so every OTHER available order is wrong:
+    task_fatal first by filename and newer by timestamp, loop_fatal second and
+    older. Returns (loop_fatal, task_fatal)."""
+    task_fatal = _open_blocker(
+        store, "t-a", "task_base_behind_head",
+        kind="task_fatal", when="2026-08-21T09:25:18+00:00",
+    )
+    loop_fatal = _open_blocker(
+        store, "t-b", "parse_budget_exhausted",
+        kind="loop_fatal", when="2026-08-21T09:19:26+00:00",
+    )
+    assert [p.stem for p in sorted(store.directory.glob("blk-*.json"))] == [
+        task_fatal.id, loop_fatal.id
+    ], "the fixture is only meaningful while the glob lists the WRONG one first"
+    return loop_fatal, task_fatal
+
+
+def test_loop_fatal_outranks_task_fatal_whatever_the_directory_says(tmp_path):
+    store = BlockerStore(tmp_path / "blockers")
+    loop_fatal, task_fatal = _severity_pair(store)
+
+    assert store.primary_blocker().id == loop_fatal.id
+    assert [b.id for b in store.open_blockers_by_severity()] == [
+        loop_fatal.id, task_fatal.id
+    ]
+
+
+def test_the_real_incident_pair_also_selects_the_loop_fatal_one(tmp_path):
+    """The ids as actually observed. `(` sorts before `b`, so the glob happened
+    to list this loop_fatal record first — the ordering must agree for the
+    RIGHT reason, not stop being exercised because the accident was benign."""
+    store = BlockerStore(tmp_path / "blockers")
+    loop_fatal = _open_blocker(
+        store, NO_TASK, "parse_budget_exhausted",
+        kind="loop_fatal", when="2026-08-21T09:25:18+00:00",
+    )
+    _open_blocker(
+        store, "blk-01", "task_base_behind_head",
+        kind="task_fatal", when="2026-08-21T09:19:26+00:00",
+    )
+    assert store.primary_blocker().id == loop_fatal.id == f"blk-{NO_TASK}-001"
+
+
+def test_no_number_of_task_fatal_blockers_outranks_one_loop_fatal(tmp_path):
+    store = BlockerStore(tmp_path / "blockers")
+    for n, tid in enumerate(("t-a", "t-b", "t-c", "t-d")):
+        _open_blocker(store, tid, "review_round_cap", when=f"2026-08-21T10:0{n}:00+00:00")
+    loop_fatal = _open_blocker(
+        store, "t-z", "login_expired", kind="loop_fatal",
+        when="2026-08-20T00:00:00+00:00",  # older than every task_fatal above
+    )
+
+    assert store.primary_blocker().id == loop_fatal.id
+    assert len(store.open_blockers_by_severity()) == 5
+
+
+def test_within_one_kind_the_most_recent_wins(tmp_path):
+    """Recency is the honest tiebreak inside a severity: the newest record
+    describes the state the loop actually reached."""
+    store = BlockerStore(tmp_path / "blockers")
+    older = _open_blocker(store, "t-a", "review_round_cap", when="2026-08-21T09:00:00+00:00")
+    newer = _open_blocker(store, "t-b", "attempt_count_ceiling", when="2026-08-21T11:00:00+00:00")
+
+    assert store.primary_blocker().id == newer.id
+    assert [b.id for b in store.open_blockers_by_severity()] == [newer.id, older.id]
+
+
+def test_identical_timestamps_order_stably_by_blocker_id(tmp_path):
+    """Two blockers written in the same second. The id is monotonic per task
+    and ascending, so the order is defined rather than glob-dependent — and
+    repeat calls agree."""
+    store = BlockerStore(tmp_path / "blockers")
+    same_second = "2026-08-21T09:25:18+00:00"
+    second = _open_blocker(store, "t-b", "review_round_cap", when=same_second)
+    first = _open_blocker(store, "t-a", "review_round_cap", when=same_second)
+
+    ranked = [b.id for b in store.open_blockers_by_severity()]
+    assert ranked == sorted([first.id, second.id])
+    assert ranked == [b.id for b in store.open_blockers_by_severity()], "stable"
+    assert store.primary_blocker().id == first.id
+
+
+def test_an_unparseable_created_at_never_wins_the_recency_tiebreak(tmp_path):
+    """A record we cannot date must not be promoted for being unreadable — it
+    sorts as the OLDEST of its kind, and is still listed."""
+    store = BlockerStore(tmp_path / "blockers")
+    dated = _open_blocker(store, "t-a", "review_round_cap", when="2026-01-01T00:00:00+00:00")
+    undated = _open_blocker(store, "t-b", "review_round_cap", when="not a timestamp")
+
+    assert store.primary_blocker().id == dated.id
+    assert {b.id for b in store.open_blockers_by_severity()} == {dated.id, undated.id}
+
+
+def test_an_unrecognised_kind_ranks_with_loop_fatal(tmp_path):
+    """Fail-closed, matching `_to_needs_user`'s `kind="loop_fatal"` default
+    (AUTOLOOP.md §9c): a severity we cannot read is treated as the
+    loop-stopping one rather than sorted below every classified record, where
+    an operator reading the primary would never see it."""
+    store = BlockerStore(tmp_path / "blockers")
+    _open_blocker(store, "t-a", "review_round_cap", when="2026-08-21T12:00:00+00:00")
+    strange = _open_blocker(
+        store, "t-b", "written_by_a_future_version",
+        kind="catastrophic", when="2026-08-21T09:00:00+00:00",
+    )
+
+    assert store.primary_blocker().id == strange.id
+
+
+def test_a_resolved_or_archived_blocker_is_never_primary(tmp_path):
+    store = BlockerStore(tmp_path / "blockers")
+    answered = _open_blocker(
+        store, "t-a", "login_expired", kind="loop_fatal", when="2026-08-21T12:00:00+00:00"
+    )
+    archived = _open_blocker(
+        store, "t-b", "checkout_escape_detected", kind="loop_fatal",
+        when="2026-08-21T11:00:00+00:00",
+    )
+    still_open = _open_blocker(store, "t-c", "review_round_cap", when="2026-08-21T09:00:00+00:00")
+    store.resolve(answered.id, "dealt with")
+    store.archive_stale(archived.id, "session retired")
+
+    # Both closed records outrank `still_open` on severity AND recency — only
+    # the open filter keeps them out.
+    assert store.primary_blocker().id == still_open.id
+    assert [b.id for b in store.open_blockers_by_severity()] == [still_open.id]
+
+
+def test_nothing_open_has_no_primary(tmp_path):
+    store = BlockerStore(tmp_path / "blockers")
+    assert store.primary_blocker() is None
+    assert store.open_blockers_by_severity() == []
+    # And a never-created directory answers the same way rather than raising.
+    assert BlockerStore(tmp_path / "never").primary_blocker() is None
+
+
+def test_exactly_one_open_blocker_is_that_blocker(tmp_path):
+    """The overwhelmingly common case: ranking must be a no-op on it."""
+    store = BlockerStore(tmp_path / "blockers")
+    only = _open_blocker(store, "t-a", "review_round_cap")
+
+    assert store.primary_blocker().id == only.id
+    assert store.open_blockers_by_severity() == store.open_blockers() == [only]
+
+
+def test_ranking_hides_nothing_and_changes_no_count(tmp_path):
+    """`open_blockers` itself is left in its documented id order — the ranking
+    is a second view of the SAME set, not a filter and not a replacement."""
+    store = BlockerStore(tmp_path / "blockers")
+    loop_fatal, task_fatal = _severity_pair(store)
+
+    assert [b.id for b in store.open_blockers()] == [task_fatal.id, loop_fatal.id]
+    assert len(store.open_blockers_by_severity()) == len(store.open_blockers()) == 2
+    assert {b.id for b in store.open_blockers_by_severity()} == {
+        b.id for b in store.open_blockers()
+    }
+    assert store.open_task_ids() == {"t-a", "t-b"}, "the whole-set readers are untouched"
+
+
+def test_by_severity_is_the_same_order_the_store_uses(tmp_path):
+    """The list-in-hand helper and the store method are one implementation —
+    the property `cli._print_blocker_summary` relies on."""
+    store = BlockerStore(tmp_path / "blockers")
+    _severity_pair(store)
+
+    assert [b.id for b in by_severity(store.open_blockers())] == [
+        b.id for b in store.open_blockers_by_severity()
+    ]
+
+
+def test_a_corrupt_record_still_raises_rather_than_ranking_around_it(tmp_path):
+    """Reads through `open_blockers`, so the crash-safety rule is unchanged: a
+    record that will not decode must not read as 'nothing more urgent'."""
+    directory = tmp_path / "blockers"
+    directory.mkdir(parents=True)
+    (directory / "blk-t1-001.json").write_text("{not json", encoding="utf-8")
+    store = BlockerStore(directory)
+
+    with pytest.raises(StateCorruptError):
+        store.primary_blocker()
+    with pytest.raises(StateCorruptError):
+        store.open_blockers_by_severity()
+
+
+# --- the operator-facing surfaces ---------------------------------------------
+
+
+def test_status_names_the_primary_and_says_how_many_else_are_open(tmp_path):
+    config = make_config(tmp_path)
+    loop_fatal, task_fatal = _severity_pair(BlockerStore(config.blockers_dir))
+
+    lines, ok = cli._report_blockers_and_phase(config)
+    text = "\n".join(lines)
+
+    assert ok is False
+    assert "2 OPEN" in text, "the count is the count"
+    assert f"{loop_fatal.id} is primary" in text
+    assert "1 other(s) also open" in text
+    # Nothing is hidden: both records still get their own block.
+    assert f"{loop_fatal.id} ({loop_fatal.kind}/{loop_fatal.code})" in text
+    assert f"{task_fatal.id} ({task_fatal.kind}/{task_fatal.code})" in text
+    # And the primary is listed before the one it outranks.
+    assert text.index(loop_fatal.id) < text.index(task_fatal.id)
+
+
+def test_status_output_for_a_single_blocker_is_unchanged(tmp_path):
+    """Byte-exact, not a substring check: a 'primary' line leaking into the
+    common case would trade one wrong impression for another."""
+    config = make_config(tmp_path)
+    only = _open_blocker(BlockerStore(config.blockers_dir), "t-a", "review_round_cap")
+
+    lines, ok = cli._report_blockers_and_phase(config)
+
+    assert ok is False
+    assert lines[:4] == [
+        "blockers     1 OPEN — each needs a decision:",
+        f"               {only.id} ({only.kind}/{only.code})",
+        f"               {only.question[:160]}",
+        f'               resolve: python -m autoloop answer {only.id} "..."',
+    ]
+
+
+def test_the_blockers_command_lists_open_ones_most_severe_first(tmp_path, capsys):
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    loop_fatal, task_fatal = _severity_pair(BlockerStore(config.blockers_dir))
+
+    assert cli._cmd_blockers(Namespace(config=config_path, all=False)) == 0
+    out = capsys.readouterr().out
+
+    assert out.index(loop_fatal.id) < out.index(task_fatal.id)
+    assert task_fatal.id in out, "ranking is a reading order, never a shortlist"
+
+
+def test_the_exhaustion_summary_ranks_and_still_prints_everything(capsys):
+    """`_print_blocker_summary` takes a list, so it is the place a second
+    caller-local `sorted()` would creep back in."""
+    loop_fatal = Blocker(
+        id="blk-t-b-001", task_id="t-b", kind="loop_fatal",
+        code="parse_budget_exhausted", question="the reply could not be parsed",
+        detail="", phase="reviewing", created_at="2026-08-21T09:19:26+00:00",
+    )
+    task_fatal = Blocker(
+        id="blk-t-a-001", task_id="t-a", kind="task_fatal",
+        code="task_base_behind_head", question="t-a is behind HEAD",
+        detail="", phase="executing", created_at="2026-08-21T09:25:18+00:00",
+    )
+
+    cli._print_blocker_summary([task_fatal, loop_fatal])
+    out = capsys.readouterr().out
+
+    assert out.index(loop_fatal.id) < out.index(task_fatal.id)
+    assert "2 blocker(s) are still open" in out
+    assert f"{loop_fatal.id} is the primary one" in out
+    assert "other 1 above are open too" in out
+    assert task_fatal.question in out
+
+
+def test_the_exhaustion_summary_for_a_single_blocker_is_unchanged(capsys):
+    only = Blocker(
+        id="blk-t-a-001", task_id="t-a", kind="task_fatal", code="review_round_cap",
+        question="t-a hit the review round cap", detail="", phase="executing",
+        created_at="2026-08-21T09:25:18+00:00",
+    )
+
+    cli._print_blocker_summary([only])
+    out = capsys.readouterr().out
+
+    assert "1 blocker(s) are still open" in out
+    assert f"  {only.id}  task=t-a  code=review_round_cap  {only.question}" in out
+    assert "primary" not in out

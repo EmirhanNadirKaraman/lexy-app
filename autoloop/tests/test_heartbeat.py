@@ -122,6 +122,33 @@ def test_open_blockers_turn_a_running_beat_into_an_alarm(config):
     assert beat["needs_attention"] is True
 
 
+def test_the_beat_reports_a_count_and_never_picks_one_blocker(config):
+    """blk-02's boundary. The heartbeat publishes HOW MANY are open and the
+    session's own question — it never names "the" blocker, so there is nothing
+    here to order and nothing that could disagree with `health`'s primary. If
+    a future change makes it name one, it must read
+    `BlockerStore.primary_blocker` and say how many else are open, as `health`
+    and the CLI do; this test is what makes that a deliberate decision."""
+    from autoloop.blockers import BlockerStore
+
+    store = BlockerStore(config.blockers_dir)
+    for task_id, kind in (("t-a", "task_fatal"), ("t-b", "loop_fatal")):
+        store.record(
+            task_id=task_id, kind=kind, code="whatever",
+            question=f"{task_id} needs a decision", detail="",
+            phase="executing", now=NOW.isoformat(timespec="seconds"),
+        )
+    heartbeat.publish(
+        config, LoopState(session_id="s", conversation_url=URL, question="the park text")
+    )
+
+    beat = json.loads(config.heartbeat_file.read_text(encoding="utf-8"))
+    assert beat["open_blockers"] == 2, "the count is the count"
+    assert beat["status"] == "blocked"
+    assert beat["detail"] == "the park text"
+    assert "t-a" not in beat["detail"] and "t-b" not in beat["detail"]
+
+
 def test_writing_never_raises(config, monkeypatch):
     """A monitor is an accessory. Failing to write its input must never take
     down the run it is watching."""

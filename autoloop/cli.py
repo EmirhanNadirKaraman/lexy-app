@@ -56,7 +56,7 @@ from pathlib import Path
 from .audit.agents import ClaudeCliRunner
 from .audit.executor import AuditExecutor
 from .audit.markdown import MarkdownPolicy
-from .blockers import NO_TASK, Blocker, BlockerStore
+from .blockers import NO_TASK, Blocker, BlockerStore, by_severity
 from .changeset_review import build_changeset_binding, build_changeset_packet
 from .config import AutoloopConfig, load_config as _read_config_file
 from .contract import AUDIT_TASK_ID, Decision, Directive
@@ -1414,12 +1414,23 @@ def _handle_parked_task(
 
 
 def _print_blocker_summary(blockers: list[Blocker]) -> None:
+    # `by_severity`, not a local `sorted(key=created_at)`: the loop must not
+    # have two opinions about which open blocker matters most (blk-02). Every
+    # one of them is still printed — ranking picks a reading order, never a
+    # shortlist.
+    ordered = by_severity(blockers)
     print(
         f"continuous mode: exhausted — no ready task, the repository fingerprint "
         f"is unchanged, and {len(blockers)} blocker(s) are still open:"
     )
-    for b in sorted(blockers, key=lambda b: b.created_at):
+    for b in ordered:
         print(f"  {b.id}  task={b.task_id}  code={b.code}  {b.question}")
+    if len(ordered) > 1:
+        print(
+            f"\nMost severe first — {ordered[0].id} is the primary one; the "
+            f"other {len(ordered) - 1} above are open too and each still needs "
+            "an answer."
+        )
     print(
         "\nResolve with `python -m autoloop answer <blocker-id> \"<text>\"`, then "
         "restart `run --continuous`."
@@ -1770,11 +1781,22 @@ def _cmd_blockers(args: argparse.Namespace) -> int:
     Lists open blockers by default; `--all` also shows resolved ones."""
     config = load_config(args.config)
     store = BlockerStore(config.blockers_dir)
-    blockers = store.all_blockers() if args.all else store.open_blockers()
+    # The default (open-only) listing is a TRIAGE view — the operator reads it
+    # to decide what to deal with first — so it uses the one primary ordering
+    # (`blockers.primary_sort_key`: severity, then recency, then id) rather
+    # than the directory order that made a recovery script pick a task_fatal
+    # record over a loop_fatal one on 2026-08-21. `--all` stays chronological:
+    # it includes resolved records and is a history, where ranking a closed
+    # loop_fatal above an open task_fatal would say something untrue.
+    blockers = (
+        sorted(store.all_blockers(), key=lambda b: b.created_at)
+        if args.all
+        else store.open_blockers_by_severity()
+    )
     if not blockers:
         print("no blockers recorded" if args.all else "no open blockers")
         return 0
-    for b in sorted(blockers, key=lambda b: b.created_at):
+    for b in blockers:
         status = "open" if b.resolved_at is None else f"resolved ({b.resolved_at})"
         print(f"[{status}] {b.id}  task={b.task_id}  kind={b.kind}  code={b.code}  age={_age(b.created_at)}")
         print(f"    {b.question}")
@@ -2369,10 +2391,20 @@ def _report_blockers_and_phase(config) -> tuple[list[str], bool]:
     """Report what needs a human. Never resolve it."""
     lines: list[str] = []
     ok = True
-    open_blockers = BlockerStore(config.blockers_dir).open_blockers()
+    open_blockers = BlockerStore(config.blockers_dir).open_blockers_by_severity()
     if open_blockers:
         ok = False
         lines.append(f"blockers     {len(open_blockers)} OPEN — each needs a decision:")
+        if len(open_blockers) > 1:
+            # Say which one is primary AND how many else are open. Naming a
+            # primary without the count would trade "the glob picked one" for
+            # "there is only one" — a different wrong impression, not a fix.
+            # Skipped entirely when exactly one is open, so that (common) case
+            # prints exactly what it always did.
+            lines.append(
+                f"               most severe first: {open_blockers[0].id} is primary, "
+                f"{len(open_blockers) - 1} other(s) also open"
+            )
         for blocker in open_blockers:
             lines.append(f"               {blocker.id} ({blocker.kind}/{blocker.code})")
             lines.append(f"               {blocker.question[:160]}")

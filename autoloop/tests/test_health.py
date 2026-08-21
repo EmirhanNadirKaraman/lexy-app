@@ -49,11 +49,19 @@ def _transcript(config, minutes_ago: float):
     )
 
 
-def _blocker(config, code="approved_paths_missing"):
+def _blocker(
+    config,
+    code="approved_paths_missing",
+    *,
+    task_id="t-1",
+    kind="task_fatal",
+    question="task t-1 has no approved_paths",
+    when=None,
+):
     return BlockerStore(config.blockers_dir).record(
-        task_id="t-1", kind="task_fatal", code=code,
-        question="task t-1 has no approved_paths", detail="",
-        phase="executing", now=NOW.isoformat(timespec="seconds"),
+        task_id=task_id, kind=kind, code=code,
+        question=question, detail="",
+        phase="executing", now=when or NOW.isoformat(timespec="seconds"),
     )
 
 
@@ -398,6 +406,51 @@ def test_an_open_blocker_needs_attention(config):
     assert verdict.code == health.STUCK_BLOCKED
     assert verdict.needs_attention is True
     assert verdict.open_blockers == 1
+
+
+def test_one_open_blockers_detail_line_is_exactly_what_it_always_was(config):
+    """The common case, pinned byte-exactly (blk-02). Ranking a primary out of
+    several must not leak a "+N more" suffix into the single-blocker line."""
+    _state(config, phase=Phase.EXECUTING.value)
+    _transcript(config, minutes_ago=1)
+    only = _blocker(config)
+    with LoopLock(config.state_dir):
+        verdict = _check(config)
+
+    assert verdict.detail == f"{only.id} ({only.code}): {only.question}"
+    assert verdict.summary == "autoloop needs a decision — 1 open blocker(s)"
+
+
+def test_the_reported_blocker_is_the_most_severe_one_not_the_first_on_disk(config):
+    """blk-02, the 2026-08-21 incident: a loop_fatal `parse_budget_exhausted`
+    and a task_fatal `task_base_behind_head` open together. Here the task_fatal
+    one is BOTH first in the blocker directory (`blk-t-a-001` < `blk-t-b-001`)
+    and the newer of the two, so only severity can pick the loop_fatal record —
+    reverting to `open_blockers()[0]` fails this test rather than passing by
+    the accident of how the glob happened to sort."""
+    _state(config, phase=Phase.EXECUTING.value)
+    _transcript(config, minutes_ago=1)
+    task_fatal = _blocker(
+        config, "task_base_behind_head", task_id="t-a", kind="task_fatal",
+        question="t-a's base is behind HEAD", when="2026-08-21T09:25:18+00:00",
+    )
+    loop_fatal = _blocker(
+        config, "parse_budget_exhausted", task_id="t-b", kind="loop_fatal",
+        question="the reply could not be parsed", when="2026-08-21T09:19:26+00:00",
+    )
+    assert task_fatal.id < loop_fatal.id, "the fixture needs the WRONG one listed first"
+
+    with LoopLock(config.state_dir):
+        verdict = _check(config)
+
+    assert verdict.code == health.STUCK_BLOCKED
+    assert loop_fatal.id in verdict.detail
+    assert loop_fatal.code in verdict.detail
+    assert task_fatal.id not in verdict.detail
+    # The count is the count, and the other one is not hidden.
+    assert verdict.open_blockers == 2
+    assert "2 open blocker(s)" in verdict.summary
+    assert "+1 more open" in verdict.detail
 
 
 def test_a_loop_fatal_park_needs_attention(config):
