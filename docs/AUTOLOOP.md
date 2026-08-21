@@ -707,6 +707,127 @@ a monitor that goes quiet when it breaks is the worst kind.
 
 ---
 
+### 3d-bis. `profile` — where the time actually goes
+
+```bash
+python -m autoloop profile                        # the configured transcript.jsonl
+python -m autoloop profile --transcript OLD.jsonl # an archived / rotated one
+```
+
+Read-only and lock-free, like `status`/`tasks`/`blockers`/`health`: it opens one
+file, prints aggregates, and touches no state, no registry and no repository. It
+is meant to be run WHILE the loop runs — that is when the question comes up.
+
+**Why it exists (measured 2026-08-20).** Every transcript record has always
+carried a `ts` and none carried a duration, so a stage could only be timed by
+subtracting two timestamps. That measures THE GAP, not the work. One
+`request_prepared` → `request_submitted` window ran 429 minutes; inside it were
+74 `browser_error`, 27 `browser_restarted` and 7 `rate_limited` records. The
+packet did not take seven hours to build. Establishing that took listing every
+event inside every window by hand, across 460 windows — 49.4h total, 36h (73%)
+in windows containing a browser fault.
+
+**Measured vs gap-derived, never mixed.** The command prints each stage twice,
+under two labels, and never averages them together:
+
+* `measured` — the operation's OWN monotonic elapsed time, recorded by the code
+  that performed it (`transcript.Stopwatch`) under `data.duration_seconds` on
+  the event it already emits. This is the work.
+* `gap-derived` — the difference between two transcript timestamps, at the
+  one-second resolution `state.utcnow_iso` writes. This is the interval: it
+  contains every fault, retry and wait inside the window, so it is an UPPER
+  BOUND on the work, not a measurement of it.
+
+**Independent sets, not competing estimates.** A round that recorded its own
+elapsed time still contributes its timestamp window to the same stage's gap row.
+For `submit` and `execute` the gap is a strictly WIDER window that CONTAINS the
+measured operation, so the two are not two guesses at one number: `measured n`
+reads as "rounds that recorded their own elapsed time", `gap n` as "rounds whose
+window could be paired", and the DIFFERENCE between the rows is what the window
+swallowed — the faults, the retries, the waits. Read the pair; never add it. The
+report says so in its own footer rather than dropping samples to enforce it,
+because suppressing a modern round's window would throw away the one comparison
+the pair exists for.
+
+**Four stages**, the smallest set both sources can support:
+
+| stage | measured on | historical pair (by `request_id`) |
+|---|---|---|
+| `prepare` | `request_prepared` | none — nothing precedes it for a request |
+| `submit` | `request_submitted` | `request_prepared` → `request_submitted` |
+| `review_wait` | none, by nature | `request_submitted` → `response_received` |
+| `execute` | `executed` | `directive` → `executed` |
+
+`review_wait` has no measured column and never will: the stage IS the wait, so
+there is no operation whose elapsed time could stand in for it. Saying that
+plainly is the point — a fabricated "measurement" of a wait is worse than an
+honest gap.
+
+**Where the gap holds real work, not only faults.** `submit`'s measured window is
+the send itself — `client.submit(...)` at its call site, closed the instant the
+transport returns — so the attach, the controlled reload and the duplicate check
+ahead of it, and the verdict persistence and reconciliation branches after it,
+are all in the gap and in no measured column. On a CHUNKED round (§5d-bis) so is the whole `delivering`
+phase: N part sends, each a browser round trip, all inside the
+`request_prepared` → `request_submitted` window.
+A large gap beside a small measured value there means "six part sends", not
+necessarily "a browser fault". Check the transcript for `review_part_delivered`
+records inside the window before reading it as breakage. Left as a documented
+limit rather than a fifth stage: `delivering` is entered only for an oversized
+patch, and a stage that is absent from most transcripts costs more to read than
+it explains.
+
+`execute` is the one the exercise above could not reach at all. It is the
+loop's most expensive stage (an implementation agent, minutes per round), and
+before 2026-08-20 the `executed` event carried no `request_id`, so
+`directive` → `executed` matched nothing and the stage had no timing of any
+kind. `executed` now carries the request id of the directive that produced it,
+read from `state.last_response` at the emit site.
+
+**Additive only, and old records stay old.** `transcript.jsonl` is append-only
+history: the 7,203 records written before this will never gain a duration
+field, and nothing retrofits one. They still report — degraded to gap-derived
+and labelled as such. A stage with neither source available prints `n/a` with
+the reason, never a blank or a zero.
+
+`measured n=0` therefore says one of two different things, and the report picks
+between them by looking at the WHOLE file rather than at the stage: if no
+record anywhere carries a duration, it says *every record here predates
+measured durations*; if the transcript does carry measured durations elsewhere,
+it says only *this stage has no measured samples* — because on a current
+transcript an empty stage means that stage's timing failed, or that stage has
+not run yet, not that the history is old.
+
+**Each measured window closes at the OPERATION, not at the record.** The
+stopwatch is stopped on the operation's own last line — the moment the packet
+exists, the moment the transport returns, the instant either executor arm
+returns — and the frozen value is stamped onto the event further down. That
+separation is the whole discipline: stamping stops a running watch, so a window
+left open until the record is written would swallow the loop's own bookkeeping
+(persisting a send verdict, reading a request id, building a payload) and print
+it under a MEASURED label — the gap-is-not-the-work error this command exists
+to remove, wearing the wrong name. Pinned from the outside by
+`test_work_after_the_boundary_cannot_inflate_any_measured_duration` (the loop
+burns clock readings after every boundary; every duration is still one step)
+and `test_no_emit_site_stamps_a_watch_that_is_still_running`, which is the rule
+itself and so also covers a measured stage nobody has written yet.
+
+**`--transcript FILE`** points the same reader at an archived transcript — a
+rotated file, or a copy taken off another machine — instead of the configured
+one. It widens WHICH file is read and nothing else: still one open, still no
+lock, still aggregates only, so a file that is not a transcript profiles to
+"no usable records" rather than putting any of its content on stdout.
+
+**Cheap and inert in the hot loop.** Timing is two `time.monotonic()` reads and
+one dict copy per operation. No control flow depends on it, and `Stopwatch.stop`
+is total: a clock that raises, a reading that is not finite, and a clock that
+runs BACKWARDS all yield "unknown", which is written as an ABSENT key rather
+than a wrong number. First stop wins, so a payload stamped twice reports the
+same elapsed time both times. A failure to record a duration can never fail the
+operation being timed.
+
+---
+
 ### 3c. Three recovery commands for interrupted work
 
 ```bash

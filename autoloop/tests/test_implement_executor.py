@@ -16,6 +16,7 @@ from autoloop.git_gateway import GitGateway
 from autoloop.implement_executor import ImplementExecutor, implement_agent_runner
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.tasks import Task
+from autoloop.transcript import DURATION_KEY, Stopwatch
 
 
 def run_git(cwd, *args):
@@ -674,3 +675,69 @@ def test_missing_validation_cwd_is_an_honest_error_not_a_silent_pass(main_repo, 
     outcome = executor.execute(implement_directive(), task)
     assert outcome.status == "error"
     assert "validation_cwd" in outcome.summary
+
+
+# ---- prof-01: timing this executor can never change what it returns --------
+#
+# `Orchestrator._dispatch_task_postcommit` wraps THIS call in a `Stopwatch` —
+# it is the loop's most expensive operation and, until prof-01, the only one
+# with no recorded duration at all. The executor itself is deliberately
+# unchanged by that: it neither knows nor cares that it is being timed. These
+# two tests pin both directions of that boundary against the REAL executor
+# rather than a double, because "the measurement is outside the operation" is
+# only worth anything if the operation really is untouched.
+
+
+class _ExplodingClock:
+    def __call__(self):
+        raise RuntimeError("the clock is on fire")
+
+
+class FakeClock:
+    """Returns each reading in turn, then repeats the last one forever."""
+
+    def __init__(self, *readings):
+        self.readings = list(readings)
+
+    def __call__(self):
+        if len(self.readings) > 1:
+            return self.readings.pop(0)
+        return self.readings[0]
+
+
+def _timed_run(main_repo, worker_repo, marker, clock=None):
+    """Run the real executor inside a stopwatch, exactly as the orchestrator
+    does: construct, execute, stamp the completion payload."""
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": f"x = 1  # {marker}\n"}),
+    )
+    watch = Stopwatch(clock) if clock is not None else Stopwatch()
+    outcome = executor.execute(implement_directive(), make_task())
+    payload = watch.stamp({"status": outcome.status, "summary": outcome.summary})
+    return outcome, payload
+
+
+def test_a_broken_timing_path_leaves_the_executor_outcome_unchanged(main_repo, worker_repo):
+    """A clock that raises on every read costs the measurement and nothing
+    else: same outcome as an untimed run, and the payload simply lacks the
+    key — which is the shape of every record written before prof-01."""
+    baseline, _ = _timed_run(main_repo, worker_repo, "a")
+    timed, payload = _timed_run(main_repo, worker_repo, "b", clock=_ExplodingClock())
+
+    assert timed.status == "ok"
+    assert timed == baseline
+    assert DURATION_KEY not in payload
+    assert payload == {"status": timed.status, "summary": timed.summary}
+
+
+def test_a_working_timing_path_measures_without_touching_the_outcome(main_repo, worker_repo):
+    baseline, _ = _timed_run(main_repo, worker_repo, "a")
+    timed, payload = _timed_run(
+        main_repo, worker_repo, "b", clock=FakeClock(500.0, 512.25)
+    )
+
+    assert timed == baseline
+    assert payload[DURATION_KEY] == 12.25
+    assert payload["status"] == "ok"

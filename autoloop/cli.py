@@ -101,7 +101,7 @@ from .publisher import (
 from .stall import StallPolicy
 from .state import TERMINAL_PHASES, LoopState, Phase, StateStore, utcnow_iso
 from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
-from .transcript import TranscriptLogger
+from .transcript import TranscriptLogger, build_profile, read_records, render_profile
 from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
 from .worktask import IntentStore, TaskExecutionStore, retire_execution
@@ -1607,6 +1607,46 @@ def _cmd_next_task(args: argparse.Namespace) -> int:
         print("no ready task")
         return 0
     print(f"{task.id} — {task.title}")
+    return 0
+
+
+def _cmd_profile(args: argparse.Namespace) -> int:
+    """Per-stage timing from the transcript. Read-only, no lock — like
+    `status`/`tasks`/`blockers`/`next-task`, and safe while the loop runs.
+
+    Reads ONE file (`config.transcript_file`) and prints aggregates. It opens
+    no state, no registry and no repository, so it cannot mutate anything and
+    cannot be blocked by a live run; the reader is tolerant line by line
+    (`transcript.read_records`) because the file it reads is being appended to
+    while it reads it, and the last line can be half-written.
+
+    Only AGGREGATES are printed. The transcript carries full review packets
+    (`request_submitted.data.prompt`) and full reviewer responses
+    (`response_received.data.raw`); this command must never grow a flag that
+    prints a record body — see docs/SECURITY.md S36. The read is reduced to a
+    `TranscriptProfile` — counts, flags and per-stage `Stats` of floats —
+    BEFORE anything renders, so the layer that writes to stdout holds no
+    record at all rather than holding one it is trusted not to print.
+
+    `--transcript FILE` points the same reader at an ARCHIVED transcript — a
+    rotated file, a copy taken off another machine, the 7,203-record history
+    that motivated this. It widens which file is read and nothing else: the
+    renderer still receives only that aggregate, so a file that is not a
+    transcript profiles to "no usable records" rather than putting any of its
+    content on stdout. Read with `getattr` so every caller that builds the
+    namespace without the flag keeps working.
+    """
+    config = load_config(args.config)
+    override = getattr(args, "transcript", None)
+    path = Path(override) if override else config.transcript_file
+    if not path.exists():
+        print(f"no transcript at {path}")
+        return 0
+    read = read_records(path)
+    if not read.records:
+        print(f"transcript   {path}\nno usable records")
+        return 0
+    print(render_profile(path, build_profile(read)))
     return 0
 
 
@@ -3525,6 +3565,11 @@ def build_parser() -> argparse.ArgumentParser:
             _cmd_next_task,
             "dry-run: print the task continuous mode would select next (read-only)",
         ),
+        (
+            "profile",
+            _cmd_profile,
+            "per-stage timing from the transcript (read-only, no lock)",
+        ),
         ("doctor", _cmd_doctor, "non-destructive preflight checks (never submits)"),
         (
             "smoke-browser",
@@ -3537,6 +3582,13 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         p = sub.add_parser(name, help=help_text)
         add_config(p)
+        if name == "profile":
+            p.add_argument(
+                "--transcript",
+                type=Path,
+                default=None,
+                help="profile an archived transcript instead of the configured one",
+            )
         if name == "smoke-browser":
             # Defaults to the browser REGARDLESS of `conversation.provider`.
             # Since Codex became the primary reviewer, reading the configured

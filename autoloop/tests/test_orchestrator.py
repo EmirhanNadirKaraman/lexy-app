@@ -46,7 +46,12 @@ from autoloop.state import (
     StateStore,
 )
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
-from autoloop.transcript import TranscriptLogger
+from autoloop.transcript import (
+    DURATION_KEY,
+    Stopwatch,
+    TranscriptLogger,
+    profile_stages,
+)
 from autoloop.worker_env import WorkerRepoManager
 from autoloop.worktask import IntentStore, TaskExecutionStore
 
@@ -1678,3 +1683,233 @@ def test_a_state_error_parks_with_a_blocker_instead_of_killing_the_run(tmp_path)
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert orch.state.park_kind == "loop_fatal"
     assert "no conversation binding" in (orch.state.question or "")
+
+
+# ---- measured stage durations (prof-01, 2026-08-20) -------------------------
+#
+# The production emit sites, exercised through the real phase machine rather
+# than by calling `Stopwatch` directly — `test_profile.py` owns the unit-level
+# behaviour of the stopwatch and the profiler. What these pin is that the
+# fields actually come out of the flow the loop runs: on the events it already
+# emitted, with no new event type, and with the round unchanged when the
+# timing path fails.
+
+
+class SteppingClock:
+    """Monotonic-shaped: every reading is `step` seconds after the last, so a
+    stopwatch that starts once and stops once measures exactly `step`. Each
+    phase step creates at most one stopwatch, which is what makes this exact
+    rather than approximate."""
+
+    def __init__(self, step=1.0, start=1000.0):
+        self.step = step
+        self.value = start - step
+
+    def __call__(self):
+        self.value += self.step
+        return self.value
+
+
+class ExplodingClock:
+    def __call__(self):
+        raise RuntimeError("the clock is on fire")
+
+
+def transcript_records(orch):
+    path = orch._config.transcript_file
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def one_record(orch, entry_type):
+    matches = [r for r in transcript_records(orch) if r.get("type") == entry_type]
+    assert matches, f"no {entry_type!r} record was written"
+    return matches[-1]
+
+
+def test_request_prepared_and_submitted_record_measured_durations(tmp_path):
+    orch, *_ = build(tmp_path, responses=[stop_block()])
+    orch._timing_clock = SteppingClock(step=2.5)
+    orch.run(max_steps=4)
+    assert one_record(orch, "request_prepared")["data"][DURATION_KEY] == 2.5
+    assert one_record(orch, "request_submitted")["data"][DURATION_KEY] == 2.5
+
+
+def test_executed_carries_its_request_id_and_a_measured_duration(tmp_path):
+    """The claim the task is built around: the loop's most expensive stage is
+    both timed and pairable. Before this, `executed` carried no request_id, so
+    `directive` -> `executed` matched nothing and the implementation agent had
+    no recorded duration of any kind."""
+    orch, *_ = build_postcommit(tmp_path, responses=[audit_block()])
+    orch._timing_clock = SteppingClock(step=7.0)
+    orch.run(max_steps=4)
+
+    executed = one_record(orch, "executed")
+    directive = one_record(orch, "directive")
+    assert executed["data"][DURATION_KEY] == 7.0
+    assert executed["request_id"] and executed["request_id"] == directive["request_id"]
+
+    profiles = {p.stage.name: p for p in profile_stages(transcript_records(orch))}
+    assert profiles["execute"].measured.count == 1
+    assert profiles["execute"].measured.total == 7.0
+    # The pair IS timeable now, and its window is reported alongside the
+    # measurement rather than instead of it. `count`, not `total`: both records
+    # land inside one test run at the transcript's one-second `ts` resolution,
+    # so the window is 0s or 1s depending on where the second tick falls.
+    assert profiles["execute"].gap.count == 1
+
+
+def test_durations_ride_existing_events_and_add_no_new_type(tmp_path):
+    """`NO NEW EVENT TYPES WHERE AN EXISTING ONE WILL DO` — 68 is already a
+    lot. Every measured duration must arrive inside an event the loop emitted
+    before prof-01."""
+    orch, *_ = build_postcommit(tmp_path, responses=[audit_block()])
+    orch.run(max_steps=4)
+    carriers = {
+        record["type"]
+        for record in transcript_records(orch)
+        if DURATION_KEY in (record.get("data") or {})
+    }
+    assert carriers  # something really was measured
+    assert carriers <= {"request_prepared", "request_submitted", "executed"}
+
+
+def test_a_timing_clock_that_raises_leaves_the_round_untouched(tmp_path):
+    """`a failure to record a duration must never fail the operation being
+    timed`. Two identical rounds, one with a clock that raises on every read:
+    same phase, same executor outcome, same `executed` payload — minus the one
+    key that could not be measured."""
+
+    def stable(data):
+        # `task_id` is a per-session synthetic audit unit id, so it differs
+        # between two independently-built orchestrators by construction.
+        return {k: v for k, v in data.items() if k not in (DURATION_KEY, "task_id")}
+
+    (tmp_path / "good").mkdir()
+    (tmp_path / "broken").mkdir()
+    good, *_ = build_postcommit(tmp_path / "good", responses=[audit_block()])
+    good.run(max_steps=4)
+    broken, *_ = build_postcommit(tmp_path / "broken", responses=[audit_block()])
+    broken._timing_clock = ExplodingClock()
+    broken.run(max_steps=4)  # must NOT raise
+
+    good_executed = one_record(good, "executed")["data"]
+    broken_executed = one_record(broken, "executed")["data"]
+    assert broken.state.phase == good.state.phase
+    assert broken_executed["status"] == "ok"
+    assert stable(broken_executed) == stable(good_executed)
+    assert set(good_executed) - set(broken_executed) == {DURATION_KEY}
+    # And the same for the other two measured stages.
+    assert DURATION_KEY not in one_record(broken, "request_prepared")["data"]
+    assert DURATION_KEY not in one_record(broken, "request_submitted")["data"]
+
+
+# ---- the measured window closes at the OPERATION, not at the record ---------
+#
+# `stamp()` stops a watch that is still running, so where a caller stamps would
+# otherwise decide what it measured: everything between the operation's last
+# line and the transcript write — persisting a verdict, reading the request id,
+# building the payload — would land inside a MEASURED column. That is the
+# gap-is-not-the-work error this task exists to remove, wearing the wrong
+# label. These pin the freeze from the outside: the loop does clock-consuming
+# work after each boundary and none of it reaches the number.
+
+
+class BurningWatch(Stopwatch):
+    """Consumes clock readings at `stamp()`, standing in for the loop's own
+    bookkeeping between the boundary and the record. A watch frozen at the
+    boundary is immune; one still running when the record is built reports the
+    burn as work — four extra readings, on a clock that only moves forward."""
+
+    BURN = 4
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self._burn_clock = clock
+
+    def stamp(self, data=None):
+        for _ in range(self.BURN):
+            self._burn_clock()
+        return super().stamp(data)
+
+
+class BoundarySpy(Stopwatch):
+    """Remembers whether the watch had already been stopped when it was first
+    stamped — the rule itself, rather than one consequence of it."""
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.stopped_before_stamp = None
+        self._was_stopped = False
+
+    def stop(self):
+        self._was_stopped = True
+        return super().stop()
+
+    def stamp(self, data=None):
+        if self.stopped_before_stamp is None:
+            self.stopped_before_stamp = self._was_stopped
+        return super().stamp(data)
+
+
+def test_work_after_the_boundary_cannot_inflate_any_measured_duration(tmp_path):
+    """Every measured stage at once. Each watch is stopped at its operation's
+    last line, so the four readings burned at the emit site cost nothing: each
+    duration is one step. Were the watch stopped at the record instead, each
+    would read five steps — the shape of the bug, not a rounding difference."""
+    clock = SteppingClock(step=3.0)
+    orch, *_ = build_postcommit(tmp_path, responses=[audit_block()])
+
+    def burning():
+        return BurningWatch(clock)
+
+    orch._stopwatch = burning
+    orch.run(max_steps=4)
+
+    for entry_type in ("request_prepared", "request_submitted", "executed"):
+        measured = one_record(orch, entry_type)["data"][DURATION_KEY]
+        assert measured == 3.0, f"{entry_type} measured {measured}, not the operation"
+
+
+def test_real_post_send_bookkeeping_cannot_inflate_the_submit_duration(tmp_path):
+    """The same claim at a REAL production seam rather than a simulated one:
+    `_client_send_outcome` runs after the transport returned and before
+    `request_submitted` is written. Here reading the verdict costs ten clock
+    readings; the recorded send is still the one step the transport took."""
+    clock = SteppingClock(step=5.0)
+    orch, *_ = build(tmp_path, responses=[stop_block()])
+    orch._timing_clock = clock
+    verdict = orch._client_send_outcome
+
+    def slow_verdict(client):
+        for _ in range(10):
+            clock()
+        return verdict(client)
+
+    orch._client_send_outcome = slow_verdict
+    orch.run(max_steps=4)
+    assert one_record(orch, "request_submitted")["data"][DURATION_KEY] == 5.0
+
+
+def test_no_emit_site_stamps_a_watch_that_is_still_running(tmp_path):
+    """Refactor-proof form of the rule, and the one that covers a stage nobody
+    has written yet: whatever the clock does, a stamped watch must already have
+    been stopped by the operation it measured."""
+    watches = []
+    orch, *_ = build_postcommit(tmp_path, responses=[audit_block()])
+
+    def spy():
+        watches.append(BoundarySpy(orch._timing_clock))
+        return watches[-1]
+
+    orch._stopwatch = spy
+    orch.run(max_steps=4)
+
+    stamped = [w for w in watches if w.stopped_before_stamp is not None]
+    assert len(stamped) >= 3, "expected prepare, submit and execute to be stamped"
+    assert all(w.stopped_before_stamp for w in stamped)

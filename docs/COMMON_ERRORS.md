@@ -2301,6 +2301,97 @@ did not expect (check the summary's "Domain charters came from …" clause and
 the coverage table), that is the same setting working: some checkout in the
 chain ships a charter file.
 
+### A test asserting a phrase in CLI output fails, and the phrase is visibly there when you print it
+**Symptom:** `assert "every record here predates measured durations" in out`
+fails against `autoloop profile`'s output, but the sentence reads correctly on
+screen. Grepping the source finds the string, spelled exactly.
+**Cause:** the renderer word-wraps its explanatory notes
+(`transcript._wrapped_note`, 74 columns), and the wrap fell inside the phrase:
+
+```
+  measured     n=0
+               no record of type 'request_prepared' carries a duration_seconds; every
+               record here predates measured durations
+```
+
+The rendered TEXT contains `"...; every\n               record here..."`, so the
+substring the test looks for does not exist in it. Nothing is wrong with either
+the assertion or the sentence — they simply cannot both be about a string a
+formatter is free to break.
+**Fix:** applied repo-side — the note is emitted as TWO `_wrapped_note` calls,
+so the load-bearing sentence is short enough (45 chars) that no wrap can split
+it. Do NOT fix it by weakening the assertion to a fragment, normalising
+whitespace in the test, or widening the wrap column: each of those leaves the
+next reformat free to break the same test again, and the first also stops the
+test checking the thing it was written for.
+**The general lesson:** if a test asserts on wrapped or formatted output, the
+asserted phrase must be short enough to be unbreakable by the formatter, or the
+formatter must be handed the phrase as its own unit.
+
+### `autoloop profile` reports `execute  measured  n=0` on a live loop while the orchestrator tests all pass
+**Symptom:** the timing instrumentation is committed and green, but a real
+`.autoloop/transcript.jsonl` shows `duration_seconds` on `request_prepared` and
+`request_submitted` and never on `executed`. The `execute` stage reports `n=0`
+measured with a gap-derived row beside it — the exact hole the measurement was
+added to close.
+**Cause:** the executor is dispatched from a BRANCH, and production and half
+the test suite take different arms of it
+(`orchestrator._dispatch_task_postcommit`):
+
+```python
+if self._worker_repos is not None and not is_audit:
+    outcome = self._execute_with_escape_detection(directive, task)   # production
+else:
+    outcome = self._executor.execute(directive, task)                # some tests
+```
+
+A stopwatch started inside the `else` measures only the second arm. Every
+`build()`-based test in `test_orchestrator.py` takes it (no `worker_repos`), so
+they pass — while every real round, and every `build_postcommit()` test, goes
+through the escape-detection arm and records nothing. The failure is silent in
+exactly the place a passing suite is most persuasive.
+**Fix:** applied repo-side — the stopwatch is started BEFORE the `if`, so both
+arms are inside the window, and `test_orchestrator.py::test_executed_carries_
+its_request_id_and_a_measured_duration` uses `build_postcommit` (worker repos
+present) rather than `build`. The escape-detector snapshots are inside the
+measured window deliberately: they are part of what the round spends.
+**The general lesson:** when adding instrumentation around a call that appears
+more than once, check which call site production actually reaches before
+choosing a test harness — and pick the harness that exercises that one.
+
+### A measured duration tracks the gap it was supposed to replace
+**Symptom:** `autoloop profile` shows `measured` and `gap-derived` moving
+together on `submit` or `execute` — the measured number is a little under the
+gap on every round, instead of being a small fraction of it on the bad ones.
+The instrumentation is at the right call site and the tests pass.
+**Cause:** `Stopwatch.stamp()` STOPS a watch that is still running, so the
+boundary of the measurement is wherever `stamp` is called, not where the
+operation ended. Starting a watch at the operation and stamping it at the
+transcript record therefore measures the operation *plus* everything between:
+
+```python
+submit_watch = self._stopwatch()
+result = client.submit(req.request_id, req.prompt)   # the operation
+req.last_send_outcome = self._client_send_outcome(client)
+...                                                  # reconciliation branches
+self._log("request_submitted", data=submit_watch.stamp({...}))  # <- stops HERE
+```
+
+The result is a number labelled `measured` that is really a small gap. It is
+the exact error the measured column exists to remove, and it is invisible in
+the output — a gap wearing a measured label looks like a measurement.
+**Fix:** applied repo-side — every site calls `watch.stop()` on the operation's
+own last line and lets the latched value be stamped later (first stop wins, so
+the later `stamp` writes the frozen reading). Do NOT "fix" a suspicious number
+by subtracting an estimate of the bookkeeping, and do not move the `stamp` call
+closer to the operation instead: the record cannot be written until the payload
+is built, which is why the two are separated in the first place.
+**The general lesson:** when a timing API can stop implicitly, the call that
+stops it IS the boundary. Write the stop where the operation ends, and test it
+by making the code between the boundary and the emit consume clock readings —
+`test_work_after_the_boundary_cannot_inflate_any_measured_duration` does
+exactly that, and it is the only kind of test that can tell the two apart.
+
 ---
 
 ## Adding an entry
