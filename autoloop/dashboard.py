@@ -911,6 +911,233 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
     }
 
 
+# ---- did a completed task's work ever land? (roadmap-01, 2026-08-20) ---------
+#
+# `merge_report` above answers "is this task's BRANCH in the base", which needs a
+# branch to still exist and an execution record to name it. On 2026-08-17 four
+# completed tasks had neither and held every merge sweep, because no record named
+# the work they shipped. All four were resolved by hand with one query — find the
+# commits whose SUBJECT names the task id, then ask git whether any of them is an
+# ancestor of the base head:
+#
+#     audit-0001 -> 07b659b     dash-02 -> dd28dfa
+#     pkt-02     -> 95b77a1     pkt-03  -> 0fcc1c6  (four "pkt-03, part N" commits)
+#
+# That query is what this section automates, and it claims NOTHING else. It does
+# not read the source, does not decide whether a capability exists, and never
+# acts: no registry write, no execution record, no merge, no ref moved. An
+# earlier attempt at the same question parsed Python for definitions and
+# behaviour and spent five review rounds closing one false-positive shape of
+# source after another. Ancestry is decidable; "does this code implement that
+# capability" is not.
+#
+# THE FAIL-OPEN READING THIS EXISTS TO AVOID: a task id that appears in no commit
+# subject is `unknown`, never "not shipped". Absence of a mention is absence of
+# evidence — the work may have shipped under a subject that never names the id —
+# and reporting that as a negative is how a report becomes a licence to retire
+# something that did land. The same rule governs every step below: git failing to
+# answer is `unverified`, which is a third thing from both "no" and "no mention".
+
+#: What this report can conclude about ONE completed task. Four states, and the
+#: last two are deliberately distinct: `unknown` means the search ran and found
+#: no subject naming the id, `unverified` means the search or the ancestry check
+#: could not be completed. Collapsing them would turn "git would not answer" into
+#: "nothing mentions this task", which reads as evidence and is not.
+SHIPPED_STATES = ("shipped", "not-in-base", "unverified", "unknown")
+
+#: Per-commit verdicts, kept beside the aggregate so no individual answer is lost
+#: to it. One matching commit being indeterminate must not erase a definite
+#: `in-base` from another (step 4 of the approved plan).
+COMMIT_ANCESTRY = ("in-base", "not-in-base", "unverified")
+
+#: The alphabet a task id is drawn from — `tasks._ID_RE` is
+#: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, and this is its tail class. Used as the
+#: BOUNDARY around a match, so an id matches only as a whole token.
+_ID_CHARS = "A-Za-z0-9._-"
+
+#: A commit line from `git log --format=%H %s`. Anything that does not start
+#: with a full object id is not one — `log.showSignature`, a pager artefact, a
+#: stray warning — and is dropped rather than parsed as a commit with a strange
+#: sha. `{40,64}` rather than `{40}` so a SHA-256 repository is parsed rather
+#: than having every line silently dropped, which would turn a readable search
+#: into "no commit mentions any task" — a false `unknown` for the whole roadmap.
+_LOG_LINE = re.compile(r"^([0-9a-f]{40,64})(?: (.*))?$")
+
+
+def mentions_task_id(subject: str, task_id: str) -> bool:
+    """Does `subject` name `task_id` as a WHOLE token?
+
+    The boundary is the id alphabet itself, on both sides, so `pkt-03` matches
+    `pkt-03, part 1` and `Merge task pkt-03 (0fcc1c6)` but not `pkt-030`,
+    `x-pkt-03` or `pkt-03.5` — each of which is a different, equally valid id.
+
+    Two consequences, documented rather than "fixed":
+
+    * `.` is in the alphabet, so a subject ending `…roadmap-01.` does NOT match.
+      That is the conservative direction — a missed mention becomes `unknown`,
+      never a false `shipped` — and dropping `.` from the class to catch it
+      would let `pkt-03.5` match `pkt-03`, which is a wrong positive about a
+      real neighbouring id.
+    * Matching is case-SENSITIVE, because ids are (`Pkt-03` and `pkt-03` are two
+      registry rows, and a case-folded match would conflate them).
+    """
+    if not subject or not task_id:
+        return False
+    pattern = rf"(?<![{_ID_CHARS}]){re.escape(task_id)}(?![{_ID_CHARS}])"
+    return re.search(pattern, subject) is not None
+
+
+def commit_subjects(repo: Path) -> list[tuple[str, str]] | None:
+    """`[(full sha, subject)]` for every commit reachable from ANY ref, or
+    `None` when git would not answer.
+
+    `--all`, not the base head, and that is the whole point of searching at all:
+    a commit that is not an ancestor cannot be found by walking the base head,
+    so a search scoped to HEAD could only ever return commits it was about to
+    classify as shipped. The remaining blind spot, stated rather than hidden: a
+    commit on no ref at all (a detached, unreferenced object) is invisible here
+    and reads as `unknown` — no mention found — which is the safe direction.
+
+    `None` on failure, via `_run_checked`, and never `[]`. `_run` collapses "git
+    failed" and "git printed nothing" into the same empty string, and that
+    collapse is exactly the fail-open bug: an unreadable repository would then
+    report every completed task as `unknown`, i.e. as though the search had run
+    and found nothing.
+    """
+    out = _run_checked(
+        ["git", "log", "--all", "--no-color", "--format=%H %s"], cwd=repo, timeout=20
+    )
+    if out is None:
+        return None
+    commits: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        match = _LOG_LINE.match(line.strip())
+        if match:
+            commits.append((match.group(1), match.group(2) or ""))
+    return commits
+
+
+def shipped_states(completed: list[dict], commits, ancestor) -> list[dict]:
+    """One row per completed task: every commit whose subject names it, each
+    commit's own ancestry verdict, and the aggregate of the two.
+
+    Pure resolution logic, like `merge_states` above — `commits` is the search
+    result (`None` when the search failed) and `ancestor(sha) -> "yes"/"no"/
+    "unknown"` is injected — so the four states are decidable without a
+    repository while the git-facing half stays in `commit_subjects` /
+    `is_ancestor`.
+
+    Aggregation, in this order, and every step keeps the per-commit list intact:
+
+    1. The search itself failed → `unverified`. No task can be judged, and
+       saying `unknown` here would claim a search that never ran.
+    2. No subject names the id → `unknown`. NOT "not shipped".
+    3. Any matching commit is an ancestor of the base head → `shipped`, naming
+       that sha. Still lists every other match with its own verdict, so four
+       `pkt-03, part N` commits stay four rows of evidence rather than one.
+    4. Otherwise, any match git could not resolve → `unverified`: one
+       indeterminate check may not be rounded down to a negative.
+    5. Every match is definitely not an ancestor → `not-in-base`.
+    """
+    rows = []
+    for task in completed:
+        task_id = str(task.get("id") or "")
+        row = {
+            "id": task_id,
+            "title": task.get("title") or "",
+            "state": "unverified",
+            "detail": "commit subjects could not be searched — no evidence either way",
+            "commits": [],
+        }
+        if commits is None:
+            rows.append(row)
+            continue
+        matches = [
+            (sha, subject) for sha, subject in commits if mentions_task_id(subject, task_id)
+        ]
+        judged = []
+        for sha, subject in matches:
+            verdict = ancestor(sha)
+            judged.append({
+                "sha": sha[:12],
+                "full": sha,
+                "subject": subject,
+                "ancestry": {"yes": "in-base", "no": "not-in-base"}.get(verdict, "unverified"),
+            })
+        row["commits"] = judged
+        in_base = [c for c in judged if c["ancestry"] == "in-base"]
+        indeterminate = [c for c in judged if c["ancestry"] == "unverified"]
+        if not judged:
+            row["state"] = "unknown"
+            row["detail"] = (
+                "no commit subject names this id — absence of a mention is NOT "
+                "evidence that the work is missing"
+            )
+        elif in_base:
+            row["state"] = "shipped"
+            row["detail"] = (
+                f"{in_base[0]['sha']} names it and is an ancestor of the base head"
+                + (f" ({len(in_base)} of {len(judged)} matching commits are)"
+                   if len(judged) > 1 else "")
+            )
+        elif indeterminate:
+            row["state"] = "unverified"
+            row["detail"] = (
+                f"{len(judged)} commit(s) name it; git could not resolve "
+                f"{len(indeterminate)} of them against the base head"
+            )
+        else:
+            row["state"] = "not-in-base"
+            row["detail"] = (
+                f"{len(judged)} commit(s) name it, none of them an ancestor of "
+                "the base head"
+            )
+        rows.append(row)
+    return rows
+
+
+def resolve_commit(repo: Path, rev: str) -> str:
+    """The full sha `rev` names in `repo`, or `""` when it names nothing.
+
+    `^{commit}` so a tag or a tree cannot be handed to an ancestry check as
+    though it were a commit, and `""` rather than an exception because the
+    caller's answer to "the base head is unreadable" is to report that and stop,
+    not to raise.
+    """
+    if not rev:
+        return ""
+    out = _run_checked(["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=repo)
+    return (out or "").strip()
+
+
+def shipped_report(repo: Path, roadmap: list[dict], head: str, branch: str = "") -> dict:
+    """The read-only payload: every COMPLETED task, the commits whose subjects
+    name it, and whether any of them is in the base.
+
+    Every git call underneath is a local read through `_run_status`, which
+    injects `--no-optional-locks` — this may run against a checkout the loop is
+    writing, and it writes nothing itself.
+
+    Deliberately NOT part of `collect`'s payload: that runs on a 2s poll and
+    this walks every commit on every ref. It is an operator-facing report,
+    reached from `python -m autoloop shipped-report`.
+    """
+    completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
+    commits = commit_subjects(repo)
+    rows = shipped_states(completed, commits, lambda sha: is_ancestor(repo, sha, head))
+    return {
+        "base_branch": branch or "HEAD",
+        "base_head": head[:12],
+        # Whether the SEARCH ran, kept beside the rows: with it false every row
+        # is `unverified` for one shared reason, and the report says so once
+        # rather than eleven times.
+        "searched": commits is not None,
+        "searched_commits": len(commits) if commits is not None else 0,
+        "counts": {s: sum(1 for r in rows if r["state"] == s) for s in SHIPPED_STATES},
+        "rows": rows,
+    }
+
+
 # ---- the roadmap, grouped by state -------------------------------------------
 #
 # One flat list of 20+ tasks answers none of the three questions an operator
