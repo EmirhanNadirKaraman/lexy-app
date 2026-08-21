@@ -2690,7 +2690,58 @@ def _window_git(config) -> GitGateway:
     return GitGateway(Path.cwd(), PolicyEngine(config.policy))
 
 
-def _candidate_publication(config, record, seen=None, git=None) -> tuple[bool, str]:
+@dataclasses.dataclass(frozen=True)
+class UnansweredWindowCheck:
+    """A git or remote question the window check ASKED and could not get an
+    answer to.
+
+    The merge window is deliberately fail-closed: an `ls-remote` that will not
+    answer counts as "not published", which keeps the window shut and keeps the
+    loop from merging on the strength of a failure. That is the right thing for
+    a MERGE, and the wrong thing to show an operator without qualification —
+    "task X is holding the window" and "we could not find out whether task X is
+    holding the window" are different claims, and only one of them is worth
+    acting on.
+
+    So the failure is also recorded HERE, on a structured channel, for callers
+    that need to tell the two apart. Structured rather than sniffed out of the
+    reason text on purpose: the reason strings are prose, they have been
+    reworded twice, and a reader that pattern-matched them would silently start
+    reporting a blocker as a failure (or the reverse) the next time someone
+    fixed a comma. `dashboard.merge_window` is the only consumer today and uses
+    it to render `unknown` instead of `closed`.
+
+    Nothing about the merge decision changes with it. The reason is still
+    appended, the window is still shut, and a caller that passes no sink gets
+    byte-identical output to before.
+    """
+
+    task_id: str
+    question: str
+    detail: str
+
+    def __str__(self) -> str:
+        return f"task {self.task_id}: {self.question} — {self.detail}"
+
+
+def _note_unanswered(sink, task_id, question, exc) -> None:
+    """Append one `UnansweredWindowCheck` to `sink`, or do nothing at all.
+
+    `sink is None` is the default for every merge-path caller, so the recording
+    is genuinely free for them — no allocation, no formatting of an exception
+    they will not read.
+    """
+    if sink is None:
+        return
+    sink.append(UnansweredWindowCheck(
+        task_id=str(task_id or "<unnamed record>"),
+        question=question,
+        detail=f"{type(exc).__name__}: {exc}",
+    ))
+
+
+def _candidate_publication(config, record, seen=None, git=None,
+                           unanswered=None) -> tuple[bool, str]:
     """Has this record's reviewed candidate already landed on its own remote
     branch? Returns `(published, why_not)`.
 
@@ -2711,6 +2762,14 @@ def _candidate_publication(config, record, seen=None, git=None) -> tuple[bool, s
     two fields as one whose push landed, and only the remote can tell them
     apart. Anything unverifiable — no remote configured, ls-remote failing,
     offline — reports not-published, which keeps the window shut.
+
+    `unanswered`, when supplied, is a list this appends an
+    `UnansweredWindowCheck` to whenever the remote raises rather than answers.
+    It changes NOTHING about the verdict — the reason is still returned and the
+    window is still shut — and exists so a read-only caller can say "could not
+    find out" where the merge path says "not published". A missing remote name
+    or ref is NOT recorded: "never pushed" is an answer, arrived at without
+    asking anyone.
 
     `seen` memoizes CONFIRMED publications for the life of one command
     invocation, and deliberately nothing else. `--wait` polls every 15s by
@@ -2736,6 +2795,11 @@ def _candidate_publication(config, record, seen=None, git=None) -> tuple[bool, s
     try:
         landed = gateway.remote_ref_sha(remote, dest_ref)
     except (GitError, OSError) as exc:
+        _note_unanswered(
+            unanswered, record.get("task_id"),
+            f"the remote could not be asked whether {remote}/{dest_ref} carries "
+            "this candidate", exc,
+        )
         return False, f"could not verify {remote}/{dest_ref} ({exc})"
     if not landed:
         return False, f"{remote}/{dest_ref} does not exist"
@@ -2746,7 +2810,8 @@ def _candidate_publication(config, record, seen=None, git=None) -> tuple[bool, s
     return True, ""
 
 
-def _candidate_is_retired(config, registry, task_id, record, git) -> str:
+def _candidate_is_retired(config, registry, task_id, record, git,
+                          unanswered=None) -> str:
     """Is this record a DEFECT rather than a hazard? A one-line reason if so,
     `""` if it must still be respected.
 
@@ -2782,6 +2847,14 @@ def _candidate_is_retired(config, registry, task_id, record, git) -> str:
        ambiguous. Only an explicit False — git itself saying the object
        database does not hold this commit — writes the record off.
 
+    `unanswered` is the same structured sink `_candidate_publication` takes, and
+    the two "not an answer" branches above fill it: a checkout that cannot
+    report its own head, and an `object_exists` probe that raises. Both of them
+    keep the record — and so the window — exactly as they always did; the sink
+    only lets a read-only caller say the answer was not had rather than
+    reporting the fail-closed guess as a finding. A resolvable candidate is an
+    ANSWER and records nothing.
+
     That combination is what `release` leaves behind, and it is provably not
     in-flight. Fourteen such records held the window shut on 2026-08-15 (see
     `worktask.retire_execution`). `release` now retires the record itself, so
@@ -2805,8 +2878,11 @@ def _candidate_is_retired(config, registry, task_id, record, git) -> str:
     gateway = git if git is not None else _window_git(config)
     try:
         gateway.head_sha()
-    except (GitError, OSError):
-        return ""       # the repository cannot answer; that is not an answer
+    except (GitError, OSError) as exc:
+        # the repository cannot answer; that is not an answer
+        _note_unanswered(unanswered, task_id,
+                         "the checkout could not be read at all", exc)
+        return ""
     try:
         gateway.read_commit(candidate)
         return ""       # resolvable here: a moved base could still strand it
@@ -2815,15 +2891,22 @@ def _candidate_is_retired(config, registry, task_id, record, git) -> str:
     try:
         if gateway.object_exists(candidate):
             return ""   # the object is there; reading it merely failed
-    except (GitError, OSError):
-        return ""       # corruption, I/O, a policy refusal — still not an answer
+    except (GitError, OSError) as exc:
+        # corruption, I/O, a policy refusal — still not an answer
+        _note_unanswered(
+            unanswered, task_id,
+            f"the checkout could not say whether {candidate[:12]} is present",
+            exc,
+        )
+        return ""
     return (
         f"its worker repo {worktree_path} is gone and the checkout cannot "
         f"resolve {candidate[:12]}"
     )
 
 
-def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list[str]]:
+def _merge_window_blockers(config, seen=None, git=None,
+                           unanswered=None) -> tuple[list[str], list[str]]:
     """Why merging into the loop's base is unsafe right now, plus advisory
     notes about work that is safe but not yet reconciled. `([], notes)` means
     the window is open.
@@ -2876,6 +2959,18 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
     park on `task_base_behind_head`. That park is recoverable exactly as its
     message says (publish, abandon, or archive the record) and does not risk
     the work — but it is a real consequence of merging, so it is printed.
+
+    `unanswered` is a THIRD, optional channel, and it is not part of the
+    verdict. Pass a list and it collects one `UnansweredWindowCheck` per git or
+    remote question that raised instead of answering; pass nothing (every merge
+    caller does) and the behaviour is unchanged down to the byte. It exists
+    because this function is fail-closed by design — an unreachable remote
+    becomes a reason, which is right for deciding whether to MERGE and
+    misleading as a report, since "task X is holding the window" and "we could
+    not find out whether task X is holding the window" are different claims.
+    `dashboard.merge_window` reads the sink to render `unknown` rather than
+    `closed`; it deliberately does not, and must not, re-read the reason strings
+    to work that out.
     """
     reasons: list[str] = []
     notes: list[str] = []
@@ -2919,7 +3014,8 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
                 continue
         if not record.get("candidate_sha"):
             continue
-        published, why_not = _candidate_publication(config, record, seen, git)
+        published, why_not = _candidate_publication(config, record, seen, git,
+                                                    unanswered)
         if published:
             # The residual differs by whether the RECORD knows what the remote
             # just told us. A record carrying a confirmed `published_sha` is
@@ -2941,7 +3037,8 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
                 )
             )
             continue
-        retired = _candidate_is_retired(config, registry, task_id, record, git)
+        retired = _candidate_is_retired(config, registry, task_id, record, git,
+                                        unanswered)
         if retired:
             notes.append(
                 f"task {task_id}: candidate {str(record.get('candidate_sha'))[:12]} "

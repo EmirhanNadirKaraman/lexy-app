@@ -27,9 +27,16 @@ What these tests hold to, in the order they would break something:
 3. **Reasons and notes stay apart.** A reason shuts the window; a note says a
    RECORD is wrong and shuts nothing. Collapsed into one list, a latent fault
    either looks like a blocker or disappears.
-4. **Never an empty list that reads as open.** A remote that cannot be answered
-   is a REASON naming the failure (the CLI is fail-closed and this page inherits
-   that); a check that could not run at all is `unknown` with the cause in words.
+4. **Never an empty list that reads as open, and never a guess reported as a
+   finding.** `closed` is claimed only when the check answered every question it
+   asked. A git or remote question that went UNANSWERED — an unreachable remote,
+   a timed-out `ls-remote` — renders `unknown` with the reasons still shown and
+   `detail` naming what could not be asked, because the loop's fail-closed guess
+   is right to merge on and wrong to act on: on 2026-08-21 a record was nearly
+   retired as a holder when it had published forty minutes earlier. The window
+   itself is unchanged and still fail-closed; only the report is qualified.
+   That distinction arrives on `cli`'s structured `unanswered` sink, never by
+   reading the reason text — pinned below in both directions.
 5. **Read-only and lock-free**, while a real other process holds `LoopLock`.
 """
 
@@ -165,8 +172,8 @@ def test_the_reasons_and_notes_come_from_the_cli_check_not_a_second_implementati
     write_execution(repo)
     calls = []
 
-    def _sentinel(config, seen=None, git=None):
-        calls.append((config, seen, git))
+    def _sentinel(config, seen=None, git=None, unanswered=None):
+        calls.append((config, seen, git, unanswered))
         return ["SENTINEL REASON"], ["SENTINEL NOTE"]
 
     monkeypatch.setattr(cli, "_merge_window_blockers", _sentinel)
@@ -176,7 +183,11 @@ def test_the_reasons_and_notes_come_from_the_cli_check_not_a_second_implementati
     assert len(calls) == 1, "the check runs exactly once per request"
     assert window["reasons"] == ["SENTINEL REASON"]
     assert window["notes"] == ["SENTINEL NOTE"]
-    config, seen, git = calls[0]
+    config, seen, git, unanswered = calls[0]
+    # The page hands the check somewhere to record a question it could not get
+    # an answer to. Passing `None` here would leave this page with only the
+    # reason strings to work from, which is the reading the next test forbids.
+    assert unanswered == [], "the check is given a fresh diagnostic sink"
     # The loop's own config, with the state dir made absolute against the
     # OBSERVED checkout, and a gateway rooted there rather than at `Path.cwd()`
     # (which is what `cli._window_git` would have built).
@@ -278,7 +289,7 @@ def test_the_window_is_read_from_the_checkout_not_from_the_process_cwd(tmp_path,
 # ---- failure never reads as "open" --------------------------------------------
 
 
-def test_a_remote_that_cannot_be_read_is_a_reason_never_an_empty_open_window(tmp_path):
+def test_a_remote_that_cannot_be_read_reads_unknown_and_still_shows_its_reason(tmp_path):
     """A record naming a push intent whose remote cannot be answered.
 
     `origin` is pointed at a path that does not exist, rather than left
@@ -287,10 +298,17 @@ def test_a_remote_that_cannot_be_read_is_a_reason_never_an_empty_open_window(tmp
     is about what happens when the answer cannot be had — so the failure is made
     deterministic instead of assumed.
 
-    `cli._candidate_publication` is fail-closed — only an `ls-remote` equal to
-    the candidate counts as published — so the failure becomes a REASON naming
-    it, and the page reads CLOSED with the cause in words. That is deliberately
-    not `unknown`: the verdict has to stay identical to the one the loop acts on.
+    `cli._candidate_publication` is fail-closed and stays that way: it still
+    returns "could not verify …" and the loop still refuses to merge on it. But
+    the PAGE says `unknown`, not `closed`, because the two are different claims
+    to an operator — "task t-1 is holding the window" is worth acting on and
+    "we could not find out whether task t-1 is holding the window" is not, and
+    acting on the second is how a record that had published forty minutes
+    earlier was nearly retired as a holder on 2026-08-21.
+
+    Both halves are asserted. The reason is not swallowed — it is the most
+    useful thing on the panel — and `detail` names the question that went
+    unanswered, so the qualification is legible rather than a bare word.
     """
     repo = make_repo(tmp_path)
     run_git(repo, "remote", "add", "origin", str(tmp_path / "no-such-remote.git"))
@@ -299,18 +317,25 @@ def test_a_remote_that_cannot_be_read_is_a_reason_never_an_empty_open_window(tmp
 
     window = merge_window(repo)
 
-    assert window["status"] == "closed"
+    assert window["status"] == "unknown"
     assert window["reasons"], "a failed remote read must never leave an empty list"
     assert any("could not verify" in reason for reason in window["reasons"])
     assert any("origin/refs/heads/autoloop/t-1" in reason
                for reason in window["reasons"])
+    assert "went unanswered" in window["detail"]
+    assert "t-1" in window["detail"], "the detail must name what could not be asked"
 
 
-def test_a_remote_that_answers_and_has_no_such_branch_is_a_reason_too(tmp_path):
-    """The other half, and the one that proves the reason above is not just
-    "any git error": a REACHABLE remote that simply does not carry the branch is
-    still not-published, so the candidate is still in flight and the window is
-    still shut — with a different sentence."""
+def test_a_remote_that_answers_and_has_no_such_branch_stays_closed(tmp_path):
+    """The other half, and the one that proves `unknown` above is not just "any
+    git call happened": a REACHABLE remote that simply does not carry the branch
+    ANSWERED. The candidate is not published, it is still in flight, and the
+    window is CLOSED on a fact rather than on a failure.
+
+    This is the ordinary-blocker case with a real network-shaped call in it, so
+    `detail` staying empty is the assertion that matters: nothing went
+    unanswered, so nothing qualifies the verdict.
+    """
     repo = make_repo(tmp_path)
     empty_remote = tmp_path / "origin.git"
     run_git(tmp_path, "init", "-q", "--bare", str(empty_remote))
@@ -322,10 +347,124 @@ def test_a_remote_that_answers_and_has_no_such_branch_is_a_reason_too(tmp_path):
 
     assert window["status"] == "closed"
     assert any("does not exist" in reason for reason in window["reasons"])
+    assert window["detail"] == "", "an answered check qualifies nothing"
+
+
+def test_an_ordinary_blocker_that_asks_git_nothing_stays_closed(tmp_path):
+    """The cheapest blocker there is, and the one that must NOT drift to
+    `unknown`: a record with no push intent is "never pushed" — an answer
+    reached from the record alone, with no remote consulted and no retirement
+    probe run (`make_repo` saves an empty registry, so `_candidate_is_retired`
+    returns at its first guard). Nothing can have gone unanswered, so the page
+    owes a plain CLOSED with nothing hedging it."""
+    repo = make_repo(tmp_path)
+    write_execution(repo, task_id="merge-04")
+
+    window = merge_window(repo)
+
+    assert window["status"] == "closed"
+    assert any("merge-04" in reason for reason in window["reasons"])
+    assert window["detail"] == ""
+
+
+def test_the_page_never_infers_a_failure_from_the_text_of_a_reason(tmp_path, monkeypatch):
+    """The reviewer's bound, in the only form that can be checked: a reason that
+    LOOKS like a remote failure, from a check that recorded nothing on the sink.
+
+    Reason strings are prose. They have been reworded twice, and a page that
+    decided "unverifiable" by matching `could not verify` in them would start
+    calling ordinary blockers `unknown` — or stop calling real failures
+    `unknown` — the next time someone fixed a comma. The verdict must come from
+    the structured channel and from nothing else, so here the sink is left
+    untouched and the answer must be CLOSED despite the wording.
+    """
+    repo = make_repo(tmp_path)
+
+    def _looks_like_a_failure(config, seen=None, git=None, unanswered=None):
+        return ["could not verify origin/refs/heads/autoloop/x (git said no)"], []
+
+    monkeypatch.setattr(cli, "_merge_window_blockers", _looks_like_a_failure)
+
+    window = merge_window(repo)
+
+    assert window["status"] == "closed"
+    assert window["detail"] == ""
+
+
+def test_an_unanswered_check_with_no_reasons_at_all_reads_unknown_not_open(
+    tmp_path, monkeypatch
+):
+    """The case that forced `unanswered` to dominate rather than to decorate.
+
+    It is reachable for real: when a candidate's publication check FAILS, the
+    fail-closed `why_not` flows on to `_candidate_is_retired`, and a record
+    whose worker repo is gone is then written off as a NOTE — leaving reasons
+    EMPTY while a remote sat there refusing to answer. `closed if reasons else
+    open` would have rendered that as OPEN, telling an operator to merge on the
+    strength of a failure, which is the single worst output this panel has.
+
+    Built by patching rather than assembled from a repo because the real path
+    needs a vanished worktree, an unreachable remote and a pending registry
+    entry to line up at once — three fixtures to pin one branch.
+    """
+    repo = make_repo(tmp_path)
+
+    def _all_unanswered(config, seen=None, git=None, unanswered=None):
+        unanswered.append(cli.UnansweredWindowCheck(
+            task_id="prov-01",
+            question="the remote could not be asked whether origin/x carries "
+                     "this candidate",
+            detail="GitCommandError: ls-remote failed (rc=128)",
+        ))
+        return [], ["task prov-01: candidate 6ab4a529a4e2 is NOT in flight"]
+
+    monkeypatch.setattr(cli, "_merge_window_blockers", _all_unanswered)
+
+    window = merge_window(repo)
+
+    assert window["status"] == "unknown", "an empty reason list is not an answer"
+    assert window["status"] != "open"
+    assert window["reasons"] == []
+    # The note still travels: it is a real observation about a real record, and
+    # the uncertainty is about the WINDOW, not about the note.
+    assert window["notes"] == ["task prov-01: candidate 6ab4a529a4e2 is NOT in flight"]
+    assert "prov-01" in window["detail"] and "ls-remote failed" in window["detail"]
+
+
+def test_a_checkout_that_cannot_answer_about_its_own_objects_reads_unknown(
+    tmp_path, monkeypatch
+):
+    """Not only the remote. `_candidate_is_retired` asks the LOCAL checkout two
+    questions, and both of them can go unanswered (a repository that will not
+    report its head, an `object_exists` probe that raises on corruption or a
+    policy refusal). The CLI keeps the record and the window shut on those,
+    unchanged; the page must not present that guess as a finding either.
+    """
+    repo = make_repo(tmp_path)
+
+    def _local_git_failed(config, seen=None, git=None, unanswered=None):
+        unanswered.append(cli.UnansweredWindowCheck(
+            task_id="auto-01",
+            question="the checkout could not be read at all",
+            detail="GitCommandError: rev-parse: not a git repository",
+        ))
+        return ["task auto-01 has a candidate (abc123def456) — never pushed; "
+                "merging would strand it"], []
+
+    monkeypatch.setattr(cli, "_merge_window_blockers", _local_git_failed)
+
+    window = merge_window(repo)
+
+    assert window["status"] == "unknown"
+    assert window["reasons"], "the reason it did establish is still the useful part"
+    assert "not a git repository" in window["detail"]
 
 
 def test_a_checkout_with_no_loop_config_reads_unknown_and_says_why(tmp_path):
-    """`unknown` is "the check could not be RUN", and it is never open."""
+    """`unknown` shape one — the check could not be RUN at all, so there is
+    nothing to report but the cause. Distinct from shape two above, where it ran
+    and could not answer one of its own questions: there `reasons` is populated
+    and here it must be empty, because nothing was assessed."""
     repo = make_repo(tmp_path)
     (repo / ".autoloop" / "config.toml").unlink()
 
@@ -342,7 +481,11 @@ def test_a_check_that_raises_reads_unknown_rather_than_open(tmp_path, monkeypatc
     of them may render as an open window, and the page must not 500 either."""
     repo = make_repo(tmp_path)
 
-    def _explode(config, seen=None, git=None):
+    # The signature MATTERS, and silently: `TypeError` is in `merge_window`'s
+    # except tuple, so a stub missing the `unanswered` parameter would produce
+    # `unknown` from a signature mismatch and every assertion below would still
+    # pass — testing nothing at all.
+    def _explode(config, seen=None, git=None, unanswered=None):
         raise GitCommandError("git rev-parse HEAD failed (rc=128): not a repository")
 
     monkeypatch.setattr(cli, "_merge_window_blockers", _explode)
@@ -457,8 +600,14 @@ def test_reading_the_window_writes_nothing_and_never_waits_for_the_loop_lock(tmp
     assert after == before, "the window check must not create, remove or touch any file"
     assert run_git(repo, "status", "--porcelain") == status_before
     assert elapsed < 5.0, f"the read waited {elapsed:.1f}s on a lock it must not take"
-    # And it still answered, rather than degrading to `unknown` under the lock.
-    assert window["status"] == "closed"
+    # And it still RAN, rather than degrading to the "could not be computed"
+    # shape of `unknown` under the lock. The status here is `unknown` for a
+    # different reason entirely — the remote above is deliberately unreachable —
+    # so the discriminator is the reason list, which only a check that read the
+    # config, the registry, the state and the execution record can produce. An
+    # `unknown` that gave up would carry no reasons at all.
+    assert window["reasons"], "the check did not run under the lock"
+    assert any("could not verify" in reason for reason in window["reasons"])
 
 
 # ---- the page -----------------------------------------------------------------
@@ -560,6 +709,8 @@ def test_the_page_renders_every_reason_and_keeps_the_notes_visibly_apart():
 
 
 def test_the_page_renders_an_unknown_check_as_not_open_and_says_why():
+    """`unknown` shape one: the check could not be RUN, so there is nothing to
+    show but the cause."""
     out = render_window({"status": "unknown", "reasons": [], "notes": [],
                          "detail": "the merge window could not be computed: "
                                    "config file not found"})
@@ -573,6 +724,39 @@ def test_the_page_renders_an_unknown_check_as_not_open_and_says_why():
     # under a verdict that made no assessment at all.
     assert "nothing was assessed" in out["reasons"]
     assert "no reason is holding" not in out["reasons"]
+
+
+def test_the_page_renders_an_unknown_check_that_did_find_reasons():
+    """`unknown` shape two, and the one with something to lose: the check ran,
+    found real reasons, and could not answer one of its own questions.
+
+    Every reason still renders — they are the most useful thing on the panel and
+    dropping them would be the log line's failure repeated — while the verdict
+    above them says they are as far as the check got, and `detail` names the
+    question that went unanswered. An operator must be able to read both "here
+    is what is holding it" and "this list may be incomplete" off one panel.
+    """
+    out = render_window({
+        "status": "unknown",
+        "reasons": ["task dash-17 has a candidate (abc123def456) — could not "
+                    "verify origin/refs/heads/autoloop/dash-17 (ls-remote failed)"],
+        "notes": [],
+        "detail": "1 git/remote question(s) went unanswered, so anything below "
+                  "is what could be established and not the whole answer: task "
+                  "dash-17: the remote could not be asked whether "
+                  "origin/refs/heads/autoloop/dash-17 carries this candidate — "
+                  "GitCommandError: ls-remote failed",
+    })
+
+    assert "UNKNOWN" in out["status"] and "OPEN" not in out["status"]
+    assert "went unanswered" in out["status"]
+    assert "dash-17" in out["reasons"], "a reason it did establish must still show"
+    assert '<span class="gc">1</span>' in out["reasons"]
+    # And the heading does NOT claim these are what is shutting the window —
+    # under `unknown` they are a floor, not the set.
+    assert "Reasons the window is shut" not in out["reasons"]
+    assert "as far as the check got" in out["reasons"]
+    assert "nothing was assessed" not in out["reasons"]
 
 
 def test_the_page_says_when_the_window_was_read():

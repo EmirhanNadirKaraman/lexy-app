@@ -952,18 +952,38 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
 
 #: The three answers the panel can carry, and what each means.
 #:
-#: * `open` — no reason to hold the base still. `reasons` is empty.
-#: * `closed` — at least one reason; every one of them renders.
-#: * `unknown` — the check could not be RUN at all (no config, an unparseable
-#:   one, a state file whose conversation url has drifted). Never "probably
-#:   open": an empty reason list that reads as open is precisely the wrong
-#:   answer, so the status word carries the difference and `detail` says why.
+#: * `open` — the check ran, answered every question it asked, and found no
+#:   reason to hold the base still. `reasons` is empty.
+#: * `closed` — the check ran, answered every question it asked, and at least
+#:   one reason came back; every one of them renders.
+#: * `unknown` — the check did not reach a verdict an operator can act on.
+#:   TWO shapes, both of them here rather than folded into `closed`:
+#:     1. it could not be RUN at all (no config, an unparseable one, a state
+#:        file whose conversation url has drifted) — `reasons` is empty;
+#:     2. it ran but a git or remote question it asked went UNANSWERED (an
+#:        unreachable remote, a timed-out `ls-remote`, a checkout that cannot
+#:        report its own head) — `reasons` may well be non-empty, and every one
+#:        of them still renders.
 #:
-#: A git or remote failure is NOT `unknown` here, and that is the CLI's
-#: behaviour rather than a choice made on this page: `_merge_window_blockers` is
-#: fail-closed, so an unreachable remote becomes a REASON naming the failure
-#: ("could not verify origin/… ") and the window reads CLOSED. That keeps the
-#: page's verdict identical to the one the loop acts on.
+#: Never "probably open": an empty reason list that reads as open is precisely
+#: the wrong answer, so the status word carries the difference and `detail` says
+#: which shape it is and why.
+#:
+#: Shape 2 is where this page's verdict deliberately differs from the CLI's, and
+#: the difference is one of PURPOSE rather than of logic. `_merge_window_blockers`
+#: is fail-closed — an unreachable remote becomes a reason and the merge does not
+#: happen — which is right for a decision and misleading as a report, because
+#: "task X is holding the window" and "we could not find out whether task X is
+#: holding the window" are different claims and only the first is worth acting
+#: on. Reporting the second as CLOSED is how an operator ends up retiring a
+#: record that had published forty minutes earlier. So the window itself stays
+#: fail-closed, unchanged, and the page qualifies what it shows: the reasons are
+#: rendered verbatim, and the status says they cannot be trusted as complete.
+#:
+#: That distinction arrives on `cli`'s own structured `unanswered` sink
+#: (`UnansweredWindowCheck`), NEVER by pattern-matching a reason string — the
+#: reason text is prose, it has been reworded twice, and a page that read it
+#: would start misclassifying blockers the next time someone fixed a comma.
 MERGE_WINDOW_STATUSES = ("open", "closed", "unknown")
 
 #: Seconds one git call made by the window check may take. `GitGateway` passes
@@ -978,11 +998,14 @@ def _window_runner(*args, **kwargs):
     FAILED rather than as an exception.
 
     The distinction is the whole point. Raising would abandon the entire check
-    on one slow ref and render the window `unknown`; a non-zero
+    on one slow ref, costing every OTHER record's answer as well; a non-zero
     `CompletedProcess` makes `GitGateway._git` raise `GitCommandError`, which
     `cli._candidate_publication` already catches and turns into a per-record
-    reason ("could not verify …"). Fail-closed, per record, and no window logic
-    is re-implemented to get there.
+    reason ("could not verify …") plus one entry on the `unanswered` sink. So a
+    slow ref costs exactly one record's certainty: the window stays fail-closed
+    for the loop, the page reports `unknown` and names the ref, and every record
+    that DID answer is still assessed. No window logic is re-implemented to get
+    there.
     """
     kwargs.setdefault("timeout", _WINDOW_GIT_TIMEOUT)
     try:
@@ -1039,6 +1062,18 @@ def merge_window(repo: Path) -> dict:
       no other operator surface, and collapsing them into one list would either
       make a latent fault look like a blocker or hide it.
 
+    A THIRD list is asked for and never published: `cli`'s `unanswered` sink,
+    one `UnansweredWindowCheck` per git or remote question that raised instead
+    of answering. It is not a payload key — it is what turns the verdict into
+    `unknown`, with the same reasons still rendered under it and `detail`
+    naming the questions that went unanswered. Anything on that sink dominates:
+    even an empty `reasons` list reads `unknown` there, which is the case that
+    forced the design — a record whose publication check FAILS and which is then
+    written off as retired becomes a NOTE, leaving no reason at all, so a flat
+    "closed if reasons else open" would have rendered OPEN off the back of a
+    remote that would not answer. See `MERGE_WINDOW_STATUSES` for why the loop
+    stays fail-closed while the page says it does not know.
+
     READ-ONLY AND LOCK-FREE, checked rather than asserted. No `LoopLock` is
     taken and nothing mutating is reached: `_load_tasks` is `TaskStore.load()`
     (a `read_text`, no mutex, no mkdir) plus `mutation_ledger_for` (a pure path
@@ -1068,8 +1103,10 @@ def merge_window(repo: Path) -> dict:
         git = GitGateway(repo, PolicyEngine(config.policy), runner=_window_runner)
         # A FRESH `seen` per request: it memoizes confirmed publications, and
         # one shared across requests would hold a positive that a force-push
-        # had since invalidated.
-        reasons, notes = cli._merge_window_blockers(config, set(), git)
+        # had since invalidated. `unanswered` is fresh for the same reason and a
+        # stronger one — it describes THIS request's git and remote calls.
+        unanswered: list = []
+        reasons, notes = cli._merge_window_blockers(config, set(), git, unanswered)
     except (AutoloopError, OSError, ImportError, ValueError,
             TypeError, KeyError, AttributeError) as exc:
         # `unknown`, never an empty `reasons` list. Everything reachable here is
@@ -1086,6 +1123,24 @@ def merge_window(repo: Path) -> dict:
         # tells the operator nothing.
         return {"status": "unknown", "reasons": [], "notes": [],
                 "detail": f"the merge window could not be computed: {exc}"}
+    if unanswered:
+        # The check RAN — its reasons and notes are real and all of them travel
+        # — but at least one git or remote question came back unanswered, so
+        # what is below is a floor rather than the answer. `unknown` rather than
+        # `closed` because the fail-closed reason a failure produces is a guess
+        # the loop is right to act on and an operator is not: on 2026-08-21 a
+        # record was nearly retired as a holder when it had published forty
+        # minutes earlier. Never `open`, whatever `reasons` holds.
+        return {
+            "status": "unknown",
+            "reasons": list(reasons),
+            "notes": list(notes),
+            "detail": (
+                f"{len(unanswered)} git/remote question(s) went unanswered, so "
+                "anything below is what could be established and not the whole "
+                "answer: " + "; ".join(str(item) for item in unanswered)
+            ),
+        }
     return {
         "status": "closed" if reasons else "open",
         "reasons": list(reasons),
@@ -2584,9 +2639,15 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       A <b>note</b> does <i>not</i> shut the window; it says a record is wrong
       in a way worth knowing (a candidate whose worker repo is gone, or a
       published candidate whose record does not say so, which is a future park
-      named in advance). <b>unknown</b> means the check could not be run at all,
-      and is never read as open. Display only: nothing here merges anything, and
-      what closes the window is unchanged.</p>
+      named in advance). <b>unknown</b> means no verdict you can act on — either
+      the check could not be run at all, or a git or remote question it asked
+      went unanswered (an unreachable remote, an <code>ls-remote</code> that
+      timed out) and what it did establish is a floor rather than the answer.
+      The loop itself still treats that failure as a closed window, which is the
+      safe thing for a merge and the wrong thing to read as a finding: "we could
+      not find out" is not "this task is holding it". <b>unknown</b> is never
+      read as open. Display only: nothing here merges anything, and what closes
+      the window is unchanged.</p>
   </section>
 
   <!-- Directly under the pipeline, and the count is also a tile above it: the
@@ -3184,23 +3245,32 @@ function renderMergeWindow(d){
         ? `<b>${esc(ic)} ${esc(word)}</b> — ${esc(reasons.length)} reason(s) `
           + `below. Moving the branch head now would strand work a task is `
           + `still holding.`
-        : `<b>${esc(ic)} ${esc(word)}</b> — the check could not be run, so this `
-          + `is NOT an open window. ${esc(w.detail || "no reason recorded")}`);
+        : `<b>${esc(ic)} ${esc(word)}</b> — no verdict you can act on, and `
+          + `therefore NOT an open window. `
+          + `${esc(w.detail || "no reason recorded")}`);
   // The reason list renders even when it is empty, and says so in as many
   // words. An open window and a panel that failed to render must not look
   // alike — that is the whole failure mode being fixed one layer up. An EMPTY
   // list under `unknown` says something different again: nothing was assessed,
   // which is not the same claim as "nothing is holding it".
+  //
+  // The HEADING is qualified under `unknown` for the same reason the status is:
+  // reasons found by a check that could not answer every question are a floor,
+  // not the set of things shutting the window. Branching on `w.status` only —
+  // what a reason MEANS is never read out of its text here.
   document.getElementById("mwreasons").innerHTML =
-    `<h3 class="gh">■ Reasons the window is shut `
-    + `<span class="gc">${esc(reasons.length)}</span></h3>`
+    `<h3 class="gh">■ `
+    + (w.status === "unknown"
+        ? "Reasons, as far as the check got"
+        : "Reasons the window is shut")
+    + ` <span class="gc">${esc(reasons.length)}</span></h3>`
     + (reasons.length
         ? mwList(reasons, "reason")
         : w.status === "open"
           ? `<p class="empty">none — no reason is holding the base branch `
             + `still.</p>`
-          : `<p class="empty">nothing was assessed — the check did not run, so `
-            + `an empty list here is not an answer.</p>`);
+          : `<p class="empty">nothing was assessed — the check reached no `
+            + `verdict, so an empty list here is not an answer.</p>`);
   // Notes only when there are any: a note is a defect report about a RECORD,
   // and "no records are wrong" is not a sentence an operator came for. An
   // empty reason list IS.

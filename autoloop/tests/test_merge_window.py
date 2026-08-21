@@ -574,6 +574,150 @@ def test_writing_a_record_off_never_touches_the_network(wired):
     assert git.lookups == []
 
 
+# --- the `unanswered` sink: a guess, told apart from a finding -----------------
+#
+# This check is fail-closed on purpose: a remote that will not answer counts as
+# "not published", the reason is appended, and the merge does not happen. That
+# is right for a DECISION and misleading as a REPORT — "task X is holding the
+# window" and "we could not find out whether task X is holding the window" are
+# different claims, and only the first is worth acting on. Reporting the second
+# as the first is how, on 2026-08-21, a record that had published forty minutes
+# earlier was nearly retired as a holder.
+#
+# So the failure is ALSO recorded on an optional structured sink, and nothing
+# else changes: same reasons, same notes, same fail-closed window. Every merge
+# caller (`_cmd_merge_window`, `auto_merge`, `merge_sweep`) passes no sink and is
+# unaffected; `dashboard.merge_window` passes one and renders `unknown` instead
+# of `closed`. The sink is STRUCTURED rather than sniffed out of the reason text
+# because these strings are prose that has been reworded twice already.
+
+
+def test_an_unanswerable_remote_is_recorded_as_unanswered_and_still_a_reason(wired):
+    """Both halves in one assertion set, because the value is in their
+    conjunction: the window must not open, and the failure must be legible as a
+    failure rather than as a holder."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="rt-9", remote="origin", dest_ref=PUSHED)
+    fake = _FakeRemote(error=GitCommandError("ls-remote", "could not read from remote"))
+    unanswered: list = []
+
+    reasons, _notes = cli._merge_window_blockers(wired, set(), fake, unanswered)
+
+    assert reasons and "would strand it" in reasons[0], "still fail-closed"
+    assert "could not verify" in reasons[0], "and the reason is unchanged"
+    assert len(unanswered) == 1
+    assert unanswered[0].task_id == "rt-9"
+    assert PUSHED in unanswered[0].question
+    assert "could not read from remote" in unanswered[0].detail
+
+
+def test_the_same_run_without_a_sink_produces_the_same_reasons(wired):
+    """The compatibility claim, measured rather than asserted in a comment: the
+    three merge callers pass no sink, and what they act on must be identical
+    down to the string."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="rt-9", remote="origin", dest_ref=PUSHED)
+    error = GitCommandError("ls-remote", "could not read from remote")
+
+    with_sink, notes_with = cli._merge_window_blockers(
+        wired, set(), _FakeRemote(error=error), []
+    )
+    without, notes_without = cli._merge_window_blockers(
+        wired, set(), _FakeRemote(error=error)
+    )
+
+    assert with_sink == without
+    assert notes_with == notes_without
+
+
+def test_a_blocker_that_asks_nobody_anything_records_nothing_unanswered(wired):
+    """An ordinary blocker must not drift into "unverifiable". A record with no
+    push intent is "never pushed" — an answer read off the record itself, with
+    no remote consulted — so the sink stays empty and the page owes a plain
+    CLOSED."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired)
+    unanswered: list = []
+
+    reasons, _notes = cli._merge_window_blockers(wired, set(), _FakeRemote(), unanswered)
+
+    assert reasons and "would strand it" in reasons[0]
+    assert unanswered == [], "nothing was asked, so nothing went unanswered"
+
+
+def test_a_remote_that_answers_no_such_ref_records_nothing_unanswered(wired):
+    """The discriminator for the test above: the remote IS consulted here and it
+    answers — the ref is simply not there. A definite negative is a finding, not
+    a failure, so the window is CLOSED on a fact and the sink stays empty."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="rt-9", remote="origin", dest_ref=PUSHED)
+    fake = _FakeRemote()          # reachable, knows no refs
+    unanswered: list = []
+
+    reasons, _notes = cli._merge_window_blockers(wired, set(), fake, unanswered)
+
+    assert fake.lookups == [("origin", PUSHED)], "the remote really was asked"
+    assert reasons and "does not exist" in reasons[0]
+    assert unanswered == []
+
+
+def test_a_checkout_that_cannot_answer_records_it_and_keeps_the_window_shut(wired):
+    """The local half. `_candidate_is_retired` asks the checkout two questions
+    and both can go unanswered; a repository that will not report its own head
+    is the first. The record is kept and the window stays shut exactly as
+    before — see `test_a_checkout_that_cannot_answer_keeps_the_window_shut` —
+    and now the guess is labelled as one."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)
+    unanswered: list = []
+
+    reasons, _notes = cli._merge_window_blockers(
+        wired, set(), _FakeCheckout(head=""), unanswered
+    )
+
+    assert reasons and "would strand it" in reasons[0]
+    assert len(unanswered) == 1
+    assert unanswered[0].task_id == "auto-01"
+    assert "could not be read" in unanswered[0].question
+
+
+def test_an_object_probe_that_raises_is_recorded_as_unanswered(wired):
+    """The second local question, and the one whose whole point is that a raise
+    is not an answer: `object_exists` failing on corruption or a policy refusal
+    leaves the record in place. That stays true; it is now also visible."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)
+    denied = GitOperationDenied("git_denied: cat-file is not allowed here")
+    unanswered: list = []
+
+    reasons, notes = cli._merge_window_blockers(
+        wired, set(),
+        _FakeCheckout(read_error=denied, exists_error=denied), unanswered,
+    )
+
+    assert reasons and "would strand it" in reasons[0]
+    assert notes == [], "nothing may be written off on an unanswered question"
+    assert len(unanswered) == 1
+    assert "abc123def456"[:12] in unanswered[0].question
+
+
+def test_a_resolvable_candidate_is_an_answer_and_records_nothing(wired):
+    """The negative that keeps the two probes honest: the checkout answers, the
+    commit is there, the record is respected. An answer, so nothing is
+    recorded — a sink that filled up on every healthy in-flight candidate would
+    render the dashboard permanently `unknown` and be ignored within a day."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)
+    unanswered: list = []
+
+    reasons, _notes = cli._merge_window_blockers(
+        wired, set(), _FakeCheckout(commits={"abc123def456"}), unanswered
+    )
+
+    assert reasons and "would strand it" in reasons[0]
+    assert unanswered == []
+
+
 # --- a stale park whose task has since completed ------------------------------
 
 

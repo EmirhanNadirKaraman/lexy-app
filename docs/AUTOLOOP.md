@@ -286,12 +286,34 @@ Four properties are worth knowing before changing it:
   payload minus `served_at` and `progress`, so a nested clock would rebuild
   everything every 2s and snap every opened disclosure shut. The "as of" line is
   written outside that guard, so it still moves each poll.
-* **A git or remote failure is a REASON, not `unknown`.** This command is
-  fail-closed — an unreachable remote becomes `could not verify origin/…` — and
-  the page shows that verdict verbatim, so it cannot disagree with the loop.
-  `unknown` means only that the check could not be RUN (no config file, an
-  unparseable one, a state file the loop itself would refuse), and it is never
-  read as open.
+* **A git or remote failure is still a REASON, and on the page it reads
+  `unknown`.** The two are not in tension, because the command and the panel are
+  answering different questions. `_merge_window_blockers` is fail-closed — an
+  unreachable remote becomes `could not verify origin/…`, the window stays shut
+  and no merge happens — and that is exactly right for a DECISION. As a REPORT
+  it misleads: "task X is holding the window" and "we could not find out whether
+  task X is holding the window" are different claims, and acting on the second
+  as if it were the first is how a record that had published forty minutes
+  earlier was nearly retired as a holder on 2026-08-21.
+
+  So the merge behaviour is untouched and the page qualifies what it shows.
+  `_merge_window_blockers` takes an optional `unanswered` sink (a list of
+  `cli.UnansweredWindowCheck`), fills it whenever a git or remote question
+  *raises* instead of answering, and changes nothing else — every merge caller
+  passes no sink and gets byte-identical output. `dashboard.merge_window` passes
+  one; anything on it renders `unknown`, with **every reason still shown** and
+  `detail` naming the questions that went unanswered. `unknown` therefore has
+  two shapes — the check could not be RUN at all (no config file, an unparseable
+  one, a state file the loop itself would refuse; `reasons` empty), or it ran and
+  could not answer everything (`reasons` may be non-empty and is a floor, not the
+  set). Neither is ever read as open.
+
+  A definite negative is **not** a failure: a reachable remote that simply does
+  not carry the ref answered, so that stays `closed` with an empty `detail`. The
+  page never decides this by pattern-matching reason text — those strings are
+  prose and have been reworded twice — which is pinned in both directions
+  (`test_the_page_never_infers_a_failure_from_the_text_of_a_reason`,
+  `test_an_unanswerable_remote_is_recorded_as_unanswered_and_still_a_reason`).
 * **Read-only, lock-free, and NOT cached.** No `LoopLock`, nothing mutating,
   every git call a read. A cached verdict would be a stale snapshot, i.e. the
   defect being fixed, so the cost is paid instead: one `ls-remote` per in-flight

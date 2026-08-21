@@ -43,7 +43,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
 | S35 | INFO | The merge sweep now auto-resolves ONE conflict shape without a human (2026-08-19, docs-01): two branches each appending change-note lines to the terminal append-only section of `docs/SUMMARY.md` / `docs/TESTS.md`. Bounded: two literal paths, each side's section must extend the merge base byte-for-byte, a conflict anywhere else in the file or the merge refuses the whole merge, and every decision is in the transcript. Replaces S34 (`merge=union`), which disabled conflict detection for the whole file | `autoloop/note_merge.py`, `autoloop/auto_merge.py`, `autoloop/git_gateway.py` |
-| S36 | INFO | `GET /api/state` now makes UNCACHED outbound `ls-remote` calls (one per in-flight candidate, from the live merge-window check) and renders raw git error text into the unauthenticated localhost page. Bounded: still read-only and lock-free, each call carries its own deadline, and every reason/note is HTML-escaped; the paths it can print were already on the page | `autoloop/dashboard.py` |
+| S36 | INFO | `GET /api/state` now makes UNCACHED outbound `ls-remote` calls (one per in-flight candidate, from the live merge-window check) and renders raw git error text into the unauthenticated localhost page. Bounded: still read-only and lock-free, each call carries its own deadline, and every reason, note and `detail` string is HTML-escaped; the paths it can print were already on the page. The `unanswered` sink it now reads adds a diagnostic field, not a decision or a write — the merge window itself is unchanged and still fail-closed | `autoloop/dashboard.py`, `autoloop/cli.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -817,7 +817,24 @@ Two small surfaces move with it, and both are recorded rather than left implied:
   information — `/api/state` has carried `task.worker` (the same
   `worktree_path`) and blocker questions since 2026-08-02 — and both go through
   the page's `esc()` at every interpolation, asserted by
-  `test_a_reason_full_of_html_is_shown_as_text_not_run_as_markup`.
+  `test_a_reason_full_of_html_is_shown_as_text_not_run_as_markup`. Since the
+  `unanswered` sink landed (below), `merge_window.detail` carries the same class
+  of text — an exception type and message, formatted by
+  `cli.UnansweredWindowCheck.__str__` — and is escaped at its own interpolation
+  (`esc(w.detail)`), so the surface grew by one field and not by one mechanism.
+
+**The fail-closed window is unchanged; only the report is qualified.**
+`cli._merge_window_blockers` gained an optional `unanswered` sink and no new
+decision. A git or remote question that raises still produces the same reason,
+still keeps the window shut, and every merge caller (`_cmd_merge_window`,
+`auto_merge`, `merge_sweep`) passes no sink and is byte-identical — pinned by
+`test_the_same_run_without_a_sink_produces_the_same_reasons`. The dashboard
+passes one and renders `unknown` rather than `closed`, because presenting a
+fail-closed guess as a finding is itself a failure mode: on 2026-08-21 a record
+that had published forty minutes earlier was nearly retired as a holder on the
+strength of one. `unknown` is never rendered as open, in either of its two
+shapes, and the sink is structured precisely so the page never has to infer a
+failure by pattern-matching reason prose.
 
 **Not a new write surface.** The check is read-only and lock-free: no
 `LoopLock`, no mutating registry or execution-store method, `TaskStore.load()` /
@@ -839,7 +856,10 @@ escape detector snapshots — the S24 mitigation this page has always respected.
 
 **file:line** — `autoloop/dashboard.py` `merge_window` / `_window_config` /
 `_window_runner` (the check and its deadline), `collect` (`"merge_window"` in
-the payload), the `MERGE_WINDOW_START`/`END` script region (rendering + `esc`).
+the payload), the `MERGE_WINDOW_START`/`END` script region (rendering + `esc`);
+`autoloop/cli.py` `UnansweredWindowCheck` / `_note_unanswered` and the optional
+`unanswered=` parameter on `_merge_window_blockers` / `_candidate_publication` /
+`_candidate_is_retired` (the diagnostic seam — no decision, no write).
 **Severity:** INFO — no new capability, no new write, no data on the page that
 was not already there; recorded because "a read-only tracker that touches the
 network only through one 60s cache" was a true statement about this file and is
@@ -855,6 +875,13 @@ rg -n 'LoopLock|apply_priority|\.save\(|archive\(|mark_' autoloop/dashboard.py
 rg -n '_WINDOW_GIT_TIMEOUT|TimeoutExpired' autoloop/dashboard.py
 # Expect: reason/note text is escaped at every interpolation
 rg -n 'mwList|esc\(line\)|esc\(w.detail' autoloop/dashboard.py
+# Expect: the unverifiable/blocking distinction comes from the structured sink.
+# Hits are the sink being passed, read and formatted, plus prose about it — any
+# hit that COMPARES a reason string is the bug this is watching for
+rg -n 'unanswered' autoloop/dashboard.py
+# Expect: the definition plus three merge call sites, and NONE of the three
+# passes a fourth argument — that is what keeps the window fail-closed for them
+rg -n '_merge_window_blockers\(' autoloop/auto_merge.py autoloop/merge_sweep.py autoloop/cli.py
 ```
 **Suggested fix (only if the page ever leaves a single-operator machine):** the
 same per-process token S28 proposes covers this too — it is the same port and
