@@ -77,7 +77,16 @@ def _execution(
 class _FakeRemote:
     """Stands in for `GitGateway.remote_ref_sha`. Records every lookup, so a
     test can assert the remote was NOT consulted — half of what the
-    fail-closed cases claim is that they never got as far as the network."""
+    fail-closed cases claim is that they never got as far as the network.
+
+    It also answers the two LOCAL questions `_candidate_base_ancestry` asks, and
+    answers them the way a checkout that has never heard of these shas would: it
+    names a head, and `merge-base` fails on an object it cannot resolve. Every
+    record in this half of the file is bound to a base no repository knows, so
+    the ancestry verdict is `BASE_UNVERIFIED` and the window stays shut —
+    which is what these tests have always asserted. `lookups` still records
+    only `remote_ref_sha`, so "never touched the network" stays checkable.
+    """
 
     def __init__(self, refs=None, error=None):
         self.refs = refs or {}
@@ -90,11 +99,25 @@ class _FakeRemote:
             raise self.error
         return self.refs.get((remote, dest_ref), "")
 
+    def head_sha(self):
+        return "head1234"
+
+    def is_descendant(self, candidate, base):
+        raise GitCommandError("merge-base", f"{base}: not a valid object name")
+
 
 @pytest.fixture
 def remote(monkeypatch):
-    """Default: a remote that knows nothing. Every existing test writes
-    records with no push intent, so none of them reach it."""
+    """Default: a remote that knows nothing, and a checkout that can place
+    nothing.
+
+    It used to be reached only by the push-intent tests — every other record in
+    this file has no push intent, so nothing consulted it. Since the
+    base-ancestry check that is no longer true: any record reaching the end of
+    the loop asks the gateway where its base sits, so the tests below take this
+    fixture for its LOCAL half as much as its network one. Without it that
+    gateway is a real `GitGateway` rooted at `Path.cwd()` — the operator's own
+    checkout under a bare `pytest`."""
     fake = _FakeRemote()
     monkeypatch.setattr(cli, "_window_git", lambda _config: fake)
     return fake
@@ -110,9 +133,17 @@ def _args(**kw):
 # --- merge-window -------------------------------------------------------------
 
 
-def test_an_in_flight_candidate_closes_the_window(wired, capsys):
+def test_an_in_flight_candidate_closes_the_window(wired, remote, capsys):
     """THE case a phase check misses. No agent is running and the phase is
-    quiet, but a candidate is bound to an older base — merging strands it."""
+    quiet, but a candidate is bound to a base this checkout cannot place —
+    merging strands it.
+
+    The `remote` fixture is here for the LOCAL half of `_FakeRemote`, not the
+    network one: since the base-ancestry check, a record that reaches the end of
+    the loop asks the gateway where its base sits, and without the fixture that
+    gateway is a real `GitGateway` rooted at whatever `Path.cwd()` happens to be
+    — the operator's own checkout under a bare `pytest`. Same verdict either way
+    (nothing can place `000111222333`), asked without leaving the test."""
     _state(wired, phase=Phase.AWAITING.value)
     _execution(wired)
 
@@ -171,7 +202,7 @@ def test_a_record_for_finished_work_does_not_close_the_window(wired):
     assert cli._cmd_merge_window(_args()) == 0
 
 
-def test_a_record_for_a_LIVE_task_still_closes_it(wired, capsys):
+def test_a_record_for_a_LIVE_task_still_closes_it(wired, remote, capsys):
     """The guard must not swallow the case the command exists for."""
     _state(wired, phase=Phase.AWAITING.value)
     _execution(wired, task_id="live-1")
@@ -183,7 +214,7 @@ def test_a_record_for_a_LIVE_task_still_closes_it(wired, capsys):
     assert "would strand it" in capsys.readouterr().out
 
 
-def test_a_record_whose_task_is_unknown_still_closes_it(wired):
+def test_a_record_whose_task_is_unknown_still_closes_it(wired, remote):
     """An id the registry has never heard of is not evidence of safety."""
     _state(wired, phase=Phase.AWAITING.value)
     _execution(wired, task_id="ghost-1")
@@ -415,19 +446,45 @@ class _FakeCheckout:
     is the whole distinction the write-off rests on: `read_commit` raising says
     only that the read failed, and `object_exists` is the one that answers
     whether the object database holds the commit at all.
+
+    `ancestors` maps a commit to the commits git would call its ancestors, and
+    `is_descendant` refuses — as real git does — to answer about a sha this
+    checkout does not hold. That refusal is not incidental: it is what keeps
+    every record bound to an unresolvable base blocking the window, by the
+    fail-closed route rather than by accident.
     """
 
-    def __init__(self, head="head1234", commits=(), read_error=None, exists_error=None):
+    def __init__(
+        self,
+        head="head1234",
+        commits=(),
+        read_error=None,
+        exists_error=None,
+        ancestors=None,
+        descendant_error=None,
+        refs=None,
+    ):
         self._head = head
         self.commits = set(commits)
         self.read_error = read_error
         self.exists_error = exists_error
+        self.ancestors = {k: set(v) for k, v in (ancestors or {}).items()}
+        self.descendant_error = descendant_error
+        self.refs = dict(refs or {})
         self.lookups = []
 
     def head_sha(self):
         if not self._head:
             raise GitCommandError("rev-parse", "not a git repository")
         return self._head
+
+    def is_descendant(self, candidate, base):
+        if self.descendant_error is not None:
+            raise self.descendant_error
+        for oid in (candidate, base):
+            if oid not in self.commits:
+                raise GitCommandError("merge-base", f"{oid}: not a valid object name")
+        return base in self.ancestors.get(candidate, set())
 
     def read_commit(self, oid):
         if self.read_error is not None:
@@ -443,7 +500,7 @@ class _FakeCheckout:
 
     def remote_ref_sha(self, remote, dest_ref):
         self.lookups.append((remote, dest_ref))
-        return ""
+        return self.refs.get((remote, dest_ref), "")
 
 
 def _released(config, task_id="auto-01", worker=None):
@@ -572,6 +629,214 @@ def test_writing_a_record_off_never_touches_the_network(wired):
     cli._merge_window_blockers(wired, set(), git)
 
     assert git.lookups == []
+
+
+# --- a candidate that is ALREADY behind the head ------------------------------
+#
+# The check held the window shut on a harm that had already happened. Measured
+# 2026-08-21: blk-01's candidate was bound to base eecae9c66331 and split-01's
+# to 4964d400c510, already 10 and 12 commits behind head 23f6829d9ad0. Every
+# merge attempt deferred with "merging would strand it" — describing a state
+# both records had been in for ten and twelve commits. Meanwhile four finished,
+# reviewed and PUBLISHED branches (dash-16, roadmap-01, prof-01, bind-01) sat
+# unmerged for a day, two of them loop fixes that stay inert until merged.
+#
+# So the rule is narrowed, not removed: a base that IS the head is in-flight
+# work about to be reviewed and still blocks; a base git confirms is a PROPER
+# ANCESTOR of the head becomes a note. Everything unverifiable keeps blocking,
+# matching `_candidate_publication`'s fail-closed rule.
+
+HEAD = "23f6829d9ad0"
+BEHIND = "eecae9c66331"
+
+
+def _behind_checkout(**kw):
+    """A checkout whose head is provably past `BEHIND`."""
+    kw.setdefault("head", HEAD)
+    kw.setdefault("commits", {HEAD, BEHIND})
+    kw.setdefault("ancestors", {HEAD: {BEHIND}})
+    return _FakeCheckout(**kw)
+
+
+def test_a_candidate_bound_to_the_CURRENT_head_still_holds_the_window(wired):
+    """The hazard is real and this task does not remove it. A base equal to the
+    head is in-flight work about to be reviewed, and moving the head under it
+    IS `task_base_behind_head` — 17 blockers, the most common code in this
+    system's history."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="live-1", base=HEAD)
+
+    reasons, notes = cli._merge_window_blockers(
+        wired, set(), _FakeCheckout(head=HEAD, commits={HEAD})
+    )
+
+    assert reasons and "would strand it" in reasons[0]
+    assert "IS the current head" in reasons[0], (
+        f"the reason must say WHICH case it is: {reasons[0]}"
+    )
+    assert notes == []
+
+
+def test_a_candidate_whose_base_is_a_PROPER_ancestor_does_not_hold_it(wired):
+    """THE case. The head moved past this candidate ten commits ago, so moving
+    it again cannot inflict a state that is already true."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="blk-01", base=BEHIND)
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _behind_checkout())
+
+    assert reasons == [], f"an already-behind candidate strands nothing: {reasons}"
+    assert len(notes) == 1
+    note = notes[0]
+    assert "blk-01" in note and "abc123def456" in note and BEHIND in note, (
+        f"the note must name the task, the candidate and the base: {note}"
+    )
+    assert "ALREADY behind" in note
+    assert "merge-forward or a recut" in note, (
+        "dropping it from the blockers must not drop it from the operator's view"
+    )
+
+
+def test_an_ancestry_git_will_not_ANSWER_keeps_the_window_shut(wired):
+    """Fail closed, exactly like `_candidate_publication`. A policy refusal, a
+    corrupt object database or an I/O error is not git saying 'already behind',
+    and the reason must not read as though it were."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="blk-01", base=BEHIND)
+    denied = GitOperationDenied("git_denied: merge-base is not allowed here")
+
+    reasons, notes = cli._merge_window_blockers(
+        wired, set(), _behind_checkout(descendant_error=denied)
+    )
+
+    assert reasons and "would strand it" in reasons[0]
+    assert "could not place it" in reasons[0]
+    assert "treated as bound to the head" in reasons[0], (
+        f"the uncertainty must be explicit, not silent: {reasons[0]}"
+    )
+    assert notes == [], "an unanswered question exempts nothing"
+
+
+def test_a_base_git_places_OUTSIDE_the_head_history_keeps_the_window_shut(wired):
+    """Git answered, and the answer was not 'behind'. A base that is not an
+    ancestor at all means a rewritten branch or another history, which is
+    unusual rather than ordinary drift — and this exemption requires the
+    affirmative answer, not merely the absence of a failure."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="blk-01", base=BEHIND)
+
+    reasons, notes = cli._merge_window_blockers(
+        wired, set(), _behind_checkout(ancestors={})
+    )
+
+    assert reasons and "OUTSIDE the history" in reasons[0]
+    assert "would strand it" in reasons[0]
+    assert notes == []
+
+
+def test_a_record_naming_NO_base_keeps_the_window_shut(wired):
+    """There is nothing to place against the head, so nothing can be shown to
+    be already behind. Absence of evidence, decided without asking git."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="blk-01", base="")
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _behind_checkout())
+
+    assert reasons and "names no base at all" in reasons[0]
+    assert notes == []
+
+
+def test_a_head_the_checkout_will_not_NAME_keeps_the_window_shut(wired):
+    """The other unverifiable end. Without a head there is no comparison to
+    make, and 'could not look' is never 'safe'."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="blk-01", base=BEHIND)
+
+    reasons, notes = cli._merge_window_blockers(
+        wired, set(), _FakeCheckout(head="")
+    )
+
+    assert reasons and "would not name its head" in reasons[0]
+    assert notes == []
+
+
+def test_an_already_behind_candidate_that_is_PUBLISHED_is_still_the_published_note(
+    wired,
+):
+    """The publication exemption is untouched and still runs FIRST. A published
+    candidate gets the note it has always got — the one about a later revise —
+    not the new one, because what an operator has to do about it is different."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="rt-9", base=BEHIND, remote="origin", dest_ref=PUSHED)
+    git = _behind_checkout(refs={("origin", PUSHED): "abc123def456"})
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), git)
+
+    assert reasons == []
+    assert len(notes) == 1 and "is published at" in notes[0]
+    assert "ALREADY behind" not in notes[0]
+    assert git.lookups == [("origin", PUSHED)], "still confirmed against the remote"
+
+
+def test_an_already_behind_RELEASED_record_is_still_the_retirement_note(wired):
+    """The retirement exemption is untouched and also runs first. Both notes
+    would be true of this record; the retirement one is the one that says
+    something should have been retired and was not, which is the finding worth
+    surfacing."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _released(wired)                                  # base defaults to 000111222333
+    git = _behind_checkout(
+        commits={HEAD, "000111222333"}, ancestors={HEAD: {"000111222333"}}
+    )
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), git)
+
+    assert reasons == []
+    assert len(notes) == 1
+    assert "NOT in flight" in notes[0] and "should have been retired" in notes[0]
+    assert "ALREADY behind" not in notes[0]
+
+
+def test_one_already_behind_candidate_does_not_excuse_a_sibling_at_the_head(wired):
+    """The narrowing is per-record. A window with one of each stays shut, and
+    stays shut for the right record."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="blk-01", base=BEHIND)
+    _execution(wired, task_id="live-1", base=HEAD)
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _behind_checkout())
+
+    assert len(reasons) == 1 and "live-1" in reasons[0]
+    assert "IS the current head" in reasons[0]
+    assert len(notes) == 1 and "blk-01" in notes[0]
+
+
+def test_an_executing_phase_still_closes_it_with_only_already_behind_candidates(wired):
+    """The two blockers stay independent: an agent may be mid-write in the
+    checkout regardless of where anybody's recorded base sits."""
+    _state(wired, phase=Phase.EXECUTING.value)
+    _execution(wired, task_id="blk-01", base=BEHIND)
+
+    reasons, notes = cli._merge_window_blockers(wired, set(), _behind_checkout())
+
+    assert reasons == ["a phase is executing — an agent may be mid-write"]
+    assert len(notes) == 1 and "blk-01" in notes[0]
+
+
+def test_the_command_OPENS_and_prints_the_already_behind_candidate(
+    wired, monkeypatch, capsys
+):
+    """End to end, through the operator's own command: exit 0, and the record
+    is still on screen."""
+    _state(wired, phase=Phase.AWAITING.value)
+    _execution(wired, task_id="blk-01", base=BEHIND)
+    monkeypatch.setattr(cli, "_window_git", lambda _config: _behind_checkout())
+
+    assert cli._cmd_merge_window(_args()) == 0
+
+    out = capsys.readouterr().out
+    assert "OPEN" in out
+    assert "note:" in out and "blk-01" in out and "ALREADY behind" in out
 
 
 # --- a stale park whose task has since completed ------------------------------

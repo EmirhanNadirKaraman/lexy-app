@@ -3298,6 +3298,88 @@ def _candidate_is_retired(config, registry, task_id, record, git) -> str:
     )
 
 
+#: Where a record's `task_base_sha` sits relative to the branch head RIGHT NOW,
+#: as `_candidate_base_ancestry` reports it. Only `BASE_BEHIND` stops a record
+#: from holding the merge window shut, and only ever by turning it into a note.
+BASE_AT_HEAD = "at_head"        # the recorded base IS the head a merge would move
+BASE_BEHIND = "behind"          # the head is already past it: a PROPER ancestor
+BASE_UNVERIFIED = "unverified"  # git could not place it, or placed it nowhere
+
+
+def _candidate_base_ancestry(config, record, git=None) -> tuple[str, str]:
+    """Where does this record's `task_base_sha` sit relative to the branch head?
+    Returns `(verdict, detail)`, the detail being a clause the caller splices
+    into whatever it decides to say.
+
+    This is the whole distinction the merge window turns on, and it exists
+    because the two cases the old check treated as one are not the same harm:
+
+    * **The base IS the head** (`BASE_AT_HEAD`). In-flight work about to be
+      reviewed. Moving the head under it is exactly the `task_base_behind_head`
+      failure — 17 blockers, the most common code in this system's history — so
+      this one still holds the window shut.
+    * **The base is a PROPER ancestor of the head** (`BASE_BEHIND`). The head
+      moved past this candidate already; the record is in the state the guard
+      exists to prevent, and has been for however many commits. Merging cannot
+      inflict it a second time. Measured 2026-08-21: two such records (bases
+      `eecae9c6` and `4964d400`, 10 and 12 commits behind head `23f6829d`) held
+      the window shut on four finished, reviewed, published branches — two of
+      them loop fixes that stay inert until merged, so the loop was being kept
+      from its own repairs by a guard protecting work already past saving.
+    * **Anything else** (`BASE_UNVERIFIED`). Fail closed, exactly as
+      `_candidate_publication` does: an unanswerable question is never answered
+      "safe". Four shapes reach it, and each carries its own detail so the
+      operator can tell them apart — no recorded base at all, a checkout that
+      will not name its head, a `merge-base` that failed, and a base git places
+      OUTSIDE the head's history (a rewritten branch, or another history
+      entirely). That last one is an answer rather than a failure, but it is not
+      the affirmative "already behind" this exemption requires, so it blocks.
+
+    **Asked affirmatively of the repository, and only of the repository.** No
+    inference from timestamps, review rounds, or how old a record looks. Errors
+    caught are `(GitError, OSError)` and nothing wider: a broad catch would make
+    a typo in a gateway method name indistinguishable from "git could not
+    answer", which would silently switch this exemption off and rebuild the
+    exact bug it exists to fix, with every test still green.
+
+    ONE `is_descendant` call, mirroring `orchestrator._rebase_execution_if_stale`
+    (the only other implementation of this same question) line for line: plain
+    string equality decides "same commit", `is_descendant(head, base)` decides
+    "behind". `task_base_sha` is only ever written from `head_sha()`, so both
+    sides are full 40-character shas and equality is exact; an abbreviated one
+    would already be a worse hazard at that call site than at this one.
+
+    `git`, when supplied, is the gateway to ask instead of building one from
+    `_window_git` — same seam, and for the same reason, as
+    `_candidate_publication`.
+    """
+    base = str(record.get("task_base_sha") or "")
+    if not base:
+        return BASE_UNVERIFIED, (
+            "its record names no base at all, leaving nothing to place against "
+            "the head"
+        )
+    gateway = git if git is not None else _window_git(config)
+    try:
+        head = gateway.head_sha()
+    except (GitError, OSError) as exc:
+        return BASE_UNVERIFIED, f"the checkout would not name its head ({exc})"
+    if base == head:
+        return BASE_AT_HEAD, f"that base IS the current head {head[:12]}"
+    try:
+        behind = gateway.is_descendant(head, base)
+    except (GitError, OSError) as exc:
+        return BASE_UNVERIFIED, (
+            f"git could not place it against head {head[:12]} ({exc})"
+        )
+    if behind:
+        return BASE_BEHIND, f"a proper ancestor of head {head[:12]}"
+    return BASE_UNVERIFIED, (
+        f"git places it OUTSIDE the history of head {head[:12]} — not an "
+        "ancestor at all, which is a rewritten branch rather than ordinary drift"
+    )
+
+
 def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list[str]]:
     """Why merging into the loop's base is unsafe right now, plus advisory
     notes about work that is safe but not yet reconciled. `([], notes)` means
@@ -3308,14 +3390,32 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
     that drifted by one case is how thirteen tasks get parked at once. See
     `_candidate_publication` for what `git` is for.
 
-    An execution record with a candidate is the REAL hazard, and the one a
-    phase check misses. It pins `task_base_sha`; moving the branch head under
-    it strands the task — `orchestrator._rebase_execution_if_stale` refuses to
-    re-base a record whose `review_round > 0` and parks it
-    (`task_base_behind_head`), correctly, since a reviewer has already seen
+    An execution record with a candidate BOUND TO THE CURRENT HEAD is the REAL
+    hazard, and the one a phase check misses. It pins `task_base_sha`; moving
+    the branch head under it strands the task — `orchestrator.
+    _rebase_execution_if_stale` refuses to re-base a record whose
+    `review_round > 0`, and parks it (`task_base_behind_head`) when it cannot
+    carry the candidate forward, correctly, since a reviewer has already seen
     that candidate. Four tasks were stranded this way on 2026-08-02, every one
     of them by a merge that looked safe because no agent happened to be running
     at that instant.
+
+    **"Bound to the current head" is the whole of it, and it is asked of git.**
+    A record whose base is a PROPER ANCESTOR of the head is already behind:
+    the head moved past it commits ago, so moving it again cannot inflict a
+    state that is already true. Such a record is reported as a NOTE and does not
+    block (`_candidate_base_ancestry`, which defines the three verdicts and why
+    everything unverifiable still blocks). Measured 2026-08-21: two records 10
+    and 12 commits behind the head held the window shut on four finished,
+    reviewed, PUBLISHED branches — dash-16, roadmap-01, prof-01, bind-01 — for a
+    day, two of which were loop fixes that stay inert until merged. Keeping the
+    window shut restored neither stranded candidate; it only withheld the four.
+    Narrowing this was reasonable only after base-02 (merged 2026-08-20) made a
+    moving head survivable for a reviewed record — `_carry_reviewed_candidate_
+    past` merges the head INTO the task branch and the round continues — but
+    base-02 is not the justification on its own: it still bails on a dirty
+    worker tree and on a merge conflict. The justification is that the harm is
+    already done for exactly these records and for no others.
 
     Records outlive the work they describe. `release` retires one now (see
     `worktask.retire_execution`) and publication advances one, but neither did
@@ -3326,7 +3426,7 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
     existed only inside quarantined worker repos — and a tool that cries wolf
     gets ignored, which is the failure it exists to prevent.
 
-    Three exemptions, and the difference between them matters:
+    Four exemptions, and the difference between them matters:
 
     * The task reached a terminal registry state (completed / quarantined).
     * The candidate is already PUBLISHED on its own side branch, confirmed
@@ -3345,6 +3445,16 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
       behind, and it is provably not in-flight work — there is no reachable
       commit for a moved base to strand. Reported as a NOTE, never hidden: a
       record that should have been retired is worth seeing.
+    * The record's base is ALREADY a proper ancestor of the head. Also a NOTE,
+      for the same reason and by the same rule: the task will need a
+      merge-forward or a recut before it can be reviewed again, and dropping it
+      from the blockers must not drop it from the operator's view. Reported, not
+      hidden; visible, not blocking.
+
+    Nothing here changes the ALL-OR-NOTHING sweep. `merge_sweep` checks this
+    predicate once for the whole backlog and merges every branch or none; this
+    only changes what closes the window, never how the sweep behaves once it is
+    open.
 
     The residual, reported as a note rather than hidden: a published record is
     still re-dispatchable, and a `revise` naming it after the base moves would
@@ -3425,11 +3535,37 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
                 "(`release` does this now); ignoring it for the window"
             )
             continue
+        candidate = str(record.get("candidate_sha"))[:12]
+        # `or "(none)"` reads the same way `_candidate_base_ancestry` does, so a
+        # record with no base prints one legible sentence rather than "bound to
+        # base  —" with a hole in it (or the bare `None` an absent key used to
+        # render). It is the one branch where the reason is about the ABSENCE.
+        base = str(record.get("task_base_sha") or "")[:12] or "(none)"
+        # LAST, so the two exemptions above keep their existing meanings: a
+        # released record that is also already behind stays the retirement note
+        # it has always been, not this one.
+        verdict, detail = _candidate_base_ancestry(config, record, git)
+        if verdict == BASE_BEHIND:
+            notes.append(
+                f"task {task_id}: candidate {candidate} is bound to base "
+                f"{base}, {detail} — it is ALREADY behind, so moving the head "
+                "cannot strand it any further than it is. Not holding the "
+                "window; it will need a merge-forward or a recut before it can "
+                "be reviewed again (its next dispatch attempts the merge-forward "
+                "and parks on task_base_behind_head if that refuses)"
+            )
+            continue
         reasons.append(
-            f"task {task_id} has a candidate "
-            f"({str(record.get('candidate_sha'))[:12]}) bound to base "
-            f"{str(record.get('task_base_sha'))[:12]} — {why_not}; "
-            "merging would strand it"
+            f"task {task_id} has a candidate ({candidate}) bound to base "
+            f"{base} — {why_not}; "
+            + (
+                f"{detail}, so merging would strand it"
+                if verdict == BASE_AT_HEAD
+                # Fail closed, and say so: this is not "already behind", it is
+                # "cannot be shown to be", and the two must not read alike.
+                else f"{detail}, so it is treated as bound to the head and "
+                "merging would strand it"
+            )
         )
 
     _, state = _load_state(config)
