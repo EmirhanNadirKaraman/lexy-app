@@ -42,6 +42,16 @@ the accepted work had been retired. So the intent binds WHICH record and WHICH
 repository it accepted, and the tests here replace each of them, and each of
 their already-filed-away destinations, and assert that nothing moves.
 
+For the worker that binding has to reach the WORKING TREE, not just the branch
+and the HEAD. A split is asked for because rounds are being cut short with work
+still uncommitted, so the repository being retired is an ordinary branch and
+HEAD wrapped around changes that exist in no commit and on no remote — and a
+worker rebuilt for the same task from the same base reproduces both of those
+fields exactly. `dirty_worker` below builds that shape (staged, unstaged,
+deleted, untracked), and the negative tests substitute such a rebuild for the
+accepted worker and for its quarantine destination in turn: both must park with
+the intent preserved, and neither may move or adopt the replacement.
+
 A `Crash` here is deliberately not an `OSError` or a `StateError`. Those are
 caught and parked, and a park is the GRACEFUL outcome; what these tests have to
 exercise is the ungraceful one, where nothing runs afterwards — no cleanup, no
@@ -55,6 +65,7 @@ fixtures imported from other test modules.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -72,6 +83,7 @@ from autoloop.orchestrator import (
     MAX_DERIVATION_DEPTH,
     SPLIT_CUT_SHORT_ROUNDS,
     Orchestrator,
+    worktree_fingerprint,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine, Verdict
 from autoloop.state import (
@@ -85,7 +97,7 @@ from autoloop.state import (
 )
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from autoloop.transcript import TranscriptLogger
-from autoloop.worker_env import WorkerRepoManager
+from autoloop.worker_env import WorkerRepoManager, worker_env
 from autoloop.worktask import (
     IntentStore,
     TaskExecution,
@@ -120,6 +132,13 @@ def real_repo(tmp_path, name="repo") -> Path:
     run_git(repo_root, "config", "user.name", "Test")
     run_git(repo_root, "config", "commit.gpgsign", "false")
     (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    # Two more tracked files, committed here so `dirty_worker` has something to
+    # edit without staging and something to DELETE — two of the four kinds of
+    # uncommitted work a worker's provenance has to bind, and neither is
+    # expressible against a repository whose only tracked file is the one the
+    # staged case already uses.
+    (repo_root / "NOTES.md").write_text("notes\n", encoding="utf-8")
+    (repo_root / "DOOMED.md").write_text("deleted by a killed round\n", encoding="utf-8")
     # Mirrors the real repo's `.gitignore`: without it `.al/state.json` reads as
     # an untracked dirty path and trips `primary_checkout_dirty` for a reason
     # unrelated to anything under test (see docs/COMMON_ERRORS.md).
@@ -349,6 +368,48 @@ class Env:
         """
         root = self.workers_root.parent / "quarantine"
         return sorted(root.glob(f"{task_id}-*")) if root.exists() else []
+
+
+def dirty_worker(env: Env, task_id=PARENT) -> Path:
+    """Leave all four kinds of uncommitted work in a worker repository, WITHOUT
+    moving its branch or its HEAD.
+
+    This is the shape a split is actually retiring. The trigger requires two
+    rounds cut short with a non-empty `changed_paths`, so by the time a split is
+    accepted the worker is a perfectly ordinary branch and HEAD wrapped around
+    work that exists in no commit and on no remote — and a worker rebuilt for the
+    same task id from the same base reproduces both of those fields exactly. The
+    content below is therefore the only thing that tells the accepted worker from
+    a replacement, which is why `worktree_fingerprint` covers every line of it:
+
+      * STAGED — a new file added to the index and never committed.
+      * STAGED, THEN EDITED AGAIN — index and working tree deliberately
+        disagree, the swap-and-restore shape a worktree-only digest misses.
+      * UNSTAGED — a tracked file edited on disk only.
+      * DELETED — a tracked file removed, with the deletion not staged.
+      * UNTRACKED — a file inside a directory git has never seen.
+    """
+    worker = env.worker_repos.path_for(task_id)
+    (worker / "staged_new.py").write_text("half of a new module\n", encoding="utf-8")
+    run_git(worker, "add", "--", "staged_new.py")
+    (worker / "README.md").write_text("staged rewrite\n", encoding="utf-8")
+    run_git(worker, "add", "--", "README.md")
+    (worker / "README.md").write_text("...and edited again afterwards\n", encoding="utf-8")
+    (worker / "NOTES.md").write_text("scratch notes from the killed round\n", encoding="utf-8")
+    (worker / "DOOMED.md").unlink()
+    (worker / "scratch").mkdir()
+    (worker / "scratch" / "unfinished.py").write_text("half a thought\n", encoding="utf-8")
+    return worker
+
+
+def worker_gateway(path: Path) -> GitGateway:
+    """A gateway onto a worker repository, built exactly as
+    `Orchestrator._worker_repo_identity` builds one — same policy shape, same
+    scrubbed worker environment — so a fingerprint a test computes is the same
+    fingerprint production compares."""
+    return GitGateway(
+        Path(path), PolicyEngine(PolicyConfig(implement_enabled=True)), env=worker_env()
+    )
 
 
 def spec(task_id, paths=("A.py",), depends_on=(), title=None, description=None) -> TaskSpec:
@@ -714,6 +775,40 @@ def test_boundary_5_reconciling_a_completed_intent_again_changes_nothing(tmp_pat
     assert second._reconcile_split_intent() is False
 
 
+def test_a_worker_full_of_uncommitted_work_survives_the_crash_and_the_move(tmp_path):
+    """The crash matrix again, but over the worker a split actually retires.
+
+    B0–B5 all run against a CLEAN worker repository, which is the one shape the
+    split trigger never produces: it fires on rounds cut short with work still
+    uncommitted. So this repeats the quarantine boundary with all four kinds of
+    that work in the tree, and asserts both halves of the property the content
+    binding has to satisfy — the accepted worker is still recognised before the
+    move, and the same tree is recognised again at the quarantine destination
+    afterwards. A fingerprint that read a timestamp, an inode, an absolute path
+    or `.git/index`'s bytes would park here instead of finishing the split.
+    """
+    env = Env(tmp_path)
+    env.seed_execution()
+    dirty_worker(env)
+    env.ask_for_split()
+    successors = (spec("big-01a"),)
+
+    crash = CrashAt(env.worker_repos, "quarantine")
+    with pytest.raises(Crash):
+        env.orch._dispatch(split_plan(*successors))
+    crash.restore()
+    assert env.worker_repos.path_for(PARENT).exists(), "the worker is still live"
+
+    assert env.restart()._resume_split_intent() is True
+    assert_split_complete(env, successors)
+
+    # And the work itself is what was preserved — one move away, intact.
+    quarantined = env.quarantines()[0]
+    assert (quarantined / "scratch" / "unfinished.py").exists()
+    assert (quarantined / "staged_new.py").exists()
+    assert not (quarantined / "DOOMED.md").exists()
+
+
 def test_reconciliation_runs_before_the_loop_takes_a_single_step(tmp_path):
     """Where the recovery is wired, not just that it works. `run()` discharges an
     outstanding intent BEFORE the pause check, the inbox drain and the phase
@@ -982,6 +1077,89 @@ def test_a_worker_repository_replaced_after_acceptance_is_never_quarantined(tmp_
     assert env.archives() == []
 
 
+def test_the_worker_fingerprint_covers_every_kind_of_uncommitted_work(tmp_path):
+    """What `worktree_fingerprint` binds, category by category.
+
+    HEAD never moves in this test, so a digest that changed can only have
+    changed because of working-tree content — which is exactly the claim the two
+    tests below rest on. The staged step is the one worth reading twice: it
+    stages bytes that are ALREADY on disk, so the working tree is byte-identical
+    either side of it and only a digest that reads the index moves.
+    """
+    env = Env(tmp_path)
+    env.worker_repos.create(PARENT, env.repo_root, env.base_sha)
+    worker = env.worker_repos.path_for(PARENT)
+    git = worker_gateway(worker)
+    head = run_git(worker, "rev-parse", "HEAD").strip()
+
+    clean = worktree_fingerprint(git)
+    assert len(clean) == 64, (
+        "a clean tree still gets a real digest — an empty one would compare "
+        "equal to every tree that could not be read"
+    )
+    assert worktree_fingerprint(git) == clean, "the same tree must hash the same"
+
+    seen = {"clean": clean}
+    (worker / "scratch").mkdir()
+    (worker / "scratch" / "unfinished.py").write_text("half a thought\n", encoding="utf-8")
+    seen["untracked"] = worktree_fingerprint(git)
+    (worker / "NOTES.md").write_text("edited, never staged\n", encoding="utf-8")
+    seen["unstaged"] = worktree_fingerprint(git)
+    run_git(worker, "add", "--", "NOTES.md")
+    seen["staged"] = worktree_fingerprint(git)
+    (worker / "DOOMED.md").unlink()
+    seen["deleted"] = worktree_fingerprint(git)
+
+    assert len(set(seen.values())) == len(seen), f"two of these share a digest: {seen}"
+    assert run_git(worker, "rev-parse", "HEAD").strip() == head, (
+        "no commit was made — every difference above is uncommitted content"
+    )
+
+
+def test_a_worker_rebuilt_at_the_same_branch_and_head_is_not_the_accepted_one(tmp_path):
+    """The hole the previous round left open, and the reason a commit-level
+    identity is not enough.
+
+    `WorkerRepoManager.create` derives the branch from the task id and checks out
+    the base sha it is given, so a worker rebuilt for the same task reproduces
+    BOTH fields exactly — while reproducing none of the uncommitted work that is
+    the only reason this task was split. Quarantining that replacement would file
+    away an empty tree, discharge the intent as though the accepted worker had
+    been retired, and take the unfinished round's work with it into a directory
+    nothing looks in again.
+    """
+    env = Env(tmp_path)
+    env.seed_execution()
+    dirty_worker(env)
+    intent = intent_for(env, (spec("big-01a"),))
+
+    env.worker_repos.remove(PARENT)
+    env.worker_repos.create(PARENT, env.repo_root, env.base_sha)
+    replacement = env.worker_repos.path_for(PARENT)
+    assert run_git(replacement, "branch", "--show-current").strip() == (
+        intent.worker_provenance["branch"]
+    )
+    assert run_git(replacement, "rev-parse", "HEAD").strip() == (
+        intent.worker_provenance["head_sha"]
+    ), "same branch AND same HEAD — only the working tree tells them apart"
+    assert worktree_fingerprint(worker_gateway(replacement)) != (
+        intent.worker_provenance["worktree_sha256"]
+    ), "...and the working tree is what differs, so the park below is about it"
+
+    orch = park_with_intent(env, intent)
+    assert_parked_with_intent_preserved(env, orch)
+    assert "not the one this split accepted" in env.disk_state().question
+
+    # The replacement is exactly where it was, unquarantined and unemptied.
+    assert replacement.is_dir()
+    assert env.quarantines() == []
+    assert not (replacement / "scratch").exists()
+    # ...and the record half never moved either: one half that cannot be
+    # identified stops the retirement before ANY store is retired.
+    assert env.execution_store.load(PARENT) is not None
+    assert env.archives() == []
+
+
 def test_an_archived_record_that_is_not_the_accepted_one_never_discharges(tmp_path):
     """The other side of the same move. Both retirement destinations are derived
     from `<parent>-<label>`, which anything can create — so a file sitting at the
@@ -1056,6 +1234,51 @@ def test_a_quarantined_repository_that_is_not_the_accepted_worker_never_discharg
     assert "is not the one this split accepted" in env.disk_state().question
     assert run_git(impostor, "rev-parse", "HEAD").strip() == impostor_head
     assert (impostor / "not-the-accepted-worker.txt").exists()
+
+
+def test_a_clean_rebuild_at_the_quarantine_destination_never_discharges(tmp_path):
+    """The same equality on the other side of the move, and the harder half.
+
+    The test above drops an obviously foreign repository at the quarantine path.
+    This one drops a repository built by `WorkerRepoManager.create` for THIS task
+    from the SAME base — the thing a well-meaning operator rebuilding a lost
+    worker, or a re-dispatch that was later moved out of the way, leaves behind.
+    Its branch and its HEAD match the intent field for field, so a commit-level
+    proof reads it as "the accepted worker was quarantined, we are done" and
+    clears the intent — with the real worker's uncommitted work already gone and
+    nothing left on disk saying it was ever owed.
+    """
+    env = Env(tmp_path)
+    env.worker_repos.create(PARENT, env.repo_root, env.base_sha)
+    dirty_worker(env)
+    intent = intent_for(env, (spec("big-01a"),))
+    assert intent.retire_worker is True
+    assert intent.retire_record is False, "this test isolates the worker half"
+
+    env.worker_repos.remove(PARENT)
+    env.worker_repos.create(PARENT, env.repo_root, env.base_sha)
+    impostor = env.workers_root.parent / "quarantine" / f"{PARENT}-{LABEL}"
+    impostor.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(env.worker_repos.path_for(PARENT)), str(impostor))
+    assert run_git(impostor, "branch", "--show-current").strip() == (
+        intent.worker_provenance["branch"]
+    )
+    assert run_git(impostor, "rev-parse", "HEAD").strip() == (
+        intent.worker_provenance["head_sha"]
+    ), "it passes every commit-level check; only the content refuses it"
+    assert worktree_fingerprint(worker_gateway(impostor)) != (
+        intent.worker_provenance["worktree_sha256"]
+    ), "...and the content is what differs, so the park below is about it"
+
+    orch = park_with_intent(env, intent)
+    assert_parked_with_intent_preserved(env, orch)
+    assert "is not the one this split accepted" in env.disk_state().question
+
+    # A park preserves evidence: the impostor is neither adopted nor rewritten,
+    # and no second copy of anything was filed beside it.
+    assert (impostor / "README.md").read_text(encoding="utf-8") == "hello\n"
+    assert not (impostor / "scratch").exists()
+    assert env.quarantines() == [impostor]
 
 
 def test_bookkeeping_written_after_acceptance_still_reconciles(tmp_path):
@@ -1147,13 +1370,14 @@ def test_a_retirement_flag_without_the_identity_it_needs_is_corruption(tmp_path)
     with pytest.raises(StateError):
         SplitIntent.from_dict(someone_else)
 
-    empty_identity = intent.to_dict()
-    empty_identity["worker_provenance"] = {
-        **empty_identity["worker_provenance"],
-        "head_sha": "",
-    }
-    with pytest.raises(StateError):
-        SplitIntent.from_dict(empty_identity)
+    for blanked in ("head_sha", "worktree_sha256"):
+        empty_identity = intent.to_dict()
+        empty_identity["worker_provenance"] = {
+            **empty_identity["worker_provenance"],
+            blanked: "",
+        }
+        with pytest.raises(StateError):
+            SplitIntent.from_dict(empty_identity)
 
 
 def test_an_intent_missing_a_retirement_flag_is_corruption_not_a_default(tmp_path):
@@ -1376,6 +1600,7 @@ def test_the_intent_carries_every_field_recovery_needs(tmp_path):
     and which halves there was anything to retire all live in the record."""
     env = Env(tmp_path)
     env.seed_execution()
+    dirty_worker(env)
     env.ask_for_split()
     successors = (spec("big-01a", paths=("A.py", "B.py"), depends_on=()),)
 
@@ -1401,6 +1626,13 @@ def test_the_intent_carries_every_field_recovery_needs(tmp_path):
     assert intent.worker_provenance["head_sha"] == run_git(
         worker, "rev-parse", "HEAD"
     ).strip()
+    # ...including the working tree, which for a split is where all the value
+    # is: this worker's uncommitted work exists in no commit and on no remote,
+    # so branch and HEAD describe everything about it EXCEPT the thing being
+    # retired.
+    assert intent.worker_provenance["worktree_sha256"] == worktree_fingerprint(
+        worker_gateway(worker)
+    )
 
 
 def test_an_intent_round_trips_through_the_state_file_unchanged(tmp_path):

@@ -468,6 +468,153 @@ def _is_placeholder_conversation(url: str) -> bool:
     return bool(conversation and conversation.startswith(PLACEHOLDER_CONVERSATION_PREFIX))
 
 
+#: Serialization version of `worktree_fingerprint`, hashed as the first record.
+#: A change to WHAT the fingerprint covers therefore produces visibly different
+#: digests for an unchanged tree, so a capture written by an older build can
+#: never be compared field-for-field against a reading taken by a newer one and
+#: silently pass or silently fail; it mismatches, which parks.
+WORKTREE_FINGERPRINT_VERSION = "worktree-fingerprint-v1"
+
+#: The index mode git gives a GITLINK — a submodule pointer, whose object is a
+#: commit rather than a blob. `worktree_fingerprint` records it by mode instead
+#: of asking `cat-file blob` for content that does not exist there.
+GITLINK_MODE = "160000"
+
+
+def _fingerprint_record(*fields: str) -> str:
+    """One record of a fingerprint serialization, encoded so that no field's
+    CONTENT can imitate the structure around it.
+
+    Each field is length-prefixed, because git paths may legally contain tabs,
+    newlines and any separator character one might otherwise pick — and a
+    plain-delimited encoding would then let two genuinely different trees
+    serialize to the same bytes (a file called `a\\nfile` versus two files, say).
+    That is a fingerprint collision an impostor can construct on purpose.
+    """
+    return "|".join(f"{len(field)}:{field}" for field in fields)
+
+
+def worktree_fingerprint(git: GitGateway) -> str:
+    """A deterministic digest of everything a worker repository holds that its
+    HEAD commit does not: STAGED edits, UNSTAGED edits, DELETED tracked files
+    and UNTRACKED files.
+
+    WHY THIS EXISTS. A split is triggered precisely because rounds are being cut
+    short with work still uncommitted (`_split_request` requires non-empty
+    `changed_paths` twice), so a parent's worker repository is, at acceptance,
+    almost always a clean branch and HEAD wrapped around a pile of unfinished
+    work that exists NOWHERE else — not in a commit, not on a remote. Branch and
+    HEAD alone therefore identify that repository only up to its committed
+    history: a freshly recreated worker for the same task id reproduces both
+    exactly (`WorkerRepoManager.create` derives `autoloop/<task_id>` from the id
+    and checks out the base sha it is given), so a replacement compares EQUAL,
+    gets quarantined in the accepted worker's place, and the unfinished work the
+    split was called for is lost with nothing saying so. The same equality lets
+    an impostor dropped at the quarantine destination discharge the intent as
+    proof that the accepted worker was filed away. This binds the content.
+
+    WHAT IS COVERED, and how each category gets in:
+      * **staged** — `staged_paths()` is `git diff --cached --name-only`, i.e.
+        every path whose INDEX entry differs from HEAD; each is recorded as its
+        index mode plus a digest of its index blob. Reading the index rather
+        than the file is what catches a swap-and-restore (stage one thing, leave
+        another on disk), the same reason `GitGateway.staged_blob` exists.
+      * **unstaged** and **untracked** — the working tree itself, hashed off the
+        filesystem by `escape_detector.snapshot_checkout` over the tracked and
+        untracked-but-not-ignored path lists, with symlink targets and the
+        executable bit alongside content.
+      * **deleted** — a tracked path with no file at it is recorded AFFIRMATIVELY
+        as absent rather than simply omitted, so "the file was deleted" cannot
+        hash the same as "the file was never enumerated".
+    The one index entry recorded by mode alone is a GITLINK (`160000`): a
+    submodule's object is a commit, so there is no blob to digest, and WHICH
+    commit it points at is not bound. Nothing in this loop creates a submodule,
+    and the alternative — asking `cat-file blob` for a commit — is an error that
+    would make the whole repository unidentifiable.
+    HEAD itself is deliberately NOT part of this digest: it is compared
+    separately as its own provenance field, and folding it in would make one
+    mismatch unable to say which half moved.
+
+    WHAT IS NOT COVERED, stated rather than hidden: IGNORED content
+    (`--exclude-standard`). This is a correctness requirement before it is a
+    performance one. Validation runs inside the worker tree and legitimately
+    writes ignored artefacts — `__pycache__/`, `*.py[cod]`, virtualenvs, build
+    output — so binding them would make an ordinary, untouched recovery park on
+    bytecode a later process wrote. Nothing an agent is asked to produce lives
+    in an ignored path, and the loop's own escape detector watches ignored paths
+    separately for a different question (`diff_worker_tree`).
+
+    STAT-FREE BY CONSTRUCTION. Nothing here reads an inode, a timestamp or an
+    absolute path, and that is what makes the digest survive the very move it
+    guards: `WorkerRepoManager.quarantine` is a `shutil.move`, so the same tree
+    at the quarantine destination fingerprints identically and can be recognised
+    as proof. It is also why `escape_detector.snapshot_worker_tree` is NOT
+    reused despite covering nearly the same ground — its `index_sha256` hashes
+    `.git/index` bytes, which carry ctime/mtime/ino per entry and are rewritten
+    by any git command that happens to refresh the index between acceptance and
+    recovery. That would turn a legitimate split into a permanent park.
+
+    THE RESIDUAL, stated rather than hidden. Anything that writes into the
+    accepted tree between acceptance and recovery — an orphaned agent process
+    still running after a crash, an operator poking at the worker — makes the
+    digest disagree, and recovery then PARKS with the intent preserved instead of
+    quarantining a tree that is no longer the one that was accepted. That is the
+    fail-closed direction and the one an operator can act on; the alternative is
+    the equality the previous design had. Cost is bounded to the tracked and
+    untracked-not-ignored tree, hashed at most three times per split (capture,
+    pre-move check, destination proof) — the heavy directories a checkout carries
+    (`node_modules`, virtualenvs, build output) are ignored and never read.
+
+    Raises whatever the underlying git calls raise (`GitError`, `OSError`);
+    the caller — `Orchestrator._worker_repo_identity` — turns any failure into
+    "this repository cannot be identified", which is never proof of anything.
+    """
+    records = [_fingerprint_record(WORKTREE_FINGERPRINT_VERSION)]
+    for rel in sorted(git.staged_paths()):
+        mode = git.staged_mode(rel)
+        if not mode or mode == GITLINK_MODE:
+            # Two index entries with no blob behind them, recorded by MODE
+            # rather than by content because `cat-file blob` has nothing to
+            # read in either case: an empty mode is a staged DELETION (the path
+            # is in `diff --cached` but no longer in the index), and `160000` is
+            # a gitlink — a submodule pointer, whose object is a commit. Nothing
+            # in this loop creates a submodule; the branch exists so that one
+            # sitting in a worker is fingerprinted rather than turned into an
+            # unidentifiable repository and a park.
+            records.append(_fingerprint_record("staged", rel, mode, "no-blob"))
+            continue
+        records.append(
+            _fingerprint_record(
+                "staged",
+                rel,
+                mode,
+                hashlib.sha256(git.staged_blob(rel)).hexdigest(),
+            )
+        )
+    paths = sorted(set(git.list_tracked_paths()) | set(git.list_untracked_paths()))
+    snapshot = escape_detector.snapshot_checkout(git.repo_root, paths)
+    for rel in paths:
+        state = snapshot.get(rel)
+        if state is None:
+            records.append(_fingerprint_record("tree", rel, "absent", "", ""))
+            continue
+        records.append(
+            _fingerprint_record(
+                "tree",
+                rel,
+                state.kind,
+                state.content_sha256 or state.symlink_target or "",
+                "x" if state.executable else "",
+            )
+        )
+    # `surrogateescape`, matching how `GitGateway` decoded these paths in the
+    # first place: a filename that is not valid UTF-8 round-trips instead of
+    # raising `UnicodeEncodeError` half way through a fingerprint.
+    return hashlib.sha256(
+        "\n".join(records).encode("utf-8", "surrogateescape")
+    ).hexdigest()
+
+
 #: The four outcomes of `Orchestrator._browser_restart_outcome`. They are
 #: distinguished — rather than collapsed into "did the browser come back" —
 #: because `RESTART_SKIPPED_COOLDOWN` is the one case where recovery was never
@@ -3608,6 +3755,16 @@ class Orchestrator:
     # (`_verify_split_retirement_sources`), and again when an already archived or
     # quarantined half is offered as proof (`_split_retirement_gap`). A mismatch
     # parks with the intent intact; nothing contradictory is ever overwritten.
+    #
+    # And "which repository" has to mean its CONTENT, not just its branch and
+    # HEAD. The split trigger fires on rounds cut short with uncommitted work, so
+    # the thing being retired is a worker whose value lives entirely in its
+    # working tree — which a rebuilt worker at the same branch and base sha
+    # reproduces neither of, while matching both of the fields a commit-level
+    # identity compares. `worktree_fingerprint` binds that content (staged,
+    # unstaged, deleted, untracked), and it is checked in both places: before the
+    # live worker is quarantined, and before a directory at the quarantine
+    # destination is accepted as proof that it already was.
 
     def _accept_split(self, directive: Directive, parent_id: str) -> None:
         """Turn a `plan` answering a split ask into a retirement of `parent_id`
@@ -3888,19 +4045,28 @@ class Orchestrator:
         provenance = self._worker_repo_identity(path)
         if provenance is None:
             raise StateError(
-                f"the worker repository at {path} exists but its branch and HEAD "
-                "cannot be read, so a split cannot record which repository it is "
-                "quarantining"
+                f"the worker repository at {path} exists but its branch, HEAD "
+                "and working-tree content cannot be read, so a split cannot "
+                "record which repository it is quarantining"
             )
         return provenance
 
     def _worker_repo_identity(self, path: Path) -> dict | None:
-        """`{path, branch, head_sha}` read from the repository at `path`, or
-        None when it is not one this loop can identify.
+        """`{path, branch, head_sha, worktree_sha256}` read from the repository
+        at `path`, or None when it is not one this loop can identify.
 
         The worker-side counterpart of `worktask.execution_record_identity`, and
         the only identity a moved directory keeps: the path changes when the
         repository is quarantined, so the proof has to come from inside it.
+
+        Branch and HEAD are the COMMITTED half of that identity and are not
+        sufficient on their own — a worker recreated for the same task id
+        reproduces both exactly, while the uncommitted work that made the task
+        worth splitting exists nowhere but its working tree. So the reading also
+        carries `worktree_fingerprint`, which binds the staged, unstaged,
+        deleted and untracked content of that tree; see its docstring for what
+        is covered, what is deliberately not, and why the digest survives the
+        `shutil.move` that quarantines the repository.
 
         `worker_repo_is_reusable` confirms the two facts that make the reading
         mean anything — `path` is the TOP LEVEL of a repository (not merely a
@@ -3930,7 +4096,19 @@ class Orchestrator:
             return None
         if not worker_repo_is_reusable(path, branch):
             return None
-        return {"path": str(path), "branch": branch, "head_sha": head_sha}
+        try:
+            fingerprint = worktree_fingerprint(git)
+        except (GitError, OSError):
+            # A tree that cannot be read is not a tree that matches: falling
+            # back to branch-and-HEAD-only here would silently restore exactly
+            # the equality this fingerprint exists to break.
+            return None
+        return {
+            "path": str(path),
+            "branch": branch,
+            "head_sha": head_sha,
+            "worktree_sha256": fingerprint,
+        }
 
     def _split_quarantine_dest(self, task_id: str, label: str) -> Path:
         """Where `WorkerRepoManager.quarantine` will put (or has put) this
@@ -4216,6 +4394,15 @@ class Orchestrator:
         half that is no longer live is not this method's business: whether what
         is at the archive or the quarantine destination is really this split's
         work is proven by `_split_retirement_gap`, on the other side of the move.
+
+        On the worker side that comparison covers the WORKING TREE as well as
+        the branch and HEAD (`split_worker_identity` /
+        `state.SPLIT_WORKER_IDENTITY_KEYS`), because the uncommitted work is the
+        whole reason this repository is being retired instead of reused: a clean
+        worker rebuilt at the same branch and base sha matches every
+        commit-level field, and quarantining it in the original's place would
+        file away an empty tree while the unfinished work it was standing in for
+        goes with the directory nobody looked at again.
         """
         parent_id = intent.parent_id
         if (
@@ -4261,8 +4448,11 @@ class Orchestrator:
         into the quarantine path, would otherwise discharge an intent whose work
         never happened. So each half is identified against what the intent bound
         at acceptance — the archived record's own provenance, the quarantined
-        repository's own branch and HEAD — exactly as the live halves are
-        identified before they are moved.
+        repository's own branch, HEAD and working-tree content — exactly as the
+        live halves are identified before they are moved. The content half is
+        what stops a clean repository built at the accepted worker's branch and
+        base sha, dropped at the quarantine destination, from discharging an
+        intent whose real subject was the uncommitted work in the original.
         """
         parent_id = intent.parent_id
         problems: list[str] = []

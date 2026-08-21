@@ -525,13 +525,33 @@ SPLIT_RECORD_PROVENANCE_KEYS: tuple[str, ...] = (
 #: the comparison: a quarantined worker lives at a different path by definition,
 #: so comparing it would fail on exactly the success case this proof exists to
 #: recognise.
-SPLIT_WORKER_PROVENANCE_KEYS: tuple[str, ...] = ("path", "branch", "head_sha")
+SPLIT_WORKER_PROVENANCE_KEYS: tuple[str, ...] = (
+    "path",
+    "branch",
+    "head_sha",
+    "worktree_sha256",
+)
 
-#: The COMPARED half of a worker provenance block. A fresh `create()` for the
-#: same task id reproduces the branch (`autoloop/<task_id>` is derived from the
-#: id), so the branch alone identifies nothing; the HEAD commit is what makes a
-#: replacement worker distinguishable from the one the split accepted.
-SPLIT_WORKER_IDENTITY_KEYS: tuple[str, ...] = ("branch", "head_sha")
+#: The COMPARED half of a worker provenance block.
+#:
+#: Branch alone identifies nothing: a fresh `create()` for the same task id
+#: reproduces it, because `autoloop/<task_id>` is derived from the id. Branch
+#: plus HEAD is not enough either, and this is the case the split trigger makes
+#: ORDINARY rather than exotic — a split is asked for precisely because rounds
+#: are being cut short with work still uncommitted, so the accepted worker is
+#: a familiar branch and HEAD wrapped around unfinished changes that exist in no
+#: commit anywhere. A worker recreated at the same base reproduces both fields
+#: exactly and would compare equal, so it could be quarantined in the accepted
+#: worker's place (destroying that work) or accepted at the quarantine
+#: destination as proof that a move which never happened did.
+#:
+#: `worktree_sha256` is what closes that: a content digest of the tree's staged,
+#: unstaged, deleted and untracked state (`orchestrator.worktree_fingerprint`),
+#: computed without reading a timestamp, an inode or an absolute path so that it
+#: survives the quarantine move it guards. Required non-empty on the wire
+#: (`_load_split_provenance`), because an empty digest would compare equal to
+#: every tree that could not be read.
+SPLIT_WORKER_IDENTITY_KEYS: tuple[str, ...] = ("branch", "head_sha", "worktree_sha256")
 
 
 def split_worker_identity(provenance: dict | None) -> dict:

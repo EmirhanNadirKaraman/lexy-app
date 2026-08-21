@@ -1529,14 +1529,29 @@ unfinished intent rather than three stores contradicting each other.
   intent preserved.
 - **Neither half is retired by task id alone.** The intent binds the identity of
   the execution record (`state.SPLIT_RECORD_PROVENANCE_KEYS`, read by
-  `worktask.execution_record_identity`) and of the worker repository (its branch
-  and HEAD commit, `orchestrator._worker_repo_identity`) at acceptance.
-  `_verify_split_retirement_sources` re-checks both before anything moves, so a
-  record or repository REPLACED after the intent was written — a re-dispatch, an
-  operator repair, some other repo moved into the quarantine path — is never
+  `worktask.execution_record_identity`) and of the worker repository (its branch,
+  its HEAD commit AND a digest of its complete uncommitted working-tree state —
+  `state.SPLIT_WORKER_IDENTITY_KEYS`, `orchestrator._worker_repo_identity` /
+  `worktree_fingerprint`) at acceptance. `_verify_split_retirement_sources`
+  re-checks both before anything moves, and `_split_retirement_gap` re-checks
+  both again before an archived or quarantined half is accepted as proof — so a
+  record or repository REPLACED after the intent was written (a re-dispatch, an
+  operator repair, some other repo moved into the quarantine path) is never
   archived, quarantined or accepted as proof; it parks with the intent intact
   instead. Without this a crash window ended in destroyed live work and an
   intent falsely discharged, which is the one outcome here that is not a move.
+  **The working-tree half is load-bearing, not belt-and-braces.** The split
+  trigger fires only on rounds cut short with work still uncommitted, so what is
+  being retired is a repository whose entire value is its dirty tree — while a
+  worker rebuilt for the same task id from the same base sha reproduces the
+  branch and the HEAD exactly. A commit-level identity therefore accepts that
+  rebuild as the accepted worker: quarantining it destroys the real work, and
+  finding one at the quarantine destination discharges the intent for a move
+  that never happened. The digest covers staged, unstaged, deleted and untracked
+  content and is computed without reading a timestamp, an inode or an absolute
+  path, so it survives `WorkerRepoManager.quarantine`'s `shutil.move`; ignored
+  paths are deliberately excluded (validation legitimately writes bytecode into
+  the tree, and binding it would park every honest recovery).
 - **Bounded repetition.** One outstanding ask at a time, and
   `MAX_DERIVATION_DEPTH` stops work being re-decomposed indefinitely.
 
@@ -1560,7 +1575,9 @@ Pinned by `autoloop/tests/test_task_split.py` — in particular
 `test_any_decision_other_than_plan_declines_the_split`,
 `test_a_plan_with_no_split_asked_for_is_still_an_ordinary_plan`,
 `test_a_duplicate_successor_id_is_refused_by_the_registrys_own_rules`,
-`test_a_successor_id_that_belongs_to_a_different_task_fails_closed` and the
+`test_a_successor_id_that_belongs_to_a_different_task_fails_closed`,
+`test_a_worker_rebuilt_at_the_same_branch_and_head_is_not_the_accepted_one`,
+`test_a_clean_rebuild_at_the_quarantine_destination_never_discharges` and the
 crash-boundary tests, which assert exactly one archive and one quarantine
 directory survive any number of recovery passes.
 
