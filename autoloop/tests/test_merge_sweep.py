@@ -1295,6 +1295,99 @@ def test_a_shut_gate_defers_the_whole_sweep_rather_than_merging_part_of_it(tmp_p
     )
 
 
+def test_a_candidate_ALREADY_behind_the_head_lets_the_whole_backlog_through(tmp_path):
+    """The measured 2026-08-21 failure, end to end through real git.
+
+    blk-01's candidate was bound to a base already 10 commits behind the head,
+    split-01's to one 12 behind. Both held the window shut with "merging would
+    strand it" — a harm inflicted ten and twelve commits ago — while four
+    finished, reviewed and published branches waited a day for a merge, two of
+    them loop fixes that stay inert until merged. Moving the head cannot strand
+    a candidate that is already behind it, so the sweep proceeds, and it
+    proceeds ALL of the way: the all-or-nothing rule is unchanged, so what this
+    proves is that every outstanding branch lands in ONE pass.
+    """
+    b = build(tmp_path)
+    stale = b.head()
+    b.in_flight("blk-01", stale)
+    # The head walks past that recorded base — an operator merge, another
+    # task's auto-merge — which is exactly the state the record was found in.
+    moved = b.commit_on_base({"moved.txt": "the head moved on\n"})
+    assert contains(b.repo, moved, stale) and moved != stale
+
+    first = b.publish("first", {"a.py": "one\n"}, published_at="2026-08-20T12:11:00+00:00")
+    second = b.publish("second", {"b.py": "two\n"}, published_at="2026-08-20T13:41:00+00:00")
+    third = b.publish("third", {"c.py": "three\n"}, published_at="2026-08-20T22:26:00+00:00")
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.SWEPT
+    assert result.merged == ["first", "second", "third"], "one pass, not one branch"
+    assert result.pending == []
+    for candidate in (first, second, third):
+        assert contains(b.repo, b.head(), candidate)
+    assert b.origin_base() == b.head(), "and the base reached the remote"
+
+    # Visible, not merely unblocked: the record still needs a merge-forward or
+    # a recut before it can be reviewed again, so the gate says so.
+    notes = [e["data"]["note"] for e in b.entries("merge_sweep_window_note")]
+    assert any("blk-01" in note and "ALREADY behind" in note for note in notes), notes
+    assert b.entries("merge_sweep_deferred") == []
+
+
+def test_a_candidate_at_the_head_STILL_shuts_the_gate_after_the_head_moves(tmp_path):
+    """The narrowing is not a one-time amnesty, and it is not a self-granting
+    one either. Once the head moves, whatever is bound to the NEW head is
+    in-flight work again and holds the window exactly as before — otherwise this
+    would trade a permanently shut window for a permanently open one.
+
+    TWO outstanding branches rather than one, deliberately. The gate is
+    evaluated ONCE against the head as it stands before anything is attempted,
+    so the all-or-nothing rule has to keep BOTH branches off the base. Letting
+    the first land would move the head past live-09's recorded base, and the
+    second would then qualify for the new already-behind note — the exemption
+    granting itself, one merge at a time, on a record that was genuinely
+    in-flight when the sweep began. The proof is the base itself: local AND
+    remote byte-for-byte at the shas the sweep found them at, which is a claim
+    an outcome slug cannot make on its own (a refused push returns `DEFERRED`
+    over a base that has already moved locally).
+
+    The moved head is pushed as well, so the two ends start out agreeing and
+    "unchanged" means the same thing at both of them.
+    """
+    b = build(tmp_path)
+    b.commit_on_base({"moved.txt": "the head moved on\n"})
+    run_git(b.repo, "push", "-q", "origin", BASE)   # the operator's merge reached origin too
+    b.in_flight("live-09", b.head())            # bound to the head as it is NOW
+    first = b.publish("first", {"a.py": "one\n"}, published_at="2026-08-06T01:00:00+00:00")
+    second = b.publish("second", {"b.py": "two\n"}, published_at="2026-08-06T02:00:00+00:00")
+    before, origin_before = b.head(), b.origin_base()
+    assert before == origin_before, "the two ends start out at the same sha"
+
+    result = b.sweep()
+
+    assert result.outcome == merge_sweep.DEFERRED
+    assert result.merged == []
+    assert result.pending == ["first", "second"], "the whole list waits, not part of it"
+    assert b.head() == before, (
+        "not one branch may move the base while a candidate is bound to the head "
+        "the gate was evaluated against"
+    )
+    assert b.origin_base() == origin_before, "and the remote base is untouched too"
+    assert not contains(b.repo, b.head(), first)
+    assert not contains(b.repo, b.head(), second)
+    assert b.entries("auto_merge_merged") == [], "no merge ran, so none was logged"
+    assert b.entries("merge_sweep_stopped") == [], "deferred before the first attempt"
+
+    reasons = b.entries("merge_sweep_deferred")[0]["data"]["reasons"]
+    assert any("live-09" in reason and "IS the current head" in reason
+               for reason in reasons), reasons
+    notes = [e["data"]["note"] for e in b.entries("merge_sweep_window_note")]
+    assert not any("live-09" in note for note in notes), (
+        f"the at-head candidate is a blocker, never an already-behind note: {notes}"
+    )
+
+
 def test_an_executing_phase_defers_the_sweep(tmp_path):
     """The other half of the same predicate: an agent may be mid-write in the
     checkout. Reached through `cli._merge_window_blockers`, called not copied."""

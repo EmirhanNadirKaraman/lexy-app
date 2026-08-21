@@ -207,14 +207,14 @@ times on 2026-08-02**, every time because "no agent is running right now"
 looked like "safe to merge".
 
 The real condition is not the phase — it is whether any
-`.autoloop/executions/*.json` carries a `candidate_sha` **for a task that could
-still be dispatched or reviewed**. Records outlive the work they describe, so a
-completed or quarantined task's record is skipped; an unknown id is not. A
-dispatched task that has not committed yet holds nothing reviewed, so it does
-not close the window; an executing phase does. A candidate already PUBLISHED on
-its own side branch — confirmed against the remote, never inferred from the
-record's own `intended_remote_ref`, which is written *before* the push — is
-durable and does not close it either.
+`.autoloop/executions/*.json` carries a `candidate_sha` **bound to the current
+head, for a task that could still be dispatched or reviewed**. Records outlive
+the work they describe, so a completed or quarantined task's record is skipped;
+an unknown id is not. A dispatched task that has not committed yet holds nothing
+reviewed, so it does not close the window; an executing phase does. A candidate
+already PUBLISHED on its own side branch — confirmed against the remote, never
+inferred from the record's own `intended_remote_ref`, which is written *before*
+the push — is durable and does not close it either.
 
 There is a third exemption, added 2026-08-15 after fourteen records held the
 window shut at once: a record whose task is back in the queue **and** whose
@@ -235,6 +235,59 @@ code (0 present, 1 absent) and raises on anything else. Only an explicit
 "the object database does not hold this" writes a record off; every other
 outcome keeps the window shut, the same fail-closed rule publication checking
 follows.
+
+**A fourth exemption, added 2026-08-21: a candidate whose base is ALREADY
+behind the head.** The hazard the check exists for is a record bound to the
+CURRENT head — in-flight work about to be reviewed, which a moved base turns
+into `task_base_behind_head`, the most common park code in this system's
+history. A record whose `task_base_sha` is a **proper ancestor** of the head is
+in that state already, and has been for however many commits; moving the head
+again cannot inflict a state that is already true. So it no longer blocks. It is
+reported as a `note:`, for the same reason the retirement exemption is: the task
+will need a merge-forward or a recut before it can be reviewed again, and
+dropping it from the blockers must not drop it from the operator's view.
+
+Measured on **2026-08-21**: blk-01's candidate was bound to a base 10 commits
+behind head `23f6829d`, split-01's to one 12 behind. Both reported "merging
+would strand it" — a harm inflicted ten and twelve commits earlier — and between
+them held four finished, reviewed and *published* branches unmerged for a day
+(dash-16, roadmap-01, prof-01, bind-01), two of them loop fixes that stay inert
+until merged. The loop was being kept from its own repairs by a guard protecting
+work already past saving, and keeping the window shut restored neither
+candidate.
+
+Narrowing it became reasonable only after **base-02** (merged 2026-08-20) made a
+moving head survivable for a reviewed record — `_carry_reviewed_candidate_past`
+merges the head *into* the task branch and the round continues — but base-02 is
+not the justification on its own, since it still bails on a dirty worker tree
+and on a merge conflict. The justification is that for these records the harm
+has already happened.
+
+"Already behind" is defined in git terms and in nothing else
+(`cli._candidate_base_ancestry`): `head_sha()`, then string equality for "the
+base IS the head", then one `is_descendant(head, base)` for "behind" — the same
+two steps, in the same order, as `orchestrator._rebase_execution_if_stale`, the
+only other implementation of this question. Three verdicts come back, and only
+one of them exempts anything:
+
+| Verdict | Meaning | Effect |
+|---|---|---|
+| `BASE_AT_HEAD` | the recorded base *is* the head | blocks, naming the head |
+| `BASE_BEHIND` | git confirms a **proper** ancestor | a `note:`, not a blocker |
+| `BASE_UNVERIFIED` | no base recorded, no readable head, `merge-base` failed, **or** git places the base outside the head's history | blocks, naming which |
+
+Everything unverifiable keeps the window shut, matching `_candidate_publication`
+exactly, and the reason says *why* it could not be placed rather than reading
+like the already-behind case. Only `(GitError, OSError)` is caught — nothing
+wider — so a gateway method that stopped existing surfaces as a crash instead of
+silently switching this exemption off with every test still green. A base that
+is not an ancestor at all is an *answer*, but not the affirmative one this
+exemption requires, so it blocks too: that is a rewritten branch, not ordinary
+drift.
+
+None of this changes the **all-or-nothing sweep**. `merge_sweep` still checks
+the predicate once for the whole backlog and merges every branch or none; this
+changes what closes the window, not how the sweep behaves once it is open.
 
 The intended workflow:
 
