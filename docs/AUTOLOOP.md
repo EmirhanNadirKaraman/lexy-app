@@ -3913,8 +3913,8 @@ blocker names, via `TaskRegistry.unblock`, and runs from five places:
 
 | where | why |
 |---|---|
-| `answer` | the resolution and the requeue are one operation, or they are the bug |
-| `archive-blocker` | an archival closes records too, so it takes the same lock and refuses outright when it cannot (below) |
+| `answer` | the resolution and the requeue are one operation, or they are the bug — and it *fails closed* if the second half cannot be done (below) |
+| `archive-blocker` | an archival closes records too, so it takes the same lock, fails closed the same way, and refuses outright when the lock cannot be taken (below) |
 | `start`'s preflight | a registry that ARRIVED in the split state; nothing else would notice |
 | top of every `run --continuous` iteration | same, for an operator who skips `start` — and on the registry that iteration hands the orchestrator, not a copy |
 | `run` without `--continuous` (`_run_locked`) | the single-round counterpart of the row above, same registry rule; a plain `run` is the other way an operator restarts after answering |
@@ -3939,12 +3939,19 @@ Four properties it holds to:
 * **`answer` cuts both ways.** A task can hold more than one open blocker
   (`record` mints one per `(task, code, phase)`), and the unblock used to be
   unconditional — the first answer requeued a task the second question was still
-  about. It is now gated on the answered blocker being the last one AND on the
-  task really being `blocked`: a plain `run` parks `task_fatal` without going
-  through `_handle_parked_task`, so the task is still `in_progress`, and
-  "stays blocked" about one of those would be a false line in the one place an
-  operator looks. That shape still gets the `task_not_blocked` refusal it
-  always did.
+  about. Since round 3 `answer` performs **no targeted unblock of its own**: the
+  release is this sweep's, so one command makes one write to `tasks.json` under
+  one rule for who may be released. (The targeted `registry.unblock` accepted any
+  `blocked` task, operator holds included — exactly what
+  `blocker_derived_blocked` exists to exclude.) The lines it prints are derived
+  from what the sweep actually did, so what it says and what it wrote cannot
+  disagree: "ready again" when the sweep released the task, "stays blocked" when
+  another record is still open, and the `task_not_blocked` / `task_retired`
+  refusal it always printed when the task was never quarantined — a plain `run`
+  parks `task_fatal` without going through `_handle_parked_task`, so the task is
+  still `in_progress`. That last question is asked through
+  `TaskRegistry.unblock_obstacle`, which reports without transitioning; asking it
+  by *calling* `unblock` would answer it by releasing an operator's hold.
 
 Every release is written to the transcript as `task_auto_unblocked`, carrying
 the `blocked_reason` the task was holding: `unblock()` clears that field, so
@@ -3973,6 +3980,39 @@ all — not the blocker, not the registry — and say which, because "archived b
 not requeued" and "not archived" want different next moves from the operator. A
 stale lock refuses the same way and names `unlock`; this command steals a lock
 no more than any other.
+
+**Both closing commands fail closed** (blk-01, round 3 —
+`cli._requeue_after_close`). Taking the lock removed the race but not the design
+fault: `answer` and `archive-blocker` still CLOSED the record first and requeued
+best-effort afterwards, catching a task-load / reconciliation / task-save failure
+and printing "any task left blocked with no open blocker is returned to the queue
+at the loop's next start". That is the invariant restated as a promise about a
+later process, and it leaves exactly the durable state this section says cannot
+exist. So a close whose requeue cannot be completed is no longer a close: the
+record is written straight back as it was read (`_reopen_blocker` — a plain
+`save` of the pre-close snapshot, not a `reopen()` verb, because nothing may ever
+un-answer an operator's answer), the command exits non-zero, and it does not
+print "resolved" or "archived". Nothing is announced before it is done, including
+the fault-budget reset `answer` performs for `fault_attempt_ceiling`.
+
+The one branch where the close DOES stand is the restore write itself failing,
+and the command says so — `remains CLOSED (resolved) on disk`, never "nothing
+changed". Those two want different next moves, exactly as the lock refusal above
+distinguishes "archived but not requeued" from "not archived"; an operator told
+"not resolved" about an answer that is on disk would answer the same blocker
+twice, and `resolve` refuses a second answer.
+
+Two boundaries on that:
+
+* **Synchronous failures only.** A process killed between the two writes still
+  leaves the split state; the startup sweeps are what repair it.
+* **The startup sweeps stay TOLERANT.** `start`, `run` and `run --continuous`
+  report an unreadable task graph and carry on — they have no blocker of their
+  own to put back, and refusing to start would trade a repairable state for an
+  unstartable loop. `_reconcile_unblocked_tasks` also cannot raise once its
+  `TaskStore.save` has returned (the transcript append after it degrades to a
+  warning), so a fault reaching `_requeue_after_close` proves the task half is
+  untouched and reopening is safe.
 
 One cost, stated rather than hidden: a task `blocked` with **no** record on disk
 at all — a hand-edited status, or a park written by a build with no blocker

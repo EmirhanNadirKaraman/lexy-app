@@ -978,17 +978,21 @@ class TaskRegistry:
             task.blocked_reason = reason
         return task
 
-    def unblock(self, task_id: str) -> Task:
-        """Reverse of `block`: back to `pending`, i.e. READY again once its
-        dependencies are still satisfied (`state_of` re-derives that from
-        `depends_on` exactly as for any other pending task). Called by
-        `python -m autoloop answer` once the operator resolves the blocker
-        that quarantined it.
+    def unblock_obstacle(self, task_id: str) -> TaskGraphError | None:
+        """Why `unblock(task_id)` would refuse, or None if it would succeed.
 
-        Deliberately no reverse of `retire`. Un-retiring is not an operator
-        answer — it is the claim that a supersession was wrong, which means
-        planning a task, not flipping a status back to pending and losing the
-        chain in the process.
+        Split out of `unblock` so a caller can REPORT the refusal without
+        performing — or risking — the transition. `cli._cmd_answer` needs
+        exactly that since blk-01: the release itself is done by
+        `cli._reconcile_unblocked_tasks`, which is narrowed by provenance
+        (`blocker_derived_blocked` excludes an operator hold), but the command
+        still has to tell an operator why a task their answer did not requeue
+        was never quarantined to begin with. Asking that question by CALLING
+        `unblock` would answer it by releasing an operator's hold.
+
+        Returns the error rather than a string so the wording — and the stable
+        `code` an operator greps for (`task_retired`, `task_not_blocked`) —
+        lives in exactly one place. `unblock` raises what this returns.
         """
         task = self.get(task_id)
         if task.status == "retired":
@@ -996,13 +1000,31 @@ class TaskRegistry:
             # say which of the two non-resolving states this is rather than
             # "not blocked" — a retired task looks blocked in every listing
             # written before this state existed.
-            raise TaskGraphError(
+            return TaskGraphError(
                 "task_retired",
                 f"task '{task_id}' is retired{_successor_hint(task)}, not "
                 "quarantined — there is no blocker to answer",
             )
         if task.status != "blocked":
-            raise TaskGraphError("task_not_blocked", f"task '{task_id}' is not blocked")
+            return TaskGraphError("task_not_blocked", f"task '{task_id}' is not blocked")
+        return None
+
+    def unblock(self, task_id: str) -> Task:
+        """Reverse of `block`: back to `pending`, i.e. READY again once its
+        dependencies are still satisfied (`state_of` re-derives that from
+        `depends_on` exactly as for any other pending task). Called by
+        `cli._reconcile_unblocked_tasks` once no OPEN blocker names the task
+        any more, and by the inbox's `operator_unblock`.
+
+        Deliberately no reverse of `retire`. Un-retiring is not an operator
+        answer — it is the claim that a supersession was wrong, which means
+        planning a task, not flipping a status back to pending and losing the
+        chain in the process.
+        """
+        obstacle = self.unblock_obstacle(task_id)
+        if obstacle is not None:
+            raise obstacle
+        task = self.get(task_id)
         task.status = "pending"
         task.blocked_reason = ""
         # Released is released: a pending task has no hold to have an origin,

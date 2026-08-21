@@ -2172,6 +2172,33 @@ Do NOT hand-edit the blocker record or call `BlockerStore.archive_stale` from a
 one-liner to get past this. That is the route the command was written to
 replace, and it skips the requeue the refusal is protecting.
 
+### `answer` / `archive-blocker` exits 1 saying the blocker "was reopened"
+**Symptom:** the command prints `error: the task graph could not be reconciled
+(...)`, then `blocker blk-xxx-001 was reopened — nothing changed`, then
+`blocker blk-xxx-001 was NOT resolved` (or `was NOT archived`), and exits 1. The
+blocker is still listed as open by `python -m autoloop blockers`.
+**Cause:** not a bug in the close — the close worked and was then UNDONE, on
+purpose (blk-01, 2026-08-21, review round 3). Closing the last open record
+naming a quarantined task has to requeue that task in the same operation
+(`docs/AUTOLOOP.md` §9c). The parenthesised error is why the task half could not
+be done, and it is a fault in `.autoloop/tasks.json`, not in the blocker:
+usually a `depends_on` naming a task that no longer exists (`KeyError`, which
+survives `from_dict` and fails on the later lookup), a graph that will not parse,
+or a `tasks.json` that cannot be written.
+**Fix:** repair the task graph, then run the same command again — the record was
+restored byte-for-byte, so it is still answerable/archivable.
+1. `python -m autoloop tasks` or `python -m autoloop start --check-only` to see
+   the same fault reported (`tasks        UNREADABLE (...)`); `start` reports it
+   and carries on rather than dying, which is the intended asymmetry.
+2. Fix what it names — most often a dangling `depends_on`, or file permissions on
+   `.autoloop/tasks.json`.
+3. Re-run the original `answer` / `archive-blocker`.
+If instead you see `blocker blk-xxx-001 could NOT be reopened (...)`, the restore
+write itself failed: the record IS closed on disk and its task was NOT requeued.
+Fix the filesystem problem, then either reopen the record by hand or leave it —
+the next `start` / `run` sweep requeues the task, since those paths stay
+deliberately tolerant.
+
 ---
 
 ## 9. Autoloop monitoring (health)
