@@ -2146,6 +2146,59 @@ refuse it as never recorded. roadmap-01's second file,
 `autoloop/tests/test_obsolete.py`, was in scope and is exactly this case. Today
 that removal needs an operator.
 
+### `archive-blocker` refuses with a lock error and archives nothing
+**Symptom:** `python -m autoloop archive-blocker blk-xxx-001 --reason "..."`
+prints `error: another autoloop process holds …/LOCK` or `error: stale lock at
+…/LOCK … recover with: python -m autoloop unlock`, followed by
+`blocker blk-xxx-001 was NOT archived — nothing changed`, and exits 1. The
+command used to work whatever the lock said.
+**Cause:** not a bug — the refusal is the fix for one (blk-01, 2026-08-21).
+Archiving a blocker can close the LAST open record naming a quarantined task,
+and that task then has to return to the queue in the same operation
+(`docs/AUTOLOOP.md` §9c), which writes `.autoloop/tasks.json`. So the command
+now takes the loop lock like `answer` and `retire` do, and when it cannot take
+it, nothing happens at all — because the alternative, archiving anyway and
+leaving the requeue to whoever runs next, produces exactly the `blocked`-with-no-
+open-blocker state the sweep exists to end.
+**Fix:** depends which lock it is.
+- **Live** (`another autoloop process holds …`): a loop really is running. Wait
+  for it, or `python -m autoloop pause` and let the round finish. The blocker is
+  still open, so nothing was lost.
+- **Stale** (`stale lock at … recover with`): the owner is verifiably dead — run
+  `python -m autoloop unlock`, then the same `archive-blocker` command again.
+  This is the common one here, because the dead session that left the lock is
+  usually the same session whose blocker you are archiving.
+Do NOT hand-edit the blocker record or call `BlockerStore.archive_stale` from a
+one-liner to get past this. That is the route the command was written to
+replace, and it skips the requeue the refusal is protecting.
+
+### `answer` / `archive-blocker` exits 1 saying the blocker "was reopened"
+**Symptom:** the command prints `error: the task graph could not be reconciled
+(...)`, then `blocker blk-xxx-001 was reopened — nothing changed`, then
+`blocker blk-xxx-001 was NOT resolved` (or `was NOT archived`), and exits 1. The
+blocker is still listed as open by `python -m autoloop blockers`.
+**Cause:** not a bug in the close — the close worked and was then UNDONE, on
+purpose (blk-01, 2026-08-21, review round 3). Closing the last open record
+naming a quarantined task has to requeue that task in the same operation
+(`docs/AUTOLOOP.md` §9c). The parenthesised error is why the task half could not
+be done, and it is a fault in `.autoloop/tasks.json`, not in the blocker:
+usually a `depends_on` naming a task that no longer exists (`KeyError`, which
+survives `from_dict` and fails on the later lookup), a graph that will not parse,
+or a `tasks.json` that cannot be written.
+**Fix:** repair the task graph, then run the same command again — the record was
+restored byte-for-byte, so it is still answerable/archivable.
+1. `python -m autoloop tasks` or `python -m autoloop start --check-only` to see
+   the same fault reported (`tasks        UNREADABLE (...)`); `start` reports it
+   and carries on rather than dying, which is the intended asymmetry.
+2. Fix what it names — most often a dangling `depends_on`, or file permissions on
+   `.autoloop/tasks.json`.
+3. Re-run the original `answer` / `archive-blocker`.
+If instead you see `blocker blk-xxx-001 could NOT be reopened (...)`, the restore
+write itself failed: the record IS closed on disk and its task was NOT requeued.
+Fix the filesystem problem, then either reopen the record by hand or leave it —
+the next `start` / `run` sweep requeues the task, since those paths stay
+deliberately tolerant.
+
 ---
 
 ## 9. Autoloop monitoring (health)

@@ -68,6 +68,8 @@ from .errors import (
     ConfigError,
     ExecutorError,
     GitError,
+    LockHeldError,
+    StaleLockError,
     StateCorruptError,
     StateError,
     TaskGraphError,
@@ -947,6 +949,12 @@ def _validate_continuous_args(args: argparse.Namespace) -> None:
 def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
     store, state = _load_state(config)
     task_store, registry = _load_tasks(config)
+    # Startup, before anything selects a task, and on the registry this round
+    # will actually use — the single-round counterpart to the sweep at the top
+    # of every `_run_continuous` iteration. A `blocked` row with no open blocker
+    # left is out of `next_ready()` for no reason (blk-01); a plain `run` is one
+    # of the two ways an operator restarts after answering one.
+    _print_auto_unblocked(_reconcile_unblocked_tasks(config, task_store, registry))
 
     if state is None:
         if args.kickoff_audit:
@@ -1140,6 +1148,17 @@ def _run_continuous(
         # no command run to notice their records were left open. Costs a set
         # comprehension over the registry when nothing is retired.
         _reconcile_retired_blockers(config, registry)
+        # The same sweep run the other way, and on the registry object this
+        # iteration is about to hand the orchestrator — not on a fresh load.
+        # A task released into a COPY would still be `blocked` in the object
+        # `next_ready()` reads, and the round's first ordinary
+        # `task_store.save` would write the stale status straight back over the
+        # reconciliation. Second, not first: `_reconcile_retired_blockers` may
+        # archive a retired task's quarantine, and a retired task is never a
+        # candidate here anyway (`blocker_derived_blocked` reads the stored
+        # status), so the order costs nothing and keeps the retirement the
+        # stronger answer.
+        _print_auto_unblocked(_reconcile_unblocked_tasks(config, task_store, registry))
 
         if state is not None and Phase(state.phase) not in TERMINAL_PHASES:
             orchestrator = _build_orchestrator(config, args, store, state, task_store, registry)
@@ -1940,10 +1959,38 @@ _RESOLUTION_PRECONDITIONS = {
 
 
 def _cmd_answer(args: argparse.Namespace) -> int:
-    """Resolve a blocker with the operator's answer and, for a `task_fatal`
-    blocker, unblock the task it quarantined so it becomes READY again.
-    Takes the lock (like `run`/`reset`) — it mutates `tasks.json`, and must
-    not race a live `run --continuous`."""
+    """Resolve a blocker with the operator's answer and, when that was the LAST
+    open blocker for the task it quarantined, unblock the task so it becomes
+    READY again. Takes the lock (like `run`/`reset`) — it mutates `tasks.json`,
+    and must not race a live `run --continuous`.
+
+    "Last" is the part that used to be missing on both sides. A task can hold
+    more than one open blocker, and the unblock was unconditional, so the first
+    answer requeued a task the second question was still about; conversely the
+    command could close the last record naming a task and leave that task
+    `blocked` anyway (a `loop_fatal` record, or an unblock the registry refused
+    because the task was not blocked YET — port-01, 2026-08-19). Both halves are
+    now decided from the same reading of the store, and ONE reconciliation
+    (`_reconcile_unblocked_tasks`) performs every release, so no OTHER task is
+    left in that state either.
+
+    **The release is the sweep's, not a second targeted unblock** (blk-01,
+    review round 3). Doing both meant two writes to `tasks.json` from one
+    command and two different rules for who may be released — the targeted
+    `registry.unblock` accepts any `blocked` task, including an OPERATOR hold,
+    which is exactly what `blocker_derived_blocked` exists to exclude. The
+    messages below are derived from what the reconciliation actually did, so
+    what this command prints and what it wrote cannot disagree.
+
+    **Fails closed** (`_requeue_after_close`). If the task graph cannot be read,
+    reconciled or saved, the resolution is written back OPEN and the command
+    exits 1 without reporting a resolution — resolving a blocker and requeueing
+    what it was holding is ONE operation or it is the bug this task exists to
+    end. Nothing is printed as done before it is done, including the fault-budget
+    reset. The one branch where the answer DOES stand is the restore itself
+    failing, and it is reported as that ("remains CLOSED (resolved) on disk"),
+    never as "was NOT resolved" — an operator who believed that line would answer
+    the same blocker twice."""
     config = load_config(args.config)
     with LoopLock(config.state_dir):
         blocker_store = BlockerStore(config.blockers_dir)
@@ -1960,32 +2007,93 @@ def _cmd_answer(args: argparse.Namespace) -> int:
                         "cannot clear it."
                     )
                     return 1
+        # The snapshot `_reopen_blocker` writes back if the requeue cannot be
+        # completed. Copied rather than aliased: `pending` is already a distinct
+        # instance from the one `resolve` mutates (each `load` decodes afresh),
+        # and a copy keeps that true no matter what the store does later.
+        before = dataclasses.replace(pending) if pending is not None else None
         blocker = blocker_store.resolve(args.blocker_id, args.text)  # raises on unknown/resolved
+        released, registry, outcome = _requeue_after_close(config, blocker_store, before)
+        if outcome == _REQUEUE_REOPENED:
+            print(
+                f"blocker {blocker.id} was NOT resolved — its answer was not "
+                "recorded and nothing was requeued."
+            )
+            return 1
+        if outcome != _REQUEUE_OK:
+            # The restore itself failed, so the resolution really is on disk.
+            # Saying "not resolved" here would be the false line the rest of
+            # this command is written to avoid.
+            print(
+                f"blocker {blocker.id} remains CLOSED (resolved) on disk and "
+                "nothing was requeued — see the error above for what to do."
+            )
+            return 1
         print(f"blocker {blocker.id} resolved.")
         if blocker.kind != "task_fatal" or blocker.task_id == NO_TASK:
             print("(not tied to a quarantined task — nothing else to do.)")
-            return 0
-        # BEFORE the unblock, deliberately. `registry.unblock` raises
-        # `TaskGraphError` for a task that is not BLOCKED_BY_OPERATOR, and plain
-        # `run` (unlike `--continuous`) parks task_fatal without ever going
-        # through `cli._handle_parked_task`, so that is a live shape — the early
-        # return below would skip the budget reset in precisely the case it
-        # exists for, leaving the operator editing the record by hand again.
-        # Harmless for a RETIRED task: one that never dispatches never reads
-        # either counter.
-        _clear_fault_budget_on_answer(config, blocker)
-        task_store, registry = _load_tasks(config)
-        try:
-            registry.unblock(blocker.task_id)
-        except TaskGraphError as exc:
-            print(
-                f"task {blocker.task_id!r} could not be unblocked ({exc}) — the "
-                "blocker itself is still resolved."
-            )
-            return 0
-        task_store.save(registry)
-        print(f"task {blocker.task_id} is ready again.")
+        else:
+            # After the requeue landed, never before it. `registry.unblock`
+            # refuses a task that is not `blocked`, and plain `run` (unlike
+            # `--continuous`) parks task_fatal without ever going through
+            # `cli._handle_parked_task` — so a task_fatal answer routinely
+            # requeues nothing and the reset still has to happen, which is the
+            # case it exists for. What it must NOT do is happen on a command
+            # that failed closed: a refilled budget with the blocker written
+            # back open is the hand-repair budget-01 removed, reintroduced.
+            _clear_fault_budget_on_answer(config, blocker)
+            if blocker.task_id in {task_id for task_id, _ in released}:
+                print(f"task {blocker.task_id} is ready again.")
+            elif blocker.task_id in blocker_store.open_task_ids():
+                # A task can hold more than one open blocker — `record` mints a
+                # separate one per (task, code, phase), so two distinct failures
+                # on one task are two questions. Releasing it on the FIRST answer
+                # put it back in `next_ready()` with the second still unanswered.
+                print(
+                    f"task {blocker.task_id} stays blocked — another blocker is "
+                    "still open for it (`python -m autoloop blockers`)."
+                )
+            else:
+                _print_answer_no_requeue(registry, blocker.task_id)
+        # Every OTHER task the same reconciliation released. The answered task
+        # has its own line above; this is how an operator learns that closing
+        # one record also cleared a quarantine somewhere else in the graph.
+        _print_auto_unblocked([r for r in released if r[0] != blocker.task_id])
     return 0
+
+
+def _print_answer_no_requeue(registry: TaskRegistry | None, task_id: str) -> None:
+    """Say why an answered task was not returned to the queue, when nothing open
+    names it any more.
+
+    Three shapes reach here and they want different words. The task may not be
+    in the registry at all; it may not be `blocked` (a task_fatal park under
+    plain `run` leaves it `in_progress`, and a retired task is not quarantined
+    either — `task_not_blocked` / `task_retired`, the codes this command has
+    always printed for that shape); or it may be blocked as an OPERATOR hold,
+    which the reconciliation deliberately never touches.
+
+    Asked through `TaskRegistry.unblock_obstacle`, which reports without
+    transitioning. Calling `unblock` to find out would answer the question by
+    releasing the operator's hold.
+    """
+    if registry is None or not registry.has(task_id):
+        print(
+            f"task {task_id!r} could not be unblocked (no such task in the "
+            "registry) — the blocker itself is still resolved."
+        )
+        return
+    obstacle = registry.unblock_obstacle(task_id)
+    if obstacle is None:
+        print(
+            f"task {task_id} stays blocked — it is an operator hold, which an "
+            "answer to a blocker does not clear."
+        )
+        return
+    print(
+        f"task {task_id!r} could not be unblocked ({obstacle}) — the "
+        "blocker itself is still resolved."
+    )
 
 
 def _clear_fault_budget_on_answer(config: AutoloopConfig, blocker: Blocker) -> None:
@@ -2364,8 +2472,15 @@ def _cmd_start(args: argparse.Namespace) -> int:
     # same pair for the same reason. That is a finding to report, not a
     # traceback out of the command whose whole job is reporting findings.
     try:
-        _, _start_registry = _load_tasks(config)
+        _start_store, _start_registry = _load_tasks(config)
         _closed_blockers = _reconcile_retired_blockers(config, _start_registry)
+        # And the reverse split brain, in the same preflight and before
+        # anything selects a task: a `blocked` row whose every blocker is
+        # already resolved or archived is excluded from `next_ready()` with
+        # nothing left to justify it (blk-01). `start` is where a registry that
+        # arrived in that state gets repaired, for the same reason the
+        # retirement sweep lives here — nothing else would notice.
+        _requeued = _reconcile_unblocked_tasks(config, _start_store, _start_registry)
     except (StateError, ConfigError, TaskGraphError, KeyError) as exc:
         print(f"tasks        UNREADABLE ({exc}) — retirements not reconciled")
         ok = False
@@ -2374,6 +2489,11 @@ def _cmd_start(args: argparse.Namespace) -> int:
             print(
                 f"blockers     {_closed.id} closed — task {_closed.task_id} is "
                 "retired, so nobody can answer it"
+            )
+        for _task_id, _prior_reason in _requeued:
+            print(
+                f"tasks        {_task_id} returned to the queue — it was blocked "
+                f"with no open blocker (was: {_prior_reason or '(no reason recorded)'})"
             )
 
     lines, healthy = _report_blockers_and_phase(config)
@@ -2554,6 +2674,229 @@ def _reconcile_retired_blockers(config, registry) -> list[Blocker]:
     return closed
 
 
+def _reconcile_unblocked_tasks(config, task_store, registry) -> list[tuple[str, str]]:
+    """Return every blocker-derived `blocked` task to the queue once no OPEN
+    blocker names it. Returns `(task_id, prior_reason)` for what it released.
+
+    The mirror image of `_reconcile_retired_blockers` above, and it exists for
+    the same reason: a quarantine is TWO halves — a status in `tasks.json` and a
+    question in its own record under `blockers/` — and moving only one is a
+    split brain rather than untidiness. That sweep answers "the task is gone, so
+    close its question"; this one answers "the question is gone, so requeue its
+    task".
+
+    Observed on port-01 (2026-08-19). It parked with `review_packet_build_
+    failed`, the operator answered that blocker and it was resolved, and hours
+    later the registry still read `status=blocked` with port-01 absent from
+    every open blocker — excluded from `next_ready()` with nothing left to
+    justify it. No supported command could undo it: `answer` needs an OPEN
+    blocker (and already REPORTED the split brain — "could not be unblocked
+    (task_not_blocked)" — before dropping it on the floor), `release` refuses
+    anything that is not `in_progress`, `retire` means "never worked again"
+    rather than "runnable again", and there is no `unblock`. The only route out
+    was editing `tasks.json` by hand with the loop stopped, which also needs a
+    pause window the escape detector otherwise punishes.
+
+    So the state is reconciled rather than a repair command being added. What
+    that costs, stated plainly: a task blocked with no record on disk AT ALL —
+    a hand-edited status, a park written by a build with no blocker store — is
+    released too. That is the claim taken literally ("a task is `blocked` only
+    while it has at least one OPEN blocker"), and it is the safe direction: the
+    task goes back into the queue, where the condition that quarantined it will
+    re-fire and record a blocker properly, rather than sitting invisible.
+
+    THREE things it does not do, each load-bearing:
+
+    * It never touches a `blockers.Blocker`. Not resolved, not archived, not
+      bumped — resolution stays an operator act (or `archive_stale`'s explicit
+      machine reason), and a sweep that could close records would be a way to
+      launder exactly the confirmation `_RESOLUTION_PRECONDITIONS` demands.
+      Membership is decided by READING them.
+    * It never reaches an operator hold. `TaskRegistry.blocker_derived_blocked`
+      excludes `hold_origin == HOLD_ORIGIN_OPERATOR`, which is the only
+      provenance marker anything here trusts — a hold placed through the inbox
+      has no blocker record by design, so "nothing open names it" is true of
+      one from the instant it is placed. Only the derived `blocked` that
+      MIRRORS a record is reconciled.
+    * It never widens what counts as blocking. Any OPEN blocker naming the task
+      keeps it out, whatever its `kind` (see `BlockerStore.open_task_ids`).
+
+    Every release is written to the TRANSCRIPT, with the reason the task was
+    carrying — `unblock()` clears `blocked_reason`, so afterwards the transcript
+    is the only place the transition stays legible. A task that returns to the
+    queue on nobody's authority must not do it silently.
+
+    Saves ONLY when something moved, so the ordinary case (nothing to
+    reconcile) writes nothing at all — this runs at the top of every continuous
+    iteration, and a `tasks.json` rewritten on each pass would be noise in the
+    escape detector's snapshot for no gain. Idempotent for the same reason: a
+    second call finds the task `pending` and has nothing to do.
+
+    **Cannot raise once `task_store.save` has returned.** The transcript append
+    that follows it is reported rather than raised, exactly as
+    `_cmd_retire_task` reports a sweep it could not run after a durable
+    retirement. That is not tidiness: `_requeue_after_close` REOPENS the blocker
+    it just closed when this function raises, and a raise from after the save
+    would reopen a blocker whose task is already back in the queue — the
+    opposite split brain. So the save is the single point of no return, and
+    everything after it degrades to a warning.
+    """
+    candidates = registry.blocker_derived_blocked()
+    if not candidates:
+        return []
+    open_task_ids = BlockerStore(config.blockers_dir).open_task_ids()
+    released: list[tuple[str, str]] = []
+    for task in candidates:
+        if task.id in open_task_ids:
+            continue
+        reason = task.blocked_reason
+        registry.unblock(task.id)
+        released.append((task.id, reason))
+    if not released:
+        return []
+    task_store.save(registry)
+    try:
+        log = TranscriptLogger(config.transcript_file).append
+        for task_id, reason in released:
+            log(
+                "task_auto_unblocked",
+                data={
+                    "task_id": task_id,
+                    "prior_status": "blocked",
+                    # Kept because `unblock` clears it: without this the account
+                    # of WHY the task was ever quarantined survives nowhere once
+                    # the blocker that carried the question is closed.
+                    "prior_blocked_reason": reason,
+                    "note": (
+                        "no OPEN blocker named this task, so its quarantine had "
+                        "nothing left to justify it — returned to the queue"
+                    ),
+                },
+            )
+    except OSError as exc:
+        print(
+            f"warning: the requeue of {', '.join(t for t, _ in released)} could "
+            f"not be written to the transcript ({exc}) — the release itself is "
+            "saved"
+        )
+    return released
+
+
+def _print_auto_unblocked(released: list[tuple[str, str]]) -> None:
+    """One operator-facing line per task `_reconcile_unblocked_tasks` released.
+
+    Separate from the sweep so the four callers that print this wording share
+    it (`_run_locked`, `_run_continuous`, `_cmd_answer`,
+    `_archive_blocker_locked`) — `_cmd_start` is the fifth reconcile site and
+    prints its own column-aligned form, since every other line of that preflight
+    is a padded `label  detail` pair. Either way the sweep's transcript entry is
+    the durable record and this is only what the operator happens to be looking
+    at.
+    """
+    for task_id, reason in released:
+        print(
+            f"task {task_id} returned to the queue — no open blocker remained "
+            f"(was: {reason or '(no reason recorded)'})"
+        )
+
+
+#: What a requeue is allowed to fail with and still be HANDLED rather than
+#: raised. Same net the tolerant sweep used to carry: `KeyError` for the reason
+#: `_cmd_start` names (a `depends_on` naming a task that no longer exists
+#: survives `from_dict` and fails on the later lookup), `OSError` because both
+#: stores are files. Anything outside it is a bug and gets a traceback.
+_REQUEUE_FAULTS = (StateError, ConfigError, TaskGraphError, KeyError, OSError)
+
+#: `_requeue_after_close`'s outcome. THREE values, not a bool, because the two
+#: failures want opposite sentences from the calling command: `_REOPENED` means
+#: nothing changed and the operator can just run the command again, while
+#: `_CLOSE_STANDS` means the record really is closed on disk with its task not
+#: requeued — the one state nothing here can repair by itself. Reporting the
+#: second as "nothing changed" would be the false line `_cmd_answer`'s
+#: "the message has to be true" rule exists to prevent.
+_REQUEUE_OK = "ok"
+_REQUEUE_REOPENED = "reopened"
+_REQUEUE_CLOSE_STANDS = "close_stands"
+
+
+def _requeue_after_close(
+    config, blocker_store: BlockerStore, before: Blocker
+) -> tuple[list[tuple[str, str]], TaskRegistry | None, str]:
+    """The task half of closing `before` — run so BOTH halves land or NEITHER
+    does. Returns `(released, registry, outcome)`; `registry` is the post-sweep
+    in-memory graph (None when it could not be read) and `outcome` is one of
+    `_REQUEUE_OK` / `_REQUEUE_REOPENED` / `_REQUEUE_CLOSE_STANDS`.
+
+    Called by the only two commands that CLOSE a blocker (`answer`,
+    `archive-blocker`), and it is where those commands FAIL CLOSED. Closing the
+    last open record naming a quarantined task and leaving that task `blocked`
+    is precisely the split brain blk-01 exists to make impossible, so a close
+    whose requeue cannot be completed is not allowed to stand as a close: the
+    record is written back exactly as it was read, the command reports the
+    failure, and it exits non-zero.
+
+    The earlier shape did the opposite. `_sweep_unblocked_tasks` caught the same
+    faults, printed a warning, and left the archival or the resolution standing
+    with the note that "the loop's next start" would repair it — which is the
+    invariant restated as a promise about some later process rather than
+    enforced here. An hour of `status=blocked` with nothing open naming the task
+    is the state the claim says cannot exist, whether or not something would
+    eventually notice.
+
+    Scope: SYNCHRONOUS command failures only. A process killed between the
+    close and the requeue still leaves the split state, and the startup sweeps
+    (`_cmd_start`, `_run_locked`, `_run_continuous`) are what repair that — they
+    stay deliberately TOLERANT, since a startup sweep has no blocker of its own
+    to put back and refusing to start would trade a repairable state for an
+    unstartable loop.
+
+    `_reconcile_unblocked_tasks` cannot raise once its `task_store.save` has
+    returned (see its docstring), so a fault reaching here proves the task half
+    is untouched and reopening is safe.
+    """
+    try:
+        task_store, registry = _load_tasks(config)
+        released = _reconcile_unblocked_tasks(config, task_store, registry)
+    except _REQUEUE_FAULTS as exc:
+        print(f"error: the task graph could not be reconciled ({exc})")
+        restored = _reopen_blocker(blocker_store, before)
+        return [], None, _REQUEUE_REOPENED if restored else _REQUEUE_CLOSE_STANDS
+    return released, registry, _REQUEUE_OK
+
+
+def _reopen_blocker(blocker_store: BlockerStore, before: Blocker) -> bool:
+    """Write `before` back exactly as it was read, so a close that could not
+    requeue is no close at all. True when the record really was restored.
+
+    A plain `save` of the pre-close snapshot rather than a `reopen()` on the
+    store: nothing else may ever move a blocker from closed back to open, and
+    adding that verb would be a way to un-answer an operator's answer. This is
+    an undo of a write THIS command made microseconds ago, inside the lock,
+    from the record it read before making it.
+
+    Best-effort at the very end, and it says so when it fails — a snapshot that
+    cannot be written back leaves the one state nothing here can fix by itself,
+    so the operator has to be told in the terms that matter (the record is
+    CLOSED, the task was not requeued) rather than getting a traceback.
+    """
+    try:
+        blocker_store.save(before)
+    except OSError as exc:
+        print(
+            f"error: blocker {before.id} could NOT be reopened ({exc}) — it is "
+            "closed on disk and its task was not returned to the queue. Reopen "
+            "the record by hand before starting the loop, or let the startup "
+            "sweep requeue the task."
+        )
+        return False
+    print(
+        f"blocker {before.id} was reopened — nothing changed. Closing the last "
+        "blocker of a quarantined task returns that task to the queue in the "
+        "same operation, so a close that cannot requeue is not a close."
+    )
+    return True
+
+
 def _cmd_retire_task(args: argparse.Namespace) -> int:
     """Record that a task is superseded and will never be worked again.
 
@@ -2653,9 +2996,78 @@ def _cmd_archive_blocker(args: argparse.Namespace) -> int:
     `answer`, and it REFUSES a blocker belonging to the session that is
     still live — otherwise it would become the "clear the escape detection"
     button that `_RESOLUTION_PRECONDITIONS` deliberately withholds.
+
+    **Takes the loop lock, like `answer` and `retire`** (blk-01, review round
+    2). Archiving can close the LAST open record naming a quarantined task, and
+    when it does, that task has to return to the queue in the same operation
+    (`_reconcile_unblocked_tasks`) — otherwise this command is itself a way to
+    manufacture exactly the split brain the sweep exists to end. Requeueing
+    means writing `tasks.json`, so it needs the lock that owns that file.
+
+    The earlier shape archived first, READ the lock afterwards, and skipped the
+    requeue when a live loop held it. Two faults, one design and one race. The
+    design fault: a successful archival could durably leave its task `blocked`
+    with no open blocker — the loop's next iteration would fix it, but "the
+    next iteration" can be an hour of a state the invariant says cannot exist.
+    The race: `read()` + write is check-then-act, so a loop starting in that
+    window got its `tasks.json` written underneath it anyway.
+
+    **And it FAILS CLOSED inside the lock too** (blk-01, review round 3). Taking
+    the lock only removed the race; the archival still landed first and the
+    requeue was best-effort, so a `tasks.json` that would not parse left exactly
+    the same durable split state with a warning printed over it. Now the
+    archival is undone (`_requeue_after_close` → `_reopen_blocker`) and the
+    command exits 1 whenever the task half cannot be completed, so "archived"
+    is never printed for an archival that did not requeue what it closed. If the
+    undo itself cannot be written, the command says the record remains CLOSED
+    rather than "nothing changed" — the two want different next moves, which is
+    the same reason the lock refusal above says which state it left behind.
+
+    So the whole command is inside the lock, and when the lock cannot be taken
+    NOTHING happens — not the archival, not the requeue. That is also the
+    stronger version of the escape-detector argument this command used to make:
+    `.autoloop/` sits inside the tree `escape_detector.enumerate_checkout_paths`
+    snapshots (ignored paths included), so a write here mid-round reads as an
+    agent escaping its worker repo; holding the lock is what proves no round is
+    in flight, rather than a read that could go stale a microsecond later.
+
+    A LIVE lock and a STALE one both refuse, and both say the blocker is
+    untouched — an operator who sees a lock error has to know the record is
+    still open, since "archived but not requeued" and "not archived at all" want
+    different next moves. Never `break_stale`: locks are not stolen here any
+    more than anywhere else, and `unlock` is the documented recovery.
     """
     config = load_config(args.config)
+    try:
+        with LoopLock(config.state_dir):
+            return _archive_blocker_locked(config, args)
+    except (LockHeldError, StaleLockError) as exc:
+        # Nothing inside the block raises either of these, so this catch can
+        # only ever be the acquisition failing — i.e. before `archive_stale`
+        # touched anything.
+        print(f"error: {exc}")
+        print(
+            f"blocker {args.blocker_id} was NOT archived — nothing changed. "
+            "Archiving the last blocker of a quarantined task returns that task "
+            "to the queue in the same operation, so this command writes "
+            "`tasks.json` and needs the loop lock."
+        )
+        return 1
+
+
+def _archive_blocker_locked(config: AutoloopConfig, args: argparse.Namespace) -> int:
+    """The body of `archive-blocker`, with the loop lock already held.
+
+    Split out so the lock is a single `with` around every read AND every write:
+    the session check reads `state.json`, the archival writes a blocker record,
+    the sweep writes `tasks.json`, and the undo of a failed sweep writes the
+    blocker record back. All four inside, so nothing decided here can be
+    invalidated between the deciding and the writing.
+    """
     store = BlockerStore(config.blockers_dir)
+    # Also the pre-close snapshot `_reopen_blocker` writes back if the requeue
+    # cannot be completed: `archive_stale` decodes its own copy from disk, so
+    # this one is never mutated by the archival it is the undo for.
     blocker = store.load(args.blocker_id)
     if blocker is None:
         print(f"error: no blocker with id {args.blocker_id!r}")
@@ -2675,8 +3087,30 @@ def _cmd_archive_blocker(args: argparse.Namespace) -> int:
     except StateError as exc:
         print(f"error: {exc}")
         return 1
+    # The other half of the state, moved with the first. An archival that closed
+    # the last record naming a quarantined task leaves that task `blocked` with
+    # nothing left to justify it, which is the split brain blk-01 exists to make
+    # impossible — not a tidiness job for whoever runs next. So it FAILS CLOSED:
+    # a task graph that cannot be read, reconciled or saved puts `blocker` back
+    # exactly as it was read, and this command reports no archival at all.
+    released, _registry, outcome = _requeue_after_close(config, store, blocker)
+    if outcome == _REQUEUE_REOPENED:
+        print(f"blocker {args.blocker_id} was NOT archived — nothing changed.")
+        return 1
+    if outcome != _REQUEUE_OK:
+        # The restore itself failed, so the archival really is on disk — the one
+        # state this command cannot repair by itself, and the one it must not
+        # describe as "nothing changed".
+        print(
+            f"blocker {args.blocker_id} remains CLOSED (archived) on disk and "
+            "nothing was requeued — see the error above for what to do."
+        )
+        return 1
+    # Only now, because an archival that cannot requeue is not an archival and
+    # must not be announced as one.
     print(f"blocker {archived.id} archived at {archived.resolved_at}")
     print("recorded as a machine reason, NOT as an operator answer")
+    _print_auto_unblocked(released)
     return 0
 
 

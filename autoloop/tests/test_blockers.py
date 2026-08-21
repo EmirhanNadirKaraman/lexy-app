@@ -30,13 +30,14 @@ from autoloop.contract import Decision, Directive
 from autoloop.errors import StateCorruptError, StateError, TaskGraphError
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
+from autoloop.lock import LoopLock
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import LoopState, Phase, StateStore, utcnow_iso
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 from autoloop.transcript import TranscriptLogger
-from autoloop.worktask import IntentStore, TaskExecutionStore
+from autoloop.worktask import IntentStore, TaskExecution, TaskExecutionStore
 from autoloop.worktree import WorktreeManager
 
 URL = "https://chatgpt.com/c/blockers-test"
@@ -1086,3 +1087,625 @@ def test_answer_cannot_clear_an_environmental_invariant_by_text(tmp_path, monkey
     assert "NOT resolved" in out
     assert "cannot be cleared by an answer" in out
     assert store.load("blk-(loop)-001").resolved_at is None, "must stay open"
+
+
+# =============================================================================
+# 15. a task is `blocked` only while it has at least one OPEN blocker (blk-01)
+#
+# The mirror image of the retirement sweep in test_start_command.py: that one
+# closes a retired task's question, this one requeues a task whose questions are
+# all closed. port-01 (2026-08-19) sat `blocked` for hours with every blocker
+# resolved — out of `next_ready()` with nothing left to justify it, and no
+# supported command able to return it (`answer` needs an open blocker,
+# `release` wants `in_progress`, `retire` means "never again", there is no
+# `unblock`). The only route out was editing tasks.json by hand.
+# =============================================================================
+
+
+def _open_blocker(store, task_id, code, kind="task_fatal", when="2026-08-19T00:00:00+00:00"):
+    return store.record(
+        task_id=task_id,
+        kind=kind,
+        code=code,
+        question=f"task {task_id} parked with {code}; what now?",
+        detail="",
+        phase="executing",
+        now=when,
+    )
+
+
+def _transcript_entries(config, entry_type):
+    path = config.transcript_file
+    if not path.exists():
+        return []
+    entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    return [e for e in entries if e.get("type") == entry_type]
+
+
+def _split_brain(config, task_ids=("t1",), extra_tasks=()):
+    """A registry in the exact state port-01 was found in: `blocked` rows with
+    no open blocker record anywhere. Returns the store and the registry."""
+    registry = TaskRegistry([ready_task(tid) for tid in (*task_ids, *extra_tasks)])
+    for tid in task_ids:
+        registry.block(tid, f"parked: {tid} needs a human")
+    store = TaskStore(config.tasks_file)
+    store.save(registry)
+    return store, registry
+
+
+def test_answering_the_last_open_blocker_returns_the_task_to_the_queue(tmp_path, capsys):
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",), extra_tasks=("t2",))
+    blocker = _open_blocker(BlockerStore(config.blockers_dir), "t1", "review_round_cap")
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="try it again")
+    ) == 0
+
+    assert "ready again" in capsys.readouterr().out
+    reloaded = store.load()
+    assert reloaded.state_of("t1") is TaskState.READY
+    assert reloaded.get("t1").blocked_reason == ""
+    assert {t.id for t in reloaded.ready_tasks()} == {"t1", "t2"}
+
+
+def test_answering_one_of_two_blockers_leaves_the_task_blocked(tmp_path, capsys):
+    """`record` mints a separate blocker per (task, code, phase), so one task
+    can carry two distinct questions. The first answer used to requeue it with
+    the second still unanswered — the invariant runs both ways round."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    first = _open_blocker(blockers, "t1", "review_round_cap")
+    second = _open_blocker(blockers, "t1", "attempt_count_ceiling")
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=first.id, text="that one is fine")
+    ) == 0
+
+    out = capsys.readouterr().out
+    assert "stays blocked" in out
+    assert "ready again" not in out
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+    assert [b.id for b in blockers.open_blockers()] == [second.id]
+
+    # ...and the second answer, which IS the last one, releases it.
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=second.id, text="and so is that")
+    ) == 0
+    assert "ready again" in capsys.readouterr().out
+    assert store.load().state_of("t1") is TaskState.READY
+
+
+def test_an_open_loop_fatal_blocker_still_keeps_its_task_blocked(tmp_path):
+    """Counting is by TASK, not by kind — deliberately wider than
+    `_reconcile_retired_blockers`' `task_fatal` allowlist. That sweep CLOSES
+    records so it must prove one is closeable; this one only decides whether to
+    keep a task out of the queue, where the conservative direction is the
+    opposite."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, registry = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    escape = _open_blocker(blockers, "t1", "checkout_escape_detected", kind="loop_fatal")
+
+    assert cli._reconcile_unblocked_tasks(config, store, registry) == []
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+
+    # Archived (never answered — an escape refuses every answer by design) and
+    # the same sweep now releases it.
+    blockers.archive_stale(escape.id, "session retired; every path inspected")
+    released = cli._reconcile_unblocked_tasks(config, store, registry)
+
+    assert [task_id for task_id, _ in released] == ["t1"]
+    assert store.load().state_of("t1") is TaskState.READY
+
+
+def test_the_sweep_reports_the_transition_and_is_idempotent(tmp_path):
+    """A task returning to the queue on nobody's authority must be visible.
+    `unblock()` clears `blocked_reason`, so the transcript is the only place the
+    account of WHY it was quarantined survives."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, registry = _split_brain(config, task_ids=("t1",))
+
+    released = cli._reconcile_unblocked_tasks(config, store, registry)
+    assert released == [("t1", "parked: t1 needs a human")]
+
+    entries = _transcript_entries(config, "task_auto_unblocked")
+    assert len(entries) == 1
+    assert entries[0]["data"]["task_id"] == "t1"
+    assert entries[0]["data"]["prior_blocked_reason"] == "parked: t1 needs a human"
+
+    # Idempotent: the task is `pending` now, so a second pass has nothing to do
+    # and writes no second entry. This runs at the top of every continuous
+    # iteration, so a sweep that re-fired would fill the transcript.
+    assert cli._reconcile_unblocked_tasks(config, store, registry) == []
+    assert len(_transcript_entries(config, "task_auto_unblocked")) == 1
+
+
+def test_the_sweep_never_writes_to_a_blocker_record(tmp_path):
+    """The bound `do not resolve blockers as a side effect of anything` made
+    checkable — byte-for-byte, open and closed records alike."""
+    from dataclasses import asdict
+
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, registry = _split_brain(config, task_ids=("t1", "t2"))
+    blockers = BlockerStore(config.blockers_dir)
+    answered = _open_blocker(blockers, "t1", "review_round_cap")
+    blockers.resolve(answered.id, "go again")          # t1: split brain
+    still_open = _open_blocker(blockers, "t2", "attempt_count_ceiling")  # t2: genuine
+    before = {b.id: asdict(b) for b in blockers.all_blockers()}
+
+    released = cli._reconcile_unblocked_tasks(config, store, registry)
+
+    assert [task_id for task_id, _ in released] == ["t1"]
+    assert {b.id: asdict(b) for b in blockers.all_blockers()} == before
+    assert [b.id for b in blockers.open_blockers()] == [still_open.id]
+    reloaded = store.load()
+    assert reloaded.state_of("t1") is TaskState.READY
+    assert reloaded.state_of("t2") is TaskState.BLOCKED_BY_OPERATOR
+
+
+def test_an_operator_hold_is_never_swept_back_into_the_queue(tmp_path, capsys):
+    """The one exclusion in the whole mechanism. An inbox hold creates NO
+    blocker record by design, so "nothing open names it" is true of one from
+    the instant it is placed — provenance (`hold_origin`), not the absence of a
+    record, is what decides."""
+    from autoloop.tasks import HOLD_ORIGIN_OPERATOR
+
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    registry = TaskRegistry([ready_task("held"), ready_task("t1")])
+    registry.operator_block("held", "waiting on a product decision")
+    registry.block("t1", "parked: t1 needs a human")
+    store = TaskStore(config.tasks_file)
+    store.save(registry)
+    blocker = _open_blocker(BlockerStore(config.blockers_dir), "t1", "review_round_cap")
+
+    # Directly...
+    assert [t.id for t in registry.blocker_derived_blocked()] == ["t1"]
+
+    # ...and through every command that runs the sweep.
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="carry on")
+    ) == 0
+    capsys.readouterr()
+
+    reloaded = store.load()
+    assert reloaded.state_of("t1") is TaskState.READY
+    held = reloaded.get("held")
+    assert held.status == "blocked"
+    assert held.hold_origin == HOLD_ORIGIN_OPERATOR
+    assert held.blocked_reason.endswith("waiting on a product decision")
+    # Scoped to `held`, not "no entries at all": since review round 3 `answer`
+    # releases through the SAME reconciliation as every other caller, so `t1`
+    # does get an entry. The claim here is only that `held` never does.
+    assert [e["data"]["task_id"] for e in _transcript_entries(config, "task_auto_unblocked")] == [
+        "t1"
+    ]
+
+
+def test_start_reconciles_a_registry_that_is_already_in_the_split_state(
+    tmp_path, monkeypatch, capsys
+):
+    """`start`'s preflight, before anything selects a task — the same place the
+    retirement sweep lives, and for the same reason: a registry that arrived in
+    this state has no command that would otherwise notice.
+
+    The operator hold rides along deliberately: the exclusion has to hold on the
+    AUTOMATIC paths, not only on the one where a human typed `answer`."""
+    from autoloop.tasks import HOLD_ORIGIN_OPERATOR
+
+    config = make_config(tmp_path)
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli, "load_config", lambda _p: config)
+    monkeypatch.setattr(cli, "_default_probe_cdp", lambda url: '{"Browser":"Chrome"}')
+    store, registry = _split_brain(config, task_ids=("t1",), extra_tasks=("held",))
+    registry.operator_block("held", "waiting on a product decision")
+    store.save(registry)
+
+    assert cli._cmd_start(Namespace(config=None, check_only=True)) == 0
+
+    out = capsys.readouterr().out
+    assert "t1 returned to the queue" in out
+    assert "no open blocker" in out
+    assert "held returned to the queue" not in out
+    reloaded = store.load()
+    assert reloaded.state_of("t1") is TaskState.READY
+    assert reloaded.get("held").status == "blocked"
+    assert reloaded.get("held").hold_origin == HOLD_ORIGIN_OPERATOR
+
+
+def test_continuous_mode_reconciles_at_the_top_of_an_iteration(tmp_path, monkeypatch, capsys):
+    """The loop's own startup sweep, wired for real — and on the registry the
+    iteration hands the orchestrator, not a copy: a task released into a copy
+    would still read `blocked` where `next_ready()` looks, and the round's first
+    ordinary save would write the stale status straight back.
+
+    `t1` depends on an in-progress `t0`, so releasing it produces no READY task
+    and the iteration reaches the exhaustion check instead of kicking off a
+    session; the `(loop)` blocker is what makes that check exit 0. The operator
+    hold rides along because this is the path that runs unattended for hours —
+    the one where an accidental release would go unnoticed longest."""
+    from autoloop.tasks import HOLD_ORIGIN_OPERATOR
+
+    repo_root = real_repo(tmp_path)
+    monkeypatch.chdir(repo_root)
+    config = make_config(tmp_path)
+
+    registry = TaskRegistry([ready_task("t0"), ready_task("t1"), ready_task("held")])
+    registry.set_depends_on("t1", ("t0",))
+    registry.mark_in_progress("t0")
+    registry.block("t1", "parked: post-commit validation failed")
+    registry.operator_block("held", "waiting on a product decision")
+    task_store = TaskStore(config.tasks_file)
+    task_store.save(registry)
+
+    _open_blocker(BlockerStore(config.blockers_dir), NO_TASK, "login_expired",
+                  kind="loop_fatal")
+    cli._save_fingerprint(config, cli.repo_fingerprint(repo_root))
+
+    def boom_conversation(*a, **kw):
+        raise AssertionError("no ChatGPT call expected")
+
+    def boom_claude(self, spec):
+        raise AssertionError("no Claude call expected")
+
+    monkeypatch.setattr(cli, "create_conversation", boom_conversation)
+    monkeypatch.setattr(ClaudeCliRunner, "run", boom_claude)
+
+    args = Namespace(
+        config=tmp_path / "unused.toml",
+        continuous=True,
+        kickoff=None,
+        kickoff_audit=False,
+        answer=None,
+        retry=False,
+        resubmit=False,
+        max_steps=None,
+        null_executor=True,
+    )
+    assert cli._run_continuous(args, config) == 0
+
+    out = capsys.readouterr().out
+    assert "t1 returned to the queue" in out
+    assert "held returned to the queue" not in out
+    reloaded = task_store.load()
+    assert reloaded.get("t1").status == "pending"
+    # Still not dispatchable — the dependency is real and the sweep does not
+    # touch it. `blocked` here is the derived kind, which resolves itself.
+    assert reloaded.state_of("t1") is TaskState.BLOCKED
+    assert reloaded.get("held").status == "blocked"
+    assert reloaded.get("held").hold_origin == HOLD_ORIGIN_OPERATOR
+    assert [e["data"]["task_id"] for e in _transcript_entries(config, "task_auto_unblocked")] == ["t1"]
+
+
+def test_archiving_the_last_blocker_returns_its_task_to_the_queue(tmp_path, capsys):
+    """The `answer` invariant on the other closing path. `checkout_escape_
+    detected` refuses every answer by design, so archival is the ONLY way its
+    record ever closes — and a task whose last record closes that way is as
+    unjustifiably quarantined as one whose last record was answered."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    stale = _open_blocker(blockers, "t1", "checkout_escape_detected", kind="loop_fatal")
+
+    assert cli._cmd_archive_blocker(
+        Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
+    ) == 0
+
+    assert "t1 returned to the queue" in capsys.readouterr().out
+    closed = blockers.load(stale.id)
+    assert closed.archived_reason and closed.answer is None, "machine reason, not an answer"
+    reloaded = store.load()
+    assert reloaded.state_of("t1") is TaskState.READY
+    assert [t.id for t in reloaded.ready_tasks()] == ["t1"]
+    assert [e["data"]["task_id"] for e in _transcript_entries(config, "task_auto_unblocked")] == [
+        "t1"
+    ]
+
+
+def test_a_live_lock_refuses_the_whole_archival_rather_than_half_of_it(tmp_path, capsys):
+    """The command writes `tasks.json` now, so it takes the loop lock — and
+    when it cannot, NOTHING moves.
+
+    The assertion that matters is on the BLOCKER, not the task: an archival
+    that lands while the requeue is skipped leaves exactly the state this whole
+    mechanism exists to make impossible (`blocked` with no open record), and
+    "the task is still blocked" is equally true of that broken outcome. Holding
+    the lock in-process is a real live lock — same pid, no `exec_handoff`
+    marker, so `acquire` refuses it like any other."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    stale = _open_blocker(blockers, "t1", "checkout_escape_detected", kind="loop_fatal")
+
+    with LoopLock(config.state_dir):
+        assert cli._cmd_archive_blocker(
+            Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
+        ) == 1
+        out = capsys.readouterr().out
+
+    assert "NOT archived" in out and "nothing changed" in out
+    assert blockers.load(stale.id).resolved_at is None, "the record must still be open"
+    assert [b.id for b in blockers.open_blockers()] == [stale.id]
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+    assert not _transcript_entries(config, "task_auto_unblocked")
+
+    # Released: the same command now moves both halves together.
+    assert cli._cmd_archive_blocker(
+        Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
+    ) == 0
+    assert "t1 returned to the queue" in capsys.readouterr().out
+    assert blockers.load(stale.id).resolved_at is not None
+    assert store.load().state_of("t1") is TaskState.READY
+
+
+def test_a_stale_lock_refuses_it_too_and_names_the_recovery(tmp_path, capsys):
+    """A dead session is exactly what leaves a lock behind, and it is exactly
+    when this command gets used — so the refusal has to name `unlock` rather
+    than read as a bug. Never `break_stale`: locks are not stolen here."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    stale = _open_blocker(blockers, "t1", "checkout_escape_detected", kind="loop_fatal")
+    lock = LoopLock(config.state_dir)
+    lock.state_dir.mkdir(parents=True, exist_ok=True)
+    lock.path.write_text("{ not json", encoding="utf-8")  # unreadable → provably not live
+
+    assert cli._cmd_archive_blocker(
+        Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
+    ) == 1
+
+    out = capsys.readouterr().out
+    assert "unlock" in out and "NOT archived" in out
+    assert lock.path.exists(), "refused, not recovered — `unlock` is the operator's call"
+    assert blockers.load(stale.id).resolved_at is None
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+
+
+# =============================================================================
+# blk-01, review round 3 — the two CLOSING commands fail closed.
+#
+# Taking the lock removed the RACE, but both commands still closed the record
+# first and requeued best-effort afterwards: a `tasks.json` that would not
+# parse, a reconciliation that raised, or a save that failed left the blocker
+# durably CLOSED with its task still `blocked` — the exact split state the whole
+# mechanism exists to make impossible, with a warning printed over it and a
+# promise that some later startup would notice.
+#
+# Scope is synchronous command failure, not crash consistency: a process killed
+# between the two writes still leaves the split state, and the startup sweeps
+# (`_cmd_start`, `_run_locked`, `_run_continuous`) stay deliberately TOLERANT
+# because they have no blocker of their own to put back.
+# =============================================================================
+
+
+def _boom_reconcile(monkeypatch, exc):
+    """Fail the reconciliation itself, AFTER the lock is taken and after the
+    record has been closed — the window the old shape left open."""
+
+    def boom(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(cli, "_reconcile_unblocked_tasks", boom)
+
+
+def _boom_task_save(monkeypatch):
+    """Fail the real `tasks.json` write, so the reconciliation runs for real and
+    only the durable half is refused."""
+
+    def boom(self, registry):
+        raise StateError("tasks.json could not be written")
+
+    monkeypatch.setattr(TaskStore, "save", boom)
+
+
+def test_answering_fails_closed_when_the_task_graph_cannot_be_reconciled(
+    tmp_path, monkeypatch, capsys
+):
+    """A resolution that cannot requeue what it was holding is not a resolution.
+
+    `KeyError` is the shape `_cmd_start` names — a `depends_on` naming a task
+    that no longer exists survives `from_dict` and fails on the later lookup —
+    and it used to be swallowed with "the loop's next start will fix it", which
+    is the invariant restated as a promise about another process."""
+    from dataclasses import asdict
+
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    blocker = _open_blocker(blockers, "t1", "review_round_cap")
+    before = asdict(blockers.load(blocker.id))
+    _boom_reconcile(monkeypatch, KeyError("t0"))
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="try it again")
+    ) == 1
+
+    out = capsys.readouterr().out
+    assert f"blocker {blocker.id} resolved." not in out, "not reported as a close"
+    assert "NOT resolved" in out and "was reopened" in out
+    assert asdict(blockers.load(blocker.id)) == before, "restored byte-for-byte"
+    assert blockers.load(blocker.id).answer is None
+    assert [b.id for b in blockers.open_blockers()] == [blocker.id]
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+    assert not _transcript_entries(config, "task_auto_unblocked")
+
+    # And the reopened record is genuinely answerable again — a restore that
+    # left it unusable would just be the split brain one file over.
+    monkeypatch.undo()
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="try it again")
+    ) == 0
+    assert "ready again" in capsys.readouterr().out
+    assert store.load().state_of("t1") is TaskState.READY
+
+
+def test_answering_fails_closed_when_tasks_json_cannot_be_saved(
+    tmp_path, monkeypatch, capsys
+):
+    """The same rule with the reconciliation running for real and only the
+    durable write refused — and the fault budget, which used to be refilled
+    before the task graph was even read, stays spent."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    blocker = _open_blocker(blockers, "t1", "fault_attempt_ceiling")
+    executions = TaskExecutionStore(config.executions_dir)
+    executions.save(
+        TaskExecution(
+            task_id="t1",
+            task_branch="autoloop/t1",
+            worktree_path="/tmp/wt",
+            task_base_sha="a" * 40,
+            attempt_count=1,
+            fault_attempt_count=3,
+        )
+    )
+    _boom_task_save(monkeypatch)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="network is fine")
+    ) == 1
+
+    out = capsys.readouterr().out
+    assert f"blocker {blocker.id} resolved." not in out
+    assert "NOT resolved" in out
+    assert blockers.load(blocker.id).resolved_at is None
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+    assert not _transcript_entries(config, "task_auto_unblocked")
+    assert executions.load("t1").fault_attempt_count == 3, "budget not refilled"
+
+
+def test_archiving_fails_closed_when_the_task_graph_cannot_be_reconciled(
+    tmp_path, monkeypatch, capsys
+):
+    """`checkout_escape_detected` refuses every answer by design, so archival is
+    the only way its record ever closes — and it is bound by the same rule."""
+    from dataclasses import asdict
+
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    stale = _open_blocker(blockers, "t1", "checkout_escape_detected", kind="loop_fatal")
+    before = asdict(blockers.load(stale.id))
+    _boom_reconcile(monkeypatch, TaskGraphError("unknown_task", "t0 is not in the registry"))
+
+    assert cli._cmd_archive_blocker(
+        Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
+    ) == 1
+
+    out = capsys.readouterr().out
+    assert "archived at" not in out, "not reported as a close"
+    assert "NOT archived" in out and "was reopened" in out
+    assert asdict(blockers.load(stale.id)) == before, "restored byte-for-byte"
+    assert blockers.load(stale.id).archived_reason == ""
+    assert [b.id for b in blockers.open_blockers()] == [stale.id]
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+    assert not _transcript_entries(config, "task_auto_unblocked")
+
+    monkeypatch.undo()
+    assert cli._cmd_archive_blocker(
+        Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
+    ) == 0
+    assert "t1 returned to the queue" in capsys.readouterr().out
+    assert store.load().state_of("t1") is TaskState.READY
+
+
+def test_archiving_fails_closed_when_tasks_json_cannot_be_saved(
+    tmp_path, monkeypatch, capsys
+):
+    """The durable-write half for `archive-blocker`, matching `answer`'s."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    stale = _open_blocker(blockers, "t1", "checkout_escape_detected", kind="loop_fatal")
+    _boom_task_save(monkeypatch)
+
+    assert cli._cmd_archive_blocker(
+        Namespace(config=config_path, blocker_id=stale.id, reason="session retired")
+    ) == 1
+
+    out = capsys.readouterr().out
+    assert "archived at" not in out
+    assert "NOT archived" in out
+    assert blockers.load(stale.id).resolved_at is None
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+    assert not _transcript_entries(config, "task_auto_unblocked")
+
+
+def test_a_reopen_that_itself_fails_says_the_record_is_still_closed(
+    tmp_path, monkeypatch, capsys
+):
+    """The one state nothing here can repair by itself. It must be reported in
+    the terms that matter — the record is CLOSED and the task was not requeued —
+    rather than raising a traceback out of a command that already wrote.
+
+    And specifically NOT as "was NOT resolved": the answer really is on disk in
+    this branch, so that line would be the false one `_cmd_answer` is written to
+    avoid, and an operator who believed it would answer the blocker twice."""
+    config_path = write_config_toml(tmp_path)
+    config = load_config(config_path)
+    store, _ = _split_brain(config, task_ids=("t1",))
+    blockers = BlockerStore(config.blockers_dir)
+    blocker = _open_blocker(blockers, "t1", "review_round_cap")
+    _boom_reconcile(monkeypatch, KeyError("t0"))
+
+    # Only the RESTORE write fails: `resolve` writes a record with `resolved_at`
+    # set, `_reopen_blocker` writes one without. Failing both would break the
+    # close itself and never reach the branch under test.
+    real_save = BlockerStore.save
+
+    def selective_save(self, record):
+        if record.resolved_at is None:
+            raise OSError("blockers/ is read-only")
+        real_save(self, record)
+
+    monkeypatch.setattr(BlockerStore, "save", selective_save)
+
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="try it again")
+    ) == 1
+
+    out = capsys.readouterr().out
+    assert "could NOT be reopened" in out
+    assert "remains CLOSED (resolved) on disk" in out
+    assert "NOT resolved" not in out, "the answer IS on disk — saying otherwise is false"
+    # Both halves of the state it reports, read back from disk.
+    reopened = blockers.load(blocker.id)
+    assert reopened.resolved_at is not None and reopened.answer == "try it again"
+    assert store.load().state_of("t1") is TaskState.BLOCKED_BY_OPERATOR
+
+
+def test_the_startup_sweeps_stay_tolerant_of_an_unreadable_task_graph(
+    tmp_path, monkeypatch, capsys
+):
+    """The narrowing that keeps this change to the two CLOSING commands. A
+    startup sweep has no blocker of its own to put back, so refusing to start
+    would trade a repairable state for an unstartable loop — `start` reports the
+    unreadable graph and carries on, exactly as before."""
+    config = make_config(tmp_path)
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli, "load_config", lambda _p: config)
+    monkeypatch.setattr(cli, "_default_probe_cdp", lambda url: '{"Browser":"Chrome"}')
+    _split_brain(config, task_ids=("t1",))
+    _boom_reconcile(monkeypatch, KeyError("t0"))
+
+    # Exit 2 is `start`'s "the items above need a decision" — a REPORT, not a
+    # traceback out of the command whose whole job is reporting findings.
+    assert cli._cmd_start(Namespace(config=None, check_only=True)) == 2
+    out = capsys.readouterr().out
+    assert "UNREADABLE" in out
+    assert "NOT started" in out

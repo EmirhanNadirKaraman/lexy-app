@@ -878,6 +878,14 @@ open blocker, and nothing on the CLI could close it. It writes
 session that is still live — otherwise it would become the "clear the escape
 detection" button the precondition table deliberately withholds.
 
+It takes the **loop lock**, like `answer` and `retire`, because closing the last
+record naming a quarantined task has to requeue that task in the same operation
+(§9c) and that means writing `tasks.json`. When the lock cannot be taken — a
+live loop holds it, or a dead one left it behind — the archival does not happen
+either, and the refusal says so: a half-done archival is precisely the split
+brain §9c exists to make impossible. A stale lock is `unlock`'s job, never this
+command's.
+
 **`retire`** is documented in full in §9d, with the six tasks it was written
 for. In short: it is the only way to say that work is superseded rather than
 stuck, it records the successor id(s) in `Task.superseded_by` so the chain is
@@ -4068,6 +4076,145 @@ Zero open blockers is still the ordinary idle steady state, unchanged.
 `reset` + fresh plan no longer has will fail to `unblock` (there is nothing
 to unblock), but `answer` still resolves the blocker record itself; the CLI
 reports this rather than raising.
+
+### 9c-bis. A task stays `blocked` only while something is blocking it
+
+The invariant: **a task is `blocked` only while at least one OPEN blocker names
+it.** When its last one is resolved or archived, it returns to the queue in the
+same operation. No task can be left `blocked` with no open blocker record.
+
+This is § 9d's rule run the other way. There, a retirement in `tasks.json` and a
+quarantine in `blockers/` are two halves of one state and moving only the first
+is a split brain; here the halves are the same two files and it is the SECOND
+that moved. Observed on `port-01` (2026-08-19): it parked with
+`review_packet_build_failed`, the operator answered that blocker, and hours
+later the registry still read
+
+```
+port-01  status=blocked
+open blockers: conv-03, roadmap-01, dash-12, split-01   (port-01 absent)
+```
+
+— excluded from `next_ready()` with nothing left to justify it. No supported
+command could return it. `answer` needs an OPEN blocker (and already *reported*
+the split brain — `task 'port-01' could not be unblocked (task_not_blocked)` —
+then dropped it); `release` refuses anything that is not `in_progress`;
+`retire` means "never worked again", not "runnable again"; there is no
+`unblock`. The only route out was hand-editing `tasks.json` with the loop
+stopped, which also needs a pause window the escape detector otherwise punishes.
+
+So the STATE is reconciled rather than a repair command added.
+`cli._reconcile_unblocked_tasks` releases every `blocked` task that no open
+blocker names, via `TaskRegistry.unblock`, and runs from five places:
+
+| where | why |
+|---|---|
+| `answer` | the resolution and the requeue are one operation, or they are the bug — and it *fails closed* if the second half cannot be done (below) |
+| `archive-blocker` | an archival closes records too, so it takes the same lock, fails closed the same way, and refuses outright when the lock cannot be taken (below) |
+| `start`'s preflight | a registry that ARRIVED in the split state; nothing else would notice |
+| top of every `run --continuous` iteration | same, for an operator who skips `start` — and on the registry that iteration hands the orchestrator, not a copy |
+| `run` without `--continuous` (`_run_locked`) | the single-round counterpart of the row above, same registry rule; a plain `run` is the other way an operator restarts after answering |
+
+Four properties it holds to:
+
+* **It never writes to a blocker record.** Not resolved, not archived, not
+  bumped. Membership is decided by READING them; a sweep that could close one
+  would be a way to launder the operator confirmation
+  `_RESOLUTION_PRECONDITIONS` demands.
+* **It never touches an operator hold.** `TaskRegistry.blocker_derived_blocked`
+  excludes `hold_origin == HOLD_ORIGIN_OPERATOR` (§ 4f-ter). An inbox hold
+  creates no blocker record by design, so "nothing open names it" is true of one
+  from the instant it is placed — provenance decides, not the absence of a
+  record. A hold stays until the operator clears it.
+* **Any kind of open blocker counts**, deliberately WIDER than
+  `_reconcile_retired_blockers`' `task_fatal` allowlist. That sweep closes
+  records so it must prove one is closeable; this one only decides whether to
+  keep a task out of the queue, where the conservative direction is the
+  opposite — a `loop_fatal` record naming a task is still an open question about
+  it.
+* **`answer` cuts both ways.** A task can hold more than one open blocker
+  (`record` mints one per `(task, code, phase)`), and the unblock used to be
+  unconditional — the first answer requeued a task the second question was still
+  about. Since round 3 `answer` performs **no targeted unblock of its own**: the
+  release is this sweep's, so one command makes one write to `tasks.json` under
+  one rule for who may be released. (The targeted `registry.unblock` accepted any
+  `blocked` task, operator holds included — exactly what
+  `blocker_derived_blocked` exists to exclude.) The lines it prints are derived
+  from what the sweep actually did, so what it says and what it wrote cannot
+  disagree: "ready again" when the sweep released the task, "stays blocked" when
+  another record is still open, and the `task_not_blocked` / `task_retired`
+  refusal it always printed when the task was never quarantined — a plain `run`
+  parks `task_fatal` without going through `_handle_parked_task`, so the task is
+  still `in_progress`. That last question is asked through
+  `TaskRegistry.unblock_obstacle`, which reports without transitioning; asking it
+  by *calling* `unblock` would answer it by releasing an operator's hold.
+
+Every release is written to the transcript as `task_auto_unblocked`, carrying
+the `blocked_reason` the task was holding: `unblock()` clears that field, so
+afterwards the transcript is the only place the transition stays legible. A task
+that returns to the queue on nobody's authority must not do it silently.
+
+**Why `archive-blocker` takes the lock, and refuses when it cannot.** An
+archival closes a record, and closing the LAST record naming a quarantined task
+has to requeue that task in the same operation — so the command writes
+`tasks.json`, so it needs the lock that owns `tasks.json`. Its first shape (blk-01,
+round 1) tried to have this both ways: archive with no lock, then READ the lock
+and skip the requeue if a loop held it. Two faults. The design one — a
+successful archival could durably leave its task `blocked` with no open blocker,
+which is the exact state this section says cannot exist; "the loop fixes it next
+iteration" can be an hour of it existing. The race — read-then-write is
+check-then-act, so a loop starting in that window got `tasks.json` written
+underneath it anyway, which is the thing the read was there to prevent.
+
+Holding the lock is also the *stronger* form of the escape-detector argument.
+`.autoloop/` sits inside the tree `enumerate_checkout_paths` snapshots (ignored
+paths included), so a write from this command mid-round reads as a write-capable
+agent escaping its worker repo and parks the loop `loop_fatal`. Owning the lock
+is what proves no round is in flight; a read only proves none was, a moment ago.
+So: lock the whole command, and when the lock cannot be taken change nothing at
+all — not the blocker, not the registry — and say which, because "archived but
+not requeued" and "not archived" want different next moves from the operator. A
+stale lock refuses the same way and names `unlock`; this command steals a lock
+no more than any other.
+
+**Both closing commands fail closed** (blk-01, round 3 —
+`cli._requeue_after_close`). Taking the lock removed the race but not the design
+fault: `answer` and `archive-blocker` still CLOSED the record first and requeued
+best-effort afterwards, catching a task-load / reconciliation / task-save failure
+and printing "any task left blocked with no open blocker is returned to the queue
+at the loop's next start". That is the invariant restated as a promise about a
+later process, and it leaves exactly the durable state this section says cannot
+exist. So a close whose requeue cannot be completed is no longer a close: the
+record is written straight back as it was read (`_reopen_blocker` — a plain
+`save` of the pre-close snapshot, not a `reopen()` verb, because nothing may ever
+un-answer an operator's answer), the command exits non-zero, and it does not
+print "resolved" or "archived". Nothing is announced before it is done, including
+the fault-budget reset `answer` performs for `fault_attempt_ceiling`.
+
+The one branch where the close DOES stand is the restore write itself failing,
+and the command says so — `remains CLOSED (resolved) on disk`, never "nothing
+changed". Those two want different next moves, exactly as the lock refusal above
+distinguishes "archived but not requeued" from "not archived"; an operator told
+"not resolved" about an answer that is on disk would answer the same blocker
+twice, and `resolve` refuses a second answer.
+
+Two boundaries on that:
+
+* **Synchronous failures only.** A process killed between the two writes still
+  leaves the split state; the startup sweeps are what repair it.
+* **The startup sweeps stay TOLERANT.** `start`, `run` and `run --continuous`
+  report an unreadable task graph and carry on — they have no blocker of their
+  own to put back, and refusing to start would trade a repairable state for an
+  unstartable loop. `_reconcile_unblocked_tasks` also cannot raise once its
+  `TaskStore.save` has returned (the transcript append after it degrades to a
+  warning), so a fault reaching `_requeue_after_close` proves the task half is
+  untouched and reopening is safe.
+
+One cost, stated rather than hidden: a task `blocked` with **no** record on disk
+at all — a hand-edited status, or a park written by a build with no blocker
+store — is released too. That is the invariant taken literally, and it is the
+safe direction: the task goes back into the queue, where whatever quarantined it
+re-fires and records a blocker properly, instead of sitting invisible.
 
 ### 9d. Retired: superseded work is not blocked work
 
