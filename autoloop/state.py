@@ -480,6 +480,129 @@ SPLIT_DEFINITION_KEYS: tuple[str, ...] = (
     "approved_paths",
 )
 
+#: WHICH execution record a `SplitIntent` undertook to archive — the record's
+#: own account of which attempt it describes, captured at acceptance and
+#: compared, in full, before that record is moved and again when an already
+#: archived one is accepted as proof.
+#:
+#: It exists because `task_id` alone is not an identity. A crash after the
+#: intent was written, followed by the parent being re-dispatched or repaired by
+#: hand, leaves a DIFFERENT record living at `executions/<parent>.json`; matching
+#: on the id would archive that replacement and discharge the intent as if the
+#: original had been retired.
+#:
+#: These five fields and no others, deliberately. They are what the record says
+#: about the attempt it belongs to — its branch, its worker directory, the base
+#: it forked from and the candidate it produced — all written once and not
+#: rewritten by ordinary bookkeeping. Everything else on `TaskExecution` is
+#: bookkeeping that legitimately moves while an intent is outstanding
+#: (`attempt_count`, `fault_attempt_count`, `attempt_ledger`, `review_round`,
+#: `assumptions`, `report_summary`, …) — `cli._clear_fault_budget_on_answer`
+#: rewrites one of them when an operator answers the very blocker a parked split
+#: raises. Binding those, or a digest of the whole file, would turn answering the
+#: park into a permanent park.
+#:
+#: The residual, stated rather than hidden: a replacement record created for the
+#: same task on the same branch, from the same base, with nothing committed yet,
+#: compares EQUAL to the original. What is then archived is a record whose every
+#: identifying field matches the one the intent accepted, and the only thing lost
+#: is bookkeeping the successors do not inherit. The worker half is pinned
+#: independently by the repository's own HEAD (below), which such a replacement
+#: does not reproduce.
+SPLIT_RECORD_PROVENANCE_KEYS: tuple[str, ...] = (
+    "task_id",
+    "task_branch",
+    "worktree_path",
+    "task_base_sha",
+    "candidate_sha",
+)
+
+#: WHICH worker repository a `SplitIntent` undertook to quarantine, read from the
+#: repository itself at acceptance (`orchestrator._worker_repo_identity`).
+#:
+#: `path` is DIAGNOSTIC — it records where the worker stood when the intent was
+#: written, for the park message and for a human. It is deliberately not part of
+#: the comparison: a quarantined worker lives at a different path by definition,
+#: so comparing it would fail on exactly the success case this proof exists to
+#: recognise.
+SPLIT_WORKER_PROVENANCE_KEYS: tuple[str, ...] = ("path", "branch", "head_sha")
+
+#: The COMPARED half of a worker provenance block. A fresh `create()` for the
+#: same task id reproduces the branch (`autoloop/<task_id>` is derived from the
+#: id), so the branch alone identifies nothing; the HEAD commit is what makes a
+#: replacement worker distinguishable from the one the split accepted.
+SPLIT_WORKER_IDENTITY_KEYS: tuple[str, ...] = ("branch", "head_sha")
+
+
+def split_worker_identity(provenance: dict | None) -> dict:
+    """The compared projection of a worker provenance block.
+
+    One projection, used for BOTH sides of every comparison, so the block the
+    intent carries and the block read back off disk can never be narrowed
+    differently.
+    """
+    source = provenance or {}
+    return {key: str(source.get(key, "")) for key in SPLIT_WORKER_IDENTITY_KEYS}
+
+
+def _load_split_provenance(
+    kind: str,
+    flag_name: str,
+    flag: object,
+    raw: object,
+    keys: tuple[str, ...],
+    non_empty: tuple[str, ...],
+) -> dict | None:
+    """Validate one provenance block against the retirement flag it belongs to.
+
+    Fail-closed in BOTH directions, because each direction is a different lie:
+    a flag saying there is a half to retire with no provenance to identify it
+    would let recovery retire whatever it finds, and provenance with the flag
+    off would describe a retirement nobody undertook.
+    """
+    if not isinstance(flag, bool):
+        raise StateCorruptError(
+            f"split intent {flag_name!r} must be a boolean, got {flag!r} — a "
+            "coerced value either fabricates a retirement obligation or "
+            "silently discharges one"
+        )
+    if not flag:
+        if raw not in (None, {}):
+            raise StateCorruptError(
+                f"split intent carries {kind} provenance while {flag_name} is "
+                f"False — it would describe a retirement nobody undertook: {raw!r}"
+            )
+        return None
+    if not isinstance(raw, dict):
+        raise StateCorruptError(
+            f"split intent {flag_name} is True but its {kind} provenance is not "
+            f"an object: {raw!r} — without it recovery cannot tell the accepted "
+            f"{kind} from a replacement"
+        )
+    unknown = set(raw) - set(keys)
+    if unknown:
+        raise StateCorruptError(
+            f"split intent {kind} provenance carries unknown field(s) {sorted(unknown)}"
+        )
+    loaded: dict = {}
+    for key in keys:
+        if key not in raw:
+            raise StateCorruptError(
+                f"split intent {kind} provenance is missing {key!r}"
+            )
+        value = raw[key]
+        if not isinstance(value, str):
+            raise StateCorruptError(
+                f"split intent {kind} provenance field {key!r} is not a string: {value!r}"
+            )
+        if key in non_empty and not value:
+            raise StateCorruptError(
+                f"split intent {kind} provenance field {key!r} is empty — an empty "
+                "identity compares equal to anything that cannot be read"
+            )
+        loaded[key] = value
+    return loaded
+
 
 @dataclass
 class SplitIntent:
@@ -512,6 +635,20 @@ class SplitIntent:
         to undertake for. Without them, "the record is gone" is ambiguous
         between "this intent archived it" and "there was never one", and the
         second reading would let a missing archive pass as success.
+      * `record_provenance` / `worker_provenance` say WHICH record and WHICH
+        repository those flags are about. The flags alone answer "was there one
+        to retire?"; only these answer "is the one on disk now still it?". A
+        crash after this record is written, followed by the parent being
+        re-dispatched or repaired by hand, leaves a DIFFERENT record at
+        `executions/<parent>.json` and a DIFFERENT repository at
+        `workers/<parent>` — and retiring by id alone would destroy that
+        replacement while discharging the intent as though the original had
+        been retired. Every comparison runs against these captured values, both
+        before a live half is moved and when an already archived or quarantined
+        half is accepted as proof; a mismatch parks with the intent intact
+        rather than overwriting anything. See `SPLIT_RECORD_PROVENANCE_KEYS` and
+        `SPLIT_WORKER_PROVENANCE_KEYS` for what each binds and why it is those
+        fields.
       * `successors` carries the FULL definition of each new task, so recovery
         never has to re-read a directive that is no longer in hand.
     """
@@ -531,7 +668,46 @@ class SplitIntent:
     retire_record: bool
     #: Was there a worker repository to quarantine? Same rule.
     retire_worker: bool
+    #: Identity of that record / that repository, REQUIRED exactly when the
+    #: matching flag is True and refused when it is False (`__post_init__`).
+    #: Keys are `SPLIT_RECORD_PROVENANCE_KEYS` / `SPLIT_WORKER_PROVENANCE_KEYS`.
+    record_provenance: dict | None = None
+    worker_provenance: dict | None = None
     created_at: str = field(default_factory=utcnow_iso)
+
+    def __post_init__(self) -> None:
+        """Enforce the flag/provenance pairing on EVERY construction, not only
+        on the way back off disk.
+
+        Both routes into this record have to obey the same rule — an intent
+        minted in-process with a retirement flag set and no identity for it
+        would be unverifiable from the moment it was written, and the state file
+        is the wrong place to discover that.
+        """
+        self.record_provenance = _load_split_provenance(
+            "execution-record",
+            "retire_record",
+            self.retire_record,
+            self.record_provenance,
+            SPLIT_RECORD_PROVENANCE_KEYS,
+            non_empty=("task_id",),
+        )
+        self.worker_provenance = _load_split_provenance(
+            "worker-repository",
+            "retire_worker",
+            self.retire_worker,
+            self.worker_provenance,
+            SPLIT_WORKER_PROVENANCE_KEYS,
+            non_empty=SPLIT_WORKER_IDENTITY_KEYS,
+        )
+        if (
+            self.record_provenance is not None
+            and self.record_provenance["task_id"] != self.parent_id
+        ):
+            raise StateCorruptError(
+                f"split intent for {self.parent_id!r} binds an execution record "
+                f"belonging to {self.record_provenance['task_id']!r}"
+            )
 
     def successor_ids(self) -> tuple[str, ...]:
         return tuple(str(spec.get("id", "")) for spec in self.successors)
@@ -550,6 +726,12 @@ class SplitIntent:
         booleans in particular must never default: reading an absent
         `retire_worker` as `False` would silently discharge a quarantine that
         never happened.
+
+        Nor are they COERCED. `bool(raw["retire_worker"])` reads the string
+        `"false"` as True (fabricating a quarantine obligation that will never
+        be dischargeable) and `0` as False (silently discharging a real one), so
+        both flags must arrive as actual booleans — enforced, with the
+        provenance blocks they pair with, in `__post_init__`.
         """
         if not isinstance(raw, dict):
             raise StateCorruptError(f"split intent is not an object: {raw!r}")
@@ -582,8 +764,12 @@ class SplitIntent:
             successors=successors,
             reason=str(raw.get("reason") or ""),
             label=str(raw["label"]),
-            retire_record=bool(raw["retire_record"]),
-            retire_worker=bool(raw["retire_worker"]),
+            # Passed through UNCOERCED, with `__post_init__` doing the type
+            # check and the pairing check — see this method's own docstring.
+            retire_record=raw["retire_record"],
+            retire_worker=raw["retire_worker"],
+            record_provenance=raw.get("record_provenance"),
+            worker_provenance=raw.get("worker_provenance"),
             created_at=str(raw.get("created_at") or ""),
         )
 

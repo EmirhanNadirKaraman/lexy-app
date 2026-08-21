@@ -33,6 +33,15 @@ and the negative half, which is the other thing a reviewer asked for: durable
 state that CONTRADICTS the intent is never overwritten — it fails closed, parks,
 and leaves the intent on disk for a human.
 
+That half includes the case a `parent_id`-only intent cannot see. Both stores
+are addressed by task id, so the thing living at that address can be REPLACED
+between the crash and the recovery — the task re-dispatched, a record repaired
+by hand, some other repository moved into the quarantine path — and retiring by
+id alone would destroy the replacement while discharging the intent as though
+the accepted work had been retired. So the intent binds WHICH record and WHICH
+repository it accepted, and the tests here replace each of them, and each of
+their already-filed-away destinations, and assert that nothing moves.
+
 A `Crash` here is deliberately not an `OSError` or a `StateError`. Those are
 caught and parked, and a park is the GRACEFUL outcome; what these tests have to
 exercise is the ungraceful one, where nothing runs afterwards — no cleanup, no
@@ -67,6 +76,8 @@ from autoloop.orchestrator import (
 from autoloop.policy import PolicyConfig, PolicyEngine, Verdict
 from autoloop.state import (
     SPLIT_DEFINITION_KEYS,
+    SPLIT_RECORD_PROVENANCE_KEYS,
+    SPLIT_WORKER_PROVENANCE_KEYS,
     LoopState,
     Phase,
     SplitIntent,
@@ -84,6 +95,10 @@ from autoloop.worktask import (
 
 URL = "https://chatgpt.com/c/task-split-test"
 PARENT = "big-01"
+#: The retirement label a hand-built intent files both halves under. Fixed, so a
+#: test can name the exact archive and quarantine destinations that intent
+#: implies — which is what the wrong-identity tests below drop an impostor at.
+LABEL = "split-20260821T000000Z"
 
 
 # =============================================================================
@@ -755,7 +770,18 @@ def park_with_intent(env: Env, intent: SplitIntent) -> Orchestrator:
     return env.restart()
 
 
-def intent_for(env: Env, successors, *, parent=PARENT, label="split-20260821T000000Z"):
+def intent_for(env: Env, successors, *, parent=PARENT, label=LABEL):
+    """An intent exactly as ACCEPTANCE would have written it — including the
+    provenance binding WHICH execution record and WHICH worker repository it
+    undertakes to retire.
+
+    Captured through the orchestrator's own capture methods rather than
+    hand-built, so a test can never bind an identity the production path would
+    not have bound, and the negative tests below are testing the real
+    comparison rather than a fixture's idea of one.
+    """
+    record = env.orch._split_record_provenance(parent)
+    worker = env.orch._split_worker_provenance(parent)
     return SplitIntent(
         parent_id=parent,
         successors=tuple(
@@ -770,8 +796,10 @@ def intent_for(env: Env, successors, *, parent=PARENT, label="split-20260821T000
         ),
         reason="split it",
         label=label,
-        retire_record=env.execution_store.load(parent) is not None,
-        retire_worker=env.worker_repos.path_for(parent).exists(),
+        retire_record=record is not None,
+        retire_worker=worker is not None,
+        record_provenance=record,
+        worker_provenance=worker,
     )
 
 
@@ -874,6 +902,258 @@ def test_a_worker_that_vanished_without_being_quarantined_fails_closed(tmp_path)
     orch = park_with_intent(env, intent)
     assert_parked_with_intent_preserved(env, orch)
     assert "quarantined worker repository" in env.disk_state().question
+
+
+def replacement_record(env: Env, *, parent=PARENT, base="0" * 40, candidate="1" * 40):
+    """A DIFFERENT execution record living at the parent's own path — what a
+    re-dispatch, or an operator rebuilding a lost record, leaves behind after an
+    intent was written."""
+    execution = TaskExecution(
+        task_id=parent,
+        task_branch=f"autoloop/{parent}",
+        worktree_path=str(env.worker_repos.path_for(parent)),
+        task_base_sha=base,
+        candidate_sha=candidate,
+    )
+    env.execution_store.save(execution)
+    return execution
+
+
+def test_an_execution_record_replaced_after_acceptance_is_never_archived(tmp_path):
+    """The hole a `parent_id`-only intent leaves open. The record at
+    `executions/<parent>.json` is addressed by task id, so the thing living
+    there can be REPLACED between the crash and the recovery — and retiring by
+    id alone would archive that replacement, destroying a live attempt while
+    discharging the intent as though the accepted record had been retired."""
+    env = Env(tmp_path)
+    env.seed_execution()
+    intent = intent_for(env, (spec("big-01a"),))
+    replacement = replacement_record(env)
+
+    orch = park_with_intent(env, intent)
+    assert_parked_with_intent_preserved(env, orch)
+    assert "not the one this split accepted" in env.disk_state().question
+
+    # The replacement is exactly where it was, unarchived and unrewritten.
+    live = env.execution_store.load(PARENT)
+    assert live is not None
+    assert live.candidate_sha == replacement.candidate_sha
+    assert live.task_base_sha == replacement.task_base_sha
+    assert env.archives() == []
+    # ...and the worker half never moved either: one half that cannot be
+    # identified stops the retirement before ANY store is retired.
+    assert env.worker_repos.path_for(PARENT).exists()
+    assert env.quarantines() == []
+    # The registry half IS applied — it is driven from the intent and matches
+    # it — and that is safe precisely because the intent survives the park.
+    assert env.disk_registry().state_of(PARENT) is TaskState.RETIRED
+
+
+def test_a_worker_repository_replaced_after_acceptance_is_never_quarantined(tmp_path):
+    """The same hole on the worker side, and the reason the binding cannot be
+    the branch: `create()` derives `autoloop/<task_id>` from the id, so a rebuilt
+    worker reproduces the branch exactly. Only the repository's own HEAD tells
+    the accepted worker from the one that replaced it."""
+    env = Env(tmp_path)
+    env.seed_execution()
+    intent = intent_for(env, (spec("big-01a"),))
+
+    env.worker_repos.remove(PARENT)
+    (env.repo_root / "later.txt").write_text("work done afterwards\n", encoding="utf-8")
+    run_git(env.repo_root, "add", "-A")
+    run_git(env.repo_root, "commit", "-q", "-m", "later")
+    newer = run_git(env.repo_root, "rev-parse", "HEAD").strip()
+    env.worker_repos.create(PARENT, env.repo_root, newer)
+    replacement = env.worker_repos.path_for(PARENT)
+    assert newer != intent.worker_provenance["head_sha"]
+    assert run_git(replacement, "branch", "--show-current").strip() == (
+        intent.worker_provenance["branch"]
+    ), "the replacement wears the same branch — only HEAD distinguishes them"
+
+    orch = park_with_intent(env, intent)
+    assert_parked_with_intent_preserved(env, orch)
+    assert "not the one this split accepted" in env.disk_state().question
+
+    assert replacement.is_dir()
+    assert run_git(replacement, "rev-parse", "HEAD").strip() == newer
+    assert env.quarantines() == []
+    # Nothing moved at all — the record was still live and stays live.
+    assert env.execution_store.load(PARENT) is not None
+    assert env.archives() == []
+
+
+def test_an_archived_record_that_is_not_the_accepted_one_never_discharges(tmp_path):
+    """The other side of the same move. Both retirement destinations are derived
+    from `<parent>-<label>`, which anything can create — so a file sitting at the
+    archive path, for this task id and under this very label, must still be
+    identified before it is read as proof that the accepted record was
+    retired."""
+    env = Env(tmp_path)
+    execution = TaskExecution(
+        task_id=PARENT,
+        task_branch=f"autoloop/{PARENT}",
+        worktree_path=str(env.worker_repos.path_for(PARENT)),
+        task_base_sha=env.base_sha,
+    )
+    env.execution_store.save(execution)
+    intent = intent_for(env, (spec("big-01a"),))
+    assert intent.retire_record is True
+    assert intent.retire_worker is False, "this test isolates the record half"
+
+    env.execution_store.clear(PARENT)
+    archive_dir = env.execution_store.directory / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    impostor = archive_dir / f"{PARENT}-{LABEL}.json"
+    impostor.write_text(
+        json.dumps(
+            {
+                "task_id": PARENT,
+                "task_branch": "autoloop/somebody-else",
+                "worktree_path": "/elsewhere",
+                "task_base_sha": "9" * 40,
+                "candidate_sha": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # It passes the weaker name/id check, which is exactly why the identity
+    # comparison has to be the thing that decides.
+    assert archived_record_is_for(impostor, PARENT) is True
+
+    orch = park_with_intent(env, intent)
+    assert_parked_with_intent_preserved(env, orch)
+    assert "is not the one this split accepted" in env.disk_state().question
+    assert json.loads(impostor.read_text(encoding="utf-8"))["task_branch"] == (
+        "autoloop/somebody-else"
+    ), "a park preserves evidence; it never rewrites what it refused to accept"
+
+
+def test_a_quarantined_repository_that_is_not_the_accepted_worker_never_discharges(
+    tmp_path,
+):
+    """The worker half of the same rule: a directory at the quarantine path is
+    not proof that THIS worker was quarantined."""
+    env = Env(tmp_path)
+    env.worker_repos.create(PARENT, env.repo_root, env.base_sha)
+    intent = intent_for(env, (spec("big-01a"),))
+    assert intent.retire_worker is True
+    assert intent.retire_record is False, "this test isolates the worker half"
+
+    env.worker_repos.remove(PARENT)
+    impostor = env.workers_root.parent / "quarantine" / f"{PARENT}-{LABEL}"
+    impostor.mkdir(parents=True)
+    run_git(impostor, "init", "-q", "-b", f"autoloop/{PARENT}")
+    run_git(impostor, "config", "user.email", "test@example.com")
+    run_git(impostor, "config", "user.name", "Test")
+    run_git(impostor, "config", "commit.gpgsign", "false")
+    (impostor / "not-the-accepted-worker.txt").write_text("elsewhere\n", encoding="utf-8")
+    run_git(impostor, "add", "-A")
+    run_git(impostor, "commit", "-q", "-m", "impostor")
+    impostor_head = run_git(impostor, "rev-parse", "HEAD").strip()
+
+    orch = park_with_intent(env, intent)
+    assert_parked_with_intent_preserved(env, orch)
+    assert "is not the one this split accepted" in env.disk_state().question
+    assert run_git(impostor, "rev-parse", "HEAD").strip() == impostor_head
+    assert (impostor / "not-the-accepted-worker.txt").exists()
+
+
+def test_bookkeeping_written_after_acceptance_still_reconciles(tmp_path):
+    """The other direction, and the reason the binding is FIELDS rather than a
+    digest of the record file.
+
+    Exercised here: bookkeeping written to the still-LIVE record between
+    acceptance and recovery — counters, the attempt ledger, the assumptions and
+    the executor's report — none of which changes WHICH attempt the record
+    describes, and none of which may therefore turn a recoverable split into a
+    permanent park. `cli._clear_fault_budget_on_answer` writes one of exactly
+    these fields when an operator answers a blocker, which is how a real loop
+    reaches this shape; the archived side needs no equivalent test because a
+    record already moved to `archive/` is not written again by anything."""
+    env = Env(tmp_path)
+    env.seed_execution()
+    env.ask_for_split()
+    successors = (spec("big-01a"),)
+
+    crash = CrashAt(env.execution_store, "archive")
+    with pytest.raises(Crash):
+        env.orch._dispatch(split_plan(*successors))
+    crash.restore()
+
+    execution = env.execution_store.load(PARENT)
+    execution.fault_attempt_count = 0
+    execution.attempt_count += 1
+    execution.attempt_ledger = ("1|fault|agent_stall",)
+    execution.assumptions = ("read the narrowest thing",)
+    execution.report_summary = "what the last round claimed"
+    env.execution_store.save(execution)
+
+    assert env.restart()._resume_split_intent() is True
+    assert_split_complete(env, successors)
+
+
+def test_a_retirement_flag_that_is_not_a_boolean_is_corruption_not_a_coercion(tmp_path):
+    """`bool("false")` is True and `bool(0)` is False, so coercion fails in both
+    directions: one fabricates a retirement obligation that can never be
+    discharged, the other silently discharges a real one."""
+    env = Env(tmp_path)
+    env.seed_execution()
+    intent = intent_for(env, (spec("big-01a"),))
+
+    fabricates = intent.to_dict()
+    fabricates["retire_worker"] = "false"
+    with pytest.raises(StateError):
+        SplitIntent.from_dict(fabricates)
+
+    discharges = intent.to_dict()
+    discharges["retire_record"] = 0
+    with pytest.raises(StateError):
+        SplitIntent.from_dict(discharges)
+
+    # ...and the loop treats it as corruption rather than running on it.
+    state = env.store.load()
+    state.split_intent = fabricates
+    env.store.save(state)
+    orch = env.restart()
+    assert orch._resume_split_intent() is False
+    assert env.disk_state().split_intent is not None
+    assert env.execution_store.load(PARENT) is not None
+    assert env.worker_repos.path_for(PARENT).exists()
+
+
+def test_a_retirement_flag_without_the_identity_it_needs_is_corruption(tmp_path):
+    """Both directions of the pairing. A flag with no provenance would let
+    recovery retire whatever it finds; provenance with the flag off would
+    describe a retirement nobody undertook."""
+    env = Env(tmp_path)
+    env.seed_execution()
+    intent = intent_for(env, (spec("big-01a"),))
+
+    unbound = intent.to_dict()
+    unbound.pop("worker_provenance")
+    with pytest.raises(StateError):
+        SplitIntent.from_dict(unbound)
+
+    unclaimed = intent.to_dict()
+    unclaimed["retire_record"] = False
+    with pytest.raises(StateError):
+        SplitIntent.from_dict(unclaimed)
+
+    someone_else = intent.to_dict()
+    someone_else["record_provenance"] = {
+        **someone_else["record_provenance"],
+        "task_id": "another-task",
+    }
+    with pytest.raises(StateError):
+        SplitIntent.from_dict(someone_else)
+
+    empty_identity = intent.to_dict()
+    empty_identity["worker_provenance"] = {
+        **empty_identity["worker_provenance"],
+        "head_sha": "",
+    }
+    with pytest.raises(StateError):
+        SplitIntent.from_dict(empty_identity)
 
 
 def test_an_intent_missing_a_retirement_flag_is_corruption_not_a_default(tmp_path):
@@ -1109,6 +1389,18 @@ def test_the_intent_carries_every_field_recovery_needs(tmp_path):
     assert intent.successors[0]["approved_paths"] == ("A.py", "B.py")
     assert intent.reason
     assert intent.created_at
+
+    # ...including WHICH record and WHICH repository the two retirement flags
+    # are about, read from the stores themselves at acceptance.
+    worker = env.worker_repos.path_for(PARENT)
+    assert set(intent.record_provenance) == set(SPLIT_RECORD_PROVENANCE_KEYS)
+    assert intent.record_provenance == env.execution_store.identity(PARENT)
+    assert set(intent.worker_provenance) == set(SPLIT_WORKER_PROVENANCE_KEYS)
+    assert intent.worker_provenance["path"] == str(worker)
+    assert intent.worker_provenance["branch"] == f"autoloop/{PARENT}"
+    assert intent.worker_provenance["head_sha"] == run_git(
+        worker, "rev-parse", "HEAD"
+    ).strip()
 
 
 def test_an_intent_round_trips_through_the_state_file_unchanged(tmp_path):

@@ -1522,9 +1522,21 @@ unfinished intent rather than three stores contradicting each other.
   intent, so the two halves name each other on disk and remain inspectable.
 - **The intent is discharged only on proof.** `TaskRegistry.split_applied`
   gates the registry save and raises on contradiction rather than overwriting;
-  `_split_retirement_gap` requires the archived record to exist AND to identify
-  itself as this task's (`worktask.archived_record_is_for`) and the quarantine
-  directory to exist. Any mismatch parks `loop_fatal` with the intent preserved.
+  `_split_retirement_gap` requires the archived record to exist, to identify
+  itself as this task's (`worktask.archived_record_is_for`) and to BE the record
+  the intent accepted, and the quarantine directory to exist and to hold the
+  repository the intent accepted. Any mismatch parks `loop_fatal` with the
+  intent preserved.
+- **Neither half is retired by task id alone.** The intent binds the identity of
+  the execution record (`state.SPLIT_RECORD_PROVENANCE_KEYS`, read by
+  `worktask.execution_record_identity`) and of the worker repository (its branch
+  and HEAD commit, `orchestrator._worker_repo_identity`) at acceptance.
+  `_verify_split_retirement_sources` re-checks both before anything moves, so a
+  record or repository REPLACED after the intent was written — a re-dispatch, an
+  operator repair, some other repo moved into the quarantine path — is never
+  archived, quarantined or accepted as proof; it parks with the intent intact
+  instead. Without this a crash window ended in destroyed live work and an
+  intent falsely discharged, which is the one outcome here that is not a move.
 - **Bounded repetition.** One outstanding ask at a time, and
   `MAX_DERIVATION_DEPTH` stops work being re-decomposed indefinitely.
 

@@ -65,7 +65,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .errors import StateCorruptError
-from .state import utcnow_iso
+from .state import SPLIT_RECORD_PROVENANCE_KEYS, utcnow_iso
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -704,6 +704,17 @@ class TaskExecutionStore:
     def clear(self, task_id: str) -> None:
         self._path(task_id).unlink(missing_ok=True)
 
+    def identity(self, task_id: str) -> dict | None:
+        """The LIVE record's provenance (`execution_record_identity`), or None
+        when there is no readable record for `task_id`.
+
+        Read straight off the file rather than through `load`, so the same
+        function produces both sides of every split-provenance comparison —
+        the value captured at acceptance, the live record checked before it is
+        archived, and the archived file checked afterwards.
+        """
+        return execution_record_identity(self._path(task_id))
+
     def archive(self, task_id: str, label: str) -> Path | None:
         """MOVE (never delete) the record for `task_id` into
         `directory/archive/<task_id>-<label>.json`. Returns the destination,
@@ -745,6 +756,42 @@ class TaskExecutionStore:
             )
         os.replace(path, dest)
         return dest
+
+
+def execution_record_identity(path: Path) -> dict | None:
+    """WHICH attempt the execution record at `path` describes — exactly
+    `state.SPLIT_RECORD_PROVENANCE_KEYS`, as strings — or None when there is no
+    readable record there.
+
+    The record-side half of split provenance (`state.SplitIntent`). A split
+    intent captures this at acceptance and compares it back, unchanged, before
+    the record is archived and again when an already archived one is offered as
+    proof — so a record that was replaced or re-created for the same task id in
+    between is recognised as a different record rather than retired as if it
+    were the accepted one.
+
+    Deliberately NOT a digest of the file. Most of a `TaskExecution` is
+    bookkeeping that legitimately moves while an intent is outstanding — down to
+    `cli._clear_fault_budget_on_answer`, which rewrites `fault_attempt_count`
+    when an operator answers the very blocker a parked split raises — and a
+    whole-file hash would turn answering that park into a permanent one. See
+    `SPLIT_RECORD_PROVENANCE_KEYS` for the fields this reads and the residual it
+    accepts.
+
+    Reads the file, never `TaskExecution` — the same reason
+    `archived_record_is_for` does: an archived record is a plain JSON file at a
+    path nothing else indexes, and this must answer for it too. None (never an
+    exception) for a missing, unreadable, non-object or task-id-less file,
+    because every one of those means the same thing to a caller: this is not the
+    record you accepted, so nothing may be discharged on the strength of it.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("task_id"):
+        return None
+    return {key: str(data.get(key, "")) for key in SPLIT_RECORD_PROVENANCE_KEYS}
 
 
 def archived_record_is_for(path: Path, task_id: str) -> bool:

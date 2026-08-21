@@ -270,6 +270,7 @@ from .state import (
     RotationRecord,
     SplitIntent,
     StateStore,
+    split_worker_identity,
     utcnow_iso,
 )
 from .inbox import apply_requests
@@ -299,6 +300,7 @@ from .worktask import (
     accumulate_assumptions,
     archived_record_is_for,
     attempt_outcome,
+    execution_record_identity,
     compose_reason,
     format_attempt,
     reconcile_after_crash,
@@ -3592,6 +3594,20 @@ class Orchestrator:
     # The same shape `publisher.py` already uses for a push that may or may not
     # have landed, and `worktask.CommitIntent` for a commit that may or may not
     # have run. This is the third instance of one pattern, not a new mechanism.
+    #
+    # WHAT THE INTENT HAS TO SAY, and the part that is easy to get wrong. "Retire
+    # the parent" is not enough, because the two stores it names are addressed by
+    # task id and the thing living at that address can CHANGE between the crash
+    # and the recovery: the parent re-dispatched, a record repaired by hand, a
+    # worker rebuilt. Recovery keyed on the id alone would then archive and
+    # quarantine those replacements — destroying live work, and discharging the
+    # intent as though the original had been retired. So the intent binds WHICH
+    # record and WHICH repository it accepted (`state.SPLIT_RECORD_PROVENANCE_KEYS`,
+    # `state.SPLIT_WORKER_PROVENANCE_KEYS`), captured once at acceptance, and
+    # every step compares against it: before a live half is moved
+    # (`_verify_split_retirement_sources`), and again when an already archived or
+    # quarantined half is offered as proof (`_split_retirement_gap`). A mismatch
+    # parks with the intent intact; nothing contradictory is ever overwritten.
 
     def _accept_split(self, directive: Directive, parent_id: str) -> None:
         """Turn a `plan` answering a split ask into a retirement of `parent_id`
@@ -3605,10 +3621,12 @@ class Orchestrator:
              been written. A refusal leaves all three stores untouched and the
              ask standing, and costs a denial from the ordinary plan budget.
           2. DURABLE. The intent — parent, full successor definitions, the
-             single retirement label, and which retirement halves there is
-             anything to do — is written in ONE save, together with clearing the
-             ask marker. After this save the split WILL happen: either now, or
-             on the next start.
+             single retirement label, which retirement halves there is anything
+             to do, and the identity of each of those halves — is written in ONE
+             save, together with clearing the ask marker. After this save the
+             split WILL happen: either now, or on the next start, and against
+             the record and repository it actually accepted rather than whatever
+             later occupies their paths.
           3. IDEMPOTENT. `_reconcile_split_intent` drives the registry, the
              execution record and the worker repository to match the intent,
              verifies each, and only then clears it.
@@ -3648,6 +3666,12 @@ class Orchestrator:
                     )
                 self._log("split_intent_reentered", data={"task_id": parent_id})
             else:
+                # Read BEFORE anything is written, and only here: these two
+                # identify the halves this split is undertaking to retire, and
+                # a half that exists but cannot be identified raises rather
+                # than being recorded as absent (see each method).
+                record_provenance = self._split_record_provenance(parent_id)
+                worker_provenance = self._split_worker_provenance(parent_id)
                 intent = SplitIntent(
                     parent_id=parent_id,
                     successors=tuple(successors),
@@ -3658,8 +3682,16 @@ class Orchestrator:
                     # exists to avoid.
                     reason=self._split_reason(directive),
                     label=self._split_label(),
-                    retire_record=self._split_record_exists(parent_id),
-                    retire_worker=self._split_worker_exists(parent_id),
+                    # WHICH record and WHICH repository this intent undertakes
+                    # to retire, captured here and never re-derived: a value
+                    # read again during recovery is a value that can describe
+                    # whatever replaced the original. Both flags are derived
+                    # from the same read as the provenance beside them, so a
+                    # half that exists can never be recorded as "nothing to do".
+                    retire_record=record_provenance is not None,
+                    retire_worker=worker_provenance is not None,
+                    record_provenance=record_provenance,
+                    worker_provenance=worker_provenance,
                 )
                 # ONE save, and the pairing is load-bearing in both directions:
                 # the intent must not become durable while the ask is still
@@ -3678,6 +3710,8 @@ class Orchestrator:
                         "label": intent.label,
                         "retire_record": intent.retire_record,
                         "retire_worker": intent.retire_worker,
+                        "record_provenance": intent.record_provenance,
+                        "worker_provenance": intent.worker_provenance,
                     },
                 )
             self._reconcile_split_intent()
@@ -3812,15 +3846,91 @@ class Orchestrator:
         stamp = utcnow_iso().replace("+00:00", "Z").replace(":", "").replace("-", "")
         return f"split-{stamp}"
 
-    def _split_record_exists(self, task_id: str) -> bool:
-        if self._execution_store is None:
-            return False
-        return self._execution_store.load(task_id) is not None
+    def _split_record_provenance(self, task_id: str) -> dict | None:
+        """Identity of the execution record this split would archive, or None
+        when there is none to archive.
 
-    def _split_worker_exists(self, task_id: str) -> bool:
+        `load` first, deliberately: it RAISES on a corrupt record, and a corrupt
+        record is the one case where "cannot be read" must not become "there is
+        nothing here". Reading it as absent would write `retire_record=False`
+        into the intent and leave a real record behind, permanently, with the
+        intent discharged and nothing to say it happened.
+        """
+        if self._execution_store is None:
+            return None
+        if self._execution_store.load(task_id) is None:
+            return None
+        provenance = self._execution_store.identity(task_id)
+        # Almost unreachable: an unreadable record already raised in `load`
+        # above. What is left is the residue — a record whose own `task_id` is
+        # empty — and it is refused rather than read as "nothing to retire".
+        if provenance is None:  # pragma: no cover - see above
+            raise StateError(
+                f"the execution record for '{task_id}' exists but cannot be "
+                "identified, so a split cannot record which record it is retiring"
+            )
+        return provenance
+
+    def _split_worker_provenance(self, task_id: str) -> dict | None:
+        """Identity of the worker repository this split would quarantine, or
+        None when there is none to quarantine.
+
+        Same rule as the record half, and the raise matters more here: a
+        directory that exists but is not a readable git repository is exactly
+        the shape a half-moved or hand-mangled worker wears, and recording it as
+        "nothing to quarantine" would discharge the intent over the top of it.
+        """
         if self._worker_repos is None:
-            return False
-        return self._worker_repos.path_for(task_id).exists()
+            return None
+        path = self._worker_repos.path_for(task_id)
+        if not path.exists():
+            return None
+        provenance = self._worker_repo_identity(path)
+        if provenance is None:
+            raise StateError(
+                f"the worker repository at {path} exists but its branch and HEAD "
+                "cannot be read, so a split cannot record which repository it is "
+                "quarantining"
+            )
+        return provenance
+
+    def _worker_repo_identity(self, path: Path) -> dict | None:
+        """`{path, branch, head_sha}` read from the repository at `path`, or
+        None when it is not one this loop can identify.
+
+        The worker-side counterpart of `worktask.execution_record_identity`, and
+        the only identity a moved directory keeps: the path changes when the
+        repository is quarantined, so the proof has to come from inside it.
+
+        `worker_repo_is_reusable` confirms the two facts that make the reading
+        mean anything — `path` is the TOP LEVEL of a repository (not merely a
+        directory sitting inside one, which would otherwise answer with that
+        repository's branch and HEAD) and the branch just read is really the one
+        checked out there. It is used here as an identity guard rather than for
+        its own question; nothing about this call reuses a worker.
+
+        Under `worker_env()`, like every other worker-side git call here: a
+        read-only probe has no business resolving the calling process's ambient
+        credential helper or system config either.
+
+        None — never an exception — for anything unreadable, so a caller can
+        treat "not a repository", "no commits" and "not there" identically: none
+        of them is proof of which worker this is.
+        """
+        path = Path(path)
+        if not path.is_dir():
+            return None
+        git = GitGateway(path, self._policy, env=worker_env())
+        try:
+            branch = git.current_branch()
+            head_sha = git.head_sha()
+        except (GitError, OSError):
+            return None
+        if not branch or not head_sha:
+            return None
+        if not worker_repo_is_reusable(path, branch):
+            return None
+        return {"path": str(path), "branch": branch, "head_sha": head_sha}
 
     def _split_quarantine_dest(self, task_id: str, label: str) -> Path:
         """Where `WorkerRepoManager.quarantine` will put (or has put) this
@@ -3911,6 +4021,12 @@ class Orchestrator:
         them — and a restart re-enters reconciliation rather than starting from a
         state nobody can reconstruct. Clearing it here would discard exactly the
         evidence this design exists to keep.
+
+        The message distinguishes the two positions it can be reached from,
+        because they ask an operator to look at different things: an intent that
+        IS on disk describes work that will be re-attempted on the next start,
+        while a failure while capturing the halves' identities happens before
+        the intent save and has changed nothing at all.
         """
         self._log(
             "split_reconcile_failed",
@@ -3919,11 +4035,18 @@ class Orchestrator:
                 "error": f"{type(exc).__name__}: {exc}",
             },
         )
+        outstanding = bool(self.state.split_intent)
+        where = (
+            "The split intent is still on disk in the state file; inspect the "
+            "task registry, the execution record and the worker repository "
+            "against it before resuming."
+            if outstanding
+            else "No split intent was recorded, so no store was touched and the "
+            "split ask still stands."
+        )
         self._to_needs_user(
-            f"a split of task '{parent_id}' is recorded but could not be applied "
-            f"or verified: {exc}. The split intent is still on disk in the state "
-            "file; inspect the task registry, the execution record and the worker "
-            "repository against it before resuming.",
+            f"a split of task '{parent_id}' could not be applied or verified: "
+            f"{exc}. {where}",
             resume_phase=self.state.phase,
             kind="loop_fatal",
             code="split_intent_unreconciled",
@@ -3947,12 +4070,15 @@ class Orchestrator:
           * the registry through `TaskRegistry.split_applied`, which also gates
             the save — a registry that already describes the split is not
             rewritten;
-          * the execution record and the worker repository through
-            `_split_retirement_gap`, which proves the archive and the quarantine
-            EXIST (and that the archived record is really this task's) instead
-            of reading the live copies' absence as success. Absence is what a
+          * the execution record and the worker repository twice over — through
+            `_verify_split_retirement_sources`, which identifies each half that
+            is still live against what the intent bound before it moves it, and
+            through `_split_retirement_gap`, which proves the archive and the
+            quarantine EXIST and are the ones this split accepted, instead of
+            reading the live copies' absence as success. Absence is what a
             deletion, a half-finished move and a never-existing record all look
-            like.
+            like; existence at the destination is what a stray file and someone
+            else's repository also look like.
 
         A store that disagrees with the intent raises rather than being
         overwritten, and the intent survives the raise (`_park_split_failure`).
@@ -4040,8 +4166,16 @@ class Orchestrator:
         Each half is guarded by what the intent recorded at acceptance AND by
         what is on disk now, so a second run skips what the first one finished
         instead of raising on a destination that already exists.
+
+        NOTHING MOVES until both halves have been identified
+        (`_verify_split_retirement_sources`). Verifying each half immediately
+        before its own move would be enough to protect that half, but it would
+        let a mismatch on the worker be discovered with the record already
+        archived — a store retired against an intent that is about to park,
+        which is the shape this whole design exists to avoid.
         """
         parent_id = intent.parent_id
+        self._verify_split_retirement_sources(intent)
         if (
             intent.retire_record
             and self._execution_store is not None
@@ -4063,15 +4197,72 @@ class Orchestrator:
                 data={"task_id": parent_id, "path": str(dest)},
             )
 
+    def _verify_split_retirement_sources(self, intent: SplitIntent) -> None:
+        """Refuse to move anything that is not what this split accepted.
+
+        The hole this closes. An intent that names only `parent_id` says which
+        TASK to retire, not which record and which repository — so a crash after
+        the intent was written, followed by the parent being re-dispatched or
+        repaired by hand, leaves a replacement at both of those paths, and a
+        recovery keyed on the id alone would archive and quarantine the
+        REPLACEMENT: destroying live work and discharging the intent as though
+        the original had been retired. Neither loss is recoverable and neither
+        announces itself.
+
+        So each half that is still LIVE is identified against what the intent
+        bound at acceptance, and a mismatch raises — which parks with the intent
+        preserved (`_park_split_failure`), because a durable state that
+        contradicts the intent is exactly the thing an operator has to see. A
+        half that is no longer live is not this method's business: whether what
+        is at the archive or the quarantine destination is really this split's
+        work is proven by `_split_retirement_gap`, on the other side of the move.
+        """
+        parent_id = intent.parent_id
+        if (
+            intent.retire_record
+            and self._execution_store is not None
+            and self._execution_store.load(parent_id) is not None
+        ):
+            live = self._execution_store.identity(parent_id)
+            if live != intent.record_provenance:
+                raise StateError(
+                    f"the live execution record for '{parent_id}' is not the one "
+                    f"this split accepted (accepted {intent.record_provenance}, "
+                    f"found {live}) — it was replaced or rewritten after the "
+                    "intent was recorded, and archiving it would retire work "
+                    "this split never saw"
+                )
+        if intent.retire_worker and self._worker_repos is not None:
+            src = self._worker_repos.path_for(parent_id)
+            if src.exists():
+                accepted = split_worker_identity(intent.worker_provenance)
+                live = split_worker_identity(self._worker_repo_identity(src))
+                if live != accepted:
+                    raise StateError(
+                        f"the worker repository at {src} is not the one this "
+                        f"split accepted (accepted {accepted}, found {live}) — "
+                        "quarantining it would file away a repository this split "
+                        "never saw"
+                    )
+
     def _split_retirement_gap(self, intent: SplitIntent) -> str:
         """What still stands between this intent and a completed retirement, as
         text. Empty means both halves are PROVEN done.
 
-        Proof, not absence. `retire_record` / `retire_worker` say which halves
-        there was anything to do, so a missing archive is read as a missing
-        archive rather than as "there was never a record" — and the live copies
-        being gone is never on its own enough, because a deletion looks exactly
-        like a successful move from that side.
+        Proof, not absence, and proof of the RIGHT one. `retire_record` /
+        `retire_worker` say which halves there was anything to do, so a missing
+        archive is read as a missing archive rather than as "there was never a
+        record" — and the live copies being gone is never on its own enough,
+        because a deletion looks exactly like a successful move from that side.
+
+        Existence at the intent's own destination is not enough either. Both
+        destinations are derived from `<parent>-<label>`, which anything can
+        create: a stray file at the archive path, or some other repository moved
+        into the quarantine path, would otherwise discharge an intent whose work
+        never happened. So each half is identified against what the intent bound
+        at acceptance — the archived record's own provenance, the quarantined
+        repository's own branch and HEAD — exactly as the live halves are
+        identified before they are moved.
         """
         parent_id = intent.parent_id
         problems: list[str] = []
@@ -4095,6 +4286,14 @@ class Orchestrator:
                     problems.append(
                         f"no archived execution record for '{parent_id}' at {dest}"
                     )
+                else:
+                    archived = execution_record_identity(dest)
+                    if archived != intent.record_provenance:
+                        problems.append(
+                            f"the archived execution record at {dest} is not the "
+                            "one this split accepted (accepted "
+                            f"{intent.record_provenance}, found {archived})"
+                        )
         if intent.retire_worker:
             if self._worker_repos is None:
                 problems.append(
@@ -4108,6 +4307,15 @@ class Orchestrator:
                     problems.append(f"the worker repository {src} still exists")
                 elif not dest.is_dir():
                     problems.append(f"no quarantined worker repository at {dest}")
+                else:
+                    found = split_worker_identity(self._worker_repo_identity(dest))
+                    if found != split_worker_identity(intent.worker_provenance):
+                        problems.append(
+                            f"the quarantined worker repository at {dest} is not "
+                            "the one this split accepted (accepted "
+                            f"{split_worker_identity(intent.worker_provenance)}, "
+                            f"found {found})"
+                        )
         return "; ".join(problems)
 
     def _split_request(
