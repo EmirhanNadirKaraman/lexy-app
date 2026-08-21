@@ -15,6 +15,7 @@ from autoloop.prompts import (
     parse_error_payload,
     plan_rejected_payload,
     policy_denied_payload,
+    represented_candidate_note,
     review_mismatch_payload,
     same_review_note,
     user_answer_payload,
@@ -104,6 +105,38 @@ def test_the_three_carrying_corrections_can_name_the_review_they_continue(build)
     # review packet (orchestrator._current_pending_postcommit)
     assert "a" * 40 not in payload
     assert "THIS request" in payload
+
+
+def test_the_re_presentation_note_leads_the_packet_and_denies_new_work():
+    """bind-01. `_handle_unbound_push` re-presents an already-reviewed
+    candidate, and the packet body opens with "The executor committed task ..."
+    — which reads as a fresh round unless the note contradicts it first."""
+    payload = (
+        TEMPLATES["postcommit_review"]
+        .render(
+            task_id="t1",
+            task_title="Title",
+            packet="THE PACKET",
+            note=represented_candidate_note("push refused — bound to no candidate"),
+        )
+        .strip()
+    )
+    assert payload.startswith("YOUR PREVIOUS `push` WAS REFUSED")
+    assert "push refused — bound to no candidate" in payload   # the verdict verbatim
+    assert "No new work was produced" in payload
+    assert "THE PACKET" in payload
+
+
+def test_an_ordinary_postcommit_packet_is_unaffected_by_the_note_field():
+    """The negative control for the field above: empty note, stripped render,
+    and the payload is exactly what it was before the field existed."""
+    payload = (
+        TEMPLATES["postcommit_review"]
+        .render(task_id="t1", task_title="Title", packet="THE PACKET", note="")
+        .strip()
+    )
+    assert payload.startswith("The executor committed task t1")
+    assert "REFUSED" not in payload
 
 
 def test_policy_denied_payload():

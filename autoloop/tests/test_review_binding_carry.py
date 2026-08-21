@@ -12,18 +12,24 @@ correctly refused every later packet, each refusal was a `stop`, each `stop`
 ended the session, each new session sent a kickoff, and the loop burned a full
 round every five minutes with `needs_attention` false throughout.
 
-Two independent mechanisms close it, and both are exercised here:
+Three independent mechanisms close it, and all three are exercised here:
 
   * the CARRY — a correction that is still answering an unchanged review packet
     inherits that packet's binding (`_carry_postcommit_binding`);
   * the LEDGER — every request sent carrying a binding is remembered with the
     stamp it published, so an approval naming an earlier request resolves
     against that request rather than against whatever is most recent
-    (`_resolve_reviewed_packet`).
+    (`_resolve_reviewed_packet`), and stays authoritative through destination
+    selection, stamp verification, staleness and publication;
+  * the RE-PRESENTATION — a `push` that really is bound to nothing is still
+    refused, but the refusal now carries the existing candidate back to the
+    reviewer as a fresh review packet (`_handle_unbound_push`), produced
+    without running the executor and without a new commit, so the refusal ends
+    somewhere the reviewer can act.
 
-Neither widens what a `push` may publish. `test_postcommit_review.py` holds the
-end-to-end run() version of the headline case; this file is the mechanism, the
-precedence rule and the negatives.
+None of them widens what a `push` may publish. `test_postcommit_review.py` holds
+the end-to-end run() version of the headline case; this file is the mechanism,
+the precedence rule and the negatives.
 
 Real git throughout, with the small `run_git`/`gateway`/`WritingExecutor`
 helpers duplicated rather than imported — this codebase's convention for
@@ -37,6 +43,7 @@ import subprocess
 from dataclasses import asdict
 from pathlib import Path
 
+from autoloop.changeset_review import build_changeset_binding, build_changeset_packet
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision, Directive, ReviewRef
 from autoloop.executor import ExecutionOutcome
@@ -44,6 +51,7 @@ from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import Orchestrator
 from autoloop.policy import PolicyConfig, PolicyEngine
+from autoloop.prompts import TEMPLATES
 from autoloop.state import (
     MAX_POSTCOMMIT_PACKETS,
     LastResponse,
@@ -53,6 +61,7 @@ from autoloop.state import (
 )
 from autoloop.tasks import Task, TaskRegistry, TaskStore
 from autoloop.transcript import TranscriptLogger
+from autoloop.worker_env import worker_repo_is_reusable
 from autoloop.worktask import IntentStore, TaskExecutionStore
 from autoloop.worktree import WorktreeManager
 
@@ -442,6 +451,93 @@ def test_a_push_naming_an_earlier_packet_publishes_after_last_response_moved_on(
     assert "push_missing_review_binding" not in transcript
 
 
+def test_a_stamped_earlier_packet_beats_a_changeset_response_in_hand(tmp_path):
+    """The sharpest case for "authoritative", because here the two candidates
+    are DIFFERENT COMMITS IN DIFFERENT REPOSITORIES.
+
+    `last_response` answers an operator-changeset packet, so it carries a
+    `changeset` binding; the approval reaches back and stamps an earlier
+    postcommit packet. The reviewed request has to stay authoritative through
+    all four decisions — which branch the policy gate judges, which stamp
+    `verify_review` checks, whether the HEAD-moved staleness check applies (the
+    changeset exemption must NOT be inherited), and which dispatch branch
+    publishes. Routing on `last_response.changeset` at the last of those would
+    publish the operator's commit against an approval that named the task's.
+
+    The operator's commit is deliberately made BEFORE the postcommit packet is
+    rendered: that keeps the main checkout's HEAD equal to what the packet
+    stamped, so this test proves the POSITIVE (the right candidate publishes)
+    rather than a head_moved refusal that would pass whatever the routing did.
+    There is no publisher configured, so a regression to the changeset path
+    cannot quietly publish either — it parks on `changeset_publisher_required`.
+    """
+    # A task id that cannot occur by accident in the changeset packet's text:
+    # `_current_pending_postcommit` binds a payload that contains all four
+    # identifiers, and a two-character id like "t1" could turn up inside a diff
+    # or a stat line, failing the `postcommit is None` assertion below for a
+    # reason that has nothing to do with routing.
+    orch, repo_root, worktrees, _execution_store, task = build(
+        tmp_path,
+        WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"}),
+        task_id="binding-task",
+    )
+    bare = make_bare(tmp_path)
+    run_git(repo_root, "remote", "add", "origin", str(bare))
+    # `main` is protected, and `build_changeset_binding` refuses a protected
+    # branch outright — an operator changeset lives on its own branch.
+    run_git(repo_root, "checkout", "-q", "-b", "feature/operator")
+    changeset_base = orch._git.head_sha()
+    (repo_root / "operator.txt").write_text("operator work\n")
+    run_git(repo_root, "add", "-A")
+    run_git(repo_root, "commit", "-q", "-m", "operator changeset")
+    changeset_candidate = orch._git.head_sha()
+
+    packet = send_review_packet(orch, task.id)
+    candidate = packet.postcommit.candidate_sha
+    task_branch = packet.postcommit.task_branch
+    assert candidate != changeset_candidate
+
+    # ...and only then does the changeset review packet go out, so the response
+    # in hand is changeset-bound while the approval names the packet above.
+    orch.state.pending_request = None
+    orch.state.phase = Phase.READY.value
+    binding = build_changeset_binding(
+        orch._git, orch._policy, changeset_base, changeset_candidate
+    )
+    orch.state.changeset = asdict(binding)
+    orch.state.outbox = TEMPLATES["changeset_review"].render(
+        branch=binding.branch,
+        dest_ref=binding.dest_ref,
+        packet=build_changeset_packet(orch._git, binding),
+    )
+    orch._step_ready()
+    changeset_request = orch.state.pending_request
+    assert changeset_request.changeset is not None
+    assert changeset_request.postcommit is None
+
+    answer(
+        orch,
+        changeset_request,
+        push_reply(packet.request_id, packet.head_sha, packet.report_sha256),
+    )
+    orch._step_executing()
+
+    worktree_git = GitGateway(worktrees.path_for(task.id), PolicyEngine(PolicyConfig()))
+    assert worktree_git.remote_ref_sha("origin", f"refs/heads/{task_branch}") == candidate
+    published = run_git(bare, "for-each-ref", "--format=%(refname) %(objectname)")
+    # The positive is asserted against the SAME string the two negatives read,
+    # so neither of them can pass on an empty remote.
+    assert f"refs/heads/{task_branch} {candidate}" in published
+    assert binding.dest_ref not in published
+    assert changeset_candidate not in published
+    # the changeset binding is untouched — `_dispatch_changeset_push` clears it
+    # on publication, so this is also proof that path never ran
+    assert orch.state.changeset == asdict(binding)
+    transcript = orch._config.transcript_file.read_text(encoding="utf-8")
+    assert "changeset_pushed" not in transcript
+    assert "changeset_publisher_required" not in transcript
+
+
 def test_a_push_naming_a_superseded_packet_is_refused_as_stale(tmp_path):
     """The obvious attack on the new resolution path: reach back past a round
     that has already advanced the candidate. `_dispatch_task_push` already
@@ -552,9 +648,8 @@ def test_re_recording_a_request_replaces_its_entry(tmp_path):
 
 
 def test_an_unbound_push_is_still_refused_and_says_what_to_do_next(tmp_path):
-    orch, repo_root, _worktrees, _execution_store, task = build(
-        tmp_path, WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
-    )
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, repo_root, _worktrees, _execution_store, task = build(tmp_path, executor)
     bare = make_bare(tmp_path)
     run_git(repo_root, "remote", "add", "origin", str(bare))
     # a real, unpublished candidate exists — this is the situation in which a
@@ -581,7 +676,12 @@ def test_an_unbound_push_is_still_refused_and_says_what_to_do_next(tmp_path):
     payload = orch.state.outbox
     assert "alr-never-0001" in payload          # why it was refused
     assert "Nothing was pushed" in payload
-    assert task.id in payload and "`revise`" in payload   # what to do about it
+    # ...and what to do about it is the packet itself, not an instruction: the
+    # same candidate, presented again, with no round of work in between.
+    assert "RE-PRESENTED" in payload
+    assert task.id in payload
+    assert orch.state.task_execution["candidate_sha"] in payload
+    assert executor.calls == 1
 
 
 def test_an_unbound_push_with_no_candidate_at_all_says_so_honestly(tmp_path):
@@ -630,3 +730,148 @@ def test_the_retired_legacy_decisions_are_still_refused_as_legacy(tmp_path):
         assert "legacy_git_path_retired" in transcript
         assert "push_missing_review_binding" not in transcript
         assert "no longer supported" in orch.state.outbox
+
+
+# =============================================================================
+# 4. THE RE-PRESENTATION — the refusal hands the candidate back for review
+# =============================================================================
+#
+# A refusal that only says "no" is what livelocked prof-01. The recovery is the
+# packet itself: the SAME committed candidate, verified again and rendered
+# again, so the approval the reviewer already wanted to give has a request to
+# answer. It must cost no work — no executor run, no new commit — and it must
+# not be reachable on the strength of a state field nobody checked.
+
+
+def test_a_refused_unbound_push_re_presents_the_same_candidate_and_publishes(tmp_path):
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    # A task id long enough that "the payload names this task" cannot be
+    # satisfied by coincidence — the re-presented packet has to bind ITSELF,
+    # and a two-character id could appear anywhere in a diff.
+    orch, repo_root, worktrees, execution_store, task = build(
+        tmp_path, executor, task_id="binding-task"
+    )
+    bare = make_bare(tmp_path)
+    run_git(repo_root, "remote", "add", "origin", str(bare))
+    packet = send_review_packet(orch, task.id)
+    candidate = packet.postcommit.candidate_sha
+    branch = packet.postcommit.task_branch
+    assert executor.calls == 1
+
+    orch.state.pending_request = None
+    orch.state.last_response = LastResponse(
+        request_id="alr-x-0002", raw="{}", received_at="now"
+    )
+    orch._dispatch(
+        Directive(
+            decision=Decision.PUSH,
+            reason="approved",
+            reviewed=ReviewRef("alr-never-0001", "head", "report"),
+        )
+    )
+
+    # NOTHING was produced to make this recovery: same commit, no executor call,
+    # and the record still points at the same candidate.
+    assert executor.calls == 1
+    assert execution_store.load(task.id).candidate_sha == candidate
+    assert orch.state.phase == Phase.READY.value
+    transcript = orch._config.transcript_file.read_text(encoding="utf-8")
+    assert "push_missing_review_binding" in transcript
+    assert "push_binding_recovery" in transcript
+
+    orch._step_ready()
+    fresh = orch.state.pending_request
+    assert fresh.request_id != packet.request_id
+    assert fresh.postcommit is not None
+    assert fresh.postcommit.candidate_sha == candidate
+    # DERIVED from its own text, not carried: the binding's `packet_sha256` is
+    # THIS request's digest, which is exactly what a re-presentation is and what
+    # a correction (see the carry tests above) must never be.
+    assert fresh.postcommit.packet_sha256 == fresh.report_sha256
+    # ...and because it really presented the candidate, it re-stamps the
+    # execution record, where a correction deliberately does not.
+    presented = execution_store.load(task.id)
+    assert presented.review_request_id == fresh.request_id
+    assert presented.presented_report_sha256 == fresh.report_sha256
+
+    answer(orch, fresh, push_reply(fresh.request_id, fresh.head_sha, fresh.report_sha256))
+    orch._step_executing()
+
+    worktree_git = GitGateway(worktrees.path_for(task.id), PolicyEngine(PolicyConfig()))
+    assert worktree_git.remote_ref_sha("origin", f"refs/heads/{branch}") == candidate
+    assert executor.calls == 1
+
+
+def test_the_re_presentation_needs_a_live_worker_not_a_state_field(tmp_path):
+    """`state.task_execution` proves a commit was made once, in some process —
+    not that it is still there. The claim in the refusal (the record names it,
+    the worker is on the recorded branch, the commit object resolves) is made
+    only after all three have actually been read."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, _repo, _worktrees, execution_store, task = build(tmp_path, executor)
+    send_review_packet(orch, task.id)
+    assert orch.state.task_execution["candidate_sha"]
+
+    # The record still names a candidate; the worker it names is not there.
+    execution = execution_store.load(task.id)
+    execution.worktree_path = str(tmp_path / "worker-that-is-not-there")
+    execution_store.save(execution)
+
+    orch.state.pending_request = None
+    orch.state.last_response = LastResponse(
+        request_id="alr-x-0002", raw="{}", received_at="now"
+    )
+    orch._dispatch(
+        Directive(
+            decision=Decision.PUSH,
+            reason="approved",
+            reviewed=ReviewRef("alr-never-0001", "head", "report"),
+        )
+    )
+
+    assert "nothing this `push` could publish" in orch.state.outbox
+    assert "RE-PRESENTED" not in orch.state.outbox
+    assert executor.calls == 1
+    transcript = orch._config.transcript_file.read_text(encoding="utf-8")
+    assert "push_missing_review_binding" in transcript
+    assert "push_binding_recovery" not in transcript
+
+
+def test_a_re_presentation_will_not_overrun_a_configured_review_round_cap(tmp_path):
+    """A re-presented packet is a real review round and is charged as one, so
+    the cap that bounds fresh rounds bounds these too — otherwise a refused
+    approval would quietly spend rounds a later `revise` then could not have."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, _repo, _worktrees, execution_store, task = build(
+        tmp_path,
+        executor,
+        policy=PolicyConfig(implement_enabled=True, max_review_rounds=1),
+    )
+    send_review_packet(orch, task.id)
+    assert execution_store.load(task.id).review_round == 1
+
+    orch.state.pending_request = None
+    orch.state.last_response = LastResponse(
+        request_id="alr-x-0002", raw="{}", received_at="now"
+    )
+    orch._dispatch(
+        Directive(
+            decision=Decision.PUSH,
+            reason="approved",
+            reviewed=ReviewRef("alr-never-0001", "head", "report"),
+        )
+    )
+
+    assert "RE-PRESENTED" not in orch.state.outbox
+    assert "nothing this `push` could publish" in orch.state.outbox
+    assert execution_store.load(task.id).review_round == 1
+    assert executor.calls == 1
+    transcript = orch._config.transcript_file.read_text(encoding="utf-8")
+    assert "push_binding_recovery" not in transcript
+    # Declined for the CAP, not for a missing worker — everything else the
+    # live checks ask for is still true, which is what stops this test and the
+    # one above passing for the same undiscriminating reason.
+    execution = execution_store.load(task.id)
+    assert worker_repo_is_reusable(
+        Path(execution.worktree_path), execution.task_branch
+    )

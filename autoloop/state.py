@@ -364,17 +364,26 @@ class LastResponse:
     base_sha: str = ""
     report_sha256: str = ""
     #: Carried over from the `PendingRequest` this response answers. The
-    #: orchestrator's push dispatch reads the candidate sha ONLY from here —
-    #: never from a fresh `TaskExecutionStore` lookup, and never from
-    #: anything in the directive itself (a `push` directive cannot even
-    #: carry a task_id — see `contract._forbid`). That is what makes an
+    #: orchestrator's push dispatch reads the candidate sha ONLY from a binding
+    #: this loop itself built and sent — this one, or (since 2026-08-21) the
+    #: `LoopState.postcommit_packets` entry for the request an approval's
+    #: `reviewed` stamp NAMES, when that is an earlier request than this
+    #: response answers. Never from a fresh `TaskExecutionStore` lookup, and
+    #: never from anything in the directive itself (a `push` directive cannot
+    #: even carry a task_id — see `contract._forbid`). That is what makes an
     #: approval of candidate A structurally unable to publish a swapped-in
-    #: candidate B.
+    #: candidate B, by either route.
     postcommit: PostcommitBinding | None = None
     #: Carried over from the `PendingRequest` this response answers, exactly
     #: like `postcommit` above but for an operator-changeset review — see
     #: `changeset_review.ChangesetBinding` and
     #: `Orchestrator._dispatch_changeset_push`.
+    #:
+    #: A request carries this or `postcommit`, never both. A RESPONSE holding
+    #: this one can still be answering an approval that names an earlier
+    #: postcommit packet, though, and there the named packet wins outright:
+    #: `_dispatch` checks the resolved postcommit binding first, and the
+    #: changeset path's HEAD-moved exemption is not extended to it.
     changeset: ChangesetBinding | None = None
     #: Which conversation this reply was actually read from, copied from the
     #: request it answers. Recorded so "only a response captured from the
@@ -582,6 +591,14 @@ class LoopState:
     #: Deliberately separate from `last_manifest_id`, which belongs to the
     #: OLD authorize-then-produce/manifest path and means something different
     #: (a `ChangeManifest` id against the main checkout, not a worktree).
+    #:
+    #: A SNAPSHOT of a record, and nothing more. A non-empty `candidate_sha`
+    #: here proves a commit was made at some point in some process — not that
+    #: the commit still resolves, that the worker repo still exists, or that
+    #: the record has not since advanced. Anything that tells a reviewer a
+    #: candidate is still there re-reads the `TaskExecutionStore` and git first
+    #: (`orchestrator._representable_candidate`); this field only ever supplies
+    #: the task id to look up.
     task_execution: dict | None = None
     #: The postcommit review packets this session has actually SENT, oldest
     #: first, capped at `MAX_POSTCOMMIT_PACKETS`. Append-only history, written
@@ -610,6 +627,14 @@ class LoopState:
     #: `TaskExecutionStore` record, its ancestry and its tree, so a superseded
     #: candidate found here is refused (`push_candidate_stale`) rather than
     #: published.
+    #:
+    #: When an approval's stamp names an entry here, that request is
+    #: AUTHORITATIVE for the whole dispatch — which branch the policy gate
+    #: judges, which stamp `verify_review` checks, whether the HEAD-moved
+    #: staleness check applies, and which publish path runs — even when
+    #: `last_response` carries a binding of its own, `changeset` included.
+    #: Deciding any of those from the response instead would judge or publish a
+    #: candidate the approval never named.
     postcommit_packets: list[dict] = field(default_factory=list)
     #: Serialised `changeset_review.ChangesetBinding` (a plain dict —
     #: `dataclasses.asdict(binding)`, never a reconstructed dataclass

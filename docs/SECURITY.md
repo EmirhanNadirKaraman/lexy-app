@@ -1789,6 +1789,29 @@ rg -n '_dispatch_git' autoloop/orchestrator.py       # no match
 > autoloop/tests/test_review_binding_carry.py -k "legacy or unbound or stale"`
 > must pass.
 
+> **Amendment 2 — 2026-08-21 (bind-01), same review round.** The amendment
+> above says only the refusal MESSAGE changed; that is now too narrow, and the
+> difference matters for this finding. An unbound `push` also causes the loop to
+> RE-PRESENT the existing committed candidate as a fresh review packet
+> (`_handle_unbound_push` → `_finish_postcommit`), because an instruction to
+> reply `revise` was not a recovery a reviewer could safely follow — `revise`
+> runs the implementation executor and can change the very work that was
+> approved. **Nothing about the publish gate moved.** The re-presentation
+> publishes nothing, runs no executor, creates no commit, and can only present
+> a candidate THIS loop committed and still finds in the worker repo the
+> execution record names; the packet it renders is bound from its own text like
+> any other, and only a `push` stamped against that new request can publish.
+> It re-runs the validation commands already frozen on the execution record
+> (`TaskExecution.validation_commands`) — no new authorization, the same
+> commands the round was dispatched under. It is bounded twice: the denial is
+> counted first (`policy_denials`, which stops the run when exhausted) and a
+> re-presented packet spends a review round, so a configured
+> `max_review_rounds` refuses it (`_round_cap_reached`). **Verification check:**
+> `rg -n 'self\._finish_postcommit\(' autoloop/orchestrator.py` must show
+> exactly three call sites — the fresh commit, crash-recovery adoption and
+> `_handle_unbound_push` — and `pytest autoloop/tests/test_review_binding_carry.py
+> -k "re_present or unbound or cap"` must pass.
+
 **Original finding (preserved for history):**
 
 > **What:** `autoloop`'s executor-manifest commit path uses `git commit`

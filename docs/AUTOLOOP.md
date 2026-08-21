@@ -1161,12 +1161,12 @@ publishes in either case:
 * `commit` / `commit_and_push` → `legacy_git_path_retired`, unchanged. These
   are the retired decisions, and the message says so.
 * a `push` that resolved to no binding → `push_missing_review_binding`
-  (`_unbound_push_verdict`). The old message described the retirement of a
+  (`_handle_unbound_push`). The old message described the retirement of a
   route the reviewer had not taken and offered no next move; this one names
-  the request id the stamp cited, states that the candidate is committed and
-  untouched, and names the one directive that gets it presented again as a
-  postcommit review packet — see §4b-bis for why a dead-end refusal here cost
-  a full night of quota.
+  the request id the stamp cited and then RE-PRESENTS the existing candidate
+  as a fresh review packet in the same message — no executor run, no new
+  commit — so the reviewer has a bound request to approve. See §4b-bis for
+  why a dead-end refusal here cost a full night of quota.
 
 **Revision rounds.** `revise` re-enters the same worktree, keeps the ORIGINAL
 `task_base_sha`, and produces a NEW commit on top of the current candidate —
@@ -1253,6 +1253,19 @@ response itself carries; those are the same object, so re-routing them through
 a lookup would buy nothing. The lookup earns its keep only where the old code
 dead-ended: a stamp reaching back past where `last_response` has moved to.
 
+**And when it does resolve, the named request is authoritative for the WHOLE
+dispatch**, not just for the sha that gets published. Four decisions follow from
+it, and each is made from the reviewed request rather than from the response in
+hand: which branch `authorize_directive`'s protected-branch gate judges; which
+stamp `verify_review` checks; whether the HEAD-moved staleness check applies (it
+does — the changeset exemption in §4f is NOT inherited); and which dispatch
+branch publishes. The case that makes this concrete is a response carrying a
+`changeset` binding — an operator queued `review-changeset` in the middle of a
+task's review — answering a `push` that names an earlier postcommit packet.
+`_dispatch` therefore checks the resolved postcommit binding BEFORE the
+changeset branch: deciding publication from `last_response` there would publish
+the operator's commit against an approval that named the task's.
+
 **What this does NOT widen.** The retirement of the legacy authorize-then-
 produce path (`docs/SECURITY.md` S21) stands. Every binding either rule can
 produce is one this loop itself built and sent; neither invents one, and
@@ -1267,13 +1280,48 @@ push refuses as `review_mismatch:head_moved` — a corrective re-prompt the
 reviewer can answer. Extending §4f's changeset exemption here would widen what
 a `push` may publish; restoring a lost binding does not.
 
+**Rule 3 — a refusal with nowhere to go is a livelock, so the refusal carries
+the candidate back.** A `push` that really is bound to nothing is still refused
+(`push_missing_review_binding`), and still publishes nothing. What changed is
+what the reviewer receives: `_handle_unbound_push` re-presents the existing
+committed candidate as a fresh review packet in the same message, so the
+approval it already wanted to give has a bound request to answer.
+
+* **It costs no work.** The recovery calls `_finish_postcommit` on the existing
+  execution record — the same method crash-recovery adoption uses to present a
+  commit no executor made in this process. No executor runs, no commit is made,
+  `candidate_sha` is unchanged. The packet is rendered again from the immutable
+  git objects and binds itself from its own text, so the new request carries a
+  DERIVED binding (`packet_sha256 == report_sha256`), not a carried one.
+* **Why not "reply `revise`"**, which is what the first version of this message
+  said: `revise` runs the implementation executor, so it can change the very
+  work that was approved, and a round that changes nothing may produce no
+  review packet at all. An instruction the reviewer cannot safely follow is not
+  a recovery.
+* **What is claimed is checked.** `_representable_candidate` re-reads the
+  `TaskExecutionStore` record, probes that the recorded worker is a git
+  repository checked out on the recorded branch (`worker_repo_is_reusable`) and
+  resolves the candidate commit object before anything says the candidate is
+  still there; `state.task_execution` supplies only the task id to look up.
+  `_finish_postcommit` then runs the ordinary post-commit gate (ancestry, a
+  non-empty range, a clean worktree, validation re-run) and parks for an
+  operator if the candidate no longer passes it. The verdict text holds either
+  way — it does not promise a packet that might not come.
+* **It is bounded twice.** The denial is recorded FIRST, so a reviewer that
+  keeps sending unbound approvals exhausts `policy_denials` and stops the run.
+  And a re-presented packet is a real review round: `review_round` increments,
+  and `_representable_candidate` declines once `max_review_rounds` is spent
+  (`_round_cap_reached`, shared with the fresh-round dispatch) rather than
+  overrunning a configured cap.
+
 **Not addressed.** The second half of the prof-01 livelock — a reviewer-issued
 `stop` ending a session, the next session sending a kickoff, and nothing
 counting the cycle or raising `needs_attention` — is untouched and is a
 separate defect.
 
 Regressions: `autoloop/tests/test_review_binding_carry.py` (mechanism,
-precedence, negatives) and `test_postcommit_review.py`'s
+precedence, the changeset-in-hand routing case, the re-presentation and the
+negatives) and `test_postcommit_review.py`'s
 `test_parse_error_correction_keeps_its_binding_and_the_stamped_push_publishes`
 (the headline case end to end through `run()`).
 
@@ -2050,8 +2098,10 @@ hashed body regardless of where the rest of the packet text came from.
 
 **Dispatch.** `Orchestrator._dispatch` routes a `push` directive whose
 response carries `resp.changeset` to `_dispatch_changeset_push` — checked
-before the `resp.postcommit` branch (the two are mutually exclusive in
-practice; the order carries no meaning) and before the unbound-push refusal,
+AFTER the resolved-postcommit branch (since 2026-08-21; a request carries one
+binding or the other, but an approval can still reach BACK to an earlier
+postcommit packet while a changeset response is in hand, and there the packet
+the stamp names decides — §4b-bis rule 2) and before the unbound-push refusal,
 so a `push` with no changeset binding still refuses exactly as before — since
 2026-08-21 as `push_missing_review_binding` rather than
 `legacy_git_path_retired`, same effect, an actionable message (§4b-bis). `_dispatch_changeset_push` mirrors
@@ -2085,11 +2135,15 @@ branch under review, and the whole feature exists to let the operator keep
 committing to it after a packet is sent — the reviewed candidate, not
 whatever HEAD has since become, is what must publish. `_step_executing`
 skips the HEAD-moved check specifically when the decision is `push` AND
-`resp.changeset is not None` — narrower than "any changeset-bound
+`resp.changeset is not None` AND the approval did not resolve to an earlier
+postcommit packet — narrower than "any changeset-bound
 response", since `resp.changeset` is only ever meant to answer a `push`
 (a stray `commit`/`commit_and_push` reply somehow carrying one still gets
 the ordinary check, and separately lands in `legacy_git_path_retired`
-either way);
+either way), and narrower still since 2026-08-21 because this exemption
+belongs to the candidate the CHANGESET packet presented: an approval
+reaching back to a postcommit packet (§4b-bis rule 2) is about a different
+candidate in a different repository and keeps the ordinary check;
 identity is instead carried entirely by `resp.changeset.candidate_sha` plus
 the `report_sha256` digest `verify_review` already checked. Proved directly:
 a later, unreviewed commit lands on the branch after the packet is queued,

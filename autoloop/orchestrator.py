@@ -253,6 +253,7 @@ from .prompts import (
     parse_error_payload,
     plan_rejected_payload,
     policy_denied_payload,
+    represented_candidate_note,
     review_mismatch_payload,
     same_review_note,
 )
@@ -3589,7 +3590,22 @@ class Orchestrator:
             # whole scope. The ordinary recovery never meets this at all,
             # because the correction carries the CURRENT head_sha and the
             # reviewer is told to stamp from it (`prompts.same_review_note`).
-            if directive.decision is not Decision.PUSH or resp.changeset is None:
+            #
+            # `reviewed_packet is not None` LEADS the condition for that
+            # reason, and it is not decoration: `resp` can be a changeset
+            # response while the stamp reaches back to a postcommit packet
+            # (an operator queues `review-changeset` in the middle of a task's
+            # review). Reading `resp.changeset` alone there would hand a
+            # ledger-resolved postcommit approval the changeset path's
+            # exemption — an exemption granted to a candidate whose identity
+            # this response knows nothing about. The reviewed request stays
+            # authoritative here exactly as it does for `destination_branch`
+            # above and `verify_review` just before.
+            if (
+                reviewed_packet is not None
+                or directive.decision is not Decision.PUSH
+                or resp.changeset is None
+            ):
                 current_head = self._git.head_sha()
                 if current_head != directive.reviewed.head_sha:
                     self._handle_review_mismatch(
@@ -3638,18 +3654,6 @@ class Orchestrator:
             self._handle_policy_denial(directive, retired_decision_verdict(decision))
         elif decision is Decision.PLAN:
             self._dispatch_plan(directive)
-        elif decision is Decision.PUSH and state.last_response is not None and (
-            state.last_response.changeset is not None
-        ):
-            # A push answering an operator-changeset review packet publishes
-            # via the Publisher, sourced entirely from the response's binding
-            # (never from `directive`, and never a fallback to the legacy
-            # path below) — see `_dispatch_changeset_push`'s docstring.
-            # Checked BEFORE the postcommit branch below only because both
-            # conditions can never be true at once in practice (see
-            # `state.PendingRequest.changeset`'s docstring); the order itself
-            # carries no meaning.
-            self._dispatch_changeset_push(directive, state.last_response)
         elif decision is Decision.PUSH and (
             push_binding := self._resolve_postcommit_binding(
                 directive, state.last_response
@@ -3664,7 +3668,31 @@ class Orchestrator:
             # either way the binding was built and sent by this loop, and
             # `_dispatch_task_push` re-verifies it against live git before
             # anything is published.
+            #
+            # Checked BEFORE the changeset branch below, and since 2026-08-21
+            # the order IS the rule rather than an arbitrary tie-break. The two
+            # conditions are mutually exclusive for a response answering its
+            # OWN request (a request carries one binding or the other — see
+            # `state.PendingRequest.changeset`), but not for a stamp that
+            # reaches BACK: `last_response` can be a changeset response while
+            # the approval names an earlier postcommit packet. There the
+            # reviewed request is what the reviewer read and what
+            # `_step_executing` already judged the destination and the stamp
+            # against, so it must decide publication too — routing that
+            # approval to `_dispatch_changeset_push` would publish a candidate
+            # nobody stamped for.
             self._dispatch_task_push(directive, state.last_response, push_binding)
+        elif decision is Decision.PUSH and state.last_response is not None and (
+            state.last_response.changeset is not None
+        ):
+            # A push answering an operator-changeset review packet publishes
+            # via the Publisher, sourced entirely from the response's binding
+            # (never from `directive`, and never a fallback to the legacy
+            # path below) — see `_dispatch_changeset_push`'s docstring. An
+            # ordinary changeset approval reaches here exactly as it always
+            # did: its stamp names its own request, so the postcommit branch
+            # above resolves to `None` and falls through.
+            self._dispatch_changeset_push(directive, state.last_response)
         elif decision in COMMIT_DECISIONS:
             # The legacy authorize-then-produce commit path (`commit`,
             # `commit_and_push`) was retired 2026-07-30 (docs/SECURITY.md S21:
@@ -3700,59 +3728,195 @@ class Orchestrator:
             # a route it did not take is retired, and says nothing about the
             # candidate that is sitting committed and unpublished. On 2026-08-20
             # that cost prof-01 an indefinite livelock. See
-            # `_unbound_push_verdict`.
-            self._handle_policy_denial(directive, self._unbound_push_verdict(directive))
+            # `_handle_unbound_push`.
+            self._handle_unbound_push(directive)
         else:  # audit / implement / revise
             self._dispatch_executor(directive)
 
-    def _unbound_push_verdict(self, directive: Directive) -> Verdict:
-        """The refusal for a `push` that is bound to no reviewed candidate.
+    # ---- the unbound push: refuse it, then re-present what it meant ----------
 
-        Refusing is not in question — an approval must name the exact sha it
-        approved, and one that names nothing publishes nothing. What this
-        changes is that the refusal ENDS SOMEWHERE. The message it replaces
-        described the retirement of a path the reviewer had not asked for,
-        which leaves a reviewer holding a correct approval with no next move;
-        on 2026-08-20 prof-01 answered it by refusing every subsequent packet
-        with `stop`, each `stop` ended the session, each new session sent a
-        kickoff, and the loop burned a full round every five minutes with
-        `needs_attention` false throughout.
+    def _round_cap_reached(self, execution: TaskExecution) -> bool:
+        """Has this task already had every review round the policy allows?
 
-        So the text says three things instead: WHY it was refused (naming the
-        request id the stamp cited, so a reviewer can see the loop looked), that
-        the candidate is committed and untouched, and the one directive that
-        gets it presented again as a postcommit review packet it can approve.
-        The candidate is read from `state.task_execution`, which
-        `_finish_postcommit` refreshes every round and `_dispatch_task_push`
-        clears on publication — so "there is a candidate awaiting publication"
-        is a checked fact here, never an assumption, and the no-candidate case
-        gets its own honest wording rather than a recovery that would not work.
+        `max_review_rounds` defaults to 0 (unlimited — see `PolicyConfig`), so
+        this is False for every default deployment. Shared by the two places
+        that may not send another packet: the dispatch of a fresh round
+        (`_dispatch_task_postcommit`, which parks) and the re-presentation of an
+        existing candidate (`_representable_candidate`, which declines and says
+        so), so a configured cap means the same thing to both.
+        """
+        cap = self._policy.config.max_review_rounds
+        return bool(cap and execution.review_round >= cap)
+
+    def _representable_candidate(
+        self,
+    ) -> tuple[TaskExecution, GitGateway, Task] | None:
+        """The committed candidate this loop can present for review AGAIN, or
+        `None` — established by reading git and the execution store, never by
+        reading `state.task_execution`'s fields alone.
+
+        That distinction is the whole point of this method. `state.task_execution`
+        is a snapshot of a record; a non-empty `candidate_sha` in it proves that
+        a commit was made at some point in some process, not that the commit is
+        still there, that the worker repo still exists, or that the work is
+        still this task's. So the snapshot supplies only the task id to look up,
+        and everything asserted afterwards is checked live:
+
+        * the task id is one the registry actually knows (an audit pseudo-task
+          or a released task is not re-presentable through here);
+        * the execution record loads and names a candidate;
+        * the recorded worker is present, is the top level of a git repository
+          and is checked out on the recorded branch (`worker_repo_is_reusable` —
+          the same probe a resumed dispatch uses, and it never mutates);
+        * the candidate object resolves in that repository and is a commit.
+
+        What is deliberately NOT claimed here is that the candidate still PASSES
+        review. `_finish_postcommit` establishes that — ancestry from the task
+        base, a non-empty commit range, a clean worktree, validation re-run
+        against the committed tree — and parks for an operator if it does not.
+        This method's job is to decide whether that verification is worth
+        starting, fail-closed at every step.
+        """
+        if self._execution_store is None:
+            return None
+        record = self.state.task_execution or {}
+        task_id = str(record.get("task_id") or "")
+        if not task_id or not self._registry.has(task_id):
+            return None
+        execution = self._execution_store.load(task_id)
+        if execution is None or not execution.candidate_sha:
+            return None
+        if self._round_cap_reached(execution):
+            return None
+        if not worker_repo_is_reusable(
+            Path(execution.worktree_path), execution.task_branch
+        ):
+            return None
+        worktree_git = GitGateway(Path(execution.worktree_path), self._policy)
+        try:
+            info = worktree_git.read_commit(execution.candidate_sha)
+        except (GitError, OSError):
+            return None
+        if not info.get("tree"):
+            return None
+        return execution, worktree_git, self._registry.get(task_id)
+
+    def _handle_unbound_push(self, directive: Directive) -> None:
+        """Refuse a `push` that is bound to no reviewed candidate — and, when
+        there is a candidate to offer, RE-PRESENT it in the same breath.
+
+        Refusing is not in question: an approval must name the exact sha it
+        approved, and one that names nothing publishes nothing. What changed on
+        2026-08-21 is that the refusal ENDS SOMEWHERE. Its predecessor described
+        the retirement of a path the reviewer had not asked for, which leaves a
+        reviewer holding a correct approval with no next move; prof-01 answered
+        that by refusing every subsequent packet with `stop`, each `stop` ended
+        the session, each new session sent a kickoff, and the loop burned a full
+        round every five minutes with `needs_attention` false throughout.
+
+        **The recovery is a packet, not an instruction.** The first version of
+        this told the reviewer to reply `revise`, which is not a recovery at
+        all: `revise` runs the implementation executor, so it can change the
+        very work that was approved, and a round that changes nothing may not
+        produce a review packet to approve either. So the loop does the only
+        thing that actually re-presents the SAME candidate — it calls
+        `_finish_postcommit` on the existing execution record. No executor runs,
+        no commit is made, `candidate_sha` is untouched; the packet is rendered
+        again from the immutable git objects, `_step_ready` binds it exactly as
+        it binds any other packet (a DERIVED binding, from the payload's own
+        identifiers — not an inherited carry), and a `push` stamped from THAT
+        request publishes the candidate. `_finish_postcommit` is already reached
+        this way by crash-recovery adoption, which likewise presents a commit no
+        executor made in this process.
+
+        Ordering, and it is deliberate: the denial is recorded FIRST, so a
+        reviewer that keeps sending unbound approvals exhausts
+        `state.policy_denials` and stops the run rather than being re-presented
+        to forever. A re-presentation is a real review round and is charged as
+        one (`review_round` increments), which is also why
+        `_representable_candidate` declines once `max_review_rounds` is
+        exhausted rather than quietly overrunning it.
+
+        The verdict text is written to hold whether or not the re-presentation
+        then completes — if `_finish_postcommit` refuses the candidate it parks
+        for an operator, and the message the reviewer would have received must
+        not have promised a packet that never came.
+        """
+        state = self.state
+        representable = self._representable_candidate()
+        verdict = self._unbound_push_verdict(directive, representable)
+        self._handle_policy_denial(directive, verdict)
+        if representable is None or state.phase != Phase.READY.value:
+            # No candidate to offer, or the denial budget just stopped the run.
+            return
+        execution, worktree_git, task = representable
+        self._log(
+            "push_binding_recovery",
+            data={
+                "task_id": task.id,
+                "candidate_sha": execution.candidate_sha,
+                "review_round": execution.review_round,
+                "stamped_request_id": (
+                    directive.reviewed.request_id if directive.reviewed else ""
+                ),
+            },
+        )
+        self._finish_postcommit(
+            execution,
+            worktree_git,
+            state,
+            task,
+            note=represented_candidate_note(verdict.reason),
+        )
+
+    def _unbound_push_verdict(
+        self,
+        directive: Directive,
+        representable: tuple[TaskExecution, GitGateway, Task] | None,
+    ) -> Verdict:
+        """The refusal text for an unbound `push`, in the two shapes it takes.
+
+        Says WHY it was refused — naming the request id the stamp cited, so a
+        reviewer can see the loop looked — and then what happens next, which is
+        decided by `representable` rather than by this method: a candidate the
+        live checks accepted is being re-presented, and anything else gets the
+        honest "there is nothing here to publish" wording rather than a recovery
+        that would not work. Nothing in either branch is inferred from
+        `state.task_execution` alone (see `_representable_candidate`).
         """
         stamped = directive.reviewed.request_id if directive.reviewed is not None else ""
-        pending = self.state.task_execution or {}
-        task_id = str(pending.get("task_id", ""))
-        candidate = str(pending.get("candidate_sha", ""))
         cited = (
             f"the `reviewed` stamp names request {stamped}, and this loop has no "
             "record of ever sending a postcommit review packet under that id"
             if stamped
             else "the approval carries no `reviewed` stamp at all"
         )
-        if task_id and candidate:
+        if representable is not None:
+            execution, _worktree_git, task = representable
             recovery = (
-                f"Task {task_id}'s candidate commit {candidate[:12]} is committed on "
-                "its own branch and is untouched. To publish it, reply `revise` "
-                f"with task_id {task_id}, saying what (if anything) must change: "
-                "that round ends with a fresh postcommit review packet naming the "
-                "candidate, and a `push` carrying the `reviewed` stamp from THAT "
-                "packet publishes it."
+                f"Task {task.id}'s candidate commit "
+                f"{execution.candidate_sha[:12]} is still there — its execution "
+                f"record names it, its worker repository is checked out on "
+                f"{execution.task_branch}, and the commit object resolves — so "
+                "the loop is RE-PRESENTING it for review, the same commit, with "
+                "no new work and no executor run. If this message carries that "
+                "review packet, approve it by replying `push` with the "
+                "`reviewed` stamp copied "
+                "from THIS request's CONTEXT block: that stamp is the binding "
+                "this approval was missing, and it publishes exactly that "
+                "candidate. If it does not, the candidate failed its own "
+                "post-commit checks and the run has parked for an operator — "
+                "nothing was published either way."
             )
         else:
             recovery = (
-                "No committed candidate is awaiting publication, so there is "
-                "nothing this `push` could publish. Continue with another "
-                "directive — `implement` or `revise` a task, then approve the "
-                "postcommit review packet the loop sends when that round ends."
+                "The loop has no candidate it can present for review in answer "
+                "to this — either nothing is committed and awaiting "
+                "publication, or the task that produced it has spent every "
+                "review round its policy allows. Either way there is nothing "
+                "this `push` could publish. Continue with another directive — "
+                "`implement` or `revise` a task, then approve the postcommit "
+                "review packet the loop sends when that round ends."
             )
         return Verdict.deny(
             "push_missing_review_binding",
@@ -4657,8 +4821,9 @@ class Orchestrator:
                 ),
             )
             return
-        cap = self._policy.config.max_review_rounds
-        if cap and execution.review_round >= cap:
+        if self._round_cap_reached(execution):
+            # Shared with `_representable_candidate`, so a configured cap bounds
+            # a re-presented packet exactly as it bounds a fresh round.
             self._park_round_cap(execution, worktree_git, directive, state, task)
             return
         # Unlimited rounds are only safe with this: a reviewer repeating itself
@@ -5555,7 +5720,23 @@ class Orchestrator:
         worktree_git: GitGateway,
         state: LoopState,
         task: Task,
+        note: str = "",
     ) -> None:
+        """Verify the committed candidate and present it for review.
+
+        `note`, when given, is a preface rendered at the TOP of the payload. It
+        exists for exactly one caller — `_handle_unbound_push`, which
+        RE-PRESENTS a candidate this loop has already reviewed rather than
+        producing a new one — and is empty on every ordinary round, where the
+        empty `{note}` collapses away (`prompts.postcommit_review` plus the
+        `.strip()` below) and the payload reads exactly as it did before the
+        field existed. The strip additionally right-trims, which changes no
+        identifier the packet is bound from and no digest it is verified
+        against — both are computed from this payload afterwards. A caller
+        passing a note is making no other change to this method: the same
+        verification runs, the same failures park, the same packet is built
+        from the same immutable objects.
+        """
         # `attempt_count` is NOT incremented here (M1 finding #3) — it is
         # incremented and persisted BEFORE the executor ever runs (see
         # `_dispatch_task_postcommit`), so a validation failure or a crash
@@ -5676,8 +5857,8 @@ class Orchestrator:
         self._execution_store.save(execution)
         state.task_execution = asdict(execution)
         state.outbox = TEMPLATES["postcommit_review"].render(
-            task_id=task.id, task_title=task.title, packet=packet_text
-        )
+            task_id=task.id, task_title=task.title, packet=packet_text, note=note
+        ).strip()
         # The patch, carried alongside the payload it is already inside, so
         # `_step_ready` can plan a chunked delivery for it without re-reading
         # git. Only when it is actually too large for one message: an ordinary

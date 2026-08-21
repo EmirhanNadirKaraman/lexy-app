@@ -145,6 +145,17 @@ TEMPLATES: dict[str, PromptTemplate] = {
         PromptTemplate(
             name="postcommit_review",
             body=(
+                # `{note}` is EMPTY for every ordinary round, and the renderer
+                # strips the payload, so an ordinary packet reads exactly as it
+                # did before this field existed (the strip also right-trims,
+                # which touches no identifier and no digest — both are computed
+                # from the finished payload). It is
+                # non-empty only when the loop RE-PRESENTS a candidate it has
+                # already reviewed (`prompts.represented_candidate_note`,
+                # `Orchestrator._handle_unbound_push`) — and it has to lead,
+                # because the sentence right after it would otherwise read as a
+                # fresh round of work.
+                "{note}\n\n"
                 "The executor committed task {task_id} ({task_title}) directly to "
                 "its own branch, and the commit passed structural post-commit "
                 "review (ancestry from the task base, path ownership, a clean "
@@ -235,6 +246,33 @@ def same_review_note(task_id: str, candidate_sha: str) -> str:
         "and no new work was produced for it. Approving now publishes exactly "
         "that candidate and nothing else, so copy request_id, head_sha and "
         "report_sha256 from THIS request's CONTEXT block."
+    )
+
+
+def represented_candidate_note(reason: str) -> str:
+    """The preface on a review packet the loop RE-PRESENTS after refusing an
+    unbound `push` (`Orchestrator._handle_unbound_push`).
+
+    A refusal that only says "no" is what livelocked prof-01: the reviewer held
+    a correct approval, was told a route it had not taken was retired, and had
+    no next move. The recovery is the packet itself — the SAME committed
+    candidate, re-verified and rendered again from immutable git objects — so
+    the approval the reviewer already wanted to give can be stamped against a
+    request that carries a binding.
+
+    Two things this must say, and both are load-bearing. `reason` (the verdict's
+    own text, passed through rather than re-worded here, so the transcript and
+    the message cannot drift) says WHY the push was refused. The rest says that
+    nothing about the work changed: the `postcommit_review` body immediately
+    below opens with "The executor committed task ...", which a reviewer would
+    otherwise read as a fresh round having produced new work.
+    """
+    return (
+        "YOUR PREVIOUS `push` WAS REFUSED, AND THE SAME CANDIDATE IS "
+        f"RE-PRESENTED BELOW.\n\n{reason}\n\nNo new work was produced for this: "
+        "no executor ran, no new commit was created, and the packet below is "
+        "that same candidate commit rendered again from the immutable git "
+        "objects. Approving it publishes exactly that commit and nothing else."
     )
 
 

@@ -2178,9 +2178,16 @@ executor-produced work whose sha does not resolve in the checkout, and a fresh
 session sends a kickoff rather than re-presenting the packet. Release the task
 and let it re-run.
 **If you see `push_missing_review_binding` instead, that is the new refusal and
-it is working** — a `push` really did resolve to no binding. Its message names
-the request id the stamp cited and the directive that re-presents the
-candidate; nothing was published, and the committed candidate is untouched.
+it is working** — a `push` really did resolve to no binding. Nothing was
+published, and the message names the request id the stamp cited. The round it
+sends is the recovery: the loop re-presents the existing committed candidate as
+a fresh review packet in the same message (no executor run, no new commit —
+look for a `push_binding_recovery` entry right after the denial), and a `push`
+stamped from THAT request publishes it. Two reasons you may see the refusal
+WITHOUT a re-presentation, both deliberate: there is no candidate the live
+checks accept (the execution record, the worker repo and the commit object are
+all re-read — `_representable_candidate`), or the task has spent every round a
+configured `max_review_rounds` allows. The wording of the refusal says which.
 **Not fixed by the above:** the `stop` → new session → kickoff cycle still
 neither counts itself nor raises `needs_attention`. If a loop is trading rounds
 with nothing changing, look for repeated `stopped` entries and stop it by hand.
