@@ -1078,6 +1078,41 @@ class TaskRegistry:
     def ready_tasks(self) -> list[Task]:
         return [t for t in self._tasks.values() if self.state_of(t.id) is TaskState.READY]
 
+    def blocker_derived_blocked(self) -> list[Task]:
+        """Every task whose `blocked` status MIRRORS a `blockers.Blocker`
+        record — i.e. every quarantine the LOOP raised for itself, and nothing
+        an operator placed by hand.
+
+        The candidate set for `cli._reconcile_unblocked_tasks` (blk-01), which
+        returns such a task to the queue once no OPEN blocker names it. Both
+        halves of that state are supposed to move together: a quarantine lives
+        in `tasks.json`, the question that caused it lives in its own record
+        under `blockers/`, and a task left `blocked` with every record closed is
+        excluded from `next_ready()` with nothing left to justify it. Same
+        argument as `cli._reconcile_retired_blockers`, run the other way.
+
+        An OPERATOR HOLD is excluded, and that is the point of reading
+        `hold_origin` rather than the status alone: `operator_block` places a
+        hold that has NO blocker record at all (see `HOLD_ORIGIN_OPERATOR`), so
+        "no open blocker names it" is true of every hold from the instant it is
+        placed. A sweep that ignored provenance would release the operator's
+        quarantine on its next pass — the inbox's own reverse is deliberately
+        narrowed the same way, and this one has no operator behind it at all.
+
+        Reads the STORED `status`, never `state_of()`. Two reasons, and the
+        second is the sharp one: `state_of` maps `blocked` to
+        `BLOCKED_BY_OPERATOR` regardless of provenance (so it cannot answer the
+        question this method exists for), and it raises `KeyError` on a graph
+        whose `depends_on` names a task that no longer exists — a shape
+        `from_dict` deliberately tolerates, and one a reconciliation sweep must
+        not crash the loop over.
+        """
+        return [
+            task
+            for task in self._tasks.values()
+            if task.status == "blocked" and task.hold_origin != HOLD_ORIGIN_OPERATOR
+        ]
+
     def set_priority(self, task_id: str, priority: int) -> Task:
         """Re-prioritise an existing task.
 

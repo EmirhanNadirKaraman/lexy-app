@@ -3873,6 +3873,89 @@ Zero open blockers is still the ordinary idle steady state, unchanged.
 to unblock), but `answer` still resolves the blocker record itself; the CLI
 reports this rather than raising.
 
+### 9c-bis. A task stays `blocked` only while something is blocking it
+
+The invariant: **a task is `blocked` only while at least one OPEN blocker names
+it.** When its last one is resolved or archived, it returns to the queue in the
+same operation. No task can be left `blocked` with no open blocker record.
+
+This is § 9d's rule run the other way. There, a retirement in `tasks.json` and a
+quarantine in `blockers/` are two halves of one state and moving only the first
+is a split brain; here the halves are the same two files and it is the SECOND
+that moved. Observed on `port-01` (2026-08-19): it parked with
+`review_packet_build_failed`, the operator answered that blocker, and hours
+later the registry still read
+
+```
+port-01  status=blocked
+open blockers: conv-03, roadmap-01, dash-12, split-01   (port-01 absent)
+```
+
+— excluded from `next_ready()` with nothing left to justify it. No supported
+command could return it. `answer` needs an OPEN blocker (and already *reported*
+the split brain — `task 'port-01' could not be unblocked (task_not_blocked)` —
+then dropped it); `release` refuses anything that is not `in_progress`;
+`retire` means "never worked again", not "runnable again"; there is no
+`unblock`. The only route out was hand-editing `tasks.json` with the loop
+stopped, which also needs a pause window the escape detector otherwise punishes.
+
+So the STATE is reconciled rather than a repair command added.
+`cli._reconcile_unblocked_tasks` releases every `blocked` task that no open
+blocker names, via `TaskRegistry.unblock`, and runs from five places:
+
+| where | why |
+|---|---|
+| `answer` | the resolution and the requeue are one operation, or they are the bug |
+| `archive-blocker` | an archival closes records too — **unless a live loop holds the lock** (below) |
+| `start`'s preflight | a registry that ARRIVED in the split state; nothing else would notice |
+| top of every `run --continuous` iteration | same, for an operator who skips `start` — and on the registry that iteration hands the orchestrator, not a copy |
+| `run` without `--continuous` (`_run_locked`) | the single-round counterpart of the row above, same registry rule; a plain `run` is the other way an operator restarts after answering |
+
+Four properties it holds to:
+
+* **It never writes to a blocker record.** Not resolved, not archived, not
+  bumped. Membership is decided by READING them; a sweep that could close one
+  would be a way to launder the operator confirmation
+  `_RESOLUTION_PRECONDITIONS` demands.
+* **It never touches an operator hold.** `TaskRegistry.blocker_derived_blocked`
+  excludes `hold_origin == HOLD_ORIGIN_OPERATOR` (§ 4f-ter). An inbox hold
+  creates no blocker record by design, so "nothing open names it" is true of one
+  from the instant it is placed — provenance decides, not the absence of a
+  record. A hold stays until the operator clears it.
+* **Any kind of open blocker counts**, deliberately WIDER than
+  `_reconcile_retired_blockers`' `task_fatal` allowlist. That sweep closes
+  records so it must prove one is closeable; this one only decides whether to
+  keep a task out of the queue, where the conservative direction is the
+  opposite — a `loop_fatal` record naming a task is still an open question about
+  it.
+* **`answer` cuts both ways.** A task can hold more than one open blocker
+  (`record` mints one per `(task, code, phase)`), and the unblock used to be
+  unconditional — the first answer requeued a task the second question was still
+  about. It is now gated on the answered blocker being the last one AND on the
+  task really being `blocked`: a plain `run` parks `task_fatal` without going
+  through `_handle_parked_task`, so the task is still `in_progress`, and
+  "stays blocked" about one of those would be a false line in the one place an
+  operator looks. That shape still gets the `task_not_blocked` refusal it
+  always did.
+
+Every release is written to the transcript as `task_auto_unblocked`, carrying
+the `blocked_reason` the task was holding: `unblock()` clears that field, so
+afterwards the transcript is the only place the transition stays legible. A task
+that returns to the queue on nobody's authority must not do it silently.
+
+**Why `archive-blocker` defers to a live loop.** It takes no `LoopLock` by
+design, and `.autoloop/tasks.json` sits inside the tree the escape detector
+snapshots (`enumerate_checkout_paths` includes ignored paths), so a write from
+it mid-round reads as a write-capable agent escaping its worker repo and parks
+the loop `loop_fatal`. When the lock is held live it says so and leaves the
+registry alone; the loop reconciles at the top of its next iteration.
+
+One cost, stated rather than hidden: a task `blocked` with **no** record on disk
+at all — a hand-edited status, or a park written by a build with no blocker
+store — is released too. That is the invariant taken literally, and it is the
+safe direction: the task goes back into the queue, where whatever quarantined it
+re-fires and records a blocker properly, instead of sitting invisible.
+
 ### 9d. Retired: superseded work is not blocked work
 
 `blocked` used to carry a THIRD meaning, and it was the one that made the

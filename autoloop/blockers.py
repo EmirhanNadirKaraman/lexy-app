@@ -198,6 +198,32 @@ class BlockerStore:
     def open_blockers(self) -> list[Blocker]:
         return [b for b in self.all_blockers() if b.resolved_at is None]
 
+    def open_task_ids(self) -> set[str]:
+        """Every task id named by at least one OPEN blocker.
+
+        The question `cli._reconcile_unblocked_tasks` asks of this store — "is
+        there still anything to answer about this task?" — and the reason a
+        `blocked` status is allowed to persist. A task that is absent from this
+        set has nothing left justifying its quarantine, so leaving it out of
+        `next_ready()` is a split brain rather than a decision (blk-01).
+
+        EVERY KIND counts, deliberately unlike `cli._reconcile_retired_
+        blockers`' `task_fatal` allowlist. That sweep CLOSES records, so it has
+        to prove a record is closeable; this one closes nothing and only ever
+        decides whether to keep a task out of the queue, so the conservative
+        direction is the opposite: a `loop_fatal` record naming a task is still
+        an open question about it, and keeping the task blocked while it stands
+        costs a delay, where releasing it early costs a dispatch nobody
+        authorised. `NO_TASK` needs no special case — `tasks._ID_RE` forbids
+        parentheses, so `"(loop)"` can never be a real task id and can never
+        match one.
+
+        Reads through `open_blockers`, so a corrupt record RAISES here too
+        rather than reading as "nothing open" — which would be exactly the
+        wrong answer for a caller about to decide a quarantine is over.
+        """
+        return {b.task_id for b in self.open_blockers()}
+
     def resolve(self, blocker_id: str, answer: str) -> Blocker:
         """Mark `blocker_id` resolved with the operator's `answer`. Refuses
         an unknown id or one that is already resolved — resolution is a
