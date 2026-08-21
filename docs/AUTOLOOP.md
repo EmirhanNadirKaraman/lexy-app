@@ -3383,6 +3383,18 @@ given while the window is still closed would just re-park.
 
 ## 5d. Two reviewers: Codex primary, browser fallback
 
+**The app-server protocol is committed, not guessed.**
+`docs/codex-app-server-protocol.generated.ts` is the authoritative wire
+protocol of the local Codex app-server, emitted by `codex app-server
+generate-ts --experimental` against codex-cli 0.147.0. It is committed as a
+read-only reference because the implementation agent has no shell and cannot
+run that command itself. Read it before spelling any method name, parameter
+key or event string: the calls are `thread/start`, `thread/resume`,
+`thread/read`, `thread/fork`, `thread/rollback`, `turn/start`,
+`turn/interrupt`, `turn/steer`. `thread/resume` is what lets a transport
+reopen its thread after the loop restarts. Regenerate the file when the
+pinned codex-cli version changes.
+
 Added 2026-08-01. The reviewer seat now has two occupants, and the default is
 the CLI.
 
