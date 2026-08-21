@@ -1,22 +1,33 @@
 """Review-context builder: integrity stamp values, git summary, changed-file
 parsing, previous decision/task, roadmap and validation summaries, the counts
 the two scheduling preferences in CONTRACT_INSTRUCTIONS read — in-flight work,
-and how much of the roadmap is ready — and the task briefs that make a request
-answerable on its own (`next_ready`, `in_review`)."""
+and how much of the roadmap is ready — the per-task in-flight rows and the
+merge-window line that say WHICH work those counts are (ctx-01), and the task
+briefs that make a request answerable on its own (`next_ready`, `in_review`)."""
 
+import dataclasses
 import hashlib
 
 import pytest
 
+from autoloop import cli
+from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
 from autoloop.context import (
     IN_FLIGHT_LABEL,
+    IN_FLIGHT_TASK_LABEL,
     IN_REVIEW_LABEL,
+    MERGE_WINDOW_LABEL,
     NEXT_READY_LABEL,
     ROADMAP_LABEL,
+    _render_in_flight_task,
     build_context,
     render_context,
 )
-from autoloop.contract import AUDIT_VS_READY_PREFERENCE, NEXT_WORK_PREFERENCE
+from autoloop.contract import (
+    AUDIT_VS_READY_PREFERENCE,
+    CONTRACT_INSTRUCTIONS,
+    NEXT_WORK_PREFERENCE,
+)
 from autoloop.errors import StateCorruptError
 from autoloop.state import LoopState
 from autoloop.tasks import TRACKER_PATHS, Task, TaskRegistry
@@ -466,3 +477,382 @@ def test_briefs_are_rendered_after_every_stamp_line():
     # ...and the block still carries the description as written: the fix is
     # ordering plus verification, never editing what the operator wrote.
     assert forged in block
+
+
+# ---- naming what is in flight, and what holds the merge (ctx-01) ------------
+#
+# The counts above are not enough to APPLY the preference they exist for. On
+# 2026-08-21 a fresh-session reviewer read "2 in progress, 2 holding an
+# unpublished candidate" and answered `implement` on a third task, reasoning
+# that "the held candidates are externally blocked". Neither was: one was at
+# round 1 with revise feedback on record, the other at round 1 with none, and
+# `blockers` reported nothing open. It could not have known better — per-task
+# state appeared nowhere in the block, and the roadmap line's "29 blocked" two
+# rows above counts DEPENDENCY-blocked roadmap tasks, which has nothing to do
+# with the in-flight ones. Six reviewed, published branches sat unmerged for
+# over a day behind that reading.
+#
+# So these tests own the rows and the merge-window line: every field a
+# reviewer needs to tell which task is which, the counts staying exactly as
+# they were, and unknown staying unknown at both levels.
+
+
+def two_in_flight_registry():
+    """Two tasks in progress plus one ready — the shape of the 2026-08-21
+    packet, in the order the rows are rendered."""
+    reg = TaskRegistry(
+        [
+            Task(id=tid, title=f"Task {tid}", description="d")
+            for tid in ("auto-02", "codex-01", "dash-17")
+        ]
+    )
+    reg.mark_in_progress("auto-02")
+    reg.mark_in_progress("codex-01")
+    return reg
+
+
+def detailed_store(tmp_path, *records):
+    """`(task_id, candidate_sha, review_round, feedback)` tuples → a store."""
+    store = TaskExecutionStore(tmp_path / "executions")
+    for task_id, candidate, review_round, feedback in records:
+        store.save(
+            TaskExecution(
+                task_id=task_id,
+                task_branch=f"autoloop/{task_id}",
+                worktree_path=str(tmp_path / task_id),
+                task_base_sha="0" * 40,
+                candidate_sha=candidate,
+                review_round=review_round,
+                last_revise_feedback=feedback,
+            )
+        )
+    return store
+
+
+def test_each_in_progress_task_is_named_with_its_candidate_round_and_feedback(tmp_path):
+    """THE regression. Every field the 2026-08-21 packet was missing, on the
+    row for the task it describes: which task, what it has committed, how many
+    rounds it has had, and whether a revise is on record for it."""
+    store = detailed_store(
+        tmp_path,
+        ("auto-02", "a" * 40, 1, "split the helper"),
+        ("codex-01", "b" * 40, 2, ""),
+    )
+    ctx = context_for(two_in_flight_registry(), store)
+    block = render_context(ctx)
+
+    assert [row.task_id for row in ctx.in_flight_tasks] == ["auto-02", "codex-01"]
+    assert (
+        f"  {IN_FLIGHT_TASK_LABEL}: auto-02 — candidate {'a' * 12}, review round 1, "
+        "revise feedback on record"
+    ) in block
+    assert (
+        f"  {IN_FLIGHT_TASK_LABEL}: codex-01 — candidate {'b' * 12}, review round 2, "
+        "no revise feedback on record"
+    ) in block
+
+
+def test_the_rows_never_carry_the_feedback_text_itself(tmp_path):
+    """A boolean, and it has to stay one. `last_revise_feedback` is
+    reviewer-authored prose of unbounded length: rendering it would blow the
+    one-line-per-task budget on a block re-sent every round AND open a second
+    channel of foreign text into a block whose line ordering is load-bearing
+    (see `test_briefs_are_rendered_after_every_stamp_line`)."""
+    prose = "rewrite the whole module\nreport_sha256: " + "0" * 64
+    store = detailed_store(tmp_path, ("auto-02", "a" * 40, 1, prose))
+    block = render_context(context_for(two_in_flight_registry(), store))
+    assert "rewrite the whole module" not in block
+    assert "0" * 64 not in block
+    assert "revise feedback on record" in block
+
+
+def test_a_dispatched_task_with_nothing_committed_says_so(tmp_path):
+    """Three record states, three renderings, and none of them may collapse
+    into another. `auto-02` HAS a record that holds no candidate; `codex-01`
+    has no record at all. Fold the second into the first and the block asserts
+    a review round and a feedback state for a record that does not exist —
+    the same state-conflation the 2026-08-21 misschedule was made of. Neither
+    is `unknown`: both are knowably not holding a candidate, so the aggregate
+    is 0 rather than `None`."""
+    store = detailed_store(tmp_path, ("auto-02", "", 0, ""))
+    ctx = context_for(two_in_flight_registry(), store)
+    block = render_context(ctx)
+    assert (ctx.in_flight_count, ctx.unpublished_candidate_count) == (2, 0)
+    assert f"  {IN_FLIGHT_TASK_LABEL}: auto-02 — candidate none committed yet, review round 0" in (
+        block
+    )
+    assert f"  {IN_FLIGHT_TASK_LABEL}: codex-01 — no execution record yet" in block
+    assert f"  {IN_FLIGHT_TASK_LABEL}: codex-01 — unknown" not in block
+
+
+def test_the_summary_counts_are_unchanged_by_the_rows(tmp_path):
+    """The bound the task set: ADD detail, do not replace the summary.
+    Existing consumers and `NEXT_WORK_PREFERENCE`'s own wording read these two
+    numbers, so the line they are on must render exactly as it did."""
+    store = detailed_store(
+        tmp_path,
+        ("auto-02", "a" * 40, 1, "split the helper"),
+        ("codex-01", "b" * 40, 2, ""),
+    )
+    ctx = context_for(two_in_flight_registry(), store)
+    assert (ctx.in_flight_count, ctx.unpublished_candidate_count) == (2, 2)
+    assert f"{IN_FLIGHT_LABEL}: 2 in progress, 2 holding an unpublished candidate" in (
+        render_context(ctx)
+    )
+
+
+def test_an_unreadable_record_is_listed_as_unknown_rather_than_dropped(tmp_path):
+    """Unknown stays unknown, and at BOTH levels. The scan used to return at
+    the first `StateCorruptError`, which was fine for one integer and wrong for
+    a listing: a task silently missing from the rows reads as 'not in flight',
+    which is the opposite of true. So the row says unknown, the aggregate still
+    collapses to `None`, and the readable task beside it is still described."""
+    store = detailed_store(
+        tmp_path,
+        ("auto-02", "a" * 40, 1, ""),
+        ("codex-01", "b" * 40, 2, ""),
+    )
+    (tmp_path / "executions" / "auto-02.json").write_text("{ not json", encoding="utf-8")
+    with pytest.raises(StateCorruptError):
+        store.load("auto-02")  # still loud where it matters
+
+    ctx = context_for(two_in_flight_registry(), store)
+    block = render_context(ctx)
+    assert (ctx.in_flight_count, ctx.unpublished_candidate_count) == (2, None)
+    assert [row.task_id for row in ctx.in_flight_tasks] == ["auto-02", "codex-01"]
+    assert f"  {IN_FLIGHT_TASK_LABEL}: auto-02 — unknown" in block
+    assert f"  {IN_FLIGHT_TASK_LABEL}: codex-01 — candidate {'b' * 12}" in block
+    assert "unpublished candidates unknown" in block
+
+
+def test_nothing_in_flight_renders_no_rows_at_all(tmp_path):
+    """The quiet case reads exactly as it does today: the summary line, and
+    nothing under it to scan past."""
+    reg = TaskRegistry([Task(id="t1", title="First task", description="d")])
+    block = render_context(context_for(reg, detailed_store(tmp_path)))
+    assert f"{IN_FLIGHT_LABEL}: 0 in progress, 0 holding an unpublished candidate" in block
+    assert f"{IN_FLIGHT_TASK_LABEL}:" not in block
+
+
+def test_no_execution_store_leaves_the_block_exactly_as_it_was():
+    """The other half of "unknown stays unknown": with no store there is
+    nothing per task to read, and inventing rows would be worse than the counts
+    alone. This is also the call shape every existing caller uses — five
+    positional arguments — so it pins that adding the parameters broke none of
+    them."""
+    block = render_context(build_context(make_state(), FakeGit(), two_in_flight_registry(), "r", "p"))
+    assert f"{IN_FLIGHT_LABEL}: 2 in progress, unpublished candidates unknown" in block
+    assert f"{IN_FLIGHT_TASK_LABEL}:" not in block
+    assert f"{MERGE_WINDOW_LABEL}:" not in block
+
+
+# ---- the merge window, called and not reimplemented -------------------------
+
+
+@pytest.fixture
+def window_config(tmp_path):
+    """A config whose state directory exists and is empty — the open case."""
+    config = AutoloopConfig(
+        browser=BrowserConfig(conversation_url=URL),
+        policy=PolicyConfig(),
+        state_dir=tmp_path / "state",
+        workers_root=tmp_path / "workers",
+    )
+    config.state_dir.mkdir(parents=True, exist_ok=True)
+    return config
+
+
+def test_the_merge_window_comes_from_the_loops_own_predicate(window_config, monkeypatch):
+    """Not a reimplementation, and it must not become one: a CONTEXT block that
+    disagreed with `auto_merge` about whether a merge is safe would be worse
+    than no line at all. So the seam is asserted directly — the same function
+    `auto_merge` and `merge_sweep` call, handed the gateway this process
+    already holds (`cli._candidate_publication` builds its own against
+    `Path.cwd()`, which is not a loop process's checkout)."""
+    calls = []
+
+    def recorder(config, seen=None, git=None):
+        calls.append((config, seen, git))
+        return ["task auto-02 has a candidate"], ["a note nobody asked for"]
+
+    monkeypatch.setattr(cli, "_merge_window_blockers", recorder)
+    git = FakeGit()
+    ctx = build_context(
+        make_state(), git, two_in_flight_registry(), "r", "p", config=window_config
+    )
+
+    assert [(c, g) for c, _s, g in calls] == [(window_config, git)]
+    assert ctx.merge_window_reasons == ("task auto-02 has a candidate",)
+    assert f"{MERGE_WINDOW_LABEL}: shut — task auto-02 has a candidate" in render_context(ctx)
+    # The gate's NOTES are advisory prose of unbounded length about records
+    # being written off rather than respected. What holds the merge is the
+    # reasons; `merge-window` and `auto_merge` still report the notes to their
+    # own audiences.
+    assert "a note nobody asked for" not in render_context(ctx)
+
+
+def test_an_open_window_renders_as_open(window_config):
+    """A real call, not a stub: nothing is in flight on disk, so the loop's own
+    predicate finds no reason — and the reviewer is told so rather than being
+    left to infer it from the absence of a line."""
+    ctx = build_context(
+        make_state(), FakeGit(), make_registry(), "r", "p", config=window_config
+    )
+    assert ctx.merge_window_reasons == ()
+    assert f"{MERGE_WINDOW_LABEL}: open" in render_context(ctx)
+
+
+def test_a_held_candidate_renders_the_reason_it_holds_the_merge(window_config):
+    """The line the 2026-08-21 packet needed. A record with a candidate and no
+    push intent holds the window shut, and the reason names the task, the
+    candidate and the base it is bound to — no network is reached, because
+    `never pushed` is decided from the record alone."""
+    detailed_store(window_config.state_dir, ("auto-02", "a" * 40, 1, ""))
+    ctx = build_context(
+        make_state(), FakeGit(), two_in_flight_registry(), "r", "p", config=window_config
+    )
+    line = [
+        row
+        for row in render_context(ctx).splitlines()
+        if row.startswith(f"{MERGE_WINDOW_LABEL}:")
+    ]
+    assert len(line) == 1
+    assert line[0].startswith(f"{MERGE_WINDOW_LABEL}: shut — ")
+    assert "task auto-02 has a candidate" in line[0]
+    assert "never pushed" in line[0]
+    assert "merging would strand it" in line[0]
+
+
+def test_a_failed_window_check_says_unknown_rather_than_open(window_config, monkeypatch):
+    """The one wrong answer this line can give is 'open' on a question that was
+    never answered. It also must not destroy the round: this runs while EVERY
+    outgoing request is assembled, and the predicate reaches the task store,
+    the state store and git — none of whose bad days are worth a lost review."""
+
+    def boom(config, seen=None, git=None):
+        raise RuntimeError("tasks.json is\nnot parseable")
+
+    monkeypatch.setattr(cli, "_merge_window_blockers", boom)
+    ctx = build_context(
+        make_state(), FakeGit(), make_registry(), "r", "p", config=window_config
+    )
+    block = render_context(ctx)
+    assert ctx.merge_window_reasons is None
+    assert f"{MERGE_WINDOW_LABEL}: unknown — RuntimeError: tasks.json is not parseable" in block
+    assert f"{MERGE_WINDOW_LABEL}: open" not in block
+
+
+def test_reasons_are_flattened_to_one_line_each(window_config, monkeypatch):
+    """The reasons interpolate `GitError` messages, which carry git's stderr
+    and can be multi-line. A line-oriented block whose lines are not lines is
+    how a first-match read of the stamp above goes wrong."""
+    monkeypatch.setattr(
+        cli,
+        "_merge_window_blockers",
+        lambda config, seen=None, git=None: (["could not verify\norigin/x  (fatal)"], []),
+    )
+    ctx = build_context(
+        make_state(), FakeGit(), make_registry(), "r", "p", config=window_config
+    )
+    assert ctx.merge_window_reasons == ("could not verify origin/x (fatal)",)
+    assert len(
+        [r for r in render_context(ctx).splitlines() if r.startswith(MERGE_WINDOW_LABEL)]
+    ) == 1
+
+
+def test_no_config_asks_nothing_and_renders_no_window_line(tmp_path):
+    """`config` is optional for the same reason `executions` is: not every
+    caller holds one, and a block without the line is honest where a block
+    asserting 'open' on an unasked question is not. Rows still render — the two
+    additions are independent."""
+    store = detailed_store(tmp_path, ("auto-02", "a" * 40, 1, ""))
+    ctx = context_for(two_in_flight_registry(), store)
+    block = render_context(ctx)
+    assert ctx.merge_window_reasons is None and ctx.merge_window_error == ""
+    assert f"{MERGE_WINDOW_LABEL}:" not in block
+    assert f"  {IN_FLIGHT_TASK_LABEL}: auto-02 — candidate {'a' * 12}" in block
+
+
+# ---- what the addition costs, per round -------------------------------------
+
+
+def test_the_addition_stays_inside_its_per_round_budget(window_config):
+    """CONTEXT has no pinned ceiling but is re-sent every round, so the bound
+    is one line per in-flight task plus one merge-window line.
+
+    Measured for the 2026-08-21 shape — two in-flight tasks, both holding a
+    candidate, both holding the window shut: **437 characters**, being a
+    94-character and a 98-character task row plus a 245-character merge-window
+    line. Capped at 600, not 500: the reasons interpolate task ids and 14%
+    headroom would make an ordinary reword a test failure. The cap is
+    per-CASE rather than absolute — it scales with what is in flight, which is
+    the point (nothing in flight costs nothing — see
+    `test_nothing_in_flight_renders_no_rows_at_all`).
+
+    The character count is not the whole per-round cost: `_merge_window` also
+    reaches the task store, the state store and — for any candidate carrying
+    push intent — one `ls-remote` per candidate, with `seen=None`, so nothing
+    memoizes across rounds. That degrades toward "shut" under throttling
+    (`cli._candidate_publication` is fail-closed), which is the safe
+    direction."""
+    # Written under the config's OWN state dir, so the rows and the window line
+    # describe the same two records rather than two coincidentally similar sets.
+    store = detailed_store(
+        window_config.state_dir,
+        ("auto-02", "a" * 40, 1, "split the helper"),
+        ("codex-01", "b" * 40, 2, ""),
+    )
+    ctx = build_context(
+        make_state(),
+        FakeGit(),
+        two_in_flight_registry(),
+        "r",
+        "p",
+        executions=store,
+        config=window_config,
+    )
+    before = dataclasses.replace(ctx, in_flight_tasks=(), merge_window_reasons=None)
+    added = len(render_context(ctx)) - len(render_context(before))
+
+    assert ctx.merge_window_reasons and len(ctx.in_flight_tasks) == 2
+    assert 0 < added <= 600
+    for row in ctx.in_flight_tasks:
+        assert "\n" not in _render_in_flight_task(row)
+
+
+def test_no_scheduling_advice_moved_into_the_context_block(window_config):
+    """FACTS, NOT ADVICE — the bound that keeps one instruction channel. The
+    preference lives in CONTRACT_INSTRUCTIONS, which is pinned at 3,700
+    characters (`test_contract.test_contract_stays_within_its_budget`); these
+    rows state what is true and never restate what to do about it, and the
+    contract gains no text from them."""
+    store = detailed_store(window_config.state_dir, ("auto-02", "a" * 40, 1, ""))
+    block = render_context(
+        build_context(
+            make_state(),
+            FakeGit(),
+            two_in_flight_registry(),
+            "r",
+            "p",
+            executions=store,
+            config=window_config,
+        )
+    )
+    added = "\n".join(
+        row
+        for row in block.splitlines()
+        if row.strip().startswith((IN_FLIGHT_TASK_LABEL, MERGE_WINDOW_LABEL))
+    )
+    # A positive anchor first, so the absence checks below cannot pass against
+    # an empty string — which is exactly what they would do if the rows or the
+    # window line silently stopped rendering.
+    assert added.count(f"{IN_FLIGHT_TASK_LABEL}:") == 2
+    assert f"{MERGE_WINDOW_LABEL}: shut — " in added
+    for word in ("prefer ", "should ", "must ", "finish before you start"):
+        assert word not in added.lower()
+    # ...and the preference is still stated in exactly one place, at its own
+    # unchanged cost.
+    assert "finish before you start" in NEXT_WORK_PREFERENCE
+    assert IN_FLIGHT_TASK_LABEL not in CONTRACT_INSTRUCTIONS
+    assert MERGE_WINDOW_LABEL not in CONTRACT_INSTRUCTIONS
+    assert len(CONTRACT_INSTRUCTIONS) <= 3700

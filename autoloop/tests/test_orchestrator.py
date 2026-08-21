@@ -48,7 +48,7 @@ from autoloop.state import (
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 from autoloop.transcript import TranscriptLogger
 from autoloop.worker_env import WorkerRepoManager
-from autoloop.worktask import IntentStore, TaskExecutionStore
+from autoloop.worktask import IntentStore, TaskExecution, TaskExecutionStore
 
 URL = "https://chatgpt.com/c/test-conversation"
 
@@ -392,6 +392,7 @@ def build(
     tasks=(),
     executor=None,
     branch="feature/x",
+    execution_store=None,
 ):
     repo_root = tmp_path / "repo"
     repo_root.mkdir(exist_ok=True)
@@ -435,6 +436,7 @@ def build(
         registry=registry,
         task_store=task_store,
         manifest_store=manifest_store,
+        execution_store=execution_store,
     )
     return orch, store, git, executor, made, registry, manifest_store
 
@@ -978,6 +980,52 @@ def test_prompt_carries_full_context_block(tmp_path):
         assert label in first, label
     assert "previous_decision: plan" in second
     assert "next ready: t0" in second
+
+
+def test_prompt_names_the_in_flight_task_and_what_holds_the_merge(tmp_path):
+    """The PRODUCTION wiring, not the renderer (ctx-01). `_step_ready` is the
+    one place that hands `build_context` both the execution store and the
+    config; drop either argument and every test in `test_context.py` still
+    passes while the loop goes on sending the block it sent before — which is
+    exactly the block that produced the 2026-08-21 misschedule.
+
+    The worker repo is created so `cli._candidate_is_retired` answers from the
+    filesystem and never reaches git: this asserts what the reviewer is SHOWN,
+    and a `FakeGit` without `read_commit` would turn it into an assertion about
+    the fake."""
+    (tmp_path / ".al" / "executions").mkdir(parents=True)
+    (tmp_path / "t0").mkdir()
+    store = TaskExecutionStore(tmp_path / ".al" / "executions")
+    store.save(
+        TaskExecution(
+            task_id="t0",
+            task_branch="autoloop/t0",
+            worktree_path=str(tmp_path / "t0"),
+            task_base_sha="0" * 40,
+            candidate_sha="c" * 40,
+            review_round=1,
+            last_revise_feedback="split step 2",
+        )
+    )
+    orch, _, _, _, clients, registry, _ = build(
+        tmp_path,
+        responses=[stop_block()],
+        tasks=[ready_task("t0")],
+        execution_store=store,
+    )
+    registry.mark_in_progress("t0")
+    orch.run()
+
+    prompt = clients[0].submitted[0][1]
+    assert "in_flight: 1 in progress, 1 holding an unpublished candidate" in prompt
+    assert (
+        "in_flight_task: t0 — candidate cccccccccccc, review round 1, "
+        "revise feedback on record"
+    ) in prompt
+    assert "merge_window: shut — task t0 has a candidate (cccccccccccc)" in prompt
+    # The feedback TEXT never rides along — see
+    # `test_context.test_the_rows_never_carry_the_feedback_text_itself`.
+    assert "split step 2" not in prompt
 
 
 # ---- contract violations ----------------------------------------------------
