@@ -216,6 +216,14 @@ Ruff is **part of backend validation, not an optional extra** — run it alongsi
 `pytest` before calling any Python change done. Baseline as of 2026-07-27: zero
 findings (was 153; see the ruff entry in `docs/TESTS.md`).
 
+Since val-03 (2026-08-22) it is also the check the autoloop stops at: a loop
+validation run executes the configured commands **in order and stops at the
+first one that fails**, reporting the rest as `NOT RUN` (`docs/AUTOLOOP.md`
+§4h). So a ruff finding means no test suite ran that round — read `NOT RUN` as
+"no evidence either way", never as "passed" — and fixing lint first is how a
+round gets past it. Nothing about the verdict changed: a failing run still
+fails, and a passing run still runs every command.
+
 Two things to know before "fixing" what it reports:
   - **`# noqa: E402` on a sibling import is load-bearing.** `subtitle-scraper/`
     modules import each other after a `sys.path.insert` — the deliberate

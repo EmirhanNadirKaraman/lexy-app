@@ -286,12 +286,21 @@ def test_a_task_declared_command_is_parallelised_by_the_executor(tmp_path):
 def test_a_parallel_run_still_reports_pass_fail_per_command(tmp_path):
     """Parallelism lives inside one command; the summary is still one
     PASS/FAIL report per command, naming the command that really ran, so a
-    failure is attributable to one suite rather than to "pytest"."""
+    failure is attributable to one suite rather than to "pytest".
+
+    Driven with `fail_fast=False` so this stays a test about PARALLELISM: the
+    default stops at the first failing command and reports the rest as NOT RUN
+    (val-03), which is asserted in `test_validation_failfast.py`. Every command
+    running is exactly the full-run mode, so this doubles as an exercise of it
+    from a test that predates it.
+    """
     effective = effective_validation_commands(LEGACY_SERIAL)
     failing = next(a for a in effective if is_pytest(a) and not is_isolated_run(a))
     runner, _seen = recording_runner(fail_argv=failing)
 
-    ok, summary = run_validation_commands(LEGACY_SERIAL, tmp_path, command_runner=runner)
+    ok, summary = run_validation_commands(
+        LEGACY_SERIAL, tmp_path, command_runner=runner, fail_fast=False
+    )
 
     assert ok is False
     # Asserted per command rather than by counting segments: `failure_digest`

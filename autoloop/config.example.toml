@@ -224,6 +224,24 @@ max_parallel_agents = 3
 # so keeping the trees on separate lines keeps a failure attributable to one of
 # them rather than to "pytest".
 #
+# THE ORDER OF THIS LIST IS LOAD-BEARING as of val-03 (2026-08-22). A validation
+# run STOPS at the first command that fails and reports every command after it as
+# "<command>: NOT RUN" — a run answers "is this approvable?", and the first
+# failure settles that, so everything after it is bought against a verdict
+# already reached.
+#
+# So order these cheapest-first, which is what the list already is: lint
+# (seconds) before the test suites (minutes), and the serial `isolated` re-run —
+# the one command that cannot be parallelised — last. Nothing re-orders this list
+# for you; a list written expensive-first would simply pay expensive-first. The
+# two pytest suites' order relative to each other is left to you, deliberately:
+# it needs a measurement this file cannot make for your repository.
+#
+# NOT RUN is not SKIPPED (that is test selection, below), the summary still names
+# every configured command either way, and nothing about the VERDICT changes.
+# There is deliberately no key here to turn it off; the full-run mode is
+# `run_validation_commands(..., fail_fast=False)`. See docs/AUTOLOOP.md §4h.
+#
 # Three things on the pytest lines are load-bearing:
 #
 #   * `-n auto` — pytest-xdist, one worker per core. Run serially the two suites

@@ -2636,6 +2636,38 @@ was holding.
 
 ---
 
+## 14. Autoloop validation reporting (fail-fast)
+
+### The validation summary says `NOT RUN` — did the suite get skipped?
+**Symptom:** a refused round's `validation:` line reads e.g.
+`ruff check .: FAIL (...); python3 -m pytest -n auto autoloop/tests …: NOT RUN;
+python3 -m pytest -n auto tests/ …: NOT RUN; STOPPED at the first failing
+command: …`. It looks like validation lost two commands.
+**Cause:** it is deliberate (val-03, 2026-08-22). A validation run stops at the
+first command that FAILS and names every command after it `NOT RUN` — the
+verdict was already decided. Nothing was skipped silently and nothing was
+weakened: `all_passed` is False exactly as before, and every configured command
+is still named in the summary.
+**Fix:** none needed — fix the failing command and the next round runs further.
+Read `NOT RUN` as "no evidence either way", never as "passed". It is also NOT
+the `SKIPPED` that per-commit test selection reports (that one means "no
+reachable test lives under this command's paths"). To run everything anyway,
+call `validation.run_validation_commands(..., fail_fast=False)`; there is no
+config key, and `docs/AUTOLOOP.md` §4h says why.
+
+### A test asserts a validation summary and now fails on a later command
+**Symptom:** a test feeding a MULTI-command list to a runner that returns a
+nonzero code asserts `<later command>: PASS` and gets `NOT RUN`.
+**Cause:** same change. Under the default only the commands up to and including
+the first failure execute.
+**Fix:** decide which property the test is really about. If it is about the
+later command, pass `fail_fast=False` (that is what
+`test_validation_parallelism.py::test_a_parallel_run_still_reports_pass_fail_per_command`
+does, and it doubles as the full-run mode's exercise). If it is about the
+report, assert `NOT RUN` — see `autoloop/tests/test_validation_failfast.py`.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found
