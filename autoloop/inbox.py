@@ -60,10 +60,11 @@ Nothing here validates the task graph — `TaskRegistry.add_many` does that on
 merge, so a bad request is refused by the same gate a ChatGPT `plan` goes
 through, not by a second implementation that could drift from it.
 
-**Mutations (2026-08-16).** The vocabulary was `task` + `priority`. It is now
-`task` plus six mutations: `priority`, `description`, `approved_paths`,
-`depends_on`, `block` and `unblock`. Four things keep that from being the
-"general edit-a-task request" the `priority`-only design was written to avoid:
+**Mutations (2026-08-16; `urgent` added 2026-08-22).** The vocabulary was
+`task` + `priority`. It is now `task` plus seven mutations: `priority`,
+`description`, `approved_paths`, `depends_on`, `block`, `unblock` and
+`urgent`. Four things keep that from being the "general edit-a-task request"
+the `priority`-only design was written to avoid:
 
 1. **Two authorities, split by question, one implementation each.** SHAPE — is
    the field present, is it the right JSON type, does this kind even carry it —
@@ -110,6 +111,16 @@ through, not by a second implementation that could drift from it.
    `apply_requests` makes ONE pass in that order, so two requests against the
    same field resolve last-write-wins and a mutation queued before its
    target's creation is refused rather than held back and retried later.
+5. **`urgent` is single-slot and never last-write-wins.** It is the one kind
+   whose effect is on the LOOP rather than on the task graph — it displaces the
+   round in flight — so the rule in point 4 is deliberately not applied to it:
+   `TaskRegistry.request_urgent` REFUSES a second request while another task's
+   pin is still waiting for its dispatch, naming the incumbent, instead of
+   overwriting it. Overwriting would let the second operator discard the
+   displaced round the first one paid for without ever seeing that they had.
+   It still decides nothing about timing: the pin is a fact in the registry,
+   and `orchestrator._preempt_for_urgent` is what acts on it, only at a phase
+   boundary the loop already treats as safe.
 
 The widening this is honest about: an inbox request can now change what an
 existing task is authorized to write, which `docs/SECURITY.md` S28 previously
@@ -200,6 +211,25 @@ REQUIRED_FIELDS = ("id", "title", "description")
 #: shaped to avoid.
 KIND_TASK = "task"
 KIND_PRIORITY = "priority"
+#: Make an existing task the loop's URGENT TARGET — the next task dispatched,
+#: ahead of whatever round is in flight. Carries a `reason`, like `block`.
+#:
+#: The one mutation whose effect is on the LOOP rather than on the task graph,
+#: and it is still a mutation of one field (`Task.urgent_at`) on one existing
+#: task, applied through the registry by the same drain as every other kind.
+#: Nothing here decides when the loop acts on it — see
+#: `TaskRegistry.request_urgent` for what may hold the pin and
+#: `orchestrator._preempt_for_urgent` for the safe boundary at which it is
+#: acted on.
+#:
+#: A separate kind rather than `{"kind": "priority", "priority": 0}` because
+#: priority CANNOT preempt: it only orders the next selection among READY
+#: tasks, so a task already in flight is untouchable by it, and a P0 request
+#: merely ties with every other P0 (measured 2026-08-21 — codex-01 lost the id
+#: tiebreak to a P0 task already mid-round and nothing said so). Keeping the
+#: two kinds apart also keeps the ordinary re-prioritisation harmless: it
+#: cannot displace a round by accident.
+KIND_URGENT = "urgent"
 KIND_DESCRIPTION = "description"
 KIND_APPROVED_PATHS = "approved_paths"
 KIND_DEPENDS_ON = "depends_on"
@@ -223,6 +253,7 @@ MUTATION_PAYLOAD: dict[str, str | None] = {
     KIND_DEPENDS_ON: "depends_on",
     KIND_BLOCK: "reason",
     KIND_UNBLOCK: None,
+    KIND_URGENT: "reason",
 }
 MUTATION_KINDS = tuple(MUTATION_PAYLOAD)
 KINDS = (KIND_TASK, *MUTATION_KINDS)
@@ -338,7 +369,7 @@ def _check_mutation(kind: str, spec: dict) -> None:
     # paths, unknown dependencies — so nothing below asks one.
     if kind == KIND_PRIORITY and not isinstance(value, int):
         raise InboxError("a priority request needs an integer 'priority'")
-    if kind in (KIND_DESCRIPTION, KIND_BLOCK) and not isinstance(value, str):
+    if kind in (KIND_DESCRIPTION, KIND_BLOCK, KIND_URGENT) and not isinstance(value, str):
         raise InboxError(f"a {kind} request needs {payload!r} as a string")
     if kind in (KIND_APPROVED_PATHS, KIND_DEPENDS_ON) and not isinstance(value, list):
         raise InboxError(
@@ -513,6 +544,16 @@ def _apply_mutation(registry, kind: str, spec: dict) -> str:
     if kind == KIND_BLOCK:
         task = registry.operator_block(task_id, spec.get("reason"))
         return f"{task.id} -> blocked: {task.blocked_reason}"
+    if kind == KIND_URGENT:
+        task = registry.request_urgent(task_id, spec.get("reason"))
+        # Says what will happen next, because "urgent" on its own reads as a
+        # flag rather than as an act: this request ends the round in flight at
+        # the loop's next safe boundary and returns that task to pending.
+        return (
+            f"{task.id} -> URGENT (requested {task.urgent_at}: "
+            f"{task.urgent_reason}); the loop preempts at its next safe phase "
+            "boundary and dispatches this task"
+        )
     task = registry.operator_unblock(task_id)
     return f"{task.id} -> pending (hold released)"
 

@@ -2582,6 +2582,124 @@ which made ordinary files unrepresentable — `tests/_auth_helper.py` and
 A leading `.` or `_` is now accepted; `.` and `..` segments are refused
 separately, which is the check that actually matters.
 
+## 4f-quinquies. Urgent preemption — taking the loop NOW, without touching the gate
+
+    python -m autoloop urgent codex-01 "the codex transport is down"
+
+The task named there is the NEXT task the loop dispatches. It does not wait for
+the round in flight to finish: the loop ends that round at its next SAFE phase
+boundary, returns the displaced task to pending, quarantines its work, and
+selects the urgent one.
+
+**Why priority could not already do this, measured 2026-08-21/22.**
+`next_ready()` chooses among READY tasks, so a task already in flight is
+untouchable by it and a re-prioritisation only wins the NEXT selection.
+codex-01 was raised to P0 while brw-13 held the loop — but brw-13 was ALREADY
+P0, so P0 only TIED, and the id tiebreak decided it (`"brw-13" < "codex-01"`).
+The urgent task lost, silently. Every urgent switch that night was therefore
+done by hand, and each one cost a full round or an error:
+
+* the manual sequence is pause → wait for the phase boundary → release → drain
+  → restart, and the WAIT alone took 10 and 15 minutes on two occasions (a
+  revise round can take 21);
+* `retire_execution` was used where `release` was needed. It moved the
+  execution record and the worker repo but NOT the task status, so auto-02 and
+  codex-01 sat `in_progress` and invisible to `next_ready` for about an hour.
+
+**The pin.** `Task.urgent_at` (plus `urgent_reason`), set only by
+`TaskRegistry.request_urgent`. It sorts its task ahead of everything in
+`next_ready()` regardless of priority, and `mark_in_progress` CONSUMES it — the
+request asks for one dispatch, not for permanent precedence. A field that
+exists on exactly one task cannot tie, which is the whole reason it is not
+expressed as a smaller priority number.
+
+**Where each rule lives.** The inbox owns the request's SHAPE
+(`inbox.KIND_URGENT`, `{kind, id, reason}` and nothing else), the registry owns
+its CONTENT (may this task hold the pin), and the orchestrator owns its TIMING.
+Same three-way split the rest of the inbox already uses, so an operator reads
+one authority's words per question.
+
+**SAFE BOUNDARIES ONLY.** `Orchestrator._preempt_for_urgent` acts only at
+`_at_round_boundary` — `phase == ready` with no pending request — which is the
+SAME predicate the self-upgrade restart boundary uses, in one function rather
+than two copies. A request arriving mid-`delivering`/`submitting`/
+`submission_unconfirmed`/`submission_rejected`/`awaiting`/`executing` is
+observed, logged (`urgent_awaiting_boundary`) and acted on when the round comes
+back to `ready`. Interrupting there would strand a review packet or an approved
+push, which is the one thing a preemption must never buy its speed with.
+
+**RELEASE PROPERLY OR NOT AT ALL.** The displaced task goes through
+`orchestrator.release_task_to_pending`, shared with `python -m autoloop
+release`, so all three things move together: the STATUS, the WORKER REPO
+(quarantined, never deleted) and the EXECUTION RECORD (archived).
+
+**Only a PLANNED task is displaced; an AUDIT round is waited out.** An audit
+unit is minted per run, is absent from the registry and takes no task out of
+the queue, so displacing it buys nothing the pin does not already buy — the
+urgent task is still what `next_ready()` returns for the round after it. This
+is the same decision as the dispatch gate below not refusing an `audit`, and
+the two have to agree: `_start_new_session` opens the session a preemption
+starts with the AUDIT KICKOFF, so that session can legitimately come back with
+an `audit`. Displacing that round too would cost a full executor round and one
+quarantined worker per lap, ending only when the reviewer happened to pick
+`implement` — the "a full round per iteration while looking like progress"
+churn `cli._report_fault_stop` exists to stop. The cost is one audit round of
+delay, and `urgent_awaiting_boundary` makes the wait visible while it happens.
+
+**THE DISPLACED TASK IS VISIBLE.** `LoopState.preemption` and a
+`task_preempted` transcript entry record the displaced task, the phase the
+request was first seen at, the phase it was acted on at, the urgent target and
+its reason, the quarantine label and both paths, plus the displaced candidate's
+sha, review round and attempt count. `run --continuous` prints the same thing.
+
+**BOUNDS, stated rather than implied.**
+
+* *A second urgent request while the first is still landing* is REFUSED
+  (`urgent_already_pending`), naming the incumbent — never queued behind it and
+  never overwriting it. Overwriting would let the second operator discard the
+  displaced round the first one paid for without seeing that they had. The slot
+  reopens the moment the first target is dispatched.
+* *A target that is not READY* is refused with its reason and its own error
+  code: `task_blocked` (naming the incomplete dependencies), `task_in_progress`
+  ("already the round in flight"), `task_blocked_by_operator`, `task_retired`,
+  `task_completed`, `task_unknown`, or `no_approved_paths` — an unscoped task
+  would park on arrival, so displacing a round for it is refused where the
+  operator can still fix it. `python -m autoloop urgent` runs the SAME check
+  before queueing, so the ordinary refusals arrive at the prompt.
+* *A pin whose task later leaves the queue* (a new dependency, a quarantine, a
+  retirement) is STALE, holds nothing shut, and is cleared when the slot is
+  granted to someone else.
+* *An idle loop, or one running an audit,* is not preempted at all: there is
+  nothing a preemption would displace that the pin does not already steer, and
+  ending such a round in a circle is the churn described above.
+
+**ONE AT A TIME, and no pause anywhere.** The documented deadlock of the manual
+sequence is two operators each pausing, the first timing out and calling
+`resume` on its way out, and the second waiting on a lock that never clears.
+This path takes NO pause: the loop observes the request itself, at its own
+boundary. There is no flag to leave behind, and only one pin can be live, so
+there is never a second preemption in flight to strand.
+
+**WHAT THIS IS NOT: a review or merge bypass.** Skipping review would save
+almost nothing — measured on the codex transport, packet build 0.98s, submit
+12–15s, verdict ~0s against an executor round of 1282s, i.e. about 2% of a
+round — and would cost the binding that makes the system safe: `report_sha256`
+covers the packet bytes INCLUDING the candidate sha, which is what stops an
+approval computed over candidate A from publishing candidate B. The urgent task
+is implemented, reviewed, approved and published through the identical path as
+any other. The one enforcement added is `_dispatch_executor` refusing an
+`implement`/`revise` of a DIFFERENT task while the pin is live, through the
+ordinary budget-capped policy-denial re-prompt — because `next_ready()` decides
+what the CONTEXT block offers, not what policy authorizes, and "offered next"
+is not the claim being made. An `audit` is deliberately not refused: it takes
+no task out of the queue, and the session a preemption starts opens with the
+audit kickoff.
+
+A preempted session ends as `stopped` with `stop_kind = "preempted"`. Like
+`"contract"` and unlike `"fault"`, that is a CLEAN round boundary — continuous
+mode reassesses and starts the next session — which is why nothing that reads
+`run()`'s outcome needed a new branch.
+
 ## 4g. The validation-environment boundary (test DB credentials)
 
 **The problem.** A task may declare validation that needs a database — `rt-01`

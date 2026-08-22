@@ -76,6 +76,27 @@ Transport-recovery additions (this change):
   never qualifies, and a reply that appears during that final reconciliation
   cancels the attempt.
 
+Urgent preemption (2026-08-22):
+
+* An operator can take the loop NOW without waiting for the round in flight, by
+  marking a task urgent through the inbox (`inbox.KIND_URGENT` ->
+  `TaskRegistry.request_urgent`). The loop observes the pin between steps and
+  acts on it only at `_at_round_boundary` — `ready` with no pending request,
+  the SAME instant a self-upgrade may replace the process — so a request that
+  arrives while a review packet is outstanding waits rather than stranding it.
+* Acting on it means: return the displaced task to pending through the one
+  release path (`release_task_to_pending`, shared with `cli._cmd_release`, so
+  the status, the worker repo and the execution record always move together),
+  record what was displaced (`LoopState.preemption` + a `task_preempted`
+  transcript entry), and end the round as a `stopped` session with
+  `stop_kind = PREEMPTION_STOP_KIND` — a CLEAN boundary, which is why every
+  existing caller of `run()` needs no new branch to handle it.
+* The review gate is untouched. Nothing here skips a packet, assumes a verdict
+  or authorizes a push; the displaced candidate stays in its quarantined worker
+  repo. The only enforcement added is `_dispatch_executor` refusing an
+  implement/revise of a DIFFERENT task while the pin is live, through the
+  ordinary policy-denial re-prompt.
+
 Note for the merge with the blocker/quarantine work (commit 5346551, branch
 `feat/autoloop-postcommit-review`): every park site added here goes through the
 existing two-argument `_to_needs_user` and emits a stable `reason_code` in its
@@ -329,6 +350,81 @@ MAX_TASK_ATTEMPTS = 5
 #: and leaves the record for the next run. Resuming after either is the
 #: ordinary "state is non-terminal, keep going" path, with no special case.
 SELF_UPGRADE = "self_upgrade"
+
+#: `LoopState.stop_kind` for a session an operator's urgent request ended.
+#:
+#: Deliberately a `stopped` session rather than a new `run()` outcome string
+#: like `SELF_UPGRADE` above. Every existing caller of `run()` already treats a
+#: non-fault `stopped` as a CLEAN ROUND BOUNDARY — reassess, select, start a
+#: fresh session — which is exactly what must happen next here, so a caller
+#: that has never heard of preemption does the right thing rather than falling
+#: through an unhandled branch. `cli._is_fault_stop` reads `"fault"`
+#: positively, so this is not a fault; `cli._cmd_smoke_browser` reads
+#: `"contract"` positively, so this is not a healthy round-trip either.
+PREEMPTION_STOP_KIND = "preempted"
+
+#: The `retire_execution` label a displaced round's worker repo and execution
+#: record are filed under, so the two halves name each other on disk as
+#: `<task>-displaced-by-urgent-<stamp>` and a human reading either one can tell
+#: at a glance that the work was PREEMPTED rather than released by hand or
+#: abandoned by a park.
+PREEMPTION_RETIREMENT_REASON = "displaced-by-urgent"
+
+
+def release_task_to_pending(
+    task_id: str,
+    registry: TaskRegistry,
+    execution_store,
+    worker_repos,
+    *,
+    persist,
+    reason: str = "released-by-operator",
+):
+    """Return an in-progress task to pending, and retire the execution it
+    leaves behind. Returns `(task, worktask.Retirement)`.
+
+    THE release path, and the only one — `cli._cmd_release` and
+    `Orchestrator._preempt_for_urgent` both come through here, because the
+    thing that goes wrong with releasing a task is doing one third of it. Three
+    things have to move together (the wording is `_cmd_release`'s own, kept
+    verbatim because it is the rule):
+
+    * the STATUS, or `next_ready` keeps skipping it;
+    * the stale WORKER REPO, or the next dispatch refuses (`create()` will not
+      write into an existing directory);
+    * the EXECUTION RECORD, or `_merge_window_blockers` keeps reading a
+      `candidate_sha` for work that no longer exists as in-flight.
+
+    That third one was silently left behind until 2026-08-15 and cost an
+    operator 14 hand-archived records; `worktask.retire_execution` does the
+    last two in one call precisely so a caller cannot do one and forget the
+    other. This function adds the first, so a SECOND caller cannot rebuild the
+    same gap one level up — which is what a preemption re-implementing the
+    sequence would have done.
+
+    ORDER, and it is not arbitrary. `registry.release` raises before anything
+    else happens, so a task that may not be released (not in progress) leaves
+    the worker repo and the record exactly where they are. `persist` then makes
+    the status durable BEFORE the artefacts move: a process that dies in
+    between leaves a pending task with a stale worker, which the next dispatch
+    refuses loudly, rather than a task still marked in-progress whose worker has
+    already been quarantined — a state no command can move.
+
+    `persist` is a callable rather than a `TaskStore`, because the two callers
+    save through different objects (the CLI's own store, the orchestrator's
+    `self._task_store`) and because a function that took a store would have to
+    decide what else to write. It is called exactly once, always.
+
+    Nothing is deleted. The worker is MOVED to quarantine (an interrupted round
+    usually has real work in it) and the record is MOVED to
+    `executions/archive/`, both under one label, so the candidate stays
+    recoverable and the two halves name each other on disk.
+    """
+    task = registry.release(task_id)
+    persist()
+    retirement = retire_execution(task_id, execution_store, worker_repos, reason=reason)
+    return task, retirement
+
 
 #: The SECOND budget, and the one that answers "a fault must not spend a task's
 #: attempt budget" (task budget-01, 2026-08-17) without removing the bound that
@@ -644,6 +740,14 @@ class Orchestrator:
         #: a real one. The ONLY thing in this class that blocks deliberately;
         #: every other wait belongs to the transport or to a subprocess.
         self._sleep = sleep
+        #: The phase at which this process FIRST saw the current urgent pin, so
+        #: the preemption record can say what it waited through rather than only
+        #: where it acted. In-memory and deliberately not persisted: it is
+        #: evidence about this process's own observation, and a restart that
+        #: inherited a stale value would claim to have waited through a phase it
+        #: never saw. `None` means "not seen yet", and it is cleared again once
+        #: the preemption it describes has been recorded.
+        self._urgent_first_seen_phase = None
         self._client = None
 
     # ---- main loop ----------------------------------------------------------
@@ -682,6 +786,16 @@ class Orchestrator:
             # step budget, so `--max-steps` cannot hide the boundary.
             if self._self_upgrade_due(phase):
                 return SELF_UPGRADE
+            # AFTER the self-upgrade check, and the order is deliberate rather
+            # than incidental: a self-upgrade replaces the process at this same
+            # boundary and comes straight back to it, so the preemption is
+            # delayed by one exec and then acted on by the merged code — while
+            # the reverse order would end the round first and leave the pending
+            # upgrade for a boundary that no longer exists in this session.
+            # Both sit AFTER the terminal check, so a parked loop reports what
+            # it is parked on rather than ending a round nobody is running.
+            if self._preempt_for_urgent(phase):
+                return Phase.STOPPED.value
             if max_steps is not None and steps >= max_steps:
                 return phase.value
             steps += 1
@@ -802,10 +916,10 @@ class Orchestrator:
         else:  # pragma: no cover - terminal phases filtered in run()
             raise StateError(f"cannot step from phase {phase.value}")
 
-    # ---- the restart boundary ------------------------------------------------
+    # ---- the round boundary ---------------------------------------------------
 
-    def _self_upgrade_due(self, phase: Phase) -> bool:
-        """Is this the moment at which the process may be replaced?
+    def _at_round_boundary(self, phase: Phase) -> bool:
+        """Is the loop between rounds, with nothing outstanding?
 
         **`READY` with no pending request, and nothing else.** That is the
         instant BEFORE the next request is prepared: `_step_ready` is what
@@ -814,16 +928,34 @@ class Orchestrator:
         running (a write-capable agent runs inside `_step_executing`, a
         different phase, synchronously — reaching here means it returned); and
         every `TaskExecution` was written by whoever last touched it, since
-        this class saves records as it goes rather than at an exit. A
-        replacement here loses nothing: the successor loads the same state file
-        and prepares the same request from the same outbox.
+        this class saves records as it goes rather than at an exit.
 
-        Every other phase is mid-round by construction and is refused —
-        `submitting` and `submission_unconfirmed` have a packet in flight,
-        `awaiting` has a reviewer holding one, `executing` has an agent writing
-        into a worker repo. `pending_request` is checked SEPARATELY from the
-        phase because it outlives its own phase: a request answered and not yet
-        consumed is still a packet this loop owes something to.
+        Every other phase is mid-round by construction — `delivering`,
+        `submitting` and `submission_unconfirmed`/`submission_rejected` have a
+        packet in flight or an unresolved send, `awaiting` has a reviewer
+        holding one, `executing` has an agent writing into a worker repo.
+        `pending_request` is checked SEPARATELY from the phase because it
+        outlives its own phase: a request answered and not yet consumed is
+        still a packet this loop owes something to.
+
+        ONE predicate, two users (`_self_upgrade_due`, `_preempt_for_urgent`),
+        because they are asking the same question — may this session be
+        interrupted right now — and a second copy would be a second answer.
+        That matters most for the phases where an interruption is destructive:
+        stopping in `submitting` or `awaiting` strands a review packet, and a
+        preemption that stranded an approved push would have traded a slow
+        queue for a lost candidate.
+        """
+        return phase is Phase.READY and self.state.pending_request is None
+
+    def _self_upgrade_due(self, phase: Phase) -> bool:
+        """Is this the moment at which the process may be replaced?
+
+        The boundary itself is `_at_round_boundary` above — `READY` with no
+        pending request — and this adds the one question that is specific to a
+        replacement: is there a merged upgrade waiting for it. A replacement at
+        that boundary loses nothing: the successor loads the same state file and
+        prepares the same request from the same outbox.
 
         Reads the record, never writes it. An unreadable or already-settled
         record answers False — the fail-closed direction here is to keep
@@ -832,7 +964,7 @@ class Orchestrator:
         """
         if not self._self_upgrade_enabled:
             return False
-        if phase is not Phase.READY or self.state.pending_request is not None:
+        if not self._at_round_boundary(phase):
             return False
         try:
             record = self._upgrades.load()
@@ -849,6 +981,206 @@ class Orchestrator:
                 "phase": phase.value,
             },
         )
+        return True
+
+    # ---- preemption ----------------------------------------------------------
+
+    def _displaced_work_exists(self, task_id: str) -> bool:
+        """Is there a PLANNED task in flight under `task_id` for a preemption
+        to displace?
+
+        The guard that keeps a preemption from being a no-op that ends healthy
+        sessions in a circle. Without it, a pin observed by a loop with nothing
+        running would end the round, the next selection would start a fresh
+        session, that session would reach the same boundary with the same pin
+        still live, and the loop would spend every iteration ending sessions
+        that had done nothing — the pin alone is what steers the next selection
+        (`TaskRegistry.next_ready`), and an idle loop needs no preemption to
+        pick up an urgent task.
+
+        In flight means the registry knows this id AND its stored status is
+        `in_progress`. Read as the stored string rather than through
+        `state_of`, which reports BLOCKED for an in-progress task with an
+        incomplete dependency and would fall silent on the very task that is
+        hardest to release (the same reasoning `_refuse_immutable` documents).
+
+        **An AUDIT unit is deliberately NOT displaced**, and that is the same
+        decision as `_dispatch_executor` not refusing an `audit` while a pin is
+        live — the two would otherwise pull against each other and churn.
+        `_start_new_session` sets the outbox to the audit kickoff, so the very
+        session a preemption starts can come back with an `audit`; if that round
+        were then displaced too, each lap would cost a full executor round and
+        leave another quarantined worker, and it would end only when the reviewer
+        happened to pick `implement` — exactly the "a full round per iteration
+        while looking like progress" churn `cli._report_fault_stop` exists to
+        stop. An audit takes no task out of the queue, so displacing it buys
+        nothing the pin does not already buy: the urgent task is still what
+        `next_ready()` returns for the round after it. The cost is bounded at
+        one audit round of delay, and `urgent_awaiting_boundary` makes the wait
+        visible while it happens.
+        """
+        if not task_id or not self._registry.has(task_id):
+            return False
+        return self._registry.get(task_id).status == "in_progress"
+
+    def _preempt_for_urgent(self, phase: Phase) -> bool:
+        """End the round in flight so an operator's urgent task can take the
+        loop. True when this round was preempted (the caller ends `run`).
+
+        THE preemption. What it costs and what it does not:
+
+        * **It waits for a safe boundary.** `_at_round_boundary` — `ready` with
+          no pending request, the same instant a self-upgrade may replace the
+          process. A request that arrives mid-`submitting` or mid-`awaiting`
+          is observed, logged as waiting, and acted on when the round comes
+          back to `ready`; interrupting there would strand a review packet or
+          an approved push, which is the one thing a preemption must never buy
+          its speed with.
+        * **It releases the displaced task properly, or not at all.**
+          `release_task_to_pending` moves the status, the worker repo and the
+          execution record together — the one implementation, shared with
+          `cli._cmd_release`. Only a PLANNED task in flight is displaced at all
+          (`_displaced_work_exists`); an audit round is waited out rather than
+          displaced, for the reason recorded there.
+        * **It records what it took.** `state.preemption` and the
+          `task_preempted` transcript entry carry the displaced task, the
+          phase the request was first seen at, the phase it was acted on at,
+          the urgent target and its reason, and the quarantine label plus the
+          two paths the work was moved to. A preemption that silently discarded
+          twenty minutes of work would be worse than a slow queue.
+        * **It changes NOTHING about review, approval or publication.** No
+          packet is skipped, no verdict is assumed, no push is authorized: the
+          round simply ends between rounds, exactly as a reviewer's own `stop`
+          does, and the displaced candidate stays in its quarantined worker
+          where it can be inspected or re-dispatched.
+
+        There is deliberately NO pause flag anywhere in this path. The
+        documented failure of the manual sequence is two operators each
+        pausing, the first timing out and calling `resume` on its way out, and
+        the second waiting on a lock that never clears. A loop that observes
+        the request itself, at its own boundary, takes no lock to strand — and
+        `TaskRegistry.request_urgent` allows only one live pin at a time, so
+        there is never a second preemption in flight to strand in the first
+        place.
+
+        Ends the session as a `stopped` round with
+        `stop_kind = PREEMPTION_STOP_KIND` rather than returning a new outcome
+        string, so every existing caller treats it as the clean round boundary
+        it is. The registry is saved before this returns, because continuous
+        mode reloads `tasks.json` from disk at the top of its next iteration —
+        an unsaved release or pin would simply not exist there.
+        """
+        target = self._registry.live_urgent_target()
+        if target is None:
+            return False
+        state = self.state
+        displaced_id = (state.current_task or {}).get("task_id") or ""
+        if displaced_id == target.id:
+            # Defense in depth, and unreachable today by construction:
+            # `live_urgent_target` only returns a READY task and a displaced
+            # task is IN_PROGRESS, so one id cannot be both. Kept because the
+            # failure it prevents is the worst one available here — quarantining
+            # the very work the request asked for — and it would become
+            # reachable the moment `live_urgent_target` widened.
+            return False
+        if not self._displaced_work_exists(displaced_id):
+            return False
+        if self._urgent_first_seen_phase is None:
+            self._urgent_first_seen_phase = phase.value
+        if not self._at_round_boundary(phase):
+            self._log(
+                "urgent_awaiting_boundary",
+                data={
+                    "urgent_task_id": target.id,
+                    "displaced_task_id": displaced_id,
+                    "phase": phase.value,
+                    "note": (
+                        "an urgent request is pending; the round continues to a "
+                        "safe boundary (ready, no packet outstanding) before it "
+                        "is displaced"
+                    ),
+                },
+            )
+            return False
+
+        execution = None
+        if self._execution_store is not None:
+            try:
+                execution = self._execution_store.load(displaced_id)
+            except (StateError, OSError):  # pragma: no cover - unreadable record
+                execution = None
+        released = False
+        obstacle = ""
+        retirement = None
+        try:
+            _, retirement = release_task_to_pending(
+                displaced_id,
+                self._registry,
+                self._execution_store,
+                self._worker_repos,
+                persist=lambda: self._task_store.save(self._registry),
+                reason=PREEMPTION_RETIREMENT_REASON,
+            )
+            released = True
+        except (TaskGraphError, StateError, OSError) as exc:
+            # Recorded, never raised, and `obstacle` therefore means exactly one
+            # thing: the release was attempted and genuinely failed. The round
+            # ends either way — re-raising here would take the process down at
+            # the one moment an operator is watching for their urgent task, and
+            # the residue this leaves (a stale worker repo) is the LOUD kind:
+            # the next dispatch of that task refuses by name rather than
+            # proceeding on top of it.
+            #
+            # Near-unreachable, since `_displaced_work_exists` has just read the
+            # status `release` demands. It stands for the filesystem half —
+            # a colliding quarantine label, an unwritable archive directory.
+            obstacle = str(exc)
+            self._log(
+                "preemption_release_failed",
+                data={"displaced_task_id": displaced_id, "error": str(exc)},
+            )
+
+        record = {
+            "urgent_task_id": target.id,
+            "urgent_reason": target.urgent_reason,
+            "urgent_requested_at": target.urgent_at,
+            "displaced_task_id": displaced_id,
+            "displaced_returned_to_pending": released,
+            "first_observed_phase": self._urgent_first_seen_phase or phase.value,
+            "preempted_at_phase": phase.value,
+            "obstacle": obstacle,
+            "quarantine_label": getattr(retirement, "label", "") or "",
+            "quarantined_worker_path": str(getattr(retirement, "worker_path", "") or ""),
+            "archived_execution_record": str(getattr(retirement, "record_path", "") or ""),
+            "displaced_candidate_sha": getattr(execution, "candidate_sha", "") or "",
+            "displaced_review_round": getattr(execution, "review_round", 0) or 0,
+            "displaced_attempt_count": getattr(execution, "attempt_count", 0) or 0,
+            "at": utcnow_iso(),
+        }
+        state.preemption = record
+        state.current_task = None
+        state.task_execution = None
+        state.last_response = None
+        # The packet this round was about to send is about the task that just
+        # went back to the queue, so it is discarded with it rather than left
+        # to be sent by anything that re-enters `ready`.
+        state.outbox = None
+        state.outbox_diff = None
+        state.outbox_attachment = None
+        state.phase = Phase.STOPPED.value
+        state.stop_kind = PREEMPTION_STOP_KIND
+        state.stop_reason = (
+            f"preempted for urgent task {target.id} ({target.urgent_reason}); "
+            f"{displaced_id} was returned to pending"
+            if released
+            else (
+                f"preempted for urgent task {target.id} ({target.urgent_reason}); "
+                f"{displaced_id} was NOT returned to pending — {obstacle}"
+            )
+        )
+        self._store.save(state)
+        self._log("task_preempted", data=record)
+        self._urgent_first_seen_phase = None
         return True
 
     # ---- phases -------------------------------------------------------------
@@ -3512,6 +3844,41 @@ class Orchestrator:
             directive.decision is Decision.AUDIT or directive.task_id == AUDIT_TASK_ID
         )
         if not is_audit and directive.decision in TASK_DECISIONS:
+            # THE URGENT PIN, enforced rather than merely offered. The pin
+            # already puts its task at the head of `next_ready()`, and that is
+            # the only task the CONTEXT block briefs (`context.build_context`'s
+            # `next_ready`), so the reviewer normally names it — but policy
+            # authorizes any READY task by id, so "offered next" is not
+            # "dispatched next", and the whole claim this exists to make is the
+            # second one. Refused through `_handle_policy_denial`, the same
+            # budget-capped corrective re-prompt every other refused directive
+            # gets: the reviewer is told which task to send instead and why, and
+            # a reviewer that keeps ignoring it runs out of denial budget and
+            # ends the run loudly rather than quietly working around the
+            # operator.
+            #
+            # Deliberately NOT extended to `audit`: an audit takes no task out
+            # of the queue and holds nothing the urgent task needs, so refusing
+            # one would spend denial budget on a round that costs the pin
+            # nothing — and the fresh session a preemption starts opens with the
+            # audit kickoff, so denying audits there is the one refusal that
+            # could wedge the loop.
+            urgent = self._registry.live_urgent_target()
+            if urgent is not None and urgent.id != directive.task_id:
+                self._handle_policy_denial(
+                    directive,
+                    Verdict.deny(
+                        "urgent_target_pending",
+                        f"task '{urgent.id}' was marked URGENT by the operator "
+                        f"({urgent.urgent_reason}) and must be the next task "
+                        f"dispatched — `{directive.decision.value}` of "
+                        f"'{directive.task_id}' cannot start ahead of it. Send "
+                        f"the same decision for '{urgent.id}' instead; the "
+                        "roadmap line in the CONTEXT block names it too. "
+                        "Nothing was executed and no attempt was spent.",
+                    ),
+                )
+                return
             task = self._registry.get(directive.task_id)
             if directive.decomposition is not None:
                 # The approved plan, made durable BEFORE the executor runs, in

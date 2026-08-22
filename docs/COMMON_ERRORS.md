@@ -2523,6 +2523,64 @@ they are different settings and either may be overridden alone.
 
 ---
 
+## 13. Autoloop urgent preemption (`python -m autoloop urgent`)
+
+### An urgent request was queued and the loop is still working on the old task
+**Symptom:** `urgent` printed `queued URGENT request for '<id>'`, minutes pass,
+and the round in flight keeps going. `tasks` shows the target still `pending`.
+**Cause:** almost always the intended behaviour, not a lost request. The
+preemption acts ONLY at a safe boundary — `phase == ready` with no pending
+request — so a request that lands while the loop is `submitting`, `awaiting` or
+`executing` waits for the round to come back to `ready` rather than stranding a
+review packet or an approved push. An `executing` phase is a write-capable
+agent inside a worker repo and can legitimately run for twenty minutes.
+**The other ordinary cause:** the round in flight is an AUDIT. Audit rounds are
+waited out rather than displaced — they take no task out of the queue, and
+displacing one would restart a session that opens on the audit kickoff and can
+come straight back with another audit, burning a round per lap. The urgent task
+is still what `next_ready()` returns for the round after it.
+**Check, in this order:** `status` for the phase; then
+`rg -n 'urgent_awaiting_boundary|task_preempted' .autoloop/transcript.jsonl` —
+the first entry means it is waiting and names the phase, the second means it has
+already happened and names what was displaced. If NEITHER appears and the
+request is gone from the inbox, look for `task_inbox_drained` with a `refused`
+line: the registry refuses a target that is blocked, quarantined, retired,
+completed, already in flight or unscoped, and that refusal is the answer.
+**Fix:** none — wait for the boundary. Do NOT `pause` to hurry it along: pausing
+is what this replaces, and a pause plus a hand `release` is the sequence that
+cost 10 and 15 minutes on 2026-08-21 and left two tasks stranded `in_progress`.
+
+### `task '<other>' is already the urgent target … and has not been dispatched yet`
+**Symptom:** `urgent` exits 1 with `urgent_already_pending`, naming a different
+task, and nothing is queued.
+**Cause:** ONE preemption at a time, by design. A pin is live from the moment
+it is granted until the dispatch it asked for starts, and a second request is
+refused rather than queued behind or applied over the first — two preemptions in
+flight with one round to displace between them is the shape the manual sequence
+failed at, and overwriting would discard the round the first operator already
+paid to displace.
+**Fix:** wait for the named task to be dispatched (`mark_in_progress` consumes
+the pin, so the slot reopens on the very next round) and resubmit. If the
+incumbent can never be dispatched — it was blocked, quarantined or retired after
+being pinned — its marker is already STALE, `live_urgent_target()` reports
+nothing, and the next request is accepted without any manual clearing.
+
+### The loop ended with `Loop ended: stopped` and no reviewer said `stop`
+**Symptom:** a session ends `stopped` after an urgent request, and `status`
+shows `stop reason  preempted for urgent task …`.
+**Cause:** a preemption ends the round as a `stopped` session with
+`stop_kind = "preempted"`, deliberately, so every caller that already treats a
+non-fault `stopped` as a clean round boundary does the right thing without a new
+branch. `run --continuous` reassesses and starts the next session immediately.
+**Fix:** none — this is the success path. The displaced round is not lost: its
+worker repo is at `<workers_root>/../quarantine/<task>-displaced-by-urgent-<stamp>`
+with its execution record archived under the same label in
+`.autoloop/executions/archive/`, and the task itself is back in the queue. Read
+the `task_preempted` transcript entry for the candidate sha and review round it
+was holding.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found

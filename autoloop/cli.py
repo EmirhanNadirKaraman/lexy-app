@@ -77,7 +77,13 @@ from .errors import (
 from .executor import ExecutionOutcome, NullExecutor, TaskExecutor
 from .git_gateway import GitGateway
 from .implement_executor import ImplementExecutor, implement_agent_runner
-from .inbox import InboxError, TaskInbox, apply_requests, inbox_dir_for
+from .inbox import (
+    KIND_URGENT,
+    InboxError,
+    TaskInbox,
+    apply_requests,
+    inbox_dir_for,
+)
 from .auto_merge import (
     UPGRADE_EXEC_FAILED,
     UPGRADE_EXECED,
@@ -90,7 +96,12 @@ from .auto_merge import (
 from .lock import LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
 from . import merge_sweep
-from .orchestrator import SELF_UPGRADE, Orchestrator
+from .orchestrator import (
+    PREEMPTION_STOP_KIND,
+    SELF_UPGRADE,
+    Orchestrator,
+    release_task_to_pending,
+)
 from .policy import PolicyConfig, PolicyEngine
 from .prompts import TEMPLATES, kickoff_payload, user_answer_payload
 from .publisher import (
@@ -106,7 +117,7 @@ from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from .transcript import TranscriptLogger, build_profile, read_records, render_profile
 from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
-from .worktask import IntentStore, TaskExecutionStore, retire_execution
+from .worktask import IntentStore, TaskExecutionStore
 
 DEFAULT_CONFIG = Path(".autoloop/config.toml")
 
@@ -1053,6 +1064,10 @@ def _run_locked(args: argparse.Namespace, config: AutoloopConfig) -> int:
         )
         return 0
     print(_summary(config, orchestrator.state, registry))
+    # Before the generic ending line, because "Loop ended: stopped" on its own
+    # reads as the reviewer's own `stop` — which is the one thing a preemption
+    # is not. Silent for every other stop.
+    _report_preemption(orchestrator.state)
     print(f"\nLoop ended: {outcome}")
     return 2 if outcome in (Phase.NEEDS_USER.value, Phase.FAILED.value) else 0
 
@@ -1190,6 +1205,12 @@ def _run_continuous(
                 return 2
             if _is_fault_stop(orchestrator.state):
                 return _report_fault_stop(config, orchestrator.state, registry)
+            # A preemption ends the round as a `stopped` session too, and is a
+            # clean boundary in exactly the same sense — the next iteration
+            # selects again, and the urgent task is what `next_ready()` now
+            # returns. Printed rather than passed over silently: the operator
+            # who asked for it needs to see what it cost.
+            _report_preemption(orchestrator.state)
             continue  # a CONTRACT stop -> reassess at the top of the loop
 
         if state is not None and Phase(state.phase) is Phase.NEEDS_USER:
@@ -1232,6 +1253,67 @@ def _run_continuous(
             _print_blocker_summary(open_blockers)
             return 0
         time.sleep(CONTINUOUS_POLL_SECONDS)
+
+
+def _is_preemption_stop(state: LoopState) -> bool:
+    """Did an operator's urgent request end this session?
+
+    Reads `stop_kind` POSITIVELY, exactly like `_is_fault_stop` below and for
+    the same reason: an unclassified stop must fall on the harmless side. A
+    session this returns False for is treated as whatever it already was, and
+    the only thing being True changes is that the displacement gets printed.
+    """
+    return (
+        Phase(state.phase) is Phase.STOPPED
+        and state.stop_kind == PREEMPTION_STOP_KIND
+    )
+
+
+def _report_preemption(state: LoopState) -> None:
+    """Print what an urgent preemption displaced, for the operator watching.
+
+    The DURABLE record is the `task_preempted` transcript entry plus the
+    quarantined worker repo and archived execution record on disk, which name
+    each other under one label; this is what the terminal shows in the moment.
+    It prints the quarantine paths rather than a summary of them because the
+    displaced round's committed candidate is still in that worker, and the
+    operator's next question is always where it went.
+
+    Silent for a session that was not preempted, so both callers can call it
+    unconditionally on a clean stop.
+    """
+    if not _is_preemption_stop(state):
+        return
+    record = state.preemption or {}
+    displaced = record.get("displaced_task_id") or "(nothing)"
+    print(
+        f"\npreempted for URGENT task {record.get('urgent_task_id')} "
+        f"({record.get('urgent_reason')})"
+    )
+    if record.get("displaced_returned_to_pending"):
+        print(f"  displaced    {displaced}: in_progress -> pending, selectable again")
+    else:
+        print(
+            f"  displaced    {displaced}: NOT returned to pending — "
+            f"{record.get('obstacle') or 'no reason recorded'}"
+        )
+    print(
+        f"  boundary     request first seen at phase "
+        f"{record.get('first_observed_phase')}, acted on at "
+        f"{record.get('preempted_at_phase')} (no review packet was interrupted)"
+    )
+    candidate = (record.get("displaced_candidate_sha") or "")[:12] or "(none)"
+    print(
+        f"  quarantined  candidate={candidate} "
+        f"review_round={record.get('displaced_review_round')} "
+        f"attempts={record.get('displaced_attempt_count')}"
+    )
+    for label, key in (
+        ("worker repo", "quarantined_worker_path"),
+        ("record", "archived_execution_record"),
+    ):
+        if record.get(key):
+            print(f"  {label:<12} {record[key]} (kept, not deleted)")
 
 
 def _is_fault_stop(state: LoopState) -> bool:
@@ -1734,6 +1816,64 @@ def _cmd_add_task(args: argparse.Namespace) -> int:
         f"queued task '{args.id}' (priority {args.priority}) -> {path}\n"
         "The running loop picks it up between steps; the task graph is validated "
         "on merge, so a duplicate id or unknown dependency is reported there."
+    )
+    return 0
+
+
+def _cmd_urgent(args: argparse.Namespace) -> int:
+    """Make an existing task the loop's URGENT TARGET: the next task
+    dispatched, ahead of whatever round is in flight.
+
+    Like `add-task`, it takes NO lock and writes only to the inbox — outside
+    the checkout, so it is safe at any instant, including while a write-capable
+    agent is mid-run. The running loop drains it between steps, and acts on it
+    only at a phase boundary it already treats as safe
+    (`orchestrator._preempt_for_urgent`): a request that arrives while a review
+    packet is outstanding waits for `ready` rather than stranding it.
+
+    **It is checked before it is queued, through the registry's own
+    `request_urgent`.** A task that is blocked, quarantined, retired, already
+    completed, already in flight, unscoped, or that arrives while another
+    task's pin is still live is refused HERE, with the registry's own wording,
+    and nothing is queued. That is not a second rule set: it is a dry run of
+    the one authority — the same method the drain calls — against the registry
+    as it stands, deliberately not saved. The drain re-checks authoritatively,
+    because the graph can move between this call and the next drain; what this
+    buys is that the ordinary refusals reach the operator at the prompt instead
+    of in a transcript entry they have to go looking for.
+
+    It does NOT weaken the review gate in any way: the urgent task is
+    dispatched through the identical implement/review/approve/publish path as
+    any other, and the round it displaces keeps its committed candidate in a
+    quarantined worker repo.
+    """
+    config = load_config(args.config)
+    _, registry = _load_tasks(config)
+    try:
+        # Dry run against a registry nothing will save. The refusal text and
+        # its stable `code` come from the one implementation, so an operator
+        # cannot be told two different things about the same request.
+        registry.request_urgent(args.task_id, args.reason)
+    except TaskGraphError as exc:
+        print(f"error: {exc}")
+        return 1
+    inbox = TaskInbox(inbox_dir_for(config.workers_root, config.state_dir))
+    try:
+        path = inbox.submit(
+            {"kind": KIND_URGENT, "id": args.task_id, "reason": args.reason}
+        )
+    except InboxError as exc:  # pragma: no cover - shape is built here
+        print(f"error: {exc}")
+        return 1
+    print(
+        f"queued URGENT request for '{args.task_id}' -> {path}\n"
+        "The running loop applies it between steps and preempts at its next "
+        "SAFE boundary (phase=ready with no packet outstanding) — it never "
+        "interrupts a review that is in flight. The displaced task returns to "
+        "pending and its worker repo is quarantined, not deleted; review, "
+        "approval and publication are unchanged.\n"
+        "One preemption at a time: a second urgent request is refused while "
+        "this one is still waiting to be dispatched."
     )
     return 0
 
@@ -2581,22 +2721,30 @@ def _cmd_release(args: argparse.Namespace) -> int:
     under one label, so the candidate stays recoverable and the two halves
     name each other on disk. `worktask.retire_execution` does both in one
     call precisely so a future caller cannot do one and forget the other.
+
+    The three-part sequence itself lives in
+    `orchestrator.release_task_to_pending`, shared with the urgent-preemption
+    path (`_preempt_for_urgent`), so a preemption cannot rebuild the same
+    "moved one of the three" gap one level up. This command keeps its own
+    refusal and its own reporting; only the move is shared.
     """
     config = load_config(args.config)
     with LoopLock(config.state_dir):
         task_store, registry = _load_tasks(config)
+        worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
         try:
-            task = registry.release(args.task_id)
+            task, retired = release_task_to_pending(
+                args.task_id,
+                registry,
+                TaskExecutionStore(config.executions_dir),
+                worker_repos,
+                persist=lambda: task_store.save(registry),
+            )
         except TaskGraphError as exc:
             print(f"error: {exc}")
             return 1
-        task_store.save(registry)
         print(f"task {task.id} released: in_progress -> pending")
 
-        worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
-        retired = retire_execution(
-            args.task_id, TaskExecutionStore(config.executions_dir), worker_repos
-        )
         if retired.record_path is not None:
             print(
                 f"execution record moved to {retired.record_path} (kept, not "
@@ -4035,6 +4183,25 @@ def build_parser() -> argparse.ArgumentParser:
     add_config(release)
     release.add_argument("task_id")
     release.set_defaults(func=_cmd_release)
+
+    urgent = sub.add_parser(
+        "urgent",
+        help=(
+            "make an existing task the next one dispatched, preempting the "
+            "round in flight at the loop's next safe boundary (the displaced "
+            "task returns to pending; review and publication are unchanged)"
+        ),
+    )
+    add_config(urgent)
+    urgent.add_argument("task_id")
+    urgent.add_argument(
+        "reason",
+        help=(
+            "why this cannot wait — required, so a preemption that discards a "
+            "round's work is never unaccounted for"
+        ),
+    )
+    urgent.set_defaults(func=_cmd_urgent)
 
     retire = sub.add_parser(
         "retire",
