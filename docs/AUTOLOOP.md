@@ -3007,48 +3007,42 @@ is the configured order (cheapest first), and how to ask for a full run.
 
 Four properties hold that up, and each was a way to get this wrong:
 
-* **The per-command report survives.** One `PASS` / `FAIL` / `NOT RUN` line per
+* **The per-command report survives** — one `PASS` / `FAIL` / `NOT RUN` line per
   configured command. The reviewer decides partly on what was *exercised*, so
-  collapsing the report to a single verdict would trade wall-clock for evidence.
-* **`NOT RUN` is not `SKIPPED`.** `TestSelection.skipped` (§4g's neighbour, the
-  per-commit test selection in `validation.py`) already means "dropped because no
-  reachable test lives under its paths", and the post-commit call site
-  (`orchestrator._run_post_commit_validation`) concatenates both strings into one
-  summary. Two senses of one word in the line a reviewer reads is worse than a
-  longer word.
+  collapsing to a single verdict would trade wall-clock for evidence.
+* **`NOT RUN` is not `SKIPPED`.** `TestSelection.skipped` (per-commit test
+  selection, same module) already means "no reachable test lives under its
+  paths", and `orchestrator._run_post_commit_validation` concatenates both
+  strings into one summary.
 * **Nothing about the verdict changed.** `all_passed` is False in exactly the
-  cases it was False before; a refused binary, a missing binary and a timeout are
-  still failures rather than exceptions; an empty command list still reports
-  passed. A PASSING run's summary is byte-identical to what it was, because
-  nothing was skipped and so there is nothing to say — as is a run whose LAST
-  command is the one that failed.
+  cases it was before; a refused binary, a missing binary and a timeout are still
+  failures rather than exceptions; an empty list still reports passed; a PASSING
+  run's summary is byte-identical, as is a run whose LAST command failed —
+  nothing was skipped, so there is nothing to say.
 * **Order is the operator's, and it is now load-bearing.** Nothing re-orders a
-  configured list: reordering by guessed cost is a semantic change, and the cost
-  of a suite is not readable from its argv. What is pinned instead is the shipped
-  template (`config.example.toml`): its first command is the lint, and the serial
-  `isolated` re-run is last. The two pytest suites' order relative to each other
-  is left alone deliberately — choosing it needs a measurement, and an unmeasured
-  claim is the thing this change is against.
+  configured list: cost is not readable from an argv, and reordering an
+  operator's list is a semantic change. What is pinned instead is the shipped
+  template (`config.example.toml`): first command the lint, serial `isolated`
+  re-run last. The two pytest suites' order relative to each other is left alone
+  deliberately — choosing it needs a measurement, and an unmeasured claim is the
+  thing this change is against.
 
 **The full run, and why there is no config key.** `run_validation_commands(...,
-fail_fast=False)` runs everything. That is the "how much is broken?" question, as
-opposed to "is this candidate approvable?", and it is already answered in
-production by a different runner: `AuditExecutor._run_validation`
-(`audit/executor.py`) does not route through this function at all — it runs every
-configured command, one `ValidationRun` each, and is untouched by this change.
+fail_fast=False)` runs everything — "how much is broken?" rather than "is this
+approvable?". That question is already answered in production by a different
+runner: `AuditExecutor._run_validation` does not route through this function at
+all and still runs every configured command.
 
 An `[audit] validation_run = "fail_fast" | "full"` key was planned and
-deliberately NOT shipped. Neither call site that would read it is reachable from
-this task's approved paths: `cli._build_executor` (`cli.py:401`) constructs the
-`ImplementExecutor`, and `orchestrator._run_post_commit_validation`
-(`orchestrator.py`) makes the post-commit call. A key documented in the template
-that no call site reads would be a false statement shipped inside a change about
-reporting honestly — worse than no key. Wiring it later is one line per site
-(`fail_fast=` from `config.audit.<key>`) plus the field and its `load_config`
-check, exactly the shape `test_selection` has today. The current state is pinned
-by `test_neither_production_call_site_overrides_the_default`
-(`autoloop/tests/test_validation_failfast.py`), so adding either line fails a
-test and forces this section to be rewritten in the same change.
+deliberately NOT shipped: neither call site that would read it is reachable from
+this task's approved paths (`cli._build_executor`,
+`orchestrator._run_post_commit_validation`), and a documented key no call site
+reads would be a false statement shipped inside a change about reporting
+honestly. Wiring it later is one line per site (`fail_fast=` from
+`config.audit.<key>`) plus the field and its `load_config` check, the shape
+`test_selection` has today — and
+`test_neither_production_call_site_overrides_the_default` fails the moment
+either line is added, forcing this section to be rewritten in the same change.
 
 **Where to look.** `autoloop/validation.py` (`run_validation_commands`,
 `_run_one_command`, `_short_circuit_note`, `NOT_RUN`), pinned by

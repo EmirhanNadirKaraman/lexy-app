@@ -1,29 +1,12 @@
 """Validation stops at the first failing command, and still accounts for the
-rest.
+rest. Measurements and rationale: `docs/AUTOLOOP.md` §4h.
 
-WHY. The executor round IS the loop's clock: measured over the 23 days to
-2026-08-22, packet build took 0.98s median, submit 12-18s, the reviewer's
-verdict ~0s and the merge sweep ~20s — against an executor round of 1,282s
-median and 42.3 minutes at worst. 64% of measurable executor time produced
-nothing reviewable, and 79 of 261 revise verdicts were caused by something
-orthogonal to the work being done (an inherited test failure, a scope
-violation, an overlong documentation change-note line). Those defects are named
-by the CHEAPEST configured command, and `run_validation_commands` used to pay
-for both full pytest suites and the serial `isolated` re-run before reporting
-one of them.
-
-WHAT IS ASSERTED HERE, and what is deliberately NOT. The claim is about
-REPORTING and EXECUTION, never about the verdict: `all_passed` is False either
-way, so nothing here loosens a gate. Two properties have to hold together, and
-each is useless alone —
-
-  * the later commands really do not launch (the saving), and
-  * the summary still names every configured command, with `NOT RUN`
-    distinguishable from `PASS` (the evidence the reviewer decides on).
-
-A test for the first alone passes against a runner that reports a single
-collapsed verdict; a test for the second alone passes against one that ran
-everything anyway.
+Two properties have to hold TOGETHER: the later commands really do not launch
+(the saving), and the summary still names every configured command with
+`NOT RUN` distinguishable from `PASS` (the evidence the reviewer decides on). A
+test of the first alone passes against a runner that collapses to one verdict; a
+test of the second alone passes against one that ran everything anyway. Nothing
+here is about the verdict — `all_passed` is False either way.
 """
 
 import subprocess
@@ -50,12 +33,9 @@ SUITE_B = ("python3", "-m", "pytest", "tests/", "-q", "-p", "no:cacheprovider")
 
 
 def runner_failing(*fail_argv):
-    """A `subprocess.run` stand-in recording every argv it is HANDED.
-
-    Failure is decided by the EFFECTIVE argv (the one a caller sees after
-    `effective_validation_commands`), so a test can name a configured command
-    and still fail the command that really runs.
-    """
+    """A `subprocess.run` stand-in recording every argv it is HANDED. Failure is
+    keyed on the EFFECTIVE argv, so a test names a configured command and still
+    fails the command that really runs."""
     seen: list[tuple[str, ...]] = []
     failing = {effective_validation_command(argv) for argv in fail_argv}
 
@@ -78,9 +58,9 @@ def runner_failing(*fail_argv):
 
 
 def named(summary: str, argv) -> str:
-    """The one report segment for `argv`, or "" — asserted on rather than the
-    whole summary, because `failure_digest` joins its own lines with "; " too,
-    so splitting the summary by that separator is not a per-command split."""
+    """The one report segment for `argv`, or "". Asserted on rather than the
+    whole summary because `failure_digest` joins its own lines with "; " too, so
+    splitting on that separator is not a per-command split."""
     command = " ".join(effective_validation_command(argv))
     for token in ("PASS", "FAIL", NOT_RUN, "TIMEOUT", "NOT FOUND", "REFUSED"):
         if f"{command}: {token}" in summary:
@@ -92,8 +72,6 @@ def named(summary: str, argv) -> str:
 
 
 def test_the_first_failing_command_stops_the_run(tmp_path):
-    """The claim the whole task is for: a round whose cheapest check fails does
-    not pay for the expensive ones."""
     runner, seen = runner_failing(RUFF)
 
     ok, _summary = run_validation_commands(
@@ -107,9 +85,7 @@ def test_the_first_failing_command_stops_the_run(tmp_path):
 
 
 def test_the_commands_that_did_not_run_are_named_as_not_run(tmp_path):
-    """`NOT RUN` is EVIDENCE, not an omission. The reviewer decides partly on
-    what was exercised, so a command that never launched must be visible and
-    must not read as one that passed."""
+    """`NOT RUN` is EVIDENCE: it must be visible and must not read as PASS."""
     runner, _seen = runner_failing(RUFF)
 
     _ok, summary = run_validation_commands(
@@ -122,8 +98,7 @@ def test_the_commands_that_did_not_run_are_named_as_not_run(tmp_path):
 
 
 def test_the_summary_still_names_every_configured_command(tmp_path):
-    """One line per configured command, whatever happened to it — the
-    per-command report is not collapsed to a single verdict."""
+    """One line per configured command, whatever happened to it."""
     runner, _seen = runner_failing(SUITE_A)
 
     _ok, summary = run_validation_commands(LEGACY_SERIAL, tmp_path, command_runner=runner)
@@ -137,8 +112,7 @@ def test_the_summary_still_names_every_configured_command(tmp_path):
 
 
 def test_the_failing_test_is_still_named(tmp_path):
-    """Short-circuiting must not cost the diagnosis: the digest that made a
-    refusal actionable (2026-08-02) is still there."""
+    """Short-circuiting must not cost the diagnosis (2026-08-02)."""
     runner, _seen = runner_failing(SUITE_A)
 
     _ok, summary = run_validation_commands(LEGACY_SERIAL, tmp_path, command_runner=runner)
@@ -147,8 +121,8 @@ def test_the_failing_test_is_still_named(tmp_path):
 
 
 def test_the_report_says_it_stopped_and_how_to_run_everything(tmp_path):
-    """A future reader has to be able to tell a deliberate stop from a run that
-    lost commands, and a deliberate ORDER from an accidental one."""
+    """A reader has to tell a deliberate stop from a run that lost commands, and
+    a deliberate ORDER from an accidental one."""
     runner, _seen = runner_failing(RUFF)
 
     _ok, summary = run_validation_commands(
@@ -162,11 +136,8 @@ def test_the_report_says_it_stopped_and_how_to_run_everything(tmp_path):
 
 
 def test_the_note_names_only_levers_that_exist(tmp_path):
-    """The note becomes `state.last_validation` and reaches the reviewer. A
-    sentence telling them to set a config key nothing reads would be a false
-    statement shipped inside a change about reporting honestly — and
-    `[audit] validation_run` is exactly the key this task did NOT ship (see
-    `docs/AUTOLOOP.md` §4h)."""
+    """The note reaches the reviewer, so it must not tell them to set
+    `[audit] validation_run` — the key this task did NOT ship (§4h)."""
     runner, _seen = runner_failing(RUFF)
 
     _ok, summary = run_validation_commands((RUFF, SUITE_A), tmp_path, command_runner=runner)
@@ -179,8 +150,7 @@ def test_the_note_names_only_levers_that_exist(tmp_path):
 
 
 def test_a_passing_run_is_byte_identical(tmp_path):
-    """Nothing is skipped when nothing fails, so there is nothing to say about
-    it. Pinned exactly, not by substring: an unconditional ordering note would
+    """Pinned exactly, not by substring: an unconditional ordering note would
     ride on every round's `state.last_validation` for no reader."""
     def runner(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
@@ -207,8 +177,7 @@ def test_a_passing_multi_command_run_still_reports_each_command(tmp_path):
 
 
 def test_a_failure_in_the_last_command_adds_no_note(tmp_path):
-    """There is nothing after it to skip, so the summary is what it always
-    was — the note appears only when it has something to explain."""
+    """Nothing after it to skip, so the summary is what it always was."""
     runner, seen = runner_failing(SUITE_B)
 
     ok, summary = run_validation_commands(
@@ -239,9 +208,8 @@ def test_a_timeout_or_missing_binary_is_still_a_failure_not_an_exception(
     tmp_path, boom, token
 ):
     """Unchanged promise: every failure mode is reported, none raises past the
-    caller. What IS new is that these stop the run too — they are failures by
-    this function's own definition, so treating them as "keep going" would make
-    the report's own vocabulary inconsistent."""
+    caller. New: these stop the run too, being failures by this function's own
+    definition."""
     seen: list[tuple[str, ...]] = []
 
     def runner(argv, **kwargs):
@@ -259,9 +227,8 @@ def test_a_timeout_or_missing_binary_is_still_a_failure_not_an_exception(
 
 
 def test_a_refused_binary_is_still_a_failure_and_launches_nothing(tmp_path):
-    """The allowlist refusal predates this and is untouched. It is also a
-    failure, so it stops the run — and the refused command itself was never
-    handed to the runner, which is the property that made it a refusal."""
+    """The allowlist refusal is untouched, and the refused command was never
+    handed to the runner — which is what made it a refusal."""
     runner, seen = runner_failing()
 
     ok, summary = run_validation_commands(
@@ -276,9 +243,8 @@ def test_a_refused_binary_is_still_a_failure_and_launches_nothing(tmp_path):
 
 def test_the_summary_is_still_redacted_end_to_end(tmp_path):
     """Redaction runs LAST over the assembled summary, so the lines fail-fast
-    added are covered by the same call. Asserted rather than assumed: this
-    string reaches state.json, the transcript, blocker records and the review
-    packet."""
+    added are covered by the same call. This string reaches state.json, the
+    transcript, blocker records and the review packet."""
     from autoloop.validation_env import ValidationEnv
 
     env = ValidationEnv(
@@ -311,8 +277,6 @@ def test_the_summary_is_still_redacted_end_to_end(tmp_path):
 
 
 def test_the_full_run_mode_still_executes_everything(tmp_path):
-    """`fail_fast=False` is the "how much is broken" question, and it answers
-    it: every command runs and every failure is reported, not just the first."""
     runner, seen = runner_failing(RUFF, SUITE_B)
 
     ok, summary = run_validation_commands(
@@ -329,8 +293,7 @@ def test_the_full_run_mode_still_executes_everything(tmp_path):
 
 
 def test_the_full_run_mode_reports_every_failure_kind(tmp_path):
-    """A refusal in the middle of a full run must not swallow the commands
-    after it either."""
+    """A refusal mid-list must not swallow the commands after it either."""
     runner, seen = runner_failing(SUITE_A)
 
     ok, summary = run_validation_commands(
@@ -351,15 +314,10 @@ def test_the_full_run_mode_reports_every_failure_kind(tmp_path):
 
 
 def test_the_cheapest_shipped_command_really_runs_first():
-    """Fail-fast makes ORDER load-bearing, so the shipped template's order is
-    now a property worth pinning rather than a preference.
-
-    The rule asserted is the one that is decidable without a stopwatch: the
-    first configured command is the LINT (no pytest anywhere in it), which is
-    seconds against suites that are minutes. The two pytest suites' order
-    relative to each other is deliberately NOT pinned — it needs measurement
-    this test cannot do, and an unmeasured claim is what this task is against.
-    """
+    """Fail-fast makes ORDER load-bearing. The rule asserted is the one
+    decidable without a stopwatch: the first command is the LINT. The two
+    suites' order relative to each other is NOT pinned — that needs a
+    measurement this test cannot make."""
     shipped = shipped_commands()
     assert shipped, "the example ships no validation commands"
     assert not is_pytest(shipped[0]), (
@@ -371,9 +329,8 @@ def test_the_cheapest_shipped_command_really_runs_first():
 
 
 def test_the_serial_isolated_rerun_is_shipped_last():
-    """It is the one command that cannot be parallelised (the marker means
-    "this test needs its own process"), so it is the most expensive per test
-    and belongs at the end of a list that now stops at the first failure."""
+    """It cannot be parallelised (the marker means "own process"), so it is the
+    most expensive per test and belongs at the end of the list."""
     shipped = shipped_commands()
     isolated = [index for index, argv in enumerate(shipped) if is_isolated_run(argv)]
     assert isolated == [len(shipped) - 1], (
@@ -385,10 +342,9 @@ def test_the_serial_isolated_rerun_is_shipped_last():
 
 
 def test_the_pre_commit_executor_run_stops_at_the_first_failure(tmp_path):
-    """The round that matters. `ImplementExecutor`'s own run is the one whose
+    """The round that matters: `ImplementExecutor`'s own run is the one whose
     failure throws the round away before a commit exists, and it takes the
-    default — so the saving is a property of production wiring, not only of
-    this function's signature."""
+    default — so the saving is a property of production wiring."""
     from autoloop.audit.agents import AgentResult
     from autoloop.contract import Decision, Directive
     from autoloop.implement_executor import ImplementExecutor
@@ -428,9 +384,9 @@ def test_the_pre_commit_executor_run_stops_at_the_first_failure(tmp_path):
 
 def test_neither_production_call_site_overrides_the_default():
     """Structural, and it carries a claim no behavioural test here can: the two
-    production callers get fail-fast because they pass nothing, so a future
-    `fail_fast=False` at either site is a deliberate decision that has to be
-    made in the open rather than a default drifting back."""
+    production callers get fail-fast because they pass NOTHING, so a future
+    `fail_fast=False` at either site has to be a deliberate decision made in the
+    open rather than a default drifting back."""
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
