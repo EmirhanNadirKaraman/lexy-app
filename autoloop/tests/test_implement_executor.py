@@ -19,6 +19,7 @@ from autoloop.implement_executor import (
     ImplementExecutor,
     _ADVERSARIAL_SELF_TEST,
     _agent_prompt,
+    _approved_paths_section,
     implement_agent_runner,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine
@@ -52,8 +53,17 @@ def worker_repo(tmp_path):
     return _init_repo(tmp_path / "worker", "autoloop/t1")
 
 
-def make_task(task_id="t1"):
-    return Task(id=task_id, title="Add widget", description="Implement the widget feature.")
+def make_task(task_id="t1", approved_paths=(), description="Implement the widget feature."):
+    """`approved_paths` defaults to EMPTY, which is the loop's "no scope
+    authorized yet" state — every test whose claim is about the fix boundary
+    must pass its own, or it silently exercises the report-only branch of
+    `_approved_paths_section` instead of the listed one."""
+    return Task(
+        id=task_id,
+        title="Add widget",
+        description=description,
+        approved_paths=tuple(approved_paths),
+    )
 
 
 def implement_directive(task_id="t1", feedback=None):
@@ -357,6 +367,14 @@ def test_a_task_with_no_stored_plan_gets_no_decomposition_section(
 # `_ADVERSARIAL_SELF_TEST` is the instruction that closes that gap. These tests
 # pin that it is actually given, on every path, and — the larger risk — that it
 # took nothing away while being added.
+#
+# Revision round 2 (2026-08-22) moved the FIX BOUNDARY off the task text and
+# onto `Task.approved_paths` (`_approved_paths_section`), because a description
+# names files as context that the task was never authorized to write and a task
+# with no decomposition was pointed at a document it does not have. So several
+# of these tests now state an `approved_paths` explicitly: `make_task()` has
+# none, which is the report-only branch, and a boundary claim tested there
+# proves nothing about the listed one.
 
 
 def capture_prompt(main_repo, worker_repo, task, directive):
@@ -390,9 +408,15 @@ def test_the_self_critique_instruction_is_given_for_implement_and_revise(
     expected = Decision.REVISE if feedback else Decision.IMPLEMENT
     assert directive.decision is expected  # the helper flips on feedback
 
-    prompt, _ = capture_prompt(main_repo, worker_repo, make_task(), directive)
+    task = make_task(approved_paths=("feature.py",))
+    prompt, _ = capture_prompt(main_repo, worker_repo, task, directive)
 
     assert "ADVERSARIALLY TEST YOUR OWN CLAIM" in prompt
+    # The boundary the instruction refers to, on both decisions — a revise
+    # round must be told its scope for the same reason it is told to look
+    # again: it is the round most likely to go fixing the next thing it finds.
+    assert "THIS TASK'S APPROVED PATHS" in prompt
+    assert "\n  feature.py\n" in prompt
     # The gap itself, named — passing validation is not the bar being graded.
     assert "DIFFERENT BARS" in prompt
     # The class the reviewer demonstrably hunts (port-02, prov-01, hlth-01).
@@ -416,22 +440,89 @@ def test_the_instruction_is_bounded_to_the_claim_and_forbids_going_fixing(
     and cost port-01 its whole branch. The instruction has to say, in the
     prompt and not merely in a comment, that this is not permission to wander."""
     prompt, _ = capture_prompt(
-        main_repo, worker_repo, make_task(), implement_directive()
+        main_repo,
+        worker_repo,
+        make_task(approved_paths=("feature.py",)),
+        implement_directive(),
     )
 
-    assert "Fix only the failures inside the files this task's description" in prompt
+    assert "Fix only the failures inside THIS TASK'S APPROVED PATHS" in prompt
     assert "Anything outside them you REPORT rather than fix" in prompt
     assert "not permission to improve the code, widen the task" in prompt
+
+
+def test_a_failure_outside_the_approved_paths_is_reported_not_fixed(
+    main_repo, worker_repo
+):
+    """The boundary is the task's OWN `approved_paths` — the set the loop
+    authorized this round against — and everything else is report-only.
+
+    Round 1 bounded it to "the files this task's description and approved
+    decomposition already cover" instead, which is the wrong set in both
+    directions: a description names files as CONTEXT that the task was never
+    authorized to write, so the agent was pointed at unapproved paths by the
+    very sentence meant to keep it in scope. Asserted through a real round's
+    prompt, and paired with the negative below so "outside" has a referent."""
+    prompt, _ = capture_prompt(
+        main_repo,
+        worker_repo,
+        make_task(approved_paths=("feature.py", "autoloop/tests/")),
+        implement_directive(),
+    )
+
+    # Inside: the authorized set, listed literally, one per line.
+    assert "\n  feature.py\n" in prompt
+    assert "\n  autoloop/tests/\n" in prompt
+    # Outside: reported, never fixed — and the report is the deliverable, so
+    # the wording has to survive verbatim.
+    assert "Anything outside them you REPORT rather than fix" in prompt
+    assert "write a path the list does not name" in prompt
+    # The directory-prefix rule the loop's own matcher applies
+    # (`tasks.unauthorized_paths`), so "inside" means the same thing in the
+    # prompt and in the check that grades the diff.
+    assert "An entry ending in '/' covers the files under it" in prompt
+
+
+def test_a_file_the_description_mentions_is_not_inside_the_fix_boundary(
+    main_repo, worker_repo
+):
+    """The exact confusion the previous wording created, pinned.
+
+    `lexy-app/backend/main.py` is named in the DESCRIPTION as context and is
+    not in `approved_paths`. It must therefore appear in the prompt (the
+    description is sent verbatim — the agent needs the context) and NOT in the
+    fix boundary. Both halves are asserted: without the first, this test would
+    pass just as well against a string that is simply nowhere in the prompt."""
+    contextual = "lexy-app/backend/main.py"
+    task = make_task(
+        approved_paths=("feature.py",),
+        description=f"Implement the widget feature. For context, {contextual} mounts it.",
+    )
+
+    prompt, _ = capture_prompt(main_repo, worker_repo, task, implement_directive())
+
+    assert contextual in prompt  # carried by the description, as before
+    assert contextual not in _ADVERSARIAL_SELF_TEST
+    assert contextual not in _approved_paths_section(task.approved_paths)
+    # ...and the instruction says so in as many words, because an agent reading
+    # a description that names a file is exactly who needs telling.
+    assert "merely MENTIONS is not approved unless the list names it" in prompt
 
 
 def test_a_task_with_no_decomposition_still_gets_a_well_formed_prompt(
     main_repo, worker_repo
 ):
-    """The instruction refers to the approved decomposition, which most tasks
-    have and some do not. A task without one must still get the instruction and
-    a prompt with every other section intact — not a dangling reference and not
-    a silently dropped clause."""
-    task = make_task()
+    """Most tasks carry an approved decomposition and some do not. A task
+    without one must still get the instruction and a prompt with every other
+    section intact — not a dangling reference and not a dropped clause.
+
+    Round 1's instruction pointed at "this task's description and approved
+    decomposition", so a task with no plan was sent to a document it does not
+    have. The reference is now `_approved_paths_section`, which is rendered
+    unconditionally — so the assertion is not merely that the prompt is well
+    formed, but that the instruction no longer names a document that may be
+    absent at all."""
+    task = make_task(approved_paths=("feature.py",))
     assert not task.decomposition
 
     prompt, outcome = capture_prompt(main_repo, worker_repo, task, implement_directive())
@@ -439,12 +530,50 @@ def test_a_task_with_no_decomposition_still_gets_a_well_formed_prompt(
     assert outcome.status == "ok"
     assert "ADVERSARIALLY TEST YOUR OWN CLAIM" in prompt
     assert "Approved decomposition" not in prompt
+    # No dangling reference: the boundary names no optional document, and what
+    # it does say "listed below" about is in the prompt underneath it.
+    assert "decomposition" not in _ADVERSARIAL_SELF_TEST.lower()
+    assert "description" not in _ADVERSARIAL_SELF_TEST.lower()
+    # ...and what "listed below" points at is really below it. Indexed on the
+    # SECTION's own opening, not on the phrase the instruction itself uses:
+    # "THIS TASK'S APPROVED PATHS" occurs in both, and `str.index` would find
+    # the instruction's own copy and compare the sentence with itself.
+    assert prompt.index("listed below") < prompt.index(
+        "THIS TASK'S APPROVED PATHS — declared by the task itself"
+    )
     # Still well formed: every other section is present and separated.
     assert task.description in prompt
     assert "Ground rules:" in prompt
     assert "SMALLEST REVERSIBLE READING" in prompt
     assert "\n\n" in prompt
     assert not prompt.startswith("\n")
+
+
+def test_a_task_with_no_approved_paths_gets_a_report_only_boundary(
+    main_repo, worker_repo
+):
+    """The empty case is FAIL-CLOSED, and it is a real one: `approved_paths`
+    empty is the state the orchestrator refuses to dispatch a write-capable
+    round in at all (`docs/SECURITY.md` finding #2 / circular ownership), so a
+    prompt built in it is already off the expected path.
+
+    "No list" must therefore read as "fix nothing extra", never as an absent
+    boundary — an instruction to hunt failures with the sentence that bounds it
+    silently gone is precisely the fail-open shape the instruction itself is
+    about."""
+    task = make_task()
+    assert task.approved_paths == ()
+
+    prompt, outcome = capture_prompt(main_repo, worker_repo, task, implement_directive())
+
+    assert outcome.status == "ok"
+    assert "ADVERSARIALLY TEST YOUR OWN CLAIM" in prompt
+    assert "the loop has NO approved path list" in prompt
+    assert "REPORT-ONLY" in prompt
+    assert "fix nothing beyond the change the task itself asks for" in prompt
+    # Well formed around it: no empty section, no doubled separator.
+    assert "\n\n\n" not in prompt
+    assert prompt.strip() == prompt
 
 
 def test_the_addition_grants_no_tool_and_relaxes_no_ground_rule(
@@ -470,28 +599,56 @@ def test_the_addition_grants_no_tool_and_relaxes_no_ground_rule(
     assert "committing is not your job" in prompt
     assert "Do not delegate to another agent" in prompt
 
-    # Checked against the CONSTANT, not the assembled prompt: the ground rules
-    # legitimately say "no Bash access", so a prompt-level search for a tool
-    # name matches that sentence and proves nothing about the new text.
+    # Checked against the CONSTANT and the new section's fixed prose, not the
+    # assembled prompt: the ground rules legitimately say "no Bash access", so
+    # a prompt-level search for a tool name matches that sentence and proves
+    # nothing about the new text — and an approved path could itself be named
+    # `autoloop/Bash.py`, which is the task's business and not this rule's.
     for tool in IMPLEMENT_DISALLOWED_TOOLS:
         assert tool not in _ADVERSARIAL_SELF_TEST
+        assert tool not in _approved_paths_section(())
+        assert tool not in _approved_paths_section(("feature.py",))
 
 
-def test_the_addition_widens_no_path_set(main_repo, worker_repo):
-    """`_agent_prompt` reads no scope field — not `Task.approved_paths`, not
-    `TaskExecution.allowed_paths` — and this addition did not start.
+def test_the_prompt_states_the_approved_paths_and_widens_no_path_set(
+    main_repo, worker_repo
+):
+    """`_agent_prompt` now READS `Task.approved_paths` — to state the boundary
+    — and that is the whole of its scope contact. Stating a scope is not
+    granting one, so what this pins is the difference:
 
-    The bound is phrased against the description and decomposition, which are
-    already in the prompt, precisely so that stays true: rendering the approved
-    path list here would be the first step toward an agent treating the prompt
-    as the authority on scope, when the authority is the loop's own check."""
-    task = make_task()
-    task.approved_paths = ("zz/sentinel/only/here.py",)
+      * the rendered set is EXACTLY the task's own list, compared as a set of
+        parsed lines rather than with `in`, which would pass against a
+        rendering that had quietly added entries beside the real ones;
+      * `TRACKER_PATHS` are absent. `effective_approved_paths()` would add six
+        of them, `CLAUDE.md` included — repo-wide paths this task never
+        declared, inside a sentence that says "fix the failures inside these
+        files". The narrower list is the deliberate choice;
+      * a path outside the set appears nowhere;
+      * the Task itself is not mutated by being rendered.
+
+    `TaskExecution.allowed_paths` is untouched here by construction: this
+    module neither reads nor writes it, and the post-commit ownership check
+    (`tasks.unauthorized_paths` against the execution record) is what actually
+    enforces scope — unchanged by this task."""
+    approved = ("feature.py", "autoloop/tests/")
+    task = make_task(approved_paths=approved)
 
     prompt, _ = capture_prompt(main_repo, worker_repo, task, implement_directive())
 
+    section = _approved_paths_section(task.approved_paths)
+    rendered = {
+        line.strip() for line in section.splitlines() if line.startswith("  ")
+    }
+    assert rendered == set(approved)
+
+    for tracker in ("CLAUDE.md", "docs/TESTS.md", "docs/SUMMARY.md", "docs/SECURITY.md"):
+        assert tracker not in section
     assert "zz/sentinel/only/here.py" not in prompt
-    assert "approved_paths" not in prompt
+    assert task.approved_paths == approved  # rendering mutates nothing
+
+    # And the text says what it is: a statement of the loop's authorization.
+    assert "it grants nothing and widens nothing" in prompt
 
 
 def test_the_cleanup_instruction_survives_alongside_the_new_section():
@@ -506,6 +663,10 @@ def test_the_cleanup_instruction_survives_alongside_the_new_section():
     assert "REMOVE-OUT-OF-SCOPE: <repository-relative path>" in prompt
     assert "does not authorize" in prompt
     assert prompt.index("stray.py") < prompt.index("remove the residue you added")
+    # The scope section sits with the instruction it bounds, ahead of both —
+    # and this task has no approved paths, so the recorded residue path below
+    # is the only path in the prompt. A cleanup grant is not a scope grant.
+    assert prompt.index("the loop has NO approved path list") < prompt.index("stray.py")
 
 
 def test_the_enumeration_reaches_the_reviewer_and_is_never_parsed_as_data(
@@ -562,8 +723,16 @@ def test_the_new_instruction_has_its_own_ceiling():
     is self-imposed for the same reason the contract's clauses carry one: this
     is the part of the prompt most likely to attract elaboration, and the
     rationale for it belongs in the source comment beside the constant, which
-    costs nothing, rather than in the text, which is re-sent to every agent."""
+    costs nothing, rather than in the text, which is re-sent to every agent.
+
+    Re-pointing the boundary at `approved_paths` (revision round 2) grew the
+    instruction; it did not breach the ceiling, and the ceiling did not move to
+    accommodate it. The section carries its own bound on its FIXED prose, on
+    both branches — the path list itself is the task's and is not something
+    this module can shorten."""
     assert len(_ADVERSARIAL_SELF_TEST) <= 1800
+    assert len(_approved_paths_section(())) <= 600
+    assert len(_approved_paths_section(("feature.py",))) <= 600
 
 
 def test_assumption_lines_are_collected_from_the_agents_own_output(
