@@ -41,6 +41,9 @@ implements only the protocol above stays valid:
   declaration is a claim about shared history, not about size limits — a
   transport whose every turn is a separate process (`codex.conversation`) must
   not set it, because parts sent to it would be reviewed as separate fragments.
+  `codex.app_server_conversation` DOES set it, and the difference is exactly
+  that: it holds one thread, every turn goes onto it, and `thread/read` reads
+  the parts and the question back as one context.
 * **Mounting the message tail** — `mount_message_tail()` scrolls older turns
   into a virtualized message list, so a readback does not conclude a message is
   absent when it is merely unmounted. Optional and best-effort: its failures
@@ -146,9 +149,42 @@ def _codex_cli_factory(config: "AutoloopConfig") -> LLMConversation:
     )
 
 
+def _codex_app_server_factory(config: "AutoloopConfig") -> LLMConversation:
+    # Lazy, like the other two. Nothing here needs the codex binary to exist
+    # until a run selects this provider and `attach()` launches it.
+    from .codex.app_server import AppServerClient, SubprocessAppServer
+    from .codex.app_server_conversation import CodexAppServerConversation
+    from .codex.protocol_errors import DEFAULT_QUOTA_ERROR_CODES
+
+    codex = config.codex
+    transport = SubprocessAppServer(
+        command=codex.app_server_command,
+        # Same containment the subprocess adapter states: outside the checkout,
+        # so the reviewer has no filesystem business here at all. Not a sandbox
+        # claim — see `codex/app_server.py`.
+        cwd=Path(codex.working_dir) if codex.working_dir else None,
+    )
+    client = AppServerClient(
+        transport,
+        timeout_seconds=codex.timeout_seconds,
+        quota_codes=codex.quota_error_codes or DEFAULT_QUOTA_ERROR_CODES,
+        working_dir=codex.working_dir,
+    )
+    return CodexAppServerConversation(
+        client,
+        part_chars=codex.app_server_part_chars,
+        max_attachment_chars=codex.app_server_max_attachment_chars,
+    )
+
+
 _PROVIDERS: dict[str, ConversationFactory] = {
     "browser_chatgpt": _browser_chatgpt_factory,
+    # Two codex transports, both selectable, neither replacing the other. The
+    # subprocess one is unchanged and stays the default codex seat;
+    # `codex_app_server` is the one that can chunk, because it has a thread.
+    # `conversation.fallback_provider` may still name any of the three.
     "codex_cli": _codex_cli_factory,
+    "codex_app_server": _codex_app_server_factory,
 }
 
 

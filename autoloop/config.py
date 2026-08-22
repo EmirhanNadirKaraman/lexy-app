@@ -101,7 +101,20 @@ class ConversationConfig:
 
 @dataclass(frozen=True)
 class CodexConfig:
-    """The Codex CLI reviewer. Only consulted when a codex provider is used."""
+    """The Codex reviewer. Only consulted when a codex provider is used.
+
+    TWO transports share this section, because they share an account, a working
+    directory and a timeout:
+
+    * `codex_cli` — one `codex exec` process per turn (`command`,
+      `sandbox_args`, `quota_patterns`).
+    * `codex_app_server` — one `codex app-server` process holding one thread
+      (`app_server_*`, `quota_error_codes`).
+
+    Nothing is shared between the two sets, so switching
+    `conversation.provider` changes which half is read and leaves the other
+    half inert rather than half-applied.
+    """
 
     #: Base invocation. Split from `sandbox_args` so the two can be reasoned
     #: about separately — this is "how do I run it", that is "what may it do".
@@ -123,6 +136,27 @@ class CodexConfig:
     #: real wording cannot be confirmed here and will change; every non-zero
     #: exit logs its stderr tail so the first real exhaustion shows what to add.
     quota_patterns: tuple[str, ...] = ()
+
+    # ---- codex_app_server only ------------------------------------------
+    #: How to launch the local app-server. It ships with codex-cli and needs no
+    #: metered API key of its own; no SDK package is involved, and none may be
+    #: assumed (`@openai/codex-sdk` is TypeScript and there is no `codex_sdk`
+    #: on this host).
+    app_server_command: tuple[str, ...] = ("codex", "app-server")
+    #: How much diff text one deposited part carries. Nothing here fights a
+    #: composer — the text travels as JSON on a pipe — so this is sized for the
+    #: reviewer rather than the transport.
+    app_server_part_chars: int = 60_000
+    #: Largest attachment this transport will deliver at all. Over it, `submit`
+    #: raises with a named reason rather than truncating a patch.
+    app_server_max_attachment_chars: int = 4_000_000
+    #: Error TYPES that mean an exhausted allowance, matched exactly against a
+    #: protocol error's own type field (never against free-form text). Empty
+    #: uses `codex.protocol_errors.DEFAULT_QUOTA_ERROR_CODES`. Overridable for
+    #: the same reason `quota_patterns` is — the committed protocol reference
+    #: carries no error-code enumeration — but a value here is compared with a
+    #: named field, not scanned for in everything the server printed.
+    quota_error_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -865,14 +899,25 @@ def load_config(path: Path) -> AutoloopConfig:
 
     codex_data = dict(data.get("codex", {}))
     _check_keys("codex", codex_data, {f.name for f in dataclasses.fields(CodexConfig)})
-    for key in ("command", "sandbox_args", "quota_patterns"):
+    # Every tuple-typed CodexConfig field must be listed here. `_check_keys`
+    # reflects over the dataclass, so a new field is ACCEPTED automatically —
+    # which means one omitted from this list lands in a frozen dataclass as a
+    # mutable list, skipping the string-element check, and fails somewhere far
+    # away instead of here.
+    for key in (
+        "command",
+        "sandbox_args",
+        "quota_patterns",
+        "app_server_command",
+        "quota_error_codes",
+    ):
         if key not in codex_data:
             continue
         value = codex_data[key]
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ConfigError(f"codex.{key} must be a list of strings")
-        if key == "command" and not value:
-            raise ConfigError("codex.command must not be empty")
+        if key in ("command", "app_server_command") and not value:
+            raise ConfigError(f"codex.{key} must not be empty")
         codex_data[key] = tuple(value)
     codex = CodexConfig(**codex_data)
 

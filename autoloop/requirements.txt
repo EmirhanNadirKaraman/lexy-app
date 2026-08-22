@@ -2,3 +2,13 @@
 # (the Playwright session is imported lazily and mocked in tests).
 # After installing, run once: playwright install chromium
 playwright==1.54.0
+
+# Nothing is listed here for either codex provider, deliberately.
+#
+# `codex_cli` shells out to `codex exec`; `codex_app_server` drives
+# `codex app-server` over stdio JSON-RPC. Both are the codex-cli binary, which
+# is installed with npm and checked by `doctor`, not by pip. There is no
+# `codex_sdk` distribution to add — the published `@openai/codex-sdk` is
+# TypeScript — and adding a line here would not make one importable inside a
+# worker anyway. The app-server transport is stdlib-only (json, queue,
+# subprocess, threading).

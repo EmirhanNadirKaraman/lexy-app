@@ -692,9 +692,32 @@ def test_cli_blockers_lists_and_answer_resolves_and_unblocks(tmp_path, capsys):
 # =============================================================================
 
 
-def test_answer_refuses_unknown_and_already_resolved(tmp_path):
+def test_answer_refuses_unknown_and_already_resolved(tmp_path, monkeypatch):
+    """`BlockerStore.resolve` refuses an id it does not know and an id it has
+    already answered — the claim is about the store's refusal, nothing else.
+
+    Two environmental dependencies are removed so the claim is what actually
+    gets measured (both predate codex-01; the test was passing only while the
+    operator's dedicated Chrome happened to be answering):
+
+    * `git_failure_budget_exhausted` carries a `_RESOLUTION_PRECONDITIONS`
+      entry, `_precondition_browser`, which runs a REAL doctor sweep — an HTTP
+      probe of `browser.cdp_url` plus a playwright import. With no browser up
+      that check fails, `_cmd_answer` returns 1 at the precondition and never
+      reaches `resolve()` at all, so the first answer is never recorded and the
+      second call has nothing to refuse. Neutralised BY NAME (rather than by
+      swapping the blocker to a precondition-free code) so the scenario stays
+      the one the test describes; `DoctorProbes.probe_cdp` binds its default at
+      class-creation time, so patching the module global does not reach it.
+    * `_load_tasks` falls back to the repository's real `autoloop/seed_tasks.
+      json` when `tasks.json` is absent. A registry written under `tmp_path`
+      keeps the requeue half reading this test's own state directory."""
     config_path = write_config_toml(tmp_path)
     config = load_config(config_path)
+    monkeypatch.setitem(
+        cli._RESOLUTION_PRECONDITIONS, "git_failure_budget_exhausted", lambda _config: ""
+    )
+    TaskStore(config.tasks_file).save(TaskRegistry([ready_task("t1")]))
     blocker_store = BlockerStore(config.blockers_dir)
 
     with pytest.raises(StateError):
@@ -711,7 +734,12 @@ def test_answer_refuses_unknown_and_already_resolved(tmp_path):
         created_at=utcnow_iso(),
     )
     blocker_store.save(blocker)
-    cli._cmd_answer(Namespace(config=config_path, blocker_id=blocker.id, text="first answer"))
+    # Asserted, not merely called: a refused answer returns 1 without raising,
+    # and the failure then surfaces two lines below as a missing StateError —
+    # which reads as a broken refusal contract rather than as what it is.
+    assert cli._cmd_answer(
+        Namespace(config=config_path, blocker_id=blocker.id, text="first answer")
+    ) == 0
 
     with pytest.raises(StateError):
         cli._cmd_answer(Namespace(config=config_path, blocker_id=blocker.id, text="second answer"))

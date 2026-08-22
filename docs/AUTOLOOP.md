@@ -3473,6 +3473,115 @@ reason — exercising that transport is its whole purpose.
 
 ---
 
+## 5d-ter. `codex_app_server`: one thread, structured errors
+
+Added 2026-08-22 (codex-01). A THIRD provider, selectable as
+`conversation.provider = "codex_app_server"`. `codex_cli` is untouched, still
+selectable, still the default codex seat, and `fallback_provider` can still name
+any of the three. Read §5d first: everything there about the failover, the two
+budgets and the seat probes is unchanged.
+
+**Why it exists, measured.** Two weaknesses in §5d come from having no thread at
+all.
+
+1. *No shared history, so no chunking.* §5d-bis's `supports_chunked_delivery` is
+   a claim about one persistent conversation, so `codex_cli` must not declare it
+   — parts sent to a fresh process per turn would be reviewed as separate
+   fragments. The diff is therefore omitted. port-01 lost a whole attempt to a
+   414,596-byte diff against the 400,000-byte packet cap
+   (`review_packet_build_failed`), and on 2026-08-21 codex-01's own 228 KB
+   candidate could not be submitted at all until an operator patch inlined it
+   through argv.
+2. *Quota detection was substring-matching stderr.* §5d says so itself: the real
+   wording "cannot be confirmed here and will change".
+
+**The transport.** `codex app-server` ships with codex-cli and is LOCAL — no
+metered API key of its own, no SDK package (the published `@openai/codex-sdk` is
+TypeScript, there is no `codex_sdk`, and a line in `autoloop/requirements.txt`
+would not make one importable in a worker). It is a subprocess over stdio
+speaking JSON-RPC: the same shape §5d already uses for `codex exec`, one level
+lower, stdlib only.
+
+**The protocol is committed, not guessed.**
+`docs/codex-app-server-protocol.generated.ts` is the authoritative binding set.
+The calls used here are `initialize`, `thread/start`, `thread/read`,
+`turn/start` and `turn/interrupt`; the notifications handled are `error`,
+`thread/started`, `turn/started`, `turn/completed`, `item/completed` and
+`item/agentMessage/delta`. Every one of those strings is checked against that
+file by test, so a codex-cli upgrade that renames a method breaks a TEST rather
+than a live review.
+
+What the reference does NOT settle, said plainly because the rest of this
+section's honesty rests on it: the `v2/` declarations (`ThreadStartParams`,
+`TurnStartParams`, `ThreadReadParams`, `ItemCompletedNotification`,
+`TurnCompletedNotification`, `ErrorNotification`) are referenced by import path
+— 362 `from "./v2/…"` lines — and their bodies are not concatenated into it, so
+`grep 'export type ThreadStartParams'` comes back empty. Those field spellings
+therefore live in `codex/wire.py` as tolerant CANDIDATE LISTS that return
+nothing rather than a plausible wrong answer, and the caller turns that into an
+error naming the shape it could not read. Message FRAMING is settled by neither
+half — the file declares message types, not delimiters — so newline-delimited
+JSON is a choice, and a server answering with LSP-style `Content-Length` headers
+gets a named error saying exactly that.
+
+**What `supports_chunked_delivery` claims here, and only that.** One thread is
+held for the life of the conversation object, so every turn of a review request
+— each numbered part, then the message that asks for a verdict — goes onto it,
+and `thread/read` reads them back as one ordered context. It is a claim about
+SHARED HISTORY. It is not a claim about size limits, and it is not a claim about
+surviving a restart. Both chunking routes land on that one thread: §5d-bis's
+`delivering` phase (one `submit` per part id, each confirmed by readback) and an
+oversized `attachment=` handed to a single `submit`, which this transport
+deposits as numbered parts and then asks its question. Because the packet says
+the diff is ATTACHED as a file and this transport has no upload, the verdict
+message carries an appended note saying the parts are the attachment and where
+they are; the packet's own bytes, and therefore `report_sha256`, are untouched.
+
+**`idempotent_submit` is explicitly False, and the asymmetry with §5d is the
+protocol's.** A failed `codex exec` appended nothing anywhere, so `codex_cli`
+may declare it. `turn/start` appends its input and THEN runs the turn, so a
+failure afterwards can leave the prompt on the thread and a retry would
+double-post. What replaces the declaration is better than it: `reconcile` calls
+`thread/read` and answers True only when the request is on the thread AND has an
+agent reply after it, stashing that reply. An appended-but-unanswered turn
+reconciles False and parks `submission_ambiguous` — from evidence, not from
+optimism — and a submission whose turn completed while this client was dying is
+RECOVERED rather than re-asked.
+
+**Errors are objects, so classification reads fields.** `codex/protocol_errors.py`
+matches `error.code` and `data.type` / `code` / `kind` / `status` / `httpStatus`
+exactly, plus a numeric 429; the child's stderr goes to `DEVNULL`, so there is no
+text blob to scan even by accident. An error whose PROSE mentions a usage limit
+but whose type is unrecognised routes as an ordinary failure, which is the
+discrimination §5d's matcher cannot make. The exhaustion VOCABULARY is still a
+list — the committed reference carries no error enumeration — and is overridable
+via `codex.quota_error_codes`, exactly as `quota_patterns` is.
+
+**Containment, stated only as far as it is provable.** The server runs with `cwd`
+outside the checkout, as §5d's does and for the same reason. Beyond that, every
+approval the server requests is answered `{"decision": "abort"}` — a shape the
+committed reference does settle (`ApplyPatchApprovalResponse` /
+`ExecCommandApprovalResponse` are `{decision: ReviewDecision}`, and
+`ReviewDecision` includes `"abort"`) — and any other server→client request gets a
+JSON-RPC error. Never silence: the server blocks on its own request, and the
+round would die at the timeout with nothing saying why. That is a property of
+this client's replies, not of a flag whose name nobody verified.
+
+**Deliberately absent, and belonging to codex-03.** `thread/resume` is a real
+method and is never sent, so the thread lives in memory and a restarted loop
+starts a new one — nothing here promises restart durability. No sandbox preset
+is selected, named or enforced; `codex.sandbox_args` is a `codex_cli` setting and
+this transport does not read it.
+
+**Two gaps left open, named rather than quietly skipped.** `doctor`'s
+`codex_seats` check still matches only `codex_cli`, so a run configured for this
+provider gets no PATH or working-dir check; and `autoloop/config.example.toml`
+documents none of the four new `[codex]` keys (`app_server_command`,
+`app_server_part_chars`, `app_server_max_attachment_chars`,
+`quota_error_codes`). Both files were outside codex-01's approved paths.
+
+---
+
 ## 5d-bis. Chunked packet delivery: a big diff arrives in parts, not omitted
 
 Added 2026-08-14 (pkt-01).
@@ -3556,6 +3665,11 @@ later ones); `codex_cli` does not and must not — every turn there is a separat
 process with no shared history, so parts sent to it would be reviewed as
 separate fragments. A provider without the declaration gets the omission
 notice, exactly as before.
+
+*Added 2026-08-22 (codex-01):* the paragraph above is about `codex_cli`
+specifically, not about Codex. `codex_app_server` DOES declare it, and the
+difference is precisely the one the rule names — it holds one thread, so earlier
+turns are context for later ones. See §5d-ter.
 
 **What it costs.** One reload per part (`_deliver_part` reconciles rather than
 trusting the send — the same price `submitting` already pays). And ChatGPT
