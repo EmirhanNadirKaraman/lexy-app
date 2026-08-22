@@ -36,6 +36,20 @@ and every path into a validation run (the configured default, a task's declared
 `validation`, and an `execution.validation_commands` record persisted by a
 session that dispatched before the flag existed) funnels through this function.
 
+**HOW FAR a run gets is owned here too** — see `run_validation_commands`'s
+`fail_fast` parameter. A validation run answers "is this approvable?", and that
+question is settled by the FIRST command that fails: every command after it is
+paid for against a verdict already decided. Measured over the 23 days to
+2026-08-22, an executor round's median was 1,282 seconds and 64% of measurable
+executor time produced nothing reviewable, with 79 of 261 revise verdicts caused
+by something orthogonal to the work (an unrelated test failure, a scope
+violation, an overlong documentation line) — defects the cheapest configured
+command often names in seconds. So the default is to stop at the first failing
+command and report the rest as `NOT RUN`, which is deliberately DIFFERENT
+information from `PASS`: the reviewer decides partly on what was exercised.
+`fail_fast=False` runs everything, for the other question ("how much is
+broken?").
+
 **WHICH tests a per-commit run needs is decided here too** — see
 `select_validation_commands` and the "per-commit test selection" section at the
 bottom of this module. That is a strictly separate function from the flag
@@ -59,8 +73,11 @@ validation runner (`AuditExecutor._run_validation`) which shares
 `SAFE_VALIDATION_BINARIES` but not this function. It runs read-only audit
 checks with no writer involved and deliberately gets NO credentials — and no
 flag normalization either, since it grades the checkout rather than a worker
-repo a gate is about to inspect. If that ever needs to change, route it through
-this function rather than growing a second policy there.
+repo a gate is about to inspect. It also runs EVERY configured command, one
+`ValidationRun` each, and is untouched by the fail-fast default above: it is
+asking "how much is broken?" about a checkout, not "is this candidate
+approvable?". If that ever needs to change, route it through this function
+rather than growing a second policy there.
 """
 
 from __future__ import annotations
@@ -95,6 +112,14 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 #: packet with tool output.
 _DIGEST_MAX_LINES = 12
 _DIGEST_MAX_CHARS = 700
+
+#: What a command that never launched is reported as. Deliberately NOT
+#: "SKIPPED": `TestSelection.skipped` already means "dropped by test selection,
+#: because no reachable test lives under its paths", and the post-commit call
+#: site concatenates both strings into one summary
+#: (`orchestrator._run_post_commit_validation`). Two senses of one word in the
+#: line a reviewer reads is worse than a longer word.
+NOT_RUN = "NOT RUN"
 
 #: One xdist worker per core. Validation re-runs the whole configured suite
 #: against the committed worker repo on EVERY round, revises included, against
@@ -274,22 +299,97 @@ def effective_validation_commands(
     return tuple(effective_validation_command(argv) for argv in commands)
 
 
+def _run_one_command(
+    argv: Sequence[str],
+    cwd: Path,
+    runner,
+    timeout: float,
+    env,
+) -> tuple[bool, str]:
+    """`(ok, report_line)` for ONE command.
+
+    Extracted so the loop below can branch on `ok` in one place instead of
+    once per failure kind. Every failure mode is still a `False` here rather
+    than an exception, which is the promise `run_validation_commands` makes to
+    its callers: a refused binary, a missing binary and a timeout are reported
+    exactly like a nonzero exit.
+    """
+    command = " ".join(argv)
+    binary = Path(argv[0]).name if argv else ""
+    if binary not in SAFE_VALIDATION_BINARIES:
+        return False, f"{command}: REFUSED (binary {binary!r} is not a safe validation binary)"
+    try:
+        proc = runner(
+            list(argv),
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{command}: TIMEOUT"
+    except FileNotFoundError:
+        return False, f"{command}: NOT FOUND"
+    if proc.returncode == 0:
+        return True, f"{command}: PASS"
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return False, f"{command}: FAIL ({failure_digest(output)})"
+
+
+def _short_circuit_note(not_run: int) -> str:
+    """Why the report has `NOT RUN` lines in it, and how to get a full run.
+
+    Bounded and static — it becomes part of `state.last_validation`, so it is
+    subject to the same discipline as `failure_digest`. It names ONLY a lever
+    that exists: `fail_fast=False` on this function. There is deliberately no
+    config key to name yet (see `docs/AUTOLOOP.md` §4h), and pointing a
+    reviewer at a setting nothing reads would be a false sentence in the one
+    string this change exists to make honest.
+    """
+    return (
+        f"STOPPED at the first failing command: the {not_run} command(s) marked "
+        f"{NOT_RUN} above were not executed, which is different information from "
+        "PASS. Order is the CONFIGURED order, cheapest first (lint, then the test "
+        "suites, then the serial `isolated` re-run), so a cheap defect costs the "
+        "cheap check and nothing else. To run every command anyway — the 'how much "
+        "is broken' question rather than 'is this approvable' — call "
+        "run_validation_commands(..., fail_fast=False)"
+    )
+
+
 def run_validation_commands(
     commands: Sequence[tuple[str, ...]],
     cwd: Path,
     command_runner=None,
     timeout: float = 1800,
     validation_env: ValidationEnv | None = None,
+    fail_fast: bool = True,
 ) -> tuple[bool, str]:
-    """Run every command in `commands` from `cwd`, in order.
+    """Run the commands in `commands` from `cwd`, in order, until one fails.
 
     Returns `(all_passed, summary)`. `all_passed` is True only if every
-    command ran and exited 0; a refused binary, a timeout, or a missing
+    command that ran exited 0; a refused binary, a timeout, or a missing
     binary all count as a failure rather than raising, so a caller can report
     validation failure the same way it reports a nonzero exit. An empty
     `commands` sequence is reported as passed (nothing configured, nothing to
     fail) with a summary saying so — callers that require at least one
     command must check for that themselves.
+
+    **`fail_fast` (default True) stops after the first failing command.** The
+    verdict is already decided at that point and everything after it is paid
+    for against it; at this repository's measured 1,282-second median executor
+    round, a one-line documentation violation was buying two full pytest suites
+    before the round could report it. The commands that did not launch are
+    still NAMED, one `NOT RUN` line each, so the summary continues to account
+    for every configured command and a reviewer can tell "did not run" from
+    "passed" — they are different evidence, and collapsing the report to a
+    single verdict would destroy that. `fail_fast=False` runs everything, which
+    is what you want when the question is how much is broken.
+
+    Failure of ANY kind stops the run, refusals and timeouts included: they are
+    failures by this function's own definition, and a caller that must see the
+    rest of the list can ask for a full run.
 
     `validation_env`, when given, supplies the database credentials the
     commands run under (see this module's docstring) and redacts its own
@@ -298,11 +398,17 @@ def run_validation_commands(
     names — so "no file configured" means "no credentials", never "whatever
     the operator happened to export".
 
-    Every command is normalized through `effective_validation_commands` first,
-    and it is the EFFECTIVE command that runs and that the summary names — so
-    the report says what was actually executed rather than what was configured
-    a deployment ago. The summary is still one `PASS`/`FAIL` line per command:
-    parallelism lives inside a command, never across the report.
+    Every command is normalized through `effective_validation_commands` first
+    — including the ones that never launch, so their `NOT RUN` lines name the
+    command that WOULD have run — and it is the EFFECTIVE command that runs and
+    that the summary names, so the report says what was actually executed
+    rather than what was configured a deployment ago. The summary is still one
+    `PASS`/`FAIL`/`NOT RUN` line per command: parallelism lives inside a
+    command, never across the report.
+
+    A run that passes, and a run whose LAST command is the one that fails, are
+    byte-identical to what this returned before fail-fast existed: there is
+    nothing to skip, so there is no note to add.
     """
     runner = command_runner or subprocess.run
     env = (
@@ -312,37 +418,21 @@ def run_validation_commands(
     )
     parts: list[str] = []
     all_ok = True
-    for argv in effective_validation_commands(commands):
-        command = " ".join(argv)
-        binary = Path(argv[0]).name if argv else ""
-        if binary not in SAFE_VALIDATION_BINARIES:
-            all_ok = False
-            parts.append(f"{command}: REFUSED (binary {binary!r} is not a safe validation binary)")
-            continue
-        try:
-            proc = runner(
-                list(argv),
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            all_ok = False
-            parts.append(f"{command}: TIMEOUT")
-            continue
-        except FileNotFoundError:
-            all_ok = False
-            parts.append(f"{command}: NOT FOUND")
-            continue
-        ok = proc.returncode == 0
-        all_ok = all_ok and ok
+    effective = effective_validation_commands(commands)
+    for index, argv in enumerate(effective):
+        ok, line = _run_one_command(argv, cwd, runner, timeout, env)
+        parts.append(line)
         if ok:
-            parts.append(f"{command}: PASS")
-        else:
-            output = (proc.stdout or "") + (proc.stderr or "")
-            parts.append(f"{command}: FAIL ({failure_digest(output)})")
+            continue
+        all_ok = False
+        if not fail_fast:
+            continue
+        remaining = effective[index + 1 :]
+        if not remaining:
+            break
+        parts.extend(f"{' '.join(later)}: {NOT_RUN}" for later in remaining)
+        parts.append(_short_circuit_note(len(remaining)))
+        break
     if not parts:
         return True, "(no validation commands configured)"
     # Redacted LAST, over the assembled summary, so every branch above is

@@ -2981,6 +2981,82 @@ brief literally would have rejected the real name as unknown.
 
 ---
 
+## 4h. Validation stops at the first failure (val-03, 2026-08-22)
+
+**The problem, measured.** The executor round is the loop's clock. Over the 23
+days to 2026-08-22: packet build 0.98s median, submit 12-18s, the reviewer's
+verdict ~0s on the codex transport, the merge sweep ~20s — against an executor
+round of **1,282s median, 20.1 min mean, 42.3 min max**. Review is about 2% of a
+round; there is nothing left to win anywhere else. Meanwhile **64% of measurable
+executor time produced nothing reviewable** (n=17 rounds: 2.03h passed, 3.66h
+failed), and **79 of 261 revise verdicts** were caused by something orthogonal to
+the work being done — 50 mention inherited or unrelated test failures, 31 a scope
+or approved-path violation, 22 an overlong documentation change-note line. At the
+20.1-minute mean that is roughly 26.5 hours. Thirty-two revise verdicts say in so
+many words that the round was otherwise finished.
+
+`run_validation_commands` ran every configured command and ANDed the results, so
+a one-line documentation violation — which `ruff` or the first suite names in
+seconds — still bought both full pytest suites and the serial `isolated` re-run
+before the round could report it.
+
+**What it does now.** The run stops at the first command that fails. Every
+command after it is reported `<command>: NOT RUN` and never launched, followed by
+one bounded note saying it stopped, how many commands did not run, that the order
+is the configured order (cheapest first), and how to ask for a full run.
+
+Four properties hold that up, and each was a way to get this wrong:
+
+* **The per-command report survives.** One `PASS` / `FAIL` / `NOT RUN` line per
+  configured command. The reviewer decides partly on what was *exercised*, so
+  collapsing the report to a single verdict would trade wall-clock for evidence.
+* **`NOT RUN` is not `SKIPPED`.** `TestSelection.skipped` (§4g's neighbour, the
+  per-commit test selection in `validation.py`) already means "dropped because no
+  reachable test lives under its paths", and the post-commit call site
+  (`orchestrator._run_post_commit_validation`) concatenates both strings into one
+  summary. Two senses of one word in the line a reviewer reads is worse than a
+  longer word.
+* **Nothing about the verdict changed.** `all_passed` is False in exactly the
+  cases it was False before; a refused binary, a missing binary and a timeout are
+  still failures rather than exceptions; an empty command list still reports
+  passed. A PASSING run's summary is byte-identical to what it was, because
+  nothing was skipped and so there is nothing to say — as is a run whose LAST
+  command is the one that failed.
+* **Order is the operator's, and it is now load-bearing.** Nothing re-orders a
+  configured list: reordering by guessed cost is a semantic change, and the cost
+  of a suite is not readable from its argv. What is pinned instead is the shipped
+  template (`config.example.toml`): its first command is the lint, and the serial
+  `isolated` re-run is last. The two pytest suites' order relative to each other
+  is left alone deliberately — choosing it needs a measurement, and an unmeasured
+  claim is the thing this change is against.
+
+**The full run, and why there is no config key.** `run_validation_commands(...,
+fail_fast=False)` runs everything. That is the "how much is broken?" question, as
+opposed to "is this candidate approvable?", and it is already answered in
+production by a different runner: `AuditExecutor._run_validation`
+(`audit/executor.py`) does not route through this function at all — it runs every
+configured command, one `ValidationRun` each, and is untouched by this change.
+
+An `[audit] validation_run = "fail_fast" | "full"` key was planned and
+deliberately NOT shipped. Neither call site that would read it is reachable from
+this task's approved paths: `cli._build_executor` (`cli.py:401`) constructs the
+`ImplementExecutor`, and `orchestrator._run_post_commit_validation`
+(`orchestrator.py`) makes the post-commit call. A key documented in the template
+that no call site reads would be a false statement shipped inside a change about
+reporting honestly — worse than no key. Wiring it later is one line per site
+(`fail_fast=` from `config.audit.<key>`) plus the field and its `load_config`
+check, exactly the shape `test_selection` has today. The current state is pinned
+by `test_neither_production_call_site_overrides_the_default`
+(`autoloop/tests/test_validation_failfast.py`), so adding either line fails a
+test and forces this section to be rewritten in the same change.
+
+**Where to look.** `autoloop/validation.py` (`run_validation_commands`,
+`_run_one_command`, `_short_circuit_note`, `NOT_RUN`), pinned by
+`autoloop/tests/test_validation_failfast.py`; the ordering rationale is in
+`autoloop/config.example.toml` beside `validation_commands`.
+
+---
+
 ## 5. Response contract (v3)
 
 As v2 (task-id-based work authorization, `plan`, `reviewed` integrity stamps —
@@ -4265,7 +4341,8 @@ Pipeline (`implement_executor.py`):
    result is `status="error"` ("changed no files") rather than an empty
    success.
 4. Re-run the configured **validation commands** (same allowlisted binaries
-   and `validation.py` helper as the audit) in the worker repo. Failure is
+   and `validation.py` helper as the audit) in the worker repo — stopping at
+   the first one that fails, with the rest reported `NOT RUN` (§4h). Failure is
    `status="error"` carrying the validation summary; the changed files are
    still reported (nothing is rolled back — produce-then-review never rolls
    anything back, §4b).
