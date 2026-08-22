@@ -4356,6 +4356,50 @@ agent wrote inside its own worker repo, surfaced back as
 only new wiring in the orchestrator's executor slot; `orchestrator.py` and
 the `TaskExecutor` protocol (`executor.py`) are unchanged.
 
+**The brief carries the repository's mechanical authoring rules (brief-01,
+2026-08-22).** Step 1's prompt ends with a MECHANICAL AUTHORING RULES section
+(`implement_executor._authoring_rules`), rendered unconditionally after the
+APPROVED SCOPE list. Measured cost of its absence: on 2026-08-21 the single
+test
+`test_docs_merge.py::test_every_change_note_line_is_short_enough_to_merge_by_line`
+destroyed two full rounds — merge-04 at 16:39:57 (976 chars)
+and blk-02 at 17:43:57 (773 chars) — each of which had implemented its task
+correctly. The agent has Read/Grep/Glob/Edit/Write and no way to know which
+test gates its diff, so without the section it can only learn the limit by
+failing, once per round, forever.
+
+* **One constant, two consumers.** The limit is
+  `note_merge.MAX_NOTE_LINE_CHARS`, beside the resolver it protects. The
+  validator test imports it and the brief renders it — read through the module
+  at call time, so a changed limit reaches the next brief with no second edit.
+  A hard-coded copy in the prompt is the failure mode the task was filed
+  against: it would agree on the day it was written and silently disagree the
+  first time the number moved.
+* **The wording is as load-bearing as the number.** The check is `len(line) <=
+  MAX`, so the text says AT MOST and states the boundary outright; and it
+  measures the WHOLE line, `| date | task-id |` cells included, so a brief
+  bounding only the sentence would let a 690-character note ride in a
+  740-character row and fail anyway.
+* **Narrow, deliberately.** Mechanical formatting rules that reject otherwise
+  correct work — not a summary of the test suite, and not project conventions,
+  which live in `CLAUDE.md` and are already read. `NOTE_TRACKERS` names the
+  files; an empty list would render a rule with no subject, so it falls back to
+  naming them generically rather than to silence.
+* **Two rules, not one.** Beside the length limit the section states the
+  marker rule — call it CHANGE-NOTES in prose, never write the comment out
+  again — because `notes_section` requires that comment to appear exactly once
+  per tracker and a second copy switches auto-resolution off for the whole
+  file, silently. Same section, same test file, same class of failure; it
+  carries no number, so it adds no drift surface. Anything further belongs in
+  `CLAUDE.md`, not here.
+* **It grants nothing.** No tool moves, no ground rule relaxes, no check
+  changes; the section contains no line starting with `ASSUMPTION:` or
+  `REMOVE-OUT-OF-SCOPE:`, so an agent echoing it back forges neither a
+  disclosure nor a deletion request. Pinned by
+  `test_implement_executor.py` (prompt shape, the monkeypatched-constant drift
+  test, echo-safety, ceiling) and `test_docs_merge.py` (the brief states the
+  number that file enforces).
+
 ---
 
 ## 8. Setup

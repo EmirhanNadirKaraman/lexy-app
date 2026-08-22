@@ -2262,6 +2262,29 @@ the comment out a second time; quoting it in `CLAUDE.md` or here is fine, since
 neither is a tracker. Rule 5 of each tracker's change-note section and `CLAUDE.md`
 §12 now say so, and the assertion message above names the consequence.
 
+### AssertionError: SUMMARY.md: a change note grew to 976 chars — split it into a second line instead
+**Symptom:** `autoloop/tests/test_docs_merge.py::test_every_change_note_line_is_short_enough_to_merge_by_line`
+fails, validation fails with it, and an executor round that implemented its task
+correctly is discarded. Hit twice on 2026-08-21 — merge-04 at 16:39:57 (976
+chars, `TESTS.md`) and blk-02 at 17:43:57 (773 chars, `SUMMARY.md`) — costing
+about 20 minutes each.
+**Cause:** a change-note line ran past `note_merge.MAX_NOTE_LINE_CHARS`. The
+limit is measured over the WHOLE line, so the `| date | task-id |` cells count
+towards it; a note that reads as a reasonable sentence can still fail on the
+assembled row. It is not a style rule — a row that keeps growing is the
+2026-08-18 merge-sweep failure returning (see the next entry), which is why it
+is enforced rather than suggested.
+**Fix:** split the note into a SECOND appended line — same first cell, one
+dated note per line, exactly as the four `state.py`, `transcript.py` rows in
+`SUMMARY.md` do. Never shorten it by editing a line someone else wrote, and
+never merge two notes into one row to save a line.
+**Do not** hard-code the number into a doc or a prompt while fixing this.
+`autoloop/note_merge.MAX_NOTE_LINE_CHARS` is the single source: the test reads
+it, and `implement_executor._authoring_rules` renders it into every
+implementing agent's brief so the rule arrives as input rather than as this
+rejection (brief-01, 2026-08-22). A copy that silently disagrees with the test
+is worse than no copy at all.
+
 ### CONFLICT (content): Merge conflict in docs/SUMMARY.md — two tasks recorded a change note
 **Symptom:** the merge sweep aborts on `docs/SUMMARY.md` (or `docs/TESTS.md`)
 for two branches that changed nothing in common. It halted three times in one
