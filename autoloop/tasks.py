@@ -214,6 +214,24 @@ def _validate_description(task_id: object, description: object) -> None:
         )
 
 
+def _validate_urgent_reason(task_id: object, reason: object) -> None:
+    """Raise `TaskGraphError` unless `reason` is a non-blank string.
+
+    Same rule and the same wording shape as `operator_block`'s: a preemption
+    displaces a round that may be twenty minutes into real work, so the record
+    of why has to exist before anything is discarded. Its own validator rather
+    than a call to `_validate_description` so the message names the act the
+    operator performed — a refusal reading "needs a non-empty description" for
+    an `urgent` request sends them to the wrong field.
+    """
+    if not isinstance(reason, str) or not reason.strip():
+        raise TaskGraphError(
+            "empty_task_field",
+            f"marking task '{task_id}' urgent needs a non-empty reason — a "
+            "preemption with no account of why is worse than a slow queue",
+        )
+
+
 def _validate_superseded_by(task_id: object, successors: object) -> tuple[str, ...]:
     """Return `successors` as a tuple, or raise `TaskGraphError`.
 
@@ -579,6 +597,34 @@ class Task:
     #: `tasks.json` written before it existed loads unchanged — same
     #: backward-compatible pattern as `approved_paths` above.
     decomposition: str = ""
+    #: WHEN this task was made the loop's urgent target, as a UTC timestamp.
+    #: `""` — the ordinary state — means "not urgent".
+    #:
+    #: THE PIN. At most one task in the registry carries it at a time
+    #: (`TaskRegistry.request_urgent` refuses a second while the first is still
+    #: waiting), it sorts that task ahead of everything else in `next_ready()`
+    #: regardless of `priority`, and `mark_in_progress` CONSUMES it — the pin
+    #: asks for one dispatch, not for permanent precedence.
+    #:
+    #: A separate field rather than `priority = 0`, and that is the whole point
+    #: of it. Priority cannot preempt: it is an integer other tasks already
+    #: share, so raising a task to P0 on 2026-08-21 only TIED with the P0 task
+    #: already mid-round and lost the id tiebreak ("brw-13" < "codex-01"). A
+    #: field that exists on exactly one task cannot tie, and unlike a magic
+    #: number it also cannot be reached by an ordinary operator re-prioritisation
+    #: that meant nothing so strong.
+    #:
+    #: New field with a default, so a `tasks.json` written before it existed
+    #: loads unchanged — same backward-compatible pattern as `decomposition`,
+    #: plus the normalising read in `from_dict` that keeps a hand-edited `null`
+    #: from becoming `None` here.
+    urgent_at: str = ""
+    #: The operator's account of WHY this task is urgent, required by
+    #: `request_urgent` for the same reason `operator_block` requires one: a
+    #: preemption that discards a round's work with no recorded reason is the
+    #: free-text blocker problem, not a fix for it. `""` whenever `urgent_at`
+    #: is, and cleared with it.
+    urgent_reason: str = ""
 
 
 #: The repository trackers every task may update, WITHOUT naming them in its
@@ -800,6 +846,15 @@ class TaskRegistry:
                 "new task instead of reviving it",
             )
         task.status = "in_progress"
+        # THE PIN IS CONSUMED HERE, and this is the only place it is spent.
+        # An urgent request asks for ONE dispatch — this one — not for
+        # permanent precedence, and leaving the marker on would keep the task
+        # ahead of every future selection while also holding the single urgent
+        # slot shut against the next operator who needs it. Cleared at the
+        # moment the dispatch it asked for actually starts, so a request that
+        # never reached a dispatch still stands.
+        task.urgent_at = ""
+        task.urgent_reason = ""
         return task
 
     def mark_completed(self, task_id: str) -> Task:
@@ -1458,17 +1513,188 @@ class TaskRegistry:
             )
         return self.unblock(task_id)
 
+    # ---- the urgent pin (preemption) ----------------------------------------
+
+    def live_urgent_target(self) -> Task | None:
+        """The one task carrying a pin that still has a dispatch coming, or None.
+
+        LIVE means `urgent_at` is set AND the task is still READY — i.e. the
+        dispatch the pin asks for has not happened and is not impossible. Every
+        other pinned state is STALE and answers None here, which is what keeps
+        the single slot from wedging: a pinned task that was later blocked by a
+        new dependency, quarantined, retired or completed would otherwise hold
+        the slot for good, and every later urgent request would be refused
+        forever on behalf of a preemption that can never occur. `request_urgent`
+        clears such a marker when it grants the slot to someone else.
+
+        `state_of` is called inside a `try`, unlike the straight-line use in
+        `ready_tasks`: it raises `KeyError` on a graph whose `depends_on` names
+        a task that no longer exists (a shape `from_dict` deliberately
+        tolerates — see `blocker_derived_blocked`), and this method is called
+        from the loop's own hot path between steps. A graph it cannot judge has
+        no live target rather than taking the run down.
+
+        At most one task can be pinned at a time, so the first match is THE
+        match; the loop over all tasks exists to find it, not to choose among
+        several.
+        """
+        for task in self._tasks.values():
+            if not task.urgent_at:
+                continue
+            try:
+                state = self.state_of(task.id)
+            except KeyError:  # pragma: no cover - dangling dependency graph
+                continue
+            if state is TaskState.READY:
+                return task
+        return None
+
+    def _refuse_unurgentable(self, task: Task) -> None:
+        """Raise unless `task` is in a state a preemption could actually
+        dispatch it from.
+
+        The BOUND on what an urgent request may name. Every arm names the state
+        it found, because the failure this exists to prevent is a silent no-op:
+        a request for a task with an unmet dependency that is accepted, never
+        dispatched, and leaves the operator watching a loop that ignored them.
+
+        `in_progress` gets its own sentence rather than falling into a generic
+        "not ready": the request has already been granted in the only sense
+        that matters, and an operator told "not ready" about the task the loop
+        is running would resubmit.
+        """
+        state = self.state_of(task.id)
+        if state is TaskState.IN_PROGRESS:
+            raise TaskGraphError(
+                "task_in_progress",
+                f"task '{task.id}' is already the round in flight — there is "
+                "nothing to preempt it with",
+            )
+        if state is TaskState.COMPLETED:
+            raise TaskGraphError(
+                "task_completed",
+                f"task '{task.id}' is already completed — it will not be "
+                "dispatched again",
+            )
+        if state is TaskState.BLOCKED:
+            waiting = ", ".join(
+                dep
+                for dep in task.depends_on
+                if self._tasks[dep].status != "completed"
+            )
+            raise TaskGraphError(
+                "task_blocked",
+                f"task '{task.id}' waits on incomplete dependencies ({waiting}) "
+                "— preempting for it would displace a round for a task the loop "
+                "still cannot dispatch",
+            )
+        if state is TaskState.BLOCKED_BY_OPERATOR:
+            recorded = task.blocked_reason or "no reason recorded"
+            raise TaskGraphError(
+                "task_blocked_by_operator",
+                f"task '{task.id}' is blocked ({recorded}) — release it first "
+                "(`python -m autoloop answer`, or an `unblock` request for an "
+                "operator hold)",
+            )
+        if state is TaskState.RETIRED:
+            raise TaskGraphError(
+                "task_retired",
+                f"task '{task.id}' is retired{_successor_hint(task)} — plan a new "
+                "task instead of preempting for one that will not be worked",
+            )
+        if not task.approved_paths:
+            # `_dispatch_task_postcommit` refuses an unscoped implement/revise
+            # (docs/SECURITY.md finding #2), so accepting this would displace a
+            # round in order to dispatch a task that parks on arrival. Refused
+            # here, where the operator can still fix it with an
+            # `approved_paths` request, rather than three minutes later in a
+            # blocker.
+            raise TaskGraphError(
+                "no_approved_paths",
+                f"task '{task.id}' has no approved_paths, so no dispatch of it "
+                "can start — send an `approved_paths` request first",
+            )
+
+    def request_urgent(self, task_id: str, reason: str) -> Task:
+        """Make `task_id` the loop's urgent target: the next task dispatched,
+        ahead of whatever is in flight.
+
+        The registry half of preemption. It decides ONE thing — may this task
+        hold the pin — and nothing about how the loop acts on it: the safe
+        boundary, the release of the displaced round and the quarantine of its
+        work all belong to `orchestrator._preempt_for_urgent`, which reads
+        `live_urgent_target()`. Same split as everywhere else here: the inbox
+        owns a request's SHAPE, this owns its CONTENT, the loop owns its
+        TIMING.
+
+        ONE AT A TIME, enforced structurally. A second request while another
+        task's pin is still live is REFUSED, naming the incumbent — not queued
+        behind it, and not silently overwriting it. Queueing would mean two
+        preemptions in flight with one round to displace between them, which is
+        exactly the shape the manual pause/resume sequence failed at
+        (`docs/AUTOLOOP.md` §4f-quinquies); overwriting would let the second
+        operator discard the first's displaced round without knowing they had.
+        The refusal is loud and the operator can resubmit once the first target
+        has been dispatched, which clears the pin (`mark_in_progress`).
+
+        IDEMPOTENT for the SAME task: a repeat while the pin is already live
+        returns it untouched, keeping the original `urgent_at` and the original
+        reason. A second submission of the same request is almost always an
+        operator who is not sure the first landed, and rewriting the timestamp
+        would make the record say the preemption was asked for later than it
+        was.
+
+        Rejection is atomic. The lookup, the reason check, the incumbent check
+        and every state refusal all run before the first assignment, so a
+        refused call leaves the registry exactly as it was — including the
+        incumbent's own pin, which is only cleared once this call is certain to
+        grant the slot.
+        """
+        task = self.get(task_id)
+        _validate_urgent_reason(task_id, reason)
+        incumbent = self.live_urgent_target()
+        if incumbent is not None and incumbent.id == task.id:
+            return task
+        if incumbent is not None:
+            raise TaskGraphError(
+                "urgent_already_pending",
+                f"task '{incumbent.id}' is already the urgent target (requested "
+                f"{incumbent.urgent_at}: {incumbent.urgent_reason}) and has not "
+                f"been dispatched yet — one preemption at a time. Wait for it to "
+                f"start, then request '{task_id}' again",
+            )
+        self._refuse_unurgentable(task)
+        # Only now, with the grant certain: any marker still on another row is
+        # STALE by definition (`live_urgent_target` just answered None), and
+        # leaving it would put a second `urgent_at` in the file for a
+        # preemption that can never happen.
+        for other in self._tasks.values():
+            if other.urgent_at:
+                other.urgent_at = ""
+                other.urgent_reason = ""
+        task.urgent_at = utcnow_iso()
+        task.urgent_reason = reason
+        return task
+
     def next_ready(self) -> Task | None:
-        """Highest-priority ready task; ties broken by id.
+        """Highest-priority ready task; ties broken by id — unless one carries
+        the URGENT PIN, which outranks both.
 
         Was insertion order. Ordering by `priority` first is what lets an
         operator steer a running loop — otherwise a task added later can
         never overtake one already queued, no matter how urgent.
+
+        Priority alone still cannot PREEMPT, and that is why the pin sorts
+        ahead of it rather than being expressed as a smaller number. Measured
+        2026-08-21: codex-01 was raised to P0 while brw-13 held the loop, but
+        brw-13 was already P0 — so P0 only TIED, the id tiebreak decided it
+        ("brw-13" < "codex-01"), and the urgent task lost silently. A pin no
+        other task can hold cannot tie.
         """
         ready = self.ready_tasks()
         if not ready:
             return None
-        return sorted(ready, key=lambda t: (t.priority, t.id))[0]
+        return sorted(ready, key=lambda t: (0 if t.urgent_at else 1, t.priority, t.id))[0]
 
     def summary(self) -> str:
         """One line of roadmap state, rendered into every review request.
@@ -1508,6 +1734,18 @@ class TaskRegistry:
         )
         if nxt is not None:
             parts += f"; next ready: {nxt.id} — {nxt.title}"
+        urgent = self.live_urgent_target()
+        if urgent is not None:
+            # Rendered for the REVIEWER, not only for the operator: this line
+            # is `context.build_context`'s `roadmap_status`, and a reviewer that
+            # cannot see the pin has no way to know why the loop just ended a
+            # round — or that naming any other task will be refused
+            # (`orchestrator._dispatch_executor`). Same coupling as the
+            # priority-1 breakdown above, and pinned by test on both sides.
+            parts += (
+                f"; URGENT: {urgent.id} was requested by the operator and must be "
+                f"the next task dispatched ({urgent.urgent_reason})"
+            )
         return parts
 
     # ---- persistence --------------------------------------------------------
@@ -1547,6 +1785,13 @@ class TaskRegistry:
                     # must become `""` rather than `None` (which would blow up
                     # on the next `strip`). See `Task.decomposition`.
                     "decomposition": str(raw.get("decomposition", "") or ""),
+                    # Same coercion again, and the same reason: a missing key
+                    # is a `tasks.json` written before the urgent pin existed
+                    # and loads as "not urgent", while a hand-edited `null`
+                    # must become `""` rather than `None` — every reader here
+                    # tests this field for truthiness and then prints it.
+                    "urgent_at": str(raw.get("urgent_at", "") or ""),
+                    "urgent_reason": str(raw.get("urgent_reason", "") or ""),
                     # VALIDATED, not just tuple()-converted — this path never
                     # reaches `add_many` (see the bypass below), so it is the
                     # only gate a stored row passes. See

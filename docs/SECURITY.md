@@ -45,6 +45,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S35 | INFO | The merge sweep now auto-resolves ONE conflict shape without a human (2026-08-19, docs-01): two branches each appending change-note lines to the terminal append-only section of `docs/SUMMARY.md` / `docs/TESTS.md`. Bounded: two literal paths, each side's section must extend the merge base byte-for-byte, a conflict anywhere else in the file or the merge refuses the whole merge, and every decision is in the transcript. Replaces S34 (`merge=union`), which disabled conflict detection for the whole file | `autoloop/note_merge.py`, `autoloop/auto_merge.py`, `autoloop/git_gateway.py` |
 | S36 | INFO | `profile` (prof-01, 2026-08-20) is the first command whose whole job is to read `transcript.jsonl`, which holds complete review packets (`request_submitted.data.prompt`) and complete reviewer replies (`response_received.data.raw`). Bounded structurally by a read/render split: `build_profile` reduces the read to counts plus per-stage floats and static stage labels, and `render_profile` receives only that, so the layer that writes to stdout holds no record at all — do not add a flag that prints one. `--transcript FILE` changes only WHICH file is read, and the bound is input-independent | `autoloop/cli.py`, `autoloop/transcript.py` |
 | S37 | INFO | The reviewer transport gained a LIVE agent session (`codex_app_server`, 2026-08-22, codex-01): one long-lived `codex app-server` child instead of a process per turn, and it can ask this client to approve a command or a patch. Bounded by this client's REPLIES — every approval is answered `{"decision": "abort"}`, every other server→client request gets a JSON-RPC error (never silence, which would wedge the turn), argv is a list with no shell and no model text on it, `cwd` stays outside the checkout and stderr is `DEVNULL`. Explicitly NOT a sandbox claim: no preset is selected or enforced | `autoloop/codex/app_server.py`, `autoloop/codex/app_server_conversation.py`, `autoloop/conversation.py` |
+| S38 | MEDIUM | The inbox gained `urgent` (preempt-01, 2026-08-22) — the first request kind whose effect is on the LOOP: it ends the round in flight at the next safe boundary and MOVES that task's worker repo and execution record to quarantine, so S30's "nothing in flight can be edited" no longer covers the whole vocabulary. Bounded: the target must be a dispatchable READY task with a non-empty scope, a non-blank reason is required, ONE live pin at a time, it acts only at `_at_round_boundary` (the same predicate the self-upgrade restart uses) so no review packet is stranded, the displaced task moves through the one release path, nothing is deleted (a retirement that fails names what survived, and pairs it back with its record when that worker is resumable), and no packet, stamp, approval or push is touched — the one added gate only DENIES an `implement`/`revise` of another task or a fresh `audit` while the pin is live | `autoloop/inbox.py`, `autoloop/tasks.py`, `autoloop/orchestrator.py`, `autoloop/cli.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -796,6 +797,111 @@ values this package wrote. That costs the per-template duplication this design
 avoided (every payload template would have to carry them, and a new template
 could forget), so it is worth doing only if a second unauthored-text section is
 ever added here.
+
+### S38 — An inbox request can now END the round in flight and quarantine its work — MEDIUM — OPEN (bounded, accepted)
+
+**What:** `inbox.KIND_URGENT` (preempt-01, 2026-08-22) is the first request kind
+whose effect is on the LOOP rather than on the task graph. Applying it makes
+`Orchestrator._preempt_for_urgent` end the round currently in flight at its next
+safe boundary, return that task to pending, and MOVE its worker repo and
+execution record to quarantine. Every other mutation kind edits a row that
+nothing is currently reading (`TaskRegistry._refuse_immutable` is built on
+exactly that); this one deliberately reaches work that is under way, so S30's
+"nothing in flight can be edited" bound no longer describes the whole
+vocabulary and is recorded here rather than left implied.
+
+The reachable damage from a hostile or mistaken request is **delay plus a
+quarantined directory**: a round's committed candidate is moved, not deleted,
+under `quarantine/<task>-displaced-by-urgent-<stamp>` with its execution record
+archived beside it under the same label, and the displaced task is returned to
+the queue where it will be dispatched again. Repeated requests could in
+principle keep displacing rounds — bounded by one live pin at a time, and by
+the fact that the pin is consumed by the very next dispatch, so a denial of
+service needs a fresh request per round rather than a single write.
+
+A retirement that FAILS (an unwritable quarantine root, a colliding label) is
+the same statement with one directory not moved: nothing is deleted there
+either, and what survived is named in `LoopState.preemption` and in the
+operator report. When the worker is one the next dispatch would resume, the
+record is put back beside it rather than left orphaned
+(`orchestrator._repair_orphaned_record`); when it is not, the split is left and
+the `mv` is named. The residual exposure either way is a worker repo that stays
+under `workers_root` instead of `quarantine/` — no wider than where it already
+was, and reachable by nothing that was not already reading it.
+
+**Why it is not a review, approval or publication bypass.** Nothing on this path
+builds a packet, verifies a stamp, marks a task completed or pushes: the round
+simply ends between rounds, exactly as a reviewer's own `stop` does. The
+`report_sha256` binding — which covers the packet bytes INCLUDING the candidate
+sha, and is what stops an approval computed over candidate A from publishing
+candidate B — is untouched, and the urgent task is implemented, reviewed,
+approved and published through the identical path as any other. The one
+enforcement ADDED is a refusal: `Orchestrator._refused_ahead_of_urgent` denies
+an `implement`/`revise` of a different task, and (since the second round of
+preempt-01, 2026-08-22) a FRESH `audit`, while a pin is live — through the
+existing budget-capped policy-denial re-prompt. A `revise` continuing an audit
+arc already in flight is the one exemption. That refusal only ever DENIES work;
+it authorizes nothing, and `push` — the sole publishing decision — never reaches
+it.
+
+**Who can write one.** The same writers as any other inbox request — anything
+able to write the inbox directory beside `workers_root`, which is outside the
+checkout and therefore outside what a write-capable agent's own worker repo can
+reach. No dashboard endpoint reaches this kind (`dashboard.TASK_REQUEST_FIELDS`
+carries no `kind`, and `/api/priority` is the one immediate write, still
+`priority`-only), so the surface is unchanged from S28/S30: an operator, or
+anything with write access to that directory.
+
+**What bounds it:**
+- a target must be READY, dependency-satisfied, not quarantined, not retired,
+  not completed, not already in flight, and must have a non-empty
+  `approved_paths` (`TaskRegistry._refuse_unurgentable`) — so it cannot be used
+  to point the loop at a task no dispatch could start;
+- a non-blank `reason` is REQUIRED, so a preemption is never unaccounted for;
+- ONE live pin at a time; a second request is refused naming the incumbent
+  rather than queued or applied over it;
+- it acts only at `_at_round_boundary` (`ready`, no pending request), the same
+  predicate the self-upgrade restart uses, so a request arriving while a review
+  packet is outstanding cannot strand it;
+- the displaced task moves through `orchestrator.release_task_to_pending`, so
+  the status, worker repo and execution record always move together;
+- it takes no lock and writes no PAUSE flag, so it cannot wedge the loop for
+  another operator (the failure mode the manual sequence had).
+
+**`file:line`:** `autoloop/inbox.py` (`KIND_URGENT`, `_apply_mutation`),
+`autoloop/tasks.py` (`TaskRegistry.request_urgent`, `_refuse_unurgentable`),
+`autoloop/orchestrator.py` (`_preempt_for_urgent`, `release_task_to_pending`,
+`_repair_orphaned_record`, `_refused_ahead_of_urgent`'s `urgent_target_pending`
+denials) and `autoloop/cli.py` (`_start_new_session`, `URGENT_KICKOFF`,
+`urgent_kickoff_payload`) — the pinned session's kickoff, which is reviewer-
+visible text only and authorizes nothing. `autoloop/prompts.py` is NOT touched:
+the kickoff template lives beside its caller in `cli.py`, as a `PromptTemplate`,
+so the shared library's strictness applies to it without the library changing.
+
+**Severity:** MEDIUM — availability/latency and operator-visible disruption, no
+path to unreviewed publication or to widened write scope.
+
+**Verification check:**
+```bash
+# Expect: the pin is refused for anything that is not a dispatchable READY task
+rg -n '_refuse_unurgentable|urgent_already_pending' autoloop/tasks.py
+# Expect: the preemption acts ONLY at the shared safe boundary, and reuses the release path
+rg -n '_at_round_boundary|release_task_to_pending' autoloop/orchestrator.py
+# Expect: the added gate only ever DENIES, and names no publishing decision
+rg -n -A3 'def _refused_ahead_of_urgent' autoloop/orchestrator.py
+rg -n 'push_exact|reviewed_commit|mark_completed' autoloop/orchestrator.py | rg 'urgent'
+# Expect: EMPTY — nothing on this path reviews, approves or publishes
+rg -n 'verify_review|report_sha256|push_exact' autoloop/orchestrator.py | rg 'preempt'
+# Expect: the gate itself still refuses a mismatched approval, unchanged
+rg -n 'review_mismatch' autoloop/contract.py
+```
+**Suggested fix (only if this ever needs to be stronger):** require the request
+to carry a shared secret written beside `workers_root` at provision time, so a
+preemption needs something more than write access to the inbox directory. Not
+done now because it would be the FIRST authenticated inbox kind while the other
+seven stay unauthenticated — a half-authenticated queue reads as protected
+without being so, and the real confinement for that whole surface is the
+OS-level sandbox S24 tracks.
 
 ### S29 — `merge` is on the git whitelist, and the loop now pushes the BASE branch — LOW — OPEN (deliberate, gated, accepted)
 
@@ -2105,6 +2211,12 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-08-22 (third round)** — **S38 narrowed to its approved paths, and one established recovery behaviour restored.** No change to what the finding permits. (1) `autoloop/prompts.py` is no longer touched at all: the pinned session's kickoff template moved to `cli.URGENT_KICKOFF`, still a `PromptTemplate` (strict rendering), with the two checks `test_prompts.py` runs over `TEMPLATES` — renders with its own fields, offers no retired decision — re-run against it in `test_urgent_preemption.py`. Reviewer-visible text either way; it authorizes nothing. (2) `release_task_to_pending` re-raises a failed retirement by DEFAULT, so `python -m autoloop release` keeps the ending it has always had (record archived first, worker repo left as the loud residue, error propagated for `main` to report and exit 1 on — `test_recovery_commands.py::test_the_record_is_retired_before_the_worker`); only `_preempt_for_urgent` passes `tolerate_retirement_failure=True` and takes the failure back inside the `Release`, because nobody is watching a preemption. `_repair_orphaned_record` therefore runs on the preemption path only, so no operator command can shut the repository-wide merge window behind a traceback. Verification check: `rg -n 'tolerate_retirement_failure' autoloop/orchestrator.py autoloop/cli.py` (expect the definition, one `True` at the preemption call site, and no CLI caller) and `pytest autoloop/tests/test_urgent_preemption.py autoloop/tests/test_recovery_commands.py`.
+
+- **2026-08-22 (second round)** — **S38 widened in one direction and tightened in another; still MEDIUM, still bounded.** Two changes to the finding above, neither of which touches review, approval or publication. (1) The added dispatch gate moved to `orchestrator._refused_ahead_of_urgent` and now also refuses a FRESH `audit` while a pin is live, because an audit is a full executor round (measured 1282s) even though it takes no task out of the queue — which is what made "the urgent task is dispatched next" true rather than merely claimed. `cli._start_new_session` opens a pinned session on the urgent task (`cli.urgent_kickoff_payload`) instead of the audit kickoff, so the refusal is a correction and not a wall. The gate only ever DENIES; it authorizes nothing, `push` never reaches it, and a `revise` continuing an audit arc already in flight is exempt. (2) `release_task_to_pending` returns an `orchestrator.Release` and now catches `GitError` — what a colliding quarantine label actually raises, and not an `OSError`, so it previously escaped the preemption's own handler — retries once under a distinct label, and when even that fails puts the execution record back beside the worker it names (`_repair_orphaned_record`) — but only when `worker_repo_is_reusable` accepts that worker, since a live record shuts the repository-wide merge window and paying that for a worker the next dispatch would refuse anyway buys nothing. Nothing is deleted on any of those paths and the residue, plus which of the two remedies applies (`residue_resumable`), is named in `LoopState.preemption`, the transcript and the operator report. Verification check: `rg -n -A3 'def _refused_ahead_of_urgent' autoloop/orchestrator.py` and `pytest autoloop/tests/test_urgent_preemption.py`.
+
+- **2026-08-22** — **An inbox request can now end the round in flight (new finding S38, MEDIUM, bounded).** `inbox.KIND_URGENT` (preempt-01) is the first request kind whose effect is on the LOOP rather than on the task graph: applying it makes `orchestrator._preempt_for_urgent` end the round currently in flight, return that task to pending, and MOVE its worker repo and execution record to quarantine. That falsifies S30's "nothing in flight can be edited" as a description of the whole vocabulary, so it is recorded rather than absorbed. It is NOT a review or merge bypass and must not become one: nothing on this path builds a packet, verifies a stamp, marks a task completed or pushes, so the `report_sha256` binding that stops an approval computed over candidate A from publishing candidate B is untouched, and the urgent task goes through the identical implement/review/approve/publish path as any other. Skipping review would have bought about 2% of a round anyway (packet build 0.98s, submit 12–15s, verdict ~0s, executor round 1282s). The one enforcement ADDED is a refusal — `_dispatch_executor` denies an `implement`/`revise` of a different task while a pin is live, through the existing budget-capped policy-denial re-prompt — because `next_ready()` decides what the CONTEXT block offers and not what policy authorizes. Bounded on six axes: the target must be a dispatchable READY task with a non-empty `approved_paths` (a blocked, quarantined, retired, completed, in-flight or unscoped target is refused by name and code, at the CLI as well as in the drain); a non-blank reason is required; exactly ONE live pin at a time, a second request refused naming the incumbent rather than queued or applied over it; it acts only at `_at_round_boundary` (`ready`, no pending request — the SAME predicate the self-upgrade restart uses, in one function), so a request arriving while a review packet is outstanding waits instead of stranding it; the displaced task moves through `release_task_to_pending`, shared with `python -m autoloop release`, so status, worker repo and execution record always move together and nothing is deleted; and no PAUSE flag or lock is taken anywhere, which is what makes two overlapping requests structurally unable to deadlock. Reachable damage is delay plus a quarantined directory. Verification check: `rg -n '_refuse_unurgentable|urgent_already_pending' autoloop/tasks.py`, `rg -n '_at_round_boundary|release_task_to_pending' autoloop/orchestrator.py`, and `pytest autoloop/tests/test_urgent_preemption.py`.
 
 - **2026-08-22** — **The reviewer seat gained a LIVE agent session as a selectable transport (new finding S37, INFO).** `codex_app_server` drives `codex app-server` over stdio JSON-RPC and holds ONE THREAD, which is what lets a codex seat declare `supports_chunked_delivery` truthfully: an oversized diff reaches the reviewer as numbered parts and the verdict question reaches it afterwards in the same context, where `codex_cli`'s process-per-turn had to omit the diff (port-01 lost an attempt to a 414,596-byte diff against the 400,000-byte packet cap; codex-01's own 228 KB candidate needed an operator patch on 2026-08-21). Security-relevant because the reviewer stops being a process that exits and becomes a session that can ask this client to approve a command or a patch — answered `{"decision": "abort"}` for the two approval requests whose response type the committed protocol settles, and a JSON-RPC error for every other server→client request, never silence. Argv is a list with no shell and carries no model-authored text at all (prompts go as JSON on stdin), `cwd` stays outside the checkout, stderr is `DEVNULL`, and transcript records are bounded and secret-free. **Two things are explicitly NOT claimed**, and no test asserts either: nothing survives a process restart (`thread/resume` exists in the protocol and is never sent) and no sandbox preset is selected or enforced — both are codex-03. Quota detection moved from substring-matching stderr to exact matches on named error fields plus a numeric 429, so an error whose prose merely mentions a usage limit routes as an ordinary failure. `codex_cli` is unchanged and still selectable; `fallback_provider` can still name any of the three. Left open and named: `doctor` does not yet recognise the new provider, and `config.example.toml` documents none of its four keys — both files were outside the task's approved paths. Verification check: `rg -n 'Popen|shell=True|stderr=' autoloop/codex/app_server.py` and `pytest autoloop/tests/test_codex_app_server.py`.
 

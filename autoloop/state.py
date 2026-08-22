@@ -102,6 +102,13 @@ if TYPE_CHECKING:
 # delivery to backfill. The phase is additive — an old state file cannot
 # contain a value that did not exist when it was written, and `Phase(...)`
 # still rejects anything unknown.
+#
+# NOT bumped for urgent preemption either (`LoopState.preemption`, plus the new
+# `"preempted"` value of the existing `stop_kind`). The field defaults to `None`,
+# which is exactly right for a state file written before it existed: that
+# session was never preempted, so there is nothing to backfill. `stop_kind` gains
+# no field at all, and every reader of it already gates on the POSITIVE value it
+# wants, so an old `""` keeps reading as unclassified rather than as this.
 SCHEMA_VERSION = 3
 
 
@@ -595,6 +602,13 @@ class LoopState:
     #:   `orchestrator._to_fault_stop`). `stop_reason` describes the wall, a
     #:   `blockers.Blocker` records it for `python -m autoloop blockers`, and
     #:   `stop_blocker_id` below names that record.
+    #: * `"preempted"` — an operator's urgent request took the loop
+    #:   (`orchestrator._preempt_for_urgent`). Like `"contract"` and unlike
+    #:   `"fault"` this is a CLEAN boundary: the round was ended deliberately at
+    #:   a safe phase, the displaced task is back in the queue, and the very
+    #:   next selection is meant to start a new session — so continuous mode
+    #:   carries on rather than stopping. `stop_reason` names the urgent target
+    #:   and `LoopState.preemption` records what was displaced.
     #: * `""` — unclassified: a state file written before this field existed,
     #:   or any phase other than `stopped`.
     #:
@@ -624,6 +638,34 @@ class LoopState:
     #: `BlockerStore` was configured (always true in production; `None` in
     #: tests/tools that construct a minimal `Orchestrator`).
     park_blocker_id: str | None = None
+    #: What this session gave up when an operator's urgent request preempted
+    #: it, or `None` for every session that was never preempted.
+    #:
+    #: Written by `orchestrator._preempt_for_urgent` in the same save that ends
+    #: the round, and it is the reason a preemption is not a silent discard:
+    #: it names the DISPLACED task, the phase the request was first observed at,
+    #: the phase it was acted on at, the urgent target that took the loop, and
+    #: the quarantine label plus the paths the displaced round's worker repo and
+    #: execution record were moved to. `stop_kind == "preempted"` is what says a
+    #: `stopped` session ended this way; this is what says what it cost.
+    #:
+    #: TWO SEPARATE TRUTHS about the release, never collapsed into one:
+    #: `displaced_returned_to_pending` is the STATUS half and
+    #: `displaced_artifacts_retired` is the ARTEFACT half, because the status is
+    #: made durable first and a retirement can fail after it. When the second is
+    #: false, `stale_worker_path` and `stale_execution_record` name what
+    #: survived — deliberately left PAIRED, since that is the shape a killed
+    #: round leaves and the next dispatch resumes it rather than refusing.
+    #:
+    #: A plain dict, like `current_task` / `task_execution` / `last_rotation`
+    #: beside it: it is a record to display and log, nothing branches on its
+    #: fields, and a dataclass would need its own loader in `from_dict`.
+    #:
+    #: DURABLE ONLY AS LONG AS THE SESSION. The next selection replaces the
+    #: whole `LoopState`, so the transcript's `task_preempted` entry — written
+    #: from this same dict — is the permanent record; this field is what
+    #: `status` and the operator's terminal can still show in between.
+    preemption: dict | None = None
     created_at: str = field(default_factory=utcnow_iso)
     updated_at: str = field(default_factory=utcnow_iso)
     schema_version: int = SCHEMA_VERSION

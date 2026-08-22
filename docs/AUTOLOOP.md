@@ -57,7 +57,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Blockers | `blockers.py` | Persisted operator-facing `Blocker` records (one JSON file per blocker, `.autoloop/blockers/`) for every park, `task_fatal` or `loop_fatal` (§9c) — `python -m autoloop blockers`/`answer`. |
 | Context | `context.py` | Per-request CONTEXT block: integrity stamp + previous decision/task, roadmap, `in_flight` counts (in progress / holding an unpublished candidate), git summary, changed files, validation summary. |
 | Context | `context.py` | **2026-08-21 (ctx-01):** the `in_flight` counts are followed by ONE `in_flight_task` row per in-progress task (id, candidate sha, review round, whether revise feedback is on record) and a `merge_window` line — `open`, `shut — <reasons>`, or `unknown — <why>` — obtained by CALLING `cli._merge_window_blockers`. Facts only; the scheduling preference stays in `CONTRACT_INSTRUCTIONS`, unchanged. See §5f. |
-| Prompts | `prompts.py` | Strict template library (incl. `audit_kickoff`, `smoke_test`, `postcommit_review`). |
+| Prompts | `prompts.py` | Strict template library (incl. `audit_kickoff`, `smoke_test`, `postcommit_review`). One payload lives outside it: `cli.URGENT_KICKOFF` — a `PromptTemplate` all the same, and what a new session opens on while an operator's urgent pin is live, instead of the audit kickoff (§4f-quinquies). |
 | Git | `git_gateway.py` | Only git runner; exact-path staging; policy-validated per call; `push_exact` is the only way to publish anything (no ambient `push()`); the legacy `commit()` method is **removed** (S21). |
 | Doctor | `doctor.py` | Non-destructive preflight (§6), including worker isolation, controlled hooks directories, publisher configuration, and publisher URL drift. |
 | Audit executor | `audit/` | The read-only production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner, tool set now a constructor param — see §7b), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. Dispatched as a task-shaped unit of work (`Orchestrator._resolve_audit_task`), so it runs through §4b like any other task. |
@@ -2581,6 +2581,198 @@ which made ordinary files unrepresentable — `tests/_auth_helper.py` and
 `.gitignore` were both refused while the error text claimed `_` was legal.
 A leading `.` or `_` is now accepted; `.` and `..` segments are refused
 separately, which is the check that actually matters.
+
+## 4f-quinquies. Urgent preemption — taking the loop NOW, without touching the gate
+
+    python -m autoloop urgent codex-01 "the codex transport is down"
+
+The task named there is the NEXT task the loop dispatches. It does not wait for
+the round in flight to finish: the loop ends that round at its next SAFE phase
+boundary, returns the displaced task to pending, quarantines its work, and
+selects the urgent one.
+
+**Why priority could not already do this, measured 2026-08-21/22.**
+`next_ready()` chooses among READY tasks, so a task already in flight is
+untouchable by it and a re-prioritisation only wins the NEXT selection.
+codex-01 was raised to P0 while brw-13 held the loop — but brw-13 was ALREADY
+P0, so P0 only TIED, and the id tiebreak decided it (`"brw-13" < "codex-01"`).
+The urgent task lost, silently. Every urgent switch that night was therefore
+done by hand, and each one cost a full round or an error:
+
+* the manual sequence is pause → wait for the phase boundary → release → drain
+  → restart, and the WAIT alone took 10 and 15 minutes on two occasions (a
+  revise round can take 21);
+* `retire_execution` was used where `release` was needed. It moved the
+  execution record and the worker repo but NOT the task status, so auto-02 and
+  codex-01 sat `in_progress` and invisible to `next_ready` for about an hour.
+
+**The pin.** `Task.urgent_at` (plus `urgent_reason`), set only by
+`TaskRegistry.request_urgent`. It sorts its task ahead of everything in
+`next_ready()` regardless of priority, and `mark_in_progress` CONSUMES it — the
+request asks for one dispatch, not for permanent precedence. A field that
+exists on exactly one task cannot tie, which is the whole reason it is not
+expressed as a smaller priority number.
+
+**Where each rule lives.** The inbox owns the request's SHAPE
+(`inbox.KIND_URGENT`, `{kind, id, reason}` and nothing else), the registry owns
+its CONTENT (may this task hold the pin), and the orchestrator owns its TIMING.
+Same three-way split the rest of the inbox already uses, so an operator reads
+one authority's words per question.
+
+**SAFE BOUNDARIES ONLY.** `Orchestrator._preempt_for_urgent` acts only at
+`_at_round_boundary` — `phase == ready` with no pending request — which is the
+SAME predicate the self-upgrade restart boundary uses, in one function rather
+than two copies. A request arriving mid-`delivering`/`submitting`/
+`submission_unconfirmed`/`submission_rejected`/`awaiting`/`executing` is
+observed, logged (`urgent_awaiting_boundary`) and acted on when the round comes
+back to `ready`. Interrupting there would strand a review packet or an approved
+push, which is the one thing a preemption must never buy its speed with.
+
+**RELEASE PROPERLY OR NOT AT ALL.** The displaced task goes through
+`orchestrator.release_task_to_pending`, shared with `python -m autoloop
+release`, so all three things move together: the STATUS, the WORKER REPO
+(quarantined, never deleted) and the EXECUTION RECORD (archived). It returns an
+`orchestrator.Release`, not a bare pair, because the two halves are durable at
+different instants and a failure between them has to be reportable:
+
+* The status is persisted BEFORE the artefacts move, on purpose (a process that
+  dies in between leaves a pending task with an intact worker/record pair,
+  which the next dispatch resumes — not a task still marked in-progress whose
+  worker has already been quarantined, which no command can move).
+* So a retirement that fails is never rolled back, and WHO hears about it is
+  the caller's choice (`tolerate_retirement_failure`). A preemption takes it
+  back inside the `Release` and reports it: `displaced_returned_to_pending`
+  stays TRUE, because it is, and `displaced_artifacts_retired` goes false beside
+  it with the residue named — reporting the first as false, which it did until
+  2026-08-22, sent an operator to fix a status that was already correct. The
+  `release` COMMAND keeps its established ending and re-raises, unchanged and of
+  its original type, for `cli.main` to report and exit 1 on: a human ran it and
+  is reading its output, so an exception is the loud ending there, and pinning
+  that is `test_recovery_commands.py::test_the_record_is_retired_before_the_worker`.
+* A colliding quarantine label (the likelier of the two named failures, since
+  `retire_execution` derives its label from the reason plus a whole-second
+  timestamp) is retried once under `<reason>-retry`. It also raises
+  `GitError`, not `OSError`, which used to escape the preemption's own `except`
+  clause entirely.
+* If even the retry fails, `_repair_orphaned_record` puts the execution record
+  BACK beside the worker that could not be moved — **but only when that worker
+  is one the next dispatch would RESUME** (`worker_repo_is_reusable`: a git
+  repository at the recorded path, on the recorded branch). Then the residue is
+  what a killed round leaves and the resume path handles it. Otherwise the
+  split is left as it is: a live record shuts the repository-wide merge window
+  (`_merge_window_blockers` exempts one only for a terminal task, a PUBLISHED
+  candidate, a base already behind the head, or a worker that is GONE — none of
+  which this residue satisfies), and paying that for a worker the next dispatch
+  would refuse anyway buys nothing. So "prevent" holds for the label collision
+  and for a resumable worker; the remaining case is REPORTED, with the one `mv`
+  named, because nothing here can move a directory the filesystem refused to
+  move. `Release.residue_resumable` is which ending happened, and
+  `_report_preemption` prints the matching remedy. That repair belongs to the
+  tolerating path only — on the raising path it would shut the repository-wide
+  merge window behind a traceback, a cost nobody chose.
+
+**Only a PLANNED task is displaced; an AUDIT round already in flight is waited
+out.** An audit unit is minted per run, is absent from the registry, holds no
+task in the queue, and its product is a report — so quarantining it mid-write
+spends the round twice to save the tail of one the loop has already paid for.
+The urgent task is still what `next_ready()` returns for the round after it,
+and `urgent_awaiting_boundary` makes the wait visible while it happens.
+
+That wait is bounded at ONE round, and two changes are what bound it (both
+2026-08-22, second round): `cli._start_new_session` opens a session with a live
+pin on the URGENT TASK rather than on the audit kickoff, and the dispatch gate
+below refuses a FRESH `audit` while the pin is live. Before them the session a
+preemption started invited an `audit` and the gate let it through, so the pin
+bought a reordering and not the round it was asking for.
+
+**THE DISPLACED TASK IS VISIBLE.** `LoopState.preemption` and a
+`task_preempted` transcript entry record the displaced task, the phase the
+request was first seen at, the phase it was acted on at, the urgent target and
+its reason, the quarantine label and both paths, plus the displaced candidate's
+sha, review round and attempt count. Four further fields cover the partial
+release above — `displaced_artifacts_retired`, `stale_worker_path`,
+`stale_execution_record` and `residue_resumable` — and a failed retirement also
+gets its own `preemption_retirement_failed` transcript entry. `run --continuous`
+prints the same thing.
+
+**BOUNDS, stated rather than implied.**
+
+* *A second urgent request while the first is still landing* is REFUSED
+  (`urgent_already_pending`), naming the incumbent — never queued behind it and
+  never overwriting it. Overwriting would let the second operator discard the
+  displaced round the first one paid for without seeing that they had. The slot
+  reopens the moment the first target is dispatched.
+* *A target that is not READY* is refused with its reason and its own error
+  code: `task_blocked` (naming the incomplete dependencies), `task_in_progress`
+  ("already the round in flight"), `task_blocked_by_operator`, `task_retired`,
+  `task_completed`, `task_unknown`, or `no_approved_paths` — an unscoped task
+  would park on arrival, so displacing a round for it is refused where the
+  operator can still fix it. `python -m autoloop urgent` runs the SAME check
+  before queueing, so the ordinary refusals arrive at the prompt.
+* *A pin whose task later leaves the queue* (a new dependency, a quarantine, a
+  retirement) is STALE, holds nothing shut, and is cleared when the slot is
+  granted to someone else.
+* *An idle loop, or one running an audit,* is not preempted at all: there is
+  nothing a preemption would displace that the pin does not already steer, and
+  ending such a round in a circle is the churn described above. The audit round
+  in flight still finishes, but the pin now denies the NEXT one, so the wait is
+  one round rather than one per lap.
+
+**ONE AT A TIME, and no pause anywhere.** The documented deadlock of the manual
+sequence is two operators each pausing, the first timing out and calling
+`resume` on its way out, and the second waiting on a lock that never clears.
+This path takes NO pause: the loop observes the request itself, at its own
+boundary. There is no flag to leave behind, and only one pin can be live, so
+there is never a second preemption in flight to strand.
+
+**WHAT THIS IS NOT: a review or merge bypass.** Skipping review would save
+almost nothing — measured on the codex transport, packet build 0.98s, submit
+12–15s, verdict ~0s against an executor round of 1282s, i.e. about 2% of a
+round — and would cost the binding that makes the system safe: `report_sha256`
+covers the packet bytes INCLUDING the candidate sha, which is what stops an
+approval computed over candidate A from publishing candidate B. The urgent task
+is implemented, reviewed, approved and published through the identical path as
+any other. The one enforcement added is `orchestrator._refused_ahead_of_urgent`,
+in front of every executor dispatch, through the ordinary budget-capped
+policy-denial re-prompt — because `next_ready()` decides what the CONTEXT block
+offers, not what policy authorizes, and "offered next" is not the claim being
+made. It refuses:
+
+* an `implement`/`revise` of a DIFFERENT task, and
+* a FRESH `audit`, which is not a task but is a full executor round.
+
+It does NOT refuse a `revise` of the audit pseudo-task, and that exemption is
+narrow rather than convenient: such a directive continues an arc already in
+flight (round 1's commit lives in a worker repo only round 2 can reach), so
+refusing it abandons real work to save a round already paid for — and it cannot
+slip a round in after a preemption, because a preemption clears
+`state.current_task` and a revise-of-audit with no audit on record parks
+(`audit_revise_no_record`) instead of minting a unit.
+
+`run --kickoff-audit` builds the audit payload directly rather than through
+`_start_new_session`, so an operator who runs it while their own pin is live
+still meets this refusal. Left as is deliberately: the two instructions
+contradict each other and the refusal names the pin being contradicted.
+
+The kickoff itself is the other half of the same claim. A session opened with a
+live pin uses `cli.urgent_kickoff_payload`, which names the task, its reason,
+and — driven by whether the task already holds an approved decomposition — says
+whether the `implement` must carry a `decomposition`. Asking flatly for
+`implement` would have traded audit churn for DENIAL churn on every unplanned
+task, since `policy._check_decomposition` refuses a bare one.
+
+Its template (`cli.URGENT_KICKOFF`) sits beside its one caller rather than in
+`prompts.TEMPLATES`, because `prompts.py` was outside this task's approved
+paths. It is a `PromptTemplate` regardless, so rendering stays strict, and the
+two checks `test_prompts.py` runs across that dict — every template renders with
+its own fields, no template offers a retired decision — are run against this one
+in `test_urgent_preemption.py`. Moving it into the library later is a
+one-function change and costs nothing; leaving it here costs no coverage.
+
+A preempted session ends as `stopped` with `stop_kind = "preempted"`. Like
+`"contract"` and unlike `"fault"`, that is a CLEAN round boundary — continuous
+mode reassesses and starts the next session — which is why nothing that reads
+`run()`'s outcome needed a new branch.
 
 ## 4g. The validation-environment boundary (test DB credentials)
 
