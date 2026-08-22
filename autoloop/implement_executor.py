@@ -76,6 +76,15 @@ or `TaskExecution.allowed_paths`, and nothing here enforces either. The check
 that grades the diff is still `tasks.unauthorized_paths` against the execution
 record, run by the orchestrator, exactly as before.
 
+It is re-validated on the way INTO the prompt (`_declared_paths`,
+`_render_path_entry`), because `TaskRegistry.from_dict` bypasses `add_many` and
+therefore bypasses the only check this field ever passes. Rendering an unchecked
+state field as prompt text is how a corrupt `tasks.json` row would put a
+sentence of its own into the section that tells the agent what it may write —
+so the shape is checked, every entry is re-checked, and anything refused is
+flattened onto one labelled line. Both checks only ever NARROW what the prompt
+claims; neither is an enforcement point and neither can widen a scope.
+
 **Model selection is automatic, deliberately.** `AgentSpec.model` is left at
 its default (`""`), so `ClaudeCliRunner.build_argv` omits `--model` entirely
 — no model table lives here or should be added; whatever the `claude` CLI
@@ -108,7 +117,7 @@ from .executor import ExecutionOutcome
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .stall import DEFAULT_CEILING_SECONDS, PartialWork, StallPolicy, WorkerTreeProbe
-from .tasks import Task, authorized_cleanup_paths
+from .tasks import Task, _validate_approved_path, authorized_cleanup_paths
 from .validation import run_validation_commands
 from .validation_env import ValidationEnv
 from .worker_env import worker_env
@@ -351,6 +360,75 @@ _ADVERSARIAL_SELF_TEST = (
 )
 
 
+#: How much of ONE refused entry is shown before it is cut. A refused entry is
+#: an arbitrary string out of loop state — a corrupt or hand-edited `tasks.json`
+#: row can hold a megabyte of it — and this section is prompt text sent to every
+#: round. Enough to recognise which entry was refused, not enough to flood the
+#: prompt with it.
+_REFUSED_ENTRY_MAX_CHARS = 80
+
+#: Everything outside printable ASCII, collapsed to `?` before a refused entry
+#: is shown. The NEWLINE is the whole point — see `_render_path_entry` — but the
+#: substitution is deliberately total rather than newline-only: a refused entry
+#: is by definition not a path the loop's own validator recognises, so there is
+#: nothing in it worth preserving, and "anything that is not plain printable
+#: text" is a rule with no residue to argue about.
+_UNPRINTABLE_RE = re.compile(r"[^\x20-\x7e]")
+
+
+def _render_path_entry(entry: object) -> str:
+    """One line of the approved-path list, rendered so it cannot become prose.
+
+    A WELL-FORMED entry is rendered verbatim, indent and all — those strings are
+    exactly what `tasks.unauthorized_paths` compares the diff against, and a
+    prettified rendering would be a second vocabulary for the same set. For
+    every task the loop actually creates this function is the identity plus two
+    spaces, so the section is byte-identical to what it rendered before.
+
+    **The other branch is the point, and it is a real path** (revision round 3,
+    2026-08-22). `_validate_approved_path` runs in `TaskRegistry.add_many`, and
+    `TaskRegistry.from_dict` deliberately BYPASSES `add_many` — its own comment
+    says "stored tasks were validated on the way in" and it re-validates only
+    `superseded_by`. So the `approved_paths` on a task loaded from `tasks.json`
+    has passed no check in this process, and until this task nothing rendered
+    that field into an agent prompt at all. An entry holding a newline would
+    otherwise be interpolated as its OWN LINE inside the one section whose
+    subject is what this round may write — a sentence the loop never authorized,
+    arriving with the authority of the boundary that bounds the agent. That is
+    precisely the echo/fail-open class `_ADVERSARIAL_SELF_TEST` sends the agent
+    hunting, reaching the agent through the section that names it.
+
+    So an entry the loop's own validator refuses is flattened to printable ASCII
+    on ONE line, cut to `_REFUSED_ENTRY_MAX_CHARS`, and labelled as unusable.
+    Shown rather than dropped: a boundary that silently loses an entry is the
+    same failure in the other direction, and a reviewer has to be able to see
+    that the state is corrupt. The label understates nothing — a changed path
+    cannot match a string that is not a path, since `unauthorized_paths`
+    compares literally, so a refused entry authorizes exactly as much rendered
+    as it does unrendered: nothing.
+
+    THE VALIDATOR IS IMPORTED, never re-expressed. A second copy of the
+    approved-path rule here is the drift `tasks._validate_approved_paths` was
+    extracted to prevent, and a local regex that admitted one shape the real
+    check refuses would put that shape back in the prompt verbatim. Any
+    exception from it is a REFUSAL, not an acceptance: validating is the only
+    reason this call exists, so a validator that cannot answer must not be read
+    as having said yes, and a prompt builder must not be what kills a round over
+    a corrupt state field.
+    """
+    try:
+        _validate_approved_path(entry)
+    except Exception:
+        flat = _UNPRINTABLE_RE.sub("?", str(entry)).strip()
+        if len(flat) > _REFUSED_ENTRY_MAX_CHARS:
+            flat = flat[:_REFUSED_ENTRY_MAX_CHARS] + "..."
+        return (
+            f"  {flat or '(empty)'}   <- NOT a usable path: the loop's own "
+            "approved-path check refuses this entry, so do not write it"
+        )
+    return f"  {entry}"
+
+
 def _approved_paths_section(paths: tuple[str, ...]) -> str:
     """The task's own `approved_paths`, as the boundary `_ADVERSARIAL_SELF_TEST`
     refers to — and the ONLY place this module renders a scope.
@@ -373,10 +451,15 @@ def _approved_paths_section(paths: tuple[str, ...]) -> str:
     The paths are listed LITERALLY and one per line — no globbing, no
     reformatting — because they are exactly the strings
     `tasks.unauthorized_paths` compares the diff against, and a prettified
-    rendering is a second vocabulary for the same set. They are safe to
-    interpolate as text: `tasks._validate_approved_path` admits only
-    `[A-Za-z0-9._-]` per segment (no whitespace, no globs, no newline), so an
-    entry cannot smuggle a sentence into the prompt around the list.
+    rendering is a second vocabulary for the same set. Interpolating them as
+    text is safe only BECAUSE each one is re-checked here: `_render_path_entry`
+    puts every entry back through `tasks._validate_approved_path` (which admits
+    only `[A-Za-z0-9._-]` per segment — no whitespace, no globs, no newline) and
+    flattens anything it refuses onto one labelled line. Round 2 argued the
+    safety from the creation-time check alone, which is the wrong half of the
+    story: `TaskRegistry.from_dict` bypasses `add_many`, so a stored row's
+    entries reach this function unchecked and an entry with a newline in it
+    would have been rendered straight into the prompt as its own sentence.
 
     Nothing here grants anything, and the text is careful about what it claims
     to be: "the paths the task itself declares", NOT "everything the loop
@@ -395,7 +478,7 @@ def _approved_paths_section(paths: tuple[str, ...]) -> str:
             "change the task itself asks for. This states what the task "
             "already declares; it grants nothing and widens nothing."
         )
-    listed = "\n".join(f"  {p}" for p in paths)
+    listed = "\n".join(_render_path_entry(p) for p in paths)
     return (
         "THIS TASK'S APPROVED PATHS — declared by the task itself, and the "
         "boundary the section above is bounded to:\n"
@@ -490,6 +573,39 @@ _DECOMPOSITION_HEADER = (
 )
 
 
+def _declared_paths(task: Task) -> tuple[str, ...]:
+    """`task.approved_paths` as a tuple of entries, or `()` for any other shape.
+
+    The SHAPE half of `tasks._validate_approved_paths`, repeated here for the
+    same reason `_render_path_entry` repeats the per-entry half: that validator
+    runs in `add_many`, and `TaskRegistry.from_dict` bypasses `add_many`, so
+    nothing has checked the field by the time this module reads it.
+
+    Two shapes, both real and both fail-CLOSED to the empty (report-only)
+    boundary rather than to a wider one:
+
+      * a bare string. `tuple("a.py")` is `('a', '.', 'p', 'y')`, and three of
+        those four pass the per-entry validator — so the prompt would state four
+        invented one-character paths as this round's authorized scope. This is
+        the exact per-character split `_validate_approved_paths` documents, and
+        `from_dict`'s `tuple(raw.get("approved_paths", ()))` reproduces it from
+        a hand-edited `"approved_paths": "a.py"`.
+      * `None`. `tuple(None)` raises `TypeError`, and nothing wraps
+        `ImplementExecutor.execute`, so a corrupt state field would take the
+        round down from inside a prompt builder. Refusing to state a scope is
+        the recoverable failure; crashing is not.
+
+    Falling to `()` narrows what the prompt claims and never widens it, and
+    enforcement is untouched either way: `tasks.unauthorized_paths` grades the
+    diff against `TaskExecution.allowed_paths`, which this module neither reads
+    nor writes.
+    """
+    paths = task.approved_paths
+    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
+        return ()
+    return tuple(paths)
+
+
 def _agent_prompt(
     task: Task, feedback: str | None, cleanup_paths: tuple[str, ...] = ()
 ) -> str:
@@ -523,8 +639,11 @@ def _agent_prompt(
         # says "listed below", so this is what it points at. `approved_paths` is
         # READ here and nowhere else in this module — see
         # `_approved_paths_section` for why the raw field rather than
-        # `effective_approved_paths`, and why stating it grants nothing.
-        _approved_paths_section(tuple(task.approved_paths)),
+        # `effective_approved_paths`, and why stating it grants nothing. Read
+        # through `_declared_paths`, not `tuple(...)` directly: the field has
+        # passed no validator on the load path, and a bare string would split
+        # per character into invented one-letter "paths".
+        _approved_paths_section(_declared_paths(task)),
     ]
     cleanup = _cleanup_instruction(cleanup_paths)
     if cleanup:
