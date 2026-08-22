@@ -1,8 +1,8 @@
 """Two branches recording a change note must merge — and nothing else may.
 
-The failure, measured 2026-08-18: every task records what it changed in
-`docs/SUMMARY.md` and `docs/TESTS.md`, so any two parallel branches touch the
-same region of the same two files. The merge sweep halted three times in one
+The failure, measured 2026-08-18: every task records what it changed in the
+repository's documentation trackers, so any two parallel branches touch the
+same region of the same files. The merge sweep halted three times in one
 evening on exactly that and left five reviewed, published tasks unmerged for a
 full day (dash-10, loop-02, brw-12, hlth-01, wrk-01), each resolved by hand.
 One of those hand-resolutions is still visible in `docs/SUMMARY.md`'s
@@ -15,6 +15,18 @@ The fix has two halves and both are pinned here:
     `CLAUDE.md` §12 makes a note ONE NEW LINE appended at the very end of it;
   * `autoloop/note_merge.py`, wired into `auto_merge.AutoMerger._merge`,
     combines two branches' appended lines — and ONLY those.
+
+**Four trackers since notes-03 (2026-08-23), and the two halves are ordered.**
+It shipped covering `docs/SUMMARY.md` and `docs/TESTS.md`; `docs/SECURITY.md`
+and `docs/COMMON_ERRORS.md` are written by every task under the same rules and
+collided the same way, and because a conflict in ONE uncovered path refuses the
+WHOLE merge, the two covered files bought nothing whenever a third collided
+too (bind-01, split-01, dash-17 — all refused on 2026-08-22). Each file got its
+delimited section BEFORE its path went into `NOTE_TRACKERS`, and that order is
+itself pinned: `test_every_shipped_tracker_ends_with_an_append_only_section`
+requires every path in the list to have one, and
+`test_a_tracker_without_the_marker_is_refused_rather_than_combined` shows what
+the resolver does when a file does not.
 
 **Almost every test here runs through the production merge path**
 (`merge_sweep.sweep_backlog` → `AutoMerger.attempt` → `_merge`), against a real
@@ -45,6 +57,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from autoloop import merge_sweep, note_merge
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.git_gateway import GitGateway
@@ -57,14 +71,31 @@ from autoloop.worktask import TaskExecution, TaskExecutionStore
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GITATTRIBUTES = REPO_ROOT / ".gitattributes"
 SUMMARY_DOC = REPO_ROOT / "docs" / "SUMMARY.md"
-TESTS_DOC = REPO_ROOT / "docs" / "TESTS.md"
 CLAUDE_DOC = REPO_ROOT / "CLAUDE.md"
 
 BASE = "work"
 BASE_REF = f"refs/heads/{BASE}"
 URL = "https://chatgpt.com/c/docs-merge"
 
-TRACKERS = ("docs/SUMMARY.md", "docs/TESTS.md")
+#: This file's own literal of the resolver's scope, in SORTED order — which is
+#: the order `AutoMerger._resolve_note_conflicts` walks conflicts in and logs
+#: them in, so a transcript assertion can compare against it directly.
+#: Deliberately a second copy rather than an import: every test below is a
+#: statement about THESE four paths, and
+#: `test_the_resolver_is_scoped_to_exactly_the_declared_trackers` is where the
+#: two are required to agree. A widening that forgot to update this file would
+#: fail there loudly instead of silently re-scoping every other test.
+TRACKERS = (
+    "docs/COMMON_ERRORS.md",
+    "docs/SECURITY.md",
+    "docs/SUMMARY.md",
+    "docs/TESTS.md",
+)
+
+#: The SHIPPED files behind those paths — the inputs `resolve_note_append` will
+#: actually be handed in production, and therefore the ones whose section shape
+#: has to hold in this repository, not merely in a fixture.
+SHIPPED_TRACKERS = tuple((REPO_ROOT / rel) for rel in TRACKERS)
 
 #: NOT redefined here. A note line that grew past this is the shape the whole
 #: fix exists to prevent, and the limit now has a second consumer — the brief
@@ -154,8 +185,15 @@ def seed(title: str) -> str:
     )
 
 
-SUMMARY_SEED = seed("SUMMARY.md")
-TESTS_SEED = seed("TESTS.md")
+#: One seeded tracker per path in `TRACKERS`, differing only in the title, so
+#: every test below can name any of the four and get the same shape.
+SEEDS = {rel: seed(rel.rsplit("/", 1)[-1]) for rel in TRACKERS}
+
+#: Named shorthands for the two trackers the single-file tests below use. The
+#: other two are reached through `SEEDS`, since those tests are parametrised
+#: over every tracker rather than naming one.
+SUMMARY_SEED = SEEDS["docs/SUMMARY.md"]
+TESTS_SEED = SEEDS["docs/TESTS.md"]
 
 
 def note_line(task_id: str) -> str:
@@ -222,8 +260,8 @@ class Trackers:
         return sha
 
     def recording_a_note(self, task_id):
-        """The edit EVERY task makes: one new line at the end of both
-        trackers, everything above it untouched."""
+        """The edit EVERY task makes: one new line at the end of EVERY
+        tracker, everything above it untouched."""
         return {rel: seed_for(rel) + note_line(task_id) for rel in TRACKERS}
 
     # -- running it --
@@ -254,18 +292,24 @@ class Trackers:
 
 
 def seed_for(rel: str) -> str:
-    return SUMMARY_SEED if rel.endswith("SUMMARY.md") else TESTS_SEED
+    return SEEDS[rel]
 
 
 def build(tmp_path, *, extra_files=None):
+    """A checkout seeded with all four trackers.
+
+    `extra_files` is applied AFTER the seeds and may therefore replace one of
+    them — which is how a tracker that is missing its marker, or carries two,
+    gets staged as a starting state rather than as a hand-written blob.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     run_git(repo, "init", "-q", "-b", BASE)
     run_git(repo, "config", "user.email", "test@example.com")
     run_git(repo, "config", "user.name", "Test")
     run_git(repo, "config", "commit.gpgsign", "false")
-    write(repo, "docs/SUMMARY.md", SUMMARY_SEED)
-    write(repo, "docs/TESTS.md", TESTS_SEED)
+    for rel in TRACKERS:
+        write(repo, rel, SEEDS[rel])
     for rel, content in (extra_files or {}).items():
         write(repo, rel, content)
     run_git(repo, "add", "-A")
@@ -301,8 +345,12 @@ def assert_stopped_after_first(t, first, second):
 
 def test_two_branches_each_recording_a_note_merge_through_the_sweep(tmp_path):
     """The provable claim, in the shape the loop actually produces it: two
-    branches cut from ONE base, each appending its own note to BOTH trackers,
-    integrated one after the other by the real merge sweep."""
+    branches cut from ONE base, each appending its own note to EVERY tracker,
+    integrated one after the other by the real merge sweep.
+
+    "Every" is `TRACKERS`, not a list written out here, so the day a fifth
+    tracker is granted this test covers it without being edited — and every
+    note from both sides must survive in all of them."""
     t = build(tmp_path)
     base = t.head()
 
@@ -396,15 +444,21 @@ def test_a_note_appended_beside_a_new_table_row_still_merges(tmp_path):
 # --- what must still conflict -------------------------------------------------
 
 
-def test_a_concurrent_edit_to_tracker_prose_still_conflicts(tmp_path):
+@pytest.mark.parametrize("rel", TRACKERS)
+def test_a_concurrent_edit_to_tracker_prose_still_conflicts(tmp_path, rel):
     """The property the union attribute could not keep, and the reason it was
     removed: two branches rewriting the same line of documentation ABOVE the
-    append-only section is a real content conflict and must stop the sweep."""
+    append-only section is a real content conflict and must stop the sweep.
+
+    Run against EVERY tracker, not one of them. Widening `NOTE_TRACKERS` is
+    exactly the change that could grant the resolver a file whose prose it then
+    starts combining, so the refusal has to be proven per path — a passing test
+    on `SUMMARY.md` says nothing about the file added yesterday."""
     t = build(tmp_path)
     base = t.head()
 
     def rewritten(text_for):
-        return {"docs/SUMMARY.md": SUMMARY_SEED.replace(PROSE_ROW, f"| `main.py` | {text_for} |")}
+        return {rel: SEEDS[rel].replace(PROSE_ROW, f"| `main.py` | {text_for} |")}
 
     first = t.publish("task-a", rewritten("A's description"), base=base)
     second = t.publish("task-b", rewritten("B's description"), base=base)
@@ -412,26 +466,30 @@ def test_a_concurrent_edit_to_tracker_prose_still_conflicts(tmp_path):
     t.sweep()
 
     assert_stopped_after_first(t, first, second)
-    text = t.read("docs/SUMMARY.md")
+    text = t.read(rel)
     assert "A's description" in text and "B's description" not in text
 
 
-def test_prose_conflicts_even_when_both_branches_also_append_notes(tmp_path):
+@pytest.mark.parametrize("rel", TRACKERS)
+def test_prose_conflicts_even_when_both_branches_also_append_notes(tmp_path, rel):
     """The hard case, and the one that proves the resolver is section-aware
     rather than file-aware: the TAIL of both sides is a clean append and would
     combine happily, while the prose above it genuinely conflicts. Git leaves
     markers there, `resolve_note_append` sees them, and the whole merge is
-    refused."""
+    refused.
+
+    Also the "one bad path poisons the merge" property from the other side:
+    the three trackers this parameter is NOT naming are clean pairs of appends
+    that would each resolve, and none of them lands."""
     t = build(tmp_path)
     base = t.head()
 
     def edited(task_id, text_for):
-        return {
-            "docs/SUMMARY.md": SUMMARY_SEED.replace(
-                PROSE_ROW, f"| `main.py` | {text_for} |"
-            ) + note_line(task_id),
-            "docs/TESTS.md": TESTS_SEED + note_line(task_id),
-        }
+        files = {other: SEEDS[other] + note_line(task_id) for other in TRACKERS}
+        files[rel] = SEEDS[rel].replace(
+            PROSE_ROW, f"| `main.py` | {text_for} |"
+        ) + note_line(task_id)
+        return files
 
     first = t.publish("task-a", edited("task-a", "A's description"), base=base)
     second = t.publish("task-b", edited("task-b", "B's description"), base=base)
@@ -439,28 +497,37 @@ def test_prose_conflicts_even_when_both_branches_also_append_notes(tmp_path):
     t.sweep()
 
     assert_stopped_after_first(t, first, second)
-    assert note_line("task-b") not in t.read("docs/SUMMARY.md")
+    for other in TRACKERS:
+        assert note_line("task-b") not in t.read(other), other
+    assert t.entries("auto_merge_notes_resolved") == []
 
 
-def test_one_refusing_tracker_stops_the_whole_merge_even_if_the_other_resolved(tmp_path):
+@pytest.mark.parametrize("refusing", TRACKERS)
+def test_one_refusing_tracker_stops_the_whole_merge_even_if_the_others_resolved(
+    tmp_path, refusing
+):
     """Nothing is written until EVERY conflicted path has resolved.
 
-    The conflicts are walked in sorted order, so `docs/SUMMARY.md` here is a
-    clean pair of appends that resolves, and `docs/TESTS.md` — reached second —
-    carries a genuine prose conflict and refuses. The merge is a single
-    decision: `SUMMARY.md` must be left exactly as git's abort finds it, not
-    carrying a resolution for a merge that never happened.
+    Three of the four trackers here are clean pairs of appends that resolve on
+    their own; the fourth carries a genuine prose conflict and refuses. The
+    merge is a single decision: the three resolvable files must be left exactly
+    as git's abort finds them, not carrying a resolution for a merge that never
+    happened.
+
+    Parametrised over WHICH file refuses, because the conflicts are walked in
+    sorted order and "resolved, then refused" is a different path through
+    `_resolve_note_conflicts` than "refused, then never reached" — the first is
+    the one that can leave a rewritten tracker on disk.
     """
     t = build(tmp_path)
     base = t.head()
 
     def edited(task_id, text_for):
-        return {
-            "docs/SUMMARY.md": SUMMARY_SEED + note_line(task_id),
-            "docs/TESTS.md": TESTS_SEED.replace(
-                PROSE_ROW, f"| `main.py` | {text_for} |"
-            ) + note_line(task_id),
-        }
+        files = {other: SEEDS[other] + note_line(task_id) for other in TRACKERS}
+        files[refusing] = SEEDS[refusing].replace(
+            PROSE_ROW, f"| `main.py` | {text_for} |"
+        ) + note_line(task_id)
+        return files
 
     first = t.publish("task-a", edited("task-a", "A's description"), base=base)
     second = t.publish("task-b", edited("task-b", "B's description"), base=base)
@@ -468,11 +535,12 @@ def test_one_refusing_tracker_stops_the_whole_merge_even_if_the_other_resolved(t
     t.sweep()
 
     assert_stopped_after_first(t, first, second)
-    summary = t.read("docs/SUMMARY.md")
-    assert note_line("task-a") in summary
-    assert note_line("task-b") not in summary, (
-        "the resolved SUMMARY text must never reach disk when TESTS.md refused"
-    )
+    for other in TRACKERS:
+        text = t.read(other)
+        assert note_line("task-a") in text, other
+        assert note_line("task-b") not in text, (
+            f"a resolved {other} must never reach disk when {refusing} refused"
+        )
     assert t.entries("auto_merge_notes_resolved") == []
 
 
@@ -558,9 +626,48 @@ def test_a_real_conflict_in_a_source_file_still_stops_the_sweep(tmp_path):
     assert t.read("autoloop/thing.py") == "TIMEOUT = 60\n"
 
 
-def test_a_documentation_file_outside_the_two_trackers_still_conflicts(tmp_path):
+def test_a_source_conflict_alongside_resolvable_trackers_refuses_the_whole_merge(tmp_path):
+    """The bound the widening must not touch, in the shape that actually
+    occurred: every tracker is a clean pair of appends that WOULD combine, and
+    one source file genuinely conflicts.
+
+    This is the case the trackers cannot buy their way out of. `bind-01`,
+    `split-01` and `dash-17` each looked like this on 2026-08-22 (with an
+    uncovered tracker in the source file's role), and the answer is the same
+    after the widening as before it: one conflicted path outside the list
+    refuses the WHOLE merge, no tracker is resolved partially, and the
+    transcript names the path that did it."""
+    t = build(tmp_path, extra_files={"autoloop/thing.py": "TIMEOUT = 30\n"})
+    base = t.head()
+
+    def edited(task_id, timeout):
+        files = {rel: SEEDS[rel] + note_line(task_id) for rel in TRACKERS}
+        files["autoloop/thing.py"] = f"TIMEOUT = {timeout}\n"
+        return files
+
+    first = t.publish("task-a", edited("task-a", 60), base=base)
+    second = t.publish("task-b", edited("task-b", 90), base=base)
+
+    t.sweep()
+
+    assert_stopped_after_first(t, first, second)
+    assert t.read("autoloop/thing.py") == "TIMEOUT = 60\n"
+    for rel in TRACKERS:
+        assert note_line("task-b") not in t.read(rel), rel
+    refusals = t.entries("auto_merge_notes_refused")
+    assert refusals, "the resolver must say why it declined"
+    assert "outside" in refusals[-1]["data"]["reason"]
+    assert "autoloop/thing.py" in refusals[-1]["data"]["reason"]
+    assert refusals[-1]["data"]["conflicted_files"] == sorted(
+        ("autoloop/thing.py", *TRACKERS)
+    )
+    assert t.entries("auto_merge_notes_resolved") == []
+
+
+def test_a_documentation_file_outside_the_trackers_still_conflicts(tmp_path):
     """What "narrow" buys: the same append-at-EOF edit that combines in the
-    trackers still conflicts in a doc nobody granted the resolver."""
+    trackers still conflicts in a doc nobody granted the resolver. `docs/` is
+    not a prefix and never becomes one — the list is four literal paths."""
     t = build(tmp_path, extra_files={"docs/TODO.md": "# TODO\n\n- one\n"})
     base = t.head()
     todo = "# TODO\n\n- one\n"
@@ -575,6 +682,34 @@ def test_a_documentation_file_outside_the_two_trackers_still_conflicts(tmp_path)
     assert refusals, "the resolver must say why it declined"
     assert "outside" in refusals[-1]["data"]["reason"]
     assert refusals[-1]["data"]["conflicted_files"] == ["docs/TODO.md"]
+
+
+@pytest.mark.parametrize("rel", TRACKERS)
+def test_a_tracker_without_the_marker_is_refused_rather_than_combined(tmp_path, rel):
+    """The precondition behind the whole list, proven rather than assumed.
+
+    A path in `NOTE_TRACKERS` whose file carries NO append-only section is the
+    dangerous shape: the resolver would have no boundary between prose and
+    ledger. It refuses — the marker count is not 1 on any side — so the failure
+    mode of shipping the list without the section is a stopped sweep, never a
+    combined paragraph. A file carrying TWO markers is refused by the same
+    count check, pinned at the unit level in
+    `test_the_resolver_refuses_a_missing_or_duplicated_marker`.
+    """
+    unmarked = "# Tracker\n\nJust prose, no append-only section at all.\n"
+    t = build(tmp_path, extra_files={rel: unmarked})
+    base = t.head()
+
+    first = t.publish("task-a", {rel: unmarked + "a line from A\n"}, base=base)
+    second = t.publish("task-b", {rel: unmarked + "a line from B\n"}, base=base)
+
+    t.sweep()
+
+    assert_stopped_after_first(t, first, second)
+    text = t.read(rel)
+    assert "a line from A" in text and "a line from B" not in text
+    assert t.entries("auto_merge_notes_resolved") == []
+    assert t.entries("auto_merge_notes_refused"), "the refusal must be explained"
 
 
 def test_every_refusal_says_why_in_the_transcript(tmp_path):
@@ -830,58 +965,131 @@ def test_the_resolver_refuses_when_neither_side_appended_anything():
     assert resolve_note_append(BASE_DOC, BASE_DOC, BASE_DOC, BASE_DOC) is None
 
 
-def test_the_resolver_is_scoped_to_exactly_the_two_trackers():
+def test_the_resolver_is_scoped_to_exactly_the_declared_trackers():
     """The whole blast radius of auto-resolution. Literal paths, no glob, no
     prefix: every entry here is a file the loop may merge without a human in a
-    case where git said "conflict"."""
+    case where git said "conflict".
+
+    The count is asserted outright. A widening is a decision that has to be
+    made deliberately, in a diff that changes this number, alongside the
+    section each new file needs — never something a helpful refactor of the
+    frozenset can slip in."""
     assert note_merge.NOTE_TRACKERS == frozenset(TRACKERS)
+    assert len(note_merge.NOTE_TRACKERS) == 4
     assert not any("*" in path for path in note_merge.NOTE_TRACKERS)
+    # `docs/` is not a prefix and `CLAUDE.md` / `docs/SCHEMA.md` are trackers a
+    # task may write (`tasks.TRACKER_PATHS`) that were deliberately NOT granted
+    # — they have no append-only section, so they still conflict normally.
+    for excluded in ("CLAUDE.md", "docs/SCHEMA.md", "docs/", "docs/TODO.md"):
+        assert excluded not in note_merge.NOTE_TRACKERS
 
 
 # --- the shape the instructions promise ---------------------------------------
+#
+# Checked over the SHIPPED files, because those are the texts
+# `resolve_note_append` is handed in production. Pure functions on the text, so
+# the same checks can be run against a deliberately malformed copy — which is
+# how "a note written the old way fails a test" is demonstrated rather than
+# asserted.
+
+MARKER_ADVICE = (
+    "must carry exactly one notes marker — a second copy anywhere in the file "
+    "makes resolve_note_append refuse EVERY parallel merge of it. Refer to the "
+    "marker as CHANGE-NOTES in prose instead of writing the comment out again."
+)
 
 
-def notes_section(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
-    # Exactly once, and this is the assertion that earns its keep: the SHIPPED
-    # tracker is an input to `resolve_note_append`, which refuses outright when
-    # the marker count is not 1 (`note_merge.py` line ~159). A second copy —
-    # written by a task quoting the comment while documenting the machinery,
-    # which is how `docs/SUMMARY.md` first shipped this fix — therefore turns
-    # auto-resolution off for that file with no symptom except the sweep
-    # halting again. Say so here, or the next reader reads a count mismatch as
-    # a formatting nit.
-    assert text.count(NOTES_MARKER) == 1, (
-        f"{path.name} must carry exactly one notes marker — a second copy anywhere "
-        "in the file makes resolve_note_append refuse EVERY parallel merge of it. "
-        "Refer to the marker as CHANGE-NOTES in prose instead of writing the "
-        "comment out again."
-    )
+def notes_lines(text: str) -> list[str]:
+    """Everything after the marker LINE. Meaningful only when the marker
+    appears exactly once — check that first."""
     return text.split(NOTES_MARKER, 1)[1].splitlines()[1:]
 
 
-def test_both_trackers_end_with_an_append_only_change_note_section():
-    """A note is appended at the END of the file, so the section has to BE the
-    end of the file — nothing may follow it that a later append would land
-    inside, and the resolver refuses an appended heading for the same reason."""
-    for path in (SUMMARY_DOC, TESTS_DOC):
-        # Load-bearing, and the one precondition whose failure is invisible:
-        # `resolve_note_append` treats a file whose section does not end in a
-        # newline as a grown last line and refuses EVERY later parallel merge,
-        # with a reason that does not mention newlines.
-        assert path.read_text(encoding="utf-8").endswith("\n"), (
-            f"{path.name} must end with a newline — without it the next task's "
-            "note continues the last line instead of starting its own, and the "
-            "resolver refuses the merge"
+def section_problems(name: str, text: str) -> list[str]:
+    """Every way this file's terminal change-note section can be malformed.
+
+    A LIST rather than an assertion so a negative test can require a doctored
+    text to be rejected without depending on which complaint fires first. Each
+    entry is a real precondition of `resolve_note_append`, not a style rule:
+
+      * the marker exactly once — the resolver's own first check, and the one
+        whose failure is invisible (a second copy, written by a task quoting the
+        comment while documenting the machinery, is how `docs/SUMMARY.md` first
+        shipped this fix and turned auto-resolution off for itself);
+      * a trailing newline — without it the next task's note continues the last
+        line instead of starting its own, and the resolver reads that as a grown
+        line and refuses;
+      * nothing after the ledger — no heading and a note row last, because a
+        note is appended at the END of the file, so the section has to BE the
+        end of the file.
+
+    What it CANNOT see, said plainly: a note grown onto an existing line, or
+    smuggled into the prose above the marker. One snapshot cannot tell an
+    always-long line from a line that grew — that is the resolver's job, and
+    `test_the_resolver_refuses_a_grown_last_line` is where it is pinned.
+    """
+    problems: list[str] = []
+    if not text.endswith("\n"):
+        problems.append(f"{name} must end with a newline")
+    markers = text.count(NOTES_MARKER)
+    if markers != 1:
+        return [*problems, f"{name} carries {markers} notes markers, not 1 — it {MARKER_ADVICE}"]
+
+    lines = notes_lines(text)
+    if not lines:
+        return [*problems, f"{name} has nothing after its notes marker"]
+    if any(ln.startswith("#") for ln in lines):
+        problems.append(
+            f"{name} has a heading after the notes marker — appends would land inside it"
         )
-        lines = notes_section(path)
-        assert lines, f"{path.name} has nothing after its notes marker"
-        assert not any(ln.startswith("#") for ln in lines), (
-            f"{path.name} has a heading after the notes marker — appends would land inside it"
+    tail = [ln for ln in lines if ln.strip()]
+    if not tail:
+        problems.append(f"{name} has only blank lines after its notes marker")
+        return problems
+    if not tail[-1].startswith("| "):
+        problems.append(
+            f"{name} must end on a note row, not {tail[-1][:60]!r} — anything else "
+            "means a later append lands outside the ledger"
         )
-        tail = [ln for ln in lines if ln.strip()]
-        assert tail[-1].startswith("| "), f"{path.name} must end on a note row"
-        assert "| Date | Task | Note |" in tail
+    if "| Date | Task | Note |" not in tail:
+        problems.append(f"{name} has no note table header")
+    return problems
+
+
+def test_every_shipped_tracker_ends_with_an_append_only_section():
+    """Every path the resolver is granted must actually HAVE the region the
+    resolver reasons about — the precondition that makes `NOTE_TRACKERS` safe
+    to widen, checked over `TRACKERS` rather than a written-out pair, so a path
+    added to the list without preparing its file fails here."""
+    for path in SHIPPED_TRACKERS:
+        assert path.exists(), f"{path} is in NOTE_TRACKERS but does not exist"
+        assert section_problems(path.name, path.read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize("rel", TRACKERS)
+def test_a_note_written_the_old_way_fails_the_shape_check(rel):
+    """The old habit has to FAIL something, or it lands quietly outside the
+    ledger and the next task's append lands inside whatever it added.
+
+    Every case below is a real shape a task reaches for in one of these four
+    files: a dated `Changelog`-style bullet at the end of `docs/SECURITY.md`, a
+    new `###` error entry at the end of `docs/COMMON_ERRORS.md`, a marker
+    quoted while explaining the machinery, a file left without its final
+    newline. Run against each tracker's seed, since the checker is per-file."""
+    good = SEEDS[rel]
+    assert section_problems(rel, good) == [], "the fixture itself must be well formed"
+
+    for label, doctored in (
+        ("a dated bullet appended after the ledger",
+         good + "- **2026-08-23** — what my task did, the old way.\n"),
+        ("a new entry appended after the ledger",
+         good + "\n### Some new error\n**Symptom:** ...\n"),
+        ("a note appended with no newline, continuing the last line",
+         good.rstrip("\n") + " and one more clause. |"),
+        ("the marker comment quoted a second time", good + MARKER_LINE + "\n"),
+        ("the section removed entirely", good.replace(MARKER_LINE + "\n", "")),
+    ):
+        assert section_problems(rel, doctored), f"{rel}: {label} must be rejected"
 
 
 def test_every_change_note_line_is_short_enough_to_merge_by_line():
@@ -889,8 +1097,10 @@ def test_every_change_note_line_is_short_enough_to_merge_by_line():
     old failure returning. Enforced HERE and deliberately not in the resolver:
     a long note is a documentation-shape problem, and refusing to merge it
     would turn a style violation into a halted sweep."""
-    for path in (SUMMARY_DOC, TESTS_DOC):
-        for line in notes_section(path):
+    for path in SHIPPED_TRACKERS:
+        text = path.read_text(encoding="utf-8")
+        assert text.count(NOTES_MARKER) == 1, f"{path.name} {MARKER_ADVICE}"
+        for line in notes_lines(text):
             assert len(line) <= MAX_NOTE_LINE_CHARS, (
                 f"{path.name}: a change note grew to {len(line)} chars — "
                 "split it into a second line instead"
@@ -920,22 +1130,23 @@ def test_the_implementing_agents_brief_states_the_limit_this_file_enforces():
     # The boundary stated outright, because "at most" is the word an agent is
     # most likely to round down out of caution and then split a legal line.
     assert f"Exactly {MAX_NOTE_LINE_CHARS} passes" in rules
-    # What is measured. `notes_section` yields whole lines, so a brief that
+    # What is measured. `notes_lines` yields whole lines, so a brief that
     # bounded the SENTENCE would let a 690-character note ride in a 740-char
     # row and fail this file anyway.
     assert "WHOLE line" in rules
     assert "| date | task-id |" in rules
-    # Both trackers this module checks are named. Compared against TRACKERS,
-    # this file's own literal, deliberately — it is what every other test here
-    # uses, and a divergence from `note_merge.NOTE_TRACKERS` fails this
-    # assertion loudly rather than passing quietly, which is the direction that
-    # wants no import.
+    # EVERY tracker this module checks is named — all four since notes-03, and
+    # an agent told about two of them would record its note in the other two
+    # any way it liked. Compared against TRACKERS, this file's own literal,
+    # deliberately — it is what every other test here uses, and a divergence
+    # from `note_merge.NOTE_TRACKERS` fails this assertion loudly rather than
+    # passing quietly, which is the direction that wants no import.
     for tracker in TRACKERS:
         assert tracker in rules
     # And the remedy, which is the half that makes the rule actionable.
     assert "append a SECOND line" in rules
     # The sibling mechanical rule of the same section, checked by
-    # `notes_section` above: the marker must appear exactly once, so a brief
+    # `section_problems` above: the marker must appear exactly once, so a brief
     # that explained the machinery without saying this invites the agent to
     # quote the comment — which is how docs-01 shipped it in `SUMMARY.md`.
     assert "never write the comment out in full a second time" in rules
@@ -951,6 +1162,12 @@ def test_claude_md_tells_a_task_to_append_one_line():
     assert "CHANGE-NOTES" in text
     assert "autoloop/note_merge.py" in text
     assert "autoloop/tests/test_docs_merge.py" in text
+    # Every tracker the resolver may combine is named where a task will read
+    # it. An agent told about two of the four records its note in the other two
+    # in whatever shape it likes, and the first parallel merge of that file
+    # stops the sweep.
+    for tracker in TRACKERS:
+        assert tracker in text, f"CLAUDE.md must name {tracker} as a change-note tracker"
     # The removal is documented so it is not reintroduced by the next reader
     # who finds a one-line attribute more attractive than a resolver.
     assert "merge=union" in text

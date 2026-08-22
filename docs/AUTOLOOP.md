@@ -339,6 +339,25 @@ candidates on 2026-08-06). What happens at each outcome:
 | Merged but the base push was refused | deferral kept; a retry re-pushes | `auto_merge_push_refused` |
 | HEAD did not move / lost the old base / dirty after merge | nothing pushed | `auto_merge_failed` |
 
+**One conflict shape, and only one, is resolved instead of aborted.** Two
+branches that each appended their own change-note lines to the terminal
+append-only section of a documentation tracker are combined by
+`note_merge.resolve_note_append` and the merge is committed
+(`auto_merge_notes_resolved`); anything else is refused with a reason
+(`auto_merge_notes_refused`) and aborts exactly as the table says. The scope is
+`note_merge.NOTE_TRACKERS`, a literal list of four paths — `docs/SUMMARY.md`,
+`docs/TESTS.md`, and since 2026-08-23 (notes-03) `docs/SECURITY.md` and
+`docs/COMMON_ERRORS.md`, each added only after it carried exactly one
+marker-delimited append-only section. `CLAUDE.md` and `docs/SCHEMA.md` are
+trackers a task may write (§4f-bis) but have no such section, so they still
+conflict normally. The refusal rule is unchanged by the widening and is what
+keeps it bounded: a conflict in ANY path outside that list — a source file, or
+a tracker's own prose above the marker — refuses the WHOLE merge, so nothing is
+resolved partially. That is also why the list needed to grow: bind-01,
+split-01 and dash-17 were each refused on 2026-08-22 because ONE uncovered
+tracker collided alongside the two covered ones. `docs/SECURITY.md` S35 carries
+the security accounting.
+
 Nothing here ever parks. By the time it runs the push has already landed and
 the task is already completed, so an integration problem is logged and left
 for the next pass — turning it into a park would stop a working loop over a

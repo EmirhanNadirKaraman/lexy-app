@@ -2244,11 +2244,15 @@ rule is load-bearing and evaluated first.
 
 ## 10. Autoloop merge sweep (documentation trackers)
 
-### AssertionError: docs/SUMMARY.md must carry exactly one notes marker
-**Symptom:** `autoloop/tests/test_docs_merge.py::test_both_trackers_end_with_an_append_only_change_note_section`
+### AssertionError: SUMMARY.md carries 2 notes markers, not 1
+**Symptom:** `autoloop/tests/test_docs_merge.py::test_every_shipped_tracker_ends_with_an_append_only_section`
 and `::test_every_change_note_line_is_short_enough_to_merge_by_line` both fail on
 one tracker while the file looks correct — its change-note section is last in the
-file, nothing follows it, and every note row is short.
+file, nothing follows it, and every note row is short. Before 2026-08-23 the
+message read `docs/SUMMARY.md must carry exactly one notes marker` and the first
+test was named `test_both_trackers_end_with_an_append_only_change_note_section`;
+both changed when the tracker set grew from two files to four, and the failing
+line now comes back inside a list of shape problems from `section_problems`.
 **Cause:** a table row ABOVE the section quoted the marker comment in FULL while
 documenting how the resolver works, so the file carried the marker twice. This is
 not a formatting nit: `note_merge.resolve_note_append` begins with
@@ -2257,10 +2261,12 @@ the append-only section), so a duplicate switches auto-resolution off for that
 tracker and every parallel note merge halts again — silently, with no symptom
 except the 2026-08-18 failure returning. Hit 2026-08-19 in docs-01's own first
 round, in `SUMMARY.md`'s `note_merge.py` row.
-**Fix:** in those two files, refer to the marker as `CHANGE-NOTES` and never write
-the comment out a second time; quoting it in `CLAUDE.md` or here is fine, since
-neither is a tracker. Rule 5 of each tracker's change-note section and `CLAUDE.md`
-§12 now say so, and the assertion message above names the consequence.
+**Fix:** in every file in `note_merge.NOTE_TRACKERS` — `docs/SUMMARY.md`,
+`docs/TESTS.md`, and since 2026-08-23 `docs/SECURITY.md` and this one — refer to
+the marker as `CHANGE-NOTES` and never write the comment out a second time;
+quoting it in `CLAUDE.md` is fine, since that file is not one of them. Rule 5 of
+each tracker's change-note section and `CLAUDE.md` §12 now say so, and the
+assertion message above names the consequence.
 
 ### AssertionError: SUMMARY.md: a change note grew to 976 chars — split it into a second line instead
 **Symptom:** `autoloop/tests/test_docs_merge.py::test_every_change_note_line_is_short_enough_to_merge_by_line`
@@ -2298,16 +2304,27 @@ branches touching the same module therefore edit the same LINE, which is the
 granularity git merges at, so nothing can reconcile them automatically.
 **Fix:** applied repo-side (2026-08-19, docs-01) in two halves, both required.
 Each tracker now ends with an append-only **"Change notes"** section opened by
-a `<!-- CHANGE-NOTES: ... -->` comment, and `CLAUDE.md` §12 makes a change note
-ONE NEW LINE — a new table row, or a line appended below that comment. The
+a CHANGE-NOTES comment, and `CLAUDE.md` §12 makes a change note ONE NEW LINE —
+a new table row, or a line appended below that comment. The
 other half is `autoloop/note_merge.py`, called from
 `auto_merge.AutoMerger._merge`: when a merge conflicts ONLY in that section and
 both sides left every pre-existing line byte-identical, the two branches'
 appended lines are combined and the merge is committed. Anything else — a
 conflict in the prose above the section, an edited/deleted/reordered existing
-note line, a conflicted path outside the two trackers — is refused and the
+note line, a conflicted path outside the trackers — is refused and the
 merge aborts exactly as before, with `auto_merge_notes_refused` in the
 transcript saying which and why.
+
+**Since 2026-08-23 (notes-03) this covers four trackers, not two.**
+`docs/SECURITY.md` and this file were added to `note_merge.NOTE_TRACKERS` after
+each was given its own marker-delimited append-only section — the section
+first, the list second, because a path granted to the resolver without one is a
+file whose ordinary prose it would start combining. It mattered because ONE
+uncovered path refuses the WHOLE merge: on 2026-08-22 bind-01, split-01 and
+dash-17 were each refused with `conflicted path(s) outside the change-note
+trackers`, over six documentation conflicts that were all this same
+append-at-the-end shape. `CLAUDE.md` and `docs/SCHEMA.md` have no such section
+and still conflict normally.
 
 **Do not "simplify" this to `merge=union`.** It was shipped that way for a few
 hours on 2026-08-19 and removed after review (`docs/SECURITY.md` S34). Git
@@ -2703,3 +2720,62 @@ by pasting the error text.
 **Fix:** the command or code change. If it is already applied repo-side, say
 where, and say plainly if it must not be removed.
 ```
+
+An entry goes in the numbered section it belongs to, newest-first, exactly as
+before — **not** at the end of the file. The end of the file is now the
+append-only change-note section below.
+
+---
+
+## Change notes — append ONE new line at the END of this file
+
+Where a task records what it changed in THIS tracker when there is no natural
+home for it above. **This section stays last in the file, and a note is
+appended at the very end of it.**
+
+**It is not where error entries go.** A new error keeps its `###` entry in the
+numbered section it belongs to, in the template shape above — ordinary prose
+that two branches conflict on and a human resolves, unchanged. This section is
+only for the one-line "what my task did here" note, and it exists because that
+note is what every parallel branch writes and therefore what every parallel
+branch collided on (measured 2026-08-22: bind-01 was refused a merge over
+exactly this file).
+
+Five rules. They are not style — they are the precondition the loop's own merge
+path checks before it will combine two branches' notes
+(`auto_merge.AutoMerger._merge` → `autoloop/note_merge.py`; the shape is pinned
+by `autoloop/tests/test_docs_merge.py`, the reasoning is in `CLAUDE.md` §12):
+
+1. **Add a line. Never grow a line.** Do not append your note into an existing
+   entry or paragraph. The resolver only combines whole lines added AFTER
+   everything that was already here; a grown line is an edit, and the merge
+   stops.
+2. **One note, one line.** Keep it to roughly a sentence. If it needs more, add
+   a second line, or put the detail in the entry above that owns it and leave a
+   pointer here.
+3. **Never edit, delete or reorder a line someone else wrote.** The resolver
+   refuses the whole merge if you do, and that refusal is the point: a
+   rewritten claim needs a human to look at it.
+4. **Order is arrival order, not chronology.** A merge concatenates one
+   branch's appended lines then the other's. Read the `Date` and `Task`
+   columns, never the position.
+5. **Call the marker `CHANGE-NOTES`; never write the comment out again.** The
+   section below opens with an HTML comment the resolver finds by that text,
+   and it requires the marker to appear EXACTLY ONCE in this file. A second
+   copy — the easy way to quote it while documenting how any of this works —
+   makes the resolver decline every parallel merge, silently. That is the
+   trap the first entry of §10 is about, and this file used to carry the
+   comment in full in §10's own text.
+
+Nothing may follow the last note line: this section is the end of the file, so
+that the next task's append lands at the end of the ledger rather than inside
+whatever came after it. Something appended below it in the older shape — a new
+`###` entry, a new `##` section — fails
+`test_docs_merge.py::test_every_shipped_tracker_ends_with_an_append_only_section`
+rather than landing outside the ledger unnoticed.
+
+<!-- CHANGE-NOTES: append below, one line per note, at the END of the file. Never edit a line above. -->
+
+| Date | Task | Note |
+|---|---|---|
+| 2026-08-23 | notes-03 | This file joined `note_merge.NOTE_TRACKERS`: a merge conflicting only in the section below is now combined by the loop, while a conflict in any error entry above the marker still refuses the whole merge. §10's fix text had to stop quoting the marker comment in full first — with two copies in the file, the resolver refuses every merge of it. |

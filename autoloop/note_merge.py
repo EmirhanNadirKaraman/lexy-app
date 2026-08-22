@@ -2,18 +2,35 @@
 
 ## What this exists for
 
-Every task records what it changed in `docs/SUMMARY.md` and `docs/TESTS.md`, so
-any two parallel branches touch the same region of the same two files. The
+Every task records what it changed in the repository's documentation trackers,
+so any two parallel branches touch the same region of the same files. The
 merge sweep halted three times in one evening on exactly that (2026-08-18) and
 left five reviewed, published tasks unmerged for a full day — dash-10, loop-02,
 brw-12, hlth-01, wrk-01 — each resolved by hand.
 
-Both trackers now end with an append-only **change-note section**, opened by the
-`NOTES_MARKER` comment, and `CLAUDE.md` §12 says a note is ONE NEW LINE appended
-at the very end. This module is the other half: given the three sides git itself
-recorded for a conflicted tracker, it returns the combined text when — and only
-when — the conflict is two branches each appending their own complete note
-lines to that terminal section.
+Every tracker in `NOTE_TRACKERS` ends with an append-only **change-note
+section**, opened by the `NOTES_MARKER` comment, and `CLAUDE.md` §12 says a note
+is ONE NEW LINE appended at the very end. This module is the other half: given
+the three sides git itself recorded for a conflicted tracker, it returns the
+combined text when — and only when — the conflict is two branches each appending
+their own complete note lines to that terminal section.
+
+## Why the list is four paths and not two (notes-03, 2026-08-23)
+
+It shipped covering `docs/SUMMARY.md` and `docs/TESTS.md` only, because those
+were the two files with a delimited section. `docs/SECURITY.md` and
+`docs/COMMON_ERRORS.md` are recorded in by every task under the same rules
+(`CLAUDE.md` §12/§14, `tasks.TRACKER_PATHS`) and collided exactly the same way,
+and a conflict in ONE uncovered path refuses the WHOLE merge — so the two
+covered files bought nothing whenever a third tracker collided too. Measured
+2026-08-22: bind-01, split-01 and dash-17 were cut from one base and all three
+were refused with `conflicted path(s) outside the change-note trackers`, over
+six documentation conflicts that were all the same append-at-the-end shape.
+
+The order that made the widening safe is the point, and it is the rule for any
+future addition: **the delimited section comes first, the list second.** A path
+in `NOTE_TRACKERS` whose file has no marked append-only region is a file whose
+ORDINARY PROSE this module would start combining.
 
 ## Why not `merge=union`, which is one line of `.gitattributes`
 
@@ -71,11 +88,34 @@ sees them.
 
 from __future__ import annotations
 
-#: The two trackers whose terminal change-note section may be combined. A
-#: literal pair, never a prefix or a glob: this list is the whole blast radius
-#: of the resolver, and every path added to it is a file that can be merged
-#: without a human in a case where git said "conflict".
-NOTE_TRACKERS: frozenset[str] = frozenset({"docs/SUMMARY.md", "docs/TESTS.md"})
+#: The trackers whose terminal change-note section may be combined. A literal
+#: list, never a prefix or a glob: this list is the whole blast radius of the
+#: resolver, and every path added to it is a file that can be merged without a
+#: human in a case where git said "conflict".
+#:
+#: **A path may only be added once the file itself carries exactly one
+#: `NOTES_MARKER`-delimited append-only section at its END.** Without that
+#: region there is no boundary between prose and ledger for `split_at_marker`
+#: to find; the marker-count check below refuses first, so every merge of that
+#: file stops — but the reason a reader sees is "not two branches appending
+#: change notes" rather than "this file was never prepared", which is why the
+#: precondition is stated here and tested. Two tests hold the pair together:
+#: `test_docs_merge.py::test_every_shipped_tracker_ends_with_an_append_only_section`
+#: checks each file named here actually has one, and
+#: `::test_a_tracker_without_the_marker_is_refused_rather_than_combined` proves
+#: the resolver refuses rather than guessing when one does not.
+#:
+#: `CLAUDE.md` and `docs/SCHEMA.md` are trackers a task may write
+#: (`tasks.TRACKER_PATHS`) and are deliberately NOT here: they have no
+#: append-only section, so a collision in either still stops the sweep.
+NOTE_TRACKERS: frozenset[str] = frozenset(
+    {
+        "docs/COMMON_ERRORS.md",
+        "docs/SECURITY.md",
+        "docs/SUMMARY.md",
+        "docs/TESTS.md",
+    }
+)
 
 #: The HTML comment opening each tracker's append-only section. Everything
 #: BEFORE it is ordinary documentation this module refuses to reconcile;
