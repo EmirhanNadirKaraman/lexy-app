@@ -30,13 +30,14 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
 from autoloop import cli, orchestrator as orchestrator_module
 from autoloop.config import AutoloopConfig, BrowserConfig, PolicyConfig
-from autoloop.contract import Decision, Directive
-from autoloop.errors import TaskGraphError
+from autoloop.contract import RETIRED_DECISIONS, Decision, Directive
+from autoloop.errors import GitCommandError, TaskGraphError, TemplateError
 from autoloop.inbox import (
     KIND_URGENT,
     InboxError,
@@ -47,6 +48,7 @@ from autoloop.inbox import (
 from autoloop.manifest import ManifestStore
 from autoloop.orchestrator import PREEMPTION_STOP_KIND, Orchestrator
 from autoloop.policy import PolicyEngine
+from autoloop.prompts import TEMPLATES
 from autoloop.state import LoopState, PendingRequest, Phase, StateStore
 from autoloop.tasks import Task, TaskRegistry, TaskState, TaskStore
 from autoloop.transcript import TranscriptLogger
@@ -342,6 +344,221 @@ def test_the_preemption_reuses_the_release_path_rather_than_repeating_it():
     assert "release_task_to_pending(" in inspect.getsource(cli._cmd_release)
 
 
+class FlakyWorkerRepos:
+    """A `WorkerRepoManager` whose `quarantine` fails its first `failures`
+    calls with the error a COLLIDING LABEL actually raises.
+
+    That collision is not hypothetical: `retire_execution` derives its label
+    from the reason plus a whole-second timestamp, so two retirements of one
+    task inside the same second collide by construction. It also raises
+    `GitCommandError`, which is not an `OSError` — the shape that used to
+    escape the preemption's own `except` clause and reach the loop's git
+    handler instead of being recorded.
+    """
+
+    def __init__(self, inner, failures):
+        self._inner = inner
+        self._failures_left = failures
+        self.labels = []
+
+    def path_for(self, task_id):
+        return self._inner.path_for(task_id)
+
+    def hooks_dir_for(self, task_id):  # pragma: no cover - not reached here
+        return self._inner.hooks_dir_for(task_id)
+
+    def quarantine(self, task_id, label):
+        self.labels.append(label)
+        if self._failures_left > 0:
+            self._failures_left -= 1
+            raise GitCommandError(
+                f"quarantine destination {task_id}-{label} already exists — "
+                "'label' must be unique per call"
+            )
+        return self._inner.quarantine(task_id, label)
+
+
+def test_a_colliding_label_is_retried_under_a_distinct_one(config):
+    """The likelier of the two named retirement failures, and it is a label
+    problem rather than a filesystem one — so retrying under `<reason>-retry`
+    is what turns it back into a clean retirement, where retrying under the
+    same label would collide identically forever."""
+    workers = FlakyWorkerRepos(
+        WorkerRepoManager(config.workers_root, config.worker_hooks_dir), failures=1
+    )
+    orch, _, task_store = build_loop(
+        config, tasks=[_task("brw-13"), _task("codex-01")], worker_repos=workers
+    )
+    worker_path = in_flight(orch, "brw-13")
+    orch._registry.request_urgent("codex-01", "transport down")
+
+    assert orch._preempt_for_urgent(Phase.READY) is True
+
+    assert [label.startswith("displaced-by-urgent-retry") for label in workers.labels] == [
+        False,
+        True,
+    ]
+    assert task_store.load().state_of("brw-13") is TaskState.READY
+    assert not worker_path.exists()
+    assert list(config.workers_root.parent.glob("quarantine/brw-13-*"))
+    record = orch.state.preemption
+    assert record["displaced_returned_to_pending"] is True
+    assert record["displaced_artifacts_retired"] is True
+    assert record["stale_worker_path"] == ""
+    # The record was filed by the attempt that then failed on the worker, so
+    # the retry had nothing left to file and reported `None`. Reporting that
+    # as "there was no record" would lose the half a human has to find.
+    assert record["archived_execution_record"].endswith(".json")
+    assert Path(record["archived_execution_record"]).exists()
+
+
+def test_a_retirement_that_cannot_succeed_is_recorded_as_the_partial_it_is(config):
+    """The failure-consistency rule. The status move is durable BEFORE the
+    artefacts move, so a retirement that fails leaves a task that IS pending —
+    reporting that as "NOT returned to pending" sent an operator to fix a
+    status that was already correct while the residue that actually blocks the
+    next dispatch went unnamed. Two facts, recorded separately."""
+    workers = FlakyWorkerRepos(
+        WorkerRepoManager(config.workers_root, config.worker_hooks_dir), failures=2
+    )
+    orch, _, task_store = build_loop(
+        config, tasks=[_task("brw-13"), _task("codex-01")], worker_repos=workers
+    )
+    worker_path = in_flight(orch, "brw-13")
+    orch._registry.request_urgent("codex-01", "transport down")
+
+    assert orch._preempt_for_urgent(Phase.READY) is True
+
+    # The STATUS moved, durably, and the task is selectable again.
+    assert task_store.load().state_of("brw-13") is TaskState.READY
+    record = orch.state.preemption
+    assert record["displaced_returned_to_pending"] is True
+    # ...and the ARTEFACTS did not, said as its own fact, naming what survived.
+    assert record["displaced_artifacts_retired"] is False
+    assert record["stale_worker_path"] == str(worker_path)
+    assert worker_path.exists(), "nothing was deleted on the way past"
+    assert "already exists" in record["obstacle"]
+    assert "returned to pending" in orch.state.stop_reason
+    assert str(worker_path) in orch.state.stop_reason
+
+    entries = [
+        json.loads(line)
+        for line in config.transcript_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    failed = [e for e in entries if e.get("type") == "preemption_retirement_failed"]
+    assert len(failed) == 1
+    assert failed[0]["data"]["stale_worker_path"] == str(worker_path)
+
+
+def test_a_resumable_residue_is_left_paired_so_the_next_dispatch_continues_it(
+    config, monkeypatch, capsys
+):
+    """`retire_execution` files the RECORD first and the worker second, so a
+    worker half that fails splits the pair. When the worker is one the dispatch
+    would RESUME, that split is pure loss — with no record the dispatch takes
+    the first-dispatch branch and `WorkerRepoManager.create` refuses to write
+    into the directory that is still there, discarding a round that could have
+    been continued. The record goes back beside it instead, which is exactly
+    what a killed round leaves."""
+    monkeypatch.setattr(orchestrator_module, "worker_repo_is_reusable", lambda p, b: True)
+    workers = FlakyWorkerRepos(
+        WorkerRepoManager(config.workers_root, config.worker_hooks_dir), failures=2
+    )
+    orch, _, _ = build_loop(
+        config, tasks=[_task("brw-13"), _task("codex-01")], worker_repos=workers
+    )
+    worker_path = in_flight(orch, "brw-13", candidate="a" * 40)
+    orch._registry.request_urgent("codex-01", "transport down")
+
+    orch._preempt_for_urgent(Phase.READY)
+
+    survivor = orch._execution_store.load("brw-13")
+    assert survivor is not None, "the record was put back beside its worker"
+    assert survivor.candidate_sha == "a" * 40, "and it is the ORIGINAL record"
+    assert survivor.worktree_path == str(worker_path)
+    record = orch.state.preemption
+    assert (record["stale_execution_record"], record["residue_resumable"]) == (True, True)
+    # Said out loud, because the pairing has a real cost the operator is the
+    # one who has to weigh: a live record shuts the repository-wide merge
+    # window, and `_merge_window_blockers` exempts it only once that
+    # candidate is PUBLISHED — a re-`release` is not available, the task is no
+    # longer in progress.
+    assert "merge window stays shut until that round publishes" in orch.state.stop_reason
+    capsys.readouterr()
+    cli._report_preemption(orch.state)
+    assert "ACTION       none required" in capsys.readouterr().out
+
+
+def test_a_worker_the_next_dispatch_cannot_resume_is_left_split_and_named(config):
+    """The gate on that repair, and the reason it is not optional. This
+    worker is a plain directory — `worker_repo_is_reusable` (the real one, run
+    here) refuses it, so the next dispatch would refuse to create over it
+    whether or not a record sits beside it. Restoring the record anyway would
+    shut the merge window for the whole repository and buy nothing, so the
+    residue is left split and the one `mv` is named instead."""
+    workers = FlakyWorkerRepos(
+        WorkerRepoManager(config.workers_root, config.worker_hooks_dir), failures=2
+    )
+    orch, _, _ = build_loop(
+        config, tasks=[_task("brw-13"), _task("codex-01")], worker_repos=workers
+    )
+    worker_path = in_flight(orch, "brw-13")
+    orch._registry.request_urgent("codex-01", "transport down")
+
+    orch._preempt_for_urgent(Phase.READY)
+
+    record = orch.state.preemption
+    assert record["residue_resumable"] is False
+    assert record["stale_execution_record"] is False, "the merge window is not shut"
+    assert orch._execution_store.load("brw-13") is None
+    assert record["stale_worker_path"] == str(worker_path)
+    assert f"Move {worker_path} aside" in orch.state.stop_reason
+
+
+def test_the_urgent_task_still_takes_the_loop_after_a_partial_release(config):
+    """The preemption's own claim must survive the residue: the operator asked
+    for their task, and a worker repo that could not be moved is the DISPLACED
+    task's problem, not theirs."""
+    workers = FlakyWorkerRepos(
+        WorkerRepoManager(config.workers_root, config.worker_hooks_dir), failures=2
+    )
+    orch, _, task_store = build_loop(
+        config, tasks=[_task("brw-13"), _task("codex-01")], worker_repos=workers
+    )
+    in_flight(orch, "brw-13")
+    orch._registry.request_urgent("codex-01", "transport down")
+
+    orch._preempt_for_urgent(Phase.READY)
+
+    assert orch.state.stop_kind == PREEMPTION_STOP_KIND
+    assert task_store.load().next_ready().id == "codex-01"
+
+
+def test_the_operator_is_told_what_the_partial_release_left_behind(config, capsys):
+    """A residue nobody can find is a residue nobody reasons about.
+    `_report_preemption` prints the partial release as the two facts it is —
+    the status moved, the artefacts did not — and names what survived."""
+    workers = FlakyWorkerRepos(
+        WorkerRepoManager(config.workers_root, config.worker_hooks_dir), failures=2
+    )
+    orch, _, _ = build_loop(
+        config, tasks=[_task("brw-13"), _task("codex-01")], worker_repos=workers
+    )
+    worker_path = in_flight(orch, "brw-13")
+    orch._registry.request_urgent("codex-01", "transport down")
+    orch._preempt_for_urgent(Phase.READY)
+    capsys.readouterr()
+
+    cli._report_preemption(orch.state)
+
+    out = capsys.readouterr().out
+    assert "in_progress -> pending, selectable again" in out
+    assert "could NOT be retired" in out
+    assert f"worker repo still at {worker_path}" in out
+    assert f"ACTION       move {worker_path} aside" in out
+
+
 def _audit_round(orch, unit_id="audit-0007"):
     """A dispatched AUDIT unit: minted per run, absent from the registry, with
     a worker repo and an execution record — the shape `_resolve_audit_task`
@@ -362,9 +579,12 @@ def _audit_round(orch, unit_id="audit-0007"):
 
 
 def test_an_audit_round_is_waited_out_rather_than_displaced(config):
-    """An audit takes no task out of the queue, so displacing it buys nothing
-    the pin does not already buy — `next_ready()` still returns the urgent task
-    for the round after it."""
+    """An audit holds no task in the queue and its product is a report, so
+    quarantining it mid-write spends the round twice — once to produce the
+    report and once to redo it — to save the tail of a round the loop has
+    already paid for. `next_ready()` still returns the urgent task for the
+    round after it, and the round AFTER that is bounded by the fresh-audit
+    refusal, not by another lap."""
     orch, _, _ = build_loop(config, tasks=[_task("codex-01")])
     worker_path = _audit_round(orch)
     orch._registry.request_urgent("codex-01", "transport down")
@@ -380,12 +600,15 @@ def test_an_audit_round_is_waited_out_rather_than_displaced(config):
 
 def test_the_session_a_preemption_starts_does_not_preempt_itself_in_a_lap(config):
     """The churn this guard exists to stop, driven one lap further than the
-    test above. `_start_new_session` sets the outbox to the AUDIT KICKOFF, so
-    the fresh session a preemption starts can legitimately come back with an
-    `audit` — and `_dispatch_executor` deliberately does not refuse one. If that
-    round were displaced too, every lap would cost a full executor round and
-    leave another quarantined worker, ending only when the reviewer happened to
-    pick `implement`."""
+    test above. An audit round that reached the executor is waited out rather
+    than quarantined mid-write — displacing it would spend the round twice to
+    save the tail of one the loop has already paid for.
+
+    What bounds the wait at ONE round rather than one per lap is the pair of
+    changes below it: `_start_new_session` opens a pinned session on the urgent
+    task instead of on the audit kickoff, and `_refused_ahead_of_urgent`
+    refuses a FRESH audit while the pin is live. Before those, the fresh
+    session invited an `audit` and the gate let it through."""
     orch, _, task_store = build_loop(
         config, tasks=[_task("brw-13"), _task("codex-01")]
     )
@@ -415,6 +638,223 @@ def test_an_idle_loop_is_not_preempted_in_a_circle(config):
     assert orch._preempt_for_urgent(Phase.READY) is False
     assert orch.state.phase == Phase.READY.value
     assert orch._registry.next_ready().id == "codex-01", "still selected next"
+
+
+# --- 2b. the urgent task is the next DISPATCH, not merely the next offer ------
+#
+# "Selected next" was not the claim. A preemption ends the round and continuous
+# mode opens a NEW session, and every new session used to open on the AUDIT
+# KICKOFF — so the reviewer was invited to answer `audit`, `_dispatch_executor`
+# let audits through, and the urgent task waited out a full executor round
+# (measured 1282s) that the whole mechanism exists to skip. Two changes close
+# that, and both are tested here: the pinned session opens on the urgent task,
+# and a fresh audit is refused while the pin is live.
+
+
+def _next_session(config, orch, store, task_store):
+    """Continuous mode's next iteration, in the two lines it actually is:
+    select and kick off from the reloaded registry, then build the round on the
+    freshly saved session. `_cmd_run` does this through `_build_orchestrator`;
+    rebinding the two loaded objects on the existing orchestrator exercises the
+    same inputs without a browser, a git repo or a lock."""
+    registry = task_store.load()
+    started = cli._select_and_kickoff(config, store, registry)
+    orch.state = store.load()
+    orch._registry = registry
+    return started
+
+
+def test_a_preempted_session_opens_on_the_urgent_task_not_on_the_audit(config):
+    """The kickoff is what the reviewer answers, so a kickoff that offers the
+    audit is a request for one. The session a preemption starts names the task
+    the operator paid a displaced round for."""
+    orch, store, task_store = build_loop(
+        config, tasks=[_task("brw-13"), _task("codex-01")]
+    )
+    in_flight(orch, "brw-13")
+    orch._registry.request_urgent("codex-01", "transport down")
+    assert orch._preempt_for_urgent(Phase.READY) is True
+
+    assert _next_session(config, orch, store, task_store) is True
+
+    outbox = store.load().outbox or ""
+    assert "codex-01" in outbox
+    assert "transport down" in outbox
+    assert outbox != TEMPLATES["audit_kickoff"].render()
+    assert "first autonomous repository audit" not in outbox
+
+
+def test_an_unpinned_session_still_opens_on_the_audit_kickoff(config):
+    """The ordinary path is untouched: with no pin live, a new session offers
+    the audit exactly as it always has."""
+    # Nothing in flight; only the selection matters here.
+    _, store, task_store = build_loop(config, tasks=[_task("brw-13")])
+
+    assert cli._select_and_kickoff(config, store, task_store.load()) is True
+
+    assert store.load().outbox == TEMPLATES["audit_kickoff"].render()
+
+
+def test_the_urgent_kickoff_asks_for_a_directive_policy_will_authorize(config):
+    """A kickoff that solicits a directive policy then denies would trade audit
+    churn for DENIAL churn, on exactly the tasks that have never been planned —
+    and the denial budget ends a run. So the ask is driven by whether the task
+    already holds an approved decomposition."""
+    registry = TaskRegistry([_task("codex-01")])
+    registry.request_urgent("codex-01", "transport down")
+    # `implement_enabled=True` because the DEFAULT is the Phase-3 gate, which
+    # denies every implement of a repository task before the decomposition
+    # check is reached — under it this test would pass on the wrong verdict.
+    policy = PolicyEngine(PolicyConfig(implement_enabled=True))
+    bare = Directive(decision=Decision.IMPLEMENT, reason="urgent", task_id="codex-01")
+
+    # Unplanned: policy refuses a bare `implement`, so the kickoff must ask for
+    # the plan rather than for the directive alone.
+    verdict = policy.authorize_directive(bare, "autoloop/x", registry)
+    assert (verdict.allowed, verdict.code) == (False, "decomposition_missing")
+    unplanned = cli.urgent_kickoff_payload("codex-01", "T", "transport down", False)
+    assert "NO approved decomposition" in unplanned
+    assert "must" in unplanned and "decomposition" in unplanned
+
+    # Planned: the same bare directive is authorized, and asking for the plan
+    # again would tax a round that is already going well.
+    registry.set_decomposition("codex-01", "Step 1: fix the transport")
+    assert policy.authorize_directive(bare, "autoloop/x", registry).allowed is True
+    planned = cli.urgent_kickoff_payload("codex-01", "T", "transport down", True)
+    assert "already has an approved decomposition" in planned
+
+
+def test_the_kickoff_reads_the_plan_state_from_the_registry(config):
+    """The half above is only true if `_start_new_session` passes the real
+    answer: a hardcoded one would be wrong for every task on one side of it."""
+    _, store, task_store = build_loop(config, tasks=[_task("codex-01")])
+    registry = task_store.load()
+    registry.request_urgent("codex-01", "transport down")
+    task_store.save(registry)
+
+    cli._select_and_kickoff(config, store, task_store.load())
+    assert "NO approved decomposition" in (store.load().outbox or "")
+
+    registry = task_store.load()
+    registry.set_decomposition("codex-01", "Step 1: fix the transport")
+    task_store.save(registry)
+
+    cli._select_and_kickoff(config, store, task_store.load())
+    assert "already has an approved decomposition" in (store.load().outbox or "")
+
+
+def test_the_urgent_kickoff_is_as_strict_as_every_other_template():
+    """The kickoff template lives in `cli.py`, not in `prompts.TEMPLATES`, so
+    the two guarantees that library provides have to be asserted here rather
+    than inherited. First: STRICT rendering. `test_prompts.py` renders every
+    template in the dict with its own fields and refuses missing/unknown ones,
+    which is what makes a template/caller drift fail a test instead of shipping
+    a mangled prompt to the reviewer."""
+    template = cli.URGENT_KICKOFF
+    fields = {f: f.upper() for f in template.fields}
+
+    rendered = template.render(**fields)
+
+    for field in template.fields:
+        assert field.upper() in rendered
+    with pytest.raises(TemplateError, match="missing"):
+        template.render(task_id="codex-01")
+    with pytest.raises(TemplateError, match="unknown"):
+        template.render(**fields, extra="nope")
+
+
+@pytest.mark.parametrize("decision", sorted(d.value for d in RETIRED_DECISIONS))
+def test_the_urgent_kickoff_offers_no_retired_decision(decision):
+    """Second: `test_prompts.py::test_no_template_offers_a_retired_decision`
+    enumerates `TEMPLATES`, and this body is not in that dict. It is exactly the
+    shape that check exists for — it names decisions outright ("Reply
+    `implement`...", "no fresh `audit`"), and a retired one surviving in it
+    would invite the reviewer to send the directive policy refuses
+    unconditionally."""
+    assert decision not in cli.URGENT_KICKOFF.body
+
+
+def test_a_fresh_audit_is_refused_while_the_pin_is_live(config):
+    """An audit takes no task out of the queue, but it takes the LOOP for a
+    full executor round — which is the only thing an urgent request is asking
+    for. Refused through the ordinary budget-capped re-prompt, naming the task
+    to send instead."""
+    dispatched = []
+    orch, _, _ = build_loop(config, tasks=[_task("codex-01")])
+    orch._dispatch_task_postcommit = lambda d, t, s: dispatched.append(t.id)
+    orch._registry.request_urgent("codex-01", "transport down")
+
+    orch._dispatch_executor(Directive(decision=Decision.AUDIT, reason="routine audit"))
+
+    assert dispatched == [], "no audit round was started"
+    assert orch.state.policy_denials == 1
+    outbox = orch.state.outbox or ""
+    assert "codex-01" in outbox
+    assert "not cancelled" in outbox, "the audit is deferred, not refused forever"
+
+
+def test_a_revise_of_an_audit_arc_already_in_flight_is_not_refused(config):
+    """The one exemption, and it is not cosmetic: round 1's commit lives in a
+    worker repo only round 2 can reach, so refusing this abandons real work to
+    save a round the loop has already paid for. It cannot smuggle a round in
+    after a preemption either — a preemption clears `current_task`, and a
+    revise-of-audit with no audit on record parks instead of minting a unit."""
+    dispatched = []
+    orch, _, _ = build_loop(config, tasks=[_task("codex-01")])
+    orch._dispatch_task_postcommit = lambda d, t, s: dispatched.append(t.id)
+    orch._registry.request_urgent("codex-01", "transport down")
+    orch.state.current_task = {"task_id": "audit-0007", "title": "repository audit"}
+
+    orch._dispatch_executor(
+        Directive(
+            decision=Decision.REVISE,
+            reason="tighten the findings",
+            task_id="audit",
+            feedback="two findings are unsupported",
+        )
+    )
+
+    assert dispatched == ["audit-0007"], "the arc in flight continues"
+    assert orch.state.policy_denials == 0
+
+
+def test_nothing_is_dispatched_between_the_preemption_and_the_urgent_task(config):
+    """THE end-to-end claim, in the order it actually happens: a round in
+    flight is displaced, continuous mode opens the next session, and the very
+    next thing that reaches the executor is the urgent task — with an `audit`
+    and an unrelated `implement` both attempted in between and both refused."""
+    dispatched = []
+    orch, store, task_store = build_loop(
+        config, tasks=[_task("brw-13", priority=0), _task("codex-01", priority=0)]
+    )
+    orch._dispatch_task_postcommit = lambda d, t, s: dispatched.append(t.id)
+    in_flight(orch, "brw-13")
+    inbox = TaskInbox(inbox_dir_for(config.workers_root, config.state_dir))
+    orch._task_inbox = inbox
+    inbox.submit({"kind": KIND_URGENT, "id": "codex-01", "reason": "transport down"})
+
+    assert orch.run() == Phase.STOPPED.value
+    assert orch.state.stop_kind == PREEMPTION_STOP_KIND
+    assert dispatched == [], "the preemption itself dispatches nothing"
+
+    assert _next_session(config, orch, store, task_store) is True
+    assert "codex-01" in (orch.state.outbox or "")
+
+    # Everything the reviewer could plausibly send FIRST, refused in turn.
+    orch._dispatch_executor(Directive(decision=Decision.AUDIT, reason="audit first"))
+    orch._dispatch_executor(
+        Directive(decision=Decision.IMPLEMENT, reason="brw-13 was nearly done", task_id="brw-13")
+    )
+    assert dispatched == [], "no audit and no other task ran ahead of the pin"
+    assert orch.state.policy_denials == 2
+
+    orch._dispatch_executor(
+        Directive(decision=Decision.IMPLEMENT, reason="the urgent one", task_id="codex-01")
+    )
+
+    assert dispatched == ["codex-01"], "the urgent task is the FIRST dispatch after the preemption"
+    assert orch._registry.state_of("codex-01") is TaskState.IN_PROGRESS
+    assert orch._registry.live_urgent_target() is None, "the pin is spent by its dispatch"
 
 
 # --- 3. a request that arrives mid-review waits for a safe boundary -----------
@@ -863,6 +1303,65 @@ def test_urgent_command_queues_a_request_without_taking_a_lock(wired, capsys):
     assert "SAFE boundary" in out
     # The registry itself is NOT written here — the loop stays its only writer.
     assert TaskStore(wired.tasks_file).load().live_urgent_target() is None
+
+
+def test_release_command_still_raises_but_the_status_move_is_already_durable(
+    wired, monkeypatch
+):
+    """The CLI half of the shared release path, and what sharing it did NOT
+    change: a retirement that fails still propagates out of `_cmd_release`, of
+    its original type, for `main` to report and exit 1 on. That contract has its
+    own pin (`test_recovery_commands.py::
+    test_the_record_is_retired_before_the_worker`) and an operator who ran the
+    command by hand is reading its output, so the raise IS the loud ending — the
+    opposite trade from `_preempt_for_urgent`, which nobody is watching and which
+    therefore takes the failure back inside the `Release`.
+
+    What is pinned HERE is the half that only became visible once one function
+    served both callers: the STATUS move is made durable BEFORE the artefacts
+    move, so on the way out of that raise the task really is pending again — and
+    the retry under a distinct label runs on this path too, since a colliding
+    label is as likely for an operator as for a preemption. No execution record
+    is put back beside the survivor: `_repair_orphaned_record` is deliberately
+    not reached on the raising path, because a live record shuts the
+    repository-wide merge window and paying that silently behind a traceback is
+    a cost nobody chose."""
+    registry = TaskRegistry([_task("brw-13")])
+    registry.mark_in_progress("brw-13")
+    TaskStore(wired.tasks_file).save(registry)
+    real = WorkerRepoManager(wired.workers_root, wired.worker_hooks_dir)
+    worker_path = real.path_for("brw-13")
+    worker_path.mkdir(parents=True)
+    (worker_path / "half-done.txt").write_text("twenty minutes", encoding="utf-8")
+    executions = TaskExecutionStore(wired.executions_dir)
+    executions.save(
+        TaskExecution(
+            task_id="brw-13",
+            task_branch="autoloop/brw-13",
+            worktree_path=str(worker_path),
+            task_base_sha="b" * 40,
+            candidate_sha="c" * 40,
+        )
+    )
+    workers = FlakyWorkerRepos(real, failures=2)
+    monkeypatch.setattr(cli, "WorkerRepoManager", lambda *a, **k: workers)
+
+    with pytest.raises(GitCommandError, match="already exists"):
+        cli._cmd_release(argparse.Namespace(config=None, task_id="brw-13"))
+
+    # The STATUS moved, durably, before the artefacts were touched at all.
+    assert TaskStore(wired.tasks_file).load().state_of("brw-13") is TaskState.READY
+    # The retry ran here too, under a label that could not collide identically.
+    assert [label.startswith("released-by-operator-retry") for label in workers.labels] == [
+        False,
+        True,
+    ]
+    # The record went first and stayed retired; the worker is the loud residue
+    # the next dispatch refuses to write over, and nothing was deleted.
+    assert executions.load("brw-13") is None
+    assert list((wired.executions_dir / "archive").glob("brw-13-*.json"))
+    assert worker_path.exists()
+    assert (worker_path / "half-done.txt").read_text(encoding="utf-8") == "twenty minutes"
 
 
 def test_urgent_command_refuses_before_queueing_anything(wired, capsys):

@@ -91,10 +91,16 @@ Urgent preemption (2026-08-22):
   transcript entry), and end the round as a `stopped` session with
   `stop_kind = PREEMPTION_STOP_KIND` — a CLEAN boundary, which is why every
   existing caller of `run()` needs no new branch to handle it.
+* The urgent task is then the next unit of work actually DISPATCHED, not merely
+  the next one offered: `cli._start_new_session` opens the session a preemption
+  starts on that task (`cli.urgent_kickoff_payload`) instead of on the audit
+  kickoff, and `_refused_ahead_of_urgent` refuses every other implement/revise
+  AND a fresh audit until it has started. A `revise` continuing an audit arc
+  already in flight is the one exemption, and it cannot follow a preemption —
+  see that method.
 * The review gate is untouched. Nothing here skips a packet, assumes a verdict
   or authorizes a push; the displaced candidate stays in its quarantined worker
-  repo. The only enforcement added is `_dispatch_executor` refusing an
-  implement/revise of a DIFFERENT task while the pin is live, through the
+  repo. The only enforcement added is the dispatch refusal above, through the
   ordinary policy-denial re-prompt.
 
 Note for the merge with the blocker/quarantine work (commit 5346551, branch
@@ -199,7 +205,7 @@ from __future__ import annotations
 import hashlib
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 import tempfile
 from pathlib import Path
@@ -311,6 +317,7 @@ from .worktask import (
     CommitIntent,
     IntentStore,
     Reconciliation,
+    Retirement,
     TaskExecution,
     TaskExecutionStore,
     accumulate_assumptions,
@@ -371,6 +378,48 @@ PREEMPTION_STOP_KIND = "preempted"
 PREEMPTION_RETIREMENT_REASON = "displaced-by-urgent"
 
 
+@dataclass(frozen=True)
+class Release:
+    """What one `release_task_to_pending` call ACTUALLY moved.
+
+    A plain `(task, Retirement)` tuple could only describe the happy path, and
+    the reporting built on it then lied in the one case worth reporting: the
+    status move is durable before the artefacts move (see the ORDER note
+    below), so a failed retirement leaves a task that IS pending while the
+    caller said it was not. This type carries the two halves separately, so a
+    partial release is recorded as the partial thing it is.
+
+    `artifacts_retired` False always comes with `obstacle` set, and with
+    whichever residue survived named exactly: `stale_worker_path` is the
+    directory still sitting where the next dispatch would create one, and
+    `stale_execution_record` says the live record is still in the merge-window
+    gate. It is only ever RETURNED to a caller that asked for it
+    (`tolerate_retirement_failure=True`); every other caller gets the failure
+    raised, which is what `cli._cmd_release` has always done.
+
+    `residue_resumable` is the difference between the two endings a caller has
+    to report differently, and it is a CHECKED fact rather than a hope — see
+    `_repair_orphaned_record`.
+    """
+
+    task: Task
+    retirement: Retirement | None = None
+    #: The STATUS half. Always True on a returned `Release` — `registry.release`
+    #: raises rather than returning when it will not move — and named anyway,
+    #: so a reader of the record does not have to know that to interpret it.
+    status_moved: bool = True
+    artifacts_retired: bool = True
+    obstacle: str = ""
+    stale_worker_path: str = ""
+    stale_execution_record: bool = False
+    #: The residue is a record PLUS a worker that `worker_repo_is_reusable`
+    #: accepts, so the next dispatch of this task resumes it instead of
+    #: refusing — at the cost of a merge window that stays shut until that
+    #: round publishes. False means the opposite ending: a worker the next
+    #: dispatch will refuse to create over, which an operator has to move.
+    residue_resumable: bool = False
+
+
 def release_task_to_pending(
     task_id: str,
     registry: TaskRegistry,
@@ -379,9 +428,10 @@ def release_task_to_pending(
     *,
     persist,
     reason: str = "released-by-operator",
-):
+    tolerate_retirement_failure: bool = False,
+) -> Release:
     """Return an in-progress task to pending, and retire the execution it
-    leaves behind. Returns `(task, worktask.Retirement)`.
+    leaves behind. Returns a `Release` describing what actually moved.
 
     THE release path, and the only one — `cli._cmd_release` and
     `Orchestrator._preempt_for_urgent` both come through here, because the
@@ -410,6 +460,55 @@ def release_task_to_pending(
     refuses loudly, rather than a task still marked in-progress whose worker has
     already been quarantined — a state no command can move.
 
+    **A FAILED RETIREMENT IS NEVER ROLLED BACK, AND WHO HEARS ABOUT IT IS THE
+    CALLER'S CHOICE (`tolerate_retirement_failure`).** Rolling the status back
+    is not an option either way: the status is already durable by the time the
+    artefacts move, so undoing it would put the task back in `in_progress` —
+    the exact invisible-to-`next_ready` state of 2026-08-21 — with its worker
+    repo and record still on disk. What differs is the ENDING:
+
+    * **False (the default, and `cli._cmd_release`)** — the failure is
+      re-raised, unchanged and of its original type, so the operator's command
+      fails loudly and `cli.main` reports it and exits 1. That is the behaviour
+      this command has always had, and `test_recovery_commands.py::
+      test_the_record_is_retired_before_the_worker` is its pin: the record is
+      retired first, the worker survives, and the error propagates. A human ran
+      that command and is reading its output; an exception is not a silent
+      failure to them.
+    * **True (`Orchestrator._preempt_for_urgent`)** — the failure comes back
+      inside the `Release` instead. Nobody is watching a preemption, the round
+      is ending regardless, and raising here would take the process down at the
+      one moment an operator is waiting for their urgent task. The `Release`
+      then says precisely how far it got, and the loop records it.
+
+    Either way the `except` clause catches `GitError`, which the colliding-
+    quarantine-label case (`WorkerRepoManager.quarantine`) actually raises: it
+    is not an `OSError`, so a caller catching only the filesystem errors it
+    believed covered that case never saw it.
+
+    **ONE RETRY, under a distinct label, because a label collision is the
+    likelier of the two named failures.** `retire_execution` derives its label
+    from `reason` plus a whole-second timestamp, so two retirements of one task
+    inside the same second collide by construction; retrying under
+    `<reason>-retry` changes the label rather than the second and is what turns
+    that case back into a clean retirement. The retry is safe to repeat because
+    both halves are absence-tolerant — `archive` returns None when the record
+    has already moved, and the worker is only quarantined `if … exists()`.
+
+    **AND ON THE TOLERATING PATH THE RESIDUE IS LEFT IN THE BEST SHAPE
+    AVAILABLE, WHICH IS NOT ALWAYS A GOOD ONE.** When even the retry fails,
+    `_repair_orphaned_record` puts the execution record back beside the worker
+    that could not be moved — but only when that worker is one the next
+    dispatch would RESUME
+    (`worker_repo_is_reusable`). Then the residue is exactly what a process
+    killed between `persist()` and the retirement leaves, and the resume path
+    already handles it. Otherwise the split is left as it is and reported: a
+    live record shuts the repository-wide merge window, and paying that for a
+    worker the next dispatch would refuse anyway buys nothing. So "prevent" is
+    true for the label collision (the retry) and for a resumable worker, and
+    the remaining case is REPORTED rather than prevented — nothing in this
+    function can move a directory the filesystem refused to move.
+
     `persist` is a callable rather than a `TaskStore`, because the two callers
     save through different objects (the CLI's own store, the orchestrator's
     `self._task_store`) and because a function that took a store would have to
@@ -418,12 +517,233 @@ def release_task_to_pending(
     Nothing is deleted. The worker is MOVED to quarantine (an interrupted round
     usually has real work in it) and the record is MOVED to
     `executions/archive/`, both under one label, so the candidate stays
-    recoverable and the two halves name each other on disk.
+    recoverable and the two halves name each other on disk — except on the
+    retry, where the labels necessarily differ and `_archived_record_path`
+    recovers the pairing for the record instead.
     """
     task = registry.release(task_id)
     persist()
-    retirement = retire_execution(task_id, execution_store, worker_repos, reason=reason)
-    return task, retirement
+    recorded = _loaded_execution(task_id, execution_store)
+    problems = []
+    first_failure = None
+    for attempt_reason in (reason, f"{reason}-retry"):
+        try:
+            retirement = retire_execution(
+                task_id, execution_store, worker_repos, reason=attempt_reason
+            )
+        except (GitError, StateError, OSError) as exc:
+            problems.append(str(exc))
+            if first_failure is None:
+                first_failure = exc
+            continue
+        if retirement.record_path is None and recorded is not None:
+            # The record was archived by the attempt that then failed on the
+            # worker, so this attempt found nothing left to file and reported
+            # `None` — which a reader would take as "there was no record". Look
+            # up where the earlier attempt put it, so the two halves can still
+            # be found from one another even though the retry changed the label.
+            retirement = replace(
+                retirement,
+                record_path=_archived_record_path(task_id, execution_store, reason),
+            )
+        return Release(task=task, retirement=retirement)
+    if not tolerate_retirement_failure:
+        # The default ending, and the one `cli._cmd_release` has always had: the
+        # original error, of its original type, to a human who is reading the
+        # output of a command they just ran. Raised BEFORE `_repair_orphaned_
+        # record`, deliberately — restoring a record shuts the repository-wide
+        # merge window, and paying that silently behind a traceback would be a
+        # cost nobody chose. The status move stands (see above), so what the
+        # operator is looking at is a task that IS pending with its artefacts
+        # still on disk.
+        raise first_failure
+    resumable = _worker_can_resume(recorded)
+    _repair_orphaned_record(task_id, execution_store, recorded, problems, resumable)
+    stale_record = _surviving_execution_record(task_id, execution_store)
+    return Release(
+        task=task,
+        artifacts_retired=False,
+        obstacle="; then ".join(problems),
+        stale_worker_path=_surviving_worker_path(task_id, worker_repos),
+        stale_execution_record=stale_record,
+        residue_resumable=stale_record and resumable,
+    )
+
+
+def _archived_record_path(task_id: str, execution_store, reason: str):
+    """Where the FIRST retirement attempt filed the execution record, when the
+    retry could not report it because there was nothing left to file.
+
+    Best-effort and read-only. Built from the naming
+    `TaskExecutionStore.archive` documents (`archive/<task_id>-<label>.json`,
+    label = `<reason>-<stamp>`), newest last because the stamp sorts
+    lexicographically; `None` when nothing matches, which reports exactly as it
+    did before — an unknown path is better said as unknown.
+    """
+    try:
+        matches = sorted(
+            (Path(execution_store.directory) / "archive").glob(
+                f"{task_id}-{reason}-*.json"
+            )
+        )
+    except (AttributeError, OSError):  # pragma: no cover - store without a directory
+        return None
+    return matches[-1] if matches else None
+
+
+def _loaded_execution(task_id: str, execution_store):
+    """The live `TaskExecution` before a retirement is attempted, or None.
+
+    Read for one purpose — `_repair_orphaned_record` — and unreadable counts
+    as absent: a record this cannot parse is one it must not try to put back.
+    """
+    if execution_store is None:
+        return None
+    try:
+        return execution_store.load(task_id)
+    except (StateError, OSError):  # pragma: no cover - unreadable record
+        return None
+
+
+def _worker_can_resume(recorded) -> bool:
+    """Would the next dispatch RESUME the worker this record names, rather
+    than try to create one over it?
+
+    The same question `_dispatch_task_postcommit` asks
+    (`worker_repo_is_reusable`: the directory is the top level of a git
+    repository and is on the recorded branch), asked here so the repair below
+    is a checked promise instead of a hopeful one. A directory that merely
+    exists does NOT qualify, and that is the common shape of a half-written
+    worker.
+    """
+    if recorded is None or not recorded.worktree_path:
+        return False
+    return worker_repo_is_reusable(Path(recorded.worktree_path), recorded.task_branch)
+
+
+def _repair_orphaned_record(
+    task_id, execution_store, recorded, problems, resumable: bool
+) -> None:
+    """Put the execution record BACK beside a worker the next dispatch can
+    actually resume — and ONLY then.
+
+    `retire_execution` files the record first and the worker second (its own
+    ordering rule), so a worker half that fails leaves the two halves split:
+    the record archived, the worker still at `workers/<task_id>`. When that
+    worker is resumable, the split is pure loss — with no record the dispatch
+    takes the first-dispatch branch and `WorkerRepoManager.create` refuses to
+    write into the directory that is still there, discarding a round that could
+    have been continued. Re-saving the record restores exactly what a killed
+    process leaves, which the resume path already handles.
+
+    **The `resumable` gate is what makes that trade honest, and it is not
+    optional.** A live record holds the merge window shut
+    (`cli._merge_window_blockers` exempts a record only for a terminal task, a
+    PUBLISHED candidate, a base already behind the head, or a worker that is
+    GONE — none of which this residue satisfies), and the window is the
+    repository-wide merge sweep, not this one task. Paying that to save a
+    resumable round is worth it; paying it for a worker the next dispatch would
+    refuse anyway buys nothing and hides the refusal behind a stalled sweep.
+    So a non-resumable residue is left SPLIT and reported as the directory an
+    operator has to move.
+
+    Re-SAVED from the object read before the attempt, rather than moved back
+    out of `archive/`: the in-memory record is the authoritative copy, and
+    reaching into the archive would need this module to spell a filename only
+    `TaskExecutionStore` should own — with nothing better to do if that move
+    failed too. The cost is one stale duplicate under `archive/`, which no
+    reader looks at (`cli._merge_window_blockers` and `dashboard.merge_states`
+    glob `executions/*.json`, which does not recurse).
+
+    The restored record carries its `candidate_sha`, `review_round` and
+    `attempt_count` forward, so the resumed dispatch continues under the
+    counters the displaced round had already spent (`_park_round_cap` reads the
+    second, `MAX_TASK_ATTEMPTS` the third). That is the intended reading — it is
+    the same unit of work being continued, not a fresh one — and it is stated
+    because a repair that quietly RESET them would look identical here and
+    would hand the task a budget it had already used.
+
+    Best-effort and never fatal. A repair that itself fails is appended to
+    `problems`, so the caller's `obstacle` carries both halves of what went
+    wrong rather than only the first.
+    """
+    if recorded is None or execution_store is None or not resumable:
+        return
+    if _surviving_execution_record(task_id, execution_store):
+        return  # the record never moved — nothing was orphaned
+    try:
+        execution_store.save(recorded)
+    except OSError as exc:  # pragma: no cover - unwritable executions dir
+        problems.append(f"the execution record could not be restored either: {exc}")
+
+
+def _surviving_worker_path(task_id: str, worker_repos) -> str:
+    """The worker repo a failed retirement left behind, or `""`.
+
+    Reported rather than merely counted because it is the one thing that
+    BREAKS the next dispatch (`WorkerRepoManager.create` refuses to write into
+    an existing directory), and because the remedy is a single `mv` an
+    operator can only run if they are told the path. Best-effort: a manager
+    that cannot even answer where the repo would be is not worth failing a
+    release over.
+    """
+    if worker_repos is None:
+        return ""
+    try:
+        path = worker_repos.path_for(task_id)
+        return str(path) if path.exists() else ""
+    except (ValueError, OSError):  # pragma: no cover - a manager that cannot answer
+        return ""
+
+
+def _surviving_execution_record(task_id: str, execution_store) -> bool:
+    """Is the LIVE execution record still there after a failed retirement?
+
+    The silent half of the pair: a surviving record announces nothing and
+    holds the merge window shut (`cli._merge_window_blockers`), so a release
+    that could not move it has to say so itself.
+    """
+    if execution_store is None:
+        return False
+    try:
+        return execution_store.load(task_id) is not None
+    except (StateError, OSError):  # pragma: no cover - unreadable record
+        return True
+
+
+def _preemption_stop_reason(target: Task, displaced_id: str, record: dict) -> str:
+    """`LoopState.stop_reason` for a preempted session — THREE endings, not two.
+
+    A release is two durable steps, so a preemption has three outcomes and
+    each needs its own sentence: the status moved and the artefacts were
+    quarantined (ordinary); the status moved but the artefacts did not (the
+    task is selectable again, and one directory has to be moved by hand before
+    it can be); the status did not move at all. Collapsing the middle case into
+    either neighbour is what the earlier two-way message did — it reported a
+    task that WAS pending as "NOT returned to pending", sending an operator to
+    fix a status that was already correct while the residue that actually
+    blocks the next dispatch went unnamed.
+    """
+    head = f"preempted for urgent task {target.id} ({target.urgent_reason}); "
+    if not record["displaced_returned_to_pending"]:
+        return f"{head}{displaced_id} was NOT returned to pending — {record['obstacle']}"
+    if record["displaced_artifacts_retired"]:
+        return f"{head}{displaced_id} was returned to pending"
+    residue = record["stale_worker_path"] or "(no worker repo left behind)"
+    if record["residue_resumable"]:
+        return (
+            f"{head}{displaced_id} was returned to pending, but its execution "
+            f"could not be retired — {record['obstacle']}. Its worker repo "
+            f"({residue}) and execution record were left paired and resumable, "
+            "so the next dispatch of it continues that round; the merge window "
+            "stays shut until that round publishes"
+        )
+    return (
+        f"{head}{displaced_id} was returned to pending, but its execution could "
+        f"not be retired — {record['obstacle']}. Move {residue} aside before "
+        f"{displaced_id} is dispatched again — it is not resumable, so the "
+        "dispatch will refuse to create a worker over it"
+    )
 
 
 #: The SECOND budget, and the one that answers "a fault must not spend a task's
@@ -1004,20 +1324,24 @@ class Orchestrator:
         incomplete dependency and would fall silent on the very task that is
         hardest to release (the same reasoning `_refuse_immutable` documents).
 
-        **An AUDIT unit is deliberately NOT displaced**, and that is the same
-        decision as `_dispatch_executor` not refusing an `audit` while a pin is
-        live — the two would otherwise pull against each other and churn.
-        `_start_new_session` sets the outbox to the audit kickoff, so the very
-        session a preemption starts can come back with an `audit`; if that round
-        were then displaced too, each lap would cost a full executor round and
-        leave another quarantined worker, and it would end only when the reviewer
-        happened to pick `implement` — exactly the "a full round per iteration
-        while looking like progress" churn `cli._report_fault_stop` exists to
-        stop. An audit takes no task out of the queue, so displacing it buys
-        nothing the pin does not already buy: the urgent task is still what
-        `next_ready()` returns for the round after it. The cost is bounded at
-        one audit round of delay, and `urgent_awaiting_boundary` makes the wait
-        visible while it happens.
+        **An AUDIT unit already in flight is deliberately NOT displaced.** An
+        audit round holds no task in the queue and its work is a report, so
+        quarantining it mid-write spends the round twice — once to produce the
+        report and once to redo it — to save at most the tail of a round the
+        loop has already paid for. Waiting it out costs the pin nothing it can
+        still get: the urgent task is what `next_ready()` returns for the round
+        after, and `urgent_awaiting_boundary` makes the wait visible while it
+        happens.
+
+        The bound on that wait is ONE round, not one per lap, and it is
+        `_refused_ahead_of_urgent` that supplies it: a FRESH `audit` is refused
+        while the pin is live, and `cli._start_new_session` opens a pinned
+        session on the urgent task rather than on the audit kickoff. Until
+        2026-08-22 neither was true — the session a preemption started invited
+        an `audit` and the gate let it through — so this exemption was load
+        bearing in a way it no longer is. It stays because displacing a
+        read-only report round is still the wrong trade, not because a lap
+        would otherwise churn.
         """
         if not task_id or not self._registry.has(task_id):
             return False
@@ -1041,7 +1365,11 @@ class Orchestrator:
           execution record together — the one implementation, shared with
           `cli._cmd_release`. Only a PLANNED task in flight is displaced at all
           (`_displaced_work_exists`); an audit round is waited out rather than
-          displaced, for the reason recorded there.
+          displaced, for the reason recorded there. When the artefact half
+          fails anyway, the record says so as its own fact
+          (`displaced_artifacts_retired`, `stale_worker_path`) rather than
+          claiming the status move did not happen: it did, durably, before the
+          artefacts were touched.
         * **It records what it took.** `state.preemption` and the
           `task_preempted` transcript entry carry the displaced task, the
           phase the request was first seen at, the phase it was acted on at,
@@ -1111,47 +1439,88 @@ class Orchestrator:
                 execution = None
         released = False
         obstacle = ""
-        retirement = None
+        release = None
         try:
-            _, retirement = release_task_to_pending(
+            release = release_task_to_pending(
                 displaced_id,
                 self._registry,
                 self._execution_store,
                 self._worker_repos,
                 persist=lambda: self._task_store.save(self._registry),
                 reason=PREEMPTION_RETIREMENT_REASON,
+                # A retirement that fails comes back INSIDE the `Release` here
+                # rather than being raised, which is the opposite of what the
+                # same call does for `cli._cmd_release`. Nobody is watching a
+                # preemption: the round is ending either way, and taking the
+                # process down at the one moment an operator is waiting for
+                # their urgent task would be the worse ending. An operator who
+                # ran `release` by hand IS watching, so that path still raises.
+                tolerate_retirement_failure=True,
             )
-            released = True
+            released = release.status_moved
         except (TaskGraphError, StateError, OSError) as exc:
-            # Recorded, never raised, and `obstacle` therefore means exactly one
-            # thing: the release was attempted and genuinely failed. The round
-            # ends either way — re-raising here would take the process down at
-            # the one moment an operator is watching for their urgent task, and
-            # the residue this leaves (a stale worker repo) is the LOUD kind:
-            # the next dispatch of that task refuses by name rather than
-            # proceeding on top of it.
+            # The STATUS half, and the only half that can still raise: a task
+            # the registry will not release (`TaskGraphError`), or a
+            # `tasks.json` that could not be written (`StateError`/`OSError`
+            # out of `persist`). Near-unreachable, since `_displaced_work_exists`
+            # has just read the status `release` demands, and recorded rather
+            # than re-raised because the round ends either way — taking the
+            # process down at the one moment an operator is watching for their
+            # urgent task would be the worse ending.
             #
-            # Near-unreachable, since `_displaced_work_exists` has just read the
-            # status `release` demands. It stands for the filesystem half —
-            # a colliding quarantine label, an unwritable archive directory.
+            # The ARTEFACT half does not arrive here at all, because of the
+            # `tolerate_retirement_failure=True` above: a retirement that fails
+            # comes back inside the `Release` instead, since by then the status
+            # move is already durable and reporting it as "not returned to
+            # pending" was a lie about a task `next_ready` can already see.
             obstacle = str(exc)
             self._log(
                 "preemption_release_failed",
                 data={"displaced_task_id": displaced_id, "error": str(exc)},
             )
+        if release is not None and not release.artifacts_retired:
+            obstacle = release.obstacle
+            self._log(
+                "preemption_retirement_failed",
+                data={
+                    "displaced_task_id": displaced_id,
+                    "error": release.obstacle,
+                    "stale_worker_path": release.stale_worker_path,
+                    "stale_execution_record": release.stale_execution_record,
+                    "residue_resumable": release.residue_resumable,
+                },
+            )
 
+        retirement = getattr(release, "retirement", None)
         record = {
             "urgent_task_id": target.id,
             "urgent_reason": target.urgent_reason,
             "urgent_requested_at": target.urgent_at,
             "displaced_task_id": displaced_id,
             "displaced_returned_to_pending": released,
+            # Separate from the line above, deliberately: the status move is
+            # durable before the artefacts move, so "pending again" and "its
+            # worker repo was quarantined" are two different facts and a
+            # preemption can honestly report the first without the second.
+            "displaced_artifacts_retired": bool(
+                release is not None and release.artifacts_retired
+            ),
             "first_observed_phase": self._urgent_first_seen_phase or phase.value,
             "preempted_at_phase": phase.value,
             "obstacle": obstacle,
             "quarantine_label": getattr(retirement, "label", "") or "",
             "quarantined_worker_path": str(getattr(retirement, "worker_path", "") or ""),
             "archived_execution_record": str(getattr(retirement, "record_path", "") or ""),
+            # The residue, named exactly, plus the one fact that decides what an
+            # operator should do about it. Resumable means the pair was kept and
+            # the next dispatch continues that round, at the cost of a merge
+            # window that stays shut until it publishes; not resumable means a
+            # directory that has to be moved before this task can run again.
+            "stale_worker_path": getattr(release, "stale_worker_path", "") or "",
+            "stale_execution_record": bool(
+                getattr(release, "stale_execution_record", False)
+            ),
+            "residue_resumable": bool(getattr(release, "residue_resumable", False)),
             "displaced_candidate_sha": getattr(execution, "candidate_sha", "") or "",
             "displaced_review_round": getattr(execution, "review_round", 0) or 0,
             "displaced_attempt_count": getattr(execution, "attempt_count", 0) or 0,
@@ -1169,15 +1538,7 @@ class Orchestrator:
         state.outbox_attachment = None
         state.phase = Phase.STOPPED.value
         state.stop_kind = PREEMPTION_STOP_KIND
-        state.stop_reason = (
-            f"preempted for urgent task {target.id} ({target.urgent_reason}); "
-            f"{displaced_id} was returned to pending"
-            if released
-            else (
-                f"preempted for urgent task {target.id} ({target.urgent_reason}); "
-                f"{displaced_id} was NOT returned to pending — {obstacle}"
-            )
-        )
+        state.stop_reason = _preemption_stop_reason(target, displaced_id, record)
         self._store.save(state)
         self._log("task_preempted", data=record)
         self._urgent_first_seen_phase = None
@@ -3828,6 +4189,87 @@ class Orchestrator:
         state.phase = Phase.READY.value
         self._store.save(state)
 
+    def _refused_ahead_of_urgent(self, directive: Directive, is_audit: bool) -> bool:
+        """Refuse an executor dispatch that would run ahead of the urgent pin.
+        True when it refused (the caller returns immediately).
+
+        THE URGENT PIN, enforced rather than merely offered. The pin already
+        puts its task at the head of `next_ready()`, and that is the only task
+        the CONTEXT block briefs (`context.build_context`'s `next_ready`), so
+        the reviewer normally names it — but policy authorizes any READY task by
+        id, so "offered next" is not "dispatched next", and the second one is
+        the whole claim. Refused through `_handle_policy_denial`, the same
+        budget-capped corrective re-prompt every other refused directive gets:
+        the reviewer is told what to send instead and why, and a reviewer that
+        keeps ignoring it runs out of denial budget and ends the run loudly
+        rather than quietly working around the operator.
+
+        **A FRESH `audit` IS REFUSED TOO** (2026-08-22, second round). It was
+        exempt, on the reasoning that an audit takes no task out of the queue —
+        true, but it takes the LOOP, for a measured 1282-second executor round,
+        which is the only thing an urgent request is asking for. The exemption
+        was not idle either: every new session opened on the audit kickoff,
+        including the one a preemption had just started, so the reviewer was
+        being invited to spend that round. `cli._start_new_session` now opens a
+        pinned session on the urgent task instead, which is what makes this
+        refusal a correction rather than a wall — the session is told what to
+        send in the same breath as being told what it may not.
+
+        **A `revise` OF THE AUDIT PSEUDO-TASK IS NOT REFUSED**, and the
+        distinction is not cosmetic. That directive continues an audit arc
+        already in flight — round 1's commit lives in a worker repo that only
+        round 2 can reach (`_resolve_audit_task` resumes the same unit id) — so
+        refusing it would abandon real work to save nothing: the round it
+        would displace is one this loop already paid for. It also cannot
+        smuggle a round in AFTER a preemption, which is the case that has to
+        hold: a preemption clears `state.current_task`, and a revise-of-audit
+        with no audit on record parks (`audit_revise_no_record`) instead of
+        minting a unit.
+
+        `python -m autoloop run --kickoff-audit` builds the audit payload
+        directly rather than through `_start_new_session`, so an operator who
+        runs it while their own pin is live still reaches this refusal. That is
+        left as is deliberately: the two instructions contradict each other,
+        and the refusal names the pin that is being contradicted.
+        """
+        urgent = self._registry.live_urgent_target()
+        if urgent is None:
+            return False
+        if directive.decision is Decision.AUDIT:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "urgent_target_pending",
+                    f"task '{urgent.id}' was marked URGENT by the operator "
+                    f"({urgent.urgent_reason}) and must be the next unit of work "
+                    "dispatched — a fresh `audit` is a full executor round and "
+                    "cannot start ahead of it. Send `implement` with task_id "
+                    f"'{urgent.id}' instead; the roadmap line in the CONTEXT "
+                    "block names it too. The audit is not cancelled — request it "
+                    "again once the urgent task has been dispatched. Nothing was "
+                    "executed and no attempt was spent.",
+                ),
+            )
+            return True
+        if is_audit or directive.decision not in TASK_DECISIONS:
+            return False
+        if directive.task_id == urgent.id:
+            return False
+        self._handle_policy_denial(
+            directive,
+            Verdict.deny(
+                "urgent_target_pending",
+                f"task '{urgent.id}' was marked URGENT by the operator "
+                f"({urgent.urgent_reason}) and must be the next task "
+                f"dispatched — `{directive.decision.value}` of "
+                f"'{directive.task_id}' cannot start ahead of it. Send "
+                f"the same decision for '{urgent.id}' instead; the "
+                "roadmap line in the CONTEXT block names it too. "
+                "Nothing was executed and no attempt was spent.",
+            ),
+        )
+        return True
+
     def _dispatch_executor(self, directive: Directive) -> None:
         """`audit`/`implement`/`revise` all run through the SAME produce-
         then-review commit path (`_dispatch_task_postcommit`) — the legacy
@@ -3838,47 +4280,18 @@ class Orchestrator:
         every directive that reaches this method ends up in its own isolated
         worker repo, committed automatically, reviewed from the immutable
         commit, never from a pre-commit manifest.
+
+        The one gate in front of all three is `_refused_ahead_of_urgent`: while
+        an operator's urgent pin is live, nothing but that task's own dispatch
+        (and a `revise` continuing an audit arc already in flight) may start.
         """
         state = self.state
         is_audit = (
             directive.decision is Decision.AUDIT or directive.task_id == AUDIT_TASK_ID
         )
+        if self._refused_ahead_of_urgent(directive, is_audit):
+            return
         if not is_audit and directive.decision in TASK_DECISIONS:
-            # THE URGENT PIN, enforced rather than merely offered. The pin
-            # already puts its task at the head of `next_ready()`, and that is
-            # the only task the CONTEXT block briefs (`context.build_context`'s
-            # `next_ready`), so the reviewer normally names it — but policy
-            # authorizes any READY task by id, so "offered next" is not
-            # "dispatched next", and the whole claim this exists to make is the
-            # second one. Refused through `_handle_policy_denial`, the same
-            # budget-capped corrective re-prompt every other refused directive
-            # gets: the reviewer is told which task to send instead and why, and
-            # a reviewer that keeps ignoring it runs out of denial budget and
-            # ends the run loudly rather than quietly working around the
-            # operator.
-            #
-            # Deliberately NOT extended to `audit`: an audit takes no task out
-            # of the queue and holds nothing the urgent task needs, so refusing
-            # one would spend denial budget on a round that costs the pin
-            # nothing — and the fresh session a preemption starts opens with the
-            # audit kickoff, so denying audits there is the one refusal that
-            # could wedge the loop.
-            urgent = self._registry.live_urgent_target()
-            if urgent is not None and urgent.id != directive.task_id:
-                self._handle_policy_denial(
-                    directive,
-                    Verdict.deny(
-                        "urgent_target_pending",
-                        f"task '{urgent.id}' was marked URGENT by the operator "
-                        f"({urgent.urgent_reason}) and must be the next task "
-                        f"dispatched — `{directive.decision.value}` of "
-                        f"'{directive.task_id}' cannot start ahead of it. Send "
-                        f"the same decision for '{urgent.id}' instead; the "
-                        "roadmap line in the CONTEXT block names it too. "
-                        "Nothing was executed and no attempt was spent.",
-                    ),
-                )
-                return
             task = self._registry.get(directive.task_id)
             if directive.decomposition is not None:
                 # The approved plan, made durable BEFORE the executor runs, in

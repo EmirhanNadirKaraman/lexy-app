@@ -103,7 +103,12 @@ from .orchestrator import (
     release_task_to_pending,
 )
 from .policy import PolicyConfig, PolicyEngine
-from .prompts import TEMPLATES, kickoff_payload, user_answer_payload
+from .prompts import (
+    TEMPLATES,
+    PromptTemplate,
+    kickoff_payload,
+    user_answer_payload,
+)
 from .publisher import (
     Publisher,
     provision_publisher_repo,
@@ -1279,6 +1284,13 @@ def _report_preemption(state: LoopState) -> None:
     displaced round's committed candidate is still in that worker, and the
     operator's next question is always where it went.
 
+    THREE displaced-task lines, not two, because a release has two durable
+    steps: status moved and artefacts retired, status moved and artefacts NOT
+    retired, or status not moved at all. The middle one is the reason this
+    branches — collapsing it into "NOT returned to pending" sends an operator
+    to fix a status that is already correct — and it carries one of two
+    remedies, keyed on whether the residue is resumable.
+
     Silent for a session that was not preempted, so both callers can call it
     unconditionally on a clean stop.
     """
@@ -1290,13 +1302,44 @@ def _report_preemption(state: LoopState) -> None:
         f"\npreempted for URGENT task {record.get('urgent_task_id')} "
         f"({record.get('urgent_reason')})"
     )
-    if record.get("displaced_returned_to_pending"):
-        print(f"  displaced    {displaced}: in_progress -> pending, selectable again")
-    else:
+    if not record.get("displaced_returned_to_pending"):
         print(
             f"  displaced    {displaced}: NOT returned to pending — "
             f"{record.get('obstacle') or 'no reason recorded'}"
         )
+    elif record.get("displaced_artifacts_retired", True):
+        print(f"  displaced    {displaced}: in_progress -> pending, selectable again")
+    else:
+        # The half-succeeded release, printed as the two facts it is. Merging it
+        # into either neighbour misdirects the operator: "NOT returned to
+        # pending" sends them to fix a status that is already correct, and
+        # "selectable again" on its own hides a residue that keeps the merge
+        # window shut for as long as it survives.
+        print(
+            f"  displaced    {displaced}: in_progress -> pending, selectable again "
+            "— but its execution could NOT be retired: "
+            f"{record.get('obstacle') or 'no reason recorded'}"
+        )
+        if record.get("stale_worker_path"):
+            print(f"  residue      worker repo still at {record['stale_worker_path']}")
+        if record.get("stale_execution_record"):
+            print(
+                f"  residue      the execution record for {displaced} is still live "
+                "— the merge window stays shut while it is"
+            )
+        if record.get("residue_resumable"):
+            print(
+                f"  ACTION       none required: the pair is resumable, so the next "
+                f"dispatch of {displaced} continues that round. The merge window "
+                "reopens when it publishes — retire the pair by hand if it has to "
+                "reopen sooner."
+            )
+        else:
+            print(
+                f"  ACTION       move {record.get('stale_worker_path') or 'the worker repo'} "
+                f"aside before {displaced} is dispatched again — it is not "
+                "resumable, so the dispatch will refuse to create a worker over it."
+            )
     print(
         f"  boundary     request first seen at phase "
         f"{record.get('first_observed_phase')}, acted on at "
@@ -1537,20 +1580,119 @@ def _select_and_kickoff(
     ZERO Claude and ZERO ChatGPT calls.
     """
     if registry.next_ready() is not None:
-        _start_new_session(config, store)
+        _start_new_session(config, store, registry)
         return True
 
     fingerprint = repo_fingerprint(Path.cwd())
     if fingerprint == _load_fingerprint(config):
         return False  # unchanged since the last audit — sleep, make no calls
     _save_fingerprint(config, fingerprint)
+    # No registry passed, and it would change nothing if it were: a live pin
+    # requires its task to be READY, and any READY task makes `next_ready()`
+    # non-None, so this branch is only ever reached with no pin live.
     _start_new_session(config, store)
     return True
 
 
-def _start_new_session(config: AutoloopConfig, store: StateStore) -> None:
+#: The audit kickoff's counterpart for a session opened while an operator's
+#: URGENT pin is live. It exists because the audit kickoff is what the loop says
+#: on EVERY new session, including the one a preemption just started: offered
+#: the audit, a reviewer reasonably answers `audit`, and the urgent task waits
+#: out a full executor round (measured 1282s) that the operator's request was
+#: supposed to skip. `Orchestrator._refused_ahead_of_urgent` refuses that audit,
+#: so this is also what keeps the refusal from being a wall — the session is
+#: told what to send instead, in the same breath.
+#:
+#: It lives HERE rather than in `prompts.TEMPLATES` because `_start_new_session`
+#: is its only caller and `prompts.py` was outside this task's approved paths.
+#: A `PromptTemplate` all the same, so the strictness that makes that library
+#: worth having still applies to this payload: an unknown or missing field
+#: raises `TemplateError` instead of rendering a mangled prompt. The two checks
+#: `test_prompts.py` runs over `TEMPLATES` (strict render, and no template
+#: offering a retired decision) are run over this one in
+#: `test_urgent_preemption.py`, so moving it out of that dict costs it no
+#: coverage.
+URGENT_KICKOFF = PromptTemplate(
+    name="urgent_kickoff",
+    body=(
+        "New session, opened for an URGENT operator request. Task "
+        "{task_id} was marked urgent ({urgent_reason}) and the round in "
+        "flight was ended for it at a safe boundary — no review packet "
+        "was interrupted and nothing was published.\n\n"
+        "{task_id}: {task_title}\n\n{plan_note}\n\n"
+        "Reply `implement` with task_id \"{task_id}\". No other "
+        "`implement`/`revise`, and no fresh `audit`, will be accepted "
+        "until this task has been dispatched — the review, approval and "
+        "publication of its work are entirely unchanged."
+    ),
+)
+
+
+def urgent_kickoff_payload(
+    task_id: str, task_title: str, urgent_reason: str, has_plan: bool
+) -> str:
+    """Open a new session on the operator's urgent task rather than the audit.
+
+    `has_plan` decides ONE sentence, and it is the sentence that makes the
+    difference between this working and only looking like it works. Policy
+    refuses an `implement` that carries no `decomposition` unless the task
+    already holds an approved one (`policy._check_decomposition`), so a kickoff
+    that asked flatly for `implement` would trade audit churn for DENIAL churn
+    on exactly the tasks that have never been planned — and the denial budget
+    ends a run. It is a parameter rather than a registry read so this stays a
+    pure payload builder, like every helper in `prompts.py`: the caller has the
+    registry in hand already.
+    """
+    plan_note = (
+        "This task already has an approved decomposition on record, so the "
+        "directive does not need to carry one — send `decomposition` only if "
+        "you are deliberately reshaping the plan."
+        if has_plan
+        else (
+            "This task has NO approved decomposition yet, so the directive must "
+            "carry one: an `implement` without a plan is refused by policy."
+        )
+    )
+    return URGENT_KICKOFF.render(
+        task_id=task_id,
+        task_title=task_title,
+        urgent_reason=urgent_reason,
+        plan_note=plan_note,
+    )
+
+
+def _start_new_session(
+    config: AutoloopConfig, store: StateStore, registry: TaskRegistry | None = None
+) -> None:
+    """Open the next session, and decide what it OPENS ON.
+
+    Ordinarily the audit kickoff, unchanged: a fresh session offers the
+    repository audit and the reviewer picks from there.
+
+    **With an operator's URGENT pin live it opens on that task instead**
+    (`urgent_kickoff_payload` above), and that is the difference between the
+    preemption reordering the queue and actually saving the operator anything.
+    The session a preemption starts is a NEW session, so before this it opened
+    on the audit kickoff like any other — the reviewer was invited to answer
+    `audit`, `_dispatch_executor` let audits through, and the urgent task waited
+    out a full executor round (measured 1282s) that the whole mechanism exists
+    to skip. The dispatch gate now refuses that audit too, so opening on the
+    audit kickoff would additionally spend denial budget on a question this
+    loop asked itself.
+
+    `registry` is optional so the no-pin callers read unchanged and a caller
+    that has no registry to hand still gets the ordinary kickoff; a missing
+    registry means "no pin", which is the fail-safe direction — one audit round
+    of delay, never a session that cannot start.
+    """
     state = LoopState.new(config.browser.conversation_url)
-    state.outbox = TEMPLATES["audit_kickoff"].render()
+    urgent = registry.live_urgent_target() if registry is not None else None
+    if urgent is None:
+        state.outbox = TEMPLATES["audit_kickoff"].render()
+    else:
+        state.outbox = urgent_kickoff_payload(
+            urgent.id, urgent.title, urgent.urgent_reason, bool(urgent.decomposition)
+        )
     store.save(state)
 
 
@@ -2727,13 +2869,32 @@ def _cmd_release(args: argparse.Namespace) -> int:
     path (`_preempt_for_urgent`), so a preemption cannot rebuild the same
     "moved one of the three" gap one level up. This command keeps its own
     refusal and its own reporting; only the move is shared.
+
+    **A retirement that FAILS propagates**, unchanged and of its original type,
+    for `main` to report and exit 1 on. That is this command's established
+    contract (`test_recovery_commands.py::
+    test_the_record_is_retired_before_the_worker`) and it is kept deliberately:
+    a human ran this command and is reading its output, so a raised error is
+    the loud ending, not a silent one. What it does NOT mean is that nothing
+    happened — the status move is durable first, so the task IS pending again
+    while its worker repo and record are still on disk, and re-running this
+    command will not help (`registry.release` refuses a task that is no longer
+    `in_progress`); move the worker repo aside instead.
+
+    The urgent-preemption caller passes `tolerate_retirement_failure=True` and
+    takes the opposite ending, because nobody is watching a preemption — see
+    `orchestrator.release_task_to_pending`.
+
+    The two "nothing to retire" lines below are about ABSENCE only (a task
+    parked before it ever committed has neither half) and, because a failure
+    now raises before reaching them, cannot absorb one.
     """
     config = load_config(args.config)
     with LoopLock(config.state_dir):
         task_store, registry = _load_tasks(config)
         worker_repos = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
         try:
-            task, retired = release_task_to_pending(
+            released = release_task_to_pending(
                 args.task_id,
                 registry,
                 TaskExecutionStore(config.executions_dir),
@@ -2743,8 +2904,9 @@ def _cmd_release(args: argparse.Namespace) -> int:
         except TaskGraphError as exc:
             print(f"error: {exc}")
             return 1
-        print(f"task {task.id} released: in_progress -> pending")
+        print(f"task {released.task.id} released: in_progress -> pending")
 
+        retired = released.retirement
         if retired.record_path is not None:
             print(
                 f"execution record moved to {retired.record_path} (kept, not "

@@ -2525,6 +2525,59 @@ they are different settings and either may be overridden alone.
 
 ## 13. Autoloop urgent preemption (`python -m autoloop urgent`)
 
+### `policy_denied … a fresh 'audit' is a full executor round and cannot start ahead of it`
+**Symptom:** the reviewer answered `audit` and the loop refused it, re-prompting
+with the urgent task's id. `state.policy_denials` went up by one.
+**Cause:** intended, since 2026-08-22. An audit takes no task out of the queue
+but it takes the LOOP, for a measured 1282-second executor round, which is the
+only thing an urgent request is asking for. Before that date audits were exempt
+and every new session opened on the audit kickoff, so the session a preemption
+had just started invited exactly the round the operator had paid to skip.
+**Fix:** none — send `implement` for the task the denial names. The audit is
+deferred, not cancelled: request it again once the urgent task has been
+dispatched, which consumes the pin. A `revise` continuing an audit arc already
+in flight is NOT refused, so a half-finished audit can still be completed.
+**If it is wedging the loop:** the denial budget is real, and a reviewer that
+keeps answering `audit` will exhaust it and fault-stop. Check that the session
+actually opened on the urgent kickoff (`rg -n 'URGENT operator request'` against
+the outbox in `.autoloop/state.json`); a session opened by
+`run --kickoff-audit` while a pin was live will not have, because that flag
+builds the audit payload directly. Clear the pin or drop the flag.
+
+### A release or a preemption could not retire the execution it left behind
+**Symptom:** `release` exits 1 with the raw failure on stderr (`error:
+quarantine destination <task>-<label> already exists …`, or whatever the
+filesystem said), or `status` shows a preemption whose report says
+`could NOT be retired`, naming a worker repo that is still in `workers/`.
+**Cause:** the status half of a release is made durable BEFORE the artefacts
+move, so a retirement that fails leaves a task that genuinely IS pending with
+its worker repo and execution record still on disk. It is not a failed release
+and the task is selectable again — check with `tasks` before treating the error
+as "nothing happened".
+**Fix, in both cases:** do not re-run `release` — it refuses a task that is no
+longer `in_progress`. Move the worker repo aside, or the next dispatch of that
+task will refuse to create one over it.
+
+The two paths differ in how much they tell you, deliberately. `release` RAISES
+(a human is reading that command's output, and the record has already been
+archived, so the worker repo is the only residue). A preemption reports instead
+— nobody is watching one, and taking the process down while an operator waits
+for their urgent task is the worse ending — **so after a preemption read the
+last line of the report, which is one of exactly two:**
+* *"none required … the pair is resumable"* — the worker repo and its execution
+  record were left PAIRED (`orchestrator._repair_orphaned_record`), which is the
+  same shape a killed round leaves, so the next dispatch of that task reuses the
+  worker and continues the round. The cost: a live execution record holds the
+  merge window shut (`python -m autoloop merge-window`) until that candidate is
+  PUBLISHED — dispatch alone does not reopen it. If the window has to reopen
+  sooner, move the worker to `<workers_root>/../quarantine/<task>-<label>` and
+  the record to `.autoloop/executions/archive/<task>-<label>.json` by hand,
+  under one label.
+* *"move &lt;path&gt; aside …"* — the worker is NOT resumable (not a git
+  repository at that path, or not on the recorded branch), so the record was
+  deliberately not restored and the merge window is not shut. Do the `mv`: the
+  next dispatch of that task refuses to create a worker over that directory.
+
 ### An urgent request was queued and the loop is still working on the old task
 **Symptom:** `urgent` printed `queued URGENT request for '<id>'`, minutes pass,
 and the round in flight keeps going. `tasks` shows the target still `pending`.
@@ -2535,10 +2588,12 @@ request — so a request that lands while the loop is `submitting`, `awaiting` o
 review packet or an approved push. An `executing` phase is a write-capable
 agent inside a worker repo and can legitimately run for twenty minutes.
 **The other ordinary cause:** the round in flight is an AUDIT. Audit rounds are
-waited out rather than displaced — they take no task out of the queue, and
-displacing one would restart a session that opens on the audit kickoff and can
-come straight back with another audit, burning a round per lap. The urgent task
-is still what `next_ready()` returns for the round after it.
+waited out rather than displaced — an audit holds no task in the queue and its
+product is a report, so quarantining it mid-write spends the round twice to save
+the tail of one already paid for. The wait is bounded at that ONE round: since
+2026-08-22 a fresh `audit` is refused while a pin is live, and the session a
+preemption starts opens on the urgent task rather than on the audit kickoff, so
+the loop cannot come back with another audit lap after lap.
 **Check, in this order:** `status` for the phase; then
 `rg -n 'urgent_awaiting_boundary|task_preempted' .autoloop/transcript.jsonl` —
 the first entry means it is waiting and names the phase, the second means it has

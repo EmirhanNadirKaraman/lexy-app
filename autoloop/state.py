@@ -649,6 +649,14 @@ class LoopState:
     #: execution record were moved to. `stop_kind == "preempted"` is what says a
     #: `stopped` session ended this way; this is what says what it cost.
     #:
+    #: TWO SEPARATE TRUTHS about the release, never collapsed into one:
+    #: `displaced_returned_to_pending` is the STATUS half and
+    #: `displaced_artifacts_retired` is the ARTEFACT half, because the status is
+    #: made durable first and a retirement can fail after it. When the second is
+    #: false, `stale_worker_path` and `stale_execution_record` name what
+    #: survived — deliberately left PAIRED, since that is the shape a killed
+    #: round leaves and the next dispatch resumes it rather than refusing.
+    #:
     #: A plain dict, like `current_task` / `task_execution` / `last_rotation`
     #: beside it: it is a record to display and log, nothing branches on its
     #: fields, and a dataclass would need its own loader in `from_dict`.
