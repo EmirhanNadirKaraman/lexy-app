@@ -76,14 +76,29 @@ or `TaskExecution.allowed_paths`, and nothing here enforces either. The check
 that grades the diff is still `tasks.unauthorized_paths` against the execution
 record, run by the orchestrator, exactly as before.
 
-It is re-validated on the way INTO the prompt (`_declared_paths`,
-`_render_path_entry`), because `TaskRegistry.from_dict` bypasses `add_many` and
-therefore bypasses the only check this field ever passes. Rendering an unchecked
-state field as prompt text is how a corrupt `tasks.json` row would put a
-sentence of its own into the section that tells the agent what it may write —
-so the shape is checked, every entry is re-checked, and anything refused is
-flattened onto one labelled line. Both checks only ever NARROW what the prompt
-claims; neither is an enforcement point and neither can widen a scope.
+Every ENTRY is re-validated on the way into the prompt (`_render_path_entry`),
+because `TaskRegistry.from_dict` bypasses `add_many` and therefore bypasses the
+only check this field ever passes. Rendering an unchecked state field as prompt
+text is how a corrupt `tasks.json` row would put a sentence of its own into the
+section that tells the agent what it may write, so anything the loop's own
+validator refuses is flattened onto one labelled line. `_declared_paths` checks
+the CONTAINER, and only so that a `Task` built in code with a non-sequence in
+that field cannot crash this prompt builder — it is not a load-path guard, and
+its docstring says which case it does not catch and why. Both checks only ever
+NARROW what the prompt claims; neither is an enforcement point and neither can
+widen a scope.
+
+One corrupt shape is REPORTED HERE AND NOT FIXED, which is this module's own
+instruction applied to itself. A hand-edited `"approved_paths": "a.py"` is split
+per character by `from_dict`'s `tuple(...)` BEFORE anything here sees it, so the
+field arrives as a well-formed tuple of one-character entries and no check in
+this module can tell it from a genuine list of one-character paths. The prompt
+then states what the loop's own record holds — and `TaskExecution.allowed_paths`
+is seeded from that same corrupt record, so the prompt does not disagree with
+what is enforced. The defect is `tasks.from_dict` accepting a string where the
+declared type is a tuple; `tasks.py` is outside this task's approved paths, so
+it is written down rather than changed (`_declared_paths`,
+`test_implement_executor.py`'s `from_dict` regression).
 
 **Model selection is automatic, deliberately.** `AgentSpec.model` is left at
 its default (`""`), so `ClaudeCliRunner.build_argv` omits `--model` entirely
@@ -576,27 +591,41 @@ _DECOMPOSITION_HEADER = (
 def _declared_paths(task: Task) -> tuple[str, ...]:
     """`task.approved_paths` as a tuple of entries, or `()` for any other shape.
 
-    The SHAPE half of `tasks._validate_approved_paths`, repeated here for the
-    same reason `_render_path_entry` repeats the per-entry half: that validator
-    runs in `add_many`, and `TaskRegistry.from_dict` bypasses `add_many`, so
-    nothing has checked the field by the time this module reads it.
+    A CRASH GUARD for the prompt builder, and nothing more. The section below
+    iterates this field; a `Task` built in code with a bare string in it would
+    be iterated per character, and one with a non-sequence (`5`) would
+    raise `TypeError` from inside a prompt builder — and nothing wraps
+    `ImplementExecutor.execute`, so that would take the round down. Both fall
+    to `()`, the report-only boundary, which narrows what the prompt claims and
+    never widens it.
 
-    Two shapes, both real and both fail-CLOSED to the empty (report-only)
-    boundary rather than to a wider one:
+    **It does NOT catch the corrupt `tasks.json` case, and this is the point
+    worth reading** (revision round 4, 2026-08-22). Round 3's docstring cited
+    `TaskRegistry.from_dict` for both arms; neither is reachable through it.
+    `from_dict` builds the field as `tuple(raw.get("approved_paths", ()))`, so
+    a hand-edited `"approved_paths": "a.py"` arrives here ALREADY SPLIT — as
+    `('a', '.', 'p', 'y')`, a perfectly well-formed tuple — and `None` never
+    arrives at all, because `tuple(None)` raises inside `from_dict`'s own
+    `except (KeyError, TypeError)` and becomes `StateCorruptError` at load. So
+    the string arm below fires only for a `Task` constructed in Python, and the
+    per-character split reaches the prompt unremarked.
 
-      * a bare string. `tuple("a.py")` is `('a', '.', 'p', 'y')`, and three of
-        those four pass the per-entry validator — so the prompt would state four
-        invented one-character paths as this round's authorized scope. This is
-        the exact per-character split `_validate_approved_paths` documents, and
-        `from_dict`'s `tuple(raw.get("approved_paths", ()))` reproduces it from
-        a hand-edited `"approved_paths": "a.py"`.
-      * `None`. `tuple(None)` raises `TypeError`, and nothing wraps
-        `ImplementExecutor.execute`, so a corrupt state field would take the
-        round down from inside a prompt builder. Refusing to state a scope is
-        the recoverable failure; crashing is not.
+    Nothing in this module can fail closed on it without guessing: `('a','p')`
+    from a split and `('a','p')` from two real one-character paths are the same
+    value, and an unfalsifiable guess inside a boundary is the failure class
+    `_ADVERSARIAL_SELF_TEST` sends the agent hunting. What bounds the damage is
+    that the loop is corrupt in the SAME direction: the orchestrator's
+    `_dispatch_task_postcommit` seeds `TaskExecution.allowed_paths` from
+    `effective_approved_paths(task.approved_paths)`, i.e. from the same split
+    tuple — so the prompt states the scope that is actually enforced and
+    invents nothing. The fix belongs in `tasks.from_dict` (validate the shape,
+    as `_persisted_superseded_by` already does for its field); `tasks.py` is
+    outside this task's approved paths, so it is reported rather than changed.
+    Pinned by the `from_dict` regression in `test_implement_executor.py`
+    (`test_a_bare_string_in_tasks_json_is_split_before_this_module_sees_it`),
+    which builds the Task through the real load path rather than around it.
 
-    Falling to `()` narrows what the prompt claims and never widens it, and
-    enforcement is untouched either way: `tasks.unauthorized_paths` grades the
+    Enforcement is untouched either way: `tasks.unauthorized_paths` grades the
     diff against `TaskExecution.allowed_paths`, which this module neither reads
     nor writes.
     """
@@ -640,9 +669,10 @@ def _agent_prompt(
         # READ here and nowhere else in this module — see
         # `_approved_paths_section` for why the raw field rather than
         # `effective_approved_paths`, and why stating it grants nothing. Read
-        # through `_declared_paths`, not `tuple(...)` directly: the field has
-        # passed no validator on the load path, and a bare string would split
-        # per character into invented one-letter "paths".
+        # through `_declared_paths` only so a `Task` built in code with a
+        # non-sequence in that field cannot crash this builder — it is NOT a
+        # load-path guard, and `from_dict` splits a bare string per character
+        # before this line ever runs (see that docstring).
         _approved_paths_section(_declared_paths(task)),
     ]
     cleanup = _cleanup_instruction(cleanup_paths)

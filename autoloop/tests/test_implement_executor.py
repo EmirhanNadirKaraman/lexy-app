@@ -12,6 +12,7 @@ import pytest
 
 from autoloop.audit.agents import AgentResult, AgentSpec
 from autoloop.contract import Decision, Directive
+from autoloop.errors import StateCorruptError
 from autoloop.git_gateway import GitGateway
 from autoloop.implement_executor import (
     IMPLEMENT_DISALLOWED_TOOLS,
@@ -25,7 +26,7 @@ from autoloop.implement_executor import (
     implement_agent_runner,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine
-from autoloop.tasks import Task
+from autoloop.tasks import Task, TaskRegistry
 from autoloop.transcript import DURATION_KEY, Stopwatch
 
 
@@ -759,28 +760,34 @@ def test_a_refused_entry_is_flattened_and_bounded():
     "bad",
     ["feature.py", None, 5],
     ids=[
-        "bare-string-splits-per-character-into-invented-paths",
-        "none-would-raise-inside-the-prompt-builder",
-        "any-other-non-sequence-is-the-same-corruption",
+        "a-bare-string-would-be-iterated-per-character",
+        "none-would-be-iterated-as-none",
+        "any-other-non-sequence-would-raise-on-iteration",
     ],
 )
-def test_a_misshapen_approved_paths_field_falls_back_to_report_only(bad):
-    """The SHAPE half, and it fails CLOSED — to the report-only boundary,
-    never to a wider one.
+def test_a_task_built_in_code_with_a_misshapen_field_cannot_crash_the_builder(bad):
+    """The CONTAINER guard, and the honest statement of what it is for.
 
-    The bare string is the case worth naming: `tuple("feature.py")` is
-    `('f', 'e', 'a', ...)`, and most of those single characters pass the
-    per-entry validator, so the prompt would have stated ten invented
-    one-character paths as this round's authorized scope. `from_dict`'s
-    `tuple(raw.get("approved_paths", ()))` reproduces that from a hand-edited
-    `"approved_paths": "feature.py"` without complaint.
+    `_approved_paths_section` iterates this field. A `Task` constructed in
+    Python — this file does it, `cli.py` and `inbox.py` do it — is not checked
+    by anything: `add_many` validates, but only for tasks that go through it.
+    So a non-sequence here would raise `TypeError` from inside a prompt builder
+    and take the whole round down, and a bare string would be iterated per
+    character. Both fall to the report-only boundary instead, which narrows
+    what the prompt claims and never widens it.
+
+    Round 3 asserted the same behaviour but justified it with `from_dict`, and
+    reached it via `object.__setattr__` on a task built by `make_task` — a
+    bypass of the very load path the docstring cited. Neither arm below is
+    reachable through `from_dict` (see the regression test that follows), so
+    this constructs the Task the way the reachable case actually arises and
+    claims nothing about stored state.
 
     Asserted through `_agent_prompt`, not `_declared_paths` alone, because the
     claim is about what the AGENT is told; and the per-character artefacts are
     asserted absent by name, since "report-only wording is present" would also
     pass against a prompt that printed both."""
-    task = make_task()
-    object.__setattr__(task, "approved_paths", bad)
+    task = Task(id="t1", title="Add widget", description="Implement it.", approved_paths=bad)
 
     assert _declared_paths(task) == ()
     prompt = _agent_prompt(task, None)
@@ -789,6 +796,83 @@ def test_a_misshapen_approved_paths_field_falls_back_to_report_only(bad):
     assert "REPORT-ONLY" in prompt
     assert "\n  f\n" not in prompt
     assert "\n  e\n" not in prompt
+
+
+def _registry_from_stored_row(**row):
+    """A `TaskRegistry` built through the REAL persistence path.
+
+    `TaskRegistry.from_dict` is the only way a stored `tasks.json` row becomes a
+    `Task` in production, and it deliberately bypasses `add_many` — so a test
+    that wants to claim anything about what a stored row does to this module has
+    to go through it rather than assigning the field afterwards."""
+    return TaskRegistry.from_dict(
+        {
+            "schema_version": 1,
+            "tasks": [{"id": "t1", "title": "Add widget", "description": "Implement it.", **row}],
+        }
+    )
+
+
+def test_a_bare_string_in_tasks_json_is_split_before_this_module_sees_it():
+    """The regression the review asked for, and it pins a REPORTED defect
+    rather than a fixed one — deliberately, and this docstring is the report.
+
+    Round 3 claimed `_declared_paths` caught a bare-string `approved_paths`
+    coming off disk. It does not, and cannot: `from_dict` builds the field as
+    `tuple(raw.get("approved_paths", ()))`, so `"feature.py"` arrives as the
+    ten-element tuple `('f','e','a',...)` — a well-formed tuple of one-character
+    entries, indistinguishable by any check in this module from a genuine list
+    of one-character paths. The prompt therefore lists them. A guess that told
+    the two apart would be exactly the unfalsifiable guard
+    `_ADVERSARIAL_SELF_TEST` sends agents hunting.
+
+    What bounds it, and why this is not a scope misrepresentation: the loop is
+    corrupt in the SAME direction. `orchestrator._dispatch_task_postcommit`
+    seeds `TaskExecution.allowed_paths` from
+    `effective_approved_paths(task.approved_paths)` — the same split tuple — so
+    the prompt states the scope that is actually enforced against the diff and
+    invents nothing beyond it. That is the property asserted below, and it holds
+    whatever `from_dict` yields.
+
+    The fix belongs in `tasks.from_dict`, which should validate this field's
+    shape the way `_persisted_superseded_by` already validates its own.
+    `tasks.py` is outside this task's approved paths, so it is reported here
+    instead of changed. When it is fixed, `from_dict` will refuse this row and
+    this test should be deleted with the same commit."""
+    registry = _registry_from_stored_row(approved_paths="feature.py")
+    task = registry.get("t1")
+
+    # The load path tuple()-ifies, so the string arm of `_declared_paths` is
+    # unreachable from here — the claim round 3 made, refuted at its source.
+    assert not isinstance(task.approved_paths, str)
+    assert task.approved_paths == tuple("feature.py")
+    assert _declared_paths(task) == task.approved_paths  # NOT the empty fallback
+    assert "the loop has NO approved path list" not in _agent_prompt(task, None)
+
+    # The prompt states the record and nothing more, asserted in BOTH
+    # directions on the parsed lines: every entry the stored field holds is
+    # rendered (nothing silently lost), and every rendered line begins with an
+    # entry the stored field holds (nothing invented — the actual scope risk).
+    section = _approved_paths_section(_declared_paths(task))
+    rendered = {line.strip() for line in section.splitlines() if line.startswith("  ")}
+    usable = {c for c in "feature.py" if c != "."}
+    assert usable <= rendered
+    assert all(entry.split()[0] in set(task.approved_paths) for entry in rendered)
+    # '.' is not a usable path segment, so it is labelled rather than listed —
+    # the one entry the per-entry validator refuses in this corrupt tuple.
+    assert any("NOT a usable path" in line for line in section.splitlines())
+
+
+def test_a_none_approved_paths_in_tasks_json_never_loads_at_all():
+    """The other arm round 3 attributed to the load path, refuted the same way.
+
+    `tuple(None)` raises `TypeError` inside `from_dict`'s own comprehension,
+    which is caught there and re-raised as `StateCorruptError` — so a
+    hand-edited `"approved_paths": null` is refused at load and never reaches a
+    prompt. The `None` arm of `_declared_paths` guards a `Task` built in code,
+    which is what the parametrized test above now says."""
+    with pytest.raises(StateCorruptError):
+        _registry_from_stored_row(approved_paths=None)
 
 
 def test_the_cleanup_instruction_survives_alongside_the_new_section():
