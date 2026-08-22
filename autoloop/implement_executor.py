@@ -66,39 +66,17 @@ the file, but ONLY when that exact path is already in the loop's own
 selects from that record; it can never add to it. Nothing about scope changes:
 an EDIT to the same path is as unauthorized as it ever was.
 
-**The prompt STATES the task's scope; it does not grant it** (impl-01,
-2026-08-22). `_agent_prompt` reads `Task.approved_paths` and renders it under
-the adversarial self-test (`_approved_paths_section`), because that instruction
-needs a boundary and the task text is not one — a description names files as
-context that the task was never authorized to write. Reading that field is the
-only scope contact this module has: nothing here writes `Task.approved_paths`
-or `TaskExecution.allowed_paths`, and nothing here enforces either. The check
-that grades the diff is still `tasks.unauthorized_paths` against the execution
-record, run by the orchestrator, exactly as before.
-
-Every ENTRY is re-validated on the way into the prompt (`_render_path_entry`),
-because `TaskRegistry.from_dict` bypasses `add_many` and therefore bypasses the
-only check this field ever passes. Rendering an unchecked state field as prompt
-text is how a corrupt `tasks.json` row would put a sentence of its own into the
-section that tells the agent what it may write, so anything the loop's own
-validator refuses is flattened onto one labelled line. `_declared_paths` checks
-the CONTAINER, and only so that a `Task` built in code with a non-sequence in
-that field cannot crash this prompt builder — it is not a load-path guard, and
-its docstring says which case it does not catch and why. Both checks only ever
-NARROW what the prompt claims; neither is an enforcement point and neither can
-widen a scope.
-
-One corrupt shape is REPORTED HERE AND NOT FIXED, which is this module's own
-instruction applied to itself. A hand-edited `"approved_paths": "a.py"` is split
-per character by `from_dict`'s `tuple(...)` BEFORE anything here sees it, so the
-field arrives as a well-formed tuple of one-character entries and no check in
-this module can tell it from a genuine list of one-character paths. The prompt
-then states what the loop's own record holds — and `TaskExecution.allowed_paths`
-is seeded from that same corrupt record, so the prompt does not disagree with
-what is enforced. The defect is `tasks.from_dict` accepting a string where the
-declared type is a tuple; `tasks.py` is outside this task's approved paths, so
-it is written down rather than changed (`_declared_paths`,
-`test_implement_executor.py`'s `from_dict` regression).
+**The prompt asks the agent to attack its own claim** (impl-01, 2026-08-22).
+`_ADVERSARIAL_SELF_TEST` is given on every implement AND revise round: hunt the
+cases in which THIS task's own stated claim would still fail, fix only what
+falls inside the scope the task was already authorized against, report the rest,
+and end the report with an `ADVERSARIAL CASES:` enumeration saying where each
+case is handled. It adds an instruction and grants nothing — the tool set, the
+ground rules and worker-repo confinement are untouched, the instruction reads
+nothing off the task and renders no path list, and the enumeration is prose for
+the reviewer that nothing in the loop parses. (This module's one contact with a
+scope-adjacent record is the cleanup path above, which is unchanged and scoped
+by `_apply_recorded_cleanup`'s own docstring.)
 
 **Model selection is automatic, deliberately.** `AgentSpec.model` is left at
 its default (`""`), so `ClaudeCliRunner.build_argv` omits `--model` entirely
@@ -132,7 +110,7 @@ from .executor import ExecutionOutcome
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .stall import DEFAULT_CEILING_SECONDS, PartialWork, StallPolicy, WorkerTreeProbe
-from .tasks import Task, _validate_approved_path, authorized_cleanup_paths
+from .tasks import Task, authorized_cleanup_paths
 from .validation import run_validation_commands
 from .validation_env import ValidationEnv
 from .worker_env import worker_env
@@ -288,36 +266,22 @@ _SMALLEST_REVERSIBLE_READING = (
 #: failure worse.** "Make it robust" is an open invitation to go fix things, and
 #: `changed_paths_outside_approved` has already parked 9 distinct tasks and cost
 #: port-01 its entire branch (10 unapproved files across 8 commits). So the
-#: instruction is pinned to the claim THIS task states and to THIS task's
-#: `approved_paths` — listed directly underneath it by
-#: `_approved_paths_section` — and anything outside that list is reported
-#: rather than fixed.
+#: instruction is pinned to the claim THIS task states and to the scope the task
+#: was already authorized against; a failure outside that scope is REPORTED
+#: rather than fixed, which is the half a reviewer can still act on.
 #:
-#: **The boundary is the approved paths, not the task text** (revision round 2,
-#: 2026-08-22). It was first written as "the files this task's description and
-#: approved decomposition already cover", which is the wrong set twice over: a
-#: description routinely NAMES a file as context that the task was never
-#: authorized to write, and a task with no decomposition was pointed at a
-#: document it does not have. `Task.approved_paths` is the BASIS of what the
-#: loop authorizes the round against — `orchestrator._dispatch_task_postcommit`
-#: seeds and re-syncs `TaskExecution.allowed_paths` from
-#: `effective_approved_paths(task.approved_paths)` on every dispatch — so it is
-#: the one boundary that cannot disagree with the check that later grades the
-#: diff.
-#:
-#: It is the RAW field, deliberately, and not `effective_approved_paths(...)`.
-#: That helper adds `TRACKER_PATHS`, `CLAUDE.md` among them — the instructions
-#: future agents read — and this section's sentence is "fix the failures inside
-#: these files". Six repo-wide paths the task never declared do not belong in
-#: it. The tracker obligation lives in `CLAUDE.md` §12 and is untouched here;
-#: listing the narrower set can only UNDER-state authority, which is the
-#: direction to err in.
-#:
-#: Reading a scope field is new; granting one is not. This module writes
-#: neither `Task.approved_paths` nor `TaskExecution.allowed_paths`, enforces
-#: neither, and the prompt is not the authority on either — `unauthorized_paths`
-#: against the execution record still is. No tool is granted and no ground rule
-#: is relaxed: repeating back what the task already declares does not widen it.
+#: **The scope is named ABSTRACTLY, and no path list is rendered** (revision
+#: round 5, 2026-08-22). Rounds 2–4 read `Task.approved_paths` and listed it
+#: under this instruction as "the only files this round may change", which is
+#: false in the loop's own terms — `effective_approved_paths` also authorizes
+#: the tracker paths every task must update — and it put unvalidated state text
+#: into the one section that says what the agent may write, which then needed
+#: validation and injection handling of its own. Both were unrelated to the
+#: claim this task makes. So `_agent_prompt` reads no scope field, exactly as it
+#: did not before: `tasks.unauthorized_paths` against
+#: `TaskExecution.allowed_paths` remains the only thing that decides what a
+#: round was allowed to change, and this instruction only says which side of
+#: that line a discovered failure gets fixed on.
 #:
 #: **Evidence, not reassurance.** "I checked and it is fine" is unfalsifiable
 #: and costs a reviewer the same read as no answer at all, so the instruction
@@ -339,11 +303,13 @@ _SMALLEST_REVERSIBLE_READING = (
 #: line can never be harvested into the assumptions a reviewer reads most
 #: closely.
 #:
-#: One coupling to know before editing the text: it says "listed below", and
-#: `_approved_paths_section` is what that refers to. That section is rendered
-#: UNCONDITIONALLY — a task with no approved paths gets its own wording rather
-#: than nothing — precisely so the reference cannot dangle, which is what the
-#: earlier "approved decomposition" phrasing did for every task with no plan.
+#: One rule before editing the text: it must not name a document or a list it
+#: does not itself carry. Round 1 said "the files this task's description and
+#: approved decomposition already cover", which pointed a task with no plan at a
+#: document it does not have; rounds 2–4 said "listed below" and had to render
+#: the list to keep the reference alive. The scope sentence stays abstract for
+#: that reason — the prompt already carries the task's own description and its
+#: decomposition, if it has one, and the loop grades the diff either way.
 _ADVERSARIAL_SELF_TEST = (
     "Before you return, ADVERSARIALLY TEST YOUR OWN CLAIM. Validation passing "
     "and the claim holding are DIFFERENT BARS: the reviewer grades whether the "
@@ -358,13 +324,11 @@ _ADVERSARIAL_SELF_TEST = (
     "what it needs is absent or unreadable — the alarm never fires and nothing "
     "says so. An ECHO is the same class: text that was GIVEN to a model, read "
     "back as if it were evidence the model produced.\n"
-    "Fix only the failures inside THIS TASK'S APPROVED PATHS, listed below — "
-    "the paths the task itself declares, and the only files this round may "
-    "change to fix something. Anything outside them you REPORT rather than "
-    "fix. A file the task text merely MENTIONS is not approved unless the "
-    "list names it. This is bounded to the claim you were given — it is not "
-    "permission to improve the code, widen the task, or write a path the "
-    "list does not name.\n"
+    "Fix only the failures that fall INSIDE THIS TASK'S APPROVED SCOPE. A "
+    "failure outside it you REPORT rather than fix, naming the file and what "
+    "breaks, so the next round can pick it up. This is bounded to the claim "
+    "you were given: it is not permission to improve the code, to widen the "
+    "task, or to go fixing whatever you find on the way.\n"
     "Then show your work: \"I checked and it is fine\" is unfalsifiable and "
     "the reviewer cannot verify it. End your report with a section headed\n"
     "  ADVERSARIAL CASES:\n"
@@ -373,136 +337,6 @@ _ADVERSARIAL_SELF_TEST = (
     "arise. List the cases you considered and dismissed too; the reviewer is "
     "checking your reasoning, not only your diff."
 )
-
-
-#: How much of ONE refused entry is shown before it is cut. A refused entry is
-#: an arbitrary string out of loop state — a corrupt or hand-edited `tasks.json`
-#: row can hold a megabyte of it — and this section is prompt text sent to every
-#: round. Enough to recognise which entry was refused, not enough to flood the
-#: prompt with it.
-_REFUSED_ENTRY_MAX_CHARS = 80
-
-#: Everything outside printable ASCII, collapsed to `?` before a refused entry
-#: is shown. The NEWLINE is the whole point — see `_render_path_entry` — but the
-#: substitution is deliberately total rather than newline-only: a refused entry
-#: is by definition not a path the loop's own validator recognises, so there is
-#: nothing in it worth preserving, and "anything that is not plain printable
-#: text" is a rule with no residue to argue about.
-_UNPRINTABLE_RE = re.compile(r"[^\x20-\x7e]")
-
-
-def _render_path_entry(entry: object) -> str:
-    """One line of the approved-path list, rendered so it cannot become prose.
-
-    A WELL-FORMED entry is rendered verbatim, indent and all — those strings are
-    exactly what `tasks.unauthorized_paths` compares the diff against, and a
-    prettified rendering would be a second vocabulary for the same set. For
-    every task the loop actually creates this function is the identity plus two
-    spaces, so the section is byte-identical to what it rendered before.
-
-    **The other branch is the point, and it is a real path** (revision round 3,
-    2026-08-22). `_validate_approved_path` runs in `TaskRegistry.add_many`, and
-    `TaskRegistry.from_dict` deliberately BYPASSES `add_many` — its own comment
-    says "stored tasks were validated on the way in" and it re-validates only
-    `superseded_by`. So the `approved_paths` on a task loaded from `tasks.json`
-    has passed no check in this process, and until this task nothing rendered
-    that field into an agent prompt at all. An entry holding a newline would
-    otherwise be interpolated as its OWN LINE inside the one section whose
-    subject is what this round may write — a sentence the loop never authorized,
-    arriving with the authority of the boundary that bounds the agent. That is
-    precisely the echo/fail-open class `_ADVERSARIAL_SELF_TEST` sends the agent
-    hunting, reaching the agent through the section that names it.
-
-    So an entry the loop's own validator refuses is flattened to printable ASCII
-    on ONE line, cut to `_REFUSED_ENTRY_MAX_CHARS`, and labelled as unusable.
-    Shown rather than dropped: a boundary that silently loses an entry is the
-    same failure in the other direction, and a reviewer has to be able to see
-    that the state is corrupt. The label understates nothing — a changed path
-    cannot match a string that is not a path, since `unauthorized_paths`
-    compares literally, so a refused entry authorizes exactly as much rendered
-    as it does unrendered: nothing.
-
-    THE VALIDATOR IS IMPORTED, never re-expressed. A second copy of the
-    approved-path rule here is the drift `tasks._validate_approved_paths` was
-    extracted to prevent, and a local regex that admitted one shape the real
-    check refuses would put that shape back in the prompt verbatim. Any
-    exception from it is a REFUSAL, not an acceptance: validating is the only
-    reason this call exists, so a validator that cannot answer must not be read
-    as having said yes, and a prompt builder must not be what kills a round over
-    a corrupt state field.
-    """
-    try:
-        _validate_approved_path(entry)
-    except Exception:
-        flat = _UNPRINTABLE_RE.sub("?", str(entry)).strip()
-        if len(flat) > _REFUSED_ENTRY_MAX_CHARS:
-            flat = flat[:_REFUSED_ENTRY_MAX_CHARS] + "..."
-        return (
-            f"  {flat or '(empty)'}   <- NOT a usable path: the loop's own "
-            "approved-path check refuses this entry, so do not write it"
-        )
-    return f"  {entry}"
-
-
-def _approved_paths_section(paths: tuple[str, ...]) -> str:
-    """The task's own `approved_paths`, as the boundary `_ADVERSARIAL_SELF_TEST`
-    refers to — and the ONLY place this module renders a scope.
-
-    UNCONDITIONAL, unlike `_cleanup_instruction`: the empty case gets its own
-    text rather than nothing, because the instruction above says "listed below"
-    and a section that disappears turns that into a dangling reference — the
-    exact defect the earlier "approved decomposition" wording had for every task
-    with no plan.
-
-    **Empty means REPORT-ONLY, not "anything goes".** No approved paths is the
-    state in which the loop refuses to dispatch a write-capable round at all
-    (`orchestrator._dispatch_task_postcommit`, `docs/SECURITY.md` finding #2 /
-    circular ownership), so a prompt reaching an agent in that state is already
-    off the expected path; the fail-CLOSED reading is the only safe one there.
-    It is also the reading that cannot be wrong by much: fixing nothing extra is
-    recoverable in the next round, whereas an unbounded fix in a round with no
-    recorded scope is what `changed_paths_outside_approved` parks tasks for.
-
-    The paths are listed LITERALLY and one per line — no globbing, no
-    reformatting — because they are exactly the strings
-    `tasks.unauthorized_paths` compares the diff against, and a prettified
-    rendering is a second vocabulary for the same set. Interpolating them as
-    text is safe only BECAUSE each one is re-checked here: `_render_path_entry`
-    puts every entry back through `tasks._validate_approved_path` (which admits
-    only `[A-Za-z0-9._-]` per segment — no whitespace, no globs, no newline) and
-    flattens anything it refuses onto one labelled line. Round 2 argued the
-    safety from the creation-time check alone, which is the wrong half of the
-    story: `TaskRegistry.from_dict` bypasses `add_many`, so a stored row's
-    entries reach this function unchecked and an entry with a newline in it
-    would have been rendered straight into the prompt as its own sentence.
-
-    Nothing here grants anything, and the text is careful about what it claims
-    to be: "the paths the task itself declares", NOT "everything the loop
-    authorizes". Those are different sets — the loop enforces
-    `effective_approved_paths(task.approved_paths)`, which adds `TRACKER_PATHS`
-    — and this renders the narrower one, so a sentence saying otherwise would
-    be false in the reviewer's favour. `TaskExecution.allowed_paths` is written
-    by the orchestrator, is neither read nor written in this module, and the
-    post-commit ownership check is unchanged.
-    """
-    if not paths:
-        return (
-            "THIS TASK'S APPROVED PATHS: the loop has NO approved path list "
-            "recorded for this round. So the boundary above is REPORT-ONLY — "
-            "write down every failure you find and fix nothing beyond the "
-            "change the task itself asks for. This states what the task "
-            "already declares; it grants nothing and widens nothing."
-        )
-    listed = "\n".join(_render_path_entry(p) for p in paths)
-    return (
-        "THIS TASK'S APPROVED PATHS — declared by the task itself, and the "
-        "boundary the section above is bounded to:\n"
-        f"{listed}\n"
-        "An entry ending in '/' covers the files under it; every other entry "
-        "is that one file and nothing beside it. This states what the task "
-        "already declares; it grants nothing and widens nothing, and the "
-        "ground rules above still hold in full."
-    )
 
 
 #: The line shape a CLEANUP REQUEST is written on — `REMOVE-OUT-OF-SCOPE:`
@@ -588,53 +422,6 @@ _DECOMPOSITION_HEADER = (
 )
 
 
-def _declared_paths(task: Task) -> tuple[str, ...]:
-    """`task.approved_paths` as a tuple of entries, or `()` for any other shape.
-
-    A CRASH GUARD for the prompt builder, and nothing more. The section below
-    iterates this field; a `Task` built in code with a bare string in it would
-    be iterated per character, and one with a non-sequence (`5`) would
-    raise `TypeError` from inside a prompt builder — and nothing wraps
-    `ImplementExecutor.execute`, so that would take the round down. Both fall
-    to `()`, the report-only boundary, which narrows what the prompt claims and
-    never widens it.
-
-    **It does NOT catch the corrupt `tasks.json` case, and this is the point
-    worth reading** (revision round 4, 2026-08-22). Round 3's docstring cited
-    `TaskRegistry.from_dict` for both arms; neither is reachable through it.
-    `from_dict` builds the field as `tuple(raw.get("approved_paths", ()))`, so
-    a hand-edited `"approved_paths": "a.py"` arrives here ALREADY SPLIT — as
-    `('a', '.', 'p', 'y')`, a perfectly well-formed tuple — and `None` never
-    arrives at all, because `tuple(None)` raises inside `from_dict`'s own
-    `except (KeyError, TypeError)` and becomes `StateCorruptError` at load. So
-    the string arm below fires only for a `Task` constructed in Python, and the
-    per-character split reaches the prompt unremarked.
-
-    Nothing in this module can fail closed on it without guessing: `('a','p')`
-    from a split and `('a','p')` from two real one-character paths are the same
-    value, and an unfalsifiable guess inside a boundary is the failure class
-    `_ADVERSARIAL_SELF_TEST` sends the agent hunting. What bounds the damage is
-    that the loop is corrupt in the SAME direction: the orchestrator's
-    `_dispatch_task_postcommit` seeds `TaskExecution.allowed_paths` from
-    `effective_approved_paths(task.approved_paths)`, i.e. from the same split
-    tuple — so the prompt states the scope that is actually enforced and
-    invents nothing. The fix belongs in `tasks.from_dict` (validate the shape,
-    as `_persisted_superseded_by` already does for its field); `tasks.py` is
-    outside this task's approved paths, so it is reported rather than changed.
-    Pinned by the `from_dict` regression in `test_implement_executor.py`
-    (`test_a_bare_string_in_tasks_json_is_split_before_this_module_sees_it`),
-    which builds the Task through the real load path rather than around it.
-
-    Enforcement is untouched either way: `tasks.unauthorized_paths` grades the
-    diff against `TaskExecution.allowed_paths`, which this module neither reads
-    nor writes.
-    """
-    paths = task.approved_paths
-    if isinstance(paths, str) or not isinstance(paths, (list, tuple)):
-        return ()
-    return tuple(paths)
-
-
 def _agent_prompt(
     task: Task, feedback: str | None, cleanup_paths: tuple[str, ...] = ()
 ) -> str:
@@ -662,18 +449,11 @@ def _agent_prompt(
         # in some case, so it is the last place to drop the instruction to go
         # looking for the next one. Placed here, after the ground rules that
         # bound what it may touch and before the cleanup section, so the
-        # documented cleanup-then-feedback adjacency below is untouched.
+        # documented cleanup-then-feedback adjacency below is untouched. It
+        # reads nothing off the task and renders no path list: the scope it
+        # refers to is the one the loop already authorized and already grades
+        # the diff against, not something this builder restates.
         _ADVERSARIAL_SELF_TEST,
-        # Immediately after it, and also unconditional: the instruction above
-        # says "listed below", so this is what it points at. `approved_paths` is
-        # READ here and nowhere else in this module — see
-        # `_approved_paths_section` for why the raw field rather than
-        # `effective_approved_paths`, and why stating it grants nothing. Read
-        # through `_declared_paths` only so a `Task` built in code with a
-        # non-sequence in that field cannot crash this builder — it is NOT a
-        # load-path guard, and `from_dict` splits a bare string per character
-        # before this line ever runs (see that docstring).
-        _approved_paths_section(_declared_paths(task)),
     ]
     cleanup = _cleanup_instruction(cleanup_paths)
     if cleanup:
@@ -961,10 +741,8 @@ class ImplementExecutor:
 
         Nothing here touches scope. `Task.approved_paths` and
         `TaskExecution.allowed_paths` are not read, not written and not
-        consulted by this method — `_approved_paths_section` states the former
-        in the prompt, which is a description of the loop's authorization and
-        not a grant, and no deletion decision anywhere consults it: this
-        authorizes one unlink of one already-recorded file, and
+        consulted by this method, and no deletion decision anywhere consults
+        them: this authorizes one unlink of one already-recorded file, and
         an ordinary edit to that same path stays exactly as unauthorized as it
         was — it lands, it is recorded out of scope, and the reviewer judges it,
         which is what the 2026-08-05 advisory-scope amendment already does.
