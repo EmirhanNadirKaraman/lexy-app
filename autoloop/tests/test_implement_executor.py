@@ -13,7 +13,14 @@ import pytest
 from autoloop.audit.agents import AgentResult, AgentSpec
 from autoloop.contract import Decision, Directive
 from autoloop.git_gateway import GitGateway
-from autoloop.implement_executor import ImplementExecutor, implement_agent_runner
+from autoloop.implement_executor import (
+    IMPLEMENT_DISALLOWED_TOOLS,
+    WRITE_ALLOWED_TOOLS,
+    ImplementExecutor,
+    _ADVERSARIAL_SELF_TEST,
+    _agent_prompt,
+    implement_agent_runner,
+)
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.tasks import Task
 from autoloop.transcript import DURATION_KEY, Stopwatch
@@ -339,6 +346,224 @@ def test_a_task_with_no_stored_plan_gets_no_decomposition_section(
     executor.execute(implement_directive(), make_task())
 
     assert "Approved decomposition" not in factory_runners[0].specs[0].prompt
+
+
+# ---- adversarial self-test: the instruction, and what it must NOT change ----
+#
+# Measured 2026-08-20 over every reviewer verdict in `transcript.jsonl` (580
+# directives): 229 `revise` to 80 `push`, and 112 of those 229 are one shape —
+# the claim is PARTLY met and one named case is not. The agent optimised for
+# validation passing; the reviewer graded whether the claim held everywhere.
+# `_ADVERSARIAL_SELF_TEST` is the instruction that closes that gap. These tests
+# pin that it is actually given, on every path, and — the larger risk — that it
+# took nothing away while being added.
+
+
+def capture_prompt(main_repo, worker_repo, task, directive):
+    """The prompt a real `execute()` round actually sent, not a hand-built one.
+
+    Goes through the executor rather than calling `_agent_prompt` directly
+    wherever a test's claim is about a DECISION (implement vs revise), because
+    the feedback branch lives in `_run_implementation` (line 650), not in the
+    prompt builder — a direct call cannot exercise it and would pass against an
+    executor that never passed feedback through at all."""
+    captured = []
+
+    def factory(root):
+        runner = FakeAgentRunner(worker_repo=root, write_files={"feature.py": "x = 1\n"})
+        captured.append(runner)
+        return runner
+
+    executor = build_executor(main_repo, worker_repo, factory)
+    outcome = executor.execute(directive, task)
+    return captured[0].specs[0].prompt, outcome
+
+
+@pytest.mark.parametrize("feedback", [None, "the claim still fails for an empty list"])
+def test_the_self_critique_instruction_is_given_for_implement_and_revise(
+    main_repo, worker_repo, feedback
+):
+    """Both decisions, and `revise` is the one that matters most: by then the
+    claim has ALREADY been judged not to hold in some case, so a revise round is
+    the last place to stop asking for the next one."""
+    directive = implement_directive(feedback=feedback)
+    expected = Decision.REVISE if feedback else Decision.IMPLEMENT
+    assert directive.decision is expected  # the helper flips on feedback
+
+    prompt, _ = capture_prompt(main_repo, worker_repo, make_task(), directive)
+
+    assert "ADVERSARIALLY TEST YOUR OWN CLAIM" in prompt
+    # The gap itself, named — passing validation is not the bar being graded.
+    assert "DIFFERENT BARS" in prompt
+    # The class the reviewer demonstrably hunts (port-02, prov-01, hlth-01).
+    assert "FAIL-OPEN" in prompt
+    assert "silently PASSES" in prompt
+    # Evidence, not reassurance.
+    assert "ADVERSARIAL CASES:" in prompt
+    assert "where it is handled" in prompt
+    assert "unfalsifiable" in prompt
+    # And the previous round's feedback still reaches the agent — the addition
+    # sits in the same `parts` list and must not have displaced it.
+    if feedback:
+        assert feedback in prompt
+
+
+def test_the_instruction_is_bounded_to_the_claim_and_forbids_going_fixing(
+    main_repo, worker_repo
+):
+    """THE bound. An unbounded "make it robust" would make the second-worst
+    failure worse: `changed_paths_outside_approved` has already parked 9 tasks
+    and cost port-01 its whole branch. The instruction has to say, in the
+    prompt and not merely in a comment, that this is not permission to wander."""
+    prompt, _ = capture_prompt(
+        main_repo, worker_repo, make_task(), implement_directive()
+    )
+
+    assert "Fix only the failures inside the files this task's description" in prompt
+    assert "Anything outside them you REPORT rather than fix" in prompt
+    assert "not permission to improve the code, widen the task" in prompt
+
+
+def test_a_task_with_no_decomposition_still_gets_a_well_formed_prompt(
+    main_repo, worker_repo
+):
+    """The instruction refers to the approved decomposition, which most tasks
+    have and some do not. A task without one must still get the instruction and
+    a prompt with every other section intact — not a dangling reference and not
+    a silently dropped clause."""
+    task = make_task()
+    assert not task.decomposition
+
+    prompt, outcome = capture_prompt(main_repo, worker_repo, task, implement_directive())
+
+    assert outcome.status == "ok"
+    assert "ADVERSARIALLY TEST YOUR OWN CLAIM" in prompt
+    assert "Approved decomposition" not in prompt
+    # Still well formed: every other section is present and separated.
+    assert task.description in prompt
+    assert "Ground rules:" in prompt
+    assert "SMALLEST REVERSIBLE READING" in prompt
+    assert "\n\n" in prompt
+    assert not prompt.startswith("\n")
+
+
+def test_the_addition_grants_no_tool_and_relaxes_no_ground_rule(
+    main_repo, worker_repo
+):
+    """The largest risk in adding an instruction is what it quietly takes away.
+
+    The tool tuples are asserted VERBATIM rather than by membership: an
+    assertion that `Bash` is still disallowed passes just as well against a
+    tuple that has grown `Bash` an allowed twin."""
+    assert WRITE_ALLOWED_TOOLS == ("Read", "Grep", "Glob", "Edit", "Write")
+    assert IMPLEMENT_DISALLOWED_TOOLS == (
+        "NotebookEdit", "Bash", "Task", "Agent", "WebFetch", "WebSearch",
+    )
+
+    prompt, _ = capture_prompt(
+        main_repo, worker_repo, make_task(), implement_directive()
+    )
+
+    assert "you may Read, Grep, Glob, Edit and Write" in prompt
+    assert "You have no Bash access" in prompt
+    assert "must never attempt to reach any path outside it" in prompt
+    assert "committing is not your job" in prompt
+    assert "Do not delegate to another agent" in prompt
+
+    # Checked against the CONSTANT, not the assembled prompt: the ground rules
+    # legitimately say "no Bash access", so a prompt-level search for a tool
+    # name matches that sentence and proves nothing about the new text.
+    for tool in IMPLEMENT_DISALLOWED_TOOLS:
+        assert tool not in _ADVERSARIAL_SELF_TEST
+
+
+def test_the_addition_widens_no_path_set(main_repo, worker_repo):
+    """`_agent_prompt` reads no scope field — not `Task.approved_paths`, not
+    `TaskExecution.allowed_paths` — and this addition did not start.
+
+    The bound is phrased against the description and decomposition, which are
+    already in the prompt, precisely so that stays true: rendering the approved
+    path list here would be the first step toward an agent treating the prompt
+    as the authority on scope, when the authority is the loop's own check."""
+    task = make_task()
+    task.approved_paths = ("zz/sentinel/only/here.py",)
+
+    prompt, _ = capture_prompt(main_repo, worker_repo, task, implement_directive())
+
+    assert "zz/sentinel/only/here.py" not in prompt
+    assert "approved_paths" not in prompt
+
+
+def test_the_cleanup_instruction_survives_alongside_the_new_section():
+    """Both optional sections at once. The new text is appended into the same
+    `parts` list, and the ordering comment there says cleanup goes after the
+    ground rules and BEFORE the feedback that usually asks for the removal —
+    so this pins that adjacency rather than merely that both strings exist."""
+    task = Task(id="t1", title="Add widget", description="Implement it.")
+    prompt = _agent_prompt(task, "remove the residue you added", ("stray.py",))
+
+    assert "ADVERSARIALLY TEST YOUR OWN CLAIM" in prompt
+    assert "REMOVE-OUT-OF-SCOPE: <repository-relative path>" in prompt
+    assert "does not authorize" in prompt
+    assert prompt.index("stray.py") < prompt.index("remove the residue you added")
+
+
+def test_the_enumeration_reaches_the_reviewer_and_is_never_parsed_as_data(
+    main_repo, worker_repo
+):
+    """The second half of the claim — "the round's output carries that
+    enumeration" — and the fail-open case in the same raw text.
+
+    CARRIED: no extractor exists for this section and none should. The agent's
+    whole output already rides `result.raw_text` -> `ExecutionOutcome.details`
+    -> `TaskExecution.report_details`, which `packet._format_executor_report`
+    renders, so the enumeration reaches the reviewer through plumbing this
+    change does not touch.
+
+    NOT PARSED: `_ASSUMPTION_RE` is `^[ \\t]*assumption:` case-insensitive and
+    anchored per line, and an adversarial-case list is exactly the kind of
+    line-per-item prose that could collide with it. If it did, cases the agent
+    merely CONSIDERED would be promoted into `TaskExecution.assumptions` — the
+    durable record a reviewer reads most closely, and the one place a
+    fabricated entry does the most damage. The real `ASSUMPTION:` line sits
+    among the cases so that `assumptions` is asserted as an exact tuple: an
+    empty-tuple assertion would pass just as well against extraction that is
+    broken outright."""
+    raw = (
+        "I implemented the widget.\n"
+        "ASSUMPTION: read 'recent' as the last 30 days\n"
+        "ADVERSARIAL CASES:\n"
+        "  empty input list — handled in widget.py:build, pinned by test_empty\n"
+        "  assumption of a non-null config — cannot arise, the caller validates\n"
+        "  malformed row read back as a verdict — echo case, rejected in parse()\n"
+    )
+    executor = build_executor(
+        main_repo,
+        worker_repo,
+        make_agent_runner_factory(write_files={"feature.py": "x = 1\n"}, raw_text=raw),
+    )
+    outcome = executor.execute(implement_directive(), make_task())
+
+    assert outcome.status == "ok"
+    assert "ADVERSARIAL CASES:" in outcome.details
+    assert "pinned by test_empty" in outcome.details
+    assert outcome.assumptions == ("read 'recent' as the last 30 days",)
+
+
+def test_the_new_instruction_has_its_own_ceiling():
+    """Mirrors the per-clause ceilings the contract instructions carry
+    (`NEXT_WORK_PREFERENCE` <= 420, `AUDIT_VS_READY_PREFERENCE` <= 470).
+
+    `_agent_prompt` carries NO pinned budget of its own and does not inherit
+    `CONTRACT_INSTRUCTIONS`' 3,700: that ceiling is justified in its own
+    docstring as a PER-TURN tax on text re-sent on every turn of a
+    conversation, whereas this prompt is built once per round (line 658) for a
+    fresh `claude -p`. So nothing was breached by adding this. The ceiling here
+    is self-imposed for the same reason the contract's clauses carry one: this
+    is the part of the prompt most likely to attract elaboration, and the
+    rationale for it belongs in the source comment beside the constant, which
+    costs nothing, rather than in the text, which is re-sent to every agent."""
+    assert len(_ADVERSARIAL_SELF_TEST) <= 1800
 
 
 def test_assumption_lines_are_collected_from_the_agents_own_output(

@@ -234,6 +234,89 @@ _SMALLEST_REVERSIBLE_READING = (
 )
 
 
+#: What the agent is told to do about the ways its OWN change fails, before it
+#: returns.
+#:
+#: **The measured gap this closes** (2026-08-20, over every reviewer verdict in
+#: `transcript.jsonl` — 580 directives): 229 `revise` against 80 `push`, a 74%
+#: rejection rate. Clustering the 229 revise reasons, 112 of them (49%) are the
+#: SAME SHAPE — "still", "despite", "remains": the claim is partly met and one
+#: named case is not. A further 16 (7%) are fail-open ("silently disable", "can
+#: mistake", "permanently disable"). The rounds were not sloppy; they were
+#: CALIBRATED DIFFERENTLY. Everything else in this prompt points the agent at
+#: making the change, and `_run_implementation` then grades it by whether
+#: validation passed — while the reviewer grades whether the task's one stated
+#: claim holds in EVERY case. Nothing here asked the agent to look for how its
+#: own change fails, so half of all rounds died in the gap between those two
+#: bars. This is the reviewer's own job, handed back one step earlier, where the
+#: agent still has the context and the tools to act on it.
+#:
+#: **Bounded on purpose, because the unbounded version makes the SECOND-worst
+#: failure worse.** "Make it robust" is an open invitation to go fix things, and
+#: `changed_paths_outside_approved` has already parked 9 distinct tasks and cost
+#: port-01 its entire branch (10 unapproved files across 8 commits). So the
+#: instruction is pinned to the claim THIS task states and to the files its
+#: description and decomposition already cover, and anything outside that is
+#: reported rather than fixed. Note what it does NOT do: it reads no scope field
+#: — `Task.approved_paths` and `TaskExecution.allowed_paths` are still neither
+#: read nor written anywhere in this module — grants no tool, and relaxes no
+#: ground rule. It adds an instruction and nothing else.
+#:
+#: **Evidence, not reassurance.** "I checked and it is fine" is unfalsifiable
+#: and costs a reviewer the same read as no answer at all, so the instruction
+#: asks for the cases considered AND where each is handled. A reviewer can check
+#: that artifact against the diff instead of deriving the case list from
+#: scratch.
+#:
+#: **The enumeration is DELIBERATELY NOT PARSED.** No regex, no
+#: `ExecutionOutcome` field, no packet section — unlike `_ASSUMPTION_RE` and
+#: `_CLEANUP_RE`, which exist because something COMPUTES with what they match (a
+#: durable cross-round record; an actual unlink). Nothing computes with this: it
+#: is prose for a human reviewer, and it already reaches them, because
+#: `result.raw_text` rides to `ExecutionOutcome.details` and on into
+#: `TaskExecution.report_details`, which `packet._format_executor_report`
+#: renders. Adding an extractor would mean a new field in `worktask.py` and a
+#: new section in `packet.py` to carry text that is already carried. The heading
+#: is a fixed string so a reviewer can find it by eye; it is not an anchor, and
+#: it deliberately collides with neither regex above, so an adversarial-case
+#: line can never be harvested into the assumptions a reviewer reads most
+#: closely.
+#:
+#: One coupling to know before editing the text: it refers to the "approved
+#: decomposition" in LOWER CASE, and two tests assert that a task without a plan
+#: gets no `"Approved decomposition"` heading. Only capitalisation separates the
+#: reference from the heading, so capitalising it here turns those tests red —
+#: which is the right outcome (the assertion is doing its job), but the reason
+#: would be obscure without this note.
+_ADVERSARIAL_SELF_TEST = (
+    "Before you return, ADVERSARIALLY TEST YOUR OWN CLAIM. Validation passing "
+    "and the claim holding are DIFFERENT BARS: the reviewer grades whether the "
+    "one claim this task states holds in every case, and most rejected rounds "
+    "die in that gap. So spend your last effort trying to BREAK your own "
+    "change — hunt the inputs and states in which the claim you were asked to "
+    "make would still fail: empty, missing, malformed or unavailable input, "
+    "the boundary, the error path, the case an earlier round already got "
+    "wrong.\n"
+    "Look hardest at FAIL-OPEN failures, where rounds most often lose: a check "
+    "that silently PASSES, or a guard that quietly switches itself off, when "
+    "what it needs is absent or unreadable — the alarm never fires and nothing "
+    "says so. An ECHO is the same class: text that was GIVEN to a model, read "
+    "back as if it were evidence the model produced.\n"
+    "Fix only the failures inside the files this task's description and "
+    "approved decomposition already cover. Anything outside them you REPORT "
+    "rather than fix. This is bounded to the claim you were given — it is not "
+    "permission to improve the code, widen the task, or write a path the task "
+    "does not name.\n"
+    "Then show your work: \"I checked and it is fine\" is unfalsifiable and "
+    "the reviewer cannot verify it. End your report with a section headed\n"
+    "  ADVERSARIAL CASES:\n"
+    "and under it one line per case, naming the case AND where it is handled — "
+    "the function that handles it, the test that pins it, or why it cannot "
+    "arise. List the cases you considered and dismissed too; the reviewer is "
+    "checking your reasoning, not only your diff."
+)
+
+
 #: The line shape a CLEANUP REQUEST is written on — `REMOVE-OUT-OF-SCOPE:`
 #: first on its line, optionally indented, nothing else in front of it.
 #: Deliberately the same anchoring discipline as `_ASSUMPTION_RE` above,
@@ -339,6 +422,13 @@ def _agent_prompt(
         "job, the orchestrator commits your changes after you finish and "
         "after validation passes. Do not delegate to another agent.",
         _SMALLEST_REVERSIBLE_READING,
+        # Unconditional — every implement AND every revise round gets it. A
+        # revise round is where the claim has ALREADY been judged not to hold
+        # in some case, so it is the last place to drop the instruction to go
+        # looking for the next one. Placed here, after the ground rules that
+        # bound what it may touch and before the cleanup section, so the
+        # documented cleanup-then-feedback adjacency below is untouched.
+        _ADVERSARIAL_SELF_TEST,
     ]
     cleanup = _cleanup_instruction(cleanup_paths)
     if cleanup:
