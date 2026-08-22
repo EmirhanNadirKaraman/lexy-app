@@ -44,6 +44,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
 | S35 | INFO | The merge sweep now auto-resolves ONE conflict shape without a human (2026-08-19, docs-01): two branches each appending change-note lines to the terminal append-only section of `docs/SUMMARY.md` / `docs/TESTS.md`. Bounded: two literal paths, each side's section must extend the merge base byte-for-byte, a conflict anywhere else in the file or the merge refuses the whole merge, and every decision is in the transcript. Replaces S34 (`merge=union`), which disabled conflict detection for the whole file | `autoloop/note_merge.py`, `autoloop/auto_merge.py`, `autoloop/git_gateway.py` |
 | S36 | INFO | `profile` (prof-01, 2026-08-20) is the first command whose whole job is to read `transcript.jsonl`, which holds complete review packets (`request_submitted.data.prompt`) and complete reviewer replies (`response_received.data.raw`). Bounded structurally by a read/render split: `build_profile` reduces the read to counts plus per-stage floats and static stage labels, and `render_profile` receives only that, so the layer that writes to stdout holds no record at all — do not add a flag that prints one. `--transcript FILE` changes only WHICH file is read, and the bound is input-independent | `autoloop/cli.py`, `autoloop/transcript.py` |
+| S37 | INFO | The reviewer transport gained a LIVE agent session (`codex_app_server`, 2026-08-22, codex-01): one long-lived `codex app-server` child instead of a process per turn, and it can ask this client to approve a command or a patch. Bounded by this client's REPLIES — every approval is answered `{"decision": "abort"}`, every other server→client request gets a JSON-RPC error (never silence, which would wedge the turn), argv is a list with no shell and no model text on it, `cwd` stays outside the checkout and stderr is `DEVNULL`. Explicitly NOT a sandbox claim: no preset is selected or enforced | `autoloop/codex/app_server.py`, `autoloop/codex/app_server_conversation.py`, `autoloop/conversation.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -1566,6 +1567,92 @@ eye.
 
 ---
 
+### S37 — The reviewer transport now holds a LIVE agent session instead of a one-shot process — INFO — OPEN (bounded by this client's replies, accepted)
+
+**Location:** `autoloop/codex/app_server.py` (`SubprocessAppServer`,
+`AppServerClient._answer_server_request`, `_read_message`),
+`autoloop/codex/app_server_conversation.py`, `autoloop/conversation.py`
+(`_codex_app_server_factory`).
+
+**Severity:** INFO. No new authority is granted to anything: the reviewer's role
+is unchanged (it answers a self-contained prompt with a directive that the
+existing contract and policy layers still gate), the process runs at the
+operator's own permissions exactly as `codex exec` did, and no new file, socket
+or credential is touched. It is recorded because codex-01 (2026-08-22) changed
+the SHAPE of the reviewer from a process that exits after each turn into a live
+agent session that stays open, asks this client questions, and could ask to run
+a command.
+
+**What actually changed, in security terms.**
+
+1. *A long-lived child process.* `codex app-server` is spawned once by `attach()`
+   and lives until `close()`, where `codex exec` was one process per turn. It is
+   started from an argv LIST — never a shell — and nothing model-authored can
+   reach that list at all: prompts travel as JSON on stdin, which also removes
+   the 700 KB argv ceiling `codex/conversation.py` had to defend with a size
+   refusal.
+2. *The server can ask this client to do things.* `ServerRequest` in the
+   committed protocol includes `applyPatchApproval`, `execCommandApproval`,
+   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`,
+   `item/tool/call` and others. This is the real new surface, and it is answered
+   rather than ignored: the two whose response type the reference settles are
+   answered `{"decision": "abort"}`, and every other server→client request gets a
+   JSON-RPC error naming the refusal. **Silence is the one forbidden answer** —
+   the server blocks on its own request, the turn dies at the timeout, and
+   nothing in the transcript says why.
+3. *`cwd` outside the checkout, unchanged.* Same containment `codex/conversation.
+   py` states and for the same reason: the prompt is self-contained, so the
+   reviewer needs no filesystem, and a containment that does not name a sandbox
+   flag still holds when the flag is renamed. **This is NOT a sandbox claim.** No
+   preset is selected, named or enforced; `codex.sandbox_args` is a `codex_cli`
+   setting and this transport does not read it. Enforcing one is codex-03.
+4. *stderr is `DEVNULL`.* Two reasons, and both are controls: an undrained
+   `stderr=PIPE` deadlocks a chatty child, and this transport classifies failures
+   from protocol fields, so there is no free-form text blob to scan even by
+   accident.
+
+**What reaches the transcript.** Bounded and secret-free by construction, the
+same rule `codex/quota.py`'s `failure_digest` follows: a protocol failure logs
+`{code, error_type, status, message}` with the message truncated to 400
+characters, and a non-JSON line on stdout logs at most 200 characters. Never the
+params — those are the review packet — and never the environment, which carries
+the child's auth.
+
+**The residual.** A live session accumulates history for the life of the process,
+so one thread holds every review packet of that run rather than each turn
+starting clean. That is the FEATURE (`supports_chunked_delivery` depends on it)
+and the exposure is unchanged in kind — the same reviewer account already
+received every one of those packets, one process at a time — but it is a longer
+retention window inside the agent's own context, and codex-03's `thread/resume`
+would extend it across restarts. Re-review this entry when it does.
+
+**Verification check:**
+```bash
+# No shell anywhere in the transport, and stderr must stay DEVNULL.
+# EXPECT: a `list(self._command)` argv, `stderr=subprocess.DEVNULL`, no shell=True:
+rg -n 'Popen|shell=True|stderr=' autoloop/codex/app_server.py
+# Every server->client request must be ANSWERED. Expect the abort branch and the
+# error branch, and no `return` that leaves one unanswered:
+rg -n '_answer_server_request' -A 30 autoloop/codex/app_server.py
+# And the reviewer must still run outside the checkout — expect `Path.home()`
+# as the default cwd:
+rg -n 'Path.home\(\)' autoloop/codex/app_server.py
+```
+Pinned by
+`autoloop/tests/test_codex_app_server.py::test_every_approval_the_server_asks_for_is_answered_abort`
+and `::test_an_unserviceable_server_request_is_refused_never_ignored`, which
+drive a fake server that asks mid-turn and assert on the JSON this client wrote
+back, plus
+`::test_the_real_transport_never_uses_a_shell_and_confines_the_working_dir`.
+
+**Suggested fix if the bound ever breaks:** if a future task needs the reviewer
+to run a command, do not widen `_answer_server_request` — add a named capability
+with its own config gate and its own finding here, so "the reviewer may execute"
+is a decision somebody made rather than a default that arrived with a protocol
+upgrade.
+
+---
+
 ## Verified strengths (do not regress)
 
 These were checked in the 2026-05-24 sweep and are working controls. A PR that weakens one is a security regression.
@@ -2018,6 +2105,8 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 ---
 
 ## Changelog
+
+- **2026-08-22** — **The reviewer seat gained a LIVE agent session as a selectable transport (new finding S37, INFO).** `codex_app_server` drives `codex app-server` over stdio JSON-RPC and holds ONE THREAD, which is what lets a codex seat declare `supports_chunked_delivery` truthfully: an oversized diff reaches the reviewer as numbered parts and the verdict question reaches it afterwards in the same context, where `codex_cli`'s process-per-turn had to omit the diff (port-01 lost an attempt to a 414,596-byte diff against the 400,000-byte packet cap; codex-01's own 228 KB candidate needed an operator patch on 2026-08-21). Security-relevant because the reviewer stops being a process that exits and becomes a session that can ask this client to approve a command or a patch — answered `{"decision": "abort"}` for the two approval requests whose response type the committed protocol settles, and a JSON-RPC error for every other server→client request, never silence. Argv is a list with no shell and carries no model-authored text at all (prompts go as JSON on stdin), `cwd` stays outside the checkout, stderr is `DEVNULL`, and transcript records are bounded and secret-free. **Two things are explicitly NOT claimed**, and no test asserts either: nothing survives a process restart (`thread/resume` exists in the protocol and is never sent) and no sandbox preset is selected or enforced — both are codex-03. Quota detection moved from substring-matching stderr to exact matches on named error fields plus a numeric 429, so an error whose prose merely mentions a usage limit routes as an ordinary failure. `codex_cli` is unchanged and still selectable; `fallback_provider` can still name any of the three. Left open and named: `doctor` does not yet recognise the new provider, and `config.example.toml` documents none of its four keys — both files were outside the task's approved paths. Verification check: `rg -n 'Popen|shell=True|stderr=' autoloop/codex/app_server.py` and `pytest autoloop/tests/test_codex_app_server.py`.
 
 - **2026-08-21** — **A task can now leave `blocked` with nobody typing anything (no new findings; one Verified Strength added).** `cli._reconcile_unblocked_tasks` returns a `blocked` task to the queue as soon as no OPEN blocker names it — the reverse of `_reconcile_retired_blockers`, and the fix for `port-01` sitting quarantined for hours with every one of its blockers already resolved, out of `next_ready()` with nothing justifying it and no supported command able to return it. Recorded as a strength rather than a finding because the sweep only ever removes a state the records no longer support, and it is bounded on four axes that matter: it never writes a blocker record (so it cannot manufacture the operator confirmation `_RESOLUTION_PRECONDITIONS` demands, nor silence `start`/`health`/the heartbeat, all of which read those records directly); it cannot reach an operator hold, gated on `Task.hold_origin` rather than on the absence of a record, since an inbox hold has no record by design and a record-counting rule alone would have released every hold on its first pass; ANY open blocker kind keeps a task out, deliberately wider than the `task_fatal` allowlist the record-closing sweep uses; and a released task returns to `pending` with `approved_paths`, `decomposition`, `depends_on` and every execution counter untouched, so it is dispatchable on exactly the authorization it already had. `answer`'s unblock was tightened in the same change — previously unconditional, so the first of two answers requeued a task the second question was still about. `archive-blocker` — the one closing path an operator reaches for a blocker that refuses every answer — takes the loop lock around the whole command for the same reason: closing the last record naming a quarantined task has to requeue that task in the same operation, which writes `.autoloop/tasks.json`, inside the tree `escape_detector.enumerate_checkout_paths` snapshots (ignored paths included). A live or stale lock refuses the ARCHIVAL too, rather than closing a record and leaving its task blocked with nothing open naming it. Verification check: `rg -n 'blocker_derived_blocked' autoloop/` shows the definition, one `cli` call site and tests, with the `hold_origin` filter intact, and `pytest autoloop/tests/test_blockers.py` — whose section 15 includes a byte-for-byte `asdict` comparison of every blocker record across a sweep and the two lock refusals, each asserting the record is still open.
 

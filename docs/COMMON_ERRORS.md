@@ -2447,6 +2447,82 @@ exactly that, and it is the only kind of test that can tell the two apart.
 
 ---
 
+## 12. Autoloop Codex app-server transport (`codex_app_server`)
+
+### `the codex app-server is framing messages with LSP-style Content-Length headers`
+**Symptom:** every round with `conversation.provider = "codex_app_server"` fails
+immediately, at `attach()`, before any thread is opened.
+**Cause:** this transport speaks newline-delimited JSON, one object per line, and
+the server answered with `Content-Length:` headers instead. That choice is the
+transport's one unverifiable structural decision:
+`docs/codex-app-server-protocol.generated.ts` declares message TYPES, not
+delimiters, so the framing cannot be checked against ground truth the way the
+method names can. The error is raised deliberately rather than letting
+`json.loads` fail on a header line and report a decode error fifty lines into a
+stack trace.
+**Fix:** the codex-cli version in use has changed its framing. Regenerate the
+reference (`codex app-server generate-ts --out <dir> --experimental`), then teach
+`AppServerClient._read_message` / `_send` the header framing — both directions,
+in the same change. Do NOT "fix" it by stripping the header and parsing the rest:
+the body length is what the header is for, and a partial read would silently
+truncate a review packet. Falling back to `codex_cli` is the immediate
+workaround; it is unaffected.
+
+### `thread/start returned no readable thread id` / `thread/read returned a shape this client cannot read`
+**Symptom:** a `codex_app_server` round fails with one of those two sentences,
+each naming the key list it looked for.
+**Cause:** protocol drift in the `v2/` param shapes. The committed reference
+concatenates the 97 top-level declaration files and REFERENCES the `v2/` ones by
+import path without including their bodies — `grep 'export type ThreadStartParams'`
+comes back empty — so `codex/wire.py` reads those fields through tolerant
+candidate lists (`THREAD_ID_KEYS`, `THREAD_ITEMS_KEYS`). Neither error means the
+call failed; it means the ANSWER could not be read. `thread/read`'s refusal is
+deliberately not a False: "not on the thread" and "cannot read the reply" are
+different, and only the first may authorize a resend.
+**Fix:** add the new spelling to the candidate tuple in `codex/wire.py` and
+regenerate the reference in the same change. If the regenerated file now
+CONTAINS the `v2/` bodies,
+`test_the_unpinned_spellings_are_declared_unpinned_and_still_are` fails — that is
+the signal to pin those fields properly instead of widening a guess list.
+
+### A `codex_app_server` turn hangs until the timeout with the reviewer visibly idle
+**Symptom:** `ResponseTimeoutError: the codex app-server did not answer
+turn/start within 900.0s`, and a `turn/interrupt` in the transcript right after
+it.
+**Cause:** most likely a server→client request nobody answered. `ServerRequest`
+includes approval asks (`applyPatchApproval`, `execCommandApproval`,
+`item/commandExecution/requestApproval`, …) and the server BLOCKS on its own
+request; a client that dispatches only responses-by-id and notifications drops
+them silently. `_answer_server_request` exists for exactly this and must answer
+everything — `{"decision": "abort"}` for the two approvals whose response type
+the reference settles, a JSON-RPC error for the rest.
+**Fix:** if a new server request method is wedging turns, it still gets an
+error response, not silence. Do NOT answer a new approval kind `approved` to
+clear the hang: that grants the reviewer command execution, which is `S37`'s
+whole bound (`docs/SECURITY.md`).
+**The other cause, and do not fix it the tempting way:** `turn/completed` never
+arriving. The transport waits for it rather than stopping at the first assistant
+text, because a reviewer that says "let me look at part 3" and keeps working
+would otherwise have its aside taken as the verdict — a silently wrong review,
+where waiting for a completion that never comes is a loud timeout. Fix the
+completion signal, not the wait.
+
+### `codex_app_server` is configured and `doctor` says nothing about codex at all
+**Symptom:** `doctor` reports no `codex_command` / `codex_workdir` /
+`codex_sandbox` rows, and a missing binary first surfaces as a failed review
+round.
+**Cause:** `doctor.py`'s check is gated on `{provider, fallback_provider} &
+{"codex_cli"}`, so it does not recognise the app-server provider. That file was
+outside codex-01's approved paths and is a known gap, recorded in
+`docs/AUTOLOOP.md` §5d-ter and in `docs/SUMMARY.md`'s change notes.
+**Fix:** until it is widened, check by hand: `which codex`, and confirm
+`codex.working_dir` (empty means `$HOME`) is outside the repository. When
+widening it, add `"codex_app_server"` to that set and read
+`codex.app_server_command[0]` rather than `codex.command[0]` for the PATH check —
+they are different settings and either may be overridden alone.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found
