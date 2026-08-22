@@ -337,15 +337,21 @@ def _short_circuit_note(not_run: int) -> str:
     exists: `fail_fast=False`. There is deliberately no config key yet
     (`docs/AUTOLOOP.md` §4h), and pointing a reviewer at a setting nothing reads
     would be a false sentence in the one string this change makes honest.
+
+    It ADVISES cheapest-first rather than claiming it. This function sees a
+    count, never the command list, and nothing re-orders what an operator
+    configured — an expensive-first list is permitted and would simply pay
+    expensive-first, so a note asserting the order was cheapest would be false
+    on exactly the run that most needs to be told.
     """
     return (
         f"STOPPED at the first failing command: the {not_run} command(s) marked "
         f"{NOT_RUN} above were not executed, which is different information from "
-        "PASS. Order is the CONFIGURED order, cheapest first (lint, then the test "
-        "suites, then the serial `isolated` re-run), so a cheap defect costs the "
-        "cheap check and nothing else. To run every command anyway — the 'how much "
-        "is broken' question rather than 'is this approvable' — call "
-        "run_validation_commands(..., fail_fast=False)"
+        "PASS. Order is the CONFIGURED order, preserved exactly as written — "
+        "nothing here re-orders it, so order the list cheapest-first if a cheap "
+        "defect should cost only the cheap check. To run every command anyway — "
+        "the 'how much is broken' question rather than 'is this approvable' — "
+        "call run_validation_commands(..., fail_fast=False)"
     )
 
 

@@ -121,8 +121,13 @@ def test_the_failing_test_is_still_named(tmp_path):
 
 
 def test_the_report_says_it_stopped_and_how_to_run_everything(tmp_path):
-    """A reader has to tell a deliberate stop from a run that lost commands, and
-    a deliberate ORDER from an accidental one."""
+    """A reader has to tell a deliberate stop from a run that lost commands.
+
+    The ordering sentence may only say what this runner knows: the configured
+    order was preserved. Cheapest-first is ADVICE — nothing re-orders an
+    operator's list, so a note asserting the order was cheapest would be false
+    against an expensive-first one.
+    """
     runner, _seen = runner_failing(RUFF)
 
     _ok, summary = run_validation_commands(
@@ -131,7 +136,8 @@ def test_the_report_says_it_stopped_and_how_to_run_everything(tmp_path):
 
     assert "STOPPED at the first failing command" in summary
     assert "2 command(s)" in summary
-    assert "CONFIGURED order, cheapest first" in summary
+    assert "CONFIGURED order, preserved exactly as written" in summary
+    assert "order the list cheapest-first" in summary
     assert "fail_fast=False" in summary
 
 

@@ -3003,7 +3003,9 @@ before the round could report it.
 **What it does now.** The run stops at the first command that fails. Every
 command after it is reported `<command>: NOT RUN` and never launched, followed by
 one bounded note saying it stopped, how many commands did not run, that the order
-is the configured order (cheapest first), and how to ask for a full run.
+is the configured one preserved exactly as written, that a list should be ordered
+cheapest-first (advice — the runner sees a count, not costs, and re-orders
+nothing), and how to ask for a full run.
 
 Four properties hold that up, and each was a way to get this wrong:
 
