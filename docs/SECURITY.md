@@ -12,6 +12,7 @@ Living security tracker for this repo. Not a vulnerability-disclosure policy —
 - **When a finding is fixed:** move it to *Resolved* with the date and the commit/PR. **Do not delete it** — the history is how we avoid regressions and how we remember why the code looks the way it does.
 - **When you find something new:** append to *Open findings* with the same four fields. Add a row to the summary table.
 - **The "Verified strengths" section is load-bearing.** Those are controls we depend on. If a PR weakens one (e.g. widens the settings whitelist, drops an ownership filter), that's a regression, not a refactor.
+- **Findings, resolutions and `Changelog` bullets stay exactly where they are — but a task's own one-line change note goes at the very END of this file**, below the CHANGE-NOTES marker that opens the *Change notes* section (added 2026-08-23, notes-03). That section is the only region the loop's merge sweep may combine without a human; everything above it still conflicts and still needs one. Nothing may follow the last note line, so do not append a `Changelog` bullet or a new `##` section after it — `test_docs_merge.py::test_every_shipped_tracker_ends_with_an_append_only_section` fails if you do.
 
 Severity legend: **HIGH** (exploitable now, real impact) · **MEDIUM** (exploitable under conditions, or a strong amplifier) · **LOW** (hardening / defense-in-depth) · **INFO** (note / good-practice gap, not a vuln today).
 
@@ -42,7 +43,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S30 | MEDIUM | The inbox vocabulary grew from create+priority to six mutation kinds, so a queued request can now rewrite an EXISTING task's `approved_paths` and `description` — falsifying S28's "it creates, never widens" bound. Guarded: nothing `in_progress`/`completed`/`retired` is editable, mutations share creation's validators, `block`/`unblock` cannot launder a loop-raised quarantine, `retire` is excluded, and no dashboard endpoint reaches any of it | `autoloop/inbox.py`, `autoloop/tasks.py` |
 | S32 | MEDIUM | The dashboard's localhost POST now writes `.autoloop/tasks.json` IMMEDIATELY (one field: `priority`), so the loop is no longer the registry's only writer, and `escape_detector.diff_snapshots` gained an `exempt` predicate for that file. Bounded: the exemption needs BOTH an attestation chain in a ledger outside the checkout AND a byte-level check that nothing but `priority` moved, so an agent editing that file still parks the loop loop-fatal | `autoloop/dashboard.py`, `autoloop/tasks.py`, `autoloop/escape_detector.py`, `autoloop/orchestrator.py` |
 | S33 | LOW | Every request's CONTEXT block now renders two task briefs — the READY task's full description and effective scope, and the under-review task's stored decomposition — so text this package did not author sits in the block that carries the review-integrity stamp. Bounded: briefs are appended strictly after every stamp line (pinned by a test whose description contains a forged one), and `verify_review` compares an approval's echo against what was recorded, so a planted stamp yields a refused approval | `autoloop/context.py`, `autoloop/contract.py` |
-| S35 | INFO | The merge sweep now auto-resolves ONE conflict shape without a human (2026-08-19, docs-01): two branches each appending change-note lines to the terminal append-only section of `docs/SUMMARY.md` / `docs/TESTS.md`. Bounded: two literal paths, each side's section must extend the merge base byte-for-byte, a conflict anywhere else in the file or the merge refuses the whole merge, and every decision is in the transcript. Replaces S34 (`merge=union`), which disabled conflict detection for the whole file | `autoloop/note_merge.py`, `autoloop/auto_merge.py`, `autoloop/git_gateway.py` |
+| S35 | INFO | The merge sweep now auto-resolves ONE conflict shape without a human (2026-08-19, docs-01): two branches each appending change-note lines to the terminal append-only section of a tracker. Scope widened 2026-08-23 (notes-03) from `docs/SUMMARY.md` / `docs/TESTS.md` to those plus `docs/SECURITY.md` / `docs/COMMON_ERRORS.md`, each only after it was given such a section. Bounded: four literal paths, each side's section must extend the merge base byte-for-byte, a conflict anywhere else in the file or the merge refuses the whole merge, and every decision is in the transcript. Replaces S34 (`merge=union`), which disabled conflict detection for the whole file | `autoloop/note_merge.py`, `autoloop/auto_merge.py`, `autoloop/git_gateway.py` |
 | S36 | INFO | `profile` (prof-01, 2026-08-20) is the first command whose whole job is to read `transcript.jsonl`, which holds complete review packets (`request_submitted.data.prompt`) and complete reviewer replies (`response_received.data.raw`). Bounded structurally by a read/render split: `build_profile` reduces the read to counts plus per-stage floats and static stage labels, and `render_profile` receives only that, so the layer that writes to stdout holds no record at all — do not add a flag that prints one. `--transcript FILE` changes only WHICH file is read, and the bound is input-independent | `autoloop/cli.py`, `autoloop/transcript.py` |
 | S37 | INFO | The reviewer transport gained a LIVE agent session (`codex_app_server`, 2026-08-22, codex-01): one long-lived `codex app-server` child instead of a process per turn, and it can ask this client to approve a command or a patch. Bounded by this client's REPLIES — every approval is answered `{"decision": "abort"}`, every other server→client request gets a JSON-RPC error (never silence, which would wedge the turn), argv is a list with no shell and no model text on it, `cwd` stays outside the checkout and stderr is `DEVNULL`. Explicitly NOT a sandbox claim: no preset is selected or enforced | `autoloop/codex/app_server.py`, `autoloop/codex/app_server_conversation.py`, `autoloop/conversation.py` |
 | S38 | MEDIUM | The inbox gained `urgent` (preempt-01, 2026-08-22) — the first request kind whose effect is on the LOOP: it ends the round in flight at the next safe boundary and MOVES that task's worker repo and execution record to quarantine, so S30's "nothing in flight can be edited" no longer covers the whole vocabulary. Bounded: the target must be a dispatchable READY task with a non-empty scope, a non-blank reason is required, ONE live pin at a time, it acts only at `_at_round_boundary` (the same predicate the self-upgrade restart uses) so no review packet is stranded, the displaced task moves through the one release path, nothing is deleted (a retirement that fails names what survived, and pairs it back with its record when that worker is resumable), and no packet, stamp, approval or push is touched — the one added gate only DENIES an `implement`/`revise` of another task or a fresh `audit` while the pin is live | `autoloop/inbox.py`, `autoloop/tasks.py`, `autoloop/orchestrator.py`, `autoloop/cli.py` |
@@ -1514,7 +1515,7 @@ re-verifying the condition that fired the park, or just checking something
 correlated with it" is exactly what the second round caught, and it is a
 design question no automated test in this codebase can fully answer.
 
-### S35 — The merge sweep auto-resolves one conflict shape in two documentation trackers — INFO — OPEN (deliberate, narrow, accepted)
+### S35 — The merge sweep auto-resolves one conflict shape in four documentation trackers — INFO — OPEN (deliberate, narrow, accepted)
 
 **Location:** `autoloop/note_merge.py` (`resolve_note_append`, the whole
 decision), `autoloop/auto_merge.py` (`AutoMerger._resolve_note_conflicts`, the
@@ -1522,23 +1523,41 @@ only caller, reached only from `_merge`'s conflict branch),
 `autoloop/git_gateway.py` (`merge_stage_blob` / `add_paths` / `commit_staged`,
 the three primitives it uses).
 
-**Severity:** INFO. No runtime behaviour and no control is reached: the two
+**Severity:** INFO. No runtime behaviour and no control is reached: all four
 files are documentation, and nothing reads them at run time. It is recorded
 because the loop now writes a merge commit that no human approved the CONTENT
 of, which is a class of action worth a tracker entry even when the content is
 prose.
 
 **What it is.** Since 2026-08-19 (docs-01), a `git merge` that conflicts ONLY
-in the append-only change-note section of `docs/SUMMARY.md` / `docs/TESTS.md`
-is resolved by the loop instead of aborted: the two branches' appended lines
-are concatenated and the merge is committed. This replaced `merge=union` on the
-same two paths (S34, resolved below), which was strictly worse — it disabled
-conflict detection for the WHOLE file.
+in the append-only change-note section of a tracker in
+`note_merge.NOTE_TRACKERS` is resolved by the loop instead of aborted: the two
+branches' appended lines are concatenated and the merge is committed. This
+replaced `merge=union` on the same paths (S34, resolved below), which was
+strictly worse — it disabled conflict detection for the WHOLE file.
+
+**Scope widened from two paths to four on 2026-08-23 (notes-03).** It covered
+`docs/SUMMARY.md` and `docs/TESTS.md`; it now also covers `docs/SECURITY.md`
+(this file) and `docs/COMMON_ERRORS.md`. This is a deliberate widening of the
+blast radius, recorded rather than quietly taken, and it was made in the only
+order that keeps the bound below true: **each of those two files was first
+given exactly one `NOTES_MARKER`-delimited append-only section at its end, and
+only then added to the list.** A path in `NOTE_TRACKERS` whose file has no such
+region would have this resolver reasoning about ordinary prose — which is why
+`CLAUDE.md` and `docs/SCHEMA.md`, trackers a task may equally write
+(`tasks.TRACKER_PATHS`), are still NOT in it and still conflict normally. What
+prompted it: a conflict in ONE uncovered path refuses the WHOLE merge, so on
+2026-08-22 bind-01, split-01 and dash-17 were each refused over documentation
+conflicts that were all the same append-at-the-end shape, and the two covered
+files bought nothing.
 
 **Why it is accepted, and what bounds it.**
-- **Two literal paths**, `note_merge.NOTE_TRACKERS` — no glob, no prefix match,
+- **Four literal paths**, `note_merge.NOTE_TRACKERS` — no glob, no prefix match,
   no source file. A conflict on any other path in the same merge refuses the
   whole merge rather than resolving the trackers partially.
+- **Only the region below the marker is ever combined.** Everything above it —
+  in this file, every finding, every verification check and the whole change
+  log — is git's own 3-way merge, and a conflict there refuses the merge.
 - **The base must survive byte-for-byte.** Each side's change-note section must
   hold the merge base's section text as a literal PREFIX, so an edited,
   deleted, rewritten or reordered pre-existing line disqualifies that side.
@@ -1556,25 +1575,34 @@ conflict detection for the WHOLE file.
 
 **The residual, stated rather than hidden.** A defect in `resolve_note_append`
 could combine tracker content in a case a human should have seen, without
-stopping the sweep. That is bounded to the two paths above and to the strict
-prefix precondition, and every tracker edit remains visible in
-`commit_range_paths` and in the reviewed diff — this changes what git resolves
-automatically, not what a reviewer can see. `docs/SECURITY.md` (this file),
-`CLAUDE.md`, `docs/SCHEMA.md` and `docs/COMMON_ERRORS.md` are deliberately NOT
-in scope and still conflict normally.
+stopping the sweep. That is bounded to the four paths above, to the region
+below each file's marker, and to the strict prefix precondition; every tracker
+edit remains visible in `commit_range_paths` and in the reviewed diff — this
+changes what git resolves automatically, not what a reviewer can see. Since
+2026-08-23 the residual reaches this file's own change-note section: a note
+appended below its marker by two branches can be combined without a human. No
+finding, control or verification check lives there — they are all prose above
+the marker, where a conflict still stops the sweep. `CLAUDE.md` and
+`docs/SCHEMA.md` are deliberately NOT in scope and still conflict normally.
 
 **Verification check:**
 ```bash
-# The scope, and that it is still two literal paths:
+# The scope, and that it is still a literal list of four documentation paths:
 rg -n 'NOTE_TRACKERS' autoloop/note_merge.py autoloop/auto_merge.py
+# Each of those files must carry the CHANGE-NOTES marker EXACTLY once (expect
+# `1` per file) — a file with none is a path the resolver was granted without an
+# append-only region, a file with two has auto-resolution silently off:
+rg -c '<!--[ ]CHANGE-NOTES:' docs/SUMMARY.md docs/TESTS.md docs/SECURITY.md docs/COMMON_ERRORS.md
 # No merge attribute may come back alongside it (must print nothing):
 grep -v '^\s*#' .gitattributes | grep -v '^\s*$'
 ```
 Pinned by `autoloop/tests/test_docs_merge.py` — in particular
-`test_the_resolver_is_scoped_to_exactly_the_two_trackers`,
+`test_the_resolver_is_scoped_to_exactly_the_declared_trackers`,
+`test_every_shipped_tracker_ends_with_an_append_only_section`,
+`test_a_tracker_without_the_marker_is_refused_rather_than_combined`,
 `test_a_concurrent_edit_to_tracker_prose_still_conflicts`,
 `test_a_concurrent_edit_to_an_existing_note_line_still_conflicts`,
-`test_one_refusing_tracker_stops_the_whole_merge_even_if_the_other_resolved`
+`test_one_refusing_tracker_stops_the_whole_merge_even_if_the_others_resolved`
 and `test_a_real_conflict_in_a_source_file_still_stops_the_sweep`.
 
 **Suggested fix if it ever needs one:** move the append-only note ledger into
@@ -1582,9 +1610,11 @@ its own per-task file and drop the resolver — the trackers then conflict
 normally again in every case. Not done now because a task's write scope is a
 list of exact paths (`tasks.unauthorized_paths`), so a new ledger file cannot
 be written by the tasks that would need to append to it, and the trackers stop
-being readable as one document. Do NOT "fix" it by adding paths to
-`NOTE_TRACKERS`; every entry there is a file the loop may merge without a
-human.
+being readable as one document. Adding a path to `NOTE_TRACKERS` is not a fix
+for anything and is never the first step: every entry there is a file the loop
+may merge without a human, and a path may only be added AFTER that file carries
+exactly one marker-delimited append-only section — section first, list second,
+in one reviewed commit that shows both.
 
 ---
 
@@ -2293,3 +2323,59 @@ The YouTube origins are in **`script-src`** (not just `frame-src`) because `Yout
 - **2026-05-24** — **S17 resolved:** `POST /phrases/seed` is now admin-gated. New `core/deps.require_admin` (403 `admin_required` for non-admins); `routers/phrases.py:seed_phrases` depends on it. `is_admin` lives in `users.settings`, planted out-of-band and not self-grantable (settings writes are filtered to `DEFAULTS`). Non-admins who could previously reseed now get 403 (intentional — the finding). New `test_phrases_seed_admin.py` +3. Moved to *Resolved findings* (no residual). Open: S2, S9, S12–S15 (+ S3 token-revocation, S4 operational/other-sites, S8 & S10 long-password residuals).
 - **2026-05-24** — **S4 fully resolved:** `DB_SSL_MODE` now covers the two remaining connection families. Alembic `migrations/env.py` appends `?sslmode=<mode>` via new `database.resolve_sslmode()`; the scraper gets `subtitle-scraper/db_ssl.py` and all five `psycopg2.connect()` sites pass `**connect_kwargs()`. Uniform policy (reject `prefer`/`allow`); libpq sites omit the param on unset/disable (preserve driver default → zero behaviour change). `test_database_ssl.py` +8, new `test_scraper_db_ssl.py` +16. The "prod must set `DB_SSL_MODE=require` for a remote DB" item is now a deployment runbook note, not a code residual. Moved to *Resolved findings*. Open: S2, S9, S12–S15 (+ S3 token-revocation, S8 & S10 long-password residuals).
 - **2026-05-24** — **S15 resolved:** added the repo's first CI — `.github/workflows/dependency-audit.yml` runs `pip-audit` (backend) + `npm audit --omit=dev --audit-level=high` (frontend) on push/PR to main + a weekly cron. Both blocking; baseline clean (0 vulns each) so green from day one. Audit tooling installed inline (not added to `requirements.txt`/`package.json`). Moved to *Resolved findings*. Open: S2, S9, S12–S14 (+ S3 token-revocation, S8 & S10 long-password residuals). Remaining open items are architecture/infra: S2/S9 (email verification/CAPTCHA), S3 (JWT/session revocation), S12 (Redis-backed limiter); S13/S14 are INFO (f-string-SQL-in-migration caution, LLM prompt-injection).
+
+---
+
+## Change notes — append ONE new line at the END of this file
+
+Where a task records what it changed in THIS tracker when there is no natural
+home for it above. **This section stays last in the file, and a note is
+appended at the very end of it.**
+
+**It is not where findings go.** A new finding is an *Open findings* entry with
+the four required fields, a fix moves that finding to *Resolved findings*, and
+a security-relevant change still gets its `Changelog` bullet. All of those live
+above, all of them stay ordinary prose that two branches conflict on and a
+human resolves — nothing about that changed. This section is only for the
+one-line "what my task did here" note, and it exists because that note is what
+every parallel branch writes and therefore what every parallel branch collided
+on (measured 2026-08-22: bind-01, split-01 and dash-17 each refused a merge
+over exactly this file).
+
+Five rules. They are not style — they are the precondition the loop's own merge
+path checks before it will combine two branches' notes
+(`auto_merge.AutoMerger._merge` → `autoloop/note_merge.py`; the shape is pinned
+by `autoloop/tests/test_docs_merge.py`, the reasoning is in `CLAUDE.md` §12):
+
+1. **Add a line. Never grow a line.** Do not append your note into an existing
+   finding, bullet or paragraph. The resolver only combines whole lines added
+   AFTER everything that was already here; a grown line is an edit, and the
+   merge stops.
+2. **One note, one line.** Keep it to roughly a sentence. If it needs more, add
+   a second line, or put the detail in the finding above that owns it and leave
+   a pointer here.
+3. **Never edit, delete or reorder a line someone else wrote.** The resolver
+   refuses the whole merge if you do, and that refusal is the point: a
+   rewritten claim needs a human to look at it.
+4. **Order is arrival order, not chronology.** A merge concatenates one
+   branch's appended lines then the other's. Read the `Date` and `Task`
+   columns, never the position.
+5. **Call the marker `CHANGE-NOTES`; never write the comment out again.** The
+   section below opens with an HTML comment the resolver finds by that text,
+   and it requires the marker to appear EXACTLY ONCE in this file. A second
+   copy — the easy way to quote it while documenting how any of this works —
+   makes the resolver decline every parallel merge, silently.
+
+Nothing may follow the last note line: this section is the end of the file, so
+that the next task's append lands at the end of the ledger rather than inside
+whatever came after it. Something appended below it in the older shape — a
+`Changelog` bullet, a new `##` section — fails
+`test_docs_merge.py::test_every_shipped_tracker_ends_with_an_append_only_section`
+rather than landing outside the ledger unnoticed.
+
+<!-- CHANGE-NOTES: append below, one line per note, at the END of the file. Never edit a line above. -->
+
+| Date | Task | Note |
+|---|---|---|
+| 2026-08-23 | notes-03 | This file joined `note_merge.NOTE_TRACKERS` (S35, widened to four paths): a merge conflicting only in the section below is now combined by the loop, while a conflict in any finding, control or `Changelog` bullet above the marker still refuses the whole merge. |
+| 2026-08-23 | notes-03 | The section was added BEFORE the path was added to the list, and that order is the rule for any future tracker — a path granted to the resolver without a marker-delimited region is a file whose ordinary prose it would start reasoning about. |
