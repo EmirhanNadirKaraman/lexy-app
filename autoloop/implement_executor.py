@@ -72,11 +72,21 @@ cases in which THIS task's own stated claim would still fail, fix only what
 falls inside the scope the task was already authorized against, report the rest,
 and end the report with an `ADVERSARIAL CASES:` enumeration saying where each
 case is handled. It adds an instruction and grants nothing — the tool set, the
-ground rules and worker-repo confinement are untouched, the instruction reads
-nothing off the task and renders no path list, and the enumeration is prose for
-the reviewer that nothing in the loop parses. (This module's one contact with a
-scope-adjacent record is the cleanup path above, which is unchanged and scoped
-by `_apply_recorded_cleanup`'s own docstring.)
+ground rules and worker-repo confinement are untouched, and the enumeration is
+prose for the reviewer that nothing in the loop parses.
+
+That bound is only actionable if the agent can SEE where the line is, so
+`_scope_instruction` renders it: the effective approved paths, from
+`tasks.effective_approved_paths` — the same function the pre-commit scope gate
+calls (`orchestrator.py:5337`) and the same one `TaskExecution.allowed_paths` is
+re-synced from on every dispatch (`orchestrator.py:4874`, `:4898`). So the list
+the agent reads and the list the loop grades against are one computation, not
+two descriptions of one. Rendering it GRANTS nothing: authorization still comes
+from the Task, this module still neither reads nor writes `allowed_paths`, and
+`tasks.unauthorized_paths` remains the only thing that decides what a round was
+allowed to change. (This module's one contact with a scope-adjacent record is
+the cleanup path above, which is unchanged and scoped by
+`_apply_recorded_cleanup`'s own docstring.)
 
 **Model selection is automatic, deliberately.** `AgentSpec.model` is left at
 its default (`""`), so `ClaudeCliRunner.build_argv` omits `--model` entirely
@@ -110,7 +120,7 @@ from .executor import ExecutionOutcome
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .stall import DEFAULT_CEILING_SECONDS, PartialWork, StallPolicy, WorkerTreeProbe
-from .tasks import Task, authorized_cleanup_paths
+from .tasks import Task, authorized_cleanup_paths, effective_approved_paths
 from .validation import run_validation_commands
 from .validation_env import ValidationEnv
 from .worker_env import worker_env
@@ -270,18 +280,23 @@ _SMALLEST_REVERSIBLE_READING = (
 #: was already authorized against; a failure outside that scope is REPORTED
 #: rather than fixed, which is the half a reviewer can still act on.
 #:
-#: **The scope is named ABSTRACTLY, and no path list is rendered** (revision
-#: round 5, 2026-08-22). Rounds 2–4 read `Task.approved_paths` and listed it
-#: under this instruction as "the only files this round may change", which is
-#: false in the loop's own terms — `effective_approved_paths` also authorizes
-#: the tracker paths every task must update — and it put unvalidated state text
-#: into the one section that says what the agent may write, which then needed
-#: validation and injection handling of its own. Both were unrelated to the
-#: claim this task makes. So `_agent_prompt` reads no scope field, exactly as it
-#: did not before: `tasks.unauthorized_paths` against
-#: `TaskExecution.allowed_paths` remains the only thing that decides what a
-#: round was allowed to change, and this instruction only says which side of
-#: that line a discovered failure gets fixed on.
+#: **The scope is named by RENDERING IT** (revision round 6, 2026-08-22, on the
+#: reviewer's instruction — this reverses round 5, which had removed the list).
+#: The bound above is only usable if the agent can tell an in-scope fix from a
+#: report-only finding, and "your approved scope" does not let it: the agent
+#: cannot see `Task.approved_paths`, and guessing at the line is how a round
+#: either overruns it or, worse, silently declines a fix it was authorized to
+#: make. So `_scope_instruction` below renders the list this sentence means, and
+#: round 5's two objections are answered rather than avoided — the list comes
+#: from `tasks.effective_approved_paths` (so the always-authorized trackers are
+#: IN it, and it is the same computation both scope gates use, not a paraphrase
+#: of one), and the entries are the ones `tasks._validate_approved_path` already
+#: allowlisted to `[A-Za-z0-9._-]` segments, rendered one line per entry so a
+#: record that somehow escaped that check still cannot open a line. Nothing
+#: about authorization moves: `tasks.unauthorized_paths` against
+#: `TaskExecution.allowed_paths` is still the only thing that decides what a
+#: round was allowed to change, and this module still neither reads nor writes
+#: that record.
 #:
 #: **Evidence, not reassurance.** "I checked and it is fine" is unfalsifiable
 #: and costs a reviewer the same read as no answer at all, so the instruction
@@ -306,10 +321,11 @@ _SMALLEST_REVERSIBLE_READING = (
 #: One rule before editing the text: it must not name a document or a list it
 #: does not itself carry. Round 1 said "the files this task's description and
 #: approved decomposition already cover", which pointed a task with no plan at a
-#: document it does not have; rounds 2–4 said "listed below" and had to render
-#: the list to keep the reference alive. The scope sentence stays abstract for
-#: that reason — the prompt already carries the task's own description and its
-#: decomposition, if it has one, and the loop grades the diff either way.
+#: document it does not have. The reference below ("under APPROVED SCOPE") is
+#: safe because `_agent_prompt` renders that section UNCONDITIONALLY — a task
+#: with no approved paths gets the fail-closed branch of `_scope_instruction`,
+#: not an absent section — so the referent exists on every path this prompt
+#: takes.
 _ADVERSARIAL_SELF_TEST = (
     "Before you return, ADVERSARIALLY TEST YOUR OWN CLAIM. Validation passing "
     "and the claim holding are DIFFERENT BARS: the reviewer grades whether the "
@@ -324,11 +340,13 @@ _ADVERSARIAL_SELF_TEST = (
     "what it needs is absent or unreadable — the alarm never fires and nothing "
     "says so. An ECHO is the same class: text that was GIVEN to a model, read "
     "back as if it were evidence the model produced.\n"
-    "Fix only the failures that fall INSIDE THIS TASK'S APPROVED SCOPE. A "
-    "failure outside it you REPORT rather than fix, naming the file and what "
-    "breaks, so the next round can pick it up. This is bounded to the claim "
-    "you were given: it is not permission to improve the code, to widen the "
-    "task, or to go fixing whatever you find on the way.\n"
+    "Fix only the failures that fall INSIDE THIS TASK'S APPROVED SCOPE — the "
+    "exact path list under APPROVED SCOPE below, which is the list the loop "
+    "grades your diff against. A failure outside it you REPORT rather than "
+    "fix, naming the file and what breaks, so the next round can pick it up. "
+    "This is bounded to the claim you were given: it is not permission to "
+    "improve the code, to widen the task, or to go fixing whatever you find "
+    "on the way.\n"
     "Then show your work: \"I checked and it is fine\" is unfalsifiable and "
     "the reviewer cannot verify it. End your report with a section headed\n"
     "  ADVERSARIAL CASES:\n"
@@ -337,6 +355,113 @@ _ADVERSARIAL_SELF_TEST = (
     "arise. List the cases you considered and dismissed too; the reviewer is "
     "checking your reasoning, not only your diff."
 )
+
+
+#: The heading of the section `_ADVERSARIAL_SELF_TEST` points at, and the prose
+#: under the rendered list. Fixed text, no interpolation — the only thing the
+#: task contributes to this section is the path lines between them.
+_SCOPE_HEADING = (
+    "APPROVED SCOPE — the exact paths this round is graded against, and what "
+    'the sentence above means by "this task\'s approved scope":'
+)
+_SCOPE_TRAILER = (
+    "That list is the loop's own answer, not a summary of one: it is "
+    "`tasks.effective_approved_paths` — the paths this task declared, UNION "
+    "the documentation trackers every task is authorized to record itself in "
+    "— which is exactly what your diff is compared against afterwards. An "
+    "entry ending in '/' means that directory and everything under it; any "
+    "other entry means that one file. Being listed is not an instruction to "
+    "touch a file: it is where a failure you find is yours to FIX. A failure "
+    "anywhere else you REPORT, naming the file and what breaks."
+)
+
+#: The fail-closed branch: rendered instead of a list when the task declares no
+#: approved paths at all. It exists so the reference in `_ADVERSARIAL_SELF_TEST`
+#: can never dangle, and it says the safe thing rather than nothing — an absent
+#: section would read as "no limit stated", which is the opposite of what an
+#: empty scope means (`tasks.effective_approved_paths` returns `()` for an
+#: unscoped task precisely so it authorizes nothing). Unreachable in production:
+#: `orchestrator._dispatch_task_postcommit` refuses to dispatch a task with no
+#: `approved_paths` (`approved_paths_missing`) before any agent runs, so the
+#: last sentence asks the agent to say so if it ever reads this.
+_SCOPE_NONE = (
+    "APPROVED SCOPE: none. This task declares no approved paths, so nothing "
+    "here is authorized to change. REPORT what you find — every case, in your "
+    "own report — and change nothing. The loop refuses to dispatch an unscoped "
+    "task, so if you are reading this line at all, say so in your report too."
+)
+
+
+def _scope_entry(path: str) -> str:
+    """One approved-path entry as it appears in the prompt — on ONE line.
+
+    Identity on every entry the loop can actually produce, and deliberately so:
+    `tasks._validate_approved_path` already refuses anything whose segments are
+    not `[A-Za-z0-9._-]` (no whitespace, no control characters, no globs), and a
+    SECOND path validator here is exactly the drift `tasks.unauthorized_paths`'
+    docstring argues against — two implementations of one rule eventually
+    disagree, and this one would be the copy nothing enforces.
+
+    So this is not validation; it is rendering. `Task` is a plain dataclass with
+    no `__post_init__`, so a hand-built or hand-edited record can hold an entry
+    that never went through that check, and the one property this section needs
+    is structural: an entry occupies one line and cannot open another. Every
+    non-printable character (which includes `\\n`, `\\r` and `\\t`) is replaced
+    by a visible escape, so a newline inside an entry can no longer forge a
+    heading or a ground rule on a line of its own. Nothing is dropped or
+    truncated — the entry stays legible, and a reviewer reading the prompt sees
+    exactly what was in the record.
+
+    This half is about NEWLINES only. An entry that needs no newline because it
+    simply BEGINS with `ASSUMPTION:` or `REMOVE-OUT-OF-SCOPE:` is stopped by the
+    `- ` bullet `_scope_instruction` renders it behind, not by anything here —
+    see that function for why the two extractors' refusal of a bullet prefix is
+    the control that closes it.
+    """
+    return "".join(
+        ch
+        if ch.isprintable()
+        else (f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}")
+        for ch in path
+    )
+
+
+def _scope_instruction(paths: tuple[str, ...]) -> str:
+    """The APPROVED SCOPE section: `paths`, one per line, under a fixed heading.
+
+    `paths` is `tasks.effective_approved_paths(task.approved_paths)` and nothing
+    else — see `_agent_prompt`, the sole caller, for why that function rather
+    than the raw field or a read of `TaskExecution.allowed_paths`.
+
+    NEVER truncated, at any length. A silently elided entry tells the agent an
+    authorized file is out of scope, so it reports a fix it was allowed to make
+    and the round dies on the same "still fails in one case" verdict this whole
+    instruction exists to prevent — a fail-open of exactly the class the text
+    above asks the agent to hunt. There is no pinned budget on this prompt to
+    breach (it is built once per round for a fresh `claude -p`, unlike
+    `contract.CONTRACT_INSTRUCTIONS`, which is re-sent every turn), and the
+    number of approved paths is bounded by what a reviewer approved.
+
+    **The `- ` bullet is load-bearing, not decoration.** `_ASSUMPTION_RE` and
+    `_CLEANUP_RE` both accept leading WHITESPACE (`^[ \\t]*<anchor>:`), so a
+    plainly indented entry that merely STARTS with one of those anchors — an
+    `approved_paths` entry reading `ASSUMPTION: the reviewer approved this`, or
+    `REMOVE-OUT-OF-SCOPE: autoloop/obsolete.py` — sits at a matching position
+    the moment an agent echoes its own prompt back: a fabricated disclosure in
+    the durable record, or a deletion request nothing asked for. No newline is
+    needed for that; escaping alone does not close it. Both regexes REFUSE a
+    `-`/`*`/`>` prefix by design (see `_ASSUMPTION_RE`'s docstring — prose about
+    the convention must not read as a use of it), so the bullet makes an echoed
+    scope line structurally unharvestable by both channels, using a property
+    those anchors already have and already test. It costs nothing here because
+    nothing asks the agent to copy a scope path verbatim — unlike
+    `_cleanup_instruction`, whose list must stay bare so a path can be copied
+    into an exact-match request.
+    """
+    if not paths:
+        return _SCOPE_NONE
+    listed = "\n".join(f"  - {_scope_entry(p)}" for p in paths)
+    return f"{_SCOPE_HEADING}\n{listed}\n{_SCOPE_TRAILER}"
 
 
 #: The line shape a CLEANUP REQUEST is written on — `REMOVE-OUT-OF-SCOPE:`
@@ -449,11 +574,24 @@ def _agent_prompt(
         # in some case, so it is the last place to drop the instruction to go
         # looking for the next one. Placed here, after the ground rules that
         # bound what it may touch and before the cleanup section, so the
-        # documented cleanup-then-feedback adjacency below is untouched. It
-        # reads nothing off the task and renders no path list: the scope it
-        # refers to is the one the loop already authorized and already grades
-        # the diff against, not something this builder restates.
+        # documented cleanup-then-feedback adjacency below is untouched.
         _ADVERSARIAL_SELF_TEST,
+        # Immediately after it, because the sentence above says "below" and a
+        # reference whose referent moved is the round-1 bug. Also
+        # unconditional: an unscoped task gets `_SCOPE_NONE` rather than an
+        # empty section, so no round is left reading "your approved scope"
+        # with nothing to read it against.
+        #
+        # `effective_approved_paths` with its DEFAULT trackers is the same
+        # call, with the same argument, that the pre-commit scope gate makes
+        # (`orchestrator.py:5337`, via `Orchestrator._tracker_paths()` which
+        # returns `tasks.TRACKER_PATHS`) and that seeds and re-syncs
+        # `TaskExecution.allowed_paths` on every dispatch. Two computations of
+        # one list would be a prompt that quietly disagrees with the check —
+        # so if the tracker source ever moves off that constant, this call has
+        # to move with it (pinned by
+        # `test_the_prompt_and_the_scope_gate_read_the_same_tracker_source`).
+        _scope_instruction(effective_approved_paths(task.approved_paths)),
     ]
     cleanup = _cleanup_instruction(cleanup_paths)
     if cleanup:
