@@ -83,6 +83,29 @@ NOTE_TRACKERS: frozenset[str] = frozenset({"docs/SUMMARY.md", "docs/TESTS.md"})
 #: second copy means a side rewrote the section boundary itself.
 NOTES_MARKER = "<!-- CHANGE-NOTES:"
 
+#: The longest a single change-note line may be, counted over the WHOLE line —
+#: the `| date | task-id | note |` cells included, since that is what a reader
+#: and a checker both see. Deliberately generous: this is a guard against a row
+#: heading back towards the 19,410 characters that started all of this, not a
+#: style rule about sentence length.
+#:
+#: It lives here, beside the resolver it protects, because two consumers need
+#: the SAME number and a second hand-maintained copy would eventually disagree
+#: with the one that is enforced:
+#:
+#:   * `test_docs_merge.py::test_every_change_note_line_is_short_enough_to_merge_by_line`
+#:     enforces it against the shipped trackers, as `len(line) <= this` — at
+#:     most, not fewer than;
+#:   * `implement_executor._authoring_rules` states it in the brief every
+#:     implementing agent receives, so the rule arrives as INPUT instead of as
+#:     a validation rejection twenty minutes later (measured 2026-08-21:
+#:     merge-04 and blk-02 each lost a full round to discovering it by failing).
+#:
+#: The RESOLVER deliberately does not enforce it — see `_added_lines`, which
+#: says why a long note must stay a documentation-shape problem rather than a
+#: halted merge sweep.
+MAX_NOTE_LINE_CHARS: int = 700
+
 #: The four line shapes git writes into a conflicted working file. `|||||||`
 #: only appears under `merge.conflictStyle=diff3`/`zdiff3`, which nothing here
 #: sets — it is checked anyway so a repository that configures it does not

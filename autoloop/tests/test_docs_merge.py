@@ -48,7 +48,8 @@ from pathlib import Path
 from autoloop import merge_sweep, note_merge
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.git_gateway import GitGateway
-from autoloop.note_merge import NOTES_MARKER, resolve_note_append
+from autoloop.implement_executor import _authoring_rules
+from autoloop.note_merge import MAX_NOTE_LINE_CHARS, NOTES_MARKER, resolve_note_append
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.tasks import Task, TaskRegistry, TaskStore
 from autoloop.worktask import TaskExecution, TaskExecutionStore
@@ -65,12 +66,13 @@ URL = "https://chatgpt.com/c/docs-merge"
 
 TRACKERS = ("docs/SUMMARY.md", "docs/TESTS.md")
 
-#: A note line that grew past this is the shape the whole fix exists to
-#: prevent. Deliberately generous — this is a guard against a row heading back
-#: towards 19,410 characters, not a style rule about sentence length. The
-#: RESOLVER deliberately enforces no such cap (a long note would then halt the
-#: sweep); this is the documentation-shape half.
-MAX_NOTE_LINE = 700
+#: NOT redefined here. A note line that grew past this is the shape the whole
+#: fix exists to prevent, and the limit now has a second consumer — the brief
+#: `implement_executor` sends every implementing agent — so it lives beside the
+#: resolver (`note_merge.MAX_NOTE_LINE_CHARS`, with its rationale) and both
+#: consumers read that one name. A hand-copied 700 here would pass on the day
+#: it was written and silently disagree with the brief the first time anyone
+#: moved the number, which is exactly the drift brief-01 was filed against.
 
 
 # --- helpers ------------------------------------------------------------------
@@ -889,10 +891,54 @@ def test_every_change_note_line_is_short_enough_to_merge_by_line():
     would turn a style violation into a halted sweep."""
     for path in (SUMMARY_DOC, TESTS_DOC):
         for line in notes_section(path):
-            assert len(line) <= MAX_NOTE_LINE, (
+            assert len(line) <= MAX_NOTE_LINE_CHARS, (
                 f"{path.name}: a change note grew to {len(line)} chars — "
                 "split it into a second line instead"
             )
+
+
+def test_the_implementing_agents_brief_states_the_limit_this_file_enforces():
+    """The rule reaches the agent BEFORE it writes, not as a rejection after.
+
+    Measured 2026-08-21: the test above destroyed two full executor rounds in
+    one day (merge-04, 976 chars; blk-02, 773 chars), each correctly
+    implementing its task. The agent has Read/Grep/Glob/Edit/Write and no way
+    to know this file gates its diff, so the limit has to be an input.
+
+    Asserted in THIS module on purpose. The enforcement above and the brief
+    below now read one name, and a later round that re-hardcodes the number in
+    either place has to break one of these two tests to do it — a check that
+    lived in `test_implement_executor.py` alone could only compare the brief
+    with itself."""
+    rules = _authoring_rules()
+    # The number, and the boundary word that goes with it: the check above is
+    # `<=`, so a brief saying "under 700" would be off by one at the boundary
+    # and send an agent to rewrite a line that was already legal.
+    assert f"AT MOST {MAX_NOTE_LINE_CHARS} characters" in rules
+    for wrong in (f"under {MAX_NOTE_LINE_CHARS}", f"fewer than {MAX_NOTE_LINE_CHARS}"):
+        assert wrong not in rules
+    # The boundary stated outright, because "at most" is the word an agent is
+    # most likely to round down out of caution and then split a legal line.
+    assert f"Exactly {MAX_NOTE_LINE_CHARS} passes" in rules
+    # What is measured. `notes_section` yields whole lines, so a brief that
+    # bounded the SENTENCE would let a 690-character note ride in a 740-char
+    # row and fail this file anyway.
+    assert "WHOLE line" in rules
+    assert "| date | task-id |" in rules
+    # Both trackers this module checks are named. Compared against TRACKERS,
+    # this file's own literal, deliberately — it is what every other test here
+    # uses, and a divergence from `note_merge.NOTE_TRACKERS` fails this
+    # assertion loudly rather than passing quietly, which is the direction that
+    # wants no import.
+    for tracker in TRACKERS:
+        assert tracker in rules
+    # And the remedy, which is the half that makes the rule actionable.
+    assert "append a SECOND line" in rules
+    # The sibling mechanical rule of the same section, checked by
+    # `notes_section` above: the marker must appear exactly once, so a brief
+    # that explained the machinery without saying this invites the agent to
+    # quote the comment — which is how docs-01 shipped it in `SUMMARY.md`.
+    assert "never write the comment out in full a second time" in rules
 
 
 def test_claude_md_tells_a_task_to_append_one_line():

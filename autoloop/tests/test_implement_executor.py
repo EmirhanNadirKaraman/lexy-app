@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from autoloop import note_merge
 from autoloop.audit.agents import AgentResult, AgentSpec
 from autoloop.contract import Decision, Directive
 from autoloop.git_gateway import GitGateway
@@ -18,10 +19,13 @@ from autoloop.implement_executor import (
     WRITE_ALLOWED_TOOLS,
     ImplementExecutor,
     _ADVERSARIAL_SELF_TEST,
+    _AUTHORING_HEADING,
+    _AUTHORING_TRACKERS_FALLBACK,
     _SCOPE_HEADING,
     _SCOPE_NONE,
     _SCOPE_TRAILER,
     _agent_prompt,
+    _authoring_rules,
     _extract_assumptions,
     _extract_cleanup_requests,
     implement_agent_runner,
@@ -825,6 +829,153 @@ def test_the_added_prose_has_its_own_ceilings():
     why capping it would be a fail-open, not a saving."""
     assert len(_ADVERSARIAL_SELF_TEST) <= 1800
     assert len(_SCOPE_HEADING) + len(_SCOPE_TRAILER) + len(_SCOPE_NONE) <= 1200
+
+
+# ---- the mechanical authoring rules (brief-01) -----------------------------
+#
+# The claim under test: an implementing agent is TOLD the change-note
+# line-length limit before it writes, and the number it is told is the number
+# the validator enforces — not a copy of it. So every test below either goes
+# through the assembled prompt or moves the shared constant and watches the
+# prompt follow; none of them compares the renderer with itself.
+
+
+def _rules_section(prompt):
+    """The MECHANICAL AUTHORING RULES section, located the way a reader locates
+    it — by its heading, among the blank-line-separated sections `_agent_prompt`
+    joins. Exactly one, and no knowledge of the renderer's internals."""
+    opener = "MECHANICAL AUTHORING RULES"
+    sections = [s for s in prompt.split("\n\n") if s.startswith(opener)]
+    assert len(sections) == 1, f"expected exactly one {opener} section, got {len(sections)}"
+    return sections[0]
+
+
+@pytest.mark.parametrize("feedback", [None, "the note you appended was too long"])
+def test_the_change_note_limit_is_an_input_on_implement_and_revise(
+    main_repo, worker_repo, feedback
+):
+    """The rule arrives as INPUT, on both decisions.
+
+    Measured 2026-08-21: two full rounds (merge-04, blk-02) implemented their
+    task correctly and were discarded because a change note ran past the limit
+    — a rule the agent is never told and cannot grep for, since it has no way
+    to know which test file gates its diff. Asserted against the prompt a real
+    `execute()` round sent, so a renderer that is never CALLED fails here."""
+    prompt, outcome = capture_prompt(
+        main_repo, worker_repo, make_scoped_task(), implement_directive(feedback=feedback)
+    )
+
+    assert outcome.status == "ok"
+    section = _rules_section(prompt)
+    assert f"AT MOST {note_merge.MAX_NOTE_LINE_CHARS} characters" in section
+    assert "ONE NEW LINE appended" in section
+    assert "append a SECOND line" in section
+    # The previous round's feedback is still carried — the new section sits in
+    # the same `parts` list and must not have displaced it.
+    if feedback:
+        assert feedback in prompt
+
+
+def test_the_stated_limit_follows_the_constant_the_validator_reads(
+    main_repo, worker_repo, monkeypatch
+):
+    """The anti-drift half, and the only assertion that can tell a shared
+    constant from a hard-coded copy that happens to agree today.
+
+    `_authoring_rules` reads `note_merge.MAX_NOTE_LINE_CHARS` at render time,
+    so moving the constant moves the brief. A module-scope `from ... import`,
+    or a literal in the prompt text, would leave the old number in the prompt
+    and this test failing — which is the point: the task's own warning is that
+    a copy which silently disagrees with the test is worse than saying
+    nothing."""
+    monkeypatch.setattr(note_merge, "MAX_NOTE_LINE_CHARS", 123)
+
+    section = _rules_section(
+        capture_prompt(main_repo, worker_repo, make_scoped_task(), implement_directive())[0]
+    )
+
+    assert "AT MOST 123 characters" in section
+    assert "Exactly 123 passes" in section
+    assert "700" not in section
+
+
+def test_the_named_trackers_come_from_the_resolvers_own_list(monkeypatch):
+    """The files named are `note_merge.NOTE_TRACKERS`, not a second list.
+
+    Sorted, because `NOTE_TRACKERS` is a frozenset: unsorted iteration order
+    varies between processes and would make the rendered brief — and any test
+    of it — differ run to run."""
+    assert all(t in _authoring_rules() for t in note_merge.NOTE_TRACKERS)
+
+    monkeypatch.setattr(note_merge, "NOTE_TRACKERS", frozenset({"docs/B.md", "docs/A.md"}))
+    rules = _authoring_rules()
+
+    assert "docs/A.md, docs/B.md" in rules
+    assert "docs/SUMMARY.md" not in rules
+
+
+def test_an_empty_tracker_list_still_states_a_rule_with_a_subject(monkeypatch):
+    """The fail-open case: an empty `NOTE_TRACKERS` would render "Recording a
+    change note (): ..." — a rule naming no file, which still READS like
+    guidance while telling the agent nothing it can act on. The fallback names
+    the trackers generically instead, and the limit itself — the half that
+    actually rejects rounds — is unaffected either way."""
+    monkeypatch.setattr(note_merge, "NOTE_TRACKERS", frozenset())
+    rules = _authoring_rules()
+
+    assert _AUTHORING_TRACKERS_FALLBACK in rules
+    assert "()" not in rules
+    assert f"AT MOST {note_merge.MAX_NOTE_LINE_CHARS} characters" in rules
+
+
+def test_the_authoring_section_grants_nothing_and_forges_nothing(
+    main_repo, worker_repo
+):
+    """Same three questions asked of every added section: does it hand over a
+    tool, can it be echoed back as data, and does it stay bounded.
+
+    The tool names are checked against the rendered TEXT rather than the whole
+    prompt, which legitimately says "no Bash access" in its ground rules. The
+    line-start check is the echo channel: `_ASSUMPTION_RE` and `_CLEANUP_RE`
+    both match an anchor at the start of an indented line, so a section an
+    agent quotes back must contain no line that begins with either."""
+    rules = _authoring_rules()
+
+    for tool in IMPLEMENT_DISALLOWED_TOOLS:
+        assert tool not in rules
+    for line in rules.splitlines():
+        stripped = line.lstrip()
+        assert not stripped.upper().startswith("ASSUMPTION:")
+        assert not stripped.upper().startswith("REMOVE-OUT-OF-SCOPE:")
+    assert _extract_assumptions(rules) == ()
+    assert _extract_cleanup_requests(rules) == ()
+    # Bounded like the other fixed prose (see the ceilings test above): this is
+    # the part of the prompt most likely to attract "one more rule".
+    assert len(rules) <= 1200
+
+    # And it displaces nothing: the prompt stays well formed, the adversarial
+    # instruction still sits immediately above the scope list it calls "below",
+    # and the new section follows both.
+    prompt, _ = capture_prompt(
+        main_repo, worker_repo, make_scoped_task(), implement_directive()
+    )
+    assert "\n\n\n" not in prompt
+    assert prompt.strip() == prompt
+    assert prompt.index(_ADVERSARIAL_SELF_TEST) < prompt.index(_SCOPE_HEADING)
+    assert prompt.index(_SCOPE_HEADING) < prompt.index(_AUTHORING_HEADING)
+    assert _scope_paths(prompt) == effective_approved_paths(
+        make_scoped_task().approved_paths, TRACKER_PATHS
+    )
+
+
+def test_the_rules_reach_an_unscoped_task_too():
+    """`_SCOPE_NONE` is the fail-closed scope branch, and it is a different
+    string with a different length — a section appended after it must still be
+    findable. A task with no approved paths can still record a change note."""
+    prompt = _agent_prompt(make_task(), None)
+
+    assert _SCOPE_NONE in prompt
+    assert f"AT MOST {note_merge.MAX_NOTE_LINE_CHARS} characters" in _rules_section(prompt)
 
 
 def test_assumption_lines_are_collected_from_the_agents_own_output(

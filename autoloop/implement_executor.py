@@ -75,6 +75,17 @@ case is handled. It adds an instruction and grants nothing — the tool set, the
 ground rules and worker-repo confinement are untouched, and the enumeration is
 prose for the reviewer that nothing in the loop parses.
 
+**The prompt carries the repository's mechanical authoring rules** (brief-01,
+2026-08-22). `_authoring_rules` states the change-note shape and the ENFORCED
+line-length limit, read from `note_merge.MAX_NOTE_LINE_CHARS` at render time —
+the same constant `test_docs_merge.py` checks the shipped trackers against, so
+the brief cannot drift out of step with the test. Measured cost of not doing
+this: two full rounds on 2026-08-21 (merge-04, blk-02), each ~20 minutes, each
+implementing its task correctly and discarded over a documentation line length
+the agent had no way to learn except by failing. It is deliberately the small
+set of mechanical formatting rules that reject correct work, not a summary of
+the test suite; it grants nothing and changes no check.
+
 That bound is only actionable if the agent can SEE where the line is, so
 `_scope_instruction` renders it: the effective approved paths, from
 `tasks.effective_approved_paths` — the same function the pre-commit scope gate
@@ -113,6 +124,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
+from . import note_merge
 from .audit.agents import AgentRunner, AgentSpec, ClaudeCliRunner, classify_agent_fault
 from .contract import AUDIT_TASK_ID, TASK_DECISIONS, Decision, Directive
 from .errors import GitError
@@ -464,6 +476,90 @@ def _scope_instruction(paths: tuple[str, ...]) -> str:
     return f"{_SCOPE_HEADING}\n{listed}\n{_SCOPE_TRAILER}"
 
 
+#: The opening of the MECHANICAL AUTHORING RULES section — what it is and why
+#: an agent is being told it before it writes rather than after validation.
+#:
+#: **The measured gap this closes** (2026-08-21): the single test
+#: `test_docs_merge.py::test_every_change_note_line_is_short_enough_to_merge_by_line`
+#: destroyed two whole executor rounds in one day — merge-04 at 16:39:57
+#: ("TESTS.md: a change note grew to 976 chars") and blk-02 at 17:43:57
+#: ("SUMMARY.md: a change note grew to 773 chars"). Both rounds implemented
+#: their task correctly and were thrown away over a documentation line-length
+#: rule the agent is never told about. It cannot find the rule on its own
+#: either: it has Read/Grep/Glob/Edit/Write and no way to know which of ~200
+#: test files gate its diff, so it rediscovers the limit by failing, once per
+#: round, forever.
+#:
+#: **Narrow on purpose.** This is NOT a summary of the test suite and must not
+#: grow into one. The target is the small set of MECHANICAL formatting rules
+#: that reject otherwise-correct work — rules an agent cannot infer from the
+#: file it is editing and cannot satisfy by understanding the task better.
+#: Project conventions belong in `CLAUDE.md`, which the agent already reads.
+_AUTHORING_HEADING = (
+    "MECHANICAL AUTHORING RULES — repository formatting rules that reject an "
+    "otherwise-correct round at validation. They are stated here because you "
+    "cannot see the checks that enforce them, and rediscovering one by failing "
+    "costs the whole round."
+)
+
+#: The generic name for the trackers, used only if `NOTE_TRACKERS` is somehow
+#: empty. An empty list would silently turn the sentence into "the change-note
+#: section of " — a rule with no subject, which is the fail-open shape (the
+#: text still looks like guidance while naming nothing).
+_AUTHORING_TRACKERS_FALLBACK = "the repository's documentation trackers"
+
+
+def _authoring_rules() -> str:
+    """The mechanical change-note rules, with the ENFORCED limit in them.
+
+    Reads `note_merge.MAX_NOTE_LINE_CHARS` and `note_merge.NOTE_TRACKERS`
+    through the module at call time, deliberately — not `from ... import` at
+    module scope. The number in the brief and the number the validator enforces
+    have to be one value, so the two consumers name one constant
+    (`test_docs_merge.py` imports the same one), and reading it here means a
+    changed limit reaches the next brief with no second edit. A hard-coded copy
+    that silently disagreed with the test would be worse than saying nothing:
+    the agent would keep to a limit nothing enforces, and still lose the round
+    to the one that does.
+
+    The wording carries two precision points that the digits alone do not, and
+    both are places a technically-true brief still fails the round:
+
+      * the check is `len(line) <= MAX`, so the text says AT MOST — "under" or
+        "fewer than" would be off by one at the boundary;
+      * it measures the WHOLE line, `| date | task-id |` cells included, so a
+        brief that said "keep your note short" would let a 690-character note
+        sit in a 740-character row and fail anyway.
+
+    The marker sentence is the second mechanical rule of the same section and
+    the same test file, kept for the same reason: `notes_section` requires the
+    CHANGE-NOTES comment to appear EXACTLY once, and quoting it in full while
+    explaining the machinery — how docs-01 shipped the bug in `SUMMARY.md`
+    itself — turns automatic note merging off for that tracker with no symptom
+    but the merge sweep halting. It carries no number, so it adds no drift
+    surface.
+    """
+    trackers = ", ".join(sorted(note_merge.NOTE_TRACKERS)) or _AUTHORING_TRACKERS_FALLBACK
+    limit = note_merge.MAX_NOTE_LINE_CHARS
+    return (
+        f"{_AUTHORING_HEADING}\n"
+        f"Recording a change note ({trackers}): each of those files ends with "
+        "an append-only change-note section, opened by a CHANGE-NOTES comment. "
+        "A note is ONE NEW LINE appended after the last line of that section. "
+        "Do not grow, edit, reorder or delete a line that is already there, "
+        "and put nothing after your own line. Name that marker CHANGE-NOTES in "
+        "prose and never write the comment out in full a second time: a "
+        "duplicate switches automatic note merging off for the whole file, "
+        "silently.\n"
+        f"Every line in that section must be AT MOST {limit} characters — the "
+        "WHOLE line, counting the leading `| date | task-id |` cells, not just "
+        f"your sentence. Exactly {limit} passes; one more fails. A single "
+        "over-long note fails validation and the round is discarded with all "
+        "the work in it, so when a note does not fit, append a SECOND line "
+        "rather than a longer one."
+    )
+
+
 #: The line shape a CLEANUP REQUEST is written on — `REMOVE-OUT-OF-SCOPE:`
 #: first on its line, optionally indented, nothing else in front of it.
 #: Deliberately the same anchoring discipline as `_ASSUMPTION_RE` above,
@@ -592,6 +688,14 @@ def _agent_prompt(
         # to move with it (pinned by
         # `test_the_prompt_and_the_scope_gate_read_the_same_tracker_source`).
         _scope_instruction(effective_approved_paths(task.approved_paths)),
+        # Last of the unconditional sections, so it displaces nothing: the
+        # adversarial instruction still names the scope list "below" and still
+        # sits immediately above it, and the cleanup-then-feedback adjacency
+        # below is untouched. Unconditional because the rule it states is
+        # unconditional — every round records a change note, and a round that
+        # does not is not harmed by reading one paragraph about the shape of
+        # one.
+        _authoring_rules(),
     ]
     cleanup = _cleanup_instruction(cleanup_paths)
     if cleanup:
