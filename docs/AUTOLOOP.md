@@ -338,7 +338,11 @@ moving head survivable for a reviewed record — `_carry_reviewed_candidate_past
 merges the head *into* the task branch and the round continues — but base-02 is
 not the justification on its own, since it still bails on a dirty worker tree
 and on a merge conflict. The justification is that for these records the harm
-has already happened.
+has already happened. (Since notes-04, 2026-08-23, the ONE conflict shape the
+merge sweep already resolves — two branches each appending change-note lines to
+a tracker's append-only section — is resolved here as well rather than bailing;
+see §4's note-resolver paragraph. Everything else still bails, so the sentence
+above stands.)
 
 "Already behind" is defined in git terms and in nothing else
 (`cli._candidate_base_ancestry`): `head_sha()`, then string equality for "the
@@ -433,6 +437,34 @@ resolved partially. That is also why the list needed to grow: bind-01,
 split-01 and dash-17 were each refused on 2026-08-22 because ONE uncovered
 tracker collided alongside the two covered ones. `docs/SECURITY.md` S35 carries
 the security accounting.
+
+**The same resolver runs in the OTHER merge direction too, since notes-04
+(2026-08-23).** The loop merges these trackers two ways — a task branch into
+the base branch (here), and the base branch's head into a task branch, which is
+how `orchestrator._carry_reviewed_candidate_past` refreshes a reviewed
+candidate's stale base (base-02, 2026-08-20). Only the first was wired, so a
+change-note collision refused the whole refresh and parked
+`task_base_behind_head`. Both directions now call
+`note_merge.combine_conflicted_notes` — one decision, one place to change it —
+and the refresh logs `execution_base_notes_resolved` /
+`execution_base_notes_refused`, its own entry types because the recovery an
+operator reaches for differs. The refusal rule is identical: any conflicted path
+outside the list, or a tracker's prose above the marker, parks the whole thing
+with the message and the three operator choices it always had, and a resolution
+`GitGateway._finish_resolved_merge` cannot verify (head moved, contains the
+branch tip AND the merged commit, clean tree) is reported as a failed merge
+rather than accepted.
+
+The one thing that DIFFERS between the two directions is which side's note
+lines go first, and it is load-bearing rather than cosmetic. `resolve_note_append`
+requires each side's section to hold the merge base's section as a literal
+prefix, so a branch stays mergeable only while its section is *everything its
+base carried, then its own additions*. Merging out, the base branch is the
+accumulator and its lines lead (`OURS_FIRST`, the default); merging the head IN,
+that head becomes the task's new base, so the head's lines lead and the task's
+own stay last (`THEIRS_FIRST`). Getting it backwards does not corrupt anything —
+it produces a branch that can never be merged out again, which is the shape
+ctx-01 had to repair by hand on 2026-08-21.
 
 Nothing here ever parks. By the time it runs the push has already landed and
 the task is already completed, so an integration problem is logged and left

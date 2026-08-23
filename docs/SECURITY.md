@@ -1520,10 +1520,15 @@ design question no automated test in this codebase can fully answer.
 ### S35 — The merge sweep auto-resolves one conflict shape in four documentation trackers — INFO — OPEN (deliberate, narrow, accepted)
 
 **Location:** `autoloop/note_merge.py` (`resolve_note_append`, the whole
-decision), `autoloop/auto_merge.py` (`AutoMerger._resolve_note_conflicts`, the
-only caller, reached only from `_merge`'s conflict branch),
-`autoloop/git_gateway.py` (`merge_stage_blob` / `add_paths` / `commit_staged`,
-the three primitives it uses).
+decision, plus `combine_conflicted_notes`, the shared read/resolve/write/commit
+plumbing), `autoloop/auto_merge.py` (`AutoMerger._resolve_note_conflicts`,
+reached only from `_merge`'s conflict branch),
+`autoloop/orchestrator.py` (`_note_conflict_resolver`, reached only from
+`_carry_reviewed_candidate_past`'s merge — the SECOND call site since notes-04,
+2026-08-23), `autoloop/git_gateway.py` (`merge_stage_blob` / `add_paths` /
+`commit_staged`, the three primitives it uses, and `merge_foreign_commit`'s
+`resolve_conflicts` hook plus `_finish_resolved_merge`, which verify the second
+site's result).
 
 **Severity:** INFO. No runtime behaviour and no control is reached: all four
 files are documentation, and nothing reads them at run time. It is recorded
@@ -1569,11 +1574,23 @@ files bought nothing.
   marker and refuses outright if git left a conflict marker there — so a
   concurrent edit to tracker PROSE still stops the sweep.
 - **Nothing is written until every conflicted path has resolved**, and the
-  result still goes through `_verify_merge` (head moved, contains both parents,
-  tree clean) before anything is pushed.
-- **Every decision is in the transcript** — `auto_merge_notes_resolved` names
-  the paths, `auto_merge_notes_refused` names the reason — and the merge
-  commit's own message says the notes were combined automatically.
+  result is then verified before it counts — `auto_merge._verify_merge` (head
+  moved, contains both parents, tree clean) before anything is pushed on the
+  task-into-base side, and `git_gateway._finish_resolved_merge` (head moved,
+  contains the branch tip AND the merged commit, tree clean) on the base-refresh
+  side. Neither direction treats "the resolver returned True" as evidence; a
+  resolution that does not verify is a FAILED merge, and the base refresh then
+  parks rather than re-pointing the record.
+- **The base refresh resolves nothing a reviewed candidate has not already
+  survived.** Its five preconditions run FIRST and are untouched: a worker with
+  uncommitted changes, or a branch tip that no longer contains the reviewed
+  candidate, is refused before any merge is attempted. Nothing is ever re-based:
+  every reviewed commit keeps its exact sha.
+- **Every decision is in the transcript** — `auto_merge_notes_resolved` /
+  `auto_merge_notes_refused` for the merge sweep, `execution_base_notes_resolved`
+  / `execution_base_notes_refused` for the base refresh, each naming the paths or
+  the reason — and both merge commits' own messages say the notes were combined
+  automatically.
 
 **The residual, stated rather than hidden.** A defect in `resolve_note_append`
 could combine tracker content in a case a human should have seen, without
@@ -1587,10 +1604,28 @@ finding, control or verification check lives there — they are all prose above
 the marker, where a conflict still stops the sweep. `CLAUDE.md` and
 `docs/SCHEMA.md` are deliberately NOT in scope and still conflict normally.
 
+Since notes-04 (2026-08-23) that residual has a second reachable site — the
+base refresh — and the honest statement of what changed is *where* the resolver
+runs, not *what* it may combine: the rule, the four paths and the prefix
+precondition are one implementation shared by both, so a widening is still a
+single diff in a single frozenset. The one thing the second site adds is a
+merge commit written into a WORKER repository without a human, which is a
+private branch that no reviewer has approved the content of and that nothing
+publishes on its own — the ordinary review and push path still runs afterwards
+and still shows the tracker edit.
+
 **Verification check:**
 ```bash
 # The scope, and that it is still a literal list of four documentation paths:
 rg -n 'NOTE_TRACKERS' autoloop/note_merge.py autoloop/auto_merge.py
+# BOTH call sites, and that neither grew a second resolver of its own. Expect
+# exactly 5 lines: 3 in `note_merge.py` (the two definitions and the one
+# internal call), plus ONE call each in `auto_merge.py` (`_resolve_note_
+# conflicts`) and `orchestrator.py` (`_note_conflict_resolver`). A sixth line,
+# or any `resolve_note_append(` call outside `note_merge.py`, is the drift this
+# finding's bound depends on not happening — two implementations of this rule
+# would mean a merge resolved in one direction and refused in the other:
+rg -n 'combine_conflicted_notes\(|resolve_note_append\(' autoloop --glob '!tests/*'
 # Each of those files must carry the CHANGE-NOTES marker EXACTLY once (expect
 # `1` per file) — a file with none is a path the resolver was granted without an
 # append-only region, a file with two has auto-resolution silently off:
@@ -1605,7 +1640,14 @@ Pinned by `autoloop/tests/test_docs_merge.py` — in particular
 `test_a_concurrent_edit_to_tracker_prose_still_conflicts`,
 `test_a_concurrent_edit_to_an_existing_note_line_still_conflicts`,
 `test_one_refusing_tracker_stops_the_whole_merge_even_if_the_others_resolved`
-and `test_a_real_conflict_in_a_source_file_still_stops_the_sweep`.
+and `test_a_real_conflict_in_a_source_file_still_stops_the_sweep`. The second
+call site is pinned by `autoloop/tests/test_base_refresh_notes.py` — in
+particular `test_a_conflict_in_tracker_prose_still_parks`,
+`test_a_conflict_in_a_source_file_still_parks_with_the_existing_message`,
+`test_a_source_conflict_alongside_resolvable_trackers_resolves_nothing`,
+`test_a_dirty_worker_is_not_merged_over_even_when_only_notes_conflict`,
+`test_a_branch_tip_that_lost_the_candidate_is_not_merged_into` and
+`test_a_resolver_that_claims_success_without_committing_is_not_believed`.
 
 **Suggested fix if it ever needs one:** move the append-only note ledger into
 its own per-task file and drop the resolver — the trackers then conflict
@@ -2594,3 +2636,4 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | quota-01 | Amends S39's closing advice, which points at `protocol_errors.py` as the safer alternative: that module had the SAME availability defect. `rate_limit_exceeded`, `rate_limited`, `too_many_requests` and a numeric 429 all raised the loop_fatal `QuotaExhaustedError`, so a short-window throttle parked the loop from a structured field instead of a substring. Split into two vocabularies; only a spent allowance parks. Nothing was widened — this is a denial removed, not a permission added. |
 | 2026-08-23 | quota-01 | Correction to the 2026-08-22 changelog bullet for S37, which says quota detection there is "exact matches on named error fields plus a numeric 429": read the 429 clause as superseded. It is a THROTTLE now and routes retryably; everything else in that bullet stands. The bullet is unedited — S37's own summary row and finding text never made the 429 claim, so nothing above the marker asserts it any more. |
 | 2026-08-23 | quota-01 | Residual on that side, named: there is no prompt guard on the app-server transport and none is needed (the comparison is exact against a named field, never against printed text), but that also means `codex.quota_error_codes` is obeyed literally — an operator who files a throttle code there still parks the loop. Pinned by a test so it is a documented consequence, not a surprise. The `codex_app_server_failed` digest gained `classification` (one of three words) and carries no new content. |
+| 2026-08-23 | notes-04 | S35 gained a SECOND call site: `orchestrator._carry_reviewed_candidate_past` reaches the same resolver through `git_gateway.merge_foreign_commit`'s new `resolve_conflicts` hook, so refreshing a reviewed candidate's stale base combines the append-only sections instead of parking. WHAT may be combined is unchanged — same four paths, same prefix precondition, one shared implementation — and the result is verified by `_finish_resolved_merge` before it counts as merged. |

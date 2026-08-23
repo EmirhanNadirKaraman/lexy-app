@@ -84,9 +84,37 @@ module never merges prose. It keeps git's merged text for the head of the file
 verbatim and only rebuilds the tail, which is why a concurrent edit to the
 tracker's prose still conflicts: git leaves markers there, and the check above
 sees them.
+
+## Two directions, one resolver (notes-04, 2026-08-23)
+
+The loop merges these trackers in BOTH directions and needs the same rule in
+each:
+
+  * task branch INTO the base branch — `auto_merge.AutoMerger._merge`, the
+    direction this module shipped for;
+  * the base branch's head INTO a task branch — `orchestrator.
+    _carry_reviewed_candidate_past`, which refreshes a REVIEWED candidate's
+    recorded base when the head moved under it.
+
+Only the first was wired, so the second refused every change-note collision and
+parked `task_base_behind_head` — measured hours after notes-03 shipped, on
+`blk-quota-01-002`: quota-01 conflicted at `docs/SUMMARY.md` and `docs/TESTS.md`,
+both in `NOTE_TRACKERS`, both exactly the shape this exists to combine, and an
+11-file reviewed candidate was abandoned over it. `combine_conflicted_notes`
+below is the plumbing both call sites now share (read three index stages, hand
+them to `resolve_note_append`, write/stage/commit only once EVERY path
+resolved), so there is one rule and one place to change it.
+
+**The two directions differ in ONE thing: which side's appended lines go
+first**, and it is load-bearing rather than cosmetic — see `lead` below.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+from .errors import GitError
 
 #: The trackers whose terminal change-note section may be combined. A literal
 #: list, never a prefix or a glob: this list is the whole blast radius of the
@@ -146,6 +174,42 @@ NOTES_MARKER = "<!-- CHANGE-NOTES:"
 #: halted merge sweep.
 MAX_NOTE_LINE_CHARS: int = 700
 
+#: `lead` — whose appended note lines are written FIRST into the combined
+#: section. Git's own words for the two sides of a merge: OURS is the branch
+#: being merged INTO (stage 2, `HEAD`), THEIRS is the branch being merged IN
+#: (stage 3).
+#:
+#: **This is not a cosmetic ordering.** `resolve_note_append` requires each
+#: side's section to hold the merge base's section as a literal PREFIX, so the
+#: rule that keeps a branch mergeable forever is: *a branch's change-note
+#: section must be everything its base already carried, followed by that
+#: branch's own additions.* Whichever side's history becomes the merge BASE of
+#: the next merge therefore has to lead.
+#:
+#:   * Merging a task INTO the base branch (`auto_merge`): the base branch is
+#:     the accumulator every later task is cut from, so its own lines lead and
+#:     the task's follow — `OURS_FIRST`, the default, unchanged since docs-01.
+#:   * Merging the base branch's head INTO a task (`orchestrator.
+#:     _carry_reviewed_candidate_past`): the incoming head becomes that task's
+#:     new base, so ITS lines must lead and the task's own additions stay at the
+#:     end — `THEIRS_FIRST`.
+#:
+#: Getting the second one wrong is not a cosmetic defect, it is a task branch
+#: that can never be merged out again: with the task's lines placed above lines
+#: the new base already carries, the branch's section no longer STARTS with the
+#: base's, and every later merge of that tracker refuses. That exact shape was
+#: hit by hand on 2026-08-21 (ctx-01) and had to be repaired by moving six note
+#: lines to the end of the ledger — see those notes in `docs/SUMMARY.md` and
+#: `docs/TESTS.md`. `test_base_refresh_notes.py::
+#: test_a_refreshed_task_branch_still_merges_back_out_through_auto_merge` is the
+#: round-trip that would catch a regression.
+#:
+#: An unrecognised value raises rather than defaulting: silently falling back to
+#: `OURS_FIRST` in the refresh direction is precisely the unmergeable-branch bug
+#: above, arriving without a word.
+OURS_FIRST = "ours-first"
+THEIRS_FIRST = "theirs-first"
+
 #: The four line shapes git writes into a conflicted working file. `|||||||`
 #: only appears under `merge.conflictStyle=diff3`/`zdiff3`, which nothing here
 #: sets — it is checked anyway so a repository that configures it does not
@@ -204,7 +268,9 @@ def _added_lines(added: str) -> list[str] | None:
     return lines
 
 
-def resolve_note_append(base: str, ours: str, theirs: str, merged: str) -> str | None:
+def resolve_note_append(
+    base: str, ours: str, theirs: str, merged: str, *, lead: str = OURS_FIRST
+) -> str | None:
     """The combined text, or `None` to leave the conflict standing.
 
     `base`/`ours`/`theirs` are the three sides git recorded in the index for
@@ -215,10 +281,18 @@ def resolve_note_append(base: str, ours: str, theirs: str, merged: str) -> str |
     conflicted, and re-deciding it here would be reimplementing a 3-way merge
     nobody asked for.
 
-    Returns `base` section text plus ours' added lines plus theirs', in that
-    order. Arrival order, not chronological — the notes carry their own date
-    column, exactly as they did under the union driver this replaced.
+    Returns the `base` section text plus both sides' added lines, `lead`
+    deciding which side's come first (see `OURS_FIRST` / `THEIRS_FIRST` above —
+    the default is the task-into-base direction and is what every caller before
+    notes-04 got). Arrival order, not chronological — the notes carry their own
+    date column, exactly as they did under the union driver this replaced.
     """
+    if lead not in (OURS_FIRST, THEIRS_FIRST):
+        raise ValueError(
+            f"lead must be {OURS_FIRST!r} or {THEIRS_FIRST!r}, not {lead!r} — "
+            "the ordering decides whether the merged branch can ever be merged "
+            "again, so an unrecognised value is refused rather than defaulted"
+        )
     if any(text.count(NOTES_MARKER) != 1 for text in (base, ours, theirs, merged)):
         return None
 
@@ -252,6 +326,128 @@ def resolve_note_append(base: str, ours: str, theirs: str, merged: str) -> str |
     if ours_added == theirs_added:
         # Both sides appended the identical text. Git resolves that on its own
         # and never reaches here, but concatenating would duplicate a note, so
-        # the case is handled rather than left to chance.
+        # the case is handled rather than left to chance. `lead` is irrelevant
+        # when the two are byte-identical.
         return merged_head + base_tail + ours_added
+    if lead == THEIRS_FIRST:
+        return merged_head + base_tail + theirs_added + ours_added
     return merged_head + base_tail + ours_added + theirs_added
+
+
+@dataclass(frozen=True)
+class NoteResolution:
+    """What `combine_conflicted_notes` did with an in-progress merge.
+
+    A VALUE, not an exception: "these two sides are not both appending change
+    notes" is the ORDINARY answer here, and every caller routes it to the same
+    place — the abort/park it would have taken anyway. Only a caller bug
+    (`lead` misspelt) raises.
+
+    * `resolved` — the only field to branch on. True means every conflicted
+      path was combined, written, staged AND committed, so the merge is
+      concluded and the caller must not abort it.
+    * `paths` — what was combined, sorted. Empty unless `resolved`.
+    * `refusal` — why not, for the transcript. Empty when `resolved`. Never
+      empty when not: a sweep that stops without saying why is how an operator
+      ends up reconstructing the merge by hand.
+    """
+
+    resolved: bool
+    paths: tuple[str, ...] = ()
+    refusal: str = ""
+
+
+def combine_conflicted_notes(
+    git, conflicts, message: str, *, lead: str = OURS_FIRST
+) -> NoteResolution:
+    """Combine two branches' appended change notes in the merge `git` is
+    currently in the middle of — the shared plumbing behind both directions.
+
+    `git` is a `GitGateway` rooted at the repository holding the conflict (the
+    primary checkout for `auto_merge`, a worker repository for the base
+    refresh); `conflicts` is what git reported unmerged; `message` is the merge
+    commit message the caller would have used, which this extends with a line
+    naming the files it combined so the automatic resolution is visible in
+    `git log` and not only in the transcript.
+
+    **Every conflicted path is resolved into memory before ANY file is
+    written.** A path that resolves followed by one that refuses would
+    otherwise leave a rewritten tracker in a half-merged tree, and the abort
+    that follows would be cleaning up after this function rather than after
+    git.
+
+    Deliberately does NO logging. The two callers log to different transcript
+    entry types (`auto_merge_notes_*` and `execution_base_notes_*`) because an
+    operator reading one is asking a different question from an operator
+    reading the other; the decision is shared, the reporting is not.
+    """
+    if lead not in (OURS_FIRST, THEIRS_FIRST):
+        raise ValueError(f"lead must be {OURS_FIRST!r} or {THEIRS_FIRST!r}, not {lead!r}")
+
+    paths = sorted(conflicts)
+    if not paths:
+        # Nothing is unmerged, so whatever failed was not a content conflict.
+        # Refusing here is what stops an unreadable `git status` (which reports
+        # no conflicted path at all) from being read as "everything resolved".
+        return NoteResolution(
+            False, refusal="git reported no conflicted path, so there is nothing to combine"
+        )
+
+    outside = [path for path in paths if path not in NOTE_TRACKERS]
+    if outside:
+        # Not even partially: a real conflict anywhere in the merge means the
+        # whole merge needs a human, so nothing is resolved.
+        return NoteResolution(
+            False,
+            refusal=f"conflicted path(s) outside the change-note trackers: {outside}",
+        )
+
+    resolutions: dict[str, str] = {}
+    for path in paths:
+        try:
+            base = git.merge_stage_blob(path, 1).decode("utf-8")
+            ours = git.merge_stage_blob(path, 2).decode("utf-8")
+            theirs = git.merge_stage_blob(path, 3).decode("utf-8")
+            merged = (Path(git.repo_root) / path).read_text(encoding="utf-8")
+        except (GitError, OSError, UnicodeDecodeError) as exc:
+            return NoteResolution(
+                False,
+                refusal=(
+                    f"could not read all three sides of {path}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        combined = resolve_note_append(base, ours, theirs, merged, lead=lead)
+        if combined is None:
+            return NoteResolution(
+                False,
+                refusal=(
+                    f"{path} is not two branches appending change notes — "
+                    "something outside the append-only section conflicted, or a "
+                    "line that was already there was edited, deleted or reordered"
+                ),
+            )
+        resolutions[path] = combined
+
+    try:
+        for path, text in resolutions.items():
+            (Path(git.repo_root) / path).write_text(text, encoding="utf-8")
+        git.add_paths(sorted(resolutions))
+        git.commit_staged(
+            f"{message}\n\nAppend-only change notes combined automatically in "
+            + ", ".join(sorted(resolutions))
+            + "."
+        )
+    except (GitError, OSError) as exc:
+        # The tree now holds this function's writes on top of git's half-merged
+        # state. Both callers abort next, which restores both — and verifies
+        # that it did.
+        return NoteResolution(
+            False,
+            refusal=(
+                f"combined the change notes but could not commit them: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+    return NoteResolution(True, paths=tuple(sorted(resolutions)))

@@ -214,6 +214,7 @@ from urllib.parse import urlsplit
 
 from . import environment
 from . import escape_detector
+from . import note_merge
 from .auto_merge import (
     UPGRADE_PENDING,
     AutoMerger,
@@ -7366,6 +7367,63 @@ class Orchestrator:
         self._mark_task_completed(task.id)
         return True
 
+    def _note_conflict_resolver(
+        self, task_id: str, head: str, candidate: str, merge_message: str
+    ):
+        """The `resolve_conflicts` hook `merge_foreign_commit` offers, bound to
+        this task so it can report itself.
+
+        Returns `(worker_git, conflicts) -> bool`. The decision is entirely
+        `note_merge.combine_conflicted_notes`'s — the same function
+        `auto_merge.AutoMerger._resolve_note_conflicts` calls — so this is the
+        reporting half and nothing more. The gateway hands it the gateway that
+        is actually mid-merge rather than one built here, which is what makes
+        "the three sides it read belong to THIS merge" structural instead of a
+        convention.
+
+        Both outcomes are logged, refusals included: this path is about to park
+        a reviewed candidate, and "the resolver looked at this and declined, for
+        this reason" is the difference between an operator reading one entry and
+        reconstructing a merge by hand. Its own entry types rather than
+        `auto_merge`'s, because the recovery an operator reaches for differs.
+        """
+
+        def resolve(worker_git, conflicts) -> bool:
+            outcome = note_merge.combine_conflicted_notes(
+                worker_git,
+                conflicts,
+                merge_message,
+                # The incoming head becomes this task's base, so ITS lines lead
+                # and the task's own additions stay at the end of the ledger.
+                # See `note_merge.OURS_FIRST` — the other order leaves a branch
+                # that can never be merged back out.
+                lead=note_merge.THEIRS_FIRST,
+            )
+            if not outcome.resolved:
+                self._log(
+                    "execution_base_notes_refused",
+                    data={
+                        "task_id": task_id,
+                        "head": head,
+                        "candidate_sha": candidate,
+                        "conflicted_files": sorted(conflicts),
+                        "reason": outcome.refusal,
+                    },
+                )
+                return False
+            self._log(
+                "execution_base_notes_resolved",
+                data={
+                    "task_id": task_id,
+                    "head": head,
+                    "candidate_sha": candidate,
+                    "paths": list(outcome.paths),
+                },
+            )
+            return True
+
+        return resolve
+
     def _carry_reviewed_candidate_past(
         self, execution: TaskExecution, task: Task, head: str
     ) -> str:
@@ -7424,6 +7482,41 @@ class Orchestrator:
         reports the conflicted paths; resolving them here would be the same
         silent rewrite of reviewed work, one level down.
 
+        ONE CONFLICT SHAPE IS COMBINED INSTEAD OF PARKED (notes-04,
+        2026-08-23), and it is the SAME one, decided by the SAME code, that
+        `auto_merge.AutoMerger._merge` already combines when a task is merged
+        the other way: both sides only appended change-note lines to the
+        terminal append-only section of a tracker in `note_merge.NOTE_TRACKERS`.
+        `note_merge.combine_conflicted_notes` is handed the in-progress merge
+        (via `merge_foreign_commit`'s `resolve_conflicts` hook, so it sees the
+        three index stages before the abort clears them) and either concludes
+        the merge or declines, and a decline lands on the park below with the
+        message it always had.
+
+        Why this direction needed it at all: every task appends a change note
+        by construction, so two tasks in flight across one merge collide in the
+        trackers by DEFAULT. Measured 2026-08-23, hours after notes-03 widened
+        the tracker list: `blk-quota-01-002` parked `task_base_behind_head`
+        because the head conflicted at `docs/SUMMARY.md` and `docs/TESTS.md` —
+        both in that list, both the append-at-the-end shape — and an 11-file
+        reviewed candidate that had passed validation was abandoned. Widening
+        WHICH files may be combined bought nothing here, because the resolver
+        was never consulted in this direction at all.
+
+        `THEIRS_FIRST` is not a detail. Here "theirs" is the incoming head,
+        which becomes this task's new base, so its note lines must come FIRST
+        and the task's own additions must stay at the very end — otherwise the
+        branch's section no longer starts with its base's byte for byte and the
+        eventual merge back OUT refuses forever (the ctx-01 shape; see
+        `note_merge.OURS_FIRST`).
+
+        NOTHING ELSE IS WEAKENED. A conflict in any path outside that list —
+        a source file, or a tracker's own prose above the marker — refuses the
+        whole merge and parks. The five preconditions below still run FIRST, so
+        a dirty worker or a tip that lost the candidate is still refused before
+        any merge is attempted, and a resolution that cannot be verified is
+        reported as a failure by `merge_foreign_commit` rather than accepted.
+
         NOT gated by `auto_merge_enabled`, deliberately. That flag exists
         because auto-merge moves the SHARED branch head with no operator in the
         loop; this merge moves one worker repository's own private branch and
@@ -7469,14 +7562,20 @@ class Orchestrator:
                     f"its worker branch tip {tip[:12]} does not contain the "
                     f"reviewed candidate {candidate[:12]}"
                 )
+            merge_message = (
+                f"autoloop: merge branch head {head[:12]} into task {task.id} "
+                f"(reviewed candidate {candidate[:12]} preserved)"
+            )
             attempt = worker.merge_foreign_commit(
                 # Absolute, resolved: the policy layer refuses a relative
                 # fetch source outright, and `GitGateway` does not resolve
                 # `repo_root` for itself.
                 str(Path(self._git.repo_root).resolve()),
                 head,
-                f"autoloop: merge branch head {head[:12]} into task {task.id} "
-                f"(reviewed candidate {candidate[:12]} preserved)",
+                merge_message,
+                resolve_conflicts=self._note_conflict_resolver(
+                    task.id, head, candidate, merge_message
+                ),
             )
         except (GitError, OSError) as exc:
             return f"its worker repository could not be merged: {type(exc).__name__}: {exc}"

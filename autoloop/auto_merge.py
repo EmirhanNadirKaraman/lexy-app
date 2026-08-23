@@ -623,67 +623,24 @@ class AutoMerger:
         merge has been resolved AND committed here; False leaves the checkout
         exactly as `git merge` left it, for `_abort` to restore.
 
-        **Every conflicted path is resolved into memory before ANY file is
-        written.** A path that resolves followed by one that refuses would
-        otherwise leave a rewritten tracker in a half-merged tree, and the
-        abort that follows would be cleaning up after this method rather than
-        after git.
+        The DECISION and the file handling live in
+        `note_merge.combine_conflicted_notes`, which the base-refresh direction
+        (`orchestrator._carry_reviewed_candidate_past`) also calls — this method
+        is the reporting half, and nothing else. Two copies of "read three index
+        stages, resolve every path before writing any, stage, commit" would
+        drift, and a drift here means a merge resolved in one direction and
+        refused in the other, which is the failure notes-04 exists to end.
+
+        `lead` is left at its default `OURS_FIRST`: merging INTO the base
+        branch, the base's own accumulated notes lead and the task's follow.
+        The other direction must pass `THEIRS_FIRST` — see `note_merge`'s
+        `OURS_FIRST` docstring for why that is not cosmetic.
         """
         if not conflicts:
             return False
-        outside = [path for path in conflicts if path not in note_merge.NOTE_TRACKERS]
-        if outside:
-            # Not even partially: a real conflict anywhere in the merge means
-            # the whole merge needs a human, so nothing is resolved.
-            self._note_refusal(
-                task_id, candidate, conflicts,
-                f"conflicted path(s) outside the change-note trackers: {outside}",
-            )
-            return False
-
-        resolutions: dict[str, str] = {}
-        for path in sorted(conflicts):
-            try:
-                base = self._git.merge_stage_blob(path, 1).decode("utf-8")
-                ours = self._git.merge_stage_blob(path, 2).decode("utf-8")
-                theirs = self._git.merge_stage_blob(path, 3).decode("utf-8")
-                merged = (Path(self._git.repo_root) / path).read_text(encoding="utf-8")
-            except (GitError, OSError, UnicodeDecodeError) as exc:
-                self._note_refusal(
-                    task_id, candidate, conflicts,
-                    f"could not read all three sides of {path}: "
-                    f"{type(exc).__name__}: {exc}",
-                )
-                return False
-            combined = note_merge.resolve_note_append(base, ours, theirs, merged)
-            if combined is None:
-                self._note_refusal(
-                    task_id, candidate, conflicts,
-                    f"{path} is not two branches appending change notes — "
-                    "something outside the append-only section conflicted, or a "
-                    "line that was already there was edited, deleted or reordered",
-                )
-                return False
-            resolutions[path] = combined
-
-        try:
-            for path, text in resolutions.items():
-                (Path(self._git.repo_root) / path).write_text(text, encoding="utf-8")
-            self._git.add_paths(sorted(resolutions))
-            self._git.commit_staged(
-                f"{message}\n\nAppend-only change notes combined automatically in "
-                + ", ".join(sorted(resolutions))
-                + "."
-            )
-        except (GitError, OSError) as exc:
-            # The tree now holds this method's writes on top of git's
-            # half-merged state. `_merge` calls `_abort` next, which restores
-            # both — and verifies that it did.
-            self._note_refusal(
-                task_id, candidate, conflicts,
-                f"combined the change notes but could not commit them: "
-                f"{type(exc).__name__}: {exc}",
-            )
+        outcome = note_merge.combine_conflicted_notes(self._git, conflicts, message)
+        if not outcome.resolved:
+            self._note_refusal(task_id, candidate, conflicts, outcome.refusal)
             return False
 
         self._log(
@@ -691,7 +648,7 @@ class AutoMerger:
             data={
                 "task_id": task_id,
                 "candidate_sha": candidate,
-                "paths": sorted(resolutions),
+                "paths": list(outcome.paths),
             },
         )
         return True
