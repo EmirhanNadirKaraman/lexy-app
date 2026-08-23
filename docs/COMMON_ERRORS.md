@@ -2240,6 +2240,32 @@ answer and delays the alert for a genuinely hung loop. A live subagent still
 suppresses the alarm regardless of transcript age or wake history — that
 rule is load-bearing and evaluated first.
 
+### the dashboard says "the task graph could not be read" and tasks.json is fine
+**Symptom:** the roadmap and summary panels both read *"the task graph could not
+be read — tasks.json did not load as a registry"*, and the file is demonstrably
+healthy: valid JSON, `TaskRegistry.from_dict` parses it, `state_of` raises for
+none of its tasks, no dangling `depends_on`, and `task_groups` returns all six
+groups when you run it by hand. (Observed 2026-08-22: 171 tasks, all six groups,
+nothing wrong with the data at all.)
+**Cause:** **the reader, not the file.** The dashboard is a long-lived Python
+process and merging into the checkout does not reload it, so a page served by a
+process older than the current `autoloop/tasks.py` is running code that cannot
+parse what the current code writes. The page had been up 19.5 hours across four
+merges. This is the most expensive shape of failure in the repo — a PROCESS
+fault reported through a DATA branch — because every obvious next step (check
+the JSON, check the dependencies, check whether the writer is atomic) is
+looking in the wrong place, and all of them come back clean.
+**Fix:** shipped 2026-08-23 (loop-03). The dashboard now reads the same
+`.autoloop/pending_upgrade.json` the loop already consumes and re-execs itself
+between connections; a stale process, an unreadable marker, a failed preflight
+and a refused exec each render their own banner, and the two "could not be read"
+panels carry a caveat pointing at it. **Read the banner before the file.** If
+you are on an older build, or the banner says `exec_failed`, restart the
+dashboard by hand and re-read the page before investigating the data — and note
+that `build.stale` alone is not enough to tell you this: it hashes
+`dashboard.py`, which on 2026-08-22 had not changed. See `docs/AUTOLOOP.md`
+§3f-quater.
+
 ---
 
 ## 10. Autoloop merge sweep (documentation trackers)
@@ -2835,6 +2861,7 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | notes-03 | This file joined `note_merge.NOTE_TRACKERS`: a merge conflicting only in the section below is now combined by the loop, while a conflict in any error entry above the marker still refuses the whole merge. §10's fix text had to stop quoting the marker comment in full first — with two copies in the file, the resolver refuses every merge of it. |
 | 2026-08-23 | port-01 | Read the two entries above about a RELATIVE `state_dir` — the sibling-worktree one in §2 and the stray `.al`/`.autoloop` one in §7 — as describing an EXPLICITLY configured value from now on. The unconfigured default is no longer `.autoloop`; it is `<workers_root>/../state`, absolute (`config.default_state_dir`, `docs/AUTOLOOP.md` §3h). Both entries stay accurate as written, because `config.example.toml` and both test helpers still set the key explicitly. |
 | 2026-08-23 | quota-01 | New §15 for the `codex_cli` transport, with the two entries a false exhaustion park actually presents as. The first is the 2026-08-22 incident and says plainly that narrowing `codex.quota_patterns` by hand was the stopgap, not the fix — do not answer a recurrence that way. |
+| 2026-08-23 | loop-03 | New §9 entry for the most expensive failure shape in this repo: a PROCESS fault reported through a DATA branch. "the task graph could not be read" on a healthy `tasks.json` means the dashboard is older than the checkout, not that the file is corrupt — read the banner before the file. `build.stale` alone will not tell you: it hashes `dashboard.py`, which on 2026-08-22 had not changed while `tasks.py` had. |
 | 2026-08-23 | quota-01 | §6's `rate_limited`-for-hours entry is about the BROWSER transport and is unaffected: it stays the right entry for a `RateLimitedError` with no attachable page behind it. The codex adapter deliberately never raises that error, which is why its transient limits get an entry of their own rather than a clause in that one. |
 | 2026-08-23 | quota-01 | §15's first entry had its Fix paragraph corrected in place: it claimed a reflowed echo could not reopen the hole, and a literal substring test against the prompt does not hold that. The corrected text names the worked case (`quota` + newline + `exceeded` printed back as `quota exceeded`) and says outright that simplifying either comparison back to a plain `in` IS the regression — the next reader's most likely wrong move. |
 | 2026-08-23 | quota-01 | §15 is titled for the `codex_cli` transport and stays that way, but read its first entry's SECOND half — a throttle routed to the loop_fatal branch — as having applied to `codex_app_server` too until this date: `rate_limit_exceeded`, `rate_limited`, `too_many_requests` and a numeric 429 were all in that transport's exhaustion vocabulary. No production symptom was ever recorded for it, which is why this is a note and not a new entry. `docs/AUTOLOOP.md` §5d-ter has the routing table. |

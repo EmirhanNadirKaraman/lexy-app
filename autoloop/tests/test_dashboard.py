@@ -73,6 +73,48 @@ def _clean_dashboard_caches():
         cache.clear()
 
 
+@pytest.fixture(autouse=True)
+def _clean_upgrade_state():
+    """The self-replacement machinery (loop-03) keeps three pieces of module
+    state: which shas this process has already failed to upgrade to, the
+    preflight results memoised beside them, and the request counter plus the
+    armed flag that decide when a replacement is safe.
+
+    All three are process-wide by design — `os.execv` replaces the whole image,
+    so a per-thread count would say nothing — and every one of them would make
+    test order load-bearing if it leaked. `_UPGRADING` is the sharp one: left
+    set, `Handler.handle` refuses every connection, so an unrelated test would
+    fail with a page that never answers.
+    """
+    import autoloop.dashboard as dash
+
+    def reset():
+        dash._UPGRADE_ATTEMPTS.clear()
+        dash._PREFLIGHTS.clear()
+        dash._INFLIGHT = 0
+        dash._UPGRADING = False
+
+    reset()
+    yield
+    reset()
+
+
+@pytest.fixture(autouse=True)
+def no_process_replacement(monkeypatch):
+    """Every route to replacing this process, disabled for the whole file.
+
+    Same fixture, same reason, as `test_self_upgrade.py`'s: a test that really
+    called `os.execv` would replace the pytest process with a dashboard — no
+    failure, no report, just a test session that turns into a web server. The
+    two tests that care about the exec install their own recorder over this.
+    """
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("this file must never replace the pytest process")
+
+    monkeypatch.setattr(os, "execv", refuse)
+
+
 def snapshot(root: Path) -> dict:
     """Every file under `root` with its mtime — the same shape the read-only
     test uses, so "did anything change" is one comparison."""
@@ -2554,7 +2596,10 @@ def test_the_summary_renders_at_the_top_of_the_page():
         assert static_markup.index('id="summary"') < static_markup.index(later), \
             f"the counts must render above {later}"
 
-    assert "renderStats(d.stats)" in script
+    # The second argument is the PROCESS's own currency (loop-03), passed so the
+    # "could not be read" branch can say which of the two failures the operator
+    # has. It is never allowed to become a source of counts.
+    assert "renderStats(d.stats, d.build && d.build.upgrade)" in script
     for field in ("s.line", "s.total", "s.open", "s.denominator", "s.percent_done",
                   "s.tiles", "t.label", "t.count", "s.open_by_priority",
                   "s.open_by_area", "c.completed", "c.retired",
@@ -2565,7 +2610,7 @@ def test_the_summary_renders_at_the_top_of_the_page():
     # cannot spell a state itself and cannot put two states under one word. A
     # hard-coded tile list is the shape that let `blocked` mean the quarantine
     # up here while the Roadmap group below meant a dependency.
-    block = script.split("function renderStats(s){", 1)[1].split("\nfunction ", 1)[0]
+    block = script.split("function renderStats(s, up){", 1)[1].split("\nfunction ", 1)[0]
     assert "(s.tiles || []).map(t => [t.label, t.count])" in block
     for state in TaskState:
         assert f'"{state.value}"' not in block, f"{state.value} is spelled in the template"
@@ -2580,7 +2625,7 @@ def test_the_summary_renders_at_the_top_of_the_page():
     # ticks on a clock, so rebuilding it on every 2s poll would discard text
     # selection for nothing.
     body = script.split("function render(d, force){", 1)[1]
-    assert body.index("sig === LASTJSON") < body.index("renderStats(d.stats)")
+    assert body.index("sig === LASTJSON") < body.index("renderStats(d.stats,")
 
 
 # ---- the roadmap docket: full descriptions, expandable (2026-08-18) -----------
@@ -4396,3 +4441,1032 @@ def test_the_filter_controls_are_static_markup_the_refresh_never_rewrites():
     assert "Both start ON" in static_markup
     assert "drawn + hidden + in no relation = every task" in static_markup
     assert "KEPT and drawn alone" in static_markup
+
+
+# ---- the dashboard runs the code the checkout holds (loop-03, 2026-08-23) -----
+#
+# MEASURED 2026-08-22: the page had been up 19.5 hours across four merges;
+# `autoloop/tasks.py` was rewritten three hours earlier and
+# `.autoloop/pending_upgrade.json` named it at 13:37. The signal was armed and
+# nothing in this module read it.
+#
+# The symptom is what these tests are really about. The page said "the task
+# graph could not be read — tasks.json did not load as a registry" about a file
+# holding 171 valid tasks that `TaskRegistry.from_dict` parses and `state_of`
+# raises for none of. A stale reader reporting a data error sends every
+# investigation in the wrong direction, so the claim has two halves and both are
+# pinned below: the process replaces itself, AND a genuinely unreadable graph
+# still says so, distinguishably.
+#
+# **No test here replaces the pytest process** — `no_process_replacement` is
+# autouse for the whole file and makes `os.execv` raise, so a test that reaches
+# a real exec fails loudly instead of turning the session into a web server. The
+# tests that care about the exec install their own recorder over it.
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+class Execed(Exception):
+    """Raised by the recorder standing in for `os.execv`. Deliberately not an
+    `OSError`: the production code catches `OSError` as "the exec was refused"
+    and would swallow it, so a test wanting to observe a REAL exec has to raise
+    something that propagates."""
+
+
+def recording_execv(monkeypatch) -> list:
+    """Install a recorder over `os.execv` and return the list it writes to.
+
+    It records `_INFLIGHT` as well as the argv, because "no request was being
+    served at the instant the image was replaced" is the safety property — not
+    "the handler that decided had finished", which is a weaker claim on a
+    threading server.
+    """
+    import autoloop.dashboard as dash
+
+    calls: list = []
+
+    def record(path, argv):
+        calls.append({"path": path, "argv": list(argv), "inflight": dash._INFLIGHT})
+        raise Execed(argv)
+
+    monkeypatch.setattr(os, "execv", record)
+    return calls
+
+
+def upgrade_record(repo_root, **over):
+    """One `PendingUpgrade` of the shape `AutoMerger._note_loop_code_merge`
+    writes: loop code changed, not acted on yet, recorded just now."""
+    from autoloop.auto_merge import UPGRADE_PENDING, PendingUpgrade
+
+    data = {
+        "base_sha": "b" * 40,
+        "previous_base_sha": "a" * 40,
+        "candidate_sha": "c" * 40,
+        "task_id": "preempt-01",
+        "repo_root": str(repo_root),
+        "paths": ["autoloop/tasks.py"],
+        "status": UPGRADE_PENDING,
+        # AFTER this pytest process imported `dashboard`, which is what makes
+        # the loaded code older than the checkout.
+        "recorded_at": utcnow_iso(),
+    }
+    data.update(over)
+    return PendingUpgrade(**data)
+
+
+def arm_upgrade(repo, record):
+    """Write the record where the dashboard reads it — through the loop's own
+    store, so this is the signal the loop writes and not a lookalike."""
+    from autoloop.auto_merge import UpgradeStore
+    import autoloop.dashboard as dash
+
+    UpgradeStore(dash._pending_upgrade_file(repo)).save(record)
+    return dash._pending_upgrade_file(repo)
+
+
+def running_tree():
+    """The package root this pytest process imported `autoloop` from — the tree
+    a replacement would load, and therefore the only `repo_root` that can make a
+    record applicable to it."""
+    import autoloop.dashboard as dash
+
+    return dash._package_root()
+
+
+class FakeSpec:
+    def __init__(self, name):
+        self.name = name
+
+
+class FakeMain:
+    """A stand-in for `sys.modules["__main__"]`. Without a `spec` it is the
+    process started by PATH rather than by `python -m` — the shape
+    `relaunch_argv` refuses."""
+
+    def __init__(self, spec=None):
+        if spec is not None:
+            self.__spec__ = spec
+
+
+def launchable(monkeypatch, argv=("/x/autoloop/dashboard.py",)):
+    """Give this process a derivable launch shape.
+
+    Needed by every test that drives an ATTEMPT, because pytest is usually
+    started as a console script and so has no `__main__.__spec__` at all — which
+    is precisely the case `relaunch_argv` refuses. Without this, those tests
+    would stop at that refusal and never reach the bound they are about, while
+    still going green on a weaker assertion.
+    """
+    monkeypatch.setattr(sys, "argv", list(argv))
+    monkeypatch.setitem(
+        sys.modules, "__main__", FakeMain(FakeSpec("autoloop.dashboard"))
+    )
+
+
+def test_the_dashboard_reads_the_signal_file_the_loop_writes(tmp_path):
+    """Two spellings of one path. The whole claim is that this reads the marker
+    the loop already writes; a dashboard resolving a different path would read
+    nothing, forever, and nothing would say so."""
+    import autoloop.dashboard as dash
+    from autoloop.config import AutoloopConfig, BrowserConfig
+
+    from autoloop.policy import PolicyConfig
+
+    repo = make_repo(tmp_path)
+    config = AutoloopConfig(
+        browser=BrowserConfig(conversation_url="https://chatgpt.com/c/x"),
+        policy=PolicyConfig(),
+        state_dir=repo / ".autoloop",
+    )
+    assert dash._pending_upgrade_file(repo) == config.pending_upgrade_file
+
+
+def test_the_dashboards_preflight_timeout_matches_the_loops():
+    """Spelled in this module rather than imported (importing `cli` would drag
+    the browser and the codex client into a read-only tracker), so the two are
+    pinned equal here instead of being allowed to drift apart silently."""
+    import autoloop.dashboard as dash
+    from autoloop import cli
+
+    assert dash.PREFLIGHT_TIMEOUT_SECONDS == cli.PREFLIGHT_TIMEOUT_SECONDS
+
+
+def test_the_preflight_covers_what_a_fresh_dashboard_loads():
+    """`cli.PREFLIGHT_MODULES` names what a LOOP loads and does not contain
+    `dashboard`, so preflighting with it would pass for a tree whose dashboard
+    does not import — the only tree that matters here. The lazily imported ones
+    are in the list because this process reaches them mid-request, long after
+    any preflight has run."""
+    import autoloop.dashboard as dash
+
+    for name in ("autoloop", "autoloop.dashboard", "autoloop.tasks",
+                 "autoloop.lock", "autoloop.inbox", "autoloop.path_suggest"):
+        assert name in dash.DASHBOARD_PREFLIGHT_MODULES
+    assert not [m for m in dash.DASHBOARD_PREFLIGHT_MODULES
+                if "playwright" in m or "codex" in m or "browser" in m], (
+        "optional third-party deps would fail every preflight on a machine "
+        "without them and disable this feature for good"
+    )
+
+
+def test_the_preflight_imports_the_tree_it_is_pointed_at(tmp_path):
+    """Both directions, with a real subprocess. A preflight that never launched
+    an interpreter would pass for a tree with a syntax error in it."""
+    import autoloop.dashboard as dash
+
+    ok, detail = dash._preflight_import(REPO_ROOT)
+    assert ok, detail
+
+    broken = tmp_path / "checkout"
+    (broken / "autoloop").mkdir(parents=True)
+    (broken / "autoloop" / "__init__.py").write_text(
+        "raise RuntimeError('this tree does not import')\n", encoding="utf-8"
+    )
+    ok, detail = dash._preflight_import(broken)
+    assert not ok
+    assert "this tree does not import" in detail
+
+
+# --- the decision: five gates, and what the page says at each one -------------
+
+
+def test_a_merge_after_this_process_started_makes_it_stale(tmp_path):
+    """The whole feature, at the decision layer: the checkout moved to a sha
+    this process did not load, and the record says so."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+
+    view = dash.upgrade_decision(repo)
+    assert view["state"] == "stale"
+    assert view["base_sha"] == "b" * 40, "the FULL sha — it keys the one-shot"
+    assert view["task_id"] == "preempt-01"
+    assert "autoloop/tasks.py" in view["paths"]
+    # And the page carries it, beside — never inside — the task-graph payload.
+    assert collect(repo)["build"]["upgrade"]["state"] == "stale"
+
+
+def test_no_marker_at_all_is_silence(tmp_path):
+    """The ordinary case, and it must stay silent: a banner on every page for a
+    loop that has merged nothing is a banner nobody reads."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    assert not dash._pending_upgrade_file(repo).exists()
+    view = dash.upgrade_decision(repo)
+    assert view["state"] == "current" and view["note"] == ""
+
+
+def test_a_docs_only_merge_does_not_trigger_a_restart(tmp_path):
+    """Same rule the loop already follows. This is a page somebody is watching:
+    re-execing it for a change it does not load is a visible flicker for
+    nothing.
+
+    Asserted against a record the dashboard filters ITSELF, through
+    `loop_code_paths`, rather than against the writer's promise not to have
+    written one — a test that only checked "no record" would pass with this
+    whole gate deleted."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(
+        running_tree(), paths=["docs/AUTOLOOP.md", "docs/TESTS.md"]))
+
+    view = dash.upgrade_decision(repo)
+    assert view["state"] == "current"
+    assert "no file under autoloop/" in view["note"]
+    # The gate is this module's own restatement of the rule, not a re-read of
+    # the writer's: the same filter, on the same input, agrees with the loop's.
+    from autoloop.auto_merge import loop_code_paths
+
+    assert loop_code_paths(["docs/AUTOLOOP.md", "docs/TESTS.md"]) == []
+
+
+def test_a_process_that_already_loaded_the_merged_code_is_current(tmp_path):
+    """The gate that makes this self-limiting, and it is doing the work of a
+    one-shot: a dashboard started AFTER the merge is already running the merged
+    tree, so acting on a still-pending record would be a restart loop wearing an
+    upgrade's clothes. It is also what the successor of a real re-exec sees."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(
+        running_tree(), recorded_at="2020-01-01T00:00:00+00:00"))
+
+    view = dash.upgrade_decision(repo)
+    assert view["state"] == "current"
+    assert "loaded its code after that merge" in view["note"]
+
+
+def test_a_settled_record_is_not_acted_on_but_is_not_silent_either(tmp_path, monkeypatch):
+    """`pending` gates the ACTION — the same gate the loop's own boundary
+    applies, so this process can never act on a sha the loop has taken off the
+    table.
+
+    It does NOT gate the report, and that is the hole this closes rather than
+    inherits. Nobody has the page open when the merge lands; the loop settles
+    the record at its next round boundary; the first person to look then gets a
+    stale page reporting nothing wrong with itself — the exact silence of
+    2026-08-22, arrived at by a different route."""
+    import autoloop.dashboard as dash
+    from autoloop.auto_merge import (
+        UPGRADE_EXEC_FAILED,
+        UPGRADE_EXECED,
+        UPGRADE_PREFLIGHT_FAILED,
+        UPGRADE_UNAPPLICABLE,
+    )
+
+    repo = make_repo(tmp_path)
+    launchable(monkeypatch)
+    monkeypatch.setattr(
+        dash, "_preflight_import", lambda root: pytest.fail("must not preflight")
+    )
+    for status in (UPGRADE_EXECED, UPGRADE_PREFLIGHT_FAILED,
+                   UPGRADE_UNAPPLICABLE, UPGRADE_EXEC_FAILED):
+        arm_upgrade(repo, upgrade_record(running_tree(), status=status))
+        view = dash.upgrade_decision(repo)
+        assert view["state"] == "stale_settled", status
+        assert status in view["note"] and "by hand" in view["note"]
+        # And nothing is attempted — `no_process_replacement` plus the refusing
+        # preflight above make that a real assertion rather than an absence.
+        assert dash._upgrade_at_boundary(repo) == "stale_settled"
+
+
+def test_a_settled_record_older_than_this_process_is_simply_current(tmp_path):
+    """The complement, and the one that keeps `stale_settled` from becoming a
+    banner on every page forever: a dashboard started AFTER the merge is running
+    the merged code, whatever became of the record."""
+    import autoloop.dashboard as dash
+    from autoloop.auto_merge import UPGRADE_EXECED
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(
+        running_tree(), status=UPGRADE_EXECED,
+        recorded_at="2020-01-01T00:00:00+00:00"))
+
+    assert dash.upgrade_decision(repo)["state"] == "current"
+
+
+def test_a_merge_in_another_checkout_is_not_a_reason_to_restart(tmp_path):
+    """Replacing this process would load the same code again."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(tmp_path / "somewhere-else"))
+
+    view = dash.upgrade_decision(repo)
+    assert view["state"] == "not_this_tree"
+    assert "would load the same code again" in view["note"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{not json", "", "[]", '{"base_sha": "b"}', '{"nope": 1}'],
+)
+def test_an_unreadable_marker_says_MARKER_not_task_graph(tmp_path, content):
+    """The failure this whole task exists to stop: a process problem reported
+    as a data problem. `UpgradeStore.load` collapses absent and corrupt into
+    `None`, so the file's existence is checked separately — otherwise a
+    half-written marker would render as silence, and the page would go on
+    blaming `tasks.json`."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    path = dash._pending_upgrade_file(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+    view = dash.upgrade_decision(repo)
+    assert view["state"] == "unreadable_marker"
+    assert "pending_upgrade.json" in view["note"]
+    assert "not the task graph" in view["note"]
+
+
+def test_an_unreadable_recorded_at_refuses_rather_than_guessing(tmp_path):
+    """A record that parses but cannot say WHEN it was written cannot establish
+    that this process predates it. Refusing costs a delayed restart; guessing
+    would either replace a current process or bless a stale one."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree(), recorded_at="not a timestamp"))
+
+    view = dash.upgrade_decision(repo)
+    assert view["state"] == "unreadable_marker"
+    assert "recorded_at" in view["note"]
+
+
+def test_a_naive_recorded_at_is_read_as_utc(tmp_path):
+    """`utcnow_iso()` is tz-aware and older records may not be. Guessing local
+    time for a naive stamp would shift it by hours in whichever direction the
+    machine happens to sit — and the comparison it feeds decides whether a
+    process replaces itself."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    naive = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    arm_upgrade(repo, upgrade_record(running_tree(), recorded_at=naive))
+
+    assert dash.upgrade_decision(repo)["state"] == "stale"
+
+
+def test_the_dashboard_never_writes_the_signal_it_reads(tmp_path, monkeypatch):
+    """Two independent reasons, both severe. The record is the LOOP's one-shot,
+    so consuming it would stop the LOOP re-execing — and loop-02's tests never
+    run a dashboard, so nothing there would catch it. And it lives inside the
+    observed checkout, where any write trips the escape detector and parks the
+    loop this page exists to watch.
+
+    Driven through a real failed attempt, not just a read: settling is exactly
+    what the loop does at this point, so the tempting write is on this path."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    path = arm_upgrade(repo, upgrade_record(running_tree()))
+    before_bytes = path.read_bytes()
+    before_tree = snapshot(repo)
+
+    launchable(monkeypatch)
+    monkeypatch.setattr(dash, "_preflight_import", lambda root: (False, "boom"))
+    assert dash._upgrade_at_boundary(repo) == "preflight_failed"
+    collect(repo)
+
+    assert path.read_bytes() == before_bytes, "the loop's one-shot is untouched"
+    assert snapshot(repo) == before_tree, "and nothing else in the checkout moved"
+
+
+# --- the attempt: preflight first, and one shot per sha ----------------------
+
+
+def test_a_tree_that_does_not_import_leaves_the_process_serving(tmp_path, monkeypatch):
+    """A dashboard that exec'd into a broken tree would be GONE — no process, no
+    message, an operator staring at a dead port. So the old image stays and the
+    page says why. `no_process_replacement` is what makes "not exec'ed" a real
+    assertion here: an exec would raise."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+    launchable(monkeypatch)
+    monkeypatch.setattr(
+        dash, "_preflight_import", lambda root: (False, "SyntaxError: invalid syntax")
+    )
+
+    assert dash._upgrade_at_boundary(repo) == "preflight_failed"
+    view = dash.upgrade_decision(repo)
+    assert view["state"] == "preflight_failed"
+    assert "SyntaxError" in view["note"]
+    assert "still serving the code it started with" in view["note"]
+    assert collect(repo)["build"]["upgrade"]["state"] == "preflight_failed"
+
+
+def test_a_failed_preflight_is_not_retried_on_every_poll(tmp_path, monkeypatch):
+    """The page polls every two seconds and the preflight launches an
+    interpreter. Retrying it per poll would spawn a process every two seconds
+    forever for an upgrade that has already been ruled out."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+    launchable(monkeypatch)
+    attempts: list = []
+
+    def preflight(root):
+        attempts.append(root)
+        return False, "boom"
+
+    monkeypatch.setattr(dash, "_preflight_import", preflight)
+
+    assert dash._upgrade_at_boundary(repo) == "preflight_failed"
+    assert dash._upgrade_at_boundary(repo) == "preflight_failed"
+    assert dash._upgrade_at_boundary(repo) == "preflight_failed"
+    assert len(attempts) == 1
+    assert attempts[0] == dash._package_root(), "the tree the replacement loads"
+
+
+def test_the_preflight_runs_before_anything_is_replaced(tmp_path, monkeypatch):
+    """Order matters: a tree that does not import must be found out while this
+    process is still the one serving."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+    launchable(monkeypatch)
+    seen: list = []
+
+    monkeypatch.setattr(dash, "_preflight_import",
+                        lambda root: (seen.append("preflight"), (True, ""))[1])
+
+    def record(path, argv):
+        seen.append("exec")
+        raise Execed(argv)
+
+    monkeypatch.setattr(os, "execv", record)
+
+    with pytest.raises(Execed):
+        dash._upgrade_at_boundary(repo)
+    assert seen == ["preflight", "exec"]
+
+
+def test_an_exec_that_is_refused_leaves_the_process_serving(tmp_path, monkeypatch):
+    """`execv` raising means this process is still here and still holding the
+    port. The gate that stopped it answering has to come back off, or refusing
+    one upgrade costs the operator the whole page."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+    launchable(monkeypatch)
+    monkeypatch.setattr(dash, "_preflight_import", lambda root: (True, ""))
+
+    def refuse(path, argv):
+        raise OSError("Exec format error")
+
+    monkeypatch.setattr(os, "execv", refuse)
+
+    assert dash._upgrade_at_boundary(repo) == "exec_failed"
+    assert dash._UPGRADING is False, (
+        "a process that could not be replaced must go on answering requests"
+    )
+    view = dash.upgrade_decision(repo)
+    assert view["state"] == "exec_failed" and "Exec format error" in view["note"]
+    # One shot: a refused exec is not a licence to try the same sha again.
+    assert dash._upgrade_at_boundary(repo) == "exec_failed"
+
+
+def test_an_exec_that_raises_something_else_still_unlocks_the_port(
+    tmp_path, monkeypatch
+):
+    """`os.execv` is documented to raise `OSError`, and the mainline catches
+    exactly that. Anything else on its way up would leave `_UPGRADING` set and
+    the port silent for good — a worse outcome than never upgrading — so the
+    flag is cleared in a `finally`, not in the `except`."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+    launchable(monkeypatch)
+    monkeypatch.setattr(dash, "_preflight_import", lambda root: (True, ""))
+    recording_execv(monkeypatch)
+
+    with pytest.raises(Execed):
+        dash._upgrade_at_boundary(repo)
+    assert dash._UPGRADING is False
+
+
+# --- the relaunch command: derived, never hard-coded --------------------------
+
+
+@pytest.mark.parametrize(
+    "spec_name, argv, expected",
+    [
+        # `python -m autoloop.dashboard --repo X --port 8787`
+        ("autoloop.dashboard",
+         ["/x/autoloop/dashboard.py", "--repo", "/checkout", "--port", "8787"],
+         ["-m", "autoloop.dashboard", "--repo", "/checkout", "--port", "8787"]),
+        # `python -m autoloop dashboard --port 8787` — runpy names the package's
+        # `__main__`, which is not what `-m` takes.
+        ("autoloop.__main__",
+         ["/x/autoloop/__main__.py", "dashboard", "--port", "8787"],
+         ["-m", "autoloop", "dashboard", "--port", "8787"]),
+    ],
+)
+def test_the_relaunch_command_is_derived_from_how_this_process_started(
+    monkeypatch, spec_name, argv, expected
+):
+    """Both documented launch shapes. The loop's own rebuild is hard-coded
+    `[-m, autoloop, *argv[1:]]` because the loop has one shape; copying it here
+    would, under `python -m autoloop.dashboard --repo X`, launch a LOOP RUN with
+    `--repo X` — a write-capable, git-pushing process started by a read-only
+    tracker."""
+    import autoloop.dashboard as dash
+
+    monkeypatch.setitem(sys.modules, "__main__", FakeMain(FakeSpec(spec_name)))
+    monkeypatch.setattr(sys, "argv", argv)
+
+    built, why = dash.relaunch_argv()
+    assert why == ""
+    assert built == [sys.executable, *expected]
+
+
+def test_a_launch_shape_that_cannot_be_derived_refuses_rather_than_guesses(
+    monkeypatch,
+):
+    """A script run by path has no `__main__.__spec__`. A wrong relaunch is
+    unrecoverable; a refused one is a sentence on the page."""
+    import autoloop.dashboard as dash
+
+    monkeypatch.setitem(sys.modules, "__main__", FakeMain())
+    built, why = dash.relaunch_argv()
+    assert built == []
+    assert "python -m" in why
+
+
+def test_an_undeterminable_launch_shape_is_never_exec_ed(tmp_path, monkeypatch):
+    """The refusal, driven through the boundary: nothing is replaced, the page
+    says so, and `no_process_replacement` proves no exec was attempted."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+    monkeypatch.setattr(dash, "_preflight_import", lambda root: (True, ""))
+    monkeypatch.setitem(sys.modules, "__main__", FakeMain())
+
+    assert dash._upgrade_at_boundary(repo) == "exec_failed"
+    assert dash.upgrade_decision(repo)["state"] == "exec_failed"
+
+
+def test_nothing_from_the_record_reaches_the_relaunch_command(tmp_path, monkeypatch):
+    """`pending_upgrade.json` is a file INSIDE the observed checkout. It decides
+    only WHETHER this process is replaced, never WHAT is run — otherwise an
+    agent that can write the state dir could choose a command line for a
+    process that then execs it."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(
+        running_tree(),
+        task_id="--evil-task",
+        paths=["autoloop/tasks.py", "--evil-path"],
+        candidate_sha="; rm -rf /",
+    ))
+    launchable(monkeypatch, ["/x/autoloop/dashboard.py", "--port", "8787"])
+    monkeypatch.setattr(dash, "_preflight_import", lambda root: (True, ""))
+    calls = recording_execv(monkeypatch)
+
+    with pytest.raises(Execed):
+        dash._upgrade_at_boundary(repo)
+
+    assert calls[0]["argv"] == [
+        sys.executable, "-m", "autoloop.dashboard", "--port", "8787"
+    ]
+    joined = " ".join(calls[0]["argv"])
+    for smuggled in ("--evil-task", "--evil-path", "rm -rf", str(repo)):
+        assert smuggled not in joined
+
+
+# --- the safe point: between requests, never mid-response --------------------
+
+
+@contextlib.contextmanager
+def serving_dashboard(repo, monkeypatch):
+    """The real `Handler` on a real threading server — the handler whose
+    `handle()` carries the boundary."""
+    import autoloop.dashboard as dash
+
+    monkeypatch.setattr(dash.Handler, "repo", repo)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), dash.Handler)
+    srv.daemon_threads = True
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
+
+
+def get(base, path="/"):
+    with urllib.request.urlopen(base + path, timeout=10) as resp:
+        return resp.status, resp.read().decode()
+
+
+def test_a_stale_dashboard_replaces_itself_at_a_request_boundary(
+    tmp_path, monkeypatch
+):
+    """The claim, through the served path. The request that triggers it is
+    answered IN FULL first — `inflight` is recorded at the instant of the exec
+    and must be zero, which is the property a threading server needs (my handler
+    having finished says nothing about the tab polling beside it)."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+    launchable(monkeypatch, ["/x/autoloop/dashboard.py", "--port", "8787"])
+    monkeypatch.setattr(dash, "_preflight_import", lambda root: (True, ""))
+    calls = recording_execv(monkeypatch)
+
+    with serving_dashboard(repo, monkeypatch) as base:
+        status, body = get(base, "/api/state")
+        # The response arrived whole — the exec is not allowed to cost the
+        # operator the answer they asked for.
+        assert status == 200
+        payload = json.loads(body)
+        assert payload["build"]["upgrade"]["state"] == "stale"
+        deadline = time.time() + 5
+        while not calls and time.time() < deadline:
+            time.sleep(0.02)
+
+    assert len(calls) == 1, "one replacement, after the response"
+    assert calls[0]["inflight"] == 0, "nothing was being served when the image went"
+    assert calls[0]["argv"][:3] == [sys.executable, "-m", "autoloop.dashboard"]
+
+
+def test_a_replacement_never_interrupts_a_response_in_flight(tmp_path, monkeypatch):
+    """`os.execv` kills every thread at once, so "the handler that decided has
+    finished" is not the safety property — "nothing else is being served" is.
+
+    One request is held inside `collect` while a second runs to completion. The
+    second one's boundary must NOT replace the process, because the first is
+    still writing. Only when the first finishes may the exec happen."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+    launchable(monkeypatch)
+    monkeypatch.setattr(dash, "_preflight_import", lambda root: (True, ""))
+    calls = recording_execv(monkeypatch)
+
+    real_collect = dash.collect
+    entered = threading.Event()
+    release = threading.Event()
+    slow_once = {"used": False}
+
+    def collect_holding_the_first_caller(target):
+        if not slow_once["used"]:
+            slow_once["used"] = True
+            entered.set()
+            release.wait(timeout=10)
+        return real_collect(target)
+
+    monkeypatch.setattr(dash, "collect", collect_holding_the_first_caller)
+    held: list = []
+
+    with serving_dashboard(repo, monkeypatch) as base:
+        first = threading.Thread(
+            target=lambda: held.append(get(base, "/api/state")), daemon=True
+        )
+        first.start()
+        assert entered.wait(timeout=10), "the held request never reached collect"
+
+        # A whole second request, start to finish, while the first is mid-response.
+        status, body = get(base, "/api/state")
+        assert status == 200 and json.loads(body)["build"]["upgrade"]["state"] == "stale"
+        time.sleep(0.2)
+        assert calls == [], (
+            "the second request's boundary replaced the process while the first "
+            "was still being written — that is a truncated page"
+        )
+
+        release.set()
+        first.join(timeout=10)
+        deadline = time.time() + 5
+        while not calls and time.time() < deadline:
+            time.sleep(0.02)
+
+    assert held and held[0][0] == 200, "the held response still arrived, whole"
+    assert len(calls) == 1 and calls[0]["inflight"] == 0
+
+
+def test_no_new_request_is_served_once_a_replacement_is_armed(tmp_path, monkeypatch):
+    """The window between arming and `execv`. A connection accepted there would
+    be answered by an image that is about to vanish; refusing it gives the
+    browser a failed poll and the successor answers the retry, which is a page
+    that blinks rather than a page cut in half."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    dash._UPGRADING = True
+    with serving_dashboard(repo, monkeypatch) as base:
+        # `RemoteDisconnected` — the connection is closed with nothing written.
+        # An `OSError` at the client is a failed poll it will retry; a partial
+        # body would be a page cut in half, which is the outcome being denied.
+        with pytest.raises(OSError):
+            get(base, "/api/state")
+    assert dash._INFLIGHT == 0, "a refused connection is not a leaked count"
+
+
+def test_a_request_arriving_at_the_boundary_defers_rather_than_truncates(
+    tmp_path, monkeypatch
+):
+    """The recheck under the lock, after the preflight ran without it. A request
+    that arrived in that gap defers the replacement — nothing is spent, nothing
+    is said, and the next boundary asks again with the preflight already
+    paid for."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    arm_upgrade(repo, upgrade_record(running_tree()))
+    launchable(monkeypatch)
+    calls: list = []
+
+    def preflight(root):
+        calls.append(root)
+        dash._INFLIGHT += 1          # a connection arrives while we are asking
+        return True, ""
+
+    monkeypatch.setattr(dash, "_preflight_import", preflight)
+
+    assert dash._upgrade_at_boundary(repo) == "deferred"
+    dash._INFLIGHT = 0
+    recording_execv(monkeypatch)
+    with pytest.raises(Execed):
+        dash._upgrade_at_boundary(repo)
+    assert len(calls) == 1, "the deferred attempt's preflight was not paid for twice"
+    assert dash.upgrade_decision(repo)["state"] == "stale", (
+        "a deferral spends nothing — the sha is still available at the next boundary"
+    )
+
+
+# --- the loop is not supervised, and does not supervise ----------------------
+
+
+def test_neither_process_finds_or_signals_the_other():
+    """loop-02's bound, still standing: each process restarts ITSELF. There is
+    no pid file that would make anything else safe, and a loop that signals
+    other processes is a different and much larger claim.
+
+    Asserted as an absence in the source, because that is what the bound is: no
+    signal, no kill, no process-table lookup for the other side."""
+    loop_side = (REPO_ROOT / "autoloop" / "cli.py").read_text(encoding="utf-8")
+    merge_side = (REPO_ROOT / "autoloop" / "auto_merge.py").read_text(encoding="utf-8")
+    orch = (REPO_ROOT / "autoloop" / "orchestrator.py").read_text(encoding="utf-8")
+    page = (REPO_ROOT / "autoloop" / "dashboard.py").read_text(encoding="utf-8")
+
+    for name, source in (("cli", loop_side), ("auto_merge", merge_side),
+                         ("orchestrator", orch)):
+        for sink in ("os.kill", "killpg", "send_signal", ".terminate()", "pkill"):
+            assert sink not in source, f"{name} signals another process ({sink})"
+    for sink in ("os.kill", "killpg", "send_signal", ".terminate()", "pkill",
+                 "SIGTERM", "SIGKILL"):
+        assert sink not in page, f"the dashboard signals another process ({sink})"
+    # The dashboard replaces ITSELF, in its own pid, and nothing else.
+    assert "os.execv(sys.executable, argv)" in page
+    assert "pgrep" in page, (
+        "reading the process table for DISPLAY is unchanged — the bound is about "
+        "signalling, not about looking"
+    )
+
+
+# --- stale process vs unreadable data: two faults, two renderings ------------
+
+
+def test_a_genuinely_unreadable_graph_still_reports_as_unreadable(tmp_path):
+    """The branch that must survive. `task_groups` returning `[]` still means
+    "could not be read", because real corruption still needs saying — what
+    changed is that STALENESS stopped being reported through it."""
+    repo = make_repo(tmp_path)
+    write_tasks(repo, [a_task("dash-03", depends_on=["nope-nothing-by-that-name"])])
+
+    payload = collect(repo)
+    assert payload["groups"] == [], "a dangling dependency is a real unreadable graph"
+    assert payload["stats"]["readable"] is False
+    # …and it is NOT reported as a process problem.
+    assert payload["build"]["upgrade"]["state"] == "current"
+
+
+def test_the_two_faults_are_distinguishable_on_the_page(tmp_path):
+    """Both true at once — the 2026-08-22 shape, except that there the data was
+    fine and only the reader was old. The payload has to carry them on separate
+    axes so the page can say which one the operator has."""
+    repo = make_repo(tmp_path)
+    write_tasks(repo, [a_task("dash-03", depends_on=["nope-nothing-by-that-name"])])
+    arm_upgrade(repo, upgrade_record(running_tree()))
+
+    payload = collect(repo)
+    assert payload["groups"] == []
+    assert payload["build"]["upgrade"]["state"] == "stale"
+    # The process verdict never speaks the data's vocabulary, in either
+    # direction — that conflation is the whole defect.
+    assert "task graph" not in payload["build"]["upgrade"]["note"]
+    assert "tasks.json" not in payload["build"]["upgrade"]["note"]
+
+
+def pure_upgrade_js() -> str:
+    """The banner helpers, lifted verbatim out of the served page. Payload-in /
+    string-out, no DOM and no module state, so they run directly."""
+    script = PAGE.split("<script>", 1)[1]
+    esc_line = next(
+        line for line in script.splitlines() if line.startswith("const esc =")
+    )
+    region = script.split("// PURE_UPGRADE_START", 1)[1].split("// PURE_UPGRADE_END", 1)[0]
+    return esc_line + "\n" + region
+
+
+def test_the_page_says_which_fault_the_operator_has():
+    """Executed, not grepped. Every non-`current` state produces a banner that
+    names the PROCESS, and the "could not be read" branches gain a caveat
+    pointing at it — because on 2026-08-22 an operator read "tasks.json did not
+    load as a registry" and went and audited a perfectly healthy file."""
+    states = ["stale", "stale_settled", "not_this_tree", "unreadable_marker",
+              "preflight_failed", "exec_failed"]
+    harness = pure_upgrade_js() + """
+const out = {};
+for (const state of __STATES__) {
+  out[state] = {
+    banner: upgradeBanner({state, base_sha: "b".repeat(40), task_id: "preempt-01",
+                           note: "the note"}),
+    caveat: graphCaveat({state}),
+  };
+}
+out.current = {banner: "", caveat: graphCaveat({state: "current"})};
+out.none = {banner: "", caveat: graphCaveat(null)};
+console.log(JSON.stringify(out));
+""".replace("__STATES__", json.dumps(states))
+    rendered = json.loads(run_js(harness))
+
+    # Five states, five different sentences. A shared one would put two faults
+    # that call for opposite actions behind the same words, which is the defect
+    # this whole task is about, one level up.
+    assert len({rendered[s]["banner"] for s in states}) == len(states)
+    for state in states:
+        banner = rendered[state]["banner"]
+        assert "bbbbbbbbbbbb" in banner and "bbbbbbbbbbbbb" not in banner, (
+            "the sha is shown, truncated to twelve"
+        )
+        assert "preempt-01" in banner and "the note" in banner
+        assert "did not load as a registry" not in banner, (
+            f"{state} is a PROCESS fault and must never be phrased as a data one"
+        )
+        assert rendered[state]["caveat"], f"{state} must caveat the unreadable branch"
+        assert "stale reader" in rendered[state]["caveat"]
+    # The marker case names itself, because it is the one whose file lives in
+    # the same directory as `tasks.json` and is the easiest to confuse with it.
+    assert "NOT the task graph" in rendered["unreadable_marker"]["banner"]
+    # Silence when there is nothing to say: a caveat on every page is a caveat
+    # nobody reads, and it would libel a genuinely corrupt registry.
+    assert rendered["current"]["caveat"] == ""
+    assert rendered["none"]["caveat"] == ""
+
+
+def test_the_unreadable_branches_carry_the_caveat_and_the_banner_carries_both():
+    """Placement, in the served template: the two panels that have historically
+    been blamed for a stale process, and the one box that says what it is."""
+    script = PAGE.split("<script>", 1)[1]
+
+    stats = script.split("function renderStats(s, up){", 1)[1].split("\nfunction ", 1)[0]
+    assert "graphCaveat(up)" in stats
+    board = script.split("function renderRoadmap(d){", 1)[1].split("\nfunction ", 1)[0]
+    assert "graphCaveat(d.build && d.build.upgrade)" in board
+    # The banner speaks for BOTH staleness questions — this file's own hash, and
+    # the checkout moving under a process that loaded its code before it. On
+    # 2026-08-22 the second was true and the first was not.
+    assert "d.build.stale" in script and "d.build.upgrade" in script
+    assert "upgradeBanner(up)" in script
+    for state in ("stale", "stale_settled", "not_this_tree", "unreadable_marker",
+                  "preflight_failed", "exec_failed"):
+        assert f"{state}:" in script.split("const UPGRADE_SAY = {", 1)[1], \
+            f"{state} would render as a bare state name"
+
+
+def test_every_backend_upgrade_state_has_a_sentence_on_the_page():
+    """The `MERGE_GROUPS` rule, applied one panel up: a state the backend can
+    emit and the template cannot spell would reach an operator as a bare word."""
+    import autoloop.dashboard as dash
+
+    say = PAGE.split("const UPGRADE_SAY = {", 1)[1].split("\n};", 1)[0]
+    for state in dash.UPGRADE_VIEW_STATES:
+        if state == "current":
+            assert f"{state}:" not in say, "current has nothing to say"
+            continue
+        assert f"{state}:" in say, f"{state} has no sentence on the page"
+
+
+# --- end to end: a stale dashboard really does serve the new code ------------
+
+
+def free_port() -> int:
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def test_a_stale_dashboard_ends_up_serving_the_new_code(tmp_path):
+    """The claim end to end, in a real process: a dashboard started before the
+    checkout moved serves the code that was on disk when it started, and after
+    the signal is armed it serves the code that is on disk now.
+
+    A COPY of this package is what the child runs, so the marker below is an
+    edit to that copy and this repository is never written to. The marker is
+    inserted ABOVE the `__main__` guard on purpose — under `python -m`, the
+    guard's body runs as part of the module and anything after it never
+    executes.
+    """
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".autoloop").mkdir()
+    shutil.copytree(
+        REPO_ROOT / "autoloop",
+        checkout / "autoloop",
+        ignore=shutil.ignore_patterns("tests", "__pycache__"),
+    )
+    module = checkout / "autoloop" / "dashboard.py"
+    port = free_port()
+    log = tmp_path / "child.log"
+    child = None
+    try:
+        with log.open("wb") as sink:
+            child = subprocess.Popen(
+                [sys.executable, "-m", "autoloop.dashboard",
+                 "--repo", str(checkout), "--port", str(port)],
+                cwd=str(checkout), stdout=sink, stderr=subprocess.STDOUT,
+            )
+        base = f"http://127.0.0.1:{port}"
+
+        def page(deadline=30.0):
+            end = time.time() + deadline
+            last = None
+            while time.time() < end:
+                if child.poll() is not None:  # pragma: no cover - a dead child
+                    raise AssertionError(
+                        f"the dashboard exited {child.returncode}: "
+                        f"{log.read_text(errors='replace')[-2000:]}"
+                    )
+                try:
+                    return get(base)[1]
+                except (urllib.error.URLError, OSError) as exc:
+                    last = exc
+                    time.sleep(0.1)
+            raise AssertionError(f"the dashboard never answered: {last}")
+
+        before = page()
+        assert "RELOADED-BY-LOOP-03" not in before
+        assert "<!doctype html>" in before
+
+        # `utcnow_iso()` truncates to SECONDS, and the child's start time does
+        # not. A record written in the same wall-clock second as the child's
+        # import would floor to at or before it and read as already current —
+        # so wait out the second rather than racing it. (In production that
+        # truncation only ever errs toward "current", i.e. toward not
+        # restarting, which is the safe direction; here it would just hang.)
+        time.sleep(1.2)
+
+        # The checkout moves: new code on disk, and the loop's own signal armed.
+        module.write_text(
+            module.read_text(encoding="utf-8").replace(
+                'if __name__ == "__main__":',
+                'PAGE = PAGE + "<!-- RELOADED-BY-LOOP-03 -->"\n\n\n'
+                'if __name__ == "__main__":',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        from autoloop.auto_merge import UpgradeStore
+
+        UpgradeStore(checkout / ".autoloop" / "pending_upgrade.json").save(
+            upgrade_record(checkout, paths=["autoloop/dashboard.py"])
+        )
+
+        end = time.time() + 120
+        served = ""
+        while time.time() < end:
+            served = page()
+            if "RELOADED-BY-LOOP-03" in served:
+                break
+            time.sleep(0.25)
+        assert "RELOADED-BY-LOOP-03" in served, (
+            "the dashboard went on serving the code it started with"
+        )
+        assert "<!doctype html>" in served, "and the new page is whole"
+        # Same pid: it replaced its own image, nothing restarted it.
+        assert child.poll() is None
+        assert "restarting into" in log.read_text(errors="replace")
+    finally:
+        if child is not None:
+            child.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                child.wait(timeout=10)
