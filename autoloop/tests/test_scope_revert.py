@@ -47,7 +47,12 @@ from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import LoopState, Phase, StateStore
 from autoloop.tasks import Task, TaskRegistry, TaskStore
 from autoloop.transcript import TranscriptLogger
-from autoloop.worktask import IntentStore, RecordedRevertAuthority, TaskExecutionStore
+from autoloop.worktask import (
+    IntentStore,
+    RecordedRevertAuthority,
+    TaskExecution,
+    TaskExecutionStore,
+)
 from autoloop.worktree import WorktreeManager
 
 URL = "https://chatgpt.com/c/test-conversation"
@@ -1006,3 +1011,194 @@ def test_a_path_already_at_the_base_state_is_reported_as_restored(tmp_path):
     assert _revert_recorded_file(git, "plain.txt", entries["plain.txt"])
     assert _revert_recorded_file(git, "never-existed.txt", None)
     assert not (root / "never-existed.txt").exists()
+
+
+# =============================================================================
+# The PRODUCTION wiring — the half a capability is worthless without
+# =============================================================================
+#
+# Everything above builds its own `ImplementExecutor` and hands it a
+# `revert_authority`. That proves the mechanism and proves NOTHING about a live
+# run: the first round of scope-05 shipped exactly this suite with
+# `cli._build_executor` passing no `revert_authority` at all, so every real round
+# took the fail-closed branch, never saw `REVERT-OUT-OF-SCOPE:` in its prompt,
+# and the task's one claim did not hold anywhere outside these tests. These
+# exercise the real CLI construction instead.
+
+
+def _cli_repo(tmp_path):
+    """A throwaway checkout `cli._build_orchestrator` will really run against.
+
+    Three things it needs that an ordinary fixture repo does not: a commit (the
+    publisher provisioning reads the checkout), an `origin` remote (that is what
+    the publisher repo is cloned/snapshotted from), and a `workers_root` OUTSIDE
+    the checkout — `validate_workers_root` refuses the run otherwise.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git(repo, "init", "-q", "-b", "work")
+    run_git(repo, "config", "user.email", "t@e.com")
+    run_git(repo, "config", "user.name", "T")
+    run_git(repo, "config", "commit.gpgsign", "false")
+    (repo / "f.txt").write_text("x\n")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-qm", "init")
+
+    upstream = tmp_path / "upstream.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(upstream)], check=True, capture_output=True
+    )
+    run_git(repo, "remote", "add", "origin", str(upstream))
+
+    (repo / ".autoloop").mkdir()
+    (repo / ".autoloop" / "config.toml").write_text(
+        '[browser]\nconversation_url = "https://chatgpt.com/c/abc"\n\n'
+        f'[paths]\nworkers_root = "{tmp_path / "outside" / "workers"}"\n',
+        encoding="utf-8",
+    )
+    return repo
+
+
+def _cli_orchestrator(tmp_path, monkeypatch):
+    """The production collaborator set, built the way `run` builds it.
+
+    Deliberately NOT `null_executor=True` (which is what
+    `test_task_inbox.py`'s own CLI-construction test uses): that returns a
+    `NullExecutor` before `ImplementExecutor` is ever constructed, so every
+    assertion below would be about an object the flag prevented from existing.
+    """
+    import argparse
+
+    from autoloop import cli
+    from autoloop.config import load_config
+
+    repo = _cli_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    config = load_config(repo / ".autoloop" / "config.toml")
+    store, state = cli._load_state(config)
+    if state is None:
+        state = LoopState.new(config.browser.conversation_url)
+        store = StateStore(config.state_file)
+        store.save(state)
+    task_store, registry = cli._load_tasks(config)
+    args = argparse.Namespace(
+        config=repo / ".autoloop" / "config.toml", null_executor=False
+    )
+    return cli._build_orchestrator(config, args, store, state, task_store, registry)
+
+
+def test_the_cli_wires_a_revert_authority_into_the_production_executor(
+    tmp_path, monkeypatch
+):
+    """The regression this exists for: `cli._build_executor` passing no
+    `revert_authority`, which leaves a live run permanently on the fail-closed
+    branch while the whole mechanism above passes."""
+    orch = _cli_orchestrator(tmp_path, monkeypatch)
+    implement = orch._executor._implement
+
+    assert isinstance(implement._revert_authority, RecordedRevertAuthority)
+    # Its sibling, asserted alongside deliberately: WHICH paths may be named
+    # still comes from `cleanup_paths_for` and from nothing else, so a round
+    # with a revert authority and no cleanup reader could authorize nothing.
+    assert implement._cleanup_paths_for is not None
+
+
+def test_the_wired_authority_reads_and_writes_the_orchestrators_own_record(
+    tmp_path, monkeypatch
+):
+    """`isinstance` is not enough, and the gap it leaves is the silent one: an
+    authority bound to a DIFFERENT `TaskExecutionStore` than the loop writes
+    through would type-check, read no base sha for any real task, and record
+    every repair where nobody looks. So this asks it about a record the
+    orchestrator's own store wrote."""
+    orch = _cli_orchestrator(tmp_path, monkeypatch)
+    authority = orch._executor._implement._revert_authority
+
+    orch._execution_store.save(
+        TaskExecution(
+            task_id="wired-1",
+            task_branch="autoloop/wired-1",
+            worktree_path=str(tmp_path / "w"),
+            task_base_sha="a" * 40,
+        )
+    )
+
+    assert authority.base_sha("wired-1") == "a" * 40, "same store, read side"
+
+    authority.record_reverted("wired-1", ("lexy-app/backend/main.py",))
+    reloaded = orch._execution_store.load("wired-1")
+    assert reloaded.reverted_out_of_scope_paths == ("lexy-app/backend/main.py",), (
+        "same store, write side"
+    )
+
+
+def test_the_wired_executor_offers_the_revert_form_for_a_recorded_path(
+    tmp_path, monkeypatch
+):
+    """End to end through the production object: a task with a recorded
+    out-of-scope path and a usable base sha gets a prompt that names the second
+    request form. Round 1 of scope-05 could not have passed this — its executor
+    had no authority, so `_revert_base_sha` returned "" and the form was never
+    rendered."""
+    orch = _cli_orchestrator(tmp_path, monkeypatch)
+    implement = orch._executor._implement
+    task = Task(id="wired-2", title="t", description="d", approved_paths=(IN_SCOPE,))
+
+    orch._execution_store.save(
+        TaskExecution(
+            task_id="wired-2",
+            task_branch="autoloop/wired-2",
+            worktree_path=str(tmp_path / "w"),
+            task_base_sha="b" * 40,
+            out_of_scope_paths=(EDITED,),
+        )
+    )
+
+    prompt = _agent_prompt(
+        task,
+        "revert it",
+        implement._recorded_cleanup_paths(task),
+        "",
+        bool(implement._revert_base_sha(task)),
+    )
+    assert EDITED in prompt, "the recorded path is listed for exact copying"
+    assert "REVERT-OUT-OF-SCOPE: <repository-relative path>" in prompt
+    assert "widens your approved scope by exactly nothing" in prompt
+
+
+def test_a_corrupt_execution_record_offers_no_revert_and_never_raises(tmp_path):
+    """The one adversarial case the wiring itself creates. `TaskExecutionStore.
+    load` RAISES `StateCorruptError` on an unreadable record, and until
+    production wired a real `RecordedRevertAuthority` nothing ever called it on
+    the executor's path — so that raise was theoretical and is now live, and it
+    fires before the agent runs. Fail-closed: no base sha, no capability, no
+    exception out of the round."""
+    store = TaskExecutionStore(tmp_path / "executions")
+    (tmp_path / "executions").mkdir(parents=True)
+    (tmp_path / "executions" / "corrupt-1.json").write_text("{not json", encoding="utf-8")
+
+    executor = ImplementExecutor(
+        git=GitGateway(tmp_path, PolicyEngine(PolicyConfig())),
+        agent_runner=ScriptedAgentRunner([{"text": "x"}]),
+        revert_authority=RecordedRevertAuthority(store),
+    )
+    task = Task(id="corrupt-1", title="t", description="d")
+
+    with pytest.raises(Exception):
+        store.load("corrupt-1")          # the record really is unreadable
+    assert executor._revert_base_sha(task) == ""
+    assert executor._record_reverted(task, (EDITED,)) is False
+
+
+def test_a_task_with_no_record_yet_offers_no_revert(tmp_path):
+    """A first dispatch has no execution record at all, so there is no base sha
+    to restore from — "" rather than a guess, and the same answer the absent
+    authority gives."""
+    executor = ImplementExecutor(
+        git=GitGateway(tmp_path, PolicyEngine(PolicyConfig())),
+        agent_runner=ScriptedAgentRunner([{"text": "x"}]),
+        revert_authority=RecordedRevertAuthority(
+            TaskExecutionStore(tmp_path / "executions")
+        ),
+    )
+    assert executor._revert_base_sha(Task(id="never", title="t", description="d")) == ""

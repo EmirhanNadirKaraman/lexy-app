@@ -2258,10 +2258,13 @@ authority, and the executor restores the file from `TaskExecution.task_base_sha`
 — git's copy, not yours, so do not try to reconstruct the content. A path that
 did not exist at the base has nothing to restore and is made absent instead;
 naming one path under BOTH forms removes it and reports the revert superseded.
-**Check the wiring before you rely on this.** If the prompt you were given does
-NOT list `REVERT-OUT-OF-SCOPE:` among the request forms, no revert authority is
-wired for this run and the line does nothing — `cli._build_executor` has to pass
-`revert_authority=` for the capability to exist. Say so in the report rather than
+**Check the prompt before you rely on this.** Production wires it
+(`cli._build_orchestrator` passes
+`revert_authority=RecordedRevertAuthority(execution_store)`), but the form is
+still rendered only when this round has a recorded path AND a usable base sha —
+so if the prompt you were given does NOT list `REVERT-OUT-OF-SCOPE:` among the
+request forms, the line does nothing for you: no execution record, no base sha
+on it, or an embedder that wired no authority. Say so in the report rather than
 retrying the line. `docs/AUTOLOOP.md` §4e's 2026-08-24 amendment has the rest.
 
 ### `archive-blocker` refuses with a lock error and archives nothing
@@ -3075,3 +3078,4 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | stop-01 | Revision round. Third §2 entry, for the trap that cost this round: a scripted `stop` whose `reason` is `""` never stops anything. `contract._require_str` refuses empty AND whitespace-only strings, so the reply is a `missing_field:reason` parse error, the round spends a corrective re-prompt, and a one-element fake client dies with "test script exhausted". Test the dispatch through `_dispatch` and the parse through the `ContractError` code — never by loosening the contract. |
 | 2026-08-24 | scope-05 | New §9 entry beside the scope-04 one, for the same park with a different residue: the reviewer asks for an out-of-scope EDIT to be undone, and `REMOVE-OUT-OF-SCOPE:` cannot express it — deleting a file the base commit contains would be a worse overrun. `REVERT-OUT-OF-SCOPE: <path>` restores it from `task_base_sha`. The entry says outright not to reconstruct the content by hand: git holds it, and an agent-authored "put it back" is a new edit, not a revert. |
 | 2026-08-24 | scope-05 | That entry ends with the check to run FIRST: if the prompt does not list `REVERT-OUT-OF-SCOPE:` among the request forms, no revert authority is wired for that run and the line does nothing — `cli._build_executor` has to pass `revert_authority=`. Report it rather than retrying the line. The scope-04 entry above is unchanged and still the right one for a file an earlier round CREATED out of scope. |
+| 2026-08-24 | scope-05 | Revision round: that §9 entry's wiring check is rewritten, because production now passes `revert_authority=` from `cli._build_orchestrator`. The form is still rendered only when the round has a recorded out-of-scope path AND a usable base sha, so an absent `REVERT-OUT-OF-SCOPE:` in your prompt now means no execution record, no base sha on it, or an embedder that wired no authority — report it rather than retrying the line. |

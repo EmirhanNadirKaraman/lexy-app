@@ -2447,16 +2447,22 @@ reverted, the prompt never mentions the capability, and every request is
 reported as refused with a reason. In particular an unreadable base never
 reaches the created-path branch, so it cannot silently become a deletion.
 
-**Not wired in production yet, and this is the one thing to know before reading
-a round's report.** `cli._build_executor` does not pass `revert_authority`, so a
-live run today has NO revert authority — deletion behaves exactly as it did, and
-`REVERT-OUT-OF-SCOPE:` lines are ignored. Turning it on is one keyword argument
-(`revert_authority=RecordedRevertAuthority(execution_store)`, beside the
-existing `cleanup_paths_for=`); scope-05's approved path list did not include
-`autoloop/cli.py`, and contaminating a branch to ship the fix for contamination
-was the wrong trade. See `autoloop/tests/test_scope_revert.py`, which wires it
-exactly that way through a real orchestrator, and `docs/SECURITY.md` S25's
-2026-08-24 amendment for the security accounting.
+**Wired in production, and it is one keyword argument.**
+`cli._build_orchestrator` passes
+`revert_authority=RecordedRevertAuthority(execution_store)` into
+`cli._build_executor`, beside the existing `cleanup_paths_for=` and over the
+SAME `TaskExecutionStore` — so "what the loop recorded out of scope" and "what a
+round may repair" cannot drift apart. Remove that argument and the capability
+does not degrade, it disappears: no base sha, no `REVERT-OUT-OF-SCOPE:` in any
+prompt, every request refused. `autoloop/tests/test_scope_revert.py` pins the
+wiring through a real `cli._build_orchestrator` — `isinstance` is only half of
+it, the other half asks the wired authority about a record the orchestrator's
+own store wrote, because an authority bound to a second store would type-check
+and read nothing. Security accounting is `docs/SECURITY.md` S25's 2026-08-24
+amendment. (The first round of scope-05 shipped the mechanism without this line;
+every live round then took the fail-closed branch while the whole suite passed,
+which is why the wiring has a test of its own rather than being read off the
+constructor.)
 
 **Also worth knowing:** a repair round's `changed_paths` still contains the
 restored path (the worker tree really did change), so the pre-commit advisory

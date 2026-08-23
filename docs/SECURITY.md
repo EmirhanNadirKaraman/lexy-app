@@ -1452,12 +1452,18 @@ worst case is a file returned to where the task found it;
 `TaskExecution.reverted_out_of_scope_paths` records it durably; and
 `out_of_scope_paths` is never pruned.
 
-**Not wired in production.** `cli._build_executor` passes no `revert_authority`,
-so a live run has no revert authority at all and `REVERT-OUT-OF-SCOPE:` lines
-are ignored — the fail-closed default. Enabling it is
-`revert_authority=RecordedRevertAuthority(execution_store)` beside the existing
-`cleanup_paths_for=`. Anyone adding that line owns re-reading this amendment
-first.
+**Wired in production since 2026-08-24 (same task, revision round).**
+`cli._build_orchestrator` passes
+`revert_authority=RecordedRevertAuthority(execution_store)` into
+`cli._build_executor`, over the SAME store `cleanup_paths_for` reads — one
+authorizing list, not two. Deleting that argument re-arms the fail-closed
+default for every live round, which is a capability change and not a cleanup.
+Two consequences of being live that were theoretical before it: a corrupt
+execution record now really can raise `StateCorruptError` inside
+`RecordedRevertAuthority.base_sha` (caught by `_revert_base_sha`'s `except
+Exception`, answered as "", pinned by
+`test_a_corrupt_execution_record_offers_no_revert_and_never_raises`), and a
+task's very first dispatch has no record at all (also "").
 
 **file:line** — `autoloop/tasks.py` (`authorized_cleanup_paths`);
 `autoloop/implement_executor.py` (`_CLEANUP_RE`, `_cleanup_instruction`,
@@ -1467,7 +1473,9 @@ first.
 the `removed_out_of_scope_paths` union); `autoloop/worktask.py`
 (`TaskExecution.removed_out_of_scope_paths`,
 `TaskExecution.reverted_out_of_scope_paths`, `RecordedRevertAuthority`);
-`autoloop/cli.py` (`_recorded_out_of_scope_paths`).
+`autoloop/cli.py` (`_recorded_out_of_scope_paths`, and the
+`revert_authority=RecordedRevertAuthority(execution_store)` argument
+`_build_orchestrator` hands `_build_executor`).
 
 **Verification check:**
 ```bash
@@ -1476,6 +1484,9 @@ the `removed_out_of_scope_paths` union); `autoloop/worktask.py`
 # `startswith`:
 rg -n 'authorized_cleanup_paths' autoloop/                  # tasks.py def + 2 implement_executor.py calls
 rg -n 'REMOVE-OUT-OF-SCOPE|REVERT-OUT-OF-SCOPE' autoloop/implement_executor.py
+# The wiring, which is what makes the capability exist at all — expect BOTH the
+# `_build_executor` parameter and the `_build_orchestrator` argument:
+rg -n 'revert_authority' autoloop/cli.py
 # Repair must never widen either authorization field — expect NO hit:
 rg -n 'allowed_paths.*cleanup|approved_paths.*cleanup' autoloop/
 rg -n 'allowed_paths|approved_paths' autoloop/implement_executor.py  # read-only rendering only
@@ -2722,3 +2733,4 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | scope-05 | The write is bounded like the unlink and then some: absolute path, `..`, and a parent outside the worker repo all refused, plus only a `100644`/`100755` BLOB base entry is restorable — a `120000` symlink or `160000` submodule is refused rather than written out as file bytes — a directory at the target is refused (no recursive delete reachable), and a symlink at the target is unlinked as the LINK and replaced, never written through. Only git's one permission bit is set. |
 | 2026-08-24 | scope-05 | Fail-closed, with the single fail-open closed by name: an unreadable base tree does NOT fall through to the created-path branch, so it can never silently convert a revert into a deletion. No authority, no base sha, a non-hex base sha and an unreadable base tree all revert nothing and report refused. No agent capability was added — `WRITE_ALLOWED_TOOLS` and `IMPLEMENT_DISALLOWED_TOOLS` are byte-identical and the executor performs the restore. |
 | 2026-08-24 | scope-05 | Not wired in production: `cli._build_executor` passes no `revert_authority`, so a live run has no revert authority and the new anchor does nothing. Enabling it is `revert_authority=RecordedRevertAuthority(execution_store)` beside the existing `cleanup_paths_for=`; whoever adds that line owns re-reading S25's 2026-08-24 amendment first. `autoloop/cli.py` was outside this task's approved paths. |
+| 2026-08-24 | scope-05 | Revision round, superseding the note directly above: `cli._build_orchestrator` now passes `revert_authority=RecordedRevertAuthority(execution_store)` over the SAME store `cleanup_paths_for` reads, so the capability is live and deleting that argument is a capability change rather than a cleanup. Two paths that were theoretical while nothing in production called `base_sha` are now reachable, and both answer "" without raising: a corrupt execution record (`StateCorruptError`) and a first dispatch with no record at all. |

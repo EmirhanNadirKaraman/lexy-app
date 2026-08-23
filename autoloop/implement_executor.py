@@ -1988,6 +1988,9 @@ class ImplementExecutor:
         # written down; it deliberately does NOT supply the path list, which
         # stays `cleanup_paths_for`'s so that one record answers "is this path
         # authorized" for both instructions rather than two readers drifting.
+        # `cli._build_orchestrator` binds it to the SAME `TaskExecutionStore` it
+        # binds `cleanup_paths_for` to, which is what keeps that true in a real
+        # run rather than only by intention.
         #
         # None — every direct `execute()` test, and any embedder that does not
         # wire it — means NO revert authority at all: the prompt never mentions
