@@ -4771,6 +4771,133 @@ failing, once per round, forever.
   test, echo-safety, ceiling) and `test_docs_merge.py` (the brief states the
   number that file enforces).
 
+### 7b-bis. The round's own validation, callable with nothing (impl-02, 2026-08-23)
+
+**The measured gap.** The agent can write a test and cannot run one —
+`WRITE_ALLOWED_TOOLS` is Read/Grep/Glob/Edit/Write and `Bash` is disallowed —
+so step 4's validation is its FIRST feedback and it arrives after the whole
+round is paid for. Over every round since val-03 went live (measured
+2026-08-23, `~/.autoloop/analysis/failures.py`): 24 passed, 15 failed BEFORE
+implementing at a mean of 0.6m, and **5 failed AFTER implementing at a mean of
+39.5m — 3.29h, a quarter of all executor time in the window**. Four of those
+five failed a test the round itself had just written (`git log
+--diff-filter=A`, not inferred from filenames); stop-01's was "test script
+exhausted: no response left", a scripted fake given fewer replies than the code
+asks for — one execution catches it in under a second, and it cost 51.6
+minutes. val-03 shortened the CHEAP failures and could do nothing for these,
+because short-circuiting the checks saves nothing once the expensive part has
+already run.
+
+**The restriction stays.** This is not "add Bash" and not a sandbox. What
+exists now is ONE fixed call with every input bound by the executor:
+
+* `implement_executor.AdvisoryValidation` closes over the four values
+  `_run_implementation` already computes for its own run — the command list
+  (`_validation_commands_for`), the working directory (`_validation_cwd_for`),
+  the command runner and the `ValidationEnv`. Both runs read those two
+  functions, so they cannot drift into validating different things.
+* `AdvisoryValidation.run()` takes **no parameter**. There is no channel
+  through which a command, a path, a flag or an environment value could arrive
+  from the agent, and `serve_advisory_tool_call` accepts a transport's payload
+  only in order to discard it unread. `advisory_tool_descriptor()` publishes an
+  `inputSchema` with no properties, nothing required and
+  `additionalProperties: false`.
+* **Cost is bounded twice.** `ADVISORY_VALIDATION_MAX_CALLS` (3) requests per
+  round, and `ADVISORY_VALIDATION_TIMEOUT_SECONDS` (600) per run — well under
+  `audit.agent_stall_seconds`, because an advisory run writes no files and
+  therefore looks like SILENCE to the `stall.WorkerTreeProbe`. A request past
+  the cap executes nothing and says `NOT RUN`, which is deliberately different
+  information from `PASS` (§4h). So do a round with no commands configured, a
+  missing `validation_cwd`, and a launcher that raises: an advisory channel
+  that answered "green" when it had nothing to run would be the fail-open it
+  exists to prevent.
+* **Step 4 is unchanged and still owns the verdict.** The executor's own run
+  happens unconditionally after the agent returns, runs the full configured
+  list, sets `ExecutionOutcome.validation`, and decides the status. A green
+  advisory run skips, shortens and replaces nothing.
+* **The round reports it, from the loop's own counters.**
+  `AdvisoryValidation.note()` is appended to every post-agent outcome summary:
+  how many times the suite ran and whether the last run was green. It never
+  reads `result.raw_text` — an agent writing "I ran the suite five times, all
+  green" moves no number — and it distinguishes NOT OFFERED (no channel was
+  wired: "could not", not "chose not to") from offered-and-unused.
+
+**The transport: two fixed paths in the worker repo.**
+`implement_executor.AdvisoryRendezvous` is what actually puts the call in front
+of the agent, and it uses only tools the agent already holds:
+
+* the agent **Writes** anything to `.autoloop-validation-request` in its working
+  directory — the file's EXISTENCE is the request, and its content is read only
+  so that `serve_advisory_tool_call` can discard it;
+* the executor **answers** in `.autoloop-validation-result.txt`, which the agent
+  **Reads**. While a run is in flight the file reads `PENDING #n`; the finished
+  answer reads `RESULT #n`.
+* **Every answer is stamped with the request's ordinal**, and that stamp is a
+  correctness requirement rather than a nicety. The agent has no delete tool, so
+  between writing its second request and the watcher taking it the result file
+  still holds the FIRST answer — an unstamped protocol would let a green answer
+  about an older tree be read as an answer about the current one.
+* Step 1's brief gains a section naming those paths (`_advisory_instruction`),
+  rendered ONLY when the channel could actually run something
+  (`AdvisoryValidation.offerable`: commands configured and a cap above zero).
+  Its "what this is" sentences are `advisory_tool_descriptor()['description']`
+  verbatim, so a tool transport wired later advertises what the agent has been
+  reading. Like every other prompt section it is echo-safe: no line begins with
+  `ASSUMPTION:` or `REMOVE-OUT-OF-SCOPE:`.
+
+Nothing about the tool policy moves. `WRITE_ALLOWED_TOOLS` and
+`IMPLEMENT_DISALLOWED_TOOLS` are unchanged, `Bash` stays disallowed, no process
+is spawned for the agent to talk to, and the `ValidationEnv` credentials never
+leave the loop's own process — the run happens on the loop's side and only
+`run_validation_commands`' redacted text crosses back.
+
+**Why not an MCP tool.** That was the obvious shape and it is not what shipped,
+for two reasons that are about verifiability rather than taste.
+`cli._build_executor`'s `agent_runner_factory` lambda is the only place holding
+BOTH the configured validation commands and the worker root, so a per-round spec
+cannot reach `ClaudeCliRunner.build_argv` without editing `cli.py` — outside
+this task's approved paths. And the `--mcp-config` family's exact spelling and
+headless approval behaviour cannot be checked from inside the loop, because the
+implementing agent has no shell: a wrong flag fails every implement round at
+spawn, including the round that would fix it. Read and Write are already in
+`WRITE_ALLOWED_TOOLS` and every round exercises them, so the rendezvous is the
+transport whose availability is not a guess. `advisory_tool_descriptor` survives
+as the source of the brief's wording, so wiring MCP later is additive.
+
+**Residue is handled here, not left for a later round.** An advisory run happens
+INSIDE the agent's window — before step 3 reads `git status` — so anything left
+in the tree is picked up as changed work and committed into the candidate,
+whereas the executor's own run happens after that read. Neither rendezvous path
+is inside any task's `approved_paths`, so a survivor is an out-of-scope write on
+the record and a parked candidate. `_run_implementation` therefore wraps the
+agent call ALONE in a `try/finally` and calls `AdvisoryRendezvous.stop()`, which
+sweeps all three paths (request, result, and the staging file the answer is
+renamed from) before any reader — the failure branch's `_partial_work`, the
+cleanup pass, the status read — sees the tree. The sweep runs even when the
+channel was never offered, which is also what clears residue from a round that
+was killed, and it tolerates a directory or a symlink sitting at either path
+(`Write` creates parent directories, so `<request>/note.txt` leaves a
+directory). VERIFIED: `.gitignore` lists neither `.ruff_cache` nor
+`.pytest_cache` (2026-08-23), and pytest's is already suppressed for every
+pytest command by `validation.NO_CACHE_ARGS`. NOT verified without a shell:
+whether `ruff check` really leaves a `.ruff_cache/` that `git status -uall`
+reports here — that is a property of the configured commands, not of this
+channel, and it would surface as an unexpected `changed_paths` entry rather than
+as a wrong verdict.
+
+**Two costs this shape has and a tool call would not.** The agent is not blocked
+while the run proceeds, so the result is a snapshot of the tree AS IT STOOD WHEN
+THE REQUEST WAS TAKEN — the brief says so. And if the agent returns while a run
+is still in flight, `stop()` waits for it (bounded by
+`ADVISORY_STOP_JOIN_SECONDS`) rather than starting the authoritative run
+alongside it; past that bound the watcher is abandoned, and it publishes nothing
+because `_stopping` is set.
+
+Pinned by `autoloop/tests/test_agent_self_validation.py`, whose section 8 drives
+whole `execute()` rounds in which the stand-in agent uses NOTHING but Write and
+Read — including the red-fix-green loop, the cap, and the assertion that
+`changed_paths` carries no trace of the channel.
+
 ---
 
 ## 8. Setup
