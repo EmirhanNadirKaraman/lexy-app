@@ -198,11 +198,31 @@ section for the full table):
   where the cause is the reviewer's own behaviour, so no operator answer could
   change what happens next; use `_to_needs_user` wherever a human doing
   something makes the SAME session resumable.
+
+Repeated stops (stop-01, 2026-08-23):
+
+* A reviewer's `stop` is a VERDICT, not a failure, so no budget ever counted
+  one. On 2026-08-20 that let a loop refuse-and-restart three times in fifteen
+  minutes over one lost postcommit binding while `health` reported `running`,
+  `open_blockers: 0`, `needs_attention: FALSE` the whole time. `stop` ends the
+  session, `--continuous` opens another, the kickoff draws the same refusal.
+* `_handle_contract_stop` now charges every stop to a durable ledger
+  (`state.StopRepetitionStore`) keyed by `_stop_situation_fingerprint` — the
+  SITUATION being stopped about, not the wording of the refusal. The
+  `MAX_REPEATED_STOPS`-th consecutive stop about one unchanged situation parks
+  `loop_fatal` (`code="stop_livelock"`) with the reviewer's last reason quoted
+  verbatim, so the blocker machinery, `health`, the monitor and `answer` all
+  behave exactly as they do for any other park. Anything that changes the
+  situation — a published candidate, a completed task, a registry mutation, a
+  new execution record — restarts the count with no special case.
+* ONE stop is unchanged in every respect: same `stopped` phase, same
+  `stop_kind="contract"`, same clean boundary for continuous mode.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import time
 from dataclasses import asdict, dataclass, replace
@@ -294,6 +314,8 @@ from .state import (
     ProviderSwitch,
     RotationRecord,
     StateStore,
+    StopRepetitionStore,
+    stop_repetition_file,
     utcnow_iso,
 )
 from .inbox import apply_requests
@@ -377,6 +399,30 @@ PREEMPTION_STOP_KIND = "preempted"
 #: at a glance that the work was PREEMPTED rather than released by hand or
 #: abandoned by a park.
 PREEMPTION_RETIREMENT_REASON = "displaced-by-urgent"
+
+#: How many consecutive reviewer `stop` verdicts about the SAME unresolved
+#: situation the loop will spend before it parks instead of opening yet another
+#: session (`_observe_contract_stop` / `_park_stop_livelock`).
+#:
+#: A `stop` is a VERDICT, not a failure — `policy.max_consecutive_failures`
+#: never counted these, which is why on 2026-08-20 a loop refused three times in
+#: fifteen minutes over one lost postcommit binding while `health` reported
+#: `running`, `open_blockers: 0`, `needs_attention: FALSE` throughout. This
+#: bounds the REPETITION; one stop still means exactly what it always did.
+#:
+#: WHY THREE, AND WHAT THREE COSTS. Each cycle is one full reviewer turn plus
+#: one packet build, and the incident's own cadence (20:05:49 → 20:10:54 →
+#: 20:16:24) makes that about five minutes of wall clock. The park fires ON the
+#: third matching stop, so the ceiling is three reviewer turns and three packet
+#: builds — roughly ten to eleven minutes — of which the last two sessions are
+#: the wasted ones. Two would be cheaper and is the number rejected: a reviewer
+#: legitimately declining twice in a row while an operator works in another
+#: window is ordinary, and a false park costs a human answer, which is the
+#: thing this mechanism is spending. Above three the saving shrinks (a fourth
+#: cycle buys no new evidence — the fingerprint is already identical) while the
+#: quota burned grows linearly, so three is the smallest count that is not
+#: plausibly a coincidence.
+MAX_REPEATED_STOPS = 3
 
 
 @dataclass(frozen=True)
@@ -957,6 +1003,16 @@ class Orchestrator:
         self._worktrees = worktrees
         self._execution_store = execution_store
         self._intent_store = intent_store
+        #: The repeated-stop ledger (`state.StopRepetitionStore`). DERIVED from
+        #: `config.state_dir` rather than taken as a constructor parameter, and
+        #: that is the point: every other optional collaborator here can be left
+        #: `None` by a construction site that has not heard of it, and a park
+        #: that only fires when somebody remembered to wire it is a park that
+        #: silently does not fire. Nothing to pass, nothing to forget — every
+        #: Orchestrator that ran `__init__` counts repeated stops.
+        self._stop_repetitions = StopRepetitionStore(
+            stop_repetition_file(config.state_dir)
+        )
         #: Persisted operator-facing blocker records (`blockers.py`).
         #: Optional, like every other produce-then-review collaborator:
         #: `None` (many existing tests that hand-build a minimal
@@ -4064,16 +4120,7 @@ class Orchestrator:
         state = self.state
         decision = directive.decision
         if decision is Decision.STOP:
-            state.stop_reason = directive.reason
-            state.last_response = None
-            state.phase = Phase.STOPPED.value
-            # Classified explicitly, not left at the default: `stopped` is now
-            # reached two ways (here, and `_to_fault_stop`), and a reader that
-            # inferred "clean" from the phase alone would announce a run that
-            # died on a wall as a healthy finish. See `LoopState.stop_kind`.
-            state.stop_kind = "contract"
-            self._log("stopped", data={"reason": directive.reason, "kind": "contract"})
-            self._store.save(state)
+            self._handle_contract_stop(directive)
         elif decision in RETIRED_DECISIONS:
             # Retired 2026-08-06, mirroring the retired legacy git path below.
             # `authorize_directive` denies a retired decision unconditionally,
@@ -4137,6 +4184,298 @@ class Orchestrator:
             )
         else:  # audit / implement / revise
             self._dispatch_executor(directive)
+
+    # ---- repeated stops -----------------------------------------------------
+    #
+    # A reviewer's `stop` is a legitimate verdict: it means a human should
+    # decide, and one of them must keep working exactly as it always has. What
+    # is NOT legitimate is the loop answering that verdict by opening another
+    # session, sending another kickoff, and collecting the same refusal for as
+    # long as the process runs. That happened on 2026-08-20 — three refusals in
+    # fifteen minutes over one lost postcommit binding — and every automated
+    # signal stayed green while it did, because a verdict is not a failure and
+    # `policy.max_consecutive_failures` counts failures.
+    #
+    # So what is bounded here is the REPETITION, and specifically the repetition
+    # OF A SITUATION rather than of stops. See `_stop_situation_fingerprint` for
+    # what "the same situation" means and why the reviewer's own words are not
+    # part of it.
+
+    def _handle_contract_stop(self, directive: Directive) -> None:
+        """Dispatch a reviewer's `stop`: end the session as it always has,
+        unless this is the `MAX_REPEATED_STOPS`-th consecutive stop about one
+        unresolved situation, in which case PARK instead.
+
+        The ordering matters and is the reason the count is taken first: a stop
+        that ends the session is a clean boundary continuous mode reacts to by
+        starting the next session, so by the time anything downstream could
+        notice a pattern the evidence (this session) has already been replaced.
+        """
+        record = self._observe_contract_stop(directive)
+        if record is None:
+            return  # the ledger was unusable; already parked, say nothing more
+        if record.count >= MAX_REPEATED_STOPS:
+            self._park_stop_livelock(record)
+            return
+        state = self.state
+        state.stop_reason = directive.reason
+        state.last_response = None
+        state.phase = Phase.STOPPED.value
+        # Classified explicitly, not left at the default: `stopped` is now
+        # reached two ways (here, and `_to_fault_stop`), and a reader that
+        # inferred "clean" from the phase alone would announce a run that
+        # died on a wall as a healthy finish. See `LoopState.stop_kind`.
+        state.stop_kind = "contract"
+        self._log(
+            "stopped",
+            data={
+                "reason": directive.reason,
+                "kind": "contract",
+                # How close this stop is to the park, so an operator watching
+                # the transcript can see a livelock forming rather than only
+                # learning about it once it has been paid for.
+                "repeat_count": record.count,
+                "repeat_ceiling": MAX_REPEATED_STOPS,
+            },
+        )
+        self._store.save(state)
+
+    def _observe_contract_stop(self, directive: Directive):
+        """Charge this stop to the repeated-stop ledger and return the updated
+        `state.StopRepetition`, or `None` when the ledger could not be used —
+        in which case the loop has ALREADY been parked and the caller must do
+        nothing further.
+
+        FAIL-CLOSED, deliberately. A ledger that cannot be read or written —
+        or a fingerprint that cannot be computed, since the digest is taken
+        inside this same guard — cannot count anything, and the tempting
+        reading of that ("no record, so this is the first stop") restarts the
+        count on every single stop: the park would never fire, the loop would
+        keep opening sessions, and no signal anywhere would say the detector
+        had stopped working. That is precisely the shape of the incident this
+        exists to end, one level up. So the loop parks instead, naming the
+        file, because a guard that cannot run should be as loud as the thing
+        it guards against.
+        """
+        try:
+            return self._stop_repetitions.observe(
+                fingerprint=self._stop_situation_fingerprint(),
+                reason=directive.reason or "",
+                session_id=self.state.session_id or "",
+                now=utcnow_iso(),
+            )
+        except (StateError, OSError) as exc:
+            path = self._stop_repetitions.path
+            self._log(
+                "stop_repetition_ledger_unusable",
+                data={"path": str(path), "error": f"{type(exc).__name__}: {exc}"},
+            )
+            self._to_needs_user(
+                "the repeated-stop ledger could not be read, written or "
+                "computed, so the loop cannot tell a reviewer stopping it "
+                "about something new from the same refusal repeating. Rather "
+                "than keep opening sessions with that check switched off, the "
+                f"loop has parked. Delete {path} (it is a counter — nothing "
+                "else depends on it) and answer this blocker to carry on. The "
+                "reviewer's stop was NOT acted on; its reason was: "
+                f"{directive.reason!r}. The underlying error was "
+                f"{type(exc).__name__}: {exc}",
+                kind="loop_fatal",
+                code="stop_repetition_ledger_unusable",
+                detail=f"{path}: {type(exc).__name__}: {exc}",
+            )
+            return None
+
+    def _stop_situation_fingerprint(self) -> str:
+        """A digest of the situation a reviewer is stopping the loop ABOUT.
+
+        Two stops carrying the same digest are two stops about one unresolved
+        situation; a different digest means something moved between them and
+        the count starts again. This is the whole definition of both "the same
+        unresolved situation" and "reset on progress" — nothing enumerates the
+        ways progress can happen, because every one of them changes one of the
+        four inputs below.
+
+        WHAT GOES IN, against the dimensions the situation is defined by:
+
+        * **Task identity** — the session's `current_task` id, or `""`. Empty
+          is the INCIDENT's own shape, not an edge case: those three refusals
+          answered fresh kickoffs, which carry no selected task, and the task
+          at fault (prof-01, holding an unpublishable candidate) was visible
+          only through its execution record below.
+        * **Execution record** and **candidate publication** — the raw bytes of
+          every live `TaskExecutionStore` record. Publication is recorded there
+          (`published_sha` / `published_at`), so "a candidate was published" is
+          a change to this input and needs no separate term. The whole record
+          counts, not a chosen subset: "no change in the execution record" is
+          what the situation is defined by, and picking fields would silently
+          decide that a change in an unpicked one is not progress.
+        * **Registry state** — `TaskRegistry.to_dict()`. A completed task, a
+          new task, a block, a re-prioritisation, an approved decomposition:
+          every registry mutation moves this.
+        * **Phase progress** — invariant at this observation point rather than
+          absent. `_dispatch` only ever runs from `executing`, so the phase is
+          the same string for every stop and could not distinguish two of them;
+          progress that would have shown as a phase change (a dispatch, a
+          packet, a publication) shows in the three inputs above instead.
+
+        WHAT DELIBERATELY STAYS OUT:
+
+        * **The reviewer's reason text.** In the incident the three refusals
+          were worded differently while describing one situation, so a
+          text-keyed counter would have missed it entirely. Two stops about
+          genuinely different things differ HERE, in the state, which is also
+          why "different reasons do not park" is really "different situations
+          do not park".
+        * **Repository HEAD.** Publication is already covered above, and HEAD
+          moves for reasons that have nothing to do with the stopped situation
+          — a merge sweep landing another task's work, an operator's own
+          commit. Including it would hand the livelock a way to reset itself.
+        * **Session id, timestamps, iteration counters.** They differ on every
+          round by construction, so any of them would make every fingerprint
+          unique and the park unreachable.
+
+        Fail-closed on unreadable inputs: an execution record that cannot be
+        read still contributes its raw bytes (never a decode, so corruption
+        cannot raise here), and an OSError enumerating the directory is left to
+        propagate to `_observe_contract_stop`, which parks. Quietly digesting
+        "nothing" instead would make an unreadable store look like steady
+        progress and switch the detector off.
+        """
+        state = self.state
+        task_id = ""
+        if isinstance(state.current_task, dict):
+            # `task_id`, spelled the way BOTH writers spell it
+            # (`_dispatch_task_postcommit` and `_resolve_audit_task`, and
+            # `cli._summary` reads the same key). `id` is the `Task` dataclass's
+            # field name and is NOT what lands in this dict — reading it here
+            # would leave this term permanently empty, which is a term silently
+            # contributing nothing rather than a term that is absent.
+            task_id = str(state.current_task.get("task_id") or "")
+        parts = [f"task={task_id}"]
+        parts.append(
+            "registry="
+            + hashlib.sha256(
+                json.dumps(self._registry.to_dict(), sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        )
+        parts.append(f"executions={self._execution_records_digest()}")
+        return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+    def _execution_records_digest(self) -> str:
+        """Content digest of every LIVE task-execution record.
+
+        Raw bytes per file, sorted by name — never `TaskExecutionStore.load`.
+        Two reasons, both about not lying: a corrupt record raises from
+        `load()`, and a fingerprint that raised would have to be answered by
+        guessing; and the question here is only "did this change", for which
+        the bytes are a better answer than a decoded subset of them.
+
+        `glob("*.json")` does not recurse, so `archive/` is excluded — and
+        retiring a record still shows up, because the top-level file it moves
+        from disappears from this listing.
+
+        No store configured (a hand-built Orchestrator) digests as the empty
+        string, which is stable rather than absent: the other inputs then carry
+        the fingerprint on their own.
+        """
+        store = getattr(self, "_execution_store", None)
+        directory = getattr(store, "directory", None) if store is not None else None
+        if directory is None or not Path(directory).is_dir():
+            return ""
+        digest = hashlib.sha256()
+        for path in sorted(Path(directory).glob("*.json")):
+            digest.update(path.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def _park_stop_livelock(self, record) -> None:
+        """The park this whole mechanism exists to produce.
+
+        `_to_needs_user`, not a new terminal of its own, and that is the
+        requirement rather than a convenience: it is what writes a
+        `blockers.Blocker`, so `health` reports `stuck_blocked` /
+        `needs_attention` and the AFK monitor alarms, and it is what makes
+        `python -m autoloop answer <id> "..."` able to clear this exactly like
+        any other blocker. The failure being fixed was an automated monitor
+        that stayed green, so a quiet exit here would fix nothing.
+
+        `loop_fatal`, not `task_fatal`. Repeated identical refusals are
+        evidence about the CONTROLLER — in the incident the reviewer was right
+        every time and the fault was the loop's own lost postcommit binding —
+        and quarantining whichever task happens to be named would assert that
+        the rest of the roadmap can proceed, which is exactly what nobody
+        knows. It also matches this file's fail-closed default for a park whose
+        blast radius is not established.
+
+        THE REASON IS QUOTED VERBATIM. In the incident the reviewer's text was
+        the diagnosis: it identified the controller's fault precisely, and an
+        operator reading only "stopped repeatedly" would have had to rediscover
+        it. It is quoted rather than summarised for the same reason
+        `_to_needs_user` persists the exact `question`.
+
+        A reason with NOTHING READABLE in it falls back to a placeholder rather
+        than ending the question on a colon. `contract._require_str` already
+        refuses an empty or whitespace-only `reason`, so no reviewer reply can
+        produce this — the fallback covers a `Directive` handed straight to
+        `_dispatch`, and a park whose text simply stopped would read as a bug in
+        this mechanism rather than as the absence of an explanation. The
+        `.strip()` costs nothing on a real reason: the contract already stripped
+        it, so this cannot alter one word the reviewer wrote.
+
+        THE LEDGER IS CLEARED HERE. Otherwise the count stays at or above the
+        ceiling forever and the very next stop — after the operator answers,
+        with the loop possibly fixed — parks again immediately, which is a new
+        livelock wearing the old one's clothes. Cleared, a relapse costs the
+        same bounded `MAX_REPEATED_STOPS` cycles as the first one did, and the
+        blocker's own `recurrences` is what says it has happened before.
+        """
+        reason = (record.last_reason or "").strip() or "(no reason recorded)"
+        self._log(
+            "stop_livelock_parked",
+            data={
+                "count": record.count,
+                "fingerprint": record.fingerprint,
+                "first_seen_at": record.first_seen_at,
+                "reason": reason,
+            },
+        )
+        self.state.last_response = None
+        # BEFORE the park, so a park that itself fails still leaves the counter
+        # reset rather than a state that re-parks on every subsequent stop.
+        try:
+            self._stop_repetitions.clear()
+        except OSError as exc:
+            self._log(
+                "stop_repetition_ledger_unusable",
+                data={
+                    "path": str(self._stop_repetitions.path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        self._to_needs_user(
+            f"The reviewer has answered `stop` {record.count} times in a row "
+            "about the same unresolved situation — same task, same task "
+            "registry, same execution records (so no candidate was published "
+            "between them either, since publishing writes one) "
+            f"(first seen {record.first_seen_at}). A `stop` is a verdict, not "
+            "a failure, so nothing was counting these: the loop was ending each "
+            "session and opening another one, and would have gone on doing that "
+            "for as long as the process ran. It has parked instead. Read the "
+            "reviewer's last words below — they usually name what is actually "
+            "wrong — fix that, then answer this blocker. The reviewer's own "
+            f"reason, verbatim: {reason}",
+            kind="loop_fatal",
+            code="stop_livelock",
+            detail=(
+                f"consecutive stops: {record.count} (ceiling "
+                f"{MAX_REPEATED_STOPS}); situation fingerprint "
+                f"{record.fingerprint}; first seen {record.first_seen_at}; "
+                f"last seen {record.last_seen_at}"
+            ),
+        )
 
     def _dispatch_plan(self, directive: Directive) -> None:
         state = self.state

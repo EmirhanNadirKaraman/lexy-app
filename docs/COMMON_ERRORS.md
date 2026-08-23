@@ -583,6 +583,49 @@ what the sweep did *not* find proves nothing unless it also pins the outcome.
 gates a loop that would otherwise move the base branch head unasked), and the
 short-circuit is correct behaviour, not the bug.
 
+### A test asserts `health.check(...).needs_attention is False` and gets `not_running`
+**Symptom:** a hermetic test drives the loop to a healthy terminal (a clean
+`stopped`, say), asserts nothing needs attention, and fails with
+`code="not_running"` / `needs_attention=True` — no blocker, no park, nothing
+wrong with the state it just built.
+**Cause:** `health.check` asks `LoopLock(config.state_dir).read()` whether a loop
+is running, and in a test there is none, so it reports the loop as down before
+ever reaching the healthy path. Correct behaviour: from outside the process, a
+state dir with no live lock IS a loop that is not running.
+**Fix:** take the lock around the assertion — `with LoopLock(config.state_dir):`
+— which makes `is_live` true for the test's own pid. See
+`test_stop_livelock.py::test_a_single_stop_behaves_exactly_as_today`.
+**The order matters more than the lock.** Open blockers are judged BEFORE the
+lock's liveness and before any phase, so a test asserting `needs_attention is
+True` off a blocker needs no lock at all, while one asserting `False` does. And
+after a `loop_fatal` park, answering the blocker leaves the SESSION parked, so
+`health` moves from `stuck_blocked` to `stuck_parked` rather than to `running` —
+assert the code, not the boolean, or the test will read as a regression.
+
+### A scripted `stop` with an empty `reason` never stops the loop
+
+**Symptom:** a test scripts `{"version": 3, "decision": "stop", "reason": ""}` as
+the round's only reply, expects `stopped`, and instead the fake conversation
+raises something like `test script exhausted: no response left` — or the round
+ends holding a corrective prompt nobody asked for.
+**Cause:** `contract._require_str` refuses an empty *or whitespace-only* string
+for every field it guards, and `reason` is one of them. The reply never becomes a
+`Directive` at all: it is a `missing_field:reason` parse error, so the round
+spends a parse retry and asks the conversation again — which a one-element
+script cannot answer. Nothing was dispatched, and nothing a stop would have done
+happened.
+**Fix:** decide which half you are testing. For the stop DISPATCH, hand the
+directive straight in — `orch._dispatch(Directive(decision=Decision.STOP,
+reason=""))` — as `test_blockers.py` and
+`test_stop_livelock.py::test_a_stop_with_an_empty_reason_still_parks_and_says_so`
+do. For the PARSE, assert the `ContractError` code, as
+`test_the_contract_never_delivers_an_empty_stop_reason` does beside it.
+**Do not loosen `_require_str` to make the round work.** The reason is the only
+record of why a session ended, and requiring one is the behaviour rather than the
+obstacle. It also means production code reading a stop reason is guarded against
+a shape only a hand-built directive can produce — worth keeping fallbacks for,
+not worth widening the contract for.
+
 ---
 
 ## 3. Frontend build
@@ -1736,6 +1779,37 @@ reason (so the next directive can name a real task) and is bounded by
 that the reviewed candidate survives — `git -C ~/.autoloop/workers/<unit-id>
 branch --contains <candidate-sha>` — since archiving the record does not touch
 the branch, and that branch is the only copy.
+
+### The loop collects the same reviewer `stop` every few minutes and every automated signal stays green
+**Symptom:** `run --continuous` is alive, `health` reports `code: running`,
+`open_blockers: 0`, `needs_attention: FALSE`, and the heartbeat keeps arriving —
+but the transcript repeats one cycle: new session → kickoff → `stopped` →
+new session. The reviewer's reasons are worded differently each time while
+describing one situation. `phase` never moves off that cycle. Measured
+2026-08-20: three full rounds in fifteen minutes, one ChatGPT turn each, and it
+would have run for as long as the process did.
+**Cause:** a `stop` is a VERDICT, not a failure, so nothing counted it.
+`policy.max_consecutive_failures` never sees one; `stop` ends the session,
+`--continuous` correctly treats a contract stop as a clean boundary and opens
+the next one, and the new session's kickoff draws the same refusal. The
+reviewer is right every time — the fault was on the controller side (in that
+incident, a lost postcommit binding left a task holding an approved,
+unpublishable candidate), which is exactly what no counter was watching.
+**Fix:** applied repo-side (stop-01) — `orchestrator._handle_contract_stop`
+charges every stop to `.autoloop/stop_repetition.json`, keyed by a fingerprint
+of the SITUATION (task id, execution records, registry) rather than the reason
+text, and the third consecutive stop about an unchanged situation parks
+`loop_fatal` with `code="stop_livelock"`, quoting the reviewer's last reason
+verbatim. `docs/AUTOLOOP.md` §9f. One stop, and stops about different
+situations, behave exactly as before.
+**Clearing one that is already parked:** read the blocker's question first — it
+carries the reviewer's own words, and in this incident that text named the
+controller's fault precisely. Fix what it names, `autoloop answer <id> "..."`,
+then `run --answer "..."` (WITHOUT `--continuous`) to resume the parked session.
+**If it parked `stop_repetition_ledger_unusable` instead:** the counter file
+could not be read or written, so the check could not run and the loop refused to
+carry on with it silently off. Delete `.autoloop/stop_repetition.json` — it is a
+counter, nothing else reads it — then answer and resume.
 
 ### `Error: It looks like you are using Playwright Sync API inside the asyncio loop.` — `run --continuous` dies after a park
 **Symptom:** the loop runs fine, parks or hits a browser error, prepares the
@@ -2972,3 +3046,6 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | ship-01 | A task showing under *Registry / code disagreements* as `completed_unwitnessed` does NOT mean the work is missing. It means no commit subject names the id, which is absence of evidence — the work may have shipped under a subject that never named it. That is why the row is marked UNPROVEN and why `shipped-report` still exits 0 for it alone. Retiring or re-running the task on the strength of that row is the licence-to-redo-landed-work failure the report is shaped to refuse. |
 | 2026-08-23 | ship-01 | `shipped-report` printing INVALIDATED for a record that was fine yesterday usually means the base moved, not that the record was wrong: a rebase or force-move renames the carrying commits. Re-run `record-shipped` with the new shas — re-recording is allowed on purpose, unlike a retirement. There is deliberately NO route back to `pending`, so do not look for one; a claim that the evidence was wrong is a task to plan, not a status to flip. |
 | 2026-08-23 | ship-01 | New §2 entry for a fixture trap that cost a round here: a `BacklogSweeper` test whose hand-built `PolicyConfig()` leaves `auto_merge_enabled` at its default False gets `disabled` from `sweep()` before enumeration runs. The loud version fails on the outcome; the quiet version (`unresolved == []`, `pending == []`) passes vacuously, which is why the entry says a sweep test must pin the outcome as well as what the sweep did not find. |
+| 2026-08-23 | stop-01 | New §8 entry for the 2026-08-20 livelock: the loop collecting the same reviewer `stop` every few minutes while `health` reports `running` / `open_blockers: 0` / `needs_attention: FALSE`. Filed as fixed rather than as a live trap — the third matching stop now parks `stop_livelock` — but the recovery is what the entry is for, including the `stop_repetition_ledger_unusable` variant, whose remedy is deleting a counter file rather than answering alone. |
+| 2026-08-23 | stop-01 | New §2 entry for the test trap beside it: `health.check` asks the LOCK whether a loop is running, so a hermetic test asserting `needs_attention is False` fails with `not_running` unless it holds `LoopLock`. The half worth knowing is the ordering — blockers are judged before the lock and before any phase, so the True direction needs no lock, and after answering a loop_fatal blocker the verdict moves to `stuck_parked`, not to running. |
+| 2026-08-23 | stop-01 | Revision round. Third §2 entry, for the trap that cost this round: a scripted `stop` whose `reason` is `""` never stops anything. `contract._require_str` refuses empty AND whitespace-only strings, so the reply is a `missing_field:reason` parse error, the round spends a corrective re-prompt, and a one-element fake client dies with "test script exhausted". Test the dispatch through `_dispatch` and the parse through the `ContractError` code — never by loosening the contract. |
