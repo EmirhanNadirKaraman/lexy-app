@@ -47,6 +47,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S36 | INFO | `profile` (prof-01, 2026-08-20) is the first command whose whole job is to read `transcript.jsonl`, which holds complete review packets (`request_submitted.data.prompt`) and complete reviewer replies (`response_received.data.raw`). Bounded structurally by a read/render split: `build_profile` reduces the read to counts plus per-stage floats and static stage labels, and `render_profile` receives only that, so the layer that writes to stdout holds no record at all — do not add a flag that prints one. `--transcript FILE` changes only WHICH file is read, and the bound is input-independent | `autoloop/cli.py`, `autoloop/transcript.py` |
 | S37 | INFO | The reviewer transport gained a LIVE agent session (`codex_app_server`, 2026-08-22, codex-01): one long-lived `codex app-server` child instead of a process per turn, and it can ask this client to approve a command or a patch. Bounded by this client's REPLIES — every approval is answered `{"decision": "abort"}`, every other server→client request gets a JSON-RPC error (never silence, which would wedge the turn), argv is a list with no shell and no model text on it, `cwd` stays outside the checkout and stderr is `DEVNULL`. Explicitly NOT a sandbox claim: no preset is selected or enforced | `autoloop/codex/app_server.py`, `autoloop/codex/app_server_conversation.py`, `autoloop/conversation.py` |
 | S38 | MEDIUM | The inbox gained `urgent` (preempt-01, 2026-08-22) — the first request kind whose effect is on the LOOP: it ends the round in flight at the next safe boundary and MOVES that task's worker repo and execution record to quarantine, so S30's "nothing in flight can be edited" no longer covers the whole vocabulary. Bounded: the target must be a dispatchable READY task with a non-empty scope, a non-blank reason is required, ONE live pin at a time, it acts only at `_at_round_boundary` (the same predicate the self-upgrade restart uses) so no review packet is stranded, the displaced task moves through the one release path, nothing is deleted (a retirement that fails names what survived, and pairs it back with its record when that worker is resumable), and no packet, stamp, approval or push is touched — the one added gate only DENIES an `implement`/`revise` of another task or a fresh `audit` while the pin is live | `autoloop/inbox.py`, `autoloop/tasks.py`, `autoloop/orchestrator.py`, `autoloop/cli.py` |
+| S39 | INFO | The Codex CLI reviewer's failure classifier no longer treats the loop's OWN prompt as evidence (quota-01, 2026-08-23). `codex exec` echoes the whole prompt onto stderr, so a packet quoting a line number made any non-zero exit read as a spent allowance and parked the loop loop-fatal, twice, on 2026-08-22 — content the loop SENT could stop the loop. A marker now counts only when it does not occur in the prompt, which is a required argument. The same change adds a bounded, echo-stripped `stdout_tail` to `codex_invocation_failed`, narrowly amending `failure_digest`'s "never stdout" promise; argv and the environment are still never recorded, and the reviewer's reply already reaches that file in full (see S36) | `autoloop/codex/quota.py`, `autoloop/codex/conversation.py`, `autoloop/conversation.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -1789,6 +1790,119 @@ upgrade.
 
 ---
 
+### S39 — A failed `codex exec` now records BOTH its streams to the transcript, and the loop's own prompt is no longer evidence — INFO — OPEN (bounded, accepted)
+
+**Location:** `autoloop/codex/quota.py` (`classify`, `strip_echoed_prompt`,
+`failure_digest`), `autoloop/codex/conversation.py` (`CodexConversation.submit`),
+`autoloop/conversation.py` (`_transcript_log`).
+
+**Severity:** INFO. Two changes are recorded here, one that REMOVES an
+availability hazard and one that narrowly widens what is written to a file the
+operator already owns. Neither grants a new reader, opens a socket or touches a
+credential.
+
+**1. The availability half — a self-inflicted denial of service, now closed.**
+`is_quota_exhausted` searched `f"{stdout}\n{stderr}".lower()`, and `codex exec`
+ECHOES THE WHOLE PROMPT BACK ON STDERR (measured: a 180,024-byte packet came
+back verbatim). The pattern list held the bare substrings `"429"`, `"quota"` and
+`"rate limit"`, so every word of the review packet was inside the string being
+matched. On 2026-08-22 a packet quoting `docs/autoloop.md:4295` — a LINE NUMBER
+— turned an unrelated non-zero exit into `QuotaExhaustedError`, which is
+loop_fatal with no retry path; the loop parked twice against an account 4%
+through its weekly window (~25 minutes down, an hour of investigation). Content
+the loop SENT could stop the loop. It is worth naming as a security property
+rather than a bug: the review packet is assembled from repository text and agent
+output, so the input that could trigger it is not fully under an operator's
+control, and several task descriptions in this repository discuss quotas and
+rate limits by name. Closed by making the prompt a REQUIRED argument to
+`classify`, dropping every output LINE the prompt accounts for
+(`codex_owned_text`) before anything is matched, matching only WITHIN a line so
+a wording cannot be assembled across a join that was never printed
+(`_folded_lines`), and counting a surviving marker only when the prompt does not
+account for it either. Which one carries the property is worth stating exactly:
+SUPPRESSION does, alone — an echoed line's squeeze is contained in the prompt's,
+so any marker folding into it squeezes into the prompt and is refused. The other
+two are not redundant (the line bound stops the comparison manufacturing a
+wording contiguous in neither side; the haystack bound makes `matched_pattern`
+readable as codex's own output) but neither holds it alone. The comparisons ignore
+whitespace and punctuation: a literal substring test was tried first and refused
+on review, because a REFLOWED echo can carry a marker the prompt does not
+contain as an exact string — prompt text `quota` + newline + `exceeded`, printed
+back as `quota exceeded`, is the worked example. Matching folds (whitespace and
+punctuation to single spaces) and suppression squeezes (folds, then removes the
+spaces); squeezing is monotone over substring containment, so anything that can
+be MATCHED in a stream is necessarily SUPPRESSED when applied to the prompt.
+
+**2. The disclosure half — `stdout_tail` is new in the transcript.**
+`failure_digest`'s docstring promised the record was "the return code plus a
+bounded stderr TAIL … never the prompt, stdout, argv or environment". It now
+also carries a bounded excerpt of STDOUT, because a `codex exec` that dies
+before writing to stderr puts its complaint there and round 1 of quota-01 was
+refused for classifying such a failure while recording nothing about it. What
+bounds the amendment: both excerpts are echo-stripped (exact occurrences of the
+prompt are excised first) and each is capped at `STDERR_TAIL_CHARS` (400); argv
+and the environment are still never included; and the reviewer's reply already
+reaches this same file in FULL under `response_received.data.raw`, so a bounded
+excerpt of the same stream is not a new class of content in the transcript. See
+S36 for what reads that file and the read/render split that bounds it.
+
+**The residual.** Echo stripping is best-effort and is deliberately NOT the
+classification bound: a codex build that reflows or re-wraps its echo defeats
+the strip, and up to 400 characters of text the loop itself wrote could then
+appear in a `codex_invocation_failed` record. That is bounded, is already
+operator-owned content, and cannot affect routing — routing is decided by the
+guard in `classify`, which does not depend on recognising the echo at all.
+
+**Verification check:**
+```bash
+# The guard must be a REQUIRED argument. Expect `prompt: str,` with NO default
+# on all three, and the prompt consulted before any marker counts — expect the
+# `sent_squeezed` test inside `first_own_match` and the line filter above it:
+rg -n 'def classify|def is_quota_exhausted|def codex_owned_text' -A 6 autoloop/codex/quota.py
+rg -n 'sent_squeezed|codex_owned_text\(' autoloop/codex/quota.py
+# The adapter must guard with the prompt it SENT (post-attachment), and the
+# factory must pass a real logger. Expect one `classify(` with `prompt` and one
+# `log=_transcript_log(config)` per codex factory:
+rg -n 'classify\(' -A 8 autoloop/codex/conversation.py
+rg -n '_transcript_log\(config\)' autoloop/conversation.py
+# The digest must still carry no argv and no environment. Read its KEYS rather
+# than grepping the function for forbidden words — its own docstring names argv
+# and the environment in order to say it excludes them, so a word grep hits.
+# `failure_digest` builds the only string-keyed literal in this module; EXPECT
+# exactly request_id, returncode, classification, matched_pattern, stderr_tail,
+# stdout_tail, stderr_chars, stdout_chars, prompt_echo_chars, prompt_guard — and
+# nothing that says argv, command, env or the prompt ITSELF (`prompt_guard` is
+# the word "active" or "inert", never any of the text). Three further keys are
+# added conditionally just below it (`suppressed_patterns`, `echo_lines_dropped`,
+# `note`) and are all derived here:
+rg -n '^\s+"[a-z_]+":|digest\["' autoloop/codex/quota.py
+```
+Pinned by
+`autoloop/tests/test_codex_provider.py::test_an_echoed_prompt_cannot_declare_the_allowance_spent`,
+`::test_the_guard_survives_framing_the_echo_is_wrapped_in`,
+`::test_classification_cannot_be_called_without_the_prompt_it_sent` (the
+signature check that stops a future call site disabling the guard by omission)
+and `::test_an_echoed_review_packet_never_parks_the_loop`, which drives a real
+`CodexConversation` through the orchestrator. The reflow bound is pinned by
+`::test_no_reshaping_of_the_echo_can_declare_the_allowance_spent` and
+`::test_no_reshaped_echo_parks_the_loop_end_to_end`, each parametrized over 15
+ways a CLI can print text back without changing a word of it, plus
+`::test_anything_that_can_match_is_first_suppressible` for the fold/squeeze
+implication the guard rests on. The other direction — codex's OWN exhaustion
+message still parking the loop while the packet in flight quotes exhaustion
+wordings — is `::test_a_genuine_exhaustion_parks_even_after_a_marker_laden_echo`.
+An absent prompt leaves the guard inert; that is recorded as
+`prompt_guard: inert` rather than inferred, and pinned by
+`::test_an_absent_prompt_leaves_the_guard_inert_and_records_that`.
+
+**Suggested fix if the bound ever breaks:** if the guard ever has to be relaxed,
+do not widen the haystack — narrow the transport instead (a mode that does not
+echo, or a structured error like the app-server's `protocol_errors.py`, which
+classifies from named fields and never scans text at all). And do not add a
+field to the digest that is not bounded and echo-stripped.
+
+---
+
 ## Verified strengths (do not regress)
 
 These were checked in the 2026-05-24 sweep and are working controls. A PR that weakens one is a security regression.
@@ -2382,3 +2496,11 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | port-01 | An unconfigured `[paths].state_dir` now resolves beside `workers_root`, outside the tree `escape_detector` snapshots. This REMOVES an exposure rather than adding one: loop state written inside that tree mid-round was a diff indistinguishable from an agent writing where it may not, which is why the inbox, PAUSE, heartbeat and mutation ledger moved first. Nothing about the detector, its ignored-path coverage, or `TRACKER_PATHS` changed — the snapshot still reaches `.autoloop/`. |
 | 2026-08-23 | port-01 | Two things NOT weakened, deliberately. No path the loop writes gained a fallback, so nothing can silently resolve back into the checkout; the single legacy read (`workers_dir`) is consumed only by `doctor`'s read-only report. And `config.example.toml` still ships an explicit `state_dir`, so a template-derived deployment keeps today's behaviour exactly — the residual exposure is unchanged for it, not newly created, until that line is removed in the follow-up. |
 | 2026-08-23 | port-01 | Transition hazard worth stating: `LoopLock` is scoped to `state_dir`, so a loop started under the old default and one started after it hold DIFFERENT lock files and neither refuses the other. Single-instance enforcement is per state dir and always was (`docs/AUTOLOOP.md` §11); moving the default is the first time that can happen without an operator editing a config. Stop the loop before taking the change, or set `state_dir` explicitly. |
+| 2026-08-23 | quota-01 | New finding S39. The availability half is the interesting one: the reviewer's own INPUT could declare the account exhausted, because `codex exec` echoes the prompt onto stderr and the classifier searched both streams for `"429"`, `"quota"` and `"rate limit"`. A packet quoting a line number parked the loop loop-fatal twice on 2026-08-22. Closed by a guard, not by narrowing the list. |
+| 2026-08-23 | quota-01 | The disclosure half is a narrow amendment: `failure_digest` promised "never stdout" and now carries a bounded, echo-stripped `stdout_tail`, because a codex failure that never writes to stderr was being classified with nothing recorded about it. Argv and the environment are still never recorded, and the reviewer's reply already reaches that file in full (S36). |
+| 2026-08-23 | quota-01 | Residual named rather than claimed away: echo stripping is best-effort and a reflowed echo defeats it, so up to 400 characters the loop wrote itself can appear in a record. It cannot affect routing — routing is the guard in `classify`, which never depends on recognising the echo's shape. |
+| 2026-08-23 | quota-01 | S39's availability half was reopened on review and re-closed. A LITERAL substring test against the prompt is not enough: a reflowed echo can carry a marker the prompt does not hold verbatim (`quota` + newline + `exceeded` printed back as `quota exceeded`). Classification now drops output lines the prompt accounts for, matches only within a line, and compares both sides ignoring whitespace and punctuation. The finding text, its verification greps and its pinned-by list were updated in place; the residual above is unchanged and still stands. |
+| 2026-08-23 | quota-01 | Two digest keys added, neither carrying prompt text: `prompt_guard` is the word `active` or `inert`, and `echo_lines_dropped` is a count. `inert` is the disclosure that matters — the guard has one input, and with no prompt sent it suppresses nothing. That behaviour is correct and unchanged; recording it is what stops "the check quietly switched itself off" from being invisible in the transcript. |
+| 2026-08-23 | quota-01 | Amends S39's closing advice, which points at `protocol_errors.py` as the safer alternative: that module had the SAME availability defect. `rate_limit_exceeded`, `rate_limited`, `too_many_requests` and a numeric 429 all raised the loop_fatal `QuotaExhaustedError`, so a short-window throttle parked the loop from a structured field instead of a substring. Split into two vocabularies; only a spent allowance parks. Nothing was widened — this is a denial removed, not a permission added. |
+| 2026-08-23 | quota-01 | Correction to the 2026-08-22 changelog bullet for S37, which says quota detection there is "exact matches on named error fields plus a numeric 429": read the 429 clause as superseded. It is a THROTTLE now and routes retryably; everything else in that bullet stands. The bullet is unedited — S37's own summary row and finding text never made the 429 claim, so nothing above the marker asserts it any more. |
+| 2026-08-23 | quota-01 | Residual on that side, named: there is no prompt guard on the app-server transport and none is needed (the comparison is exact against a named field, never against printed text), but that also means `codex.quota_error_codes` is obeyed literally — an operator who files a throttle code there still parks the loop. Pinned by a test so it is a documented consequence, not a surprise. The `codex_app_server_failed` digest gained `classification` (one of three words) and carries no new content. |

@@ -53,9 +53,11 @@ from ..errors import BrowserError, ResponseTimeoutError, SessionLostError
 from . import wire
 from .protocol_errors import (
     DEFAULT_QUOTA_ERROR_CODES,
+    DEFAULT_RATE_LIMIT_ERROR_CODES,
     CodexProtocolError,
     classify,
     failure_digest,
+    usable_codes,
 )
 
 #: How long one blocking read may sit before the client re-checks its own
@@ -280,13 +282,23 @@ class AppServerClient:
         *,
         timeout_seconds: float = 900.0,
         quota_codes: tuple[str, ...] = DEFAULT_QUOTA_ERROR_CODES,
+        rate_limit_codes: tuple[str, ...] = DEFAULT_RATE_LIMIT_ERROR_CODES,
         working_dir: str = "",
         log: Callable[[str, dict], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self._transport = transport
         self._timeout = timeout_seconds
-        self._quota_codes = tuple(quota_codes) or DEFAULT_QUOTA_ERROR_CODES
+        # Two vocabularies, because a spent allowance and a short-window
+        # throttle are different events with different remedies and only the
+        # first is worth parking a loop over. `usable_codes` rather than
+        # `tuple(...) or DEFAULT`: an override that is non-empty but carries
+        # nothing usable (`[""]`) would otherwise pass the fallback and then
+        # recognise no error at all — a check quietly switched off by config.
+        self._quota_codes = usable_codes(quota_codes, DEFAULT_QUOTA_ERROR_CODES)
+        self._rate_limit_codes = usable_codes(
+            rate_limit_codes, DEFAULT_RATE_LIMIT_ERROR_CODES
+        )
         self._working_dir = working_dir
         self._log = log or (lambda event, data: None)
         self._clock = clock
@@ -554,12 +566,31 @@ class AppServerClient:
             self._log("codex_app_server_interrupt_failed", {"thread_id": thread_id})
 
     def _raise(self, error: Any, *, context: str) -> None:
-        digest = failure_digest(error if isinstance(error, dict) else {"message": str(error)})
+        # The SAME object `classify` is about to read, not a reshaped copy of
+        # it. Wrapping a non-`dict` in `{"message": str(error)}` here (as this
+        # did until quota-01) meant the digest and the exception could be
+        # computed from two different values — a Mapping that is not a `dict`
+        # would classify one way at the wire and be recorded as unclassified —
+        # and "the record cannot disagree with the routing" is the property
+        # `classification` exists to carry. `failure_digest` already tolerates a
+        # non-Mapping: every field it reads is guarded.
+        digest = failure_digest(
+            error,
+            quota_codes=self._quota_codes,
+            rate_limit_codes=self._rate_limit_codes,
+        )
         # Logged on EVERY failure, not only unrecognised ones — the same rule
         # `codex/quota.py` follows, and what turns the first real exhaustion
-        # into a config edit instead of an investigation.
+        # into a config edit instead of an investigation. The digest carries the
+        # classification, so the record names which of the three routes was
+        # taken rather than leaving it to be inferred from the exception.
         self._log("codex_app_server_failed", {**digest, "context": context})
-        raise classify(error, quota_codes=self._quota_codes, context=context)
+        raise classify(
+            error,
+            quota_codes=self._quota_codes,
+            rate_limit_codes=self._rate_limit_codes,
+            context=context,
+        )
 
     def _read_message(self, deadline: float, *, context: str) -> dict:
         while True:

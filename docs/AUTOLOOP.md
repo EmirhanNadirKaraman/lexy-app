@@ -3822,15 +3822,118 @@ With no fallback configured, a fallback equal to the primary, no request in
 flight, or the budget spent, the loop parks `loop_fatal` and says which.
 
 **Quota detection is honest about what it cannot verify.** `codex/quota.py` is a
-pure function over `(returncode, stdout, stderr)` with an overridable pattern
-list, because the exact exhaustion wording could not be confirmed when this was
-written and will change. A `returncode == 0` is never exhaustion whatever the
-text says — OpenAI's documented behaviour is a soft stop, so a turn in flight
-finishes and that reply should be used. Every non-zero exit logs its return code
-and a bounded stderr tail, so the first real exhaustion shows exactly what to add
-to `codex.quota_patterns`. A missed pattern degrades to an ordinary failure:
-noisy, never unsafe — an unrecognised failure authorizes nothing, and re-running
-a stateless call cannot double-post.
+pure function over `(returncode, stdout, stderr, prompt)` with overridable
+pattern lists, because the exact exhaustion wording could not be confirmed when
+this was written and will change. A `returncode == 0` is never a failure of any
+kind whatever the text says — OpenAI's documented behaviour is a soft stop, so a
+turn in flight finishes and that reply should be used. A missed pattern degrades
+to an ordinary failure: noisy, never unsafe — an unrecognised failure authorizes
+nothing, and re-running a stateless call cannot double-post.
+
+**The prompt is not evidence** (quota-01, 2026-08-23). `codex exec` ECHOES THE
+WHOLE PROMPT BACK ON STDERR — measured, a 180,024-byte packet came back verbatim
+— so the old haystack, `f"{stdout}\n{stderr}"`, contained every word of the
+review packet. With `"429"`, `"quota"` and `"rate limit"` in the list as bare
+substrings, a packet quoting `docs/autoloop.md:4295` (a LINE NUMBER) turned any
+non-zero exit into a spent allowance. On 2026-08-22 the loop parked twice,
+loop_fatal, against an account 4% through its weekly window: ~25 minutes of
+downtime and an hour of investigation. It was the reviewer's own INPUT declaring
+the account exhausted.
+
+The fix bounds the haystack by the one thing the loop holds with certainty — the
+prompt — rather than by a framing marker a codex release could rename. Two
+layers, and each covers what the other cannot:
+
+* **Lines the prompt accounts for are dropped before anything is matched**
+  (`quota.codex_owned_text`). This is what "classify from codex's own error
+  output" means on a transport that offers no other separation, and it is what
+  lets `matched_pattern` be read as "codex said this" rather than as "this
+  survived a rule applied to a stream that was mostly ours". Lines below a small
+  content floor are kept deliberately — without it `Error:` folds to a word
+  every packet contains, and short lines vanish from the record entirely.
+* **A marker must sit inside ONE line** (`quota._folded_lines`). Nothing is
+  matched across the join between two lines, so a wording cannot be assembled
+  from one line's tail and the next line's head — text that was never printed
+  adjacently and that neither side ever contained. The cost is stated: a message
+  the CLI hard-wraps is not recognised, which degrades to a retryable failure.
+* **A surviving marker still cannot be one the loop sent** (`quota.classify`).
+
+Be precise about which one carries the property, because an overclaim here is
+how a fix gets believed in the wrong place. **Suppression carries it alone**: an
+echoed line's squeeze is contained in the prompt's, so any marker folding into
+that line squeezes into the prompt and is refused, with or without the other
+two. The other two are not redundant — the line bound stops the *comparison*
+manufacturing a wording contiguous in NEITHER side, which suppression cannot
+see; the haystack bound is what makes `matched_pattern` readable as codex's own
+output. Drop suppression and a hard-wrapped echo can leave a short line under
+the content floor that a widened pattern list matches.
+
+The comparisons ignore whitespace and punctuation entirely, which is the part
+the first cut got wrong. A literal substring test against the prompt let a
+REFLOWED echo classify: prompt text `quota` + newline + `exceeded`, printed back
+as `quota exceeded`, is a marker the prompt does not contain as an exact string.
+Re-wrapping, re-indenting, quoting, bulleting, tab-ing, swapping punctuation and
+upper-casing are each pinned as a case in `test_codex_provider.py`, at the
+classifier AND at the loop.
+
+Nothing recognises the echo's shape, so `codex.quota_patterns` is safe to widen
+again. The price is stated rather than hidden — when a packet genuinely
+discusses usage limits, in any spelling, a genuine exhaustion that round degrades
+to an ordinary retryable failure — and it is never silent: every suppressed
+marker is named in the transcript record, alongside `echo_lines_dropped` and a
+`prompt_guard` field that reads `inert` when there was no prompt to guard with.
+
+**OPERATORS: re-read your `[codex] quota_patterns` before the next run.** The
+2026-08-22 stopgap narrowed that list by hand to multi-word phrases that could
+not occur incidentally, and it is no longer what protects you — the guard is. But
+the list's MEANING changed under it: `quota_patterns` is now the SPENT list
+alone, and anything in it routes to the loop_fatal branch. A stopgap entry that
+describes a short-window throttle (`"rate limit exceeded"`, `"too many
+requests"`, `"429 Too Many Requests"`) will park a run on a limit that clears in
+thirty seconds — the harm this section is about, surviving the fix through
+config. Move those entries to `codex.rate_limit_patterns`, or empty both and take
+the built-in lists, which are split correctly. This file cannot be checked from
+the repository: `.autoloop/config.toml` lives under the state dir, outside the
+checkout (§3h).
+
+**Transient is not spent.** Two lists: `codex.quota_patterns` (a SPENT
+allowance — park or hand over) and `codex.rate_limit_patterns` (a short-window
+throttle — the remedy is time). Spent is tested first, so "429 — you have hit
+your usage limit" reads as spent. `"429"`, `"too many requests"` and
+`"rate limit"` now live in the transient list, where they route to
+`SubmitResult.REJECTED`: retryable, on the ordinary failure budget, never the
+loop_fatal `QuotaExhaustedError` branch that has no retry path at all.
+
+This adapter deliberately does NOT raise `RateLimitedError` for a transient
+limit, even though that error owns the back-off budget. `RateLimitedError` is
+routed through `orchestrator._classify_rate_limit_state`, which is written for
+the browser: it probes the held page for a throttle modal, and when it cannot,
+it counts CDP page targets. A codex-primary deployment normally keeps a Chrome
+profile around for the fallback seat, and a browser whose window is closed
+answers `/json/version` while `/json/list` returns ZERO targets — the documented
+2026-08-17 state. That routes to `_recover_unattachable_browser` and parks
+`loop_fatal` on `browser_unattachable`: one false park traded for another.
+`REJECTED` is this transport's existing retryable path and costs nothing it does
+not already cost. Giving the adapter an `is_rate_limited()` that returns True
+would be worse still — it manufactures `MODAL_SIGHTED` evidence for a transport
+with no page, which is the echo failure in a different hat.
+
+**Every non-zero exit leaves a record, and it now reaches the transcript.**
+`codex_invocation_failed` carries the return code, the classification, the
+marker that decided it, the markers the guard suppressed, how many output lines
+the prompt accounted for, whether the guard was `active` or `inert`, bounded
+echo-stripped excerpts of BOTH streams, and the raw sizes. The excerpts strip
+EXACT prompt occurrences only, deliberately: the generous line filter that
+bounds classification is the wrong tool for the one diagnostic anyone will read,
+and over-stripping it deleted the useful line in an earlier cut of this fix. A
+reshaped echo therefore survives into `stderr_tail` — bounded to
+`STDERR_TAIL_CHARS`, and it is text the loop wrote itself. It had been written on every
+failure since the adapter shipped and appeared ZERO times in 24 days of
+transcript, because the factory constructed `CodexConversation` without a
+logger — so when the false park happened, the exit code and stderr that would
+have named the real fault had already been discarded. The wiring is at the
+factory (`conversation._transcript_log`); the no-op constructor default stays,
+because it is right for a unit test and wrong only for production.
 
 **The reviewer gets no repository access.** It runs with `cwd` outside the
 checkout. The prompt is self-contained (every turn carries its own CONTEXT block
@@ -3925,12 +4028,61 @@ RECOVERED rather than re-asked.
 
 **Errors are objects, so classification reads fields.** `codex/protocol_errors.py`
 matches `error.code` and `data.type` / `code` / `kind` / `status` / `httpStatus`
-exactly, plus a numeric 429; the child's stderr goes to `DEVNULL`, so there is no
-text blob to scan even by accident. An error whose PROSE mentions a usage limit
-but whose type is unrecognised routes as an ordinary failure, which is the
-discrimination §5d's matcher cannot make. The exhaustion VOCABULARY is still a
-list — the committed reference carries no error enumeration — and is overridable
-via `codex.quota_error_codes`, exactly as `quota_patterns` is.
+exactly; the child's stderr goes to `DEVNULL`, so there is no text blob to scan
+even by accident. An error whose PROSE mentions a usage limit but whose type is
+unrecognised routes as an ordinary failure — a discrimination §5d's matcher still
+cannot make from wording alone, though since quota-01 it can no longer be fooled
+by wording the loop itself SENT. The VOCABULARIES are still lists — the committed
+reference carries no error enumeration — and are overridable via
+`codex.quota_error_codes` and `codex.rate_limit_error_codes`, exactly as
+`quota_patterns` and `rate_limit_patterns` are.
+
+**Transient is not spent here either** (quota-01, 2026-08-23). This module
+shipped with `rate_limit_exceeded`, `rate_limited`, `too_many_requests` and a
+numeric `429` in the EXHAUSTION list, so a short-window throttle raised
+`QuotaExhaustedError` — loop_fatal, no retry path. That is §5d's defect one
+transport over, arriving through a structured field instead of a substring
+match, and it is worth naming because the structured transport is the one §5d
+points at as the safer alternative. Two vocabularies now, and 429 lives in the
+transient one:
+
+* SPENT (`codex.quota_error_codes`) → `QuotaExhaustedError` → hand over to
+  `conversation.fallback_provider` or park.
+* TRANSIENT (`codex.rate_limit_error_codes`, plus the numeric status 429
+  without being listed) → `CodexProtocolError` with `transient=True`, which is a
+  `BrowserError` and therefore already on the ordinary retryable failure budget.
+* Anything else → `CodexProtocolError`, the same retryable route. Never
+  swallowed: an unrecognised failure still raises and still records.
+
+Spent is tested FIRST, in one place (`protocol_errors.classification_of`), so an
+error carrying both — a `usage_limit_reached` type alongside a 429 status, which
+is how a weekly allowance reports over HTTP — reads as spent, and the digest
+written to the transcript can never disagree with the exception raised at the
+wire. `codex_app_server_failed` carries that `classification` field for exactly
+that reason. As in §5d, `RateLimitedError` is deliberately NOT raised for the
+transient case: its handler probes a held browser page and then counts CDP
+targets, and a codex deployment whose Chrome window is closed answers with ZERO
+targets and parks `loop_fatal` on `browser_unattachable` — one false park traded
+for another.
+
+**OPERATORS: `codex.quota_error_codes` is the SPENT list alone.** There is no
+prompt guard on this side — the comparison is exact against a named field, and
+the list is your explicit statement — so a throttle code named there parks the
+loop on a limit that clears in thirty seconds. Put throttle codes in
+`codex.rate_limit_error_codes`, or leave both empty and take the built-in lists,
+which are split correctly. A list that recognises nothing means the BUILT-IN
+list, never an empty vocabulary — and the fallback tests the list's CONTENTS
+(`protocol_errors.usable_codes`), not just its length, so a configured `[""]`
+falls back too rather than silently matching no error at all. A blank entry could
+never over-classify here (the comparison is equality against a named field, the
+opposite of the blank-pattern hole `quota._usable` closes on the other
+transport); the harm it would do is the other one, a real exhaustion going
+unrecognised, and that is the check quietly switching itself off.
+
+The mistake is otherwise asymmetric, and that is deliberate: because spent is
+tested first, misfiling a SPENT marker into the transient list cannot downgrade a
+real exhaustion into a retry. A config error here costs a false park, never a
+missed one.
 
 **Containment, stated only as far as it is provable.** The server runs with `cwd`
 outside the checkout, as §5d's does and for the same reason. Beyond that, every
@@ -3951,9 +4103,12 @@ this transport does not read it.
 **Two gaps left open, named rather than quietly skipped.** `doctor`'s
 `codex_seats` check still matches only `codex_cli`, so a run configured for this
 provider gets no PATH or working-dir check; and `autoloop/config.example.toml`
-documents none of the four new `[codex]` keys (`app_server_command`,
-`app_server_part_chars`, `app_server_max_attachment_chars`,
-`quota_error_codes`). Both files were outside codex-01's approved paths.
+still documents none of the three SIZE/COMMAND keys (`app_server_command`,
+`app_server_part_chars`, `app_server_max_attachment_chars`). `doctor` was outside
+codex-01's approved paths and stays outside quota-01's. The two vocabularies
+(`quota_error_codes`, `rate_limit_error_codes`) ARE in the template as of
+quota-01, because misfiling a code between them parks a live loop and that is
+not a thing to leave undocumented.
 
 ---
 

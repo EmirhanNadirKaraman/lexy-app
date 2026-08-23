@@ -146,11 +146,49 @@ timeout_seconds = 900.0
 # access, and running outside the checkout is a containment that holds no
 # matter what the sandbox flags are called. `doctor` fails if it is inside.
 working_dir = ""
-# Substrings that mark an exhausted allowance in a FAILED invocation. Empty
-# uses the built-in list. Every non-zero exit logs its return code and a
-# stderr tail to the transcript, so the first real exhaustion shows you exactly
-# what to add here — it is a config edit, not a code change.
+# Substrings that mark a SPENT ALLOWANCE in a FAILED invocation — the window is
+# used up, waiting does not help, and the loop hands the reviewer role to
+# `conversation.fallback_provider` or parks. Empty uses the built-in list.
+#
+# Every non-zero exit writes a `codex_invocation_failed` record to the
+# transcript carrying the return code, the classification and a bounded excerpt
+# of what codex printed, so the first real exhaustion shows you exactly what to
+# add here — a config edit, not a code change.
+#
+# Safe to widen. A marker is ignored when the prompt accounts for it — either
+# because it occurs in the text that was sent, or because it sits on an output
+# line that does. `codex exec` echoes the whole prompt back on stderr, so before
+# that guard existed a review packet quoting a line number like `docs/x.md:4295`
+# made any failure read as an exhausted account and parked the loop (twice, on
+# 2026-08-22, against an account 4% through its weekly window). Both comparisons
+# ignore whitespace and punctuation, so an echo codex re-wraps is still ignored.
+# Suppressed markers are named in the record, together with `echo_lines_dropped`
+# and `prompt_guard`, so the guard is visible rather than silent.
 quota_patterns = []
+# Substrings that mark a TRANSIENT throttle — the account is being asked to
+# slow down and the remedy is time. Empty uses the built-in list, which is where
+# "429", "too many requests" and "rate limit" live. Kept apart from
+# `quota_patterns` on purpose: these never park the loop, because a
+# thirty-second limit routed to the permanent branch is a false outage.
+rate_limit_patterns = []
+#
+# The two keys below are the same distinction for the OTHER codex transport,
+# `conversation.provider = "codex_app_server"`. That one classifies from a named
+# field on a JSON-RPC error object rather than from printed text, so there is no
+# echo to guard against — and no guard either, which is why misfiling a code
+# between these two lists is the mistake to avoid. Both empty = the built-in
+# lists, which are split correctly. A list that would recognise nothing — []
+# or [""] alike — falls back to the built-in one rather than switching the
+# check off, and misfiling a SPENT marker into the transient list cannot
+# downgrade a real exhaustion, because spent is tested first.
+#
+# Error TYPES that mean a SPENT allowance. A value here reaches the loop_fatal
+# park, exactly as `quota_patterns` does. Do not put a throttle code here.
+quota_error_codes = []
+# Error TYPES that mean a TRANSIENT throttle. These stay on the ordinary
+# retryable failure budget. The numeric HTTP status 429 is recognised as a
+# throttle without being listed, and is deliberately NOT an exhaustion.
+rate_limit_error_codes = []
 
 [conversation]
 # Which LLMConversation adapter holds the reviewer role (see

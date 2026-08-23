@@ -109,7 +109,7 @@ class CodexConfig:
     * `codex_cli` — one `codex exec` process per turn (`command`,
       `sandbox_args`, `quota_patterns`).
     * `codex_app_server` — one `codex app-server` process holding one thread
-      (`app_server_*`, `quota_error_codes`).
+      (`app_server_*`, `quota_error_codes`, `rate_limit_error_codes`).
 
     Nothing is shared between the two sets, so switching
     `conversation.provider` changes which half is read and leaves the other
@@ -131,11 +131,27 @@ class CodexConfig:
     #: filesystem access, and this containment holds without depending on a
     #: sandbox flag's name.
     working_dir: str = ""
-    #: Substrings that identify an exhausted allowance in a FAILED invocation.
-    #: Empty uses `codex.quota.DEFAULT_QUOTA_PATTERNS`. Overridable because the
-    #: real wording cannot be confirmed here and will change; every non-zero
-    #: exit logs its stderr tail so the first real exhaustion shows what to add.
+    #: Substrings that identify a SPENT ALLOWANCE in a FAILED invocation — the
+    #: window is used up and waiting does not help, so the loop parks or hands
+    #: over. Empty uses `codex.quota.DEFAULT_QUOTA_PATTERNS`. Overridable
+    #: because the real wording cannot be confirmed here and will change; every
+    #: non-zero exit now logs a real diagnostic (`codex_invocation_failed`), so
+    #: the first real exhaustion shows exactly what to add.
+    #:
+    #: A marker here can no longer be triggered by the loop's OWN prompt: it is
+    #: ignored when the prompt accounts for it — either because it occurs in the
+    #: text that was sent or because it sits on an output line that does —
+    #: because `codex exec` echoes the whole prompt onto stderr. Both
+    #: comparisons ignore whitespace and punctuation, so an echo codex re-wraps
+    #: is still ignored. Widening this list is therefore safe in a way it was
+    #: not before — see `codex/quota.py`.
     quota_patterns: tuple[str, ...] = ()
+    #: Substrings that identify a TRANSIENT throttle — the account is being
+    #: asked to slow down and the remedy is time, not a different provider.
+    #: Empty uses `codex.quota.DEFAULT_RATE_LIMIT_PATTERNS`. Separate from
+    #: `quota_patterns` because routing a thirty-second 429 to the permanent,
+    #: loop_fatal branch is most of the harm a misclassification here can do.
+    rate_limit_patterns: tuple[str, ...] = ()
 
     # ---- codex_app_server only ------------------------------------------
     #: How to launch the local app-server. It ships with codex-cli and needs no
@@ -156,7 +172,24 @@ class CodexConfig:
     #: the same reason `quota_patterns` is — the committed protocol reference
     #: carries no error-code enumeration — but a value here is compared with a
     #: named field, not scanned for in everything the server printed.
+    #:
+    #: SPENT ONLY. A value here routes to the loop_fatal `QuotaExhaustedError`
+    #: branch, which has no retry path, and unlike `quota_patterns` there is no
+    #: prompt guard on this side to catch a mistake: naming a throttle code here
+    #: parks the loop on a limit that clears in thirty seconds. Throttles go in
+    #: `rate_limit_error_codes`.
     quota_error_codes: tuple[str, ...] = ()
+    #: Error TYPES that mean a TRANSIENT throttle — the server is asking this
+    #: account to slow down and the remedy is time. Empty uses
+    #: `codex.protocol_errors.DEFAULT_RATE_LIMIT_ERROR_CODES`. These route to
+    #: `CodexProtocolError`, which is retryable on the ordinary failure budget.
+    #: The numeric HTTP status 429 is recognised here without being listed.
+    #:
+    #: "Empty" means EMPTY OF CONTENT, for this key and for `quota_error_codes`
+    #: both: `protocol_errors.usable_codes` drops blanks first, so a configured
+    #: `[""]` falls back to the built-in list rather than becoming a vocabulary
+    #: that recognises nothing.
+    rate_limit_error_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1055,8 +1088,10 @@ def load_config(path: Path) -> AutoloopConfig:
         "command",
         "sandbox_args",
         "quota_patterns",
+        "rate_limit_patterns",
         "app_server_command",
         "quota_error_codes",
+        "rate_limit_error_codes",
     ):
         if key not in codex_data:
             continue
