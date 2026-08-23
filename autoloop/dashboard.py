@@ -2830,7 +2830,15 @@ def _remote_refs(repo: Path, ttl: int = 60) -> tuple[bool, list[dict]]:
 
 
 def collect(repo: Path) -> dict:
-    sd = repo / ".autoloop"
+    # THROUGH `_state_dir`, never `repo / ".autoloop"` — this line was the
+    # literal path until 2026-08-23, and when port-01 moved the state dir out
+    # of the checkout it made the page half-live: the roadmap followed the
+    # config (it resolves through `_tasks_file` -> `_state_dir`) while phase,
+    # iteration, the unit panel and live-progress stayed frozen at the moment
+    # of the move. A page that is partly current reads as authoritative, and
+    # three dashboard restarts changed nothing because a restart cannot fix a
+    # hardcoded path.
+    sd = _state_dir(repo)
     state = _json(sd / "state.json") or {}
     # `tasks.json` only exists once a registry has been saved; before that the
     # CLI seeds from the tracked file. Reading only the former showed an empty
