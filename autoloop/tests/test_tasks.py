@@ -16,6 +16,7 @@ from autoloop.errors import LockHeldError, StateCorruptError, StateError, TaskGr
 from autoloop.tasks import (
     LEDGER_PHASE_COMPLETE,
     LEDGER_PHASE_INTENT,
+    StrandReport,
     Task,
     TaskRegistry,
     TaskState,
@@ -1480,13 +1481,33 @@ def test_a_retired_task_is_retired_rather_than_blocked_by_its_dependencies():
     assert reg.state_of("b") is TaskState.RETIRED
 
 
-def test_a_task_depending_on_a_retired_one_stays_blocked():
-    """Stated because it is a real consequence, not an oversight: retirement
-    does not satisfy a dependency — the prerequisite genuinely never happened
-    under that id. The dependent must be re-planned against the successor."""
-    reg = registry(task("a"), task("b", deps=["a"]))
-    reg.retire("a", superseded_by=["a2"])
+def test_a_task_depending_on_a_retired_one_is_blocked_with_no_way_out():
+    """WHY the strand refusal exists, pinned on a graph that ALREADY holds the
+    shape. Retirement does not satisfy a dependency — `state_of` counts only
+    `completed` — and there is no command that clears it: `unblock` wants a
+    quarantine, `release` wants an in-progress task, and `retire` has no
+    reverse.
+
+    Built through `from_dict` rather than through `retire`, because since
+    retire-01 `retire` refuses to create it. That is exactly how a `tasks.json`
+    written before retire-01 holds it: the load path deliberately bypasses
+    `add_many` and does not re-validate a stored graph."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "a", "title": "A", "description": "d", "status": "retired",
+             "superseded_by": ["a2"]},
+            {"id": "b", "title": "B", "description": "d", "status": "pending",
+             "depends_on": ["a"]},
+        ],
+    })
     assert reg.state_of("b") is TaskState.BLOCKED
+    expect_code(lambda: reg.unblock("b"), "task_not_blocked")
+    expect_code(lambda: reg.release("b"), "task_not_in_progress")
+    # The one supported way back: re-point it, which is what `retire` now does
+    # for the operator in the same operation rather than leaving it to them.
+    reg.set_depends_on("b", [])
+    assert reg.state_of("b") is TaskState.READY
 
 
 def test_a_retired_task_cannot_be_dispatched_or_completed():
@@ -1688,6 +1709,541 @@ def test_a_task_file_without_superseded_by_still_loads(tmp_path):
         encoding="utf-8",
     )
     assert TaskStore(path).load().get("t1").superseded_by == ()
+
+
+# ---- retiring must not permanently strand a dependent ------------------------
+#
+# Measured 2026-08-20: an operator asked for `roadmap-01` to be retired. Four
+# tasks named it directly and 21 waited on it transitively — the entire ingest
+# line. `state_of` counts a dependency satisfied ONLY when it is `completed`, a
+# retirement is written once with no reverse, and no supported command returns
+# a task blocked on one (`answer` needs an open blocker, `release` needs an
+# in-progress task, and there is no `unblock`). All 21 would have become
+# permanently unreachable. A human caught it before the command ran; nothing in
+# the code would have stopped it.
+
+
+def test_retiring_a_task_with_a_pending_dependent_is_refused_and_names_it():
+    reg = registry(task("roadmap-01"), task("ingest-01", deps=["roadmap-01"]))
+
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.retire("roadmap-01")
+
+    assert excinfo.value.code == "task_would_strand_dependents"
+    assert "ingest-01" in str(excinfo.value)
+    assert reg.get("roadmap-01").status == "pending", "a refused retirement writes nothing"
+    assert reg.get("ingest-01").depends_on == ("roadmap-01",)
+
+
+def test_the_refusal_names_every_dependent_that_would_be_stranded():
+    """"Names it" is not "names one of them". An operator who has to re-run the
+    command to discover the next id cannot judge the decision at all — and the
+    decision is the whole point of refusing instead of repairing."""
+    reg = registry(
+        task("roadmap-01"),
+        *[task(f"ingest-0{n}", deps=["roadmap-01"]) for n in (1, 2, 3, 8)],
+    )
+
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.retire("roadmap-01")
+
+    message = str(excinfo.value)
+    for dependent in ("ingest-01", "ingest-02", "ingest-03", "ingest-08"):
+        assert dependent in message
+
+
+def test_the_refusal_reports_the_transitive_count_beside_the_direct_one():
+    """4 direct reads very differently from 21 in total, and the operator's
+    decision turns on the second number."""
+    reg = registry(
+        task("roadmap-01"),
+        task("ingest-01", deps=["roadmap-01"]),
+        task("ingest-02", deps=["ingest-01"]),
+        task("ingest-03", deps=["ingest-02"]),
+    )
+
+    report = reg.stranded_dependents("roadmap-01")
+    assert report.direct == ("ingest-01",)
+    assert report.transitive == ("ingest-01", "ingest-02", "ingest-03")
+
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.retire("roadmap-01")
+    message = str(excinfo.value)
+    assert "1 dependent (ingest-01)" in message
+    assert "3 tasks blocked in total" in message
+
+
+def test_the_total_is_reported_even_when_nothing_is_behind_the_direct_ones():
+    """Printed ALWAYS, not only when it is larger. A count a reader sees
+    sometimes and not others cannot be told apart from a message that does not
+    report it — and "the same as the direct count" is a fact, not an omission."""
+    reg = registry(task("old-01"), task("dep-01", deps=["old-01"]))
+
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.retire("old-01")
+
+    assert "1 dependent (dep-01); 1 task blocked in total" in str(excinfo.value)
+
+
+def test_a_self_edge_on_a_stored_graph_is_refused_at_load_not_at_retirement():
+    """First, the reachability, because the guard below is easy to mis-document
+    as covering a hand-edited file. It does not: `from_dict` runs
+    `_check_acyclic` over the WHOLE stored graph, and a self-edge is a one-node
+    cycle, so such a `tasks.json` never loads at all."""
+    with pytest.raises(TaskGraphError) as excinfo:
+        TaskRegistry.from_dict({
+            "schema_version": 1,
+            "tasks": [
+                {"id": "old-01", "title": "O", "description": "d", "status": "pending",
+                 "depends_on": ["old-01"]},
+            ],
+        })
+
+    assert excinfo.value.code == "dependency_cycle"
+    # The other two routes in, for completeness: neither can produce one either.
+    expect_code(lambda: registry(task("old-01", deps=["old-01"])), "dependency_cycle")
+    reg = registry(task("old-01"))
+    expect_code(lambda: reg.set_depends_on("old-01", ["old-01"]), "dependency_cycle")
+
+
+def corrupt_self_edge(reg, task_id):
+    """Give `task_id` a dependency on itself, by writing the dataclass field.
+
+    The ONLY way to build this shape: every route into a registry refuses it
+    (test above), so a test that tried to load one would raise before it could
+    assert anything — which is exactly what an earlier version of the tests
+    below did. What is being pinned is defence in depth against an in-memory
+    corruption, and against the day `from_dict` is relaxed to tolerate a stored
+    cycle the way it already tolerates a dangling `depends_on`. Naming that
+    honestly here is the point: a guard whose test cannot reach it is not a
+    guard, and a comment claiming a route that does not exist is worse.
+    """
+    live = reg.get(task_id)
+    live.depends_on = (*live.depends_on, task_id)
+    return reg
+
+
+def test_the_task_being_retired_is_never_its_own_stranded_dependent():
+    """Without the guard the refusal would name the task as a dependent of
+    itself — and the rewrite would then edit the row it is retiring."""
+    reg = corrupt_self_edge(registry(task("old-01")), "old-01")
+
+    assert reg.stranded_dependents("old-01") == StrandReport()
+    reg.retire("old-01", reason="stale")
+
+    assert reg.state_of("old-01") is TaskState.RETIRED
+    assert reg.get("old-01").depends_on == ("old-01",), "its own record is untouched"
+
+
+def test_a_completed_or_retired_dependent_cannot_be_stranded():
+    """Count only REAL stranding. A dependent that already finished, or that is
+    itself a retirement record, is not waiting on anything and will never be
+    dispatched again — refusing on its behalf would block retirements that harm
+    nobody.
+
+    Built through `from_dict`, because `mark_completed` cannot produce it: the
+    shape comes from a stored graph, which the load path deliberately does not
+    re-validate."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "roadmap-01", "title": "R", "description": "d", "status": "pending"},
+            {"id": "done-01", "title": "D", "description": "d", "status": "completed",
+             "depends_on": ["roadmap-01"]},
+            {"id": "gone-01", "title": "G", "description": "d", "status": "retired",
+             "depends_on": ["roadmap-01"]},
+        ],
+    })
+
+    assert reg.stranded_dependents("roadmap-01") == StrandReport()
+    reg.retire("roadmap-01", reason="stale")
+
+    assert reg.state_of("roadmap-01") is TaskState.RETIRED
+
+
+def test_a_terminal_dependent_is_not_descended_through_either():
+    """`done-01` is satisfied, so `behind-01` is NOT waiting on the retirement —
+    counting it would inflate the number the operator decides on."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "roadmap-01", "title": "R", "description": "d", "status": "pending"},
+            {"id": "done-01", "title": "D", "description": "d", "status": "completed",
+             "depends_on": ["roadmap-01"]},
+            {"id": "behind-01", "title": "B", "description": "d", "status": "pending",
+             "depends_on": ["done-01"]},
+        ],
+    })
+
+    assert reg.stranded_dependents("roadmap-01").transitive == ()
+
+
+def test_a_quarantined_dependent_still_counts_as_stranded():
+    """`blocked` is a question waiting for an operator, not a terminal record.
+    Answering it puts the task back in the queue — where it would then wait on
+    a retired id forever."""
+    reg = registry(task("old-01"), task("dep-01", deps=["old-01"]))
+    reg.block("dep-01", "attempt ceiling")
+
+    expect_code(lambda: reg.retire("old-01"), "task_would_strand_dependents")
+
+
+def test_a_task_with_no_dependents_retires_exactly_as_it_did_before():
+    """The ordinary case, and the one this must not change: `dash-01` went
+    stale with nothing waiting on it and no successor to name."""
+    reg = registry(task("dash-01"), task("unrelated-01"))
+    reg.mark_in_progress("dash-01")
+
+    retired = reg.retire("dash-01", reason="stale since 2026-08-03")
+
+    assert reg.state_of("dash-01") is TaskState.RETIRED
+    assert retired.superseded_by == ()
+    assert retired.blocked_reason == "stale since 2026-08-03"
+    assert reg.get("unrelated-01").depends_on == ()
+
+
+def test_asking_about_an_unknown_id_is_refused_rather_than_answered_empty():
+    """The fail-open shape this whole check exists to avoid: a typo that
+    answers "nothing depends on it" reads as a safe retirement."""
+    expect_code(lambda: registry(task("a-01")).stranded_dependents("ghost"), "task_unknown")
+
+
+# ---- lifting the refusal: a live successor, or an explicit rewrite ------------
+#
+# Supersession satisfaction is DIRECT — the successor id replaces the retired
+# one in each affected dependent, in the same operation. Lifting the refusal
+# without that rewrite would be a lie: the dependents would still name a retired
+# id and still never dispatch, which is the defect, not the fix.
+
+
+def test_a_live_successor_lifts_the_refusal_and_re_points_every_dependent():
+    reg = registry(
+        task("roadmap-01"),
+        task("roadmap-02"),
+        task("ingest-01", deps=["roadmap-01"]),
+        task("ingest-02", deps=["roadmap-01", "roadmap-02"]),
+    )
+
+    reg.retire("roadmap-01", superseded_by=["roadmap-02"])
+
+    assert reg.state_of("roadmap-01") is TaskState.RETIRED
+    assert reg.get("roadmap-01").superseded_by == ("roadmap-02",), "the record survives"
+    assert reg.get("ingest-01").depends_on == ("roadmap-02",)
+    assert reg.get("ingest-02").depends_on == ("roadmap-02",), "not ('roadmap-02',) twice"
+    # The point of the whole exercise: the dependency is SATISFIABLE now.
+    assert reg.state_of("ingest-01") is TaskState.BLOCKED
+    reg.mark_completed("roadmap-02")
+    assert reg.state_of("ingest-01") is TaskState.READY
+
+
+def test_a_completed_successor_satisfies_the_dependency_immediately():
+    reg = registry(task("old-01"), task("new-01"), task("dep-01", deps=["old-01"]))
+    reg.mark_completed("new-01")
+
+    reg.retire("old-01", superseded_by=["new-01"])
+
+    assert reg.get("dep-01").depends_on == ("new-01",)
+    assert reg.state_of("dep-01") is TaskState.READY
+
+
+def test_a_successor_that_is_not_a_task_yet_cannot_satisfy_a_dependency():
+    """A supersession is a record, not a schedule — brw-06 was retired into
+    brw-07/brw-08 before either was planned, and that stays legal for a task
+    nothing depends on. But nothing can WAIT on an id that is not in the graph,
+    so it does not lift the refusal, and the message says which id and why."""
+    reg = registry(task("brw-02"), task("brw-09", deps=["brw-02"]))
+
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.retire("brw-02", superseded_by=["brw-06"])
+
+    assert excinfo.value.code == "task_would_strand_dependents"
+    assert "brw-06 is not a task in this graph" in str(excinfo.value)
+    assert reg.get("brw-02").status == "pending"
+
+
+def test_a_successor_that_is_itself_retired_cannot_satisfy_a_dependency():
+    reg = registry(task("a-01"), task("b-01"), task("c-01", deps=["a-01"]))
+    reg.retire("b-01", reason="also stale")
+
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.retire("a-01", superseded_by=["b-01"])
+
+    assert excinfo.value.code == "task_would_strand_dependents"
+    assert "b-01 is itself retired" in str(excinfo.value)
+
+
+def test_a_partly_planned_successor_list_refuses_without_the_flag():
+    """`--superseded-by brw-07 brw-08` with only brw-07 planned. Replacing with
+    brw-07 alone would silently re-point the dependents at half a continuation,
+    so the AUTOMATIC lift demands that every named successor be live; the flag
+    is how an operator says they meant it. The record keeps both ids either
+    way — only what a dependent can wait on is narrowed."""
+    reg = registry(task("brw-06"), task("brw-07"), task("dep-01", deps=["brw-06"]))
+
+    expect_code(
+        lambda: reg.retire("brw-06", superseded_by=["brw-07", "brw-08"]),
+        "task_would_strand_dependents",
+    )
+    assert reg.get("brw-06").status == "pending"
+
+    reg.retire("brw-06", superseded_by=["brw-07", "brw-08"], rewrite_dependents=True)
+
+    assert reg.get("brw-06").superseded_by == ("brw-07", "brw-08")
+    assert reg.get("dep-01").depends_on == ("brw-07",)
+
+
+def test_the_rewrite_flag_drops_the_dependency_when_nothing_replaces_the_task():
+    """The stale case: no successor exists to wait on, so the edge goes. This
+    is the branch that needs an EXPLICIT opt-in — it is the one where the loop
+    has no evidence at all about what the dependents should wait for instead."""
+    reg = registry(
+        task("dash-01"),
+        task("dep-01", deps=["dash-01"]),
+        task("dep-02", deps=["dash-01"]),
+    )
+
+    reg.retire("dash-01", reason="stale", rewrite_dependents=True)
+
+    assert reg.state_of("dash-01") is TaskState.RETIRED
+    assert reg.get("dep-01").depends_on == ()
+    assert reg.get("dep-02").depends_on == ()
+    assert reg.state_of("dep-01") is TaskState.READY
+    assert reg.state_of("dep-02") is TaskState.READY
+
+
+def test_only_the_direct_dependents_are_rewritten():
+    """The transitive ones never named the retired task. They unblock by
+    themselves once the direct ones can run, and rewriting them would edit
+    dependencies the retirement says nothing about."""
+    reg = registry(
+        task("roadmap-01"),
+        task("roadmap-02"),
+        task("ingest-01", deps=["roadmap-01"]),
+        task("ingest-02", deps=["ingest-01"]),
+    )
+
+    reg.retire("roadmap-01", superseded_by=["roadmap-02"])
+
+    assert reg.get("ingest-01").depends_on == ("roadmap-02",)
+    assert reg.get("ingest-02").depends_on == ("ingest-01",), "untouched"
+
+
+def test_a_successor_that_is_itself_a_dependent_loses_the_edge():
+    """Retire A into B where B already waits on A. B CONTINUES the work; it does
+    not wait on itself, and `_validate_depends_on` refuses a self-edge."""
+    reg = registry(task("brw-02"), task("brw-06", deps=["brw-02"]))
+
+    reg.retire("brw-02", superseded_by=["brw-06"])
+
+    assert reg.get("brw-06").depends_on == ()
+    assert reg.state_of("brw-06") is TaskState.READY
+
+
+def test_a_rewrite_that_would_build_a_cycle_leaves_nothing_applied():
+    """The cycle is only visible in the WHOLE candidate graph, and it is found
+    after every dependent has already been planned — so this is the case that
+    proves the rewrites are validated before ANY of them is written. Half of
+    this applied would be a graph no command could repair."""
+    reg = registry(
+        task("old-01"),
+        task("dep-01", deps=["old-01"]),
+        task("new-01", deps=["dep-01"]),
+        task("dep-02", deps=["old-01"]),
+    )
+
+    expect_code(lambda: reg.retire("old-01", superseded_by=["new-01"]), "dependency_cycle")
+
+    assert reg.get("old-01").status == "pending", "the retirement did not land either"
+    assert reg.get("old-01").superseded_by == ()
+    assert reg.get("dep-01").depends_on == ("old-01",)
+    assert reg.get("dep-02").depends_on == ("old-01",)
+
+
+# ---- the subject's own self-edge is not a cycle this retirement may be vetoed by
+#
+# `stranded_dependents` refuses to count the subject as its own dependent (test
+# above), which means the rewrite pass never re-points that row — so the edge
+# rides into the whole-candidate cycle check untouched and refuses an otherwise
+# valid retirement as `dependency_cycle: old-01 -> old-01`, naming the
+# retirement itself as the loop. Half a guard is worse than none here: it turns
+# "reported as its own dependent" into "refused for a cycle no command removes".
+#
+# Every case below builds the corruption IN MEMORY, because no route into a
+# registry produces it (see `corrupt_self_edge` and the load test above). The
+# four split the carve-out (first two) from what it must NOT weaken: a
+# self-edge on any other task still refuses, and a cycle that runs THROUGH the
+# subject is dissolved by the rewrite rather than exempted from the check.
+
+
+def test_a_self_edge_on_the_subject_does_not_veto_its_retirement():
+    """The path the guard's first half does not reach. `test_the_task_being_
+    retired_is_never_its_own_stranded_dependent` retires a task with NO
+    dependents, so `_retirement_rewrites` returns before the cycle check runs;
+    this one has a real dependent, so the check runs on a candidate graph that
+    still holds the subject's row."""
+    reg = corrupt_self_edge(
+        registry(task("old-01"), task("new-01"), task("dep-01", deps=["old-01"])),
+        "old-01",
+    )
+
+    reg.retire("old-01", superseded_by=["new-01"])
+
+    assert reg.state_of("old-01") is TaskState.RETIRED
+    assert reg.get("old-01").depends_on == ("old-01",), "its own record is untouched"
+    assert reg.get("dep-01").depends_on == ("new-01",)
+    assert reg.state_of("dep-01") is TaskState.BLOCKED
+    reg.mark_completed("new-01")
+    assert reg.state_of("dep-01") is TaskState.READY
+
+
+def test_the_self_edge_carve_out_covers_the_rewrite_flag_too():
+    """Same row, the other route out of the refusal. A carve-out that only held
+    for `--superseded-by` would leave `--rewrite-dependents` refusing with a
+    cycle the operator cannot act on."""
+    reg = corrupt_self_edge(
+        registry(task("old-01"), task("dep-01", deps=["old-01"])), "old-01"
+    )
+
+    reg.retire("old-01", reason="stale", rewrite_dependents=True)
+
+    assert reg.state_of("old-01") is TaskState.RETIRED
+    assert reg.get("old-01").depends_on == ("old-01",), "its own record is untouched"
+    assert reg.get("dep-01").depends_on == ()
+    assert reg.state_of("dep-01") is TaskState.READY
+
+
+def test_a_self_edge_on_a_task_the_retirement_does_not_touch_still_refuses():
+    """The fail-closed half, and the bound on the carve-out: the exemption is
+    the SUBJECT's self-edge and nothing else. `loop-01` is a corruption this
+    retirement was not asked about and cannot repair, so the whole operation
+    refuses and applies nothing — including the retirement."""
+    reg = corrupt_self_edge(
+        registry(
+            task("old-01"),
+            task("new-01"),
+            task("dep-01", deps=["old-01"]),
+            task("loop-01"),
+        ),
+        "loop-01",
+    )
+
+    expect_code(lambda: reg.retire("old-01", superseded_by=["new-01"]), "dependency_cycle")
+
+    assert reg.get("old-01").status == "pending"
+    assert reg.get("old-01").superseded_by == ()
+    assert reg.get("dep-01").depends_on == ("old-01",)
+
+
+def test_a_two_task_cycle_through_the_subject_is_dissolved_by_the_rewrite():
+    """Not the carve-out — the rewrite. `old-01 -> dep-01 -> old-01` is a real
+    cycle, but `dep-01` is a stranded dependent, so the substitution takes
+    `old-01` out of its `depends_on` and the loop is gone from the candidate
+    graph before it is checked. Proves the exemption above is not what lets a
+    cycle involving the subject through."""
+    reg = registry(task("old-01"), task("dep-01", deps=["old-01"]), task("new-01"))
+    # The other half of a two-node cycle, written the same way and for the same
+    # reason as `corrupt_self_edge`: `set_depends_on` would refuse it.
+    reg.get("old-01").depends_on = ("dep-01",)
+
+    assert reg.stranded_dependents("old-01").direct == ("dep-01",)
+    reg.retire("old-01", superseded_by=["new-01"])
+
+    assert reg.get("dep-01").depends_on == ("new-01",)
+    assert reg.get("old-01").depends_on == ("dep-01",), "its own record is untouched"
+
+
+def test_an_in_progress_dependent_refuses_the_whole_operation():
+    """Its `depends_on` is what the running dispatch is being judged against —
+    rewriting it mid-round is exactly the strand `_refuse_immutable` exists to
+    prevent (`state_of` reads dependencies before the in-progress branch, so
+    the round would finish and then be refused both completion and release).
+    Neither route may force it."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "old-01", "title": "O", "description": "d", "status": "pending"},
+            {"id": "new-01", "title": "N", "description": "d", "status": "pending"},
+            {"id": "dep-01", "title": "D", "description": "d", "status": "in_progress",
+             "depends_on": ["old-01"]},
+        ],
+    })
+
+    assert reg.stranded_dependents("old-01").in_progress == ("dep-01",)
+    expect_code(lambda: reg.retire("old-01", superseded_by=["new-01"]), "task_in_progress")
+    expect_code(
+        lambda: reg.retire("old-01", superseded_by=["new-01"], rewrite_dependents=True),
+        "task_in_progress",
+    )
+    assert reg.get("old-01").status == "pending"
+    assert reg.get("dep-01").depends_on == ("old-01",)
+
+
+def test_the_strand_check_survives_a_dependency_naming_a_task_that_is_gone():
+    """`state_of` raises `KeyError` on this shape and `from_dict` tolerates it,
+    so the check reads STORED statuses and walks the edges backwards. A guard
+    that crashed here — or that was wrapped in a `try: … except: continue` —
+    would fail OPEN on precisely the graph it should refuse.
+
+    The rewrite path fails CLOSED on the same graph: it cannot write a
+    `depends_on` that still names a task nobody has, so it refuses and applies
+    nothing rather than persisting a half-repaired row."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "old-01", "title": "O", "description": "d", "status": "pending"},
+            {"id": "dep-01", "title": "D", "description": "d", "status": "pending",
+             "depends_on": ["old-01", "vanished-01"]},
+        ],
+    })
+
+    with pytest.raises(TaskGraphError) as excinfo:
+        reg.retire("old-01")
+    assert excinfo.value.code == "task_would_strand_dependents"
+    assert "dep-01" in str(excinfo.value)
+
+    expect_code(lambda: reg.retire("old-01", rewrite_dependents=True), "unknown_dependency")
+    assert reg.get("old-01").status == "pending"
+    assert reg.get("dep-01").depends_on == ("old-01", "vanished-01")
+
+
+def test_the_rewrite_flag_on_an_already_retired_task_is_refused_not_ignored():
+    """A flag that quietly does nothing is the same failure class as a check
+    that silently passes: the operator reads "nothing changed" and believes the
+    strand they came to clear was cleared. Retirement stays written-once, so
+    the route for a strand an EARLIER retirement left is `set_depends_on`."""
+    reg = TaskRegistry.from_dict({
+        "schema_version": 1,
+        "tasks": [
+            {"id": "old-01", "title": "O", "description": "d", "status": "retired",
+             "superseded_by": ["new-01"]},
+            {"id": "new-01", "title": "N", "description": "d", "status": "pending"},
+            {"id": "dep-01", "title": "D", "description": "d", "status": "pending",
+             "depends_on": ["old-01"]},
+        ],
+    })
+
+    expect_code(lambda: reg.retire("old-01", rewrite_dependents=True), "task_already_retired")
+    assert reg.get("dep-01").depends_on == ("old-01",)
+
+    # The bare repeat is still the no-op it has always been.
+    reg.retire("old-01")
+    assert reg.get("old-01").superseded_by == ("new-01",)
+
+
+def test_the_rewrite_and_the_retirement_persist_as_one_save(tmp_path):
+    """One registry mutation, one `save`. Both halves land together or the
+    refusal happened before either was written — there is no window in which
+    the file holds a retirement whose dependents were not re-pointed."""
+    store = TaskStore(tmp_path / "tasks.json")
+    reg = registry(task("old-01"), task("new-01"), task("dep-01", deps=["old-01"]))
+    reg.retire("old-01", superseded_by=["new-01"])
+
+    store.save(reg)
+
+    loaded = store.load()
+    assert loaded.state_of("old-01") is TaskState.RETIRED
+    assert loaded.get("old-01").superseded_by == ("new-01",)
+    assert loaded.get("dep-01").depends_on == ("new-01",)
 
 
 # ---- a stored row is validated too -------------------------------------------

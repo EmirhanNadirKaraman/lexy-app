@@ -113,7 +113,12 @@ def test_retired_task_denied(decision):
     confusing roadmap it replaces. The successor is named so a reviewer that
     asked for retired work is pointed at its continuation."""
     registry = make_registry()
-    registry.retire("ready1", superseded_by=["ready2"], reason="superseded")
+    # `blocked1` depends on `ready1`, so since retire-01 the retirement has to
+    # say what happens to it — `--rewrite-dependents` drops the edge, which is
+    # the smallest thing that keeps this test about the POLICY denial.
+    registry.retire(
+        "ready1", superseded_by=["ready2"], reason="superseded", rewrite_dependents=True
+    )
 
     verdict = auth(
         task_engine(), task_directive(decision, task_id="ready1"), registry=registry

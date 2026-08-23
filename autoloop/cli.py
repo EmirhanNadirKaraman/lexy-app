@@ -7,6 +7,7 @@
                                                                (read-only, no lock)
     python -m autoloop answer <blocker-id> "<text>"
     python -m autoloop retire <task-id> [--superseded-by ID ...] [--reason TEXT]
+                                        [--rewrite-dependents]
     python -m autoloop smoke-browser [--config PATH]
     python -m autoloop pause | resume | unlock | reset --yes [--tasks]
     python -m autoloop merge-window [--wait] | merge-backlog
@@ -3276,16 +3277,33 @@ def _cmd_retire_task(args: argparse.Namespace) -> int:
     retirement that would add, change or reword anything, and reports an exact
     repeat as the no-op it is — a bare `retire brw-02` must never be the
     command that erases brw-02's recorded successor.
+
+    **It refuses a retirement that would strand a dependent** (retire-01), and
+    this command's job is to make that refusal actionable: it prints every
+    direct dependent by name and the transitive count beside it, because 4
+    direct dependents and 21 tasks behind them are different decisions.
+    `--superseded-by` naming live successors lifts the refusal and re-points
+    those dependents at them; `--rewrite-dependents` is the explicit opt-in
+    that drops the dependency instead. Either way the rewrite and the
+    retirement are one registry mutation followed by one `save`, so a crash
+    cannot land half of it — and on success the new `depends_on` of every
+    dependent is echoed, read back off the registry rather than assumed.
     """
     config = load_config(args.config)
     with LoopLock(config.state_dir):
         task_store, registry = _load_tasks(config)
         previous = registry.get(args.task_id).status if registry.has(args.task_id) else ""
         try:
+            # Read BEFORE the retirement, and inside the same `try` so an
+            # unknown id is reported as the ordinary refusal rather than as a
+            # traceback: afterwards the dependents no longer name this task, so
+            # there would be nothing left to report having re-pointed.
+            strand = registry.stranded_dependents(args.task_id)
             task = registry.retire(
                 args.task_id,
                 superseded_by=tuple(args.superseded_by or ()),
                 reason=args.reason or "",
+                rewrite_dependents=bool(getattr(args, "rewrite_dependents", False)),
             )
         except TaskGraphError as exc:
             print(f"error: {exc}")
@@ -3314,6 +3332,32 @@ def _cmd_retire_task(args: argparse.Namespace) -> int:
         f"superseded by {successors}\n"
         f"reason kept: {task.blocked_reason or '(none recorded)'}"
     )
+    if not strand.strands:
+        print("dependents: none — nothing was waiting on this task")
+    elif previous == "retired":
+        # The repeat returned early and rewrote nothing, so these are reported
+        # as the state of the graph, never as an outcome of this command. A
+        # strand an earlier retirement left behind is re-pointed with a
+        # `depends_on` mutation (`TaskRegistry.set_depends_on`).
+        print(f"dependents unchanged: {strand.describe()}")
+    else:
+        # NOT `strand.describe()`. That sentence is written for the REFUSAL and
+        # says "N tasks blocked in total" in the present tense — true while the
+        # retirement is being refused, false the moment it goes through, since
+        # these are the dependents that were just re-pointed. Both counts are
+        # still reported, because the transitive one is what the operator's
+        # decision turned on; only the tense changes.
+        direct = len(strand.direct)
+        total = len(strand.transitive)
+        print(
+            f"dependents re-pointed: {direct} that named {task.id} directly; "
+            f"{total} task{'s' if total != 1 else ''} "
+            f"{'was' if total == 1 else 'were'} waiting on it in total, "
+            "counting those behind them"
+        )
+        for dependent_id in strand.direct:
+            now = ", ".join(registry.get(dependent_id).depends_on) or "nothing"
+            print(f"  {dependent_id} now depends on {now}")
     for blocker in closed:
         print(
             f"blocker {blocker.id} closed — its task is retired "
@@ -4388,6 +4432,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--reason",
         default="",
         help="why it was retired; the existing reason is kept when this is omitted",
+    )
+    retire.add_argument(
+        "--rewrite-dependents",
+        action="store_true",
+        help=(
+            "re-point every task that depends on this one, in the SAME operation: "
+            "the retired id is replaced by whichever --superseded-by successors are "
+            "live tasks, and dropped when none is. Needed only when the retirement "
+            "would otherwise be refused for stranding them"
+        ),
     )
     retire.set_defaults(func=_cmd_retire_task)
 

@@ -2199,6 +2199,85 @@ Fix the filesystem problem, then either reopen the record by hand or leave it �
 the next `start` / `run` sweep requeues the task, since those paths stay
 deliberately tolerant.
 
+### `retire` exits 1: `retiring task '…' would strand N dependents (…)`
+**Symptom:** `python -m autoloop retire roadmap-01` prints
+`error: retiring task 'roadmap-01' would strand 4 dependents (ingest-01,
+ingest-02, ingest-03, ingest-08); 21 tasks blocked in total, counting those
+behind them — …` and exits 1. Nothing was written: the task is still pending
+and every dependent still names it.
+**Cause:** working as intended (retire-01, 2026-08-23). `state_of` counts a
+dependency satisfied only when it is `completed`, and a retirement is written
+once with no reverse — so those 4 tasks, and the 17 behind them, would be
+BLOCKED forever with no command able to release them (`answer` needs an open
+blocker, `release` needs an in-progress task, and there is no `unblock`). The
+refusal is the point; the old behaviour was to do it silently.
+**Fix:** decide what the dependents should wait for, then say so in the same
+command. Read BOTH numbers first — 4 direct and 21 total are different
+decisions.
+1. If a successor continues the work and is already a task in the graph:
+   `retire roadmap-01 --superseded-by roadmap-02`. That id replaces
+   `roadmap-01` in each dependent's `depends_on`, in the same operation.
+2. If the task went stale, or the successor is not planned yet:
+   `retire roadmap-01 --rewrite-dependents`, which drops the dependency
+   instead. Add `--superseded-by` alongside it to keep the record even when the
+   successor cannot be waited on.
+3. If you would rather re-plan by hand, leave the retirement and re-point the
+   dependents through the inbox's `depends_on` mutation first.
+
+Two neighbouring messages, so you do not reach for the wrong flag:
+* `--superseded-by names brw-08, which nothing can wait on (brw-08 is not a
+  task in this graph)` — a successor need not exist for the RECORD, but nothing
+  can wait on an id the graph does not have. Plan it, or use
+  `--rewrite-dependents`.
+* `ingest-01 depends on 'roadmap-01' and is in progress` — its dependencies are
+  what the running dispatch is being judged against. Wait for the round, or
+  `python -m autoloop release ingest-01` first. No flag forces this one.
+
+If the task is ALREADY retired and its dependents are stranded, `retire` cannot
+fix it — a repeat rewrites nothing, and `--rewrite-dependents` on one is refused
+rather than silently ignored. Re-point them with a `depends_on` mutation.
+
+### `retire --superseded-by` exits 1: `dependency_cycle: dependency cycle: …`
+**Symptom:** `python -m autoloop retire old-01 --superseded-by new-01` prints
+`error: dependency_cycle: dependency cycle: new-01 -> dep-01 -> new-01` (the
+code and the message, as every `TaskGraphError` prints) and exits 1. Nothing
+was written — not the retirement, not one dependent. The same command without
+`--superseded-by` refuses for stranding instead, and every id in the chain
+looked fine on its own.
+**Cause:** working as intended (retire-01, 2026-08-23). The successor you named
+is what closes the loop: `--superseded-by new-01` replaces `old-01` with
+`new-01` in every dependent, so if `new-01` already waits (directly or through
+a chain) on one of those dependents, the rewrite makes it wait on itself.
+`tasks.TaskRegistry._retirement_rewrites` plans every dependent, then
+cycle-checks the WHOLE resulting graph once before writing any of it — a
+per-task check would pass each new edge on its own and still build the cycle.
+Fails CLOSED: nothing is applied, so there is no half-repaired graph to unwind.
+**Fix:** the successor is wrong for these dependents, so choose again — the
+error names the loop, and the ids in it are the ones to look at.
+1. `python -m autoloop tasks` and read `new-01`'s own `depends_on`. If it waits
+   on work that waits on `old-01`, it cannot also replace `old-01` for them.
+2. Name a different successor — one that does not wait on any of the listed
+   dependents.
+3. Or drop the dependency instead: `retire old-01 --rewrite-dependents` with no
+   `--superseded-by`. Note that adding `--rewrite-dependents` *alongside*
+   `--superseded-by new-01` does NOT get past this — it applies the same
+   substitution and builds the same loop. The flag lifts the strand refusal,
+   never the cycle check.
+4. Or re-point the dependents by hand first (`depends_on` mutation), then
+   retire.
+**Do NOT** relax the cycle check to get past it: it is the only thing standing
+between this command and a graph that can never be scheduled. Exactly ONE edge
+is exempt — a self-edge on the task BEING retired, which nothing re-points
+(that task is going terminal, so `state_of` never reads its dependencies again)
+and which therefore cannot strand anybody.
+
+A *stored* cycle cannot produce this message: `TaskRegistry.from_dict` runs the
+same check over the whole graph on load, so a hand-edited `tasks.json` naming a
+task after itself (or any longer loop) fails to LOAD. That surfaces as a load
+error wherever the graph is read — `python -m autoloop start --check-only`
+prints `tasks        UNREADABLE (dependency cycle: …)` (`cli.py:2800`) — and it
+is the entry above, not this one.
+
 ---
 
 ## 9. Autoloop monitoring (health)
@@ -2867,3 +2946,5 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | quota-01 | §15's first entry had its Fix paragraph corrected in place: it claimed a reflowed echo could not reopen the hole, and a literal substring test against the prompt does not hold that. The corrected text names the worked case (`quota` + newline + `exceeded` printed back as `quota exceeded`) and says outright that simplifying either comparison back to a plain `in` IS the regression — the next reader's most likely wrong move. |
 | 2026-08-23 | quota-01 | §15 is titled for the `codex_cli` transport and stays that way, but read its first entry's SECOND half — a throttle routed to the loop_fatal branch — as having applied to `codex_app_server` too until this date: `rate_limit_exceeded`, `rate_limited`, `too_many_requests` and a numeric 429 were all in that transport's exhaustion vocabulary. No production symptom was ever recorded for it, which is why this is a note and not a new entry. `docs/AUTOLOOP.md` §5d-ter has the routing table. |
 | 2026-08-23 | quota-01 | If that one ever DOES present: the symptom is a `loop_fatal` park, code `quota_exhausted`, whose `codex_app_server_failed` record shows `classification: quota_exhausted` next to an `error_type` or `status` that describes a throttle. The remedy is a config edit — move the code out of `codex.quota_error_codes` into `codex.rate_limit_error_codes` — not a code change, and not emptying either list. |
+| 2026-08-23 | retire-01 | New §8 entry for `retire`'s strand refusal, filed there with the other recovery-command exits rather than as a §9/§10 entry, because the symptom is a CLI exit 1 on `python -m autoloop retire`. It is a working-as-intended entry: the refusal is the fix landing, not a fault, and the three neighbouring messages (`--superseded-by names … which nothing can wait on`, `… is in progress`, and the already-retired refusal) are listed so the reader does not reach for the wrong flag. |
+| 2026-08-23 | retire-01 | Second §8 entry beside it, for the symptom the strand rewrite makes reachable: `retire --superseded-by` exiting 1 with `dependency cycle:`. The successor is what closes the loop, so the fix is choosing a different one (or dropping the edge) — never relaxing the check, and `--rewrite-dependents` does not get past it either, which the entry says outright because it is the obvious wrong move. It also says a STORED cycle cannot produce this: `from_dict` cycle-checks on load, so such a file fails to load instead. |

@@ -1109,7 +1109,8 @@ The first two put work BACK; the third takes it out. `release` says "this round
 was interrupted, run it again"; `retire` says "this will never run again,
 because it already happened under another id". Reaching for the wrong one is
 recoverable in only one direction, which is why `release` refuses anything that
-is not in-progress and `retire` refuses only completed work.
+is not in-progress, and why `retire` refuses completed work and — since
+retire-01 — any retirement that would leave a dependent waiting forever (§9d).
 
 **`release`** returns a task stranded IN-PROGRESS to pending. A task is marked
 in-progress at dispatch and cleared when the round finishes; a `loop_fatal`
@@ -5232,12 +5233,13 @@ supersession chain is the only record that brw-07/brw-08 continue brw-02/brw-04
 
 ```bash
 python -m autoloop retire <task-id> --superseded-by <id> [--superseded-by <id>] \
-                                    [--reason "..."]
+                                    [--reason "..."] [--rewrite-dependents]
 ```
 
 Takes the loop lock (it writes `tasks.json`). Accepts a pending, in-progress or
 quarantined task — `dash-01` was in-progress, which is exactly the shape that
-needs retiring — and refuses only a completed one.
+needs retiring — and refuses a completed one, or one whose retirement would
+strand a dependent (below).
 
 **A retirement is written ONCE.** A second `retire` on the same task cannot
 add, replace, reorder or reword anything: an exact repeat is reported as the
@@ -5316,11 +5318,87 @@ The dashboard groups by it (§ the roadmap panel in `dashboard.py`): **Ready /
 In progress / Blocked / Needs a human / Retired / Done**, with the Retired
 group collapsed like Done and its rows naming the successor.
 
-One consequence, stated rather than hidden: a task that DEPENDS on a retired
-one stays BLOCKED forever, since only `completed` satisfies a dependency. That
-is correct — the prerequisite genuinely never happened under that id — and it
-is not new (a retirement stored as `blocked` did the same). Re-plan the
-dependent against the successor `superseded_by` names.
+**A retirement that would strand a dependent is REFUSED** (retire-01,
+2026-08-23). A task that DEPENDS on a retired one is BLOCKED forever, since
+only `completed` satisfies a dependency — that part was always true and used to
+be documented here as an accepted consequence. What was wrong is calling it
+acceptable: no supported command returns such a dependent. `answer` needs an
+open blocker, `release` needs an in-progress task, `retire` means never worked
+again, and there is no `unblock`. The only exit was hand-editing `tasks.json`
+with the loop stopped, which is the route blk-01 exists to remove.
+
+Measured 2026-08-20: an operator asked for `roadmap-01`. It had 4 direct
+dependents (`ingest-01`, `ingest-02`, `ingest-03`, `ingest-08`) and 21 tasks
+transitively — the whole ingest line — every one of which would have become
+permanently unreachable. A human caught it before the command ran; nothing in
+the code would have.
+
+So `TaskRegistry.stranded_dependents` runs before the write and the retirement
+is refused, naming **every** direct dependent plus the transitive count (4
+direct and 21 total are different decisions, so the operator gets both). It
+counts only REAL stranding: a dependent that is already `completed` or itself
+`retired` is not waiting on anything, is excluded, and is not descended
+through. A quarantined dependent IS counted — a quarantine is a live question,
+and answering it puts the task back in a queue it can never leave.
+
+Two things lift the refusal, and both do their work in the same operation:
+
+* **`--superseded-by` naming successors that are all LIVE tasks** in this graph
+  (present, and not themselves retired). Satisfaction is **direct**: the
+  successor id replaces the retired one in each affected dependent's
+  `depends_on`. Lifting the refusal without that rewrite would be a lie — the
+  dependents would still name a retired id and still never dispatch. A
+  successor that is not planned yet cannot satisfy anything, so it does not
+  lift the refusal and the message says which id and why; the shape-only rule
+  above is unchanged for a task nothing depends on (brw-06 → brw-07/brw-08
+  still retires exactly as it did).
+* **`--rewrite-dependents`**, the explicit opt-in. Same rewrite, but it accepts
+  a partial or empty successor list: the retired id is replaced by whichever
+  named successors are live, and dropped outright when none is.
+
+Refused, not silently repaired: rewriting another task's `depends_on` is a
+roadmap decision, and inferring one from a retirement would make this command
+edit tasks nobody named. Only DIRECT dependents are rewritten — the transitive
+ones never named the retired task and unblock by themselves. An IN-PROGRESS
+direct dependent refuses the whole operation (`task_in_progress`): its
+dependencies are what the running dispatch is judged against.
+
+The rewrite is planned in full and validated in full before ANY of it is
+written: every re-pointed `depends_on` is checked, and the resulting graph is
+cycle-checked once, as a whole. Substituting a successor can genuinely close a
+loop (retire A into B where B already waits on a dependent of A), and a
+per-task check would pass each new edge on its own and still build it. So a
+retirement can refuse with `dependency cycle: …`, writing nothing — the
+successor is the wrong one for those dependents, and `docs/COMMON_ERRORS.md` §8
+covers what to do. A cycle already in `tasks.json` cannot produce that refusal:
+`TaskRegistry.from_dict` runs the same check on load, so such a file does not
+load at all.
+
+**Exactly one edge is exempt: a self-edge on the task being retired** — and it
+is exempt as defence in depth, not because anything can produce one (every
+route in refuses it, including the load check just named). The subject is never
+counted as its own stranded dependent, so nothing re-points that row; it can
+strand nobody, because a retired task's own dependencies are never read again
+(`state_of` answers `RETIRED` before it looks at them). Exempting it in one
+place and not the other is what would hurt: the retirement would be refused for
+a cycle consisting of the retirement itself, which no command can remove. A
+self-edge on any OTHER task, and any cycle running through the retired id via a
+task this operation does not rewrite, still refuses the whole thing.
+
+Nothing here weakens retirement. There is still no un-retire and it is still
+written once; this is a precondition before the write. A repeat `retire`
+therefore cannot rewrite dependents either, and says so rather than no-opping —
+a strand an EARLIER retirement left behind is re-pointed with a `depends_on`
+mutation (§4f-ter's inbox vocabulary / `TaskRegistry.set_depends_on`), which is
+the operation that actually describes what is being changed. The load-time
+migration in `tasks._RETIREMENTS` also bypasses the check by design: those six
+rows are already `retired` on disk, and a precondition applied at load would
+make an existing `tasks.json` refuse to load.
+
+The check is one shared method rather than a rule per call site, because it
+belongs to `state_of`'s dependency test (`!= "completed"` satisfies nothing) and
+not to retirement: any future transition to a terminal non-completed status asks
+the same question by calling `stranded_dependents`.
 
 ## 10. Recovery procedures
 
