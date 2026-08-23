@@ -64,7 +64,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from .errors import EnvironmentDriftError, GitCommandError, GitOperationDenied
+from .errors import EnvironmentDriftError, GitCommandError, GitError, GitOperationDenied
 from .policy import PolicyEngine
 from .worktask import CommitIntent, IntentStore
 
@@ -655,7 +655,7 @@ class GitGateway:
         self._git("commit", "-m", message)
 
     def merge_foreign_commit(
-        self, source_path: str, sha: str, message: str
+        self, source_path: str, sha: str, message: str, resolve_conflicts=None
     ) -> MergeAttempt:
         """Bring `sha` in from the repository at `source_path` and merge it
         into THIS repository's checked-out branch, WITHOUT rewriting anything
@@ -696,6 +696,18 @@ class GitGateway:
         second, special-cased one. If a deployment cannot resolve an identity,
         the merge fails here exactly as an ordinary task commit would, and the
         caller parks.
+
+        `resolve_conflicts`, when given, is `(self, conflicted_paths) -> bool`
+        and is offered ONE chance to conclude a conflicted merge before the
+        abort — the hook `orchestrator._carry_reviewed_candidate_past` uses to
+        reach `note_merge.combine_conflicted_notes` (notes-04). It is called
+        only when git actually reported unmerged paths AND this branch's
+        pre-merge tip could be read — an unreadable status yields no paths, and
+        an unreadable head leaves nothing to verify a resolution against, and
+        neither may be mistaken for "there was nothing to resolve". Whatever it
+        claims is then VERIFIED here before this returns `merged=True`; see
+        `_finish_resolved_merge`. Omitted — the default, and what every caller
+        got before it existed — this method behaves exactly as it always has.
         """
         try:
             self.fetch_object(source_path, sha)
@@ -704,6 +716,16 @@ class GitGateway:
                 merged=False,
                 error=f"could not fetch {sha[:12]} from {source_path}: {exc}",
             )
+        # Read BEFORE the merge: it is the only value that can prove afterwards
+        # that a resolved merge actually moved the branch forward from what was
+        # already on it, rather than replacing it. An unreadable head leaves
+        # `pre_tip` empty, which DISABLES the hook below rather than verifying
+        # against nothing — and it is read inside a try because this method's
+        # contract is that only a policy refusal escapes it.
+        try:
+            pre_tip = self.head_sha()
+        except GitCommandError:  # pragma: no cover - head unreadable
+            pre_tip = ""
         try:
             self.merge_commit(sha, message)
         except GitCommandError as exc:
@@ -712,6 +734,23 @@ class GitGateway:
                 conflicted = tuple(self.conflicted_paths())
             except GitCommandError:  # pragma: no cover - status unreadable
                 conflicted = ()
+            if conflicted and pre_tip and resolve_conflicts is not None:
+                try:
+                    accepted = bool(resolve_conflicts(self, conflicted))
+                except (GitError, OSError, UnicodeDecodeError):
+                    # A resolver that BLEW UP has resolved nothing. Falling
+                    # through to the abort below is the pre-existing behaviour
+                    # and the safe one; letting the exception escape would turn
+                    # an ordinary conflict into a crash, and swallowing it into
+                    # a success would merge something nobody checked.
+                    accepted = False
+                if accepted:
+                    settled = self._finish_resolved_merge(pre_tip, sha)
+                    if settled is not None:
+                        return settled
+                    # `None` means nothing was committed after all, so the tree
+                    # is still exactly as `git merge` left it and the ordinary
+                    # abort below is both possible and correct.
             try:
                 self.merge_abort()
             except GitCommandError:
@@ -727,6 +766,70 @@ class GitGateway:
                 restored=restored,
             )
         return MergeAttempt(merged=True, head_sha=self.head_sha())
+
+    def _finish_resolved_merge(self, pre_tip: str, sha: str) -> "MergeAttempt | None":
+        """Check what a `resolve_conflicts` hook claims it concluded.
+
+        Returns the `MergeAttempt` to hand back, or `None` when NOTHING was
+        committed — a hook that returned True without moving `HEAD` has left
+        the merge exactly where git did, so the caller's abort still applies.
+
+        A hook returning True is a CLAIM, not evidence, and the same discipline
+        the whole gateway applies to `git merge` returning 0 applies to it: the
+        head must have moved, must contain the tip that was already on this
+        branch (which for the base refresh is the reviewed candidate), must
+        contain the commit being merged in, and the tree must be clean.
+
+        Anything short of that is reported as a FAILED merge and deliberately
+        NOT undone: `git merge --abort` has nothing to abort once a commit
+        landed, and `reset` is absent from the git whitelist by design. The
+        caller then parks with the error below, which discards nothing — every
+        commit involved is still reachable — and asks a human, exactly like
+        `auto_merge._merge`'s own unverifiable-merge branch.
+
+        **Both failure returns carry NO `conflicted_paths`, and that is the
+        load-bearing part of the report.** `MergeAttempt` documents that field
+        as "empty for a failure that was not a content conflict", and an
+        unverifiable resolution is exactly that — the paths conflicted, but
+        their conflict is not what went wrong. Naming them would also make
+        `orchestrator._carry_reviewed_candidate_past` park with "it conflicts at
+        docs/SUMMARY.md, docs/TESTS.md" (that branch prefers the path list) and
+        never show `error` at all, telling an operator the trackers disagreed
+        when what actually happened is that the loop wrote a merge commit it
+        could not vouch for. Empty routes the park to `git refused: <error>`,
+        which names the real condition.
+        """
+        try:
+            new_head = self.head_sha()
+            if new_head == pre_tip:
+                return None
+            problems = []
+            if not self.is_descendant(new_head, pre_tip):
+                problems.append(f"it does not contain the branch tip {pre_tip[:12]}")
+            if not self.is_descendant(new_head, sha):
+                problems.append(f"it does not contain the merged commit {sha[:12]}")
+            dirty = self.is_dirty()
+            if dirty:
+                problems.append("the working tree is not clean")
+        except GitCommandError as exc:  # pragma: no cover - status unreadable
+            return MergeAttempt(
+                merged=False,
+                error=(
+                    "the conflict resolution could not be verified: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                restored=False,
+            )
+        if not problems:
+            return MergeAttempt(merged=True, head_sha=new_head)
+        return MergeAttempt(
+            merged=False,
+            error=(
+                f"the conflict resolution committed {new_head[:12]} but "
+                + "; ".join(problems)
+            ),
+            restored=not dirty,
+        )
 
     # ---- produce-then-review commit path ------------------------------------
     #
