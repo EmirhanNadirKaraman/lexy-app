@@ -135,7 +135,7 @@ from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from .transcript import TranscriptLogger, build_profile, read_records, render_profile
 from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
-from .worktask import IntentStore, TaskExecutionStore
+from .worktask import IntentStore, RecordedRevertAuthority, TaskExecutionStore
 
 DEFAULT_CONFIG = Path(".autoloop/config.toml")
 
@@ -368,6 +368,7 @@ def _build_executor(
     policy: PolicyEngine,
     validation_env=None,
     cleanup_paths_for=None,
+    revert_authority=None,
 ) -> TaskExecutor:
     if getattr(args, "null_executor", False) or config.executor.kind == "null":
         return NullExecutor()
@@ -448,6 +449,14 @@ def _build_executor(
         # passes one — the executor grants no cleanup at all, so this wiring is
         # what turns the capability on for a real run and for nothing else.
         cleanup_paths_for=cleanup_paths_for,
+        # The REVERT exception's only authority (scope-05, 2026-08-24), and the
+        # same story one field on: without this keyword the executor offers no
+        # revert at all, never mentions `REVERT-OUT-OF-SCOPE:` in the prompt, and
+        # refuses every request — the fail-closed default. It supplies the base
+        # sha a restore reads from and records what was restored; WHICH paths may
+        # be named still comes from `cleanup_paths_for` alone, so there is
+        # exactly one authorizing list and this adds no second one.
+        revert_authority=revert_authority,
     )
     return _DispatchingExecutor(audit_executor, implement_executor)
 
@@ -495,6 +504,12 @@ def _build_orchestrator(config, args, store, state, task_store, registry) -> Orc
             # with — the cleanup authority has to read what the loop recorded,
             # not a second view of it.
             cleanup_paths_for=_recorded_out_of_scope_paths(execution_store),
+            # And the same store again, for the two things a RESTORE needs off
+            # the record that a deletion does not: the `task_base_sha` its
+            # content is read from, and the durable note of what was put back.
+            # One store, so "what the loop recorded" and "what the executor may
+            # repair" cannot drift apart.
+            revert_authority=RecordedRevertAuthority(execution_store),
         ),
         transcript=TranscriptLogger(config.transcript_file),
         client_factory=lambda: create_conversation(config.conversation.provider, config),

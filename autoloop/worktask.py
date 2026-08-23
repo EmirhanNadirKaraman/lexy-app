@@ -388,6 +388,44 @@ class TaskExecution:
     #: itself must not end up with a record indistinguishable from a round that
     #: never overran at all.
     removed_out_of_scope_paths: tuple[str, ...] = ()
+    #: Recorded out-of-scope paths a LATER round of this task RESTORED to their
+    #: `task_base_sha` content (scope-05, 2026-08-24). The third member of the
+    #: family above, and the one that covers an out-of-scope EDIT: that is the
+    #: contamination `removed_out_of_scope_paths` structurally cannot describe,
+    #: because there is nothing to delete — the file existed at the base and
+    #: still has to exist afterwards, just with the base's bytes in it.
+    #:
+    #: It exists for exactly the reason its sibling does, and the invisibility
+    #: is if anything sharper. Every path section a reviewer reads is computed
+    #: from `commit_range_paths(task_base_sha, candidate_sha)`, a TREE-to-tree
+    #: diff, so a file edited in round 1 and put back in round 2 has the same
+    #: bytes at both ends of the range and is absent from it entirely. That
+    #: absence is the right thing for the reviewer to see — the candidate really
+    #: is back inside the declared scope — but "a round took its overrun back"
+    #: and "no round ever overran" must not be one record.
+    #:
+    #: Written by `implement_executor._run_implementation` through the injected
+    #: `revert_authority` (`RecordedRevertAuthority` below), from the paths the
+    #: executor's OWN restore call reported as done — never from the agent's
+    #: report, and never from a path outside `out_of_scope_paths`, which is the
+    #: same record `tasks.authorized_cleanup_paths` gates the request against.
+    #:
+    #: Written mid-dispatch, unlike its two siblings, because that is when the
+    #: fact becomes true: the restore is on disk from that moment and survives a
+    #: round whose validation then fails (the worker tree is not rewound, and
+    #: the next round commits it). `TaskExecutionStore.save` unions this ONE
+    #: field with what is already on disk so the orchestrator's own later save
+    #: of its in-memory record cannot silently drop it — see that method.
+    #:
+    #: ACCUMULATED (union), sorted, and `out_of_scope_paths` is never pruned
+    #: when a path lands here either: same regression-history rule.
+    #:
+    #: OVERLAPS `removed_out_of_scope_paths` deliberately, on one shape: a
+    #: recorded path that did not exist at `task_base_sha` has no base content,
+    #: so restoring it to the base state means making it absent. Such a path is
+    #: recorded here (this executor restored it) AND lands in
+    #: `removed_out_of_scope_paths` (git saw a deletion). Both are true.
+    reverted_out_of_scope_paths: tuple[str, ...] = ()
 
 
 #: There is deliberately NO per-round cap here, and there was one until
@@ -617,11 +655,47 @@ class TaskExecutionStore:
     def _path(self, task_id: str) -> Path:
         return self.directory / f"{task_id}.json"
 
+    def _reverted_on_disk(self, task_id: str) -> set[str]:
+        """`reverted_out_of_scope_paths` as the file currently holds it.
+
+        DEFENSIVE, and never raises: `save` is on every write path in the loop,
+        and until this existed it never read anything. A record that is missing,
+        truncated, corrupt or written by an older build must not turn a save
+        into a crash — the honest fallback is "nothing extra on disk", which
+        leaves `save` writing exactly what its caller passed, i.e. the pre-
+        scope-05 behaviour.
+        """
+        try:
+            raw = json.loads(self._path(task_id).read_text(encoding="utf-8"))
+            return {str(p) for p in raw.get("reverted_out_of_scope_paths", ())}
+        except Exception:
+            return set()
+
     def save(self, execution: TaskExecution) -> None:
         data = asdict(execution)
         data["allowed_paths"] = sorted(execution.allowed_paths)
         data["out_of_scope_paths"] = sorted(execution.out_of_scope_paths)
         data["removed_out_of_scope_paths"] = sorted(execution.removed_out_of_scope_paths)
+        # THE ONE FIELD THAT IS UNIONED WITH DISK RATHER THAN OVERWRITTEN, and
+        # the reason is specific rather than general (scope-05, 2026-08-24):
+        # inside a single dispatch TWO holders write this record. The
+        # orchestrator loads it before dispatch and saves its in-memory copy
+        # after the executor returns (`_dispatch_task_postcommit`), while the
+        # executor writes a revert onto the record MID-dispatch, through
+        # `RecordedRevertAuthority`. Plain last-writer-wins would silently drop
+        # the executor's write every single time, and the symptom would be an
+        # empty record rather than an error.
+        #
+        # Safe precisely because the field is append-only by construction — it
+        # is never pruned, never reset, and only ever unioned (same rule as
+        # `out_of_scope_paths`), so a union can lose nothing and invent nothing.
+        # The other two path tuples are deliberately NOT treated this way: they
+        # have exactly one writer, and giving them a resurrect-from-disk rule
+        # would change behaviour nothing asked for.
+        data["reverted_out_of_scope_paths"] = sorted(
+            set(execution.reverted_out_of_scope_paths)
+            | self._reverted_on_disk(execution.task_id)
+        )
         data["validation_commands"] = [list(c) for c in execution.validation_commands]
         # NOT sorted, unlike the two path sets above — see
         # `TaskExecution.assumptions`: accumulation order is which round chose
@@ -651,6 +725,13 @@ class TaskExecutionStore:
             # nothing could delete an out-of-scope path before then.
             data["removed_out_of_scope_paths"] = tuple(
                 data.get("removed_out_of_scope_paths", ())
+            )
+            # Same coercion, same `.get` default, same reasoning one field on:
+            # a record written before the revert rule existed has no key and
+            # loads as "no round has restored anything", which is true of every
+            # such record.
+            data["reverted_out_of_scope_paths"] = tuple(
+                data.get("reverted_out_of_scope_paths", ())
             )
             # JSON has no tuples: a record written before this field existed
             # has no key at all, and one written after has lists-of-lists.
@@ -722,6 +803,74 @@ class TaskExecutionStore:
             )
         os.replace(path, dest)
         return dest
+
+
+class RecordedRevertAuthority:
+    """The execution record, in the two shapes the revert rule needs from it.
+
+    scope-05, 2026-08-24. `ImplementExecutor` already reads this task's recorded
+    out-of-scope paths through an injected callable (`cleanup_paths_for`, bound
+    in `cli._build_executor`), and that stays the single source for WHICH paths
+    a request may name. Restoring one needs two further things off the same
+    record, and this is the whole of them:
+
+      * `base_sha(task_id)` — `TaskExecution.task_base_sha`, recorded before any
+        implementation work started. That is what makes a revert CHECKABLE
+        rather than a second edit: the executor asks git what the file said at
+        that commit, not the agent. It is LOOP-written, not immutable — a stale
+        base refresh or a recut moves it (`orchestrator._rebase_execution_if_
+        stale`, `_carry_reviewed_candidate_past`) — and that is harmless here,
+        because it stays the commit `commit_range_paths` measures the candidate
+        against, which is the property a revert is trying to satisfy. Nothing an
+        agent writes can move it.
+      * `record_reverted(task_id, paths)` — the durable note that a round took
+        its own overrun back, unioned onto
+        `TaskExecution.reverted_out_of_scope_paths`.
+
+    Deliberately NOT a second reader of `out_of_scope_paths`. Two readers of one
+    record eventually disagree about which paths are authorized, and the whole
+    authority model here is that there is exactly one such list.
+
+    **Read-modify-write, and it may race with the orchestrator's own save.** It
+    does not have to win that race: `TaskExecutionStore.save` unions this one
+    field with what is on disk, so whichever writer lands second keeps both
+    sides. See that method for why the union is safe (append-only field).
+
+    Absent — no `revert_authority` injected — `ImplementExecutor` offers no
+    revert at all and refuses every request. That is the fail-closed default and
+    matches `cleanup_paths_for`'s.
+    """
+
+    def __init__(self, store: TaskExecutionStore):
+        self._store = store
+
+    def base_sha(self, task_id: str) -> str:
+        """`task_base_sha`, or "" when there is no record to read it from.
+
+        "" is the fail-closed answer and the executor treats it as "no revert
+        authority this round": a first dispatch has no record, and a revert
+        against a base nobody recorded would be a guess.
+        """
+        execution = self._store.load(task_id)
+        return execution.task_base_sha if execution is not None else ""
+
+    def record_reverted(self, task_id: str, paths: Sequence[str]) -> None:
+        """Union `paths` onto the record's `reverted_out_of_scope_paths`.
+
+        A no-op when there is nothing to record or no record to record onto —
+        never a create, because a record this store has never written has no
+        base sha either, so nothing could have been reverted against it.
+        """
+        wanted = {str(p) for p in paths if str(p)}
+        if not wanted:
+            return
+        execution = self._store.load(task_id)
+        if execution is None:
+            return
+        execution.reverted_out_of_scope_paths = tuple(
+            sorted(set(execution.reverted_out_of_scope_paths) | wanted)
+        )
+        self._store.save(execution)
 
 
 @dataclass(frozen=True)

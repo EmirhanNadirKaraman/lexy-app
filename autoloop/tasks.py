@@ -681,12 +681,21 @@ def authorized_cleanup_paths(requested, recorded) -> tuple[set[str], set[str]]:
     file paths), and if one ever appeared it would still authorize only a file
     literally named with the trailing slash, i.e. nothing.
 
-    This grants DELETION and grants nothing else. It never reaches
+    This grants REPAIR and grants nothing else. It never reaches
     `Task.approved_paths` or `TaskExecution.allowed_paths`, so editing,
     recreating or renaming into an authorized path remains exactly as
-    unauthorized as it was before the file was ever recorded — see
-    `implement_executor._apply_recorded_cleanup`, the one caller, which acts on
-    the `authorized` half by unlinking and does nothing else with it.
+    unauthorized as it was before the file was ever recorded.
+
+    TWO callers since scope-05 (2026-08-24), one matcher, one authority:
+    `implement_executor._apply_recorded_cleanup` acts on the `authorized` half
+    by UNLINKING the file (`REMOVE-OUT-OF-SCOPE:`, scope-04), and
+    `_apply_recorded_reverts` acts on it by restoring the file to its content at
+    `TaskExecution.task_base_sha` (`REVERT-OUT-OF-SCOPE:`). Both narrow a diff
+    back toward the declared scope and neither widens it; both do nothing else
+    with what this returns. A second matcher for the second instruction is
+    exactly the drift this function's own "one matcher" rule warns about, so
+    there is not one — a path either is in the loop's record or it is not, and
+    that single answer gates both requests.
 
     `refused` is returned rather than dropped so the caller can report what it
     ignored. A silently ignored request looks identical to a satisfied one in

@@ -1404,28 +1404,100 @@ capability is the agent's, not the authorization's — so a review asking for th
 removal of an in-scope file remains unperformable. roadmap-01's second file,
 `autoloop/tests/test_obsolete.py`, was exactly that case.
 
+**Amended 2026-08-24 (scope-05) — the same authority now also RESTORES a
+recorded path to its base content, and still grants nothing else.** The
+amendment above covers a CREATED file. port-01's contamination on 2026-08-20 was
+ten EDITED files and zero creations, so the exception reached none of it and the
+same edits were carried onto every following round of the same branch (8 commits
+over 11 attempts, discarded by hand). `REVERT-OUT-OF-SCOPE: <path>` is a second
+request form whose authorizing set is EXACTLY the one above — the loop's own
+`out_of_scope_paths`, through the same `tasks.authorized_cleanup_paths`, exact
+match only, agent selects and never adds.
+
+Four properties bound the new capability, and each is the deletion's own
+property restated for a write:
+
+* **The content is git's, at a LOOP-written sha.** `_revert_recorded_file` writes
+  the blob `TaskExecution.task_base_sha` holds for that path — never bytes the
+  agent supplied, and never a path the agent named that is not already recorded.
+  That field is not immutable (a stale-base refresh or a recut moves it) but it
+  is unreachable from any agent, and it is the commit the reviewed range is
+  already measured from, which is the property that matters here.
+  A revert is therefore verifiable after the fact (the path leaves
+  `commit_range_paths(task_base_sha, candidate_sha)`), which an agent-authored
+  "put it back" would not be.
+* **The write is bounded like the unlink.** Same refusals — absolute path, any
+  `..` segment, a parent that does not resolve inside the worker repo — plus:
+  only a `100644`/`100755` BLOB entry is restorable (a `120000` symlink or
+  `160000` submodule at the base is refused, never written out as file bytes), a
+  directory at the target is refused (no recursive delete is reachable), and a
+  symlink at the target is unlinked as the LINK and replaced, never written
+  through. Only git's one permission bit is set; nothing else is chmod'ed.
+* **No new agent capability.** `WRITE_ALLOWED_TOOLS` and
+  `IMPLEMENT_DISALLOWED_TOOLS` are byte-identical; the executor performs the
+  restore. The second anchor refuses `-`/`*`/`>` prefixes like the first, and
+  the prompt's placeholder is not a path any record can hold.
+* **Fail-closed at every absent input.** No injected `revert_authority`, no base
+  sha, a base sha that is not a plain hex object name, or a base tree git cannot
+  read: nothing is reverted, the capability is not offered, and every request is
+  reported refused. An unreadable base explicitly does NOT fall through to the
+  created-path branch — the one fail-open available here would have been an
+  unreadable base silently converting a revert into a deletion.
+
+**Residual exposure, stated plainly.** A round can now overwrite an out-of-scope
+file the reviewer wanted left as the round had edited it. Bounded by the same
+controls: the write is staged and committed like any other change and is in the
+diff the reviewer reads; the content can only ever be the base commit's, so the
+worst case is a file returned to where the task found it;
+`TaskExecution.reverted_out_of_scope_paths` records it durably; and
+`out_of_scope_paths` is never pruned.
+
+**Wired in production since 2026-08-24 (same task, revision round).**
+`cli._build_orchestrator` passes
+`revert_authority=RecordedRevertAuthority(execution_store)` into
+`cli._build_executor`, over the SAME store `cleanup_paths_for` reads — one
+authorizing list, not two. Deleting that argument re-arms the fail-closed
+default for every live round, which is a capability change and not a cleanup.
+Two consequences of being live that were theoretical before it: a corrupt
+execution record now really can raise `StateCorruptError` inside
+`RecordedRevertAuthority.base_sha` (caught by `_revert_base_sha`'s `except
+Exception`, answered as "", pinned by
+`test_a_corrupt_execution_record_offers_no_revert_and_never_raises`), and a
+task's very first dispatch has no record at all (also "").
+
 **file:line** — `autoloop/tasks.py` (`authorized_cleanup_paths`);
 `autoloop/implement_executor.py` (`_CLEANUP_RE`, `_cleanup_instruction`,
-`_apply_recorded_cleanup`, `_remove_recorded_file`); `autoloop/orchestrator.py`
-(`_dispatch_task_postcommit`, the `removed_out_of_scope_paths` union);
-`autoloop/worktask.py` (`TaskExecution.removed_out_of_scope_paths`);
-`autoloop/cli.py` (`_recorded_out_of_scope_paths`).
+`_apply_recorded_cleanup`, `_remove_recorded_file`, and since scope-05
+`_REVERT_RE`, `_apply_recorded_reverts`, `_revert_recorded_file`,
+`_revert_base_sha`); `autoloop/orchestrator.py` (`_dispatch_task_postcommit`,
+the `removed_out_of_scope_paths` union); `autoloop/worktask.py`
+(`TaskExecution.removed_out_of_scope_paths`,
+`TaskExecution.reverted_out_of_scope_paths`, `RecordedRevertAuthority`);
+`autoloop/cli.py` (`_recorded_out_of_scope_paths`, and the
+`revert_authority=RecordedRevertAuthority(execution_store)` argument
+`_build_orchestrator` hands `_build_executor`).
 
 **Verification check:**
 ```bash
-# The gate: the ONLY caller of the matcher is the executor's cleanup, and the
-# matcher is exact-match — no `is_directory_prefix`, no `startswith`:
-rg -n 'authorized_cleanup_paths' autoloop/                  # tasks.py def + implement_executor.py call
-rg -n 'REMOVE-OUT-OF-SCOPE' autoloop/implement_executor.py  # the request literal, prompt + regex
-# Cleanup must never widen either authorization field — expect NO hit:
+# The gate: the ONLY callers of the matcher are the executor's two repair
+# passes, and the matcher is exact-match — no `is_directory_prefix`, no
+# `startswith`:
+rg -n 'authorized_cleanup_paths' autoloop/                  # tasks.py def + 2 implement_executor.py calls
+rg -n 'REMOVE-OUT-OF-SCOPE|REVERT-OUT-OF-SCOPE' autoloop/implement_executor.py
+# The wiring, which is what makes the capability exist at all — expect BOTH the
+# `_build_executor` parameter and the `_build_orchestrator` argument:
+rg -n 'revert_authority' autoloop/cli.py
+# Repair must never widen either authorization field — expect NO hit:
 rg -n 'allowed_paths.*cleanup|approved_paths.*cleanup' autoloop/
-pytest autoloop/tests/test_scope_cleanup.py -q
+rg -n 'allowed_paths|approved_paths' autoloop/implement_executor.py  # read-only rendering only
+pytest autoloop/tests/test_scope_cleanup.py autoloop/tests/test_scope_revert.py -q
 ```
 
 **Suggested fix:** none outstanding. If a future change ever populates the
-cleanup set from an agent's report, admits a prefix match, or lets a cleanup
-path reach `allowed_paths`/`approved_paths`, that is a regression of this
-finding, not a refactor.
+repair set from an agent's report, admits a prefix match, lets a repair path
+reach `allowed_paths`/`approved_paths`, restores content from anywhere but
+`task_base_sha`, or makes an unreadable base fall through to a deletion, that is
+a regression of this finding, not a refactor.
 
 ### S26 — Two `answer`-precondition keys were dead or mismapped, letting environmental blockers clear on text alone — MEDIUM — RESOLVED 2026-07-31
 
@@ -2657,3 +2729,8 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | impl-02 | Revision round, and it changes the reachability sentence above: a transport now DOES publish the call, so an agent can reach it in this build. Still no new finding. The transport is `AdvisoryRendezvous` — two fixed dotfile paths in the worker repo, reached with the Read/Write the agent already had. No tool was added, `IMPLEMENT_DISALLOWED_TOOLS` is byte-identical, no server or subprocess is spawned for the agent, and no flag reaches the `claude` argv. |
 | 2026-08-23 | impl-02 | What the agent can now cause is bounded to: up to `ADVISORY_VALIDATION_MAX_CALLS` runs of the ALREADY-CONFIGURED validation commands, in the executor's own directory, under the executor's own environment. The one byte-stream it controls is the request file's content, which is read only to be handed to `serve_advisory_tool_call` and discarded — no field of it is parsed, so there is no injection surface, and the credential boundary is unmoved (the run is still in-process). |
 | 2026-08-23 | impl-02 | The new deletion capability is narrow and is NOT the scope-04 cleanup path. `_remove_entry` unlinks only three FIXED names joined onto the round's own root, contributes no agent-supplied path component, unlinks a symlink as the LINK (never following it), and recursively removes only a directory sitting at one of those three names — which `Write` can create, since it makes parent directories. Nothing else in the tree is reachable from it. |
+| 2026-08-24 | scope-05 | S25 amended: the recorded-cleanup authority now also RESTORES a recorded path to its `task_base_sha` content (`REVERT-OUT-OF-SCOPE:`). Authorizing set unchanged — same `out_of_scope_paths`, same exact-match matcher, agent selects and never adds. New exposure is a WRITE rather than a delete, bounded by the content being git's at a loop-written sha no agent can reach: the worst case is a file returned to where the task found it, staged and committed like any other change and visible in the reviewed diff. |
+| 2026-08-24 | scope-05 | The write is bounded like the unlink and then some: absolute path, `..`, and a parent outside the worker repo all refused, plus only a `100644`/`100755` BLOB base entry is restorable — a `120000` symlink or `160000` submodule is refused rather than written out as file bytes — a directory at the target is refused (no recursive delete reachable), and a symlink at the target is unlinked as the LINK and replaced, never written through. Only git's one permission bit is set. |
+| 2026-08-24 | scope-05 | Fail-closed, with the single fail-open closed by name: an unreadable base tree does NOT fall through to the created-path branch, so it can never silently convert a revert into a deletion. No authority, no base sha, a non-hex base sha and an unreadable base tree all revert nothing and report refused. No agent capability was added — `WRITE_ALLOWED_TOOLS` and `IMPLEMENT_DISALLOWED_TOOLS` are byte-identical and the executor performs the restore. |
+| 2026-08-24 | scope-05 | Not wired in production: `cli._build_executor` passes no `revert_authority`, so a live run has no revert authority and the new anchor does nothing. Enabling it is `revert_authority=RecordedRevertAuthority(execution_store)` beside the existing `cleanup_paths_for=`; whoever adds that line owns re-reading S25's 2026-08-24 amendment first. `autoloop/cli.py` was outside this task's approved paths. |
+| 2026-08-24 | scope-05 | Revision round, superseding the note directly above: `cli._build_orchestrator` now passes `revert_authority=RecordedRevertAuthority(execution_store)` over the SAME store `cleanup_paths_for` reads, so the capability is live and deleting that argument is a capability change rather than a cleanup. Two paths that were theoretical while nothing in production called `base_sha` are now reachable, and both answer "" without raising: a corrupt execution record (`StateCorruptError`) and a first dispatch with no record at all. |

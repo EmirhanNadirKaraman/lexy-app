@@ -2372,6 +2372,104 @@ second file, `autoloop/tests/test_obsolete.py`, was that case. See
 `docs/SECURITY.md` S25's 2026-08-19 amendment for the security accounting and
 `autoloop/tests/test_scope_cleanup.py` for the regressions.
 
+**Amendment, 2026-08-24 — a round may also REVERT an out-of-scope EDIT, not
+only delete an out-of-scope CREATION (task `scope-05`).** The amendment above
+shipped with its own limit written down: "an EDIT to the same path is as
+unauthorized as it ever was". That limit is where the deadlock moved rather than
+ended. port-01's contamination on 2026-08-20 was TEN EDITED FILES AND ZERO
+CREATIONS — `auto_merge.py`, `blockers.py`, `cli.py`, `config.example.toml`,
+`dashboard.py`, `health.py`, `lock.py`, `publisher.py`, `state.py`,
+`worktask.py` — so `REMOVE-OUT-OF-SCOPE` could do nothing for any of them and
+"strip the residue" was unperformable for the second time. It compounds, which
+is the part that costs whole branches: a revise builds on the SAME branch, so a
+round rejected FOR its out-of-scope edits hands those same edits to the next
+round. port-01 accumulated 8 commits across 11 attempts and 6 review rounds, the
+contaminated set never shrank — it could not — and an operator eventually
+discarded the branch by hand. `changed_paths_outside_approved` has parked 9
+distinct tasks; this is the general case, not one bad branch.
+
+**The rule.** A later round of the same execution may restore a path already in
+that execution's `TaskExecution.out_of_scope_paths` to the content git holds for
+it at `TaskExecution.task_base_sha`. The authority model is scope-04's,
+unchanged in every respect: same record, same exact-match gate
+(`tasks.authorized_cleanup_paths` — ONE matcher, now with two callers), same
+"the agent's line SELECTS from the record and can never add to it", same
+fail-closed default. No agent tool is added — `WRITE_ALLOWED_TOOLS` is still
+Read/Grep/Glob/Edit/Write with `Bash` disallowed, and the executor performs the
+restore exactly as it performs the unlink. `approved_paths` and `allowed_paths`
+are neither read nor written: this NARROWS a diff back toward the declared
+scope and can never widen it.
+
+What is different from the deletion, in the order a round meets it:
+
+* **The base sha, and why it is the base sha.** `worktask.RecordedRevertAuthority`
+  reads `task_base_sha` off the same record and is injected as
+  `revert_authority`. The content is read from git at that commit — not from
+  what the agent believes the file used to say — which is what makes a revert
+  CHECKABLE rather than a second edit the agent authored from memory. That sha
+  is written by the LOOP and by nothing else: recorded before any implementation
+  work starts, and moved only when the loop itself rebases the task onto a newer
+  base (`_rebase_execution_if_stale`, `_carry_reviewed_candidate_past`). It is
+  not immutable, and it does not need to be — after such a move it is still
+  exactly the commit `commit_range_paths` measures the candidate against, so
+  restoring to it still takes the path out of the reviewed range, which is the
+  property the repair is for. No agent can influence it either way.
+* **The request.** `REVERT-OUT-OF-SCOPE: <path>`, a second anchor with the same
+  discipline as the first: start of line, indent allowed, `-`/`*`/`>` prefixes
+  refused so prose about the convention cannot read as a use of it. Echo-safe
+  the same structural way — the placeholder in the prompt is not a path any
+  record can hold.
+* **The restore.** `implement_executor._revert_recorded_file`, in the same
+  window as the unlink (before the `git status` read, so a repair-only round has
+  something to commit; before validation, so the suite grades the tree that is
+  committed). It restores the bytes AND git's one permission bit, because a
+  stale mode alone keeps the path in the range diff — which is the thing the
+  repair exists to take out of it.
+* **The overlap with REMOVE, decided.** The two instructions stay DISTINCT,
+  because on a file that existed at the base their end states differ: REMOVE
+  deletes it, REVERT puts the base's bytes back. They CONVERGE on a created
+  path, which has no base content, so reverting one makes it absent. Asking for
+  both on one path is not an error: the removal runs first and the revert is
+  reported as superseded.
+* **The record.** `TaskExecution.reverted_out_of_scope_paths`, written by the
+  executor through the same authority. It exists for the reason its sibling
+  does and the invisibility is sharper: a file edited in round 1 and put back in
+  round 2 has the same bytes at both ends of
+  `commit_range_paths(task_base_sha, candidate_sha)` and is absent from the
+  reviewed range entirely. `out_of_scope_paths` is never pruned. A created path
+  reverted this way lands in BOTH records — this executor restored it, and git
+  saw a deletion — and both are true.
+
+**Fail-closed at every absent input**, which is the same default deletion has:
+no injected `revert_authority`, no base sha on the record, a base sha that is
+not a plain hex object name, or a base tree git will not read means NOTHING is
+reverted, the prompt never mentions the capability, and every request is
+reported as refused with a reason. In particular an unreadable base never
+reaches the created-path branch, so it cannot silently become a deletion.
+
+**Wired in production, and it is one keyword argument.**
+`cli._build_orchestrator` passes
+`revert_authority=RecordedRevertAuthority(execution_store)` into
+`cli._build_executor`, beside the existing `cleanup_paths_for=` and over the
+SAME `TaskExecutionStore` — so "what the loop recorded out of scope" and "what a
+round may repair" cannot drift apart. Remove that argument and the capability
+does not degrade, it disappears: no base sha, no `REVERT-OUT-OF-SCOPE:` in any
+prompt, every request refused. `autoloop/tests/test_scope_revert.py` pins the
+wiring through a real `cli._build_orchestrator` — `isinstance` is only half of
+it, the other half asks the wired authority about a record the orchestrator's
+own store wrote, because an authority bound to a second store would type-check
+and read nothing. Security accounting is `docs/SECURITY.md` S25's 2026-08-24
+amendment. (The first round of scope-05 shipped the mechanism without this line;
+every live round then took the fail-closed branch while the whole suite passed,
+which is why the wiring has a test of its own rather than being read off the
+constructor.)
+
+**Also worth knowing:** a repair round's `changed_paths` still contains the
+restored path (the worker tree really did change), so the pre-commit advisory
+comparison re-records it in `out_of_scope_paths` — which is a no-op, since that
+field is never pruned anyway. The POST-commit comparison is the one that
+notices: the path has left the reviewed range.
+
 ---
 
 ## 4f. Operator-changeset review (publishing a hand-authored commit)
