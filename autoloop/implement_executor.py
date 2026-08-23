@@ -104,6 +104,66 @@ its default (`""`), so `ClaudeCliRunner.build_argv` omits `--model` entirely
 — no model table lives here or should be added; whatever the `claude` CLI
 picks by default is what runs.
 
+**The round's own validation is a bound, zero-argument CALL** (impl-02,
+2026-08-23). `AdvisoryValidation` closes over the four things
+`_run_implementation` already computes for its authoritative run — the command
+list, the working directory, the command runner and the validation environment
+— and exposes ONE method that takes no arguments at all. The agent cannot name
+a command, a path, a flag or an environment value, because there is no
+parameter to name one in: `serve_advisory_tool_call` accepts whatever payload
+a transport hands it and discards it unread. The run is ADVISORY — the
+executor still runs validation itself afterwards, and that run alone decides
+`ExecutionOutcome.validation` and the round's status.
+
+Cost is bounded twice: `ADVISORY_VALIDATION_MAX_CALLS` requests per round, and
+`ADVISORY_VALIDATION_TIMEOUT_SECONDS` per run. A request past the cap executes
+nothing and says `validation.NOT_RUN`, which is deliberately different
+information from `PASS` — the same rule val-03 established for the executor's
+own run, and the one thing this must not weaken. So is a round with no
+commands configured and one whose declared `validation_cwd` is missing: an
+advisory channel that answered "green" because it had nothing to run would be
+exactly the fail-open it exists to prevent.
+
+`note()` is what the round reports, and it is computed from THIS module's own
+counters — never from `result.raw_text`. An agent that writes "I ran the suite
+five times and it was green" moves no number here. It also distinguishes
+"offered and unused" from NOT OFFERED, because a guard nobody could reach must
+not read as one nobody wanted.
+
+**The TRANSPORT is a filesystem rendezvous, because that is the one the agent
+demonstrably already has.** `AdvisoryRendezvous` watches two fixed paths in the
+worker repo: the agent Writes anything to `.autoloop-validation-request` to ask,
+and Reads `.autoloop-validation-result.txt` to get the answer. Nothing else is
+granted — Read and Write are already in `WRITE_ALLOWED_TOOLS`, so this adds no
+tool, no flag, no shell and no new process, and `IMPLEMENT_DISALLOWED_TOOLS` is
+untouched.
+
+An MCP tool would have been the obvious shape and is NOT what shipped, for two
+reasons that are about verifiability rather than taste. `cli._build_executor`'s
+`agent_runner_factory` lambda is the only place holding both the configured
+validation commands and the worker root, so a per-round spec cannot reach
+`ClaudeCliRunner.build_argv` without editing `cli.py`; and the `--mcp-config`
+family's exact spelling and headless approval behaviour cannot be checked from
+inside this loop (the implementing agent has no shell). A wrong flag fails every
+implement round at spawn, including the round that would fix it. A rendezvous
+over two file paths fails, when it fails, by the agent simply not being answered
+— and `note()` reports that as a measured zero. `advisory_tool_descriptor` is
+kept and is the source of the brief's own wording, so the day a tool transport
+IS wired, the description it publishes is the one the agent has been reading.
+
+The residue trap is handled here rather than left for a later round. An advisory
+run happens INSIDE the agent's window, i.e. before `git.dirty_paths_all()` reads
+the tree, so anything left behind is picked up as changed work — whereas the
+executor's own run happens after that read. Both rendezvous paths are swept in a
+`finally` around the agent call itself, so every reader downstream (the
+failure-path `_partial_work`, the cleanup pass, the status read) sees a tree with
+no trace of the channel. VERIFIED: `.gitignore` lists neither `.ruff_cache` nor
+`.pytest_cache` (2026-08-23), and pytest's is already suppressed for every pytest
+command by `validation.NO_CACHE_ARGS`. NOT verified without a shell: whether
+`ruff check` really leaves a `.ruff_cache/` that `git status -uall` reports here
+— that one is a property of the commands, not of this channel, and it would show
+up as an unexpected `changed_paths` entry rather than as a wrong verdict.
+
 **The agent is bounded by SILENCE, not by elapsed time** (2026-08-14). The
 write-capable runner this module builds carries a `stall.WorkerTreeProbe`, so
 `ClaudeCliRunner` spawns and supervises rather than running under a wall-clock
@@ -119,10 +179,13 @@ nothing.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
+import threading
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from . import note_merge
 from .audit.agents import AgentRunner, AgentSpec, ClaudeCliRunner, classify_agent_fault
@@ -133,7 +196,7 @@ from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .stall import DEFAULT_CEILING_SECONDS, PartialWork, StallPolicy, WorkerTreeProbe
 from .tasks import Task, authorized_cleanup_paths, effective_approved_paths
-from .validation import run_validation_commands
+from .validation import NOT_RUN, run_validation_commands
 from .validation_env import ValidationEnv
 from .worker_env import worker_env
 
@@ -208,6 +271,717 @@ def implement_agent_runner(
         spawn=spawn,
         **kwargs,
     )
+
+
+# ---- the round's own validation, callable by the agent ----------------------
+#
+# WHY THIS IS A BOUND CALL AND NOT A SHELL. The write-capable agent can write a
+# test and cannot run one: `WRITE_ALLOWED_TOOLS` is Read/Grep/Glob/Edit/Write
+# and `Bash` sits in `IMPLEMENT_DISALLOWED_TOOLS`, so validation is the agent's
+# FIRST feedback and it arrives after the whole round is paid for. Measured over
+# every round since val-03 went live (2026-08-23): five rounds failed AFTER
+# implementing, 3.29h between them — a quarter of all executor time in the
+# window — and FOUR of the five failed a test the round itself had just written.
+# stop-01's was "test script exhausted: no response left", a scripted fake given
+# fewer replies than the code asks for: one execution catches it in under a
+# second, and it cost 51.6 minutes.
+#
+# The restriction stays. What is added is ONE fixed call, not a shell: every
+# input is bound here, from values the executor already computed, and the
+# agent-facing surface has no parameter at all. That is the whole security
+# argument — there is no argument to sanitize, because there is no argument.
+
+
+#: How many advisory runs ONE round may pay for.
+#:
+#: A bound on COST, and the reason the cap is small: the executor's own run is
+#: still owed on top of these, and a round that could re-run the suite freely
+#: would spend its whole `agent_ceiling_seconds` proving the same thing. Three
+#: is enough for the loop this exists to close (run, see the failure, fix it,
+#: confirm) and stops well short of an unbounded retry loop.
+ADVISORY_VALIDATION_MAX_CALLS = 3
+
+#: The wall-clock bound on ONE advisory run — deliberately far below
+#: `run_validation_commands`' own 1800s default, which is also the default
+#: `audit.agent_stall_seconds`. An advisory run writes no files, so to the
+#: `stall.WorkerTreeProbe` watching the worker repo it looks exactly like
+#: SILENCE; a run allowed to last as long as the stall bound could get the agent
+#: killed mid-call by the detector that is supposed to catch a wedge.
+ADVISORY_VALIDATION_TIMEOUT_SECONDS = 600.0
+
+#: The name a transport publishes the zero-argument call under.
+ADVISORY_TOOL_NAME = "run_validation"
+
+
+def advisory_tool_descriptor(max_calls: int = ADVISORY_VALIDATION_MAX_CALLS) -> dict:
+    """What the zero-argument call IS, in the form a tool transport publishes.
+
+    Its production caller today is `_advisory_instruction`, which renders
+    `description` into the agent's brief verbatim — so the sentences the agent
+    reads and the sentences an MCP/`--mcp-config` transport would advertise are
+    one string, not two that drift. That is the whole reason this survives the
+    filesystem rendezvous shipping first: the description is transport-neutral
+    on purpose (it says what happens and what is fixed, never how to call it),
+    and the `how` lives in `_advisory_instruction` beside the paths it names.
+
+    The `inputSchema` is the MECHANICAL form of this task's first constraint:
+    no properties, nothing required, `additionalProperties` false. A caller that
+    somehow sends a payload anyway is handled by `serve_advisory_tool_call`,
+    which discards it unread — the schema states the rule, the handler does not
+    depend on the rule being honoured.
+    """
+    return {
+        "name": ADVISORY_TOOL_NAME,
+        "description": (
+            "Run this repository's configured validation (lint/tests) against "
+            "your own worker repo, exactly as the executor will run it after "
+            "you return. It takes NO arguments: the commands, the working "
+            "directory and the environment are fixed by the executor, and "
+            "nothing you supply can change any of them. The result comes back "
+            "to you as text. This run is ADVISORY — the executor runs "
+            "validation itself afterwards and that run is the verdict. At most "
+            f"{max_calls} run(s) per round; past that the request executes "
+            f"nothing and says {NOT_RUN}, which is not a pass."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    }
+
+
+class AdvisoryValidation:
+    """The round's configured validation, bound to executor-owned inputs and
+    callable with nothing.
+
+    Constructed by `ImplementExecutor._advisory_for` from the same four values
+    `_run_implementation` uses for its authoritative run — so the agent's run
+    and the executor's run are the same commands in the same directory under
+    the same environment, and a green advisory run means what the agent will
+    naturally read it to mean. They are two SEPARATE runs: nothing here is
+    consulted by, shortens, or stands in for the executor's own call, which
+    happens unconditionally after the agent returns.
+
+    **The agent supplies nothing.** `run()` takes no parameter, so there is no
+    channel through which a command, a path, a flag or an environment value
+    could arrive from the agent. `serve_advisory_tool_call` is the transport
+    boundary and drops whatever payload it is handed.
+
+    **Every answer that is not a real result says so.** The cap, an empty
+    command list, a missing working directory and an exception inside the run
+    all return `NOT_RUN`/failure text rather than silence or a pass. An
+    advisory channel that answered "green" when it had nothing to run would be
+    the exact fail-open this exists to prevent, and it would be believed —
+    that is the whole point of giving the agent an answer at all.
+
+    **The counters are the loop's own record.** `note()` reads them and nothing
+    else; the agent's report text is never consulted. A round that never
+    offered the call says NOT OFFERED rather than "0 runs", because "could not"
+    and "chose not to" are different facts and only one of them is a finding
+    about the agent.
+    """
+
+    def __init__(
+        self,
+        commands: Sequence[Sequence[str]],
+        cwd: Path,
+        command_runner=None,
+        validation_env: ValidationEnv | None = None,
+        max_calls: int = ADVISORY_VALIDATION_MAX_CALLS,
+        timeout: float = ADVISORY_VALIDATION_TIMEOUT_SECONDS,
+    ):
+        # Normalised defensively: an unusable list becomes the EMPTY list,
+        # which `run()` answers as NOT_RUN and never as a pass. The round-level
+        # version of this guard is in `ImplementExecutor._advisory_for`, which
+        # is where a malformed `Task.validation` would actually be met.
+        try:
+            self._commands = tuple(tuple(argv) for argv in commands)
+        except TypeError:
+            self._commands = ()
+        self._cwd = Path(cwd)
+        self._command_runner = command_runner
+        # The SAME credentials the executor's own run gets, and for one reason:
+        # this object runs inside the loop's own process, so the values never
+        # approach the agent's process, and `run_validation_commands` redacts
+        # them out of the text before it is returned. A CROSS-PROCESS transport
+        # (an MCP server spawned by the CLI) must NOT carry this or the file it
+        # came from — that would put a credential, or the path to one, on the
+        # agent's own command line and undo `validation_env.py`'s promise that
+        # "the writer never learns the file's path either".
+        self._validation_env = validation_env
+        self._max_calls = max(0, int(max_calls))
+        self._timeout = timeout
+        #: One entry per run that actually EXECUTED commands: True if every
+        #: command that ran passed. Requests refused at the cap and requests
+        #: that could not run are counted separately and never land here — a
+        #: list that mixed them could not answer "was the last RUN green".
+        self._results: list[bool] = []
+        self._requests = 0
+        self._refused = 0
+        self._blocked = 0
+        self._exposed = False
+        # Guards the counter that DECIDES the cap, and nothing else. `+=` is
+        # not atomic, so two tool calls served concurrently could each read the
+        # same count and both be admitted — a cap that holds only if the
+        # transport happens to be single-threaded is not a cap. The lock is
+        # released before the run itself, so it bounds the NUMBER of runs
+        # without serialising them into one 600-second queue.
+        self._lock = threading.Lock()
+
+    # ---- what a transport binds --------------------------------------------
+
+    def expose(self) -> None:
+        """Record that this round actually OFFERED the call to the agent.
+
+        Called by `AdvisoryRendezvous.start()` — the one thing that actually
+        puts the channel in front of an agent — and by any future transport
+        that does the same. It changes no behaviour; it changes what a zero
+        MEANS in `note()`, which is the difference between "the agent did not
+        check its work" and "the agent had no way to".
+        """
+        self._exposed = True
+
+    @property
+    def exposed(self) -> bool:
+        return self._exposed
+
+    @property
+    def runs(self) -> int:
+        """Runs that really executed commands."""
+        return len(self._results)
+
+    @property
+    def requests(self) -> int:
+        return self._requests
+
+    @property
+    def refused(self) -> int:
+        return self._refused
+
+    @property
+    def blocked(self) -> int:
+        return self._blocked
+
+    @property
+    def max_calls(self) -> int:
+        return self._max_calls
+
+    @property
+    def offerable(self) -> bool:
+        """Is there anything here worth telling the agent about?
+
+        False when nothing could ever execute — no commands configured, or a
+        cap of zero. Offering the channel then would spend the agent's turns
+        collecting `NOT_RUN` answers it can do nothing with, and `note()` would
+        report OFFERED for a round in which the agent could not possibly have
+        checked anything.
+
+        Deliberately does NOT test the working directory. A missing
+        `validation_cwd` is a round-fatal error the executor reports on its own
+        run, and the honest thing for the agent to hear meanwhile is the
+        `NOT_RUN` text naming that directory — not silence.
+        """
+        return bool(self._commands) and self._max_calls > 0
+
+    @property
+    def last_run_ok(self) -> bool | None:
+        """Was the last executed run green? None when nothing ever ran.
+
+        None is a third state on purpose: `False` would report a red run that
+        never happened, and `True` would be the fail-open.
+        """
+        return self._results[-1] if self._results else None
+
+    # ---- the agent-facing call ---------------------------------------------
+
+    def run(self) -> str:
+        """Run the bound validation once and return the result AS TEXT.
+
+        Takes no arguments — see the class docstring. Never raises: this is
+        called from inside a transport serving an agent mid-turn, and an
+        exception there would break the turn rather than report a failure. A
+        run that could not complete is reported as a failure, never as a pass.
+        """
+        with self._lock:
+            self._requests += 1
+            over_budget = self._requests > self._max_calls
+            if over_budget:
+                self._refused += 1
+        if over_budget:
+            return (
+                f"{NOT_RUN}: this round's advisory validation budget of "
+                f"{self._max_calls} run(s) is already spent, so nothing was "
+                f"executed. {NOT_RUN} is not a pass — it is the absence of "
+                "evidence either way. The executor runs validation itself after "
+                "you return; fix what your last run reported rather than asking "
+                "again."
+            )
+        if not self._commands:
+            with self._lock:
+                self._blocked += 1
+            return (
+                f"{NOT_RUN}: no validation commands are configured for this "
+                f"round, so there was nothing to execute. {NOT_RUN} is not a "
+                "pass."
+            )
+        if not self._cwd.is_dir():
+            with self._lock:
+                self._blocked += 1
+            return (
+                f"{NOT_RUN}: the working directory this round's validation runs "
+                f"in ({self._cwd}) does not exist, so nothing was executed. "
+                f"{NOT_RUN} is not a pass — the executor's own run will fail on "
+                "the same directory."
+            )
+        try:
+            ok, summary = run_validation_commands(
+                self._commands,
+                self._cwd,
+                command_runner=self._command_runner,
+                timeout=self._timeout,
+                validation_env=self._validation_env,
+            )
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            self._results.append(False)
+            return (
+                "ADVISORY validation could not complete: "
+                f"{type(exc).__name__}: {str(exc).strip() or '(no detail)'}. "
+                "Treat this as a FAILURE, not a pass — nothing was proved."
+            )
+        self._results.append(bool(ok))
+        verdict = "PASSED" if ok else "FAILED"
+        return (
+            f"ADVISORY validation run {self.runs} of {self._max_calls} — "
+            f"{verdict}.\n{summary}\n"
+            "This run is advisory: the executor runs the same commands itself "
+            "after you return, and that run is what decides the round."
+        )
+
+    # ---- what the round reports --------------------------------------------
+
+    def note(self) -> str:
+        """The sentence the round's summary carries about this channel.
+
+        Leading space, so callers concatenate it onto an existing summary the
+        way `_cleanup_note` already does. Built ONLY from the counters above —
+        the agent's own account of what it ran is not an input here, and the
+        test that pins that feeds a report claiming five green runs and expects
+        a zero.
+        """
+        if not self._exposed:
+            return (
+                " Agent self-validation: NOT OFFERED — no advisory validation "
+                "channel was wired to the agent this round, so it ran the suite "
+                "0 time(s). Read that as 'could not', not 'chose not to'."
+            )
+        if not self._results and not self._requests:
+            parts = [
+                " Agent self-validation: OFFERED, and the agent ran the suite 0 "
+                "time(s) — it had the call available and did not use it."
+            ]
+        elif not self._results:
+            # It ASKED and got nothing back. Reporting that as "did not use it"
+            # would blame the agent for a channel that refused it, which is the
+            # same misreading `NOT OFFERED` exists to prevent one level up.
+            parts = [
+                " Agent self-validation: OFFERED; the agent asked "
+                f"{self._requests} time(s) and the suite ran 0 time(s)."
+            ]
+        else:
+            verdict = "PASSED" if self._results[-1] else "FAILED"
+            parts = [
+                f" Agent self-validation: the agent ran the suite {self.runs} "
+                f"time(s); its last run {verdict}."
+            ]
+        if self._refused:
+            parts.append(
+                f" {self._refused} further request(s) were refused at the cap of "
+                f"{self._max_calls} and executed nothing ({NOT_RUN}, not a pass)."
+            )
+        if self._blocked:
+            parts.append(
+                f" {self._blocked} request(s) could not run at all (no commands "
+                f"configured, or a missing working directory) — {NOT_RUN}, not a "
+                "pass."
+            )
+        parts.append(
+            " Advisory only; the validation summary recorded for this round is "
+            "the executor's own run."
+        )
+        return "".join(parts)
+
+
+def serve_advisory_tool_call(service: AdvisoryValidation, arguments=None) -> str:
+    """The transport boundary: one tool call in, the run's text out.
+
+    `arguments` exists because transports hand a payload to every tool call,
+    and it is accepted ONLY so that it can be discarded here, once, in a place a
+    test can point at. It is never inspected, never merged into anything and
+    never reaches `run()` — which has no parameter to receive it with. That is
+    what makes "the agent supplies no command, no path, no flag and no
+    environment value" a property of the code's SHAPE rather than of a
+    validation routine that could be wrong about a payload.
+    """
+    del arguments
+    return service.run()
+
+
+# ---- the transport: two fixed paths in the worker repo ----------------------
+#
+# WHY A FILE RENDEZVOUS AND NOT AN MCP TOOL. See the module docstring: an MCP
+# tool needs `cli.py` (the only place holding both the validation commands and
+# the worker root) and needs `--mcp-config`'s exact spelling and headless
+# approval behaviour verified against the installed CLI — which the agent
+# implementing it cannot do, having no shell. Read and Write are already in
+# `WRITE_ALLOWED_TOOLS` and are exercised by every round, so a rendezvous over
+# two fixed paths is the transport whose availability is not a guess.
+#
+# Nothing about the security posture moves. No tool is added,
+# `IMPLEMENT_DISALLOWED_TOOLS` is unchanged, no process is spawned for the agent
+# to talk to, and the credentials in `ValidationEnv` never leave this process:
+# the run happens HERE, on the loop's side, and only redacted text crosses back.
+
+#: What the agent writes to ASK. Content irrelevant — existence is the request.
+ADVISORY_REQUEST_FILE = ".autoloop-validation-request"
+
+#: What the executor writes the ANSWER to, and the agent reads.
+ADVISORY_RESULT_FILE = ".autoloop-validation-result.txt"
+
+#: Where the answer is staged so a reader never sees half of one. Swept with
+#: the other two — an interrupted write must not leave a third path behind.
+ADVISORY_RESULT_TMP_FILE = ".autoloop-validation-result.tmp"
+
+#: The result file's first word while a run is in flight, and when it is done.
+#: The agent polls on this distinction, so the two must not be prefixes of one
+#: another and neither may appear at the start of the other's body.
+ADVISORY_PENDING_PREFIX = "PENDING"
+ADVISORY_RESULT_PREFIX = "RESULT"
+
+#: How often the watcher looks for a request. Small: this is the latency the
+#: agent pays before it sees `PENDING`, and the cost is one `stat` per tick.
+ADVISORY_POLL_SECONDS = 0.25
+
+#: How long `stop()` waits for a run that is still in flight when the agent
+#: returns. Generous on purpose — the alternative is the executor's own
+#: authoritative run starting while an advisory run is still executing the same
+#: suite in the same directory. Bounded so a wedged runner cannot hang a round.
+#:
+#: Not a guarantee that the wait covers every run: `run_validation_commands`
+#: applies its timeout PER COMMAND, so a long list can outlast this. What is
+#: guaranteed is the part that matters for correctness — an abandoned run writes
+#: NOTHING, because `_publish` finds `_stopping` set (see `stop()`). The cost of
+#: exceeding the bound is two suites running at once for a while, not residue
+#: and not a wrong verdict.
+ADVISORY_STOP_JOIN_SECONDS = ADVISORY_VALIDATION_TIMEOUT_SECONDS + 60.0
+
+
+def _advisory_instruction(max_calls: int) -> str:
+    """The brief's section on the channel: what it is, and how to use it.
+
+    The WHAT is `advisory_tool_descriptor`'s description, verbatim, so a future
+    tool transport advertises the same sentences (see that function). The HOW is
+    here, beside the constants it names, because it is the only part that is
+    specific to this transport.
+
+    **Echo-safe by construction.** No line in this text begins with
+    `ASSUMPTION:` or `REMOVE-OUT-OF-SCOPE:`, so an agent that quotes the whole
+    brief back forges neither a disclosure nor a deletion request — the same
+    property `_authoring_rules` and `_scope_instruction` are held to.
+
+    One sentence is doing real work and is not decoration: the ground rules
+    above say the agent has no shell and must not run commands, and this section
+    would read as a contradiction without saying which it is. It is not a
+    command the agent composes; it is a request for the executor's own run.
+    """
+    return (
+        "RUN THE SUITE BEFORE YOU RETURN — you can, and finding your own "
+        "mistake costs a minute instead of a whole round.\n"
+        f"{advisory_tool_descriptor(max_calls)['description']}\n"
+        "You still have no shell and still may not run `git` or any other "
+        "command: this is not a command you compose, it is a request for the "
+        "executor's own validation run, which it performs on your behalf.\n"
+        "How to ask, with the Read and Write tools you already have:\n"
+        f"  1. Write anything at all to `{ADVISORY_REQUEST_FILE}` in your "
+        "working directory. The content is discarded unread — the file's "
+        "EXISTENCE is the whole request, and there is no field in it through "
+        "which a command, a path, a flag or an environment value could be "
+        "passed.\n"
+        f"  2. Read `{ADVISORY_RESULT_FILE}`. Every answer is STAMPED WITH YOUR "
+        f"REQUEST NUMBER: your first request is answered by "
+        f"`{ADVISORY_RESULT_PREFIX} #1`, your second by "
+        f"`{ADVISORY_RESULT_PREFIX} #2`. While a run is in flight the file "
+        f"reads `{ADVISORY_PENDING_PREFIX} #n` instead. Re-read it until you "
+        f"see `{ADVISORY_RESULT_PREFIX} #n` for the request you just made — a "
+        "LOWER number is the previous answer and yours has not been taken yet, "
+        "and a full run takes minutes, so expect several reads.\n"
+        "  3. Fix what it reports, then ask again to confirm if you have "
+        "budget left.\n"
+        "Both files are the executor's control channel, not part of your "
+        "change: it deletes them before it reads what you changed, so nothing "
+        "you write there is committed and nothing you leave there counts as "
+        "work. The result is a snapshot of the tree AS IT STOOD WHEN YOU ASKED "
+        "— edit something afterwards and the answer is about the older tree."
+    )
+
+
+class AdvisoryRendezvous:
+    """The agent's end of `AdvisoryValidation`: two fixed paths in the repo the
+    agent is already working in.
+
+    `start()` sweeps stale files, marks the service EXPOSED and puts a watcher
+    thread on the request path. `stop()` stops it and sweeps again — and it is
+    safe on a rendezvous that was never started, which is what makes the
+    `finally` in `_run_implementation` a total guarantee rather than a
+    happy-path one.
+
+    **The agent supplies nothing, structurally.** The two paths are constants
+    joined onto the executor's own root; the request file's bytes are handed to
+    `serve_advisory_tool_call`, whose only purpose is to discard them. There is
+    no field, header or filename convention through which the agent could name
+    a command, a directory, a flag or an environment value, because nothing that
+    arrives from the agent is ever read.
+
+    **Residue is the failure mode that would cost a round**, since neither path
+    is inside any task's `approved_paths`: a file left behind is an out-of-scope
+    write on the record and a parked candidate. So the sweep runs on stop
+    unconditionally (not only when a request was served), tolerates a directory
+    or a symlink sitting at either path, and never raises.
+    """
+
+    def __init__(
+        self,
+        service: AdvisoryValidation,
+        root: Path,
+        poll_seconds: float = ADVISORY_POLL_SECONDS,
+        join_timeout: float = ADVISORY_STOP_JOIN_SECONDS,
+    ):
+        self._service = service
+        self._root = Path(root)
+        self._poll = poll_seconds
+        self._join_timeout = join_timeout
+        self._thread: threading.Thread | None = None
+        self._stopping = threading.Event()
+        # Serialises the two file-touching moments (taking a request + writing
+        # PENDING, and publishing the RESULT) against `stop()`'s sweep. Without
+        # it a run still in flight could write its answer AFTER the sweep and
+        # leave exactly the residue the sweep exists to remove. The validation
+        # run itself is OUTSIDE the lock, so `stop()` is never blocked behind a
+        # ten-minute suite.
+        self._lock = threading.Lock()
+        self._broken = False
+        #: The bytes the last request file held. Kept only to be handed to
+        #: `serve_advisory_tool_call`, which discards them; it exists so that
+        #: "the payload is discarded" is a step in the real code path rather
+        #: than a property of a code path nothing takes.
+        self._payload = b""
+        #: How many requests have been TAKEN. Stamped into every `PENDING` and
+        #: every answer, and the whole of the staleness defence: the agent
+        #: cannot delete the result file (it has no delete tool), so between
+        #: writing its second request and the watcher taking it, the file still
+        #: holds the FIRST answer. An unstamped protocol would let a green
+        #: answer to an older tree be read as an answer to the current one —
+        #: a fail-open, and the expensive kind, since it would be believed.
+        self._served = 0
+
+    # ---- the paths ----------------------------------------------------------
+
+    @property
+    def request_path(self) -> Path:
+        return self._root / ADVISORY_REQUEST_FILE
+
+    @property
+    def result_path(self) -> Path:
+        return self._root / ADVISORY_RESULT_FILE
+
+    @property
+    def _tmp_path(self) -> Path:
+        return self._root / ADVISORY_RESULT_TMP_FILE
+
+    def brief(self) -> str:
+        """The prompt section describing this channel."""
+        return _advisory_instruction(self._service.max_calls)
+
+    # ---- lifecycle ----------------------------------------------------------
+
+    def start(self) -> None:
+        """Sweep, expose, and begin watching. Idempotent enough to be safe: a
+        second call replaces nothing, because `_run_implementation` calls it
+        once."""
+        self._sweep()
+        self._service.expose()
+        self._stopping.clear()
+        self._thread = threading.Thread(
+            target=self._watch, name="autoloop-advisory-validation", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop watching and leave no trace. Safe if `start()` never ran.
+
+        Order matters, and the two orders a publish can take are both covered.
+        `_stopping` is set FIRST (an `Event` needs no lock of its own), so a run
+        still in flight finds it set when it reaches `_publish` and writes
+        nothing at all. Then the thread is joined, bounded, so the ordinary case
+        never races. Then the sweep runs UNDER THE LOCK, so a publish that had
+        already passed its check either completed its write before the sweep
+        (which then removes it) or waits behind the sweep and finds `_stopping`
+        set. Either way nothing survives `stop()`.
+        """
+        self._stopping.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=self._join_timeout)
+        with self._lock:
+            self._sweep()
+
+    def _watch(self) -> None:
+        # Never raises: an exception here would kill the watcher silently and
+        # the agent would poll a result file that never appears. `serve_once`
+        # is already total; this is the second layer.
+        while not self._stopping.is_set():
+            try:
+                self.serve_once()
+            except Exception:  # noqa: BLE001 — see above
+                pass
+            # `wait` rather than `sleep`, so `stop()` is not held up by a tick.
+            self._stopping.wait(self._poll)
+
+    # ---- serving ------------------------------------------------------------
+
+    def serve_once(self) -> bool:
+        """Answer ONE pending request, if there is one. True when one was.
+
+        Called on a timer by `_watch`, and directly by tests — the same entry
+        point, so what the tests exercise is what production runs.
+        """
+        if not self._take_request():
+            return False
+        ordinal = self._served
+        text = serve_advisory_tool_call(self._service, self._payload)
+        self._publish(f"{ADVISORY_RESULT_PREFIX} #{ordinal} — {text}")
+        return True
+
+    def _take_request(self) -> bool:
+        """Consume a request and announce that it is running. True if there was
+        one.
+
+        Everything that touches the filesystem here happens under the lock and
+        behind the stopping check, so a request arriving as the round ends is
+        either fully served or not started — never half-served with a file left
+        behind.
+        """
+        with self._lock:
+            if self._stopping.is_set() or self._broken:
+                return False
+            path = self.request_path
+            try:
+                present = path.is_symlink() or path.exists()
+            except OSError:
+                return False
+            if not present:
+                return False
+            self._payload = _read_bytes_or_empty(path)
+            self._served += 1
+            if not _remove_entry(path):
+                # The request cannot be consumed, so serving it would re-serve
+                # it on every tick until the cap absorbed the loop. Say so once
+                # and stop, rather than spinning or going quiet.
+                self._broken = True
+                self._write_result(
+                    f"{ADVISORY_RESULT_PREFIX} #{self._served} — {NOT_RUN}: the "
+                    f"executor could not consume `{ADVISORY_REQUEST_FILE}` "
+                    "(something that is not a removable file is sitting at that "
+                    "path), so nothing was executed and no further request can "
+                    f"be made this round. {NOT_RUN} is not a pass."
+                )
+                return False
+            self._write_result(
+                f"{ADVISORY_PENDING_PREFIX} #{self._served} — your advisory "
+                "validation run has started. Re-read this file until it reads "
+                f"`{ADVISORY_RESULT_PREFIX} #{self._served}`; a full run takes "
+                "minutes."
+            )
+            return True
+
+    def _publish(self, text: str) -> None:
+        with self._lock:
+            if self._stopping.is_set():
+                # The round is over. Writing now would put residue in the tree
+                # AFTER the sweep, i.e. an out-of-scope path on the record.
+                return
+            self._write_result(text)
+
+    def _write_result(self, text: str) -> None:
+        """Stage, then rename. A reader must never see half an answer — the
+        agent polls this file, and a torn read of a `RESULT` header with no body
+        is indistinguishable from a run that reported nothing.
+
+        Never raises: called under the lock from the watcher thread, where an
+        exception would end the watcher and leave the agent polling forever.
+        """
+        tmp = self._tmp_path
+        try:
+            tmp.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+            os.replace(tmp, self.result_path)
+        except OSError:
+            _remove_entry(tmp)
+
+    def _sweep(self) -> None:
+        """Remove every trace of the channel. Total, and never raises."""
+        for path in (self.request_path, self.result_path, self._tmp_path):
+            _remove_entry(path)
+
+
+def _read_bytes_or_empty(path: Path) -> bytes:
+    """The request file's content, or `b""` — which is the same thing here.
+
+    Nothing reads what this returns: it goes straight to
+    `serve_advisory_tool_call`, which deletes it. It is read at all so that the
+    discard is a real step on the real path, and it is read DEFENSIVELY because
+    the alternative (an exception) would abort a request the agent is waiting
+    on. A symlink is not followed — a request file that points somewhere else
+    yields nothing, rather than making the loop read a file of the agent's
+    choosing for no reason.
+    """
+    try:
+        if path.is_symlink():
+            return b""
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
+def _remove_entry(path: Path) -> bool:
+    """Make `path` not exist. True when it is gone afterwards (including when
+    it never existed).
+
+    The blast radius is one of three FIXED names joined onto the round's own
+    root — the agent contributes no part of it, so there is no traversal to
+    defend against and the recursive branch below cannot reach anything but a
+    directory the channel itself named. That branch exists because `Write`
+    creates parent directories: an agent that writes
+    `.autoloop-validation-request/note.txt` leaves a DIRECTORY at the request
+    path, and a sweep that gave up there would leave residue outside every
+    task's approved paths, which parks the candidate.
+
+    A symlink is removed as the LINK and never followed, so a link pointing out
+    of the worker repo costs the link and leaves its target alone.
+    """
+    try:
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink()
+    except OSError:
+        pass
+    try:
+        return not (path.is_symlink() or path.exists())
+    except OSError:
+        return False
 
 
 #: The line shape an assumption is reported on: the DECLARATION form and only
@@ -644,7 +1418,10 @@ _DECOMPOSITION_HEADER = (
 
 
 def _agent_prompt(
-    task: Task, feedback: str | None, cleanup_paths: tuple[str, ...] = ()
+    task: Task,
+    feedback: str | None,
+    cleanup_paths: tuple[str, ...] = (),
+    advisory_brief: str = "",
 ) -> str:
     parts = [
         "You are a write-capable coding subagent inside an automated "
@@ -697,6 +1474,16 @@ def _agent_prompt(
         # one.
         _authoring_rules(),
     ]
+    if advisory_brief:
+        # Rendered ONLY when a rendezvous is actually running for this round
+        # (`AdvisoryValidation.offerable`), because a brief describing a channel
+        # nothing answers would spend the agent's turns polling a file that
+        # never appears — the same "told about a capability it does not have"
+        # failure `_cleanup_instruction` avoids by staying silent. Placed after
+        # the unconditional sections so it displaces none of them: the
+        # adversarial instruction still names the scope list "below" and still
+        # sits immediately above it.
+        parts.append(advisory_brief)
     cleanup = _cleanup_instruction(cleanup_paths)
     if cleanup:
         # After the ground rules, which say the agent cannot run commands, and
@@ -839,6 +1626,7 @@ class ImplementExecutor:
         agent_runner_factory: Callable[[Path], AgentRunner] | None = None,
         validation_env: ValidationEnv | None = None,
         cleanup_paths_for: Callable[[str], tuple[str, ...]] | None = None,
+        advisory_max_calls: int = ADVISORY_VALIDATION_MAX_CALLS,
     ):
         """`git` / `agent_runner` are the STANDALONE bindings — used verbatim
         whenever `worker_repo_root_for` is not supplied (every direct
@@ -887,6 +1675,11 @@ class ImplementExecutor:
         # `execute()` test, and any embedder that does not wire it — means NO
         # cleanup authority at all, which is the fail-closed default.
         self._cleanup_paths_for = cleanup_paths_for
+        # How many advisory runs ONE round may pay for. A constructor override
+        # rather than a config key: a key would have to be read in `cli.py` and
+        # threaded through from there, and a setting nothing reads is worse than
+        # no setting at all.
+        self._advisory_max_calls = advisory_max_calls
 
     # ---- TaskExecutor -------------------------------------------------------
 
@@ -998,6 +1791,70 @@ class ImplementExecutor:
         )
         return removed, tuple(sorted(ignored))
 
+    def _validation_commands_for(self, task: Task) -> tuple[tuple[str, ...], ...]:
+        """The commands THIS round validates with.
+
+        A task may declare its own validation. Without that the configured
+        default (ruff + the autoloop and root-pipeline suites) runs for every
+        task regardless of what it touched — so a change under
+        `lexy-app/backend` would pass validation with nothing exercising it,
+        including the test the agent just wrote. An empty `task.validation`
+        keeps the configured default, which is right for tasks the default does
+        cover.
+
+        Extracted so the advisory run and the authoritative run are ONE
+        computation rather than two descriptions of one. Two would eventually
+        disagree, and the shape of that disagreement is the worst one available
+        here: the agent proving a green run against commands the executor was
+        never going to use.
+        """
+        return tuple(task.validation) or self._validation_commands
+
+    @staticmethod
+    def _validation_cwd_for(task: Task, git: GitGateway) -> Path:
+        """Where those commands run. Pure path arithmetic — whether the
+        directory EXISTS is a separate question, answered where the answer is
+        acted on (`_run_implementation` returns an honest error for the
+        executor's own run; `AdvisoryValidation.run` returns `NOT_RUN` text for
+        the agent's). Computing it here and checking it there is what lets this
+        be called before the agent runs without moving that check."""
+        if task.validation_cwd:
+            return git.repo_root / task.validation_cwd
+        return git.repo_root
+
+    def _advisory_for(self, task: Task, git: GitGateway) -> AdvisoryValidation:
+        """The zero-argument validation call this round would offer its agent.
+
+        Every input is bound here, from this executor's own state and this
+        task's own record: the commands, the directory, the runner and the
+        credentials. The returned object has no parameter through which any of
+        them could be replaced — see `AdvisoryValidation`.
+
+        Never raises, and that is not decoration. This is built on EVERY round
+        now, including the agent-failure and changed-nothing paths that
+        returned before `task.validation` was ever read — so a record
+        `TaskRegistry.from_dict`'s coercion did not produce (`validation=None`
+        on a hand-built `Task`) would turn a round that used to report its
+        failure honestly into an unhandled exception out of `execute()`, which
+        nothing at the orchestrator's call site catches. The fallback binds
+        NOTHING to run, which `run()` reports as `NOT_RUN`. The AUTHORITATIVE
+        run is deliberately left to meet the same value unguarded wherever it
+        reaches it: this protects the advisory channel, it does not paper over
+        a bad record.
+        """
+        try:
+            commands = self._validation_commands_for(task)
+            cwd = self._validation_cwd_for(task, git)
+        except Exception:
+            commands, cwd = (), git.repo_root
+        return AdvisoryValidation(
+            commands=commands,
+            cwd=cwd,
+            command_runner=self._command_runner,
+            validation_env=self._validation_env,
+            max_calls=self._advisory_max_calls,
+        )
+
     def _run_implementation(
         self,
         directive: Directive,
@@ -1006,6 +1863,12 @@ class ImplementExecutor:
         agent_runner: AgentRunner,
     ) -> ExecutionOutcome:
         feedback = directive.feedback if directive.decision is Decision.REVISE else None
+        # Bound BEFORE the agent runs, because the agent is who it exists for:
+        # the brief has to name the channel and the watcher has to be up before
+        # the first tool call can reach it.
+        advisory = self._advisory_for(task, git)
+        rendezvous = AdvisoryRendezvous(advisory, git.repo_root)
+        offered = advisory.offerable
         # Read BEFORE the agent runs, because it is what the prompt has to
         # state, and read through the callable rather than from anything the
         # agent or this round produced — see `self._cleanup_paths_for`.
@@ -1013,9 +1876,24 @@ class ImplementExecutor:
         spec = AgentSpec(
             domain=task.id,
             title=task.title,
-            prompt=_agent_prompt(task, feedback, cleanup_paths),
+            prompt=_agent_prompt(
+                task, feedback, cleanup_paths, rendezvous.brief() if offered else ""
+            ),
         )
-        result = agent_runner.run(spec)
+        try:
+            if offered:
+                rendezvous.start()
+            result = agent_runner.run(spec)
+        finally:
+            # TOTAL, and around the agent call ALONE. Every reader of the tree
+            # below — `_partial_work`'s `dirty_paths_all` on the agent-failure
+            # branch, `_apply_recorded_cleanup`, the status read, and the
+            # authoritative validation run — must see a tree with no trace of
+            # the channel, because neither rendezvous path is inside any task's
+            # `approved_paths` and a survivor is an out-of-scope write on the
+            # record. `stop()` sweeps even when `start()` never ran, which is
+            # also what clears residue left by a round that was killed.
+            rendezvous.stop()
         if not result.ok:
             # A failed agent still leaves whatever it had already written in
             # the worker repo, and a reviewer cannot act on "the agent failed"
@@ -1041,6 +1919,11 @@ class ImplementExecutor:
                     f" Partial work left in the worker repository: "
                     f"{partial.describe()}. Validation did not run."
                 )
+            # On this path too, and for the same reason a reviewer is told how
+            # many lines a killed agent left: "wedged having never checked its
+            # work" and "wedged after three red advisory runs" call for
+            # different responses, and only the record can tell them apart.
+            summary += advisory.note()
             return ExecutionOutcome(
                 status="error",
                 summary=summary,
@@ -1079,7 +1962,7 @@ class ImplementExecutor:
                 status="error",
                 summary=(
                     f"task '{task.id}': could not read the worker repo's status "
-                    f"after the agent ran — {exc}"
+                    f"after the agent ran — {exc}" + advisory.note()
                 ),
                 details=result.raw_text,
                 validation="not run",
@@ -1090,33 +1973,36 @@ class ImplementExecutor:
                 summary=(
                     f"task '{task.id}': the implementation agent ran but changed "
                     "no files in its worker repo — nothing to review"
+                    + advisory.note()
                 ),
                 details=result.raw_text,
                 validation="not run",
             )
 
-        # A task may declare its own validation. Without this the configured
-        # default (ruff + the autoloop and root-pipeline suites) runs for every
-        # task regardless of what it touched — so a change under
-        # `lexy-app/backend` would pass validation with nothing exercising it,
-        # including the test the agent just wrote. An empty `task.validation`
-        # keeps the configured default, which is right for tasks the default
-        # does cover.
-        commands = tuple(task.validation) or self._validation_commands
-        validation_cwd = git.repo_root
-        if task.validation_cwd:
-            validation_cwd = git.repo_root / task.validation_cwd
-            if not validation_cwd.is_dir():
-                return ExecutionOutcome(
-                    status="error",
-                    summary=(
-                        f"task '{task.id}': declared validation_cwd "
-                        f"{task.validation_cwd!r} does not exist in the worker repo"
-                    ),
-                    details=result.raw_text,
-                    validation="not run",
-                    changed_paths=tuple(sorted(changed)),
-                )
+        # The SAME two computations the advisory call was bound to — see
+        # `_validation_commands_for` for why they are one function and not two
+        # copies. The `is_dir()` check stays HERE, where its failure is a
+        # reportable outcome of the round; moving it next to the computation
+        # would move a tested error branch for no gain.
+        commands = self._validation_commands_for(task)
+        validation_cwd = self._validation_cwd_for(task, git)
+        if task.validation_cwd and not validation_cwd.is_dir():
+            return ExecutionOutcome(
+                status="error",
+                summary=(
+                    f"task '{task.id}': declared validation_cwd "
+                    f"{task.validation_cwd!r} does not exist in the worker repo"
+                    + advisory.note()
+                ),
+                details=result.raw_text,
+                validation="not run",
+                changed_paths=tuple(sorted(changed)),
+            )
+        # THE AUTHORITATIVE RUN. Independent of everything above: it runs
+        # unconditionally, it runs the full configured list, and it is the only
+        # thing that sets `validation` and decides the status. A green advisory
+        # run does not skip it, shorten it or stand in for it — the agent's runs
+        # are evidence for the AGENT, and this one is evidence for the reviewer.
         passed, validation_summary = run_validation_commands(
             commands,
             validation_cwd,
@@ -1128,7 +2014,7 @@ class ImplementExecutor:
                 status="error",
                 summary=(
                     f"task '{task.id}': validation failed after implementation — "
-                    f"{validation_summary}"
+                    f"{validation_summary}" + advisory.note()
                 ),
                 details=result.raw_text,
                 validation=validation_summary,
@@ -1139,7 +2025,9 @@ class ImplementExecutor:
             status="ok",
             summary=(
                 f"task '{task.id}' implemented: {len(changed)} file(s) changed; "
-                "validation passed." + _cleanup_note(removed, ignored)
+                "validation passed."
+                + _cleanup_note(removed, ignored)
+                + advisory.note()
             ),
             details=result.raw_text,
             validation=validation_summary,
