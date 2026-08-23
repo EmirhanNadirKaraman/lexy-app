@@ -5531,6 +5531,110 @@ written-once rule: a retirement records a decision, this records an observation
 about commits, and a rebase legitimately renames every one of them — the
 continuous re-check is what makes a wrong rewrite visible immediately.
 
+### 9f. Repeated stops for one unchanged situation park (stop-01, 2026-08-23)
+
+**A `stop` is a legitimate verdict and stays one.** One `stop` means a human
+should decide; the session ends, `--continuous` treats it as a clean boundary,
+selects again and opens the next one. Nothing about that changes. What is
+bounded here is the REPETITION.
+
+**What went wrong (2026-08-20).** A lost postcommit binding (bind-01) left
+prof-01 holding an approved, unpublishable candidate. The reviewer refused
+correctly every time, and every refusal was a `stop`:
+
+    20:05:49  stop  "prof-01 still holds the already-approved unpublished
+                     candidate, but this packet is not a postcommit review
+                     packet..."
+    20:10:54  stop  "...this new-session packet cannot authorize its push
+                     without first resurfacing it as a supported postcommit
+                     review packet."
+    20:16:24  stop  "...the controller is repeatedly starting fresh sessions
+                     instead of presenting the required postcommit review
+                     packet needed to publish it."
+
+`stop` ends the session, `--continuous` starts a new one, a new session sends a
+kickoff, the reviewer refuses that too. Three full rounds in fifteen minutes,
+and it would have continued for as long as the process ran. **The part that
+matters most:** `health` reported `code: running`, `open_blockers: 0`,
+`needs_attention: FALSE` throughout. `policy.max_consecutive_failures` is 3, but
+a reviewer-issued `stop` is a VERDICT, not a failure, so nothing counted these.
+Every automated signal said the loop was fine while it burned quota in a
+livelock. It was caught only because a person noticed the phase had not changed.
+
+**What "the same unresolved situation" means.** Not "N stops in a row" — that
+would park a loop legitimately being told to stop about different things. The
+loop compares a FINGERPRINT of the situation
+(`orchestrator._stop_situation_fingerprint`), and two stops are "the same" when
+that digest is unchanged. It covers, one term per dimension:
+
+| Dimension | Term in the digest |
+|---|---|
+| Task identity | `state.current_task`'s id, or `""`. Empty is the incident's own shape: those refusals answered fresh kickoffs, which carry no selected task. |
+| Execution record | Raw bytes of every live `TaskExecutionStore` record, whole. "No change in the execution record" is what the situation is defined by, so picking fields would silently rule some change out of being progress. |
+| Candidate publication | The same term — `published_sha` / `published_at` live inside that record, so a publication IS a change to it. |
+| Registry state | `TaskRegistry.to_dict()`. A completed task, a new task, a block, a re-prioritisation, an approved decomposition all move it. |
+| Phase progress | Invariant at the observation point rather than missing: `_dispatch` only ever runs from `executing`, so the phase is the same string for every stop and can distinguish nothing. Progress that would have shown as a phase change shows in the three terms above instead. |
+
+**The reviewer's reason text is deliberately NOT in it.** The three refusals
+above were worded differently while describing one situation, so a text-keyed
+counter would have missed the incident entirely. Two stops about genuinely
+different things differ in the STATE, which is why "different reasons do not
+park" is really "different situations do not park". Repository HEAD is out too:
+publication is already covered, and HEAD moves for unrelated reasons (a merge
+sweep landing another task's work, an operator commit) that would hand the
+livelock a way to reset itself.
+
+**Reset on progress.** Any change to any term restarts the count at 1. Nothing
+enumerates the ways progress can happen — a published candidate, a completed
+task, a new candidate, a registry mutation — because each of them is already a
+change to one of the terms above.
+
+**The threshold is three, and three costs three reviewer turns.** Each cycle is
+one full reviewer turn plus one packet build; the incident's own cadence makes
+that about five minutes of wall clock. The park fires ON the third matching
+stop, so the ceiling is **three reviewer turns and three packet builds** — about
+ten to eleven minutes — of which the last two sessions are the wasted ones. Two
+was rejected: a reviewer legitimately declining twice in a row while an operator
+works in another window is ordinary, and a false park spends the very thing this
+mechanism is protecting (a human's attention). Above three the saving shrinks —
+a fourth cycle buys no new evidence, since the fingerprint is already identical
+— while the quota burned grows linearly. The number lives in exactly one place,
+`orchestrator.MAX_REPEATED_STOPS`.
+
+**The park is an ordinary blocker, not a quiet exit.** The whole failure was
+automated monitoring staying green, so the third matching stop goes through
+`_to_needs_user` like every other park: `kind="loop_fatal"`,
+`code="stop_livelock"`, a durable `blockers.Blocker`, `phase=needs_user`. So
+`health` reports `stuck_blocked` with `needs_attention: true`, the heartbeat
+publishes `open_blockers: 1`, the AFK monitor alarms, `python -m autoloop
+blockers` lists it and `answer <id> "..."` clears it. `loop_fatal` rather than
+`task_fatal` because repeated identical refusals are evidence about the
+CONTROLLER — in the incident the reviewer was right every time — and
+quarantining whichever task happens to be named would assert that the rest of
+the roadmap can proceed, which is exactly what nobody knows.
+
+**The blocker quotes the reviewer's last reason verbatim.** In this incident the
+reviewer's text WAS the diagnosis: it named the controller's fault precisely. An
+operator reading only "stopped repeatedly" would have had to rediscover it.
+
+**The park clears the counter.** Left at the ceiling, the next stop after an
+operator answers would park again immediately — a new livelock wearing the old
+one's clothes. Cleared, a relapse costs the same bounded three cycles, and the
+blocker's own `recurrences` is what records that it has happened before.
+
+**A ledger it cannot read parks too**, `code="stop_repetition_ledger_unusable"`,
+naming the file. A counter that cannot be read counts nothing, and reading that
+as "this is the first stop" would restart the count on every stop: the park
+would never fire and no signal would say the detector had stopped working —
+which is the incident again, one level up. The ledger
+(`.autoloop/stop_repetition.json`, `state.StopRepetitionStore`) is disposable;
+delete it and answer the blocker.
+
+**Watching it climb.** `python -m autoloop status` prints a `repeat stops` line
+once anything has been counted (`N consecutive stop(s) about one unchanged
+situation (parks at 3)`), so a forming livelock is visible before it has been
+paid for. No line at all is the ordinary state.
+
 ## 10. Recovery procedures
 
 | Situation | Do |
@@ -5551,6 +5655,8 @@ continuous re-check is what makes a wrong rewrite visible immediately.
 | `doctor`'s `publisher_url_drift` check fails | The main checkout's `origin` changed since the publisher was last provisioned. Verify the NEW destination is actually correct, then `python -m autoloop reprovision-publisher --confirm` (§4d) — the only way the snapshot updates. Any push attempted before that is refused, not silently redirected. |
 | `run --continuous` exited 0 with "continuous mode: exhausted" | Nothing autonomous is left to do — every ready task is done/blocked and the repository fingerprint hasn't changed. `python -m autoloop blockers` lists what's waiting; `answer <id> "..."` each one (unblocking any `task_fatal` task), then restart `run --continuous`. |
 | `run --continuous` exited 2 | A `loop_fatal` park (§9c) — the environment or the operator is the problem, not one task. `python -m autoloop blockers` shows the question (also in `status`); resolve it (fix the environment, or `answer` it if that's enough), then `run --retry`/`--answer` (WITHOUT `--continuous`) before restarting `run --continuous`. |
+| Parked `stop_livelock` | The reviewer answered `stop` three times in a row about one unchanged situation, so the loop parked instead of opening a fourth session (§9f). **Read the blocker's question first** — it quotes the reviewer's last reason verbatim, and in the incident this mechanism was built from, that text named the controller's fault exactly. Fix what it names, then `answer <id> "..."` and `run --answer "..."` (WITHOUT `--continuous`) to resume the parked session before restarting `run --continuous`. The counter was cleared by the park, so a relapse costs the same three cycles rather than parking instantly. |
+| Parked `stop_repetition_ledger_unusable` | `.autoloop/stop_repetition.json` could not be read or written, so the repeated-stop check (§9f) could not run — and the loop parked rather than keep opening sessions with it silently off. The reviewer's stop was NOT acted on. Delete that file (it is a counter; nothing else reads it), `answer <id> "..."`, then `run --answer "..."` to resume. |
 
 ---
 

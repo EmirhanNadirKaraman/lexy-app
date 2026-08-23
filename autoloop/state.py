@@ -109,6 +109,14 @@ if TYPE_CHECKING:
 # session was never preempted, so there is nothing to backfill. `stop_kind` gains
 # no field at all, and every reader of it already gates on the POSITIVE value it
 # wants, so an old `""` keeps reading as unclassified rather than as this.
+#
+# NOT bumped for repeated-stop detection either (`StopRepetition` /
+# `StopRepetitionStore` below). Nothing was added to `LoopState` at all: the
+# ledger is its OWN file under `state_dir` (`stop_repetition_file`), because the
+# thing it counts is a sequence of SESSIONS and a field here would be discarded
+# by the very session replacement it exists to observe. An old state file
+# therefore needs no backfill, and a deployment with no ledger file yet simply
+# starts counting from its next stop.
 SCHEMA_VERSION = 3
 
 
@@ -742,3 +750,166 @@ class StateStore:
         backup = self.path.with_name(f"{self.path.name}.bak-{stamp}")
         os.replace(self.path, backup)
         return backup
+
+
+#: Filename of the repeated-stop ledger under `AutoloopConfig.state_dir`.
+#: Derived rather than added to `AutoloopConfig` so nothing has to be wired:
+#: `Orchestrator.__init__` builds the store from `config.state_dir` itself, and
+#: a guard that a construction site can forget to pass is a guard that switches
+#: itself off the first time somebody adds one.
+STOP_REPETITION_FILENAME = "stop_repetition.json"
+
+
+def stop_repetition_file(state_dir: Path) -> Path:
+    """Where `StopRepetitionStore` keeps its one record."""
+    return Path(state_dir) / STOP_REPETITION_FILENAME
+
+
+@dataclass
+class StopRepetition:
+    """How many times IN A ROW the reviewer has answered `stop` about ONE
+    unresolved situation, and what it last said about it.
+
+    Deliberately NOT a `LoopState` field. A reviewer's `stop` ENDS the session
+    (`Phase.STOPPED`), and `cli._select_and_kickoff` then replaces the whole
+    `LoopState` with a fresh one — so a counter living there would be reset by
+    the very transition it exists to count, and the livelock this record
+    detects (2026-08-20: three kickoff→stop rounds in fifteen minutes) would be
+    invisible in exactly the state it happens in.
+
+    `fingerprint` is `Orchestrator._stop_situation_fingerprint`'s digest of the
+    situation the stop was issued about; `count` is how many consecutive stops
+    have now carried that same digest. A stop with a DIFFERENT fingerprint
+    replaces the record and restarts the count at 1 — that is the whole of
+    "reset on progress", and it is why nothing here has to enumerate the ways
+    progress can happen.
+
+    `last_reason` is the reviewer's own words from the most recent stop, kept
+    verbatim so the park it eventually produces can quote them. In the incident
+    the reviewer's text WAS the diagnosis (it named the controller's fault
+    precisely), and an operator reading only "stopped repeatedly" would have
+    had to rediscover it.
+    """
+
+    fingerprint: str
+    count: int
+    last_reason: str
+    first_seen_at: str
+    last_seen_at: str
+    last_session_id: str = ""
+
+
+class StopRepetitionStore:
+    """The one `StopRepetition` record, as a small JSON file.
+
+    Same crash-safety rule as `blockers.BlockerStore` and
+    `worktask.TaskExecutionStore`: a corrupt record RAISES
+    (`StateCorruptError`) rather than reading as absent. Reading an unreadable
+    ledger as "no stops recorded" would restart the count on every stop, so the
+    park would never fire and nothing would say why — the guard would have
+    switched itself off silently, which is the exact failure shape this whole
+    mechanism exists to end. `Orchestrator._observe_contract_stop` turns the
+    raise into a loop_fatal park naming this file.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def load(self) -> StopRepetition | None:
+        """The stored record, `None` when there is none, `StateCorruptError`
+        when there is one this cannot be trusted to read.
+
+        TYPES ARE CHECKED, not merely unpacked, and that is the whole reason
+        this is not a two-line `StopRepetition(**data)`. `count` is compared
+        against `MAX_REPEATED_STOPS` and incremented; a hand-edited `"3"` would
+        raise `TypeError` from the comparison, deep inside `_dispatch`, where
+        NOTHING catches it — `Orchestrator.run`'s handler chain is by exception
+        type and has no clause for it, so the process would end with a
+        traceback, no park and no blocker, which is the one failure shape this
+        package went out of its way to eliminate (see `run`'s `StateError`
+        clause). Raising here instead routes it to `_observe_contract_stop`,
+        which parks with a record naming this file.
+
+        A count below 1 is refused for the same reason from the other side: it
+        is not a shape the writer produces, and honouring a hand-edited `-1000`
+        would silently postpone the park by a thousand stops — the guard
+        switched off by a plausible-looking number rather than by an error.
+        """
+        if not self.path.exists():
+            return None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise TypeError(f"expected a JSON object, got {type(data).__name__}")
+            record = StopRepetition(**data)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise StateCorruptError(
+                f"stop-repetition ledger {self.path} is unreadable: {exc}"
+            ) from exc
+        # `bool` is an `int` in Python, and `True >= 3` is a legal comparison
+        # that answers False — exactly the quiet wrong answer this rejects.
+        if isinstance(record.count, bool) or not isinstance(record.count, int):
+            raise StateCorruptError(
+                f"stop-repetition ledger {self.path} has a non-integer count "
+                f"{record.count!r}"
+            )
+        if record.count < 1:
+            raise StateCorruptError(
+                f"stop-repetition ledger {self.path} has count {record.count}, "
+                "which no writer produces"
+            )
+        for field_name in ("fingerprint", "last_reason", "first_seen_at",
+                           "last_seen_at", "last_session_id"):
+            if not isinstance(getattr(record, field_name), str):
+                raise StateCorruptError(
+                    f"stop-repetition ledger {self.path} has a non-string "
+                    f"{field_name}"
+                )
+        return record
+
+    def save(self, record: StopRepetition) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(asdict(record), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp, self.path)
+
+    def clear(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+    def observe(
+        self, *, fingerprint: str, reason: str, session_id: str, now: str
+    ) -> StopRepetition:
+        """Record one reviewer `stop` about `fingerprint` and return the
+        updated record — `count == 1` for a situation not seen last time,
+        `previous + 1` for the same one again.
+
+        The comparison is the WHOLE definition of "the same unresolved
+        situation": equality of the caller's digest, never of `reason`. The
+        three refusals in the 2026-08-20 incident were worded differently while
+        describing one situation, so matching on text would have missed it;
+        conversely two stops about genuinely different things carry different
+        digests and each start at 1.
+        """
+        previous = self.load()
+        if previous is not None and previous.fingerprint == fingerprint:
+            record = StopRepetition(
+                fingerprint=fingerprint,
+                count=previous.count + 1,
+                last_reason=reason,
+                first_seen_at=previous.first_seen_at,
+                last_seen_at=now,
+                last_session_id=session_id,
+            )
+        else:
+            record = StopRepetition(
+                fingerprint=fingerprint,
+                count=1,
+                last_reason=reason,
+                first_seen_at=now,
+                last_seen_at=now,
+                last_session_id=session_id,
+            )
+        self.save(record)
+        return record

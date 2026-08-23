@@ -101,6 +101,7 @@ from .lock import LoopLock
 from .manifest import ManifestStore, snapshot as manifest_snapshot
 from . import merge_sweep
 from .orchestrator import (
+    MAX_REPEATED_STOPS,
     PREEMPTION_STOP_KIND,
     SELF_UPGRADE,
     Orchestrator,
@@ -121,7 +122,15 @@ from .publisher import (
     reprovision_publisher as _reprovision_publisher_snapshot,
 )
 from .stall import StallPolicy
-from .state import TERMINAL_PHASES, LoopState, Phase, StateStore, utcnow_iso
+from .state import (
+    TERMINAL_PHASES,
+    LoopState,
+    Phase,
+    StateStore,
+    StopRepetitionStore,
+    stop_repetition_file,
+    utcnow_iso,
+)
 from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from .transcript import TranscriptLogger, build_profile, read_records, render_profile
 from .validation_env import load_validation_env
@@ -1122,6 +1131,22 @@ def _run_continuous(
     as a boundary would kick off a fresh session into the identical wall on the
     very next iteration; see `_report_fault_stop`.
 
+    **A CONTRACT STOP IS STILL A CLEAN BOUNDARY — but not an unlimited one.**
+    Ending the session and selecting again is the right response to one `stop`,
+    and to the second one about something else. It is the wrong response to the
+    same unresolved situation over and over: on 2026-08-20 this loop spent three
+    reviewer turns in fifteen minutes collecting three refusals of one lost
+    postcommit binding, and would have kept going for as long as the process
+    ran, with `health` reporting `running` / `needs_attention: FALSE`
+    throughout. Nothing changes HERE — the bound lives where the stop is
+    dispatched (`orchestrator._handle_contract_stop`), and it converts the
+    `MAX_REPEATED_STOPS`-th consecutive stop about an unchanged situation into
+    an ordinary `loop_fatal` park. This function then handles it through the
+    `outcome == Phase.NEEDS_USER.value` branch above like any other park: a
+    blocker record exists, `health`/the monitor go red, and `python -m autoloop
+    answer <id> "..."` clears it. What the operator sees is the loop stopping
+    with the reviewer's own last words quoted, instead of a green dashboard.
+
     **SELF-UPGRADE.** `Orchestrator.run` can also return `SELF_UPGRADE`: a
     merge has changed the loop's own code and the session has reached a round
     boundary. This is the ONLY place the process replaces itself, and the
@@ -1821,7 +1846,43 @@ def _summary(config: AutoloopConfig, state: LoopState, registry: TaskRegistry) -
         lines.append(f"question     {state.question}")
     if state.stop_reason:
         lines.append(f"stop reason  {state.stop_reason}")
+    repeated = _repeated_stop_display(config)
+    if repeated:
+        lines.append(repeated)
     return "\n".join(lines)
+
+
+def _repeated_stop_display(config: AutoloopConfig) -> str:
+    """The `repeated stop` summary line, or `""` when there is nothing to say.
+
+    Visibility for the counter `orchestrator._handle_contract_stop` keeps: the
+    2026-08-20 livelock was caught only because a person noticed the phase had
+    not changed, so a loop climbing toward `MAX_REPEATED_STOPS` should be
+    readable in `status` BEFORE it has paid for the park.
+
+    Silent — no line at all — when no stop has been counted yet, which is the
+    ordinary state and keeps the summary byte-identical to what it was. Silent
+    for an unreadable ledger too, deliberately unlike `_observe_contract_stop`,
+    which parks on one: this is a status LINE among many and it is not the
+    thing that enforces anything. The enforcement point is the one that must
+    fail closed; failing the whole summary here would hide the rest of the
+    operator-relevant state over a counter file. Same reasoning as
+    `_open_blocker_count_display` beside it, and the same shape of catch —
+    `OSError` included, because a path that is a directory raises that rather
+    than `StateCorruptError`.
+    """
+    try:
+        record = StopRepetitionStore(stop_repetition_file(config.state_dir)).load()
+    except (StateCorruptError, OSError):
+        return ""
+    if record is None or record.count < 1:
+        return ""
+    # `repeat stops ` is 13 characters, the label width every other line in
+    # `_summary` uses (`open blockers` is the same trick with no trailing space).
+    return (
+        f"repeat stops {record.count} consecutive stop(s) about one unchanged "
+        f"situation (parks at {MAX_REPEATED_STOPS})"
+    )
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
