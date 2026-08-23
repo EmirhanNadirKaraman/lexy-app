@@ -39,6 +39,7 @@ from autoloop.dashboard import (
     is_ancestor,
     merge_groups,
     merge_states,
+    naming_ancestor,
     pipeline,
     roadmap_stats,
     task_groups,
@@ -56,13 +57,19 @@ def _clean_dashboard_caches():
     content with a fixed author and no `GIT_AUTHOR_DATE`, so two repos built in
     the same wall-clock second have the SAME commit sha in different
     directories — a verdict keyed on the sha alone would leak across them and
-    fail only near a second boundary."""
+    fail only near a second boundary.
+
+    `_SUBJECT_CACHE` (dash-18) joins them for the same reason and one of its
+    own: it holds `git log --all` for 60s per repo, so without this a `collect`
+    test would judge its own registry against the previous test's commits."""
     import autoloop.dashboard as dash
 
-    for cache in (dash._REMOTE_CACHE, dash._ANCESTRY_CACHE, dash._SHALLOW_CACHE):
+    caches = (dash._REMOTE_CACHE, dash._ANCESTRY_CACHE, dash._SHALLOW_CACHE,
+              dash._SUBJECT_CACHE)
+    for cache in caches:
         cache.clear()
     yield
-    for cache in (dash._REMOTE_CACHE, dash._ANCESTRY_CACHE, dash._SHALLOW_CACHE):
+    for cache in caches:
         cache.clear()
 
 
@@ -1465,6 +1472,373 @@ console.log(JSON.stringify({
     assert "▲ NOT merged" in out["inline"] and "✓ merged" in out["collapsedRows"]
     # The base branch and base head stay visible above the groups.
     assert "autoloop/mainline" in out["head"] and "abc123def456" in out["head"]
+
+
+# ---- a commit naming the task: the third evidence source (dash-18, 2026-08-23) -
+#
+# Measured 2026-08-21: the panel reported `unpublished: 3` — dash-02, pkt-03 and
+# audit-0001 — and all three were done and IN the branch. `git merge-base
+# --is-ancestor 07b659b autoloop/mainline` succeeds for audit-0001, whose commit
+# subject is "repository audit". None of the three had an execution record and
+# origin carried no branch for any of them: they landed by routes that predate
+# the publisher, so `merge_states` fell to its last branch and labelled
+# integrated work as though it had never shipped.
+#
+# The evidence it was missing already exists one section down, shipped by
+# roadmap-01 — `mentions_task_id` + `is_ancestor`, whole-token matching and
+# git's own ancestry answer. This wires that in as a THIRD source rather than
+# writing a second copy of it, and the wiring is bounded by four properties, all
+# asserted below rather than promised:
+#
+# * POSITIVE ONLY. A matching ancestor proves integration; no match, a match
+#   that is not an ancestor, a match git could not resolve, a failed search and
+#   an empty search all leave the row byte-identical to what it is today.
+# * ORDER UNCHANGED. It is consulted only on the final fall-through, so it can
+#   neither overrule a branch git says is not in HEAD nor re-word a row the
+#   execution record already decided.
+# * `unknown` STAYS `unknown`. It lives INSIDE the readable-remote branch: an
+#   ancestor commit does not make an unreachable remote readable.
+# * THE ROW SAYS WHICH EVIDENCE DECIDED IT. A subject-line match is a heuristic
+#   and a published ref is not, and an operator acting on the row has to be able
+#   to tell them apart.
+
+
+def one_completed(task_id="dash-02", title="T"):
+    """The `completed` list `merge_states` takes — one task, nothing else."""
+    return [{"id": task_id, "title": title}]
+
+
+def test_a_commit_naming_a_completed_task_and_in_head_renders_merged():
+    """THE measured case. No execution record, no branch on origin, and a commit
+    whose subject names the task sitting in the branch — which is decidable, and
+    which the panel was throwing away."""
+    commits = [("d" * 40, "Merge task dash-02 (dd28dfa) into autoloop/mainline")]
+
+    rows = merge_states(one_completed(), {}, True, {}, lambda sha: "yes", commits)
+
+    assert rows[0]["state"] == "merged"
+    # The sha that decided it reaches the column, not a blank cell.
+    assert rows[0]["sha"] == "d" * 12
+    assert "names dash-02 in its subject" in rows[0]["detail"]
+    assert "ancestor of HEAD" in rows[0]["detail"]
+
+
+def test_each_evidence_source_says_which_one_decided_the_row():
+    """Three sources, three different confidences, three distinguishable
+    sentences — `git ls-remote` reported the exact ref the publisher wrote, the
+    execution record named a commit, and the third is a match on a subject line.
+    A shared wording would hide the weakest of the three behind the strongest."""
+    def verdict(_sha):
+        return "yes"
+
+    by_ref = merge_states(one_completed("rt-9"), {}, True, {"autoloop/rt-9": "a" * 40}, verdict)
+    by_record = merge_states(
+        one_completed("rt-9"), {"rt-9": {"candidate_sha": "b" * 40}}, True, {}, verdict)
+    by_subject = merge_states(one_completed("rt-9"), {}, True, {}, verdict,
+                              [("c" * 40, "rt-9: the work")])
+
+    assert [r[0]["state"] for r in (by_ref, by_record, by_subject)] == ["merged"] * 3
+    details = [r[0]["detail"] for r in (by_ref, by_record, by_subject)]
+    assert len(set(details)) == 3, f"an operator cannot tell these apart: {details}"
+    # The heuristic is the one that has to name itself, because it is the one
+    # whose evidence is a string a human typed.
+    assert "subject" in details[2]
+    assert "subject" not in details[0] and "subject" not in details[1]
+
+
+def test_no_commit_names_the_task_and_the_row_is_byte_identical_to_today():
+    """Absence of a mention is not evidence. The ancestry stub says "yes" to
+    everything here, so a row that flipped would be one matched by something
+    other than the subject."""
+    commits = [("a" * 40, "second"), ("b" * 40, "Merge task pkt-03 (0fcc1c6)")]
+
+    before = merge_states(one_completed("t-ghost"), {}, True, {}, lambda sha: "yes")
+    after = merge_states(one_completed("t-ghost"), {}, True, {}, lambda sha: "yes", commits)
+
+    assert after == before
+    assert before[0]["state"] == "unpublished"
+    assert "never pushed" in before[0]["detail"] and before[0]["sha"] == ""
+
+
+def test_a_failed_search_and_an_empty_one_can_never_move_a_row():
+    """`None` (git would not answer) and `[]` (it answered, nothing is there)
+    are different facts and neither is evidence of integration. This is the
+    fail-open shape to watch: a guard that switches itself off when the material
+    it needs is missing, and merges the row because nothing said not to."""
+    baseline = merge_states(one_completed(), {}, True, {}, lambda sha: "yes")
+
+    for commits in (None, [], (), [("", "")]):
+        assert merge_states(one_completed(), {}, True, {}, lambda sha: "yes", commits) == baseline
+    assert baseline[0]["state"] == "unpublished"
+
+
+def test_the_source_is_optional_so_an_uninformed_caller_is_unchanged():
+    """`commits` defaults to `None`, so every existing call site — and any
+    caller with no search to offer — gets exactly the classification it got
+    before this source existed."""
+    assert (merge_states(one_completed(), {}, True, {}, lambda sha: "yes")
+            == merge_states(one_completed(), {}, True, {}, lambda sha: "yes", None))
+
+
+def test_a_matching_commit_that_is_not_an_ancestor_does_not_flip_the_row():
+    """Naming the task is the thing to TEST, never the answer. A commit sitting
+    on a branch nobody merged names it just as well as one that landed."""
+    commits = [("e" * 40, "dash-02: on a branch nobody merged")]
+
+    rows = merge_states(one_completed(), {}, True, {}, lambda sha: "no", commits)
+
+    assert rows[0]["state"] == "unpublished"
+    assert rows[0]["sha"] == "", "a non-ancestor must not reach the sha column"
+
+
+def test_a_match_git_could_not_resolve_is_not_read_as_integration():
+    """The fail-open case this source is easiest to get wrong: the test has to
+    be `== "yes"` and never `!= "no"`. `is_ancestor` answers `"unknown"` for an
+    unreadable repository and for a shallow clone, and reading an unanswered
+    question as integration asserts a merge nobody observed."""
+    commits = [("f" * 40, "dash-02: shipped")]
+
+    rows = merge_states(one_completed(), {}, True, {}, lambda sha: "unknown", commits)
+
+    assert rows[0]["state"] == "unpublished"
+
+
+def test_the_match_is_whole_token_so_pkt_03_is_not_satisfied_by_pkt_030():
+    """`mentions_task_id` owns this and is reused rather than reimplemented, so
+    the boundary is the task-id alphabet on both sides. `pkt-030`, `x-pkt-03`
+    and `pkt-03.5` are three other real, legal ids."""
+    decoys = [("a" * 40, "pkt-030: a different task entirely"),
+              ("b" * 40, "x-pkt-03 and pkt-03.5 are two more")]
+
+    rows = merge_states(one_completed("pkt-03"), {}, True, {}, lambda sha: "yes", decoys)
+    assert rows[0]["state"] == "unpublished", "a substring match is a wrong positive"
+
+    # …and the same list plus a real whole-token mention DOES decide the row, so
+    # this is matching rather than never matching.
+    rows = merge_states(one_completed("pkt-03"), {}, True, {}, lambda sha: "yes",
+                        decoys + [("c" * 40, "pkt-03, part 4")])
+    assert rows[0]["state"] == "merged" and rows[0]["sha"] == "c" * 12
+
+
+def test_a_row_with_no_id_matches_nothing_rather_than_every_commit():
+    """An empty id must not become a wildcard — that is how a malformed registry
+    row would read as merged against whatever commit happens to be first."""
+    commits = [("a" * 40, "Merge task dash-02 into autoloop/mainline")]
+
+    rows = merge_states([{"title": "no id at all"}], {}, True, {},
+                        lambda sha: "yes", commits)
+
+    assert rows[0]["id"] == "" and rows[0]["state"] == "unpublished"
+
+
+def test_an_unreadable_remote_stays_unknown_even_with_a_naming_ancestor():
+    """An ancestor commit does not make an unreachable remote readable. The
+    third source sits INSIDE the readable-remote branch for exactly this: a row
+    nobody could judge has to keep saying so."""
+    commits = [("a" * 40, "dash-02: shipped")]
+
+    rows = merge_states(one_completed(), {}, False, {}, lambda sha: "yes", commits)
+
+    assert rows[0]["state"] == "unknown"
+    assert "unverified" in rows[0]["detail"]
+
+
+def test_the_first_two_evidence_sources_still_decide_their_own_rows():
+    """Order of evidence is unchanged. The third source is reached only on the
+    fall-through, so it can neither overrule a branch git says is NOT in HEAD
+    nor re-word a row the execution record already decided — both of which it
+    would do here if it were consulted first, since it matches in both."""
+    def verdict(sha):
+        return {"a" * 40: "no", "b" * 40: "yes"}.get(sha, "yes")
+
+    record = {"rt-10": {"task_branch": "autoloop/rt-10", "candidate_sha": "b" * 40}}
+    commits = [("c" * 40, "rt-10: also named here, and an ancestor")]
+
+    on_origin = merge_states(one_completed("rt-10"), record, True,
+                             {"autoloop/rt-10": "a" * 40}, verdict, commits)
+    assert on_origin[0]["state"] == "unmerged"
+    assert on_origin[0]["detail"] == f"on origin at {'a' * 12}, not in HEAD"
+    assert on_origin[0]["sha"] == "a" * 12
+
+    from_record = merge_states(one_completed("rt-10"), record, True, {}, verdict, commits)
+    assert from_record[0]["state"] == "merged"
+    assert from_record[0]["detail"] == f"no branch on origin; commit {'b' * 12} is in HEAD"
+    assert from_record[0]["sha"] == "b" * 12
+
+
+def test_ancestry_is_asked_only_about_commits_whose_subject_names_the_task():
+    """Matching GATES the ancestry check rather than running beside it. The
+    negative is the load-bearing half: an implementation that asked git about
+    every commit and then matched the subject would pass every state assertion
+    above and walk the whole log for each row."""
+    asked = []
+
+    def verdict(sha):
+        asked.append(sha)
+        return "yes"
+
+    commits = [("a" * 40, "unrelated"), ("b" * 40, "dash-02: shipped"),
+               ("c" * 40, "also unrelated")]
+
+    assert naming_ancestor("dash-02", commits, verdict) == "b" * 40
+    assert asked == ["b" * 40], "ancestry must be asked only about matches"
+
+
+def test_the_named_sha_is_the_first_match_in_log_order():
+    """`shipped_states`' own convention, so the merge panel and `shipped-report`
+    cannot name two different commits for a task that shipped as four."""
+    commits = [("a" * 40, "pkt-03, part 1"), ("b" * 40, "pkt-03, part 2"),
+               ("c" * 40, "pkt-03, part 3")]
+
+    assert naming_ancestor("pkt-03", commits, lambda sha: "yes") == "a" * 40
+    # …and a first match git says is NOT an ancestor does not stop the search.
+    assert naming_ancestor(
+        "pkt-03", commits, lambda sha: "no" if sha == "a" * 40 else "yes") == "b" * 40
+
+
+def naming_commit_fixture(tmp_path, subject="Merge task t-ghost (0fcc1c6) into work"):
+    """`merge_fixture`'s repo plus one commit on the observed branch whose
+    subject names `t-ghost` — a task with no execution record and no branch on
+    origin, i.e. the production shape of all three measured rows."""
+    repo, _, _ = merge_fixture(tmp_path)
+    (repo / "shipped.txt").write_text("shipped\n")
+    run_git(repo, "add", "shipped.txt")
+    run_git(repo, "commit", "-q", "-m", subject)
+    return repo, run_git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_a_task_named_by_an_ancestor_commit_renders_merged_end_to_end(tmp_path):
+    """The claim, against a real repository and through the payload the page
+    renders. A pure-function test cannot show this: the title says DISPLAY, and
+    the wiring — `merge_report` fetching the search and handing it down — is
+    where it would silently not happen."""
+    repo, sha = naming_commit_fixture(tmp_path)
+    write_registry(repo, [completed("t-ghost")])   # no record, no branch on origin
+
+    payload = collect(repo)
+    row = by_id(payload)["t-ghost"]
+
+    assert row["state"] == "merged", "integrated work must not read as unpublished"
+    assert row["sha"] == sha[:12]
+    assert "names t-ghost in its subject" in row["detail"]
+    assert payload["merge"]["counts"] == {"merged": 1, "unmerged": 0,
+                                          "unpublished": 0, "unknown": 0}
+    # …and it renders in the merged GROUP, which is what the panel actually
+    # draws — a row classified merged and grouped elsewhere is still misfiled.
+    groups = merge_groups_by_key(payload["merge"]["groups"])
+    assert [r["id"] for r in groups["merged"]["rows"]] == ["t-ghost"]
+    assert groups["unpublished"]["rows"] == []
+
+
+def test_the_same_task_with_no_naming_commit_still_renders_unpublished(tmp_path):
+    """The other half of the claim: this must not have turned `unpublished` into
+    a state nothing reaches. Same repository, same registry, one word changed in
+    the commit subject."""
+    repo, _ = naming_commit_fixture(tmp_path, subject="an unrelated commit")
+    write_registry(repo, [completed("t-ghost")])
+
+    row = by_id(collect(repo))["t-ghost"]
+
+    assert row["state"] == "unpublished"
+    assert "never pushed" in row["detail"]
+
+
+def test_an_unreachable_origin_stays_unknown_even_with_the_commit_in_the_branch(tmp_path):
+    """End-to-end version of the `unknown` bound. The commit naming the task is
+    right there in the branch and git will confirm it — and the row must still
+    say the remote could not be read, because it could not."""
+    import autoloop.dashboard as dash
+
+    repo, _ = naming_commit_fixture(tmp_path)
+    write_registry(repo, [completed("t-ghost")])
+    # A path that is not a repository fails instantly; an unroutable URL would
+    # sit on the ls-remote timeout and stall the suite instead.
+    run_git(repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    calls = []
+    original = dash.commit_subjects
+
+    def counted(target):
+        calls.append(target)
+        return original(target)
+
+    dash.commit_subjects = counted
+    try:
+        payload = collect(repo)
+    finally:
+        dash.commit_subjects = original
+
+    assert payload["merge"]["remote_ok"] is False
+    assert by_id(payload)["t-ghost"]["state"] == "unknown"
+    # …and the walk is skipped outright, because no row can reach the third
+    # source with the remote unreadable. The same bound, stated at the call site
+    # in `merge_report` as well as inside `merge_states`.
+    assert calls == [], "a search whose result cannot be used must not run"
+
+
+def test_the_subject_search_writes_nothing_to_the_observed_checkout(tmp_path):
+    """`git log --all` runs on the 2s poll now, so it joins everything else here
+    under the read-only rule: the loop's escape detector refuses a write-capable
+    task if the primary checkout is dirty. `--no-optional-locks` is injected at
+    `_run_status`, the single subprocess entry point, so this inherits it — and
+    this is the test that would notice if a call were ever added around it."""
+    repo, _ = naming_commit_fixture(tmp_path)
+    write_registry(repo, [completed("t-ghost")])
+    # Order matters: `run_git` here does NOT pass --no-optional-locks, so it
+    # rewrites .git/index. Snapshot AFTER it, or the test measures its own
+    # side effect and blames the tracker.
+    status_before = run_git(repo, "status", "--porcelain")
+    before = snapshot(repo)
+
+    row = by_id(collect(repo))["t-ghost"]
+
+    assert row["state"] == "merged", "the search must actually have run"
+    assert snapshot(repo) == before, "the tracker must not create, remove or touch any file"
+    assert run_git(repo, "status", "--porcelain") == status_before
+
+
+def test_the_subject_search_is_cached_so_the_2s_poll_does_not_walk_every_ref(tmp_path):
+    """The cost bound. `shipped-report` asks this once; the panel asks it on
+    every poll, and it is the only read there whose cost grows with history —
+    so it is memoized per repo exactly like `ls-remote`, and `shipped_report`
+    still calls `commit_subjects` directly so a one-shot report never reads a
+    cached answer."""
+    import autoloop.dashboard as dash
+
+    repo, _ = naming_commit_fixture(tmp_path)
+    write_registry(repo, [completed("t-ghost")])
+    calls = []
+    original = dash.commit_subjects
+
+    def counted(target):
+        calls.append(target)
+        return original(target)
+
+    dash.commit_subjects = counted
+    try:
+        assert by_id(collect(repo))["t-ghost"]["state"] == "merged"
+        assert by_id(collect(repo))["t-ghost"]["state"] == "merged"
+    finally:
+        dash.commit_subjects = original
+
+    assert len(calls) == 1, f"the log walk ran {len(calls)} times across two polls"
+
+
+def test_a_stale_cached_search_can_still_only_be_positive_evidence(tmp_path):
+    """Caching `None` is safe by construction rather than by luck: the evidence
+    is positive-only, so the worst a stale "the search failed" can do is leave a
+    row reading as it did before this source existed. It is never allowed to
+    freeze a VERDICT — it holds no verdicts, only the material one is read
+    from."""
+    import autoloop.dashboard as dash
+
+    repo, _ = naming_commit_fixture(tmp_path)
+    write_registry(repo, [completed("t-ghost")])
+    dash._SUBJECT_CACHE[str(repo)] = {"at": time.time(), "commits": None}
+
+    row = by_id(collect(repo))["t-ghost"]
+
+    assert row["state"] == "unpublished", "a failed search must never assert a merge"
+    assert "never pushed" in row["detail"]
 
 
 # ---- the roadmap, grouped by state (2026-08-15) -------------------------------
