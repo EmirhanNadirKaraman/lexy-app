@@ -321,11 +321,97 @@ class AuditConfig:
     test_selection: str = TEST_SELECTION_REACHABLE
 
 
+#: What the unconfigured `[paths].state_dir` is called, as a SIBLING of
+#: `workers_root` (port-01, 2026-08-23). Everything writable the loop keeps
+#: between steps — `state.json`, `tasks.json`, the lock, the transcript, the
+#: publisher repo, executions, blockers — lives under it, so this is the last
+#: of the loop's own writable paths to leave the checkout. The inbox, the
+#: PAUSE flag, the heartbeat and the mutation ledger went first, for the one
+#: reason that applies here too: `escape_detector` snapshots the checkout
+#: around every write-capable agent call INCLUDING ignored paths, so loop
+#: state written inside it mid-round is indistinguishable from an agent
+#: writing where it may not.
+DEFAULT_STATE_DIR_NAME = "state"
+
+#: The pre-port-01 default, kept as a name rather than a path because that is
+#: all it ever was: `Path(".autoloop")`, resolved against the PROCESS CWD at
+#: every use — i.e. inside the checkout for any run started from it, and
+#: pointing at a directory that does not exist for anything else (see
+#: `docs/COMMON_ERRORS.md`, "An autoloop CLI run from a sibling worktree
+#: reports on an EMPTY state dir"). Also the directory the config file itself
+#: lives in (`cli.DEFAULT_CONFIG` is `.autoloop/config.toml`), which is what
+#: `legacy_state_dir_for` uses to find it.
+LEGACY_STATE_DIR_NAME = ".autoloop"
+
+
+def default_state_dir(workers_root: Path) -> Path:
+    """Where writable loop state goes when `[paths].state_dir` is unset.
+
+    Beside `workers_root`, exactly like `inbox.inbox_dir_for`,
+    `AutoloopConfig.pause_file`, `AutoloopConfig.heartbeat_file` and
+    `tasks.mutation_ledger_for` — that path is already required to be absolute
+    and outside the checkout, its `.git`, the state dir and the publisher paths
+    (`worker_env.validate_workers_root`), so a sibling of it inherits the same
+    guarantee without a second rule about where it may point.
+
+    Absolute by construction, because `workers_root` is (`load_config` refuses
+    a relative one). That is the second thing this fixes: the old default was
+    relative, so every command resolved the state dir against its own cwd and a
+    run from the wrong directory reported confidently on an empty one.
+    """
+    return Path(workers_root).expanduser().parent / DEFAULT_STATE_DIR_NAME
+
+
+def legacy_state_dir_for(config_path: Path) -> Path | None:
+    """The pre-port-01 in-checkout state directory for THIS deployment, or
+    `None` when there is nothing to point at.
+
+    Derived from the config file's own location rather than from a literal
+    `Path(LEGACY_STATE_DIR_NAME)`, because the config has always lived INSIDE
+    the state dir — `cli.DEFAULT_CONFIG` is `.autoloop/config.toml` and
+    `config_writer` refuses to rewrite the file unless git is verifiably not
+    tracking it, i.e. unless it sits in the gitignored state dir. So the
+    directory holding the config IS the old state dir, whatever cwd the
+    command ran from and wherever `--config` pointed.
+
+    Gated on the directory NAME so it fires only for that shape. A config kept
+    anywhere else belongs to an operator who has already said where their state
+    lives, and guessing a state dir from an arbitrary parent directory would
+    hand `workers_dir` a fallback pointing at something that is not a state dir
+    at all.
+
+    Returned UNRESOLVED, so it inherits exactly the resolution the old default
+    had: `.autoloop/config.toml` yields `.autoloop`, relative, read against the
+    caller's cwd — byte-identical to what `state_dir` used to be. Read-only by
+    contract: nothing derives a write target from this (see
+    `AutoloopConfig.workers_dir`, its one consumer).
+    """
+    parent = Path(config_path).parent
+    return parent if parent.name == LEGACY_STATE_DIR_NAME else None
+
+
 @dataclass(frozen=True)
 class AutoloopConfig:
     browser: BrowserConfig
     policy: PolicyConfig
+    #: THE write target for every path below. Since port-01 (2026-08-23) an
+    #: unconfigured one resolves OUTSIDE the checkout (`default_state_dir`);
+    #: an explicit `[paths].state_dir` is still honoured verbatim, unchanged,
+    #: which is how an existing deployment keeps its state exactly where it is.
     state_dir: Path
+    #: The pre-port-01 in-checkout state dir (`legacy_state_dir_for`), or
+    #: `None`. READ-ONLY, and set ONLY when the default moved out from under a
+    #: deployment — an explicitly configured `state_dir` did not move, so it
+    #: gets `None` and nothing here changes for it.
+    #:
+    #: Deliberately NOT a general read-through fallback: exactly one property
+    #: consults it (`workers_dir`, whose entire job is finding what a previous
+    #: layout left behind, and which nothing writes to). Every other path below
+    #: resolves under `state_dir` and only `state_dir`, because a read that can
+    #: silently become a write is how loop state would land back inside the
+    #: snapshotted tree. `state.json`, `tasks.json` and the lock are therefore
+    #: NOT read from here — see `docs/AUTOLOOP.md` §3h for the one-line remedy.
+    legacy_state_dir: Path | None = None
     #: EXTERNAL worker-repo location (Autoloop M1 finding #1) — `None` is a
     #: valid dataclass value (every direct `AutoloopConfig(...)` construction
     #: across the test suite predates this field and does not set it) but is
@@ -472,8 +558,34 @@ class AutoloopConfig:
         docstring). Kept only so `doctor.py` / the CLI can find and report on
         worker repos a pre-fix deployment left behind here (finding #1's
         "migrate or safely abandon existing disposable workers" — reported,
-        never moved)."""
-        return self.state_dir / "workers"
+        never moved).
+
+        **The one place `legacy_state_dir` is read** (port-01, 2026-08-23), and
+        the reason that field exists. Moving `state_dir` out of the checkout
+        moved this property with it, onto a directory no pre-fix deployment
+        ever wrote to — so `doctor`'s `legacy_workers` check would have gone
+        permanently silent while still reading as a check that ran. That is the
+        fail-open this branch closes: an empty report and "there is nothing
+        there" would have become indistinguishable.
+
+        The rule in full: **the first of the two that is a real DIRECTORY, new
+        first; the new one when neither is.** So the new location wins whenever
+        it holds anything, an absent/unreadable/file-shaped legacy entry falls
+        through instead of raising, and — the case `.exists()` would get wrong
+        — a stray FILE at the new path does not silence the legacy report,
+        because a file is not worker repos and reading it as "the new location
+        is populated" would be a check going quiet on garbage.
+
+        Resolvable this way ONLY because every consumer is read-only —
+        `doctor.run_doctor` calls `.is_dir()` and `.iterdir()` and reports. A
+        property anything WROTE to must never do this, which is why no other
+        path here has a fallback: a read that can silently become a write is
+        how loop state would land back inside the snapshotted tree."""
+        current = self.state_dir / "workers"
+        if current.is_dir() or self.legacy_state_dir is None:
+            return current
+        legacy = Path(self.legacy_state_dir) / "workers"
+        return legacy if legacy.is_dir() else current
 
     @property
     def worker_hooks_dir(self) -> Path:
@@ -847,7 +959,10 @@ def load_config(path: Path) -> AutoloopConfig:
 
     paths_data = data.get("paths", {})
     _check_keys("paths", paths_data, {"state_dir", "workers_root", "validation_env_file"})
-    state_dir = Path(paths_data.get("state_dir", ".autoloop"))
+    # Read now, RESOLVED below `workers_root` — the default is derived from it
+    # (port-01). Kept as the raw value so "absent" stays distinguishable from
+    # every value an operator could actually have written.
+    state_dir_raw = paths_data.get("state_dir")
 
     # `workers_root` (Autoloop M1 finding #1): required, absolute, no
     # default — NEVER silently falls back to `state_dir / "workers"`. This
@@ -873,6 +988,38 @@ def load_config(path: Path) -> AutoloopConfig:
             "(after expanding '~') — a relative path is ambiguous across the "
             "different working directories worker-repo subprocesses run from"
         )
+
+    # `state_dir` (port-01, 2026-08-23) — resolved HERE, after `workers_root`,
+    # because the default is now derived from it.
+    #
+    # An EXPLICIT value is honoured verbatim, exactly as before: same `Path()`,
+    # same relative-resolves-against-cwd behaviour, no expansion, no refusal
+    # that did not exist yesterday. That is the whole compatibility contract —
+    # a deployment that wants its state to stay where it is says so in one
+    # line, and `config.example.toml` still ships that line. Such a config also
+    # gets `legacy_state_dir=None`: nothing moved out from under it, so there
+    # is no older location to look in.
+    #
+    # UNSET now means "beside workers_root", outside the checkout, absolute.
+    if state_dir_raw is not None:
+        state_dir = Path(state_dir_raw)
+        legacy_state_dir: Path | None = None
+    else:
+        state_dir = default_state_dir(workers_root)
+        # The one way the derivation can collide with the path it derives
+        # from. Refused HERE, naming the remedy, rather than left to surface
+        # later as `validate_workers_root`'s "workers_root is nested beneath
+        # the state directory" — true, but baffling to an operator who never
+        # configured a state directory at all.
+        if state_dir == workers_root:
+            raise ConfigError(
+                f"paths.workers_root ends in {DEFAULT_STATE_DIR_NAME!r} "
+                f"({workers_root}), which collides with the default state "
+                "directory derived beside it. Set [paths].state_dir "
+                "explicitly, or point workers_root at a differently named "
+                "directory."
+            )
+        legacy_state_dir = legacy_state_dir_for(path)
 
     # `validation_env_file` (the validation-environment boundary): OPTIONAL,
     # but absolute when present. Same split as `workers_root` above — "unset"
@@ -979,6 +1126,7 @@ def load_config(path: Path) -> AutoloopConfig:
         browser=browser,
         policy=policy,
         state_dir=state_dir,
+        legacy_state_dir=legacy_state_dir,
         workers_root=workers_root,
         validation_env_file=validation_env_file,
         conversation=conversation,

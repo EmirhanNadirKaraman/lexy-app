@@ -2779,3 +2779,4 @@ rather than landing outside the ledger unnoticed.
 | Date | Task | Note |
 |---|---|---|
 | 2026-08-23 | notes-03 | This file joined `note_merge.NOTE_TRACKERS`: a merge conflicting only in the section below is now combined by the loop, while a conflict in any error entry above the marker still refuses the whole merge. §10's fix text had to stop quoting the marker comment in full first — with two copies in the file, the resolver refuses every merge of it. |
+| 2026-08-23 | port-01 | Read the two entries above about a RELATIVE `state_dir` — the sibling-worktree one in §2 and the stray `.al`/`.autoloop` one in §7 — as describing an EXPLICITLY configured value from now on. The unconfigured default is no longer `.autoloop`; it is `<workers_root>/../state`, absolute (`config.default_state_dir`, `docs/AUTOLOOP.md` §3h). Both entries stay accurate as written, because `config.example.toml` and both test helpers still set the key explicitly. |

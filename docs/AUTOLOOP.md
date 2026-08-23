@@ -156,6 +156,82 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
   non-ASCII value is a refusal, never a raise, because that comparison happens
   in the successor's very first act after the exec.
 
+### 3h. Where writable loop state lives (port-01, 2026-08-23)
+
+```toml
+[paths]
+# state_dir omitted  ->  <workers_root>/../state    (absolute, outside the checkout)
+workers_root = "~/.autoloop/workers"
+```
+
+`[paths].state_dir` defaulted to `.autoloop` — relative, resolved against each
+command's own cwd, and therefore **inside the checkout** for any run started
+from it. That made it the last of the loop's own writable paths still living in
+the tree `escape_detector` snapshots around every write-capable agent call. That
+snapshot covers IGNORED paths deliberately (`.autoloop/` is gitignored in
+production, and `tasks.json` carries `approved_paths`, so an agent forging state
+there is exactly what it exists to catch — §4e, `docs/SECURITY.md` finding #2),
+so loop state written inside it mid-round is a diff indistinguishable from an
+agent writing where it may not. The inbox, the PAUSE flag (§3a), the heartbeat
+(§3e) and the mutation ledger (§4f-ter) each moved beside `workers_root` for
+that reason; this is the same move for the state dir, and step 1 of pointing
+autoloop at a repository other than this one.
+
+**The rule, in full:**
+
+* **Unconfigured** → `config.default_state_dir(workers_root)`, i.e.
+  `<workers_root>/../state`. Absolute by construction, because `workers_root`
+  is — which also ends the second half of the old defect: every command
+  resolved a relative state dir against its own cwd, so a run from a sibling
+  worktree reported confidently on an empty one (`docs/COMMON_ERRORS.md`).
+* **Explicit** → honoured **verbatim**, unchanged in every respect, including a
+  relative value. This is the compatibility contract: one line and a deployment
+  keeps its state exactly where it is.
+* **Write target.** Every path under `state_dir` — `state.json`, `tasks.json`,
+  `LOCK`, the transcript, `publisher.git`, executions, intents, blockers,
+  merge-deferrals — resolves under `state_dir` and only `state_dir`. No path
+  the loop writes has a fallback, and that is not an oversight: a read that can
+  silently become a write is how state would land back inside the snapshotted
+  tree.
+* **The one legacy read** is `config.workers_dir`, whose entire job is finding
+  worker repos a pre-M1-fix deployment left at `<checkout>/.autoloop/workers`
+  for `doctor` to REPORT (never move — §4e). Moving `state_dir` pointed it at a
+  directory no such deployment ever wrote to, so it would have gone silent
+  while still reading as a check that ran. It now consults
+  `config.legacy_state_dir` — the directory holding the config file, when that
+  directory is named `.autoloop`. Precedence is **the first of the two that is
+  a real directory, new first**, so live state always wins and a stray FILE at
+  the new path cannot take the report quiet by looking populated.
+* **One state dir per `workers_root`.** The default is derived from it, so two
+  checkouts pointed at one `workers_root` now share one state dir — and the
+  single-instance lock, which is scoped to `state_dir`, will refuse the second
+  loop. Give each repository its own `workers_root` (or its own explicit
+  `state_dir`); this is the shape to get right before pointing autoloop at a
+  second repository.
+
+**No migration, deliberately.** Nothing copies, moves or reads an existing
+`state.json`, `tasks.json` or `LOCK` out of the old directory, and nothing ever
+writes back into the checkout. Two consequences to plan around before an
+unconfigured deployment takes this change:
+
+* **Stop the loop first.** `LoopLock` is scoped to `state_dir`, so a loop
+  running under the old default holds `<checkout>/.autoloop/LOCK` while a new
+  process takes the external one — two loops, no refusal. Stopping first, or
+  setting `state_dir` explicitly, avoids it entirely.
+* **`config.example.toml` still ships `state_dir = ".autoloop"`.** A deployment
+  that copied the template therefore has an explicit value, keeps its state in
+  the checkout, and is unaffected by this change in both directions — nothing
+  moves, and nothing is out of the snapshotted tree yet either. Deleting that
+  line from the template, and the matching one-line edit to a live config, is
+  the follow-up step; it is not something this repository could have made for
+  you (same shape as §8a's warning about `restart_command`).
+
+Also unmoved: **the config file itself** is still `.autoloop/config.toml`
+(`cli.DEFAULT_CONFIG`), and `config_writer` still refuses to rewrite it unless
+git is verifiably not tracking it. Only writable runtime state moved.
+
+---
+
 ### 3g. Detecting a task's scope (propose, never authorize)
 
 The dashboard's new-task form has a **Detect paths** button. It reads the
