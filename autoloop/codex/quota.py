@@ -14,24 +14,71 @@ exhausted.
 
 **Two bounds, for two different jobs. Do not merge them.**
 
-1. *Classification* is bounded by a GUARD, not by trying to carve the echo out
-   of the stream. A marker classifies only when it does **not** occur in the
-   prompt (`classify`). If the loop sent the characters `429`, an echoed `429`
-   cannot fire — whatever framing codex wraps the echo in, whether it reflows
-   it, indents it, or invents a new output format next release. Nothing here
-   depends on recognising the echo's shape, which is why the property survives
-   a codex upgrade.
+1. *Classification* is bounded three times, and no bound depends on recognising
+   the echo's shape:
+
+   * **The haystack is narrowed to text the prompt cannot account for**
+     (`codex_owned_text`). Every output LINE whose content already occurs in
+     the prompt — ignoring whitespace and punctuation entirely — is dropped
+     before anything is matched. This is what "classify from codex's own error
+     output" means on a transport that gives no other way to tell the two
+     apart: the separation is not a framing marker codex might rename, it is
+     *the prompt itself*, which is the one thing we hold with certainty.
+   * **A marker must sit inside ONE line** (`_folded_lines`). Nothing is
+     matched across the join between two lines, so a wording cannot be
+     assembled from the tail of one and the head of the next — text that was
+     never printed adjacently and that neither side ever contained.
+   * **A surviving marker still cannot be one the loop sent** (`classify`). It
+     classifies only when its letters and digits do not occur, in order,
+     anywhere in the prompt.
+
+   The comparisons are **whitespace- and punctuation-insensitive**, which is the
+   property the first cut of this module got wrong: a literal substring test
+   against the prompt let a REFLOWED echo carry a marker the prompt did not
+   contain as an exact string — prompt text `quota\\nexceeded` echoed back as
+   `quota exceeded` classified as a spent allowance. `_fold` and `_squeeze` make
+   the two sides comparable, so re-wrapping, re-indenting, quoting, bulleting,
+   swapping punctuation or upper-casing the echo changes nothing.
+
+   **Which one actually carries the property, stated precisely, because an
+   overclaim here is how this fix gets believed in the wrong place.** SUPPRESSION
+   carries it alone: any echoed line's squeeze is contained in the prompt's, so
+   any marker folding into that line squeezes into the prompt and is refused —
+   whether or not the other two exist. The other two are not decoration and are
+   not redundant either. The line bound stops the *comparison* manufacturing a
+   wording that was never printed, which suppression cannot see, because such a
+   marker is contiguous in NEITHER side. The haystack bound is what lets
+   `matched_pattern` be read as "codex said this" instead of "this survived a
+   rule applied to a stream that was mostly ours".
+
+   Concretely, the two that do NOT carry it alone: drop suppression and a
+   hard-wrapped echo can leave a short line (`'quota`, under the line filter's
+   content floor) that a widened pattern list matches; drop the line bound and
+   two short kept lines can be joined into a marker contiguous in neither.
 2. *Diagnostics* are bounded by conservative echo REMOVAL (`strip_echoed_prompt`
    + `failure_digest`). Exact occurrences of the prompt are deleted and the
    text on BOTH sides is kept, because stderr in the wild looks like
    `Error: <the useful diagnostic>\\n<the prompt echo>` and a strip that keeps
    only what follows the echo throws the diagnostic away. Over-stripping here
    is the round-1 bug of this very task; under-stripping costs at most a
-   bounded excerpt of text the loop already wrote itself.
+   bounded excerpt of text the loop already wrote itself. The line-attribution
+   filter above is deliberately NOT applied here: it is tuned to delete
+   generously, which is right when the output is evidence and wrong when it is
+   the only diagnostic anyone will ever read.
+
+**The ordering property that makes the guard provable.** Matching folds
+(whitespace and punctuation to single spaces); suppression squeezes (folds, then
+removes the spaces). Squeezing is monotone over substring containment, so
+`fold(marker) ⊆ fold(text)` IMPLIES `squeeze(marker) ⊆ squeeze(text)`. Therefore
+anything that can be MATCHED in a stream is, applied to the prompt, necessarily
+SUPPRESSED — an exact echo of the prompt can never classify, whatever the
+patterns are. Pinned by
+`test_codex_provider.py::test_anything_that_can_match_is_first_suppressible`.
 
 **The price of the guard, stated plainly.** When a review packet genuinely
-discusses usage limits, a genuine exhaustion during that round degrades to an
-ordinary failure. That is the trade `quota.py` has always documented in the
+discusses usage limits — in any spelling, since the comparison ignores
+whitespace and punctuation — a genuine exhaustion during that round degrades to
+an ordinary failure. That is the trade `quota.py` has always documented in the
 other direction ("a missed pattern degrades to an ordinary failure — noisy, but
 never unsafe: an unrecognised failure cannot authorize anything, and re-running
 a stateless CLI call cannot double-post"), and it is the direction this task
@@ -56,6 +103,7 @@ exhaustion is a one-line config edit rather than an investigation.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 #: Substrings that mark a SPENT ALLOWANCE — the plan's window is used up and
@@ -112,6 +160,19 @@ STDERR_TAIL_CHARS = 400
 #: the guard is visible, not so a pathological prompt can pad the audit log.
 MAX_SUPPRESSED = 10
 
+#: How much CONTENT an output line must carry before it is allowed to be written
+#: off as an echo of the prompt. Measured on the folded form, so it counts
+#: letters and digits rather than indentation.
+#:
+#: Without a floor, `Error:` folds to `error` — a word that occurs in essentially
+#: every review packet — and so does every other short line codex prints,
+#: including a bare `429`. Dropping those is a FALSE-NEGATIVE hole with no alarm
+#: on it: the line leaves the haystack AND leaves `everything`, so the marker on
+#: it is neither counted nor reported as suppressed, and the record goes silent
+#: about text codex actually printed. Short lines are kept instead, where
+#: per-marker suppression decides them and NAMES what it refused.
+ECHO_LINE_MIN_CHARS = 12
+
 #: What an excised prompt echo leaves behind. A newline rather than a marker,
 #: so `Error: A\n<echo>\nError: B` does not glue into `Error: AError: B` and so
 #: a stream that was NOTHING but echo strips to empty — which is what makes
@@ -141,11 +202,17 @@ class CodexFailure:
     ignored because the loop had sent those same characters, so an operator
     reading the transcript can see the guard fire rather than wonder why an
     exhaustion was never recognised.
+
+    `echo_lines` counts the output lines the prompt accounted for. Same job, one
+    level up: an operator who sees a classification of `unclassified` alongside
+    `echo_lines: 3100` knows the stream was mostly our own text coming back, not
+    that codex printed nothing.
     """
 
     kind: str
     matched: str = ""
     suppressed: tuple[str, ...] = ()
+    echo_lines: int = 0
 
     @property
     def is_exhaustion(self) -> bool:
@@ -154,6 +221,106 @@ class CodexFailure:
     @property
     def is_transient(self) -> bool:
         return self.kind == RATE_LIMITED
+
+
+#: Everything that is not a lower-case letter or a digit. Folded to a single
+#: space, so `Quota-Exceeded`, `quota, exceeded`, `**quota** exceeded` and
+#: `quota\nexceeded` all reduce to the same four-and-eight letters. Deliberately
+#: ASCII: the markers are ASCII, so folding a non-ASCII character to a space can
+#: only ever make the prompt side MORE permissive, which is the safe direction.
+_NOT_ALNUM = re.compile(r"[^0-9a-z]+")
+
+
+def _fold(text) -> str:
+    """Lower-cased, punctuation and whitespace collapsed to single spaces.
+
+    The comparison basis for MATCHING. A codex build that re-wraps, re-indents,
+    quotes or bullets its output prints different bytes and the same fold.
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    return _NOT_ALNUM.sub(" ", text.lower()).strip()
+
+
+def _folded_lines(text) -> tuple[str, ...]:
+    """Each line of `text`, folded; blank and punctuation-only lines dropped.
+
+    Matching happens WITHIN a line, never across the join between two. Folding a
+    whole stream would replace its newlines with spaces and so let a marker be
+    assembled from the tail of one line and the head of the next — text that was
+    never printed adjacently, and that neither codex nor the prompt ever
+    contained. That is a manufactured match, and manufacturing one against a
+    stream that is mostly our own echo is precisely this module's failure mode.
+
+    The cost is stated: an exhaustion message the CLI hard-wraps across two lines
+    is not recognised. That degrades to an ordinary retryable failure, which is
+    the direction this module is asked to err in, and a subprocess without a tty
+    is not normally given a width to wrap at.
+
+    The PROMPT side does the opposite and folds everything together — see
+    `_squeeze`. The asymmetry is the point: hard to match, easy to suppress.
+    """
+    if not isinstance(text, str) or not text:
+        return ()
+    return tuple(folded for folded in (_fold(line) for line in text.splitlines()) if folded)
+
+
+def _squeeze(text) -> str:
+    """`_fold` with the spaces removed as well.
+
+    The comparison basis for SUPPRESSION, and strictly more permissive than
+    `_fold` — removing spaces cannot break a substring relation, so anything
+    that folds into a text also squeezes into it. That inclusion is what makes
+    "an echo of the prompt can never classify" a property rather than a hope.
+    It also absorbs a hyphenated line break (`ex-\\nceeded`), which folding
+    alone does not.
+    """
+    return _fold(text).replace(" ", "")
+
+
+def codex_owned_text(text: str, prompt: str) -> tuple[str, int]:
+    """`(the lines of `text` the prompt cannot account for, lines dropped)`.
+
+    The narrowest haystack this transport can honestly offer. `codex exec` gives
+    no framing that separates its own diagnostics from the prompt it echoes —
+    there is no marker to key on, and inventing one would be a guess that a
+    codex release could silently invalidate. So the separation is made from the
+    prompt instead: a line whose letters and digits already appear, in order,
+    somewhere in what we SENT is not evidence about what came back.
+
+    Why bother, when `classify` also checks each marker against the prompt: this
+    is the layer that lets `matched_pattern` be read as "codex said this", rather
+    than as "this survived a suppression rule applied to a stream that was mostly
+    ours". It does NOT carry the property on its own and is not claimed to —
+    suppression does; see the module docstring, which names which bound does
+    what and which two do not.
+
+    Short lines are kept whatever they contain (see `ECHO_LINE_MIN_CHARS`): a
+    generous line filter with no floor deletes `Error:` and takes a genuine
+    diagnostic's first line with it.
+
+    An empty prompt drops nothing — with nothing sent there is no echo to find.
+    `failure_digest` records that state as an INERT guard rather than leaving it
+    to be inferred.
+    """
+    if not isinstance(text, str) or not text:
+        return ("", 0)
+    sent = _squeeze(prompt)
+    if not sent:
+        return (text, 0)
+    kept: list[str] = []
+    dropped = 0
+    for line in text.splitlines():
+        folded = _fold(line)
+        if not folded:
+            # Blank or punctuation-only. Carries no marker either way, and
+            # counting it as a dropped echo would inflate the record.
+            continue
+        if len(folded) >= ECHO_LINE_MIN_CHARS and folded.replace(" ", "") in sent:
+            dropped += 1
+            continue
+        kept.append(line)
+    return ("\n".join(kept), dropped)
 
 
 def _usable(patterns) -> tuple[str, ...]:
@@ -208,38 +375,57 @@ def classify(
     """
     if returncode == 0:
         return CodexFailure(NOT_A_FAILURE)
-    haystack = f"{stdout or ''}\n{stderr or ''}".lower()
     # A non-str prompt is a programming error the annotation already forbids;
     # treating it as "nothing was sent" keeps this path from raising while a
-    # failure is being handled, and the suppressed list will show an empty
-    # guard if it ever happens.
-    sent = prompt.lower() if isinstance(prompt, str) else ""
+    # failure is being handled, and `failure_digest` reports the guard as INERT
+    # so the state is visible rather than inferred.
+    sent = prompt if isinstance(prompt, str) else ""
+    printed = f"{stdout or ''}\n{stderr or ''}"
+    owned, echo_lines = codex_owned_text(printed, sent)
+    # Two haystacks, two jobs. `everything` decides whether a marker was PRESENT
+    # AT ALL, which is what makes the guard visible; `haystack` decides whether
+    # it may classify, and holds only what the prompt could not account for.
+    # Both are LISTS OF LINES, and a marker must sit inside one of them — see
+    # `_folded_lines` for why a marker assembled across a join is not evidence.
+    everything = _folded_lines(printed)
+    haystack = _folded_lines(owned)
+    sent_squeezed = _squeeze(sent)
 
     suppressed: list[str] = []
+    considered: set[str] = set()
 
     def first_own_match(patterns) -> str:
-        """The first marker present in the output that the loop did NOT send."""
+        """The first marker in codex's OWN output that the loop did not send."""
         found = ""
         for needle in _usable(patterns):
-            if needle not in haystack:
+            folded = _fold(needle)
+            # A pattern that folds away entirely ("---", "!!") would be a
+            # substring of every stream — the empty-pattern hole by a second
+            # door, now that matching is fold-based.
+            if not folded or folded in considered:
                 continue
-            if needle in sent:
-                # Present, but it is our own text coming back. Recorded, never
-                # counted. This is the whole fix.
+            considered.add(folded)
+            own = any(folded in line for line in haystack) and not (
+                sent_squeezed and folded.replace(" ", "") in sent_squeezed
+            )
+            if own:
+                if not found:
+                    found = needle
+            elif any(folded in line for line in everything):
+                # Present in what codex printed, and refused: either the prompt
+                # accounts for the line it sat on, or it accounts for the marker
+                # itself. Recorded, never counted. This is the whole fix.
                 suppressed.append(needle)
-                continue
-            if not found:
-                found = needle
         return found
 
     spent = first_own_match(quota_patterns)
     transient = first_own_match(rate_limit_patterns)
     ignored = tuple(suppressed[:MAX_SUPPRESSED])
     if spent:
-        return CodexFailure(QUOTA_EXHAUSTED, spent, ignored)
+        return CodexFailure(QUOTA_EXHAUSTED, spent, ignored, echo_lines)
     if transient:
-        return CodexFailure(RATE_LIMITED, transient, ignored)
-    return CodexFailure(UNCLASSIFIED, "", ignored)
+        return CodexFailure(RATE_LIMITED, transient, ignored, echo_lines)
+    return CodexFailure(UNCLASSIFIED, "", ignored, echo_lines)
 
 
 def is_quota_exhausted(
@@ -350,7 +536,16 @@ def failure_digest(
       empty excerpt is readable as "all echo" or "printed nothing" rather than
       as "the record failed".
     * `suppressed_patterns` — the markers the guard refused to count because the
-      prompt contained them. The guard's visibility.
+      prompt accounted for them. The guard's visibility.
+    * `prompt_guard` — `"active"` or `"inert"`. The guard has exactly one input,
+      the prompt, and with nothing sent there is nothing to suppress: matching
+      then behaves as it did before this task. That is the correct behaviour and
+      a dangerous silence, because "the check quietly switched itself off" is
+      the failure class this whole module exists to remove — so the state is
+      RECORDED rather than left to be inferred from an absent field.
+    * `echo_lines_dropped` — output lines the prompt accounted for, excluded
+      from the classification haystack. Reads as "the stream was mostly our own
+      text" rather than "codex printed nothing".
 
     Never the prompt, the argv or the environment: the prompt is the review
     packet and the environment carries auth. `stdout_tail` is new as of this
@@ -377,9 +572,14 @@ def failure_digest(
         "stderr_chars": len(stderr or ""),
         "stdout_chars": len(stdout or ""),
         "prompt_echo_chars": echoed,
+        "prompt_guard": (
+            "active" if isinstance(prompt, str) and prompt.strip() else "inert"
+        ),
     }
     if verdict.suppressed:
         digest["suppressed_patterns"] = list(verdict.suppressed)
+    if verdict.echo_lines:
+        digest["echo_lines_dropped"] = verdict.echo_lines
     # Echo-stripped and bounded like the excerpts: a caller-supplied note can
     # carry an exception's message, and an exception raised by a runner this
     # module does not own could carry anything, the prompt included.
@@ -398,6 +598,7 @@ def failure_digest(
 __all__ = [
     "DEFAULT_QUOTA_PATTERNS",
     "DEFAULT_RATE_LIMIT_PATTERNS",
+    "ECHO_LINE_MIN_CHARS",
     "MAX_SUPPRESSED",
     "NOT_A_FAILURE",
     "QUOTA_EXHAUSTED",
@@ -406,6 +607,7 @@ __all__ = [
     "UNCLASSIFIED",
     "CodexFailure",
     "classify",
+    "codex_owned_text",
     "failure_digest",
     "is_quota_exhausted",
     "strip_echoed_prompt",

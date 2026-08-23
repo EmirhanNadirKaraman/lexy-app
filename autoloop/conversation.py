@@ -192,7 +192,10 @@ def _codex_app_server_factory(config: "AutoloopConfig") -> LLMConversation:
     # until a run selects this provider and `attach()` launches it.
     from .codex.app_server import AppServerClient, SubprocessAppServer
     from .codex.app_server_conversation import CodexAppServerConversation
-    from .codex.protocol_errors import DEFAULT_QUOTA_ERROR_CODES
+    from .codex.protocol_errors import (
+        DEFAULT_QUOTA_ERROR_CODES,
+        DEFAULT_RATE_LIMIT_ERROR_CODES,
+    )
 
     codex = config.codex
     transport = SubprocessAppServer(
@@ -211,6 +214,13 @@ def _codex_app_server_factory(config: "AutoloopConfig") -> LLMConversation:
         transport,
         timeout_seconds=codex.timeout_seconds,
         quota_codes=codex.quota_error_codes or DEFAULT_QUOTA_ERROR_CODES,
+        # Two vocabularies here for the same reason the subprocess seat above
+        # takes two pattern lists: a short-window throttle and a spent weekly
+        # allowance are different events, and only the second is worth parking
+        # a loop over.
+        rate_limit_codes=(
+            codex.rate_limit_error_codes or DEFAULT_RATE_LIMIT_ERROR_CODES
+        ),
         working_dir=codex.working_dir,
         log=log,
     )

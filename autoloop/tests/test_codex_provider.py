@@ -30,6 +30,7 @@ and every test injects a fake, exactly as `audit/agents.py` does for `claude`.
 
 import inspect
 import json
+import textwrap
 
 import pytest
 
@@ -45,8 +46,12 @@ from autoloop.codex.quota import (
     NOT_A_FAILURE,
     QUOTA_EXHAUSTED,
     RATE_LIMITED,
+    STDERR_TAIL_CHARS,
     UNCLASSIFIED,
+    _fold,
+    _squeeze,
     classify,
+    codex_owned_text,
     failure_digest,
     is_quota_exhausted,
     strip_echoed_prompt,
@@ -252,9 +257,327 @@ def test_a_prompt_that_quotes_the_exhaustion_wording_degrades_to_a_retry():
 def test_classification_cannot_be_called_without_the_prompt_it_sent():
     """A default on `prompt` would let a call site forget it and silently turn
     the guard off — an alarm that disables itself when its input is missing."""
-    for func in (classify, is_quota_exhausted, failure_digest, strip_echoed_prompt):
+    for func in (
+        classify,
+        is_quota_exhausted,
+        failure_digest,
+        strip_echoed_prompt,
+        codex_owned_text,
+    ):
         parameter = inspect.signature(func).parameters["prompt"]
         assert parameter.default is inspect.Parameter.empty, func.__name__
+
+
+# ---- the guard ignores whitespace and punctuation ----------------------------
+#
+# The finding that refused the previous round of this task, and the reason this
+# section exists. The first cut compared each marker against the prompt as a
+# LITERAL substring, so an echo codex reflowed on the way back could synthesise
+# a marker the prompt never contained as an exact string: prompt text
+# `quota\nexceeded`, echoed as `quota exceeded`, classified as a spent allowance
+# and parked the loop. Indenting the echo — the only transform the old test
+# covered — is the one shape a literal substring test already survived.
+#
+# Three bounds answer it. `codex_owned_text` drops whole output lines the prompt
+# accounts for; `_folded_lines` refuses to match across the join between two
+# lines, so a wording cannot be assembled out of text that was never printed
+# adjacently; and `classify` refuses any surviving marker whose letters and
+# digits occur in the prompt. The comparisons ignore whitespace and punctuation.
+#
+# SUPPRESSION is the one that carries the property alone — not all three, and
+# saying otherwise would be a second overclaim in a task that was refused for
+# the first. `test_no_reshaping_survives_a_widened_pattern_list_either` is the
+# case that shows it: a hard-wrapped echo leaves the short line `'quota` under
+# the content floor, and only suppression refuses it.
+
+#: A packet quoting every marker the loop can classify on, in the shapes a task
+#: description in this repository actually uses: a wording split across a line
+#: break, a line number, a status code, a list of pattern names.
+MARKER_PROMPT = (
+    "[autoloop request alr-codex-0042 | iteration 2]\n\n"
+    "Task quota-01: when the plan's own 'quota\n"
+    "exceeded' message arrives, park the loop. See docs/AUTOLOOP.md:4295.\n"
+    "The usage limit reached wording, the 429 status, the rate limit list\n"
+    "and 'out of credits' are all named in DEFAULT_QUOTA_PATTERNS today.\n"
+)
+
+
+def _per_line(text, prefix):
+    return "\n".join(prefix + line for line in text.splitlines())
+
+
+#: Every way a CLI can print back text it was given without changing a word of
+#: it. None of these may let the packet classify its own failure.
+ECHO_TRANSFORMS = {
+    "verbatim": lambda t: t,
+    "newlines_to_spaces": lambda t: t.replace("\n", " "),
+    "collapsed_to_one_line": lambda t: " ".join(t.split()),
+    "crlf": lambda t: t.replace("\n", "\r\n"),
+    "hard_wrapped_at_40": lambda t: "\n".join(
+        textwrap.fill(line, 40) for line in t.splitlines()
+    ),
+    "doubled_spaces": lambda t: t.replace(" ", "   "),
+    "tabs": lambda t: t.replace(" ", "\t"),
+    "non_breaking_spaces": lambda t: t.replace(" ", " "),
+    # The entry above holds a LITERAL U+00A0 as its replacement, which is
+    # invisible here — so `test_the_non_breaking_space_case_is_really_one`
+    # asserts it rather than trusting the eye. A case that quietly degrades to
+    # an identity transform is a test that passes while covering nothing. Do not
+    # "tidy" it into an ordinary space: t.replace(" ", " "),
+    "indented": lambda t: _per_line(t, "    "),
+    "quoted": lambda t: _per_line(t, "> "),
+    "bulleted": lambda t: _per_line(t, "- "),
+    "uppercased": lambda t: t.upper(),
+    "punctuation_stripped": lambda t: "".join(
+        c for c in t if c.isalnum() or c.isspace()
+    ),
+    "punctuation_swapped": lambda t: (
+        t.replace("-", "_").replace(".", ",").replace(":", " -- ").replace("'", '"')
+    ),
+    "framed": lambda t: (
+        f"codex 0.9.1\n--- prompt ---\n{_per_line(t, '  ')}\n--- end ---\n"
+        "Error: connection reset by peer\n"
+    ),
+}
+
+
+def test_every_echo_transform_actually_changes_something():
+    """A transform that silently reduced to identity would leave its case green
+    while covering nothing — the fail-open shape of a test suite. `verbatim` is
+    the one deliberate identity, and it is named as such."""
+    for name, transform in ECHO_TRANSFORMS.items():
+        changed = transform(MARKER_PROMPT) != MARKER_PROMPT
+        assert changed is (name != "verbatim"), name
+
+
+def test_the_non_breaking_space_case_is_really_one():
+    """The replacement character is invisible in the source, so it is asserted
+    rather than read: U+00A0, not the ordinary space next to it."""
+    reshaped = ECHO_TRANSFORMS["non_breaking_spaces"](MARKER_PROMPT)
+    assert " " in reshaped
+    assert " " not in reshaped.replace("\n", "")
+
+
+@pytest.mark.parametrize("name", sorted(ECHO_TRANSFORMS))
+def test_no_reshaping_of_the_echo_can_declare_the_allowance_spent(name):
+    """The reviewer named the transforms: newlines, repeated whitespace,
+    wrapping, punctuation. Each is applied to a packet that quotes every marker
+    the classifier knows, and none of them may reach the loop_fatal branch."""
+    echoed = ECHO_TRANSFORMS[name](MARKER_PROMPT)
+    assert classify(1, "", echoed, MARKER_PROMPT).kind != QUOTA_EXHAUSTED
+    assert classify(1, echoed, "", MARKER_PROMPT).kind != QUOTA_EXHAUSTED
+    assert not is_quota_exhausted(1, "", echoed, MARKER_PROMPT)
+
+
+#: Everything the built-in lists hold, PLUS the bare words the 2026-08-22 stopgap
+#: narrowed away, PLUS single common words. Deliberately the worst list an
+#: operator could plausibly write. `"limit"` is the discriminating entry: it
+#: occurs in `MARKER_PROMPT` (`usage limit reached`), so it must be suppressed
+#: for every reshaping, and a hard-wrapped echo hands it a short kept line that
+#: only suppression can refuse.
+WIDENED = DEFAULT_QUOTA_PATTERNS + DEFAULT_RATE_LIMIT_PATTERNS + (
+    "429",
+    "quota",
+    "rate limit",
+    "exceeded",
+    "credits",
+    "limit",
+)
+
+
+@pytest.mark.parametrize("name", sorted(ECHO_TRANSFORMS))
+def test_no_reshaping_survives_a_widened_pattern_list_either(name):
+    """The stopgap narrowing of `[codex] quota_patterns` is not the fix and must
+    not have to be. An operator who puts the bare words back gets the guard —
+    and this is the case that shows suppression is the bound carrying the
+    property, since `hard_wrapped_at_40` leaves `'quota` on a line too short for
+    the echo filter to drop and too small for the line bound to matter."""
+    echoed = ECHO_TRANSFORMS[name](MARKER_PROMPT)
+    verdict = classify(1, "", echoed, MARKER_PROMPT, quota_patterns=WIDENED)
+    assert verdict.kind != QUOTA_EXHAUSTED
+    assert not is_quota_exhausted(1, "", echoed, MARKER_PROMPT, WIDENED)
+
+
+def test_the_bound_that_carries_the_property_is_suppression():
+    """Shown, not asserted in prose. A hard-wrapped echo leaves `'quota` on a
+    line the content floor keeps, and the line bound is no help there — it is a
+    single line and the marker sits inside it. Only suppression refuses it. That
+    is why the module docstring names suppression as the bound that carries the
+    property and says plainly that the other two do not; claiming all three were
+    independent would be a second overclaim in a task refused for the first."""
+    echoed = ECHO_TRANSFORMS["hard_wrapped_at_40"](MARKER_PROMPT)
+    owned, _ = codex_owned_text(echoed, MARKER_PROMPT)
+    assert "quota" in [_fold(line) for line in owned.splitlines()], (
+        "the short line really does survive the other two bounds"
+    )
+
+    verdict = classify(1, "", echoed, MARKER_PROMPT, quota_patterns=("quota",))
+    assert verdict.kind == UNCLASSIFIED
+    # `suppressed` spans BOTH lists — `classify` runs the spent list and then
+    # the transient one, and `MARKER_PROMPT` also quotes `429` and `rate limit`,
+    # which the default transient list holds and the guard therefore also
+    # refuses. So the assertion here is that the bare word was refused and
+    # NAMED, not that it was the only refusal in the pass.
+    assert "quota" in verdict.suppressed
+    assert set(verdict.suppressed) <= set(("quota",) + DEFAULT_RATE_LIMIT_PATTERNS)
+
+    # With one list in play the refusal is exactly it, which is the isolated
+    # form of the same claim.
+    isolated = classify(
+        1, "", echoed, MARKER_PROMPT, quota_patterns=("quota",), rate_limit_patterns=()
+    )
+    assert isolated.kind == UNCLASSIFIED
+    assert isolated.suppressed == ("quota",)
+
+
+def test_a_wording_split_across_a_line_break_cannot_be_reflowed_into_a_marker():
+    """The reviewer's literal example, pinned by itself so a regression names
+    itself: the prompt says `quota` at the end of one line and `exceeded` at the
+    start of the next, and codex prints the two back on one line."""
+    prompt = "the loop must park when the plan's own quota\nexceeded message arrives"
+    assert "quota exceeded" not in prompt, "the exact string is genuinely absent"
+    verdict = classify(1, "", "quota exceeded", prompt)
+    assert verdict.kind == UNCLASSIFIED
+    assert verdict.suppressed == ("quota exceeded",)
+    assert verdict.echo_lines == 1
+
+
+def test_two_echoed_lines_cannot_synthesise_a_marker_across_the_join():
+    """A marker neither side ever held, manufactured by the comparison itself.
+    Folding a whole stream replaces its newlines with spaces, so an echo of two
+    prompt lines that are NOT adjacent in the prompt assembles `quota exceeded`
+    out of one line's tail and the next line's head. Two independent bounds
+    refuse it: the lines are attributed to the prompt and dropped, and matching
+    never crosses a line join in the first place."""
+    prompt = (
+        "the first paragraph ends by naming the weekly quota\n"
+        "an entire paragraph of unrelated review notes sits in between\n"
+        "exceeded expectations is how a much later paragraph opens\n"
+    )
+    stderr = (
+        "the first paragraph ends by naming the weekly quota\n"
+        "exceeded expectations is how a much later paragraph opens\n"
+    )
+    # The join really does manufacture the marker, and the prompt really does
+    # not contain it — under either normalization.
+    assert "quota exceeded" in _fold(stderr)
+    assert "quota exceeded" not in _fold(prompt)
+    assert "quotaexceeded" not in _squeeze(prompt)
+
+    verdict = classify(1, "", stderr, prompt)
+    assert verdict.kind == UNCLASSIFIED
+    assert verdict.echo_lines == 2, "both lines were attributed to the prompt"
+
+
+def test_a_marker_split_across_two_lines_of_codex_output_is_not_a_match():
+    """The line bound, isolated from the prompt guard: neither line here is
+    attributable to the prompt, so only the refusal to match across a join can
+    reject it. A wording assembled from two lines was never printed as a wording
+    — and manufacturing one against a stream that is mostly our own echo is this
+    module's failure mode in miniature."""
+    prompt = "an ordinary review packet with nothing relevant in it"
+    stderr = "internal failure while checking the usage limit\nreached the server anyway"
+    assert "usage limit reached" in _fold(stderr), "the join manufactures it"
+    assert classify(1, "", stderr, prompt).kind == UNCLASSIFIED
+    # On ONE line the same words are codex's own, and classify normally.
+    joined = "internal failure: usage limit reached on the server"
+    assert classify(1, "", joined, prompt).kind == QUOTA_EXHAUSTED
+
+
+def test_anything_that_can_match_is_first_suppressible():
+    """The ordering property the guard rests on. Matching folds; suppression
+    squeezes; removing spaces cannot break a substring relation. So every marker
+    that COULD match a stream is, applied to the prompt, necessarily suppressed
+    — which is why an echo of the prompt can never classify, whatever the
+    pattern list happens to contain."""
+    texts = [MARKER_PROMPT, LOUD_PROMPT, CLEAN, ""] + [
+        transform(MARKER_PROMPT) for transform in ECHO_TRANSFORMS.values()
+    ]
+    checked = 0
+    for needle in DEFAULT_QUOTA_PATTERNS + DEFAULT_RATE_LIMIT_PATTERNS:
+        for text in texts:
+            if _fold(needle) in _fold(text):
+                assert _squeeze(needle) in _squeeze(text), needle
+                checked += 1
+    assert checked, "the corpus must actually exercise the implication"
+
+
+def test_the_line_bound_is_stricter_than_the_property_above_covers():
+    """The bridge between the two. What actually matches is a folded LINE, and a
+    folded line is a contiguous run of the folded whole — so a per-line match
+    implies the whole-text match the property above quantifies over, and the
+    property therefore covers the stricter matcher too."""
+    for text in (MARKER_PROMPT, LOUD_PROMPT, ECHO_TRANSFORMS["framed"](MARKER_PROMPT)):
+        whole = _fold(text)
+        lines = [_fold(line) for line in text.splitlines() if _fold(line)]
+        assert lines
+        for line in lines:
+            assert line in whole
+
+
+@pytest.mark.parametrize("returncode", [1, 2, 137])
+def test_output_identical_to_the_prompt_is_never_exhaustion(returncode):
+    """The operational corollary, on both streams and for any failing code."""
+    for text in (MARKER_PROMPT, LOUD_PROMPT, "quota exceeded", "429"):
+        assert classify(returncode, "", text, text).kind != QUOTA_EXHAUSTED
+        assert classify(returncode, text, "", text).kind != QUOTA_EXHAUSTED
+
+
+def test_a_genuine_exhaustion_survives_a_marker_laden_echo():
+    """The other half of the claim, tested where it is hard rather than where it
+    is easy: the prompt in play quotes exhaustion wordings, and codex's OWN
+    message still classifies."""
+    stderr = f"{MARKER_PROMPT}\nError: you have hit your usage limit for Codex.\n"
+    verdict = classify(1, "", stderr, MARKER_PROMPT)
+    assert verdict.kind == QUOTA_EXHAUSTED
+    assert verdict.matched == "hit your usage limit"
+    # And the wording the PACKET quoted was refused in the same pass, visibly.
+    assert "usage limit reached" in verdict.suppressed
+
+
+def test_an_absent_prompt_leaves_the_guard_inert_and_records_that():
+    """The guard has exactly one input. With nothing sent there is nothing to
+    suppress, and matching behaves as it did before this task — correct, and
+    exactly the shape ("the check quietly switched itself off") this module
+    exists to make impossible to miss. So the state is RECORDED, not inferred."""
+    assert classify(1, "", "Error: quota exceeded", "").kind == QUOTA_EXHAUSTED
+    assert failure_digest(1, "", "Error: quota exceeded", "")["prompt_guard"] == "inert"
+    assert failure_digest(1, "", "boom", "   ")["prompt_guard"] == "inert"
+    assert failure_digest(1, "", "boom", CLEAN)["prompt_guard"] == "active"
+
+
+def test_a_pattern_that_folds_away_cannot_classify_every_failure():
+    """`_usable` drops the empty string, but matching now compares FOLDED text,
+    so a punctuation-only pattern folds to `""` and would be a substring of
+    every stream — the empty-pattern hole through a door the first fix had no
+    reason to cover."""
+    verdict = classify(
+        1, "", "segmentation fault", CLEAN, quota_patterns=("---", "!!", " . ")
+    )
+    assert verdict.kind == UNCLASSIFIED
+
+
+def test_a_short_echo_line_stays_in_the_haystack_instead_of_vanishing():
+    """The line filter has a content floor, and it is not a rounding choice.
+    Without it `Error:` folds to a word every review packet contains and a bare
+    `429` folds to three digits any packet may quote, so those lines leave the
+    haystack AND leave the record: the marker on them is neither counted nor
+    reported as suppressed, and the transcript goes silent about text codex
+    actually printed. Kept instead, and decided by the OTHER layer — visibly."""
+    prompt = "the review packet mentions an error and a 429 in passing"
+    owned, dropped = codex_owned_text("Error:\n429\nboom", prompt)
+    assert dropped == 0
+    assert "Error:" in owned and "429" in owned
+    assert "429" in classify(1, "", "429\nboom", prompt).suppressed
+
+
+def test_line_attribution_never_touches_the_recorded_diagnostic():
+    """Deliberately asymmetric. The line filter is tuned to delete generously,
+    which is right when the output is evidence and wrong when it is the only
+    diagnostic anyone will read — over-stripping there is the finding that
+    refused the first round of this task."""
+    stderr = f"Error: model 'gpt-5-codex' is not available\n{MARKER_PROMPT}"
+    assert "is not available" in failure_digest(1, "", stderr, MARKER_PROMPT)["stderr_tail"]
 
 
 # ---- the digest: a failure must stay diagnosable -----------------------------
@@ -986,6 +1309,65 @@ def test_a_genuine_exhaustion_still_parks_the_loop(tmp_path):
     assert entries(config, "codex_invocation_failed")[0]["data"]["classification"] == (
         QUOTA_EXHAUSTED
     )
+
+
+@pytest.mark.parametrize("name", sorted(ECHO_TRANSFORMS))
+def test_no_reshaped_echo_parks_the_loop_end_to_end(tmp_path, name):
+    """The previous round's finding, pinned where it has to hold: the loop, not
+    a helper's return value. A packet quoting every marker the classifier knows
+    comes back reshaped, and the run must stay on the retryable path AND leave a
+    record naming why it failed."""
+    orch, config = run_real_codex(
+        tmp_path,
+        prompt=MARKER_PROMPT,
+        returncode=1,
+        stderr=ECHO_TRANSFORMS[name](MARKER_PROMPT),
+    )
+
+    assert orch.state.phase == Phase.SUBMISSION_REJECTED.value
+    assert park_code(config) is None
+    row = entries(config, "codex_invocation_failed")[0]["data"]
+    assert row["classification"] != QUOTA_EXHAUSTED
+    # Not swallowed: the guard was live, and it says what it refused to count.
+    assert row["prompt_guard"] == "active"
+    # Both keys are omitted when empty, so `.get` — the assertion is that the
+    # guard left at least one of the two traces, not that both fired.
+    assert row.get("suppressed_patterns") or row.get("echo_lines_dropped")
+
+
+def test_a_genuine_exhaustion_parks_even_after_a_marker_laden_echo(tmp_path):
+    """The half a false-park fix can quietly break. The packet in flight quotes
+    exhaustion wordings, the echo comes back reshaped — and codex's OWN message
+    still parks the loop, with the record naming the marker that decided it and
+    the marker the guard refused."""
+    orch, config = run_real_codex(
+        tmp_path,
+        prompt=MARKER_PROMPT,
+        returncode=1,
+        stderr=(
+            f"{' '.join(MARKER_PROMPT.split())}\n"
+            "Error: you have hit your usage limit for Codex.\n"
+        ),
+    )
+
+    assert orch.state.phase == Phase.NEEDS_USER.value
+    assert park_code(config) == "quota_exhausted"
+    row = entries(config, "codex_invocation_failed")[0]["data"]
+    assert row["classification"] == QUOTA_EXHAUSTED
+    assert row["matched_pattern"] == "hit your usage limit"
+    assert "usage limit reached" in row["suppressed_patterns"]
+
+
+def test_a_reshaped_echo_defeats_the_exact_strip_but_stays_bounded():
+    """Stated rather than left to be found. `strip_echoed_prompt` removes EXACT
+    occurrences only, so an echo codex re-wrapped is NOT removed and up to
+    `STDERR_TAIL_CHARS` of the loop's own text can reach `stderr_tail`. Bounded,
+    and text the loop wrote itself. The alternative — reusing the generous line
+    filter here — is the over-strip that deleted the diagnostic in round 1."""
+    reshaped = " ".join(LOUD_PROMPT.split())
+    digest = failure_digest(1, "", reshaped, LOUD_PROMPT)
+    assert digest["prompt_echo_chars"] == 0, "an exact match is what it looks for"
+    assert len(digest["stderr_tail"]) <= STDERR_TAIL_CHARS
 
 
 def test_a_fallback_equal_to_the_primary_parks(tmp_path):

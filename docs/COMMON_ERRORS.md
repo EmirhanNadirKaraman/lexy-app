@@ -2729,10 +2729,16 @@ and thrown away: `CodexConversation.submit` logs `codex_invocation_failed` on
 every non-zero exit, but the factory constructed the adapter without a `log=`, so
 the no-op default stood and that record appeared ZERO times in 24 days.
 **Fix:** applied repo-side 2026-08-23 (quota-01) and load-bearing. `quota.classify`
-takes the FINAL prompt as a REQUIRED argument and counts a marker only when it
-does not occur in that prompt, so nothing the loop sent can classify what came
-back — a guard, not an attempt to carve the echo out of the stream, which is why
-a reframed or reflowed echo cannot reopen it. `"429"`, `"too many requests"` and
+takes the FINAL prompt as a REQUIRED argument, drops every output LINE the prompt
+accounts for (`codex_owned_text`), matches only WITHIN a line so a wording cannot
+be assembled across a join that was never printed, and counts a surviving marker
+only when the prompt does not account for it either — so nothing the loop sent
+can classify what came back. The comparisons ignore whitespace and punctuation, and that
+detail is the whole of it: the first cut compared literal substrings, which a
+REFLOWED echo defeats, because prompt text `quota` + newline + `exceeded` printed
+back as `quota exceeded` is a marker the prompt does not contain verbatim. If you
+are tempted to "simplify" either comparison back to a plain `in`, that is the
+regression. `"429"`, `"too many requests"` and
 `"rate limit"` moved to `codex.rate_limit_patterns`, which returns REJECTED and
 stays retryable. `conversation._transcript_log` wires the real logger at all three
 codex factories. **Do not** answer a recurrence by narrowing
@@ -2830,3 +2836,6 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | port-01 | Read the two entries above about a RELATIVE `state_dir` — the sibling-worktree one in §2 and the stray `.al`/`.autoloop` one in §7 — as describing an EXPLICITLY configured value from now on. The unconfigured default is no longer `.autoloop`; it is `<workers_root>/../state`, absolute (`config.default_state_dir`, `docs/AUTOLOOP.md` §3h). Both entries stay accurate as written, because `config.example.toml` and both test helpers still set the key explicitly. |
 | 2026-08-23 | quota-01 | New §15 for the `codex_cli` transport, with the two entries a false exhaustion park actually presents as. The first is the 2026-08-22 incident and says plainly that narrowing `codex.quota_patterns` by hand was the stopgap, not the fix — do not answer a recurrence that way. |
 | 2026-08-23 | quota-01 | §6's `rate_limited`-for-hours entry is about the BROWSER transport and is unaffected: it stays the right entry for a `RateLimitedError` with no attachable page behind it. The codex adapter deliberately never raises that error, which is why its transient limits get an entry of their own rather than a clause in that one. |
+| 2026-08-23 | quota-01 | §15's first entry had its Fix paragraph corrected in place: it claimed a reflowed echo could not reopen the hole, and a literal substring test against the prompt does not hold that. The corrected text names the worked case (`quota` + newline + `exceeded` printed back as `quota exceeded`) and says outright that simplifying either comparison back to a plain `in` IS the regression — the next reader's most likely wrong move. |
+| 2026-08-23 | quota-01 | §15 is titled for the `codex_cli` transport and stays that way, but read its first entry's SECOND half — a throttle routed to the loop_fatal branch — as having applied to `codex_app_server` too until this date: `rate_limit_exceeded`, `rate_limited`, `too_many_requests` and a numeric 429 were all in that transport's exhaustion vocabulary. No production symptom was ever recorded for it, which is why this is a note and not a new entry. `docs/AUTOLOOP.md` §5d-ter has the routing table. |
+| 2026-08-23 | quota-01 | If that one ever DOES present: the symptom is a `loop_fatal` park, code `quota_exhausted`, whose `codex_app_server_failed` record shows `classification: quota_exhausted` next to an `error_type` or `status` that describes a throttle. The remedy is a config edit — move the code out of `codex.quota_error_codes` into `codex.rate_limit_error_codes` — not a code change, and not emptying either list. |

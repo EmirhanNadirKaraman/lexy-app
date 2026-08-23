@@ -54,10 +54,17 @@ from autoloop.codex.app_server_conversation import (
 from autoloop.codex.conversation import CodexConversation
 from autoloop.codex.protocol_errors import (
     DEFAULT_QUOTA_ERROR_CODES,
+    DEFAULT_RATE_LIMIT_ERROR_CODES,
+    QUOTA_EXHAUSTED,
+    RATE_LIMITED,
+    UNCLASSIFIED,
     CodexProtocolError,
+    classification_of,
     classify,
     failure_digest,
     is_quota_exhausted,
+    is_rate_limited,
+    usable_codes,
 )
 from autoloop.config import (
     AutoloopConfig,
@@ -382,10 +389,8 @@ def test_no_rotation_surface_is_exposed():
     "error",
     [
         {"code": -32000, "message": "no", "data": {"type": "usage_limit_reached"}},
-        {"code": -32000, "message": "no", "data": {"code": "rate_limit_exceeded"}},
         {"code": -32000, "message": "no", "data": {"kind": "Quota-Exceeded"}},
-        {"code": -32000, "message": "no", "data": {"status": 429}},
-        {"code": 429, "message": "no"},
+        {"code": -32000, "message": "no", "data": {"code": "out_of_credits"}},
     ],
 )
 def test_exhaustion_is_read_off_a_named_field(error):
@@ -396,6 +401,129 @@ def test_exhaustion_is_read_off_a_named_field(error):
         codex.submit(RID, PROMPT)
     # The message explains why a fallback is worth trying at all.
     assert "separate quota" in str(exc.value)
+
+
+# ---- 2a. transient throttle vs spent allowance ------------------------------
+#
+# quota-01, 2026-08-23. Three of the cases above USED to live in the list: a
+# `rate_limit_exceeded` type, a 429 status, and a bare `code: 429`. Every one of
+# them raised `QuotaExhaustedError`, which is loop_fatal with NO retry path — so
+# a thirty-second throttle parked the loop exactly as the stderr matcher next
+# door did before this task split its lists. They are the same defect one
+# transport over, and these are the regressions that keep them apart.
+
+
+#: Every shape a short-window limit wears on this wire.
+TRANSIENT_ERRORS = [
+    {"code": -32000, "message": "slow down", "data": {"code": "rate_limit_exceeded"}},
+    {"code": -32000, "message": "slow down", "data": {"type": "Rate-Limited"}},
+    {"code": -32000, "message": "slow down", "data": {"type": "too_many_requests"}},
+    {"code": -32000, "message": "slow down", "data": {"status": 429}},
+    {"code": -32000, "message": "slow down", "data": {"httpStatus": 429}},
+    {"code": 429, "message": "slow down"},
+]
+
+
+@pytest.mark.parametrize("error", TRANSIENT_ERRORS)
+def test_a_transient_throttle_is_not_a_spent_allowance(error):
+    """Two different events with two different remedies. A short-window limit
+    clears on a server-side timer; a weekly allowance does not. Only the second
+    may reach `QuotaExhaustedError`."""
+    assert is_quota_exhausted(error) is False
+    assert is_rate_limited(error) is True
+    assert classification_of(error) == RATE_LIMITED
+
+
+@pytest.mark.parametrize("error", TRANSIENT_ERRORS)
+def test_a_transient_throttle_takes_the_retryable_path_not_the_fatal_one(error):
+    """At the transport seam, where the routing actually happens: the raised
+    exception must be an ordinary `BrowserError`, which the orchestrator retries
+    on its normal failure budget, and never the park."""
+    fake = FakeAppServer()
+    fake.fail_next_turn = {"error": error}
+    codex = build(fake)
+    with pytest.raises(CodexProtocolError) as exc:
+        codex.submit(RID, PROMPT)
+    assert not isinstance(exc.value, QuotaExhaustedError)
+    assert isinstance(exc.value, BrowserError)  # routed on the ordinary budget
+    # Named as a throttle rather than left to be guessed from the message.
+    assert exc.value.transient is True
+    assert "not a spent allowance" in str(exc.value)
+
+
+def test_a_numeric_429_alone_never_parks_the_loop():
+    """The single case that caused this, isolated. `QUOTA_STATUS_CODES` used to
+    hold 429 and `is_quota_exhausted` returned True on it before it looked at
+    any type field at all."""
+    for error in ({"code": 429}, {"code": "429"}, {"data": {"status": 429}}):
+        assert is_quota_exhausted(error) is False
+        assert isinstance(classify(error), CodexProtocolError)
+        assert not isinstance(classify(error), QuotaExhaustedError)
+
+
+def test_spent_wins_when_one_error_carries_both():
+    """How a weekly allowance actually reports over HTTP: a 429 status with a
+    type that names the allowance. Precedence lives in `classification_of`
+    alone, so the digest and the raised exception cannot disagree."""
+    error = {"code": 429, "data": {"type": "usage_limit_reached", "status": 429}}
+    assert is_quota_exhausted(error) is True
+    assert is_rate_limited(error) is False, "spent is tested first and wins"
+    assert classification_of(error) == QUOTA_EXHAUSTED
+    assert isinstance(classify(error), QuotaExhaustedError)
+    assert failure_digest(error)["classification"] == QUOTA_EXHAUSTED
+
+
+def test_an_unrecognised_failure_is_neither():
+    """Degrades to an ordinary failure — noisy, never unsafe. It must not be
+    swallowed either: it is still a raised `CodexProtocolError`."""
+    error = {"code": -32603, "message": "segmentation fault", "data": {"type": "boom"}}
+    assert classification_of(error) == UNCLASSIFIED
+    assert isinstance(classify(error), CodexProtocolError)
+
+
+def test_the_two_vocabularies_do_not_overlap():
+    """A code in both lists would make the ORDER of the two checks the thing
+    that decides whether the loop parks — which is a coin flip dressed as a
+    rule. Same pin as `test_default_patterns_are_not_empty` next door."""
+    assert DEFAULT_QUOTA_ERROR_CODES
+    assert DEFAULT_RATE_LIMIT_ERROR_CODES
+    assert not set(DEFAULT_QUOTA_ERROR_CODES) & set(DEFAULT_RATE_LIMIT_ERROR_CODES)
+    # And nothing in the SPENT list describes a throttle, which is the property
+    # the disjointness above only half covers.
+    assert not [code for code in DEFAULT_QUOTA_ERROR_CODES if "rate" in code]
+
+
+def test_the_transient_vocabulary_is_overridable_without_touching_code():
+    error = {"code": -32000, "data": {"type": "seat_cooling_down"}}
+    assert is_rate_limited(error) is False
+    assert is_rate_limited(error, rate_limit_codes=("seat_cooling_down",)) is True
+
+
+def test_an_operator_who_files_a_throttle_as_spent_is_obeyed_and_it_is_stated():
+    """The honest limit of this side of the fix. There is no prompt guard here —
+    the comparison is exact against a named field, and the list is the
+    operator's explicit statement — so naming a throttle code in
+    `quota_error_codes` parks the loop. Pinned so the behaviour is a documented
+    consequence rather than a surprise."""
+    error = {"code": -32000, "data": {"type": "rate_limited"}}
+    assert is_quota_exhausted(error) is False, "not by default, which is the fix"
+    assert is_quota_exhausted(error, quota_codes=("rate_limited",)) is True
+
+
+def test_a_misfiled_transient_entry_cannot_suppress_a_real_park():
+    """The other direction, which is the one that would be UNSAFE. Spent is
+    tested first against `quota_codes`, so listing a spent marker in the
+    transient vocabulary cannot downgrade a genuine exhaustion into a retry —
+    a config mistake can cost a false park, never a missed one."""
+    error = {"code": -32000, "data": {"type": "usage_limit_reached"}}
+    assert is_rate_limited(error, rate_limit_codes=("usage_limit_reached",)) is False
+    assert (
+        classification_of(error, rate_limit_codes=("usage_limit_reached",))
+        == QUOTA_EXHAUSTED
+    )
+    assert isinstance(
+        classify(error, rate_limit_codes=("usage_limit_reached",)), QuotaExhaustedError
+    )
 
 
 def test_prose_that_mentions_a_usage_limit_is_not_exhaustion():
@@ -451,7 +579,68 @@ def test_a_failure_digest_is_bounded_and_carries_no_packet():
     )
     assert digest["error_type"] == "boom"
     assert len(digest["message"]) <= 400
-    assert set(digest) == {"code", "error_type", "status", "message"}
+    assert set(digest) == {
+        "code",
+        "error_type",
+        "status",
+        "classification",
+        "message",
+    }
+    # The record names the routing decision, so a reader does not have to infer
+    # it from whichever exception happened to be raised afterwards.
+    assert digest["classification"] == UNCLASSIFIED
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        ({"data": {"type": "usage_limit_reached"}}, QUOTA_EXHAUSTED),
+        ({"data": {"status": 429}}, RATE_LIMITED),
+        ({"code": -32601, "message": "method not found"}, UNCLASSIFIED),
+    ],
+)
+def test_the_logged_digest_names_which_of_the_three_routes_was_taken(error, expected):
+    """Asserted through the CLIENT, not the helper: what a reader will see is
+    the digest built inside `_raise`, and it must name the same route the raised
+    exception took. `test_a_configured_vocabulary_reaches_the_digest_and_the_routing`
+    is the same claim with a non-default vocabulary."""
+    logged = []
+    fake = FakeAppServer()
+    fake.fail_next_turn = {"error": error}
+    client = AppServerClient(
+        fake,
+        timeout_seconds=30.0,
+        clock=_fake_clock(),
+        log=lambda event, data: logged.append((event, data)),
+    )
+    codex = CodexAppServerConversation(client)
+    with pytest.raises((CodexProtocolError, QuotaExhaustedError)):
+        codex.submit(RID, PROMPT)
+    failures = [row for row in logged if row[0] == "codex_app_server_failed"]
+    assert failures, "every protocol failure leaves a record"
+    assert failures[0][1]["classification"] == expected
+    assert failures[0][1]["context"] == "turn/start"
+
+
+def test_a_configured_vocabulary_reaches_the_digest_and_the_routing():
+    """The two must move together. A client told that `seat_cooling_down` is a
+    throttle has to both route it retryably AND say so in the record."""
+    logged = []
+    fake = FakeAppServer()
+    fake.fail_next_turn = {"error": {"data": {"type": "seat_cooling_down"}}}
+    client = AppServerClient(
+        fake,
+        timeout_seconds=30.0,
+        clock=_fake_clock(),
+        rate_limit_codes=("seat_cooling_down",),
+        log=lambda event, data: logged.append((event, data)),
+    )
+    codex = CodexAppServerConversation(client)
+    with pytest.raises(CodexProtocolError) as exc:
+        codex.submit(RID, PROMPT)
+    assert exc.value.transient is True
+    failures = [row for row in logged if row[0] == "codex_app_server_failed"]
+    assert failures[0][1]["classification"] == RATE_LIMITED
 
 
 def test_every_protocol_failure_is_logged_for_diagnosis():
@@ -953,6 +1142,8 @@ def test_the_new_config_keys_load_and_are_validated(tmp_path):
         'app_server_command = "codex app-server"',
         "app_server_command = []",
         "quota_error_codes = [1, 2]",
+        "rate_limit_error_codes = [1, 2]",
+        'rate_limit_error_codes = "throttled"',
     ],
 )
 def test_a_malformed_new_config_key_is_refused_at_load(tmp_path, line):
@@ -979,3 +1170,69 @@ def test_a_malformed_new_config_key_is_refused_at_load(tmp_path, line):
 
 def test_the_default_quota_vocabulary_is_not_empty():
     assert DEFAULT_QUOTA_ERROR_CODES
+
+
+def test_the_transient_vocabulary_loads_from_config_and_reaches_the_client(tmp_path):
+    """Config → factory → client, in one line each, because a setting that
+    loads and is never passed on is indistinguishable from a setting that does
+    not exist — which is the shape of the logger bug this task is about."""
+    config_file = tmp_path / "autoloop.toml"
+    config_file.write_text(
+        "\n".join(
+            [
+                "[browser]",
+                'conversation_url = "https://chatgpt.com/c/x"',
+                "[conversation]",
+                'provider = "codex_app_server"',
+                "[codex]",
+                'quota_error_codes = ["seat_allowance_spent"]',
+                'rate_limit_error_codes = ["seat_cooling_down"]',
+                "[paths]",
+                f'state_dir = "{tmp_path / ".al"}"',
+                f'workers_root = "{tmp_path / "workers"}"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(config_file)
+    assert config.codex.rate_limit_error_codes == ("seat_cooling_down",)
+
+    conversation = create_conversation("codex_app_server", config)
+    assert conversation._client._quota_codes == ("seat_allowance_spent",)
+    assert conversation._client._rate_limit_codes == ("seat_cooling_down",)
+
+    # An unset section still means the built-in lists, not empty ones: empty
+    # would classify every failure as unrecognised, silently.
+    default = create_conversation(
+        "codex_app_server",
+        AutoloopConfig(
+            browser=BrowserConfig(conversation_url="https://chatgpt.com/c/x"),
+            policy=PolicyConfig(),
+            state_dir=tmp_path / ".al2",
+            conversation=ConversationConfig(provider="codex_app_server"),
+        ),
+    )
+    assert default._client._quota_codes == DEFAULT_QUOTA_ERROR_CODES
+    assert default._client._rate_limit_codes == DEFAULT_RATE_LIMIT_ERROR_CODES
+
+
+def test_a_vocabulary_of_blanks_falls_back_instead_of_recognising_nothing():
+    """`[""]` is a NON-EMPTY list of nothing. `tuple(codes) or DEFAULT` passes it
+    through, and the client then recognises no error at all — a check switched
+    off by config, which is the failure class this task exists to remove. The
+    fallback tests the CONTENTS. (Equality matching means a blank could never
+    over-classify, unlike the substring hole `quota._usable` closes; the harm
+    here is the opposite one, a real exhaustion going unrecognised.)"""
+    assert usable_codes([""], DEFAULT_QUOTA_ERROR_CODES) == DEFAULT_QUOTA_ERROR_CODES
+    assert usable_codes(["  ", None, 7], DEFAULT_QUOTA_ERROR_CODES) == (
+        DEFAULT_QUOTA_ERROR_CODES
+    )
+    assert usable_codes(None, DEFAULT_QUOTA_ERROR_CODES) == DEFAULT_QUOTA_ERROR_CODES
+    # A real entry beside the junk is kept, and only it.
+    assert usable_codes(["", " seat_spent "], DEFAULT_QUOTA_ERROR_CODES) == (
+        "seat_spent",
+    )
+
+    client = AppServerClient(FakeAppServer(), quota_codes=("",), rate_limit_codes=("",))
+    assert client._quota_codes == DEFAULT_QUOTA_ERROR_CODES
+    assert client._rate_limit_codes == DEFAULT_RATE_LIMIT_ERROR_CODES

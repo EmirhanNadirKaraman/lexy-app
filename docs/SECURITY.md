@@ -1815,7 +1815,23 @@ rather than a bug: the review packet is assembled from repository text and agent
 output, so the input that could trigger it is not fully under an operator's
 control, and several task descriptions in this repository discuss quotas and
 rate limits by name. Closed by making the prompt a REQUIRED argument to
-`classify` and counting a marker only when it does not occur in that prompt.
+`classify`, dropping every output LINE the prompt accounts for
+(`codex_owned_text`) before anything is matched, matching only WITHIN a line so
+a wording cannot be assembled across a join that was never printed
+(`_folded_lines`), and counting a surviving marker only when the prompt does not
+account for it either. Which one carries the property is worth stating exactly:
+SUPPRESSION does, alone — an echoed line's squeeze is contained in the prompt's,
+so any marker folding into it squeezes into the prompt and is refused. The other
+two are not redundant (the line bound stops the comparison manufacturing a
+wording contiguous in neither side; the haystack bound makes `matched_pattern`
+readable as codex's own output) but neither holds it alone. The comparisons ignore
+whitespace and punctuation: a literal substring test was tried first and refused
+on review, because a REFLOWED echo can carry a marker the prompt does not
+contain as an exact string — prompt text `quota` + newline + `exceeded`, printed
+back as `quota exceeded`, is the worked example. Matching folds (whitespace and
+punctuation to single spaces) and suppression squeezes (folds, then removes the
+spaces); squeezing is monotone over substring containment, so anything that can
+be MATCHED in a stream is necessarily SUPPRESSED when applied to the prompt.
 
 **2. The disclosure half — `stdout_tail` is new in the transcript.**
 `failure_digest`'s docstring promised the record was "the return code plus a
@@ -1840,8 +1856,10 @@ guard in `classify`, which does not depend on recognising the echo at all.
 **Verification check:**
 ```bash
 # The guard must be a REQUIRED argument. Expect `prompt: str,` with NO default
-# on both, and `sent = prompt.lower()` consulted before any marker counts:
-rg -n 'def classify|def is_quota_exhausted|needle in sent' -A 6 autoloop/codex/quota.py
+# on all three, and the prompt consulted before any marker counts — expect the
+# `sent_squeezed` test inside `first_own_match` and the line filter above it:
+rg -n 'def classify|def is_quota_exhausted|def codex_owned_text' -A 6 autoloop/codex/quota.py
+rg -n 'sent_squeezed|codex_owned_text\(' autoloop/codex/quota.py
 # The adapter must guard with the prompt it SENT (post-attachment), and the
 # factory must pass a real logger. Expect one `classify(` with `prompt` and one
 # `log=_transcript_log(config)` per codex factory:
@@ -1852,9 +1870,11 @@ rg -n '_transcript_log\(config\)' autoloop/conversation.py
 # and the environment in order to say it excludes them, so a word grep hits.
 # `failure_digest` builds the only string-keyed literal in this module; EXPECT
 # exactly request_id, returncode, classification, matched_pattern, stderr_tail,
-# stdout_tail, stderr_chars, stdout_chars, prompt_echo_chars — and nothing that
-# says argv, command, env or prompt. Two further keys are added conditionally
-# just below it (`suppressed_patterns`, `note`) and are both derived here:
+# stdout_tail, stderr_chars, stdout_chars, prompt_echo_chars, prompt_guard — and
+# nothing that says argv, command, env or the prompt ITSELF (`prompt_guard` is
+# the word "active" or "inert", never any of the text). Three further keys are
+# added conditionally just below it (`suppressed_patterns`, `echo_lines_dropped`,
+# `note`) and are all derived here:
 rg -n '^\s+"[a-z_]+":|digest\["' autoloop/codex/quota.py
 ```
 Pinned by
@@ -1863,7 +1883,17 @@ Pinned by
 `::test_classification_cannot_be_called_without_the_prompt_it_sent` (the
 signature check that stops a future call site disabling the guard by omission)
 and `::test_an_echoed_review_packet_never_parks_the_loop`, which drives a real
-`CodexConversation` through the orchestrator.
+`CodexConversation` through the orchestrator. The reflow bound is pinned by
+`::test_no_reshaping_of_the_echo_can_declare_the_allowance_spent` and
+`::test_no_reshaped_echo_parks_the_loop_end_to_end`, each parametrized over 15
+ways a CLI can print text back without changing a word of it, plus
+`::test_anything_that_can_match_is_first_suppressible` for the fold/squeeze
+implication the guard rests on. The other direction — codex's OWN exhaustion
+message still parking the loop while the packet in flight quotes exhaustion
+wordings — is `::test_a_genuine_exhaustion_parks_even_after_a_marker_laden_echo`.
+An absent prompt leaves the guard inert; that is recorded as
+`prompt_guard: inert` rather than inferred, and pinned by
+`::test_an_absent_prompt_leaves_the_guard_inert_and_records_that`.
 
 **Suggested fix if the bound ever breaks:** if the guard ever has to be relaxed,
 do not widen the haystack — narrow the transport instead (a mode that does not
@@ -2469,3 +2499,8 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | quota-01 | New finding S39. The availability half is the interesting one: the reviewer's own INPUT could declare the account exhausted, because `codex exec` echoes the prompt onto stderr and the classifier searched both streams for `"429"`, `"quota"` and `"rate limit"`. A packet quoting a line number parked the loop loop-fatal twice on 2026-08-22. Closed by a guard, not by narrowing the list. |
 | 2026-08-23 | quota-01 | The disclosure half is a narrow amendment: `failure_digest` promised "never stdout" and now carries a bounded, echo-stripped `stdout_tail`, because a codex failure that never writes to stderr was being classified with nothing recorded about it. Argv and the environment are still never recorded, and the reviewer's reply already reaches that file in full (S36). |
 | 2026-08-23 | quota-01 | Residual named rather than claimed away: echo stripping is best-effort and a reflowed echo defeats it, so up to 400 characters the loop wrote itself can appear in a record. It cannot affect routing — routing is the guard in `classify`, which never depends on recognising the echo's shape. |
+| 2026-08-23 | quota-01 | S39's availability half was reopened on review and re-closed. A LITERAL substring test against the prompt is not enough: a reflowed echo can carry a marker the prompt does not hold verbatim (`quota` + newline + `exceeded` printed back as `quota exceeded`). Classification now drops output lines the prompt accounts for, matches only within a line, and compares both sides ignoring whitespace and punctuation. The finding text, its verification greps and its pinned-by list were updated in place; the residual above is unchanged and still stands. |
+| 2026-08-23 | quota-01 | Two digest keys added, neither carrying prompt text: `prompt_guard` is the word `active` or `inert`, and `echo_lines_dropped` is a count. `inert` is the disclosure that matters — the guard has one input, and with no prompt sent it suppresses nothing. That behaviour is correct and unchanged; recording it is what stops "the check quietly switched itself off" from being invisible in the transcript. |
+| 2026-08-23 | quota-01 | Amends S39's closing advice, which points at `protocol_errors.py` as the safer alternative: that module had the SAME availability defect. `rate_limit_exceeded`, `rate_limited`, `too_many_requests` and a numeric 429 all raised the loop_fatal `QuotaExhaustedError`, so a short-window throttle parked the loop from a structured field instead of a substring. Split into two vocabularies; only a spent allowance parks. Nothing was widened — this is a denial removed, not a permission added. |
+| 2026-08-23 | quota-01 | Correction to the 2026-08-22 changelog bullet for S37, which says quota detection there is "exact matches on named error fields plus a numeric 429": read the 429 clause as superseded. It is a THROTTLE now and routes retryably; everything else in that bullet stands. The bullet is unedited — S37's own summary row and finding text never made the 429 claim, so nothing above the marker asserts it any more. |
+| 2026-08-23 | quota-01 | Residual on that side, named: there is no prompt guard on the app-server transport and none is needed (the comparison is exact against a named field, never against printed text), but that also means `codex.quota_error_codes` is obeyed literally — an operator who files a throttle code there still parks the loop. Pinned by a test so it is a documented consequence, not a surprise. The `codex_app_server_failed` digest gained `classification` (one of three words) and carries no new content. |

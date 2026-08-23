@@ -45,9 +45,11 @@ it does not recognise — and it classifies with `quota.classify`, which is
 handed the FINAL prompt so that a marker the loop itself sent can never be read
 back as evidence. `codex exec` echoes the whole prompt onto stderr, so without
 that argument the review packet is inside the haystack; see `quota.py` for the
-two parks that fact caused. Only a SPENT allowance raises
-`QuotaExhaustedError`; a transient throttle and an unrecognised fault both
-return REJECTED and stay retryable.
+two parks that fact caused, and for why the comparison ignores whitespace and
+punctuation on both sides — a literal substring test let a REFLOWED echo
+synthesise a marker the prompt never contained verbatim. Only a SPENT allowance
+raises `QuotaExhaustedError`; a transient throttle and an unrecognised fault
+both return REJECTED and stay retryable.
 """
 
 from __future__ import annotations
@@ -286,10 +288,11 @@ class CodexConversation:
         if result.returncode != 0:
             # `prompt` — the FINAL one, after any attachment was inlined above,
             # which is the text that actually reached the process. This is the
-            # guard: a marker that occurs in what we SENT cannot classify what
-            # came back, because `codex exec` echoes the whole prompt onto
-            # stderr and every word of the review packet is therefore inside
-            # the string being matched. See `quota.py`.
+            # guard: an output line the prompt accounts for is not part of the
+            # haystack, and a marker whose letters occur in what we SENT cannot
+            # classify what came back — because `codex exec` echoes the whole
+            # prompt onto stderr and every word of the review packet is
+            # therefore inside the string being matched. See `quota.py`.
             failure = classify(
                 result.returncode,
                 result.stdout,
