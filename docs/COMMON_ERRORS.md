@@ -2708,6 +2708,54 @@ report, assert `NOT RUN` — see `autoloop/tests/test_validation_failfast.py`.
 
 ---
 
+## 15. Autoloop Codex CLI transport (`codex_cli`)
+
+### `the Codex allowance for this ChatGPT plan is exhausted (exit 1)` — and it is not
+**Symptom:** the loop parks `loop_fatal`, code `quota_exhausted`, on an account
+that is nowhere near its limit. Checked two ways on 2026-08-22: `codex app-server`
+`account/rateLimits/read` reported 4% of the weekly window used with
+`rateLimitReachedType=None` and `spendControlReached=false`, and a live
+`codex exec --skip-git-repo-check` request completed with exit 0. Roughly 25
+minutes of downtime across two parks and an hour of investigation.
+**Cause:** two defects at once. (1) `codex exec` ECHOES THE WHOLE PROMPT BACK ON
+STDERR — measured, a 180,024-byte packet came back verbatim — and
+`is_quota_exhausted` searched `f"{stdout}\n{stderr}"`, so every word of the
+review packet was inside the haystack. With `"429"`, `"quota"` and `"rate limit"`
+in the pattern list as bare substrings, a packet quoting `docs/autoloop.md:4295`
+— a LINE NUMBER — made ANY non-zero exit read as a spent allowance. The real
+failure could have been anything; `QuotaExhaustedError` is loop_fatal with no
+retry path. (2) The diagnostic that would have named the real fault was written
+and thrown away: `CodexConversation.submit` logs `codex_invocation_failed` on
+every non-zero exit, but the factory constructed the adapter without a `log=`, so
+the no-op default stood and that record appeared ZERO times in 24 days.
+**Fix:** applied repo-side 2026-08-23 (quota-01) and load-bearing. `quota.classify`
+takes the FINAL prompt as a REQUIRED argument and counts a marker only when it
+does not occur in that prompt, so nothing the loop sent can classify what came
+back — a guard, not an attempt to carve the echo out of the stream, which is why
+a reframed or reflowed echo cannot reopen it. `"429"`, `"too many requests"` and
+`"rate limit"` moved to `codex.rate_limit_patterns`, which returns REJECTED and
+stays retryable. `conversation._transcript_log` wires the real logger at all three
+codex factories. **Do not** answer a recurrence by narrowing
+`codex.quota_patterns` by hand — that was the 2026-08-22 stopgap and it only
+lowered the odds; read the `codex_invocation_failed` record instead, which now
+names the classification, the deciding marker and the markers the guard
+suppressed.
+
+### `codex_invocation_failed` records a `note` and both tails are empty
+**Symptom:** the record says `codex printed nothing but an echo of the prompt` (or
+`codex printed nothing at all`) and carries no excerpt of either stream.
+**Cause:** not a broken record. `failure_digest` excises exact occurrences of the
+prompt from both streams before bounding them, and `codex exec` echoes the prompt
+onto stderr — so a process that failed without printing anything of its own leaves
+nothing behind but its exit code. `prompt_echo_chars`, `stderr_chars` and
+`stdout_chars` tell the two cases apart.
+**Fix:** read `returncode`. If the exit code alone is not enough, reproduce the
+invocation by hand with the same `codex.command` and `codex.sandbox_args`
+(`autoloop doctor` reports both, as `codex_command` and `codex_sandbox`) — the
+digest deliberately carries no argv and no environment.
+
+---
+
 ## Adding an entry
 
 Newest-first within a section. Keep the symptom line verbatim so it can be found
@@ -2780,3 +2828,5 @@ rather than landing outside the ledger unnoticed.
 |---|---|---|
 | 2026-08-23 | notes-03 | This file joined `note_merge.NOTE_TRACKERS`: a merge conflicting only in the section below is now combined by the loop, while a conflict in any error entry above the marker still refuses the whole merge. §10's fix text had to stop quoting the marker comment in full first — with two copies in the file, the resolver refuses every merge of it. |
 | 2026-08-23 | port-01 | Read the two entries above about a RELATIVE `state_dir` — the sibling-worktree one in §2 and the stray `.al`/`.autoloop` one in §7 — as describing an EXPLICITLY configured value from now on. The unconfigured default is no longer `.autoloop`; it is `<workers_root>/../state`, absolute (`config.default_state_dir`, `docs/AUTOLOOP.md` §3h). Both entries stay accurate as written, because `config.example.toml` and both test helpers still set the key explicitly. |
+| 2026-08-23 | quota-01 | New §15 for the `codex_cli` transport, with the two entries a false exhaustion park actually presents as. The first is the 2026-08-22 incident and says plainly that narrowing `codex.quota_patterns` by hand was the stopgap, not the fix — do not answer a recurrence that way. |
+| 2026-08-23 | quota-01 | §6's `rate_limited`-for-hours entry is about the BROWSER transport and is unaffected: it stays the right entry for a `RateLimitedError` with no attachable page behind it. The codex adapter deliberately never raises that error, which is why its transient limits get an entry of their own rather than a clause in that one. |

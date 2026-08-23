@@ -130,11 +130,44 @@ def _browser_chatgpt_factory(config: "AutoloopConfig") -> LLMConversation:
     )
 
 
+def _transcript_log(config: "AutoloopConfig") -> Callable[[str, dict], None]:
+    """The failure logger every PRODUCTION codex adapter is built with.
+
+    The codex adapters all take `log=` and all default it to a no-op. That
+    default is right for a unit test that only wants a return value; it was
+    catastrophic in production, because the factories constructed them without
+    passing anything. `CodexConversation.submit` has always written
+    `codex_invocation_failed` on every non-zero exit, with a comment saying it
+    "turns the first real exhaustion into a one-line config fix instead of an
+    investigation" — and across a 24-day transcript that record appeared ZERO
+    times. When the loop then parked twice on a false exhaustion (2026-08-22),
+    the exit code and stderr that would have named the real fault had already
+    been thrown away, so the investigation had to start from the account API.
+
+    Fixed HERE, at the construction site, rather than by removing the no-op
+    default: a default that keeps tests hermetic is reasonable, and a
+    production adapter built without a logger is the bug.
+
+    Deliberately not wrapped in `try`. `orchestrator._log` does not guard its
+    writes either, and a transcript this cannot write to is a real fault that
+    should be visible rather than a record that quietly does not exist — which
+    is the shape of the failure this whole function is undoing.
+    """
+    from .transcript import TranscriptLogger
+
+    logger = TranscriptLogger(config.transcript_file)
+
+    def log(event: str, data: dict) -> None:
+        logger.append(event, data=data)
+
+    return log
+
+
 def _codex_cli_factory(config: "AutoloopConfig") -> LLMConversation:
     # Lazy import for symmetry with the browser factory — nothing here depends
     # on the codex binary existing until a run actually selects this provider.
     from .codex.conversation import CodexConversation, SubprocessCodexRunner
-    from .codex.quota import DEFAULT_QUOTA_PATTERNS
+    from .codex.quota import DEFAULT_QUOTA_PATTERNS, DEFAULT_RATE_LIMIT_PATTERNS
 
     codex = config.codex
     runner = SubprocessCodexRunner(
@@ -146,6 +179,11 @@ def _codex_cli_factory(config: "AutoloopConfig") -> LLMConversation:
     return CodexConversation(
         runner,
         quota_patterns=codex.quota_patterns or DEFAULT_QUOTA_PATTERNS,
+        # Two lists, because a short-window throttle and a spent weekly
+        # allowance are different events with different remedies, and only the
+        # second one is worth parking a loop over.
+        rate_limit_patterns=codex.rate_limit_patterns or DEFAULT_RATE_LIMIT_PATTERNS,
+        log=_transcript_log(config),
     )
 
 
@@ -164,16 +202,23 @@ def _codex_app_server_factory(config: "AutoloopConfig") -> LLMConversation:
         # claim — see `codex/app_server.py`.
         cwd=Path(codex.working_dir) if codex.working_dir else None,
     )
+    # Same wiring as the subprocess seat, and for the same reason: this
+    # transport's own `codex_app_server_failed` digest never reached the
+    # transcript either, because both objects were constructed without a
+    # logger. See `_transcript_log`.
+    log = _transcript_log(config)
     client = AppServerClient(
         transport,
         timeout_seconds=codex.timeout_seconds,
         quota_codes=codex.quota_error_codes or DEFAULT_QUOTA_ERROR_CODES,
         working_dir=codex.working_dir,
+        log=log,
     )
     return CodexAppServerConversation(
         client,
         part_chars=codex.app_server_part_chars,
         max_attachment_chars=codex.app_server_max_attachment_chars,
+        log=log,
     )
 
 

@@ -38,6 +38,16 @@ block and the full contract), so the reviewer needs no filesystem at all, and
 containment that does not depend on knowing a sandbox flag's name is
 containment that still holds when the flag is renamed. Configured sandbox
 arguments are passed through on top of that, not instead of it.
+
+**Every non-zero exit leaves a record, and the prompt cannot classify it.**
+`submit` logs `codex_invocation_failed` on every failure — including the ones
+it does not recognise — and it classifies with `quota.classify`, which is
+handed the FINAL prompt so that a marker the loop itself sent can never be read
+back as evidence. `codex exec` echoes the whole prompt onto stderr, so without
+that argument the review packet is inside the haystack; see `quota.py` for the
+two parks that fact caused. Only a SPENT allowance raises
+`QuotaExhaustedError`; a transient throttle and an unrecognised fault both
+return REJECTED and stay retryable.
 """
 
 from __future__ import annotations
@@ -50,7 +60,12 @@ from typing import Protocol
 
 from ..browser.chatgpt import SubmitResult
 from ..errors import BrowserError, QuotaExhaustedError, ResponseTimeoutError
-from .quota import DEFAULT_QUOTA_PATTERNS, failure_digest, is_quota_exhausted
+from .quota import (
+    DEFAULT_QUOTA_PATTERNS,
+    DEFAULT_RATE_LIMIT_PATTERNS,
+    classify,
+    failure_digest,
+)
 
 #: Ceiling on the argv-borne prompt, well under this host's 1 MiB ARG_MAX so
 #: the environment block and the rest of the command line still fit.
@@ -156,15 +171,24 @@ class CodexConversation:
         runner: CodexRunner,
         *,
         quota_patterns: tuple[str, ...] = DEFAULT_QUOTA_PATTERNS,
+        rate_limit_patterns: tuple[str, ...] = DEFAULT_RATE_LIMIT_PATTERNS,
         log=None,
     ):
         self._runner = runner
         self._quota_patterns = tuple(quota_patterns)
+        self._rate_limit_patterns = tuple(rate_limit_patterns)
         #: request_id -> captured reply. In-memory on purpose: it is a cache of
         #: what THIS process observed, not a claim about the world. After a
         #: restart it is empty, `reconcile` truthfully says "no reply captured",
         #: and `idempotent_submit` makes re-running the correct response.
         self._responses: dict[str, str] = {}
+        #: A no-op default is right for a unit test that only wants the return
+        #: value. It is NOT right for a production adapter, and the factory
+        #: (`autoloop.conversation._codex_cli_factory`) passes a real transcript
+        #: writer — see that function. Constructing this class in production
+        #: without one is the defect that left ZERO `codex_invocation_failed`
+        #: records across a 24-day transcript, so the wiring lives at the
+        #: factory rather than being enforced by removing this default.
         self._log = log or (lambda event, data: None)
 
     # ---- lifecycle ----------------------------------------------------------
@@ -232,24 +256,76 @@ class CodexConversation:
                     "this ceiling."
                 )
 
-        result = self._runner.run(prompt)
+        try:
+            result = self._runner.run(prompt)
+        except Exception as exc:
+            # An invocation that never produced an exit code at all — the binary
+            # could not be launched, or the process was killed at the timeout.
+            # Still a failed invocation and still owed a record: the routing is
+            # unchanged (the error is re-raised untouched, so the orchestrator
+            # sees exactly what it saw before), but "why did this fail" is now
+            # answerable from the transcript rather than only from whatever the
+            # handler upstream happened to print. `returncode` is None, not a
+            # fabricated -1.
+            self._log(
+                "codex_invocation_failed",
+                failure_digest(
+                    None,
+                    "",
+                    "",
+                    prompt,
+                    request_id=request_id,
+                    note=(
+                        "the invocation never returned an exit code — "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                ),
+            )
+            raise
 
         if result.returncode != 0:
-            digest = failure_digest(result.returncode, result.stderr)
+            # `prompt` — the FINAL one, after any attachment was inlined above,
+            # which is the text that actually reached the process. This is the
+            # guard: a marker that occurs in what we SENT cannot classify what
+            # came back, because `codex exec` echoes the whole prompt onto
+            # stderr and every word of the review packet is therefore inside
+            # the string being matched. See `quota.py`.
+            failure = classify(
+                result.returncode,
+                result.stdout,
+                result.stderr,
+                prompt,
+                quota_patterns=self._quota_patterns,
+                rate_limit_patterns=self._rate_limit_patterns,
+            )
             # Logged on EVERY failure, not only unrecognised ones: this is what
             # turns the first real exhaustion into a one-line config fix
             # instead of an investigation. See `quota.py`.
-            self._log("codex_invocation_failed", digest)
-            if is_quota_exhausted(
-                result.returncode, result.stdout, result.stderr, self._quota_patterns
-            ):
+            self._log(
+                "codex_invocation_failed",
+                failure_digest(
+                    result.returncode,
+                    result.stdout,
+                    result.stderr,
+                    prompt,
+                    request_id=request_id,
+                    classification=failure,
+                ),
+            )
+            if failure.is_exhaustion:
                 raise QuotaExhaustedError(
                     "the Codex allowance for this ChatGPT plan is exhausted "
-                    f"(exit {result.returncode}). Codex shares an agentic pool "
-                    "with ChatGPT Work and ChatGPT for Excel; ordinary ChatGPT "
-                    "conversations draw on a separate quota, which is why the "
-                    "browser fallback can still run."
+                    f"(exit {result.returncode}; codex's own error output says "
+                    f"{failure.matched!r}, which is not text this prompt sent "
+                    "it). Codex shares an agentic pool with ChatGPT Work and "
+                    "ChatGPT for Excel; ordinary ChatGPT conversations draw on "
+                    "a separate quota, which is why the browser fallback can "
+                    "still run."
                 )
+            # Everything else — a transient throttle and an unrecognised fault
+            # alike — is REJECTED, which is retryable and is not loop_fatal. A
+            # short-window 429 is emphatically NOT a spent allowance and must
+            # not reach the branch above, which parks with no retry path.
             return SubmitResult.REJECTED
 
         reply = result.stdout.strip()
@@ -260,7 +336,14 @@ class CodexConversation:
             # retry saying so.
             self._log(
                 "codex_invocation_failed",
-                failure_digest(result.returncode, "exited 0 with empty stdout"),
+                failure_digest(
+                    result.returncode,
+                    result.stdout,
+                    result.stderr,
+                    prompt,
+                    request_id=request_id,
+                    note="exited 0 with no reply on stdout",
+                ),
             )
             return SubmitResult.REJECTED
 

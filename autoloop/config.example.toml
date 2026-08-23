@@ -146,11 +146,28 @@ timeout_seconds = 900.0
 # access, and running outside the checkout is a containment that holds no
 # matter what the sandbox flags are called. `doctor` fails if it is inside.
 working_dir = ""
-# Substrings that mark an exhausted allowance in a FAILED invocation. Empty
-# uses the built-in list. Every non-zero exit logs its return code and a
-# stderr tail to the transcript, so the first real exhaustion shows you exactly
-# what to add here — it is a config edit, not a code change.
+# Substrings that mark a SPENT ALLOWANCE in a FAILED invocation — the window is
+# used up, waiting does not help, and the loop hands the reviewer role to
+# `conversation.fallback_provider` or parks. Empty uses the built-in list.
+#
+# Every non-zero exit writes a `codex_invocation_failed` record to the
+# transcript carrying the return code, the classification and a bounded excerpt
+# of what codex printed, so the first real exhaustion shows you exactly what to
+# add here — a config edit, not a code change.
+#
+# Safe to widen. A marker is ignored when it also occurs in the prompt that was
+# sent: `codex exec` echoes the whole prompt back on stderr, so before that
+# guard existed a review packet quoting a line number like `docs/x.md:4295` made
+# any failure read as an exhausted account and parked the loop (twice, on
+# 2026-08-22, against an account 4% through its weekly window). Suppressed
+# markers are named in the record, so the guard is visible rather than silent.
 quota_patterns = []
+# Substrings that mark a TRANSIENT throttle — the account is being asked to
+# slow down and the remedy is time. Empty uses the built-in list, which is where
+# "429", "too many requests" and "rate limit" live. Kept apart from
+# `quota_patterns` on purpose: these never park the loop, because a
+# thirty-second limit routed to the permanent branch is a false outage.
+rate_limit_patterns = []
 
 [conversation]
 # Which LLMConversation adapter holds the reviewer role (see

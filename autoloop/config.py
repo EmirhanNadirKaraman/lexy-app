@@ -131,11 +131,24 @@ class CodexConfig:
     #: filesystem access, and this containment holds without depending on a
     #: sandbox flag's name.
     working_dir: str = ""
-    #: Substrings that identify an exhausted allowance in a FAILED invocation.
-    #: Empty uses `codex.quota.DEFAULT_QUOTA_PATTERNS`. Overridable because the
-    #: real wording cannot be confirmed here and will change; every non-zero
-    #: exit logs its stderr tail so the first real exhaustion shows what to add.
+    #: Substrings that identify a SPENT ALLOWANCE in a FAILED invocation — the
+    #: window is used up and waiting does not help, so the loop parks or hands
+    #: over. Empty uses `codex.quota.DEFAULT_QUOTA_PATTERNS`. Overridable
+    #: because the real wording cannot be confirmed here and will change; every
+    #: non-zero exit now logs a real diagnostic (`codex_invocation_failed`), so
+    #: the first real exhaustion shows exactly what to add.
+    #:
+    #: A marker here can no longer be triggered by the loop's OWN prompt: it is
+    #: ignored when it also occurs in the text that was sent, because
+    #: `codex exec` echoes the whole prompt onto stderr. Widening this list is
+    #: therefore safe in a way it was not before — see `codex/quota.py`.
     quota_patterns: tuple[str, ...] = ()
+    #: Substrings that identify a TRANSIENT throttle — the account is being
+    #: asked to slow down and the remedy is time, not a different provider.
+    #: Empty uses `codex.quota.DEFAULT_RATE_LIMIT_PATTERNS`. Separate from
+    #: `quota_patterns` because routing a thirty-second 429 to the permanent,
+    #: loop_fatal branch is most of the harm a misclassification here can do.
+    rate_limit_patterns: tuple[str, ...] = ()
 
     # ---- codex_app_server only ------------------------------------------
     #: How to launch the local app-server. It ships with codex-cli and needs no
@@ -1055,6 +1068,7 @@ def load_config(path: Path) -> AutoloopConfig:
         "command",
         "sandbox_args",
         "quota_patterns",
+        "rate_limit_patterns",
         "app_server_command",
         "quota_error_codes",
     ):
