@@ -1411,7 +1411,11 @@ def _executions(repo: Path) -> dict:
     record is half-written tells the operator nothing.
     """
     out: dict = {}
-    directory = repo / ".autoloop" / "executions"
+    # THROUGH `_state_dir`, for the same reason `collect` was fixed on
+    # 2026-08-23: a second hardcoded path here kept the candidate, round
+    # and attempt figures reading pre-migration records while the rest of
+    # the page had followed the config.
+    directory = _state_dir(repo) / "executions"
     if not directory.is_dir():
         return out
     for path in sorted(directory.glob("*.json")):

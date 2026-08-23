@@ -116,6 +116,44 @@ def _agent_running(pattern: str = "claude -p") -> bool:
     return bool(result.stdout.strip())
 
 
+def _work_running(loop_pid: int | None) -> bool:
+    """Is the loop's own process doing something other than waiting?
+
+    A SECOND proof-of-work signal, weaker than `_agent_running` and checked
+    after it. Validation is not an agent: while `pytest -n auto` runs the
+    writer has already exited, nothing reaches the transcript until the round
+    ends, and a healthy round was reported STUCK_SILENT — measured 2026-08-23,
+    stop-01 at 48 minutes with eight pytest workers live.
+
+    CAFFEINATE IS EXCLUDED, and that is the whole difficulty. The loop starts
+    as `caffeinate -is python3 -m autoloop run`, so a bare has-children test is
+    ALWAYS true and would retire this alarm entirely — trading a false positive
+    for a false negative, which is worse: a monitor that never fires cannot be
+    noticed failing.
+
+    Anything else under the loop is work — pytest, ruff, npm, a git subprocess.
+    Enumerating them would go stale the first time `validation_commands`
+    changes, so the rule is "a child that is not the caffeinate wrapper".
+    """
+    if not loop_pid:
+        return False
+    try:
+        children = subprocess.run(
+            ["pgrep", "-P", str(loop_pid)], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for pid in children.stdout.split():
+        try:
+            cmd = subprocess.run(["ps", "-o", "command=", "-p", pid],
+                                 capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if cmd.strip() and not cmd.lstrip().startswith("caffeinate"):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class SleepEvidence:
     """What the platform can prove about machine sleep inside a time window.
@@ -290,6 +328,7 @@ def check(
     now: datetime | None = None,
     silence_minutes: float = DEFAULT_SILENCE_MINUTES,
     agent_probe=_agent_running,
+    work_probe=_work_running,
     sleep_probe=machine_sleep_in_window,
 ) -> Health:
     """Judge the loop. Read-only, and safe to run mid-round."""
@@ -386,6 +425,19 @@ def check(
                 code=OK_RUNNING,
                 needs_attention=False,
                 summary=f"autoloop is working (agent running, quiet {silent:.0f}m)",
+                phase=phase,
+                silent_minutes=silent,
+            )
+        if work_probe(info.pid if info else None):
+            # Weaker than a live agent and checked after it: this only says the
+            # loop's process is busy, which during validation is the truth the
+            # transcript cannot tell. Still ahead of sleep evidence — a running
+            # subprocess settles the question without it.
+            return Health(
+                code=OK_RUNNING,
+                needs_attention=False,
+                summary=f"autoloop is working (round in progress, quiet {silent:.0f}m)",
+                detail="validation or another subprocess is running under the loop",
                 phase=phase,
                 silent_minutes=silent,
             )
