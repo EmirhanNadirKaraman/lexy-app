@@ -2240,6 +2240,30 @@ refuse it as never recorded. roadmap-01's second file,
 `autoloop/tests/test_obsolete.py`, was in scope and is exactly this case. Today
 that removal needs an operator.
 
+### The same park, but the reviewer asked for an EDIT to be UNDONE
+**Symptom:** identical to the entry above — repeated feedback, the convergence
+guard fires, the task parks — except the residue is a file that ALREADY EXISTED
+and was merely modified out of scope, so there is nothing to delete. Observed on
+port-01, 2026-08-20: ten edited files, zero creations, and because a revise
+builds on the same branch the contaminated set was handed to every following
+round unchanged. 8 commits, 11 attempts, 6 review rounds, branch discarded by
+hand.
+**Cause:** `REMOVE-OUT-OF-SCOPE:` deletes; it has no "put it back" form, and
+deleting a file the base commit contains would be a second and worse overrun.
+The agent cannot restore it either — it has no `Bash`, and reconstructing the
+original from memory is a new edit, not a revert.
+**Fix (since 2026-08-24, task `scope-05`):** write
+`REVERT-OUT-OF-SCOPE: <path>`, same anchoring rules and same recorded-paths-only
+authority, and the executor restores the file from `TaskExecution.task_base_sha`
+— git's copy, not yours, so do not try to reconstruct the content. A path that
+did not exist at the base has nothing to restore and is made absent instead;
+naming one path under BOTH forms removes it and reports the revert superseded.
+**Check the wiring before you rely on this.** If the prompt you were given does
+NOT list `REVERT-OUT-OF-SCOPE:` among the request forms, no revert authority is
+wired for this run and the line does nothing — `cli._build_executor` has to pass
+`revert_authority=` for the capability to exist. Say so in the report rather than
+retrying the line. `docs/AUTOLOOP.md` §4e's 2026-08-24 amendment has the rest.
+
 ### `archive-blocker` refuses with a lock error and archives nothing
 **Symptom:** `python -m autoloop archive-blocker blk-xxx-001 --reason "..."`
 prints `error: another autoloop process holds …/LOCK` or `error: stale lock at
@@ -3049,3 +3073,5 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | stop-01 | New §8 entry for the 2026-08-20 livelock: the loop collecting the same reviewer `stop` every few minutes while `health` reports `running` / `open_blockers: 0` / `needs_attention: FALSE`. Filed as fixed rather than as a live trap — the third matching stop now parks `stop_livelock` — but the recovery is what the entry is for, including the `stop_repetition_ledger_unusable` variant, whose remedy is deleting a counter file rather than answering alone. |
 | 2026-08-23 | stop-01 | New §2 entry for the test trap beside it: `health.check` asks the LOCK whether a loop is running, so a hermetic test asserting `needs_attention is False` fails with `not_running` unless it holds `LoopLock`. The half worth knowing is the ordering — blockers are judged before the lock and before any phase, so the True direction needs no lock, and after answering a loop_fatal blocker the verdict moves to `stuck_parked`, not to running. |
 | 2026-08-23 | stop-01 | Revision round. Third §2 entry, for the trap that cost this round: a scripted `stop` whose `reason` is `""` never stops anything. `contract._require_str` refuses empty AND whitespace-only strings, so the reply is a `missing_field:reason` parse error, the round spends a corrective re-prompt, and a one-element fake client dies with "test script exhausted". Test the dispatch through `_dispatch` and the parse through the `ContractError` code — never by loosening the contract. |
+| 2026-08-24 | scope-05 | New §9 entry beside the scope-04 one, for the same park with a different residue: the reviewer asks for an out-of-scope EDIT to be undone, and `REMOVE-OUT-OF-SCOPE:` cannot express it — deleting a file the base commit contains would be a worse overrun. `REVERT-OUT-OF-SCOPE: <path>` restores it from `task_base_sha`. The entry says outright not to reconstruct the content by hand: git holds it, and an agent-authored "put it back" is a new edit, not a revert. |
+| 2026-08-24 | scope-05 | That entry ends with the check to run FIRST: if the prompt does not list `REVERT-OUT-OF-SCOPE:` among the request forms, no revert authority is wired for that run and the line does nothing — `cli._build_executor` has to pass `revert_authority=`. Report it rather than retrying the line. The scope-04 entry above is unchanged and still the right one for a file an earlier round CREATED out of scope. |

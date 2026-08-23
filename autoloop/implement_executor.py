@@ -66,6 +66,29 @@ the file, but ONLY when that exact path is already in the loop's own
 selects from that record; it can never add to it. Nothing about scope changes:
 an EDIT to the same path is as unauthorized as it ever was.
 
+**A round can also PUT BACK what an earlier round of the same task edited out
+of scope** (scope-05, 2026-08-24), which is the shape the sentence above could
+not reach. scope-04 covers a CREATED file; port-01's contamination on
+2026-08-20 was ten EDITED files and zero creations, so "strip the residue" was
+once again unperformable, and because a revise builds on the same branch the
+same edits were handed to every following round — 8 commits over 11 attempts,
+a contaminated set that could not shrink, and a branch an operator eventually
+discarded by hand. `REVERT-OUT-OF-SCOPE: <path>` is the second request form
+(`_REVERT_RE`, `_apply_recorded_reverts`, `_revert_recorded_file`) and it runs
+under EXACTLY the authority above: the same record, the same exact-match gate,
+the same "the agent selects, it never adds". The content is read from git at
+`TaskExecution.task_base_sha` — a LOOP-written field no agent can influence, and
+the commit `commit_range_paths` already measures the candidate against — so the
+result is checkable rather than being a second edit the agent authored from
+memory. No tool is added (`WRITE_ALLOWED_TOOLS` is unchanged and `Bash` is
+still disallowed), `approved_paths`/`allowed_paths` are neither read nor
+written, and a path with no content at the base is restored to ABSENCE, which
+is where the two instructions deliberately converge. Fail-closed everywhere the
+input is missing: no injected `revert_authority`, no base sha, or a base tree
+git will not read means nothing is reverted and every request says so.
+`worktask.RecordedRevertAuthority` supplies the base sha and records the result
+on `TaskExecution.reverted_out_of_scope_paths`.
+
 **The prompt asks the agent to attack its own claim** (impl-01, 2026-08-22).
 `_ADVERSARIAL_SELF_TEST` is given on every implement AND revise round: hunt the
 cases in which THIS task's own stated claim would still fail, fix only what
@@ -185,7 +208,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, NamedTuple, Sequence
 
 from . import note_merge
 from .audit.agents import AgentRunner, AgentSpec, ClaudeCliRunner, classify_agent_fault
@@ -686,9 +709,10 @@ def _advisory_instruction(max_calls: int) -> str:
     specific to this transport.
 
     **Echo-safe by construction.** No line in this text begins with
-    `ASSUMPTION:` or `REMOVE-OUT-OF-SCOPE:`, so an agent that quotes the whole
-    brief back forges neither a disclosure nor a deletion request — the same
-    property `_authoring_rules` and `_scope_instruction` are held to.
+    `ASSUMPTION:`, `REMOVE-OUT-OF-SCOPE:` or `REVERT-OUT-OF-SCOPE:`, so an agent
+    that quotes the whole brief back forges neither a disclosure nor a request
+    to delete or restore a file — the same property `_authoring_rules` and
+    `_scope_instruction` are held to.
 
     One sentence is doing real work and is not decoration: the ground rules
     above say the agent has no shell and must not run commands, and this section
@@ -1091,9 +1115,10 @@ _SMALLEST_REVERSIBLE_READING = (
 #: scratch.
 #:
 #: **The enumeration is DELIBERATELY NOT PARSED.** No regex, no
-#: `ExecutionOutcome` field, no packet section — unlike `_ASSUMPTION_RE` and
-#: `_CLEANUP_RE`, which exist because something COMPUTES with what they match (a
-#: durable cross-round record; an actual unlink). Nothing computes with this: it
+#: `ExecutionOutcome` field, no packet section — unlike `_ASSUMPTION_RE`,
+#: `_CLEANUP_RE` and `_REVERT_RE`, which exist because something COMPUTES with
+#: what they match (a durable cross-round record; an actual unlink; an actual
+#: restore from the base commit). Nothing computes with this: it
 #: is prose for a human reviewer, and it already reaches them, because
 #: `result.raw_text` rides to `ExecutionOutcome.details` and on into
 #: `TaskExecution.report_details`, which `packet._format_executor_report`
@@ -1199,10 +1224,10 @@ def _scope_entry(path: str) -> str:
     exactly what was in the record.
 
     This half is about NEWLINES only. An entry that needs no newline because it
-    simply BEGINS with `ASSUMPTION:` or `REMOVE-OUT-OF-SCOPE:` is stopped by the
-    `- ` bullet `_scope_instruction` renders it behind, not by anything here —
-    see that function for why the two extractors' refusal of a bullet prefix is
-    the control that closes it.
+    simply BEGINS with `ASSUMPTION:`, `REMOVE-OUT-OF-SCOPE:` or
+    `REVERT-OUT-OF-SCOPE:` is stopped by the `- ` bullet `_scope_instruction`
+    renders it behind, not by anything here — see that function for why the
+    three extractors' refusal of a bullet prefix is the control that closes it.
     """
     return "".join(
         ch
@@ -1228,21 +1253,22 @@ def _scope_instruction(paths: tuple[str, ...]) -> str:
     `contract.CONTRACT_INSTRUCTIONS`, which is re-sent every turn), and the
     number of approved paths is bounded by what a reviewer approved.
 
-    **The `- ` bullet is load-bearing, not decoration.** `_ASSUMPTION_RE` and
-    `_CLEANUP_RE` both accept leading WHITESPACE (`^[ \\t]*<anchor>:`), so a
-    plainly indented entry that merely STARTS with one of those anchors — an
-    `approved_paths` entry reading `ASSUMPTION: the reviewer approved this`, or
-    `REMOVE-OUT-OF-SCOPE: autoloop/obsolete.py` — sits at a matching position
-    the moment an agent echoes its own prompt back: a fabricated disclosure in
-    the durable record, or a deletion request nothing asked for. No newline is
-    needed for that; escaping alone does not close it. Both regexes REFUSE a
-    `-`/`*`/`>` prefix by design (see `_ASSUMPTION_RE`'s docstring — prose about
-    the convention must not read as a use of it), so the bullet makes an echoed
-    scope line structurally unharvestable by both channels, using a property
-    those anchors already have and already test. It costs nothing here because
-    nothing asks the agent to copy a scope path verbatim — unlike
-    `_cleanup_instruction`, whose list must stay bare so a path can be copied
-    into an exact-match request.
+    **The `- ` bullet is load-bearing, not decoration.** `_ASSUMPTION_RE`,
+    `_CLEANUP_RE` and `_REVERT_RE` all accept leading WHITESPACE
+    (`^[ \\t]*<anchor>:`), so a plainly indented entry that merely STARTS with
+    one of those anchors — an `approved_paths` entry reading `ASSUMPTION: the
+    reviewer approved this`, or `REMOVE-OUT-OF-SCOPE: autoloop/obsolete.py`, or
+    `REVERT-OUT-OF-SCOPE: autoloop/state.py` — sits at a matching position the
+    moment an agent echoes its own prompt back: a fabricated disclosure in the
+    durable record, or a deletion or restore request nothing asked for. No
+    newline is needed for that; escaping alone does not close it. All three
+    regexes REFUSE a `-`/`*`/`>` prefix by design (see `_ASSUMPTION_RE`'s
+    docstring — prose about the convention must not read as a use of it), so the
+    bullet makes an echoed scope line structurally unharvestable by every
+    channel, using a property those anchors already have and already test. It
+    costs nothing here because nothing asks the agent to copy a scope path
+    verbatim — unlike `_cleanup_instruction`, whose list must stay bare so a
+    path can be copied into an exact-match request.
     """
     if not paths:
         return _SCOPE_NONE
@@ -1360,7 +1386,37 @@ _CLEANUP_RE = re.compile(
 )
 
 
-def _cleanup_instruction(paths: tuple[str, ...]) -> str:
+#: The line shape a REVERT REQUEST is written on — `REVERT-OUT-OF-SCOPE:`
+#: first on its line, optionally indented, nothing else in front of it. The
+#: same anchoring discipline as `_CLEANUP_RE` and `_ASSUMPTION_RE` above,
+#: including the refusal of `-`/`*`/`>` prefixes, so an agent summarising the
+#: instruction as a bullet is reporting, not requesting.
+#:
+#: **Why a SECOND anchor and not a widened first one** (scope-05, 2026-08-24).
+#: scope-04's exception covers a CREATED file: the agent asks and the executor
+#: unlinks. It could do nothing at all for an out-of-scope EDIT, which is the
+#: shape that actually parks tasks — port-01's contamination on 2026-08-20 was
+#: ten edited files and zero creations, so "strip the residue" was again
+#: literally unperformable and the same edits were handed to every following
+#: round on the same branch. The two instructions stay DISTINCT because their
+#: end states differ on a file that existed before the task: `REMOVE` deletes
+#: it, `REVERT` puts the base's bytes back. They CONVERGE on a created path,
+#: which has no base content — see `_revert_recorded_file`, where "restore the
+#: base state" of a path absent at the base is defined, deliberately and
+#: testably, as making it absent.
+#:
+#: Echo-safety is structural here for the same reason as `_CLEANUP_RE`: an
+#: agent quoting this instruction back emits the placeholder
+#: `<repository-relative path>`, which is not a path the loop ever recorded, so
+#: `authorized_cleanup_paths` refuses it and nothing is restored. A fabricated
+#: request cannot restore anything either — the authority is the persisted
+#: record, and this line only ever SELECTS from it.
+_REVERT_RE = re.compile(
+    r"^[ \t]*revert-out-of-scope:[ \t]*(.+)$", re.IGNORECASE | re.MULTILINE
+)
+
+
+def _cleanup_instruction(paths: tuple[str, ...], revert_enabled: bool = False) -> str:
     """The cleanup section of the agent prompt, or "" when there is nothing to
     clean up.
 
@@ -1370,16 +1426,26 @@ def _cleanup_instruction(paths: tuple[str, ...]) -> str:
     literally because the match is exact: an agent that retypes a path
     approximately gets a refusal, not a near-miss deletion.
 
+    `revert_enabled` adds the SECOND request form, and only when a revert could
+    actually be performed this round — `ImplementExecutor._run_implementation`
+    passes True only when a `revert_authority` is wired AND it yielded a base
+    sha. Fail-closed exactly like the section as a whole: with no authority the
+    paragraph is absent, the anchor never appears in the prompt, and every
+    `REVERT-OUT-OF-SCOPE:` line an agent writes anyway is ignored and reported.
+
     The wording is doing one specific job beyond describing the mechanism — it
     has to stop the capability being read as scope. "You may remove this file"
     is one sentence away from "this file is mine to edit", and the second
     reading is the one that would quietly undo the never-widened
-    `allowed_paths` rule this whole mechanism is built to preserve.
+    `allowed_paths` rule this whole mechanism is built to preserve. The revert
+    paragraph repeats that sentence rather than relying on the first one: it is
+    the form an agent reaches for when the path is a file it merely EDITED, i.e.
+    exactly when "this file is mine to work in" is most tempting.
     """
     if not paths:
         return ""
     listed = "\n".join(f"  {p}" for p in paths)
-    return (
+    text = (
         "Out-of-scope residue from an earlier round of THIS task — the loop "
         "recorded these paths itself, from its own diff of what your earlier "
         "rounds committed, because your approved scope did not cover them:\n"
@@ -1398,6 +1464,32 @@ def _cleanup_instruction(paths: tuple[str, ...]) -> str:
         "Remove only what the review actually asks you to remove; residue a "
         "reviewer has not objected to is work, not litter."
     )
+    if revert_enabled:
+        text += (
+            "\nDeleting is wrong for a path that ALREADY EXISTED before this "
+            "task and was merely edited out of scope — the file has to stay, "
+            "it just has to say what it said before. For those, ask for the "
+            "edit to be UNDONE instead, one line per path, at the start of a "
+            "line, in the exact form\n"
+            "  REVERT-OUT-OF-SCOPE: <repository-relative path>\n"
+            "copying the path exactly as listed above, under the same rules: a "
+            "path that does not match one of those lines exactly is ignored and "
+            "reported as ignored. The executor restores the file from the "
+            "task's recorded base commit — the content git holds, not what you "
+            "believe the file used to say, so you do not need to reconstruct it "
+            "and must not try. It runs after you finish and before validation, "
+            "like the deletion.\n"
+            "A path that did not exist at the base commit has no content to "
+            "restore, so reverting it makes it absent — the same end state "
+            "REMOVE gives. Asking for BOTH on one path is not an error: the "
+            "removal is performed and the revert of that same path is reported "
+            "as superseded.\n"
+            "This is permission to PUT BACK, and nothing else. It authorizes no "
+            "edit of your own to these paths, and it widens your approved scope "
+            "by exactly nothing — an ordinary edit to any of them is as "
+            "unauthorized as it was before they were ever recorded."
+        )
+    return text
 
 
 #: Introduces `tasks.Task.decomposition` in the agent's prompt.
@@ -1422,6 +1514,7 @@ def _agent_prompt(
     feedback: str | None,
     cleanup_paths: tuple[str, ...] = (),
     advisory_brief: str = "",
+    revert_enabled: bool = False,
 ) -> str:
     parts = [
         "You are a write-capable coding subagent inside an automated "
@@ -1484,7 +1577,7 @@ def _agent_prompt(
         # adversarial instruction still names the scope list "below" and still
         # sits immediately above it.
         parts.append(advisory_brief)
-    cleanup = _cleanup_instruction(cleanup_paths)
+    cleanup = _cleanup_instruction(cleanup_paths, revert_enabled)
     if cleanup:
         # After the ground rules, which say the agent cannot run commands, and
         # before the feedback that is usually what asks for the removal.
@@ -1506,8 +1599,26 @@ def _extract_cleanup_requests(raw_text: str) -> tuple[str, ...]:
     says to copy the path literally, so a near-miss is an agent that did not
     follow a stated instruction, not a case worth guessing at.
     """
+    return _extract_requests(_CLEANUP_RE, raw_text)
+
+
+def _extract_revert_requests(raw_text: str) -> tuple[str, ...]:
+    """The paths an agent's output ASKED to have restored, in the order written.
+
+    Identical rules to `_extract_cleanup_requests` — deduplicated, stripped, and
+    normalised no further — for identical reasons, which is why both go through
+    `_extract_requests` rather than being written twice. A near-miss is
+    FAIL-CLOSED here too: it restores nothing and the round reports the request
+    as ignored.
+    """
+    return _extract_requests(_REVERT_RE, raw_text)
+
+
+def _extract_requests(pattern: "re.Pattern[str]", raw_text: str) -> tuple[str, ...]:
+    """Shared body of the two extractors above — see `_extract_cleanup_requests`
+    for why nothing here normalises a path beyond stripping whitespace."""
     seen: list[str] = []
-    for match in _CLEANUP_RE.finditer(raw_text or ""):
+    for match in pattern.finditer(raw_text or ""):
         text = match.group(1).strip()
         if text and text not in seen:
             seen.append(text)
@@ -1579,6 +1690,200 @@ def _remove_recorded_file(root: Path, rel: str) -> bool:
     return True
 
 
+class _Reverts(NamedTuple):
+    """What one round's revert pass actually did, split by WHY.
+
+    Six separate facts rather than one list, because a reviewer who asked for
+    the residue to be stripped needs to tell them apart, and because collapsing
+    them is how a refusal comes to read like a success:
+
+      * `done` — restored to the base state. Named in full downstream: every
+        entry came out of the loop's own record.
+      * `failed` — authorized (the record holds it) and NOT restored. Also
+        named: same bounded source, and a silent one here is the fail-open.
+      * `refused` — the record does not hold it. COUNTED, never named: these
+        are strings the agent chose and the round summary becomes the commit
+        message (the rule `_cleanup_note` already follows).
+      * `superseded` — also removed by this round's removal pass, which ran
+        first. Named; the removal is the end state.
+      * `base_unavailable` — this round has no base commit to restore from: no
+        `revert_authority` was wired, or the record names none, or what it
+        names is not a plain object id. NOTHING was restored.
+      * `base_unreadable` — there IS a base sha and git would not read its
+        tree. Also nothing restored.
+
+    The last two are separate booleans rather than one, because they are
+    different facts with different remedies — "the capability is not wired
+    here" versus "git could not answer" — and reporting the first as the second
+    would send a reviewer looking for a corrupt repository. Both are kept out of
+    `failed`'s wording for the same reason.
+    """
+
+    done: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
+    refused: tuple[str, ...] = ()
+    superseded: tuple[str, ...] = ()
+    base_unavailable: bool = False
+    base_unreadable: bool = False
+
+
+#: Blob modes a revert will write back. Git tracks exactly one bit of file
+#: permission, so these two are the whole of "a regular file at the base".
+#: A `120000` (symlink) or `160000` (submodule) entry is REFUSED rather than
+#: written out as file bytes — restoring a symlink as a text file containing its
+#: target path is not the base state, it is a new and stranger edit.
+_REVERTABLE_BLOB_MODES = ("100644", "100755")
+
+#: What `_revert_base_sha` will pass to git. Defense in depth on a value that
+#: comes from a persisted record rather than from an agent: anything that is not
+#: a plain hex object name is refused HERE, before it can reach `rev-parse` as
+#: an argument. The policy whitelist would already refuse a token starting with
+#: `-`, so this is the second layer, not the only one.
+_BASE_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _revert_recorded_file(git: GitGateway, rel: str, entry) -> bool:
+    """Put `rel` back to the base state described by `entry`. True when it is
+    there afterwards.
+
+    `entry` is `(mode, kind, oid)` from `GitGateway.tree_entries` of the base
+    commit's tree, or None when the base tree has no such path. Called ONLY for
+    a path `authorized_cleanup_paths` has already matched against the loop's own
+    record, so — exactly like `_remove_recorded_file`, whose guards this repeats
+    and reuses — every check here is defence in depth against a tampered record
+    rather than a real expectation.
+
+    **The created-path rule, stated once and in code.** A path with no entry at
+    the base did not exist there, so its base state is ABSENCE and this deletes
+    it, through `_remove_recorded_file` and its guards rather than a second
+    unlink. That is the deliberate convergence of the two instructions on the
+    one shape where they cannot differ; `_REVERT_RE`'s comment says why they
+    stay distinct everywhere else. A path that is ALREADY absent is True with
+    nothing done: the requested end state holds.
+
+    **It never falls through to that branch on an error.** `entry is None` means
+    git positively answered "not at the base". A base tree that could not be
+    read produces no entries to consult at all and is refused one level up
+    (`_apply_recorded_reverts`, `base_unreadable`) — an unreadable base silently
+    turning a revert into a deletion is the worst outcome available here.
+
+    Refuses, in order: an empty/absolute/`..` path, a parent that does not
+    resolve inside the worker repo, a non-blob or non-regular-file base entry, a
+    blob git will not hand over, and a directory sitting at the target path (no
+    recursive delete is reachable from a revert, exactly as none is from a
+    removal). A SYMLINK at the target is unlinked as the link and replaced by
+    the file — never written through, so a link pointing out of the worker repo
+    costs the link and leaves its target alone.
+    """
+    root = git.repo_root
+    if not rel.strip() or rel.startswith("/") or ".." in Path(rel).parts:
+        return False
+    target = root / rel
+    try:
+        # BEFORE anything is created: `Path.resolve()` is non-strict, so this
+        # answers for a parent that does not exist yet, and the `mkdir` below
+        # therefore cannot be the thing that puts a directory outside the root.
+        base = root.resolve()
+        parent = target.parent.resolve()
+        if parent != base and base not in parent.parents:
+            return False
+    except OSError:
+        return False
+    if entry is None:
+        try:
+            if not (target.is_symlink() or target.exists()):
+                return True     # already absent; the base state holds
+        except OSError:
+            return False
+        return _remove_recorded_file(root, rel)
+    try:
+        mode, kind, oid = entry
+    except (TypeError, ValueError):
+        return False
+    if kind != "blob" or mode not in _REVERTABLE_BLOB_MODES:
+        return False
+    try:
+        content = git.blob_bytes(oid)
+    except Exception:
+        return False
+    try:
+        if target.is_symlink():
+            target.unlink()
+        elif target.is_dir():
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        # Git tracks ONE permission bit. Restoring the bytes and leaving the
+        # bit wrong would leave the path in `commit_range_paths` forever — the
+        # diff would still show a mode change — which is precisely the thing a
+        # revert exists to take out of the reviewed range.
+        current = target.stat().st_mode
+        os.chmod(
+            target,
+            (current | 0o111) if mode == "100755" else (current & ~0o111),
+        )
+    except OSError:
+        return False
+    return True
+
+
+def _revert_note(reverts: _Reverts, recorded_ok: bool) -> str:
+    """The sentence the round's summary carries about reverts, or "".
+
+    Same asymmetry as `_cleanup_note`, and for the same reason: paths that came
+    out of the loop's record are NAMED (the text is bounded by a set the loop
+    wrote), and paths the agent chose are COUNTED (this summary becomes the
+    commit message and an agent-chosen string has no bound at all).
+
+    `recorded_ok` is False when the restore happened but the note of it could
+    not be written to the execution record. Said out loud rather than swallowed:
+    the repair is real and in the tree either way, and a reviewer reading a
+    record with no revert on it needs to know which of the two it is.
+    """
+    parts = []
+    if reverts.done:
+        parts.append(
+            f" Reverted {len(reverts.done)} recorded out-of-scope path(s) to "
+            "their task base content: " + ", ".join(reverts.done) + "."
+        )
+    if reverts.superseded:
+        parts.append(
+            f" {len(reverts.superseded)} revert request(s) were superseded by "
+            "this round's removal of the same path(s): "
+            + ", ".join(reverts.superseded)
+            + "."
+        )
+    if reverts.base_unavailable:
+        parts.append(
+            " No task base commit was available to this round — no revert "
+            "authority is wired, or the execution record names none — so "
+            "NOTHING was reverted and every revert request was refused."
+        )
+    elif reverts.base_unreadable:
+        parts.append(
+            " The task's recorded base commit could not be read, so NOTHING "
+            "was reverted this round — every revert request was refused."
+        )
+    elif reverts.failed:
+        parts.append(
+            f" Could not revert {len(reverts.failed)} recorded path(s): "
+            + ", ".join(reverts.failed)
+            + "."
+        )
+    if reverts.refused:
+        parts.append(
+            f" Ignored {len(reverts.refused)} revert request(s) for path(s) "
+            "this task has no recorded out-of-scope write to (nothing was "
+            "restored for them; the requests are in the executor report below)."
+        )
+    if reverts.done and not recorded_ok:
+        parts.append(
+            " The revert(s) above could NOT be written to the execution record; "
+            "the files are restored in the tree but the record does not say so."
+        )
+    return "".join(parts)
+
+
 def _extract_assumptions(raw_text: str) -> tuple[str, ...]:
     """The `ASSUMPTION:` lines in an agent's own output, in the order written.
 
@@ -1626,6 +1931,7 @@ class ImplementExecutor:
         agent_runner_factory: Callable[[Path], AgentRunner] | None = None,
         validation_env: ValidationEnv | None = None,
         cleanup_paths_for: Callable[[str], tuple[str, ...]] | None = None,
+        revert_authority=None,
         advisory_max_calls: int = ADVISORY_VALIDATION_MAX_CALLS,
     ):
         """`git` / `agent_runner` are the STANDALONE bindings — used verbatim
@@ -1675,6 +1981,19 @@ class ImplementExecutor:
         # `execute()` test, and any embedder that does not wire it — means NO
         # cleanup authority at all, which is the fail-closed default.
         self._cleanup_paths_for = cleanup_paths_for
+        # The revert exception's only authority (scope-05, 2026-08-24). An
+        # object with `base_sha(task_id)` and `record_reverted(task_id, paths)`
+        # — `worktask.RecordedRevertAuthority` in a wired run. It supplies the
+        # BASE SHA a restore reads from and the place a completed restore is
+        # written down; it deliberately does NOT supply the path list, which
+        # stays `cleanup_paths_for`'s so that one record answers "is this path
+        # authorized" for both instructions rather than two readers drifting.
+        #
+        # None — every direct `execute()` test, and any embedder that does not
+        # wire it — means NO revert authority at all: the prompt never mentions
+        # the capability, and every `REVERT-OUT-OF-SCOPE:` line is ignored and
+        # reported as ignored. Same fail-closed default as `cleanup_paths_for`.
+        self._revert_authority = revert_authority
         # How many advisory runs ONE round may pay for. A constructor override
         # rather than a config key: a key would have to be read in `cli.py` and
         # threaded through from there, and a setting nothing reads is worse than
@@ -1791,6 +2110,139 @@ class ImplementExecutor:
         )
         return removed, tuple(sorted(ignored))
 
+    @staticmethod
+    def _apply_recorded_reverts(
+        git: GitGateway,
+        recorded: tuple[str, ...],
+        base_sha: str,
+        raw_text: str,
+        removed: tuple[str, ...] = (),
+    ) -> _Reverts:
+        """Restore the paths this round asked for AND is authorized to restore.
+
+        The claim scope-05 exists to make, in one method: an agent can name a
+        path an earlier round of the same task EDITED outside its declared
+        scope, and that path goes back to its `task_base_sha` content.
+
+        **The authority is scope-04's, unchanged.** `recorded` is
+        `TaskExecution.out_of_scope_paths` — the loop's own record, written from
+        its own two path comparisons and never from anything an agent asserts —
+        and `tasks.authorized_cleanup_paths` is the same exact-match gate the
+        removal uses. The agent's line SELECTS from that record; nothing it
+        writes can extend it. `Task.approved_paths` and
+        `TaskExecution.allowed_paths` are not read, not written and not consulted
+        anywhere on this path: an ordinary edit to a recorded path stays exactly
+        as unauthorized as it was, and this only ever narrows a diff back toward
+        the declared scope.
+
+        **The content comes from git, never from the agent.** One `ls-tree` of
+        the base commit's tree answers, for every requested path at once, both
+        "what did this say at the base" and "did it exist at the base at all".
+        That is what makes a revert checkable rather than a second edit — the
+        base sha is LOOP-written and is the commit the reviewed range is already
+        measured from, so "restored to base" and "gone from the range" are the
+        same statement. A stale-base refresh moves it; that is fine and is why
+        the property is phrased about the range rather than about a fixed sha.
+
+        **Fail-closed at every absent input.** No base sha, a base sha that is
+        not a plain object name, or a base tree git will not read: NOTHING is
+        restored and every request is refused with a reason. In particular an
+        unreadable base never reaches `_revert_recorded_file`'s created-path
+        branch, so it cannot silently become a deletion.
+
+        `removed` is what this round's removal pass already deleted, and it runs
+        FIRST. A path named under both instructions is therefore removed, and
+        its revert is reported as SUPERSEDED rather than performed — otherwise
+        restoring the base bytes would quietly undo the deletion the same report
+        asked for. The order is fixed here and stated in the prompt.
+        """
+        requested = _extract_revert_requests(raw_text)
+        if not requested:
+            return _Reverts()
+        authorized, refused = authorized_cleanup_paths(requested, recorded)
+        already = set(removed)
+        superseded = sorted(p for p in authorized if p in already)
+        targets = sorted(p for p in authorized if p not in already)
+        if not targets:
+            return _Reverts(
+                refused=tuple(sorted(refused)), superseded=tuple(superseded)
+            )
+        if not base_sha:
+            # No authority wired, or a record with no usable base sha. Nothing
+            # is restorable, and saying so is the point: a round that reported
+            # nothing here would read exactly like one that had nothing to do.
+            return _Reverts(
+                failed=tuple(targets),
+                refused=tuple(sorted(refused)),
+                superseded=tuple(superseded),
+                base_unavailable=True,
+            )
+        try:
+            entries = git.tree_entries(git.tree_of(base_sha))
+        except Exception:
+            return _Reverts(
+                failed=tuple(targets),
+                refused=tuple(sorted(refused)),
+                superseded=tuple(superseded),
+                base_unreadable=True,
+            )
+        done, failed = [], []
+        for path in targets:
+            if _revert_recorded_file(git, path, entries.get(path)):
+                done.append(path)
+            else:
+                failed.append(path)
+        return _Reverts(
+            done=tuple(done),
+            failed=tuple(failed),
+            refused=tuple(sorted(refused)),
+            superseded=tuple(superseded),
+        )
+
+    def _revert_base_sha(self, task: Task) -> str:
+        """The commit a revert restores from, or "" for "no revert authority".
+
+        Fail-closed at three points, matching `_recorded_cleanup_paths`: no
+        injected authority means no revert capability at all; an authority that
+        raises — a missing, unreadable or corrupt execution record — yields ""
+        rather than propagating; and a value that is not a plain hex object name
+        is refused here rather than handed to git. The consequence of "" is only
+        that no revert can be requested this round. The consequence of guessing
+        would be a file rewritten from a commit nothing authorized.
+        """
+        if self._revert_authority is None:
+            return ""
+        try:
+            sha = str(self._revert_authority.base_sha(task.id) or "").strip()
+        except Exception:
+            return ""
+        return sha if _BASE_SHA_RE.match(sha) else ""
+
+    def _record_reverted(self, task: Task, paths: tuple[str, ...]) -> bool:
+        """Write the completed reverts onto the execution record. True on
+        success, and True when there was nothing to write.
+
+        Called immediately after the restore rather than on the success path
+        with `assumptions`, because that is when the fact becomes true: the
+        files are on disk from that moment and a round whose validation then
+        fails does NOT rewind the worker tree — the next round commits the very
+        same restored content. Recording only on success would lose exactly
+        those repairs, silently.
+
+        Never raises. A record that cannot be written is reported in the round
+        summary (`_revert_note`) instead, because the repair itself is real and
+        a reviewer must not read the missing record as "no revert happened".
+        """
+        if not paths:
+            return True
+        if self._revert_authority is None:
+            return False
+        try:
+            self._revert_authority.record_reverted(task.id, paths)
+        except Exception:
+            return False
+        return True
+
     def _validation_commands_for(self, task: Task) -> tuple[tuple[str, ...], ...]:
         """The commands THIS round validates with.
 
@@ -1873,11 +2325,20 @@ class ImplementExecutor:
         # state, and read through the callable rather than from anything the
         # agent or this round produced — see `self._cleanup_paths_for`.
         cleanup_paths = self._recorded_cleanup_paths(task)
+        # Read here too, and for the same reason: the prompt only offers the
+        # revert form when one could actually be performed. Doubly fail-closed
+        # — no recorded paths means no request can be authorized anyway, and no
+        # base sha means there is nothing to restore FROM.
+        revert_base_sha = self._revert_base_sha(task)
         spec = AgentSpec(
             domain=task.id,
             title=task.title,
             prompt=_agent_prompt(
-                task, feedback, cleanup_paths, rendezvous.brief() if offered else ""
+                task,
+                feedback,
+                cleanup_paths,
+                rendezvous.brief() if offered else "",
+                bool(cleanup_paths) and bool(revert_base_sha),
             ),
         )
         try:
@@ -1949,6 +2410,15 @@ class ImplementExecutor:
         # that is actually going to be committed rather than against one that
         # still contains the file being removed.
         removed, ignored = self._apply_recorded_cleanup(git, cleanup_paths, result.raw_text)
+        # SECOND, and inside the same window, for the same two reasons: the
+        # restored content has to be part of `changed_paths` so it is staged and
+        # committed, and validation has to grade the tree that is committed. The
+        # removal running first is what makes a path named under both
+        # instructions deterministic — see `_apply_recorded_reverts`.
+        reverts = self._apply_recorded_reverts(
+            git, cleanup_paths, revert_base_sha, result.raw_text, removed
+        )
+        reverts_recorded = self._record_reverted(task, reverts.done)
 
         try:
             changed = sorted(git.dirty_paths_all())
@@ -1962,7 +2432,14 @@ class ImplementExecutor:
                 status="error",
                 summary=(
                     f"task '{task.id}': could not read the worker repo's status "
-                    f"after the agent ran — {exc}" + advisory.note()
+                    f"after the agent ran — {exc}"
+                    # On every branch below the restore, not only the success
+                    # one: a revert is already ON DISK and already on the
+                    # execution record by this point, and a round that failed
+                    # afterwards must not report itself as having done nothing
+                    # to a path the record now says it repaired.
+                    + _revert_note(reverts, reverts_recorded)
+                    + advisory.note()
                 ),
                 details=result.raw_text,
                 validation="not run",
@@ -1973,6 +2450,7 @@ class ImplementExecutor:
                 summary=(
                     f"task '{task.id}': the implementation agent ran but changed "
                     "no files in its worker repo — nothing to review"
+                    + _revert_note(reverts, reverts_recorded)
                     + advisory.note()
                 ),
                 details=result.raw_text,
@@ -1992,6 +2470,7 @@ class ImplementExecutor:
                 summary=(
                     f"task '{task.id}': declared validation_cwd "
                     f"{task.validation_cwd!r} does not exist in the worker repo"
+                    + _revert_note(reverts, reverts_recorded)
                     + advisory.note()
                 ),
                 details=result.raw_text,
@@ -2014,7 +2493,9 @@ class ImplementExecutor:
                 status="error",
                 summary=(
                     f"task '{task.id}': validation failed after implementation — "
-                    f"{validation_summary}" + advisory.note()
+                    f"{validation_summary}"
+                    + _revert_note(reverts, reverts_recorded)
+                    + advisory.note()
                 ),
                 details=result.raw_text,
                 validation=validation_summary,
@@ -2027,6 +2508,7 @@ class ImplementExecutor:
                 f"task '{task.id}' implemented: {len(changed)} file(s) changed; "
                 "validation passed."
                 + _cleanup_note(removed, ignored)
+                + _revert_note(reverts, reverts_recorded)
                 + advisory.note()
             ),
             details=result.raw_text,
