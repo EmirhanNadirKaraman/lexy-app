@@ -79,13 +79,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
+import sys
+import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# Imported at MODULE level, unlike `lock` / `inbox` / `path_suggest` / `TaskStore`
+# below, and that is the point rather than an inconsistency: these three read the
+# signal that decides whether this process is running the checkout's code, so
+# they have to be part of the same load. A lazy import on that path would read
+# `auto_merge.py` off disk AFTER a merge changed it — the half-swapped state the
+# `os.execv` further down exists to avoid, arrived at while deciding whether to
+# execv. Everything they pull in is pure Python with no optional dependency.
+from .auto_merge import UPGRADE_PENDING, UpgradeStore, loop_code_paths
 from .errors import StateError, TaskGraphError
 from .tasks import TaskRegistry, TaskState
 
@@ -166,6 +177,35 @@ def _source_stamp() -> str:
 
 
 _IMPORT_STAMP = _source_stamp()
+
+#: When this process loaded its code, as an aware UTC datetime. Set at IMPORT,
+#: which is exactly the instant every question below is about: has the checkout
+#: moved since the bytes in memory came off disk.
+#:
+#: Compared against `PendingUpgrade.recorded_at` rather than against a digest of
+#: the package, and that is load-bearing rather than a shortcut. It is one
+#: comparison on a 2s poll instead of a hash of 135 files; it does not have to
+#: decide which files count (this module imports some lazily, so a digest would
+#: read new bytes for a module loaded after the merge and under-report at the
+#: same time as it over-reports); and it is SELF-LIMITING. A successor started
+#: by the re-exec below has a start time LATER than the record it restarted for,
+#: so it reads that same still-pending record as "already current" — the absence
+#: of a restart loop falls out of the mechanism rather than out of bookkeeping.
+#:
+#: ONE BOUND, and it points the safe way. `utcnow_iso()` truncates to SECONDS
+#: while this does not, so a merge recorded in the same wall-clock second as
+#: this import floors to at-or-before it and reads as "already current" — one
+#: missed restart, in a one-second window, on a signal that is re-armed by the
+#: next merge. The opposite error is impossible: truncation can only move a
+#: stamp EARLIER, so a process that really is current can never read as stale.
+#: Do not "fix" this with a fudge factor in the other direction; that trades a
+#: missed restart for a restart loop.
+#:
+#: `_IMPORT_STAMP` above is a different and narrower question, kept as it was:
+#: it hashes THIS FILE, so it catches an uncommitted edit the loop never merged,
+#: and it says nothing at all about `tasks.py` — which is the file that actually
+#: moved under the 19.5-hour-old dashboard on 2026-08-22.
+_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 #: `git ls-remote` per observed checkout: `{str(repo): {"at", "ok", "refs"}}`.
 #: Keyed by repo rather than global because a single flat dict silently served
@@ -638,6 +678,487 @@ def _task_store(repo: Path):
     )
     return TaskStore(
         _tasks_file(repo), ledger=mutation_ledger_for(root, _state_dir(repo))
+    )
+
+
+# ---- serving the code the checkout now holds (loop-03, 2026-08-23) -----------
+#
+# Merging into the checkout does not reload a live Python process, and the loop
+# has replaced itself over that fact since loop-02 (`cli._self_upgrade_at_
+# boundary`, docs/AUTOLOOP.md §3f-quater). The dashboard is the OTHER long-lived
+# process in that design and its half was never built.
+#
+# MEASURED 2026-08-22. This page had been up 19.5 hours, across four merges.
+# `autoloop/tasks.py` was rewritten three hours earlier and
+# `.autoloop/pending_upgrade.json` named it among the merge's changed paths at
+# 13:37. The signal was armed and nothing here read it.
+#
+# WHAT IT COST IS NOT THE STALENESS — it is what the page said instead. It read
+# "the task graph could not be read — tasks.json did not load as a registry",
+# and the data was entirely healthy: 171 tasks, valid JSON, `TaskRegistry.
+# from_dict` fine, `state_of` raising for none of them, `task_groups` returning
+# all six groups when run against the CURRENT code. An operator reading that
+# message goes and audits the file — its JSON, its dependencies, whether the
+# writer is atomic (it is). None of that is the fault. The PROCESS is. So the
+# rule this section is built to keep is not "re-exec"; it is that a stale reader
+# must never be reported through the branch that means "your data is corrupt".
+#
+# EACH PROCESS RESTARTS ITSELF. Nothing here finds, signals or supervises the
+# loop, and nothing there does the reverse — there is no pid file that would
+# make it safe, and a loop that signals other processes is a much larger claim
+# than this one.
+#
+# AND NOTHING HERE WRITES THE RECORD. Not `save`, not `clear`, not a settle.
+# Twice over: it is the LOOP's one-shot, so consuming it would stop the loop
+# re-execing (and loop-02's tests never run a dashboard, so nothing would catch
+# that); and it lives inside the observed checkout, where any write trips the
+# escape detector and parks the loop. Everything this process learns from an
+# attempt is kept in memory, in `_UPGRADE_ATTEMPTS`.
+
+#: What a fresh `python -m autoloop.dashboard` imports on its way to serving a
+#: page — the module list this module's preflight subprocess checks.
+#:
+#: Deliberately NOT `cli.PREFLIGHT_MODULES`: that tuple names what a LOOP loads
+#: and does not contain `dashboard`, so a dashboard preflighted with it would
+#: pass for a tree whose dashboard does not import — the one tree that matters
+#: here. Deliberately NOT a walk of the package either, for the reason `cli`'s
+#: own comment records: `browser.playwright_session` and the codex client have
+#: optional third-party dependencies, and a machine without them would fail
+#: every preflight and disable this feature for good. The modules this file
+#: imports lazily mid-request (`lock`, `inbox`, `path_suggest`, `tasks`) are in
+#: the list because this process reaches them long after any preflight has run.
+DASHBOARD_PREFLIGHT_MODULES = (
+    "autoloop",
+    "autoloop.errors",
+    "autoloop.tasks",
+    "autoloop.lock",
+    "autoloop.inbox",
+    "autoloop.path_suggest",
+    "autoloop.auto_merge",
+    "autoloop.dashboard",
+)
+
+#: Same number and the same reason as `cli.PREFLIGHT_TIMEOUT_SECONDS`: long
+#: enough for a cold interpreter on a loaded machine, and a timeout counts as a
+#: FAILED preflight — which keeps this process serving rather than replacing it
+#: on an unanswered question. Spelled here rather than imported so the dashboard
+#: does not have to import `cli` (the browser, the codex client, the whole loop)
+#: to know its own bound; a test pins the two equal.
+PREFLIGHT_TIMEOUT_SECONDS = 120.0
+
+#: What this process can say about its own currency. EVERY one of them is a
+#: statement about the PROCESS, and none of them is ever a statement about the
+#: task graph — which keeps its own vocabulary and its own empty-list branch in
+#: `task_groups`, because real corruption still has to be sayable.
+UPGRADE_VIEW_STATES = (
+    "current",            # nothing to act on: no record, docs-only, or already new
+    "stale",              # the checkout moved after this process loaded its code
+    "stale_settled",      # older than the checkout, but the signal is no longer offered
+    "not_this_tree",      # the merge moved a checkout this process does not run
+    "unreadable_marker",  # pending_upgrade.json is there and did not parse
+    "preflight_failed",   # tried: the merged tree does not import
+    "exec_failed",        # tried: the replacement was refused
+)
+
+#: Guards the two counters below AND the flag, because the decision they answer
+#: together — "is this the last request in flight, and has anyone armed a
+#: replacement" — is not decidable from either one alone.
+_REQUEST_LOCK = threading.Lock()
+#: Connections being served RIGHT NOW, process-wide. Process-wide and not
+#: per-thread because `os.execv` kills every thread at once: "my handler
+#: finished" says nothing about the tab polling beside it.
+_INFLIGHT = 0
+#: A replacement is armed. No new connection is served while it is set — the
+#: successor answers the retry two seconds later, which is a page that blinks
+#: rather than a page cut in half.
+_UPGRADING = False
+#: `base_sha -> view dict` for a sha THIS process has already tried and failed
+#: to upgrade to. In memory only (see the section note), and it is what stops a
+#: failed preflight or a refused exec being retried on every poll.
+_UPGRADE_ATTEMPTS: dict = {}
+#: `base_sha -> (ok, detail)`. The preflight launches an interpreter, so it runs
+#: at most once per sha per process even when the exec is deferred because a
+#: request arrived in the meantime.
+_PREFLIGHTS: dict = {}
+
+
+def _package_root() -> Path:
+    """The directory holding the `autoloop` package this process imported — the
+    tree a fresh interpreter would load.
+
+    The same definition as `cli._package_root`, spelled here so that knowing
+    what this process runs does not require importing the whole loop.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+def _pending_upgrade_file(repo: Path) -> Path:
+    """The signal file, resolved through the same `[paths].state_dir` the loop
+    resolves `AutoloopConfig.pending_upgrade_file` from.
+
+    Two spellings of one path, pinned equal by a test — the entire claim is that
+    this reads the signal the loop already writes, and a second path would read
+    nothing, forever, silently.
+    """
+    return _state_dir(repo) / "pending_upgrade.json"
+
+
+def _parse_stamp(value) -> datetime | None:
+    """An ISO stamp as an aware UTC datetime, `None` when it cannot be read.
+
+    A naive stamp is read as UTC, exactly as `_elapsed_seconds` reads one:
+    `utcnow_iso()` is tz-aware and older records may not be, and guessing local
+    time for one would shift it by hours in whichever direction the machine sits.
+    """
+    try:
+        stamp = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+
+
+def _view(state: str, note: str, record=None) -> dict:
+    """One `UPGRADE_VIEW_STATES` verdict plus the evidence the page renders.
+
+    `base_sha` travels in full and is truncated by the page, like every other
+    sha in this payload; it is also the key `_UPGRADE_ATTEMPTS` is memoised on,
+    so truncating it here would collide two shas that share a prefix.
+    """
+    paths = getattr(record, "paths", None)
+    return {
+        "state": state,
+        "note": note,
+        "base_sha": str(getattr(record, "base_sha", "") or ""),
+        "task_id": str(getattr(record, "task_id", "") or ""),
+        "paths": [str(p) for p in paths[:20]] if isinstance(paths, list) else [],
+    }
+
+
+def upgrade_decision(repo: Path) -> dict:
+    """Should this process replace itself, and what does the page say either way?
+
+    A PURE READ of `pending_upgrade.json` — the same file, in the same state
+    dir, that `cli._self_upgrade_at_boundary` consumes. It writes nothing, and
+    must never: see the section note above.
+
+    `stale` is the ONE state that authorises a replacement, and reaching it
+    needs all five of these. Each is a bound this feature carries, and each is
+    the reason some other state exists:
+
+    1. **A record that parses.** A marker that is there and unreadable is a
+       MARKER problem and says so in those words. `UpgradeStore.load` collapses
+       "absent" and "corrupt" into `None`, so the file's existence is checked
+       separately — otherwise a half-written marker would render as silence.
+    2. **At least one `autoloop/` path in it**, restated here through
+       `loop_code_paths` rather than trusted from the writer, so a docs-only
+       change — which this process does not load — never flickers a page
+       somebody is watching.
+    3. **The merged checkout IS the tree this process imported from.**
+       Otherwise replacing it would load the same code again.
+    4. **The record was written AFTER this process loaded its code.** Without
+       this one there is no claim at all: a dashboard started after the merge is
+       already running the merged tree, and re-execing it would be a restart
+       loop wearing an upgrade's clothes.
+    5. **`status == pending`**, the same gate the loop's own boundary applies,
+       and deliberately the LAST one — see the comment at that branch. A record
+       the loop has settled still establishes that the checkout moved under this
+       process, so it reports `stale_settled` and asks for a manual restart
+       rather than going quiet.
+
+    Anything that cannot be established reads `current`, which is the
+    fail-CLOSED direction here: `current` means "do not replace the process",
+    and the merged code is on disk either way for the next start. The states
+    that are NOT silent — `unreadable_marker`, `stale_settled` and the two
+    attempt failures — are the cases where refusing needs saying out loud,
+    because a process that cannot tell whether it is current, or knows it is
+    not, must never look like one that knows it is.
+    """
+    path = _pending_upgrade_file(repo)
+    record = UpgradeStore(path).load()
+    if record is None:
+        if path.exists():
+            return _view(
+                "unreadable_marker",
+                f"{path} exists but did not parse as an upgrade record, so this "
+                "process cannot tell whether its own code is current. That is "
+                "this marker file — not the task graph.",
+            )
+        return _view("current", "")
+
+    sha = str(record.base_sha or "")
+    spent = _UPGRADE_ATTEMPTS.get(sha)
+    if spent is not None:
+        # Checked BEFORE the status gate: what became of this process's own
+        # attempt stays on the page even after the loop settles the record it
+        # was made against. The failure is a fact about this process.
+        return dict(spent)
+    # Every value below comes out of a JSON file, so each is filtered to the
+    # type it is used AS rather than trusted. `loop_code_paths` calls
+    # `.startswith`, so one integer in `paths` would raise straight through
+    # `collect` and take the whole page down — and this is the page you read
+    # when something is already wrong.
+    raw_paths = record.paths if isinstance(record.paths, list) else []
+    if not loop_code_paths([p for p in raw_paths if isinstance(p, str)]):
+        return _view(
+            "current",
+            "that merge changed no file under autoloop/, so nothing this process "
+            "loads moved",
+            record,
+        )
+    running = _package_root()
+    raw_root = str(record.repo_root or "")
+    try:
+        merged = Path(raw_root).resolve() if raw_root else running
+    except (OSError, ValueError, RuntimeError):
+        # `Path("a\x00b")` raises ValueError, and JSON can carry a NUL. An
+        # unusable root is not this tree by definition.
+        merged = None
+    if merged != running:
+        moved = str(merged) if merged is not None else repr(raw_root)
+        return _view(
+            "not_this_tree",
+            f"the merge moved {moved}, and this process imports autoloop from "
+            f"{running} — replacing it would load the same code again",
+            record,
+        )
+    recorded = _parse_stamp(record.recorded_at)
+    if recorded is None:
+        return _view(
+            "unreadable_marker",
+            f"the record's recorded_at ({record.recorded_at!r}) is not a readable "
+            "timestamp, so whether this process predates that merge cannot be "
+            "established and nothing is replaced",
+            record,
+        )
+    if recorded <= _PROCESS_STARTED_AT:
+        return _view(
+            "current", "this process loaded its code after that merge", record
+        )
+    # LAST, after everything that decides whether the record is about THIS
+    # process. The order matters: a settled record still establishes that the
+    # checkout moved under us, and the operator who opens the page an hour later
+    # needs to hear that. It is only the ACTION that `pending` gates — the same
+    # gate `cli._self_upgrade_at_boundary` applies, so the dashboard can never
+    # act on a sha the loop has taken off the table.
+    #
+    # Without this branch the gap is silent, and silent in exactly the shape
+    # this whole feature exists to end: nobody has the page open when the merge
+    # lands, the loop settles the record at its next round boundary, and the
+    # first person to look gets a stale page reporting nothing wrong with
+    # itself.
+    if record.status != UPGRADE_PENDING:
+        return _view(
+            "stale_settled",
+            f"the checkout moved to {sha[:12]} after this process loaded its code, "
+            f"but the loop has already settled that signal ({record.status}), so "
+            "nothing here will restart on it — restart this dashboard by hand",
+            record,
+        )
+    return _view(
+        "stale",
+        f"the checkout moved to {sha[:12]} (task {record.task_id}) after this "
+        "process loaded its code, so this page is being served by a reader older "
+        "than the files it reads",
+        record,
+    )
+
+
+def _preflight_import(root: Path) -> tuple[bool, str]:
+    """Does the tree at `root` import? `(True, "")` only when it demonstrably does.
+
+    In a SUBPROCESS, for the reason `cli._preflight_import` gives: this process
+    already holds the old modules, so importing again would hit `sys.modules`,
+    and reloading would produce exactly the half-swapped state `execv` exists to
+    avoid. `-c` puts the cwd at `sys.path[0]`, so running it in `root` imports
+    the checkout rather than an installed copy.
+
+    A failure is a report, never a fault. A dashboard that exec'd into a tree
+    that does not import would be GONE — no process, nothing to say it, and an
+    operator left with a dead port and no message. So the old image stays, and
+    the page says why.
+    """
+    script = "\n".join(f"import {name}" for name in DASHBOARD_PREFLIGHT_MODULES)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, f"rc={proc.returncode} {detail[-2000:]}"
+    return True, ""
+
+
+def relaunch_argv() -> tuple[list, str]:
+    """The command that would start THIS dashboard again, or `([], why-not)`.
+
+    DERIVED from `__main__.__spec__`, never hard-coded, because the dashboard
+    has two documented launch shapes and the loop's own rebuild
+    (`[sys.executable, "-m", "autoloop", *sys.argv[1:]]`) is wrong for one of
+    them in a way far worse than not restarting: under
+    `python -m autoloop.dashboard --repo X --port Y` it would launch a LOOP RUN
+    with `--repo X` — a write-capable, git-pushing process started by a
+    read-only tracker on the strength of a file in the checkout.
+
+    `runpy` sets `__main__.__spec__.name` to the module it ran: `autoloop.
+    dashboard` for `-m autoloop.dashboard`, and `autoloop.__main__` for
+    `-m autoloop dashboard`, which is stripped back to the package because that
+    is what `-m` takes. A script run by path has no `__spec__` at all, and that
+    case REFUSES rather than guesses — a wrong relaunch is unrecoverable, a
+    refused one is a sentence on the page.
+
+    NOTHING FROM THE RECORD REACHES THE ARGV — not `repo_root`, not `paths`,
+    not `task_id`. The record decides only WHETHER, never WHAT: it is a file
+    inside the observed checkout, so an agent that can write it must not thereby
+    be able to choose a command line. `sys.argv[1:]` is carried verbatim, which
+    is also what preserves `--repo` and `--port`.
+    """
+    if not sys.executable:
+        return [], "this interpreter does not know its own executable path"
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    name = str(getattr(spec, "name", "") or "")
+    if not name:
+        return [], (
+            "this process was not started with `python -m`, so the command that "
+            "would start it again cannot be derived from what it knows"
+        )
+    if name.endswith(".__main__"):
+        name = name[: -len(".__main__")]
+    return [sys.executable, "-m", name, *sys.argv[1:]], ""
+
+
+def _spend(sha: str, state: str, note: str, decision: dict) -> str:
+    """Record what became of ONE attempt, so the page says it and this process
+    never tries the same sha again.
+
+    In memory, and printed to the terminal this dashboard was started in —
+    never into the checkout. The loop writes its own outcome to
+    `transcript.jsonl`, which lives inside the observed tree; a tracker doing
+    the same would trip the escape detector it exists to stay clear of.
+    """
+    _UPGRADE_ATTEMPTS[sha] = {**decision, "state": state, "note": note}
+    print(f"autoloop dashboard: {state} — {note}")
+    return state
+
+
+def _enter_request() -> bool:
+    """Count one connection in, or refuse it because a replacement is armed."""
+    global _INFLIGHT
+
+    with _REQUEST_LOCK:
+        if _UPGRADING:
+            return False
+        _INFLIGHT += 1
+        return True
+
+
+def _leave_request() -> bool:
+    """Count it out. `True` for the ONE thread that leaves nothing in flight —
+    the only thread allowed to consider replacing the process."""
+    global _INFLIGHT
+
+    with _REQUEST_LOCK:
+        _INFLIGHT = max(0, _INFLIGHT - 1)
+        return _INFLIGHT == 0
+
+
+def _upgrade_at_boundary(repo: Path) -> str:
+    """Replace this process, BETWEEN requests, when the decision says stale.
+
+    **Does not return on success** — `os.execv` never returns — so every return
+    value means "carry on serving in this process", and names why:
+
+    * anything `upgrade_decision` returns other than `stale`;
+    * `deferred` — a request arrived between the count reaching zero and here,
+      or another thread is already replacing us. Nothing is spent and nothing is
+      said: the next request boundary asks again, and the preflight it already
+      paid for is cached.
+    * `preflight_failed` / `exec_failed` — tried, did not happen, said so, and
+      the sha is spent so it is not retried on every poll.
+
+    The call site is `Handler.handle`'s `finally`, reached by the thread that
+    watched the in-flight count reach zero — so the response that triggered this
+    has been written AND flushed. Re-execing mid-response would hand the
+    operator a truncated page, which is a worse failure than a stale one.
+    """
+    global _UPGRADING
+
+    decision = upgrade_decision(repo)
+    if decision["state"] != "stale":
+        return decision["state"]
+    sha = decision["base_sha"]
+
+    with _REQUEST_LOCK:
+        if _UPGRADING or _INFLIGHT:
+            return "deferred"
+
+    # BEFORE the preflight, because it is free and it is decidable from what
+    # this process already knows: a launch shape that cannot be derived is
+    # refused outright rather than after launching an interpreter to prove a
+    # tree imports for a replacement that was never going to happen.
+    argv, why = relaunch_argv()
+    if not argv:
+        return _spend(
+            sha, "exec_failed", f"the replacement was not attempted: {why}", decision
+        )
+
+    # Outside the lock deliberately: this launches an interpreter, and a page
+    # that stopped answering for the length of an import would be a visible
+    # outage in exchange for a bound that the recheck below provides anyway.
+    ok, detail = _PREFLIGHTS.get(sha, (None, ""))
+    if ok is None:
+        ok, detail = _preflight_import(_package_root())
+        _PREFLIGHTS[sha] = (ok, detail)
+    if not ok:
+        return _spend(
+            sha,
+            "preflight_failed",
+            f"the checkout at {sha[:12]} does not import, so nothing was replaced "
+            f"and this process is still serving the code it started with: {detail}",
+            decision,
+        )
+
+    with _REQUEST_LOCK:
+        # Re-checked under the lock, because the preflight above ran without it.
+        # From here to the `execv`, `_enter_request` refuses every new
+        # connection, so nothing can start being served into an image that is
+        # about to vanish.
+        if _UPGRADING or _INFLIGHT:
+            return "deferred"
+        _UPGRADING = True
+
+    exec_error: OSError | None = None
+    try:
+        print(
+            f"\nautoloop dashboard: restarting into {sha[:12]} — the merge for "
+            f"task {decision['task_id']} changed this process's own code.\n"
+        )
+        # There is no "after" to flush in: `execv` replaces the image, so
+        # anything still buffered is simply lost.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(sys.executable, argv)
+    except OSError as exc:
+        exec_error = exc
+    finally:
+        # Only ever reached when the replacement did NOT happen. Whatever went
+        # wrong — including something that is not an `OSError` and is on its way
+        # up — this process is still the one serving, so the gate that stopped it
+        # answering has to come back off or the port goes silent for good.
+        with _REQUEST_LOCK:
+            _UPGRADING = False
+    return _spend(
+        sha,
+        "exec_failed",
+        f"os.execv refused the replacement ({type(exec_error).__name__}: "
+        f"{exec_error}), so this process is still serving the code it started "
+        "with — restart it by hand",
+        decision,
     )
 
 
@@ -2489,10 +3010,18 @@ def collect(repo: Path) -> dict:
                               executions),
         "git": {"branch": branch, "head": head[:12], "dirty": dirty, "remote": remote_refs},
         "served_at": time.strftime("%H:%M:%S"),
-        # `stale` means the file on disk has changed since this process
+        # `stale` means THIS FILE on disk has changed since this process
         # imported it — restart the dashboard to pick the change up.
+        #
+        # `upgrade` is the wider question the same process cannot answer from
+        # its own hash: has the CHECKOUT moved under it, which is what happened
+        # on 2026-08-22 when `tasks.py` was rewritten and `dashboard.py` was
+        # not. It is a pure read of the loop's own `pending_upgrade.json` and it
+        # writes nothing — the replacement it may authorise happens later, at a
+        # request boundary, in `Handler.handle`.
         "build": {"running": _IMPORT_STAMP, "on_disk": _source_stamp(),
-                  "stale": _IMPORT_STAMP != _source_stamp()},
+                  "stale": _IMPORT_STAMP != _source_stamp(),
+                  "upgrade": upgrade_decision(repo)},
     }
 
 
@@ -3015,6 +3544,56 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const rows = (head, body) => body ? `<table><tr>${head.map(h=>`<th>${h}</th>`).join("")}</tr>${body}</table>` : `<p class="empty">none</p>`;
+// PURE_UPGRADE_START
+// ---- what this PROCESS is, which is never what the DATA is -------------------
+//
+// One line per `UPGRADE_VIEW_STATES` member, each a statement about the reader
+// rather than about anything it read, and each naming what to do about it.
+// "current" has no entry because it has nothing to say.
+//
+// This vocabulary exists precisely so it can never be confused with the task
+// graph's. On 2026-08-22 a 19.5-hour-old process reported "the task graph could
+// not be read — tasks.json did not load as a registry" about a file holding 171
+// valid tasks, and the operator went and audited the file. The fault was the
+// reader. `UPGRADE_SAY[state]` is what that process should have said.
+const UPGRADE_SAY = {
+  stale: "⚠ This dashboard is running code from BEFORE the checkout moved. "
+       + "It is replacing itself now — this page reloads into the new code on the "
+       + "next poll. NOTHING BELOW IS EVIDENCE ABOUT YOUR DATA until it does.",
+  stale_settled: "⚠ This dashboard is running code from BEFORE the checkout "
+       + "moved, and the restart signal has already been settled by the loop — so "
+       + "nothing here will restart on it. Restart the dashboard by hand.",
+  not_this_tree: "ℹ A merge moved a different checkout, so this process is "
+       + "not replaced — it runs another tree.",
+  unreadable_marker: "⚠ The upgrade MARKER could not be read. That is "
+       + "pending_upgrade.json, NOT the task graph: this process cannot tell "
+       + "whether its own code is current, so restart it to be sure.",
+  preflight_failed: "⚠ The checkout does not import, so nothing was "
+       + "replaced and this process is still serving the code it started with, "
+       + "which works. Fix the tree — the task data is not what is at fault.",
+  exec_failed: "⚠ This dashboard could not replace itself and is still "
+       + "serving the code it started with. Restart it by hand.",
+};
+function upgradeBanner(u){
+  const say = UPGRADE_SAY[u.state] || `⚠ upgrade state ${u.state}`;
+  const sha = (u.base_sha || "").slice(0, 12);
+  const at = sha ? ` (checkout at ${sha}${u.task_id ? `, task ${u.task_id}` : ""})` : "";
+  return `${say}${at} ${u.note || ""}`;
+}
+// Appended to the "could not be read" branches below, and ONLY when this
+// process cannot prove it is current. The two failures render differently
+// because they call for opposite reactions: a corrupt registry is a file to
+// repair, a stale reader is a process to restart, and the branch that says the
+// first has been carrying the second.
+function graphCaveat(u){
+  return (u && u.state !== "current")
+    ? ` <b>But check the banner at the top first:</b> this process is not known `
+      + `to be running the checkout's current code (${esc(u.state)}), and a stale `
+      + `reader reports a healthy file as unreadable.`
+    : "";
+}
+// PURE_UPGRADE_END
+
 // state -> icon + word. Colour never carries meaning on its own: every mark
 // ships both, and the table view below repeats all of it as text.
 const MARK = {active:["▶","running"],done:["✓","done"],blocked:["■","blocked"],idle:["·","idle"]};
@@ -3145,7 +3724,7 @@ const WIP = {published:["✓","published to its side branch"],
              no_candidate:["·","no candidate committed"],
              unknown:["?","publication unknown"]};
 
-function renderStats(s){
+function renderStats(s, up){
   const line = document.getElementById("statline");
   const tiles = document.getElementById("stattiles");
   const wiphead = document.getElementById("statwiphead");
@@ -3155,7 +3734,8 @@ function renderStats(s){
   // would be believed, so an unloadable graph says so and shows nothing else.
   if (!s || !s.readable) {
     line.innerHTML = `<p class="empty">the task graph could not be read — `
-      + `tasks.json did not load as a registry, so there are no counts.</p>`;
+      + `tasks.json did not load as a registry, so there are no counts.`
+      + graphCaveat(up) + `</p>`;
     tiles.innerHTML = ""; wiphead.innerHTML = ""; wip.innerHTML = ""; open.innerHTML = "";
     return;
   }
@@ -3318,7 +3898,8 @@ function renderRoadmap(d){
     // and "unreadable" call for opposite reactions.
     board.innerHTML = `<p class="empty">the task graph could not be read — `
       + `tasks.json did not load as a registry, so nothing here is grouped. `
-      + `The tasks themselves are still listed by the loop's own commands.</p>`;
+      + `The tasks themselves are still listed by the loop's own commands.`
+      + graphCaveat(d.build && d.build.upgrade) + `</p>`;
     countEl.textContent = "";
     return;
   }
@@ -3881,12 +4462,25 @@ function render(d, force){
   renderProgress(progress);
   // A stale process serves the old PAGE forever, which looks exactly like a
   // missing feature. Say so instead of letting someone wonder.
+  //
+  // TWO independent sentences share this box. `build.stale` is THIS FILE's hash
+  // moving — an edit on disk that this process never loaded. `build.upgrade` is
+  // the CHECKOUT moving under a process that loaded its code before it. On
+  // 2026-08-22 the second was true and the first was not (`tasks.py` had been
+  // rewritten, `dashboard.py` had not), so a banner that spoke only for
+  // `build.stale` said nothing at all for 19.5 hours while the page blamed the
+  // task graph instead.
   const stale = document.getElementById("stale");
+  const up = (d.build && d.build.upgrade) || null;
+  const upline = (up && up.state !== "current") ? upgradeBanner(up) : "";
   if (d.build && d.build.stale) {
     stale.style.display = "block";
     stale.textContent = `\u26a0 This page is STALE — dashboard.py changed on disk `
       + `(running ${d.build.running}, on disk ${d.build.on_disk}). `
-      + `Restart the dashboard to load it.`;
+      + `Restart the dashboard to load it.` + upline;
+  } else if (upline) {
+    stale.style.display = "block";
+    stale.textContent = upline;
   } else { stale.style.display = "none"; }
 
   // ---- the dependency graph ----------------------------------------------
@@ -3908,7 +4502,7 @@ function render(d, force){
   // Inside the change guard, unlike `renderProgress`: nothing here ticks on a
   // clock, so rebuilding it every 2s would throw away text selection for
   // nothing.
-  renderStats(d.stats);
+  renderStats(d.stats, d.build && d.build.upgrade);
 
   const t = d.task;
   // Completed-but-not-in-the-branch, above the fold. The tile carries the icon
@@ -4462,6 +5056,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle(self):
+        """One connection — and the only safe point at which this process may
+        replace itself.
+
+        `handle()` rather than `do_GET` / `do_POST`, because `handle()` is what
+        writes and flushes `wfile` (in `handle_one_request`'s own `finally`): a
+        check inside a `do_*` method would still be mid-response. And the count
+        it maintains is process-wide rather than per-thread because this is a
+        `ThreadingHTTPServer` and `os.execv` kills every thread at once — "my
+        handler has finished" says nothing about the tab polling beside it.
+
+        Exactly one thread can observe the count reach zero (the decrement is
+        under `_REQUEST_LOCK`), and while a replacement is armed no new
+        connection is served at all. The successor answers the poll two seconds
+        later: a page that blinks, never a page cut in half.
+
+        A raise from the boundary lands after the response is complete, so the
+        operator still has their page; `ThreadingHTTPServer` logs it per-thread
+        and the next connection tries again. It is deliberately not swallowed —
+        a silently skipped upgrade is the failure this whole section exists to
+        stop being invisible.
+        """
+        if not _enter_request():
+            return
+        try:
+            super().handle()
+        finally:
+            if _leave_request():
+                _upgrade_at_boundary(self.repo)
 
     def log_message(self, *args):
         pass  # a poll every 2s would bury the terminal

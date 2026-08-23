@@ -48,6 +48,7 @@ Last full sweep: **2026-05-24** (manual read of backend auth, routers, services,
 | S37 | INFO | The reviewer transport gained a LIVE agent session (`codex_app_server`, 2026-08-22, codex-01): one long-lived `codex app-server` child instead of a process per turn, and it can ask this client to approve a command or a patch. Bounded by this client's REPLIES — every approval is answered `{"decision": "abort"}`, every other server→client request gets a JSON-RPC error (never silence, which would wedge the turn), argv is a list with no shell and no model text on it, `cwd` stays outside the checkout and stderr is `DEVNULL`. Explicitly NOT a sandbox claim: no preset is selected or enforced | `autoloop/codex/app_server.py`, `autoloop/codex/app_server_conversation.py`, `autoloop/conversation.py` |
 | S38 | MEDIUM | The inbox gained `urgent` (preempt-01, 2026-08-22) — the first request kind whose effect is on the LOOP: it ends the round in flight at the next safe boundary and MOVES that task's worker repo and execution record to quarantine, so S30's "nothing in flight can be edited" no longer covers the whole vocabulary. Bounded: the target must be a dispatchable READY task with a non-empty scope, a non-blank reason is required, ONE live pin at a time, it acts only at `_at_round_boundary` (the same predicate the self-upgrade restart uses) so no review packet is stranded, the displaced task moves through the one release path, nothing is deleted (a retirement that fails names what survived, and pairs it back with its record when that worker is resumable), and no packet, stamp, approval or push is touched — the one added gate only DENIES an `implement`/`revise` of another task or a fresh `audit` while the pin is live | `autoloop/inbox.py`, `autoloop/tasks.py`, `autoloop/orchestrator.py`, `autoloop/cli.py` |
 | S39 | INFO | The Codex CLI reviewer's failure classifier no longer treats the loop's OWN prompt as evidence (quota-01, 2026-08-23). `codex exec` echoes the whole prompt onto stderr, so a packet quoting a line number made any non-zero exit read as a spent allowance and parked the loop loop-fatal, twice, on 2026-08-22 — content the loop SENT could stop the loop. A marker now counts only when it does not occur in the prompt, which is a required argument. The same change adds a bounded, echo-stripped `stdout_tail` to `codex_invocation_failed`, narrowly amending `failure_digest`'s "never stdout" promise; argv and the environment are still never recorded, and the reviewer's reply already reaches that file in full (see S36) | `autoloop/codex/quota.py`, `autoloop/codex/conversation.py`, `autoloop/conversation.py` |
+| S40 | INFO | The dashboard now replaces its own process image (loop-03, 2026-08-23) when `.autoloop/pending_upgrade.json` — a file inside the observed checkout — says the checkout moved under it. Bounded: that record decides only WHETHER, never WHAT. The argv is `sys.executable` + a module name derived from `__main__.__spec__` + `sys.argv[1:]`, with no record field interpolated and an underivable launch shape refused outright; `repo_root` is compared, never acted on; a preflight subprocess proves the tree imports first; the record is never written back (it is the loop's one-shot, and writing into `.autoloop/` parks the loop on its escape detector); and the exec happens only between connections, with the armed flag cleared in a `finally` so a refused replacement cannot silence the port | `autoloop/dashboard.py` |
 | S29 | LOW | `merge` joined the git whitelist (first subcommand that moves the checkout's own head) and `push_exact` now publishes the BASE branch — deliberate, shape-checked to a literal 40-hex, default off. Amended 2026-08-15: the same head may now move at STARTUP and from `merge-backlog`, via the same gate, flag and primitives — and, since that head can be left moved-but-unpushed by a failed verification or a refused push with no undo primitive available, startup now probes the checkout and refuses to run the loop on one it did not finish integrating | `autoloop/policy.py`, `autoloop/git_gateway.py`, `autoloop/auto_merge.py`, `autoloop/merge_sweep.py`, `autoloop/cli.py` |
 
 ---
@@ -1903,6 +1904,93 @@ field to the digest that is not bounded and echo-stripped.
 
 ---
 
+### S40 — A file inside the observed checkout can now make the dashboard `os.execv` itself — INFO — OPEN (bounded, accepted)
+
+**Location:** `autoloop/dashboard.py` (`upgrade_decision`, `relaunch_argv`,
+`_upgrade_at_boundary`, `Handler.handle`).
+
+**Severity:** INFO. The dashboard was a read-only tracker that also serves two
+narrow POST paths (S28, S32); since loop-03 it also **replaces its own process
+image** when `.autoloop/pending_upgrade.json` says the checkout moved under it.
+That file is inside the tree a write-capable agent runs in, so it is worth
+recording plainly: **a file an agent could write decides whether this process
+execs.** It does not decide WHAT it execs, and that is the whole bound.
+
+**What is actually reachable.** The record can make the dashboard (a) do
+nothing, (b) print a sentence and render a banner, or (c) restart itself into
+the code already on disk. It cannot make it run anything else:
+
+- **The argv is built from `sys.executable` and `sys.argv[1:]` only**, with the
+  module name derived from `__main__.__spec__`. No field of the record —
+  `repo_root`, `paths`, `task_id`, `candidate_sha`, `base_sha` — is
+  interpolated, appended or consulted while building it. A launch shape that
+  cannot be derived (a script run by path) REFUSES rather than guessing, which
+  is also why the loop's hard-coded `-m autoloop` rebuild was not copied: under
+  `python -m autoloop.dashboard --repo X` it would have started a LOOP RUN — a
+  write-capable, git-pushing process — from a read-only tracker.
+- **`repo_root` is compared, never used as a path to act on.** A record naming
+  another checkout is refused (`not_this_tree`); it is not resolved, entered, or
+  passed anywhere.
+- **The replacement runs the tree this process already imports from**, proven by
+  a preflight subprocess before anything is replaced. Writing the record cannot
+  substitute a different tree — only moving `autoloop/` on disk can, which is
+  the same authority as editing the running program.
+- **`sys.argv[1:]` is the operator's own command line**, inherited from the
+  process being replaced. The record cannot add to it.
+
+**What the dashboard does NOT do to the record.** It never calls `save`,
+`clear` or a settle. Two reasons, both load-bearing: the record is the LOOP's
+one-shot, so consuming it would silently stop the loop re-execing (loop-02's
+tests never run a dashboard, so nothing there would catch it); and any write
+into `.autoloop/` mid-round is a diff `escape_detector` cannot tell from an
+agent writing where it may not, which parks the loop loop-fatal. Attempt
+outcomes are held in memory and printed to the dashboard's own terminal.
+
+**Availability, both directions.** A tree that does not import leaves the old
+image serving and says so on the page — a dashboard that exec'd into a broken
+tree would be gone, with nothing left to report it. An `execv` that raises, and
+anything else on its way up, clears the armed flag in a `finally`, because a
+flag left set makes the port refuse every connection for good. One attempt per
+sha, so a failure is not retried on each 2s poll.
+
+**Verification check:**
+```bash
+# The argv must be built from the interpreter and this process's own command
+# line, and from nothing in the record. EXPECT one construction, naming only
+# sys.executable / "-m" / a derived module name / sys.argv[1:]:
+rg -n 'def relaunch_argv' -A 14 autoloop/dashboard.py
+# And EXPECT no record field on any line that builds argv. Prose lines may
+# match (the docstring names the fields in order to say it excludes them), so
+# read the hits — any line that is CODE is the bug:
+rg -n 'argv.*(record|repo_root|task_id|candidate_sha|decision\[)' autoloop/dashboard.py
+# The record must never be written by this module. EXPECT only `.load()`:
+rg -n 'UpgradeStore\(' -A 2 autoloop/dashboard.py
+rg -n '\.save\(|\.clear\(' autoloop/dashboard.py
+```
+Pinned by
+`autoloop/tests/test_dashboard.py::test_nothing_from_the_record_reaches_the_relaunch_command`
+(a record carrying `--evil-task`, `--evil-path` and a shell metacharacter, driven
+through a real attempt),
+`::test_a_launch_shape_that_cannot_be_derived_refuses_rather_than_guesses`,
+`::test_an_undeterminable_launch_shape_is_never_exec_ed`,
+`::test_the_dashboard_never_writes_the_signal_it_reads` (byte-identical record
+plus an unchanged checkout snapshot, driven through a FAILED attempt — settling
+is exactly what the loop does at that point),
+`::test_a_merge_in_another_checkout_is_not_a_reason_to_restart`,
+`::test_a_tree_that_does_not_import_leaves_the_process_serving`,
+`::test_an_exec_that_is_refused_leaves_the_process_serving` and
+`::test_an_exec_that_raises_something_else_still_unlocks_the_port`. The
+whole file's `no_process_replacement` fixture makes "not exec'ed" a real
+assertion rather than an absence.
+
+**Suggested fix if the bound ever breaks:** do not add a record field to the
+argv, and do not add a fallback launch shape — refusing is the correct answer to
+an underivable one. If the marker ever needs to carry more authority than "the
+checkout moved", move it out of the observed checkout (as `port-01` moved
+`state_dir`) rather than trusting it further where it is.
+
+---
+
 ## Verified strengths (do not regress)
 
 These were checked in the 2026-05-24 sweep and are working controls. A PR that weakens one is a security regression.
@@ -2495,6 +2583,8 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | notes-03 | The section was added BEFORE the path was added to the list, and that order is the rule for any future tracker — a path granted to the resolver without a marker-delimited region is a file whose ordinary prose it would start reasoning about. |
 | 2026-08-23 | port-01 | An unconfigured `[paths].state_dir` now resolves beside `workers_root`, outside the tree `escape_detector` snapshots. This REMOVES an exposure rather than adding one: loop state written inside that tree mid-round was a diff indistinguishable from an agent writing where it may not, which is why the inbox, PAUSE, heartbeat and mutation ledger moved first. Nothing about the detector, its ignored-path coverage, or `TRACKER_PATHS` changed — the snapshot still reaches `.autoloop/`. |
 | 2026-08-23 | port-01 | Two things NOT weakened, deliberately. No path the loop writes gained a fallback, so nothing can silently resolve back into the checkout; the single legacy read (`workers_dir`) is consumed only by `doctor`'s read-only report. And `config.example.toml` still ships an explicit `state_dir`, so a template-derived deployment keeps today's behaviour exactly — the residual exposure is unchanged for it, not newly created, until that line is removed in the follow-up. |
+| 2026-08-23 | loop-03 | New S40: the dashboard now `os.execv`s itself on the strength of a record inside the observed checkout. The bound is that the record decides only WHETHER, never WHAT — the argv is `sys.executable` plus a module name derived from `__main__.__spec__` plus `sys.argv[1:]`, no record field is interpolated, and an underivable launch shape refuses rather than guessing. Pinned by a test driving `--evil-task`, `--evil-path` and a shell metacharacter through a real attempt. |
+| 2026-08-23 | loop-03 | Nothing was weakened. The dashboard never writes `pending_upgrade.json`, so S32's escape-detector exemption is untouched and still covers only `tasks.json`; S28's and S32's POST paths are unchanged; and the loop still neither finds nor signals the dashboard, asserted as an absence of `os.kill` / `killpg` / `send_signal` / `pkill` in `cli.py`, `auto_merge.py` and `orchestrator.py`. |
 | 2026-08-23 | port-01 | Transition hazard worth stating: `LoopLock` is scoped to `state_dir`, so a loop started under the old default and one started after it hold DIFFERENT lock files and neither refuses the other. Single-instance enforcement is per state dir and always was (`docs/AUTOLOOP.md` §11); moving the default is the first time that can happen without an operator editing a config. Stop the loop before taking the change, or set `state_dir` explicitly. |
 | 2026-08-23 | quota-01 | New finding S39. The availability half is the interesting one: the reviewer's own INPUT could declare the account exhausted, because `codex exec` echoes the prompt onto stderr and the classifier searched both streams for `"429"`, `"quota"` and `"rate limit"`. A packet quoting a line number parked the loop loop-fatal twice on 2026-08-22. Closed by a guard, not by narrowing the list. |
 | 2026-08-23 | quota-01 | The disclosure half is a narrow amendment: `failure_digest` promised "never stdout" and now carries a bounded, echo-stripped `stdout_tail`, because a codex failure that never writes to stderr was being classified with nothing recorded about it. Argv and the environment are still never recorded, and the reviewer's reply already reaches that file in full (S36). |

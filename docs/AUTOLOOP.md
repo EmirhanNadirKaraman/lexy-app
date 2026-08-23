@@ -714,6 +714,78 @@ upgrade counts as a new run, because it is one.
 | One full iteration completed under the new code | the one-shot marker is retired | `self_upgrade_confirmed` |
 | The merge landed but could not be inspected/recorded | no restart offered; the merge is unaffected | `self_upgrade_error` |
 
+**The dashboard's half of the same rule** (loop-03, 2026-08-23). Two processes
+qualify for this design; the loop's half shipped first and the dashboard's did
+not. **Each restarts ITSELF — the loop must not find, signal or restart the
+dashboard, and there is no pid file that would make that safe.**
+
+MEASURED 2026-08-22: the page had been up 19.5 hours across four merges,
+`autoloop/tasks.py` was rewritten three hours earlier, and
+`pending_upgrade.json` named it at 13:37. The signal was armed and nothing in
+`dashboard.py` read it — the file contained no reference to `UpgradeStore`,
+`pending_upgrade` or `execv`.
+
+**What it cost is not the staleness — it is what the page said instead.** It
+read *"the task graph could not be read — tasks.json did not load as a
+registry"*, about a file holding 171 valid tasks that `TaskRegistry.from_dict`
+parses, that `state_of` raises for none of, and that `task_groups` returns all
+six groups for when run against the CURRENT code. An operator reading that
+audits the file — its JSON, its dependencies, whether the writer is atomic (it
+is). None of that is the fault. **A stale reader that reports a data error sends
+every investigation in the wrong direction.**
+
+`dashboard.upgrade_decision` reads the SAME `pending_upgrade.json`, and
+`Handler.handle` acts on it. It differs from the loop's half in five places, all
+forced by what a web server is:
+
+* **The safe point is BETWEEN CONNECTIONS, never mid-response.** A process-wide
+  in-flight count under one lock, incremented in `handle()` and decremented in
+  its `finally`; only the thread that watches it reach zero may replace the
+  image. Per-thread would not do — `os.execv` kills every thread at once, so "my
+  handler has finished" says nothing about the tab polling beside it. While a
+  replacement is armed no new connection is served at all: the successor answers
+  the retry, which is a page that blinks rather than a page cut in half.
+* **It NEVER writes the record.** No save, no clear, no settle. It is the loop's
+  one-shot (consuming it would stop the LOOP re-execing) and it lives inside the
+  observed checkout, where a write parks the loop on its escape detector.
+  Everything an attempt learns stays in memory.
+* **Staleness is `recorded_at` vs this process's import time**, not the record's
+  status transitions — because the dashboard has no marker of its own to spend.
+  That comparison is self-limiting: a successor started BY the re-exec postdates
+  the record it restarted for, so it reads the same still-pending record as
+  already current, and no restart loop is possible. **`pending` gates the ACTION
+  and not the report** — it is the last gate applied, so a record the loop has
+  already settled still says the checkout moved under this process
+  (`stale_settled`) instead of going quiet. Without that, a merge landing while
+  nobody has the page open is silent by the time somebody looks.
+* **The relaunch command is DERIVED from `__main__.__spec__`**, never
+  hard-coded, because there are two launch shapes (`python -m autoloop
+  dashboard` and `python -m autoloop.dashboard --repo X`). Copying the loop's
+  hard-coded `-m autoloop` rebuild would, under the second, start a LOOP RUN
+  with `--repo X`. A shape that cannot be derived refuses. Nothing from the
+  record ever reaches the argv (see `docs/SECURITY.md` S40).
+* **The outcome is printed to its own terminal and rendered on the page**, not
+  logged to `transcript.jsonl` — that file is inside the checkout.
+
+Everything else is the loop's rule unchanged: a preflight subprocess first (a
+dashboard that exec'd into a tree that does not import would be GONE, with
+nothing left to say so), a docs-only merge triggers nothing, a merge in another
+checkout triggers nothing, and one attempt per sha.
+
+| The page says | What it means |
+|---|---|
+| nothing | no record, docs-only, another checkout's merge, or already current |
+| *running code from BEFORE the checkout moved* | `stale` — it is replacing itself now |
+| *…and the signal has already been settled* | `stale_settled` — the loop took that sha off the table before this page was next looked at. Nothing restarts on it; restart by hand |
+| *the upgrade MARKER could not be read* | `pending_upgrade.json` is unreadable, or its `recorded_at` is not a timestamp. **Not** the task graph |
+| *the checkout does not import* | `preflight_failed` — old image still serving, and that is deliberate |
+| *could not replace itself* | `exec_failed` — `execv` refused, or the launch shape was underivable. Restart by hand |
+
+`task_groups` returning `[]` still means the graph genuinely could not be read,
+and both "could not be read" panels now carry a caveat pointing at the banner
+whenever the process cannot prove it is current. The two faults render
+differently and each says which one you have.
+
 ---
 
 ### 3f-quinquies. `shipped-report` — did this completed task's work ever land?
