@@ -13,6 +13,17 @@ waits on a human and resolves when they answer, `RETIRED` waits on nobody
 because the work already happened (or stopped) under another id. See
 `TaskState` and `_RETIREMENTS`.
 
+A FOURTH, `SHIPPED_ELSEWHERE` (ship-01, 2026-08-23), is not one of those: it
+does not mean "not running", it means DONE — under another task's commits.
+Unlike `RETIRED` it SATISFIES a dependency (`SATISFIES_DEPENDENCY`), because a
+dependent waiting for that work is waiting for something that is already in the
+base. It carries the evidence rather than a flag: `Task.shipped_commits` names
+the commits that carry the work, and every reader re-checks their ancestry
+against the current base instead of trusting the record once. This module does
+no git of its own — it never has, by design — so a record whose evidence has
+stopped holding is REPORTED as a disagreement (`dashboard.shipped_elsewhere_
+states`), never silently converted back. See `record_shipped_elsewhere`.
+
 Graph invariants enforced on every mutation: unique slug ids, dependencies
 must reference known tasks (same batch counts), no cycles, no completing a
 task whose dependencies are incomplete. Violations raise TaskGraphError with a
@@ -356,6 +367,146 @@ def _persisted_superseded_by(raw: dict) -> tuple[str, ...]:
         raise StateCorruptError(f"task file has an invalid superseded_by: {exc}") from exc
 
 
+#: A FULL commit object id — 40 hex for SHA-1, 64 for SHA-256 — lowercase only.
+#:
+#: Full, deliberately, and this is the load-bearing half of "the record carries
+#: the evidence". An abbreviation is ambiguous: it names whatever object it
+#: happens to prefix in whichever checkout re-checks it, so the same record
+#: could verify in one clone and resolve to a different commit in another. The
+#: whole point of storing the evidence is that anyone can re-run the ancestry
+#: check and get the SAME answer, which an abbreviation cannot promise.
+#: `cli._cmd_record_shipped` resolves whatever the operator typed to a full sha
+#: (`dashboard.resolve_commit`) before queueing, so nothing about this is a
+#: usability tax on the operator route.
+#:
+#: Lowercase because that is what git prints and what `dashboard._LOG_LINE`
+#: parses; normalising here would make two spellings of one sha compare unequal
+#: in `record_shipped_elsewhere`'s idempotence check while looking identical.
+_COMMIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _validate_shipped_commits(task_id: object, commits: object) -> tuple[str, ...]:
+    """Return `commits` as a tuple of full shas, or raise `TaskGraphError`.
+
+    THE evidence check, and it is a SHAPE check only — this module has no
+    repository awareness (see the module docstring and `_validate_approved_
+    path`), so whether a sha is an ancestor of the base head is decided by the
+    caller that has a checkout (`cli._cmd_record_shipped` before the request is
+    queued) and re-decided continuously by the reader that has one
+    (`dashboard.shipped_elsewhere_states`).
+
+    An EMPTY list is refused, and that refusal is the point of the whole
+    function: "this shipped somewhere" with nothing naming where is exactly the
+    operator assertion this state exists to replace. A record that cannot be
+    checked is not evidence, and the only way to keep it from becoming one is to
+    refuse to write it.
+
+    SHAPE is checked first, and for the reason `_validate_approved_paths` gives:
+    a bare string `"4f2a…"` is iterable, so without this it would be stored as
+    one single-character "commit" per character — the same silent per-character
+    split `_persisted_superseded_by` documents, on the field the dependents of
+    this task are unblocked on the strength of.
+    """
+    if isinstance(commits, str) or not isinstance(commits, (list, tuple)):
+        raise TaskGraphError(
+            "bad_shipped_commits",
+            f"task '{task_id}' needs shipped commits as a list of full commit "
+            f"shas, got {commits!r}",
+        )
+    if not commits:
+        raise TaskGraphError(
+            "bad_shipped_commits",
+            f"task '{task_id}' cannot be recorded as shipped elsewhere with no "
+            "commits — the record IS the evidence, and a claim naming nothing "
+            "cannot be re-checked against the base",
+        )
+    seen: set[str] = set()
+    for sha in commits:
+        if not isinstance(sha, str) or not _COMMIT_SHA_RE.match(sha):
+            raise TaskGraphError(
+                "bad_shipped_commits",
+                f"task '{task_id}' names {sha!r} as a carrying commit, which is "
+                "not a full lowercase commit sha (40 or 64 hex characters) — an "
+                "abbreviation names a different object in a different checkout",
+            )
+        if sha in seen:
+            raise TaskGraphError(
+                "bad_shipped_commits",
+                f"task '{task_id}' names carrying commit {sha!r} more than once",
+            )
+        seen.add(sha)
+    return tuple(commits)
+
+
+def _validate_shipped_note(task_id: object, note: object) -> None:
+    """Raise `TaskGraphError` unless `note` is a non-blank string.
+
+    Its own validator rather than a call to `_validate_description`, for the
+    reason `_validate_urgent_reason` has one: the refusal has to name the act
+    the operator performed, and "needs a non-empty description" sends them to
+    the wrong field.
+
+    Required, not optional. The shas say WHICH commits; this says WHERE the work
+    landed in words a human can follow ("shipped under inbox-02's commits"), and
+    it is what the dashboard group prints — the same job `superseded_by` does for
+    a retirement. A record with shas and no account of them is a puzzle rather
+    than a record.
+    """
+    if not isinstance(note, str) or not note.strip():
+        raise TaskGraphError(
+            "empty_task_field",
+            f"recording task '{task_id}' as shipped elsewhere needs a non-empty "
+            "note saying where the work landed — the commits say which, the note "
+            "says whose",
+        )
+
+
+def _persisted_shipped_commits(raw: dict) -> tuple[str, ...]:
+    """`shipped_commits` off a stored row, validated, as a tuple.
+
+    Same authority and the same failure mode as `_persisted_superseded_by`:
+    `TaskRegistry.from_dict` bypasses `add_many` by design, so this is the ONLY
+    gate a stored or hand-edited row passes, and `tuple(raw.get(...))` over a
+    bare string would load one "commit" per character — on the field that
+    decides whether this task's dependents may dispatch.
+
+    FAILS CLOSED into `StateCorruptError`, like its sibling: reading a malformed
+    evidence list as "no evidence" would silently delete the claim's own
+    support while leaving the claim standing, which is precisely the fail-open
+    this state exists to prevent.
+
+    A MISSING key defaults to `()` — that is every `tasks.json` written before
+    this field existed, and it is not malformed. `_validate_shipped_commits`
+    refuses an empty list on the WRITE path, so `()` here can only mean "this
+    row predates the field"; a row that also says `status: shipped_elsewhere` is
+    an evidence-free claim, and it is reported as a disagreement by the readers
+    rather than refused at load (refusing would take the whole registry — and
+    with it every dashboard panel — down over one hand-edited row).
+    """
+    commits = raw.get("shipped_commits", ())
+    if commits == () or commits == []:
+        return ()
+    try:
+        return _validate_shipped_commits(raw.get("id"), commits)
+    except TaskGraphError as exc:
+        raise StateCorruptError(f"task file has invalid shipped_commits: {exc}") from exc
+
+
+def _shipped_hint(task: "Task") -> str:
+    """A parenthetical naming the carrying commits, empty when none is recorded:
+    ` (shipped under 4f2a9c1b3d5e, 9b1c…)`.
+
+    The `_successor_hint` of this state, and it exists for the same reason:
+    "this task shipped elsewhere" without naming where sends the reader back to
+    the free text the evidence fields replace. Abbreviated to 12 characters for
+    a refusal message — the full shas are in the record, and a refusal quoting
+    four 40-character ids is unreadable.
+    """
+    if not task.shipped_commits:
+        return ""
+    return " (shipped under " + ", ".join(s[:12] for s in task.shipped_commits) + ")"
+
+
 def _successor_hint(task: "Task") -> str:
     """A parenthetical naming the successors, empty when none is recorded:
     ` (superseded by brw-07, brw-08)`.
@@ -427,16 +578,55 @@ OPERATOR_HOLD_PREFIX = "operator hold: "
 #: blocker can be answered.
 _MUTABLE_STATUSES = frozenset({"pending", "blocked"})
 
+#: The statuses that SATISFY a dependency — the whole of `state_of`'s
+#: dependency test, and THE one place that rule is written down.
+#:
+#: `completed` means the work shipped under this task's own id.
+#: `shipped_elsewhere` means it shipped under another task's commits, with the
+#: commits named on the row (`Task.shipped_commits`). Both are the same fact for
+#: a dependent: what it was waiting for is in the base. That is the difference
+#: from `retired`, which means SUPERSEDED — the work described here did not
+#: happen, someone else's task describes what will — and which therefore
+#: satisfies nothing and strands every dependent (`retire`'s own strand
+#: precondition exists because of it).
+#:
+#: A frozenset rather than four hand-written `!= "completed"` tests, because
+#: there were four: `state_of`, `stranded_dependents` (via `_TERMINAL_STATUSES`),
+#: `dashboard._waiting_on` and `dashboard._dep_states`. Four copies of a rule is
+#: the drift this module writes a docstring against on every other page — and
+#: here a copy that disagreed would show one panel a task as READY while another
+#: showed it BLOCKED on a dependency that is done.
+SATISFIES_DEPENDENCY = frozenset({"completed", "shipped_elsewhere"})
+
 #: Statuses a task never leaves. `completed` is the successful terminal state;
 #: `retired` is the unsuccessful one (`TaskState.RETIRED` — superseded, never
-#: coming back, and deliberately with no reverse).
+#: coming back, and deliberately with no reverse); `shipped_elsewhere` is the
+#: second successful one (`TaskState.SHIPPED_ELSEWHERE` — done, under another
+#: task's commits).
 #:
 #: The distinction the strand check turns on: `state_of` satisfies a dependency
-#: on `completed` and on NOTHING ELSE, so a dependency on a task that has
-#: reached the OTHER terminal status can never be satisfied by waiting. A task
-#: already sitting in either status, meanwhile, cannot itself be stranded — it
-#: is a record, not queue, and nothing is waiting to dispatch it.
-_TERMINAL_STATUSES = frozenset({"completed", "retired"})
+#: on the statuses in `SATISFIES_DEPENDENCY` and on NOTHING ELSE, so a
+#: dependency on a task that has reached a terminal status OUTSIDE that set can
+#: never be satisfied by waiting. A task already sitting in ANY of these,
+#: meanwhile, cannot itself be stranded — it is a record, not queue, and nothing
+#: is waiting to dispatch it. That is why `shipped_elsewhere` belongs here as
+#: well as in `SATISFIES_DEPENDENCY`: leave it out and `retire` starts refusing
+#: valid retirements on behalf of a "dependent" that is already done.
+_TERMINAL_STATUSES = frozenset({"completed", "retired", "shipped_elsewhere"})
+
+
+def satisfies_dependency(state: "TaskState") -> bool:
+    """Does a dependency in `state` count as done?
+
+    The DERIVED-state form of `SATISFIES_DEPENDENCY`, for callers holding a
+    `TaskState` rather than a stored status — `dashboard._waiting_on` is the
+    one. Keyed off the same constant rather than listing the states again, so
+    the two forms of the rule cannot disagree; every status in that set maps to
+    the `TaskState` of the same value (`state_of` answers each one before the
+    dependency check), which is what makes the value comparison exact rather
+    than approximate.
+    """
+    return state.value in SATISFIES_DEPENDENCY
 
 
 def is_directory_prefix(approved: str) -> bool:
@@ -538,6 +728,37 @@ class TaskState(str, Enum):
     #: brw-07/brw-08 continue brw-02/brw-04, and that is regression history in
     #: the same sense `docs/SECURITY.md` findings are.
     RETIRED = "retired"
+    #: DONE, under another task's commits (ship-01, 2026-08-23). The state the
+    #: other three could not express, and each of them was tried first:
+    #:
+    #:   * `COMPLETED` — the merge sweep enumerates completed tasks and treats
+    #:     one whose record names no candidate as UNRESOLVED, which makes the
+    #:     whole invocation non-mutating (`merge_sweep.HELD`). Completing five
+    #:     tasks that never had a branch to tidy the registry would have held
+    #:     every future merge; one empty execution record already held the sweep
+    #:     for hours on 2026-08-21.
+    #:   * `RETIRED` — means SUPERSEDED BY NAMED SUCCESSORS, a different fact,
+    #:     and it satisfies no dependency (`SATISFIES_DEPENDENCY`), so anything
+    #:     waiting on it waits forever. `retire` also refuses a completed task
+    #:     ("it was not superseded"), so it cannot describe the other half of the
+    #:     disagreement at all.
+    #:   * `BLOCKED_BY_OPERATOR` — where the five sat as a stopgap. It means "do
+    #:     not work this", not "this shipped", and its reason is hand-written
+    #:     prose that the next reader has to re-derive.
+    #:
+    #: What it carries is EVIDENCE, not a flag: `Task.shipped_commits` names the
+    #: commits, `Task.shipped_note` says whose they are. The registry stores and
+    #: shape-checks them; ancestry is checked by whoever has a checkout, at
+    #: record time (`cli._cmd_record_shipped`) and again on every read
+    #: (`dashboard.shipped_elsewhere_states`). A record pointing at a sha that is
+    #: no longer an ancestor of the base head reads as a DISAGREEMENT and is
+    #: never auto-converted back — detecting is in scope, rewriting is not.
+    #:
+    #: The sweep never asks it for a branch: `merge_sweep._backlog` enumerates
+    #: `TaskState.COMPLETED` and nothing else, so this state is skipped without
+    #: becoming a fourth `unresolved` reason — which would rebuild the exact
+    #: failure it exists to avoid.
+    SHIPPED_ELSEWHERE = "shipped_elsewhere"
 
 
 @dataclass
@@ -674,6 +895,34 @@ class Task:
     #: free-text blocker problem, not a fix for it. `""` whenever `urgent_at`
     #: is, and cleared with it.
     urgent_reason: str = ""
+    #: The commits that CARRY this task's work, when it shipped under another
+    #: task's id — full lowercase shas, written only by
+    #: `record_shipped_elsewhere` and validated by `_validate_shipped_commits`
+    #: on both the write path and the load path
+    #: (`_persisted_shipped_commits`).
+    #:
+    #: THE EVIDENCE, and the reason `status == "shipped_elsewhere"` is not a
+    #: flag. Everything that reads this state re-checks these shas against the
+    #: CURRENT base head rather than trusting the row: a record whose commits
+    #: have stopped being ancestors (a rebase, a force-move, a reset) reads as a
+    #: disagreement, exactly like a `completed` task whose work is not there.
+    #: Empty means the row predates this field — on a `shipped_elsewhere` row it
+    #: is an evidence-free claim, reported as a disagreement rather than
+    #: believed.
+    #:
+    #: NOT a dependency and not a branch. Nothing schedules off it, the merge
+    #: sweep never asks this task for a branch (it never had one), and no code
+    #: here fetches, resolves or merges these commits.
+    shipped_commits: tuple[str, ...] = ()
+    #: WHERE the work landed, in words — "shipped under inbox-02's commits".
+    #: Required by `record_shipped_elsewhere`; the machine-readable half is
+    #: `shipped_commits` above, and this is the half the dashboard group prints,
+    #: the same job `superseded_by` does for a retirement.
+    shipped_note: str = ""
+    #: WHEN the record was written, as a UTC timestamp. Not evidence — the
+    #: ancestry check is — but it is what tells a reader whether they are
+    #: looking at a claim made before or after the base moved.
+    shipped_at: str = ""
 
 
 #: The repository trackers every task may update, WITHOUT naming them in its
@@ -922,6 +1171,16 @@ class TaskRegistry:
             _validate_description(task.id, task.description)
             task.approved_paths = _validate_approved_paths(task.id, task.approved_paths)
             task.superseded_by = _validate_superseded_by(task.id, task.superseded_by)
+            # Only when something is there: every ordinary creation leaves this
+            # empty, and `_validate_shipped_commits` refuses an empty list
+            # because on the WRITE path emptiness means an evidence-free claim.
+            # A `seed_tasks.json` row that does carry evidence is held to the
+            # same shape rule `record_shipped_elsewhere` applies, so creation
+            # cannot be the one door a malformed sha list walks through.
+            if task.shipped_commits:
+                task.shipped_commits = _validate_shipped_commits(
+                    task.id, task.shipped_commits
+                )
             candidate[task.id] = task
         # A second pass, after every task in the batch is in `candidate`, so a
         # dependency on a task added by this same call resolves.
@@ -965,6 +1224,21 @@ class TaskRegistry:
                 "task_retired",
                 f"task '{task_id}' is retired{_successor_hint(task)} — plan a "
                 "new task instead of reviving it",
+            )
+        if state is TaskState.SHIPPED_ELSEWHERE:
+            # The same defense in depth, and the one that actually catches the
+            # dispatch path: `policy._check_task_reference` has no arm for this
+            # state and falls through to `Verdict.ok()`, so THIS refusal is what
+            # stands between a directive naming a shipped-elsewhere id and a
+            # round that redoes work already in the base. (policy.py is outside
+            # ship-01's approved scope; the gap is reported rather than reached
+            # into.) Redoing it is not merely wasted — the second attempt would
+            # commit a second copy of code that is already there.
+            raise TaskGraphError(
+                "task_shipped_elsewhere",
+                f"task '{task_id}' is recorded as shipped elsewhere"
+                f"{_shipped_hint(task)} — its work is already in the base; plan a "
+                "new task rather than redoing it",
             )
         task.status = "in_progress"
         # THE PIN IS CONSUMED HERE, and this is the only place it is spent.
@@ -1013,6 +1287,22 @@ class TaskRegistry:
                 f"task '{task_id}' is retired{_successor_hint(task)} — the work "
                 "it describes did not complete under this id",
             )
+        if state is TaskState.SHIPPED_ELSEWHERE:
+            # Completing this would DELETE the evidence-backed record and put
+            # the task straight into the merge sweep's enumeration, where it has
+            # no branch and no execution record — the `unresolved` → `HELD`
+            # shape this state was created to keep out of the sweep, arrived at
+            # by tidying. The bare `task.status = "completed"` below would
+            # otherwise do exactly that, silently, keeping the shas on the row
+            # while the status stopped meaning what they support.
+            raise TaskGraphError(
+                "task_shipped_elsewhere",
+                f"task '{task_id}' is recorded as shipped elsewhere"
+                f"{_shipped_hint(task)} — its work landed under another task's "
+                "commits, so it never had a branch of its own to complete. "
+                "Completing it would put it into the merge sweep with nothing to "
+                "merge, which holds every sweep",
+            )
         task.status = "completed"
         task.completed_at = utcnow_iso()
         return task
@@ -1047,6 +1337,22 @@ class TaskRegistry:
                 "task_retired",
                 f"task '{task_id}' is retired{_successor_hint(task)} — it cannot be "
                 "quarantined, and should never have been dispatched",
+            )
+        if task.status == "shipped_elsewhere":
+            # The same reasoning as the retired refusal directly above, and the
+            # same shape of hole it closes: the bare `task.status = "blocked"`
+            # below would overwrite the record, leaving the shas and the note on
+            # a row that now reads "needs a human" with nothing to say what
+            # happened. It should be unreachable — `_handle_parked_task` blocks
+            # a task that just parked, and `mark_in_progress` refuses to
+            # dispatch this state — so reaching it means the dispatch guards
+            # were bypassed, and that caller's fail-close to loop_fatal is the
+            # right answer rather than something to smooth over.
+            raise TaskGraphError(
+                "task_shipped_elsewhere",
+                f"task '{task_id}' is recorded as shipped elsewhere"
+                f"{_shipped_hint(task)} — it cannot be quarantined, and should "
+                "never have been dispatched",
             )
         task.status = "blocked"
         task.blocked_reason = reason
@@ -1171,6 +1477,21 @@ class TaskRegistry:
             raise TaskGraphError(
                 "task_completed",
                 f"task '{task_id}' is already completed — it was not superseded",
+            )
+        if task.status == "shipped_elsewhere":
+            # Mirrors the completed refusal directly above, and for the same
+            # reason: retirement means SUPERSEDED — the work described here did
+            # not happen and a successor task describes what will. This row says
+            # the opposite, with commits naming where the work already is.
+            # Retiring it would also strand every dependent, since a retirement
+            # satisfies nothing (`SATISFIES_DEPENDENCY`), so it would take a
+            # record that unblocks its dependents and turn it into one that
+            # blocks them forever.
+            raise TaskGraphError(
+                "task_shipped_elsewhere",
+                f"task '{task_id}' is recorded as shipped elsewhere"
+                f"{_shipped_hint(task)} — it was not superseded, its work is in "
+                "the base, and retiring it would strand every task depending on it",
             )
         successors = _validate_superseded_by(task_id, superseded_by)
         if task.status == "retired":
@@ -1376,6 +1697,18 @@ class TaskRegistry:
                 f"task '{task_id}' is retired{_successor_hint(task)}, not "
                 "quarantined — there is no blocker to answer",
             )
+        if task.status == "shipped_elsewhere":
+            # Its own arm rather than the generic "not blocked" below, for the
+            # reason the retired arm has one: `answer` reaches here, and every
+            # one of the five records this state was created for was sitting in
+            # `blocked` the day before. An operator whose answer did not requeue
+            # the task needs to be told it is not waiting on them at all.
+            return TaskGraphError(
+                "task_shipped_elsewhere",
+                f"task '{task_id}' is recorded as shipped elsewhere"
+                f"{_shipped_hint(task)}, not quarantined — there is no blocker to "
+                "answer",
+            )
         if task.status != "blocked":
             return TaskGraphError("task_not_blocked", f"task '{task_id}' is not blocked")
         return None
@@ -1462,7 +1795,22 @@ class TaskRegistry:
         # further down.
         if task.status == "retired":
             return TaskState.RETIRED
-        if any(self._tasks[dep].status != "completed" for dep in task.depends_on):
+        # Before the dependency check for the same reason as the three above,
+        # and with an extra one of its own: this row is a RECORD, so reading it
+        # as BLOCKED would put a task whose work is demonstrably in the base
+        # back under "waiting on inbox-02" — and it would then be counted as an
+        # unsatisfied dependency by nothing, since `SATISFIES_DEPENDENCY` below
+        # already answers for the dependents.
+        if task.status == "shipped_elsewhere":
+            return TaskState.SHIPPED_ELSEWHERE
+        # `SATISFIES_DEPENDENCY`, never a hand-written `!= "completed"`. That
+        # test used to be spelled out in four places; the constant is what keeps
+        # the Roadmap panel, the dependency graph and this method from
+        # disagreeing about whether a dependency is done. See the constant.
+        if any(
+            self._tasks[dep].status not in SATISFIES_DEPENDENCY
+            for dep in task.depends_on
+        ):
             return TaskState.BLOCKED
         if task.status == "in_progress":
             return TaskState.IN_PROGRESS
@@ -1665,7 +2013,22 @@ class TaskRegistry:
                 f"task '{task.id}' is retired{_successor_hint(task)} — a retirement "
                 f"is history and its {field} is never rewritten; plan a new task",
             )
-        raise TaskGraphError(  # pragma: no cover - no other status exists today
+        if task.status == "shipped_elsewhere":
+            # A record, exactly like the two above. Rewriting the scope or the
+            # description of work that is already in the base edits history, and
+            # rewriting `depends_on` would change what a row nothing dispatches
+            # claims to have waited for. The pragma that used to sit on the
+            # fall-through below is gone with this arm: that branch was
+            # unreachable only while `completed`, `retired` and `in_progress`
+            # were the whole of the non-mutable set, and adding a status without
+            # naming it here is precisely how it becomes reachable.
+            raise TaskGraphError(
+                "task_shipped_elsewhere",
+                f"task '{task.id}' is recorded as shipped elsewhere"
+                f"{_shipped_hint(task)} — its work is already in the base and its "
+                f"{field} is never rewritten; plan a new task",
+            )
+        raise TaskGraphError(  # pragma: no cover - defensive; every status has an arm
             "task_not_mutable",
             f"task '{task.id}' has status {task.status!r}, which cannot be edited",
         )
@@ -1738,10 +2101,20 @@ class TaskRegistry:
         the task.
         """
         task = self.get(task_id)
-        if task.status in ("completed", "retired"):
+        if task.status in _TERMINAL_STATUSES:
+            # Driven off `_TERMINAL_STATUSES` rather than a literal pair, so a
+            # status added to that set cannot fall through this guard and let a
+            # dispatch rewrite the approved plan of finished work. That is how
+            # the pair `("completed", "retired")` would have failed the day
+            # `shipped_elsewhere` arrived.
+            code = {
+                "completed": "task_completed",
+                "retired": "task_retired",
+            }.get(task.status, "task_shipped_elsewhere")
+            hint = _successor_hint(task) or _shipped_hint(task)
             raise TaskGraphError(
-                "task_completed" if task.status == "completed" else "task_retired",
-                f"task '{task_id}' is {task.status}{_successor_hint(task)} — its "
+                code,
+                f"task '{task_id}' is {task.status}{hint} — its "
                 "decomposition is the record of what was approved and is not "
                 "rewritten; plan a new task",
             )
@@ -1909,6 +2282,149 @@ class TaskRegistry:
             )
         return self.unblock(task_id)
 
+    # ---- shipped under another task's commits -------------------------------
+
+    def record_shipped_elsewhere(self, task_id: str, commits, note: str) -> Task:
+        """Record that `task_id`'s work is in the base under OTHER commits.
+
+        The registry half of ship-01. It decides ONE thing — may this task carry
+        such a record, and is the record well-formed — and nothing about whether
+        the evidence is TRUE right now: this module has no repository awareness
+        by design (module docstring, `_validate_approved_path`), so ancestry is
+        checked by the caller that has a checkout before the request is queued
+        (`cli._cmd_record_shipped`) and re-checked on every read by the one that
+        has one (`dashboard.shipped_elsewhere_states`). Same split as everywhere
+        else here: the inbox owns a request's SHAPE, this owns its CONTENT, and
+        the reader with git owns its TRUTH.
+
+        **It stores evidence, not an assertion.** `commits` must be a non-empty
+        list of full lowercase shas and `note` a non-blank account of whose they
+        are — refused otherwise, because "trust me, this shipped" is precisely
+        the hand-written prose this state replaces. What makes the record safe
+        is not that it was hard to write but that anyone can re-run the check:
+        the shas are on the row, and a sha that is no longer an ancestor of the
+        base head makes the record read as a DISAGREEMENT rather than as done.
+
+        **It satisfies dependents** (`SATISFIES_DEPENDENCY`) — the difference
+        from `retire`, and the main reason the state exists. inbox-03 and
+        inbox-04 both depend on inbox-02; recording inbox-02 as retired would
+        leave them BLOCKED with no command able to release them.
+
+        **Accepted from `pending` and from an OPERATOR HOLD**, the two states
+        the five measured records were actually in (all five were parked
+        through the inbox as a stopgap). A LOOP-RAISED quarantine is refused —
+        see the `hold_origin` arm below, which is the same provenance test
+        `operator_unblock` reads and exists for the same reason. Also refused
+        from:
+
+          * `in_progress` — a dispatch is running against this task right now,
+            and flipping it terminal mid-round strands it exactly as
+            `_refuse_immutable` describes: `mark_completed` and `release` would
+            both then refuse it.
+          * `completed` — this is the OTHER half of the disagreement, and it
+            must not be laundered. bind-01, split-01 and dash-17 are completed
+            with their work provably absent; converting them here would rewrite
+            a wrong record into a differently-wrong one instead of showing it.
+            A completed task whose work really did land under someone else's
+            commits already reads as shipped on the report, and needs nothing.
+          * `retired` — a supersession is written once and is history.
+
+        **Re-recording is allowed**, unlike `retire`'s written-once rule, and
+        the asymmetry is deliberate. A retirement records a DECISION, which
+        cannot change without a new decision; this records an OBSERVATION about
+        commits, and observations legitimately move — a rebase renames every
+        carrying sha, and the record must be able to follow rather than sit
+        there permanently disagreeing. The safety that buys it is the same
+        continuous re-check: a rewrite pointing at commits that are not
+        ancestors is visible as a disagreement the moment it is made, so a wrong
+        rewrite cannot hide. An identical re-record is a NO-OP that keeps the
+        original `shipped_at`, so a resubmitted request does not make the record
+        say it was written later than it was.
+
+        There is deliberately NO route back to `pending`. Un-recording is the
+        claim that the evidence was wrong, which the disagreement report already
+        surfaces for a human; a status flip that silently re-queued a task whose
+        code is in the base would be the same one-way-door problem
+        `block`/`unblock` are shaped to avoid, pointed the other way.
+
+        Rejection is atomic: the lookup, the state refusals and both validators
+        all run before the first assignment, so a refused call leaves the
+        registry exactly as it was.
+        """
+        task = self.get(task_id)
+        if task.status == "in_progress":
+            raise TaskGraphError(
+                "task_in_progress",
+                f"task '{task_id}' is in progress — recording it as shipped "
+                "elsewhere now would strand the round, which would finish and "
+                "then be refused completion. Wait for it, or "
+                "`python -m autoloop release` it first",
+            )
+        if task.status == "completed":
+            raise TaskGraphError(
+                "task_completed",
+                f"task '{task_id}' is already completed — a completed record that "
+                "the code cannot show is a DISAGREEMENT to look at, not a record "
+                "to rewrite. `python -m autoloop shipped-report` names it",
+            )
+        if task.status == "retired":
+            raise TaskGraphError(
+                "task_retired",
+                f"task '{task_id}' is retired{_successor_hint(task)} — a retirement "
+                "is history and is never rewritten; plan a new task",
+            )
+        if task.status == "blocked" and task.hold_origin != HOLD_ORIGIN_OPERATOR:
+            # A LOOP QUARANTINE, and the refusal is about the OTHER FILE. A
+            # `task_fatal` park writes a `blockers.Blocker` record beside the
+            # registry row, and that record is read INDEPENDENTLY of the
+            # registry — by `start`'s preflight, by `health.check` and by the
+            # heartbeat. Moving this row to a terminal status without closing it
+            # is the split brain `cli._reconcile_retired_blockers` was written
+            # for: the dashboard would say "already done, elsewhere" while the
+            # loop stayed stopped waiting on exactly this task.
+            #
+            # Refused rather than reconciled here, for two reasons. This module
+            # has no blocker store and must not grow one (it has no filesystem
+            # awareness at all, by design), and closing an unanswered question
+            # from a drain would forge the operator confirmation
+            # `_RESOLUTION_PRECONDITIONS` demands. Both supported steps already
+            # exist: `python -m autoloop answer` resolves the blocker AND
+            # returns the task to pending, and this command then records it.
+            #
+            # An OPERATOR HOLD is accepted, and the asymmetry is exactly the one
+            # `operator_unblock` turns on: a hold placed through the inbox
+            # creates no blocker record at all, so there is nothing to orphan.
+            # Provenance is the stored field and never the reason text.
+            raise TaskGraphError(
+                "task_blocked_by_operator",
+                f"task '{task_id}' was quarantined by the loop, not held by an "
+                "operator, so a `blockers.Blocker` record is open against it and "
+                "would be orphaned by this. Resolve it with `python -m autoloop "
+                "answer` — which closes the blocker and returns the task to "
+                "pending — then record it",
+            )
+        recorded = _validate_shipped_commits(task_id, commits)
+        _validate_shipped_note(task_id, note)
+        if (
+            task.status == "shipped_elsewhere"
+            and task.shipped_commits == recorded
+            and task.shipped_note == note
+        ):
+            return task
+        task.status = "shipped_elsewhere"
+        task.shipped_commits = recorded
+        task.shipped_note = note
+        task.shipped_at = utcnow_iso()
+        # `blocked_reason` is PRESERVED — it is the account of why the task was
+        # parked, which is history in the same sense a retirement's reason is,
+        # and five of these rows carry the stopgap note explaining the park.
+        # `hold_origin` is CLEARED, for the reason `unblock` clears it: the task
+        # is no longer blocked, so there is no hold to have an origin, and a
+        # marker left behind would still be sitting on the row deciding who may
+        # release a quarantine that no longer exists.
+        task.hold_origin = ""
+        return task
+
     # ---- the urgent pin (preemption) ----------------------------------------
 
     def live_urgent_target(self) -> Task | None:
@@ -1972,11 +2488,23 @@ class TaskRegistry:
                 f"task '{task.id}' is already completed — it will not be "
                 "dispatched again",
             )
+        if state is TaskState.SHIPPED_ELSEWHERE:
+            # Without an arm this state falls through to the `approved_paths`
+            # check below and the pin is ACCEPTED — the silent no-op accept this
+            # method's own docstring names as the failure it exists to prevent,
+            # on a task that can never be dispatched at all. The operator would
+            # watch a loop that displaced nothing and ran something else.
+            raise TaskGraphError(
+                "task_shipped_elsewhere",
+                f"task '{task.id}' is recorded as shipped elsewhere"
+                f"{_shipped_hint(task)} — its work is already in the base, so "
+                "preempting for it would displace a round for nothing",
+            )
         if state is TaskState.BLOCKED:
             waiting = ", ".join(
                 dep
                 for dep in task.depends_on
-                if self._tasks[dep].status != "completed"
+                if self._tasks[dep].status not in SATISFIES_DEPENDENCY
             )
             raise TaskGraphError(
                 "task_blocked",
@@ -2126,7 +2654,13 @@ class TaskRegistry:
             # Counted separately for the same reason the state exists: folded
             # into `quarantined` it reads as work waiting on the reviewer, and
             # `AUDIT_VS_READY_PREFERENCE` has them weighing exactly that.
-            f"{counts[TaskState.RETIRED]} retired"
+            f"{counts[TaskState.RETIRED]} retired, "
+            # And separately from `completed`, though both are done: this count
+            # is work with no branch of its own, so a reviewer reading it as
+            # completed would expect the merge sweep to have something to
+            # integrate for it. `dashboard.roadmap_stats` copies this sentence
+            # word for word and a test pins the two equal.
+            f"{counts[TaskState.SHIPPED_ELSEWHERE]} shipped elsewhere"
         )
         if nxt is not None:
             parts += f"; next ready: {nxt.id} — {nxt.title}"
@@ -2188,6 +2722,20 @@ class TaskRegistry:
                     # tests this field for truthiness and then prints it.
                     "urgent_at": str(raw.get("urgent_at", "") or ""),
                     "urgent_reason": str(raw.get("urgent_reason", "") or ""),
+                    # Same coercion, same reason as the four above: a missing
+                    # key is a `tasks.json` written before ship-01 and loads as
+                    # "nothing recorded", while a hand-edited `null` must become
+                    # `""` rather than `None` — both are printed and stripped by
+                    # their readers without a None check.
+                    "shipped_note": str(raw.get("shipped_note", "") or ""),
+                    "shipped_at": str(raw.get("shipped_at", "") or ""),
+                    # VALIDATED, not just tuple()-converted, exactly like
+                    # `superseded_by` below and for a sharper reason: this path
+                    # never reaches `add_many`, so it is the only gate a stored
+                    # or hand-edited row passes, and this is the field whose
+                    # contents unblock this task's dependents. A bare string sha
+                    # would otherwise load as 40 single-character "commits".
+                    "shipped_commits": _persisted_shipped_commits(raw),
                     # VALIDATED, not just tuple()-converted — this path never
                     # reaches `add_many` (see the bypass below), so it is the
                     # only gate a stored row passes. See

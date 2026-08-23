@@ -12,6 +12,7 @@
     python -m autoloop pause | resume | unlock | reset --yes [--tasks]
     python -m autoloop merge-window [--wait] | merge-backlog
     python -m autoloop shipped-report [--repo PATH] [--base REV]  (read-only)
+    python -m autoloop record-shipped <task-id> --commit REV --note "..."
     python -m autoloop reprovision-publisher --confirm
     python -m autoloop review-changeset --base <sha> --candidate <sha> [--packet FILE]
 
@@ -21,7 +22,9 @@ the single-instance lock on the state directory (fail closed against a live
 process; `unlock` is the only stale-lock recovery, and it refuses live locks).
 status / tasks / doctor / next-task / blockers / pause / merge-window /
 shipped-report stay available while locked — they only report. `merge-backlog`
-moves the branch head, so it does not.
+moves the branch head, so it does not. `record-shipped` stays available too, and
+for a different reason: it writes only to the INBOX, outside the checkout, like
+`add-task` and `urgent` — the loop applies it between steps.
 
 **Blockers (`blockers.py`).** `run --continuous` no longer stops on every
 park: a `task_fatal` one (see `orchestrator._to_needs_user`'s classification)
@@ -2021,6 +2024,127 @@ def _cmd_urgent(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_record_shipped(args: argparse.Namespace) -> int:
+    """Record that a task's work is already in the base under OTHER commits.
+
+    Like `add-task` and `urgent`, it takes NO lock and writes only to the inbox
+    — outside the checkout, so it is safe at any instant, including while a
+    write-capable agent is mid-run. That is the requirement rather than a
+    convenience: writing under `.autoloop/` needs the loop stopped (the escape
+    detector snapshots that directory), and the whole point of this record is
+    that it can be made about a live roadmap.
+
+    **The evidence is CHECKED before it is queued, and the check is git's.**
+    Every `--commit` is resolved to a full sha in `--repo` and then asked
+    `merge-base --is-ancestor` against `--base`. Three answers, three outcomes,
+    and the third is the one that matters:
+
+      * an ancestor → this commit may be recorded;
+      * provably not an ancestor → REFUSED, naming it. An operator asserting
+        that work shipped under a commit the base does not contain is exactly
+        the unsupported assertion this record replaces;
+      * git could not answer (a shallow clone, an object nobody fetched, an
+        unreadable repository) → ALSO REFUSED. "Could not look" is not
+        "verified", and a command that queued on an indeterminate check would
+        be a verification step that switches itself off precisely when it
+        cannot see.
+
+    That check is a GATE, not a guarantee, and the record does not rest on it:
+    the base moves, so `shipped-report` and the dashboard re-ask the same
+    question of the same shas on every read. A record whose commits stop being
+    ancestors reads as a disagreement from that moment on. This command exists
+    so the ordinary mistake is caught at the prompt rather than surfacing as a
+    disagreement an hour later.
+
+    The registry half is dry-run first, exactly as `urgent` does it — through
+    `record_shipped_elsewhere`, the same method the drain calls, against a
+    registry nothing will save — so a task that is in progress, completed,
+    retired or unknown is refused HERE in the registry's own words. The drain
+    re-checks authoritatively, because the graph can move in between.
+
+    It records; it never converts. Nothing here inspects other tasks, guesses
+    which commits might carry the work, or rewrites a status because a
+    heuristic matched — the commits come from the operator, and git's answer
+    about them is what decides.
+    """
+    from . import dashboard
+    from .inbox import KIND_SHIPPED_ELSEWHERE
+
+    config = load_config(args.config)
+    _, registry = _load_tasks(config)
+    repo = args.repo or Path.cwd()
+    head = dashboard.resolve_commit(repo, args.base)
+    if not head:
+        print(
+            f"error: cannot resolve {args.base!r} in {repo} — the base head is "
+            "what the evidence is checked against, so nothing is queued rather "
+            "than queueing a claim nobody could check"
+        )
+        return 1
+    resolved: list[str] = []
+    for rev in args.commit:
+        sha = dashboard.resolve_commit(repo, rev)
+        if not sha:
+            print(
+                f"error: {rev!r} names no commit in {repo} — an unresolvable "
+                "revision cannot be evidence"
+            )
+            return 1
+        verdict = dashboard.is_ancestor(repo, sha, head)
+        if verdict == "no":
+            print(
+                f"error: {sha[:12]} ({rev}) is NOT an ancestor of {head[:12]} — "
+                "recording it would claim work is in this base that git says is "
+                "not. Nothing was queued"
+            )
+            return 1
+        if verdict != "yes":
+            print(
+                f"error: git could not decide whether {sha[:12]} ({rev}) is an "
+                f"ancestor of {head[:12]} — a shallow clone, an object this "
+                "checkout has never fetched, or a repository it cannot read. "
+                "'Could not look' is not 'verified', so nothing was queued"
+            )
+            return 1
+        if sha in resolved:
+            print(f"error: {rev!r} resolves to {sha[:12]}, which is already listed")
+            return 1
+        resolved.append(sha)
+    try:
+        # Dry run against a registry nothing will save, exactly as `urgent`
+        # does it: the refusal text and its stable `code` come from the one
+        # implementation, so an operator cannot be told two different things
+        # about the same request.
+        registry.record_shipped_elsewhere(args.task_id, resolved, args.note)
+    except TaskGraphError as exc:
+        print(f"error: {exc}")
+        return 1
+    inbox = TaskInbox(inbox_dir_for(config.workers_root, config.state_dir))
+    try:
+        path = inbox.submit({
+            "kind": KIND_SHIPPED_ELSEWHERE,
+            "id": args.task_id,
+            KIND_SHIPPED_ELSEWHERE: {"commits": resolved, "note": args.note},
+        })
+    except InboxError as exc:  # pragma: no cover - shape is built here
+        print(f"error: {exc}")
+        return 1
+    listed = ", ".join(sha[:12] for sha in resolved)
+    print(
+        f"queued shipped-elsewhere record for '{args.task_id}' -> {path}\n"
+        f"  evidence: {listed} — each verified as an ancestor of {head[:12]} "
+        "just now\n"
+        f"  note: {args.note}\n"
+        "The running loop applies it between steps. Recording it satisfies the "
+        "tasks that depend on this one, keeps it out of the scheduler, and does "
+        "NOT put it in the merge sweep — it never had a branch.\n"
+        "The evidence is re-checked on every read: if these commits stop being "
+        "ancestors of the base head, the record reads as a disagreement rather "
+        "than as done (`python -m autoloop shipped-report`)."
+    )
+    return 0
+
+
 def _cmd_drain_inbox(args: argparse.Namespace) -> int:
     """Merge queued task requests into the registry WITHOUT stepping the phase
     machine.
@@ -3882,10 +4006,21 @@ def _merge_window_blockers(config, seen=None, git=None) -> tuple[list[str], list
             # retirement its own status without listing it here would let a
             # superseded task's leftover execution record hold the merge
             # window shut permanently, on work nobody will ever finish.
+            # SHIPPED_ELSEWHERE belongs here for exactly the reason RETIRED
+            # does, and it is a regression guard in the same literal sense. The
+            # five records ship-01 exists for were parked `blocked` — i.e.
+            # exempted through BLOCKED_BY_OPERATOR — and recording them as
+            # shipped elsewhere MOVES them out of that arm. Without this line,
+            # converting a parked task to the honest record would REMOVE its
+            # exemption, so a leftover execution record would start holding the
+            # merge window shut on work that is already in the base and has no
+            # branch to wait for. The task is terminal, nothing will dispatch it
+            # again, and moving the base cannot strand it.
             if state in (
                 TaskState.COMPLETED,
                 TaskState.BLOCKED_BY_OPERATOR,
                 TaskState.RETIRED,
+                TaskState.SHIPPED_ELSEWHERE,
             ):
                 continue
         if not record.get("candidate_sha"):
@@ -4153,6 +4288,18 @@ SHIPPED_LABELS = {
     "unknown": "NO MENTION  ",
 }
 
+#: The same for a `shipped_elsewhere` record's own re-check. Separate table
+#: because the words mean different things on the two sides: `VERIFIED` is a
+#: claim about commits the RECORD names, while `SHIPPED` above is a claim about
+#: commits a SEARCH found. `NO EVIDENCE` is not a weaker `INVALIDATED` — it means
+#: the row names no commits at all, so there was nothing to ask git about.
+SHIPPED_ELSEWHERE_LABELS = {
+    "verified": "VERIFIED    ",
+    "invalidated": "INVALIDATED ",
+    "unverified": "UNVERIFIED  ",
+    "unsupported": "NO EVIDENCE ",
+}
+
 
 def _format_shipped(report: dict) -> list[str]:
     """One block of operator-facing lines for a finished shipped-report.
@@ -4185,8 +4332,12 @@ def _format_shipped(report: dict) -> list[str]:
         "  " + ", ".join(f"{state} {counts.get(state, 0)}" for state in SHIPPED_STATES)
     )
     if not rows:
+        # NOT an early return any more. It used to be one, and since ship-01
+        # that would skip the two blocks below — so a roadmap whose only
+        # evidence-backed record had just been invalidated would print "no
+        # completed task to report on" and stop, which is the report going
+        # silent about the exact row it exists to surface.
         lines.append("  no completed task to report on")
-        return lines
     for row in rows:
         label = SHIPPED_LABELS.get(row.get("state") or "", "?           ")
         lines.append(f"  {label} {row.get('id')} — {row.get('title')}")
@@ -4196,9 +4347,81 @@ def _format_shipped(report: dict) -> list[str]:
                 f"               {commit.get('ancestry') or '':<12} "
                 f"{commit.get('sha')}  {commit.get('subject')}"
             )
+    if rows:
+        lines.append(
+            "  NO MENTION means no commit subject names the id — it is not "
+            "evidence that the work is missing, and this report never acts on "
+            "any row."
+        )
+    lines.extend(_format_elsewhere(report))
+    lines.extend(_format_disagreements(report))
+    return lines
+
+
+def _format_elsewhere(report: dict) -> list[str]:
+    """The shipped-elsewhere half: every record's own carrying commits, each
+    re-checked against THIS base head.
+
+    Printed even when the subject search failed, because these rows do not
+    depend on it — the record names its commits, so ancestry is asked directly.
+    That asymmetry is worth the extra block: a report that went silent about the
+    evidence-backed records whenever `git log --all` hiccupped would hide the
+    one kind of row that is still perfectly answerable.
+    """
+    from .dashboard import SHIPPED_ELSEWHERE_STATES
+
+    rows = report.get("elsewhere") or []
+    if not rows:
+        return ["  no task is recorded as shipped elsewhere"]
+    counts = {
+        state: sum(1 for row in rows if row.get("state") == state)
+        for state in SHIPPED_ELSEWHERE_STATES
+    }
+    lines = [
+        "  shipped elsewhere — records re-checked against this head, never "
+        "trusted from when they were written",
+        "  " + ", ".join(f"{state} {counts[state]}" for state in SHIPPED_ELSEWHERE_STATES),
+    ]
+    for row in rows:
+        label = SHIPPED_ELSEWHERE_LABELS.get(row.get("state") or "", "?           ")
+        lines.append(f"  {label} {row.get('id')} — {row.get('title')}")
+        lines.append(f"               {row.get('detail')}")
+        for commit in row.get("commits") or ():
+            lines.append(
+                f"               {commit.get('ancestry') or '':<12} "
+                f"{commit.get('sha')}"
+            )
+    return lines
+
+
+def _format_disagreements(report: dict) -> list[str]:
+    """Where the registry and the base disagree, and what could not be judged.
+
+    The `unverified` list is printed unconditionally when it is non-empty, right
+    under the findings, because the failure this whole report guards against is
+    "I could not look" reading as "there is nothing to see". An empty findings
+    list with four unchecked rows above it must not print as a clean bill of
+    health, so it does not.
+    """
+    disagreements = report.get("disagreements") or {}
+    rows = disagreements.get("rows") or []
+    unverified = disagreements.get("unverified") or []
+    lines = [
+        f"  registry / code disagreements: {len(rows)} "
+        f"({disagreements.get('proven', 0)} proven)"
+    ]
+    for row in rows:
+        strength = "PROVEN  " if row.get("proven") else "UNPROVEN"
+        lines.append(f"  {strength} {row.get('kind')}  {row.get('id')}")
+        lines.append(f"               {row.get('detail')}")
+    for row in unverified:
+        lines.append(
+            f"  UNCHECKED {row.get('record')}  {row.get('id')} — "
+            "no evidence either way, and never counted as agreeing"
+        )
     lines.append(
-        "  NO MENTION means no commit subject names the id — it is not evidence "
-        "that the work is missing, and this report never acts on any row."
+        "  Nothing here is converted automatically: a disagreement is reported "
+        "for a human, never resolved by changing the record that made it."
     )
     return lines
 
@@ -4223,11 +4446,24 @@ def _cmd_shipped_report(args: argparse.Namespace) -> int:
     the commits and the base head are properties of a checkout rather than of
     the state dir.
 
-    Exit 0 means every completed task got an ANSWER, which includes "no commit
-    subject names this id" — that is a real answer to the question asked. Exit 1
-    means at least one row could not be judged (the search failed, or git could
-    not resolve a matching commit against the base head), because "I could not
-    look" must not read the same as "I looked, and here is the answer".
+    Since ship-01 (2026-08-23) it also re-checks every `shipped_elsewhere`
+    record's own carrying commits against this head, and prints where the two
+    directions disagree. Still read-only, still never acting: a record whose
+    evidence has stopped holding is REPORTED, never rewritten, completed or
+    converted.
+
+    Exit 0 means every completed task got an ANSWER and nothing provably
+    disagrees. "No commit subject names this id" is a real answer to the
+    question asked, so it does NOT on its own make the exit non-zero — that is
+    the fail-open guard, kept: absence of a mention is absence of evidence, and
+    an exit code that treated it as proof would be a licence to undo work that
+    landed. Exit 1 means either something could not be judged (the search
+    failed, git could not resolve a commit, a shipped-elsewhere record could not
+    be checked) or the registry PROVABLY disagrees with the base — a recorded
+    carrying commit that is not an ancestor, a shipped-elsewhere row naming no
+    commits, or a completed task whose naming commits are all outside the base.
+    "I could not look" and "I looked, and it does not hold" are both reasons to
+    stop; only the second is a claim about the code.
     """
     from . import dashboard
 
@@ -4244,14 +4480,35 @@ def _cmd_shipped_report(args: argparse.Namespace) -> int:
         return 1
     branch = args.base
     roadmap = [
-        {"id": task.id, "title": task.title, "status": task.status}
+        {"id": task.id, "title": task.title, "status": task.status,
+         # The evidence half. Read off the Task rather than re-derived, because
+         # re-deriving it is what this record exists to stop: the shas the
+         # operator recorded are what gets re-checked, not a fresh guess at
+         # which commits might carry the work.
+         "shipped_commits": list(task.shipped_commits),
+         "shipped_note": task.shipped_note,
+         "shipped_at": task.shipped_at}
         for task in registry.all_tasks()
     ]
     report = dashboard.shipped_report(repo, roadmap, head, branch)
     for line in _format_shipped(report):
         print(line)
     unjudged = report["counts"].get("unverified", 0)
-    return 1 if unjudged or not report.get("searched") else 0
+    disagreements = report.get("disagreements") or {}
+    # Anything other than `verified` on a shipped-elsewhere record: it either
+    # provably no longer holds, or it could not be checked. Both are reasons to
+    # stop, and neither may be rounded down to "the record is fine".
+    unsettled_records = [
+        row for row in (report.get("elsewhere") or ()) if row.get("state") != "verified"
+    ]
+    return (
+        1
+        if unjudged
+        or not report.get("searched")
+        or disagreements.get("proven")
+        or unsettled_records
+        else 0
+    )
 
 
 def _cmd_pause(args: argparse.Namespace) -> int:
@@ -4408,6 +4665,45 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     urgent.set_defaults(func=_cmd_urgent)
+
+    shipped_elsewhere = sub.add_parser(
+        "record-shipped",
+        help=(
+            "record that a task's work is already in the base under ANOTHER "
+            "task's commits (evidence-backed: every --commit is verified as an "
+            "ancestor of --base before anything is queued)"
+        ),
+    )
+    add_config(shipped_elsewhere)
+    shipped_elsewhere.add_argument("task_id")
+    shipped_elsewhere.add_argument(
+        "--commit",
+        action="append",
+        required=True,
+        metavar="REV",
+        help=(
+            "a commit that carries this work; repeatable. Any revision git can "
+            "resolve — it is stored as the full sha, so the record means the "
+            "same commit in every checkout"
+        ),
+    )
+    shipped_elsewhere.add_argument(
+        "--note",
+        required=True,
+        help=(
+            "where the work landed, in words ('shipped under inbox-02's "
+            "commits') — the commits say which, this says whose"
+        ),
+    )
+    shipped_elsewhere.add_argument(
+        "--repo", type=Path, default=None,
+        help="checkout the commits are resolved and checked in (default: cwd)",
+    )
+    shipped_elsewhere.add_argument(
+        "--base", default="HEAD",
+        help="the base head each commit must be an ancestor of (default: HEAD)",
+    )
+    shipped_elsewhere.set_defaults(func=_cmd_record_shipped)
 
     retire = sub.add_parser(
         "retire",

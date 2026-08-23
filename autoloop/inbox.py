@@ -60,11 +60,12 @@ Nothing here validates the task graph — `TaskRegistry.add_many` does that on
 merge, so a bad request is refused by the same gate a ChatGPT `plan` goes
 through, not by a second implementation that could drift from it.
 
-**Mutations (2026-08-16; `urgent` added 2026-08-22).** The vocabulary was
-`task` + `priority`. It is now `task` plus seven mutations: `priority`,
-`description`, `approved_paths`, `depends_on`, `block`, `unblock` and
-`urgent`. Four things keep that from being the "general edit-a-task request"
-the `priority`-only design was written to avoid:
+**Mutations (2026-08-16; `urgent` added 2026-08-22, `shipped_elsewhere`
+2026-08-23).** The vocabulary was `task` + `priority`. It is now `task` plus
+eight mutations: `priority`, `description`, `approved_paths`, `depends_on`,
+`block`, `unblock`, `urgent` and `shipped_elsewhere`. Four things keep that from
+being the "general edit-a-task request" the `priority`-only design was written
+to avoid:
 
 1. **Two authorities, split by question, one implementation each.** SHAPE — is
    the field present, is it the right JSON type, does this kind even carry it —
@@ -84,8 +85,10 @@ the `priority`-only design was written to avoid:
 
    And it runs at BOTH gates — `TaskInbox.submit` and `apply_requests` — off
    the one function, because hand-writing the JSON file is the ONLY operator
-   route to the five new kinds (no CLI flag, no dashboard endpoint), and a
-   hand-written file never passes through `submit`. Checking shape only on the
+   route to most of the mutation kinds (no CLI flag, no dashboard endpoint —
+   `priority` has both and `shipped_elsewhere` has `python -m autoloop
+   record-shipped`), and a hand-written file never passes through `submit`.
+   Checking shape only on the
    way in therefore left the documented route unchecked: a hand-written
    creation carrying `reason`, or a `block` carrying a stray `approved_paths`,
    reached `apply_requests`, which consumed the fields it recognised and
@@ -176,10 +179,24 @@ CREATION_FIELDS = frozenset(
 )
 
 #: Fields only a MUTATION request can carry, i.e. everything in
-#: `MUTATION_PAYLOAD` that creation has no field for. Today just `reason` —
-#: `Task.blocked_reason` on the registry side, the account an operator gives
-#: for holding a task.
-MUTATION_ONLY_FIELDS = frozenset({"reason"})
+#: `MUTATION_PAYLOAD` that creation has no field for. Two of them:
+#:
+#:   * `reason` — `Task.blocked_reason` on the registry side, the account an
+#:     operator gives for holding a task (and for pinning one urgent).
+#:   * `shipped_elsewhere` — the evidence payload of `KIND_SHIPPED_ELSEWHERE`
+#:     (ship-01, 2026-08-23). Creation has no field for it and must not grow
+#:     one: a task cannot be born already recorded as shipped under someone
+#:     else's commits, and the registry refuses the record on anything but a
+#:     pending or held task anyway.
+#:
+#: Membership here is what keeps `ALLOWED_FIELDS` the whole vocabulary
+#: (`test_no_payload_field_falls_outside_both_per_kind_sets` is the drift
+#: guard), and it earns the payload name a better refusal on the wrong kind:
+#: `_check_creation` reports a mutation-only field as such and names the kinds
+#: that take it, instead of "unknown field", which sends the author looking for
+#: a typo. Nothing validates AGAINST this set — the per-kind checks do — so
+#: adding a name here widens no request's shape.
+MUTATION_ONLY_FIELDS = frozenset({"reason", "shipped_elsewhere"})
 
 #: Every field name the vocabulary knows, across all kinds. A UNION, not a
 #: contract: no single request may carry all of these, and nothing validates
@@ -235,6 +252,32 @@ KIND_APPROVED_PATHS = "approved_paths"
 KIND_DEPENDS_ON = "depends_on"
 KIND_BLOCK = "block"
 KIND_UNBLOCK = "unblock"
+#: Record that an existing task's work is already in the base under ANOTHER
+#: task's commits (ship-01, 2026-08-23). Carries the EVIDENCE — the carrying
+#: commits and a note saying whose they are — as one payload object.
+#:
+#: Here rather than only behind a `.autoloop/` edit because writing under
+#: `.autoloop/` requires the loop STOPPED (the escape detector snapshots that
+#: directory — see the module docstring), and the whole point of this record is
+#: that it can be made about a live roadmap. The inbox is the attested path for
+#: everything except `priority`, so this uses it rather than growing a second
+#: immediate writer.
+#:
+#: A composite payload, unlike every other kind, and deliberately so: the two
+#: halves are one fact and a request carrying shas with no account of them — or
+#: an account with no shas — is exactly the unsupported assertion this record
+#: exists to replace. `MUTATION_PAYLOAD`'s one-field-per-kind invariant is
+#: unchanged: the field is one field, and its INSIDE is shape-checked by
+#: `_check_shipped_elsewhere` with the same "carries only these keys" rule the
+#: outer request gets.
+#:
+#: The registry re-checks everything here (`record_shipped_elsewhere`), and
+#: nothing on this route asserts ANCESTRY: git is asked by
+#: `cli._cmd_record_shipped` before the request is queued and again by every
+#: reader afterwards. A hand-written request that skips that command still lands
+#: — and a claim whose commits are not ancestors then reads as a disagreement on
+#: the dashboard, which is the point of re-checking rather than trusting.
+KIND_SHIPPED_ELSEWHERE = "shipped_elsewhere"
 
 #: kind -> the ONE payload field it carries besides `kind` and `id`. `None`
 #: means the kind is the whole instruction (`unblock` names a task and says
@@ -254,7 +297,15 @@ MUTATION_PAYLOAD: dict[str, str | None] = {
     KIND_BLOCK: "reason",
     KIND_UNBLOCK: None,
     KIND_URGENT: "reason",
+    KIND_SHIPPED_ELSEWHERE: "shipped_elsewhere",
 }
+
+#: The keys the `shipped_elsewhere` payload object carries — BOTH required,
+#: nothing else accepted. The per-kind field rule applied one level down, for
+#: the same reason it exists one level up: a request naming a key its receiver
+#: ignores has almost certainly not done what its author intended, and here the
+#: silently-dropped key would be half the evidence.
+SHIPPED_ELSEWHERE_KEYS = ("commits", "note")
 MUTATION_KINDS = tuple(MUTATION_PAYLOAD)
 KINDS = (KIND_TASK, *MUTATION_KINDS)
 
@@ -277,7 +328,7 @@ def check_request_shape(spec: object) -> str:
     the rule an API submit gets. Two copies would drift, and a drift here means
     the field an operator typed is refused by one route and silently ignored by
     the other — which is the whole defect the per-kind rule exists to prevent,
-    and hand-writing the file is the ONLY route to five of the six mutation
+    and hand-writing the file is the ONLY route to most of the mutation
     kinds today.
 
     SHAPE only, deliberately: is this request even usable, given its kind.
@@ -375,6 +426,50 @@ def _check_mutation(kind: str, spec: dict) -> None:
         raise InboxError(
             f"a {kind} request needs {payload!r} as a list (use [] to clear it)"
         )
+    if kind == KIND_SHIPPED_ELSEWHERE:
+        _check_shipped_elsewhere(value)
+
+
+def _check_shipped_elsewhere(value: object) -> None:
+    """Shape-check the `shipped_elsewhere` payload object. Raises `InboxError`.
+
+    TYPE and PRESENCE only, like every other arm above — whether a sha is
+    well-formed, whether the note is blank, and whether the task may carry the
+    record at all are the registry's calls (`_validate_shipped_commits`,
+    `_validate_shipped_note`, `record_shipped_elsewhere`), so the operator reads
+    one authority's words per question.
+
+    What it does own is the composite: this is the only kind whose payload is an
+    object, so "is it an object, and does it carry only the two keys" has no
+    other home. Both keys are REQUIRED rather than defaulted: a request with
+    commits and no note, or a note and no commits, is half a record, and the
+    half that is missing is the half that makes the other half checkable.
+    """
+    if not isinstance(value, dict):
+        raise InboxError(
+            f"a {KIND_SHIPPED_ELSEWHERE} request needs {KIND_SHIPPED_ELSEWHERE!r} "
+            f"as an object carrying {list(SHIPPED_ELSEWHERE_KEYS)}"
+        )
+    extra = sorted(set(value) - set(SHIPPED_ELSEWHERE_KEYS))
+    if extra:
+        raise InboxError(
+            f"a {KIND_SHIPPED_ELSEWHERE} payload carries only "
+            f"{list(SHIPPED_ELSEWHERE_KEYS)}; got {extra}"
+        )
+    missing = [key for key in SHIPPED_ELSEWHERE_KEYS if key not in value]
+    if missing:
+        raise InboxError(
+            f"a {KIND_SHIPPED_ELSEWHERE} payload needs {missing} — the commits "
+            "are the evidence and the note says whose they are; one without the "
+            "other is not a record"
+        )
+    if not isinstance(value["commits"], list):
+        raise InboxError(
+            f"a {KIND_SHIPPED_ELSEWHERE} payload needs 'commits' as a list of "
+            "full commit shas"
+        )
+    if not isinstance(value["note"], str):
+        raise InboxError(f"a {KIND_SHIPPED_ELSEWHERE} payload needs 'note' as a string")
 
 
 class TaskInbox:
@@ -554,6 +649,26 @@ def _apply_mutation(registry, kind: str, spec: dict) -> str:
             f"{task.urgent_reason}); the loop preempts at its next safe phase "
             "boundary and dispatches this task"
         )
+    if kind == KIND_SHIPPED_ELSEWHERE:
+        # `or {}` for the never-raises promise alone: `check_request_shape` has
+        # already refused a non-object payload at BOTH gates, so the fallback
+        # can only be reached by a caller bypassing them — and it then hands the
+        # registry an empty commit list, which `_validate_shipped_commits`
+        # refuses in its own words rather than an `AttributeError` out of a
+        # `.get` on a string.
+        payload = spec.get(KIND_SHIPPED_ELSEWHERE)
+        payload = payload if isinstance(payload, dict) else {}
+        task = registry.record_shipped_elsewhere(
+            task_id, payload.get("commits", ()), payload.get("note")
+        )
+        landed = ", ".join(sha[:12] for sha in task.shipped_commits)
+        # Says what the record CLAIMS and where to check it, never that the
+        # claim was verified here: nothing on the drain path talks to git.
+        return (
+            f"{task.id} -> shipped elsewhere under {landed} ({task.shipped_note}); "
+            "ancestry is re-checked on every read — `python -m autoloop "
+            "shipped-report` names it if the evidence stops holding"
+        )
     task = registry.operator_unblock(task_id)
     return f"{task.id} -> pending (hold released)"
 
@@ -598,7 +713,7 @@ def apply_requests(registry, specs: list[dict]) -> tuple[list[str], list[str], l
 
     **Shape is re-checked here, by the same `check_request_shape` `submit`
     calls.** Not belt-and-braces: hand-writing the JSON file is the documented —
-    and today the only — operator route to five of the six mutation kinds, and
+    and for most kinds today the only — operator route to a mutation, and
     such a file reaches this function without ever passing through `submit`.
     Without the re-check the loop below simply consumed the keys it recognised
     and ignored the rest, so a creation carrying `reason` and a `block`

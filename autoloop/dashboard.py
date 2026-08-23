@@ -98,7 +98,12 @@ from pathlib import Path
 # execv. Everything they pull in is pure Python with no optional dependency.
 from .auto_merge import UPGRADE_PENDING, UpgradeStore, loop_code_paths
 from .errors import StateError, TaskGraphError
-from .tasks import TaskRegistry, TaskState
+from .tasks import (
+    SATISFIES_DEPENDENCY,
+    TaskRegistry,
+    TaskState,
+    satisfies_dependency,
+)
 
 #: Reserved status roles (dataviz palette). Never reused for anything else, and
 #: every use in the page ships an icon + label so state is never colour-alone.
@@ -227,6 +232,13 @@ _SHALLOW_CACHE: dict = {}
 #: construction: the evidence it feeds is positive-only, so a stale "could not
 #: search" can never assert anything about a row. See `_cached_commit_subjects`.
 _SUBJECT_CACHE: dict = {}
+
+#: "the caller did not hand me a commit search, read one yourself" — the default
+#: of `disagreement_report`'s `commits` parameter. A sentinel rather than `None`
+#: because `None` is a REAL value there: it is what the search returning nothing
+#: usable looks like, and collapsing the two would make "the caller decided not
+#: to search" indistinguishable from "no caller has decided anything yet".
+_UNREAD = object()
 
 
 def _run_status(args, cwd=None, timeout=8):
@@ -1756,10 +1768,29 @@ def shipped_report(repo: Path, roadmap: list[dict], head: str, branch: str = "")
     `_cached_commit_subjects`, which is what keeps a walk of every ref off a 2s
     poll. Nothing here is on that path; `commit_subjects` is called directly
     below so a one-shot report never reads a cached answer.
+
+    Since ship-01 (2026-08-23) it answers the question in BOTH directions and
+    returns them together: `rows` is the completed side as before, `elsewhere`
+    re-checks every `shipped_elsewhere` record's own carrying commits against
+    this head, and `disagreements` is where the two say something the base does
+    not support. One payload rather than two commands, because the two halves
+    are the same claim — "the registry must not claim what the code cannot show,
+    in either direction" — and a caller able to render one without the other
+    would rebuild exactly the blind spot this report exists to close.
     """
     completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
+    recorded = [t for t in roadmap if (t.get("status") or "") == "shipped_elsewhere"]
     commits = commit_subjects(repo)
-    rows = shipped_states(completed, commits, lambda sha: is_ancestor(repo, sha, head))
+
+    def ancestor(sha: str) -> str:
+        return is_ancestor(repo, sha, head)
+
+    rows = shipped_states(completed, commits, ancestor)
+    # The shipped-elsewhere half needs NO subject search: the record names its
+    # own commits, so it is judged even when `git log --all` will not answer —
+    # which is the case the completed half reports as `unverified` for every row
+    # at once.
+    elsewhere = shipped_elsewhere_states(recorded, ancestor)
     return {
         "base_branch": branch or "HEAD",
         "base_head": head[:12],
@@ -1770,7 +1801,266 @@ def shipped_report(repo: Path, roadmap: list[dict], head: str, branch: str = "")
         "searched_commits": len(commits) if commits is not None else 0,
         "counts": {s: sum(1 for r in rows if r["state"] == s) for s in SHIPPED_STATES},
         "rows": rows,
+        # The other direction of the same question, computed off the same
+        # ancestry check and returned in the same payload so no caller can read
+        # one without the other. See `registry_disagreements`.
+        "elsewhere": elsewhere,
+        "disagreements": registry_disagreements(rows, elsewhere),
     }
+
+
+# ---- does the registry still agree with the code? (ship-01, 2026-08-23) -------
+#
+# `shipped_states` above answers "for a COMPLETED task, is there a commit naming
+# it in the base". This section is the same question asked of the OTHER kind of
+# record and then asked in reverse:
+#
+#   * a `shipped_elsewhere` row NAMES its carrying commits, so the check is not
+#     a search at all — it is ancestry on shas the record already holds. Run
+#     EVERY time, never once at record time, because a rebase, a force-move or a
+#     reset can take the base out from under a record that was true when it was
+#     written. "It verified on 2026-08-23" is not a claim about today.
+#   * a `completed` row whose work the base cannot show is the mirror image, and
+#     it was measured: bind-01, split-01 and dash-17 were all completed, all cut
+#     from a base nineteen commits behind, and `shipped-report` returned NO
+#     MENTION for each.
+#
+# NOTHING HERE CONVERTS ANYTHING. Detecting a disagreement and reporting it is
+# the whole of it: no status is rewritten, no evidence is edited, no task is
+# completed or re-queued. A heuristic that matched and then silently changed a
+# record would be a worse version of the problem it was written for.
+#
+# THE FAIL-OPEN THIS EXISTS TO AVOID, in both directions:
+#   * "git could not answer" must never read as "verified". A shallow clone, an
+#     unreadable repository and an object nobody fetched all answer `unknown`
+#     (`is_ancestor`), and rounding that up would switch the alarm off exactly
+#     when it cannot see.
+#   * "git could not answer" must never read as "disagreement" either, or every
+#     shallow clone reports the whole roadmap as broken and the report becomes
+#     noise nobody reads. So `unverified` is its OWN answer, carried beside the
+#     disagreements rather than folded into them — the same three-way split
+#     `SHIPPED_STATES` already makes for the completed side.
+
+#: What the continuous re-check can conclude about ONE shipped-elsewhere record.
+#: `unsupported` is not a weaker `invalidated`: it means the row claims the work
+#: shipped and names NO commits, so there is nothing to check rather than a check
+#: that failed. Only a hand-edited `tasks.json` can produce it —
+#: `record_shipped_elsewhere` refuses an empty list — and it must not render as
+#: an ordinary record.
+SHIPPED_ELSEWHERE_STATES = ("verified", "invalidated", "unverified", "unsupported")
+
+#: The kinds of disagreement between what the registry says and what the base
+#: shows. `proven` on each row is what separates them: the first three are
+#: definite (git said no, or there is nothing to ask), the last is NOT — a task
+#: id that appears in no commit subject may have shipped under a subject that
+#: never named it, and reporting that as proof of absence is the exact
+#: fail-open `shipped_states` refuses to make.
+DISAGREEMENT_KINDS = (
+    "shipped_evidence_absent",
+    "shipped_evidence_missing",
+    "completed_not_in_base",
+    "completed_unwitnessed",
+)
+
+
+def shipped_elsewhere_states(recorded: list[dict], ancestor) -> list[dict]:
+    """One row per shipped-elsewhere record: each carrying commit's own ancestry
+    verdict, and the aggregate.
+
+    Pure resolution logic, like `shipped_states` and `merge_states` above —
+    `ancestor(sha) -> "yes"/"no"/"unknown"` is injected, so every state is
+    decidable without a repository.
+
+    **Aggregation is ALL, not ANY, and that is the opposite of `shipped_states`
+    on purpose.** There, the commits are search RESULTS — subjects that happen
+    to name the id — so one of them being in the base proves the work is there
+    and the others are noise. Here the commits are the record's own claim about
+    what carries the work, so a commit that is provably not an ancestor means
+    the record as written no longer holds. Reading it as `any` would let a
+    record survive by its stalest half.
+
+    Order of evidence:
+
+    1. No commits recorded → `unsupported`. A claim with nothing to check.
+    2. Any recorded commit is provably NOT an ancestor → `invalidated`. This is
+       the disagreement the record exists to make visible.
+    3. Otherwise, any commit git could not resolve → `unverified`. One
+       indeterminate check may not be rounded up to "verified" — that is the
+       alarm switching itself off when it cannot see.
+    4. Every commit is an ancestor → `verified`.
+    """
+    rows = []
+    for task in recorded:
+        task_id = str(task.get("id") or "")
+        commits = [str(sha) for sha in (task.get("shipped_commits") or ()) if sha]
+        row = {
+            "id": task_id,
+            "title": task.get("title") or "",
+            "note": str(task.get("shipped_note") or ""),
+            "recorded_at": str(task.get("shipped_at") or ""),
+            "state": "unsupported",
+            "detail": (
+                "recorded as shipped elsewhere with no commits — there is nothing "
+                "to check, so this claim is not evidence-backed at all"
+            ),
+            "commits": [],
+        }
+        judged = []
+        for sha in commits:
+            verdict = ancestor(sha)
+            judged.append({
+                "sha": sha[:12],
+                "full": sha,
+                "ancestry": {"yes": "in-base", "no": "not-in-base"}.get(
+                    verdict, "unverified"
+                ),
+            })
+        row["commits"] = judged
+        missing = [c for c in judged if c["ancestry"] == "not-in-base"]
+        indeterminate = [c for c in judged if c["ancestry"] == "unverified"]
+        if not judged:
+            pass  # the `unsupported` default above
+        elif missing:
+            row["state"] = "invalidated"
+            row["detail"] = (
+                f"{missing[0]['sha']} is recorded as carrying this work and is NOT "
+                f"an ancestor of the base head ({len(missing)} of {len(judged)} "
+                "recorded commits are not) — the record no longer holds"
+            )
+        elif indeterminate:
+            row["state"] = "unverified"
+            row["detail"] = (
+                f"{len(judged)} recorded commit(s); git could not resolve "
+                f"{len(indeterminate)} of them against the base head — no evidence "
+                "either way, and never read as verified"
+            )
+        else:
+            row["state"] = "verified"
+            row["detail"] = (
+                f"all {len(judged)} recorded commit(s) are ancestors of the base "
+                f"head — {row['note'] or 'no note recorded'}"
+            )
+        rows.append(row)
+    return rows
+
+
+def registry_disagreements(shipped_rows: list[dict], elsewhere_rows: list[dict]) -> dict:
+    """Where the registry and the base disagree, in both directions, plus what
+    could not be judged.
+
+    Pure: it re-reads rows the two resolvers above already produced, so there is
+    exactly one ancestry implementation on the page and this cannot reach a
+    different verdict from the panel beside it.
+
+    Returns `{"rows": [...], "unverified": [...], "counts": {...}}`. The
+    `unverified` half travels IN the same dict rather than being computed
+    separately, so a caller cannot render the disagreements and quietly drop
+    "and there are four more I could not look at" — the collapse this whole
+    section is written against.
+
+    `proven` distinguishes the two strengths of finding, and the report must
+    keep them apart:
+
+      * `shipped_evidence_absent`, `shipped_evidence_missing` and
+        `completed_not_in_base` are DEFINITE. Git was asked and said no, or
+        there was nothing to ask.
+      * `completed_unwitnessed` is NOT. No commit subject names the id, and
+        absence of a mention is absence of evidence — the work may have shipped
+        under a subject that never named the task. It is still a disagreement
+        worth a human's eye (a completed task the base cannot witness at all is
+        how bind-01, split-01 and dash-17 read), but it is not proof, and a
+        report that presented it as proof would be a licence to undo work that
+        did land.
+    """
+    rows: list[dict] = []
+    unverified: list[dict] = []
+    for row in elsewhere_rows:
+        base = {"id": row["id"], "title": row["title"], "detail": row["detail"]}
+        if row["state"] == "invalidated":
+            rows.append({**base, "kind": "shipped_evidence_absent", "proven": True})
+        elif row["state"] == "unsupported":
+            rows.append({**base, "kind": "shipped_evidence_missing", "proven": True})
+        elif row["state"] == "unverified":
+            unverified.append({**base, "record": "shipped_elsewhere"})
+    for row in shipped_rows:
+        base = {"id": row["id"], "title": row["title"], "detail": row["detail"]}
+        if row["state"] == "not-in-base":
+            rows.append({**base, "kind": "completed_not_in_base", "proven": True})
+        elif row["state"] == "unknown":
+            rows.append({**base, "kind": "completed_unwitnessed", "proven": False})
+        elif row["state"] == "unverified":
+            unverified.append({**base, "record": "completed"})
+    # Proven first, then by kind order, then by id: the definite findings are
+    # what an operator acts on, and a list that opened with twelve "no commit
+    # names this" rows would bury the one that git actually refuted.
+    order = {kind: index for index, kind in enumerate(DISAGREEMENT_KINDS)}
+    rows.sort(key=lambda r: (not r["proven"], order[r["kind"]], r["id"]))
+    return {
+        "rows": rows,
+        "unverified": sorted(unverified, key=lambda r: r["id"]),
+        "counts": {
+            kind: sum(1 for r in rows if r["kind"] == kind) for kind in DISAGREEMENT_KINDS
+        },
+        "proven": sum(1 for r in rows if r["proven"]),
+    }
+
+
+def disagreement_report(
+    repo: Path, roadmap: list[dict], head: str, commits=_UNREAD
+) -> dict:
+    """`registry_disagreements` for the live page, on the CACHED commit search.
+
+    The same two resolvers and the same combiner `shipped_report` uses — the
+    duplication is the two SEARCH reads, not the judgement — so the operator
+    command and the panel cannot reach different verdicts. What differs is
+    cost: `shipped-report` is run once and reads `commit_subjects` directly, and
+    this is polled every 2 seconds, so it goes through
+    `_cached_commit_subjects` for the same reason `merge_report` does. Ancestry
+    is cached per `(repo, sha, head)` by `is_ancestor` itself.
+
+    `commits` lets the CALLER hand over a search it has already made or already
+    decided not to make: `[(sha, subject)]`, or `None` for "it did not run".
+    `collect` passes `None` when the remote was unreadable, because dash-18 pins
+    that the ref walk is SKIPPED OUTRIGHT in that case (`merge_report` states the
+    same bound at its own call site) and a second consumer on the same poll must
+    not quietly reintroduce a walk that page decided against. Left unset — which
+    is every caller but `collect` — it reads the search itself, so the default is
+    the thorough one and only an explicit hand-over can narrow it. `_UNREAD`
+    rather than a `None` default because `None` is a real value here: it is what
+    "the search ran and would not answer" already means to `shipped_states`, so
+    the two must stay distinguishable.
+
+    What `None` costs, stated rather than hidden: no COMPLETED task can be
+    judged that poll, so every one of them lands in `unverified` — "could not
+    look", carried beside the findings and rendered under them — and never in
+    `rows`. It is never rounded up to agreement, which is the only property this
+    section is not allowed to lose. The shipped-elsewhere half does not depend
+    on the search at all (the record names its own commits), so it is judged
+    either way, and `shipped-report` always runs its own search: the answer is
+    delayed on one panel, not unavailable.
+
+    `searched` travels with the answer: with it false every completed row is
+    `unverified` for one shared reason, which the page must be able to say once
+    rather than per row.
+
+    Read-only, like everything in this section. It runs no git that writes and
+    it touches neither the registry nor an execution record.
+    """
+    completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
+    recorded = [t for t in roadmap if (t.get("status") or "") == "shipped_elsewhere"]
+    if commits is _UNREAD:
+        commits = _cached_commit_subjects(repo)
+
+    def ancestor(sha: str) -> str:
+        return is_ancestor(repo, sha, head)
+
+    elsewhere = shipped_elsewhere_states(recorded, ancestor)
+    report = registry_disagreements(
+        shipped_states(completed, commits, ancestor), elsewhere
+    )
+    report["elsewhere"] = elsewhere
+    report["searched"] = commits is not None
+    return report
 
 
 # ---- the roadmap, grouped by state -------------------------------------------
@@ -1809,6 +2099,15 @@ GROUPS: tuple[tuple[str, str, TaskState], ...] = (
     # call to action, which is exactly why it may not sit in either Blocked
     # group.
     ("retired", "Retired", TaskState.RETIRED),
+    # Beside Retired, and for the mirror-image reason: neither is a call to
+    # action, and both answer "where did this work go". They are NOT the same
+    # answer, which is why they are two groups rather than one — a retirement
+    # says the work described here did not happen and names the successor task
+    # that will do it; this says the work DID happen, in this base, under
+    # another task's commits, and names them. Folding it into Retired would
+    # strand every dependent (a retirement satisfies no dependency) and would
+    # put "already done" under a heading that means "never will be".
+    ("shipped_elsewhere", "Shipped elsewhere", TaskState.SHIPPED_ELSEWHERE),
     ("done", "Done", TaskState.COMPLETED),
 )
 
@@ -1818,8 +2117,9 @@ GROUPS: tuple[tuple[str, str, TaskState], ...] = (
 #: the one group whose emptiness IS the answer the operator came for.
 ALWAYS_SHOWN = frozenset({"needs_human"})
 
-#: Collapsed behind a `<details>`, with its count in the summary. `done` and
-#: `retired`, the two groups that only ever grow and that nobody has to act on
+#: Collapsed behind a `<details>`, with its count in the summary. `done`,
+#: `retired` and `shipped_elsewhere` — the three groups that only ever grow and
+#: that nobody has to act on
 #: — an operator scrolling past 40 finished tasks to reach the four that matter
 #: is the flat list's failure repeated inside the fix. Collapsed is not hidden:
 #: each renders its count, and a retirement's whole value is that it stays
@@ -1829,7 +2129,7 @@ ALWAYS_SHOWN = frozenset({"needs_human"})
 #: Each collapsed group gets its OWN disclosure in the static markup, looked up
 #: by key. `groups.find(g => g.collapsed)` would silently hand the first one to
 #: whichever `<details>` asked.
-COLLAPSED = frozenset({"done", "retired"})
+COLLAPSED = frozenset({"done", "retired", "shipped_elsewhere"})
 
 
 def _ready_order(registry: TaskRegistry) -> list:
@@ -1867,12 +2167,20 @@ def _in_progress_detail(record: dict) -> str:
 
 
 def _waiting_on(registry: TaskRegistry, task) -> list[str]:
-    """The dependencies that are NOT yet completed, in declared order.
+    """The dependencies that are NOT yet satisfied, in declared order.
 
     Incompleteness is asked of `state_of` rather than of the dependency's
     status string, for the same reason the groups are: a dependency that is
     itself quarantined is not completed either, and only one of those two
     readings survives a task being blocked behind a blocked task.
+
+    SATISFACTION is `tasks.SATISFIES_DEPENDENCY`, imported rather than spelled
+    here, and that import is the fix rather than tidiness: this used to read
+    `is not TaskState.COMPLETED`, which is a second copy of the registry's
+    dependency rule. Since ship-01 a `shipped_elsewhere` dependency is satisfied
+    too, so the copy would have listed it in the chip and in the sentence beside
+    it — a task shown as Ready by `state_of` while this panel named a dependency
+    it was supposedly waiting on.
 
     One function, two consumers — the prose `detail` below and the row's
     "waits on" chip — so the sentence an operator reads and the chip beside it
@@ -1880,7 +2188,7 @@ def _waiting_on(registry: TaskRegistry, task) -> list[str]:
     """
     return [
         dep for dep in task.depends_on
-        if registry.state_of(dep) is not TaskState.COMPLETED
+        if not satisfies_dependency(registry.state_of(dep))
     ]
 
 
@@ -1909,6 +2217,33 @@ def _retired_detail(task) -> str:
     return task.blocked_reason or "retired; no successor recorded"
 
 
+def _shipped_elsewhere_detail(task) -> str:
+    """WHERE the work landed — the one thing an operator needs from a row they
+    cannot act on, exactly as `_retired_detail` names the successor.
+
+    The commits come FIRST because they are the evidence: they are what a reader
+    can re-check, and the note is the human half beside them. Abbreviated to 12
+    characters because that is what every other sha on this page renders as; the
+    full values travel in the row payload (`shipped_commits`).
+
+    A row with NO commits says so in as many words rather than rendering the
+    note alone. That state is only reachable by hand-editing `tasks.json`
+    (`record_shipped_elsewhere` refuses an empty list), and it is exactly the
+    unsupported claim this record exists to make impossible — so the group must
+    not quietly render it as though it carried evidence. `registry_
+    disagreements` reports the same row as a disagreement; this is the version
+    an operator sees in the group itself.
+    """
+    if not task.shipped_commits:
+        return (
+            "recorded as shipped elsewhere with NO commits — nothing to check"
+            + (f" ({task.shipped_note})" if task.shipped_note else "")
+        )
+    landed = ", ".join(sha[:12] for sha in task.shipped_commits)
+    note = task.shipped_note or "no note recorded"
+    return f"shipped under {landed} — {note}"
+
+
 def _group_detail(key: str, task, index: int, registry: TaskRegistry,
                   executions: dict) -> str:
     if key == "in_progress":
@@ -1922,6 +2257,8 @@ def _group_detail(key: str, task, index: int, registry: TaskRegistry,
         return _blocked_detail(registry, task)
     if key == "retired":
         return _retired_detail(task)
+    if key == "shipped_elsewhere":
+        return _shipped_elsewhere_detail(task)
     if key == "ready" and index == 0:
         return "next to be dispatched"
     return ""
@@ -1952,6 +2289,13 @@ def _grouped(registry: TaskRegistry, executions: dict) -> list[dict]:
              # `/data.json` reading it should not have to know which group a
              # task landed in first. Empty for everything else.
              "superseded_by": list(task.superseded_by),
+             # Carried on every row for the same reason `superseded_by` is: it
+             # is the machine-readable half of this record, a consumer of
+             # `/data.json` should not have to know which group a task landed in
+             # to read it, and the FULL shas are what makes the claim
+             # re-checkable by anything downstream. Empty for everything else.
+             "shipped_commits": list(task.shipped_commits),
+             "shipped_note": str(task.shipped_note or ""),
              # THE WHOLE DESCRIPTION, never a slice. This is the field the
              # roadmap is steered from and the page sent none of it, so an
              # operator asking what a queued task actually says had to open
@@ -2164,7 +2508,20 @@ def _dep_states(rows: list[dict], groups: list[dict] | None) -> tuple[dict[str, 
             states[row["id"]] = TaskState.BLOCKED_BY_OPERATOR.value
         elif stored == "retired":
             states[row["id"]] = TaskState.RETIRED.value
-        elif any(status.get(dep) != "completed" for dep in row["depends_on"]):
+        elif stored == "shipped_elsewhere":
+            states[row["id"]] = TaskState.SHIPPED_ELSEWHERE.value
+        elif any(
+            # `SATISFIES_DEPENDENCY`, the registry's own set, rather than a
+            # third hand-written `!= "completed"`. This fallback is only reached
+            # when the registry would not load, which is exactly when a
+            # disagreement between the two derivations is least noticeable: the
+            # Roadmap panel is already showing "the task graph could not be
+            # read", so a node drawn BLOCKED behind a dependency that is done
+            # would be the only thing on the page saying anything, and it would
+            # be wrong.
+            status.get(dep) not in SATISFIES_DEPENDENCY
+            for dep in row["depends_on"]
+        ):
             states[row["id"]] = TaskState.BLOCKED.value
         elif stored == "in_progress":
             states[row["id"]] = TaskState.IN_PROGRESS.value
@@ -2546,6 +2903,7 @@ STAT_BUCKETS: tuple[tuple[str, str, str], ...] = (
     ("blocked", "blocked on a dependency", "blocked"),
     ("blocked_by_operator", "needs a human", "needs_human"),
     ("retired", "retired", "retired"),
+    ("shipped_elsewhere", "shipped elsewhere", "shipped_elsewhere"),
 )
 
 #: The groups whose tasks count as OPEN work — everything that is neither
@@ -2711,6 +3069,15 @@ def roadmap_stats(groups: list[dict], executions: dict, remote_ok: bool,
     # `total - retired`, spelled from the buckets rather than recomputed, so the
     # figure under the percentage is the same number the retired count shows.
     denominator = total - counts["retired"]
+    # BOTH done states. `completed` means the work shipped under this task's own
+    # id and `shipped_elsewhere` means it shipped under another task's commits;
+    # for "how much of the roadmap is done" they are the same answer, and the
+    # numerator has to say so or every record of the second kind would push the
+    # percentage DOWN — counted in the denominator as outstanding work and never
+    # in the numerator as finished. Retired stays out of both sides, exactly as
+    # `OPEN_GROUPS` describes: nobody will ever do it, so it is not a fraction
+    # of anything.
+    finished = counts["completed"] + counts["shipped_elsewhere"]
     rows = in_progress_rows(
         by_key.get("in_progress", {}).get("tasks", []),
         executions, remote_ok, refs, remote_name,
@@ -2736,7 +3103,7 @@ def roadmap_stats(groups: list[dict], executions: dict, remote_ok: bool,
         # `None`, never 0, when there is nothing to be a fraction of: 0% of an
         # empty roadmap is a verdict nobody measured.
         "percent_done": (
-            round(100.0 * counts["completed"] / denominator, 1) if denominator else None
+            round(100.0 * finished / denominator, 1) if denominator else None
         ),
         "in_progress": {
             "counts": {k: sum(1 for r in rows if r["kind"] == k) for k in IN_PROGRESS_KINDS},
@@ -2754,7 +3121,8 @@ def roadmap_stats(groups: list[dict], executions: dict, remote_ok: bool,
             f"{counts['in_progress']} in progress, {counts['ready']} ready, "
             f"{counts['blocked']} blocked, "
             f"{counts['blocked_by_operator']} quarantined, "
-            f"{counts['retired']} retired"
+            f"{counts['retired']} retired, "
+            f"{counts['shipped_elsewhere']} shipped elsewhere"
         ),
     }
 
@@ -2903,6 +3271,14 @@ def collect(repo: Path) -> dict:
             # list stays the tolerant view that renders even when the graph
             # does not load as a registry.
             "superseded_by": list(t.get("superseded_by") or ()),
+            # Read off the raw row for the same reason `superseded_by` is: this
+            # list is the tolerant view, and the disagreement report below has
+            # to be able to judge a `shipped_elsewhere` record even on a graph
+            # that will not load as a registry — that is precisely when a
+            # silently-believed claim would do the most damage.
+            "shipped_commits": [str(s) for s in (t.get("shipped_commits") or ())],
+            "shipped_note": str(t.get("shipped_note") or ""),
+            "shipped_at": str(t.get("shipped_at") or ""),
             # Ascending: 1 outranks 2, default 100 sorts last (tasks.Task.priority).
             "priority": t.get("priority", 100),
         })
@@ -2955,6 +3331,16 @@ def collect(repo: Path) -> dict:
     # the in-progress breakdown both ask what a branch is at; they must ask the
     # same read, not the network twice.
     ref_shas = {r["ref"]: r.get("full") or r.get("sha") or "" for r in remote_refs}
+    # The commit-subject walk, decided ONCE for this poll and shared by the two
+    # panels that read it. `None` when the remote was unreadable, which is not a
+    # cost saving: dash-18 pins that the walk is skipped outright then, because
+    # no merge row can reach the evidence source it feeds, and adding a second
+    # consumer must not reintroduce a read that bound refuses. The cost of the
+    # skip lands on the disagreements panel and it says so — every completed
+    # task reads "could not be checked" for that poll, never "agrees". See
+    # `disagreement_report`; `merge_report` re-reads the same memo, so this is
+    # one walk either way.
+    subjects = _cached_commit_subjects(repo) if remote_ok else None
 
     live_agents_cache = live_agents()
     ex = state.get("task_execution") or {}
@@ -3008,6 +3394,12 @@ def collect(repo: Path) -> dict:
         # branch, decided by git ancestry rather than by their status.
         "merge": merge_report(repo, roadmap, head, remote_ok, remote_refs, branch,
                               executions),
+        # The registry against the code, in BOTH directions: a shipped-elsewhere
+        # record whose carrying commits have stopped being ancestors, and a
+        # completed task the base cannot show. Re-derived on every poll rather
+        # than stored, so a record that was true when it was written and is not
+        # now stops reading as done the moment the base moves.
+        "disagreements": disagreement_report(repo, roadmap, head, subjects),
         "git": {"branch": branch, "head": head[:12], "dirty": dirty, "remote": remote_refs},
         "served_at": time.strftime("%H:%M:%S"),
         # `stale` means THIS FILE on disk has changed since this process
@@ -3490,6 +3882,32 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
         the successor column IS the record that (say) brw-07 + brw-08 continue
         brw-02 / brw-04. A blank successor means the task went stale rather
         than being replaced.</p>
+    </details>
+    <details id="shippedbox">
+      <summary id="shippedsum">⇄ Shipped elsewhere</summary>
+      <div id="shipped" class="scroll"></div>
+      <p class="muted" style="font-size:12px;margin:9px 0 0">
+        Shipped elsewhere means DONE — under another task's commits. It is not
+        Retired: a retirement says the work described here did not happen and
+        names the successor that will do it, while this says the work is in
+        this base already and names the commits that carry it. Dependents are
+        satisfied by it, and the merge sweep never asks it for a branch — it
+        never had one. The commit column IS the evidence, and it is re-checked
+        against the current head on every poll: a record whose commits stop
+        being ancestors moves to the disagreements box below.</p>
+    </details>
+    <details id="disagreebox">
+      <summary id="disagreesum">⚠ Registry / code disagreements</summary>
+      <div id="disagree" class="scroll"></div>
+      <p class="muted" style="font-size:12px;margin:9px 0 0">
+        Where the roadmap claims something the base cannot show. PROVEN rows are
+        git's own answer: a recorded carrying commit that is not an ancestor, a
+        shipped-elsewhere row with no commits at all, or a completed task whose
+        naming commits are all outside the base. UNPROVEN rows are weaker on
+        purpose — "no commit subject names this id" is absence of evidence, not
+        evidence of absence, so it is shown for a human to look at and is never
+        treated as proof. Nothing here is converted automatically; this panel
+        reports, and an operator decides.</p>
     </details>
     <details id="donebox">
       <summary id="donesum">✓ Done</summary>
@@ -4083,13 +4501,19 @@ let DSEL = null;
 const DMARK = {completed:["✓","completed"], in_progress:["▶","in progress"],
                ready:["○","ready"], blocked:["◍","blocked"],
                blocked_by_operator:["■","needs a human"], retired:["⊘","retired"],
+               shipped_elsewhere:["⇄","elsewhere"],
                unknown:["?","not a task"]};
 // The same tokens the rest of the page uses; no new colours. --critical is the
 // one status role, on the state that genuinely is a verdict, and every node
 // ships its icon and word beside the dot.
+// `shipped_elsewhere` takes --mark-done, the SAME fill as `completed`: for the
+// question this drawing answers — is this node holding anything up — the two
+// are one answer, and inventing an eighth colour would imply a distinction the
+// edges do not have. The icon and the word are what tell them apart.
 const DFILL = {completed:"var(--mark-done)", in_progress:"var(--mark-active)",
                ready:"var(--axis)", blocked:"var(--warning)",
                blocked_by_operator:"var(--critical)", retired:"var(--mark-idle)",
+               shipped_elsewhere:"var(--mark-done)",
                unknown:"var(--muted)"};
 // The WIDE spelling, for every place that has room for it. `blocked` ON DISK
 // means quarantined and `blocked` here means waiting on a dependency — two
@@ -4099,9 +4523,10 @@ const DFILL = {completed:"var(--mark-done)", in_progress:"var(--mark-active)",
 // stays in the box and never travels alone into a context that can hold more:
 // the legend, the edge table and the tooltip all take this one.
 const DLONG = {blocked:"blocked on a dependency",
+               shipped_elsewhere:"shipped under another task's commits",
                unknown:"depended on, but not a task in the registry"};
 const DORDER = ["in_progress","blocked_by_operator","blocked","ready",
-                "retired","completed","unknown"];
+                "retired","shipped_elsewhere","completed","unknown"];
 // `pad` is headroom for the arcs a cycle edge draws OVER the nodes; without it
 // they would be clipped by the viewBox and a cycle would look like a gap.
 const DGEO = {w:126, h:34, gapx:54, gapy:10, pad:48};
@@ -4540,10 +4965,12 @@ function render(d, force){
   // nothing.
   //
   // By KEY, never by scanning for the first group carrying the collapsed flag.
-  // With two collapsed groups that predicate hands both disclosures the same
-  // one, and the failure is silent: the Done box would quietly fill with
-  // retirements. A test asserts the old expression is absent from this script,
-  // so do not quote it back into a comment here.
+  // With more than one collapsed group that predicate hands every disclosure
+  // the same one, and the failure is silent: the Done box would quietly fill
+  // with retirements. There are THREE collapsed groups now — done, retired and
+  // shipped elsewhere — so the margin that predicate ever had is gone. A test
+  // asserts the old expression is absent from this script, so do not quote it
+  // back into a comment here.
   const byKey = k => groups.find(g => g.key === k);
   const gRetired = byKey("retired");
   document.getElementById("retiredsum").textContent =
@@ -4559,6 +4986,56 @@ function render(d, force){
               ? (t.superseded_by||[]).map(s => `<code>${esc(s)}</code>`).join(", ")
               : esc(t.detail || "no successor recorded")}</td></tr>`).join(""))
     : `<p class="empty">unknown</p>`;
+  // Shipped elsewhere: its own group, naming WHERE the work landed, the same
+  // way the Retired table names successors. The commit column is the evidence \u2014
+  // full shas travel in the payload, abbreviated here like every other sha on
+  // the page \u2014 and the note beside it says whose commits they are. A row with
+  // no commits renders its detail sentence instead, which says so in words:
+  // that state is only reachable by hand-editing tasks.json and must never look
+  // like an ordinary record.
+  const gShipped = byKey("shipped_elsewhere");
+  document.getElementById("shippedsum").textContent =
+    gShipped ? `\u21c4 Shipped elsewhere (${gShipped.count})` : "\u21c4 Shipped elsewhere";
+  document.getElementById("shipped").innerHTML = gShipped
+    ? rows(["task","title","landed in"], gShipped.tasks.map(t =>
+        `<tr><td><code>${esc(t.id)}</code></td>
+          <td>${esc((t.title||"").slice(0,70))}</td>
+          <td class="muted">${(t.shipped_commits||[]).length
+              ? (t.shipped_commits||[]).map(s => `<code>${esc(s.slice(0,12))}</code>`).join(", ")
+                + (t.shipped_note ? ` \u00b7 ${esc(t.shipped_note)}` : "")
+              : esc(t.detail || "no commits recorded")}</td></tr>`).join(""))
+    : `<p class="empty">unknown</p>`;
+
+  // Disagreements. The summary carries a \u25b2 only when something is PROVEN,
+  // so an unproven "no commit names this" row cannot make the box shout; the
+  // count is always shown, because a silent box is indistinguishable from one
+  // that failed to render.
+  const dis = d.disagreements || {};
+  const disRows = dis.rows || [];
+  const disUnverified = dis.unverified || [];
+  document.getElementById("disagreesum").textContent =
+    `${dis.proven ? "\u25b2" : "\u26a0"} Registry / code disagreements (${disRows.length})`
+    + (disUnverified.length ? ` \u00b7 ${disUnverified.length} could not be checked` : "");
+  document.getElementById("disagree").innerHTML =
+    (disRows.length
+      ? rows(["task","finding","what the base shows"], disRows.map(r =>
+          `<tr><td><code>${esc(r.id)}</code></td>
+            <td>${esc(r.proven ? "proven" : "unproven")} \u00b7 ${esc(r.kind)}</td>
+            <td class="muted">${esc(r.detail || "")}</td></tr>`).join(""))
+      : `<p class="empty">none \u2014 every record the base could be asked about agrees</p>`)
+    // "Could not look" is never "nothing to report": rendered under the table
+    // rather than folded into it, so an unreadable repository does not empty
+    // the panel and read as a clean bill of health.
+    + (disUnverified.length
+        ? `<p class="muted" style="font-size:12px;margin:9px 0 0">could not be checked: `
+          + disUnverified.map(r => `<code>${esc(r.id)}</code>`).join(", ")
+          + ` \u2014 no evidence either way, never counted as agreeing</p>`
+        : "")
+    + (dis.searched === false
+        ? `<p class="muted" style="font-size:12px;margin:9px 0 0">the commit-subject `
+          + `search did not run, so no completed task could be judged this poll</p>`
+        : "");
+
   const gDone = byKey("done");
   document.getElementById("donesum").textContent =
     gDone ? `\u2713 Done (${gDone.count})` : "\u2713 Done";
@@ -4571,13 +5048,25 @@ function render(d, force){
   // A queued creation request carries approved_paths, and the loop merges it
   // without asking again — so the paths are spelled out here rather than
   // counted. Visibility between submit and merge is the mitigation.
+  //
+  // The CREATION branch is selected by kind === "task" (or a request written
+  // before `kind` existed, which means the same), never by "not priority". The
+  // old test was `r.kind === "priority" ? … : <creation>`, so every OTHER
+  // mutation kind — description, approved_paths, depends_on, block, unblock,
+  // urgent, shipped_elsewhere — rendered as "new task <id> … may write: nothing
+  // — undispatchable", which is a sentence about a task that is not being
+  // created and a scope that is not being set. A mutation now says which field
+  // it touches and nothing more; the payload deliberately is not spelled out
+  // here, since `_pending_inbox` carries only the creation fields.
   const q = d.inbox || [];
   document.getElementById("queued").textContent = q.length
     ? `${q.length} queued request(s) awaiting the loop: ` +
-      q.map(r => r.kind === "priority"
-        ? `${r.id} → priority ${r.priority}`
-        : `new task ${r.id} (priority ${r.priority ?? 100}) may write: `
-          + ((r.approved_paths || []).join(", ") || "nothing — undispatchable")).join(" · ")
+      q.map(r => (!r.kind || r.kind === "task")
+        ? `new task ${r.id} (priority ${r.priority ?? 100}) may write: `
+          + ((r.approved_paths || []).join(", ") || "nothing — undispatchable")
+        : (r.kind === "priority"
+            ? `${r.id} → priority ${r.priority}`
+            : `${r.id} → ${r.kind}`)).join(" · ")
     : "no queued requests";
 
   // which app task is actually being worked
@@ -4594,6 +5083,11 @@ function render(d, force){
       // and "■ blocked" on a superseded task is the misread this whole change
       // is about.
       else if (r && r.status === "retired") mark = "⊘ retired";
+      // Beside retired, and checked BEFORE the `○ queued` fallback for the same
+      // reason: a shipped-elsewhere row is finished work, and letting it fall
+      // through to "queued" would put a "when will this run?" against a task
+      // whose code is already in the base.
+      else if (r && r.status === "shipped_elsewhere") mark = "⇄ elsewhere";
       else if (r && r.status === "blocked") mark = "■ blocked";
       else if (r && r.status === "completed") mark = "✓ done";
       else if (r) mark = "○ queued";

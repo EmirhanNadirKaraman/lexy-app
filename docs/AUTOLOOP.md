@@ -5396,9 +5396,140 @@ rows are already `retired` on disk, and a precondition applied at load would
 make an existing `tasks.json` refuse to load.
 
 The check is one shared method rather than a rule per call site, because it
-belongs to `state_of`'s dependency test (`!= "completed"` satisfies nothing) and
-not to retirement: any future transition to a terminal non-completed status asks
-the same question by calling `stranded_dependents`.
+belongs to `state_of`'s dependency test and not to retirement: any future
+transition to a terminal non-completed status asks the same question by calling
+`stranded_dependents`. (That test now reads `tasks.SATISFIES_DEPENDENCY` rather
+than a literal `!= "completed"` — see §9e, which adds the second status that
+satisfies one. Nothing about the strand rule changed: `retired` is still not in
+that set and still satisfies nothing.)
+
+### 9e. Shipped elsewhere: done, under another task's commits
+
+The FOURTH not-dispatchable state, and the only one that means DONE without the
+task ever having had a branch. Measured 2026-08-22: eight registry records
+disagreed with the code, in both directions, and no state said so.
+
+| task | what the code shows |
+|---|---|
+| `auto-11` | `policy.legacy_ask_user_retired` exists; `contract.py` refuses a literal `ask_user` reply unconditionally |
+| `inbox-01` | `inbox.KINDS` already carries six mutation kinds beyond `task` |
+| `inbox-08` | `MUTATION_PAYLOAD` is the per-kind request protocol |
+| `inbox-03` | `orchestrator` calls `_drain_task_inbox()` every round |
+| `inbox-04` | `docs/SECURITY.md` S30 documents the mutation vocabulary |
+| `bind-01`, `split-01`, `dash-17` | recorded `completed`; `shipped-report` returns NO MENTION for each |
+
+The first five shipped and were not recorded; the last three are recorded and
+did not ship. **None of the three existing states fits**, and each was rejected
+for a checkable reason rather than on taste:
+
+* **`completed`** — `merge_sweep` enumerates completed tasks and treats one
+  whose record names no candidate as UNRESOLVED, which makes the whole
+  invocation non-mutating (§3f-ter). Completing those five to tidy the registry
+  would have HELD every future merge; one empty record already held the sweep
+  for hours on 2026-08-21.
+* **`retired`** — means SUPERSEDED BY NAMED SUCCESSORS, a different fact, and it
+  satisfies no dependency, so `inbox-03` and `inbox-04` (both depending on
+  `inbox-02`) would wait forever. `retire` also refuses a completed task, so it
+  cannot describe the second group at all.
+* **`blocked_by_operator`** — where the five were parked as a stopgap. It means
+  "do not work this", not "this shipped", and its reason is prose the next
+  reader has to re-derive.
+
+**The record carries the EVIDENCE, not a flag.** `Task.shipped_commits` holds
+the full lowercase shas of the commits that carry the work and
+`Task.shipped_note` says whose they are. Full shas, never abbreviations: an
+abbreviation names whatever object it happens to prefix in whichever checkout
+re-checks it, and the whole point is that anyone can re-run the check and get
+the same answer.
+
+**It is re-checked, never trusted once.** Every reader asks git whether each
+recorded sha is still an ancestor of the base head — `shipped-report` on demand,
+the dashboard on every poll. Four answers, and the last two are the ones that
+keep the alarm honest:
+
+| state | meaning |
+|---|---|
+| `verified` | every recorded commit is an ancestor of the base head |
+| `invalidated` | at least one is provably NOT — a DISAGREEMENT, not done |
+| `unverified` | git could not decide (shallow clone, unfetched object, unreadable repo) — no evidence either way, never "verified" |
+| `unsupported` | the row claims it shipped and names no commits at all (only reachable by hand-editing `tasks.json`) |
+
+Aggregation is ALL, not ANY — deliberately the opposite of `shipped-report`'s
+completed side (§3f-quinquies). There the commits are search results, so one in
+the base proves the work landed; here they are the record's own claim, so a
+record must not survive by its stalest half.
+
+**What it changes, and what it must not.**
+
+* **Dependents ARE satisfied.** `tasks.SATISFIES_DEPENDENCY` is
+  `{completed, shipped_elsewhere}` and is THE dependency rule — one constant,
+  read by `state_of`, the strand check and both dashboard derivations.
+* **The scheduler skips it.** `ready_tasks()` is derived from `state_of`, and
+  `mark_in_progress` refuses it as defence in depth.
+* **The merge sweep never asks it for a branch.** `merge_sweep._backlog`
+  enumerates `COMPLETED` only, so it is skipped WITHOUT becoming a fourth
+  `unresolved` reason — which would rebuild the exact failure this state exists
+  to avoid. The unresolved rule for genuinely completed tasks is untouched.
+* **`cli._merge_window_blockers` treats it as terminal**, alongside completed,
+  quarantined and retired. Without that, converting a parked task would REMOVE
+  its exemption and a leftover execution record would start holding the merge
+  window shut on work already in the base.
+* **Nothing is auto-converted.** A completed task whose work the base cannot
+  show is REPORTED as a disagreement and left alone. `record_shipped_elsewhere`
+  refuses a completed task for the same reason — converting `bind-01`,
+  `split-01` and `dash-17` would rewrite a wrong record instead of showing it.
+
+**The operator route is live-safe.** Writing under the state directory needs the
+loop stopped, so the record goes through the inbox (§4f-ter) as
+`kind: "shipped_elsewhere"` — the one kind whose payload is an object,
+`{commits, note}`, both required. The command:
+
+```bash
+python -m autoloop record-shipped <task-id> --commit REV [--commit REV] \
+                                  --note "shipped under inbox-02's commits" \
+                                  [--repo PATH] [--base REV]
+```
+
+It resolves every `REV` to a full sha and refuses to queue anything unless git
+says each one is an ancestor of `--base`. A commit that is provably not an
+ancestor is refused; so is one git could not decide about, because "could not
+look" is not "verified". It takes no lock and writes only to the inbox.
+
+**A LOOP-RAISED QUARANTINE IS REFUSED**, and this is the one refusal that is
+about a different file. A `task_fatal` park writes a `blockers.Blocker` record
+beside the registry row, and that record is read independently of the registry
+by `start`, `health.check` and the heartbeat — so moving the row to a terminal
+status without closing it is the split brain §9d's blocker sweep exists to
+prevent: the page would say "already done, elsewhere" while the loop stayed
+stopped waiting on exactly that task. Answer the blocker first
+(`python -m autoloop answer`, which closes it AND returns the task to pending),
+then record it. An OPERATOR HOLD converts directly, because a hold placed
+through the inbox creates no blocker record at all — the same provenance
+asymmetry `operator_unblock` turns on, read from `Task.hold_origin` and never
+from the reason text.
+
+**On the dashboard** it is its own group — *Shipped elsewhere*, naming the
+commits and the note the way *Retired* names successors — beside a *Registry /
+code disagreements* box carrying both directions. Findings there are marked
+PROVEN or UNPROVEN: `completed_unwitnessed` (no commit subject names the id) is
+deliberately unproven, because absence of a mention is absence of evidence and a
+report that presented it as proof would be a licence to undo work that landed.
+
+That box does not walk every ref of its own accord. The commit-subject search
+its COMPLETED half needs is the merge panel's read, taken once per poll and
+skipped outright when the remote is unreadable, so with an unreachable origin the
+box says *the commit-subject search did not run* and lists every completed task
+under **could not be checked** — never under "agrees". The shipped-elsewhere half
+is unaffected either way, because such a record names its own commits, and
+`python -m autoloop shipped-report` always runs its own search: with the origin
+down the answer moves to that command, it does not disappear.
+
+**There is no route back to `pending`**, and none was added. Un-recording is the
+claim that the evidence was wrong, which the disagreement report already
+surfaces for a human. Re-recording IS allowed, unlike a retirement's
+written-once rule: a retirement records a decision, this records an observation
+about commits, and a rebase legitimately renames every one of them — the
+continuous re-check is what makes a wrong rewrite visible immediately.
 
 ## 10. Recovery procedures
 

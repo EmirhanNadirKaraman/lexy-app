@@ -2265,7 +2265,13 @@ def test_the_counts_are_what_state_of_reports_and_nothing_else():
     # on an operator. Folding them — or spending the name `blocked` on the
     # quarantine, as the first version of this summary did — is the regression.
     assert stats["counts"] == {"completed": 2, "in_progress": 1, "ready": 1,
-                               "blocked": 1, "blocked_by_operator": 1, "retired": 1}
+                               "blocked": 1, "blocked_by_operator": 1, "retired": 1,
+                               # ship-01: DONE, under another task's commits. Its
+                               # own count for the reason it is its own state —
+                               # folded into `completed` a reader would expect the
+                               # merge sweep to have a branch to integrate for it,
+                               # and it never had one.
+                               "shipped_elsewhere": 0}
     # And the one-line summary says the same thing in `TaskRegistry.summary()`'s
     # own words, so the page and the review packet cannot report two roadmaps.
     # Asserted as an EXACT string because the vocabulary is the point, not the
@@ -2274,7 +2280,8 @@ def test_the_counts_are_what_state_of_reports_and_nothing_else():
     # rather than counts). If this fails, the fix is to change both or neither —
     # `summary()` is the authority, this is the copy.
     assert stats["line"] == ("7 tasks: 2 completed, 1 in progress, 1 ready, "
-                             "1 blocked, 1 quarantined, 1 retired")
+                             "1 blocked, 1 quarantined, 1 retired, "
+                             "0 shipped elsewhere")
 
 
 def test_every_task_state_is_claimed_by_exactly_one_bucket():

@@ -105,6 +105,34 @@ record nobody can read cannot even be checked for the relationship. Skipping the
 unresolved entry and sweeping on therefore integrates, transitively, exactly the
 work the skip refused to integrate directly.
 
+## What is NOT enumerated: a task recorded as shipped elsewhere
+
+`TaskState.SHIPPED_ELSEWHERE` (ship-01, 2026-08-23) means the task's work is in
+the base under ANOTHER task's commits. Such a task never had a branch, never had
+an execution record, and has nothing here to merge — so `_backlog` does not
+enumerate it at all. That falls out of the enumeration rule already written
+above (only `TaskState.COMPLETED` is a candidate), and it is stated here rather
+than left implicit because the alternative was tried and is exactly what this
+module must not do: completing those tasks to tidy the registry would enumerate
+five tasks whose records name no candidate, and a record naming no candidate is
+`unresolved` — so every future sweep would be HELD, on work that is already in
+the base.
+
+It is emphatically NOT a fifth `unresolved` reason either. The four reasons in
+that list share one property: being COMPLETED implies a confirmed publication,
+so there is very likely a branch out there this module cannot name. A
+shipped-elsewhere record makes the opposite claim, and makes it with evidence
+(`Task.shipped_commits`), so there is no branch to be unaccounted for. Skipping
+it therefore costs no coverage — nothing is being rounded down to "nothing to
+merge", which is the rule the rest of this docstring exists to protect. What
+DOES check that claim is `dashboard.shipped_elsewhere_states`, which re-asks git
+whether each recorded commit is still an ancestor of the base head and reports a
+record that has stopped holding as a disagreement. Nothing in this module reads
+or acts on those commits.
+
+The genuinely-completed rule is unchanged in every respect: a completed task
+that cannot be judged still makes the whole invocation non-mutating.
+
 Being unresolved is per-task, but the safe response is per-INVOCATION, and
 deliberately so. The alternative — excluding every candidate that descends from
 an unresolved one — needs the ancestry of a commit the sweep may be unable to
@@ -673,6 +701,11 @@ class BacklogSweeper:
         candidates: list[SweepCandidate] = []
         for task in self._registry.all_tasks():
             task_id = task.id
+            # COMPLETED and nothing else. That single test is also what keeps a
+            # SHIPPED_ELSEWHERE record out of the sweep — it never had a branch,
+            # so asking it for one would mint an `unresolved` entry that holds
+            # every invocation. See the module docstring's "what is NOT
+            # enumerated"; the rule for a genuinely completed task is untouched.
             if self._registry.state_of(task_id) is not TaskState.COMPLETED:
                 continue
             try:
