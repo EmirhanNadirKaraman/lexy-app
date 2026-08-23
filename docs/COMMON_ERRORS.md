@@ -563,6 +563,26 @@ returns notices as data (`AutoloopConfig.migration_notices`) and writes to no
 stream, so content assertions cannot be contaminated by ordering at all — only
 the genuinely global "once" contract needs the subprocess.
 
+### A `BacklogSweeper` test asserts `nothing_to_do` / `held` and gets `disabled`
+**Symptom:** a test builds an `AutoloopConfig` by hand, calls
+`merge_sweep.BacklogSweeper(...).sweep()` and asserts on `result.outcome`. It
+gets `disabled`, and nothing in the message points at the fixture.
+**Cause:** `PolicyConfig()` defaults `auto_merge_enabled` to **False** —
+`test_auto_merge.py` pins that default deliberately — and the flag check is the
+FIRST thing `sweep()` does, ahead of the checkout probe and the backlog walk. A
+hand-built config that does not set it short-circuits before the code under test
+runs at all.
+**Fix:** `PolicyConfig(auto_merge_enabled=True)` in the fixture. See
+`test_shipped_elsewhere.py`'s `config` fixture and `test_merge_sweep.py`'s
+`build`, which passes it explicitly for the same reason.
+**Watch for the quiet version.** An outcome assertion fails loudly; an assertion
+like `result.unresolved == []` or `result.pending == []` PASSES on a `disabled`
+sweep, vacuously, because enumeration never ran. A sweep test that only checks
+what the sweep did *not* find proves nothing unless it also pins the outcome.
+**Do NOT** change the default to make a test pass — it is off deliberately (it
+gates a loop that would otherwise move the base branch head unasked), and the
+short-circuit is correct behaviour, not the bug.
+
 ---
 
 ## 3. Frontend build
@@ -2948,3 +2968,7 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-23 | quota-01 | If that one ever DOES present: the symptom is a `loop_fatal` park, code `quota_exhausted`, whose `codex_app_server_failed` record shows `classification: quota_exhausted` next to an `error_type` or `status` that describes a throttle. The remedy is a config edit — move the code out of `codex.quota_error_codes` into `codex.rate_limit_error_codes` — not a code change, and not emptying either list. |
 | 2026-08-23 | retire-01 | New §8 entry for `retire`'s strand refusal, filed there with the other recovery-command exits rather than as a §9/§10 entry, because the symptom is a CLI exit 1 on `python -m autoloop retire`. It is a working-as-intended entry: the refusal is the fix landing, not a fault, and the three neighbouring messages (`--superseded-by names … which nothing can wait on`, `… is in progress`, and the already-retired refusal) are listed so the reader does not reach for the wrong flag. |
 | 2026-08-23 | retire-01 | Second §8 entry beside it, for the symptom the strand rewrite makes reachable: `retire --superseded-by` exiting 1 with `dependency cycle:`. The successor is what closes the loop, so the fix is choosing a different one (or dropping the edge) — never relaxing the check, and `--rewrite-dependents` does not get past it either, which the entry says outright because it is the obvious wrong move. It also says a STORED cycle cannot produce this: `from_dict` cycle-checks on load, so such a file fails to load instead. |
+| 2026-08-23 | ship-01 | `python -m autoloop record-shipped` exiting 1 with "git could not decide whether … is an ancestor" is WORKING AS INTENDED, not a fault: a shallow clone, an object this checkout has never fetched, or an unreadable repository all answer `unknown`, and queueing on that would make the verification step pass precisely when it cannot see. The fix is `git fetch` the carrying commit (or unshallow) and re-run — never widening the check to accept `unknown`, which is the obvious wrong move. |
+| 2026-08-23 | ship-01 | A task showing under *Registry / code disagreements* as `completed_unwitnessed` does NOT mean the work is missing. It means no commit subject names the id, which is absence of evidence — the work may have shipped under a subject that never named it. That is why the row is marked UNPROVEN and why `shipped-report` still exits 0 for it alone. Retiring or re-running the task on the strength of that row is the licence-to-redo-landed-work failure the report is shaped to refuse. |
+| 2026-08-23 | ship-01 | `shipped-report` printing INVALIDATED for a record that was fine yesterday usually means the base moved, not that the record was wrong: a rebase or force-move renames the carrying commits. Re-run `record-shipped` with the new shas — re-recording is allowed on purpose, unlike a retirement. There is deliberately NO route back to `pending`, so do not look for one; a claim that the evidence was wrong is a task to plan, not a status to flip. |
+| 2026-08-23 | ship-01 | New §2 entry for a fixture trap that cost a round here: a `BacklogSweeper` test whose hand-built `PolicyConfig()` leaves `auto_merge_enabled` at its default False gets `disabled` from `sweep()` before enumeration runs. The loud version fails on the outcome; the quiet version (`unresolved == []`, `pending == []`) passes vacuously, which is why the entry says a sweep test must pin the outcome as well as what the sweep did not find. |
