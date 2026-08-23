@@ -192,6 +192,44 @@ def _validate_depends_on(
     return tuple(depends_on)
 
 
+def _substitute_dependency(
+    depends_on: tuple[str, ...],
+    retired_id: str,
+    successors: tuple[str, ...],
+    owner_id: str,
+) -> tuple[str, ...]:
+    """A NEW tuple: `depends_on` with `retired_id` replaced by `successors`,
+    in position.
+
+    How a retirement makes its dependents' dependencies satisfiable again (see
+    `TaskRegistry.retire`). An empty `successors` drops the edge outright,
+    which is what `rewrite_dependents=True` means when the task went stale
+    rather than being replaced.
+
+    Returns rather than mutates, because `_retirement_rewrites` has to be able
+    to plan every dependent and then abandon the whole plan. Position is
+    preserved rather than appending at the end, so a dependency list still
+    reads in the order it was planned in.
+
+    Two shapes are filtered, and both are reachable rather than theoretical:
+
+      * a successor that IS the dependent — retire A into B where B already
+        waits on A. B continues the work; it does not wait on itself, and
+        `_validate_depends_on` refuses a self-edge outright.
+      * a repeat — the dependent already named the successor alongside the
+        retired task, so the substitution would produce `('b', 'b')`.
+        `_validate_depends_on` does NOT refuse duplicates (unlike
+        `_validate_superseded_by`), so nothing downstream would have caught it.
+    """
+    rewritten: list[str] = []
+    for dep in depends_on:
+        for candidate in (successors if dep == retired_id else (dep,)):
+            if candidate == owner_id or candidate in rewritten:
+                continue
+            rewritten.append(candidate)
+    return tuple(rewritten)
+
+
 def _validate_description(task_id: object, description: object) -> None:
     """Raise `TaskGraphError` unless `description` is a non-blank string.
 
@@ -388,6 +426,17 @@ OPERATOR_HOLD_PREFIX = "operator hold: "
 #: widening a scope is exactly what a quarantined task usually needs before its
 #: blocker can be answered.
 _MUTABLE_STATUSES = frozenset({"pending", "blocked"})
+
+#: Statuses a task never leaves. `completed` is the successful terminal state;
+#: `retired` is the unsuccessful one (`TaskState.RETIRED` — superseded, never
+#: coming back, and deliberately with no reverse).
+#:
+#: The distinction the strand check turns on: `state_of` satisfies a dependency
+#: on `completed` and on NOTHING ELSE, so a dependency on a task that has
+#: reached the OTHER terminal status can never be satisfied by waiting. A task
+#: already sitting in either status, meanwhile, cannot itself be stranded — it
+#: is a record, not queue, and nothing is waiting to dispatch it.
+_TERMINAL_STATUSES = frozenset({"completed", "retired"})
 
 
 def is_directory_prefix(approved: str) -> bool:
@@ -753,6 +802,78 @@ def effective_approved_paths(
     return tuple(sorted(set(approved) | set(trackers)))
 
 
+@dataclass(frozen=True)
+class StrandReport:
+    """Who a task would leave waiting forever if it reached a terminal
+    non-completed status right now — the answer `TaskRegistry.
+    stranded_dependents` returns.
+
+    ONE report shape for the whole question, deliberately. Only `retire`
+    reaches such a status today, but the rule is a property of `state_of`
+    (`!= "completed"` satisfies nothing), not of retirement, so any future
+    terminal transition asks the same question by calling the same method
+    rather than re-deriving "who depends on this" per call site. That is what
+    the CLI prints, what the refusal message is built from, and what a test
+    asserts against.
+
+    `direct` names the tasks that declare the id in their own `depends_on` —
+    every one of them, because those are the dependencies that become
+    unsatisfiable, and a refusal that truncated the list would leave an
+    operator re-running the command to discover the rest. `transitive` is the
+    whole closure INCLUDING `direct`, in breadth-first order: 4 direct reads
+    very differently from 21 in total, and the operator's decision turns on
+    the second number (measured 2026-08-20 — `roadmap-01` had 4 direct
+    dependents and the entire 21-task ingest line behind them).
+
+    A dependent already `completed` or `retired` appears in NEITHER, and is
+    not descended through. It cannot be stranded — it is a record, nothing is
+    waiting to dispatch it — and counting it would make the refusal fire on
+    graphs where nothing is actually at risk.
+
+    `in_progress` is the subset of `direct` that is mid-round. Split out
+    because those are the ones a dependency rewrite may not touch: `state_of`
+    checks dependencies BEFORE the in-progress branch, so rewriting them
+    under a running dispatch is exactly the strand `_refuse_immutable`
+    documents.
+    """
+
+    direct: tuple[str, ...] = ()
+    transitive: tuple[str, ...] = ()
+    in_progress: tuple[str, ...] = ()
+
+    @property
+    def strands(self) -> bool:
+        """Is there anything to refuse for? False for the ordinary case — a
+        task nothing depends on, which must retire exactly as it does today."""
+        return bool(self.direct)
+
+    def describe(self) -> str:
+        """`4 dependents (ingest-01, …); 21 tasks blocked in total, counting
+        those behind them`.
+
+        BOTH numbers, always, each labelled. The transitive count is not
+        printed only when it is larger — a reader who saw it sometimes and not
+        others would have no way to tell "nothing behind them" from "this
+        message does not report that". It equals the direct count when nothing
+        is behind them, which is a fact, not an omission. An unlabelled `21`
+        beside a list of 4 ids, meanwhile, reads as a bug.
+
+        Says `no dependents` rather than an empty string when there is nothing,
+        so a caller that prints it unconditionally still prints a sentence.
+        """
+        if not self.direct:
+            return "no dependents"
+        listed = ", ".join(self.direct)
+        total = len(self.transitive)
+        text = (
+            f"{len(self.direct)} dependent{'s' if len(self.direct) != 1 else ''} "
+            f"({listed}); {total} task{'s' if total != 1 else ''} blocked in total"
+        )
+        if total > len(self.direct):
+            text += ", counting those behind them"
+        return text
+
+
 class TaskRegistry:
     def __init__(self, tasks: list[Task] | None = None):
         self._tasks: dict[str, Task] = {}
@@ -939,7 +1060,8 @@ class TaskRegistry:
         return task
 
     def retire(
-        self, task_id: str, superseded_by=(), reason: str = ""
+        self, task_id: str, superseded_by=(), reason: str = "",
+        rewrite_dependents: bool = False,
     ) -> Task:
         """Record that `task_id` is superseded and will never be worked again.
 
@@ -972,7 +1094,8 @@ class TaskRegistry:
 
         Refuses `completed`, mirroring `block`: finished work is not superseded
         work, and rewriting it as retired would hide a real completion from the
-        merge panel.
+        merge panel. That is no longer the ONLY refusal — see the strand
+        precondition below, which was added after this paragraph was written.
 
         WRITTEN ONCE. A retirement is a historical record, so a second `retire`
         on the same task may not add, remove, change or reword anything: an
@@ -989,14 +1112,59 @@ class TaskRegistry:
         to keep. Argue with a recorded retirement by planning a task, not by
         overwriting the record of the last one.
 
-        One consequence stated rather than papered over: a task that DEPENDS
-        on a retired one stays BLOCKED forever, because `state_of` only counts
-        a dependency satisfied when it is `completed`. That is deliberate — the
-        prerequisite genuinely never happened under this id — and it is not new
-        behaviour (a retirement stored as `blocked` did the same). The fix is
-        to plan the dependent against the successor, which is what
-        `superseded_by` is there to tell you; the dashboard's Blocked group
-        names the dependency, and its Retired group now names the successor.
+        REFUSED WHEN IT WOULD STRAND A DEPENDENT (retire-01, 2026-08-23). This
+        used to be documented as an accepted consequence: a task that DEPENDS
+        on a retired one stays BLOCKED forever, because `state_of` counts a
+        dependency satisfied only when it is `completed`, and a retirement has
+        no reverse. The consequence is real — what was wrong is calling it
+        acceptable. There is no supported command that returns such a
+        dependent: `answer` needs an open blocker, `release` needs an
+        in-progress task, `retire` means never worked again, and there is no
+        `unblock`. Hand-editing `tasks.json` with the loop stopped was the only
+        exit, which is the route blk-01 exists to remove. Measured 2026-08-20:
+        an operator asked for `roadmap-01`, which had 4 direct dependents and
+        the whole 21-task ingest line behind them; a human caught it, nothing
+        in the code would have.
+
+        So `stranded_dependents` runs first, and a retirement that would leave
+        any dependent waiting forever is REFUSED, naming every one of them plus the
+        transitive count. Refused, not silently repaired: rewriting another
+        task's `depends_on` is a roadmap decision, and inferring it from a
+        retirement would make this command edit tasks nobody named.
+
+        Two things lift the refusal, and both do their work in THIS call so a
+        crash cannot leave half of it done:
+
+          * `superseded_by` naming successors that are ALL live tasks in this
+            graph (present, and not themselves retired). Satisfaction is
+            DIRECT: the successor id replaces `task_id` in each affected
+            dependent's `depends_on`, which is what the dependents were
+            actually waiting for. Lifting the refusal WITHOUT that rewrite
+            would be a lie — the dependents would still name a retired id and
+            still never dispatch. A successor that is not planned yet cannot
+            satisfy anything (brw-06 was retired into brw-07/brw-08 before
+            either existed), so it refuses and says so; the shape-only rule in
+            `_validate_superseded_by` is unchanged for a task with nothing
+            depending on it.
+          * `rewrite_dependents=True` — the explicit opt-in. Same rewrite, but
+            it accepts a partial or empty successor list: the retired id is
+            replaced by whichever named successors are live, and dropped
+            outright when none is. `python -m autoloop retire
+            --rewrite-dependents`.
+
+        Only DIRECT dependents are rewritten. The transitive ones never named
+        this task; they unblock by themselves once the direct ones do, and
+        rewriting them would edit dependencies the retirement says nothing
+        about. That is why the report carries both numbers.
+
+        An IN-PROGRESS direct dependent refuses the whole operation instead
+        (`task_in_progress`): its dependencies are what the running dispatch is
+        judged against, and rewriting them mid-round is precisely the strand
+        `_refuse_immutable` exists to prevent.
+
+        Retirement itself is NOT weakened by any of this. There is still no
+        un-retire, it is still written once, and this is a precondition that
+        runs before the write — never a way back out of one.
         """
         task = self.get(task_id)
         if task.status == "completed":
@@ -1006,6 +1174,22 @@ class TaskRegistry:
             )
         successors = _validate_superseded_by(task_id, superseded_by)
         if task.status == "retired":
+            if rewrite_dependents:
+                # A flag that quietly does nothing is worse than a refusal: the
+                # operator would read "already retired; nothing changed" and
+                # believe the strand they were trying to clear had been
+                # cleared. The written-once record is not reopened for it —
+                # a dependency left stranded by an EARLIER retirement is
+                # rewritten through the `depends_on` mutation (`inbox`
+                # `KIND_DEPENDS_ON` / `set_depends_on`), which is the operation
+                # that actually describes what is being changed.
+                raise TaskGraphError(
+                    "task_already_retired",
+                    f"task '{task_id}' is already retired{_successor_hint(task)} — "
+                    "a repeat cannot rewrite dependents, because it cannot rewrite "
+                    "the retirement either. Re-point the stranded tasks with a "
+                    "`depends_on` mutation instead",
+                )
             # Terminal and immutable. The two checks below are deliberately
             # asymmetric with the write path underneath: an OMITTED successor
             # list or reason means "say nothing about it", never "clear it", so
@@ -1027,11 +1211,143 @@ class TaskRegistry:
                     "retiring it again cannot reword it",
                 )
             return task
+        # EVERY refusal is behind this call and none of the writes are, which is
+        # the atomicity guarantee: a retirement that cannot go through touches
+        # neither the task nor a single dependent, so there is no half-applied
+        # state to unwind and no un-retire needed to unwind it.
+        rewrites = self._retirement_rewrites(task, successors, rewrite_dependents)
         task.status = "retired"
         task.superseded_by = successors
         if reason:
             task.blocked_reason = reason
+        for dependent_id, depends_on in rewrites:
+            self._tasks[dependent_id].depends_on = depends_on
         return task
+
+    def _retirement_rewrites(
+        self, task: Task, successors: tuple[str, ...], rewrite_dependents: bool
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """The `(dependent id, new depends_on)` pairs `retire` must write, or a
+        `TaskGraphError` saying why the retirement is refused.
+
+        PURE — it validates the whole mutation and mutates nothing. `retire`
+        applies what it returns, in one pass, after every check has passed.
+        Rewriting through `set_depends_on` in a loop was the obvious
+        alternative and is the wrong one: it writes each task as it goes, so a
+        refusal on the third dependent leaves the first two already re-pointed
+        at a task that then never gets retired.
+
+        The cycle check runs ONCE, on a candidate graph carrying every rewrite
+        at once — the same shape `set_depends_on` uses, for the same reason.
+        Substituting a successor can genuinely close a loop (retire A into B
+        where B already waits on a dependent of A), and a per-task check would
+        pass each edge individually and still build the cycle. Exactly ONE edge
+        is exempt from it — a self-edge on the subject, which no supported
+        route can produce and which is exempted anyway so the two halves of
+        that guard cannot drift; see the comment at the candidate build. Every
+        other cycle, however it got there, still refuses the whole operation.
+        """
+        report = self.stranded_dependents(task.id)
+        if not report.strands:
+            return ()  # the ordinary retirement: nothing is waiting on this task
+        live = tuple(
+            s for s in successors if self.has(s) and self._tasks[s].status != "retired"
+        )
+        unusable = tuple(s for s in successors if s not in live)
+        if not rewrite_dependents and (not successors or unusable):
+            raise TaskGraphError(
+                "task_would_strand_dependents",
+                f"retiring task '{task.id}' would strand {report.describe()} — a "
+                "retired task never satisfies a dependency and a retirement has no "
+                "reverse, so each of those would wait forever with no command able "
+                f"to release it. {self._strand_remedy(task, unusable)}",
+            )
+        if report.in_progress:
+            raise TaskGraphError(
+                "task_in_progress",
+                f"{', '.join(report.in_progress)} depends on '{task.id}' and is in "
+                "progress — rewriting a running round's dependencies is what strands "
+                "it (`state_of` reads them before the in-progress branch, so "
+                "`mark_completed` and `release` would both refuse afterwards). Wait "
+                "for the round, or `python -m autoloop release` it first",
+            )
+        planned: list[tuple[str, tuple[str, ...]]] = []
+        candidate = dict(self._tasks)
+        # A SELF-EDGE ON THE SUBJECT is dropped from the candidate — from that
+        # copy only, never from the stored row, which this operation does not
+        # write at all. The SECOND half of the guard in `stranded_dependents`,
+        # and it exists because the first half alone is not enough: that one
+        # refuses to count the subject as its own dependent, so the loop below
+        # never re-points that row, so the edge rides into `_check_acyclic`
+        # untouched and refuses an otherwise valid retirement as
+        # `dependency_cycle: X -> X` — naming the retirement itself as the
+        # loop. The subject is the task GOING terminal; its own dependencies
+        # are inert afterwards (`state_of` answers RETIRED before it reads
+        # them), so this edge can strand nobody and must not veto.
+        #
+        # UNREACHABLE TODAY, exactly as the comment there says: `from_dict`
+        # cycle-checks the whole stored graph, so a `tasks.json` naming a task
+        # after itself fails to LOAD rather than reaching a retirement, and
+        # both mutation routes refuse one outright. Kept, and tested by
+        # corrupting a loaded registry in memory, so the two halves of the
+        # guard cannot drift apart — one without the other is worse than
+        # neither, because it converts "reported as its own dependent" into
+        # "refused for a cycle nobody can remove".
+        #
+        # ONLY the entries equal to `task.id`, and only on the subject. Two
+        # narrower-than-obvious choices, each fail-open if widened:
+        #   * dropping the subject from `candidate` entirely would be worse
+        #     than the bug — `_check_acyclic` reads `color.get(dep)`, so a
+        #     missing key is neither GRAY nor WHITE and EVERY edge into the
+        #     subject stops being walked;
+        #   * clearing the subject's whole `depends_on` would hide a cycle
+        #     running back through a dependent this operation does not rewrite
+        #     (a `completed`/`retired` one still names the subject and is
+        #     excluded from `report.direct`).
+        # A self-edge on any OTHER task is a corruption this retirement was not
+        # asked about, and still refuses the whole thing.
+        if task.id in task.depends_on:
+            candidate[task.id] = replace(
+                task, depends_on=tuple(d for d in task.depends_on if d != task.id)
+            )
+        for dependent_id in report.direct:
+            dependent = self._tasks[dependent_id]
+            depends_on = _substitute_dependency(
+                dependent.depends_on, task.id, live, dependent_id
+            )
+            _validate_depends_on(dependent_id, depends_on, self._tasks)
+            candidate[dependent_id] = replace(dependent, depends_on=depends_on)
+            planned.append((dependent_id, depends_on))
+        _check_acyclic(candidate)
+        return tuple(planned)
+
+    def _strand_remedy(self, task: Task, unusable: tuple[str, ...]) -> str:
+        """The second half of the strand refusal: what the operator can do.
+
+        Split out because the two situations need different sentences and a
+        combined one would be wrong in both. Naming NO successor is the common
+        case and the remedy is to name one; naming a successor the graph cannot
+        wait on is the surprising case, and the message has to say which id and
+        why, or the operator re-runs the identical command.
+        """
+        if not unusable:
+            return (
+                "Name the task that continues this work with `--superseded-by` (its "
+                f"id replaces '{task.id}' in each dependent), or pass "
+                "`--rewrite-dependents` to drop the dependency in the same operation."
+            )
+        why = ", ".join(
+            f"{s} is not a task in this graph"
+            if not self.has(s)
+            else f"{s} is itself retired"
+            for s in unusable
+        )
+        return (
+            f"`--superseded-by` names {', '.join(unusable)}, which nothing can wait "
+            f"on ({why}) — a supersession is a record and a successor need not exist, "
+            "but only a live one can satisfy a dependency. Name a planned successor, "
+            "or pass `--rewrite-dependents` to re-point the dependents anyway."
+        )
 
     def unblock_obstacle(self, task_id: str) -> TaskGraphError | None:
         """Why `unblock(task_id)` would refuse, or None if it would succeed.
@@ -1154,6 +1470,80 @@ class TaskRegistry:
 
     def ready_tasks(self) -> list[Task]:
         return [t for t in self._tasks.values() if self.state_of(t.id) is TaskState.READY]
+
+    def stranded_dependents(self, task_id: str) -> StrandReport:
+        """Who would wait on `task_id` forever if it reached a terminal
+        non-completed status right now (see `StrandReport`).
+
+        THE shared precondition, and it is shared on purpose: the rule belongs
+        to `state_of`'s dependency test — `!= "completed"` is satisfied by
+        nothing else, so a dependency on a task that ended any other way is
+        unsatisfiable and there is no command that clears it (`answer` needs an
+        open blocker, `release` needs an in-progress task, `retire` means never
+        again, and there is no `unblock`). `retire` is the only transition that
+        reaches such a status today; a second one calls this rather than
+        restating the rule, which is how the two cannot drift.
+
+        Reads the STORED `status`, and never calls `state_of`, for the reason
+        `blocker_derived_blocked` gives: `state_of` raises `KeyError` on a graph
+        whose `depends_on` names a task that no longer exists — a shape
+        `from_dict` deliberately tolerates — and a guard that either crashes or
+        gets wrapped in a `try: … except: continue` on the graph it is meant to
+        judge is a guard that fails OPEN on exactly the malformed input it
+        should refuse. Nothing here indexes `self._tasks[dep]`; the edges are
+        walked backwards, by asking each task whether it NAMES the id, so a
+        dangling dependency is simply an edge to nowhere.
+
+        Raises `task_unknown` for an id that is not in the graph, so a caller
+        cannot ask about a typo and read the empty answer as "safe".
+        """
+        self.get(task_id)
+        direct: list[str] = []
+        transitive: list[str] = []
+        seen: set[str] = set()
+        frontier = [task_id]
+        while frontier:
+            current = frontier.pop(0)
+            for candidate in self._tasks.values():
+                if current not in candidate.depends_on:
+                    continue
+                # A record cannot be stranded, and its own dependents are not
+                # stranded THROUGH it: a completed dependency is satisfied, and
+                # a retired one is already unsatisfiable on its own account
+                # rather than by anything this operation does.
+                if candidate.status in _TERMINAL_STATUSES or candidate.id in seen:
+                    continue
+                # The subject is never its own stranded dependent. It is the
+                # task GOING terminal, so it is a record afterwards, not queue,
+                # and reporting it as a dependent of itself would then have the
+                # rewrite edit the very row being retired.
+                #
+                # DEFENCE IN DEPTH, not a reachable shape — say so plainly,
+                # because the reverse claim is easy to write and wrong. Every
+                # construction route already refuses a self-edge:
+                # `_validate_depends_on` at `add_many` and `set_depends_on`,
+                # and `_check_acyclic` inside `from_dict`, which cycle-checks
+                # the WHOLE stored graph on load (a self-edge is a one-node
+                # cycle). So a hand-edited `tasks.json` naming a task after
+                # itself does not reach this method — it fails to LOAD. What
+                # this guard covers is an in-memory corruption, and the day
+                # `from_dict` is relaxed to tolerate a stored cycle the way it
+                # already tolerates a dangling `depends_on`.
+                if candidate.id == task_id:
+                    continue
+                seen.add(candidate.id)
+                transitive.append(candidate.id)
+                if current == task_id:
+                    # The frontier starts as exactly `[task_id]`, so every
+                    # direct dependent is found on the first pass — before any
+                    # transitive one can claim its place in `seen`.
+                    direct.append(candidate.id)
+                frontier.append(candidate.id)
+        return StrandReport(
+            direct=tuple(direct),
+            transitive=tuple(transitive),
+            in_progress=tuple(d for d in direct if self._tasks[d].status == "in_progress"),
+        )
 
     def blocker_derived_blocked(self) -> list[Task]:
         """Every task whose `blocked` status MIRRORS a `blockers.Blocker`
@@ -1399,8 +1789,14 @@ class TaskRegistry:
         REPLACES, for the same reason `set_approved_paths` does: an operator
         who cannot remove a dependency cannot correct a mistaken one, and a
         task waiting on a dependency that will never complete is stuck forever
-        (`state_of` only counts `completed` as satisfied — see `retire`'s
-        closing note).
+        (`state_of` only counts `completed` as satisfied — see `retire`).
+
+        Since retire-01 a NEW retirement can no longer create that shape:
+        `retire` refuses one that would strand a dependent, and rewrites the
+        dependents itself when the operator asks it to. This stays the route
+        for a strand an EARLIER retirement already left behind — a repeat
+        `retire` cannot rewrite anything, because it cannot rewrite the
+        retirement either.
 
         Validation is `_validate_depends_on` (shape, known ids, no self-edge)
         followed by `_check_acyclic`, which is what creation runs; the cycle

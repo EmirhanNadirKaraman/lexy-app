@@ -284,9 +284,10 @@ def test_the_record_is_retired_before_the_worker(wired, monkeypatch):
 # the fallback when a reason no longer matches that table.
 
 
-def _retire_args(task_id, superseded_by=None, reason=""):
+def _retire_args(task_id, superseded_by=None, reason="", rewrite_dependents=False):
     return argparse.Namespace(
-        config=None, task_id=task_id, superseded_by=superseded_by, reason=reason
+        config=None, task_id=task_id, superseded_by=superseded_by, reason=reason,
+        rewrite_dependents=rewrite_dependents,
     )
 
 
@@ -434,6 +435,86 @@ def test_a_retire_command_that_would_rewrite_the_record_is_refused(wired, capsys
     task = store.load().get("old-01")
     assert task.superseded_by == ("new-01",)
     assert task.blocked_reason == "superseded by new-01"
+
+
+# --- CLI: retire must not strand the tasks that depend on it ------------------
+#
+# The operator-facing half of retire-01. The registry refuses; this command has
+# to make the refusal ACTIONABLE — every direct dependent by name, the
+# transitive count beside it, and the two ways out — because the decision is
+# the operator's and 4 direct dependents read very differently from 21 total.
+
+
+def test_the_retire_command_refuses_a_strand_and_names_the_dependents(wired, capsys):
+    store = _seed(
+        wired,
+        _task("roadmap-01"),
+        _task("ingest-01", depends_on=("roadmap-01",)),
+        _task("ingest-02", depends_on=("roadmap-01",)),
+        _task("ingest-03", depends_on=("ingest-01",)),
+    )
+
+    assert cli._cmd_retire_task(_retire_args("roadmap-01")) == 1
+
+    out = capsys.readouterr().out
+    assert "ingest-01" in out and "ingest-02" in out
+    assert "3 tasks blocked in total" in out, "the transitive count, not just the direct one"
+    assert "--rewrite-dependents" in out and "--superseded-by" in out
+    reloaded = store.load()
+    assert reloaded.state_of("roadmap-01") is TaskState.READY, "nothing was written"
+    assert reloaded.get("ingest-01").depends_on == ("roadmap-01",)
+
+
+def test_the_retire_command_re_points_dependents_at_a_live_successor(wired, capsys):
+    store = _seed(
+        wired,
+        _task("roadmap-01"),
+        _task("roadmap-02"),
+        _task("ingest-01", depends_on=("roadmap-01",)),
+    )
+
+    assert cli._cmd_retire_task(_retire_args("roadmap-01", superseded_by=["roadmap-02"])) == 0
+
+    reloaded = store.load()
+    assert reloaded.state_of("roadmap-01") is TaskState.RETIRED
+    assert reloaded.get("ingest-01").depends_on == ("roadmap-02",)
+    out = capsys.readouterr().out
+    assert "dependents re-pointed" in out
+    assert "ingest-01 now depends on roadmap-02" in out
+    # Both counts survive onto the SUCCESS path — the transitive one is what
+    # the operator's decision turned on — but in the past tense. `describe()`
+    # is the refusal's sentence and says "blocked in total", which would be a
+    # false present-tense claim about tasks this command just unblocked.
+    assert "1 that named roadmap-01 directly" in out
+    assert "1 task was waiting on it in total" in out
+    assert "blocked in total" not in out
+
+
+def test_the_retire_command_rewrite_flag_drops_the_dependency(wired, capsys):
+    """The stale case — nothing continues the work, so the edge goes and the
+    dependent is dispatchable again. One command, one save: the retirement and
+    the rewrite are in the same file after it."""
+    store = _seed(wired, _task("dash-01"), _task("dep-01", depends_on=("dash-01",)))
+
+    assert cli._cmd_retire_task(
+        _retire_args("dash-01", reason="stale", rewrite_dependents=True)
+    ) == 0
+
+    reloaded = store.load()
+    assert reloaded.state_of("dash-01") is TaskState.RETIRED
+    assert reloaded.get("dep-01").depends_on == ()
+    assert reloaded.state_of("dep-01") is TaskState.READY
+    assert "dep-01 now depends on nothing" in capsys.readouterr().out
+
+
+def test_the_retire_command_says_so_when_nothing_depended_on_the_task(wired, capsys):
+    """The ordinary retirement still reports the question it answered — silence
+    would leave an operator unsure whether the check ran at all."""
+    _seed(wired, _task("old-01"))
+
+    assert cli._cmd_retire_task(_retire_args("old-01", superseded_by=["new-01"])) == 0
+
+    assert "dependents: none" in capsys.readouterr().out
 
 
 # --- CLI: archive-blocker -----------------------------------------------------
