@@ -261,6 +261,32 @@ class Directive:
     notes: str | None = None
 
 
+#: The response schema itself. Two clauses in it are worth explaining HERE
+#: rather than in the prompt, which is re-sent every turn:
+#:
+#: **The `notes` bound and the line-break rule (2026-08-24).** `parse_response`
+#: is unchanged by them and enforces neither — they are guidance the model
+#: reads, exactly like the two preference clauses below. Measured 2026-08-20/21:
+#: `parse_error` fired 25 times in three weeks, eight of them in one thirty-hour
+#: window, and the recent ones were all the same defect —
+#: `invalid_json: Invalid control character at: line 6 column ~2073` — a literal
+#: newline inside the long `notes` value. The reviewer's CONTENT was right every
+#: time; only its encoding was not. Two of those parked the loop
+#: `parse_budget_exhausted` (loop_fatal, `policy.max_parse_retries` is 2), once
+#: for six unattended hours. Both recoveries were a conversational `run
+#: --answer` saying "escape newlines, keep notes short", which works and then
+#: decays, because it lives in the thread and does not survive a rotation or a
+#: fresh session. This text does, which is the whole point of putting it here.
+#:
+#: Why "write \\n" and NOT "keep every string on one line": `commit.message` is
+#: documented above as the FULL commit message and this repo's messages have
+#: bodies, so a one-line-only rule would quietly cost every commit body. The
+#: escape is legal JSON and keeps multi-line values expressible.
+#:
+#: Why 200 is a literal here and not a named constant: nothing reads or
+#: enforces it, so there is no second copy for it to drift from — unlike
+#: `note_merge.MAX_NOTE_LINE_CHARS`, which a validator checks and a prompt
+#: states. A constant would advertise an enforcement that does not exist.
 _RESPONSE_FORMAT = """\
 RESPONSE FORMAT — mandatory.
 Your ENTIRE reply is exactly one fenced JSON block (```json ... ```) and
@@ -293,7 +319,9 @@ trailing text is REJECTED, never guessed at. One object, these keys only:
              Copy all three EXACTLY from the CONTEXT block of the request
              you are answering; never approve from memory. A mismatched stamp
              is rejected.
-  notes      (optional) anything else worth recording
+  notes      (optional) at most 200 characters, on ONE line.
+NEVER put a literal line break inside a JSON string value — write \\n.
+A raw newline in a string is invalid JSON, and the reply is REJECTED.
 
 Decisions:
   audit — the executor audits the repository and reports back.

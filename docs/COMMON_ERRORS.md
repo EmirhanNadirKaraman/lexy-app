@@ -782,6 +782,32 @@ Regression tests use the byte-exact captured text.
 test it against bytes captured from the real page, not against what you believe
 the model sends.
 
+### `invalid_json: Invalid control character at: line 6 column 2073 (char 2324)`
+**Symptom:** `parse_error` fired 25 times in three weeks and EIGHT of those in
+one thirty-hour window (measured 2026-08-20/21), every recent one reporting the
+same offset shape — line 6, column ~2000. Twice the third malformed reply in a
+row parked the loop `parse_budget_exhausted`, which is loop_fatal
+(`policy.max_parse_retries` is 2): 2026-08-20 23:23 on bind-01's postcommit
+review, unattended for six hours, and 2026-08-21 07:02 on auto-02's.
+**Cause:** a literal newline inside a JSON string value. The deep column offset
+is the tell — it lands inside the long `notes` value, whose entire
+specification in `CONTRACT_INSTRUCTIONS` was "anything else worth recording":
+no length, no format, no escaping. The reviewer's CONTENT was correct every
+time; only its encoding was not. Note the KIND changed. Historically the common
+parse failure was `no_json_block` (13 of 25) — a conversational reply with no
+JSON at all — so a `parse_error` count alone will not show you this.
+**Fix:** `autoloop/contract.py` bounds `notes` (at most 200 characters, on one
+line) and states the general rule — never a literal line break inside a JSON
+string value, write `\n` — in the text that is re-sent EVERY round. The parser
+is deliberately unchanged and still refuses the malformed reply. Both incidents
+were first recovered with `run --answer` saying the same thing by hand, which
+works and then decays: a conversational instruction lives in the thread and
+does not survive a rotation or a fresh session.
+**Lesson:** an optional free-text field with no stated bound is a latent parse
+failure. `notes` had been used in 0 of 578 directives and is read by nothing in
+`orchestrator.py`, `dashboard.py`, `transcript.py` or `worktask.py` — and it
+was still the single largest source of loop-fatal parks.
+
 ### `submission of alr-… is AMBIGUOUS` on a send that simply never landed
 **Symptom:** roughly one turn in eight parked for a human. `.autoloop/state.json`
 sat in `awaiting`; the diagnostics snapshot said `send_attempted: true`,
@@ -3079,3 +3105,5 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | scope-05 | New §9 entry beside the scope-04 one, for the same park with a different residue: the reviewer asks for an out-of-scope EDIT to be undone, and `REMOVE-OUT-OF-SCOPE:` cannot express it — deleting a file the base commit contains would be a worse overrun. `REVERT-OUT-OF-SCOPE: <path>` restores it from `task_base_sha`. The entry says outright not to reconstruct the content by hand: git holds it, and an agent-authored "put it back" is a new edit, not a revert. |
 | 2026-08-24 | scope-05 | That entry ends with the check to run FIRST: if the prompt does not list `REVERT-OUT-OF-SCOPE:` among the request forms, no revert authority is wired for that run and the line does nothing — `cli._build_executor` has to pass `revert_authority=`. Report it rather than retrying the line. The scope-04 entry above is unchanged and still the right one for a file an earlier round CREATED out of scope. |
 | 2026-08-24 | scope-05 | Revision round: that §9 entry's wiring check is rewritten, because production now passes `revert_authority=` from `cli._build_orchestrator`. The form is still rendered only when the round has a recorded out-of-scope path AND a usable base sha, so an absent `REVERT-OUT-OF-SCOPE:` in your prompt now means no execution record, no base sha on it, or an embedder that wired no authority — report it rather than retrying the line. |
+| 2026-08-24 | contract-01 | New §6 entry for `invalid_json: Invalid control character at:` with a deep column offset — a literal newline inside the long `notes` value, which twice parked the loop `parse_budget_exhausted`. Filed beside the `no_json_block` entry because that is where contract-parse symptoms already live, though the cause is the model's encoding rather than the browser. The half worth knowing is that the KIND changed: 13 of the 25 historical parse errors were `no_json_block`, so a `parse_error` count alone will not show you this one. |
+| 2026-08-24 | contract-01 | That entry's Fix says the recovery used twice — `run --answer` telling the reviewer to escape newlines and keep notes short — WORKS and then decays, because a conversational instruction lives in the thread and does not survive a rotation or a fresh session. `CONTRACT_INSTRUCTIONS` is re-sent every round, which is why the rule was put there instead. Do not answer a recurrence with another `--answer` alone. |

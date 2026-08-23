@@ -788,6 +788,154 @@ def test_contract_documents_every_top_level_field(field):
     assert field in CONTRACT_INSTRUCTIONS
 
 
+# ---- the `notes` length / line-break rule ----------------------------------
+#
+# Measured 2026-08-20/21: `parse_error` fired 25 times in three weeks and EIGHT
+# of them landed in one thirty-hour window. The recent ones were all the same
+# defect — `invalid_json: Invalid control character at: line 6 column ~2073` —
+# a literal newline inside the long `notes` value. The reviewer's CONTENT was
+# right every time; only its encoding was not. Two parked the loop
+# `parse_budget_exhausted` (loop_fatal), one of them for six unattended hours.
+#
+# `notes`' entire specification was "anything else worth recording": no length,
+# no format, no escaping. These tests pin the rule that replaced it. It is
+# GUIDANCE, in the same category as the two preference clauses below —
+# `parse_response` is untouched and enforces neither half, which
+# `test_the_notes_rules_are_guidance_the_parser_does_not_enforce` is what
+# proves rather than asserts.
+
+
+def _flat(text):
+    """Whitespace-normalised, exactly like
+    `test_the_documented_key_set_is_the_accepted_key_set` above: the rule spans
+    two lines and where it wraps is formatting rather than contract."""
+    return " ".join(text.split())
+
+
+def test_contract_bounds_the_length_of_notes():
+    """The field that broke the loop now carries a bound the reviewer can apply
+    without reference to anything else.
+
+    Pinned as the whole clause rather than as the digits. `"200" in text` would
+    pass against any unrelated number that ever appeared in the schema — and
+    `notes` is the field a trim would plausibly shorten back to a bare
+    `(optional)`, which is the state this rule exists to leave behind."""
+    assert "notes (optional) at most 200 characters, on ONE line." in _flat(
+        CONTRACT_INSTRUCTIONS
+    )
+
+
+def test_contract_forbids_a_literal_line_break_inside_a_string_value():
+    r"""The defect itself, stated as an instruction rather than as a lesson on
+    JSON escaping, and scoped to every string value rather than to `notes`.
+
+    The escape MUST be asserted as a raw backslash-n. `"\n" in
+    CONTRACT_INSTRUCTIONS` passes vacuously — the instructions are full of real
+    newlines — so that assertion would certify the exact bug it looks like it
+    is catching: `_RESPONSE_FORMAT` is a NON-raw triple-quoted string, so a
+    source that wrote `\n` there would ship a real line break inside the very
+    sentence forbidding them, and the model would read a wrapped line."""
+    flat = _flat(CONTRACT_INSTRUCTIONS)
+    assert "NEVER put a literal line break inside a JSON string value" in flat
+    assert r"write \n." in flat
+    # ...and what happens otherwise, so it reads as a rule and not a taste.
+    assert "invalid JSON, and the reply is REJECTED" in flat
+
+
+def test_the_rule_names_the_escape_so_multiline_values_stay_expressible():
+    r"""Why it is `write \n` and NOT "keep every string on one line".
+
+    `commit.message` is documented two lines above as the FULL commit message,
+    and this repository's commit messages have bodies. A one-line-only rule
+    would have fixed the parse errors by quietly costing every commit body —
+    a worse trade, and an invisible one. The escape is legal JSON, so the
+    permissive reading survives; this test fails if either half is dropped."""
+    assert r"\n" in CONTRACT_INSTRUCTIONS
+    assert "the full commit message" in CONTRACT_INSTRUCTIONS
+
+
+def test_the_notes_rule_advertises_no_retired_decision():
+    """The rule is new text in a prompt that must offer ACTIVE decisions only.
+    Covered for the whole document by
+    `test_contract_never_offers_a_retired_decision`; asserted here too because
+    this clause sits in the same paragraph as the key list and is the text most
+    likely to be reworded next."""
+    for retired in RETIRED_DECISIONS:
+        assert retired.value not in _flat(CONTRACT_INSTRUCTIONS)
+
+
+#: The production failure's SHAPE, hand-built. `json.dumps` escapes a newline
+#: into a valid `\n`, so the malformed reply cannot be produced through it.
+def _raw_newline_in_notes(envelope):
+    body = (
+        '{\n'
+        '  "version": 3,\n'
+        '  "decision": "stop",\n'
+        '  "reason": "done",\n'
+        '  "notes": "first line\n'
+        'second line"\n'
+        '}'
+    )
+    return f"```json\n{body}\n```" if envelope == "fenced" else f"JSON\n{body}"
+
+
+@pytest.mark.parametrize("envelope", ["rendered", "fenced"])
+def test_a_raw_newline_inside_a_string_value_is_still_rejected(envelope):
+    """The parser is deliberately UNCHANGED: the rule above makes this reply
+    rarer, never acceptable. A malformed reply is still refused with a code and
+    re-prompted inside the same `policy.max_parse_retries` budget.
+
+    Both envelopes, because the reported failures were `line 6 column 2073` —
+    a pretty-printed object, i.e. the rendered/bare path — and a test that only
+    covered the fenced form would miss the shape that actually took the loop
+    down twice."""
+    with pytest.raises(ContractError) as excinfo:
+        parse_response(_raw_newline_in_notes(envelope))
+    assert excinfo.value.code == "invalid_json"
+    # The refusal names the real reason, so the corrective re-prompt does too.
+    assert "control character" in str(excinfo.value).lower()
+
+
+def test_a_short_single_line_notes_parses():
+    """The shape the rule asks for: within the bound, no line break."""
+    directive = parse_response(
+        block(base("stop", notes="roadmap drained; nothing else in flight"))
+    )
+    assert directive.notes == "roadmap drained; nothing else in flight"
+
+
+@pytest.mark.parametrize("decision", sorted(_COMPLETE_PAYLOADS))
+def test_a_directive_omitting_notes_parses_exactly_as_it_did_before(decision):
+    """`notes` stays OPTIONAL on every active decision. The task that added the
+    rule was about making the field safe, not about deciding its fate — it is
+    read by nothing in `orchestrator.py`, `dashboard.py`, `transcript.py` or
+    `worktask.py`, and removing it is a separate question. Parametrized so the
+    optionality is pinned per decision rather than for `stop` alone."""
+    directive = parse_response(block(base(decision, **_COMPLETE_PAYLOADS[decision])))
+    assert directive.notes is None
+
+
+def test_the_notes_rules_are_guidance_the_parser_does_not_enforce():
+    r"""The other half of "do not change the parser", and the half an
+    enforcement-shaped fix would fail.
+
+    Neither the 200-character bound nor the line-break rule is a parser rule:
+    `parse_response` still accepts any string. Enforcing the bound here would
+    convert a formatting slip into a `ContractError` charged to the small
+    parse-retry budget — the same budget the overlong notes were exhausting —
+    and a reply the reviewer meant would be thrown away for being verbose.
+
+    The second case is the rule's own remedy: a newline written the documented
+    way (`\n`, which `json.dumps` produces) is valid JSON and parses, carrying
+    the real newline through to `Directive.notes`. So the rule asks for
+    something that works, not merely for something shorter."""
+    long_notes = "x" * 5_000
+    assert parse_response(block(base("stop", notes=long_notes))).notes == long_notes
+
+    escaped = "first line\nsecond line"
+    assert parse_response(block(base("stop", notes=escaped))).notes == escaped
+
+
 def test_contract_states_that_one_step_is_a_valid_decomposition():
     """The constraint most easily lost to a trim, and the one whose loss is
     silent: a reviewer who is told to decompose but not that one step counts
@@ -1059,7 +1207,26 @@ def test_contract_stays_within_its_budget():
     is authored from — worth ~45 characters — was deliberately not written here:
     those sections label themselves in every request, so paying a per-turn tax
     to restate them is the "room for explanation" this ceiling refuses. Hand
-    count, no shell."""
+    count, no shell.
+
+    The `notes` rule (2026-08-24) is the first genuine new requirement to be
+    paid for out of the headroom this ceiling already had, rather than by
+    moving it. It cost +147 — +7 on the `notes` line itself ("anything else
+    worth recording" -> "at most 200 characters, on ONE line.") plus two new
+    lines of 69 and 68 characters and their joins — and buys the field that
+    caused eight `invalid_json` parse errors in thirty hours and two loop_fatal
+    `parse_budget_exhausted` parks. The ceiling did NOT move, which is the rule
+    this docstring has stated since 2026-08-15: raising it for a real
+    requirement is fine, raising it to make room for explanation is not — and
+    the explanation for this one lives in the source comment above
+    `_RESPONSE_FORMAT`, which costs nothing per turn.
+
+    This is the FIRST entry here whose number was measured rather than
+    hand-summed. Every count above says "hand count, no shell"; this executor
+    had impl-02's advisory validation channel, so the length was read off a
+    real run — **3,636**, i.e. 64 characters of headroom left, and the hand sum
+    (3,489 + 147) agreed with it exactly. Treat the earlier figures as the
+    estimates they say they are; treat this one as observed."""
     assert len(CONTRACT_INSTRUCTIONS) <= 3700
 
 
