@@ -713,6 +713,22 @@ Code: `dashboard.shipped_report` / `shipped_states` / `mentions_task_id` /
 `commit_subjects`, printed by `cli._format_shipped`. Tests:
 `autoloop/tests/test_roadmap_ancestry.py`, against real repositories.
 
+**The merge panel reuses this evidence** (dash-18, 2026-08-23). `merge_states`
+takes the same commit list as a THIRD source, after the remote ref and after the
+execution record's candidate, and only on the readable-remote fall-through: a
+commit whose subject names a completed task and which is an ancestor of HEAD
+renders that row `merged` rather than `unpublished`, and the row's `detail` says
+a subject match is what decided it — a heuristic on a line a human typed is not
+the same confidence as git's answer about the ref the publisher wrote. Measured
+2026-08-21: `dash-02`, `pkt-03` and `audit-0001` were all in the branch and all
+read `unpublished`, having landed by routes that predate the publisher, so no
+record and no branch named their work. Positive-only exactly as above — no
+match, a non-ancestor match, a match git could not resolve, and a search that
+failed all leave the row as it was, and an unreachable remote is still
+`unknown`. The panel reads the search through `_cached_commit_subjects` (60s per
+repo, like `ls-remote`) so a walk of every ref stays off its 2s poll; this
+command calls `commit_subjects` directly and never sees a cached answer.
+
 ---
 
 ### 3e. Heartbeat + the durable monitor

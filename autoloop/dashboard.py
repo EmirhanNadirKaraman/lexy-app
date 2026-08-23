@@ -180,6 +180,13 @@ _REMOTE_CACHE: dict = {}
 #: identical shas across different directories.
 _ANCESTRY_CACHE: dict = {}
 _SHALLOW_CACHE: dict = {}
+#: `git log --all` per observed checkout: `{str(repo): {"at", "commits"}}`, the
+#: same shape and the same reason as `_REMOTE_CACHE` above — the merge panel
+#: polls every 2s and this walk is the one read on that path whose cost grows
+#: with history. `None` (the search FAILED) is cached too and that is safe by
+#: construction: the evidence it feeds is positive-only, so a stale "could not
+#: search" can never assert anything about a row. See `_cached_commit_subjects`.
+_SUBJECT_CACHE: dict = {}
 
 
 def _run_status(args, cwd=None, timeout=8):
@@ -665,8 +672,9 @@ def _pending_inbox(repo: Path) -> list[dict]:
 BRANCH_PREFIX = "autoloop/"
 
 #: The four states a completed task can be in. `unpublished` is not a normal
-#: state — it means the registry says done and no side branch exists anywhere —
-#: so it is shown rather than folded into one of the others.
+#: state — it means the registry says done, no side branch exists anywhere, and
+#: (since dash-18) no commit in the branch names the task either — so it is
+#: shown rather than folded into one of the others.
 #:
 #: This is the VOCABULARY, not a display order: the page lists these in
 #: `MERGE_GROUPS`'s triage order, which puts the one nobody has to act on last.
@@ -744,13 +752,46 @@ def branch_for(task_id: str, record: dict) -> str:
     return str(record.get("task_branch") or "") or f"{BRANCH_PREFIX}{task_id}"
 
 
+def naming_ancestor(task_id: str, commits, ancestor) -> str:
+    """The full sha of the FIRST commit whose subject names `task_id` and which
+    git says is an ancestor of the base head. `""` when there is no such commit.
+
+    Deliberately thin, and deliberately built out of roadmap-01's helpers rather
+    than beside them: `mentions_task_id` (defined below, in that section) owns
+    whole-token matching and `ancestor` owns ancestry, so a second copy of
+    either here is the defect, not the feature.
+
+    `""` is the ONLY negative it can return and it means "no evidence", never
+    "not merged" — the caller's job is to leave the row exactly as it was. Every
+    way of having nothing to say lands on it: no commits (`None` when the search
+    FAILED, `[]` when it ran and the repo is empty), an empty id, no subject
+    naming the id, and — the one that decides this feature — a match git could
+    not resolve. That last is why the test is `== "yes"` and never `!= "no"`:
+    `is_ancestor` answers `"unknown"` for an unreadable repository or a shallow
+    clone, and reading an unanswered question as integration is exactly the
+    fail-open claim this evidence source is not allowed to make.
+
+    FIRST in `git log --all` order, which is `shipped_states`' own convention,
+    so the merge panel and `shipped-report` name the same sha for a task that
+    shipped as four commits instead of quietly disagreeing about which one.
+    """
+    if not task_id or not commits:
+        return ""
+    for sha, subject in commits:
+        if mentions_task_id(subject, task_id) and ancestor(sha) == "yes":
+            return sha
+    return ""
+
+
 def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
-                 refs: dict, ancestor) -> list[dict]:
+                 refs: dict, ancestor, commits=None) -> list[dict]:
     """One row per completed task: which of `MERGE_STATES` it is in, and why.
 
     Pure resolution logic — `ancestor(sha) -> "yes"/"no"/"unknown"` is injected,
     so the four states are decidable without a repository, while the git-facing
-    half stays in `is_ancestor` above.
+    half stays in `is_ancestor` above. `commits` is the same injected search
+    result `shipped_states` takes: `[(full sha, subject)]`, or `None` when the
+    search failed or was never run.
 
     Order of evidence, and why:
 
@@ -761,9 +802,24 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
        integrated whatever became of the branch (merged then deleted on origin
        is ordinary). It can never produce "not merged" — the record is not
        allowed to make a negative claim, which is the failure this replaces.
-    3. Otherwise: `unpublished` when the remote was readable and simply had no
+    3. With neither, and the remote readable: a commit whose SUBJECT names the
+       task id and which is an ancestor of HEAD (dash-18, 2026-08-23). Also
+       POSITIVE evidence only, and for a stronger reason than (2) — this one is
+       a heuristic on a subject line, so it is allowed to say "the work is in
+       the branch" and nothing else. No match, or a match git could not resolve,
+       leaves the row exactly as it would have read without this step.
+    4. Otherwise: `unpublished` when the remote was readable and simply had no
        such branch, `unknown` when it was not readable, because an unreachable
        remote cannot distinguish "no branch" from "seven branches".
+
+    (3) sits INSIDE (4)'s readable-remote branch rather than beside it, which is
+    what keeps `unknown` unknown: an ancestor commit does not make an unreachable
+    remote readable, and a row that could not be judged must still say so.
+
+    `detail` says WHICH of the three decided the row, because they are three
+    different confidences — a published branch that is an ancestor is git's own
+    answer about the exact ref the publisher wrote, while (3) is a subject-line
+    match — and an operator acting on the row needs to tell them apart.
     """
     out = []
     for task in completed:
@@ -772,6 +828,7 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
         branch = branch_for(task_id, record)
         published = refs.get(branch) or ""
         candidate = str(record.get("candidate_sha") or "")
+        named = ""
         state, detail = "unknown", "origin unreachable — merged-ness unverified"
         if published:
             verdict = ancestor(published)
@@ -785,11 +842,25 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
             state = "merged"
             detail = f"no branch on origin; commit {candidate[:12]} is in HEAD"
         elif remote_ok:
-            state = "unpublished"
-            detail = f"completed, but origin has no {branch} — the work was never pushed"
+            named = naming_ancestor(task_id, commits, ancestor)
+            if named:
+                state = "merged"
+                detail = (f"no branch on origin; commit {named[:12]} names {task_id} "
+                          f"in its subject and is an ancestor of HEAD")
+            else:
+                state = "unpublished"
+                detail = f"completed, but origin has no {branch} — the work was never pushed"
         out.append({
             "id": task_id, "title": task.get("title") or "", "branch": branch,
-            "sha": (published or candidate)[:12], "state": state, "detail": detail,
+            # The sha that DECIDED the row, which is why `named` outranks
+            # `candidate`: it is non-empty only on the fall-through, i.e. only
+            # when there is no ref AND the candidate was not an ancestor, so a
+            # row decided by (1) or (2) still shows exactly what it showed
+            # before. Without the ordering, a task whose candidate was rebased
+            # away at merge would read "merged" with the detail naming one
+            # commit and the column showing another.
+            "sha": (published or named or candidate)[:12],
+            "state": state, "detail": detail,
         })
     return out
 
@@ -888,12 +959,25 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
 
     Read-only and lock-free, like everything else here: `executions` is read by
     `_executions` as plain JSON and every git call is a local read.
+
+    The subject search is the third evidence source (`merge_states` step 3) and
+    the one read on this path whose cost grows with history, so it comes from
+    `_cached_commit_subjects` rather than straight from `commit_subjects` — the
+    page polls every 2s.
+
+    It is NOT fetched only when a row would otherwise read `unpublished`: those
+    rows are precisely the ones this exists for, so such a test is true on every
+    poll for exactly the tasks that need it and buys nothing but a second pass.
+    It IS skipped when the remote was unreadable, because no row can reach the
+    third source then — `merge_states` keeps it inside the readable-remote
+    branch — and that skip states the same bound at the call site.
     """
     completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
     rows = merge_states(
         completed, executions, remote_ok,
         {r["ref"]: r.get("full") or r.get("sha") or "" for r in refs},
         lambda sha: is_ancestor(repo, sha, head),
+        _cached_commit_subjects(repo) if remote_ok else None,
     )
     return {
         "base_branch": branch or "HEAD",
@@ -1017,6 +1101,32 @@ def commit_subjects(repo: Path) -> list[tuple[str, str]] | None:
     return commits
 
 
+def _cached_commit_subjects(repo: Path, ttl: int = 60):
+    """`commit_subjects` memoized per checkout for `ttl` seconds.
+
+    `shipped-report` is an operator command run once; the merge panel asks the
+    same question on a 2s poll, and this walk is the only read there whose cost
+    grows with history. Cached exactly like `_remote_refs` and keyed by repo for
+    the same reason — one flat entry would serve one checkout's commits to
+    another.
+
+    `None` is cached as readily as a list, and that is safe rather than lax:
+    `merge_states` uses this as positive evidence only, so the worst a stale
+    "the search failed" can do is leave a row reading as it did before this
+    evidence source existed. It is deliberately NOT allowed to freeze a
+    verdict, the way `_ANCESTRY_CACHE` refuses to cache `"unknown"`, because it
+    holds no verdicts — only the material one is read from.
+    """
+    key = str(repo)
+    entry = _SUBJECT_CACHE.get(key)
+    now = time.time()
+    if entry and now - entry["at"] <= ttl:
+        return entry["commits"]
+    commits = commit_subjects(repo)
+    _SUBJECT_CACHE[key] = {"at": now, "commits": commits}
+    return commits
+
+
 def shipped_states(completed: list[dict], commits, ancestor) -> list[dict]:
     """One row per completed task: every commit whose subject names it, each
     commit's own ancestry verdict, and the aggregate of the two.
@@ -1118,9 +1228,13 @@ def shipped_report(repo: Path, roadmap: list[dict], head: str, branch: str = "")
     injects `--no-optional-locks` — this may run against a checkout the loop is
     writing, and it writes nothing itself.
 
-    Deliberately NOT part of `collect`'s payload: that runs on a 2s poll and
-    this walks every commit on every ref. It is an operator-facing report,
-    reached from `python -m autoloop shipped-report`.
+    This REPORT is not part of `collect`'s payload and is not meant to be: it is
+    an operator-facing command, reached from `python -m autoloop shipped-report`.
+    Its underlying search now is, though — since dash-18 (2026-08-23) the merge
+    panel reads the same commit list as its third evidence source, through
+    `_cached_commit_subjects`, which is what keeps a walk of every ref off a 2s
+    poll. Nothing here is on that path; `commit_subjects` is called directly
+    below so a one-shot report never reads a cached answer.
     """
     completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
     commits = commit_subjects(repo)
