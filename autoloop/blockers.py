@@ -51,6 +51,30 @@ from .state import utcnow_iso
 #: parentheses, so this can never collide with one.
 NO_TASK = "(loop)"
 
+#: `code` for a task the loop could NOT return to scheduling after a round the
+#: environment destroyed (strand-01, 2026-08-24). Written by
+#: `orchestrator.Orchestrator._reconcile_stranded_tasks` when the record is
+#: outside the narrow safe shape — it holds a candidate, a reviewer has already
+#: seen a round, its attempt budget is spent, or it cannot be read at all.
+#:
+#: **Recorded WITHOUT parking, which no other code here is.** Every other
+#: blocker is minted by `orchestrator._to_needs_user` or `_to_fault_stop`, and
+#: both of those stop something: a park holds the session open for an answer, a
+#: fault stop ends the run. Neither is right here — the loop is working, on
+#: other tasks, and the failure being reported is one task's ABSENCE from the
+#: queue. So the record is filed on its own and the loop carries on. Two
+#: consequences worth knowing before adding a second code like this:
+#:
+#:   * it is invisible to `test_m1_hardening._emitted_blocker_codes`, which
+#:     AST-walks those two emitters only, so it is deliberately absent from
+#:     `cli._RESOLUTION_PRECONDITIONS` (that dict's keys must all be emitted
+#:     codes) and an operator can answer it with no precondition recheck;
+#:   * `answer` will report `task_not_blocked` while resolving it, because the
+#:     task is `in_progress` rather than `blocked` — this code never changes a
+#:     task's status. The question text says so and names `release` as the
+#:     command that moves the task.
+STRANDED_AFTER_FAULT = "stranded_after_environment_fault"
+
 
 @dataclass
 class Blocker:

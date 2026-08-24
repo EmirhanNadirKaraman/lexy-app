@@ -26,6 +26,18 @@ Signals, and why these rather than the obvious ones:
   process being alive is treated as proof of work even when everything else
   is quiet.
 
+* **A task stranded by an environment fault is a fault the transcript is
+  silent about.** Every other signal here asks about the LOOP; this one asks
+  about the queue behind it. A round destroyed by the environment leaves its
+  task `in_progress`, which `next_ready()` never returns, so the task stops
+  being scheduled with no symptom other than its own absence — three sat that
+  way for twenty-one hours on 2026-08-22 while the loop worked perfectly on
+  other tasks and reported `running` throughout. `stranded_fault_rounds` is
+  the predicate; it is carried on EVERY verdict (`Health.stranded_tasks`)
+  rather than being a code of its own, because the states it co-occurs with
+  — not running, blocked, a stale lock — all return before any late check
+  could fire, which would make it decoration.
+
 * **Silence is awake time, not wall-clock.** A laptop that sleeps for hours
   is indistinguishable from a hung loop if silence is measured on the wall
   clock — observed 2026-08-05: "no activity for 224 minutes" over a machine
@@ -58,13 +70,23 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .blockers import BlockerStore
+from .errors import StateError, TaskGraphError
 from .lock import LoopLock, boot_time_epoch
 from .state import Phase, StateStore
+from .tasks import TaskStore
+from .worktask import (
+    ATTEMPT_FAULT,
+    ATTEMPT_OPEN,
+    REASON_SENT_FOR_REVIEW,
+    TaskExecutionStore,
+    attempt_outcome,
+    split_attempt,
+)
 
 #: How long a live loop may write nothing before it is called stuck. Generous
 #: on purpose: an audit fan-out is quiet for fifteen-plus minutes, and a
@@ -85,6 +107,11 @@ STUCK_FAILED = "failed"
 STUCK_STALE_LOCK = "stale_lock"
 STUCK_SILENT = "silent"
 STUCK_NOT_RUNNING = "not_running"
+#: A task is `in_progress` with nothing scheduling it and no open blocker
+#: saying why — see `stranded_fault_rounds`. Returned only when NOTHING ELSE
+#: needs attention; when something does, that verdict keeps its own code and
+#: carries the strand in `Health.stranded_tasks` and its detail instead.
+STUCK_STRANDED = "stranded"
 
 
 @dataclass(frozen=True)
@@ -96,9 +123,283 @@ class Health:
     phase: str = ""
     open_blockers: int = 0
     silent_minutes: float | None = None
+    #: Ids of tasks left `in_progress` by a round the environment destroyed
+    #: (`stranded_fault_rounds`). Carried on EVERY verdict, including the ones
+    #: that need attention for another reason: the 2026-08-22 incident's most
+    #: likely health states were `not_running` and `blocked`, both of which
+    #: return before any late check could run, so a code of its own would never
+    #: have fired when it mattered. Empty is the ordinary case and the field
+    #: has a default, so a caller reading `asdict` gains a key and loses
+    #: nothing.
+    stranded_tasks: tuple[str, ...] = ()
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
+
+
+@dataclass(frozen=True)
+class StrandedRound:
+    """One task left `in_progress` by a round the environment destroyed.
+
+    The unit `stranded_fault_rounds` returns, and the whole of what the two
+    readers need: `health.check` NAMES these tasks, and
+    `orchestrator.Orchestrator._reconcile_stranded_tasks` either returns one to
+    the queue or files a blocker saying why it did not.
+
+    `obstacle` is the split between those two answers, and it is a STRING
+    rather than a boolean so the blocker can quote it. Empty means the record
+    is in the narrow shape that is provably safe to hand back to scheduling —
+    no candidate, no review round — and anything else names what stopped that.
+    """
+
+    task_id: str
+    fault_code: str
+    candidate_sha: str = ""
+    review_round: int = 0
+    attempt_count: int = 0
+    fault_attempt_count: int = 0
+    obstacle: str = ""
+
+    @property
+    def safe_to_requeue(self) -> bool:
+        """`candidate_sha` empty AND `review_round == 0`, and nothing else.
+
+        Deliberately derived from `obstacle` rather than re-testing the fields:
+        one place decides, so a caller cannot get "safe" and "no obstacle to
+        report" from two different rules. The BUDGET is not part of it — a
+        record whose fault allowance is spent is safe in this sense and still
+        must not be requeued, which is the caller's own gate (it owns the
+        ceilings).
+        """
+        return not self.obstacle
+
+
+#: The fault code reported for a round that never stamped its own exit — the
+#: same slug `orchestrator._reconcile_unfinished_attempts` will settle it under
+#: when the task is dispatched again, so the transcript reads consistently
+#: whichever half of the loop names it first.
+FAULT_INTERRUPTED = "interrupted_mid_round"
+
+#: Reported instead of a fault code when the execution record itself cannot be
+#: read. NOT treated as "no fault round": a record that fails to decode is the
+#: one state in which we cannot tell, and reading "cannot tell" as "nothing
+#: happened" is exactly how a task goes missing quietly.
+FAULT_UNREADABLE_RECORD = "execution_record_unreadable"
+
+
+def stranded_fault_rounds(
+    registry, execution_store, current_task_id: str = ""
+) -> tuple[StrandedRound, ...]:
+    """Every task the loop has left `in_progress` after a round the ENVIRONMENT
+    destroyed, in registry order.
+
+    THE predicate, and there is deliberately one of it for two very different
+    users: `check` below only reports these, while `orchestrator._reconcile_
+    stranded_tasks` acts on them. A second implementation would eventually
+    disagree about which tasks are stranded, and then the monitor would name a
+    task the loop had already returned to the queue (or, worse, stay quiet
+    about one it had not).
+
+    It lives HERE, in the detection module, rather than in `worktask` beside the
+    record it reads: this is a judgement about the loop's health made from
+    several stores at once, and `worktask` is deliberately a persistence module
+    with no opinions. Nothing in this file writes, so the orchestrator importing
+    it cannot import a mutation by accident.
+
+    **What counts as stranded — four conditions, all required.**
+
+    1. The registry's STORED status is `in_progress` (`TaskRegistry.
+       in_progress_tasks`). That is the state `next_ready()` never returns.
+    2. It is NOT `current_task_id` — the task the loop's own session says it is
+       working (`LoopState.task_execution`). This is the whole of the "the loop
+       moved on" evidence, and it is what makes this safe to run every round: a
+       round that has just faulted is still the current task while its report
+       goes to the reviewer, so the reviewer keeps its redo (that is how
+       quota-01 and dash-18 recovered on their own in the incident). Only once
+       the loop has dispatched something ELSE is the task demonstrably
+       abandoned.
+    3. Its execution record's LAST attempt reads as a round the environment
+       took: settled on the fault budget with an outcome that is not
+       `sent_for_review`, or still OPEN (nothing ever stamped it, which
+       `_reconcile_unfinished_attempts` defines as environmental). A round that
+       reached a reviewer is not stranded — its next move belongs to the
+       reviewer — and a round that failed on the TASK's own merits is charged to
+       the task budget and reads `task`, so it is not swept either.
+    4. The record does not carry a `published_sha`. A published candidate is
+       durable on its own branch and its task is finishing, not stranded;
+       drawing a blocker for one would be a loud false alarm.
+
+    **Fail-closed on unreadable input, never quiet.** A corrupt or unreadable
+    execution record for an in-progress task is returned as a strand carrying
+    `FAULT_UNREADABLE_RECORD` and an obstacle, so it is reported and never
+    auto-requeued. A record that is simply ABSENT is a different thing and is
+    skipped: there is no evidence of a fault round, so this predicate has
+    nothing to say about it (an in-progress task with no record at all is an
+    adjacent strand class that neither reader acts on — it is visible in the
+    dashboard's own in-progress list).
+
+    **A ledger entry whose budget label parses to neither OPEN nor settled is
+    left alone** (`worktask.split_attempt` is deliberately tolerant of a
+    hand-edited record). It is not evidence of a fault, and inventing one from
+    an unparseable field would be the same guess the attempt ledger exists to
+    replace.
+    """
+    stranded: list[StrandedRound] = []
+    for task in registry.in_progress_tasks():
+        if task.id == current_task_id:
+            continue
+        try:
+            execution = execution_store.load(task.id)
+        except (StateError, OSError, ValueError) as exc:
+            stranded.append(
+                StrandedRound(
+                    task_id=task.id,
+                    fault_code=FAULT_UNREADABLE_RECORD,
+                    obstacle=f"its execution record could not be read ({exc})",
+                )
+            )
+            continue
+        if execution is None or not execution.attempt_ledger:
+            continue
+        if execution.published_sha:
+            continue
+        _, budget, reason = split_attempt(execution.attempt_ledger[-1])
+        outcome = attempt_outcome(reason)
+        if budget in ATTEMPT_OPEN:
+            fault_code = FAULT_INTERRUPTED
+        elif budget == ATTEMPT_FAULT and outcome != REASON_SENT_FOR_REVIEW:
+            fault_code = outcome or "unclassified_fault"
+        else:
+            continue
+        obstacles = []
+        if execution.candidate_sha:
+            obstacles.append(
+                f"it holds candidate {execution.candidate_sha[:12]}, and archiving "
+                "that would destroy an incoming verdict"
+            )
+        if execution.review_round:
+            obstacles.append(
+                f"a reviewer has already seen review round {execution.review_round}"
+            )
+        stranded.append(
+            StrandedRound(
+                task_id=task.id,
+                fault_code=fault_code,
+                candidate_sha=execution.candidate_sha,
+                review_round=execution.review_round,
+                attempt_count=execution.attempt_count,
+                fault_attempt_count=execution.fault_attempt_count,
+                obstacle="; ".join(obstacles),
+            )
+        )
+    return tuple(stranded)
+
+
+def _strand_survey(config) -> tuple[tuple[StrandedRound, ...], str]:
+    """`(strands, note)` for the loop `config` describes, read from disk.
+
+    `note` non-empty means the survey COULD NOT RUN — an unreadable task file,
+    an unreadable state file — and the caller escalates on it rather than
+    reading a failed check as a clean one. A file that is simply ABSENT is not
+    a failure: no task file means no tasks, which is the honest answer for a
+    state directory the loop has never written to (and is what keeps this
+    silent for every caller that has no roadmap at all).
+
+    Never raises. It is called from `check`, which is advisory, read-only and
+    routinely run against a half-initialised state directory.
+    """
+    try:
+        registry = TaskStore(config.tasks_file).load()
+    except (StateError, OSError, ValueError, TaskGraphError, KeyError) as exc:
+        # The same net `cli._cmd_start`'s preflight casts over this exact call,
+        # and for the same reason: `from_dict` deliberately tolerates shapes
+        # that later raise `TaskGraphError`/`KeyError` rather than `StateError`,
+        # and a monitor must report a task file it cannot read instead of dying
+        # on it.
+        return (), f"the task registry could not be read ({exc})"
+    if registry is None:
+        return (), ""
+    try:
+        state = (
+            StateStore(config.state_file).load() if config.state_file.exists() else None
+        )
+    except (StateError, OSError, ValueError) as exc:
+        # The state file names the task the loop is CURRENTLY working, and
+        # without it every in-progress task looks abandoned. Refuse to guess:
+        # reporting a healthy round as a strand is the false alarm this module
+        # is written against, and reporting nothing would be the fail-open.
+        return (), f"the loop state could not be read ({exc})"
+    current = ((state.task_execution if state is not None else None) or {}).get(
+        "task_id"
+    ) or ""
+    try:
+        strands = stranded_fault_rounds(
+            registry, TaskExecutionStore(config.executions_dir), current
+        )
+    except (  # pragma: no cover - defensive
+        StateError,
+        OSError,
+        ValueError,
+        TaskGraphError,
+        KeyError,
+    ) as exc:
+        return (), f"the strand check could not run ({exc})"
+    return strands, ""
+
+
+def _describe_strands(strands: tuple[StrandedRound, ...]) -> str:
+    """One line naming every stranded task and its fault code.
+
+    Every id, not a sample: the whole failure being reported is a task nobody
+    can see, and a truncated list would recreate it one row down.
+    """
+    return "stranded in_progress after an environment fault: " + ", ".join(
+        f"{s.task_id} ({s.fault_code})" for s in strands
+    )
+
+
+def _with_strands(config, verdict: Health) -> Health:
+    """`verdict`, plus whatever the strand survey found.
+
+    Applied to EVERY verdict rather than being a check of its own, because the
+    verdicts that return early are exactly the ones a stranded task co-occurs
+    with — a stale lock, an open blocker, a loop that is not running. A late
+    check would have stayed silent through the whole 2026-08-22 incident.
+
+    A verdict that already needs attention keeps its own code (the operator is
+    being sent somewhere for a reason) and gains the strand in its detail and in
+    `stranded_tasks`. One that does not becomes `STUCK_STRANDED`: a task off the
+    board with nothing scheduling it is precisely what this monitor exists to
+    say out loud.
+    """
+    strands, note = _strand_survey(config)
+    if not strands and not note:
+        return verdict
+    ids = tuple(s.task_id for s in strands)
+    described = _describe_strands(strands) if strands else note
+    if verdict.needs_attention:
+        return replace(
+            verdict,
+            stranded_tasks=ids,
+            detail=f"{verdict.detail}; {described}" if verdict.detail else described,
+        )
+    if strands:
+        summary = (
+            f"autoloop has {len(strands)} task(s) stranded in_progress — nothing "
+            "will schedule them"
+        )
+    else:
+        summary = "autoloop cannot verify whether any task is stranded"
+    return Health(
+        code=STUCK_STRANDED,
+        needs_attention=True,
+        summary=summary,
+        detail=described,
+        phase=verdict.phase,
+        open_blockers=verdict.open_blockers,
+        silent_minutes=verdict.silent_minutes,
+        stranded_tasks=ids,
+    )
 
 
 def _agent_running(pattern: str = "claude -p") -> bool:
@@ -331,7 +632,31 @@ def check(
     work_probe=_work_running,
     sleep_probe=machine_sleep_in_window,
 ) -> Health:
-    """Judge the loop. Read-only, and safe to run mid-round."""
+    """Judge the loop, then the queue behind it. Read-only, and safe to run
+    mid-round.
+
+    Two steps rather than one, and the split is the point. `_judge` answers "is
+    this loop working", which is what every signal in this module's docstring
+    is about, and it returns EARLY from a dozen places. `_with_strands` then
+    asks the question that is true independently of all of them — "is a task
+    off the board with nothing scheduling it" — and applies the answer to
+    whatever verdict came back, so it cannot be shadowed by one.
+    """
+    return _with_strands(
+        config, _judge(config, now, silence_minutes, agent_probe, work_probe, sleep_probe)
+    )
+
+
+def _judge(
+    config,
+    now: datetime | None = None,
+    silence_minutes: float = DEFAULT_SILENCE_MINUTES,
+    agent_probe=_agent_running,
+    work_probe=_work_running,
+    sleep_probe=machine_sleep_in_window,
+) -> Health:
+    """Is the LOOP working? The verdict `check` starts from — every signal in
+    the module docstring except the strand survey, unchanged."""
     now = now or datetime.now(timezone.utc)
 
     lock = LoopLock(config.state_dir)

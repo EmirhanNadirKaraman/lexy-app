@@ -1937,6 +1937,29 @@ class TaskRegistry:
             if task.status == "blocked" and task.hold_origin != HOLD_ORIGIN_OPERATOR
         ]
 
+    def in_progress_tasks(self) -> list[Task]:
+        """Every task whose STORED status is `in_progress` — the candidate set
+        for the strand sweep (`orchestrator.Orchestrator._reconcile_stranded_
+        tasks`, strand-01).
+
+        The sibling of `blocker_derived_blocked` above, one status over, and it
+        reads the stored string for the SAME two reasons. `state_of` cannot
+        answer this question at all: it reports `BLOCKED` for an in-progress
+        task whose dependency is incomplete (the dependency test runs BEFORE the
+        `in_progress` branch — see `state_of`), so a sweep asking it would fall
+        silent on exactly the row hardest to move, the way `_refuse_immutable`
+        and `_displaced_work_exists` both document. And it raises `KeyError` on
+        a graph whose `depends_on` names a task that no longer exists — a shape
+        `from_dict` deliberately tolerates, and one a reconciliation sweep must
+        not crash the loop over.
+
+        Reports; decides nothing. Whether a given in-progress task is STRANDED
+        (its round ended in an environment fault and the loop moved on) is a
+        question about its execution record, which this module has no awareness
+        of by design — see `health.stranded_fault_rounds`, which owns it.
+        """
+        return [task for task in self._tasks.values() if task.status == "in_progress"]
+
     def set_priority(self, task_id: str, priority: int) -> Task:
         """Re-prioritise an existing task.
 
