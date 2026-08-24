@@ -624,6 +624,25 @@ after a `loop_fatal` park, answering the blocker leaves the SESSION parked, so
 `health` moves from `stuck_blocked` to `stuck_parked` rather than to `running` —
 assert the code, not the boolean, or the test will read as a regression.
 
+### A `health.check` test about a CORRUPT state file raises instead of returning a verdict
+
+**Symptom:** a test writes `{ not json` into `config.state_file` to exercise the
+strand survey's "cannot tell which task is current" arm, calls `health.check`,
+and gets `StateCorruptError` out of the call instead of a `Health` back.
+**Cause:** `check` is two steps — `_judge` (is the LOOP working) then
+`_with_strands` (is a task off the board) — and `_judge` loads the same state
+file first, where a corrupt one raises. That is pre-existing behaviour and is not
+the strand survey's; the survey's own state-read guard is only reachable if the
+file rots between the two reads.
+**Fix:** assert against `health._strand_survey(config)` directly and say in the
+docstring why. The guard is defensive, still correct, and testing it where it
+lives is honest; routing `_judge`'s own raise through the survey would be a
+different change (it would make every corrupt-state verdict a strand verdict).
+Do **not** "fix" it by making `_strand_survey` swallow the error silently — a
+survey that answers "nothing is stranded" when it could not look is exactly the
+fail-open the survey exists to close. See
+`test_strand_recovery.py::test_an_unreadable_state_file_refuses_to_guess_which_task_is_current`.
+
 ### A scripted `stop` with an empty `reason` never stops the loop
 
 **Symptom:** a test scripts `{"version": 3, "decision": "stop", "reason": ""}` as
@@ -3192,3 +3211,4 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | recov-01 | New §2 entry: an `inspect.getsource` test failing in a file you never touched, showing the WRONG function's body. Editing a module while its validation run is in flight shifts the lines under a seek that reads the file live, so the failure names an unrelated neighbour. Cost this round its last advisory run — two `test_task_inbox.py` tests "failed" against code that was correct. Check the named subject directly before debugging it. |
 | 2026-08-24 | recov-01 | Same §15 entry gained the reachable variant: two consecutive codex failures on ONE request used to park `rotation_unavailable` telling the operator to set `browser.project_url`. Same trap, same remedy — that key is a browser setting and cannot help. `codex_cli` returns REJECTED on every non-zero exit, so this needs no exotic condition; the park is now `rotation_unsupported_by_transport` and names the transport. |
 | 2026-08-24 | recov-01 | Same entry names the second, less obvious half: the `awaiting` phase is UNSATISFIABLE after a restart on `codex_cli`, because the reply lives in an in-memory dict. Persisting it is the wrong fix and was rejected; the transport already declares `idempotent_submit`, so the loop now re-runs the invocation. A recurrence on a transport WITHOUT that declaration is expected to keep waiting — that is not this bug. |
+| 2026-08-24 | strand-01 | New §2 entry for the test trap this round hit: a `health.check` test that corrupts `config.state_file` to exercise the strand survey's "cannot tell which task is current" arm gets an exception instead of a verdict, because `check` is `_judge` then `_with_strands` and `_judge` reads the same file first. Assert against `health._strand_survey` and say why. The entry names the wrong fix outright — making the survey swallow the error is the fail-open it exists to close. |

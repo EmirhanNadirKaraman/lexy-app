@@ -262,7 +262,7 @@ from .auto_merge import (
     MergeDeferralStore,
     UpgradeStore,
 )
-from .blockers import NO_TASK, BlockerStore
+from .blockers import NO_TASK, STRANDED_AFTER_FAULT, BlockerStore
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
 from .browser.playwright_session import attachable_page_targets
@@ -302,6 +302,12 @@ from .errors import (
 )
 from .manifest import ManifestStore
 from .executor import ExecutionOutcome, TaskExecutor
+from .health import (
+    StrandedRound,
+    current_round_age_seconds,
+    round_ceiling_for,
+    stranded_fault_rounds,
+)
 from . import heartbeat
 from .git_gateway import GitGateway
 from .packet import (
@@ -1650,6 +1656,13 @@ class Orchestrator:
 
     def _step_ready(self) -> None:
         state = self.state
+        # FIRST, and before `build_context` reads `next_ready()` below: a task
+        # the environment stranded is returned to the pool in time to appear in
+        # the very packet that asks what to do next, rather than one round
+        # later. Ahead of the iteration-budget check too — a local
+        # reconciliation costs nothing and a budget park must not leave a task
+        # unscheduled and unreported behind it (strand-01).
+        self._reconcile_stranded_tasks()
         next_iteration = state.iteration + 1
         verdict = self._policy.check_iteration_budget(next_iteration)
         if not verdict.allowed:
@@ -5226,6 +5239,272 @@ class Orchestrator:
             )
         except Exception:
             return
+
+    # ---- strand reconciliation (strand-01) -----------------------------------
+
+    def _reconcile_stranded_tasks(self) -> None:
+        """Return every task the environment stranded to the queue, or file a
+        blocker saying why it could not be.
+
+        THE invariant this exists for: after a round ends in an environment
+        fault, its task is either back in the pool `next_ready()` draws from, or
+        an OPEN BLOCKER names it and says why it is not. There was a third state
+        until strand-01, and a task could sit in it indefinitely with no symptom
+        other than its own absence — on 2026-08-22 an outage killed fourteen
+        consecutive rounds in ten minutes, and three of the six tasks dispatched
+        into it (scope-05 P1, contract-01, recov-01) sat `in_progress` for
+        twenty-one hours. `next_ready()` returns READY tasks and an
+        `in_progress` task is not one, so the loop never re-offered them; no
+        blocker was filed; the dashboard showed work in flight. They were found
+        only because an unrelated analysis happened to list in-progress tasks.
+
+        **Run at the top of `_step_ready`, and the ORDER is the point.**
+        `_step_ready` is where the next packet is built, and `build_context`
+        reads `next_ready()` while building it — so a task released here is in
+        the pool for the very packet that asks the reviewer what to do next,
+        rather than one round later.
+
+        **What is safe to requeue is decided by `health.stranded_fault_rounds`**
+        (see it for the four conditions, including the one that keeps this from
+        firing on a healthy round: the task the loop's own session names as
+        current is exempt while its round is YOUNGER THAN THE ROUND CEILING, so
+        a round that has just faulted keeps the reviewer's redo — that is how
+        quota-01 and dash-18 recovered on their own in the incident).
+
+        **That exemption is bounded, and the bound is not decoration.**
+        `state.task_execution` is replaced only by the NEXT dispatch, so a
+        faulted task that nothing displaces stays "current" indefinitely — with
+        an unconditional exemption this sweep would skip it forever while
+        `next_ready()` also refuses it and no blocker named it, which is this
+        task's own defect rebuilt one level up. Past `health.round_ceiling_for`
+        (the agent ceiling the executor KILLS a round at, plus a grace for the
+        validation/commit/packet tail) the round provably is not executing, so
+        the task is judged like any other strand: requeued if the shape is safe,
+        blocked if it is not. Nothing here can sweep a live round — this method
+        runs from `_step_ready`, the loop is single-threaded, and a round that
+        is executing is inside `_dispatch_executor` rather than here.
+
+        **The record is KEPT, and the status is moved with the bare
+        `TaskRegistry.release`.** This deliberately does NOT call
+        `release_task_to_pending`, which is otherwise THE release path
+        (`cli._cmd_release`, `_preempt_for_urgent`), and the reason is exact
+        rather than stylistic: that function retires the execution record, so
+        the next dispatch mints a fresh one with `attempt_count = 0` and
+        `fault_attempt_count = 0`. That would hand the task an allowance it did
+        not earn and delete the only bound on an outage — fault, requeue, fresh
+        record, fault — which is the dispatch loop this must not build. Keeping
+        the record is what makes the bound provable: every requeued dispatch
+        still charges `fault_attempt_count`, so a task faulting into a dead API
+        walks into `fault_attempt_ceiling` in `MAX_TASK_FAULT_ATTEMPTS`
+        dispatches and parks with a blocker, exactly as it does without this
+        sweep. Nothing here refills either counter, and nothing here resets
+        `pending_fault_code`.
+
+        Keeping the record costs nothing elsewhere: a record with an empty
+        `candidate_sha` does not hold the merge window shut
+        (`cli._merge_window_blockers` skips it), and the safe shape is empty by
+        definition.
+
+        **A task whose budget is already spent is NOT requeued** — the next
+        dispatch would refuse it and park anyway, and the strand would stay
+        invisible until something chose it. It gets the blocker instead, which
+        is the same answer the ceiling itself would give, one round earlier and
+        without needing the reviewer to pick the task first.
+
+        Saves `tasks.json` only when something actually moved: this runs every
+        round, and a file rewritten on each pass is noise in the escape
+        detector's snapshot for no gain (the same rule
+        `cli._reconcile_unblocked_tasks` follows).
+        """
+        if self._execution_store is None:
+            return
+        current = (self.state.task_execution or {}).get("task_id") or ""
+        strands = stranded_fault_rounds(
+            self._registry,
+            self._execution_store,
+            current,
+            current_round_age_seconds(self.state),
+            round_ceiling_for(self._config),
+        )
+        if not strands:
+            return
+        released: list[StrandedRound] = []
+        for strand in strands:
+            if strand.obstacle:
+                self._report_strand_blocker(strand, strand.obstacle)
+                continue
+            if (
+                strand.attempt_count >= MAX_TASK_ATTEMPTS
+                or strand.fault_attempt_count >= MAX_TASK_FAULT_ATTEMPTS
+            ):
+                self._report_strand_blocker(
+                    strand,
+                    "its attempt budget is already spent "
+                    f"(attempts {strand.attempt_count}/{MAX_TASK_ATTEMPTS}, "
+                    f"faults {strand.fault_attempt_count}/{MAX_TASK_FAULT_ATTEMPTS}), "
+                    "so the next dispatch would refuse it",
+                )
+                continue
+            try:
+                self._registry.release(strand.task_id)
+            except TaskGraphError as exc:
+                # Reported, never skipped. A silent `continue` here is the exact
+                # fail-open this whole sweep exists to close: the task would
+                # stay in_progress, out of the pool, with nothing saying so.
+                self._report_strand_blocker(
+                    strand, f"the registry refused to release it ({exc.code})"
+                )
+                continue
+            released.append(strand)
+        if not released:
+            return
+        self._task_store.save(self._registry)
+        for strand in released:
+            self._log(
+                "task_strand_requeued",
+                data={
+                    "task_id": strand.task_id,
+                    "fault_code": strand.fault_code,
+                    # Both counters, so the bound is auditable from the
+                    # transcript alone: neither is changed by the requeue, and a
+                    # reader can watch `fault_attempt_count` climb toward the
+                    # ceiling across an outage instead of inferring it.
+                    "attempt_count": strand.attempt_count,
+                    "fault_attempt_count": strand.fault_attempt_count,
+                    # Which of the two ways it stopped being scheduled: the loop
+                    # dispatched something else, or the loop still names this
+                    # task and only the round ceiling proved that claim stale.
+                    # The second arm is invisible in the state file itself —
+                    # `task_execution` still names the task after this runs —
+                    # so the transcript is the only place it can be read.
+                    "stale_current": strand.stale_current,
+                    "note": (
+                        "its round was destroyed by the environment and nothing "
+                        "was scheduling it — returned to pending with its "
+                        "execution record and both attempt budgets untouched"
+                    ),
+                },
+            )
+
+    def _report_strand_blocker(self, strand: StrandedRound, obstacle: str) -> None:
+        """File (or retain) an OPEN blocker naming a task this sweep would not
+        return to the queue, and say so in the transcript.
+
+        The other half of the invariant. A task that cannot be requeued
+        automatically must still be VISIBLE — the twenty-one hours the incident
+        cost were bought by silence, not by the strand itself.
+
+        **Retains rather than re-records.** An open blocker for the same
+        `(task_id, code)` is left exactly as it is: `BlockerStore.record` is an
+        idempotent upsert that bumps `recurrences`, and `recurrences` means "this
+        condition re-parked", not "a sweep looked at it again" — running every
+        round, this would inflate it into noise. Matched on task and code and
+        deliberately NOT on phase (unlike `BlockerStore.find_open`), because the
+        loop's phase when it notices a strand says nothing about the strand.
+
+        **Never changes the task's status.** Not to `blocked`, not to anything:
+        the unsafe cases are precisely the ones holding a candidate or a
+        reviewed round, and `blocked` is a merge-window exemption
+        (`cli._merge_window_blockers` treats BLOCKED_BY_OPERATOR as terminal) —
+        so quarantining one of these would open the window on live reviewed
+        work. Reporting is the whole action.
+
+        Best-effort on the store, loud in the transcript. A blocker directory
+        that cannot be read or written must not take down a round, so the
+        transcript entry is written either way and carries what went wrong; the
+        entry is what a later reader greps for the task id and the fault code.
+        """
+        blocker_id = ""
+        note = ""
+        if self._blocker_store is None:
+            note = "no blocker store configured — this strand is reported here only"
+        else:
+            # Said out loud because it changes what the operator is looking at:
+            # the loop's own state (and so the dashboard's in-flight panel)
+            # still names this task as the round in progress, and only the
+            # round ceiling established that the round is over. Without this
+            # line the blocker and the dashboard disagree with no explanation.
+            stale = (
+                " The loop's state still names it as the round in flight, but "
+                "that round is older than the round ceiling, so it is not "
+                "running."
+                if strand.stale_current
+                else ""
+            )
+            question = (
+                f"task {strand.task_id} was left in progress by a round the "
+                f"environment destroyed ({strand.fault_code}), and it cannot be "
+                f"returned to the queue automatically: {obstacle}.{stale} Nothing "
+                "will schedule it until you decide. Read its execution record, then "
+                "either continue it (re-dispatch, once the fault is over) or "
+                f"`python -m autoloop release {strand.task_id}` — which retires "
+                "the worker repo and the execution record, so the task starts "
+                "over. Answering this blocker records your decision; it does "
+                "NOT move the task."
+            )
+            detail = (
+                f"fault_code={strand.fault_code} "
+                f"candidate_sha={strand.candidate_sha[:12] or '(none)'} "
+                f"review_round={strand.review_round} "
+                f"attempt_count={strand.attempt_count}/{MAX_TASK_ATTEMPTS} "
+                f"fault_attempt_count={strand.fault_attempt_count}/"
+                f"{MAX_TASK_FAULT_ATTEMPTS} "
+                f"stale_current={'yes' if strand.stale_current else 'no'}"
+            )
+            # TWO try blocks, not one, and the split is deliberate: the LOOKUP
+            # is a de-duplication convenience and the RECORD is the report. A
+            # blocker directory this cannot read must not therefore go
+            # unreported — it degrades to "record anyway, possibly a second
+            # time", because a duplicate blocker is a nuisance and a missing one
+            # is the invisibility this whole sweep exists to end.
+            try:
+                existing = next(
+                    (
+                        blocker
+                        for blocker in self._blocker_store.open_blockers()
+                        if blocker.task_id == strand.task_id
+                        and blocker.code == STRANDED_AFTER_FAULT
+                    ),
+                    None,
+                )
+            except (StateError, OSError) as exc:
+                existing = None
+                note = f"the open blockers could not be read ({exc}) — recording anyway"
+            if existing is not None:
+                return  # already open and already reported — say nothing more
+            try:
+                blocker_id = self._blocker_store.record(
+                    task_id=strand.task_id,
+                    # `task_fatal`: one task is set aside and the loop keeps
+                    # working the rest of the roadmap, which is exactly what is
+                    # happening. It does not stop continuous mode (only
+                    # exhaustion reads the open set), and it does stop `start`
+                    # and wake `health`, which is the point.
+                    kind="task_fatal",
+                    code=STRANDED_AFTER_FAULT,
+                    question=question,
+                    detail=detail,
+                    phase=self.state.phase,
+                    now=utcnow_iso(),
+                    session_id=self.state.session_id or "",
+                ).id
+            except (StateError, OSError) as exc:
+                note = f"the blocker could not be recorded ({exc})"
+        self._log(
+            "task_strand_blocked",
+            data={
+                "task_id": strand.task_id,
+                "fault_code": strand.fault_code,
+                "obstacle": obstacle,
+                "blocker_id": blocker_id,
+                "candidate_sha": strand.candidate_sha,
+                "review_round": strand.review_round,
+                "attempt_count": strand.attempt_count,
+                "fault_attempt_count": strand.fault_attempt_count,
+                "stale_current": strand.stale_current,
+                "note": note,
+            },
+        )
 
     def _dispatch_task_postcommit(self, directive: Directive, task: Task, state: LoopState) -> None:
         if (self._worktrees is None and self._worker_repos is None) or (

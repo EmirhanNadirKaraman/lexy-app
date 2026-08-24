@@ -5588,6 +5588,143 @@ store — is released too. That is the invariant taken literally, and it is the
 safe direction: the task goes back into the queue, where whatever quarantined it
 re-fires and records a blocker properly, instead of sitting invisible.
 
+### 9c-ter. A task stays `in_progress` only while something is working it (strand-01, 2026-08-24)
+
+The sibling of 9c-bis, one status over, and it closes the same kind of hole from
+the other side. That section's invariant is "a task is `blocked` only while an
+open blocker justifies it". This one is:
+
+> **After a round ends in an environment fault, its task is either back in the
+> pool `next_ready()` draws from, or an OPEN BLOCKER names it and says why it is
+> not. There is no third state.**
+
+There was a third state until strand-01, and a task could sit in it
+indefinitely with no symptom other than its own absence.
+
+**Measured 2026-08-22.** Between 22:36:54Z and 22:46:27Z fourteen consecutive
+rounds failed carrying `"terminal_reason":"api_error"`, `"num_turns":1`,
+`"duration_api_ms":0` — zero tokens billed, zero cost, the implementation agent
+never started. Nothing about any task caused it and nothing about any task could
+have avoided it. Six tasks were dispatched into that window and the recovery was
+inconsistent: `quota-01` (5 rounds lost) and `dash-18` (2) completed after the
+reviewer re-dispatched them, `codex-02` (5) returned to the queue, and
+`scope-05` (P1), `contract-01` and `recov-01` (1 round each) were left
+`in_progress` with `review_round: 0`, `candidate_sha: ""`, `attempt_count: 0`,
+`fault_attempt_count: 1`. `next_ready()` returns READY tasks and an
+`in_progress` task is not one, so the loop never re-offered them. No blocker was
+filed. The dashboard showed them as work in flight. They sat for twenty-one
+hours, were found only because an unrelated analysis listed in-progress tasks,
+and an operator released all three by hand at 20:30:52Z the next day.
+
+The recovery path existed — half those tasks used it — and it is the REVIEWER's:
+a faulted round reports back and the reviewer may say `revise`. Nothing reported
+when it did not fire, and nothing in the loop reconciled afterwards.
+
+**What runs now.** `Orchestrator._reconcile_stranded_tasks`, at the top of
+`_step_ready`. The placement is the point: `build_context` reads `next_ready()`
+while building the packet, so a task released here appears in the very message
+that asks the reviewer what to do next, not one round later.
+
+**What counts as stranded** — `health.stranded_fault_rounds`, one predicate for
+both readers (this sweep ACTS on it; `health.check` only REPORTS it). Four
+conditions, all required:
+
+1. the registry's stored status is `in_progress` (`TaskRegistry.in_progress_tasks`,
+   which reads the stored string — `state_of` answers BLOCKED for an in-progress
+   task with an incomplete dependency, and raises on a dangling one);
+2. it is **not** the task `LoopState.task_execution` names, **or** that claim is
+   older than the round ceiling. The exemption is what makes the sweep safe to
+   run every round — a round that has just faulted is still the current task
+   while its report travels to the reviewer, so the reviewer keeps the redo that
+   recovered quota-01 and dash-18 on their own — and the bound on it is what
+   keeps the exemption from becoming a second hiding place (see below);
+3. the execution record's LAST attempt reads as a round the environment took:
+   settled on the fault budget with an outcome that is not `sent_for_review`, or
+   still OPEN (nothing ever stamped it — what `_reconcile_unfinished_attempts`
+   already defines as environmental);
+4. the record carries no `published_sha`.
+
+**The two answers.**
+
+* `candidate_sha` empty **and** `review_round == 0` **and** neither attempt
+  ceiling reached → `TaskRegistry.release` puts it back to `pending`, and the
+  transcript gets `task_strand_requeued` with the task id, the fault code and
+  both counters.
+* anything else → an OPEN `task_fatal` blocker, code
+  `stranded_after_environment_fault`, plus a `task_strand_blocked` transcript
+  entry. The status is not touched — the unsafe cases are exactly the ones
+  holding a candidate or a reviewed round, and `blocked` is a merge-window
+  exemption, so quarantining one would open the window on live reviewed work.
+  An open blocker for the same task and code is RETAINED rather than re-recorded:
+  `recurrences` means "this condition re-parked", not "a sweep looked at it
+  again".
+
+**The execution record is KEPT, and that is what bounds an outage.** This
+deliberately does not call `release_task_to_pending` — otherwise THE release path
+(§3c, `cli._cmd_release`, urgent preemption) — because that retires the record,
+so the next dispatch would mint a fresh one with `attempt_count = 0` and
+`fault_attempt_count = 0`. That hands the task an allowance it did not earn and
+deletes the only bound on an outage: fault, requeue, fresh record, fault, for as
+long as the API stays down. Keeping the record means every requeued dispatch
+still charges `fault_attempt_count`, so a task faulting into a dead API reaches
+`fault_attempt_ceiling` in `MAX_TASK_FAULT_ATTEMPTS` dispatches and parks — the
+same ending it has without this sweep. Nothing here refills either counter or
+clears `pending_fault_code`. It costs nothing elsewhere either: a record with an
+empty `candidate_sha` does not hold the merge window shut (§3f), and the safe
+shape is empty by definition.
+
+**A spent budget is reported, not requeued.** The next dispatch would refuse it
+and park, and until something chose the task the strand would be invisible again
+— so it gets the blocker straight away, which is the same answer the ceiling
+gives one round earlier.
+
+**The exemption for the current task is BOUNDED, and the bound is the point.**
+`LoopState.task_execution` is replaced only by the NEXT dispatch, so a faulted
+task that nothing else displaces stays "the current task" for as long as the
+session lasts — forever, when it is the only task on the roadmap. An
+unconditional exemption would therefore rebuild this section's own defect one
+level up: `next_ready()` refuses the task, the sweep skips it, no blocker names
+it. So the exemption is granted on POSITIVE evidence that the round is young —
+`health.current_round_age_seconds`, the dispatch stamp
+`state.current_task["started_at"]` matched to the task `task_execution` names
+(the same pair, under the same matching rule, that `dashboard.worker_progress`
+dates a round from) — measured against `health.round_ceiling_for`:
+`config.audit.agent_ceiling_seconds` plus an hour's grace. That ceiling is not a
+related number, it is the absolute backstop the implementation agent is KILLED
+at (`cli._build_executor` passes it to both implement-agent bindings), plus the
+tail a round still has after the kill: validation, the commit, the review
+packet. So a round older than it provably is not executing, and sweeping past
+the bound cannot sweep a live round. Nothing else changes: past the ceiling the
+task is judged by the same two answers above, and the arm that fired is recorded
+as `stale_current` in both transcript entries and in the blocker. An age that
+CANNOT be established (no stamp, a stamp for a different dispatch, an
+unparseable one) is the absence of evidence, not evidence of youth, so it grants
+no exemption either — the reachable way to get one is a dispatch that died
+between stamping `current_task` and writing `task_execution`, whose task is
+genuinely abandoned.
+
+The age is WALL-CLOCK, and machine sleep is deliberately not discounted from it
+the way §3d's silence alarm discounts it. Over-ageing here cannot cause a wrong
+action — the sweep runs only from `_step_ready`, and a round that is executing
+is inside `_dispatch_executor`, not in the sweep — so the whole cost is that a
+round which slept through the ceiling can draw one advisory `stranded` verdict,
+which mutates nothing and is re-judged when the round ends.
+
+**Detection is carried on every health verdict.** `Health.stranded_tasks` and a
+clause in `detail` are added to whatever `health.check` was going to say, and the
+verdict becomes `stranded` only when nothing else needed attention. A code of its
+own would have been decoration: a stale lock, an open blocker, a FAILED session
+and a loop that is not running all return earlier, and those are precisely the
+states a strand co-occurs with.
+
+**Two adjacent classes this does NOT act on, named rather than implied.** An
+in-progress task with **no** execution record has no evidence of a fault round;
+one whose last round failed on the task's own merits (`executor_reported_failure`
+and friends, charged to `attempt_count`) is the task's problem, not the
+environment's. Both stay `in_progress` until the reviewer or an operator moves
+them. An unreadable execution record is the one "cannot tell" case, and it fails
+closed: it is reported as a blocker and never requeued.
+
 ### 9d. Retired: superseded work is not blocked work
 
 `blocked` used to carry a THIRD meaning, and it was the one that made the
