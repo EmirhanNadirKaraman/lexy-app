@@ -851,18 +851,45 @@ def test_oversized_review_packet_parks_instead_of_raising(tmp_path):
 # The replacement below pins the STRONGER guarantee: a live, unpublished
 # postcommit candidate on record does not change the outcome — the legacy
 # decision is refused either way.
+#
+# AMENDED 2026-08-24 (bind-02). This test used to drive the refusal with a
+# `push` answering a parse-error correction, on the reasoning quoted in its old
+# docstring: "the corrective re-prompt's payload carries none of the postcommit
+# identifiers, so a `push` answering THAT request carries no binding". That was
+# true and it was the BUG — on 2026-08-20 it turned a candidate that had passed
+# four review rounds and full validation into approved-and-unpublishable, and
+# livelocked the loop for fifteen minutes. A corrective re-prompt now inherits
+# the binding of the request it corrects, so that exact sequence PUBLISHES; it
+# is pinned in `test_postcommit_binding_carry.py`. What this test is really
+# about — a retired git decision is refused even with a live candidate on
+# record — is unchanged, and is now driven by `commit_and_push`, which is
+# retired by DECISION and therefore cannot be rescued by any binding.
+# `test_postcommit_binding_carry.py` covers the other half: a `push` with no
+# binding at all is still refused, and still cannot reach `push_exact`.
 # =============================================================================
+
+
+def commit_and_push_approval_from_last_submitted(client):
+    stamp = extract_stamp(client.submitted[-1][1])
+    return block(
+        {
+            "version": 3,
+            "decision": "commit_and_push",
+            "reason": "approved",
+            "commit": {"message": "do it", "paths": ["a.py"]},
+            "reviewed": stamp,
+        }
+    )
 
 
 def test_legacy_commit_and_push_is_always_refused_even_with_a_live_candidate(tmp_path):
     """Supersedes the three retired leak-guard tests above (see the block
-    comment). A malformed reply to the review packet triggers a corrective
-    re-prompt (whose payload carries none of the postcommit identifiers); a
-    `push` approval answering THAT request therefore carries no postcommit
-    binding. Previously this fell through to `_dispatch_git`'s fail-closed
-    leak guard specifically because a live candidate was on record; now there
-    is no legacy git path left to fall through to at all — it is refused the
-    same way regardless of whether a candidate exists."""
+    comment). A `commit_and_push` arrives while a live, unpublished postcommit
+    candidate IS on record. Previously the fall-through to `_dispatch_git`'s
+    fail-closed leak guard depended on that candidate being there; now there is
+    no legacy git path left to fall through to at all — the decision is refused
+    the same way regardless of whether a candidate exists, and regardless of
+    whether the response carries a postcommit binding."""
     executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
     orch, repo_root, worktrees, execution_store, intent_store, task, client = (
         build_postcommit_with_client(
@@ -870,7 +897,7 @@ def test_legacy_commit_and_push_is_always_refused_even_with_a_live_candidate(tmp
             executor,
             responses=[
                 "not a json directive at all",
-                push_approval_from_last_submitted,
+                commit_and_push_approval_from_last_submitted,
                 stop_block(),
             ],
             policy=PolicyConfig(implement_enabled=True, allow_protected_push=True),
@@ -895,6 +922,42 @@ def test_legacy_commit_and_push_is_always_refused_even_with_a_live_candidate(tmp
     assert any("policy_denied" in p and "no longer supported" in p for p in prompts)
     # the live candidate is unaffected — nothing was published or lost
     assert execution_store.load(task.id).candidate_sha != ""
+
+
+def test_a_push_answering_a_parse_error_correction_publishes(tmp_path):
+    """The other half of the amended test above, and the 2026-08-20 incident
+    driven through the REAL transport chain rather than a hand-built response.
+
+    `test_postcommit_binding_carry.py` proves the binding is attached to the
+    correction; this proves it survives the round trip that A2
+    (docs/AUTOLOOP_TODO.md) broke — `_step_submitting`, `_step_awaiting`
+    persisting the reply, `_step_executing` dispatching it. A binding that is
+    built correctly and then dropped when the response is persisted looks
+    identical from the request side, which is exactly why A2 went unnoticed."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    orch, repo_root, worktrees, execution_store, intent_store, task, client = (
+        build_postcommit_with_client(
+            tmp_path,
+            executor,
+            responses=[
+                "not a json directive at all",
+                push_approval_from_last_submitted,
+                stop_block(),
+            ],
+        )
+    )
+    orch._dispatch_executor(implement(task.id))
+    execution = execution_store.load(task.id)
+    bare = make_bare(tmp_path)
+    run_git(repo_root, "remote", "add", "origin", str(bare))
+
+    assert orch.run() == Phase.STOPPED.value
+
+    wt_git = worktree_git_for(worktrees, task.id)
+    dest_ref = f"refs/heads/{execution.task_branch}"
+    assert wt_git.remote_ref_sha("origin", dest_ref) == execution.candidate_sha
+    prompts = [p for _, p in client.submitted]
+    assert not any("legacy_git_path_retired" in p for p in prompts)
 
 
 # =============================================================================

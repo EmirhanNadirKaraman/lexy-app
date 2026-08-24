@@ -1878,6 +1878,41 @@ could not be read or written, so the check could not run and the loop refused to
 carry on with it silently off. Delete `.autoloop/stop_repetition.json` — it is a
 counter, nothing else reads it — then answer and resume.
 
+### `policy_denied … legacy_git_path_retired` on a fully stamped `push` that the reviewer got right
+**Symptom:** the transcript shows a postcommit review packet going out, a
+`parse_error` on the reply, a corrective re-prompt under a NEW request id, and
+then a `push` directive with a complete `reviewed` block — refused as
+`legacy_git_path_retired`. The candidate is committed, validated and on its
+branch, and nothing can publish it: `review-changeset` refuses it (it is
+executor-produced and its sha does not resolve in the checkout) and a fresh
+session sends a kickoff rather than re-presenting the packet. Usually followed
+by the repeated-`stop` livelock above, since the reviewer starts refusing every
+subsequent packet for exactly this reason. Measured 2026-08-20 on prof-01:
+`alr-683fbfc7-0005` was the packet, `-0006` the correction, and four review
+rounds of approved work were discarded by hand to break it.
+**Cause:** `_dispatch` gated the postcommit publish path on
+`state.last_response.postcommit`, and a corrective re-prompt carried none —
+`_current_pending_postcommit` binds a request only when the payload holds the
+candidate's four identifiers as literal text, and a correction's payload holds
+none of them. The reviewer's stamp was never the problem; the loop had thrown
+away its own side of the binding. Same class as `AUTOLOOP_TODO` A2, one layer
+over: there the binding was dropped when the response was persisted, here across
+a re-prompt.
+**Fix:** applied repo-side (bind-02) — a corrective re-prompt now inherits the
+binding of the request it corrects (`LoopState.carry_postcommit`, all four
+corrective sites), and a stamped `push` may name the packet it reviewed
+(`LoopState.sent_postcommits` + `_approval_packet`) when `last_response` has
+moved on. `docs/AUTOLOOP.md` §4b. Nothing an approval is allowed to publish
+changed: `verify_review` still demands the named packet's three stamps exactly
+and an approval that resolves no binding is still refused.
+**If you meet this on an OLD build:** the candidate is not lost. It is a real
+commit on `autoloop/<task-id>` in the task's worker repo, so publish it by hand
+from there and then `autoloop release <task-id>`; do not re-run the task, which
+would produce a second candidate for work that already exists.
+**If it happens on a current build:** the denial text now names the candidate
+and asks for `revise` on that task so a fresh packet is sent — send that rather
+than resending `push`, which will be refused identically.
+
 ### `Error: It looks like you are using Playwright Sync API inside the asyncio loop.` — `run --continuous` dies after a park
 **Symptom:** the loop runs fine, parks or hits a browser error, prepares the
 next request, and the whole process dies with this traceback ending at
@@ -3212,3 +3247,6 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | recov-01 | Same §15 entry gained the reachable variant: two consecutive codex failures on ONE request used to park `rotation_unavailable` telling the operator to set `browser.project_url`. Same trap, same remedy — that key is a browser setting and cannot help. `codex_cli` returns REJECTED on every non-zero exit, so this needs no exotic condition; the park is now `rotation_unsupported_by_transport` and names the transport. |
 | 2026-08-24 | recov-01 | Same entry names the second, less obvious half: the `awaiting` phase is UNSATISFIABLE after a restart on `codex_cli`, because the reply lives in an in-memory dict. Persisting it is the wrong fix and was rejected; the transport already declares `idempotent_submit`, so the loop now re-runs the invocation. A recurrence on a transport WITHOUT that declaration is expected to keep waiting — that is not this bug. |
 | 2026-08-24 | strand-01 | New §2 entry for the test trap this round hit: a `health.check` test that corrupts `config.state_file` to exercise the strand survey's "cannot tell which task is current" arm gets an exception instead of a verdict, because `check` is `_judge` then `_with_strands` and `_judge` reads the same file first. Assert against `health._strand_survey` and say why. The entry names the wrong fix outright — making the survey swallow the error is the fail-open it exists to close. |
+| 2026-08-24 | bind-02 | New §8 entry directly above the repeated-`stop` one, for the fault that CAUSED that livelock rather than the livelock itself: `legacy_git_path_retired` on a correctly stamped `push`, after a `parse_error` on a review packet. The two entries are deliberately adjacent and cross-referenced — stop-01 bounds the symptom, this removes the cause, and an operator meeting the stop park should read both. |
+| 2026-08-24 | bind-02 | That entry carries the recovery for an OLD build, which is the half nobody had: the candidate is a real commit on `autoloop/<task-id>` in the worker repo, so publish it from there and `release` the task — do NOT re-run it, which produces a second candidate for work that already exists. On a current build the denial names the candidate and asks for `revise`; resending `push` is refused identically. |
+| 2026-08-24 | bind-02 | Revision round: the same §8 entry has a second, later-discovered shape worth recognising in a transcript. The re-prompt before the refused `push` is a `review_mismatch`, not a `parse_error`, and the `push` before THAT named an earlier packet id. Cause is the seam: a ledger-resolved approval leaves `last_response.postcommit` None, so the correction had nothing to inherit — and `review_mismatch_payload` asks the reviewer to stamp THIS request, which walks it straight back into the same denial. Fixed by carrying the resolved binding. |

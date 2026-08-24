@@ -118,6 +118,16 @@ if TYPE_CHECKING:
 # therefore needs no backfill, and a deployment with no ledger file yet simply
 # starts counting from its next stop.
 #
+# NOT bumped for the postcommit binding a corrective re-prompt inherits either
+# (`LoopState.carry_postcommit` / `LoopState.sent_postcommits`). Both default to
+# the empty value, and the empty value is the truth rather than a guess: a
+# session written before this existed had no re-prompt to carry a binding onto
+# and had recorded no sent packets, because nothing recorded them. It is also
+# the direction that fails CLOSED — an empty ledger resolves no approval and an
+# absent carry binds nothing, so an old state file behaves exactly as it did
+# before this existed (an unbound `push` is refused) rather than resolving a
+# binding out of a record nobody wrote.
+#
 # NOT bumped for transport-aware fault recovery either
 # (`PendingRequest.replays_used`). Same reasoning as `start_timeouts` above: a
 # new field defaulting to 0, and 0 is the truth rather than a guess for a
@@ -409,6 +419,50 @@ def _load_postcommit(raw: dict | None) -> PostcommitBinding | None:
     return PostcommitBinding(**raw) if raw else None
 
 
+#: Every field a `PostcommitBinding` record must carry to be usable.
+_POSTCOMMIT_FIELDS = (
+    "task_id",
+    "task_branch",
+    "base_sha",
+    "candidate_sha",
+    "candidate_tree_sha",
+    "packet_sha256",
+)
+
+
+def postcommit_binding_from_record(raw: object) -> PostcommitBinding | None:
+    """A `PostcommitBinding` from a plain dict, or `None` when the dict is not
+    one — the TOLERANT reader, for the two places a binding is stored as loose
+    JSON rather than as a typed field (`LoopState.carry_postcommit`,
+    `LoopState.sent_postcommits`).
+
+    Deliberately different from `_load_postcommit` above, which is the strict
+    reader for `PendingRequest.postcommit` / `LastResponse.postcommit` and
+    raises through `LoopState.from_dict`'s `StateCorruptError` clause. There is
+    nothing to catch a raise here: both callers run deep inside
+    `Orchestrator._step_ready` / `_dispatch`, whose exception handling is by
+    type and has no clause for a `TypeError` from `PostcommitBinding(**data)`,
+    so a hand-edited or half-written record would end the process with a
+    traceback, no park and no blocker.
+
+    `None` is the fail-CLOSED answer, which is why returning it rather than
+    raising is safe: an unreadable carry binds nothing and an unreadable ledger
+    entry resolves nothing, so the approval that depended on it is REFUSED —
+    the same outcome as before either mechanism existed. Every field must be a
+    non-empty string; no writer here produces anything else, and honouring a
+    partially-filled record would publish against identifiers nobody stamped.
+    """
+    if not isinstance(raw, dict):
+        return None
+    values: dict[str, str] = {}
+    for name in _POSTCOMMIT_FIELDS:
+        value = raw.get(name)
+        if not isinstance(value, str) or not value:
+            return None
+        values[name] = value
+    return PostcommitBinding(**values)
+
+
 def _load_changeset(raw: dict | None) -> ChangesetBinding | None:
     if not raw:
         return None
@@ -589,6 +643,52 @@ class LoopState:
     #: (`None`) once `Orchestrator._dispatch_changeset_push` actually
     #: publishes it.
     changeset: dict | None = None
+    #: Every produce-then-review packet this session has BOUND A REQUEST TO,
+    #: oldest first, as plain dicts (`{"request_id", "head_sha", "report_sha256",
+    #: "postcommit": asdict(binding)}` — same convention as `task_execution` /
+    #: `last_rotation` beside it). Bounded by
+    #: `orchestrator.MAX_SENT_POSTCOMMIT_RECORDS`.
+    #:
+    #: This is the loop's own record of WHAT IT PRESENTED, and it exists
+    #: because `last_response` is not that record: it is merely the most recent
+    #: thing the loop sent, which a corrective re-prompt, a git report or any
+    #: other round replaces. A stamped approval names the request it reviewed
+    #: (`Directive.reviewed.request_id`); this is what lets that name be
+    #: checked against a packet the loop can prove it sent, instead of being
+    #: refused because the conversation moved on.
+    #:
+    #: Written only from `_step_ready` / `_fall_back_to_omission`, the only two
+    #: places a request's `report_sha256` is ever stamped — so an entry cannot
+    #: describe a request whose digest has since been rewritten underneath it.
+    #: An entry is therefore written when the request is BUILT, one step before
+    #: it goes out; a request that never reaches the reviewer leaves an entry no
+    #: approval can ever name, because no approval saw the id.
+    #: NEVER an authorization on its own: it says which candidate a request
+    #: presented, and every push-time check in `_dispatch_task_push` still runs
+    #: against it unchanged.
+    sent_postcommits: list[dict] = field(default_factory=list)
+    #: The `PostcommitBinding` (as a plain dict) that the NEXT corrective
+    #: re-prompt must inherit, or `None` when there is none.
+    #:
+    #: A corrective re-prompt — parse error, policy denial, review mismatch,
+    #: plan rejection — is a formatting/decision correction about a packet that
+    #: has NOT changed: the candidate has not moved and nothing new has been
+    #: reviewed. Its payload carries none of the candidate's identifiers, so
+    #: `_current_pending_postcommit` binds it to nothing, and before this field
+    #: existed an approval answering the correction was structurally
+    #: unpublishable (2026-08-20, prof-01). Set by `_carry_postcommit_forward`
+    #: from the response being corrected, consumed and cleared by the very next
+    #: `_step_ready`, so it can never attach to a request that is not the
+    #: correction it was recorded for.
+    #:
+    #: "The response being corrected" is `LastResponse.postcommit` for an
+    #: ordinary round and the binding the caller already RESOLVED for that
+    #: response otherwise — an approval naming an earlier packet
+    #: (`_approval_packet`) has an authoritative binding while
+    #: `LastResponse.postcommit` is None, and a correction built from one of
+    #: those went out unbound until 2026-08-24. Either way this holds one
+    #: binding, for one candidate, for one request.
+    carry_postcommit: dict | None = None
     #: Current conversation generation. Requests are stamped with it, so a
     #: response captured under an older epoch can be recognised and ignored.
     conversation_epoch: int = 0
