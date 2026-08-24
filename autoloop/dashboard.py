@@ -3429,6 +3429,104 @@ def collect(repo: Path) -> dict:
     }
 
 
+#: The sweeps RUNNING RIGHT NOW: `{str(repo): _Sweep}`, and nothing else, ever.
+#:
+#: THIS IS NOT A CACHE AND MUST NEVER BECOME ONE. An entry exists only between
+#: the moment a leader starts `collect()` and the moment that same call returns;
+#: `collect_shared`'s `finally` removes it BEFORE any waiter is woken, so a
+#: caller that arrives after a sweep has ended cannot find it and starts its own.
+#: There is no TTL, no head key, no per-branch verdict and no payload kept
+#: between sweeps — the whole reason dash-21 was rewritten is that a cache here
+#: needs invalidation, and five rounds died in that question. If you are about to
+#: add an expiry stamp to this dict, you are writing the thing that was cut.
+#:
+#: Keyed by repo for the reason `_REMOTE_CACHE` is: a single global slot would
+#: hand one checkout's payload to a caller asking about a different one, which is
+#: silently wrong for anything (tests included) observing two.
+_SWEEPS_IN_FLIGHT: dict = {}
+#: Guards `_SWEEPS_IN_FLIGHT`, and is held ONLY for the lookup/insert/removal —
+#: never across `collect()` itself. Holding it across the sweep would turn N
+#: concurrent tabs into N sweeps run back to back, which is the pile-up moved
+#: rather than removed.
+_SWEEP_LOCK = threading.Lock()
+
+
+class _Sweep:
+    """One running `collect()` and the seat its later callers wait in.
+
+    `done` is set exactly once, from `collect_shared`'s `finally`, so it is set
+    on the failure path as well as the success path — a sweep that raises
+    releases its waiters rather than parking them forever.
+    """
+
+    __slots__ = ("done", "payload", "error")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.payload: dict | None = None
+        self.error: BaseException | None = None
+
+
+def collect_shared(repo: Path) -> dict:
+    """`collect(repo)`, with at most ONE sweep of it running at a time.
+
+    The served path calls this; `collect()` itself is untouched and still the
+    direct, unguarded read every test and caller uses.
+
+    `ThreadingHTTPServer` gives every connection its own thread, so before this
+    existed a page polling every 2s against a 35s sweep had about seventeen of
+    them running at once, each re-walking the same git history — the process
+    pegged a core and answered a second later every 35 seconds. The first caller
+    LEADS: it runs the sweep. Every caller that arrives while that sweep is
+    running JOINS it and is answered from its result. The first caller to arrive
+    after it has finished leads a fresh one — nothing is remembered in between.
+
+    Joiners share the leader's dict rather than a copy. Every consumer of it is
+    read-only (`do_GET` serialises it and drops it), and a copy per joiner would
+    be paying to defend against a mutation nobody makes.
+    """
+    key = str(repo)
+    with _SWEEP_LOCK:
+        sweep = _SWEEPS_IN_FLIGHT.get(key)
+        leading = sweep is None
+        if leading:
+            sweep = _Sweep()
+            _SWEEPS_IN_FLIGHT[key] = sweep
+
+    if leading:
+        try:
+            sweep.payload = collect(repo)
+        except BaseException as exc:
+            # Recorded for the waiters and re-raised for this caller, so the
+            # thread that actually ran the sweep keeps its own traceback.
+            # `BaseException` rather than `Exception`: a `KeyboardInterrupt` or a
+            # `SystemExit` in the leader must still release everyone waiting on
+            # it — the alternative is a hung tab whose sweep died of a signal.
+            sweep.error = exc
+            raise
+        finally:
+            # Removed BEFORE the waiters are woken, and under the lock that
+            # decides joining, so the set of joiners is exactly "the callers who
+            # found this sweep still active". Nothing can join it afterwards, and
+            # nothing outlives it: this line is what makes the dict a registry of
+            # what is running rather than a store of what was found.
+            with _SWEEP_LOCK:
+                if _SWEEPS_IN_FLIGHT.get(key) is sweep:
+                    del _SWEEPS_IN_FLIGHT[key]
+            sweep.done.set()
+    else:
+        # Unbounded on purpose. The release is in the `finally` above, so the
+        # only way it does not come is the interpreter dying — and then this
+        # thread is gone too. A timeout here would have to answer "and then
+        # what?", and the only available answer (run a second sweep) is the
+        # concurrency this function exists to deny.
+        sweep.done.wait()
+
+    if sweep.error is not None:
+        raise sweep.error
+    return sweep.payload
+
+
 PAGE = """<!doctype html>
 <meta charset="utf-8"><title>Autoloop — live</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -5253,7 +5351,66 @@ tog.addEventListener("click", () => {
   applyTheme(next);
 });
 
-async function tick(){ try { render(await (await fetch("/api/state")).json()); } catch {} }
+// ---- the poll ---------------------------------------------------------------
+// ONE outstanding /api/state per tab, ever.
+//
+// This timer fires every 2s; `collect()` on the loop's own checkout takes tens
+// of seconds and gets slower with every completed task. Measured 2026-08-24
+// against the live dashboard, three consecutive answers arrived 34.6s, 35.6s
+// and 36.6s apart — one second of progress per poll, because the tab had issued
+// about seventeen requests before the first one answered. `ThreadingHTTPServer`
+// gives each its own thread, so they stacked rather than replaced one another,
+// the process pegged a core, and the browser ran out of connections to that
+// host. What the operator saw was a frozen "17m 32s since dispatch".
+//
+// A tick that finds one in flight does NOTHING: it does not queue a second, and
+// it does not touch the DOM. Not touching the DOM is the point — the figures on
+// screen must stay the ones the last COMPLETED poll carried. Nothing on this
+// page advances a clock of its own (`elapsed_seconds` and `served_at` are both
+// computed server-side and rendered straight from the payload; this is the only
+// `setInterval` on the page), so a skipped tick leaves the display exactly as it
+// was rather than ageing it locally into a figure no poll ever returned.
+//
+// The page therefore refreshes at whatever rate the server can sustain: a slow
+// dashboard instead of a dead one. "updated HH:MM:SS" is how old the figures
+// are, and it stops moving when the server is the slow part.
+//
+// The flag is cleared in `finally` AND the request carries its own deadline,
+// because a guard that latches ON is the same dead page by another route: one
+// request that never settles — a wedged server, a suspended laptop, a dropped
+// socket — would otherwise stop this tab polling for as long as it stays open.
+// PURE_POLL_START
+let POLLING = false;
+// Far longer than any sweep observed (35s), and far shorter than "forever":
+// this is an escape hatch for a request that will never settle, not a timeout
+// on a slow-but-working server. Abandoning a live sweep would make the page
+// poll a server that is still working, which is the pile-up again.
+const POLL_DEADLINE_MS = 120000;
+async function tick(){
+  if (POLLING) return "skipped";
+  POLLING = true;
+  // EVERYTHING after the flag is raised sits inside the try, including
+  // constructing the controller and arming the bell. A throw between raising
+  // the flag and entering the block would latch the guard on for the life of
+  // the tab — the guard silently switching itself off, which is the failure
+  // this whole section is against, arriving through the guard itself.
+  // `clearTimeout(0)` is a no-op, so the `finally` is safe before it is armed.
+  let bell = 0;
+  try {
+    const ctl = new AbortController();
+    bell = setTimeout(() => ctl.abort(), POLL_DEADLINE_MS);
+    render(await (await fetch("/api/state", {signal: ctl.signal})).json());
+    return "rendered";
+  } catch {
+    // A failed poll draws nothing and says nothing: the previous payload stays
+    // on screen, and its own "updated" stamp is what says how old it is.
+    return "failed";
+  } finally {
+    clearTimeout(bell);
+    POLLING = false;
+  }
+}
+// PURE_POLL_END
 tick(); setInterval(tick, 2000);
 </script>
 """
@@ -5549,7 +5706,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path.startswith("/api/state"):
-            payload = json.dumps(collect(self.repo)).encode()
+            # THROUGH `collect_shared`, never `collect` — this is a threading
+            # server, so "one request per thread" means concurrent tabs, reloads
+            # and curls each ran their own 35s sweep of the same git history. A
+            # second caller now joins the sweep already running.
+            #
+            # `startswith` also matches `/api/state?whatever`: the payload has no
+            # query-dependent content (nothing here reads `self.path` past this
+            # line), so every spelling of the route is the same question and
+            # sharing one sweep between them is right rather than merely cheap.
+            payload = json.dumps(collect_shared(self.repo)).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
