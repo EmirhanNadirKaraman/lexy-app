@@ -400,6 +400,169 @@ from .worktree import WorktreeManager
 #: in the same budget.
 MAX_TASK_ATTEMPTS = 5
 
+#: How many times a reviewer `recut` may discard ONE task's execution and send
+#: it back to be cut again from the base. The cut after this parks for a human
+#: (`Orchestrator._park_recut_cap`) instead of recutting again.
+#:
+#: TWO, and the number is an argument rather than a taste. A recut is the
+#: reviewer's claim that the BRANCH is the problem — contaminated history, work
+#: far outside scope, a structural dead end — and a fresh cut from the current
+#: base is the complete remedy for that claim. One clean rebuild that still
+#: cannot produce a reviewable candidate is ordinary bad luck (a base that moved
+#: under it, an agent round that died); TWO is the point at which "the branch was
+#: contaminated" stops explaining the evidence, because the second cut shared
+#: nothing with the first except the task's own description, scope and approved
+#: plan. What is left is the SPECIFICATION, and no third branch fixes a spec.
+#:
+#: Three was the alternative and is rejected for what it costs: each cut is a
+#: full executor round plus a review round on work that is then thrown away, so
+#: a third buys one more identical experiment at the price of the operator
+#: attention this cap exists to summon. One was rejected in the other direction
+#: — it makes the first bad round unrecoverable and pushes every recut into the
+#: park it is meant to avoid.
+#:
+#: Counted on `tasks.Task.recut_count` (durable; a recut archives the execution
+#: record, so a count kept only there would reset to 0 on every cut) and
+#: mirrored onto `worktask.TaskExecution.recut_count`. `_recut_count_for` reads
+#: the HIGHER of the two.
+MAX_TASK_RECUTS = 2
+
+#: The `retire_execution` label a recut's execution record and worker repo are
+#: filed under, so the two halves name each other on disk as
+#: `<task>-recut-by-reviewer-<stamp>` and a human reading either one can tell at
+#: a glance that the REVIEWER discarded the round, rather than an operator
+#: releasing it by hand or an urgent request displacing it.
+RECUT_RETIREMENT_REASON = "recut-by-reviewer"
+
+#: Filename of the wanted-verb tally under `AutoloopConfig.state_dir`.
+WANTED_DECISIONS_FILENAME = "wanted_decisions.json"
+
+#: How many DISTINCT wanted verbs the tally keeps before folding the rest into
+#: one bucket. The value is reviewer-authored free text (see
+#: `contract.Directive.wanted_decision`), so without a bound it is a way for the
+#: reviewer to grow a file in the loop's state directory one key per round. Fifty
+#: is far more vocabulary than this protocol will ever plausibly be missing, and
+#: the fold is visible rather than silent — the counts still add up.
+MAX_WANTED_DECISION_KINDS = 50
+
+#: How long one wanted verb may be. It is meant to be A WORD ("split",
+#: "rebase"); anything longer is a sentence in the wrong field, and a reviewer
+#: cannot make the record unreadable by sending a paragraph.
+MAX_WANTED_DECISION_CHARS = 40
+
+#: Where the overflow of both bounds above is counted, so a folded or truncated
+#: entry still appears in the total instead of vanishing.
+WANTED_DECISION_OVERFLOW = "(other)"
+
+
+def wanted_decisions_file(state_dir: Path) -> Path:
+    """Where `WantedDecisionTally` keeps its counts."""
+    return Path(state_dir) / WANTED_DECISIONS_FILENAME
+
+
+class WantedDecisionTally:
+    """Cumulative count of the verbs reviewers said they WOULD have used, as a
+    small JSON object: `{"recut": 7, "split": 3}`.
+
+    **Why a file of its own rather than a `LoopState` field.** A reviewer names
+    a missing verb once in a while, across many sessions, and the whole value of
+    the number is that it accumulates — but `cli._select_and_kickoff` replaces
+    the entire `LoopState` at every session boundary, so a counter there would
+    be reset by the ordinary transition it is trying to count. Exactly the
+    reasoning `state.StopRepetition` records for itself.
+
+    **It ENFORCES NOTHING, and that is why it is tolerant where
+    `StopRepetitionStore` raises.** That ledger decides whether a park fires, so
+    reading a corrupt one as "no stops" would switch the park off silently. This
+    one decides nothing at all: it is evidence for a HUMAN, who reads it and
+    files a task. An unreadable file therefore reads as empty and is rewritten,
+    rather than taking a round down over a counter — but the caller is told
+    (`record`'s second return value), so a lost history is stated in the
+    transcript instead of looking like a first sighting.
+
+    Both bounds are reviewer-facing: `MAX_WANTED_DECISION_CHARS` truncates one
+    verb, `MAX_WANTED_DECISION_KINDS` folds the (N+1)th distinct verb into
+    `WANTED_DECISION_OVERFLOW`. Neither drops a count.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    @staticmethod
+    def normalise(wanted: str) -> str:
+        """One verb, as it is counted: whitespace collapsed, lower-cased and
+        truncated. `""` when there is nothing left, which the caller reads as
+        "nothing to record" rather than as an empty key."""
+        text = " ".join(str(wanted or "").split()).lower()
+        return text[:MAX_WANTED_DECISION_CHARS]
+
+    def load(self) -> dict[str, int]:
+        """The stored counts, or `{}` when there are none or they are
+        unreadable. Never raises — see the class docstring."""
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        counts: dict[str, int] = {}
+        for key, value in data.items():
+            # Each entry is validated on its own, so one hand-edited row costs
+            # its own count and not the whole history.
+            if not isinstance(key, str) or not key:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                continue
+            counts[key] = value
+        return counts
+
+    def record(self, wanted: str) -> tuple[dict[str, int], bool]:
+        """Count one occurrence of `wanted`; return `(counts, reset)`.
+
+        `reset` is True when a file was on disk and could not be read, so the
+        counts returned are a fresh start rather than a continuation. The caller
+        puts that in the transcript.
+        """
+        key = self.normalise(wanted)
+        if not key:
+            return self.load(), False
+        existed = self.path.exists()
+        counts = self.load()
+        reset = existed and not counts
+        if key not in counts and len(counts) >= MAX_WANTED_DECISION_KINDS:
+            key = WANTED_DECISION_OVERFLOW
+        counts[key] = counts.get(key, 0) + 1
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(counts, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            # `Path.replace`, not `os.replace`: same atomic rename, and this
+            # module does not import `os`.
+            tmp.replace(self.path)
+        except OSError:
+            # An unwritable state directory must not take a round down over a
+            # counter. The occurrence still reaches the transcript through the
+            # caller's event; only the cumulative file misses it.
+            pass
+        return counts, reset
+
+    @staticmethod
+    def render(counts: dict[str, int]) -> str:
+        """`wanted: recut x7, split x3`, or `""` when nothing has been counted.
+
+        THE operator-facing line, and the reason the tally exists at all: a
+        directive-by-directive record answers "did anyone ask for this?", and
+        only the total answers "is it worth a task?". Ordered by count, then by
+        name so equal counts render deterministically.
+        """
+        if not counts:
+            return ""
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        return "wanted: " + ", ".join(f"{name} x{count}" for name, count in ordered)
+
 #: `run()`'s outcome when a merge has changed the loop's own code and the loop
 #: has reached a boundary at which its process may be replaced. NOT a phase:
 #: the session is mid-flight and untouched — the outbox is durable, no packet
@@ -520,6 +683,7 @@ def release_task_to_pending(
     persist,
     reason: str = "released-by-operator",
     tolerate_retirement_failure: bool = False,
+    move=None,
 ) -> Release:
     """Return an in-progress task to pending, and retire the execution it
     leaves behind. Returns a `Release` describing what actually moved.
@@ -605,6 +769,18 @@ def release_task_to_pending(
     `self._task_store`) and because a function that took a store would have to
     decide what else to write. It is called exactly once, always.
 
+    `move` is WHICH registry transition returns the row to pending, defaulting
+    to `registry.release`. It exists for exactly one caller —
+    `Orchestrator._dispatch_recut`, which passes `registry.recut` — and it is a
+    parameter rather than a second copy of this function because everything
+    BELOW the status move is identical for both verbs and is the part that has
+    historically gone wrong: the ordering, the label-collision retry, the
+    orphaned-record repair, the partial-`Release` reporting. A recut
+    re-implementing that sequence one level up is precisely the gap this
+    function was written to close, one caller later. It changes nothing for the
+    default: `registry.release` is still what refuses a task that may not be
+    released, still before anything else happens.
+
     Nothing is deleted. The worker is MOVED to quarantine (an interrupted round
     usually has real work in it) and the record is MOVED to
     `executions/archive/`, both under one label, so the candidate stays
@@ -612,7 +788,7 @@ def release_task_to_pending(
     retry, where the labels necessarily differ and `_archived_record_path`
     recovers the pairing for the record instead.
     """
-    task = registry.release(task_id)
+    task = (move or registry.release)(task_id)
     persist()
     recorded = _loaded_execution(task_id, execution_store)
     problems = []
@@ -1076,6 +1252,14 @@ class Orchestrator:
         #: Orchestrator that ran `__init__` counts repeated stops.
         self._stop_repetitions = StopRepetitionStore(
             stop_repetition_file(config.state_dir)
+        )
+        #: The wanted-verb tally (`WantedDecisionTally`). DERIVED from
+        #: `config.state_dir` for exactly the reason above, plus one of its own:
+        #: this counter's whole value is being CUMULATIVE across sessions, and a
+        #: collaborator a construction site can forget to pass is a counter that
+        #: is quietly zero in production.
+        self._wanted_decisions = WantedDecisionTally(
+            wanted_decisions_file(config.state_dir)
         )
         #: Persisted operator-facing blocker records (`blockers.py`).
         #: Optional, like every other produce-then-review collaborator:
@@ -4537,8 +4721,19 @@ class Orchestrator:
                 "planned_tasks": len(directive.tasks) if directive.tasks else 0,
                 "commit_message": directive.commit_message,
                 "question": directive.question,
+                # The verb the reviewer would have used, when it named one.
+                # `None` on every ordinary directive, which is every directive
+                # written before this field existed.
+                "wanted_decision": directive.wanted_decision,
             },
         )
+        # Recorded and COUNTED, never acted on. This is the only place the
+        # field is consumed, and what it produces is a transcript event and a
+        # number in a file — `_dispatch` below branches on `directive.decision`
+        # alone, and nothing anywhere converts this string to a `Decision`. See
+        # `contract.Directive.wanted_decision` for why that bound is the whole
+        # point of the field.
+        self._record_wanted_decision(directive, resp)
         # A postcommit-bound push publishes `resp.postcommit.task_branch`, an
         # entirely different ref than whatever the main checkout has current
         # (usually the branch the orchestrator itself runs from, e.g. "main").
@@ -4653,6 +4848,60 @@ class Orchestrator:
         state.policy_denials = 0
         self._dispatch(directive)
 
+    def _record_wanted_decision(self, directive: Directive, resp: LastResponse) -> None:
+        """Count and record a `wanted_decision`, and do nothing else with it.
+
+        A NO-OP when the directive carries none, which is every directive today
+        — no event, no file, nothing on disk. That is what makes the field free
+        for the existing protocol: a reply that omits it behaves exactly as it
+        did before this existed.
+
+        **It cannot influence what happens next, structurally.** This method
+        neither returns a value nor mutates anything the dispatch reads: it
+        writes one transcript event and increments one counter in
+        `state_dir/wanted_decisions.json`. `_dispatch` selects its branch from
+        `directive.decision`, a `Decision` enum member the parser produced, and
+        this string is never converted to one — `parse_response` deliberately
+        does not even validate it against `Decision`, so a reviewer writing
+        `"push"` here gets it COUNTED, not executed. That is the hard bound the
+        field is designed around (`docs/SECURITY.md` finding #2's circular
+        ownership: the reviewer must never be able to name an action the policy
+        engine did not authorize).
+
+        The event's `result` key carries the rendered running total, because
+        `dashboard.collect`'s recent-events feed shows `decision`/`code`/
+        `error`/`result` in that order — with none of the first three present,
+        an operator watching the live page reads `wanted: recut x7, split x3`
+        without anything in the dashboard having to know this field exists.
+        """
+        wanted = directive.wanted_decision
+        if not wanted:
+            return
+        counts, reset = self._wanted_decisions.record(wanted)
+        self._log(
+            "wanted_decision",
+            request_id=resp.request_id if resp is not None else None,
+            data={
+                "wanted": WantedDecisionTally.normalise(wanted),
+                # What the reviewer sent verbatim, before normalisation — a
+                # value that was truncated or folded should still be readable
+                # in full somewhere.
+                "wanted_raw": wanted,
+                # NOT under the key `decision`: that is the dashboard's first
+                # detail choice, and this event is about the verb that was NOT
+                # taken. Naming it `with_decision` keeps the two apart in the
+                # record as well as on the page.
+                "with_decision": directive.decision.value,
+                "reason": directive.reason,
+                "task_id": directive.task_id,
+                "tally": dict(counts),
+                # True only when a tally file existed and could not be read, so
+                # a rebuilt count is never mistaken for a first sighting.
+                "tally_reset": reset,
+                "result": WantedDecisionTally.render(counts),
+            },
+        )
+
     # ---- dispatch -----------------------------------------------------------
 
     def _dispatch(self, directive: Directive) -> None:
@@ -4668,6 +4917,13 @@ class Orchestrator:
         )
         if decision is Decision.STOP:
             self._handle_contract_stop(directive)
+        elif decision is Decision.RECUT:
+            # The reviewer discarding an unsalvageable candidate itself. Its own
+            # branch rather than a case inside `_dispatch_executor`, because it
+            # runs NO executor and starts no round: it retires the execution and
+            # puts the task back in the queue, and the next `implement` for it
+            # is an ordinary first dispatch off the current base.
+            self._dispatch_recut(directive)
         elif decision in RETIRED_DECISIONS:
             # Retired 2026-08-06, mirroring the retired legacy git path below.
             # `authorize_directive` denies a retired decision unconditionally,
@@ -4794,6 +5050,488 @@ class Orchestrator:
                 "packet — approve that packet's request_id"
             )
         return Verdict.deny("legacy_git_path_retired", reason)
+
+    # ---- recut: the reviewer discards an unsalvageable candidate ------------
+    #
+    # THE ONE DESTRUCTIVE ACTION THE REVIEWER TAKES WITHOUT AN OPERATOR, and the
+    # bounds below are what make that acceptable rather than decoration.
+    #
+    # Why it exists. `Decision` had eight members and none of them meant "this
+    # branch is contaminated, cut it again from the base". On 2026-08-20 a
+    # reviewer that had reached exactly that conclusion about port-01 issued the
+    # only verb available — `revise` — while its own `reason` argued against
+    # another ordinary retry, and the round before that it had spelled the
+    # remedy out in prose. Prose in a `reason` field executes nothing. An
+    # operator then performed the recovery by hand twice in one day
+    # (roadmap-01, port-01); `changed_paths_outside_approved` has parked nine
+    # distinct tasks, and four completed scope tasks never stopped it. Detection
+    # existed; recovery was entirely manual.
+    #
+    # The five bounds, each with the check that carries it:
+    #
+    #   * CAP — `MAX_TASK_RECUTS` cuts per task, counted durably on
+    #     `tasks.Task.recut_count` (`_recut_count_for`), the cut after which
+    #     parks for a human (`_park_recut_cap`).
+    #   * NEVER DISCARD WORK THAT MAY ALREADY BE APPROVED — a published
+    #     candidate is refused outright, and so is one whose verdict is still
+    #     outstanding (`_recut_outstanding_verdict`). Evidence this is real:
+    #     budget-01's record was archived by an operator release at 21:33:52Z,
+    #     54 seconds before the reviewer returned PUSH for that exact candidate.
+    #   * NOTHING IS DELETED — the retirement goes through
+    #     `release_task_to_pending`, i.e. `worktask.retire_execution`, which
+    #     MOVES the record to `executions/archive/` and the worker to
+    #     `quarantine/`, under one label, in one call.
+    #   * DISTINCT FROM `stop` — `stop` parks because a human must decide; this
+    #     is the reviewer deciding. `contract._RESPONSE_FORMAT` says so in those
+    #     words, and says to use `stop` when unsure.
+    #   * RECORDED — the transition is logged as `task_recut` with the
+    #     reviewer's own reason and both retirement destinations, so a task that
+    #     silently restarted is never a mystery afterwards.
+    #
+    # Everything here refuses through `_handle_policy_denial` rather than
+    # parking, deliberately: a denial re-prompts with the reason, is bounded by
+    # `check_denial_budget`, and lets the reviewer choose `stop` if a human
+    # really is needed. A park would hold an autonomous session open for an
+    # answer nobody is there to give. The ONE exception is the cap, which parks
+    # on purpose — that is the whole point of a cap.
+
+    def _recut_count_for(self, task: Task, execution) -> int:
+        """How many cuts this task has already spent: the HIGHER of the durable
+        registry count and whatever the live execution record mirrors.
+
+        Two copies and `max`, not one copy, because each survives a failure the
+        other does not. A recut ARCHIVES the execution record, so a count kept
+        only there reads 0 on the fresh record and the cap enforces nothing;
+        conversely a `tasks.json` row written before `recut_count` existed loads
+        as 0 while the record that the last cut seeded still says 1. Taking the
+        larger is the only combination in which neither loss can LOWER the
+        count, which is the direction that matters — a cap that reads too low is
+        a cap that is off.
+
+        Defensive on the record's side only: `tasks.Task.recut_count` is
+        validated at load (`tasks._persisted_recut_count` refuses anything that
+        is not a non-negative int), while a `TaskExecution` is rehydrated by
+        `TaskExecution(**data)` with no such gate, so a hand-edited record could
+        hold a string. That reads as 0 here and the registry's own count still
+        stands — never as a crash inside a dispatch.
+        """
+        recorded = getattr(execution, "recut_count", 0) if execution is not None else 0
+        if isinstance(recorded, bool) or not isinstance(recorded, int) or recorded < 0:
+            recorded = 0
+        return max(int(task.recut_count or 0), recorded)
+
+    def _recut_outstanding_verdict(
+        self, state: LoopState, task_id: str, candidate_sha: str
+    ) -> str:
+        """The request id of a review packet that PRESENTED this exact candidate
+        and that the directive being dispatched is not the reply to — or `""`
+        when no verdict is outstanding.
+
+        **What "outstanding" means here, precisely.** The loop presents a
+        candidate once and the next directive it dispatches is the verdict on
+        it. So for the candidate the reviewer is answering ABOUT, there is by
+        construction no outstanding verdict — the reviewer IS the verdict, and
+        refusing that case would refuse the recut's primary use (port-01's
+        reviewer recutting the task whose packet it is reading). What is NOT
+        answered is a packet for a DIFFERENT candidate: `_approval_packet` lets
+        an approval resolve a packet by the request id it names, so a candidate
+        still in `state.sent_postcommits` remains approvable by a later reply.
+        Discarding one of those is exactly the budget-01 shape — work destroyed
+        while a verdict for it was still in flight — with the reviewer in the
+        operator's seat.
+
+        Two ways a reply counts as the verdict on this candidate, and both are
+        needed:
+
+          * its OWN binding names it (`resp.postcommit`), which covers a
+            corrective re-prompt that inherited the binding — there the answered
+            request id is the correction's, not the packet's;
+          * the ledger entry's request id is the one being answered.
+
+        Reads the ledger through `_sent_postcommit_records`, which already
+        fail-closes a non-list to empty and drops non-dict entries. An empty
+        ledger means no outstanding verdict, and that is the honest answer
+        rather than a hole: `sent_postcommits` lives on `LoopState`, which
+        `cli._select_and_kickoff` replaces per session, so a task parked in an
+        earlier session genuinely has no packet this loop is still waiting on.
+
+        A candidate that was never committed (`candidate_sha == ""`) can never
+        match an entry, so nothing was ever presented and nothing is
+        outstanding — the caller does not special-case it.
+        """
+        resp = state.last_response
+        bound = resp.postcommit if resp is not None else None
+        if (
+            bound is not None
+            and bound.task_id == task_id
+            and bound.candidate_sha == candidate_sha
+        ):
+            return ""
+        answered_id = resp.request_id if resp is not None else ""
+        outstanding = ""
+        for record in self._sent_postcommit_records(state):
+            presented = record.get("postcommit")
+            if not isinstance(presented, dict):
+                continue
+            if (
+                presented.get("task_id") != task_id
+                or presented.get("candidate_sha") != candidate_sha
+            ):
+                continue
+            request_id = str(record.get("request_id") or "")
+            if request_id and request_id == answered_id:
+                # This directive answers the packet that presented it. Return
+                # immediately rather than remembering it: one answered
+                # presentation settles the candidate, however many times it was
+                # presented (a re-stamped or re-sent packet records a second
+                # entry for the same candidate).
+                return ""
+            outstanding = request_id or "(a packet with no recorded request id)"
+        return outstanding
+
+    def _dispatch_recut(self, directive: Directive) -> None:
+        """Retire `directive.task_id`'s execution and return the task to the
+        queue, so its next dispatch is cut fresh from the current base.
+
+        Every refusal below happens BEFORE anything moves, and the order is
+        cheapest-and-most-specific first so the reviewer is told the actual
+        reason rather than the first one that happens to fire.
+        """
+        state = self.state
+        task_id = directive.task_id or ""
+
+        if task_id == AUDIT_TASK_ID or task_id.startswith("audit-"):
+            # An audit unit is synthetic, minted per iteration and never
+            # planned, so there is no queue to return it to and a "fresh cut"
+            # of it is just the next `audit`. Refused by NAME rather than by
+            # registry lookup: most audit units are not in the registry at all,
+            # so a lookup would answer `task_unknown` and send the reviewer
+            # looking for a planning mistake.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "recut_audit_unit",
+                    f"'{task_id}' is an audit unit, not a roadmap task — there "
+                    "is no queue to return it to, and a fresh audit is simply "
+                    "`audit`. Nothing was discarded.",
+                ),
+            )
+            return
+        if not self._registry.has(task_id):
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "task_unknown",
+                    f"task '{task_id}' is not in the registry, so there is no "
+                    "execution to discard. Nothing was changed.",
+                ),
+            )
+            return
+        obstacle = self._registry.recut_obstacle(task_id)
+        if obstacle is not None:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    obstacle.code,
+                    f"{obstacle}. `recut` discards an in-flight or quarantined "
+                    "round; it can neither un-finish completed work nor release "
+                    "an operator's hold. Nothing was discarded.",
+                ),
+            )
+            return
+        if self._execution_store is None or self._worker_repos is None:
+            # BOTH halves are required, and the worker manager is the one worth
+            # spelling out: `retire_execution` quarantines only
+            # `if worker_repos is not None`, so without one it would archive the
+            # record, report success, and leave the contaminated worktree
+            # exactly where the next dispatch looks for it — a recut that says
+            # it discarded the branch and did not. Refusing is the honest
+            # answer: this loop cannot perform the operation the verb promises.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "recut_unavailable",
+                    "this loop has no execution store and worker-repository "
+                    "manager configured, so it cannot retire both halves of an "
+                    "execution — and retiring one half is worse than retiring "
+                    "neither. Nothing was discarded.",
+                ),
+            )
+            return
+        if state.pending_request is not None:
+            # Defence in depth against a state the ordinary single-request flow
+            # does not reach (`_step_awaiting` clears the pending request before
+            # `_step_executing` runs). It is cheap, and it is the literal form
+            # of the bound: never discard a candidate while this loop is waiting
+            # to hear about one.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "recut_verdict_outstanding",
+                    "this loop is still waiting on a reply to request "
+                    f"'{state.pending_request.request_id}', so a verdict is in "
+                    "flight and nothing may be discarded yet. Nothing was "
+                    "changed.",
+                ),
+            )
+            return
+        try:
+            execution = self._execution_store.load(task_id)
+        except (StateError, OSError) as exc:
+            # Unreadable, NOT absent. Refusing is the fail-closed reading: a
+            # record this cannot parse may name a published candidate or a
+            # candidate under review, and archiving it unread would destroy the
+            # only evidence of which.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "recut_record_unreadable",
+                    f"task '{task_id}' has an execution record this loop cannot "
+                    f"read ({exc}), so it cannot be shown safe to discard. An "
+                    "operator has to look at it. Nothing was discarded.",
+                ),
+            )
+            return
+        if execution is None:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "recut_no_execution",
+                    f"task '{task_id}' has no execution record, so there is no "
+                    "candidate to discard — its next dispatch is already a "
+                    "fresh cut from the current base. Nothing was changed.",
+                ),
+            )
+            return
+        if execution.published_sha:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "recut_candidate_published",
+                    f"task '{task_id}' has ALREADY PUBLISHED candidate "
+                    f"{execution.published_sha[:12]} to "
+                    f"{execution.intended_remote}/{execution.intended_remote_ref} "
+                    f"at {execution.published_at or 'an unrecorded time'} — "
+                    "published work is never discarded by this loop. If it is "
+                    "wrong, that is a new task, not a recut. Nothing was "
+                    "changed.",
+                ),
+            )
+            return
+        outstanding = self._recut_outstanding_verdict(
+            state, task_id, execution.candidate_sha
+        )
+        if outstanding:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "recut_verdict_outstanding",
+                    f"candidate {execution.candidate_sha[:12]} for task "
+                    f"'{task_id}' was presented for review under request "
+                    f"'{outstanding}', which this reply does not answer — so an "
+                    "approval for it can still arrive and the work may already "
+                    "be approved. Judge that packet first (approve it, or "
+                    "`revise` the task), then recut if it is still needed. "
+                    "Nothing was discarded.",
+                ),
+            )
+            return
+        task = self._registry.get(task_id)
+        spent = self._recut_count_for(task, execution)
+        if spent >= MAX_TASK_RECUTS:
+            self._park_recut_cap(directive, task, execution, spent)
+            return
+
+        try:
+            release = release_task_to_pending(
+                task_id,
+                self._registry,
+                self._execution_store,
+                self._worker_repos,
+                persist=lambda: self._task_store.save(self._registry),
+                reason=RECUT_RETIREMENT_REASON,
+                # Nobody is watching this the way an operator watches
+                # `python -m autoloop release`: raising here would take the
+                # process down mid-round. The `Release` says how far it got and
+                # the park below reports it.
+                tolerate_retirement_failure=True,
+                move=self._registry.recut,
+            )
+        except TaskGraphError as exc:  # pragma: no cover - `recut_obstacle` ran
+            # The registry refused the move after `recut_obstacle` said it
+            # would not. Nothing has moved (`_return_to_pending` raises before
+            # the assignment), so this is a denial and not a park.
+            self._handle_policy_denial(
+                directive, Verdict.deny(exc.code, f"{exc}. Nothing was discarded.")
+            )
+            return
+
+        retirement = release.retirement
+        self._log(
+            "task_recut",
+            request_id=state.last_response.request_id if state.last_response else None,
+            data={
+                "task_id": task_id,
+                # The reviewer's OWN words for why, kept verbatim: this is the
+                # transition's only account of itself, and a recut whose reason
+                # is not in the transcript is the "task that silently restarted"
+                # this record exists to prevent.
+                "reason": directive.reason,
+                "wanted_decision": directive.wanted_decision,
+                "discarded_candidate": execution.candidate_sha,
+                "discarded_base": execution.task_base_sha,
+                "recut_count": release.task.recut_count,
+                "cap": MAX_TASK_RECUTS,
+                "label": retirement.label if retirement is not None else "",
+                "archived_record": (
+                    str(retirement.record_path)
+                    if retirement is not None and retirement.record_path is not None
+                    else ""
+                ),
+                "quarantined_worker": (
+                    str(retirement.worker_path)
+                    if retirement is not None and retirement.worker_path is not None
+                    else ""
+                ),
+                "artifacts_retired": release.artifacts_retired,
+                "obstacle": release.obstacle,
+            },
+        )
+        # The task's own bookkeeping is gone; so must every pointer this session
+        # still holds to it, or a later approval naming the discarded packet
+        # would resolve a binding to work that no longer has a record.
+        self._forget_sent_postcommits_for_task(state, task_id)
+        if isinstance(state.task_execution, dict) and (
+            state.task_execution.get("task_id") == task_id
+        ):
+            state.task_execution = None
+        if isinstance(state.current_task, dict) and (
+            state.current_task.get("task_id") == task_id
+        ):
+            state.current_task = None
+        carried = state.carry_postcommit
+        if isinstance(carried, dict) and carried.get("task_id") == task_id:
+            state.carry_postcommit = None
+
+        if not release.artifacts_retired:
+            # The STATUS move is already durable (`release_task_to_pending`
+            # persists before the artefacts move), so the task is pending with
+            # its worker repo and/or its record still on disk — the next
+            # dispatch would refuse to create over that directory, and a
+            # surviving record holds the repository-wide merge window shut.
+            # Neither is something a further message to the reviewer can fix.
+            state.last_response = None
+            self._to_needs_user(
+                f"task {task_id}: the reviewer's `recut` returned the task to "
+                "the queue, but its artefacts could not be retired — "
+                f"{release.obstacle}. "
+                + (
+                    f"The worker repository is still at {release.stale_worker_path}, "
+                    "where the next dispatch will refuse to create one. "
+                    if release.stale_worker_path
+                    else ""
+                )
+                + (
+                    "Its execution record is still live, so the merge window "
+                    "stays shut on it. "
+                    if release.stale_execution_record
+                    else ""
+                )
+                + "Move them aside by hand, then the task can be dispatched "
+                f"again. Reviewer's reason: {directive.reason}",
+                kind="task_fatal",
+                code="recut_retirement_failed",
+                task_id=task_id,
+                detail=(
+                    f"obstacle={release.obstacle} "
+                    f"stale_worker={release.stale_worker_path} "
+                    f"stale_record={release.stale_execution_record} "
+                    f"residue_resumable={release.residue_resumable}"
+                ),
+            )
+            return
+
+        state.outbox = self._recut_report(directive, task_id, execution, release)
+        state.last_response = None
+        state.consecutive_failures = 0
+        state.phase = Phase.READY.value
+        self._store.save(state)
+
+    def _recut_report(self, directive, task_id, execution, release) -> str:
+        """What the loop tells the reviewer after a recut landed.
+
+        Built here rather than from a `prompts.TEMPLATES` entry because it says
+        one thing that no template shape covers: exactly what was discarded, and
+        exactly how many cuts are left before the task parks for a human. A
+        reviewer that cannot see the second number cannot spend the first
+        budget sensibly.
+        """
+        retirement = release.retirement
+        remaining = MAX_TASK_RECUTS - release.task.recut_count
+        return (
+            f"RECUT APPLIED — task {task_id} is back in the queue.\n\n"
+            f"Your reason: {directive.reason}\n\n"
+            f"Discarded candidate {execution.candidate_sha[:12] or '(none committed)'} "
+            f"cut from base {execution.task_base_sha[:12]} "
+            f"(review round {execution.review_round}, "
+            f"{execution.attempt_count} attempt(s) spent).\n"
+            "Nothing was deleted: the execution record was archived to "
+            f"{retirement.record_path if retirement and retirement.record_path else '(no record on disk)'} "
+            "and the worker repository quarantined at "
+            f"{retirement.worker_path if retirement and retirement.worker_path else '(no worker on disk)'}"
+            f", both under the label {retirement.label if retirement else '(none)'}.\n\n"
+            f"This was recut {release.task.recut_count} of {MAX_TASK_RECUTS}. "
+            + (
+                f"{remaining} recut(s) remain for this task; after that it parks "
+                "for a human instead of being cut again."
+                if remaining > 0
+                else "No recuts remain: another `recut` of this task will park "
+                "for a human rather than cut it again."
+            )
+            + "\n\nThe next `implement` for this task starts from the CURRENT "
+            "base with an empty tree. If the same work fails again from a clean "
+            "cut, the task's specification is the problem, not its branch — say "
+            "so with `stop` or reshape it with a new `decomposition`."
+        )
+
+    def _park_recut_cap(
+        self, directive: Directive, task: Task, execution, spent: int
+    ) -> None:
+        """The cut after `MAX_TASK_RECUTS` parks for a human instead of cutting
+        again — the bound that makes handing the reviewer a destructive verb
+        acceptable.
+
+        A PARK, deliberately, where every other recut refusal is a denial. The
+        other refusals have an answer the reviewer can act on ("judge that
+        packet first", "that task is not in flight"); this one does not. Two
+        clean rebuilds that still could not produce a reviewable candidate is
+        evidence about the SPECIFICATION, and re-prompting the reviewer would
+        only invite the third cut the cap exists to refuse.
+
+        Nothing is discarded here: the candidate, the worker repo and the
+        execution record are all exactly where the last cut left them, so the
+        operator has the whole arc to read.
+        """
+        self.state.last_response = None
+        self._to_needs_user(
+            f"task {task.id}: the reviewer asked to recut it again, but it has "
+            f"already been recut {spent} time(s) (cap {MAX_TASK_RECUTS}). A task "
+            "that cannot produce a clean candidate in that many cuts from the "
+            "base has a specification problem, not a branch problem — the cuts "
+            "shared nothing but its description, scope and approved plan. "
+            "Nothing was discarded: candidate "
+            f"{execution.candidate_sha[:12] or '(none)'} on "
+            f"{execution.task_branch} and its worker repo are untouched. Rewrite "
+            "the task or retire it; do not simply allow another cut.\n\n"
+            f"Reviewer's reason: {directive.reason}",
+            kind="task_fatal",
+            code="recut_cap",
+            task_id=task.id,
+            detail=(
+                f"recut_count={spent} cap={MAX_TASK_RECUTS} "
+                f"branch={execution.task_branch} candidate={execution.candidate_sha}"
+            ),
+        )
 
     # ---- repeated stops -----------------------------------------------------
     #
@@ -6098,6 +6836,13 @@ class Orchestrator:
                 if is_audit
                 else effective_approved_paths(task.approved_paths, self._tracker_paths())
             )
+            # Mirrored from the registry onto the record the moment the record
+            # exists, so the reviewer and the operator can see that this
+            # candidate is the Nth cut of the task where its base sha and
+            # attempt budget already are. The AUTHORITATIVE count stays on the
+            # `Task` — this record is archived by the very operation that
+            # increments it (see `worktask.TaskExecution.recut_count`).
+            seeded_recuts = 0 if is_audit else int(task.recut_count or 0)
             if self._worker_repos is not None:
                 repo = self._worker_repos.create(task.id, self._git.repo_root, base_sha)
                 execution = TaskExecution(
@@ -6108,12 +6853,14 @@ class Orchestrator:
                     allowed_paths=allowed_paths,
                     validation_commands=declared_validation,
                     validation_cwd=declared_validation_cwd,
+                    recut_count=seeded_recuts,
                 )
             else:
                 execution = self._worktrees.create(task.id, base_sha)
                 execution.allowed_paths = allowed_paths
                 execution.validation_commands = declared_validation
                 execution.validation_cwd = declared_validation_cwd
+                execution.recut_count = seeded_recuts
             self._execution_store.save(execution)
         elif not is_audit:
             dirty = False

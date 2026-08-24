@@ -56,6 +56,26 @@ class Decision(str, Enum):
     COMMIT = "commit"
     PUSH = "push"
     COMMIT_AND_PUSH = "commit_and_push"
+    #: Discard an unsalvageable candidate and start the named task again from
+    #: the current base. THE reviewer's own destructive verb — every other
+    #: discarding action in this system passes through an operator — so it is
+    #: bounded by `orchestrator._dispatch_recut` rather than by this enum: at
+    #: most `orchestrator.MAX_TASK_RECUTS` per task, never a published
+    #: candidate, never one whose verdict is still outstanding, and nothing is
+    #: deleted (`worktask.retire_execution` moves both halves aside).
+    #:
+    #: Deliberately NOT `stop`. `stop` parks because a HUMAN must decide; this
+    #: is the reviewer deciding. When it is unsure, `stop` is still correct, and
+    #: `_RESPONSE_FORMAT` below says which is which in those words.
+    #:
+    #: The CAP appears in `_RESPONSE_FORMAT` as a literal `2` rather than as a
+    #: rendered constant, because `orchestrator` imports this module and not the
+    #: other way round. That is a second copy of a number, so it is pinned by
+    #: test (`test_recut.test_the_instructions_state_the_cap_the_loop_actually_
+    #: enforces`) instead of by construction: moving `MAX_TASK_RECUTS` without
+    #: moving the sentence fails the suite rather than quietly telling the
+    #: reviewer it has a cut it does not have.
+    RECUT = "recut"
     STOP = "stop"
     #: RETIRED — no longer offered by CONTRACT_INSTRUCTIONS, still parsed. A
     #: live conversation that already saw the old instructions can answer
@@ -73,6 +93,12 @@ RETIRED_DECISIONS = frozenset({Decision.ASK_USER})
 ACTIVE_DECISIONS = frozenset(Decision) - RETIRED_DECISIONS
 # Decisions that authorize executor work on a referenced task.
 TASK_DECISIONS = frozenset({Decision.IMPLEMENT, Decision.REVISE})
+# Decisions that must NAME a task, whatever they then do with it. `recut` is
+# not a TASK_DECISION — it authorizes no executor work and carries no
+# decomposition — but a recut with no task id names nothing to discard, so
+# `task_id` is required for it too. Derived rather than restated so a third
+# task-naming decision cannot be added to one list and forgotten in the other.
+NAMES_A_TASK = TASK_DECISIONS | {Decision.RECUT}
 # Decisions that authorize a git commit.
 COMMIT_DECISIONS = frozenset({Decision.COMMIT, Decision.COMMIT_AND_PUSH})
 # Decisions that authorize a git push.
@@ -96,6 +122,10 @@ _TOP_LEVEL_KEYS = {
     # `unknown_keys` before its own (retired) branch is ever reached.
     "question",
     "notes",
+    # The vocabulary gap the reviewer NAMES but never gets to use — see
+    # `Directive.wanted_decision`. Listed here or every reply carrying it would
+    # die at `unknown_keys` before the field is read.
+    "wanted_decision",
 }
 _COMMIT_KEYS = {"message", "paths"}
 _REVIEWED_KEYS = {"request_id", "head_sha", "report_sha256"}
@@ -259,6 +289,31 @@ class Directive:
     #: the contract no longer asks for it, so a legacy reply may omit it.
     question: str | None = None
     notes: str | None = None
+    #: The decision the reviewer WOULD have used, when none of the available
+    #: ones fit. A plain string, parsed, recorded, counted and rendered — and
+    #: STRUCTURALLY UNABLE TO BE ACTED ON.
+    #:
+    #: **Why it is a string and not a `Decision`.** If this value could ever
+    #: become the verb that is dispatched, the reviewer would hold an unbounded
+    #: vocabulary and could name actions the policy engine never authorized —
+    #: the circular-ownership hazard `docs/SECURITY.md` finding #2 exists to
+    #: close. So it is never passed to `Decision(...)`, never compared against a
+    #: `Decision`, and `orchestrator._dispatch` branches on `decision` alone.
+    #: `parse_response` deliberately does NOT validate it against `Decision`
+    #: either: a value naming a decision that already exists is itself the
+    #: signal — the reviewer believed the fitting verb was unavailable when it
+    #: was not, i.e. these instructions are unclear.
+    #:
+    #: **Why ONE narrow question and not `notes`.** `notes` is documented as
+    #: "anything else worth recording"; measured over 578 directives it was used
+    #: zero times and has no consumer anywhere in `orchestrator.py`,
+    #: `dashboard.py`, `transcript.py` or `worktask.py`. An open-ended optional
+    #: field earns exactly that. A specific question has an answer shape, and
+    #: the tally of the answers (`wanted: recut x7, split x3`) is how the NEXT
+    #: missing verb gets found by counting instead of by someone happening to
+    #: read a `reason` field. A named verb becomes real only the slow way: a
+    #: person reads the tally and files a task.
+    wanted_decision: str | None = None
 
 
 #: The response schema itself. Two clauses in it are worth explaining HERE
@@ -295,7 +350,7 @@ trailing text is REJECTED, never guessed at. One object, these keys only:
 
   version    (required) always 3
   decision   (required) one of: audit | plan | implement | revise | commit |
-             push | commit_and_push | stop
+             push | commit_and_push | recut | stop
   reason     (required) one short sentence explaining the decision
   scope      (audit only, optional) what the audit should focus on
   tasks      (required for plan) list of {id, title, description, depends_on?,
@@ -304,7 +359,7 @@ trailing text is REJECTED, never guessed at. One object, these keys only:
              approved_paths: the EXACT repo-relative files this task may touch
              — no globs, no "..", no absolute paths; name new files. A task
              with no approved path cannot be implemented.
-  task_id    (required for implement/revise; optional for commit /
+  task_id    (required for implement/revise/recut; optional for commit /
              commit_and_push, marking that task completed)
   decomposition (required for implement) {approach, files, steps}; steps are
              worked in order; one step with a reason is valid.
@@ -320,6 +375,9 @@ trailing text is REJECTED, never guessed at. One object, these keys only:
              you are answering; never approve from memory. A mismatched stamp
              is rejected.
   notes      (optional) at most 200 characters, on ONE line.
+  wanted_decision (optional) ONE word: the decision you WOULD have used when
+             none above fits. Counted for the operator, and NEVER acted on —
+             the loop still executes `decision`.
 NEVER put a literal line break inside a JSON string value — write \\n.
 A raw newline in a string is invalid JSON, and the reply is REJECTED.
 
@@ -334,7 +392,16 @@ Decisions:
   commit — commit the reviewed work; no push. task_id marks the task completed.
   push — push the current branch (the reviewed commit); no new commit.
   commit_and_push — commit, then push.
-  stop — end the loop."""
+  recut — DISCARD task_id's candidate; the task is re-cut from the CURRENT
+    base. ONLY for an unsalvageable branch (contaminated history, a dead end
+    another `revise` would repeat); work that needs changing is `revise`.
+    Nothing is deleted — the record is archived, the worker quarantined.
+    REFUSED for a published candidate, one whose verdict is outstanding, and
+    after 2 recuts of a task (the third parks for a human: two clean cuts
+    failing means the SPEC is wrong, not the branch).
+  stop — end the loop.
+`recut` vs `stop`: `recut` is YOU deciding a branch is beyond saving; `stop`
+asks a HUMAN to decide. Unsure? Use `stop`."""
 
 #: A scheduling PREFERENCE, appended to the response format above.
 #:
@@ -623,6 +690,17 @@ def parse_response(text: str) -> Directive:
     if notes is not None and not isinstance(notes, str):
         raise ContractError("bad_type:notes", "'notes' must be a string when present")
 
+    # Accepted on EVERY decision, deliberately: the field says "none of these
+    # fitted", and the reviewer still had to send one of them, so forbidding it
+    # per-decision would forbid it exactly where it is used. Validated as a
+    # non-empty string and NOTHING else — never against `Decision` — see
+    # `Directive.wanted_decision` for why a value naming a real decision is a
+    # signal to keep rather than an error to raise. An omitted key stays None,
+    # which is byte-for-byte today's behaviour for every existing reply.
+    wanted_decision = None
+    if data.get("wanted_decision") is not None:
+        wanted_decision = _require_str("wanted_decision", data.get("wanted_decision"))
+
     scope_raw = data.get("scope")
     tasks_raw = data.get("tasks")
     task_id_raw = data.get("task_id")
@@ -646,7 +724,7 @@ def parse_response(text: str) -> Directive:
         _forbid("tasks", tasks_raw, decision)
 
     task_id = None
-    if decision in TASK_DECISIONS:
+    if decision in NAMES_A_TASK:
         task_id = _require_str("task_id", task_id_raw)
     elif decision in COMMIT_DECISIONS:
         if task_id_raw is not None:
@@ -752,6 +830,7 @@ def parse_response(text: str) -> Directive:
         reviewed=reviewed,
         question=question,
         notes=notes,
+        wanted_decision=wanted_decision,
     )
 
 

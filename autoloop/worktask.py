@@ -426,6 +426,22 @@ class TaskExecution:
     #: recorded here (this executor restored it) AND lands in
     #: `removed_out_of_scope_paths` (git saw a deletion). Both are true.
     reverted_out_of_scope_paths: tuple[str, ...] = ()
+    #: How many times this task's execution has ALREADY been discarded and cut
+    #: again from the base by a reviewer `recut` (recut-01, 2026-08-24). Seeded
+    #: onto every fresh record from `tasks.Task.recut_count` at creation
+    #: (`orchestrator._dispatch_task_postcommit`); zero on a task that has never
+    #: been recut, and on every record written before this field existed.
+    #:
+    #: A MIRROR, not the ledger. The authoritative count is on the `Task`,
+    #: because a recut ARCHIVES this record — a count that lived only here would
+    #: read 0 on the fresh record every time and the cap would enforce nothing,
+    #: which is the guard silently switching itself off. `orchestrator.
+    #: _recut_count_for` therefore reads the HIGHER of the two, so neither a
+    #: registry row written before the field existed nor a lost record can lower
+    #: the count. It is kept here anyway because the record is what an operator
+    #: and the review packet read: a candidate that is the second cut of a task
+    #: should say so where its base sha and attempt budget are.
+    recut_count: int = 0
 
 
 #: There is deliberately NO per-round cap here, and there was one until

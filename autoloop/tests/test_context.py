@@ -850,10 +850,11 @@ def test_the_addition_stays_inside_its_per_round_budget(window_config):
 
 def test_no_scheduling_advice_moved_into_the_context_block(window_config):
     """FACTS, NOT ADVICE — the bound that keeps one instruction channel. The
-    preference lives in CONTRACT_INSTRUCTIONS, which is pinned at 3,700
-    characters (`test_contract.test_contract_stays_within_its_budget`); these
-    rows state what is true and never restate what to do about it, and the
-    contract gains no text from them."""
+    preference lives in CONTRACT_INSTRUCTIONS, which is pinned at 4,550
+    characters (`test_contract.test_contract_stays_within_its_budget`, which
+    carries the accounting for every move of that number); these rows state
+    what is true and never restate what to do about it, and the contract gains
+    no text from them."""
     store = detailed_store(
         window_config.state_dir, ("auto-02", "a" * 40, 1, ""), base="a" * 40
     )
@@ -885,4 +886,4 @@ def test_no_scheduling_advice_moved_into_the_context_block(window_config):
     assert "finish before you start" in NEXT_WORK_PREFERENCE
     assert IN_FLIGHT_TASK_LABEL not in CONTRACT_INSTRUCTIONS
     assert MERGE_WINDOW_LABEL not in CONTRACT_INSTRUCTIONS
-    assert len(CONTRACT_INSTRUCTIONS) <= 3700
+    assert len(CONTRACT_INSTRUCTIONS) <= 4550
