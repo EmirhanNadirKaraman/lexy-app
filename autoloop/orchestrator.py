@@ -6932,18 +6932,28 @@ class Orchestrator:
 
         try:
             self._split_intents.save(intent)
-        except OSError as exc:
+        except (OSError, StateError) as exc:
             # Nothing has moved: the intent is written BEFORE the first store,
             # so a loop that cannot write it simply does not start the split.
             # Parked rather than denied — the reviewer cannot fix an unwritable
             # state directory, and proceeding without the record would be
             # performing exactly the unrecoverable operation this task removes.
+            #
+            # `StateError` alongside `OSError` covers the store's own refusal to
+            # write a record somewhere `parent_ids` could never list it
+            # (`SplitIntentStore.save`) — a parent id that is not usable as a
+            # filename, which `TaskRegistry.from_dict` does not re-validate and a
+            # hand-edited `tasks.json` can therefore hold. Same ending as an
+            # unwritable directory and for the same reason: an intent nothing can
+            # find is worse than no split at all, since the registry write would
+            # follow it.
             state.last_response = None
             self._to_needs_user(
                 f"task {parent_id}: the split could not be started because its "
                 f"durable intent record could not be written ({exc}). Nothing was "
                 "changed — the registry, the execution record and the worker "
-                "repository are all as they were. Fix the state directory and "
+                "repository are all as they were. Fix what the error above names "
+                "— the state directory, or the task id the roadmap holds — and "
                 "restart.",
                 kind="loop_fatal",
                 code="split_intent_unwritable",

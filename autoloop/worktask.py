@@ -1400,6 +1400,37 @@ class SplitIntentStore:
         return self._path(parent_id)
 
     def save(self, intent: SplitIntent) -> None:
+        # THE FILENAME IS THE INDEX. `parent_ids` finds an interrupted split by
+        # listing `*.json` in THIS directory, so a record written anywhere else
+        # is a record the reconciler can never look at — and this record is the
+        # only thing that would tell the next process to look at all. That makes
+        # a stray destination worse than an unwritable one: the caller would be
+        # told the intent was saved and would go on to mutate the registry.
+        #
+        # Reachable without a crash. A task id is a slug by the time
+        # `TaskRegistry.add_many` is done with it, but `TaskRegistry.from_dict`
+        # deliberately does NOT re-validate a stored row (see the comment on its
+        # `add_many` bypass), so a hand-edited `tasks.json` can carry `../x` and
+        # the reviewer can then name it in `split_of` — every check in
+        # `orchestrator._dispatch_split` passes, because the row really is there
+        # and really is splittable.
+        #
+        # Refused by the PROPERTY that matters — the file lands directly in this
+        # directory, under a name that is more than the extension — rather than
+        # by a second copy of the task-id grammar. A copy of `tasks._ID_RE` would
+        # agree with it today and drift from it silently later; this cannot,
+        # because it asks the question the directory listing actually asks. It is
+        # also why the guard is HERE and not in `_path`/`path_for`: those are the
+        # methods a caller uses to NAME the record while reporting that it could
+        # not be written, and a reporter that raises is a park that cannot print.
+        path = self._path(intent.parent_id)
+        if path.parent != self.directory or path.name == ".json":
+            raise StateCorruptError(
+                f"a split intent for parent {intent.parent_id!r} would be written to "
+                f"{path}, which is not {self.directory}/<parent_id>.json — a record "
+                "outside this directory is one that `parent_ids` can never list, so "
+                "an interrupted split would never be finished. Nothing was written"
+            )
         data = asdict(intent)
         data["successors"] = [
             {

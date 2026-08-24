@@ -1868,3 +1868,60 @@ def test_a_denied_split_leaves_the_execution_record_and_worker_untouched(tmp_pat
     assert (tmp_path / "workers" / "t1").is_dir()
     assert not (tmp_path / "quarantine").exists()
     assert intent_files(wiring) == []
+
+
+# ---------------------------------------------------------------------------
+# the parent id is a FILENAME: an intent nobody can list is worse than none
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "parent_id", ["../escapee", "sub/dir", "", "/absolute", "a/../../b"]
+)
+def test_an_intent_that_would_land_outside_its_directory_is_refused(tmp_path, parent_id):
+    """`parent_ids` finds an interrupted split by listing `*.json` in ONE
+    directory, so an intent written anywhere else is one the reconciler can never
+    look at — and it is the only record that anything was in flight.
+
+    Refused rather than written, and BEFORE the caller is told it was saved: the
+    caller's next act is to mutate the registry, so a store that accepted this
+    would hand back a split whose durable half is unreachable."""
+    store = SplitIntentStore(tmp_path / "split-intents")
+    with pytest.raises(StateCorruptError) as exc:
+        store.save(make_intent(parent=parent_id))
+    assert "never be finished" in str(exc.value)
+    assert store.parent_ids() == ()
+    assert not (tmp_path / "escapee.json").exists()
+    assert not (tmp_path / "absolute.json").exists()
+
+
+def test_a_parent_id_the_registry_holds_but_a_filename_cannot_parks_before_anything_moves(
+    tmp_path,
+):
+    """The reachable version of the case above, with no crash in it at all.
+
+    `TaskRegistry.add_many` validates every id it accepts, but `from_dict`
+    deliberately does not re-validate a stored row — so a hand-edited
+    `tasks.json` can hold `../escapee`, every refusal in `_dispatch_split` passes
+    (the row is really there and really splittable), and the intent write is the
+    first thing that can object. It must object BEFORE the registry moves: this
+    is the one path to a retired parent whose intent no reconciliation would
+    ever find."""
+    wiring = build(tmp_path, tasks=[ready_task("t1")])
+    edit_task_row(wiring, "t1", id="../escapee")
+    fresh = restart(wiring, tmp_path)
+    assert fresh.registry.has("../escapee")
+
+    fresh.orch._dispatch(split_directive(parent="../escapee"))
+
+    assert park_codes(fresh)[-1] == "split_intent_unwritable"
+    assert fresh.orch.state.phase == Phase.NEEDS_USER.value
+    assert records(fresh, "task_split") == []
+    # Nothing written, here or anywhere the listing cannot reach.
+    assert intent_files(fresh) == []
+    assert not (fresh.config.state_dir / "escapee.json").exists()
+    # And nothing moved: the registry write comes after the intent, so the
+    # parent is still live work and its successors do not exist.
+    registry = fresh.task_store.load()
+    assert registry.get("../escapee").status == "pending"
+    assert not registry.has("t1a")
