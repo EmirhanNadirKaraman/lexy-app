@@ -241,6 +241,36 @@ def _substitute_dependency(
     return tuple(rewritten)
 
 
+def depends_on_after_retirement(
+    depends_on: tuple[str, ...],
+    retired_id: str,
+    live_successors: tuple[str, ...],
+    owner_id: str,
+) -> tuple[str, ...]:
+    """What `owner_id`'s `depends_on` READS AS once `retired_id`'s retirement
+    has re-pointed it — the public name for the rewrite `retire` applies.
+
+    A thin alias on purpose. It exists so a caller that has to PREDICT the
+    durable value can call the very function the retirement uses instead of
+    keeping a second copy of the substitution rule — one that would agree today
+    and diverge the first time the self-edge or duplicate filtering above moves.
+    `orchestrator._expected_successor_depends_on` is that caller: a split's
+    successor may itself declare the parent as a dependency, so the value the
+    registry ends up holding is NOT the one the split intent recorded, and a
+    verification comparing against the recorded one would park every legitimate
+    split of a task its own successor waits on.
+
+    `live_successors` is the caller's, and must be the set that is live AT THE
+    MOMENT THE RETIREMENT RUNS — which is what `_retirement_rewrites` computes
+    before calling through. A caller passing the full successor list would
+    predict a substitution the retirement did not make; a caller PREDICTING
+    ahead of a mutation that still has successors to create has to count those
+    too, since they will exist by then (see
+    `orchestrator._expected_successor_depends_on`, which does exactly that).
+    """
+    return _substitute_dependency(depends_on, retired_id, live_successors, owner_id)
+
+
 def _validate_description(task_id: object, description: object) -> None:
     """Raise `TaskGraphError` unless `description` is a non-blank string.
 

@@ -262,6 +262,26 @@ class NoopQuarantine(WorkerRepoManager):
         return self.root_dir.parent / "quarantine" / f"{task_id}-{label}"
 
 
+class ScopeDriftingTaskStore(TaskStore):
+    """Persists a WIDER scope for `t1a` than the registry it was handed carries.
+
+    The registry counterpart of `NoopQuarantine`, and the purest form of the
+    fail-open the final read-back exists to refuse: the in-memory mutation is
+    exactly right, every write returns cleanly, and the file the NEXT process
+    will read authorizes writes nobody approved. A verification that asked the
+    just-mutated registry — or that asked the file only whether the ids were
+    there — would answer yes and delete the intent.
+    """
+
+    def save(self, registry):
+        super().save(registry)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        for row in data["tasks"]:
+            if row["id"] == "t1a":
+                row["approved_paths"] = ["docs/EVERYTHING.md"]
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+
+
 @dataclass
 class Wiring:
     orch: Orchestrator
@@ -398,6 +418,27 @@ def intent_files(wiring):
     return sorted(directory.glob("*.json")) if directory.exists() else []
 
 
+def edit_task_row(wiring, task_id, **fields):
+    """Hand-edit one row of `tasks.json`, the way an operator with the loop
+    stopped can — and the way this suite's `docs/SECURITY.md` note says the
+    successor fields can change between a crash and the restart.
+
+    Through the raw file rather than through a `TaskRegistry`, deliberately: the
+    registry's own mutators refuse most of what an operator can type into the
+    file, so going through them would test a state the loop can already reach
+    rather than the one it has to survive.
+    """
+    path = wiring.config.tasks_file
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for row in data["tasks"]:
+        if row["id"] == task_id:
+            row.update(fields)
+            break
+    else:  # pragma: no cover - a typo in a test
+        raise AssertionError(f"no task {task_id!r} in {path}")
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
 def install_crash(wiring, boundary):
     """Arm the crash AFTER the parent's implement round has already run.
 
@@ -455,6 +496,13 @@ def assert_split_is_consistent(wiring, parent="t1", successors=("t1a", "t1b")):
     assert tuple(parent_task.superseded_by) == tuple(successors)
     for tid in successors:
         assert registry.has(tid), f"successor {tid} is missing from the registry"
+        # PRESENCE IS NOT AGREEMENT. Every helper in this suite plans its
+        # successors with `PATHS`, so a successor that reads back with any other
+        # scope is a successor the reconciler adopted rather than created — the
+        # fail-open every crash boundary below now also carries.
+        assert tuple(registry.get(tid).approved_paths) == PATHS, (
+            f"successor {tid} does not carry the write scope the split recorded"
+        )
     assert wiring.execution_store.load(parent) is None
     assert not (wiring.tmp_path / "workers" / parent).exists()
     assert intent_files(wiring) == []
@@ -879,12 +927,12 @@ def test_a_split_can_replace_a_task_that_was_never_dispatched(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def crash_a_split(tmp_path, boundary, tasks=None):
+def crash_a_split(tmp_path, boundary, tasks=None, directive=None):
     """Drive the real split dispatch to `boundary` and die there. Returns the
     crashed wiring, whose on-disk state is what the next process will find."""
     wiring = install_crash(dispatched_round(tmp_path, tasks=tasks), boundary)
     with pytest.raises(_Crash):
-        wiring.orch._dispatch(split_directive())
+        wiring.orch._dispatch(directive or split_directive())
     return wiring
 
 
@@ -1111,6 +1159,152 @@ def test_a_successor_id_taken_by_a_different_task_is_refused_not_adopted(tmp_pat
     assert "split_successor_occupied" in (wiring.orch.state.question or "")
     assert wiring.task_store.load().get("t1a").title == "A DIFFERENT TASK"
     assert wiring.task_store.load().get("t1").status != "retired"
+
+
+def test_a_successor_whose_write_scope_was_widened_after_the_crash_is_not_adopted(
+    tmp_path,
+):
+    """The hole this round closes, on the field that makes it a security one.
+    Boundary 2 leaves the successors on disk and the artefacts not yet moved; an
+    operator who edits `tasks.json` before the restart can hand `t1a` a scope the
+    reviewer never approved. Checking title and description only, the replay
+    adopts it and the read-back certifies it on PRESENCE — and the intent, the
+    only record that anything was ever in flight, is deleted over it."""
+    crashed = crash_a_split(tmp_path, "registry")
+    edit_task_row(crashed, "t1a", approved_paths=["docs/A.md", "docs/EVERYTHING.md"])
+
+    fresh = restart(crashed, tmp_path)
+    assert fresh.orch._reconcile_split_intents() is False
+    assert fresh.orch.state.phase == Phase.NEEDS_USER.value
+    assert "approved_paths" in (fresh.orch.state.question or "")
+
+    # PRESERVED, not cleared — and it still carries the scope that was approved,
+    # which is what lets an operator see what the edit changed.
+    store = SplitIntentStore(split_intents_dir(fresh.config.state_dir))
+    intent = store.load("t1")
+    assert intent is not None
+    assert tuple(intent.successors[0].approved_paths) == PATHS
+    # Nothing was repaired behind the operator either: refusing is this
+    # reconciler's job, rewriting somebody else's task is not.
+    assert tuple(fresh.task_store.load().get("t1a").approved_paths) == (
+        "docs/A.md",
+        "docs/EVERYTHING.md",
+    )
+    # The trial refuses before the live registry or either artefact is touched,
+    # so the parent's round is still there to be looked at.
+    assert fresh.execution_store.load("t1") is not None
+    assert (tmp_path / "workers" / "t1").is_dir()
+
+
+def test_a_successor_whose_dependencies_were_edited_after_the_crash_is_not_adopted(
+    tmp_path,
+):
+    """The same hole on the other durable field. `t1b` is planned with no
+    dependencies; an edit that makes it wait on `t1a` changes the order the
+    roadmap will schedule this split's work in, and a reconciler that reads
+    "both ids exist" calls that the split it recorded."""
+    crashed = crash_a_split(tmp_path, "registry")
+    edit_task_row(crashed, "t1b", depends_on=["t1a"])
+
+    fresh = restart(crashed, tmp_path)
+    assert fresh.orch._reconcile_split_intents() is False
+    assert fresh.orch.state.phase == Phase.NEEDS_USER.value
+    assert "depends_on" in (fresh.orch.state.question or "")
+    assert SplitIntentStore(split_intents_dir(fresh.config.state_dir)).load("t1")
+    assert tuple(fresh.task_store.load().get("t1b").depends_on) == ("t1a",)
+    assert fresh.execution_store.load("t1") is not None
+
+
+def test_a_registry_that_persists_a_scope_it_was_not_given_is_never_certified(tmp_path):
+    """The read-back proved to be a READ-BACK. Every write here succeeds and the
+    mutated registry in memory is exactly right — only the file disagrees, which
+    is precisely the thing the next process reads and the in-memory object can
+    never reveal.
+
+    It fires AFTER the artefacts have moved, and that is the honest reading of
+    the obstacle: this is not "nothing happened", it is "the parent's round is
+    filed away and the registry does not describe the split that filed it", so
+    the intent stays and a human is sent to the registry."""
+    wiring = dispatched_round(tmp_path)
+    lying = ScopeDriftingTaskStore(wiring.config.tasks_file)
+    store = SplitIntentStore(split_intents_dir(wiring.config.state_dir))
+    intent = make_intent()
+    store.save(intent)
+
+    result = apply_split_intent(
+        intent,
+        registry=wiring.registry,
+        task_store=lying,
+        execution_store=wiring.execution_store,
+        worker_repos=wiring.worker_repos,
+        intent_store=store,
+    )
+    assert result.complete is False
+    assert "approved_paths" in result.obstacle
+    assert "t1a" in result.obstacle
+    assert store.load("t1") is not None
+    assert result.record_path is not None
+    assert wiring.execution_store.load("t1") is None
+
+
+@pytest.mark.parametrize("boundary", ["intent", "registry", "archive", "quarantine"])
+def test_a_successor_that_names_the_parent_reconciles_rather_than_parking(
+    tmp_path, boundary
+):
+    """The other half of verifying `depends_on`, and the half a naive check gets
+    wrong. The registry legitimately does NOT store what the intent recorded when
+    a successor declares the parent as its own dependency: retiring the parent
+    re-points every direct dependent, including that successor, so
+    `('t1',)` on the record is `('t1b',)` on disk. Comparing against the recorded
+    tuple would park a CORRECT split at every boundary from the registry write
+    on — a fail-closed check turned into a machine that refuses valid work."""
+    crashed = crash_a_split(
+        tmp_path,
+        boundary,
+        directive=split_directive(
+            successors=(spec("t1a", depends_on=("t1",)), spec("t1b"))
+        ),
+    )
+    fresh = restart(crashed, tmp_path)
+    assert fresh.orch._reconcile_split_intents() is True
+    assert_split_is_consistent(fresh)
+    assert tuple(fresh.task_store.load().get("t1a").depends_on) == ("t1b",)
+    assert intent_files(fresh) == []
+
+
+def test_a_successor_deleted_from_a_half_applied_registry_is_recreated_not_parked_on(
+    tmp_path,
+):
+    """The sharp edge of accounting for the rewrite: the prediction has to be
+    made against the registry AS IT WILL BE when the retirement runs, not as it
+    is on the way in.
+
+    `t1a` declares the parent, so the retirement pointed it at `t1b`. Delete
+    `t1b`'s row and `t1a` still reads `('t1b',)` — but a prediction computed from
+    who is present RIGHT NOW would compute the live set as `t1a` alone, drop the
+    edge, and park a replay on a mismatch it invented, while the honest repair
+    (re-create the missing successor) was available all along."""
+    crashed = crash_a_split(
+        tmp_path,
+        "registry",
+        directive=split_directive(
+            successors=(spec("t1a", depends_on=("t1",)), spec("t1b"))
+        ),
+    )
+    path = crashed.config.tasks_file
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["tasks"] = [row for row in data["tasks"] if row["id"] != "t1b"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    fresh = restart(crashed, tmp_path)
+    assert fresh.task_store.load().has("t1b") is False
+    assert fresh.orch._reconcile_split_intents() is True
+    assert_split_is_consistent(fresh)
+    # Re-created from the intent's own definition, scope included — which is why
+    # the record carries the full successor and not merely its id.
+    registry = fresh.task_store.load()
+    assert tuple(registry.get("t1b").approved_paths) == PATHS
+    assert tuple(registry.get("t1a").depends_on) == ("t1b",)
 
 
 def test_a_quarantine_that_did_not_happen_is_not_reported_as_a_finished_split(tmp_path):

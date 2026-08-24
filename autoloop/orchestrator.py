@@ -353,6 +353,7 @@ from .tasks import (
     TaskRegistry,
     TaskState,
     TaskStore,
+    depends_on_after_retirement,
     effective_approved_paths,
     unauthorized_paths,
 )
@@ -1053,18 +1054,133 @@ class SplitAcceptance:
     worker_path: Path | None = None
 
 
+def _expected_successor_depends_on(
+    registry: TaskRegistry, intent: SplitIntent, successor: SplitSuccessor
+) -> tuple[str, ...]:
+    """What `successor.depends_on` must READ AS in `registry`, given how far the
+    split has got — the intent's own value, re-pointed if the retirement has run.
+
+    The registry does not always store what the intent recorded, and that is by
+    design rather than by accident: a successor may declare the task being split
+    as its own dependency (a reviewer writing "t1a continues t1"), and retiring
+    the parent re-points every direct dependent at the live successors —
+    including that one. So `depends_on=('t1',)` in the intent is
+    `depends_on=('t1b',)` on disk afterwards, and a verification that compared
+    against the recorded tuple would park every legitimate split of a task one of
+    its own successors waits on.
+
+    Predicted through `tasks.depends_on_after_retirement`, i.e. through the very
+    function `_retirement_rewrites` applies, so the prediction cannot drift from
+    the rewrite. Two conditions gate it, and both mirror that function exactly:
+
+      * the parent must actually BE retired in this registry. Before the
+        retirement runs (a first attempt, or a replay that has not reached it)
+        nothing has been re-pointed and the recorded tuple is the right
+        expectation;
+      * `live` is the successors that will be live WHEN THE RETIREMENT RUNS,
+        which is the set `_retirement_rewrites` computes — after `add_many`, not
+        before it. So a successor still absent here counts as live (this mutation
+        creates it a few lines further down) and one that is present but itself
+        retired does not. Reading it as "present right now" instead would predict
+        a different substitution than the one that happens, on exactly the
+        half-applied registry this whole mechanism exists for: with `t1a` on disk
+        and `t1b` not, `t1a`'s edge would be predicted as dropped when the
+        retirement pointed it at `t1b`, and a correct replay would park on a
+        mismatch it invented.
+
+    A successor that does not name the parent is returned unchanged rather than
+    passed through the substitution. That is not an optimisation: the rewrite
+    only ever touches DIRECT dependents, so a successor that names nobody is left
+    exactly as it was created — duplicates and all — while the substitution
+    de-duplicates, and running it unconditionally would invent a mismatch on a
+    task the retirement never looked at.
+    """
+    declared = tuple(successor.depends_on)
+    if intent.parent_id not in declared:
+        return declared
+    if not registry.has(intent.parent_id):
+        return declared
+    if registry.get(intent.parent_id).status != "retired":
+        return declared
+    live = tuple(
+        sid
+        for sid in intent.successor_ids
+        if not registry.has(sid) or registry.get(sid).status != "retired"
+    )
+    return depends_on_after_retirement(declared, intent.parent_id, live, successor.id)
+
+
+def _successor_disagreement(
+    registry: TaskRegistry, intent: SplitIntent, successor: SplitSuccessor
+) -> str:
+    """How the task `registry` holds under `successor.id` differs from the one
+    this split recorded, or `""` when it is that task exactly.
+
+    ONE implementation, called from BOTH sides of the acceptance — the
+    already-present branch of `_split_registry_mutation` (may this replay adopt
+    the task that is there?) and the final read-back in `_split_disagreement`
+    (may this intent be thrown away?). They asked the same question with two
+    different answers before: the mutation compared title and description while
+    the read-back checked mere presence, so a successor whose `approved_paths`
+    had been widened between a crash and the restart was adopted by the first and
+    then certified by the second, and the intent — the only record that anything
+    was ever in flight — was deleted on the strength of it. A split is not
+    complete because tasks with the right IDS exist; it is complete when the
+    tasks the reviewer authorized exist.
+
+    **All four durable fields, and exactly the four the intent records.**
+    `approved_paths` is the sharp one: it is the task's write authorization
+    (`Task.approved_paths`, the DECLARED scope — not `effective_approved_paths`,
+    which adds the documentation trackers every task may write and so is not what
+    the reviewer approved), so a successor silently adopted with a different
+    scope is a successor authorized to write files nobody agreed to.
+
+    **Deliberately NOT compared: `priority`, `status`, or any timestamp.** None
+    is in the intent, and `TaskStore.save` deliberately adopts the on-disk
+    priority for tasks the caller has not re-prioritised — so an operator who
+    re-prioritises a successor between the crash and the restart is doing a
+    supported thing, and parking the split forever over it would turn a
+    fail-closed check into a false-park machine. The line is: fields the split
+    AUTHORIZED are verified, fields the roadmap owns are left alone.
+    """
+    existing = registry.get(successor.id)
+    if existing.title != successor.title:
+        return (
+            f"its title reads {existing.title!r} rather than the recorded "
+            f"{successor.title!r}"
+        )
+    if existing.description != successor.description:
+        return "its description is not the one this split recorded"
+    if tuple(existing.approved_paths) != tuple(successor.approved_paths):
+        return (
+            f"its approved_paths read {list(existing.approved_paths)} rather than "
+            f"the recorded {list(successor.approved_paths)} — that is the task's "
+            "write authorization, so accepting it would authorize writes this "
+            "split never approved"
+        )
+    expected_depends_on = _expected_successor_depends_on(registry, intent, successor)
+    if tuple(existing.depends_on) != expected_depends_on:
+        return (
+            f"its depends_on reads {list(existing.depends_on)} rather than the "
+            f"{list(expected_depends_on)} this split recorded (after the parent's "
+            "retirement re-points its dependents)"
+        )
+    return ""
+
+
 def _split_registry_mutation(registry: TaskRegistry, intent: SplitIntent) -> tuple[str, ...]:
     """Perform the REGISTRY half of `intent` on `registry`; return the ids added.
 
     Idempotent by construction, because a replay must be able to run it over a
     registry where some or all of it already happened:
 
-      * a successor already present is skipped — but only after its title and
-        description are checked against the intent. `add_many` refuses a
-        duplicate id outright, so "skip what is there" is the only way a replay
-        can proceed at all, and skipping WITHOUT checking would let a task
-        somebody else created under the same id be silently adopted as this
-        split's successor;
+      * a successor already present is skipped — but only after every durable
+        field the intent records (title, description, `depends_on`,
+        `approved_paths`) is checked against it by `_successor_disagreement`.
+        `add_many` refuses a duplicate id outright, so "skip what is there" is
+        the only way a replay can proceed at all, and skipping WITHOUT checking
+        would let a task somebody else created — or edited — under the same id be
+        silently adopted as this split's successor, write scope and all;
       * `TaskRegistry.retire` is written-once and an exact repeat is a no-op that
         returns the task untouched, so the retirement is simply re-issued with
         the successors and reason the intent recorded. A retirement that is
@@ -1087,17 +1203,14 @@ def _split_registry_mutation(registry: TaskRegistry, intent: SplitIntent) -> tup
     added: list[Task] = []
     for successor in intent.successors:
         if registry.has(successor.id):
-            existing = registry.get(successor.id)
-            if (
-                existing.title != successor.title
-                or existing.description != successor.description
-            ):
+            mismatch = _successor_disagreement(registry, intent, successor)
+            if mismatch:
                 raise TaskGraphError(
                     "split_successor_occupied",
                     f"task '{successor.id}' already exists and is not the successor "
-                    f"this split of '{intent.parent_id}' recorded (its title or "
-                    "description differs), so the split cannot be completed without "
-                    "overwriting somebody else's task",
+                    f"this split of '{intent.parent_id}' recorded — {mismatch}. The "
+                    "split cannot be completed without overwriting somebody else's "
+                    "task, and it is not completed by adopting one",
                 )
             continue
         added.append(
@@ -1184,12 +1297,17 @@ def apply_split_intent(
          and it is why the intent is cleared LAST.
 
     **NOTHING IS CLEARED THAT WAS NOT VERIFIED.** The three stores are read back
-    — the registry says retired with these successors and every successor
-    exists, the execution store has no live record, the worker directory is gone
-    — and an intent whose stores do not agree is left exactly where it is with
-    `obstacle` set. A reconciler that cleared on the strength of "no exception
-    escaped" would be the fail-open version of this whole mechanism: the alarm
-    would stop ringing while the inconsistency stayed.
+    — the registry says retired with these successors and every successor is the
+    task this split authorized, DOWN TO ITS `depends_on` AND `approved_paths`
+    (`_successor_disagreement`); the execution store has no live record; the
+    worker directory is gone — and an intent whose stores do not agree is left
+    exactly where it is with `obstacle` set. A reconciler that cleared on the
+    strength of "no exception escaped" would be the fail-open version of this
+    whole mechanism: the alarm would stop ringing while the inconsistency stayed.
+    So would one that checked the successors merely EXIST: an operator editing
+    `tasks.json` between the crash and the restart can change either field, and a
+    split certified complete over a successor whose write scope somebody widened
+    is a split that authorized writes the reviewer never approved.
 
     Missing stores are an OBSTACLE, never a skip. `execution_store` /
     `worker_repos` being `None` while an intent exists means this process cannot
@@ -1345,6 +1463,18 @@ def _split_disagreement(
     missing = [s for s in intent.successor_ids if not registry.has(s)]
     if missing:
         return f"the registry is missing successor task(s) {missing}"
+    # PRESENCE IS NOT AGREEMENT. Every durable field the intent authorized is
+    # compared, through the same `_successor_disagreement` the mutation asks —
+    # see there for why the two may not answer differently, and why
+    # `approved_paths` is the field that makes this a security check rather than
+    # a tidiness one.
+    for successor in intent.successors:
+        mismatch = _successor_disagreement(registry, intent, successor)
+        if mismatch:
+            return (
+                f"successor task '{successor.id}' is in the registry but is not the "
+                f"task this split recorded — {mismatch}"
+            )
     try:
         if execution_store.load(intent.parent_id) is not None:
             return (
