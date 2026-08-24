@@ -198,6 +198,24 @@ killed six agents mid-write in two days and never once caught a hang — see
 `_partial_work` reads the numbers from the worker repo's own git state, so a
 reviewer can tell a wedge that produced 600 lines from one that produced
 nothing.
+
+**Every UNCOMMITTED round says what it produced, not just why it stopped**
+(exec-01, 2026-08-24). A round that fails validation, times out or whose agent
+errors makes no commit and no packet, so the reviewer answers from the summary
+alone — and that summary named only the CAUSE. Measured cost: brw-11 wrote
+2,347 insertions across four attempts, committed none, and drew four identical
+`revise` directives, while an operator reading the worker diff called the task
+too big in one look. `_partial_work_note` is what the reviewer reads instead:
+files changed, lines written and — the part counts cannot supply — WHICH files,
+on the failed-validation, missing-`validation_cwd` and agent-failed branches
+alike. It is EVIDENCE: every field comes from `git status`/`git diff HEAD` in
+the worker repo via `stall.WorkerTreeProbe`, and nothing in it is derived from
+`result.raw_text`, which the packet renders separately and clearly labelled as
+the agent's own account. The measurement is taken BEFORE the authoritative
+validation run for the reason the residue trap above gives — a run that leaves
+a cache directory would otherwise be counted as the agent's work — and the
+success path is untouched: a round that commits reports exactly what it did
+before.
 """
 
 from __future__ import annotations
@@ -1884,6 +1902,105 @@ def _revert_note(reverts: _Reverts, recorded_ok: bool) -> str:
     return "".join(parts)
 
 
+#: How many partial-work paths an uncommitted round's summary NAMES before it
+#: stops and says how many it left out.
+#:
+#: The path list is here because the counts alone cannot answer the question a
+#: reviewer of a no-candidate round is actually asking. brw-11 wrote 2,347
+#: insertions across four attempts and committed none of them, and that number
+#: is equally consistent with "one more round finishes it" and "this task is
+#: too big to land at all" — whereas three files that match the task's own plan
+#: and twenty-two spread across four subsystems are not. So the discriminator
+#: is WHICH files, and it is named rather than counted.
+#:
+#: Bounded, because the length of that list is decided by the work rather than
+#: by this module, and what the bound dropped is ALWAYS stated: a silent
+#: truncation reads exactly like complete coverage, which is the one way a
+#: report of this kind can mislead while looking correct.
+PARTIAL_WORK_MAX_PATHS = 20
+#: A second bound on the same list, for the same reason, in the dimension the
+#: count cannot see: twenty deeply-nested paths are far longer than twenty
+#: top-level ones. At least one path is always named even if it alone exceeds
+#: this — "and 34 more" with no example tells the reviewer nothing about WHERE.
+PARTIAL_WORK_MAX_PATH_CHARS = 800
+
+_PARTIAL_WORK_LABEL = "Partial work left in the worker repository"
+#: Said out loud in the text, not just true of the code. The same packet also
+#: renders `details = result.raw_text` — the agent's own account of itself —
+#: and the whole value of this section is that it is NOT that. A reviewer can
+#: only weigh the two differently if the packet says which is which.
+_PARTIAL_WORK_SOURCE = "read from the worker repo's git state, not from the agent's report"
+
+
+def _partial_work_note(
+    changed: Sequence[str], partial: PartialWork, *, with_counts: bool = True
+) -> str:
+    """What an UNCOMMITTED round says about the work it actually produced, or "".
+
+    Every branch that returns `status="error"` from `_run_implementation` after
+    the agent has run produces no commit and no packet, so the reviewer sees
+    only the summary. Before this existed it told them the CAUSE (the failing
+    test, the agent's error) and nothing about the WORK, which is why four
+    identical-looking brw-11 failures drew four identical `revise` directives.
+
+    `with_counts=False` is the stall/ceiling case: `stall.StallReport.describe`
+    has already stated the counts it measured at kill time, and printing a
+    second, separately-measured pair for one fact is worse than printing none.
+    It names no PATHS though, so the list is still added there — new
+    information, not a re-measurement.
+
+    The path sentence is keyed on `partial.measured`, never on `bool(changed)`.
+    A worker repo that could not be read yields an empty path tuple, and
+    rendering that as an empty list would report "the agent wrote nothing" when
+    the truth is "we could not look" — the exact fail-open where a check
+    silently passes because its input was missing.
+    """
+    parts: list[str] = []
+    if with_counts:
+        parts.append(f" {_PARTIAL_WORK_LABEL} ({_PARTIAL_WORK_SOURCE}): {partial.describe()}.")
+    if changed:
+        parts.append(f" Paths it touched ({_PARTIAL_WORK_SOURCE}): {_bounded_paths(changed)}.")
+    elif not partial.measured or partial.files_changed:
+        # Two separate git reads produce the two halves of this, so either can
+        # fail alone. Both ways round, an ABSENT path list has to be said out
+        # loud: silence here reads as "and it touched nothing", which is the
+        # opposite of what a count of 12 with no names means.
+        parts.append(
+            " The list of paths it touched could not be read, so that list is "
+            "UNKNOWN and is NOT a report of zero files."
+        )
+    return "".join(parts)
+
+
+def _bounded_paths(changed: Sequence[str]) -> str:
+    shown: list[str] = []
+    used = 0
+    for path in list(changed)[:PARTIAL_WORK_MAX_PATHS]:
+        if shown and used + len(path) > PARTIAL_WORK_MAX_PATH_CHARS:
+            break
+        shown.append(path)
+        used += len(path) + 2
+    dropped = len(changed) - len(shown)
+    body = ", ".join(shown)
+    return f"{body}, and {dropped} more not listed" if dropped > 0 else body
+
+
+def _measure_partial_work(git: GitGateway) -> PartialWork:
+    """The counts, from the worker repo's own git state. Never raises.
+
+    This runs only on paths that are already reporting a failure, and a report
+    that can itself fail is not a report. An unreadable repo comes back as
+    `measured=False`, which every reader must keep distinct from a measured
+    zero — see `PartialWork.describe`.
+    """
+    try:
+        return WorkerTreeProbe(git).partial_work()
+    except Exception as exc:
+        return PartialWork(
+            measured=False, note=f"{type(exc).__name__} reading the worker repository"
+        )
+
+
 def _extract_assumptions(raw_text: str) -> tuple[str, ...]:
     """The `ASSUMPTION:` lines in an agent's own output, in the order written.
 
@@ -2058,12 +2175,7 @@ class ImplementExecutor:
             changed = tuple(sorted(git.dirty_paths_all()))
         except Exception:
             changed = ()
-        try:
-            return changed, WorkerTreeProbe(git).partial_work()
-        except Exception as exc:
-            return changed, PartialWork(
-                measured=False, note=f"{type(exc).__name__} reading the worker repository"
-            )
+        return changed, _measure_partial_work(git)
 
     def _recorded_cleanup_paths(self, task: Task) -> tuple[str, ...]:
         """What the loop has recorded as this task's own out-of-scope residue.
@@ -2375,14 +2487,16 @@ class ImplementExecutor:
                 f"task '{task.id}': implementation agent failed — "
                 f"{result.error or f'rc={result.returncode}'}"
             )
+            # A stall report already states the COUNTS it measured at kill time;
+            # repeating them here would print two separately-measured numbers
+            # for one fact. Every OTHER failure — a provider error, a crash, the
+            # `subprocess.TimeoutExpired` path in `ClaudeCliRunner.run`, which
+            # carries no `stall` — has said nothing about them at all. The PATH
+            # list is added on both, because no stall report has ever carried
+            # one: it is new information, not a second measurement.
+            summary += _partial_work_note(changed, partial, with_counts=result.stall is None)
             if result.stall is None:
-                # A stall report already states the partial work it measured
-                # at kill time; repeating it here would print two numbers for
-                # one fact. Every OTHER failure has said nothing about it.
-                summary += (
-                    f" Partial work left in the worker repository: "
-                    f"{partial.describe()}. Validation did not run."
-                )
+                summary += " Validation did not run."
             # On this path too, and for the same reason a reviewer is told how
             # many lines a killed agent left: "wedged having never checked its
             # work" and "wedged after three red advisory runs" call for
@@ -2460,6 +2574,24 @@ class ImplementExecutor:
                 validation="not run",
             )
 
+        # ONE measurement of what this round produced, taken HERE: after the
+        # `changed` read above, so the two describe the same tree, and — this is
+        # the part that has to stay true — BEFORE validation runs. The
+        # authoritative run can itself write into the worker repo (a `ruff`
+        # cache directory that `git status -uall` would then report; see this
+        # module's docstring on the residue trap), so a count taken after it
+        # would fold validation's own writes into the agent's and disagree with
+        # the `changed_paths` the same outcome carries. Both no-candidate
+        # branches below report from this read and no other.
+        #
+        # Deliberately NOT taken on the two branches above it. Reaching `not
+        # changed` means the status read SUCCEEDED and returned nothing, which
+        # the sentence there already states; and on the `GitError` branch the
+        # measurement would fail for the same reason the read did, so its own
+        # message is the honest report. In both cases a `PartialWork` line would
+        # restate what is already said rather than add evidence.
+        partial = _measure_partial_work(git)
+
         # The SAME two computations the advisory call was bound to — see
         # `_validation_commands_for` for why they are one function and not two
         # copies. The `is_dir()` check stays HERE, where its failure is a
@@ -2473,6 +2605,10 @@ class ImplementExecutor:
                 summary=(
                     f"task '{task.id}': declared validation_cwd "
                     f"{task.validation_cwd!r} does not exist in the worker repo"
+                    # A no-candidate round like any other: nothing is committed
+                    # from here, so the work the agent did leaves no trace the
+                    # reviewer can read except this.
+                    + _partial_work_note(changed, partial)
                     + _revert_note(reverts, reverts_recorded)
                     + advisory.note()
                 ),
@@ -2497,6 +2633,13 @@ class ImplementExecutor:
                 summary=(
                     f"task '{task.id}': validation failed after implementation — "
                     f"{validation_summary}"
+                    # THE measured gap (exec-01). This branch already named the
+                    # CAUSE — `validation_summary` carries the failing command
+                    # and test — and said nothing whatever about the WORK, so
+                    # four brw-11 rounds that wrote 2,347 uncommitted insertions
+                    # between them were indistinguishable from four that wrote
+                    # nothing, and drew the same `revise` four times.
+                    + _partial_work_note(changed, partial)
                     + _revert_note(reverts, reverts_recorded)
                     + advisory.note()
                 ),
