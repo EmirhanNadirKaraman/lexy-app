@@ -489,6 +489,25 @@ real break, check the named subject directly: if `_drain_task_inbox` still
 contains `apply_requests(` with a three-name unpack, the assertion holds and the
 run's view of the file was stale.
 
+### An advisory validation result truncates the assertion message you asked for
+**Symptom:** a test is made to fail on purpose so a number it computed can be
+read out of the worker — an agent has no shell, so a failing assertion is one of
+the few ways to see a figure a passing test would swallow — and the result comes
+back as
+`FAILED …::test_the_pile_up_before_and_after_measured_in_one_repository - AssertionError: TEMPORARY MEASUREMENT REPORT — dash-21 measurement — one re...`
+with every number past the cut. Measured 2026-08-24 (dash-21).
+**Cause:** the channel returns pytest's `-q` short-summary line, and the WHOLE
+line — `FAILED <nodeid> - <ExceptionType>: <message>` — is truncated at roughly
+180 characters. A descriptive test name spends most of that budget before the
+message even starts, and the run is otherwise a normal FAIL, so the command
+stops there and everything after it reads `NOT RUN`.
+**Fix:** put the numbers FIRST and make them terse — `B 8/321/2.53s A 1/41/0.62s`
+costs about 30 characters and survives. Labels, units and prose belong in the
+test's own `print()` (captured, and nobody downstream reads it) or in the
+document you are writing the number into. Budget it as `180 − len("FAILED ") −
+len(nodeid) − len(" - AssertionError: ")`, and remember the deliberate failure
+costs you every command configured after that one.
+
 ### Backend suite: hundreds of `asyncpg` errors, or one unreproducible failure
 **Symptom:** `python3 -m pytest -n auto` in `lexy-app/backend` reports something
 like `1260 errors` with tracebacks bottoming out in
@@ -3250,3 +3269,4 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | bind-02 | New §8 entry directly above the repeated-`stop` one, for the fault that CAUSED that livelock rather than the livelock itself: `legacy_git_path_retired` on a correctly stamped `push`, after a `parse_error` on a review packet. The two entries are deliberately adjacent and cross-referenced — stop-01 bounds the symptom, this removes the cause, and an operator meeting the stop park should read both. |
 | 2026-08-24 | bind-02 | That entry carries the recovery for an OLD build, which is the half nobody had: the candidate is a real commit on `autoloop/<task-id>` in the worker repo, so publish it from there and `release` the task — do NOT re-run it, which produces a second candidate for work that already exists. On a current build the denial names the candidate and asks for `revise`; resending `push` is refused identically. |
 | 2026-08-24 | bind-02 | Revision round: the same §8 entry has a second, later-discovered shape worth recognising in a transcript. The re-prompt before the refused `push` is a `review_mismatch`, not a `parse_error`, and the `push` before THAT named an earlier packet id. Cause is the seam: a ledger-resolved approval leaves `last_response.postcommit` None, so the correction had nothing to inherit — and `review_mismatch_payload` asks the reviewer to stamp THIS request, which walks it straight back into the same denial. Fixed by carrying the resolved binding. |
+| 2026-08-24 | dash-21 | New §2 entry, beside the `inspect.getsource` one recov-01 added: the advisory validation channel returns pytest's `-q` short-summary line and truncates the WHOLE line at roughly 180 characters, so a number smuggled out through a deliberately failed assertion is cut off if the message is not terse. A descriptive node id spends most of the budget before the message starts. The entry gives the arithmetic and the surviving shape (`B 8/141/3.06s A 1/20/1.96s`). |

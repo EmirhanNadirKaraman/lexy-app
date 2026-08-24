@@ -5117,7 +5117,15 @@ def test_a_replacement_never_interrupts_a_response_in_flight(tmp_path, monkeypat
 
     One request is held inside `collect` while a second runs to completion. The
     second one's boundary must NOT replace the process, because the first is
-    still writing. Only when the first finishes may the exec happen."""
+    still writing. Only when the first finishes may the exec happen.
+
+    The second request is `/` and NOT `/api/state`, since dash-21: a second
+    `/api/state` would now join the held sweep by design (`collect_shared`) and
+    could not complete while the first is parked, which is the single-flight
+    property and not a fault. `handle()` is the boundary under test and it is
+    the same code for both routes — `_INFLIGHT` counts connections, not paths —
+    so the claim is unchanged. Do not "fix" this back to `/api/state`; the held
+    response's own body carries the upgrade state and is checked below."""
     import autoloop.dashboard as dash
 
     repo = make_repo(tmp_path)
@@ -5149,8 +5157,8 @@ def test_a_replacement_never_interrupts_a_response_in_flight(tmp_path, monkeypat
         assert entered.wait(timeout=10), "the held request never reached collect"
 
         # A whole second request, start to finish, while the first is mid-response.
-        status, body = get(base, "/api/state")
-        assert status == 200 and json.loads(body)["build"]["upgrade"]["state"] == "stale"
+        status, body = get(base, "/")
+        assert status == 200 and "<title>Autoloop" in body
         time.sleep(0.2)
         assert calls == [], (
             "the second request's boundary replaced the process while the first "
@@ -5164,6 +5172,9 @@ def test_a_replacement_never_interrupts_a_response_in_flight(tmp_path, monkeypat
             time.sleep(0.02)
 
     assert held and held[0][0] == 200, "the held response still arrived, whole"
+    # The held request's OWN body, read after it was released: the upgrade state
+    # the second request used to assert, from the response that was in flight.
+    assert json.loads(held[0][1])["build"]["upgrade"]["state"] == "stale"
     assert len(calls) == 1 and calls[0]["inflight"] == 0
 
 
@@ -5245,6 +5256,690 @@ def test_neither_process_finds_or_signals_the_other():
         "reading the process table for DISPLAY is unchanged — the bound is about "
         "signalling, not about looking"
     )
+
+
+# --- dash-21: one sweep at a time, one outstanding poll per tab --------------
+#
+# The claim, in two halves that are tested separately because they are two
+# independent guards:
+#
+#   * the PAGE never has more than one `/api/state` request outstanding; and
+#   * the SERVER never has more than one `collect()` sweep running.
+#
+# Measured 2026-08-24 06:20 against the live dashboard, before either guard
+# existed: three consecutive `/api/state` answers took 34.6s, 35.6s and 36.6s,
+# one second of progress per poll, because a 2s `setInterval` had issued about
+# seventeen requests before the first one answered and `ThreadingHTTPServer`
+# ran every one of them in its own thread. `test_the_pile_up_before_and_after_
+# measured_in_one_repository` at the end of this section is the reproducible
+# half of that: both arms in one process against ONE checkout.
+#
+# NOTHING IS CACHED, and these tests are also what say so. A caller arriving
+# while a sweep runs joins THAT sweep; a caller arriving after it finished
+# starts a new one. If a future change adds a TTL or a per-branch verdict store
+# here, `test_a_caller_arriving_after_the_sweep_ended_runs_a_fresh_one` and
+# `test_the_sweep_registry_is_not_a_cache_and_must_never_become_one` fail.
+
+
+def wait_until(predicate, what, timeout=20):
+    """Block until `predicate()` is true, or fail saying what never happened.
+
+    Concurrency tests here must not `sleep(0.2)` and hope: "one sweep ran" is
+    also true when the later callers arrived after it finished, which is the
+    opposite of the property under test.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    raise AssertionError(f"timed out after {timeout}s waiting for {what}")
+
+
+class _JoinRecordingEvent(threading.Event):
+    """A `_Sweep.done` that records every caller which WAITS on it.
+
+    Waiting on that event is exactly what "joined the sweep already running"
+    means — the caller has been past `_SWEEP_LOCK`, found a live sweep and
+    decided not to lead one. Recording it is what lets a test hold the leader
+    until every other caller has provably joined, instead of sleeping and
+    hoping the scheduler cooperated.
+    """
+
+    def __init__(self, joined: list):
+        super().__init__()
+        self._joined = joined
+
+    def wait(self, timeout=None):
+        self._joined.append(threading.current_thread().name)
+        return super().wait(timeout)
+
+
+@contextlib.contextmanager
+def joins_recorded(monkeypatch):
+    """Yield the list of callers that joined a running sweep, as they join."""
+    import autoloop.dashboard as dash
+
+    joined: list = []
+
+    class RecordingSweep(dash._Sweep):
+        __slots__ = ()
+
+        def __init__(self):
+            super().__init__()
+            self.done = _JoinRecordingEvent(joined)
+
+    monkeypatch.setattr(dash, "_Sweep", RecordingSweep)
+    yield joined
+
+
+def test_concurrent_callers_share_the_one_sweep_already_running(tmp_path, monkeypatch):
+    """Eight callers, one `collect()`. The leader is held inside the sweep until
+    all seven others have provably joined it, so this cannot pass by the other
+    seven arriving after it finished."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    sweeps: list = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def one_held_sweep(target):
+        sweeps.append(target)
+        entered.set()
+        assert release.wait(timeout=20), "the held sweep was never released"
+        return {"served_at": "12:00:00", "sweep": len(sweeps)}
+
+    monkeypatch.setattr(dash, "collect", one_held_sweep)
+    answers: dict = {}
+
+    def caller(index):
+        answers[index] = dash.collect_shared(repo)
+
+    with joins_recorded(monkeypatch) as joined:
+        threads = [
+            threading.Thread(target=caller, args=(i,), daemon=True) for i in range(8)
+        ]
+        threads[0].start()
+        assert entered.wait(timeout=20), "the leader never reached collect()"
+        for thread in threads[1:]:
+            thread.start()
+        wait_until(lambda: len(joined) >= 7, "seven callers to join the running sweep")
+        release.set()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), "a caller was never answered"
+
+    assert len(sweeps) == 1, f"eight concurrent callers ran {len(sweeps)} sweeps"
+    assert len(answers) == 8
+    assert all(answer is answers[0] for answer in answers.values()), (
+        "every joiner is answered from the leader's own result"
+    )
+    assert dash._SWEEPS_IN_FLIGHT == {}, "nothing outlives the sweep that made it"
+
+
+def test_concurrent_api_state_requests_run_exactly_one_sweep(tmp_path, monkeypatch):
+    """The same property through the real server and the real route, because
+    `do_GET` calling `collect` instead of `collect_shared` would leave every
+    test above passing while the page pile-up was untouched."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    sweeps: list = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def one_held_sweep(target):
+        sweeps.append(target)
+        entered.set()
+        assert release.wait(timeout=20), "the held sweep was never released"
+        return {"served_at": "12:00:00", "sweep": len(sweeps)}
+
+    monkeypatch.setattr(dash, "collect", one_held_sweep)
+    answers: dict = {}
+
+    with serving_dashboard(repo, monkeypatch) as base, joins_recorded(monkeypatch) as joined:
+        def poll(index):
+            answers[index] = get(base, "/api/state")
+
+        threads = [
+            threading.Thread(target=poll, args=(i,), daemon=True) for i in range(5)
+        ]
+        threads[0].start()
+        assert entered.wait(timeout=20), "the first request never reached collect()"
+        for thread in threads[1:]:
+            thread.start()
+        wait_until(lambda: len(joined) >= 4, "four tabs to join the running sweep")
+        release.set()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), "a request was never answered"
+
+    assert len(sweeps) == 1, f"five concurrent tabs ran {len(sweeps)} sweeps"
+    assert len(answers) == 5
+    assert {status for status, _ in answers.values()} == {200}
+    bodies = {body for _, body in answers.values()}
+    assert len(bodies) == 1, "every caller was answered from the same sweep"
+
+
+def test_a_caller_arriving_after_the_sweep_ended_runs_a_fresh_one(tmp_path, monkeypatch):
+    """The no-cache half of the claim. A sweep's result is reachable only while
+    that sweep is running; the next caller pays for a new one and gets the new
+    one's answer, so there is no invalidation question to get wrong."""
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    sweeps: list = []
+
+    def counting(target):
+        sweeps.append(target)
+        return {"sweep": len(sweeps)}
+
+    monkeypatch.setattr(dash, "collect", counting)
+
+    first = dash.collect_shared(repo)
+    assert dash._SWEEPS_IN_FLIGHT == {}, "a finished sweep leaves nothing behind"
+    second = dash.collect_shared(repo)
+    third = dash.collect_shared(repo)
+
+    assert [first["sweep"], second["sweep"], third["sweep"]] == [1, 2, 3]
+    assert first is not second and second is not third
+    assert len(sweeps) == 3
+
+
+def test_the_sweep_registry_is_not_a_cache_and_must_never_become_one():
+    """A drift guard on the constraint the task was rewritten around.
+
+    Five earlier attempts died on cache invalidation — a head-keyed store whose
+    old in-flight sweep evicted the new head's entry, and a 2.45s git timeout
+    that must not be remembered. `collect_shared` therefore reads no clock and
+    keys nothing on a head: an entry exists between the leader starting and the
+    leader returning, and that is the entire lifetime.
+    """
+    import inspect
+
+    import autoloop.dashboard as dash
+
+    source = inspect.getsource(dash.collect_shared)
+    for smell in ("time.time", "monotonic", "ttl", "TTL", "expire", "expiry",
+                  "datetime", "_CACHE"):
+        assert smell not in source, (
+            f"`collect_shared` mentions {smell!r} — the cache is out of scope for "
+            "dash-21 and re-adding one reopens the invalidation question that "
+            "killed five rounds"
+        )
+    assert dash._SWEEPS_IN_FLIGHT == {}, (
+        "with no sweep running the registry is empty; anything left in it is a cache"
+    )
+
+
+@pytest.mark.parametrize(
+    "boom",
+    [
+        RuntimeError("git went away mid-sweep"),
+        subprocess.TimeoutExpired(cmd=["git", "log", "--all"], timeout=2.45),
+        KeyboardInterrupt(),
+    ],
+    ids=["error", "git-timeout", "interrupt"],
+)
+def test_a_sweep_that_fails_releases_every_waiter(boom, tmp_path, monkeypatch):
+    """The failure path, which is where a single-flight usually parks a page.
+
+    `KeyboardInterrupt` is in the table on purpose: an `except Exception` in the
+    leader would not catch it, `done` would never be set, and every joined tab
+    would wait forever on a sweep whose thread had already gone. The git timeout
+    is the real 2.45s one measured on 2026-08-24.
+    """
+    import autoloop.dashboard as dash
+
+    repo = make_repo(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    attempts: list = []
+
+    def failing(target):
+        attempts.append(target)
+        entered.set()
+        assert release.wait(timeout=20), "the held sweep was never released"
+        raise boom
+
+    monkeypatch.setattr(dash, "collect", failing)
+    raised: dict = {}
+
+    def caller(index):
+        try:
+            dash.collect_shared(repo)
+        except BaseException as exc:  # the point of the test
+            raised[index] = exc
+
+    with joins_recorded(monkeypatch) as joined:
+        threads = [
+            threading.Thread(target=caller, args=(i,), daemon=True) for i in range(5)
+        ]
+        threads[0].start()
+        assert entered.wait(timeout=20), "the leader never reached collect()"
+        for thread in threads[1:]:
+            thread.start()
+        wait_until(lambda: len(joined) >= 4, "four callers to join the doomed sweep")
+        release.set()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), "a waiter was never released"
+
+    assert len(attempts) == 1
+    assert len(raised) == 5, "every caller was told, rather than left waiting"
+    assert all(exc is boom for exc in raised.values())
+    assert dash._SWEEPS_IN_FLIGHT == {}, "a failed sweep leaves no seat behind"
+
+    # …and the failure is not remembered either: the next caller runs a fresh
+    # sweep and is answered normally.
+    def working(target):
+        attempts.append(target)
+        return {"sweep": len(attempts)}
+
+    monkeypatch.setattr(dash, "collect", working)
+    assert dash.collect_shared(repo) == {"sweep": 2}
+
+
+def test_two_checkouts_never_share_a_sweep(tmp_path, monkeypatch):
+    """Keyed by repo, for the reason `_REMOTE_CACHE` is: a single global slot
+    would answer a question about checkout B with checkout A's payload, and
+    would also make B wait on a sweep it has no interest in."""
+    import autoloop.dashboard as dash
+
+    repo_a = make_repo(tmp_path / "a")
+    repo_b = make_repo(tmp_path / "b")
+    held = threading.Event()
+    release = threading.Event()
+    sweeps: list = []
+
+    def collect_holding_a(target):
+        sweeps.append(target)
+        if target == repo_a:
+            held.set()
+            assert release.wait(timeout=20), "A's sweep was never released"
+        return {"repo": str(target)}
+
+    monkeypatch.setattr(dash, "collect", collect_holding_a)
+    answers: dict = {}
+
+    def caller(name, repo):
+        answers[name] = dash.collect_shared(repo)
+
+    slow = threading.Thread(target=caller, args=("a", repo_a), daemon=True)
+    slow.start()
+    assert held.wait(timeout=20), "A's sweep never started"
+
+    fast = threading.Thread(target=caller, args=("b", repo_b), daemon=True)
+    fast.start()
+    fast.join(timeout=20)
+    assert not fast.is_alive(), "B waited on A's sweep — the registry is not keyed"
+    assert answers["b"] == {"repo": str(repo_b)}
+
+    release.set()
+    slow.join(timeout=20)
+    assert answers["a"] == {"repo": str(repo_a)}
+    assert sorted(str(s) for s in sweeps) == sorted([str(repo_a), str(repo_b)])
+    assert dash._SWEEPS_IN_FLIGHT == {}
+
+
+# --- the page half: one outstanding /api/state per tab -----------------------
+
+
+def pure_poll_js() -> str:
+    """The tab's whole polling loop, lifted verbatim out of the served page.
+
+    Everything between the markers depends on nothing but `fetch`, `render` and
+    the timer functions, so a harness can supply those and drive real ticks
+    against the real code. The `setInterval` that fires it is deliberately
+    OUTSIDE the region — a test that started a real 2s timer would be testing
+    node's clock rather than the guard.
+    """
+    script = PAGE.split("<script>", 1)[1]
+    return script.split("// PURE_POLL_START", 1)[1].split("// PURE_POLL_END", 1)[0]
+
+
+def test_a_tick_that_finds_one_in_flight_issues_nothing_and_draws_nothing():
+    """Seventeen ticks against one unanswered request — the measured shape.
+
+    One request is issued, sixteen ticks do nothing at all, and `render` is not
+    called until the one request answers. Both halves matter: the second is
+    what keeps the figures on screen the ones the last COMPLETED poll carried.
+    """
+    out = json.loads(run_js("""
+const OUT = {issued: 0, live: 0, peak: 0, rendered: []};
+const waiting = [];
+const fetch = (url, opts) => {
+  OUT.issued++; OUT.live++; OUT.peak = Math.max(OUT.peak, OUT.live);
+  return new Promise(resolve => waiting.push(payload => {
+    OUT.live--; resolve({json: async () => payload});
+  }));
+};
+const render = d => OUT.rendered.push(d);
+""" + pure_poll_js() + """
+const settle = () => new Promise(r => setImmediate(r));
+(async () => {
+  const ticks = [];
+  for (let i = 0; i < 17; i++) ticks.push(tick());
+  await settle();
+  OUT.duringTheBurst = {issued: OUT.issued, peak: OUT.peak, drawn: OUT.rendered.length};
+  waiting.shift()({served_at: "12:00:00", n: 1});
+  OUT.outcomes = await Promise.all(ticks);
+  await settle();
+  OUT.afterTheAnswer = {issued: OUT.issued, drawn: OUT.rendered.length};
+  const later = tick();
+  await settle();
+  waiting.shift()({served_at: "12:00:35", n: 2});
+  OUT.later = await later;
+  OUT.final = {issued: OUT.issued, peak: OUT.peak, rendered: OUT.rendered};
+  console.log(JSON.stringify(OUT));
+})();
+"""))
+
+    assert out["duringTheBurst"] == {"issued": 1, "peak": 1, "drawn": 0}
+    assert out["outcomes"] == ["rendered"] + ["skipped"] * 16
+    assert out["afterTheAnswer"] == {"issued": 1, "drawn": 1}, (
+        "a skipped tick must not draw — the display stays on the last completed poll"
+    )
+    assert out["later"] == "rendered"
+    assert out["final"]["peak"] == 1, "never more than one request outstanding"
+    assert out["final"]["issued"] == 2, "the guard releases once the answer lands"
+    assert [row["n"] for row in out["final"]["rendered"]] == [1, 2]
+    assert [row["served_at"] for row in out["final"]["rendered"]] == [
+        "12:00:00", "12:00:35"
+    ], "every figure drawn came from a poll that returned"
+
+
+def test_a_request_that_never_settles_cannot_latch_the_guard_off():
+    """The fail-open shape: a guard that latches ON is the same dead page by
+    another route. A suspended laptop or a dropped socket leaves a request that
+    never settles, and without the deadline this tab would stop polling for as
+    long as it stayed open.
+
+    The timers are faked so the 120s deadline can be fired directly; the real
+    `AbortController` does the aborting.
+    """
+    out = json.loads(run_js("""
+const timers = [];
+const setTimeout = (fn, ms) => { timers.push({fn, ms, cleared: false}); return timers.length - 1; };
+const clearTimeout = id => { if (timers[id]) timers[id].cleared = true; };
+let issued = 0;
+const drawn = [];
+const fetch = (url, opts) => {
+  issued++;
+  return new Promise((resolve, reject) => {
+    opts.signal.addEventListener("abort", () => reject(new Error("aborted")));
+  });
+};
+const render = d => drawn.push(d);
+""" + pure_poll_js() + """
+const settle = () => new Promise(r => setImmediate(r));
+(async () => {
+  const stuck = tick();
+  await settle();
+  const skipped = await tick();
+  const armed = timers[0];
+  armed.fn();
+  const stuckOut = await stuck;
+  await settle();
+  const next = tick();
+  await settle();
+  const issuedAfter = issued;
+  timers[timers.length - 1].fn();
+  const nextOut = await next;
+  console.log(JSON.stringify({deadlineMs: armed.ms, cleared: armed.cleared,
+    skipped, stuckOut, nextOut, issuedAfter, drawn: drawn.length}));
+})();
+"""))
+
+    assert out["deadlineMs"] == 120000, (
+        "far longer than any sweep observed (35s), far shorter than forever"
+    )
+    assert out["skipped"] == "skipped", "the tick during the stuck request did nothing"
+    assert out["stuckOut"] == "failed"
+    assert out["cleared"] is True, "the deadline is cancelled once the tick settles"
+    assert out["issuedAfter"] == 2, "the next tick polls again — the guard did not latch"
+    assert out["nextOut"] == "failed"
+    assert out["drawn"] == 0, "a poll that never answered draws nothing"
+
+
+def test_no_error_path_leaves_the_page_stuck_on_a_poll_that_failed():
+    """Every way a poll can go wrong, in one tab, in order: a refused socket, a
+    body that is not JSON, a body that cannot be read, and a `render` that
+    throws. Each must clear the guard, and the last tick must still draw."""
+    out = json.loads(run_js("""
+let mode = "network";
+let issued = 0;
+const drawn = [];
+const fetch = () => {
+  issued++;
+  if (mode === "network") return Promise.reject(new Error("connection refused"));
+  if (mode === "badbody") return Promise.resolve({json: () => Promise.reject(new SyntaxError("not json"))});
+  if (mode === "unreadable") return Promise.resolve({json: async () => { throw new Error("no body"); }});
+  return Promise.resolve({json: async () => ({served_at: "12:01:10"})});
+};
+const render = d => { if (mode === "drawthrows") throw new Error("boom"); drawn.push(d); };
+""" + pure_poll_js() + """
+(async () => {
+  const seen = {};
+  for (const m of ["network", "badbody", "unreadable", "drawthrows", "ok"]) {
+    mode = m;
+    seen[m] = await tick();
+  }
+  console.log(JSON.stringify({seen, issued, drawn: drawn.length}));
+})();
+"""))
+
+    assert out["seen"] == {
+        "network": "failed", "badbody": "failed", "unreadable": "failed",
+        "drawthrows": "failed", "ok": "rendered",
+    }
+    assert out["issued"] == 5, "each tick after a failure still issued its own request"
+    assert out["drawn"] == 1
+
+
+def test_a_throw_before_the_request_is_even_made_does_not_latch_the_guard():
+    """The narrowest fail-open the guard can have: a throw AFTER `POLLING` is
+    raised and BEFORE the `try` is entered would latch the flag on and the tab
+    would never poll again — the dead page this change exists to fix, arriving
+    through the fix. Everything after the flag therefore sits inside the block.
+
+    Modelled with an `AbortController` that cannot be constructed, which is the
+    only thing on that line that could throw.
+    """
+    out = json.loads(run_js("""
+let AbortController = function(){ throw new ReferenceError("AbortController is not defined"); };
+let issued = 0;
+const drawn = [];
+const fetch = () => { issued++; return Promise.resolve({json: async () => ({served_at: "12:02:00"})}); };
+const render = d => drawn.push(d);
+const RealAbortController = globalThis.AbortController;
+""" + pure_poll_js() + """
+(async () => {
+  const broken = await tick();
+  AbortController = RealAbortController;
+  const repaired = await tick();
+  console.log(JSON.stringify({broken, repaired, issued, drawn: drawn.length}));
+})();
+"""))
+
+    assert out["broken"] == "failed", "the tick reported a failed poll"
+    assert out["issued"] == 1, "the broken tick never reached the network"
+    assert out["repaired"] == "rendered", (
+        "the very next tick polled — a latched guard would have said 'skipped'"
+    )
+    assert out["drawn"] == 1
+
+
+def test_the_page_polls_once_and_invents_no_clock_of_its_own():
+    """The second constraint, asserted structurally because it is an absence.
+
+    A skipped tick may leave stale figures on screen; it may never age them
+    locally into a figure no poll ever returned. `elapsed_seconds` and
+    `served_at` are computed server-side and rendered straight from the
+    payload, `renderProgress` is reached only from `render`, and `render` is
+    reached only from a completed poll or a forced redraw of `LAST`.
+    """
+    script = PAGE.split("<script>", 1)[1]
+
+    assert script.count("setInterval(") == 1, "one timer on the page, and it is the poll"
+    assert "setInterval(tick, 2000)" in script
+    assert script.count('fetch("/api/state"') == 1, "one place asks the server for state"
+    assert "Date.now(" not in script and "new Date(" not in script, (
+        "nothing on this page runs a clock — every elapsed figure is the server's"
+    )
+    assert script.count("renderProgress(") == 2, (
+        "defined once, called once, from `render` — a second caller could advance "
+        "the live figures without a poll behind them"
+    )
+    assert "let POLLING = false;" in script
+
+
+# --- the measurement ---------------------------------------------------------
+
+MEASURED_CALLERS = 8
+MEASURED_TASKS = 12
+
+
+def measurement_repo(tmp_path):
+    """A checkout whose sweep costs real git work: an origin, twelve completed
+    tasks and a published branch for each, so `merge_report` and
+    `disagreement_report` ask git about every one of them.
+
+    BOTH arms of the measurement run against THIS repository, in this process,
+    which is the objection two earlier rounds died on — a before taken against
+    one tree and an after against another is not a measurement.
+    """
+    repo = make_repo(tmp_path)
+    origin = tmp_path / "origin.git"
+    run_git(tmp_path, "init", "--bare", "-q", str(origin))
+    run_git(repo, "remote", "add", "origin", str(origin))
+    run_git(repo, "push", "-q", "origin", "work")
+
+    tasks = []
+    for index in range(MEASURED_TASKS):
+        task_id = f"m-{index:02d}"
+        head = run_git(repo, "rev-parse", "HEAD").strip()
+        run_git(repo, "push", "-q", "origin", f"{head}:refs/heads/autoloop/{task_id}")
+        (repo / f"f{index}.txt").write_text(f"{index}\n")
+        run_git(repo, "add", f"f{index}.txt")
+        run_git(repo, "commit", "-q", "-m", f"Merge task {task_id} into autoloop/mainline")
+        tasks.append(completed(task_id))
+    write_registry(repo, tasks)
+    return repo
+
+
+def test_the_pile_up_before_and_after_measured_in_one_repository(tmp_path, monkeypatch):
+    """The before/after, taken in one process against one checkout.
+
+    Each arm starts `MEASURED_CALLERS` callers and reports three numbers: how
+    many `collect()` sweeps ran, how many subprocesses those sweeps launched
+    (through `_run_status`, the single subprocess entry point — git, plus the
+    one `ps` that reads the agent table), and the wall clock.
+
+    The AFTER arm runs FIRST on purpose. It is the arm this change is meant to
+    favour, so giving the BEFORE arm the warm filesystem is the conservative
+    ordering rather than the flattering one.
+
+    Both arms rendezvous before doing their work, so neither is measured against
+    a straggler: the before arm's callers meet at a barrier inside `collect`,
+    and the after arm's leader waits until every other caller has provably
+    joined its sweep. That rendezvous is the only thing either arm is made to
+    wait for, and both pay it.
+    """
+    import autoloop.dashboard as dash
+
+    repo = measurement_repo(tmp_path)
+    real_collect = dash.collect
+    real_status = dash._run_status
+    caches = (dash._REMOTE_CACHE, dash._ANCESTRY_CACHE, dash._SHALLOW_CACHE,
+              dash._SUBJECT_CACHE)
+
+    def arm(entry, gate):
+        for cache in caches:
+            cache.clear()
+        sweeps: list = []
+        git_calls: list = []
+        tally = threading.Lock()
+
+        def counted_status(*args, **kwargs):
+            with tally:
+                git_calls.append(1)
+            return real_status(*args, **kwargs)
+
+        def counted_collect(target):
+            with tally:
+                sweeps.append(target)
+            gate()
+            return real_collect(target)
+
+        monkeypatch.setattr(dash, "collect", counted_collect)
+        monkeypatch.setattr(dash, "_run_status", counted_status)
+        errors: list = []
+
+        def caller():
+            try:
+                entry(repo)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=caller, daemon=True)
+            for _ in range(MEASURED_CALLERS)
+        ]
+        started = time.perf_counter()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=180)
+        wall = time.perf_counter() - started
+        assert all(not t.is_alive() for t in threads), "a measured caller never returned"
+        assert not errors, f"a measured caller failed: {errors[0]!r}"
+        return {"sweeps": len(sweeps), "git": len(git_calls), "wall": wall}
+
+    with joins_recorded(monkeypatch) as joined:
+        after = arm(
+            lambda target: dash.collect_shared(target),
+            lambda: wait_until(
+                lambda: len(joined) >= MEASURED_CALLERS - 1,
+                "every other caller to join the one sweep",
+                timeout=60,
+            ),
+        )
+
+    barrier = threading.Barrier(MEASURED_CALLERS, timeout=60)
+    before = arm(lambda target: dash.collect(target), barrier.wait)
+
+    measurement = (
+        f"dash-21 measurement — one repository, {MEASURED_TASKS} completed tasks, "
+        f"{MEASURED_CALLERS} concurrent callers. "
+        f"BEFORE (a sweep per caller, as ThreadingHTTPServer did): "
+        f"sweeps={before['sweeps']} subprocesses={before['git']} "
+        f"wall={before['wall']:.2f}s | "
+        f"AFTER (collect_shared): sweeps={after['sweeps']} "
+        f"subprocesses={after['git']} wall={after['wall']:.2f}s"
+    )
+    print(measurement)
+
+    assert before["sweeps"] == MEASURED_CALLERS, (
+        "the before arm is the unguarded path: one sweep per caller"
+    )
+    assert after["sweeps"] == 1, "the after arm runs one sweep for all eight callers"
+    assert after["git"] < before["git"], measurement
+    # The wall clock is REPORTED, not asserted, and the docstring above says why
+    # the arms are ordered the way they are. Eight sweeps on eight threads spend
+    # most of their time inside git subprocesses with the GIL released, so on a
+    # machine with cores to spare the before arm can finish in not much more
+    # than one sweep's wall clock while doing eight sweeps' work — an assertion
+    # on it would be measuring the host's core count. The count of git
+    # subprocesses above is the same cost without that confound, and the failure
+    # the operator actually saw was requests stacking, which `sweeps` states
+    # exactly.
+    #
+    # Observed 2026-08-24 on this repository, recorded in `docs/AUTOLOOP.md` §4i:
+    # BEFORE 8 sweeps / 141 subprocess launches / 3.06s, AFTER 1 sweep / 20
+    # launches / 1.96s. The wall clock moved least, for the reason above, and it
+    # is quoted with the other two rather than on its own.
 
 
 # --- stale process vs unreadable data: two faults, two renderings ------------

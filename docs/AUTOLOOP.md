@@ -3493,6 +3493,123 @@ either line is added, forcing this section to be rewritten in the same change.
 
 ---
 
+## 4i. The dashboard answers at the rate the server can sustain (dash-21, 2026-08-24)
+
+**The incident.** With one dashboard tab open, `/api/state` stopped answering.
+Measured 2026-08-24 06:20 against the live dashboard, three consecutive answers
+arrived after 34.6s, 35.6s and 36.6s — one second of progress per poll. What the
+operator sees is a frozen "17m 32s since dispatch", because `elapsed_seconds` is
+computed server-side (`dashboard.py`, `_elapsed_seconds`) and rendered from the
+poll payload, so it advances only when a poll RETURNS. A freshly restarted
+server answered `/` in 0.25s and the same server answered nothing ten minutes
+later, which is why it was first misread as a wedged process — and why the
+watcher restarting it on a "not responding" check made it look intermittent
+rather than broken.
+
+The cause is a rate mismatch with a multiplier on it. The page polls on
+`setInterval(tick, 2000)`; `collect()` on the loop's own checkout took 10.6s when
+the page was written and 35s by 2026-08-24, and it grows with every completed
+task because the merge and disagreement panels ask git about each one. Seventeen
+requests are therefore issued before the first answers, `ThreadingHTTPServer`
+gives every one of them its own thread, they stack rather than replace one
+another, the process pegs a core and the browser exhausts its per-host
+connection limit.
+
+**Two guards, one on each side, and they are independent.**
+
+* **The page keeps at most one `/api/state` outstanding.** `tick()` returns
+  immediately if a request is already in flight; it does not queue a second and
+  it does not touch the DOM. The page then refreshes at whatever rate the server
+  can sustain — a slow dashboard instead of a dead one, with "updated HH:MM:SS"
+  saying how old the figures are.
+* **The server runs at most one `collect()` sweep at a time.** `collect_shared`
+  is what `do_GET` calls. The first caller LEADS and runs the sweep; every caller
+  that arrives while it is running JOINS and is answered from its result; the
+  first caller to arrive after it finished leads a fresh one.
+
+**A skipped tick may not age the display.** The figures on screen stay the ones
+the last COMPLETED poll carried. Nothing on the page runs a clock of its own —
+`elapsed_seconds` and `served_at` are both server-computed and rendered straight
+from the payload, the poll is the page's only `setInterval`, and `renderProgress`
+is reached only from `render`. A locally advanced clock would show a figure no
+poll ever returned, which is a worse failure than a stale one because it looks
+current.
+
+**NOTHING IS CACHED, and that is the design rather than an omission.**
+`_SWEEPS_IN_FLIGHT` maps `str(repo)` to the sweep RUNNING RIGHT NOW and holds
+nothing else, ever: `collect_shared`'s `finally` removes the entry before any
+waiter is woken, and under the same lock that decides joining, so the set of
+joiners is exactly "the callers who found this sweep still active". There is no
+TTL, no head key, no per-branch verdict and no payload kept between sweeps. This
+task was rewritten specifically to cut the cache: the earlier spec asked that the
+cost of answering not grow with the number of task branches, that needs a cache
+of per-branch ancestry, a cache needs invalidation when the head moves, and five
+attempts died there — including a head-invalidation race in which an old
+in-flight sweep evicted the new head's entry and restored the superseded head as
+authoritative, and a real 2.45s git timeout that must not be remembered. With no
+store there is no invalidation question to get wrong.
+
+**Both guards fail open into polling, never closed into silence.** A sweep that
+raises releases its waiters: `sweep.done.set()` is in `collect_shared`'s
+`finally`, so it runs on the error path as well as the success path, and the
+`except` clause is `BaseException` rather than `Exception` — a `KeyboardInterrupt`
+or a `SystemExit` in the leader must still release everyone waiting on it. The
+error is recorded on the sweep and re-raised to every caller, so a joiner is told
+rather than parked, and nothing about the failure survives into the next sweep.
+On the page side the flag is cleared in `finally`, EVERYTHING after `POLLING =
+true` sits inside the `try` (a throw between raising the flag and entering the
+block would latch it on for the life of the tab), AND the request carries a
+120,000 ms deadline through an `AbortController`, because a guard that latches ON
+is the same dead page by another route: one request that never settles — a
+suspended laptop, a dropped socket — would otherwise stop the tab polling for as
+long as it stays open. The deadline is far longer than any sweep observed and
+far shorter than forever; abandoning a live sweep would put the page back to
+polling a server that is still working, which is the pile-up again.
+
+**One deliberate cost, stated rather than hidden.** A sweep that fails now fails
+every caller joined to it, where before each connection failed on its own. The
+alternative — a joiner running its own sweep when the leader fails — is exactly
+the concurrency this exists to deny, and the page treats the result as a failed
+poll and retries on its next tick, so the cost is one skipped refresh rather than
+a lost answer.
+
+**Measured, before and after, in one repository.** The 06:20 field figures above
+are the pre-change observation and cannot be re-taken after the fix without a
+live loop, so the reproducible half runs in the suite.
+`test_the_pile_up_before_and_after_measured_in_one_repository` builds ONE
+checkout — twelve completed tasks, a published branch for each — and runs eight
+concurrent callers through it twice: once calling `collect()` directly, which is
+what a thread per connection did, and once through `collect_shared`. Observed
+2026-08-24:
+
+| | sweeps | subprocess launches | wall |
+|---|---|---|---|
+| BEFORE — a sweep per caller | 8 | 141 | 3.06s |
+| AFTER — `collect_shared` | 1 | 20 | 1.96s |
+
+Read those three columns differently. **Sweeps** and **launches** are the cost
+and they fall 8→1 and 141→20; both are counted, not timed, and both are
+asserted. The **wall clock** is reported and NOT asserted, and it is the one that
+moved least on purpose: eight sweeps on eight threads spend most of their time
+inside subprocesses with the GIL released, so on a host with cores to spare that
+figure measures the core count as much as the change — and on the live dashboard
+the failure was never one slow answer, it was seventeen requests stacked against
+a browser's connection limit, which is what the sweep column states exactly. The
+AFTER arm runs FIRST so the BEFORE arm gets the warm filesystem: the conservative
+ordering, not the flattering one.
+
+**Making `collect()` itself faster is a separate, later question.** 35s every 35s
+is survivable; 35s every 2s is not. Fix the pile-up first, then measure again and
+decide whether the per-branch ancestry cost is worth attacking at all.
+
+**Where to look.** `autoloop/dashboard.py`: `collect_shared`, `_Sweep`,
+`_SWEEPS_IN_FLIGHT`, `_SWEEP_LOCK`, `Handler.do_GET`, and the poll region of
+`PAGE` between its `PURE_POLL` markers. Tests: the dash-21 section of
+`autoloop/tests/test_dashboard.py`, which drives real threads against a real
+`ThreadingHTTPServer` and runs the page's own poll loop under node.
+
+---
+
 ## 5. Response contract (v3)
 
 As v2 (task-id-based work authorization, `plan`, `reviewed` integrity stamps —
