@@ -36,11 +36,9 @@ from autoloop.dashboard import (
     collect,
     dep_view_key,
     dependency_graph,
-    format_merge_time,
     is_ancestor,
     merge_groups,
     merge_states,
-    merge_times,
     naming_ancestor,
     pipeline,
     roadmap_stats,
@@ -64,16 +62,11 @@ def _clean_dashboard_caches():
 
     `_SUBJECT_CACHE` (dash-18) joins them for the same reason and one of its
     own: it holds `git log --all` for 60s per repo, so without this a `collect`
-    test would judge its own registry against the previous test's commits.
-
-    `_MERGE_TIME_CACHE` (dash-15) is keyed by `(repo, rev)`, so a leak needs two
-    fixtures to agree on both — which `make_repo`'s fixed content and fixed
-    author make entirely possible. Cleared here because that is the convention,
-    not because the key is weak."""
+    test would judge its own registry against the previous test's commits."""
     import autoloop.dashboard as dash
 
     caches = (dash._REMOTE_CACHE, dash._ANCESTRY_CACHE, dash._SHALLOW_CACHE,
-              dash._SUBJECT_CACHE, dash._MERGE_TIME_CACHE)
+              dash._SUBJECT_CACHE)
     for cache in caches:
         cache.clear()
     yield
@@ -1408,7 +1401,7 @@ def test_grouping_is_display_only_and_changes_no_row_and_no_count(tmp_path):
     assert [r["id"] for r in rows] == ["t-ghost", "t-merged", "t-unmerged"]
     for row in rows:
         assert set(row) == {"id", "title", "branch", "sha", "state", "detail",
-                            "description", "chars", "merged_at", "merged_when"}
+                            "description", "chars"}
     # Every row in exactly one group, unaltered, and nothing invented.
     grouped = [row for group in merge["groups"] for row in group["rows"]]
     assert sorted(grouped, key=lambda r: r["id"]) == sorted(rows, key=lambda r: r["id"])
@@ -1530,39 +1523,27 @@ console.log(JSON.stringify({
     assert "autoloop/mainline" in out["head"] and "abc123def456" in out["head"]
 
 
-# ---- a branch row says what it was FOR and WHEN it landed (dash-15) -----------
+# ---- a branch row says what it was FOR (dash-15) ------------------------------
 #
-# Two questions this panel's 91 rows could not answer, both one field on a row
-# that is built from a BRANCH rather than from a registry task.
+# The question this panel's 91 rows could not answer, as one field on a row that
+# is built from a BRANCH rather than from a registry task.
 #
-# WHAT WAS IT FOR. dash-10 put every live task's whole description behind a
-# disclosure in the roadmap docket; this panel is grouped by merge state, so its
-# rows never received that work at all. An operator who could see that a branch
-# landed had to go back to the roadmap and find the task by id to learn what it
-# was for.
+# dash-10 put every live task's whole description behind a disclosure in the
+# roadmap docket; this panel is grouped by merge state, so its rows never
+# received that work at all. An operator who could see that a branch landed had
+# to go back to the roadmap and find the task by id to learn what it was for.
 #
-# WHEN DID IT LAND. `merge.rows` carried id, title, branch, sha, state and detail
-# — and no time. `MERGE_GROUPS` renders in TRIAGE order, which is right for "what
-# needs attention" and useless for "what just landed", so the question left the
-# page entirely and was answered with `git log`.
-#
-# THE FAIL-SOFT RULE governs the first, and it is the half that is easy to get
-# wrong. A branch is matched to a task by NAME — `BRANCH_PREFIX` plus the WHOLE
-# id — and that mapping does not always resolve: a branch outlives its task when
-# the task is retired (merge-01) or superseded (base-01), and the registry can be
-# missing an id outright. A row whose task cannot be resolved still renders, with
-# its branch and its state and no description. Never dropped, never a partial-id
-# guess, never an error on the panel.
-#
-# THE TIME IS ONE GIT CALL for the whole panel, not one per row: every merge the
-# loop makes is a commit whose subject names the task, so `--grep` collects all
-# 91 answers at once. It is the MERGE's time, not the task's completion — the
-# 2026-08-21 sweep merged five tasks in ninety seconds having finished them
-# across several days — which is why the column says so.
+# THE FAIL-SOFT RULE is the half that is easy to get wrong. A branch is matched
+# to a task by NAME — `BRANCH_PREFIX` plus the WHOLE id — and that mapping does
+# not always resolve: a branch outlives its task when the task is retired
+# (merge-01) or superseded (base-01), and the registry can be missing an id
+# outright. A row whose task cannot be resolved still renders, with its branch
+# and its state and no description. Never dropped, never a partial-id guess,
+# never an error on the panel.
 
 
-def described_rows(descriptions=None, merged=None):
-    """`four_state_rows`' three states, with the two new inputs injected.
+def described_rows(descriptions=None):
+    """`four_state_rows`' three states, with descriptions injected.
 
     Built by `merge_states` itself, like its sibling, so these tests exercise the
     rows the page really renders rather than a hand-made shape of them.
@@ -1573,35 +1554,12 @@ def described_rows(descriptions=None, merged=None):
         [{"id": "t-merged", "title": "M"}, {"id": "t-unmerged", "title": "U"},
          {"id": "t-ghost", "title": "G"}],
         {}, True, refs, lambda sha: verdict.get(sha, "unknown"), None,
-        descriptions or {}, merged or {},
+        descriptions or {},
     )
 
 
 def rows_by_id(rows):
     return {row["id"]: row for row in rows}
-
-
-def run_git_dated(cwd, when, *args):
-    """`run_git` with both commit dates pinned, so an ordering test measures the
-    dates it set and never the second the suite happened to run in."""
-    env = {**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
-    return subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                          capture_output=True, text=True, env=env).stdout
-
-
-def merge_commit_repo(tmp_path, commits):
-    """`merge_fixture`'s repo plus one dated commit per `(subject, when)`.
-
-    The production shape of a merged task with no execution record and no branch
-    left on origin: the loop's own merge subject is the only thing naming it, and
-    it is what both the third evidence source and the merge time read.
-    """
-    repo, _, _ = merge_fixture(tmp_path)
-    for index, (subject, when) in enumerate(commits):
-        (repo / f"m{index}.txt").write_text(f"{index}\n")
-        run_git(repo, "add", f"m{index}.txt")
-        run_git_dated(repo, when, "commit", "-q", "-m", subject)
-    return repo
 
 
 def test_a_merged_branchs_whole_task_description_reaches_the_panel(tmp_path):
@@ -1656,7 +1614,7 @@ def test_a_partial_id_never_answers_for_a_branch():
     work went."""
     rows = merge_states(
         [{"id": "dash-1", "title": "T"}], {}, True, {}, lambda sha: "unknown", None,
-        {"dash-15": "the OTHER task", "dash-1x": "not this one either"}, {},
+        {"dash-15": "the OTHER task", "dash-1x": "not this one either"},
     )
 
     assert rows[0]["branch"] == "autoloop/dash-1"
@@ -1695,151 +1653,32 @@ def test_the_description_lookup_decides_no_state_and_no_group():
             == [(g["key"], g["count"], g["collapsed"]) for g in merge_groups(without)])
 
 
-def test_the_merged_group_reads_newest_merge_first_and_undated_last():
-    """The ordering claim, and the bound on it in the same test: only the merged
-    group is time-sorted, and a row with no merge commit still appears.
+def test_adding_descriptions_reorders_nothing_inside_a_group(tmp_path):
+    """Grouping is a second axis on the same list, not a re-sort of it: the rows
+    inside a group arrive in — and keep — the roadmap's `(priority, id)` order,
+    descriptions or no descriptions.
 
-    A silently shortened list is the failure this panel exists to prevent, so the
-    undated rows are asserted PRESENT and last rather than merely tolerated —
-    and they keep their arrival order among themselves, because `sorted` is
-    stable and there is nothing to order them by.
-    """
-    def row(task_id, state, when):
-        return {"id": task_id, "state": state, "merged_at": when}
+    Through `collect`, so the flat payload and the grouped one are compared
+    against each other rather than against a hand-made expectation."""
+    repo, merged_sha, _ = merge_fixture(tmp_path)
+    write_registry(
+        repo,
+        [dict(completed(f"t-{index:02d}"), description=f"d{index}") for index in range(6)],
+        executions=[{"task_id": f"t-{index:02d}", "candidate_sha": merged_sha}
+                    for index in range(6)],
+    )
 
-    groups = merge_groups_by_key(merge_groups([
-        row("m-old", "merged", 1_700_000_000),
-        row("m-hand-a", "merged", None),
-        row("m-new", "merged", 1_800_000_000),
-        row("m-hand-b", "merged", None),
-        row("m-mid", "merged", 1_750_000_000),
-        row("u-second", "unmerged", None),
-        row("u-first", "unmerged", 1_800_000_001),
-    ]))
+    merge = collect(repo)["merge"]
+    merged = merge_groups_by_key(merge["groups"])["merged"]
 
-    assert [r["id"] for r in groups["merged"]["rows"]] == [
-        "m-new", "m-mid", "m-old", "m-hand-a", "m-hand-b",
-    ]
-    assert groups["merged"]["count"] == 5, "nothing was dropped to sort it"
-    # The other groups matter because something is WRONG with them, not because
-    # of when they happened: they keep the order they arrived in.
-    assert [r["id"] for r in groups["unmerged"]["rows"]] == ["u-second", "u-first"]
-    # TRIAGE ORDER ACROSS THE GROUPS IS UNCHANGED — the row order moved, the
-    # group order did not.
-    assert ([g["key"] for g in merge_groups([])]
-            == [key for key, _label, _collapsed in MERGE_GROUPS])
-
-
-def test_a_merge_time_is_attached_only_to_a_row_that_is_actually_merged():
-    """A date beside `▲ NOT merged` would be a contradiction on one row: the
-    commit landed once and the branch has moved since. The row shows no date at
-    all rather than a true fact that reads as a false one."""
-    when = {"t-merged": 1_800_000_000, "t-unmerged": 1_700_000_000,
-            "t-ghost": 1_700_000_001}
-    rows = rows_by_id(described_rows({}, when))
-
-    assert rows["t-merged"]["merged_at"] == 1_800_000_000
-    assert rows["t-merged"]["merged_when"] == format_merge_time(1_800_000_000)
-    for task_id in ("t-unmerged", "t-ghost"):
-        assert rows[task_id]["state"] != "merged", "the fixture's premise"
-        assert rows[task_id]["merged_at"] is None
-        assert rows[task_id]["merged_when"] == ""
-
-
-def test_the_merge_time_is_an_absolute_utc_stamp():
-    """ABSOLUTE, never "3 days ago". A relative label would differ on every 2s
-    poll, so the payload — and the page's re-render signature with it — would
-    change every tick and rebuild a panel the operator is reading, which is the
-    failure dash-12 exists to stop. It is also what lets a burst read as one
-    sweep: five rows at one minute say "one merge sweep" in a way five "3 days
-    ago"s cannot."""
-    assert format_merge_time(1_787_488_440) == "2026-08-23 12:34Z"
-    # Anything that is not a readable stamp is "", never a guess and never a raise.
-    for junk in (None, "", "1755952440", True, float("nan")):
-        assert format_merge_time(junk) == ""
-
-
-def test_merge_times_reads_every_task_from_one_git_invocation(tmp_path, monkeypatch):
-    """One `--grep` walk for the whole panel. Resolving a date per branch would
-    be 91 subprocesses for data one command already carries — the same rule
-    `_remote_refs` follows about the network."""
-    import autoloop.dashboard as dash
-
-    repo = merge_commit_repo(tmp_path, [
-        ("Merge task t-old (aaaaaaaaaaaa) into work", "2026-08-21T12:00:00+00:00"),
-        ("Merge task t-new (bbbbbbbbbbbb) into work", "2026-08-23T09:30:00+00:00"),
-        ("an ordinary commit that names nothing", "2026-08-23T10:00:00+00:00"),
-    ])
-    calls: list = []
-    real = dash._run_checked
-
-    def counting(args, **kwargs):
-        calls.append(list(args))
-        return real(args, **kwargs)
-
-    monkeypatch.setattr(dash, "_run_checked", counting)
-
-    times = merge_times(repo, "HEAD")
-
-    assert set(times) == {"t-old", "t-new"}, "only the loop's own merge subjects"
-    assert times["t-new"] > times["t-old"]
-    assert format_merge_time(times["t-new"]) == "2026-08-23 09:30Z"
-    greps = [c for c in calls if any(a.startswith("--grep") for a in c)]
-    assert len(greps) == 1, f"one walk, not {len(greps)}"
-
-
-def test_the_panel_asks_for_merge_times_once_however_many_rows(tmp_path, monkeypatch):
-    """The same bound through `collect`, with twelve rows: a per-row
-    implementation passes the unit test above and fails here."""
-    import autoloop.dashboard as dash
-
-    repo = merge_commit_repo(tmp_path, [
-        (f"Merge task t-{index:02d} (aaaaaaaaaaaa) into work",
-         f"2026-08-{index + 1:02d}T12:00:00+00:00")
-        for index in range(12)
-    ])
-    write_registry(repo, [completed(f"t-{index:02d}") for index in range(12)])
-    calls: list = []
-    real = dash._run_checked
-
-    def counting(args, **kwargs):
-        calls.append(list(args))
-        return real(args, **kwargs)
-
-    monkeypatch.setattr(dash, "_run_checked", counting)
-
-    payload = collect(repo)
-
-    greps = [c for c in calls if any(a.startswith("--grep") for a in c)]
-    assert len(greps) == 1, f"twelve rows cost {len(greps)} walks"
-    merged = merge_groups_by_key(payload["merge"]["groups"])["merged"]
-    assert merged["count"] == 12, "the fixture's premise"
+    assert merged["count"] == 6, "the fixture's premise"
     assert ([r["id"] for r in merged["rows"]]
-            == [f"t-{index:02d}" for index in reversed(range(12))])
-
-
-def test_a_merged_row_carries_the_merge_commits_own_time(tmp_path):
-    """End to end, against a real repository: the stamp on the row is the stamp
-    on the merge commit, and a merged branch the walk found nothing for still
-    renders — undated, and last."""
-    repo = merge_commit_repo(tmp_path, [
-        ("Merge task t-dated (0fcc1c6) into work", "2026-08-21T12:34:00+00:00"),
-        # A merged task nothing named in a merge subject: the second commit is
-        # what makes `t-hand` an ancestor-by-subject, and it is deliberately NOT
-        # of the loop's own form.
-        ("t-hand, part 1 — merged by hand", "2026-08-22T08:00:00+00:00"),
-    ])
-    write_registry(repo, [completed("t-dated"), completed("t-hand")])
-
-    payload = collect(repo)
-    rows = by_id(payload)
-
-    assert rows["t-dated"]["state"] == rows["t-hand"]["state"] == "merged"
-    assert rows["t-dated"]["merged_when"] == "2026-08-21 12:34Z"
-    assert rows["t-hand"]["merged_at"] is None, "no merge commit named it"
-    assert rows["t-hand"]["merged_when"] == ""
-    merged = merge_groups_by_key(payload["merge"]["groups"])["merged"]
-    assert [r["id"] for r in merged["rows"]] == ["t-dated", "t-hand"]
+            == [f"t-{index:02d}" for index in range(6)])
+    # …the same order the flat list has, which is the order `merge_states` built.
+    assert ([r["id"] for r in merged["rows"]]
+            == [r["id"] for r in merge["rows"] if r["state"] == "merged"])
+    assert ([r["description"] for r in merged["rows"]]
+            == [f"d{index}" for index in range(6)])
 
 
 def merge_panel_payload(rows):
@@ -1922,8 +1761,12 @@ def test_a_row_with_no_description_renders_its_cells_and_no_disclosure():
     assert 'data-id="t-ghost"' not in out["inline"]
     assert 'data-id="t-unmerged"' not in out["inline"]
     assert 'data-id="t-merged"' in out["collapsed"]
-    # The merge column renders on every row, dashed where there is no stamp.
-    assert "<th>merged (UTC)</th>" in out["inline"]
+    # …and the branch's own cells are still the five columns they were, which is
+    # exactly what the description row spans: a colspan that disagreed with the
+    # header would leave the table ragged, and nothing else would say so.
+    assert ("<tr><th>task</th><th>branch</th><th>sha</th><th>state</th><th>why</th></tr>"
+            in out["inline"])
+    assert '<td colspan="5">' in out["collapsed"]
 
 
 def test_the_description_disclosures_are_bound_over_both_containers():
@@ -1945,6 +1788,81 @@ def test_the_description_disclosures_are_bound_over_both_containers():
     binder = script.split("function bindMergeDescriptions(){", 1)[1].split("\n}", 1)[0]
     assert '"merged"' in binder and '"mgmergedrows"' in binder
     assert 'addEventListener("toggle"' in binder
+
+
+def test_the_binder_is_what_actually_records_an_operators_click():
+    """The gap the test above cannot close, and the one an operator would meet
+    first: every other page-side test calls `msToggle` by hand, so all of them
+    stay green for a binder that reads the wrong attribute or never fires.
+
+    So this runs the WHOLE chain under node — render, bind, dispatch the `toggle`
+    the browser would, render again — and never calls `msToggle` itself. The stub
+    element the toggle is dispatched on is always the one the LATEST render
+    emitted and `MSBIND` bound: `querySelectorAll` reads the disclosures back out
+    of that render's own HTML, and rebuilds them whenever the HTML changes, so a
+    render that emitted no disclosure has none to bind and a binder that never
+    fired leaves `MSOPEN` empty.
+    """
+    script = PAGE.split("<script>", 1)[1]
+    binder = script.split("function bindMergeDescriptions(){", 1)[1].split("\n}", 1)[0]
+    rows = described_rows({"t-merged": "what the merged branch was for"})
+
+    harness = merge_panel_js() + "\nfunction bindMergeDescriptions(){" + binder + """
+}
+MSBIND = bindMergeDescriptions;
+// A node is whatever `renderMerge` last wrote into it, read back: the elements
+// are derived from that HTML rather than handed to the binder, and they are
+// rebuilt whenever the HTML changes — which is what makes the dispatch below
+// land on the element THIS render bound, exactly as a browser's would. Cached
+// between changes only so the binder and the test see the same objects.
+const mk = () => ({
+  innerHTML: "", textContent: "", open: false, seen: null, els: [],
+  querySelectorAll(_sel) {
+    if (this.seen !== this.innerHTML) {
+      this.seen = this.innerHTML;
+      this.els = [];
+      for (const m of this.innerHTML.matchAll(/data-id="([^"]*)"/g))
+        this.els.push({dataset: {id: m[1]}, open: false,
+                       addEventListener(type, fn) { this[type] = fn; }});
+    }
+    return this.els;
+  },
+});
+const NODES = {};
+for (const id of ["mergehead", "merged", "mgmergedsum", "mgmergedrows", "mgmergedbox"])
+  NODES[id] = mk();
+const document = {getElementById: id => NODES[id]};
+const PAYLOAD = __PAYLOAD__;
+const grab = () => NODES.mgmergedrows.querySelectorAll("details.mdesc")[0];
+renderMerge(PAYLOAD);
+const bound = NODES.mgmergedrows.querySelectorAll("details.mdesc").length;
+// The browser's own sequence: the operator opens it, THEN the event fires.
+const first = grab();
+first.open = true;
+first.toggle();
+const opened = [...MSOPEN];
+renderMerge(PAYLOAD);
+const afterOpen = NODES.mgmergedrows.innerHTML;
+// A fresh element, because that render rebuilt the row — the premise of the
+// whole mechanism, asserted rather than assumed.
+const second = grab();
+second.open = false;
+second.toggle();
+renderMerge(PAYLOAD);
+console.log(JSON.stringify({bound: bound, opened: opened, afterOpen: afterOpen,
+  rebuilt: first !== second, closed: [...MSOPEN],
+  afterClose: NODES.mgmergedrows.innerHTML}));
+""".replace("__PAYLOAD__", merge_panel_payload(rows))
+    out = json.loads(run_js(harness))
+
+    assert out["bound"] == 1, "the render emitted the disclosure the binder needs"
+    assert out["opened"] == ["t-merged"], "the toggle listener never reached MSOPEN"
+    assert '<details class="mdesc" data-id="t-merged" open>' in out["afterOpen"]
+    assert out["rebuilt"] is True, "the poll did not rebuild the row it binds"
+    # …and the second element — bound by the SECOND render, not the first —
+    # records the close, so an opened row can be shut again.
+    assert out["closed"] == [], "closing was never recorded; the row sticks open"
+    assert '<details class="mdesc" data-id="t-merged">' in out["afterClose"]
 
 
 # ---- a commit naming the task: the third evidence source (dash-18, 2026-08-23) -
@@ -6284,7 +6202,7 @@ def test_the_pile_up_before_and_after_measured_in_one_repository(tmp_path, monke
     real_collect = dash.collect
     real_status = dash._run_status
     caches = (dash._REMOTE_CACHE, dash._ANCESTRY_CACHE, dash._SHALLOW_CACHE,
-              dash._SUBJECT_CACHE, dash._MERGE_TIME_CACHE)
+              dash._SUBJECT_CACHE)
 
     def arm(entry, gate):
         for cache in caches:

@@ -232,15 +232,6 @@ _SHALLOW_CACHE: dict = {}
 #: construction: the evidence it feeds is positive-only, so a stale "could not
 #: search" can never assert anything about a row. See `_cached_commit_subjects`.
 _SUBJECT_CACHE: dict = {}
-#: `git log --grep="^Merge task" <rev>` per `(repo, rev)`: `{"at", "times"}`.
-#: The merge panel's WHEN column, and the reason it is one read rather than one
-#: per row — see `merge_times`. Keyed by the rev as well as the repo because the
-#: answer for a FIXED head can never change, so a new merge (which moves the
-#: head) refreshes it immediately rather than waiting the TTL out. `{}` (git
-#: would not answer) is cached as readily as a full map, and that is safe for the
-#: same reason `_SUBJECT_CACHE`'s `None` is: a missing timestamp renders a row
-#: without a date, and never as a different row.
-_MERGE_TIME_CACHE: dict = {}
 
 #: "the caller did not hand me a commit search, read one yourself" — the default
 #: of `disagreement_report`'s `commits` parameter. A sentinel rather than `None`
@@ -1319,102 +1310,6 @@ def task_id_for_branch(branch: str) -> str:
     return branch[len(BRANCH_PREFIX):]
 
 
-#: What `auto_merge.AutoMerger._merge` writes as the subject of every merge it
-#: makes (`auto_merge.py:566`): `Merge task <id> (<sha>) into <base>`. The id is
-#: the whole next space-delimited token, which is what makes the match exact
-#: rather than a prefix — `Merge task dash-1 …` can never answer for `dash-15`.
-_MERGE_SUBJECT_PREFIX = "Merge task "
-
-
-def merge_times(repo: Path, rev: str) -> dict[str, int]:
-    """`{task_id: unix seconds}` — when each task's merge commit landed on `rev`.
-
-    ONE git invocation for the whole panel, however many rows it has. Every merge
-    the loop makes is a commit whose subject names the task, so `--grep` asks git
-    for exactly those and `%ct` carries the time with them; resolving a date per
-    branch would be 91 subprocesses for data one command already has, which is
-    the same reason `_remote_refs` refuses to ask the network twice.
-
-    `%ct` — COMMITTER time, not author time — because the question is when the
-    merge landed on this branch, and a rebase preserves the author date of work
-    written days earlier. That is also why the field is labelled *merge* time
-    wherever it is shown: on 2026-08-21 five tasks merged inside ninety seconds
-    having been completed across several days, and a column reading as completion
-    would turn one backlog sweep into five simultaneous finishes.
-
-    `{}` on any failure and on an empty rev, and that is the fail-soft direction
-    this feature needs: a row with no timestamp still renders, without a date.
-    Absence here is never evidence about a merge — a hand-made merge, or one
-    whose subject does not match, simply has no time to show.
-
-    A task merged more than once (a revert, then a re-merge) keeps the LATEST of
-    its commits, via `max`, rather than whichever git happened to print first:
-    the panel's question is when the work that is in the branch now landed.
-    """
-    rev = str(rev or "")
-    if not rev:
-        return {}
-    out = _run_checked(
-        ["git", "log", "--no-color", "--format=%ct %s",
-         f"--grep=^{_MERGE_SUBJECT_PREFIX}", rev],
-        cwd=repo, timeout=20,
-    )
-    if out is None:
-        return {}
-    times: dict[str, int] = {}
-    for line in out.splitlines():
-        stamp, _, subject = line.strip().partition(" ")
-        if not stamp.isdigit() or not subject.startswith(_MERGE_SUBJECT_PREFIX):
-            continue
-        # The whole next token, so the id is matched entire: `Merge task dash-15
-        # (abc) into …` gives `dash-15` and nothing shorter. A subject with no
-        # token after the prefix yields "" and is dropped.
-        task_id = subject[len(_MERGE_SUBJECT_PREFIX):].split(" ", 1)[0]
-        if not task_id:
-            continue
-        when = int(stamp)
-        if when > times.get(task_id, 0):
-            times[task_id] = when
-    return times
-
-
-def _cached_merge_times(repo: Path, rev: str, ttl: int = 60) -> dict[str, int]:
-    """`merge_times` memoized per `(repo, rev)` for `ttl` seconds.
-
-    The page polls every 2s and this walk's cost grows with history, exactly like
-    `_cached_commit_subjects`'. The rev is part of the key because the answer for
-    a fixed head cannot change — so the poll after a merge lands reads a new head
-    and refreshes at once, instead of showing a stale panel for up to a minute.
-    """
-    key = (str(repo), str(rev))
-    entry = _MERGE_TIME_CACHE.get(key)
-    now = time.time()
-    if entry and now - entry["at"] <= ttl:
-        return entry["times"]
-    times = merge_times(repo, rev)
-    if len(_MERGE_TIME_CACHE) > 64:  # a long-lived process, not a leak
-        _MERGE_TIME_CACHE.clear()
-    _MERGE_TIME_CACHE[key] = {"at": now, "times": times}
-    return times
-
-
-def format_merge_time(when) -> str:
-    """`1787488440` → `2026-08-23 12:34Z`. `""` for anything unreadable.
-
-    ABSOLUTE and UTC, never "3 days ago": a relative label would change on every
-    2s poll, so the payload — and with it the page's re-render signature — would
-    differ every tick and rebuild a panel the operator is reading. It is also
-    what makes a burst legible as one sweep: five rows at the same minute say
-    "one merge sweep" in a way "3 days ago" five times cannot.
-    """
-    if not isinstance(when, (int, float)) or isinstance(when, bool):
-        return ""
-    try:
-        return datetime.fromtimestamp(when, timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-    except (OverflowError, OSError, ValueError):
-        return ""
-
-
 def naming_ancestor(task_id: str, commits, ancestor) -> str:
     """The full sha of the FIRST commit whose subject names `task_id` and which
     git says is an ancestor of the base head. `""` when there is no such commit.
@@ -1447,8 +1342,7 @@ def naming_ancestor(task_id: str, commits, ancestor) -> str:
 
 
 def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
-                 refs: dict, ancestor, commits=None, descriptions=None,
-                 merged=None) -> list[dict]:
+                 refs: dict, ancestor, commits=None, descriptions=None) -> list[dict]:
     """One row per completed task: which of `MERGE_STATES` it is in, and why.
 
     Pure resolution logic — `ancestor(sha) -> "yes"/"no"/"unknown"` is injected,
@@ -1485,7 +1379,7 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
     answer about the exact ref the publisher wrote, while (3) is a subject-line
     match — and an operator acting on the row needs to tell them apart.
 
-    TWO DISPLAY FIELDS RIDE ALONG, and neither may touch the four states above.
+    ONE DISPLAY FIELD RIDES ALONG, and it may not touch the four states above.
 
     `descriptions` is `{task_id: text}` — the raw registry read — and the row
     gets the WHOLE description of the task its BRANCH NAMES (`task_id_for_branch`,
@@ -1496,17 +1390,8 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
     lookup goes through the branch name rather than the row's own id — the panel
     is a report about BRANCHES, and a description hung on a row whose branch
     belongs to something else would be a claim nobody made.
-
-    `merged` is `{task_id: unix seconds}` from `merge_times`, and it is attached
-    ONLY to a row that reads `merged`, keyed by the same branch-resolved id. A
-    merge date beside `NOT merged` would be a contradiction on one row — the
-    commit landed once and the branch has moved since — so a row that is not in
-    the branch shows no date at all. `None` means "no merge commit named this
-    task", never "not merged": a hand-made merge has no timestamp here and must
-    still render.
     """
     descriptions = descriptions or {}
-    merged = merged or {}
     out = []
     for task in completed:
         task_id = task.get("id") or ""
@@ -1541,7 +1426,6 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
         # again and would hide the case the fail-soft rule exists for.
         named_task = task_id_for_branch(branch)
         description = str(descriptions.get(named_task) or "") if named_task else ""
-        when = merged.get(named_task) if (named_task and state == "merged") else None
         out.append({
             "id": task_id, "title": task.get("title") or "", "branch": branch,
             # The sha that DECIDED the row, which is why `named` outranks
@@ -1560,14 +1444,6 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
             # without the page measuring a string the backend already has.
             "description": description,
             "chars": len(description),
-            # Two fields for one fact: the raw stamp for anything sorting or
-            # re-checking it, and the ABSOLUTE UTC rendering for the page. The
-            # page is not given the job of formatting it — a relative label
-            # ("3 days ago") would change on every 2s poll and rebuild a panel
-            # the operator is reading, which is exactly what dash-12 exists to
-            # stop.
-            "merged_at": when,
-            "merged_when": format_merge_time(when),
         })
     return out
 
@@ -1651,28 +1527,15 @@ def merge_groups(rows: list[dict]) -> list[dict]:
     ever produces the four, and the page's own `MS[r.state] || MS.unknown`
     falls back the same way.
 
-    THE MERGED GROUP, AND ONLY IT, IS ORDERED BY MERGE TIME, newest first
-    (dash-15, operator request of 2026-08-23). Triage order across the groups is
-    unchanged — that is what the panel is structured by — but "what just landed"
-    is a question only this group answers, and it was previously in roadmap
-    `(priority, id)` order, which says nothing about when. The other three matter
-    because something is WRONG with them, not because of when they happened, so
-    they keep the order they arrived in.
-
-    A ROW WITH NO TIMESTAMP STILL RENDERS, at the END of the group. A branch
-    merged by hand, or one whose commit subject the loop did not write, has no
-    time to sort by — and a silently shortened list is the exact failure this
-    panel exists to prevent. `sorted` is stable, so those rows keep their
-    incoming order among themselves.
+    ROW ORDER INSIDE A GROUP IS THE ORDER THE ROWS ARRIVED IN, which is the
+    roadmap's `(priority, id)` order — this is a second axis on the same list,
+    not a re-sort of it, so nothing here may reorder what `merge_states`
+    produced.
     """
     grouped: dict[str, list[dict]] = {state: [] for state, _label, _collapsed in MERGE_GROUPS}
     for row in rows:
         state = str(row.get("state") or "")
         grouped[state if state in grouped else "unknown"].append(row)
-    grouped["merged"] = sorted(
-        grouped["merged"],
-        key=lambda row: (row.get("merged_at") is None, -(row.get("merged_at") or 0)),
-    )
     return [
         {"key": state, "label": label, "collapsed": collapsed,
          "count": len(grouped[state]), "rows": grouped[state]}
@@ -1708,12 +1571,6 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
     vanished exactly when the roadmap panel broke would fail in the one state an
     operator most needs to read a branch's row. Passed in rather than re-read
     here for the reason `executions` is — one read of one file per poll.
-
-    The merge times are one `git log --grep` for the whole panel, against the
-    base HEAD this report already measures merged-ness against (`head`, falling
-    back to the branch name), memoized like the subject walk because the page
-    polls every 2s. Deliberately NOT per row: that would be one subprocess per
-    completed task for data a single command already carries.
     """
     completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
     rows = merge_states(
@@ -1722,7 +1579,6 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
         lambda sha: is_ancestor(repo, sha, head),
         _cached_commit_subjects(repo) if remote_ok else None,
         descriptions or {},
-        _cached_merge_times(repo, head or branch),
     )
     return {
         "base_branch": branch or "HEAD",
@@ -3976,7 +3832,7 @@ summary:hover{color:var(--ink)}
    --rm- tokens: a branch row and a task row are the same object read two ways,
    so a second style for the same text would make one page look like two. The
    description sits in its own full-width row under the branch's cells rather
-   than in a sixth cell — this is a six-column table and a `pre` of several
+   than in a sixth cell — this is a five-column table and a `pre` of several
    thousand characters in a table cell is a column nobody can read.
    The `pre` declarations are the roadmap's, unchanged except for the top
    margin that separates it from the cells above — same tokens, same
@@ -4121,8 +3977,7 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
         Merged is the one group here nobody has to act on: the work is in this
         branch. Collapsed is not hidden — the count is in the summary above, and
         a merged row's whole value is that it stays findable when someone asks
-        where a task's commit went. This group alone reads newest merge first;
-        a row whose merge commit could not be found sits at the end, undated.</p>
+        where a task's commit went.</p>
     </details>
     <p class="muted" style="font-size:12px;margin:9px 0 0">
       Merged means git's own answer: the branch sha is an ancestor of this
@@ -4131,12 +3986,9 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       branch. <b>unknown</b> means git could not answer (origin unreachable, or
       the repository would not read); it is never reported as not-merged — which
       is why that group renders with its count even at zero.
-      <b>merged (UTC)</b> is when the MERGE commit landed on this branch, which
-      is not when the task was finished: a backlog sweep merges days of work in
-      a minute, and reading those stamps as completions would turn one sweep
-      into five simultaneous finishes. Open a row's <i>description</i> for the
-      whole task text, exactly as tasks.json holds it; a branch whose task the
-      registry no longer holds keeps its row and simply has none.</p>
+      Open a row's <i>description</i> for the whole task text, exactly as
+      tasks.json holds it; a branch whose task the registry no longer holds
+      keeps its row and simply has none.</p>
   </section>
 
   <!-- The roadmap read as a RELATION rather than as a list. A second hand-built
@@ -4790,8 +4642,8 @@ const MS = {merged:["✓","merged"], unmerged:["▲","NOT merged"],
 // rows themselves are rebuilt from the payload on every 2s poll, so the `open`
 // attribute a browser was holding is destroyed each tick — this is what puts it
 // back, and it is the same mechanism `RMOPEN` uses one panel down. Keyed by the
-// task id rather than by position: a row that moves when the merged group
-// re-sorts must keep the disclosure the operator opened on it.
+// task id rather than by position: a row whose state changes moves to another
+// group, and it must keep the disclosure the operator opened on it.
 const MSOPEN = new Set();
 const msToggle = (id, open) => { if (open) MSOPEN.add(String(id)); else MSOPEN.delete(String(id)); };
 // The listener wiring, installed from outside this region because it reaches
@@ -4812,28 +4664,25 @@ const msDesc = r => {
   // esc() on BOTH: a description is untrusted text out of tasks.json — anyone
   // who can write that file can write `<script>` — and it is the one field here
   // long enough that nobody would notice it had been read as markup.
-  return `<tr class="mdrow"><td colspan="6">`
+  return `<tr class="mdrow"><td colspan="5">`
     + `<details class="mdesc" data-id="${esc(id)}"${MSOPEN.has(id) ? " open" : ""}>`
     + `<summary>description — ${esc(chars)} ch</summary>`
     + `<pre class="desc">${esc(desc)}</pre></details></td></tr>`;
 };
-// The row content is what it was before the grouping — same cells, same icon +
-// word, same `row-active` on an unmerged row — plus WHEN it merged, which is
-// the one thing 91 branch rows could not say. The description rides in its own
-// row underneath, so the cells above stay a table.
+// The row content is exactly what it was before the grouping — same cells, same
+// icon + word, same `row-active` on an unmerged row. The description rides in
+// its own row underneath, so the cells above stay a table.
 const msRow = r => {
   const [ic, word] = MS[r.state] || MS.unknown;
   return `<tr class="${r.state === "unmerged" ? "row-active" : ""}">
     <td><code>${esc(r.id)}</code></td><td><code>${esc(r.branch)}</code></td>
     <td><code>${esc(r.sha || "—")}</code></td><td>${esc(ic)} ${esc(word)}</td>
-    <td><code>${esc(r.merged_when || "—")}</code></td>
     <td class="muted">${esc(r.detail)}</td></tr>` + msDesc(r);
 };
-// "merged (UTC)" and never "when": the stamp is the MERGE commit's, not the
-// task's completion, and those differ — five tasks merged inside ninety seconds
-// on 2026-08-21 having been finished across several days. The column is dashed
-// on every row that is not merged, and on a merge nothing named.
-const msTable = g => rows(["task","branch","sha","state","merged (UTC)","why"],
+// FIVE columns, which is what `msDesc`'s colspan spans: a column added here
+// without moving that number leaves the description row short and the table
+// ragged.
+const msTable = g => rows(["task","branch","sha","state","why"],
                           (g.rows || []).map(msRow).join(""));
 const msHeading = g => `<h3 class="gh">${esc((MS[g.key] || MS.unknown)[0])} `
   + `${esc(g.label)} <span class="gc">${esc(g.count)}</span></h3>`;
