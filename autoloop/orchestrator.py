@@ -457,6 +457,25 @@ SPLIT_RETIREMENT_REASON = "split-into-successors"
 #: fact would be a capability taken back, which is the harder direction.
 _SPLITTABLE_STATUSES = frozenset({"pending", "in_progress"})
 
+#: The stored statuses a REPLAY may find an already-present successor in and
+#: still adopt it as this split's successor (`_successor_disagreement`).
+#:
+#: An ALLOW-LIST, and never a test against `tasks._TERMINAL_STATUSES`. The two
+#: are complements today, so on every status this repository actually writes they
+#: agree — but `TaskRegistry.from_dict` does not validate `status` at all (it is
+#: `Task(**raw)`, and the field carries whatever the row says), and this check
+#: exists precisely for a `tasks.json` an operator hand-edited between a crash
+#: and the restart. A deny-list asked about `"Retired"` or `"retiredx"` answers
+#: "not terminal, therefore live" and adopts the row: the guard switching itself
+#: off on exactly the malformed input it was added to survive. Asked the same
+#: question, this set answers "not a status I recognise" and parks.
+#:
+#: The cost of the allow-list is the opposite error — a genuinely new LIVE status
+#: added to `tasks.py` and not added here would false-park a correct split. That
+#: is the direction to be wrong in: it stops the loop and names the status, where
+#: the deny-list's error clears the intent and leaves nothing behind saying so.
+_ADOPTABLE_SUCCESSOR_STATUSES = frozenset({"pending", "in_progress", "blocked"})
+
 #: How much of the reviewer's own sentence is kept in the parent's durable
 #: retirement reason (`Task.blocked_reason`, which lands in `tasks.json` and is
 #: printed by the dashboard and by every refusal that mentions the retirement).
@@ -1135,15 +1154,51 @@ def _successor_disagreement(
     the reviewer approved), so a successor silently adopted with a different
     scope is a successor authorized to write files nobody agreed to.
 
-    **Deliberately NOT compared: `priority`, `status`, or any timestamp.** None
-    is in the intent, and `TaskStore.save` deliberately adopts the on-disk
-    priority for tasks the caller has not re-prioritised — so an operator who
-    re-prioritises a successor between the crash and the restart is doing a
-    supported thing, and parking the split forever over it would turn a
-    fail-closed check into a false-park machine. The line is: fields the split
-    AUTHORIZED are verified, fields the roadmap owns are left alone.
+    **Plus ONE thing the intent cannot record: the successor is still WORK.**
+    There is no status in the intent to compare against — every successor a split
+    creates is born `pending` — so this is a liveness test
+    (`_ADOPTABLE_SUCCESSOR_STATUSES`) rather than a field comparison, and it is
+    checked first because it is the cheapest true answer to "is this the task
+    this split created?".
+
+    It closes a hole the other four cannot see. A successor planned with the
+    DEFAULT empty `depends_on` never reaches the substitution in
+    `_expected_successor_depends_on` (which short-circuits on a successor that
+    does not name the parent), and `_retirement_rewrites` returns early when the
+    parent has no dependents at all — so `TaskRegistry.retire` never consults its
+    `live` filter either. Hand-edit that successor to `retired` between the crash
+    and the restart and it matched on title, description, `approved_paths` and
+    `depends_on`, was adopted by the mutation, was certified by the read-back,
+    and the intent — the only record that anything was ever in flight — was
+    deleted over a parent now superseded by a task that satisfies no dependency
+    and has no un-retire.
+
+    **Deliberately NOT compared: `priority` or any timestamp.** Neither is in the
+    intent, and `TaskStore.save` deliberately adopts the on-disk priority for
+    tasks the caller has not re-prioritised — so an operator who re-prioritises a
+    successor between the crash and the restart is doing a supported thing, and
+    parking the split forever over it would turn a fail-closed check into a
+    false-park machine. The line is: fields the split AUTHORIZED are verified,
+    plus that the row is still workable; fields the roadmap owns are left alone.
+
+    **A SIBLING successor's status can colour this answer, and that is left
+    alone.** `_expected_successor_depends_on` computes the retirement's `live`
+    set by dropping retired successors, so with `t1a` retired by hand a `t1b`
+    that declares the parent can report a `depends_on` mismatch before anyone
+    asks about `t1a`. Both are refusals, the intent survives either way, and
+    which message the operator reads follows plan order — guaranteeing that order
+    would need a pre-pass over all the successors, i.e. the second overlapping
+    implementation the paragraph at the top of this docstring exists to refuse.
     """
     existing = registry.get(successor.id)
+    if existing.status not in _ADOPTABLE_SUCCESSOR_STATUSES:
+        return (
+            f"it reads status {existing.status!r} rather than one this split can "
+            "still be completed into "
+            f"({', '.join(sorted(_ADOPTABLE_SUCCESSOR_STATUSES))}) — the successors "
+            "a split creates are live work, so retiring the parent into this row "
+            "would supersede it with a task nobody is going to work"
+        )
     if existing.title != successor.title:
         return (
             f"its title reads {existing.title!r} rather than the recorded "
@@ -1176,8 +1231,9 @@ def _split_registry_mutation(registry: TaskRegistry, intent: SplitIntent) -> tup
 
       * a successor already present is skipped — but only after every durable
         field the intent records (title, description, `depends_on`,
-        `approved_paths`) is checked against it by `_successor_disagreement`.
-        `add_many` refuses a duplicate id outright, so "skip what is there" is
+        `approved_paths`) and its liveness are checked against it by
+        `_successor_disagreement`. `add_many` refuses a duplicate id outright,
+        so "skip what is there" is
         the only way a replay can proceed at all, and skipping WITHOUT checking
         would let a task somebody else created — or edited — under the same id be
         silently adopted as this split's successor, write scope and all;
@@ -1298,7 +1354,8 @@ def apply_split_intent(
 
     **NOTHING IS CLEARED THAT WAS NOT VERIFIED.** The three stores are read back
     — the registry says retired with these successors and every successor is the
-    task this split authorized, DOWN TO ITS `depends_on` AND `approved_paths`
+    task this split authorized, DOWN TO ITS `depends_on` AND `approved_paths` AND
+    still being live work rather than a terminal record
     (`_successor_disagreement`); the execution store has no live record; the
     worker directory is gone — and an intent whose stores do not agree is left
     exactly where it is with `obstacle` set. A reconciler that cleared on the
@@ -6506,6 +6563,20 @@ class Orchestrator:
             # Reported as done rather than denied — a denial would spend the
             # denial budget telling the reviewer its directive failed when it
             # succeeded, which is the correction that cannot be acted on.
+            #
+            # But only once ALL THREE stores say so. The registry alone saying
+            # "retired, superseded by exactly these" is not evidence the split
+            # finished: an operator who took the park's second option and DELETED
+            # a boundary-2 intent leaves precisely that registry with the parent's
+            # execution record and worker repository still on disk, and this reply
+            # would then tell the reviewer the loop "finished it from its durable
+            # intent record" — a claim about a record that is gone, over a residue
+            # that holds the merge window shut and that nothing else will ever
+            # look at, since a retired task is never dispatched or swept again.
+            residue = self._split_residue(parent_id)
+            if residue:
+                self._park_split_residue(parent_id, spec_ids, residue)
+                return
             self._log(
                 "task_split_already_applied",
                 request_id=state.last_response.request_id if state.last_response else None,
@@ -6801,6 +6872,67 @@ class Orchestrator:
         if parent.status != "retired" or tuple(parent.superseded_by) != spec_ids:
             return False
         return all(self._registry.has(tid) for tid in spec_ids)
+
+    def _split_residue(self, parent_id: str) -> str:
+        """What a split the REGISTRY says is finished has still left on disk, or
+        `""` when the other two stores agree with it.
+
+        The same two facts `_split_disagreement` reads back before an intent may
+        be cleared, asked here through the helpers `release` already uses — a
+        surviving execution record (silent: it holds the repository-wide merge
+        window shut, `cli._merge_window_blockers`) and a surviving worker
+        repository (loud: the next `WorkerRepoManager.create` refuses it). An
+        UNREADABLE record counts as surviving (`_surviving_execution_record`),
+        which is the fail-closed direction: a record nobody can parse is exactly
+        the one nobody may declare gone.
+
+        A loop with neither store configured answers `""`, and that is a blind
+        spot rather than a check: it cannot look. It is bounded by the fact that
+        the same loop refuses to START a split at all (`split_unavailable`), so
+        such a registry can only have been written by a process that DID have
+        both stores.
+        """
+        leftovers = []
+        if _surviving_execution_record(parent_id, self._execution_store):
+            leftovers.append(
+                f"its execution record is still live at "
+                f"{self._execution_store.path_for(parent_id)}, which holds the merge "
+                "window shut on work the roadmap says is retired"
+            )
+        worker = _surviving_worker_path(parent_id, self._worker_repos)
+        if worker:
+            leftovers.append(
+                f"its worker repository is still at {worker}, where the next "
+                "dispatch would refuse to create one"
+            )
+        return "; and ".join(leftovers)
+
+    def _park_split_residue(
+        self, parent_id: str, spec_ids: tuple[str, ...], residue: str
+    ) -> None:
+        """Park on a registry that records a split whose artefacts never moved.
+
+        `loop_fatal` for `_park_split_intent`'s reason, and one more: the parent
+        is already retired, which `TaskRegistry.block` refuses outright, so there
+        is no task-level park available even if this were a task-level fault. It
+        is not one — the roadmap and the artefact stores disagree about whether a
+        task exists, and the durable record that would let the loop repair that by
+        itself is the thing that is missing.
+        """
+        self.state.last_response = None
+        self._to_needs_user(
+            f"task {parent_id}: the roadmap records it as retired and superseded by "
+            f"{', '.join(spec_ids)}, but the split was never finished — {residue}. "
+            "No split-intent record is on disk, so this loop cannot finish it by "
+            "itself and will not report the split as applied. Either move those by "
+            "hand (`executions/archive/` and `quarantine/`, under one shared label) "
+            "or, if the retirement itself was a mistake, fix the roadmap. Nothing "
+            "was changed.",
+            kind="loop_fatal",
+            code="split_residue_unreconciled",
+            task_id=parent_id,
+            detail=f"successors={list(spec_ids)} residue={residue}",
+        )
 
     def _reconcile_split_intents(self) -> bool:
         """Finish every split-acceptance intent left on disk. False means the

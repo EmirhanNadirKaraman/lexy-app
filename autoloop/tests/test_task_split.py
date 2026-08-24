@@ -282,6 +282,25 @@ class ScopeDriftingTaskStore(TaskStore):
         self.path.write_text(json.dumps(data), encoding="utf-8")
 
 
+class StatusDriftingTaskStore(TaskStore):
+    """Persists `t1a` as RETIRED however live the registry it was handed says it
+    is — the same fail-open shape as `ScopeDriftingTaskStore`, one field over.
+
+    The field the intent cannot record, so the mutation's trial (which runs on an
+    in-memory copy that is exactly right) has nothing to catch. Only the file
+    disagrees, and the file is what the next process reads and what the intent is
+    about to be deleted on the strength of.
+    """
+
+    def save(self, registry):
+        super().save(registry)
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        for row in data["tasks"]:
+            if row["id"] == "t1a":
+                row["status"] = "retired"
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+
+
 @dataclass
 class Wiring:
     orch: Orchestrator
@@ -1065,6 +1084,65 @@ def test_a_reviewer_that_resends_the_same_split_is_told_it_already_landed(tmp_pa
     assert fresh.orch.state.phase == Phase.READY.value
 
 
+def test_a_registry_that_records_a_split_whose_artifacts_never_moved_is_not_reported_done(
+    tmp_path,
+):
+    """The park message's SECOND option, taken — and the fail-open it opens.
+
+    `_park_split_intent` tells an operator they may DELETE the intent if the
+    split should not happen. After a boundary-2 crash that leaves `tasks.json`
+    already saying "retired, superseded by t1a, t1b" while the execution record
+    and the worker repo are still on disk, and the deleted record is the only
+    thing that would have made the loop finish them. A registry-only
+    `_split_already_applied` then answers yes and the loop tells the reviewer it
+    "finished it from its durable intent record" — a claim about a file that no
+    longer exists, over a live record that holds the merge window shut and that
+    nothing will ever revisit, since a retired task is neither dispatched nor
+    swept. It must park on all three stores instead of reporting on one.
+    """
+    crashed = crash_a_split(tmp_path, "registry")
+    for path in intent_files(crashed):
+        path.unlink()
+    assert intent_files(crashed) == []
+
+    fresh = restart(crashed, tmp_path)
+    fresh.orch._dispatch(split_directive())
+
+    assert fresh.orch.state.phase == Phase.NEEDS_USER.value
+    assert fresh.orch.state.park_kind == "loop_fatal"
+    assert "SPLIT ALREADY APPLIED" not in (fresh.orch.state.outbox or "")
+    question = fresh.orch.state.question or ""
+    assert "was never finished" in question
+    # BOTH residues named: the silent one (a record nothing announces) and the
+    # loud one (a directory the next dispatch trips over).
+    assert "merge window" in question
+    assert str(tmp_path / "workers" / "t1") in question
+    # A park, not a denial — the reviewer cannot fix this by sending anything.
+    assert denial_codes(fresh) == []
+    # And nothing was moved behind the operator: refusing is this loop's job.
+    assert fresh.execution_store.load("t1") is not None
+    assert (tmp_path / "workers" / "t1").is_dir()
+
+
+def test_an_unreadable_record_is_residue_rather_than_a_finished_split(tmp_path):
+    """The fail-closed direction of the same check. A record this loop cannot
+    parse is exactly the one nobody may declare gone, so it counts as surviving
+    — a reader that swallowed the error into "no record" would report the split
+    as applied on the strength of a file it could not read."""
+    crashed = crash_a_split(tmp_path, "registry")
+    for path in intent_files(crashed):
+        path.unlink()
+    (tmp_path / "workers" / "t1").rename(tmp_path / "workers" / "t1-moved-by-hand")
+    (tmp_path / "executions" / "t1.json").write_text("{ truncated", encoding="utf-8")
+
+    fresh = restart(crashed, tmp_path)
+    fresh.orch._dispatch(split_directive())
+
+    assert fresh.orch.state.phase == Phase.NEEDS_USER.value
+    assert "was never finished" in (fresh.orch.state.question or "")
+    assert "SPLIT ALREADY APPLIED" not in (fresh.orch.state.outbox or "")
+
+
 # ---------------------------------------------------------------------------
 # the reconciler fails CLOSED
 # ---------------------------------------------------------------------------
@@ -1213,6 +1291,80 @@ def test_a_successor_whose_dependencies_were_edited_after_the_crash_is_not_adopt
     assert SplitIntentStore(split_intents_dir(fresh.config.state_dir)).load("t1")
     assert tuple(fresh.task_store.load().get("t1b").depends_on) == ("t1a",)
     assert fresh.execution_store.load("t1") is not None
+
+
+@pytest.mark.parametrize(
+    "status", ["retired", "completed", "shipped_elsewhere", "Retired", "retiredx"]
+)
+def test_a_successor_that_stopped_being_live_after_the_crash_is_not_adopted(
+    tmp_path, status
+):
+    """The hole the other four field comparisons cannot see, on the DEFAULT
+    successor — `make_intent`/`split_directive` plan `t1a` and `t1b` with no
+    dependencies at all, which is the ordinary shape.
+
+    Empty `depends_on` never reaches the substitution in
+    `_expected_successor_depends_on`, and a parent with no dependents makes
+    `_retirement_rewrites` return before `retire` consults its `live` filter — so
+    with `t1a` hand-edited to a terminal status the replay matched on title,
+    description, `approved_paths` and `depends_on`, adopted it, certified it on
+    the read-back, and deleted the intent over a parent superseded by work that
+    will never happen.
+
+    The last two statuses are why this is an ALLOW-LIST. Neither is in
+    `tasks._TERMINAL_STATUSES`, `TaskRegistry.from_dict` validates `status`
+    not at all, and a deny-list would read both as live and adopt the row —
+    the guard going quiet on exactly the hand-edited input it exists for.
+    """
+    crashed = crash_a_split(tmp_path, "registry")
+    edit_task_row(crashed, "t1a", status=status)
+
+    fresh = restart(crashed, tmp_path)
+    assert fresh.orch._reconcile_split_intents() is False
+    assert fresh.orch.state.phase == Phase.NEEDS_USER.value
+    # NAMED, not merely refused: an operator who cannot see which status stopped
+    # the split has to go and diff `tasks.json` against the intent by hand.
+    assert repr(status) in (fresh.orch.state.question or "")
+
+    # PRESERVED — the intent is the only record that a split was ever in flight.
+    assert SplitIntentStore(split_intents_dir(fresh.config.state_dir)).load("t1")
+    # Refused by the trial, so neither the live registry nor either artefact
+    # moved: the parent's round is still there for the operator to look at.
+    assert fresh.task_store.load().get("t1a").status == status
+    assert fresh.execution_store.load("t1") is not None
+    assert (tmp_path / "workers" / "t1").is_dir()
+
+
+def test_a_registry_that_persists_a_status_it_was_not_given_is_never_certified(
+    tmp_path,
+):
+    """The same liveness check on the OTHER side of the acceptance — the final
+    read-back, immediately before the intent is cleared.
+
+    Every write here succeeds and the mutated registry in memory is exactly
+    right, so the trial has nothing to refuse; only the file the next process
+    will read says `t1a` is retired. A read-back that asked the just-mutated
+    registry, or that asked the file for presence alone, would clear the intent
+    and leave the parent superseded by a terminal row with nothing recording it.
+    """
+    wiring = dispatched_round(tmp_path)
+    lying = StatusDriftingTaskStore(wiring.config.tasks_file)
+    store = SplitIntentStore(split_intents_dir(wiring.config.state_dir))
+    intent = make_intent()
+    store.save(intent)
+
+    result = apply_split_intent(
+        intent,
+        registry=wiring.registry,
+        task_store=lying,
+        execution_store=wiring.execution_store,
+        worker_repos=wiring.worker_repos,
+        intent_store=store,
+    )
+    assert result.complete is False
+    assert "'retired'" in result.obstacle
+    assert "t1a" in result.obstacle
+    assert store.load("t1") is not None
 
 
 def test_a_registry_that_persists_a_scope_it_was_not_given_is_never_certified(tmp_path):
