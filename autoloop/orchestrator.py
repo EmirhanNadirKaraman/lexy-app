@@ -1022,6 +1022,15 @@ def _surviving_worker_path(task_id: str, worker_repos) -> str:
     operator can only run if they are told the path. Best-effort: a manager
     that cannot even answer where the repo would be is not worth failing a
     release over.
+
+    **`""` from here means "nothing to name", NOT "nothing is there" — which is
+    why `_split_residue` may not ask this function.** Every caller here is
+    already reporting a retirement that FAILED, so the residue is known and this
+    only decorates the message with a path; swallowing an unanswerable manager
+    into `""` costs a sentence. `_split_residue`'s `""` is the opposite kind of
+    answer — a licence to tell the reviewer that all three stores agree — so it
+    reads the same directory through `_split_worker_residue`, which fails the
+    other way. Two functions, two documented fail directions, on purpose.
     """
     if worker_repos is None:
         return ""
@@ -1038,6 +1047,12 @@ def _surviving_execution_record(task_id: str, execution_store) -> bool:
     The silent half of the pair: a surviving record announces nothing and
     holds the merge window shut (`cli._merge_window_blockers`), so a release
     that could not move it has to say so itself.
+
+    Unreadable counts as surviving, but an ABSENT store counts as gone — the
+    same asymmetry `_surviving_worker_path` documents, for the same reason: this
+    is called where the residue is already known. `_split_residue` needs "was it
+    actually looked at?", which this cannot answer, so it asks
+    `_split_record_residue` instead.
     """
     if execution_store is None:
         return False
@@ -1045,6 +1060,131 @@ def _surviving_execution_record(task_id: str, execution_store) -> bool:
         return execution_store.load(task_id) is not None
     except (StateError, OSError):  # pragma: no cover - unreadable record
         return True
+
+
+def _store_path_text(store, task_id: str, fallback: str) -> str:
+    """Where `store` keeps `task_id`, as text for an operator — never raising.
+
+    Only ever called to decorate a residue that has ALREADY been established, so
+    a store that will not answer where its file lives must not turn a park into
+    a traceback. The fallback says the path is unknown, which is worth strictly
+    more than the exception.
+    """
+    try:
+        return str(store.path_for(task_id))
+    except (AttributeError, ValueError, OSError):  # pragma: no cover - exotic store
+        return fallback
+
+
+def _split_record_residue(parent_id: str, execution_store) -> tuple[str, str]:
+    """The execution-record half of `_split_residue`, as `(found, unknown)`.
+
+    Exactly one of the two is ever non-empty, and both being empty is the only
+    answer that means "this loop looked, and the record is gone". The three
+    endings:
+
+      * a live record — FOUND. Silent residue: it announces nothing and holds the
+        repository-wide merge window shut (`cli._merge_window_blockers`) on work
+        the roadmap says is retired;
+      * a record that cannot be parsed — UNKNOWN, never a pass. A record nobody
+        can read is precisely the one nobody may declare gone;
+      * no execution store at all — UNKNOWN. This process cannot look, and "did
+        not look" must not read as "looked and saw nothing".
+    """
+    if execution_store is None:
+        return (
+            "",
+            "this loop has no execution store configured, so whether the parent's "
+            "execution record is still live — holding the merge window shut — "
+            "cannot be established here",
+        )
+    try:
+        live = execution_store.load(parent_id) is not None
+    except (StateError, OSError) as exc:
+        return (
+            "",
+            f"its execution record cannot be read ({exc}), and a record nobody can "
+            "parse is the one nobody may declare gone",
+        )
+    if not live:
+        return "", ""
+    path = _store_path_text(execution_store, parent_id, "an unknown path")
+    return (
+        f"its execution record is still live at {path}, which holds the merge "
+        "window shut on work the roadmap says is retired",
+        "",
+    )
+
+
+def _split_worker_residue(parent_id: str, worker_repos) -> tuple[str, str]:
+    """The worker-repository half of `_split_residue`, as `(found, unknown)`.
+
+    The loud counterpart of `_split_record_residue`, with the same three endings
+    and the same rule: `("", "")` is returned only after a real `exists()` on a
+    real path answered no.
+
+      * a surviving directory — FOUND, and named, because the next
+        `WorkerRepoManager.create` refuses to write into it and the remedy is one
+        `mv` an operator can only run if they are told where;
+      * a `path_for` (or `exists`) that will not answer — UNKNOWN. `AttributeError`
+        is caught alongside `ValueError`/`OSError` on purpose: a collaborator that
+        does not answer this question at all is the same not-knowing, and the
+        fail-closed reading of a manager this cannot interrogate is residue;
+      * no manager at all — UNKNOWN, for `_split_record_residue`'s reason.
+    """
+    if worker_repos is None:
+        return (
+            "",
+            "this loop has no worker-repository manager configured, so whether the "
+            "parent's worker repository is still where the next dispatch would "
+            "refuse to create one cannot be established here",
+        )
+    try:
+        path = worker_repos.path_for(parent_id)
+        exists = path.exists()
+    except (AttributeError, ValueError, OSError) as exc:
+        return (
+            "",
+            f"the parent's worker repository path could not be resolved ({exc}), so "
+            "whether a worker repository survives cannot be established here",
+        )
+    if not exists:
+        return "", ""
+    return (
+        f"its worker repository is still at {path}, where the next dispatch would "
+        "refuse to create one",
+        "",
+    )
+
+
+@dataclass(frozen=True)
+class SplitResidue:
+    """What a split the REGISTRY calls finished has left behind — split into what
+    was SEEN (`found`) and what could not be LOOKED AT (`unknown`).
+
+    The two are kept apart rather than concatenated because they are different
+    facts and an operator acts on them differently: `found` is a directory or a
+    record to move, `unknown` is a loop to reconfigure or a file to repair. Both
+    block, which is the whole point — `blocking` is false only when both artefact
+    stores were interrogated and both said the parent is gone.
+    """
+
+    found: tuple[str, ...] = ()
+    unknown: tuple[str, ...] = ()
+
+    @property
+    def blocking(self) -> bool:
+        return bool(self.found or self.unknown)
+
+    @property
+    def proven(self) -> bool:
+        """Is any of this residue something this loop actually SAW? Decides which
+        park an operator is sent to, and therefore which code the transcript
+        carries."""
+        return bool(self.found)
+
+    def describe(self) -> str:
+        return "; and ".join(self.found + self.unknown)
 
 
 @dataclass(frozen=True)
@@ -1542,7 +1682,10 @@ def _split_disagreement(
         return f"the parent's execution record could not be read back ({exc})"
     try:
         worker = worker_repos.path_for(intent.parent_id)
-    except (ValueError, OSError) as exc:  # pragma: no cover - a manager that cannot answer
+    except (ValueError, OSError) as exc:
+        # Fail-closed for `_split_worker_residue`'s reason, and this is the site
+        # that matters most: an unanswerable manager here would otherwise certify
+        # a worker repository as gone and clear the intent over it.
         return f"the parent's worker repository path could not be resolved ({exc})"
     if worker.exists():
         return (
@@ -6564,17 +6707,19 @@ class Orchestrator:
             # denial budget telling the reviewer its directive failed when it
             # succeeded, which is the correction that cannot be acted on.
             #
-            # But only once ALL THREE stores say so. The registry alone saying
-            # "retired, superseded by exactly these" is not evidence the split
-            # finished: an operator who took the park's second option and DELETED
-            # a boundary-2 intent leaves precisely that registry with the parent's
-            # execution record and worker repository still on disk, and this reply
-            # would then tell the reviewer the loop "finished it from its durable
-            # intent record" — a claim about a record that is gone, over a residue
-            # that holds the merge window shut and that nothing else will ever
-            # look at, since a retired task is never dispatched or swept again.
+            # But only once ALL THREE stores say so, AND only when all three were
+            # actually READ. The registry alone saying "retired, superseded by
+            # exactly these" is not evidence the split finished: an operator who
+            # took the park's second option and DELETED a boundary-2 intent leaves
+            # precisely that registry with the parent's execution record and worker
+            # repository still on disk, and this reply would then report a split
+            # that never happened, over a residue that holds the merge window shut
+            # and that nothing else will ever look at, since a retired task is
+            # never dispatched or swept again. A store this process cannot
+            # interrogate at all is the same claim with even less behind it, so
+            # `_split_residue` returns it as `unknown` and this parks too.
             residue = self._split_residue(parent_id)
-            if residue:
+            if residue.blocking:
                 self._park_split_residue(parent_id, spec_ids, residue)
                 return
             self._log(
@@ -6584,11 +6729,14 @@ class Orchestrator:
             )
             state.outbox = (
                 f"SPLIT ALREADY APPLIED — task {parent_id} is retired and superseded "
-                f"by {', '.join(spec_ids)}.\n\nThis loop was interrupted while "
-                "accepting exactly this split and finished it from its durable "
-                "intent record on the next start, so your directive names work that "
-                "is already done. Nothing was changed a second time.\n\nRoadmap: "
-                f"{self._registry.summary()}\n\nAnswer with your next directive."
+                f"by {', '.join(spec_ids)}.\n\nAll three stores were read and all "
+                "three agree: the roadmap records exactly this split, no execution "
+                "record for the parent is live, and its worker repository is gone. "
+                "So your directive names work that is already done — most likely "
+                "because a previous run of this loop was interrupted mid-split and "
+                "finished it on the next start. Nothing was changed a second "
+                f"time.\n\nRoadmap: {self._registry.summary()}\n\nAnswer with your "
+                "next directive."
             )
             state.last_response = None
             state.consecutive_failures = 0
@@ -6873,65 +7021,101 @@ class Orchestrator:
             return False
         return all(self._registry.has(tid) for tid in spec_ids)
 
-    def _split_residue(self, parent_id: str) -> str:
-        """What a split the REGISTRY says is finished has still left on disk, or
-        `""` when the other two stores agree with it.
+    def _split_residue(self, parent_id: str) -> SplitResidue:
+        """What a split the REGISTRY says is finished has still left on disk —
+        AND what this loop could not look at well enough to say.
 
         The same two facts `_split_disagreement` reads back before an intent may
-        be cleared, asked here through the helpers `release` already uses — a
-        surviving execution record (silent: it holds the repository-wide merge
-        window shut, `cli._merge_window_blockers`) and a surviving worker
-        repository (loud: the next `WorkerRepoManager.create` refuses it). An
-        UNREADABLE record counts as surviving (`_surviving_execution_record`),
-        which is the fail-closed direction: a record nobody can parse is exactly
-        the one nobody may declare gone.
+        be cleared, asked here of the stores directly: a surviving execution
+        record (silent — it holds the repository-wide merge window shut,
+        `cli._merge_window_blockers`) and a surviving worker repository (loud —
+        the next `WorkerRepoManager.create` refuses it).
 
-        A loop with neither store configured answers `""`, and that is a blind
-        spot rather than a check: it cannot look. It is bounded by the fact that
-        the same loop refuses to START a split at all (`split_unavailable`), so
-        such a registry can only have been written by a process that DID have
-        both stores.
+        **A NON-BLOCKING answer is a three-store claim, so every way of not
+        knowing blocks.** The caller's next line on a non-blocking answer is
+        `SPLIT ALREADY APPLIED`, i.e. this loop telling the reviewer that the
+        registry, the execution record and the worker repository all agree. An
+        unreadable record, an absent execution store, an absent worker-repository
+        manager and a `path_for` that will not answer are each a store this
+        process did NOT read — so each is reported as `unknown` residue and parks
+        (`_park_split_residue`), rather than collapsing into the silence that
+        would be indistinguishable from having looked.
+
+        (An earlier round did answer "no residue" for the two missing
+        collaborators, on the argument that `split_unavailable` refuses to START
+        a split without them, so such a registry can only have been written by a
+        process that had both. That is a claim about how the registry GOT there,
+        not about what is on disk now: both stores are constructor arguments, so
+        the loop that wrote the retirement and the loop that reads it back need
+        not be configured alike — and a completion claim sourced from the
+        registry alone is exactly what this method exists to refuse.)
         """
-        leftovers = []
-        if _surviving_execution_record(parent_id, self._execution_store):
-            leftovers.append(
-                f"its execution record is still live at "
-                f"{self._execution_store.path_for(parent_id)}, which holds the merge "
-                "window shut on work the roadmap says is retired"
-            )
-        worker = _surviving_worker_path(parent_id, self._worker_repos)
-        if worker:
-            leftovers.append(
-                f"its worker repository is still at {worker}, where the next "
-                "dispatch would refuse to create one"
-            )
-        return "; and ".join(leftovers)
+        found: list[str] = []
+        unknown: list[str] = []
+        for seen, unseen in (
+            _split_record_residue(parent_id, self._execution_store),
+            _split_worker_residue(parent_id, self._worker_repos),
+        ):
+            if seen:
+                found.append(seen)
+            if unseen:
+                unknown.append(unseen)
+        return SplitResidue(found=tuple(found), unknown=tuple(unknown))
 
     def _park_split_residue(
-        self, parent_id: str, spec_ids: tuple[str, ...], residue: str
+        self, parent_id: str, spec_ids: tuple[str, ...], residue: SplitResidue
     ) -> None:
-        """Park on a registry that records a split whose artefacts never moved.
+        """Park on a registry whose recorded split the artefact stores do not
+        confirm — either because they contradict it, or because they could not be
+        read at all.
 
         `loop_fatal` for `_park_split_intent`'s reason, and one more: the parent
         is already retired, which `TaskRegistry.block` refuses outright, so there
         is no task-level park available even if this were a task-level fault. It
         is not one — the roadmap and the artefact stores disagree about whether a
-        task exists, and the durable record that would let the loop repair that by
-        itself is the thing that is missing.
+        task exists (or cannot be asked), and the durable record that would let
+        the loop repair that by itself is the thing that is missing.
+
+        TWO CODES, because they are two different operator jobs and the
+        transcript is the only place that distinction survives:
+        `split_residue_unreconciled` is "these artefacts are on disk, move them",
+        `split_residue_uninspectable` is "this loop could not look, so no claim
+        was made". A mixed answer takes the first: something WAS seen, and that
+        is the actionable half.
         """
         self.state.last_response = None
-        self._to_needs_user(
+        head = (
             f"task {parent_id}: the roadmap records it as retired and superseded by "
-            f"{', '.join(spec_ids)}, but the split was never finished — {residue}. "
-            "No split-intent record is on disk, so this loop cannot finish it by "
-            "itself and will not report the split as applied. Either move those by "
-            "hand (`executions/archive/` and `quarantine/`, under one shared label) "
-            "or, if the retirement itself was a mistake, fix the roadmap. Nothing "
-            "was changed.",
+            f"{', '.join(spec_ids)}, but "
+        )
+        if residue.proven:
+            body = (
+                f"the split's artefacts never moved — {residue.describe()}. No "
+                "split-intent record is on disk, so this loop cannot finish it by "
+                "itself and will not report the split as applied. Either move those "
+                "by hand (`executions/archive/` and `quarantine/`, under one shared "
+                "label) or, if the retirement itself was a mistake, fix the roadmap."
+            )
+            code = "split_residue_unreconciled"
+        else:
+            body = (
+                f"this loop cannot see whether the split ever finished — "
+                f"{residue.describe()}. It will not report a split as applied over a "
+                "store it did not read, and no split-intent record is on disk for it "
+                "to finish. Run this loop with its execution store and "
+                "worker-repository manager configured (or repair the store it could "
+                "not read), then look at `executions/` and `workers/` for this task."
+            )
+            code = "split_residue_uninspectable"
+        self._to_needs_user(
+            f"{head}{body} Nothing was changed.",
             kind="loop_fatal",
-            code="split_residue_unreconciled",
+            code=code,
             task_id=parent_id,
-            detail=f"successors={list(spec_ids)} residue={residue}",
+            detail=(
+                f"successors={list(spec_ids)} found={list(residue.found)} "
+                f"unknown={list(residue.unknown)}"
+            ),
         )
 
     def _reconcile_split_intents(self) -> bool:

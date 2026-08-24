@@ -262,6 +262,46 @@ class NoopQuarantine(WorkerRepoManager):
         return self.root_dir.parent / "quarantine" / f"{task_id}-{label}"
 
 
+class UnresolvableWorkerPath(WorkerRepoManager):
+    """A manager that cannot say WHERE this task's worker repository would be.
+
+    Not hypothetical: `WorkerRepoManager.path_for` calls `validate_task_id`
+    first, so any id `tasks.json` holds that the validator refuses — an
+    operator's hand-edit, a row from an older build — answers exactly like this.
+    A reader that swallowed it would report "no worker repository" about a
+    directory it never managed to name.
+    """
+
+    def path_for(self, task_id):
+        raise ValueError(f"unsafe task id {task_id!r}")
+
+
+class MutePathAfterQuarantine(WorkerRepoManager):
+    """Answers `path_for` until the worker has been quarantined, and then stops.
+
+    Contrived, and deliberately so: the real `quarantine` (and `retire_execution`
+    before it) calls `path_for` itself, so a manager that never answers fails on
+    a path `apply_split_intent` already covers by catching `ValueError` from the
+    retirement. Going mute AFTERWARDS is the only way to reach the worker branch
+    of the final read-back — which is the branch that decides whether the intent,
+    the only record that anything was in flight, may be deleted.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._quarantined = False
+
+    def quarantine(self, task_id, label):
+        dest = super().quarantine(task_id, label)
+        self._quarantined = True
+        return dest
+
+    def path_for(self, task_id):
+        if self._quarantined:
+            raise ValueError(f"unsafe task id {task_id!r}")
+        return super().path_for(task_id)
+
+
 class ScopeDriftingTaskStore(TaskStore):
     """Persists a WIDER scope for `t1a` than the registry it was handed carries.
 
@@ -430,6 +470,13 @@ def records(wiring, kind):
 
 def denial_codes(wiring):
     return [record.get("code") for record in records(wiring, "policy_denied")]
+
+
+def park_codes(wiring):
+    """Every park this wiring recorded, by code — `_to_needs_user` puts it in the
+    transcript and nowhere else, and it is the only place "I found residue" and
+    "I could not look" are told apart without reading prose."""
+    return [record.get("code") for record in records(wiring, "needs_user")]
 
 
 def intent_files(wiring):
@@ -1094,11 +1141,11 @@ def test_a_registry_that_records_a_split_whose_artifacts_never_moved_is_not_repo
     already saying "retired, superseded by t1a, t1b" while the execution record
     and the worker repo are still on disk, and the deleted record is the only
     thing that would have made the loop finish them. A registry-only
-    `_split_already_applied` then answers yes and the loop tells the reviewer it
-    "finished it from its durable intent record" — a claim about a file that no
-    longer exists, over a live record that holds the merge window shut and that
-    nothing will ever revisit, since a retired task is neither dispatched nor
-    swept. It must park on all three stores instead of reporting on one.
+    `_split_already_applied` then answers yes and the loop reports a finished
+    split to the reviewer — over a live record that holds the merge window shut
+    and that nothing will ever revisit, since a retired task is neither
+    dispatched nor swept. It must park on all three stores instead of reporting
+    on one.
     """
     crashed = crash_a_split(tmp_path, "registry")
     for path in intent_files(crashed):
@@ -1112,7 +1159,10 @@ def test_a_registry_that_records_a_split_whose_artifacts_never_moved_is_not_repo
     assert fresh.orch.state.park_kind == "loop_fatal"
     assert "SPLIT ALREADY APPLIED" not in (fresh.orch.state.outbox or "")
     question = fresh.orch.state.question or ""
-    assert "was never finished" in question
+    # The residue was SEEN, so it is the actionable park rather than the "could
+    # not look" one — the transcript is where those two stay told apart.
+    assert park_codes(fresh) == ["split_residue_unreconciled"]
+    assert "artefacts never moved" in question
     # BOTH residues named: the silent one (a record nothing announces) and the
     # loud one (a directory the next dispatch trips over).
     assert "merge window" in question
@@ -1126,9 +1176,13 @@ def test_a_registry_that_records_a_split_whose_artifacts_never_moved_is_not_repo
 
 def test_an_unreadable_record_is_residue_rather_than_a_finished_split(tmp_path):
     """The fail-closed direction of the same check. A record this loop cannot
-    parse is exactly the one nobody may declare gone, so it counts as surviving
-    — a reader that swallowed the error into "no record" would report the split
-    as applied on the strength of a file it could not read."""
+    parse is exactly the one nobody may declare gone, so it counts as unknown
+    residue — a reader that swallowed the error into "no record" would report the
+    split as applied on the strength of a file it could not read.
+
+    The worker half is moved out of the way first, so the ONLY thing that can
+    park this dispatch is the unreadable record.
+    """
     crashed = crash_a_split(tmp_path, "registry")
     for path in intent_files(crashed):
         path.unlink()
@@ -1139,8 +1193,174 @@ def test_an_unreadable_record_is_residue_rather_than_a_finished_split(tmp_path):
     fresh.orch._dispatch(split_directive())
 
     assert fresh.orch.state.phase == Phase.NEEDS_USER.value
-    assert "was never finished" in (fresh.orch.state.question or "")
+    question = fresh.orch.state.question or ""
+    assert "execution record cannot be read" in question
+    assert "cannot see whether the split ever finished" in question
+    assert park_codes(fresh) == ["split_residue_uninspectable"]
     assert "SPLIT ALREADY APPLIED" not in (fresh.orch.state.outbox or "")
+
+
+@pytest.mark.parametrize(
+    "missing, fragment",
+    [
+        ("execution", "no execution store configured"),
+        ("worker", "no worker-repository manager configured"),
+        ("both", "no execution store configured"),
+    ],
+)
+def test_a_store_this_loop_cannot_inspect_is_never_read_as_a_finished_split(
+    tmp_path, missing, fragment
+):
+    """The blind spot an earlier round documented and left open, closed.
+
+    `SPLIT ALREADY APPLIED` is a claim about THREE stores. A loop whose execution
+    store or worker-repository manager is `None` has read one of them — the
+    registry — and cannot read the other, so answering "no residue" would be the
+    check going silent exactly where it cannot look, and the reviewer would be
+    told the artefacts are gone by a process that never asked. It parks instead,
+    under its own code, and moves nothing.
+
+    Crashed at boundary 4, deliberately: every artefact really HAS moved, so the
+    only thing this dispatch could park on is the store it cannot inspect. That
+    is the exact shape of the collapse being refused — with the missing store
+    read as "nothing there", all three cases would report the split as verified
+    across three stores while one of them was never opened.
+
+    The old defence — "`split_unavailable` refuses to START a split without both
+    stores, so this registry must have been written by a process that had them" —
+    is a claim about how the registry got there, not about what is on disk: both
+    stores are constructor arguments, so the loop that wrote the retirement and
+    the loop that reads it back need not be configured alike. This test IS that
+    mismatch.
+    """
+    crashed = crash_a_split(tmp_path, "quarantine")
+    for path in intent_files(crashed):
+        path.unlink()
+
+    fresh = restart(crashed, tmp_path)
+    # Both artefacts are genuinely gone — verified through the stores this
+    # wiring still has, before either is taken away from the orchestrator.
+    assert fresh.execution_store.load("t1") is None
+    assert not (tmp_path / "workers" / "t1").exists()
+    if missing in ("execution", "both"):
+        fresh.orch._execution_store = None
+    if missing in ("worker", "both"):
+        fresh.orch._worker_repos = None
+
+    fresh.orch._dispatch(split_directive())
+
+    assert fresh.orch.state.phase == Phase.NEEDS_USER.value
+    assert fresh.orch.state.park_kind == "loop_fatal"
+    assert park_codes(fresh) == ["split_residue_uninspectable"]
+    assert fragment in (fresh.orch.state.question or "")
+    # No success report, and no denial either — the reviewer cannot fix a loop's
+    # own wiring by sending a different directive.
+    assert "SPLIT ALREADY APPLIED" not in (fresh.orch.state.outbox or "")
+    assert denial_codes(fresh) == []
+    # Nothing was moved to make the park true: the quarantined evidence is still
+    # exactly where the crashed process left it.
+    assert len(list((tmp_path / "quarantine").glob("t1-*"))) == 1
+
+
+def test_residue_that_was_seen_outranks_residue_that_could_not_be_looked_at(tmp_path):
+    """The mixed answer, and the rule it follows: something WAS found, so the
+    park is the actionable one and both halves are named.
+
+    Boundary 2 with no execution store — the worker repo is really there
+    (`found`) while the record cannot be inspected at all (`unknown`). Reporting
+    only the half this loop could see would send an operator to move one
+    directory and call it done.
+    """
+    crashed = crash_a_split(tmp_path, "registry")
+    for path in intent_files(crashed):
+        path.unlink()
+
+    fresh = restart(crashed, tmp_path)
+    fresh.orch._execution_store = None
+    fresh.orch._dispatch(split_directive())
+
+    question = fresh.orch.state.question or ""
+    assert park_codes(fresh) == ["split_residue_unreconciled"]
+    assert str(tmp_path / "workers" / "t1") in question
+    assert "no execution store configured" in question
+    assert "SPLIT ALREADY APPLIED" not in (fresh.orch.state.outbox or "")
+    assert denial_codes(fresh) == []
+
+
+def test_a_worker_path_that_cannot_be_resolved_is_residue_rather_than_silence(
+    tmp_path,
+):
+    """A manager that raises instead of answering where the worker repo would be.
+
+    Crashed at boundary 3, so the execution-record half is genuinely CLEAN (the
+    record is already archived) — which is what makes this test sharp: the only
+    thing standing between this dispatch and a `SPLIT ALREADY APPLIED` is a
+    `path_for` that will not answer. `_surviving_worker_path` swallows exactly
+    this into `""`, which is right where it is used (decorating a residue already
+    known) and would be a fail-open here.
+    """
+    crashed = crash_a_split(tmp_path, "archive")
+    for path in intent_files(crashed):
+        path.unlink()
+
+    fresh = restart(crashed, tmp_path)
+    assert fresh.execution_store.load("t1") is None
+    fresh.orch._worker_repos = UnresolvableWorkerPath(
+        tmp_path / "workers", tmp_path / "worker-hooks"
+    )
+
+    fresh.orch._dispatch(split_directive())
+
+    assert fresh.orch.state.phase == Phase.NEEDS_USER.value
+    question = fresh.orch.state.question or ""
+    assert "could not be resolved" in question
+    assert "unsafe task id" in question
+    assert park_codes(fresh) == ["split_residue_uninspectable"]
+    assert "SPLIT ALREADY APPLIED" not in (fresh.orch.state.outbox or "")
+    assert denial_codes(fresh) == []
+    assert (tmp_path / "workers" / "t1").is_dir()
+
+
+def test_a_worker_path_that_cannot_be_resolved_also_blocks_the_intent_from_clearing(
+    tmp_path,
+):
+    """The OTHER emitter of a completion claim, on the same fault.
+
+    `_split_disagreement` is what lets `apply_split_intent` throw the intent away,
+    so it has to fail closed on an unanswerable `path_for` for the same reason
+    `_split_residue` does — the intent is the only record that anything was ever
+    in flight.
+    """
+    wiring = dispatched_round(tmp_path, worker_repos_cls=MutePathAfterQuarantine)
+    store = SplitIntentStore(split_intents_dir(wiring.config.state_dir))
+    intent = make_intent()
+    store.save(intent)
+
+    result = apply_split_intent(
+        intent,
+        registry=wiring.registry,
+        task_store=wiring.task_store,
+        execution_store=wiring.execution_store,
+        worker_repos=wiring.orch._worker_repos,
+        intent_store=store,
+    )
+    assert result.complete is False
+    assert "could not be resolved" in result.obstacle
+    assert store.load("t1") is not None
+
+
+def test_a_replay_over_three_agreeing_stores_still_reports_the_split(tmp_path):
+    """The other side of the same coin, pinned so the fail-closed reading above
+    cannot quietly become "park on everything": when all three stores WERE read
+    and all three agree, the reviewer is told the split landed."""
+    crashed = crash_a_split(tmp_path, "registry")
+    fresh = restart(crashed, tmp_path)
+    assert fresh.orch._reconcile_split_intents() is True
+    assert fresh.orch._split_residue("t1").blocking is False
+
+    fresh.orch._dispatch(split_directive())
+    assert "SPLIT ALREADY APPLIED" in (fresh.orch.state.outbox or "")
+    assert park_codes(fresh) == []
 
 
 # ---------------------------------------------------------------------------
