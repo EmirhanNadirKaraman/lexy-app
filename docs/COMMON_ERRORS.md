@@ -2520,6 +2520,42 @@ error wherever the graph is read — `python -m autoloop start --check-only`
 prints `tasks        UNREADABLE (dependency cycle: …)` (`cli.py:2800`) — and it
 is the entry above, not this one.
 
+### A QUARANTINED task's execution has to go, and `release` exits 1: `task_not_in_progress`
+**Symptom:** a `blocked` task still holds a worker repo and an execution record
+with a live `candidate_sha` (`.autoloop/executions/<id>.json`), and no command
+appears to get rid of them. `release <id>` refuses — `task '<id>' is not in
+progress (status 'blocked')`. `answer` *does* return the task to the queue, but
+by design it leaves the record and the worker exactly where they are; the record
+is exempt from `merge-window` only while the task is quarantined, so the window
+shuts on it the moment the answer requeues the task.
+**Cause:** four combinations of "what state is the task in" and "is the in-flight
+work worth keeping", and until release-01 (2026-08-24) only two had a verb.
+`release` is in_progress + discard, `answer` is blocked + keep, in_progress +
+keep is still unimplemented (shelve-01) — and blocked + discard had nothing. Hit
+on dash-12 (2026-08-20), which parked `task_fatal` on `attempt_count_ceiling`
+holding an unpublished candidate; the only route out was performing
+`worktask.retire_execution`'s two moves by hand with the loop stopped.
+**Fix:** `python -m autoloop release-blocked <id> --reason "<why this work is
+being thrown away>"`. It refuses first, then moves the worker to
+`quarantine/<id>-<label>` and the record to
+`executions/archive/<id>-<label>.json` under one label, archives every open
+`task_fatal` blocker naming the task with your reason, and returns the task to
+the queue. Nothing is deleted and the task comes back with fresh attempt and
+fault budgets, which is what an `attempt_count_ceiling` park needs.
+**Three refusals that are not bugs.** `task_completed` — this cannot un-complete
+finished work, which is the hazard `release`'s narrowness exists to prevent.
+`task_operator_hold` — a hold placed through the inbox has no blocker record and
+no failed round to discard, so lift it through the inbox first (there is
+deliberately no override flag). And an open `loop_fatal` blocker naming the task
+stops the whole command: that is a LOOP-WIDE condition (dirty checkout, escaped
+write, dead browser) that discarding one task's work is no evidence about —
+`answer` or `archive-blocker` it first.
+**Failure endings, both safe to re-run.** If the retirement itself fails, the
+blocker stays OPEN and the task stays quarantined — nothing is half-done. If a
+later step fails, the retirement is NOT rolled back (both halves are moved, not
+deleted) and the message names the paths; the blocker is written back open where
+it can be. Re-running the command from either state is safe.
+
 ---
 
 ## 9. Autoloop monitoring (health)
@@ -3270,3 +3306,5 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | bind-02 | That entry carries the recovery for an OLD build, which is the half nobody had: the candidate is a real commit on `autoloop/<task-id>` in the worker repo, so publish it from there and `release` the task — do NOT re-run it, which produces a second candidate for work that already exists. On a current build the denial names the candidate and asks for `revise`; resending `push` is refused identically. |
 | 2026-08-24 | bind-02 | Revision round: the same §8 entry has a second, later-discovered shape worth recognising in a transcript. The re-prompt before the refused `push` is a `review_mismatch`, not a `parse_error`, and the `push` before THAT named an earlier packet id. Cause is the seam: a ledger-resolved approval leaves `last_response.postcommit` None, so the correction had nothing to inherit — and `review_mismatch_payload` asks the reviewer to stamp THIS request, which walks it straight back into the same denial. Fixed by carrying the resolved binding. |
 | 2026-08-24 | dash-21 | New §2 entry, beside the `inspect.getsource` one recov-01 added: the advisory validation channel returns pytest's `-q` short-summary line and truncates the WHOLE line at roughly 180 characters, so a number smuggled out through a deliberately failed assertion is cut off if the message is not terse. A descriptive node id spends most of the budget before the message starts. The entry gives the arithmetic and the surviving shape (`B 8/141/3.06s A 1/20/1.96s`). |
+| 2026-08-24 | release-01 | New §8 entry for the dead end dash-12 hit on 2026-08-20: a QUARANTINED task whose in-flight work is worthless, `release` refusing it with `task_not_in_progress`, and the `unblock` that message used to name never having been a CLI verb at all. `release-blocked` is the fix. The entry states both failure endings and that each is safe to re-run, plus the three refusals that are working as intended — completed, operator hold, and any open `loop_fatal` blocker naming the task. |
+| 2026-08-24 | release-01 | Read that entry's merge-window sentence precisely: while the task is `blocked`, `_merge_window_blockers` EXEMPTS its record (terminal registry state), so the window shuts the moment an `answer` requeues the task without retiring anything. That is why the retirement and the requeue are ONE command — pinned by `test_worker_publisher.py::test_release_blocked_frees_a_merge_window_a_bare_unblock_would_hold_shut`, which runs the counterfactual first. |

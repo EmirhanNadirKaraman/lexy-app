@@ -1746,6 +1746,85 @@ class TaskRegistry:
         task.hold_origin = ""
         return task
 
+    def release_blocked_obstacle(self, task_id: str) -> TaskGraphError | None:
+        """Why discarding a QUARANTINED task's execution would refuse, or None
+        if it may go ahead. Reports without transitioning, exactly like
+        `unblock_obstacle` above, and for the same reason: the release itself is
+        performed by `cli._reconcile_unblocked_tasks`, so the command needs to
+        say why a task it will not touch was refused.
+
+        The fourth cell of the matrix `release` and `answer` already cover.
+        `release` retires an IN-PROGRESS task's execution and discards it;
+        `answer` unblocks a QUARANTINED task and KEEPS its execution, because
+        most answers mean "carry on with the work you have". A quarantined task
+        whose in-flight work is worthless had no verb at all: `release` refuses
+        anything that is not `in_progress`, correctly, and the `unblock` its
+        message names is not a CLI command. Observed on dash-12 (2026-08-20) —
+        parked `task_fatal` on `attempt_count_ceiling` while its worker held an
+        unpublished candidate, and that record was the only thing holding the
+        merge window shut on three approved tasks. The operator did
+        `worktask.retire_execution`'s two moves by hand, with the loop stopped.
+
+        FOUR refusals, and none of them is a matter of taste:
+
+        * `completed` gets its own arm and its own code rather than falling
+          through the "not blocked" one below, because the sentence an operator
+          needs is "this cannot un-complete finished work", which is the exact
+          hazard `release`'s narrowness exists to prevent. Same wording shape as
+          `block`'s refusal.
+        * `in_progress` likewise, so the refusal can name `release` — that cell
+          of the matrix has a verb, and the delegate's generic wording is shared
+          with `answer` and cannot say so.
+        * `retired` and `shipped_elsewhere` are refused by `unblock_obstacle`,
+          which is DELEGATED to rather than restated — those two arms carry the
+          successor/shipped hints, and a second copy would drift. That call is
+          also what refuses every remaining non-`blocked` status — `pending`
+          being the one the two arms above do not already catch.
+        * An OPERATOR HOLD (`hold_origin == HOLD_ORIGIN_OPERATOR`) is refused
+          outright. It is the one `blocked` state with no blocker record behind
+          it and no loop failure to discard, so treating it like a quarantine
+          would silently overrule a human decision — the "broad relaxation"
+          this command was written NOT to be. `blocker_derived_blocked` excludes
+          it too, so the sweep would not release it either; this arm exists so
+          the operator is TOLD that, instead of reading a command that reported
+          success and moved nothing.
+
+        Deliberately no override flag for that last one. Adding one later is a
+        widening; shipping one now and withdrawing it would break a documented
+        verb, and an operator who wants their own hold gone can lift it through
+        the inbox and then run this.
+        """
+        task = self.get(task_id)
+        if task.status == "completed":
+            return TaskGraphError(
+                "task_completed",
+                f"task '{task_id}' is completed — `release-blocked` discards a "
+                "quarantined task's in-flight work, it cannot un-complete "
+                "finished work",
+            )
+        if task.status == "in_progress":
+            # Its own arm, ahead of the delegate, purely so the message names
+            # the verb that DOES cover this cell. `unblock_obstacle`'s generic
+            # "is not blocked" is shared with `answer` and cannot say it
+            # without changing what that command prints.
+            return TaskGraphError(
+                "task_in_progress",
+                f"task '{task_id}' is in progress, not quarantined — `release` "
+                "is the verb that returns an interrupted round to pending and "
+                "retires the execution it leaves behind",
+            )
+        obstacle = self.unblock_obstacle(task_id)
+        if obstacle is not None:
+            return obstacle
+        if task.hold_origin == HOLD_ORIGIN_OPERATOR:
+            return TaskGraphError(
+                "task_operator_hold",
+                f"task '{task_id}' is an OPERATOR hold, not a loop quarantine — "
+                "it has no blocker record and no failed round to discard. Lift "
+                "the hold through the inbox first if that is what you mean",
+            )
+        return None
+
     def release(self, task_id: str) -> Task:
         """Return an IN-PROGRESS task to pending, so it can be picked again.
 
@@ -1763,16 +1842,21 @@ class TaskRegistry:
 
         Narrow on purpose. Refuses a task that is not in progress, so it
         cannot quietly un-complete finished work or launder a quarantine
-        (`blocked` still goes through `unblock`, which is what the blocker
-        record is tied to).
+        (`blocked` still goes through the blocker record that is tied to it —
+        `answer` to keep the in-flight work, `release-blocked` /
+        `release_blocked_obstacle` to discard it). That narrowness is
+        UNCHANGED: the blocked cell got its own verb rather than this one being
+        widened, precisely so neither of those two hazards could arrive here by
+        the back door.
         """
         task = self.get(task_id)
         if self.state_of(task_id) is not TaskState.IN_PROGRESS:
             raise TaskGraphError(
                 "task_not_in_progress",
                 f"task '{task_id}' is not in progress (status {task.status!r}) — "
-                "`release` only returns an interrupted round to pending; use "
-                "`unblock` for a quarantined task",
+                "`release` only returns an interrupted round to pending; a "
+                "quarantined task goes through `answer` (keep its work) or "
+                "`release-blocked` (discard it)",
             )
         task.status = "pending"
         return task

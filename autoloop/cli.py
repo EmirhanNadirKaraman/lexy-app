@@ -135,7 +135,12 @@ from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from .transcript import TranscriptLogger, build_profile, read_records, render_profile
 from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
-from .worktask import IntentStore, RecordedRevertAuthority, TaskExecutionStore
+from .worktask import (
+    IntentStore,
+    RecordedRevertAuthority,
+    TaskExecutionStore,
+    retire_execution_retrying,
+)
 
 DEFAULT_CONFIG = Path(".autoloop/config.toml")
 
@@ -3106,23 +3111,289 @@ def _cmd_release(args: argparse.Namespace) -> int:
             print(f"error: {exc}")
             return 1
         print(f"task {released.task.id} released: in_progress -> pending")
-
-        retired = released.retirement
-        if retired.record_path is not None:
-            print(
-                f"execution record moved to {retired.record_path} (kept, not "
-                "deleted — its candidate is still in the quarantined worker)"
-            )
-        else:
-            print("no execution record to retire")
-        if retired.worker_path is not None:
-            print(
-                f"worker repo moved to {retired.worker_path} "
-                "(kept, not deleted — it may hold work)"
-            )
-        else:
-            print("no worker repo to clear")
+        _print_retirement(released.retirement)
     return 0
+
+
+#: The label half of a blocked-discard retirement. FIXED, and deliberately NOT
+#: the operator's `--reason`: `worktask.retire_execution` interpolates its
+#: `reason` into a quarantine DIRECTORY NAME and an archive FILENAME, so free
+#: text there would put spaces, slashes and `..` into two paths — the operator's
+#: words go into the blocker's `archived_reason`, where they are data, and the
+#: label stays a constant plus a timestamp exactly as `release`'s does.
+_DISCARD_LABEL_REASON = "discarded-by-operator"
+
+
+def _print_retirement(retired) -> None:
+    """The two lines every retirement reports, shared by `release` and
+    `release-blocked` so the wording of "moved, not deleted" cannot drift
+    between the two commands that perform the same paired move."""
+    if retired.record_path is not None:
+        print(
+            f"execution record moved to {retired.record_path} (kept, not "
+            "deleted — its candidate is still in the quarantined worker)"
+        )
+    else:
+        print("no execution record to retire")
+    if retired.worker_path is not None:
+        print(
+            f"worker repo moved to {retired.worker_path} "
+            "(kept, not deleted — it may hold work)"
+        )
+    else:
+        print("no worker repo to clear")
+
+
+def _cmd_release_blocked(args: argparse.Namespace) -> int:
+    """Discard a QUARANTINED task's execution and return the task to the queue
+    — worker repo to quarantine, execution record to `executions/archive/`,
+    both under one label, and its blocker archived with the reason you give.
+
+    THE FOURTH CELL. Four combinations of "what state is the task in" and "is
+    the in-flight work worth keeping", and until this command three of them had
+    a verb: in_progress + discard is `release`; blocked + keep is `answer`,
+    which deliberately leaves the execution record alone because most answers
+    mean "carry on with the work you have"; in_progress + keep has none (that
+    is shelve-01, not this). Blocked + discard had none either, and it holds
+    exactly the hazard `release` was extended for in the first place.
+
+    Hit on dash-12 (2026-08-20). It parked `task_fatal` on
+    `attempt_count_ceiling` while its worker still held an unpublished
+    candidate, and that ONE record was the whole reason
+    `_merge_window_blockers` held the window shut on base-02, dash-14 and
+    val-02 — base-02 being the fix for the largest single failure class in the
+    log, approved and waiting four hours behind it. `release` refuses anything
+    that is not in progress (correctly), the `unblock` its message used to name
+    is not a CLI verb, and `answer` keeps the record by design. So the operator
+    performed `worktask.retire_execution`'s two moves by hand, with the loop
+    stopped, to do what the tool already implements.
+
+    ORDER, and every step of it is load-bearing:
+
+    1. **Refuse first** (`TaskRegistry.release_blocked_obstacle`), so a task
+       this may not touch keeps its worker, its record and its blocker exactly
+       where they are. Completed work cannot be un-completed here, and an
+       OPERATOR hold is refused rather than laundered.
+    2. **Refuse a `loop_fatal` blocker** naming the task, for the reason
+       `_reconcile_retired_blockers` keeps its `task_fatal` allowlist: a
+       loop-wide condition (a dirty checkout, an escaped write, a dead browser)
+       merely happened to be recorded while this task was in flight, and
+       discarding one task's work is no evidence about it. Closing it would let
+       `start` proceed and `health` go quiet with the condition still there.
+       Refused rather than partially done: the task would otherwise return to
+       the queue with an open question about it, which is the state this whole
+       area exists to make impossible.
+    3. **Retire the execution** (`worktask.retire_execution_retrying`) — BOTH
+       halves in one call under one label, so no caller can move one and forget
+       the other. A failure here ends the command: the blocker stays open and
+       the task stays quarantined, because a retirement that failed while the
+       blocker was resolved would return the task to the queue with the stale
+       record still holding the merge window shut — the exact defect
+       `retire_execution` was written to prevent after 25 released tasks left
+       14 pinned records on 2026-08-15.
+    4. **Archive the blocker(s)**, never `resolve` them. `archive_stale` writes
+       a machine reason and leaves `answer` None, which is the honest record:
+       nobody answered the question, the work it was about was thrown away.
+       Writing an answer would forge exactly the operator confirmation
+       `_RESOLUTION_PRECONDITIONS` demands elsewhere. The reason is REQUIRED
+       and carries the operator's words plus where both halves went.
+    5. **Requeue through the shared reconciliation**
+       (`_reconcile_unblocked_tasks`), never a targeted `registry.unblock`.
+       Same rule `answer` follows since blk-01: one release path, narrowed by
+       provenance, so what the command prints and what it wrote cannot
+       disagree — and the release condition is literally "no open blocker names
+       this task any more", which is the invariant that must hold afterwards.
+       If that half cannot be completed the archival is written back OPEN
+       (`_requeue_after_discard`) and the command exits 1, so a close that
+       cannot requeue is not a close.
+
+    What it does NOT do: the retirement in step 3 is never rolled back. Once
+    the record is archived and the worker quarantined, a later failure leaves
+    them there and says so — both are MOVED, never deleted, so the candidate
+    stays recoverable, and the residue is the safe direction (a record out of
+    the merge window, a worker the next dispatch would refuse to write over,
+    loudly). Re-running the command from that state is safe: both halves are
+    absence-tolerant.
+
+    The task comes back with a FRESH slate, and that is the point rather than a
+    side effect: its `attempt_count`, `fault_attempt_count`, `review_round` and
+    `candidate_sha` went into the archive with the record, so the next dispatch
+    starts a new one. That is what an `attempt_count_ceiling` park needs and
+    what `answer` deliberately will not do (`_clear_fault_budget_on_answer`
+    refills one counter, on one code, precisely because it keeps the work).
+    """
+    config = load_config(args.config)
+    reason = (args.reason or "").strip()
+    if not reason:
+        # Before the lock and before anything is read: an empty reason would
+        # reach `archive_stale`, which refuses it — and a blocker cleared with
+        # no recorded reason is the silent delete this command must never be.
+        print(
+            "error: --reason must not be empty — discarding a task's work "
+            "without saying why is what this command exists to prevent"
+        )
+        return 1
+    with LoopLock(config.state_dir):
+        # The registry is READ here and mutated nowhere: the requeue is
+        # `_reconcile_unblocked_tasks`' (blk-01's rule — one release path,
+        # narrowed by provenance), so this copy exists only to answer "may this
+        # task be discarded at all" before anything moves.
+        _task_store, registry = _load_tasks(config)
+        try:
+            obstacle = registry.release_blocked_obstacle(args.task_id)
+        except TaskGraphError as exc:  # unknown id
+            print(f"error: {exc}")
+            return 1
+        if obstacle is not None:
+            print(f"error: {obstacle}")
+            return 1
+
+        blocker_store = BlockerStore(config.blockers_dir)
+        try:
+            open_here = [
+                b for b in blocker_store.open_blockers() if b.task_id == args.task_id
+            ]
+        except (StateError, OSError) as exc:
+            # A store that cannot be read is not a store with nothing in it:
+            # proceeding would archive nothing, requeue the task, and leave any
+            # open question behind. Fail closed and say which half stopped it.
+            print(f"error: the blocker store could not be read ({exc}) — nothing changed")
+            return 1
+        unclosable = [b for b in open_here if b.kind != "task_fatal"]
+        if unclosable:
+            print(
+                f"error: task {args.task_id} holds an open blocker this command "
+                "may not close: "
+                + ", ".join(f"{b.id} ({b.kind or 'unclassified'}/{b.code})" for b in unclosable)
+                + ". A loop_fatal record is a LOOP-WIDE condition that discarding "
+                "one task's work is no evidence about — answer or `archive-blocker` "
+                "it first. Nothing changed."
+            )
+            return 1
+
+        try:
+            retired = retire_execution_retrying(
+                args.task_id,
+                TaskExecutionStore(config.executions_dir),
+                WorkerRepoManager(config.workers_root, config.worker_hooks_dir),
+                reason=_DISCARD_LABEL_REASON,
+            )
+        except (GitError, StateError, OSError) as exc:
+            print(
+                f"error: the execution of {args.task_id} could not be retired "
+                f"({exc}) — its blocker is still open and the task is still "
+                "quarantined, so nothing is half-done. Move the worker repo or "
+                "the archive destination aside and run this again."
+            )
+            return 1
+        _print_retirement(retired)
+
+        snapshots = [dataclasses.replace(b) for b in open_here]
+        closed: list[Blocker] = []
+        machine_reason = (
+            f"the execution of {args.task_id} was discarded by the operator "
+            f"(`release-blocked`): {reason}. Worker repo: "
+            f"{retired.worker_path or '(none on disk)'}; execution record: "
+            f"{retired.record_path or '(none on disk)'}. The task returns to the "
+            "queue and is redone from scratch, so this question was not answered "
+            "— the work it was about was thrown away."
+        )
+        try:
+            for blocker in open_here:
+                closed.append(blocker_store.archive_stale(blocker.id, machine_reason))
+        except (StateError, OSError) as exc:
+            print(
+                f"error: a blocker of {args.task_id} could not be archived ({exc}) "
+                "— the task was NOT returned to the queue. The execution is already "
+                "retired (see the paths above); re-running this command is safe."
+            )
+            _reopen_all(blocker_store, [s for s in snapshots if s.id in {c.id for c in closed}])
+            return 1
+
+        released, _registry, outcome = _requeue_after_discard(config, blocker_store, snapshots)
+        if outcome != _REQUEUE_OK:
+            print(
+                f"task {args.task_id} was NOT returned to the queue. Its "
+                "execution is already retired (see the paths above) and re-running "
+                "this command is safe."
+                + (
+                    ""
+                    if outcome == _REQUEUE_REOPENED
+                    else " Its blocker(s) remain CLOSED on disk — see the error above."
+                )
+            )
+            return 1
+        if args.task_id not in {task_id for task_id, _ in released}:
+            # Unreachable through the checks above, which all ran under this
+            # lock: the task was `blocked`, not an operator hold, and every open
+            # record naming it was just archived. Reported rather than assumed
+            # away, because the alternative is printing "returned to the queue"
+            # about a task that is still quarantined.
+            print(
+                f"error: task {args.task_id} was not returned to the queue by the "
+                "reconciliation. Its execution is already retired (see the paths "
+                "above); its blocker(s) are being reopened so the two halves stay "
+                "together."
+            )
+            _reopen_all(blocker_store, snapshots)
+            return 1
+        print(f"task {args.task_id} returned to the queue: blocked -> pending")
+        for blocker in closed:
+            print(
+                f"blocker {blocker.id} ({blocker.code}) archived with your reason "
+                "— NOT an operator answer, because the work its question was "
+                "about was discarded"
+            )
+        if not closed:
+            # Legitimate: a task can be `blocked` with every record already
+            # closed (blk-01's split brain). Said out loud so the operator is
+            # never left inferring that a blocker was closed silently.
+            print("no open blocker named this task — nothing to archive")
+        if retired.record_path is not None:
+            # Gated on the record really having moved. Printing this line for a
+            # task that had no record would be the false sentence `_cmd_answer`'s
+            # "the message has to be true" rule exists to prevent — there were no
+            # budgets to archive, and the next dispatch mints the first record.
+            print(
+                "its attempt and fault budgets went into the archive with the "
+                "record, so the next dispatch starts a fresh one"
+            )
+        _print_auto_unblocked([r for r in released if r[0] != args.task_id])
+    return 0
+
+
+def _reopen_all(blocker_store: BlockerStore, snapshots: list[Blocker]) -> bool:
+    """Write every snapshot back exactly as it was read. True only when ALL of
+    them were restored.
+
+    A list comprehension rather than `all(...)` over a generator, deliberately:
+    short-circuiting on the first failure would leave the remaining records
+    closed with nothing announcing it, which is the fail-open half of exactly
+    the split brain this undo exists to prevent."""
+    return all([_reopen_blocker(blocker_store, before) for before in snapshots])
+
+
+def _requeue_after_discard(
+    config, blocker_store: BlockerStore, snapshots: list[Blocker]
+) -> tuple[list[tuple[str, str]], TaskRegistry | None, str]:
+    """`_requeue_after_close` for a command that closed MORE THAN ONE record.
+
+    Same contract, same three outcomes, same fail-closed rule — the archival is
+    written back OPEN when the task half cannot be completed, so a close that
+    cannot requeue is not a close. It is a second function rather than a
+    widened first one because `answer` and `archive-blocker` each close exactly
+    one blocker and must keep behaving precisely as they do today; a task's
+    quarantine can be several records (`record` mints one per
+    (task, code, phase)), and `release-blocked` closes all of them together.
+    """
+    try:
+        task_store, registry = _load_tasks(config)
+        released = _reconcile_unblocked_tasks(config, task_store, registry)
+    except _REQUEUE_FAULTS as exc:
+        print(f"error: the task graph could not be reconciled ({exc})")
+        restored = _reopen_all(blocker_store, snapshots)
+        return [], None, _REQUEUE_REOPENED if restored else _REQUEUE_CLOSE_STANDS
+    return released, registry, _REQUEUE_OK
 
 
 def _reconcile_retired_blockers(config, registry) -> list[Blocker]:
@@ -4722,6 +4993,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_config(release)
     release.add_argument("task_id")
     release.set_defaults(func=_cmd_release)
+
+    release_blocked = sub.add_parser(
+        "release-blocked",
+        help=(
+            "return a QUARANTINED task to the queue and DISCARD the execution "
+            "it holds: worker repo to quarantine, record to executions/archive, "
+            "its blocker archived with your reason (refuses an operator hold)"
+        ),
+    )
+    add_config(release_blocked)
+    release_blocked.add_argument("task_id")
+    release_blocked.add_argument(
+        "--reason",
+        required=True,
+        help=(
+            "why this task's in-flight work is being thrown away — required, so "
+            "a discarded candidate and a cleared blocker are never unaccounted "
+            "for. It is recorded on the blocker, never used as a path label"
+        ),
+    )
+    release_blocked.set_defaults(func=_cmd_release_blocked)
 
     urgent = sub.add_parser(
         "urgent",

@@ -64,7 +64,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Sequence
 
-from .errors import StateCorruptError
+from .errors import GitError, StateCorruptError, StateError
 from .state import utcnow_iso
 
 
@@ -915,6 +915,12 @@ def retire_execution(
     `executions/archive/<task_id>-<label>.json` name each other, so a human
     reading either one can find the other half of the same attempt.
 
+    TWO operator routes reach this, one per matrix cell: `cli._cmd_release`
+    for a task stranded IN-PROGRESS, and `cli._cmd_release_blocked` (through
+    `retire_execution_retrying` below) for a QUARANTINED one whose in-flight
+    work is being discarded. Both get the same paired move under one label,
+    which is the whole reason this is a function rather than two call sites.
+
     RECORD FIRST, worker second, deliberately. Either half can fail
     (a filesystem error, a colliding label), and the two residues are not
     equally safe. A left-behind record is SILENT: it holds the merge window
@@ -931,6 +937,109 @@ def retire_execution(
     if worker_repos is not None and worker_repos.path_for(task_id).exists():
         worker_path = worker_repos.quarantine(task_id, label)
     return Retirement(label=label, record_path=record_path, worker_path=worker_path)
+
+
+#: What `retire_execution_retrying` appends to `reason` for its second attempt,
+#: written down once because TWO functions depend on the same word: the retry
+#: builds the label with it, and `_archived_record_path` recognises — and skips —
+#: the names it produces. A second literal that drifted from the first would not
+#: fail; it would silently start reporting a retry file as a first attempt's.
+_RETRY_LABEL_SUFFIX = "retry"
+
+
+def retire_execution_retrying(
+    task_id: str,
+    execution_store: TaskExecutionStore,
+    worker_repos,
+    reason: str = "released-by-operator",
+) -> Retirement:
+    """`retire_execution`, retried ONCE under `<reason>-retry`, for a caller
+    that has nothing to fall back on and reports its failure to a human.
+
+    A LABEL COLLISION is the likelier of the two ways `retire_execution` fails,
+    and it is the one a retry actually fixes: the label is `reason` plus a
+    WHOLE-SECOND stamp, so two retirements of one task inside the same second
+    collide by construction — and both halves refuse a colliding destination
+    rather than clobbering the earlier attempt's evidence. Retrying under a
+    different `reason` changes the label rather than waiting out the second.
+    A filesystem that genuinely refuses the move fails both times and the
+    original error is raised, unchanged and of its original type.
+
+    Safe to repeat because both halves are ABSENCE-TOLERANT: `archive` returns
+    None when the record has already moved, and the worker is quarantined only
+    `if … exists()`. That is also why the returned `record_path` is REPAIRED
+    below — when the first attempt archived the record and then failed on the
+    worker, the retry finds nothing left to file and reports `None`, which a
+    reader would take as "there was no record at all". The archive is globbed
+    for what the first attempt actually wrote instead, so the report cannot
+    claim an absence that is not true.
+
+    `orchestrator.release_task_to_pending` keeps its own copy of this loop and
+    is deliberately NOT rewritten to call this: it must collect BOTH failures
+    for the tolerating caller (`_repair_orphaned_record`), which needs the
+    problems rather than an exception. This is the same one-retry rule for the
+    callers that simply fail loudly — `cli._cmd_release_blocked` today.
+    """
+    first_failure = None
+    for attempt_reason in (reason, f"{reason}-{_RETRY_LABEL_SUFFIX}"):
+        try:
+            retirement = retire_execution(
+                task_id, execution_store, worker_repos, reason=attempt_reason
+            )
+        except (GitError, StateError, OSError) as exc:
+            if first_failure is None:
+                first_failure = exc
+            continue
+        if retirement.record_path is None and first_failure is not None:
+            retirement = Retirement(
+                label=retirement.label,
+                record_path=_archived_record_path(task_id, execution_store, reason),
+                worker_path=retirement.worker_path,
+            )
+        return retirement
+    raise first_failure
+
+
+def _archived_record_path(
+    task_id: str, execution_store: TaskExecutionStore, reason: str
+) -> Path | None:
+    """Where a FIRST retirement attempt filed the record, when the retry could
+    not report it because there was nothing left to file.
+
+    Best-effort and read-only, built from the naming `TaskExecutionStore.
+    archive` documents (`archive/<task_id>-<label>.json`, label =
+    `<reason>-<stamp>`). `None` when nothing matches — an unknown path is better
+    reported as unknown than guessed at.
+
+    TWO things the obvious `sorted(glob(...))[-1]` gets wrong, and both bite the
+    same way: the reported path lands in `release-blocked`'s blocker reason, so
+    naming the wrong archive is a false statement in the record that exists to
+    account for the discard.
+
+    * The glob's `*` also matches the RETRY namespace (`<reason>-retry-<stamp>`),
+      and `"r"` sorts after every digit — so ONE stale `-retry-` file from an
+      earlier retirement of the same task outranks the record this call just
+      filed, whatever the stamps say. Retry-labelled names are excluded outright:
+      the file being looked for is always the FIRST attempt's, whose label is
+      `reason` + stamp by construction (a retry that filed the record returns a
+      `record_path` and never reaches this function).
+    * Whole-name ordering only happens to agree with "newest" while every name
+      shares a prefix. The stamp is the trailing `-`-delimited segment
+      (`utcnow_iso` with `:` and `-` stripped, so it holds none of its own), so
+      it is sorted on directly rather than inferred from the rest of the name.
+    """
+    try:
+        candidates = list(
+            (Path(execution_store.directory) / "archive").glob(f"{task_id}-{reason}-*.json")
+        )
+    except (AttributeError, OSError):  # pragma: no cover - store without a directory
+        return None
+    prefix = f"{task_id}-{reason}-"
+    matches = sorted(
+        (p for p in candidates if not p.name.startswith(f"{prefix}{_RETRY_LABEL_SUFFIX}-")),
+        key=lambda p: p.stem.rsplit("-", 1)[-1],
+    )
+    return matches[-1] if matches else None
 
 
 class IntentStore:

@@ -20,15 +20,19 @@ somehow blocked (that is explicitly out of scope).
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from autoloop import cli, worktask
+from autoloop.blockers import BlockerStore
 from autoloop.config import AutoloopConfig, BrowserConfig
 from autoloop.contract import Decision, Directive
-from autoloop.errors import GitCommandError
+from autoloop.errors import GitCommandError, StateError, TaskGraphError
 from autoloop.executor import ExecutionOutcome
 from autoloop.git_gateway import GitGateway
 from autoloop.manifest import ManifestStore
@@ -40,9 +44,9 @@ from autoloop.publisher import (
     read_publisher_url_snapshot,
 )
 from autoloop.state import LastResponse, LoopState, Phase, StateStore
-from autoloop.tasks import Task, TaskRegistry, TaskStore
+from autoloop.tasks import HOLD_ORIGIN_OPERATOR, Task, TaskRegistry, TaskState, TaskStore
 from autoloop.transcript import TranscriptLogger
-from autoloop.worktask import IntentStore, TaskExecutionStore
+from autoloop.worktask import IntentStore, TaskExecution, TaskExecutionStore
 from autoloop.worktree import WorktreeManager
 from autoloop.worker_env import (
     WorkerRepoManager,
@@ -1013,3 +1017,546 @@ def test_orchestrator_refuses_a_worker_repo_with_an_active_hook(tmp_path):
     wgit = GitGateway(repo.path, PolicyEngine(PolicyConfig()), env=worker_env())
     violations = verify_worker_isolation(wgit)
     assert any("hook" in v.lower() for v in violations), violations
+
+
+# =============================================================================
+# 6. `release-blocked` — retiring a QUARANTINED task's execution (release-01)
+# =============================================================================
+#
+# `release` is the only verb that retires an execution, and it refuses anything
+# that is not in progress. A BLOCKED task holds exactly the same hazard: on
+# 2026-08-20 dash-12 parked `task_fatal` on `attempt_count_ceiling` while its
+# worker still held an unpublished candidate, and that ONE record was the whole
+# reason `_merge_window_blockers` held the window shut on base-02, dash-14 and
+# val-02. `release` refused it, the `unblock` its message named is not a CLI
+# verb, and `answer` keeps the record by design — so the operator performed
+# `worktask.retire_execution`'s two moves by hand with the loop stopped.
+#
+# These tests live beside the worker-repo primitives because the quarantine
+# half of that retirement is `WorkerRepoManager.quarantine`, exercised here
+# against real directories rather than a stub.
+
+
+@pytest.fixture
+def loop_config(tmp_path):
+    return AutoloopConfig(
+        browser=BrowserConfig(conversation_url=URL),
+        policy=PolicyConfig(),
+        state_dir=tmp_path / ".al",
+        # `quarantine/` is a SIBLING of `workers_root`, so keeping the root one
+        # level down leaves both inside `tmp_path`.
+        workers_root=tmp_path / "outside" / "workers",
+    )
+
+
+@pytest.fixture
+def wired_cli(loop_config, monkeypatch):
+    monkeypatch.setattr(cli, "load_config", lambda _p: loop_config)
+    loop_config.state_dir.mkdir(parents=True, exist_ok=True)
+    return loop_config
+
+
+class _UnreadableCheckout:
+    """A gateway that can answer nothing. `_merge_window_blockers` fails CLOSED
+    on every unanswerable question, so this pins the counterfactual below to the
+    records on disk rather than to whatever git repository the test runner
+    happens to have as its working directory."""
+
+    def head_sha(self):
+        raise GitCommandError("rev-parse", "no checkout here")
+
+    def remote_ref_sha(self, *_args):
+        raise GitCommandError("ls-remote", "no checkout here")
+
+    def read_commit(self, *_args):
+        raise GitCommandError("cat-file", "no checkout here")
+
+    def object_exists(self, *_args):
+        raise GitCommandError("cat-file", "no checkout here")
+
+    def is_descendant(self, *_args):
+        raise GitCommandError("merge-base", "no checkout here")
+
+
+def _quarantined_task(
+    config,
+    task_id="dash-12",
+    *,
+    candidate="c" * 40,
+    worker=True,
+    record=True,
+    blocker=True,
+    kind="task_fatal",
+):
+    """dash-12's shape: a task parked `task_fatal`, its worker repo still on
+    disk with real work in it, and an execution record still claiming an
+    unpublished candidate. Returns `(task_store, execution_store, blocker)`."""
+    store = TaskStore(config.tasks_file)
+    registry = TaskRegistry(
+        [Task(id=task_id, title="t", description="d", approved_paths=["docs/A.md"])]
+    )
+    registry.mark_in_progress(task_id)
+    registry.block(task_id, "attempt count ceiling")
+    store.save(registry)
+
+    workers = WorkerRepoManager(config.workers_root, config.worker_hooks_dir)
+    worker_path = workers.path_for(task_id)
+    if worker:
+        worker_path.mkdir(parents=True)
+        (worker_path / "half-done.txt").write_text("work in progress", encoding="utf-8")
+
+    executions = TaskExecutionStore(config.executions_dir)
+    if record:
+        executions.save(
+            TaskExecution(
+                task_id=task_id,
+                task_branch=f"autoloop/{task_id}",
+                worktree_path=str(worker_path),
+                task_base_sha="d2d4d6b8" + "0" * 32,
+                candidate_sha=candidate,
+                review_round=2,
+                attempt_count=3,
+            )
+        )
+
+    parked = None
+    if blocker:
+        parked = BlockerStore(config.blockers_dir).record(
+            task_id=task_id,
+            kind=kind,
+            code="attempt_count_ceiling",
+            question=f"{task_id} hit the attempt ceiling; what now?",
+            detail="3 attempts",
+            phase="executing",
+            now="2026-08-20T00:00:00+00:00",
+        )
+    return store, executions, parked
+
+
+def _discard(task_id="dash-12", reason="superseded by a hand-written fix"):
+    return argparse.Namespace(config=None, task_id=task_id, reason=reason)
+
+
+def test_release_blocked_retires_the_execution_and_returns_the_task(wired_cli, capsys):
+    """THE claim: one supported command moves the worker to quarantine, the
+    record to executions/archive, resolves the blocker with the recorded
+    reason, and returns the task to the queue — no hand-editing."""
+    store, executions, parked = _quarantined_task(wired_cli)
+    workers = WorkerRepoManager(wired_cli.workers_root, wired_cli.worker_hooks_dir)
+
+    assert cli._cmd_release_blocked(_discard()) == 0
+
+    # 1. the task is back in the queue
+    assert store.load().state_of("dash-12") is TaskState.READY
+    assert store.load().next_ready().id == "dash-12"
+    # 2. the worker moved, and its work went with it
+    assert not workers.path_for("dash-12").exists()
+    quarantined = sorted((wired_cli.workers_root.parent / "quarantine").glob("dash-12-*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "half-done.txt").read_text(encoding="utf-8") == "work in progress"
+    # 3. the record moved — out of the live directory, into the archive, kept
+    assert executions.load("dash-12") is None
+    archived = sorted((wired_cli.executions_dir / "archive").glob("dash-12-*.json"))
+    assert len(archived) == 1
+    assert json.loads(archived[0].read_text(encoding="utf-8"))["candidate_sha"] == "c" * 40
+    # 4. the blocker is closed WITH the reason, and never as an operator answer
+    closed = BlockerStore(wired_cli.blockers_dir).load(parked.id)
+    assert closed.resolved_at is not None
+    assert closed.answer is None, "nobody answered this question — the work was discarded"
+    assert "superseded by a hand-written fix" in closed.archived_reason
+    assert closed.question == "dash-12 hit the attempt ceiling; what now?"
+    out = capsys.readouterr().out
+    assert "blocked -> pending" in out and "kept, not deleted" in out
+
+
+def test_release_blocked_files_both_halves_under_one_label(wired_cli):
+    """One operation, not two that happen to run next to each other: the
+    quarantined worker and the archived record name the same attempt, so a
+    human reading either finds the other half."""
+    _quarantined_task(wired_cli, task_id="dash-14")
+
+    assert cli._cmd_release_blocked(_discard("dash-14")) == 0
+
+    quarantined = sorted((wired_cli.workers_root.parent / "quarantine").glob("dash-14-*"))
+    archived = sorted((wired_cli.executions_dir / "archive").glob("dash-14-*.json"))
+    assert len(quarantined) == 1 and len(archived) == 1
+    worker_label = quarantined[0].name[len("dash-14-"):]
+    record_label = archived[0].stem[len("dash-14-"):]
+    assert worker_label == record_label, (
+        f"the halves drifted apart: {worker_label!r} vs {record_label!r}"
+    )
+    assert worker_label.startswith("discarded-by-operator-")
+    assert worker_label[len("discarded-by-operator-"):], "the label must be unique per call"
+
+
+def test_release_blocked_never_uses_the_operator_reason_as_a_path_label(wired_cli):
+    """`retire_execution` interpolates its `reason` into a directory name and a
+    filename. The operator's `--reason` is free text, so it goes on the blocker
+    record — where it is data — and never into either path."""
+    _quarantined_task(wired_cli, task_id="val-02")
+
+    assert cli._cmd_release_blocked(_discard("val-02", reason="../../etc/passwd  oops")) == 0
+
+    quarantined = sorted((wired_cli.workers_root.parent / "quarantine").glob("val-02-*"))
+    archived = sorted((wired_cli.executions_dir / "archive").glob("val-02-*.json"))
+    assert len(quarantined) == 1 and len(archived) == 1
+    assert quarantined[0].parent.name == "quarantine", "the move stayed inside quarantine/"
+    assert archived[0].parent.name == "archive", "the record stayed inside archive/"
+    for name in (quarantined[0].name, archived[0].name):
+        assert "etc" not in name and ".." not in name and " " not in name
+    # ...and the words themselves are not lost: they are on the record.
+    closed = BlockerStore(wired_cli.blockers_dir).open_blockers()
+    assert closed == []
+    archived_blocker = BlockerStore(wired_cli.blockers_dir).all_blockers()[0]
+    assert "../../etc/passwd" in archived_blocker.archived_reason
+
+
+def test_release_blocked_requires_a_reason(wired_cli, capsys):
+    """A blocker cleared with no recorded reason is the silent delete this
+    command exists to avoid — and nothing may move before that is known."""
+    store, executions, parked = _quarantined_task(wired_cli)
+
+    assert cli._cmd_release_blocked(_discard(reason="   ")) == 1
+
+    assert "must not be empty" in capsys.readouterr().out
+    assert store.load().state_of("dash-12") is TaskState.BLOCKED_BY_OPERATOR
+    assert executions.load("dash-12") is not None
+    assert BlockerStore(wired_cli.blockers_dir).load(parked.id).resolved_at is None
+
+
+def test_release_blocked_refuses_completed_work_and_an_operator_hold(wired_cli, capsys):
+    """The two states a broad relaxation of `release` would have swallowed.
+    Completed work cannot be un-completed, and an operator's own quarantine is
+    not the loop's to discard."""
+    store = TaskStore(wired_cli.tasks_file)
+    registry = TaskRegistry(
+        [
+            Task(id="done-01", title="t", description="d", approved_paths=["docs/A.md"]),
+            Task(id="held-01", title="t", description="d", approved_paths=["docs/A.md"]),
+        ]
+    )
+    registry.mark_completed("done-01")
+    registry.operator_block("held-01", "paused while I think")
+    store.save(registry)
+    executions = TaskExecutionStore(wired_cli.executions_dir)
+    for task_id in ("done-01", "held-01"):
+        executions.save(
+            TaskExecution(
+                task_id=task_id,
+                task_branch=f"autoloop/{task_id}",
+                worktree_path="",
+                task_base_sha="a" * 40,
+                candidate_sha="b" * 40,
+            )
+        )
+
+    assert cli._cmd_release_blocked(_discard("done-01")) == 1
+    assert "cannot un-complete" in capsys.readouterr().out
+    assert cli._cmd_release_blocked(_discard("held-01")) == 1
+    assert "OPERATOR hold" in capsys.readouterr().out
+
+    reloaded = store.load()
+    assert reloaded.state_of("done-01") is TaskState.COMPLETED
+    assert reloaded.get("held-01").hold_origin == HOLD_ORIGIN_OPERATOR
+    assert reloaded.get("held-01").status == "blocked"
+    # A refused command moves NOTHING: both records are still live.
+    assert executions.load("done-01") is not None
+    assert executions.load("held-01") is not None
+    assert cli._cmd_release_blocked(_discard("nope-99")) == 1
+    assert "no task with id" in capsys.readouterr().out
+
+
+def test_release_blocked_refuses_a_loop_fatal_blocker(wired_cli, capsys):
+    """A `loop_fatal` record is a LOOP-WIDE condition — a dirty checkout, an
+    escaped write — that merely happened to be recorded while this task was in
+    flight. Discarding one task's work is no evidence about it, so the command
+    refuses rather than closing it and letting `start` proceed."""
+    store, executions, parked = _quarantined_task(wired_cli, kind="loop_fatal")
+
+    assert cli._cmd_release_blocked(_discard()) == 1
+
+    out = capsys.readouterr().out
+    assert "loop_fatal" in out and "Nothing changed." in out
+    assert BlockerStore(wired_cli.blockers_dir).load(parked.id).resolved_at is None
+    assert store.load().state_of("dash-12") is TaskState.BLOCKED_BY_OPERATOR
+    assert executions.load("dash-12") is not None, "the retirement never started"
+
+
+def test_release_blocked_leaves_the_blocker_open_when_the_worker_cannot_move(
+    wired_cli, monkeypatch, capsys
+):
+    """Both halves move or neither does. A retirement that failed while the
+    blocker was resolved would return the task to the queue with a stale record
+    still holding the merge window shut — the exact defect `retire_execution`
+    was written to prevent."""
+    store, _executions, parked = _quarantined_task(wired_cli)
+
+    def refuse(self, task_id, label):
+        raise GitCommandError("mv", "quarantine destination is not writable")
+
+    monkeypatch.setattr(WorkerRepoManager, "quarantine", refuse)
+
+    assert cli._cmd_release_blocked(_discard()) == 1
+
+    assert "still open" in capsys.readouterr().out
+    assert BlockerStore(wired_cli.blockers_dir).load(parked.id).resolved_at is None
+    assert store.load().state_of("dash-12") is TaskState.BLOCKED_BY_OPERATOR
+    # The record went first and stays archived — the safe residue, since a
+    # surviving RECORD is the silent failure and a surviving WORKER is the loud
+    # one (the next dispatch refuses to create over it, naming the path).
+    assert sorted((wired_cli.executions_dir / "archive").glob("dash-12-*.json"))
+    assert WorkerRepoManager(
+        wired_cli.workers_root, wired_cli.worker_hooks_dir
+    ).path_for("dash-12").exists()
+
+
+def test_release_blocked_frees_a_merge_window_a_bare_unblock_would_hold_shut(
+    wired_cli, monkeypatch
+):
+    """Why the two halves cannot be split. Requeueing the task ALONE removes
+    the terminal-state exemption its `blocked` status was getting, so the live
+    record starts holding the window shut on everything else. Retiring the
+    record is what makes the requeue safe."""
+    store, _executions, _parked = _quarantined_task(wired_cli)
+    monkeypatch.setattr(cli, "_window_git", lambda _config: _UnreadableCheckout())
+
+    # While quarantined, the record is exempt (terminal registry state).
+    assert cli._merge_window_blockers(wired_cli)[0] == []
+
+    # THE COUNTERFACTUAL: unblock without retiring, exactly what the only
+    # available commands could do, and the window shuts on dash-12.
+    registry = store.load()
+    registry.unblock("dash-12")
+    store.save(registry)
+    reasons, _notes = cli._merge_window_blockers(wired_cli)
+    assert any("dash-12" in r for r in reasons), reasons
+
+    # Put it back the way dash-12 actually was, and run the real command.
+    registry = store.load()
+    registry.block("dash-12", "attempt count ceiling")
+    store.save(registry)
+    assert cli._cmd_release_blocked(_discard()) == 0
+
+    assert store.load().state_of("dash-12") is TaskState.READY
+    reasons, _notes = cli._merge_window_blockers(wired_cli)
+    assert reasons == [], f"the retired record must not hold the window shut: {reasons}"
+
+
+def test_release_blocked_tolerates_a_quarantine_with_nothing_left_to_retire(
+    wired_cli, capsys
+):
+    """Absence is a no-op, not an error, and never a silent one: a task parked
+    before it ever committed has no worker and no record, and a `blocked` row
+    whose records were already closed has no blocker either. The task still has
+    to reach the queue, and the operator still has to be told what was there."""
+    store, _executions, _parked = _quarantined_task(
+        wired_cli, task_id="bare-01", worker=False, record=False, blocker=False
+    )
+
+    assert cli._cmd_release_blocked(_discard("bare-01")) == 0
+
+    assert store.load().state_of("bare-01") is TaskState.READY
+    out = capsys.readouterr().out
+    assert "no execution record to retire" in out
+    assert "no worker repo to clear" in out
+    assert "no open blocker named this task" in out
+    # ...and the fresh-budgets line is NOT printed, because there were no
+    # budgets to archive. A summary that says what did not happen is the false
+    # sentence every message here is written to avoid.
+    assert "went into the archive" not in out
+
+
+def test_a_blocker_record_that_cannot_be_read_refuses_rather_than_requeueing(
+    wired_cli, capsys
+):
+    """The fail-open shape this whole area loses to: a store that RAISES must
+    not be read as a store with nothing open in it. Requeueing on that reading
+    would return the task to the queue with its question still live, which is
+    the one state the command exists to make impossible."""
+    store, executions, _parked = _quarantined_task(wired_cli, blocker=False)
+    wired_cli.blockers_dir.mkdir(parents=True, exist_ok=True)
+    (wired_cli.blockers_dir / "blk-dash-12-001.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+
+    assert cli._cmd_release_blocked(_discard()) == 1
+
+    assert "blocker store could not be read" in capsys.readouterr().out
+    assert store.load().state_of("dash-12") is TaskState.BLOCKED_BY_OPERATOR
+    assert executions.load("dash-12") is not None, "the retirement never started"
+
+
+def test_an_archival_that_fails_leaves_the_task_quarantined(wired_cli, monkeypatch, capsys):
+    """The other half of "both halves move or neither does". The retirement is
+    already durable at this point and is NOT rolled back — it is reported — but
+    the task must not reach the queue with its blocker still open."""
+    store, _executions, parked = _quarantined_task(wired_cli)
+
+    def refuse(self, blocker_id, reason):
+        raise StateError("the blockers directory is not writable")
+
+    monkeypatch.setattr(BlockerStore, "archive_stale", refuse)
+
+    assert cli._cmd_release_blocked(_discard()) == 1
+
+    assert "could not be archived" in capsys.readouterr().out
+    assert BlockerStore(wired_cli.blockers_dir).load(parked.id).resolved_at is None
+    assert store.load().state_of("dash-12") is TaskState.BLOCKED_BY_OPERATOR
+
+
+def test_a_requeue_that_cannot_be_completed_reopens_the_blocker(
+    wired_cli, monkeypatch, capsys
+):
+    """`answer`'s rule, applied to a multi-record close: closing the last open
+    blocker of a quarantined task returns that task to the queue in the SAME
+    operation, so a close that cannot requeue is not a close."""
+    store, _executions, parked = _quarantined_task(wired_cli)
+
+    def refuse(config, task_store, registry):
+        raise StateError("tasks.json could not be rewritten")
+
+    monkeypatch.setattr(cli, "_reconcile_unblocked_tasks", refuse)
+
+    assert cli._cmd_release_blocked(_discard()) == 1
+
+    out = capsys.readouterr().out
+    assert "could not be reconciled" in out and "NOT returned to the queue" in out
+    reopened = BlockerStore(wired_cli.blockers_dir).load(parked.id)
+    assert reopened.resolved_at is None and reopened.archived_reason == ""
+    assert store.load().state_of("dash-12") is TaskState.BLOCKED_BY_OPERATOR
+    # The retirement stands — it is never rolled back — and the message says so.
+    assert sorted((wired_cli.executions_dir / "archive").glob("dash-12-*.json"))
+
+
+def test_a_colliding_label_is_retried_under_a_second_one(wired_cli, monkeypatch):
+    """Both halves refuse a colliding destination rather than clobbering an
+    earlier attempt's evidence, and the label carries only a WHOLE-SECOND stamp
+    — so two retirements of one task inside the same second collide by
+    construction. The retry changes the label instead of waiting out the
+    second. Time is frozen here because that is the only way to make the
+    collision deterministic."""
+    monkeypatch.setattr(worktask, "utcnow_iso", lambda: "2026-08-20T09:00:00+00:00")
+    _quarantined_task(wired_cli)
+    assert cli._cmd_release_blocked(_discard()) == 0
+
+    # The same task parks again, in the same frozen second: the first attempt's
+    # archive destination is already taken.
+    store, executions, _parked = _quarantined_task(wired_cli)
+    assert cli._cmd_release_blocked(_discard(reason="and again")) == 0
+
+    assert store.load().state_of("dash-12") is TaskState.READY
+    assert executions.load("dash-12") is None
+    archived = sorted((wired_cli.executions_dir / "archive").glob("dash-12-*.json"))
+    assert len(archived) == 2, archived
+    assert any("discarded-by-operator-retry-" in p.name for p in archived)
+    quarantined = sorted((wired_cli.workers_root.parent / "quarantine").glob("dash-12-*"))
+    assert len(quarantined) == 2, "neither attempt's evidence was clobbered"
+
+
+def test_a_repaired_record_path_names_this_retirement_not_an_older_retry(
+    wired_cli, monkeypatch, capsys
+):
+    """When the first attempt archives the record and then fails on the worker,
+    the retry has nothing left to file and the reported `record_path` is
+    REPAIRED by reading the archive. It has to name the file THIS call wrote:
+    the path is interpolated into the blocker's machine reason, so naming an
+    older attempt's archive is a false statement in the very record that exists
+    to account for the discard.
+
+    The trap is that a task retired more than once has TWO namespaces in that
+    archive — `<reason>-<stamp>` and `<reason>-retry-<stamp>` — and whole-name
+    ordering puts every `-retry-` file after every dated one, whatever the
+    stamps say. So one stale retry file outranks the fresh record."""
+    clock = {"now": "2026-08-20T09:00:00+00:00"}
+    monkeypatch.setattr(worktask, "utcnow_iso", lambda: clock["now"])
+
+    # Two earlier retirements inside one frozen second, which is what puts a
+    # `-retry-` RECORD in the archive at all: the second one's plain label
+    # collides, so its retry label is what files the record.
+    _quarantined_task(wired_cli)
+    assert cli._cmd_release_blocked(_discard()) == 0
+    _quarantined_task(wired_cli)
+    assert cli._cmd_release_blocked(_discard(reason="and again")) == 0
+    stale_retry = sorted((wired_cli.executions_dir / "archive").glob("dash-12-*-retry-*.json"))
+    assert len(stale_retry) == 1, stale_retry
+
+    # A third retirement, LATER, whose worker half fails once — the shape that
+    # reaches the repair at all.
+    clock["now"] = "2026-08-21T09:00:00+00:00"
+    _store, _executions, parked = _quarantined_task(wired_cli)
+    real_quarantine = WorkerRepoManager.quarantine
+    calls = {"n": 0}
+
+    def fail_once(self, task_id, label):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise GitCommandError("mv", "quarantine destination is busy")
+        return real_quarantine(self, task_id, label)
+
+    monkeypatch.setattr(WorkerRepoManager, "quarantine", fail_once)
+    capsys.readouterr()
+
+    assert cli._cmd_release_blocked(_discard(reason="third time")) == 0
+
+    filed = (
+        wired_cli.executions_dir
+        / "archive"
+        / "dash-12-discarded-by-operator-20260821T090000Z.json"
+    )
+    assert filed.exists(), sorted((wired_cli.executions_dir / "archive").iterdir())
+    out = capsys.readouterr().out
+    assert f"execution record moved to {filed}" in out
+    assert str(stale_retry[0]) not in out
+    archived_reason = BlockerStore(wired_cli.blockers_dir).load(parked.id).archived_reason
+    assert str(filed) in archived_reason
+    assert str(stale_retry[0]) not in archived_reason, (
+        "the blocker names an older retirement's record"
+    )
+
+
+def test_release_and_answer_behave_exactly_as_they_did(wired_cli, capsys):
+    """The two verbs the new one must not disturb. `release` still refuses a
+    quarantined task, and `answer` still leaves the execution record alone —
+    most answers mean "carry on with the work you have", and discarding the
+    candidate on every ordinary unblock is precisely what must not happen."""
+    store, executions, parked = _quarantined_task(wired_cli)
+
+    # `release` on a BLOCKED task: refused, exactly as before.
+    assert cli._cmd_release(argparse.Namespace(config=None, task_id="dash-12")) == 1
+    assert "not in progress" in capsys.readouterr().out
+    assert executions.load("dash-12") is not None
+    with pytest.raises(TaskGraphError) as excinfo:
+        store.load().release("dash-12")
+    assert excinfo.value.code == "task_not_in_progress"
+
+    # `answer` on that same blocked task: requeues it and KEEPS the record.
+    assert cli._cmd_answer(
+        argparse.Namespace(config=None, blocker_id=parked.id, text="try again")
+    ) == 0
+    assert store.load().state_of("dash-12") is TaskState.READY
+    kept = executions.load("dash-12")
+    assert kept is not None and kept.candidate_sha == "c" * 40
+    assert kept.attempt_count == 3, "an answer refills no budget on this code"
+    assert BlockerStore(wired_cli.blockers_dir).load(parked.id).answer == "try again"
+    assert WorkerRepoManager(
+        wired_cli.workers_root, wired_cli.worker_hooks_dir
+    ).path_for("dash-12").exists(), "answer keeps the worker too"
+
+    # `release` on an IN-PROGRESS task: unchanged, record and worker retired
+    # under its own label.
+    registry = store.load()
+    registry.mark_in_progress("dash-12")
+    store.save(registry)
+    # The two verbs stay on their own sides of the matrix: `release-blocked`
+    # refuses an in-progress task and says which verb covers it.
+    assert cli._cmd_release_blocked(_discard()) == 1
+    refusal = capsys.readouterr().out
+    assert "in progress, not quarantined" in refusal and "`release`" in refusal
+    assert executions.load("dash-12") is not None, "a refusal moves nothing"
+
+    assert cli._cmd_release(argparse.Namespace(config=None, task_id="dash-12")) == 0
+    assert store.load().state_of("dash-12") is TaskState.READY
+    assert executions.load("dash-12") is None
+    assert sorted(
+        (wired_cli.executions_dir / "archive").glob("dash-12-released-by-operator-*.json")
+    )
