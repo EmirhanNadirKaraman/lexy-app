@@ -594,6 +594,95 @@ def worker_progress(state: dict, now: float | None = None) -> dict | None:
     return progress
 
 
+#: The three states the unit tiles can be in, and the only three. `idle` means
+#: nothing is in flight at all; `no_candidate` means a unit IS in flight and has
+#: committed nothing yet; `candidate` means it has.
+#:
+#: The middle one is the whole reason this vocabulary exists. Until dash-20 the
+#: page rendered `t.candidate || "—"`, so "no unit is executing" and "a unit is
+#: executing and has produced nothing" were the SAME two characters on screen —
+#: and an em dash beside a live agent reads as an absent feature rather than as
+#: the alarming state it is.
+UNIT_STATES = ("idle", "no_candidate", "candidate")
+
+#: What the candidate tile says while a unit is in flight and has committed
+#: nothing. Deliberately a sentence about THIS dispatch, never a dash: the same
+#: distinction `_in_progress_detail` already draws one panel down with "no
+#: candidate committed yet".
+NO_CANDIDATE_YET = "no candidate yet"
+
+#: What a unit tile says when nothing is in flight — the page's own absent
+#: marker, used everywhere else on it for the same meaning.
+UNIT_IDLE = "—"
+
+#: What the round tile says for a unit in flight whose record carries no
+#: readable round. Never `UNIT_IDLE`: "no unit" and "a unit whose round could
+#: not be read" are different facts and this panel exists to keep them apart.
+UNIT_UNKNOWN = "unknown"
+
+
+def unit_panel(state: dict) -> dict:
+    """The execution being DISPATCHED NOW, and the word each tile shows for it.
+
+    Sourced from `state.task_execution` — the loop's own record of the unit in
+    flight, cleared the moment a candidate is published
+    (`orchestrator._dispatch_task_push`) — and from NOTHING else. That is the
+    same source `worker_progress` reads, so the unit tile and the live-progress
+    line can never name two different tasks.
+
+    Pure and read-only: a dict in, a dict out, no path resolved and no file
+    touched. Everything it reads has already been read off the state directory
+    `collect` resolved through `_state_dir`.
+
+    THE BACKEND PINS THE WORDS, the template renders them. Same rule as the
+    summary tiles and the merge groups, and it buys the same thing: the page
+    cannot invent a word for a state, and the empty state is assertable in
+    Python instead of grep-able in `PAGE`.
+
+    `round` is the trap. `TaskExecution.review_round` starts at 0 and is only
+    incremented once a review packet is BUILT (`orchestrator.py:8125`), so a
+    unit executing its first round genuinely carries 0 — and `round || "—"`
+    would render that real zero as unknown, which is the same fabricate-an-
+    absence bug this panel is closing, one field over. The label is therefore
+    built here, where 0 can be told from missing, and the tolerance matches
+    `_in_progress_detail`'s: anything that stringifies to non-blank is shown as
+    the record has it.
+    """
+    execution = state.get("task_execution") or {}
+    task_id = str(execution.get("task_id") or "")
+    if not task_id:
+        # Nothing in flight — and NOTHING off the record reaches the payload,
+        # not even the raw fields. A record with no `task_id` names no unit, so
+        # a sha or a round taken off it would be a figure with nobody to belong
+        # to; the finished-record leak is exactly what this panel exists to
+        # stop, and `worker_progress` returns `None` on the same condition.
+        return {
+            "state": "idle", "id": "", "branch": "", "worker": "",
+            "base": "", "candidate": "", "round": None, "attempts": None,
+            "unit_label": UNIT_IDLE, "round_label": UNIT_IDLE,
+            "candidate_label": UNIT_IDLE,
+        }
+    candidate = str(execution.get("candidate_sha") or "")[:12]
+    review_round = execution.get("review_round")
+    has_round = review_round is not None and str(review_round).strip() != ""
+    return {
+        # The raw record fields, unchanged in name and meaning — the labels
+        # beside them are additive, so nothing reading this payload has to
+        # learn about them.
+        "id": task_id,
+        "branch": execution.get("task_branch"),
+        "worker": execution.get("worktree_path"),
+        "base": str(execution.get("task_base_sha") or "")[:12],
+        "candidate": candidate,
+        "round": review_round,
+        "attempts": execution.get("attempt_count"),
+        "state": "candidate" if candidate else "no_candidate",
+        "unit_label": task_id,
+        "round_label": str(review_round) if has_round else UNIT_UNKNOWN,
+        "candidate_label": candidate or NO_CANDIDATE_YET,
+    }
+
+
 def _config_toml(repo: Path) -> dict:
     """The loop's own `config.toml` as a plain dict, `{}` when it cannot be
     read.
@@ -3597,7 +3686,6 @@ def collect(repo: Path) -> dict:
     subjects = _cached_commit_subjects(repo) if remote_ok else None
 
     live_agents_cache = live_agents()
-    ex = state.get("task_execution") or {}
     return {
         "health": {"role": health[0], "label": health[1], "pids": pids,
                    "lock_pid": lock_pid, "lock_alive": lock_alive},
@@ -3608,13 +3696,12 @@ def collect(repo: Path) -> dict:
             "question": state.get("question"),
             "updated_at": (state.get("updated_at") or "")[11:19],
         },
-        "task": {
-            "id": ex.get("task_id"), "branch": ex.get("task_branch"),
-            "worker": ex.get("worktree_path"),
-            "base": (ex.get("task_base_sha") or "")[:12],
-            "candidate": (ex.get("candidate_sha") or "")[:12],
-            "round": ex.get("review_round"), "attempts": ex.get("attempt_count"),
-        },
+        # The unit being dispatched NOW, read off `state.task_execution` and
+        # carrying the word each tile shows — including the one for a dispatch
+        # that has produced nothing yet. See `unit_panel`; the same `state` dict
+        # feeds `worker_progress` below, so the tile and the live-progress line
+        # cannot name two different tasks.
+        "task": unit_panel(state),
         "agents": live_agents_cache,
         # `None` when nothing is executing — the page then renders no figures at
         # all rather than the last round's. See `worker_progress`.
@@ -5516,6 +5603,14 @@ function render(d, force){
   // nothing.
   renderStats(d.stats, d.build && d.build.upgrade);
 
+  // The unit tiles, WORD AND ALL from the backend (`unit_panel`). This template
+  // spells none of them, and deliberately does not fall back with `||`: every
+  // `||` here is a place where a real value the backend measured — a task on
+  // its FIRST round carries `review_round` 0, and 0 is falsy — would be
+  // overwritten with an em dash that means "nothing in flight". That is the
+  // same fabricate-an-absence bug the panel is closing, so the three states
+  // (idle / dispatched-with-no-candidate / dispatched-with-one) are decided
+  // where 0 can be told from missing and arrive here already said.
   const t = d.task;
   // Completed-but-not-in-the-branch, above the fold. The tile carries the icon
   // and the word as well as the number, so the border colour is decoration.
@@ -5526,7 +5621,8 @@ function render(d, force){
   document.getElementById("tiles").innerHTML = [
     ["phase", d.session.phase], ["iteration", d.session.iteration],
     ["agents live", d.agents.length], ["open blockers", d.blockers.length],
-    ["unit", t.id || "—"], ["candidate", t.candidate || "—"],
+    ["unit", t.unit_label], ["review round", t.round_label],
+    ["candidate", t.candidate_label],
     ["not merged", (nUnmerged ? "▲ " : "✓ ") + nUnmerged, nUnmerged ? "warn" : ""],
   ].map(([k,v,cls]) => `<div class="tile ${cls || ""}"><div class="k">${esc(k)}</div>`
       + `<div class="v">${esc(v ?? "—")}</div></div>`).join("");

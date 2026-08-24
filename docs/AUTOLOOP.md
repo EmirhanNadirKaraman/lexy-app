@@ -3714,6 +3714,97 @@ panel's own render under node.
 
 ---
 
+## 4k. One state directory, and the unit on screen is the one in flight (dash-20, 2026-08-24)
+
+**The failure, measured 2026-08-23.** The page read PHASE `ready`, UNIT
+`notes-04` and "55m 20s since dispatch" while the loop was executing `ship-01`.
+`notes-04` had been completed, published and merged an hour earlier. Restarting
+the dashboard three times changed nothing.
+
+**The cause was one line, not a display rule.** `collect()` opened its state
+directory as the literal `repo / ".autoloop"`, while everything reaching it
+through `_tasks_file` → `_state_dir` honoured `[paths].state_dir`. So when
+port-01 (§1, "Where loop state lives") moved state out of the checkout, the page
+went HALF LIVE:
+
+| slice | resolver | after the move |
+|---|---|---|
+| roadmap, groups, counters, merge | `_state_dir` | live (176 tasks) |
+| phase, iteration, unit, live progress, session | `repo / ".autoloop"` | frozen at the instant of the move |
+
+**A page that is partly current reads as authoritative and is worse than one
+that is plainly stale.** That is the property this section exists to keep, and
+it is also why a restart could not fix it — which is what sent the diagnosis
+through a browser-cache theory, a wrong-port theory and a stale-process theory
+before anyone read the line.
+
+**The rule.** Every state read in `dashboard.py` goes through `_state_dir(repo)`
+and nothing resolves the directory for itself. Three `.autoloop` literals
+legitimately remain and are NOT that resolution: `_config_toml` and
+`merge_window` name the CONFIG FILE, which lives at
+`<repo>/.autoloop/config.toml` whatever the state dir is (`cli.DEFAULT_CONFIG`),
+and `main()` requires that directory to exist before it will serve at all.
+
+**How it is pinned.** `test_dashboard.py` writes a COMPLETE decoy state
+directory at `<repo>/.autoloop` — state, tasks, execution records, a blocker, a
+transcript, an audit run, an upgrade marker and a LIVE LOCK, every value
+carrying the marker `decoy` — configures `state_dir` elsewhere, and requires
+that marker to appear nowhere in the payload. A source grep for `repo /
+".autoloop"` was rejected as the proof: it would assert the literal the test
+itself supplies, and would pass silently against a second resolver spelled
+`Path(repo, ".autoloop")` or `repo.joinpath(...)`.
+
+**The residual hole, stated rather than hidden.** `_config_toml` swallows an
+unreadable or unparseable config into `{}` so one bad TOML cannot take down the
+page you read when something is already wrong — and `_state_dir` then answers
+`<repo>/.autoloop`. On a post-port-01 deployment a typo in `config.toml`
+therefore puts the whole page back on the stale in-checkout directory. It is
+tolerable only because that fallback is TOTAL: every panel moves together, so
+the page is plainly stale rather than half-live. port-06 owns the unconfigured
+default; this is its explicitly-configured sibling and neither fixes the other.
+
+**The unit panel, and the honest empty state.** `collect()["task"]` is
+`unit_panel(state)`, read off `state.task_execution` — the loop's own record of
+the unit in flight, cleared the moment a candidate is published — and off
+nothing else. It carries the record's raw fields plus the WORD each tile shows:
+
+```json
+{"state": "idle" | "no_candidate" | "candidate",
+ "id": "", "branch": "", "worker": "", "base": "", "candidate": "",
+ "round": null, "attempts": null,
+ "unit_label": "—", "round_label": "—", "candidate_label": "—"}
+```
+
+The three states must stay distinguishable. Before this the page rendered
+`t.candidate || "—"`, so "nothing is executing" and "something is executing and
+has committed nothing" were the same two characters — and an em dash beside a
+live agent reads as an absent feature rather than as the alarming state it is. A
+dispatch with no candidate now says `no candidate yet`, beside its task id and
+its round.
+
+**`review_round` 0 is a measured value, not a missing one.** It starts at 0 and
+is incremented only once a review packet is BUILT, so a unit executing its first
+round genuinely carries 0. The labels are therefore built on the backend, where
+0 can be told from absent; the template spells none of them and falls back with
+no `||`, because every value such a fallback would replace is one the backend
+measured. A record naming no unit at all contributes nothing — not even a raw
+field — since a sha with no task to belong to is the same half-live reading in a
+different pane.
+
+**"Since dispatch" belongs to the dispatch on screen.** `worker_progress` takes
+its stamp from `state.current_task` only when that names the SAME task as
+`state.task_execution`; otherwise elapsed reads `unknown` and never another
+round's number. When `task_execution` is cleared, the whole progress payload is
+`None` and the section hides — a finished execution's figures are correct and
+other views read them, but this panel is not one of their readers.
+
+**Where to look.** `autoloop/dashboard.py`: `_state_dir`, `unit_panel`,
+`UNIT_STATES`, `NO_CANDIDATE_YET`, `UNIT_IDLE`, `UNIT_UNKNOWN`, the `task` key in
+`collect()`, `worker_progress`, and the `#tiles` assignment in `PAGE`. Tests:
+the dash-20 section at the end of `autoloop/tests/test_dashboard.py`.
+
+---
+
 ## 5. Response contract (v3)
 
 As v2 (task-id-based work authorization, `plan`, `reviewed` integrity stamps —
