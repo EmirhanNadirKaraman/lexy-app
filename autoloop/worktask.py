@@ -762,6 +762,18 @@ class TaskExecutionStore:
     def clear(self, task_id: str) -> None:
         self._path(task_id).unlink(missing_ok=True)
 
+    def path_for(self, task_id: str) -> Path:
+        """Where this store keeps `task_id`'s LIVE record, whether or not one
+        is there. The counterpart to `WorkerRepoManager.path_for`, and it exists
+        for the same reason: a caller that needs to name the record — to report
+        that it was left alone (`preserve_execution`), or to point an operator
+        at it — must not spell `<task_id>.json` a second time, because a second
+        speller is how the two drift.
+
+        Read-only. Nothing here creates, moves or removes anything.
+        """
+        return self._path(task_id)
+
     def archive(self, task_id: str, label: str) -> Path | None:
         """MOVE (never delete) the record for `task_id` into
         `directory/archive/<task_id>-<label>.json`. Returns the destination,
@@ -931,6 +943,144 @@ def retire_execution(
     if worker_repos is not None and worker_repos.path_for(task_id).exists():
         worker_path = worker_repos.quarantine(task_id, label)
     return Retirement(label=label, record_path=record_path, worker_path=worker_path)
+
+
+@dataclass(frozen=True)
+class Preservation:
+    """What one `preserve_execution` call found and deliberately LEFT ALONE.
+
+    The counterpart of `Retirement`, and it describes the opposite operation:
+    `retire_execution` moves both halves of an attempt out of the way so the
+    task is redone from scratch, while this moves nothing at all and merely
+    attests that both halves are still where the next dispatch will look for
+    them. A `Retirement` names two destinations; this names two survivors.
+
+    `resumable` is the part that makes it an attestation rather than a hope. It
+    is the SAME three-fact probe the dispatch runs (`worker_env.
+    worker_repo_is_reusable`: the recorded `worktree_path` exists, is a git
+    repository in its own right, and is checked out on the recorded
+    `task_branch`), so False means the next dispatch will NOT resume this round
+    — it will fall back to `WorkerRepoManager.create`, which refuses to write
+    into an existing directory. A caller that reported "your round is kept"
+    without asking would be making a promise nothing checked.
+
+    `obstacle` is why not, in words, and is empty exactly when there is nothing
+    to say — either the pair is resumable or there was never a record.
+    """
+
+    #: The LIVE record's path (`executions/<task_id>.json`), when one is on
+    #: disk. `None` means there is no in-flight round to preserve.
+    record_path: Path | None = None
+    #: The worker repository, when one is on disk. Reported separately from
+    #: `resumable` on purpose: a directory that merely EXISTS is the common
+    #: shape of a half-written worker, and the two facts must not read alike.
+    worker_path: Path | None = None
+    candidate_sha: str = ""
+    review_round: int = 0
+    attempt_count: int = 0
+    resumable: bool = False
+    obstacle: str = ""
+
+    @property
+    def holds_a_candidate(self) -> bool:
+        """Is there a candidate commit here for a moving base to strand?
+
+        The one fact the merge window turns on (`cli._merge_window_blockers`
+        skips a record with no `candidate_sha`), named here so a caller does
+        not re-derive it from two fields.
+        """
+        return bool(self.record_path is not None and self.candidate_sha)
+
+
+def preserve_execution(task_id: str, execution_store, worker_repos) -> Preservation:
+    """Attest that BOTH halves of a task's execution — the `TaskExecution`
+    record AND its worker repository — are still exactly where they were, and
+    report what the next dispatch will therefore resume.
+
+    The sibling of `retire_execution`, written as its own function for the same
+    structural reason that one exists: the two halves describe one attempt, and
+    a caller that checked one and assumed the other is how they drift. `release`
+    moves both; `shelve` (`cli._cmd_shelve`) moves neither, and this is what
+    lets it say so with evidence instead of by omission.
+
+    **PURE READ. It creates nothing, moves nothing, deletes nothing** — there is
+    no filesystem write anywhere below, which is the property the whole shelve
+    verb rests on. An unreadable record is reported as an obstacle rather than
+    raised, because the record is still preserved (nothing touched it) and the
+    caller's job is to say so loudly, not to fail after the status has moved.
+
+    The counters come back on the `Preservation` because they are the claim a
+    shelve makes: the next dispatch continues under this `candidate_sha`, this
+    `review_round` and this `attempt_count`, rather than starting a fresh
+    record. `_park_round_cap` reads the second and `MAX_TASK_ATTEMPTS` the
+    third, so preserving a round preserves its cost — a shelve that quietly
+    reset them would look identical here and would hand the task a budget it
+    had already spent.
+    """
+    record_path = None
+    recorded = None
+    obstacle = ""
+    if execution_store is not None:
+        try:
+            path = execution_store.path_for(task_id)
+        except (AttributeError, ValueError, OSError):  # pragma: no cover - odd store
+            path = None
+        if path is not None and path.exists():
+            record_path = path
+        try:
+            recorded = execution_store.load(task_id)
+        except (StateCorruptError, OSError) as exc:
+            # Preserved, and unreadable. Both halves of that are true and the
+            # caller has to say both: nothing moved the file, AND the next
+            # dispatch will raise on it rather than resume. Swallowing this to
+            # `resumable=False` with no reason would be the fail-open reading —
+            # it looks exactly like a worker on the wrong branch, which has a
+            # completely different remedy.
+            obstacle = f"its execution record is on disk but unreadable ({exc})"
+
+    worker_path = None
+    if worker_repos is not None:
+        try:
+            path = worker_repos.path_for(task_id)
+        except (ValueError, OSError):  # pragma: no cover - a manager that cannot answer
+            path = None
+        if path is not None and path.exists():
+            worker_path = path
+
+    resumable = False
+    if recorded is not None:
+        if not recorded.worktree_path:
+            obstacle = "its execution record names no worker repository"
+        else:
+            # Deferred import, and it has to be: `worker_env` imports
+            # `git_gateway`, which imports THIS module for `CommitIntent` /
+            # `IntentStore`. A module-level import here would close that cycle
+            # and break every importer of `autoloop.worktask`. Same shape as
+            # `merge_sweep`'s deferred `from . import cli`.
+            from .worker_env import worker_repo_is_reusable
+
+            resumable = worker_repo_is_reusable(
+                Path(recorded.worktree_path), recorded.task_branch
+            )
+            if not resumable:
+                obstacle = (
+                    f"the recorded worker {recorded.worktree_path} does not pass "
+                    "the three-fact reuse probe (it must exist, be a git "
+                    "repository, and be checked out on "
+                    f"{recorded.task_branch or '(no branch recorded)'})"
+                )
+    elif record_path is None:
+        obstacle = "there is no execution record, so there is no round to keep"
+
+    return Preservation(
+        record_path=record_path,
+        worker_path=worker_path,
+        candidate_sha=getattr(recorded, "candidate_sha", "") or "",
+        review_round=getattr(recorded, "review_round", 0) or 0,
+        attempt_count=getattr(recorded, "attempt_count", 0) or 0,
+        resumable=resumable,
+        obstacle=obstacle,
+    )
 
 
 class IntentStore:

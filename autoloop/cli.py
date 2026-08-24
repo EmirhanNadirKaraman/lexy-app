@@ -94,6 +94,7 @@ from .auto_merge import (
     UPGRADE_PENDING,
     UPGRADE_PREFLIGHT_FAILED,
     UPGRADE_UNAPPLICABLE,
+    MergeDeferralStore,
     PendingUpgrade,
     UpgradeStore,
 )
@@ -135,7 +136,12 @@ from .tasks import Task, TaskRegistry, TaskState, TaskStore, mutation_ledger_for
 from .transcript import TranscriptLogger, build_profile, read_records, render_profile
 from .validation_env import load_validation_env
 from .worker_env import WorkerRepoManager, validate_workers_root, verify_worker_isolation
-from .worktask import IntentStore, RecordedRevertAuthority, TaskExecutionStore
+from .worktask import (
+    IntentStore,
+    RecordedRevertAuthority,
+    TaskExecutionStore,
+    preserve_execution,
+)
 
 DEFAULT_CONFIG = Path(".autoloop/config.toml")
 
@@ -3125,6 +3131,508 @@ def _cmd_release(args: argparse.Namespace) -> int:
     return 0
 
 
+#: `LoopState.stop_kind` for a session an operator's `shelve` detached from the
+#: task it was running. Its own value rather than `"contract"` or
+#: `PREEMPTION_STOP_KIND`, because every reader of that field gates on the
+#: POSITIVE value it wants (see `LoopState.stop_kind`): reusing `"contract"`
+#: would make `smoke-browser` report PASS for a session no reviewer ever
+#: answered, and reusing `"preempted"` would make `_is_preemption_stop` print a
+#: displacement that never happened. Unrecognised-by-everything is the correct
+#: reading — `_run_continuous` treats it as the clean boundary it is, because
+#: only `"fault"` stops the loop.
+SHELVE_STOP_KIND = "shelved"
+
+#: The phases in which the loop OWES A REVIEW PACKET whose acceptance it cannot
+#: yet prove, and in which `shelve` therefore refuses outright — whatever task
+#: the packet is about. `delivering` is mid-deposit of a chunked payload,
+#: `submitting` has a request created and possibly sent, the two
+#: `submission_*` phases are a send whose acceptance is unknown or disproved,
+#: and `awaiting` has a reviewer holding one. Exiting at any of them strands a
+#: packet nobody can classify afterwards.
+#:
+#: The same set `orchestrator._at_round_boundary` refuses a preemption at,
+#: arrived at from the other side: that predicate names the one SAFE phase
+#: (`ready`, no pending request) and this names the unsafe ones, so the
+#: `pending_request` half is checked separately here for the same reason it is
+#: there — a request outlives its own phase.
+PACKET_OUTSTANDING_PHASES = frozenset(
+    {
+        Phase.DELIVERING,
+        Phase.SUBMITTING,
+        Phase.SUBMISSION_UNCONFIRMED,
+        Phase.SUBMISSION_REJECTED,
+        Phase.AWAITING,
+    }
+)
+
+
+def _session_names_task(state: LoopState, task_id: str) -> bool:
+    """Does this saved session belong to `task_id`?
+
+    THREE fields, not one, because three different readers decide "which task
+    is this session about" from three different places and shelving has to
+    satisfy all of them: `current_task` is what `orchestrator._preempt_for_
+    urgent` reads, `task_execution` is the serialised record a resumed dispatch
+    rehydrates, and `park_task_id` is what `cli._handle_parked_task` quarantines
+    on the next continuous iteration. A session that names the task in ANY of
+    them can still act on it, so any of them counts.
+    """
+    return task_id != "" and task_id in {
+        (state.current_task or {}).get("task_id") or "",
+        (state.task_execution or {}).get("task_id") or "",
+        state.park_task_id or "",
+    }
+
+
+def _shelve_session_refusal(state: LoopState | None, task_id: str) -> str:
+    """Why this session must not be shelved out from under, or `""` when it may.
+
+    TWO guards with deliberately different scopes.
+
+    **Guard 1 is loop-wide and refuses outright.** A review packet outstanding
+    (`PACKET_OUTSTANDING_PHASES`, or a `pending_request` that outlived its
+    phase) is not about one task: whatever it concerns, ending the session there
+    strands a packet whose acceptance is unknown, and unknown acceptance is the
+    one thing no later reconciliation can undo. It refuses even when the packet
+    belongs to some OTHER task, because the hazard is the packet, not the task.
+
+    **Guard 2 is task-scoped and only fires when this session could still act on
+    the task being shelved** (`_session_names_task`). A session about something
+    else needs no detaching, so its phase is none of shelve's business. When it
+    IS about this task, the session has to be detachable, and only two phases
+    are: `ready` (guard 1 has already established there is no pending request)
+    and `stopped` (already a boundary — nothing to detach). The rest are refused
+    with the specific reason, because each would lose something a shelve has no
+    business losing:
+
+    * `executing` holds a reviewer's directive that was received and not yet
+      dispatched. Detaching discards a verdict the reviewer already gave.
+    * `needs_user` is a park that OWNS this task: the next continuous iteration
+      runs `_handle_parked_task`, which quarantines `park_task_id`. Shelving
+      would be silently undone one iteration later — the task would come back
+      `blocked`, not `pending`.
+    * `failed` is an exhausted failure budget. `run --retry` is the route out,
+      and rewriting that state into a clean stop would hide a wall the next
+      iteration walks straight back into.
+
+    An unrecognised phase refuses, fail-closed: whether a packet is outstanding
+    is exactly what cannot be decided about a phase this build does not know.
+    """
+    if state is None:
+        return ""
+    try:
+        phase = Phase(state.phase)
+    except ValueError:
+        return (
+            f"the session is in an unrecognised phase {state.phase!r}, so "
+            "whether it owes a review packet cannot be decided — refusing "
+            "rather than guessing. Inspect the state file, or "
+            "`python -m autoloop reset --yes` if the session is genuinely dead."
+        )
+    if phase in PACKET_OUTSTANDING_PHASES:
+        return (
+            f"a review packet is outstanding (phase {phase.value}) — leaving "
+            "the session there would strand a packet whose acceptance nobody "
+            "can establish afterwards. Let the round reach its boundary "
+            "(`python -m autoloop run`, WITHOUT --continuous) and shelve then."
+        )
+    if state.pending_request is not None:
+        return (
+            f"request {state.pending_request.request_id} is still pending in "
+            f"phase {phase.value} — a request outlives its own phase, and "
+            "shelving on top of one strands it exactly as the packet phases "
+            "would. Finish or resolve it first (`python -m autoloop run`, "
+            "WITHOUT --continuous)."
+        )
+    if not _session_names_task(state, task_id):
+        return ""
+    if phase in (Phase.READY, Phase.STOPPED):
+        return ""
+    if phase is Phase.EXECUTING:
+        return (
+            f"the session is mid-round on {task_id} (phase executing): a "
+            "reviewer's response has been received and not yet dispatched, and "
+            "detaching would discard a verdict that was already given. Let it "
+            "dispatch (`python -m autoloop run`, WITHOUT --continuous), then "
+            "shelve."
+        )
+    if phase is Phase.NEEDS_USER:
+        return (
+            f"the session is parked on {task_id} (phase needs_user), and the "
+            "park owns it: the next continuous iteration quarantines "
+            "`park_task_id`, so this task would come back `blocked` rather "
+            "than pending and the shelve would be silently undone. Resolve the "
+            "park first — `python -m autoloop blockers`, then `answer` or "
+            "`archive-blocker`."
+        )
+    if phase is Phase.FAILED:
+        return (
+            f"the session ended on an exhausted failure budget (phase failed) "
+            f"while running {task_id}. Resolve that with `python -m autoloop "
+            "run --retry` (WITHOUT --continuous) first; rewriting it into a "
+            "clean stop here would only hide the wall."
+        )
+    return (  # pragma: no cover - every Phase member is handled above
+        f"the session is in phase {phase.value} on {task_id}, which shelve has "
+        "no rule for — refusing rather than guessing"
+    )
+
+
+def _detach_shelved_session(store: StateStore, state: LoopState | None, task_id: str) -> str:
+    """Stop the saved session from pulling the loop straight back onto the task
+    that was just shelved. Returns one line saying what it did.
+
+    THE second failure mode, observed 2026-08-20 on dash-09: flipping a status
+    to pending redirects nothing on its own, because `run --continuous` resumes
+    a saved session in a NON-terminal phase BEFORE it ever consults
+    `next_ready()` (`_run_continuous`'s `Phase(state.phase) not in
+    TERMINAL_PHASES` branch). The loop restarted straight back onto the same
+    task, and only `reset --yes` broke the pull.
+
+    Ending the session as a `stopped` round is the same ending
+    `orchestrator._preempt_for_urgent` uses, and for the same reason: every
+    existing caller already treats `stopped` as the clean boundary it is, so
+    the next iteration falls through to `_select_and_kickoff` and selects by
+    priority again. NOT `store.path.unlink()` (what `_handle_parked_task` does
+    for a task_fatal park): a selection at that boundary opens a brand-new
+    `LoopState` either way, so deleting buys nothing and costs the one thing
+    worth keeping — a `stop_reason` an operator can read in `status` afterwards
+    saying why the session ended.
+
+    The outbox is cleared with it, exactly as a preemption clears it: the
+    payload queued in `ready` is about the task that just went back to the
+    queue, so leaving it would send a packet about a round nobody is running.
+
+    Called only after `_shelve_session_refusal` returned `""`, so the phase
+    here is `ready`, a terminal phase, or a session about some other task.
+    """
+    if state is None:
+        return "session: none on disk — nothing was holding the loop to this task"
+    phase = Phase(state.phase)
+    if not _session_names_task(state, task_id):
+        return (
+            f"session: in phase {phase.value} and does not name {task_id} — "
+            "left exactly as it was"
+        )
+    if phase in TERMINAL_PHASES:
+        return (
+            f"session: already at a stop (phase {phase.value}) — the next "
+            "`run --continuous` iteration selects afresh, so there was nothing "
+            "to detach"
+        )
+    state.current_task = None
+    state.task_execution = None
+    state.last_response = None
+    state.outbox = None
+    state.outbox_diff = None
+    state.outbox_attachment = None
+    state.phase = Phase.STOPPED.value
+    state.stop_kind = SHELVE_STOP_KIND
+    state.stop_reason = (
+        f"task {task_id} was shelved by the operator: its execution record and "
+        "worker repository were left in place, so its next dispatch resumes "
+        "that round rather than starting a new one"
+    )
+    store.save(state)
+    return (
+        f"session: detached from {task_id} (was {phase.value}, now stopped/"
+        f"{SHELVE_STOP_KIND}) — `run --continuous` selects by priority again "
+        "instead of resuming this task's session"
+    )
+
+
+def _branches_waiting_on_the_merge_window(config) -> tuple[list[str], str]:
+    """Every published-but-unmerged branch a shut merge window is withholding,
+    as `(lines, obstacle)`.
+
+    Read off the auto-merge DEFERRAL records, which is where this fact already
+    lives: `AutoMerger.attempt` records one per completed task whose merge it
+    had to defer, naming the side branch, the candidate and the reason. That is
+    a local file read — no remote, no `ls-remote` — which matters here, because
+    this runs inside an operator command that has just moved a status and must
+    not fail on a network that is down.
+
+    It is also, precisely, what nobody read on 2026-08-20: dash-12's preserved
+    candidate held the window shut on four branches for six hours and nothing
+    named the connection until these records were opened by hand.
+
+    Deliberately NOT `merge_sweep.sweep_backlog`, which would answer the same
+    question more completely and at the cost of a remote round-trip per
+    completed task — and which MERGES. A report has no business doing that.
+    The residual is stated where it is printed: a branch that has never been
+    attempted yet has no deferral record, so this is a floor on what is waiting,
+    never a ceiling.
+    """
+    try:
+        deferrals = MergeDeferralStore(config.merge_deferrals_dir).all_deferrals()
+    except (StateCorruptError, OSError) as exc:
+        return [], f"the merge-deferral records could not be read ({exc})"
+    return [
+        f"{d.task_id}: {d.dest_ref or '(no branch recorded)'} "
+        f"(candidate {d.candidate_sha[:12]}, deferred {d.attempts}x since "
+        f"{d.created_at} — last reason: {d.reason})"
+        for d in deferrals
+    ], ""
+
+
+def _shelved_candidate_window_report(config, task_id: str, preserved) -> list[str]:
+    """What the preserved candidate costs the repository, in the operator's own
+    terms: is the merge window shut, is THIS task what shuts it, and which
+    branches are waiting behind it.
+
+    Reported because the operator will not otherwise see the connection. A kept
+    candidate is a real hazard — moving the head under it is what parks a task
+    on `task_base_behind_head` — and `shelve` deliberately does NOT exempt it
+    from `_merge_window_blockers`. The exemption would reopen the window by
+    lying about the hazard; naming the cost is the honest alternative.
+
+    The predicate is CALLED, never re-derived: a second implementation of "may
+    the branch head move" that drifted by one case is how thirteen tasks get
+    parked at once (see `_merge_window_blockers`). A failure to evaluate it is
+    reported as UNKNOWN and read as SHUT, never as open — the fail-closed
+    direction, and the same one the predicate takes internally.
+    """
+    lines: list[str] = []
+    # The ONLY short circuit, and it is the only one that is decidable without
+    # asking: no record means no `candidate_sha` for any reader to find, so
+    # keeping this task's round withholds nothing. Deliberately NOT gated on
+    # `holds_a_candidate` — a record that is present but UNREADABLE reports an
+    # empty candidate here, and answering "this task holds no candidate" from
+    # that would be a claim made without asking, which is this report's own
+    # fail-open shape.
+    if preserved.record_path is None:
+        lines.append(
+            "merge window: there is no execution record here, so keeping this "
+            "task's round withholds nothing from the merge sweep"
+        )
+        return lines
+    try:
+        reasons, notes = _merge_window_blockers(config, set())
+    except (StateError, ConfigError, TaskGraphError, KeyError, GitError, OSError) as exc:
+        lines.append(
+            f"merge window: UNKNOWN — the predicate could not be evaluated "
+            f"({exc}). Treat it as SHUT: the candidate you just preserved is "
+            "still on disk and still bound to its base."
+        )
+        return lines
+    mine = [r for r in reasons if r.startswith(f"task {task_id} ")]
+    if mine:
+        lines.append(
+            "merge window SHUT, and the candidate you just preserved is what "
+            "holds it:"
+        )
+        lines.extend(f"  - {reason}" for reason in mine)
+        for reason in reasons:
+            if reason not in mine:
+                lines.append(f"  - (also) {reason}")
+    elif reasons:
+        lines.append(
+            "merge window SHUT, but not by anything this task preserved (its "
+            "record names no candidate, or one that is exempt or already "
+            "behind — see the notes below):"
+        )
+        lines.extend(f"  - {reason}" for reason in reasons)
+    else:
+        lines.append(
+            "merge window OPEN — nothing this task preserved is holding it "
+            "(no candidate on the record, or one that is published, already "
+            "behind the head, or belongs to a terminal task)"
+        )
+    for note in notes:
+        lines.append(f"  note: {note}")
+    if not mine:
+        return lines
+
+    waiting, obstacle = _branches_waiting_on_the_merge_window(config)
+    if obstacle:
+        lines.append(f"  waiting behind it: UNKNOWN — {obstacle}")
+    elif waiting:
+        # "waiting on THIS window" is exact rather than loose, and the reason is
+        # `merge_sweep`'s own shape: the sweep checks this predicate ONCE before
+        # the first merge and is all-or-nothing, so a shut window withholds
+        # every published-but-unmerged branch regardless of why each was
+        # individually deferred. Each entry still carries its own reason, so an
+        # operator can tell a window deferral from a dirty-checkout one.
+        lines.append(
+            f"  {len(waiting)} published branch(es) are deferred and unmerged; "
+            "the sweep is all-or-nothing and checks this window once, so NONE "
+            "of them can be swept while it is shut:"
+        )
+        lines.extend(f"    - {entry}" for entry in waiting)
+        lines.append(
+            "    (deferral records only — a branch the sweep has not tried yet "
+            "has none, so this is a floor, not a ceiling)"
+        )
+    else:
+        lines.append(
+            "  no merge deferral is recorded yet, so nothing is known to be "
+            "waiting behind it — but the window stays shut for the whole "
+            "repository until this task publishes or is released"
+        )
+    return lines
+
+
+def _cmd_shelve(args: argparse.Namespace) -> int:
+    """Return a task stranded IN-PROGRESS to pending and KEEP the round it
+    holds — the sibling of `release`, not a replacement for it.
+
+    `release` is "throw it back and redo it": `worktask.retire_execution` moves
+    the execution record to `executions/archive/` and the worker repo to
+    quarantine, so the next dispatch starts a fresh record from scratch. That is
+    the right answer often enough to be the default, and it is exactly the wrong
+    answer when the round in flight is work somebody asked to keep.
+
+    Observed 2026-08-20. dash-12 held a candidate of 5 files / 1160 insertions
+    at review round 1, and its reviewer's instruction was explicit: "resume the
+    existing dash-12 worker repository and preserve its partial implementation;
+    do not restart the task". It was also stranded `in_progress`, which
+    `next_ready()` skips, so nothing would ever pick it up — and while stranded
+    its unpublished candidate held the merge window shut on base-02, dash-14 and
+    val-02 for six hours. `release` would have discarded precisely what the
+    reviewer asked to keep, so the status was edited in `tasks.json` by hand,
+    with the loop stopped, three separate times in one night.
+
+    THE RESUME PATH ALREADY EXISTS; this command only reaches it. A dispatch
+    loads the record (`_dispatch_task_postcommit`), probes the recorded worker
+    with `worker_env.worker_repo_is_reusable` BEFORE the staleness check, and
+    on a pass resumes that worker as it stands — a base that merely moved on is
+    not grounds to quarantine and rebuild it. So a task whose record and worker
+    are left intact already resumes correctly; the only thing missing was a
+    supported, attested way to make it selectable. Three things therefore move,
+    or rather two move and one is proved NOT to:
+
+    * the STATUS, `in_progress -> pending` (`TaskRegistry.shelve`), or
+      `next_ready` keeps skipping it;
+    * the SESSION, which otherwise drags the loop straight back onto the same
+      task before priority is ever consulted (`_detach_shelved_session`);
+    * the EXECUTION RECORD and the WORKER REPO, which are left exactly where
+      they are and ATTESTED as still resumable (`worktask.preserve_execution`
+      runs the same three-fact probe the dispatch will).
+
+    THREE THINGS THIS DELIBERATELY DOES NOT DO.
+
+    * **It does not change `release`.** Both verbs are legitimate and the
+      choice is the operator's.
+    * **It does not exempt the preserved candidate from the merge window.** A
+      kept candidate IS a real hazard — moving the head under it is what parks
+      a task on `task_base_behind_head` — so `_merge_window_blockers` must keep
+      seeing it. What this command adds is the sentence nobody had: the window
+      is shut, THIS is what shuts it, and these branches are waiting.
+    * **It does not refund the attempt budget.** Preserving a round preserves
+      its cost. `release` resets the budget only as a consequence of archiving
+      the record, never by editing a counter, and this archives nothing.
+
+    REFUSALS. Under the loop lock like every operator write beneath
+    `.autoloop/`, and refusing outright while a review packet is outstanding —
+    see `_shelve_session_refusal` for the two guards and why their scopes
+    differ. Nothing durable is written until both refusals and the registry's
+    own have passed: the registry move below is in memory, and `task_store.save`
+    is the first write.
+
+    ORDER, and it is the same rule `release` follows: the STATUS is made durable
+    BEFORE the session is detached. A process that dies in between leaves a
+    pending task whose session still names it — the loop resumes that round,
+    which is what shelving promised the next dispatch would do anyway. The
+    reverse order would leave the task `in_progress` with its session gone: the
+    invisible-to-`next_ready` dead end this command exists to end, rebuilt by
+    the command itself.
+    """
+    config = load_config(args.config)
+    with LoopLock(config.state_dir):
+        try:
+            state_store, state = _load_state(config)
+        except (StateError, ConfigError) as exc:
+            # FAIL CLOSED. An unreadable session is precisely the one in which
+            # "is a packet outstanding?" cannot be answered, and answering it
+            # "no" by default is the failure the guard exists to prevent.
+            print(
+                f"error: the session state could not be read ({exc}) — refusing "
+                "to shelve, because whether a review packet is outstanding is "
+                "exactly what cannot be established from it."
+            )
+            return 1
+        task_store, registry = _load_tasks(config)
+        try:
+            task = registry.shelve(args.task_id)
+        except TaskGraphError as exc:
+            print(f"error: {exc}")
+            return 1
+        refusal = _shelve_session_refusal(state, args.task_id)
+        if refusal:
+            # Nothing has been persisted: `registry.shelve` moved an in-memory
+            # status and `task_store.save` has not run, so returning here leaves
+            # the task exactly as it was found.
+            print(f"error: {args.task_id} was NOT shelved — {refusal}")
+            return 1
+
+        preserved = preserve_execution(
+            args.task_id,
+            TaskExecutionStore(config.executions_dir),
+            WorkerRepoManager(config.workers_root, config.worker_hooks_dir),
+        )
+        task_store.save(registry)
+        print(f"task {task.id} shelved: in_progress -> pending")
+
+        if preserved.record_path is not None:
+            print(
+                f"execution record KEPT at {preserved.record_path} — candidate "
+                f"{(preserved.candidate_sha or '(none)')[:12]}, review round "
+                f"{preserved.review_round}, attempt {preserved.attempt_count} "
+                "(not refunded: preserving a round preserves its cost)"
+            )
+        else:
+            print(
+                "no execution record to keep — nothing on disk describes an "
+                "in-flight round for this task, so its next dispatch starts a "
+                "fresh record. (Absence, not a claim about why: a task parked "
+                "before it ever committed looks the same as one whose record "
+                "was already retired.)"
+            )
+        if preserved.worker_path is not None:
+            print(f"worker repo KEPT at {preserved.worker_path} — not quarantined")
+        else:
+            print("no worker repo on disk to keep")
+        if preserved.record_path is not None:
+            if preserved.resumable:
+                print(
+                    "next dispatch RESUMES this round: the recorded worker "
+                    "passes the same three-fact reuse probe the dispatch runs "
+                    "(present, a git repository, on the recorded branch)"
+                )
+            else:
+                print(
+                    "WARNING — the next dispatch will NOT resume this round: "
+                    f"{preserved.obstacle or 'the reuse probe did not pass'}. "
+                    "Nothing was moved, so the evidence is all still on disk; "
+                    "fix the worker, or use `release` if the round is genuinely "
+                    "not worth keeping."
+                )
+
+        print(_detach_shelved_session(state_store, state, args.task_id))
+        for line in _shelved_candidate_window_report(config, args.task_id, preserved):
+            print(line)
+
+        # What the loop will actually do next, rather than what "set aside"
+        # sounds like it should do. Shelving returns a task to the QUEUE; it
+        # does not lower its priority, so a task that is still the most urgent
+        # thing ready is selected again on the very next iteration — and
+        # resumed, which is correct and is the whole claim, but is not what an
+        # operator who typed "shelve" is necessarily expecting.
+        nxt = registry.next_ready()
+        if nxt is not None and nxt.id == args.task_id:
+            print(
+                f"note: {args.task_id} is still what `next_ready()` returns, so "
+                "the loop picks it straight back up (resuming this round). Lower "
+                "its priority, or `urgent` another task, to work on something "
+                "else first."
+            )
+        elif nxt is not None:
+            print(f"note: the loop's next selection is {nxt.id}")
+        else:
+            print("note: nothing else is ready — the loop will idle or audit")
+    return 0
+
+
 def _reconcile_retired_blockers(config, registry) -> list[Blocker]:
     """Close the open QUARANTINE blockers of RETIRED tasks. Returns what it closed.
 
@@ -4722,6 +5230,19 @@ def build_parser() -> argparse.ArgumentParser:
     add_config(release)
     release.add_argument("task_id")
     release.set_defaults(func=_cmd_release)
+
+    shelve = sub.add_parser(
+        "shelve",
+        help=(
+            "return a task stranded IN-PROGRESS to pending and KEEP the round "
+            "it holds — its execution record and worker repo stay put, so the "
+            "next dispatch RESUMES that candidate instead of starting over "
+            "(the sibling of `release`, which discards it)"
+        ),
+    )
+    add_config(shelve)
+    shelve.add_argument("task_id")
+    shelve.set_defaults(func=_cmd_shelve)
 
     urgent = sub.add_parser(
         "urgent",

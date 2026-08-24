@@ -1766,12 +1766,102 @@ class TaskRegistry:
         (`blocked` still goes through `unblock`, which is what the blocker
         record is tied to).
         """
+        return self._return_to_pending(
+            task_id,
+            verb="release",
+            remedy="returns an interrupted round to pending",
+        )
+
+    def shelve(self, task_id: str) -> Task:
+        """Return an IN-PROGRESS task to pending WITHOUT discarding the round
+        it holds. The registry half of `cli._cmd_shelve`.
+
+        The STATUS move is byte-for-byte `release`'s — a task is selectable
+        again or it is not, and there is only one way to be pending — so the
+        two share `_return_to_pending` below rather than keeping two copies of
+        one assignment that could drift. **The difference between the two verbs
+        is entirely in what the CALLER does with the artefacts**, and it is the
+        whole point of having two: `release` goes on to retire the execution
+        record and quarantine the worker repo (`worktask.retire_execution`), so
+        the task is redone from scratch; `shelve` deliberately leaves both where
+        they are (`worktask.preserve_execution` attests that it did), so the
+        next dispatch RESUMES the recorded round — same `candidate_sha`, same
+        `review_round`, same `attempt_count`.
+
+        Its own entry point rather than an argument to `release`, for a reason
+        an operator feels: the refusal text differs. "`release` only returns an
+        interrupted round to pending" is the wrong sentence to print at somebody
+        who typed `shelve`, and a shared method taking a verb string is how you
+        get one that is right for both.
+
+        Observed 2026-08-20: dash-12 held a 5-file candidate at review round 1
+        and its reviewer asked in as many words to "resume the existing dash-12
+        worker repository and preserve its partial implementation; do not
+        restart the task". It was also stranded `in_progress`, which
+        `next_ready` skips. `release` was the wrong tool — it would have thrown
+        away exactly what the reviewer asked to keep — and there was no right
+        one, so `tasks.json` was edited by hand, with the loop stopped, three
+        times in one night.
+
+        Narrow on the same terms as `release`: anything whose STORED status is
+        not `in_progress` is refused, so this can neither un-complete finished
+        work nor launder a quarantine.
+
+        **The one place it is deliberately WIDER than `release`, and it is the
+        `state_of` reading rather than a new permission.** `state_of` returns
+        BLOCKED — not IN_PROGRESS — for an in-progress task with an incomplete
+        dependency, because the dependency test runs before the `in_progress`
+        test. `release` asks `state_of` and therefore refuses exactly the task
+        that is hardest to get back; this asks the STORED status, which is the
+        same reading `_displaced_work_exists` and `_refuse_immutable` already
+        take, and for the reason the first of those records: "`state_of` …
+        would fall silent on the very task that is hardest to release".
+
+        That widening grants nothing. `in_progress` is written by
+        `mark_in_progress` alone, so a row carrying it IS a dispatched round
+        whatever its dependencies now say, and the result of moving it is a
+        `pending` row that `state_of` still reports as BLOCKED and `next_ready`
+        still skips until the dependency lands — honest, and selectable the
+        moment it is. `release` is untouched: changing what it accepts is out
+        of bounds, and the two readings are one keyword apart here so the
+        difference is visible rather than buried in a second copy.
+
+        The dead end it reaches is already written down one method over:
+        `_refuse_immutable` exists because such a task "can be neither
+        completed nor returned to pending". That is still true of `release`,
+        and it is what this arm answers.
+        """
+        return self._return_to_pending(
+            task_id,
+            verb="shelve",
+            remedy="sets an interrupted round aside without discarding it",
+            by_stored_status=True,
+        )
+
+    def _return_to_pending(
+        self, task_id: str, *, verb: str, remedy: str, by_stored_status: bool = False
+    ) -> Task:
+        """The one status move behind `release` and `shelve`, and the one
+        refusal. Both verbs mean "this in-progress round is over for now", and
+        there is exactly one way to be pending, so letting them keep two copies
+        of this assignment would be a bug in whichever one drifted.
+
+        `by_stored_status` is the single documented difference between them —
+        see `shelve`, which explains why it reads `task.status` directly and
+        why `release` must keep asking `state_of`. Default False, so a future
+        caller that does not think about it gets `release`'s stricter reading.
+        """
         task = self.get(task_id)
-        if self.state_of(task_id) is not TaskState.IN_PROGRESS:
+        in_progress = (
+            task.status == "in_progress"
+            if by_stored_status
+            else self.state_of(task_id) is TaskState.IN_PROGRESS
+        )
+        if not in_progress:
             raise TaskGraphError(
                 "task_not_in_progress",
                 f"task '{task_id}' is not in progress (status {task.status!r}) — "
-                "`release` only returns an interrupted round to pending; use "
+                f"`{verb}` only {remedy}; use "
                 "`unblock` for a quarantined task",
             )
         task.status = "pending"
