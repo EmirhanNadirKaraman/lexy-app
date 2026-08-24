@@ -4015,19 +4015,57 @@ class Orchestrator:
             )
         ]
 
-    def _carry_postcommit_forward(self) -> None:
+    def _carry_postcommit_forward(
+        self, binding: PostcommitBinding | None = None
+    ) -> None:
         """Record the binding of the response being corrected, so the corrective
         re-prompt about to be queued inherits it.
 
-        Called by all four corrective-re-prompt sites (`_handle_parse_error`,
-        `_handle_policy_denial`, `_handle_review_mismatch`, and
-        `_dispatch_plan`'s plan-rejection branch) and deliberately not
+        Called by all five corrective-re-prompt sites (`_handle_parse_error`,
+        `_handle_policy_denial`, `_handle_review_mismatch`,
+        `_dispatch_plan`'s plan-rejection branch, and `_handle_git_failure`)
+        and deliberately not
         special-cased per site: they build the same kind of message — "that
         reply cannot be acted on, send another one about the SAME presented
         state" — and a binding that survives one of them and not the others is
         a trap that only shows up on whichever path nobody tested. Plan
         rejection self-resolves to a no-op: a `plan` reply answers a request
         that never carried a binding, so there is nothing to carry.
+
+        `binding` is the binding the CALLER already resolved for this response,
+        and it wins over `resp.postcommit` when both exist — the same
+        precedence `_push_binding` and `_dispatch` use, stated once so there is
+        never a second resolution order for the same question. It exists
+        because `resp.postcommit` is not the only authoritative binding a
+        response can have: an approval that NAMES a postcommit packet this loop
+        sent (`_approval_packet`) resolves one while `resp.postcommit` is
+        `None`, and a correction built from THAT response — bad stamps
+        (`_handle_review_mismatch`) or a refused decision
+        (`_handle_policy_denial`) — would otherwise go out unbound. That is not
+        a hypothetical: `review_mismatch_payload` tells the reviewer to stamp
+        "THIS request if you are approving the state described above", so the
+        re-stamped approval names the CORRECTION, `_approval_packet` no longer
+        applies (the reviewed id is the response's own), and an unbound
+        correction turns the loop's own repair request into
+        `legacy_git_path_retired` — the exact bug this whole mechanism exists to
+        remove, reached one path over.
+
+        The other three sites pass nothing, and each for a reason rather than by
+        omission. `_handle_parse_error` is raised before any directive exists to
+        resolve a binding FROM; plan rejection answers a request that never
+        carried one; and `_handle_git_failure` is reached from `run`'s exception
+        handlers, which have no resolved binding in scope. That last one does
+        not dead-end: `git_error_payload` does not redirect the stamp to THIS
+        request, so the reviewer re-names the packet and `_approval_packet`
+        resolves it from the ledger — and if it does stamp the correction, it
+        meets `_legacy_git_verdict`'s actionable `revise` refusal.
+
+        Passing it WIDENS NOTHING. It decides what the next request is bound
+        to, never whether a push is authorized: the corrected approval still
+        goes through `authorize_directive` (re-evaluated against the carried
+        binding's own `task_branch`, so a protected-branch denial denies again),
+        still through `verify_review` against the correction's own three
+        stamps, and still through every check in `_dispatch_task_push`.
 
         MUST be called BEFORE the caller clears `state.last_response`, and only
         on the path that actually sends a correction — a budget exhaustion
@@ -4036,13 +4074,17 @@ class Orchestrator:
         """
         state = self.state
         resp = state.last_response
-        binding = resp.postcommit if resp is not None else None
+        if binding is None:
+            binding = resp.postcommit if resp is not None else None
         if binding is None:
             return
         state.carry_postcommit = asdict(binding)
         self._log(
             "postcommit_carry_recorded",
-            request_id=resp.request_id,
+            # `resp` is not None at any site that reaches here today, but the
+            # early return above stopped being the thing that guarantees it the
+            # moment an explicit binding could arrive without one.
+            request_id=resp.request_id if resp is not None else None,
             data={
                 "task_id": binding.task_id,
                 "candidate_sha": binding.candidate_sha,
@@ -4530,7 +4572,14 @@ class Orchestrator:
             destination_branch = self._git.current_branch()
         verdict = self._policy.authorize_directive(directive, destination_branch, self._registry)
         if not verdict.allowed:
-            self._handle_policy_denial(directive, verdict)
+            # `named_binding`, not `push_binding`: the carry's job is to rescue
+            # the binding that `resp.postcommit` does NOT hold, and passing the
+            # latter would be handing `_carry_postcommit_forward` the value it
+            # already reads for itself. Where both exist they name the same
+            # candidate anyway (`_consume_carried_postcommit` refuses a carry
+            # that is not the live one). `None` for every non-push denial,
+            # which is every denial that reached here before.
+            self._handle_policy_denial(directive, verdict, named_binding)
             return
         if directive.decision in REVIEWED_DECISIONS:
             # Verified against the packet the approval NAMES when it names one
@@ -4564,7 +4613,11 @@ class Orchestrator:
                     expected_report_sha256,
                 )
             except ContractError as exc:
-                self._handle_review_mismatch(exc)
+                # The correction this raises asks for a RE-STAMP of the same
+                # state, against THIS request (`review_mismatch_payload`) — so
+                # it has to carry the binding the approval resolved, or the
+                # reply the loop just asked for arrives unbindable.
+                self._handle_review_mismatch(exc, named_binding)
                 return
             # The generic "repository HEAD must still equal the reviewed
             # head_sha" staleness check below does not apply to a
@@ -4593,7 +4646,8 @@ class Orchestrator:
                             f"repository HEAD is {current_head[:12]} but the approval "
                             f"references {directive.reviewed.head_sha[:12]} — the tree "
                             "changed since the review",
-                        )
+                        ),
+                        named_binding,
                     )
                     return
         state.policy_denials = 0
@@ -7967,7 +8021,18 @@ class Orchestrator:
         state.phase = Phase.READY.value
         self._store.save(state)
 
-    def _handle_policy_denial(self, directive: Directive, verdict) -> None:
+    def _handle_policy_denial(
+        self,
+        directive: Directive,
+        verdict,
+        binding: PostcommitBinding | None = None,
+    ) -> None:
+        """`binding` is the binding the caller already resolved for this
+        response, forwarded to `_carry_postcommit_forward` — see its docstring.
+        Only the `push` sites in `_step_executing` have one to pass; every other
+        caller (a refused executor decision, a retired decision, the legacy git
+        path) resolves none by construction and leaves it `None`, which is
+        byte-for-byte the behaviour they had."""
         state = self.state
         state.policy_denials += 1
         self._log(
@@ -8003,13 +8068,20 @@ class Orchestrator:
         # SAME presented state, and dropping the binding here would leave an
         # approval that answers the correction unpublishable in exactly the way
         # a parse error used to.
-        self._carry_postcommit_forward()
+        self._carry_postcommit_forward(binding)
         state.outbox = policy_denied_payload(directive.decision.value, verdict.reason)
         state.last_response = None
         state.phase = Phase.READY.value
         self._store.save(state)
 
-    def _handle_review_mismatch(self, exc: ContractError) -> None:
+    def _handle_review_mismatch(
+        self, exc: ContractError, binding: PostcommitBinding | None = None
+    ) -> None:
+        """`binding` is the binding the caller already resolved for this
+        response, forwarded to `_carry_postcommit_forward` — see its docstring.
+        It matters most HERE: `review_mismatch_payload` asks the reviewer to
+        stamp THIS request, so an unbound correction guarantees the re-stamped
+        approval resolves nothing."""
         state = self.state
         state.policy_denials += 1
         self._log("review_mismatch", data={"code": exc.code, "error": str(exc)})
@@ -8037,7 +8109,7 @@ class Orchestrator:
         # get a correctly stamped one back. Dropping the binding would make the
         # re-stamped approval unpublishable — the loop refusing the very reply
         # it asked for.
-        self._carry_postcommit_forward()
+        self._carry_postcommit_forward(binding)
         state.outbox = review_mismatch_payload(exc.code, str(exc))
         state.last_response = None
         state.phase = Phase.READY.value

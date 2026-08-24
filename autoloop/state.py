@@ -680,6 +680,14 @@ class LoopState:
     #: from the response being corrected, consumed and cleared by the very next
     #: `_step_ready`, so it can never attach to a request that is not the
     #: correction it was recorded for.
+    #:
+    #: "The response being corrected" is `LastResponse.postcommit` for an
+    #: ordinary round and the binding the caller already RESOLVED for that
+    #: response otherwise — an approval naming an earlier packet
+    #: (`_approval_packet`) has an authoritative binding while
+    #: `LastResponse.postcommit` is None, and a correction built from one of
+    #: those went out unbound until 2026-08-24. Either way this holds one
+    #: binding, for one candidate, for one request.
     carry_postcommit: dict | None = None
     #: Current conversation generation. Requests are stamped with it, so a
     #: response captured under an older epoch can be recognised and ignored.

@@ -23,6 +23,14 @@ TWO MECHANISMS, TESTED SEPARATELY BECAUSE THEY FAIL SEPARATELY:
     is better evidence of what was approved than `last_response`, which is only
     the most recent thing sent.
 
+...AND THEIR SEAM, which is where they fail TOGETHER and where the second round
+of this task was still broken. A ledger-resolved approval has
+`last_response.postcommit is None` by construction, so a correction built from
+one inherited nothing — and `review_mismatch_payload` asks the reviewer to stamp
+THIS request, walking the re-stamped approval straight back into
+`legacy_git_path_retired`. Section 3's two `..._naming_a_sent_packet_...`
+repair tests are that case; the first fails without the fix.
+
 WHAT IS NOT WIDENED, and has its own tests below: an approval that resolves no
 binding is still refused, the named packet's three stamps are still demanded
 exactly, `commit`/`commit_and_push` are still retired, and every push-time
@@ -553,6 +561,100 @@ def test_naming_a_sent_packet_still_demands_that_packet_s_exact_stamps(tmp_path)
     wt_git = worktree_git_for(worktrees, task.id)
     execution = execution_store.load(task.id)
     assert wt_git.remote_ref_sha("origin", f"refs/heads/{execution.task_branch}") == ""
+    # The refusal is unchanged; what IS new is that the correction it queues
+    # inherits the binding the approval resolved, so the re-stamped reply can
+    # publish. Asserted here, at the test that proves the refusal, rather than
+    # only in the end-to-end regression below — the two facts live together.
+    assert orch.state.carry_postcommit is not None
+
+
+def test_a_mis_stamped_push_naming_a_sent_packet_is_repairable_by_re_stamping(tmp_path):
+    """THE TWO MECHANISMS MEETING, which is where the second round of this task
+    was still broken. `last_response` has moved on, so the approval's binding
+    comes from the LEDGER; one stamp is wrong, so the loop asks for a re-stamp;
+    and `review_mismatch_payload` tells the reviewer to stamp "THIS request if
+    you are approving the state described above" — the CORRECTION, not the
+    packet. So the corrected approval names an id `_approval_packet` will not
+    look up (it is the response's own), and unless the correction inherited the
+    resolved binding it is unbound, refused as `legacy_git_path_retired`, and
+    the loop has refused the very reply it asked for. That is the original
+    incident, reached one path over.
+    """
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    (orch, repo_root, worktrees, execution_store, task, config, packet, later) = (
+        _packet_then_unrelated_round(tmp_path, executor)
+    )
+    execution = execution_store.load(task.id)
+    with_origin(tmp_path, repo_root)
+
+    # One stamp wrong, on an approval that names the packet rather than the
+    # request it answers: resolved by the ledger, refused by `verify_review`.
+    deliver(orch, later, push_naming(packet, report_sha256="0" * 64))
+    orch._step_executing()
+    assert "review_integrity" in (orch.state.outbox or "")
+
+    correction = send_packet(orch)
+    # The link that was missing: the re-prompt carries the resolved binding
+    # even though `later.postcommit` — the only place the carry used to look —
+    # is `None`.
+    assert later.postcommit is None
+    assert correction.postcommit == packet.postcommit
+
+    # The reviewer does what it was told: re-stamp THIS request.
+    deliver(orch, correction, push_naming(correction))
+    orch._step_executing()
+
+    assert orch.state.phase == Phase.READY.value
+    wt_git = worktree_git_for(worktrees, task.id)
+    assert (
+        wt_git.remote_ref_sha("origin", f"refs/heads/{execution.task_branch}")
+        == execution.candidate_sha
+    )
+    text = transcript_of(config)
+    assert "legacy_git_path_retired" not in text
+    assert "task_pushed" in text
+
+
+def test_a_policy_denied_push_naming_a_sent_packet_keeps_the_resolved_binding(tmp_path):
+    """The sibling path, and the reason the carry takes the resolved binding at
+    `_handle_policy_denial` too rather than only where it was observed to
+    matter. `push` is denied here because the candidate's own branch is
+    protected — a denial about the SAME presented state, so the correction
+    inherits the same binding a mismatch correction would.
+
+    It widens nothing: the corrected approval is authorized AGAIN, against the
+    carried binding's own `task_branch`, so the protected branch is still
+    protected and nothing reaches the remote."""
+    executor = WritingExecutor(tmp_path / "worktrees", {"a.py": "one\n"})
+    (orch, repo_root, worktrees, execution_store, task, config, packet, later) = (
+        _packet_then_unrelated_round(
+            tmp_path,
+            executor,
+            policy=PolicyConfig(
+                implement_enabled=True, protected_branches=("autoloop/t1",)
+            ),
+        )
+    )
+    assert packet.postcommit.task_branch == "autoloop/t1"
+    with_origin(tmp_path, repo_root)
+
+    deliver(orch, later, push_naming(packet))
+    orch._step_executing()
+    assert "policy_denied" in (orch.state.outbox or "")
+
+    correction = send_packet(orch)
+    assert correction.postcommit == packet.postcommit
+
+    # ...and the denial still denies: re-sending `push` against the correction
+    # is refused by the same protected-branch gate, not published.
+    deliver(orch, correction, push_naming(correction))
+    orch._step_executing()
+
+    assert "policy_denied" in (orch.state.outbox or "")
+    execution = execution_store.load(task.id)
+    wt_git = worktree_git_for(worktrees, task.id)
+    assert wt_git.remote_ref_sha("origin", f"refs/heads/{execution.task_branch}") == ""
+    assert "task_pushed" not in transcript_of(config)
 
 
 def test_naming_a_request_id_the_loop_never_bound_is_refused(tmp_path):

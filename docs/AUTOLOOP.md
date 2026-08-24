@@ -1632,6 +1632,32 @@ making the ledger primary would put a second source of truth in front of the
 common path, where a future site that re-stamps a request without updating the
 ledger would begin refusing legitimate approvals.
 
+*THE TWO MECHANISMS MEETING.* They are not independent, and the seam between them
+was the second round's remaining hole. When an approval resolves its binding from
+the LEDGER, `last_response.postcommit` is `None` by construction — that is the
+whole case — so a correction built from that approval had nothing to carry: the
+`_carry_postcommit_forward` of the paragraph above looked only at
+`last_response`. Two corrective paths reach it from a resolved approval:
+`_handle_review_mismatch` (a stamp was wrong) and `_handle_policy_denial` (the
+decision was refused). The first is the dangerous one, because
+`review_mismatch_payload` asks the reviewer to stamp "THIS request if you are
+approving the state described above" — so the re-stamped approval names the
+CORRECTION, `_approval_packet` declines to look it up (the reviewed id is the
+response's own), and an unbound correction lands back on
+`legacy_git_path_retired`: the original incident, reached one path over, with the
+loop refusing the very reply it asked for. So `_step_executing` now passes the
+binding it already resolved into both handlers, which forward it to
+`_carry_postcommit_forward`; an explicitly passed binding wins over
+`last_response.postcommit`, the same precedence `_push_binding` uses, so there is
+one resolution order rather than two. `_handle_parse_error` needs nothing (a
+parse error is raised before any directive is resolved), plan rejection stays a
+no-op, and `_handle_git_failure` is left reading `last_response` alone — it is
+reached from exception handlers that have no resolved binding in scope, and it
+does not dead-end there: `git_error_payload` does not redirect the stamp to THIS
+request, so the reviewer re-names the packet and the ledger resolves it, and if
+it does stamp the correction it meets the actionable `revise` refusal below
+rather than the old dead end.
+
 *WHAT THIS DOES NOT WIDEN.* An approval that names a packet must match that
 packet's `request_id`, `head_sha` and `report_sha256` exactly —
 `verify_review`'s demand is unchanged, asked of the request the reviewer says it
@@ -1647,7 +1673,13 @@ entry — reads as ABSENT and is logged (`postcommit_carry_unusable`,
 approval; the tolerant reader is `state.postcommit_binding_from_record`, and its
 docstring says why raising here would end the process with no park and no
 blocker. A carry is additionally checked against `state.task_execution`, so it
-cannot re-present a candidate a later round has superseded.
+cannot re-present a candidate a later round has superseded. Nor does carrying a
+LEDGER-resolved binding widen anything: it decides what the next request is bound
+to, never whether a push is authorized. The corrected approval is authorized
+again from scratch — `authorize_directive` re-evaluated against the carried
+binding's own `task_branch` (so a protected branch stays protected),
+`verify_review` against the correction's own three stamps, and every push-time
+check in `_dispatch_task_push`.
 
 *WHY IT MATTERS.* On 2026-08-20 (prof-01) an `unexpected_field` parse error on a
 review packet produced an unbound correction; the reviewer answered it with a
