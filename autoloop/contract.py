@@ -112,6 +112,12 @@ _TOP_LEVEL_KEYS = {
     "reason",
     "scope",
     "tasks",
+    # The parent a `plan` REPLACES (split-02). Additive and optional:
+    # PROTOCOL_VERSION stays 3 because every directive that parsed before this
+    # existed parses identically — an omitted key is `None`, which is an
+    # ordinary plan. Listed here or a reply carrying it would die at
+    # `unknown_keys` before its own branch is reached.
+    "split_of",
     "task_id",
     "feedback",
     "decomposition",
@@ -274,6 +280,22 @@ class Directive:
     reason: str
     scope: str | None = None
     tasks: tuple[TaskSpec, ...] | None = None
+    #: The task these planned tasks REPLACE, on a `plan` that is a split
+    #: (split-02, 2026-08-24). `None` — the ordinary plan — adds tasks and
+    #: changes nothing else.
+    #:
+    #: A key on `plan` rather than a tenth `Decision`, deliberately. The
+    #: successors are exactly a plan's `tasks` and are validated by exactly the
+    #: same code (`TaskRegistry.add_many`), so a separate decision would be a
+    #: second door onto one registry write. It also keeps the accepting side
+    #: honest about what a split IS: adding the successors and retiring the
+    #: parent are one transition, and `orchestrator.apply_split_intent` is where
+    #: that is made to survive a crash.
+    #:
+    #: SHAPE only here, like every other field: whether the named task exists,
+    #: may be split, and can be retired without stranding a dependent is decided
+    #: by the dispatcher, which has the registry.
+    split_of: str | None = None
     task_id: str | None = None
     feedback: str | None = None
     #: The plan this directive authorizes, when it carries one. Accepted on
@@ -359,6 +381,9 @@ trailing text is REJECTED, never guessed at. One object, these keys only:
              approved_paths: the EXACT repo-relative files this task may touch
              — no globs, no "..", no absolute paths; name new files. A task
              with no approved path cannot be implemented.
+  split_of   (plan only, optional) a queued or in-flight task id these tasks
+             REPLACE: it is retired naming them, and its round is filed away.
+             All of it lands or none of it does, across a crash too.
   task_id    (required for implement/revise/recut; optional for commit /
              commit_and_push, marking that task completed)
   decomposition (required for implement) {approach, files, steps}; steps are
@@ -703,6 +728,7 @@ def parse_response(text: str) -> Directive:
 
     scope_raw = data.get("scope")
     tasks_raw = data.get("tasks")
+    split_of_raw = data.get("split_of")
     task_id_raw = data.get("task_id")
     feedback_raw = data.get("feedback")
     commit_raw = data.get("commit")
@@ -722,6 +748,18 @@ def parse_response(text: str) -> Directive:
         tasks = _parse_task_specs(tasks_raw)
     else:
         _forbid("tasks", tasks_raw, decision)
+
+    # Accepted on `plan` and NOWHERE else. A `split_of` riding on any other
+    # decision names a parent that decision has no successors for, and silently
+    # dropping it would read as configured while behaving as if it were not —
+    # the same reasoning `decomposition` gets one branch down. OPTIONAL on
+    # `plan`: omitted is an ordinary plan, which is every plan sent so far.
+    split_of = None
+    if decision is Decision.PLAN:
+        if split_of_raw is not None:
+            split_of = _require_str("split_of", split_of_raw)
+    else:
+        _forbid("split_of", split_of_raw, decision)
 
     task_id = None
     if decision in NAMES_A_TASK:
@@ -822,6 +860,7 @@ def parse_response(text: str) -> Directive:
         reason=reason,
         scope=scope,
         tasks=tasks,
+        split_of=split_of,
         task_id=task_id,
         feedback=feedback,
         decomposition=decomposition,

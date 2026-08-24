@@ -369,6 +369,9 @@ from .worktask import (
     IntentStore,
     Reconciliation,
     Retirement,
+    SplitIntent,
+    SplitIntentStore,
+    SplitSuccessor,
     TaskExecution,
     TaskExecutionStore,
     accumulate_assumptions,
@@ -378,6 +381,7 @@ from .worktask import (
     reconcile_after_crash,
     retire_execution,
     split_attempt,
+    split_intents_dir,
 )
 from .worktree import WorktreeManager
 
@@ -433,6 +437,51 @@ MAX_TASK_RECUTS = 2
 #: a glance that the REVIEWER discarded the round, rather than an operator
 #: releasing it by hand or an urgent request displacing it.
 RECUT_RETIREMENT_REASON = "recut-by-reviewer"
+
+#: The `retire_execution` label a SPLIT parent's execution record and worker repo
+#: are filed under (split-02). Same job as `RECUT_RETIREMENT_REASON` and
+#: deliberately a different word: both discard a round, but a recut says "cut
+#: this task again" and a split says "this task is finished and these other ones
+#: continue it", and an operator reading `quarantine/<task>-split-into-successors-
+#: <stamp>` should not have to guess which happened.
+SPLIT_RETIREMENT_REASON = "split-into-successors"
+
+#: The stored statuses a task may be SPLIT out of. Deliberately the narrow pair
+#: and not "everything `retire` accepts": `retire` also takes a quarantined task,
+#: because deciding a park will never be worked is itself a retirement — but a
+#: quarantine is an open question with a `blockers.Blocker` record behind it, and
+#: retiring the row while that question is unanswered is the split brain
+#: `cli._reconcile_retired_blockers` exists for. Answer it first, then split.
+#: Widening this is a one-line change if the case turns up; narrowing after the
+#: fact would be a capability taken back, which is the harder direction.
+_SPLITTABLE_STATUSES = frozenset({"pending", "in_progress"})
+
+#: How much of the reviewer's own sentence is kept in the parent's durable
+#: retirement reason (`Task.blocked_reason`, which lands in `tasks.json` and is
+#: printed by the dashboard and by every refusal that mentions the retirement).
+#: The reviewer authors that text and the contract asks for one short sentence,
+#: but nothing enforces it — so this is the bound that keeps a paragraph in the
+#: wrong field from being written into the roadmap forever. Truncation is
+#: VISIBLE (an ellipsis), never silent.
+MAX_SPLIT_REASON_CHARS = 400
+
+
+def _split_retirement_reason(successor_ids: tuple[str, ...], reason: str) -> str:
+    """The parent's `blocked_reason` after a split: what replaced it, then why.
+
+    The ids come first because they are the machine-checkable half and are what a
+    reader needs; the reviewer's sentence follows, bounded. Built by a function
+    rather than inline so the DURABLE text and the text a replay re-issues are
+    one expression — `TaskRegistry.retire` refuses a repeat that would reword a
+    recorded retirement, so the two disagreeing would turn an idempotent replay
+    into a refusal.
+    """
+    said = " ".join((reason or "").split())
+    if len(said) > MAX_SPLIT_REASON_CHARS:
+        said = said[: MAX_SPLIT_REASON_CHARS - 1].rstrip() + "…"
+    joined = ", ".join(successor_ids)
+    return f"split into {joined}" + (f" — {said}" if said else "")
+
 
 #: Filename of the wanted-verb tally under `AutoloopConfig.state_dir`.
 WANTED_DECISIONS_FILENAME = "wanted_decisions.json"
@@ -978,6 +1027,344 @@ def _surviving_execution_record(task_id: str, execution_store) -> bool:
         return True
 
 
+@dataclass(frozen=True)
+class SplitAcceptance:
+    """What one `apply_split_intent` call found, moved, and left agreeing.
+
+    `complete` is the whole verdict and is deliberately not derivable from the
+    other fields: a replay that finds every store already at its target moves
+    NOTHING and is still complete, while a first attempt that adds the
+    successors and then cannot quarantine the worker moves plenty and is not.
+    The caller clears no intent and reports no success without it.
+
+    `obstacle` is empty exactly when `complete` is true. Everything else is
+    reporting: which successor ids THIS call created, whether THIS call retired
+    the parent, and where the two halves of the retirement went (both `None` on
+    a replay that found them already filed).
+    """
+
+    intent: SplitIntent
+    complete: bool = False
+    obstacle: str = ""
+    successors_added: tuple[str, ...] = ()
+    parent_retired: bool = False
+    registry_saved: bool = False
+    record_path: Path | None = None
+    worker_path: Path | None = None
+
+
+def _split_registry_mutation(registry: TaskRegistry, intent: SplitIntent) -> tuple[str, ...]:
+    """Perform the REGISTRY half of `intent` on `registry`; return the ids added.
+
+    Idempotent by construction, because a replay must be able to run it over a
+    registry where some or all of it already happened:
+
+      * a successor already present is skipped — but only after its title and
+        description are checked against the intent. `add_many` refuses a
+        duplicate id outright, so "skip what is there" is the only way a replay
+        can proceed at all, and skipping WITHOUT checking would let a task
+        somebody else created under the same id be silently adopted as this
+        split's successor;
+      * `TaskRegistry.retire` is written-once and an exact repeat is a no-op that
+        returns the task untouched, so the retirement is simply re-issued with
+        the successors and reason the intent recorded. A retirement that is
+        already on record with DIFFERENT successors raises `task_already_retired`
+        — which is correct: the intent no longer describes this graph and a
+        human has to look.
+
+    Successors are added BEFORE the parent is retired, and that order is
+    load-bearing rather than tidy: `_retirement_rewrites` lifts its
+    strand refusal only for successors that are LIVE TASKS IN THE GRAPH, so with
+    the parent retired first there would be nothing to re-point the parent's
+    dependents at and a task with a dependent could never be split at all. It is
+    also why `rewrite_dependents` is NOT passed — that flag raises on a repeat,
+    which would break the replay, and adding the successors first satisfies the
+    same precondition without it.
+
+    Raises `TaskGraphError`. `apply_split_intent` runs it on a THROWAWAY COPY
+    first, so a refusal never reaches the live registry.
+    """
+    added: list[Task] = []
+    for successor in intent.successors:
+        if registry.has(successor.id):
+            existing = registry.get(successor.id)
+            if (
+                existing.title != successor.title
+                or existing.description != successor.description
+            ):
+                raise TaskGraphError(
+                    "split_successor_occupied",
+                    f"task '{successor.id}' already exists and is not the successor "
+                    f"this split of '{intent.parent_id}' recorded (its title or "
+                    "description differs), so the split cannot be completed without "
+                    "overwriting somebody else's task",
+                )
+            continue
+        added.append(
+            Task(
+                id=successor.id,
+                title=successor.title,
+                description=successor.description,
+                depends_on=successor.depends_on,
+                approved_paths=successor.approved_paths,
+            )
+        )
+    if added:
+        registry.add_many(added)
+    registry.retire(
+        intent.parent_id,
+        superseded_by=intent.successor_ids,
+        reason=intent.reason,
+    )
+    return tuple(t.id for t in added)
+
+
+def apply_split_intent(
+    intent: SplitIntent,
+    *,
+    registry: TaskRegistry,
+    task_store: TaskStore,
+    execution_store,
+    worker_repos,
+    intent_store: SplitIntentStore,
+) -> SplitAcceptance:
+    """Drive every store named by `intent` to the accepted-split state, however
+    much of it already happened, and clear the intent only once all three agree.
+
+    THE PROBLEM, stated plainly. Accepting a split writes THREE stores that
+    cannot be written together — the task registry (`tasks.json`), the parent's
+    execution record (`executions/<id>.json`), and its worker repository
+    (`workers/<id>`) — so there is a moment between any two of them where a
+    process death leaves them disagreeing. The registry would say the parent is
+    retired and superseded while its execution record still claims an in-flight
+    candidate (which holds the repository-wide merge window shut,
+    `cli._merge_window_blockers`) and its worker repo still sits where the next
+    dispatch would refuse to create one.
+
+    **DURABLE INTENT + IDEMPOTENT RECONCILIATION is the answer, and the other
+    two were rejected on their merits.**
+
+      * *Rerun-only recovery* (make the sequence re-runnable and let the next
+        start redo it) needs something to tell the next start that a split was
+        in flight AND what it was. Neither store answers that: a parent that is
+        not yet retired is indistinguishable from a task nobody ever split, and
+        an execution record that is still live is the ordinary state of every
+        running task. So the recovery either never fires or has to GUESS from
+        the shape of the graph — which is the "infer a successor from free text"
+        heuristic `tasks._RETIREMENTS` explicitly refuses to become.
+      * *Write reordering* (order the writes so every crash point is stale
+        rather than contradictory) does not exist for this operation. Registry
+        first leaves the window above. Artefacts first leaves a parent still
+        `in_progress` with no execution record and no worker — a shape
+        `_reconcile_stranded_tasks` would then requeue for dispatch, so a crash
+        would silently schedule work whose successors already exist. There is no
+        third order: the registry write is what makes the split true, and the
+        artefacts are what make it consistent.
+
+    The intent is written by the caller BEFORE this runs and is the one durable
+    fact that survives the gap. This function is then re-runnable to a fixed
+    point from ANY prefix, so a crash costs a replay rather than a repair.
+
+    **CRASH-POINT TABLE.** With the intent on disk, the state a restart finds
+    and what this call does with it:
+
+      1. *After the intent, before the registry save* — nothing else moved. The
+         registry mutation runs in full; the artefacts are then retired.
+      2. *After the registry save, before the record is archived* — the parent
+         reads retired and the successors exist. `_split_registry_mutation` is a
+         no-op (successors present and matching, retirement an exact repeat), the
+         save is skipped, and both artefacts are retired.
+      3. *After the record is archived, before the worker is quarantined* —
+         `execution_store.archive` finds nothing to file and answers `None`, and
+         the worker is quarantined under the SAME label the intent recorded, so
+         the two halves still name each other.
+      4. *After both, before the intent is cleared* — nothing moves at all; the
+         verification below finds all three stores at their target and the intent
+         is cleared. This is the only crash point that leaves no visible residue,
+         and it is why the intent is cleared LAST.
+
+    **NOTHING IS CLEARED THAT WAS NOT VERIFIED.** The three stores are read back
+    — the registry says retired with these successors and every successor
+    exists, the execution store has no live record, the worker directory is gone
+    — and an intent whose stores do not agree is left exactly where it is with
+    `obstacle` set. A reconciler that cleared on the strength of "no exception
+    escaped" would be the fail-open version of this whole mechanism: the alarm
+    would stop ringing while the inconsistency stayed.
+
+    Missing stores are an OBSTACLE, never a skip. `execution_store` /
+    `worker_repos` being `None` while an intent exists means this process cannot
+    finish an operation an earlier one started — a park, exactly like
+    `_dispatch_recut`'s `recut_unavailable`, and emphatically not a quiet return
+    that would leave the intent to be reported as reconciled by nobody.
+    """
+    if execution_store is None or worker_repos is None:
+        return SplitAcceptance(
+            intent=intent,
+            obstacle=(
+                "this loop has no execution store and worker-repository manager "
+                "configured, so it cannot retire the parent's record and worker "
+                "repository — and an accepted split with either half left behind "
+                "is the inconsistency the intent exists to prevent"
+            ),
+        )
+
+    # THE TRIAL. `_split_registry_mutation` raises on anything the graph refuses,
+    # and half of it (`add_many`) would already have landed in memory by then —
+    # so it is proved on a throwaway copy first and only then applied to the live
+    # registry. Same rule `_retirement_rewrites` follows one level down: validate
+    # the whole mutation, mutate nothing, then apply.
+    try:
+        trial = TaskRegistry.from_dict(registry.to_dict())
+        _split_registry_mutation(trial, intent)
+    except (TaskGraphError, StateError) as exc:
+        return SplitAcceptance(
+            intent=intent,
+            obstacle=(
+                f"the registry will not accept this split ({getattr(exc, 'code', 'error')}: "
+                f"{exc}) — nothing was changed"
+            ),
+        )
+
+    parent_was_retired = registry.get(intent.parent_id).status == "retired"
+    try:
+        added = _split_registry_mutation(registry, intent)
+    except (TaskGraphError, StateError) as exc:  # pragma: no cover - the trial ran
+        return SplitAcceptance(
+            intent=intent,
+            obstacle=f"the registry refused the split after accepting a trial of it: {exc}",
+        )
+    registry_saved = False
+    if added or not parent_was_retired:
+        try:
+            task_store.save(registry)
+        except OSError as exc:
+            return SplitAcceptance(
+                intent=intent,
+                obstacle=f"the task registry could not be saved ({exc})",
+                successors_added=added,
+                parent_retired=not parent_was_retired,
+            )
+        registry_saved = True
+
+    try:
+        retirement = retire_execution(
+            intent.parent_id,
+            execution_store,
+            worker_repos,
+            reason=SPLIT_RETIREMENT_REASON,
+            label=intent.label,
+        )
+    except (GitError, StateError, OSError, ValueError) as exc:
+        return SplitAcceptance(
+            intent=intent,
+            obstacle=(
+                "the parent's execution record and worker repository could not be "
+                f"retired ({exc}) — the registry already records the split, so the "
+                "intent is kept and the next start will finish it"
+            ),
+            successors_added=added,
+            parent_retired=not parent_was_retired,
+            registry_saved=registry_saved,
+        )
+
+    disagreement = _split_disagreement(intent, task_store, execution_store, worker_repos)
+    if disagreement:
+        return SplitAcceptance(
+            intent=intent,
+            obstacle=disagreement,
+            successors_added=added,
+            parent_retired=not parent_was_retired,
+            registry_saved=registry_saved,
+            record_path=retirement.record_path,
+            worker_path=retirement.worker_path,
+        )
+    try:
+        intent_store.clear(intent.parent_id)
+    except OSError as exc:  # pragma: no cover - unwritable state directory
+        return SplitAcceptance(
+            intent=intent,
+            obstacle=(
+                f"every store agrees, but the split intent could not be cleared ({exc}) "
+                "— a later reconciliation will replay it, which is idempotent, but the "
+                "file has to go"
+            ),
+            successors_added=added,
+            parent_retired=not parent_was_retired,
+            registry_saved=registry_saved,
+            record_path=retirement.record_path,
+            worker_path=retirement.worker_path,
+        )
+    return SplitAcceptance(
+        intent=intent,
+        complete=True,
+        successors_added=added,
+        parent_retired=not parent_was_retired,
+        registry_saved=registry_saved,
+        record_path=retirement.record_path,
+        worker_path=retirement.worker_path,
+    )
+
+
+def _split_disagreement(
+    intent: SplitIntent, task_store: TaskStore, execution_store, worker_repos
+) -> str:
+    """Why the three stores do NOT yet describe this accepted split, or `""`.
+
+    Read back from the STORES rather than inferred from what the writes returned,
+    because "no exception escaped" is not the property being claimed. Each
+    unreadable answer is a DISAGREEMENT and never a pass — an execution record
+    this cannot parse is precisely the case where nobody may say the record is
+    gone.
+
+    The registry half deliberately re-reads `tasks.json` instead of asking the
+    in-memory `TaskRegistry`. That object is the one this call just mutated, so
+    asking it whether the mutation happened is asking a question that answers
+    itself; the file is what the NEXT process will read, and it is the file that
+    has to agree before the intent — the only thing that would tell that process
+    to look — is thrown away.
+    """
+    try:
+        registry = task_store.load()
+    except (StateError, OSError) as exc:
+        return f"the task registry could not be read back ({exc})"
+    if registry is None:
+        return "the task registry file is not there to read back"
+    if not registry.has(intent.parent_id):
+        return f"the registry no longer holds parent task '{intent.parent_id}'"
+    parent = registry.get(intent.parent_id)
+    if parent.status != "retired":
+        return (
+            f"parent task '{intent.parent_id}' reads '{parent.status}' rather than "
+            "retired"
+        )
+    if tuple(parent.superseded_by) != intent.successor_ids:
+        return (
+            f"parent task '{intent.parent_id}' is retired naming "
+            f"{list(parent.superseded_by)} rather than {list(intent.successor_ids)}"
+        )
+    missing = [s for s in intent.successor_ids if not registry.has(s)]
+    if missing:
+        return f"the registry is missing successor task(s) {missing}"
+    try:
+        if execution_store.load(intent.parent_id) is not None:
+            return (
+                f"a live execution record for '{intent.parent_id}' is still on disk, "
+                "so the merge window stays shut on work the registry says is retired"
+            )
+    except (StateError, OSError) as exc:
+        return f"the parent's execution record could not be read back ({exc})"
+    try:
+        worker = worker_repos.path_for(intent.parent_id)
+    except (ValueError, OSError) as exc:  # pragma: no cover - a manager that cannot answer
+        return f"the parent's worker repository path could not be resolved ({exc})"
+    if worker.exists():
+        return (
+            f"the parent's worker repository is still at {worker}, where the next "
+            "dispatch would refuse to create one"
+        )
+    return ""
+
+
 def _preemption_stop_reason(target: Task, displaced_id: str, record: dict) -> str:
     """`LoopState.stop_reason` for a preempted session — THREE endings, not two.
 
@@ -1261,6 +1648,15 @@ class Orchestrator:
         self._wanted_decisions = WantedDecisionTally(
             wanted_decisions_file(config.state_dir)
         )
+        #: Split-acceptance intents (`worktask.SplitIntentStore`). DERIVED from
+        #: `config.state_dir` for the reason the two above are, and this one is
+        #: the sharpest case of it: the store's whole job is being READ at the
+        #: start of every round so an interrupted split is finished, and a
+        #: reconciliation that only runs when a construction site remembered to
+        #: pass a store is a reconciliation that is quietly absent in production
+        #: — the guard switching itself off exactly where the crash it covers
+        #: leaves no other trace. Nothing to pass, nothing to forget.
+        self._split_intents = SplitIntentStore(split_intents_dir(config.state_dir))
         #: Persisted operator-facing blocker records (`blockers.py`).
         #: Optional, like every other produce-then-review collaborator:
         #: `None` (many existing tests that hand-build a minimal
@@ -1857,6 +2253,16 @@ class Orchestrator:
 
     def _step_ready(self) -> None:
         state = self.state
+        # BEFORE the strand sweep, and the order is the point: an interrupted
+        # split leaves its parent reading `in_progress` with its execution record
+        # still live, which is exactly the shape `_reconcile_stranded_tasks`
+        # examines — so a sweep that ran first could requeue a task the finished
+        # split is about to retire. Finishing the split first settles the status
+        # the sweep then reads. A park here ends the step (the phase is already
+        # `needs_user` and the state saved), because everything below builds and
+        # sends a packet about a roadmap the loop has just said it cannot trust.
+        if not self._reconcile_split_intents():
+            return
         # FIRST, and before `build_context` reads `next_ready()` below: a task
         # the environment stranded is returned to the pool in time to appear in
         # the very packet that asks what to do next, rather than one round
@@ -5400,18 +5806,7 @@ class Orchestrator:
         # The task's own bookkeeping is gone; so must every pointer this session
         # still holds to it, or a later approval naming the discarded packet
         # would resolve a binding to work that no longer has a record.
-        self._forget_sent_postcommits_for_task(state, task_id)
-        if isinstance(state.task_execution, dict) and (
-            state.task_execution.get("task_id") == task_id
-        ):
-            state.task_execution = None
-        if isinstance(state.current_task, dict) and (
-            state.current_task.get("task_id") == task_id
-        ):
-            state.current_task = None
-        carried = state.carry_postcommit
-        if isinstance(carried, dict) and carried.get("task_id") == task_id:
-            state.carry_postcommit = None
+        self._forget_task_pointers(state, task_id)
 
         if not release.artifacts_retired:
             # The STATUS move is already durable (`release_task_to_pending`
@@ -5456,6 +5851,34 @@ class Orchestrator:
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
+
+    def _forget_task_pointers(self, state: LoopState, task_id: str) -> None:
+        """Drop every pointer this SESSION still holds to `task_id`'s round.
+
+        Called after a transition that files the task's execution record away —
+        a `recut` (which cuts it again) or a `split` (which retires it into
+        successors). Both leave the record gone, and a pointer that outlives it
+        is how a later approval resolves a binding to work that no longer has a
+        record to publish from.
+
+        One method rather than the same four statements at each site, because
+        the set is the interesting part: the sent-packet ledger, the current
+        execution, the current task, and a carried postcommit binding. A second
+        caller open-coding it would inevitably cover three of the four, and the
+        omission would only ever show up as an approval binding to a ghost.
+        """
+        self._forget_sent_postcommits_for_task(state, task_id)
+        if isinstance(state.task_execution, dict) and (
+            state.task_execution.get("task_id") == task_id
+        ):
+            state.task_execution = None
+        if isinstance(state.current_task, dict) and (
+            state.current_task.get("task_id") == task_id
+        ):
+            state.current_task = None
+        carried = state.carry_postcommit
+        if isinstance(carried, dict) and carried.get("task_id") == task_id:
+            state.carry_postcommit = None
 
     def _recut_report(self, directive, task_id, execution, release) -> str:
         """What the loop tells the reviewer after a recut landed.
@@ -5828,6 +6251,14 @@ class Orchestrator:
     def _dispatch_plan(self, directive: Directive) -> None:
         state = self.state
         specs = directive.tasks or ()
+        if directive.split_of:
+            # A plan that REPLACES a task. Its own method rather than a branch
+            # inside the registry write below, because the registry write is one
+            # third of it: the parent's execution record and worker repository
+            # move too, and making those three survive a crash together is the
+            # whole of `apply_split_intent`.
+            self._dispatch_split(directive)
+            return
         try:
             self._registry.add_many(
                 [
@@ -5885,6 +6316,497 @@ class Orchestrator:
         state.consecutive_failures = 0
         state.phase = Phase.READY.value
         self._store.save(state)
+
+    def _dispatch_split(self, directive: Directive) -> None:
+        """Accept `directive`'s plan as a SPLIT of `directive.split_of`: create
+        the successors, retire the parent naming them, and file its execution
+        record and worker repository away — atomically, in the only sense
+        available across three stores that cannot be written together (see
+        `apply_split_intent`).
+
+        Every refusal below happens BEFORE the intent is written and therefore
+        before anything moves at all, and the order is cheapest-and-most-specific
+        first so the reviewer is told the actual reason rather than the first one
+        that happens to fire. The LAST of them is a full trial of the registry
+        mutation on a throwaway copy, so a split the graph would refuse — a
+        cycle, a dependent in progress, a strand — is a denial the reviewer can
+        act on rather than a durable intent that parks the loop every round.
+        """
+        state = self.state
+        parent_id = directive.split_of or ""
+        specs = directive.tasks or ()
+        spec_ids = tuple(s.id for s in specs)
+
+        # FIRST: finish any split an earlier process left half-applied. Two
+        # reasons, and the second is the one that matters. A restart re-enters
+        # `_step_executing` with the same directive, so a crash inside a split
+        # replays THIS method — reconciling first turns that replay into the
+        # idempotent completion of the interrupted attempt instead of a second
+        # attempt at a graph the first one already moved. And a leftover intent
+        # for ANY parent means the registry may not describe what these refusals
+        # are about to read.
+        if not self._reconcile_split_intents():
+            return
+
+        if not spec_ids:
+            # BEFORE everything else, including the already-applied check, and it
+            # is not merely defensive. `_parse_task_specs` refuses an empty
+            # `tasks` list so no parsed directive reaches here with one — but
+            # this method is also reachable from a hand-built `Directive`, and
+            # with no successors the sequence below would retire the parent
+            # naming nothing and create nothing: a split that deletes work.
+            # `SplitIntentStore.load` refuses such a record on the REPLAY path
+            # for the same reason; this is the other half of that pair, covering
+            # the first application, which the store never sees.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "split_no_successors",
+                    f"a split of '{parent_id}' names no successor tasks — that would "
+                    "retire the parent with nothing to continue it, which is a "
+                    "deletion rather than a split. Send the successors in `tasks`. "
+                    "Nothing was changed.",
+                ),
+            )
+            return
+
+        if self._split_already_applied(parent_id, spec_ids):
+            # The replay's ordinary ending: the reconciliation above (or an
+            # earlier one) completed exactly the split this directive asks for.
+            # Reported as done rather than denied — a denial would spend the
+            # denial budget telling the reviewer its directive failed when it
+            # succeeded, which is the correction that cannot be acted on.
+            self._log(
+                "task_split_already_applied",
+                request_id=state.last_response.request_id if state.last_response else None,
+                data={"task_id": parent_id, "successors": list(spec_ids)},
+            )
+            state.outbox = (
+                f"SPLIT ALREADY APPLIED — task {parent_id} is retired and superseded "
+                f"by {', '.join(spec_ids)}.\n\nThis loop was interrupted while "
+                "accepting exactly this split and finished it from its durable "
+                "intent record on the next start, so your directive names work that "
+                "is already done. Nothing was changed a second time.\n\nRoadmap: "
+                f"{self._registry.summary()}\n\nAnswer with your next directive."
+            )
+            state.last_response = None
+            state.consecutive_failures = 0
+            state.phase = Phase.READY.value
+            self._store.save(state)
+            return
+
+        if parent_id == AUDIT_TASK_ID or parent_id.startswith("audit-"):
+            # Refused by NAME rather than by registry lookup, exactly like
+            # `_dispatch_recut`: most audit units are not in the registry, so a
+            # lookup would answer `task_unknown` and send the reviewer looking
+            # for a planning mistake.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "split_audit_unit",
+                    f"'{parent_id}' is an audit unit, not a roadmap task — it is "
+                    "minted per iteration and has no roadmap row to retire, so it "
+                    "cannot be superseded. Plan the tasks without `split_of`. "
+                    "Nothing was changed.",
+                ),
+            )
+            return
+        if not self._registry.has(parent_id):
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "task_unknown",
+                    f"task '{parent_id}' is not in the registry, so there is nothing "
+                    "for these tasks to replace. Plan them without `split_of`, or "
+                    "name the right parent. Nothing was changed.",
+                ),
+            )
+            return
+        if parent_id in spec_ids:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "split_successor_is_parent",
+                    f"'{parent_id}' is named both as the task being split and as one "
+                    "of its successors — a task cannot supersede itself. Give each "
+                    "successor a NEW id. Nothing was changed.",
+                ),
+            )
+            return
+        occupied = [tid for tid in spec_ids if self._registry.has(tid)]
+        if occupied:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "duplicate_task",
+                    f"task id(s) {', '.join(occupied)} already exist, so this split "
+                    "would overwrite planned work rather than create successors. "
+                    "Choose new ids. Nothing was changed.",
+                ),
+            )
+            return
+        parent = self._registry.get(parent_id)
+        if parent.status not in _SPLITTABLE_STATUSES:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "split_parent_not_splittable",
+                    f"task '{parent_id}' reads '{parent.status}', and a split may "
+                    "only replace work that is queued or in flight. A completed or "
+                    "shipped task's work already landed, a retired one was already "
+                    "superseded, and a blocked one is a question somebody has to "
+                    "answer first. Nothing was changed.",
+                ),
+            )
+            return
+        if self._execution_store is None or self._worker_repos is None:
+            # BOTH halves are required, and for `_dispatch_recut`'s reason:
+            # `retire_execution` quarantines only `if worker_repos is not None`,
+            # so without one this would retire the parent in the registry, report
+            # success, and leave its worker repo exactly where the next dispatch
+            # looks — an accepted split that is inconsistent from the first
+            # instant, which is the whole thing this task exists to prevent.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "split_unavailable",
+                    "this loop has no execution store and worker-repository manager "
+                    "configured, so it cannot retire the parent's record and worker "
+                    "repository — and retiring the roadmap row alone is worse than "
+                    "retiring nothing. Nothing was changed.",
+                ),
+            )
+            return
+        if state.pending_request is not None:
+            # Defence in depth against a state the ordinary single-request flow
+            # does not reach, and the literal form of the bound `_dispatch_recut`
+            # states: never discard a round while this loop is waiting to hear
+            # about one.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "split_verdict_outstanding",
+                    "this loop is still waiting on a reply to request "
+                    f"'{state.pending_request.request_id}', so a verdict is in "
+                    "flight and no round may be filed away yet. Nothing was changed.",
+                ),
+            )
+            return
+        try:
+            execution = self._execution_store.load(parent_id)
+        except (StateError, OSError) as exc:
+            # Unreadable, NOT absent — the fail-closed reading. A record this
+            # cannot parse may name a published candidate, and archiving it
+            # unread would destroy the only evidence of which.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "split_record_unreadable",
+                    f"task '{parent_id}' has an execution record this loop cannot "
+                    f"read ({exc}), so it cannot be shown safe to file away. An "
+                    "operator has to look at it. Nothing was changed.",
+                ),
+            )
+            return
+        if execution is not None and execution.published_sha:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "split_candidate_published",
+                    f"task '{parent_id}' has ALREADY PUBLISHED candidate "
+                    f"{execution.published_sha[:12]} to "
+                    f"{execution.intended_remote}/{execution.intended_remote_ref} — "
+                    "published work is never retired by this loop. Plan the "
+                    "follow-on tasks without `split_of`. Nothing was changed.",
+                ),
+            )
+            return
+        outstanding = (
+            self._recut_outstanding_verdict(state, parent_id, execution.candidate_sha)
+            if execution is not None
+            else ""
+        )
+        if outstanding:
+            # The same helper `recut` uses, and the same hazard: a candidate this
+            # loop presented under a request this reply does not answer can still
+            # be approved, so filing its record away would destroy work whose
+            # verdict is in flight.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "split_verdict_outstanding",
+                    f"candidate {execution.candidate_sha[:12]} for task "
+                    f"'{parent_id}' was presented for review under request "
+                    f"'{outstanding}', which this reply does not answer — so an "
+                    "approval for it can still arrive. Judge that packet first, then "
+                    "split if the task is still too big. Nothing was changed.",
+                ),
+            )
+            return
+
+        intent = SplitIntent.create(
+            parent_id,
+            [
+                SplitSuccessor(
+                    id=s.id,
+                    title=s.title,
+                    description=s.description,
+                    depends_on=s.depends_on,
+                    approved_paths=s.approved_paths,
+                )
+                for s in specs
+            ],
+            retirement_reason=SPLIT_RETIREMENT_REASON,
+            reason=_split_retirement_reason(spec_ids, directive.reason),
+        )
+        # THE TRIAL, and it is the last refusal for a reason: it is the only one
+        # that needs the whole mutation, and running it here means a graph
+        # refusal (a cycle a successor's `depends_on` closes, a direct dependent
+        # mid-round, a strand) reaches the reviewer as a denial it can answer —
+        # instead of becoming a durable intent that can never apply and parks the
+        # loop on every subsequent round.
+        try:
+            _split_registry_mutation(
+                TaskRegistry.from_dict(self._registry.to_dict()), intent
+            )
+        except (TaskGraphError, StateError) as exc:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    getattr(exc, "code", "split_refused"),
+                    f"{exc}. The split was refused before anything moved, so the "
+                    "registry, the task's execution record and its worker "
+                    "repository are all untouched.",
+                ),
+            )
+            return
+
+        try:
+            self._split_intents.save(intent)
+        except OSError as exc:
+            # Nothing has moved: the intent is written BEFORE the first store,
+            # so a loop that cannot write it simply does not start the split.
+            # Parked rather than denied — the reviewer cannot fix an unwritable
+            # state directory, and proceeding without the record would be
+            # performing exactly the unrecoverable operation this task removes.
+            state.last_response = None
+            self._to_needs_user(
+                f"task {parent_id}: the split could not be started because its "
+                f"durable intent record could not be written ({exc}). Nothing was "
+                "changed — the registry, the execution record and the worker "
+                "repository are all as they were. Fix the state directory and "
+                "restart.",
+                kind="loop_fatal",
+                code="split_intent_unwritable",
+                task_id=parent_id,
+                detail=f"path={self._split_intents.path_for(parent_id)} error={exc}",
+            )
+            return
+        self._finish_split(directive, intent, execution)
+
+    def _finish_split(self, directive, intent: SplitIntent, execution) -> None:
+        """Apply `intent` through the reconciler and report what happened.
+
+        The ONE application path: the happy path and the crash replay both come
+        through `apply_split_intent`, so there is no second implementation of the
+        sequence to drift from the one the reconciliation runs.
+        """
+        state = self.state
+        result = apply_split_intent(
+            intent,
+            registry=self._registry,
+            task_store=self._task_store,
+            execution_store=self._execution_store,
+            worker_repos=self._worker_repos,
+            intent_store=self._split_intents,
+        )
+        self._log(
+            "task_split",
+            request_id=state.last_response.request_id if state.last_response else None,
+            data={
+                "task_id": intent.parent_id,
+                # The reviewer's OWN words for why, kept verbatim: this is the
+                # transition's only account of itself.
+                "reason": directive.reason,
+                "wanted_decision": directive.wanted_decision,
+                "successors": list(intent.successor_ids),
+                "successors_added": list(result.successors_added),
+                "label": intent.label,
+                "discarded_candidate": getattr(execution, "candidate_sha", "") or "",
+                "archived_record": str(result.record_path or ""),
+                "quarantined_worker": str(result.worker_path or ""),
+                "complete": result.complete,
+                "obstacle": result.obstacle,
+            },
+        )
+        # The parent's record is filed away (or partly so, on the failure branch),
+        # so every pointer this session holds to its round has to go with it.
+        self._forget_task_pointers(state, intent.parent_id)
+        if not result.complete:
+            self._park_split_intent(intent.parent_id, result.obstacle, "split_incomplete")
+            return
+        state.outbox = self._split_report(directive, intent, result, execution)
+        state.last_response = None
+        state.consecutive_failures = 0
+        state.phase = Phase.READY.value
+        self._store.save(state)
+
+    def _split_already_applied(self, parent_id: str, spec_ids: tuple[str, ...]) -> bool:
+        """Is the split this directive describes ALREADY exactly on record?
+
+        True only when every part of it holds: the parent is retired, superseded
+        by precisely these ids in precisely this order, and each one is a task in
+        the graph. Anything weaker would report a DIFFERENT split (or a plain
+        retirement) as this one's success — so a parent retired into other
+        successors falls through to the `split_parent_not_splittable` refusal,
+        which is the honest answer.
+
+        Deliberately does NOT consult the intent store: this runs after
+        `_reconcile_split_intents`, so an intent still on disk means that
+        reconciliation parked and the caller already returned.
+        """
+        if not self._registry.has(parent_id):
+            return False
+        parent = self._registry.get(parent_id)
+        if parent.status != "retired" or tuple(parent.superseded_by) != spec_ids:
+            return False
+        return all(self._registry.has(tid) for tid in spec_ids)
+
+    def _reconcile_split_intents(self) -> bool:
+        """Finish every split-acceptance intent left on disk. False means the
+        loop PARKED and the caller must return immediately.
+
+        Run at the top of `_step_ready` (so a restart in any phase reaches it
+        before the next packet is built) and at the top of `_dispatch_split` (so
+        a crash INSIDE a split, which replays the same directive, completes the
+        interrupted attempt instead of starting a second one).
+
+        `apply_split_intent` is idempotent to a fixed point, so a run with
+        nothing outstanding costs one directory listing and a run over a
+        completed split costs a few reads. There is deliberately no "have I
+        already reconciled this session" flag: the cost of asking is negligible
+        and a flag is one more thing that can be wrong.
+
+        **An intent that cannot be READ parks, and an intent that cannot be
+        COMPLETED parks.** Neither is skipped and neither is cleared. Skipping
+        would leave the loop running with a registry, an execution record and a
+        worker repository that may already disagree — with nothing saying so,
+        which is the failure mode the record exists to make impossible.
+        """
+        try:
+            parent_ids = self._split_intents.parent_ids()
+        except (StateError, OSError) as exc:
+            # An unlistable directory is not an empty one. Reading it as empty
+            # would silently skip an interrupted split — the check going quiet
+            # exactly where it cannot see — so it parks instead.
+            self.state.last_response = None
+            self._to_needs_user(
+                "the split-intent directory cannot be listed, so this loop cannot "
+                "tell whether a split was interrupted: "
+                f"{exc}. Nothing was changed. Fix the state directory and restart.",
+                kind="loop_fatal",
+                code="split_intent_dir_unreadable",
+                detail=f"directory={self._split_intents.directory} error={exc}",
+            )
+            return False
+        if not parent_ids:
+            return True
+        state = self.state
+        for parent_id in parent_ids:
+            try:
+                intent = self._split_intents.load(parent_id)
+            except (StateError, OSError) as exc:
+                self._park_split_intent(
+                    parent_id,
+                    f"its split intent record cannot be read ({exc})",
+                    "split_intent_unreadable",
+                )
+                return False
+            if intent is None:  # pragma: no cover - listed, then removed underneath
+                continue
+            result = apply_split_intent(
+                intent,
+                registry=self._registry,
+                task_store=self._task_store,
+                execution_store=self._execution_store,
+                worker_repos=self._worker_repos,
+                intent_store=self._split_intents,
+            )
+            self._forget_task_pointers(state, parent_id)
+            self._log(
+                "task_split_reconciled",
+                data={
+                    "task_id": parent_id,
+                    "successors": list(intent.successor_ids),
+                    "successors_added": list(result.successors_added),
+                    "parent_retired_now": result.parent_retired,
+                    "registry_saved": result.registry_saved,
+                    "archived_record": str(result.record_path or ""),
+                    "quarantined_worker": str(result.worker_path or ""),
+                    "label": intent.label,
+                    "complete": result.complete,
+                    "obstacle": result.obstacle,
+                },
+            )
+            if not result.complete:
+                self._park_split_intent(parent_id, result.obstacle, "split_incomplete")
+                return False
+        self._store.save(state)
+        return True
+
+    def _park_split_intent(self, parent_id: str, obstacle: str, code: str) -> None:
+        """Park on a split that could not be completed, naming the intent file.
+
+        `loop_fatal`, not `task_fatal`, and the classification is the argument: a
+        `task_fatal` park quarantines the task and lets continuous mode carry on
+        with the rest of the roadmap, but what is wrong here is the ROADMAP —
+        three stores may disagree about whether a task exists — and the parent
+        may already be retired, which `TaskRegistry.block` refuses outright. The
+        loop stops and an operator reads the blocker.
+        """
+        self.state.last_response = None
+        path = self._split_intents.path_for(parent_id)
+        self._to_needs_user(
+            f"task {parent_id}: an accepted split could not be completed — "
+            f"{obstacle}. Its durable intent is at {path}: it names the successors "
+            "and the one retirement label, and replaying it is safe (every step is "
+            "idempotent), so the loop will finish the split by itself once whatever "
+            "the message above names is fixed. Delete that file instead if the split "
+            "should not happen at all. Until one of those, the registry, the task's "
+            "execution record and its worker repository may disagree about it.",
+            kind="loop_fatal",
+            code=code,
+            task_id=parent_id,
+            detail=f"split_intent={path} obstacle={obstacle}",
+        )
+
+    def _split_report(self, directive, intent: SplitIntent, result, execution) -> str:
+        """What the loop tells the reviewer after a split landed.
+
+        Built here rather than from a `prompts.TEMPLATES` entry for
+        `_recut_report`'s reason: it states things no template shape covers —
+        which task stopped existing as work, which tasks continue it, and where
+        the retired round was filed — and a reviewer that cannot see the last of
+        those cannot tell a split from a deletion.
+        """
+        candidate = getattr(execution, "candidate_sha", "") or ""
+        return (
+            f"SPLIT APPLIED — task {intent.parent_id} is retired and superseded by "
+            f"{', '.join(intent.successor_ids)}.\n\n"
+            f"Your reason: {directive.reason}\n\n"
+            f"Added {len(result.successors_added)} task(s) to the roadmap and retired "
+            f"{intent.parent_id} naming them, in one registry write.\n"
+            "Nothing was deleted: its execution record was archived to "
+            f"{result.record_path or '(no record on disk)'} and its worker repository "
+            f"quarantined at {result.worker_path or '(no worker on disk)'}, both under "
+            f"the label {intent.label}"
+            + (f" (candidate {candidate[:12]} is in there)." if candidate else ".")
+            + "\n\nThe parent is terminal: it satisfies no dependency and there is no "
+            "un-retire, so anything that was waiting on it now waits on the "
+            "successors instead. Each successor is an ordinary READY task with its "
+            "own scope — `implement` one when you are ready.\n\nRoadmap: "
+            f"{self._registry.summary()}"
+        )
 
     def _refused_ahead_of_urgent(self, directive: Directive, is_audit: bool) -> bool:
         """Refuse an executor dispatch that would run ahead of the urgent pin.

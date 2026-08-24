@@ -1252,8 +1252,26 @@ def test_contract_stays_within_its_budget():
     "unsalvageable" means, how the cap survives the retirement that charges it,
     and the whole argument for the wanted-verb field. Those are in
     `docs/AUTOLOOP.md` §9g and in the source comments — the reviewer needs the
-    RULE every turn and the reasoning never."""
-    assert len(CONTRACT_INSTRUCTIONS) <= 4550
+    RULE every turn and the reasoning never.
+
+    **The ceiling moved a second time (split-02, 2026-08-24), to 4,750.** A new
+    top-level KEY — `split_of`, three lines under `tasks` — is the same "genuine
+    new requirement" recut-01 paid for: a reviewer that is never told a plan can
+    REPLACE a task will keep asking for a `revise` of one that is too big, which
+    is the situation exec-01 spent seven revise verdicts in. Hand-summed at +228
+    over recut-01's hand-summed 4,478, so a hand sum on a hand sum: the number
+    that is OBSERVED is asserted by
+    `test_task_split.test_the_contract_instruction_ceiling_is_not_slack`, which
+    bounds the HEADROOM as well as the length and prints the measured value on
+    failure, so the next executor to touch this text gets a real reading instead
+    of continuing the chain of estimates.
+
+    Nothing was paid for out of it beyond the rule itself: why a key on `plan`
+    rather than a tenth decision, what "atomically" means across three stores,
+    and which crash point leaves which state are all in the source comments and
+    in `orchestrator.apply_split_intent`'s docstring, which cost nothing per
+    turn."""
+    assert len(CONTRACT_INSTRUCTIONS) <= 4750
 
 
 def test_preference_clause_has_its_own_tighter_budget():

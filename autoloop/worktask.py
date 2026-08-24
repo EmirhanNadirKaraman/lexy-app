@@ -2,7 +2,7 @@
 marker that lets a crash between "commit ran" and "the SHA was persisted" be
 reconciled safely.
 
-Two things live here.
+Three things live here.
 
 **`TaskExecution`** is the per-task bookkeeping record: which branch and
 worktree the task ran in, the base sha recorded BEFORE any implementation
@@ -51,12 +51,27 @@ available; the risk is bounded by how narrow "same parent + subset of a
 specific planned path list" actually is). Anything looser than that — a
 different parent, extra parents, or so much as one path outside the plan —
 is AMBIGUOUS and parked for the operator rather than guessed at.
+
+**`SplitIntent`** is the same idea one operation up (split-02, 2026-08-24).
+Accepting a split plan has to move THREE stores that cannot be written
+together — the task registry, the parent's execution record, and its worker
+repository — so no ordering of those writes has a crash point that is merely
+stale rather than self-contradictory. This record is written durably BEFORE
+the first of them and cleared only after all three have been observed to
+agree, which turns "prevent the window" (impossible) into "finish whatever was
+half-done" (`orchestrator.apply_split_intent`, re-run at every `_step_ready`).
+It carries the FULL successor definitions and the ONE retirement label, so a
+replay adds exactly the tasks the interrupted attempt was adding and files
+both halves of the retirement under exactly the same name. See
+`orchestrator.apply_split_intent` for the crash-point table and for why
+rerun-only recovery and write reordering were both rejected.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import os
 from dataclasses import asdict, dataclass, field
@@ -910,11 +925,37 @@ class Retirement:
     worker_path: Path | None = None
 
 
+#: What a retirement label may be made of. It becomes a path COMPONENT twice —
+#: `executions/archive/<task_id>-<label>.json` and
+#: `quarantine/<task_id>-<label>` — so a label carrying `/` or `..` would write
+#: outside the directory that owns it. Every label this module MAKES is safe by
+#: construction; this exists for the one that arrives from a record on disk
+#: (`SplitIntent.label`, which a hand edit can reach) and is enforced there, at
+#: load, rather than here, where a raise would be inside a retirement that has
+#: already started.
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+
+
+def retirement_label(reason: str) -> str:
+    """`<reason>-<compact UTC stamp>` — the ONE label both halves of a
+    retirement are filed under.
+
+    Extracted from `retire_execution` so a caller that must record the label
+    BEFORE the retirement runs (a durable split intent, whose whole purpose is
+    that a replay files under the same name) derives it from the same function
+    rather than reimplementing the format. A second speller is how the archived
+    record and the quarantined worker stop naming each other.
+    """
+    stamp = utcnow_iso().replace("+00:00", "Z").replace(":", "").replace("-", "")
+    return f"{reason}-{stamp}"
+
+
 def retire_execution(
     task_id: str,
     execution_store: TaskExecutionStore,
     worker_repos,
     reason: str = "released-by-operator",
+    label: str = "",
 ) -> Retirement:
     """Retire BOTH halves of a task's execution — the `TaskExecution` record
     AND the worker repository that produced it — under ONE label, in one call.
@@ -951,9 +992,20 @@ def retire_execution(
     `WorkerRepoManager.create` refuses to write into an existing directory and
     parks with a message naming it. Order the risk so the surviving failure is
     the one that reports itself.
+
+    **`label` is the caller's, when it has one.** Empty (every existing caller)
+    derives one here exactly as before, from `reason` plus a whole-second
+    timestamp. A caller that supplies one is a caller that recorded it durably
+    BEFORE this ran and may have to run this AGAIN after a crash
+    (`orchestrator.apply_split_intent`): a freshly derived label on the replay
+    would file the second half of one retirement under a different name than the
+    first — breaking exactly the pairing the shared label exists for — and could
+    collide with the first attempt's destination, which both halves refuse
+    rather than clobber. Passing the SAME label back makes the replay idempotent
+    instead: `archive` returns `None` once the record has moved, and the worker
+    is quarantined only `if … exists()`.
     """
-    stamp = utcnow_iso().replace("+00:00", "Z").replace(":", "").replace("-", "")
-    label = f"{reason}-{stamp}"
+    label = label or retirement_label(reason)
     record_path = execution_store.archive(task_id, label)
     worker_path = None
     if worker_repos is not None and worker_repos.path_for(task_id).exists():
@@ -1182,3 +1234,276 @@ def reconcile_after_crash(
         # subset of the plan", it is not the planned work at all.
         return Reconciliation.AMBIGUOUS
     return Reconciliation.RECOVERABLE
+
+
+def split_intents_dir(state_dir: Path) -> Path:
+    """Where a split-acceptance intent lives: one JSON file per PARENT task id.
+
+    A DIFFERENT directory from `AutoloopConfig.intents_dir`, deliberately.
+    `IntentStore` already keys `<task_id>.json` there for the commit intent, and
+    a task being split is very often holding one — same filename, same
+    directory, and the second writer would destroy the first without an error.
+    Two questions, two directories.
+
+    A function over `state_dir` rather than a new `AutoloopConfig` property,
+    because `autoloop/config.py` is not this change's to edit and because the
+    reasoning `Orchestrator.__init__` already gives for `StopRepetitionStore`
+    applies with more force here: a reconciliation that only runs when a
+    construction site remembered to pass a store is a reconciliation that is
+    quietly absent in production. Every Orchestrator that ran `__init__` has one.
+    """
+    return Path(state_dir) / "split-intents"
+
+
+@dataclass(frozen=True)
+class SplitSuccessor:
+    """One task a split will create, as the intent records it.
+
+    The FULL definition and not just an id, because the crash this record exists
+    for can land before the registry write: a replay that knew only the ids
+    could not re-create the tasks, and one that re-read them from the directive
+    would be reading a message the restarted process no longer has.
+
+    Deliberately the same five fields `contract.TaskSpec` carries, so the
+    reconciler builds a `tasks.Task` from this exactly as `_dispatch_plan` builds
+    one from a spec — no field that a split could set and an ordinary plan could
+    not.
+    """
+
+    id: str
+    title: str
+    description: str
+    depends_on: tuple[str, ...] = ()
+    approved_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SplitIntent:
+    """The durable record of a split that is being accepted, or was interrupted.
+
+    Written before the FIRST of the three participating stores is touched and
+    cleared only after all three have been read back and found to agree
+    (`orchestrator.apply_split_intent`). Between those two moments its presence
+    means exactly one thing: some prefix of the acceptance may have happened, and
+    nothing may be assumed about which.
+
+    `label` is the whole retirement label, fixed here rather than derived at
+    retirement time — see `retire_execution`'s `label` parameter for why a replay
+    that re-derived it would break the pairing it exists to keep.
+    """
+
+    parent_id: str
+    successors: tuple[SplitSuccessor, ...]
+    label: str
+    #: The prose half of the parent's retirement record (`Task.blocked_reason`).
+    #: Stored so a replay writes the SAME reason: `TaskRegistry.retire` refuses a
+    #: repeat that would reword a recorded retirement, so a reconstructed reason
+    #: would turn an idempotent replay into a refusal.
+    reason: str = ""
+    created_at: str = field(default_factory=utcnow_iso)
+
+    @property
+    def successor_ids(self) -> tuple[str, ...]:
+        return tuple(s.id for s in self.successors)
+
+    @classmethod
+    def create(
+        cls,
+        parent_id: str,
+        successors: Sequence[SplitSuccessor],
+        *,
+        retirement_reason: str,
+        reason: str = "",
+    ) -> "SplitIntent":
+        """Build an intent with its label already fixed, from the same helper
+        `retire_execution` would have used."""
+        return cls(
+            parent_id=parent_id,
+            successors=tuple(successors),
+            label=retirement_label(retirement_reason),
+            reason=reason,
+        )
+
+
+def _successor_from_raw(parent_id: str, raw: object) -> SplitSuccessor:
+    """One `SplitSuccessor` off a stored intent, or `StateCorruptError`.
+
+    Explicit rehydration rather than `SplitIntent(**data)`, for the reason
+    `TaskExecution.attempt_ledger` documents about nested dataclasses: the
+    constructor would happily store a dict here and every reader downstream
+    would then see a `dict` where it typed a `SplitSuccessor`. Shape is checked
+    on the way in — a split intent is replayed without the directive that
+    produced it, so this file IS the authorization for creating those tasks.
+    """
+    if not isinstance(raw, dict):
+        raise StateCorruptError(
+            f"split intent for '{parent_id}' has a successor that is not an object"
+        )
+    unknown = set(raw) - {"id", "title", "description", "depends_on", "approved_paths"}
+    if unknown:
+        raise StateCorruptError(
+            f"split intent for '{parent_id}' has unknown successor keys: {sorted(unknown)}"
+        )
+    for key in ("id", "title", "description"):
+        value = raw.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise StateCorruptError(
+                f"split intent for '{parent_id}' has a successor whose '{key}' is "
+                f"not a non-empty string: {value!r}"
+            )
+    lists: dict[str, tuple[str, ...]] = {}
+    for key in ("depends_on", "approved_paths"):
+        value = raw.get(key, ())
+        # A bare string is iterable, which is the per-character split
+        # `tasks._persisted_superseded_by` documents; refuse it by TYPE.
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise StateCorruptError(
+                f"split intent for '{parent_id}' has a successor whose '{key}' is "
+                f"not a list: {value!r}"
+            )
+        if not all(isinstance(item, str) and item.strip() for item in value):
+            raise StateCorruptError(
+                f"split intent for '{parent_id}' has a successor whose '{key}' "
+                "contains something that is not a non-empty string"
+            )
+        lists[key] = tuple(value)
+    return SplitSuccessor(
+        id=raw["id"],
+        title=raw["title"],
+        description=raw["description"],
+        depends_on=lists["depends_on"],
+        approved_paths=lists["approved_paths"],
+    )
+
+
+class SplitIntentStore:
+    """One JSON file per PARENT task id under `directory`.
+
+    A corrupt or malformed intent RAISES (`StateCorruptError`) rather than
+    reading as absent, for the reason `IntentStore` gives and one sharper: the
+    absence of a file here means "no split was in flight", so reading a file it
+    cannot parse as absent would let the loop carry on with a registry, an
+    execution record and a worker repository that may already disagree — the
+    exact state this record exists to reconcile. The caller parks on it.
+    """
+
+    def __init__(self, directory: Path):
+        self.directory = Path(directory)
+
+    def _path(self, parent_id: str) -> Path:
+        return self.directory / f"{parent_id}.json"
+
+    def path_for(self, parent_id: str) -> Path:
+        """Where this store keeps `parent_id`'s intent, whether or not one is
+        there. Named so a caller reporting an unreadable record to an operator
+        does not spell `<parent_id>.json` a second time."""
+        return self._path(parent_id)
+
+    def save(self, intent: SplitIntent) -> None:
+        data = asdict(intent)
+        data["successors"] = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "description": s.description,
+                "depends_on": list(s.depends_on),
+                "approved_paths": list(s.approved_paths),
+            }
+            for s in intent.successors
+        ]
+        _atomic_write_json(self._path(intent.parent_id), data)
+
+    def load(self, parent_id: str) -> SplitIntent | None:
+        path = self._path(parent_id)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise StateCorruptError(f"split intent {path} is unreadable: {exc}") from exc
+        if not isinstance(data, dict):
+            raise StateCorruptError(f"split intent {path} is not a JSON object")
+        stored_id = data.get("parent_id")
+        # The filename and the record must agree. They can only disagree by a
+        # hand edit or a rename, and either way the reconciler would then apply
+        # one task's split while the operator believes it is looking at
+        # another's.
+        if stored_id != parent_id:
+            raise StateCorruptError(
+                f"split intent {path} names parent {stored_id!r}, not {parent_id!r}"
+            )
+        label = data.get("label")
+        if not isinstance(label, str) or not LABEL_RE.match(label):
+            # A label becomes a path component twice. Refused HERE rather than
+            # inside `retire_execution`, which by then has already started.
+            raise StateCorruptError(
+                f"split intent {path} has an unusable retirement label {label!r} — "
+                "it must match "
+                f"{LABEL_RE.pattern}"
+            )
+        raw_successors = data.get("successors")
+        if not isinstance(raw_successors, list) or not raw_successors:
+            raise StateCorruptError(
+                f"split intent {path} names no successors — a split that creates "
+                "nothing is not a split, and replaying it would retire the parent "
+                "with nothing to continue it"
+            )
+        successors = tuple(
+            _successor_from_raw(parent_id, raw) for raw in raw_successors
+        )
+        seen: set[str] = set()
+        for successor in successors:
+            if successor.id in seen:
+                raise StateCorruptError(
+                    f"split intent {path} names successor {successor.id!r} twice"
+                )
+            if successor.id == parent_id:
+                raise StateCorruptError(
+                    f"split intent {path} names the parent {parent_id!r} as its own "
+                    "successor"
+                )
+            seen.add(successor.id)
+        reason = data.get("reason", "")
+        if not isinstance(reason, str):
+            raise StateCorruptError(f"split intent {path} has a non-string reason")
+        created_at = data.get("created_at", "")
+        if not isinstance(created_at, str):
+            raise StateCorruptError(f"split intent {path} has a non-string created_at")
+        return SplitIntent(
+            parent_id=parent_id,
+            successors=successors,
+            label=label,
+            reason=reason,
+            created_at=created_at,
+        )
+
+    def clear(self, parent_id: str) -> None:
+        self._path(parent_id).unlink(missing_ok=True)
+
+    def parent_ids(self) -> tuple[str, ...]:
+        """Every parent id this store currently holds an intent for, sorted.
+
+        A MISSING directory is `()` — that is the ordinary state of a loop that
+        has never split anything, and it is not corruption.
+
+        An UNLISTABLE one raises, and the distinction is the whole point: an
+        empty answer here means "no split was in flight", which is the fact the
+        entire mechanism turns on. Swallowing an `OSError` into `()` would be the
+        guard switching itself off exactly where it cannot see — a permission or
+        I/O fault on the state directory would silently skip an interrupted
+        split, and nothing anywhere would say so.
+
+        An unreadable FILE is deliberately not this method's business: it reports
+        the id and `load` raises on it, so a file that cannot be parsed still
+        reaches the caller as a park rather than being dropped from the listing.
+        """
+        try:
+            if not self.directory.exists():
+                return ()
+            return tuple(sorted(p.stem for p in self.directory.glob("*.json")))
+        except OSError as exc:
+            raise StateCorruptError(
+                f"the split-intent directory {self.directory} cannot be listed "
+                f"({exc}) — an unlistable directory is not an empty one, and "
+                "reading it as empty would silently skip an interrupted split"
+            ) from exc
