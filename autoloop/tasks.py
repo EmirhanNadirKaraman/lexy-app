@@ -492,6 +492,38 @@ def _persisted_shipped_commits(raw: dict) -> tuple[str, ...]:
         raise StateCorruptError(f"task file has invalid shipped_commits: {exc}") from exc
 
 
+def _persisted_recut_count(raw: dict) -> int:
+    """`recut_count` off a stored row, validated, as an int.
+
+    Same authority as `_persisted_shipped_commits` above — `from_dict` bypasses
+    `add_many`, so this is the only gate a stored or hand-edited row passes —
+    and the same fail-closed ending, for a sharper reason: this number is the
+    ONLY bound on a destructive action the reviewer can take by itself
+    (`contract.Decision.RECUT`). Reading a value it cannot trust as 0 would not
+    merely lose information, it would silently hand back the whole allowance.
+
+    A MISSING key, and an explicit `null`, both default to 0: that is every
+    `tasks.json` written before this field existed, and it is not malformed —
+    such a row genuinely has never been recut, because nothing could recut it.
+
+    Everything else raises. `True` is refused explicitly because `bool` is an
+    `int` in Python and `True >= 2` is a legal comparison answering False —
+    exactly the quiet wrong answer this rejects. A negative is refused because
+    no writer produces one and honouring `-1000` would postpone the cap by a
+    thousand cuts, which is the guard switched off by a plausible-looking
+    number rather than by an error.
+    """
+    value = raw.get("recut_count", 0)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise StateCorruptError(
+            f"task file has an invalid recut_count {value!r} for task "
+            f"{raw.get('id')!r} — it must be a non-negative integer"
+        )
+    return value
+
+
 def _shipped_hint(task: "Task") -> str:
     """A parenthetical naming the carrying commits, empty when none is recorded:
     ` (shipped under 4f2a9c1b3d5e, 9b1c…)`.
@@ -932,6 +964,30 @@ class Task:
     #: ancestry check is — but it is what tells a reader whether they are
     #: looking at a claim made before or after the base moved.
     shipped_at: str = ""
+    #: How many times a reviewer `recut` has discarded this task's execution and
+    #: sent it back to be cut again from the base (recut-01, 2026-08-24).
+    #: Incremented by `recut` below, and by nothing else.
+    #:
+    #: THE DURABLE COUNT, and the reason it lives here rather than only on the
+    #: execution record the cap is nominally "enforced on". A recut ARCHIVES
+    #: that record (`worktask.retire_execution`) and the next dispatch writes a
+    #: fresh one, so a counter kept solely there would read 0 on every cut and
+    #: the cap would enforce nothing — a guard that switches itself off exactly
+    #: when it is needed. `worktask.TaskExecution.recut_count` mirrors this for
+    #: the reviewer and the operator to read; `orchestrator._recut_count_for`
+    #: takes the HIGHER of the two, so neither copy can lower the count.
+    #:
+    #: NEVER reset. Two clean rebuilds that still could not produce a reviewable
+    #: candidate is evidence about the SPECIFICATION, and that evidence has to
+    #: survive the very operation it is bounding. An operator who decides a task
+    #: deserves another cut edits `tasks.json` with the loop stopped, which is a
+    #: deliberate, visible act — exactly what handing a destructive verb to the
+    #: reviewer is not allowed to be.
+    #:
+    #: New field with a default, same backward-compatible pattern as the fields
+    #: above, plus `_persisted_recut_count`, which REFUSES a stored value it
+    #: cannot read rather than defaulting it to 0.
+    recut_count: int = 0
 
 
 #: The repository trackers every task may update, WITHOUT naming them in its
@@ -1838,26 +1894,154 @@ class TaskRegistry:
             by_stored_status=True,
         )
 
-    def _return_to_pending(
-        self, task_id: str, *, verb: str, remedy: str, by_stored_status: bool = False
-    ) -> Task:
-        """The one status move behind `release` and `shelve`, and the one
-        refusal. Both verbs mean "this in-progress round is over for now", and
-        there is exactly one way to be pending, so letting them keep two copies
-        of this assignment would be a bug in whichever one drifted.
+    def recut_obstacle(self, task_id: str) -> TaskGraphError | None:
+        """Why `recut` would refuse `task_id`, or `None` when it would move it.
 
-        `by_stored_status` is the single documented difference between them —
+        The ASKABLE form of the refusal, split out for the reason
+        `unblock_obstacle` is: `orchestrator._dispatch_recut` has to tell the
+        reviewer WHY before it performs anything destructive, and a caller that
+        learned the answer by attempting the move and catching the exception
+        would already have charged a cut by the time it knew. One set of rules,
+        two readers, no second copy to drift.
+
+        Raises `task_unknown` for an id that is not in the graph rather than
+        answering `None`, so a caller cannot ask about a typo and read the
+        silence as "eligible" — the same fail-closed reading `stranded_dependents`
+        takes.
+        """
+        task = self.get(task_id)
+        if task.status == "blocked" and task.hold_origin == HOLD_ORIGIN_OPERATOR:
+            # Its own arm, ahead of the status test below, because that test
+            # ACCEPTS `blocked`: without this the reviewer could release an
+            # operator's hold by naming it in a recut, which is exactly the
+            # laundering `blocker_derived_blocked` exists to prevent.
+            return TaskGraphError(
+                "task_operator_hold",
+                f"task '{task_id}' is held by the operator "
+                f"({task.blocked_reason or 'no reason recorded'}) — `recut` "
+                "never releases an operator hold; only the operator does",
+            )
+        if task.status not in ("in_progress", "blocked"):
+            return TaskGraphError(
+                "task_not_in_progress",
+                f"task '{task_id}' has status {task.status!r}, and `recut` only "
+                "discards a round that is in progress or quarantined — there is "
+                "nothing in flight to discard",
+            )
+        return None
+
+    def recut(self, task_id: str) -> Task:
+        """Return a task to pending so its execution can be DISCARDED and cut
+        again from the current base, and charge the cut. The registry half of
+        the reviewer's `recut` verdict (`contract.Decision.RECUT`).
+
+        The third member of the `release` / `shelve` family, and it shares their
+        one status assignment (`_return_to_pending`) for the same reason they
+        share it with each other: there is exactly one way to be pending, and
+        three copies of that line is a bug in whichever one drifts. What differs
+        is entirely what the CALLER does with the artefacts —
+        `orchestrator._dispatch_recut` retires both halves through
+        `worktask.retire_execution`, exactly as `release` does.
+
+        **Its own entry point, and `release` is deliberately untouched.** That
+        method says "Narrow on purpose" and is what `cli._cmd_release` and
+        `Orchestrator._preempt_for_urgent` call; widening it would change
+        behaviour for two callers this has no business changing. The refusal
+        text also has to name the verb the caller actually used.
+
+        **Wider than `release` in exactly one way: it accepts a `blocked` task.**
+        That is not a courtesy, it is the whole point. A contaminated candidate
+        is normally already parked `task_fatal` by the time a recut is warranted
+        — port-01 was `blocked` on `attempt_count_ceiling` when its reviewer
+        reached that conclusion — so a verb that only accepted `in_progress`
+        would refuse precisely when it is needed. Like `shelve`, it reads the
+        STORED status rather than `state_of`: `state_of` answers BLOCKED for an
+        in-progress task with an incomplete dependency, which would again hide
+        the task that is hardest to recover.
+
+        **It never reaches an OPERATOR HOLD.** `status == "blocked"` carries two
+        meanings and they must not be reversible by the same route: a
+        `task_fatal` quarantine is the loop's own record of a failure, while a
+        hold placed through the inbox is a human saying "not this one, not now"
+        and has no blocker record at all. The same test `blocker_derived_blocked`
+        and `_cmd_unblock` already use (`hold_origin != HOLD_ORIGIN_OPERATOR`)
+        keeps this from becoming a way for the reviewer to launder that hold.
+
+        Terminal statuses are refused by `_return_to_pending`'s own reading, so
+        a completed, retired or shipped-elsewhere task cannot be un-finished
+        here any more than it can by `release`.
+
+        The COUNT is charged here rather than by the caller, so it is written in
+        the same object the status move writes and reaches disk in the caller's
+        single `persist()`. A recut that moved the status and then failed to
+        record the cut would hand the task its allowance back.
+        """
+        obstacle = self.recut_obstacle(task_id)
+        if obstacle is not None:
+            raise obstacle
+        moved = self._return_to_pending(
+            task_id,
+            verb="recut",
+            remedy=(
+                "discards an in-progress or quarantined round and cuts the task "
+                "again from the base"
+            ),
+            by_stored_status=True,
+            also_accepts=("blocked",),
+        )
+        # Released is released, exactly as `unblock` treats it: a pending task
+        # has no hold, and a marker left behind here would still be sitting on
+        # the row the next time the loop quarantines it.
+        moved.blocked_reason = ""
+        moved.hold_origin = ""
+        moved.recut_count += 1
+        return moved
+
+    def _return_to_pending(
+        self,
+        task_id: str,
+        *,
+        verb: str,
+        remedy: str,
+        by_stored_status: bool = False,
+        also_accepts: tuple[str, ...] = (),
+    ) -> Task:
+        """The one status move behind `release`, `shelve` and `recut`, and the
+        one refusal. All three verbs mean "this round is over for now", and
+        there is exactly one way to be pending, so letting them keep three
+        copies of this assignment would be a bug in whichever one drifted.
+
+        `by_stored_status` is the first documented difference between them —
         see `shelve`, which explains why it reads `task.status` directly and
         why `release` must keep asking `state_of`. Default False, so a future
         caller that does not think about it gets `release`'s stricter reading.
+
+        `also_accepts` is the second, and it is only ever `("blocked",)`, only
+        ever from `recut` — see that method for why a quarantined task is
+        exactly the one a recut has to be able to reach, and for the operator-
+        hold refusal that runs BEFORE this and is not repeated here. Default
+        empty, so a caller that does not think about it accepts `in_progress`
+        alone. It is deliberately a status LIST rather than a boolean: the
+        refusal below prints what the verb does accept, and a caller that widens
+        the set without widening the message produces a refusal that lies.
         """
+        if also_accepts and not by_stored_status:  # pragma: no cover - caller bug
+            # The `state_of` reading below cannot express "or blocked" — it
+            # answers BLOCKED for several unrelated shapes — so a caller that
+            # widened the set without also asking for the stored reading would
+            # have its widening SILENTLY IGNORED. Refuse the combination rather
+            # than accept a call that does not do what it says.
+            raise ValueError(
+                "_return_to_pending: `also_accepts` requires `by_stored_status`"
+            )
         task = self.get(task_id)
-        in_progress = (
-            task.status == "in_progress"
+        accepted = ("in_progress",) + tuple(also_accepts)
+        movable = (
+            task.status in accepted
             if by_stored_status
             else self.state_of(task_id) is TaskState.IN_PROGRESS
         )
-        if not in_progress:
+        if not movable:
             raise TaskGraphError(
                 "task_not_in_progress",
                 f"task '{task_id}' is not in progress (status {task.status!r}) — "
@@ -2858,6 +3042,12 @@ class TaskRegistry:
                     # contents unblock this task's dependents. A bare string sha
                     # would otherwise load as 40 single-character "commits".
                     "shipped_commits": _persisted_shipped_commits(raw),
+                    # VALIDATED for the same reason, and the sharpest of the
+                    # three: this is the only bound on a destructive action the
+                    # reviewer takes without an operator. See
+                    # `_persisted_recut_count` — an unreadable value raises
+                    # rather than defaulting to "no cuts spent yet".
+                    "recut_count": _persisted_recut_count(raw),
                     # VALIDATED, not just tuple()-converted — this path never
                     # reaches `add_many` (see the bypass below), so it is the
                     # only gate a stored row passes. See

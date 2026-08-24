@@ -489,6 +489,27 @@ real break, check the named subject directly: if `_drain_task_inbox` still
 contains `apply_requests(` with a three-name unpack, the assertion holds and the
 run's view of the file was stale.
 
+### Adding to `CONTRACT_INSTRUCTIONS` fails two tests in two files at once
+**Symptom:** a change that adds a decision, a key or a clause to
+`contract.CONTRACT_INSTRUCTIONS` comes back as two failures with the same
+number — `test_contract.py::test_contract_stays_within_its_budget` and
+`test_context.py::test_no_scheduling_advice_moved_into_the_context_block`, both
+`AssertionError: assert 4988 <= 3700`. Measured 2026-08-24 (recut-01).
+**Cause:** one cause, two assertions. The instructions are re-sent on EVERY turn,
+so their length is a per-turn tax on a metered allowance and carries a hard
+ceiling. `test_context.py` asserts the same ceiling independently, because the
+rule it pins — facts in the CONTEXT block, advice in the contract — is only worth
+anything while the contract stays bounded. Neither file is broken; the text grew.
+**Fix:** in this order. First COMPRESS the addition: the reviewer needs the RULE
+every turn and the reasoning never, so the rationale belongs in the source
+comment beside `_RESPONSE_FORMAT` and in `docs/AUTOLOOP.md`, both of which cost
+nothing per turn. Then, only if a genuine new requirement remains, raise the
+ceiling in BOTH places and record the arithmetic in
+`test_contract_stays_within_its_budget`'s docstring, which is where every earlier
+move of that number is accounted for. Raising it to make room for explanation is
+what the ceiling exists to refuse; the first cut of recut-01 was 1,352 characters
+of prose and went in at 510 after compression.
+
 ### An advisory validation result truncates the assertion message you asked for
 **Symptom:** a test is made to fail on purpose so a number it computed can be
 read out of the worker — an agent has no shell, so a failing assertion is one of
@@ -3271,3 +3292,9 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | bind-02 | Revision round: the same §8 entry has a second, later-discovered shape worth recognising in a transcript. The re-prompt before the refused `push` is a `review_mismatch`, not a `parse_error`, and the `push` before THAT named an earlier packet id. Cause is the seam: a ledger-resolved approval leaves `last_response.postcommit` None, so the correction had nothing to inherit — and `review_mismatch_payload` asks the reviewer to stamp THIS request, which walks it straight back into the same denial. Fixed by carrying the resolved binding. |
 | 2026-08-24 | dash-21 | New §2 entry, beside the `inspect.getsource` one recov-01 added: the advisory validation channel returns pytest's `-q` short-summary line and truncates the WHOLE line at roughly 180 characters, so a number smuggled out through a deliberately failed assertion is cut off if the message is not terse. A descriptive node id spends most of the budget before the message starts. The entry gives the arithmetic and the surviving shape (`B 8/141/3.06s A 1/20/1.96s`). |
 | 2026-08-24 | shelve-01 | No new error entry, and the absence is deliberate — nothing this round produced a symptom that is not already logged. The one trap worth knowing is documented at its call site instead: a module-level `from .worker_env import …` inside `worktask.py` is an IMPORT CYCLE (`worker_env` → `git_gateway` → `worktask`) that breaks every importer of the package, so `preserve_execution` defers it into the function body, the shape `merge_sweep` already uses for `from . import cli`. |
+| 2026-08-24 | recut-01 | A `task_fatal` park with code `recut_cap` is WORKING AS INTENDED: the reviewer asked to recut a task already cut twice from the base (§9g). Nothing was discarded on the way to it. |
+| 2026-08-24 | recut-01 | The wrong move there is raising `orchestrator.MAX_TASK_RECUTS` or editing `recut_count` down. Two clean rebuilds that still failed is evidence about the SPECIFICATION — rewrite, split or retire the task. |
+| 2026-08-24 | recut-01 | `recut_retirement_failed` IS a fault and needs hands: the task is `pending` while its worker repo and/or record survived. Move the worker out of `workers/` and archive a still-live record; the park names both. |
+| 2026-08-24 | recut-01 | `recut_verdict_outstanding` is not a bug: the recut named a task whose candidate an unanswered packet still presents, so a later `push` could approve it. Judge that packet first; do not widen the check. |
+| 2026-08-24 | recut-01 | New §2 entry: growing `CONTRACT_INSTRUCTIONS` fails `test_contract_stays_within_its_budget` AND `test_context.test_no_scheduling_advice_moved_into_the_context_block` — two failures, one ceiling. Compress first, raise both numbers second. |
+| 2026-08-24 | recut-01 | Revision round. A change-note line far longer than anything a task would write is usually TWO rows with the newline between them deleted: the seam shows a doubled pipe followed by the next row's date. Grep the four trackers for that shape before rewriting anyone's note. The 941-char failure this round was exactly that, and the first fix mis-read it as an over-long note of its own and shortened its own lines instead, leaving the real line untouched. Restore the newline; do not rewrite either half. |

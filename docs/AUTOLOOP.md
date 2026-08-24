@@ -1156,6 +1156,14 @@ either, and the refusal says so: a half-done archival is precisely the split
 brain §9c exists to make impossible. A stale lock is `unlock`'s job, never this
 command's.
 
+Since recut-01 (2026-08-24) the REVIEWER can perform this recovery itself, for
+the one case where it is the right answer: an unsalvageable candidate. That verb
+(`recut`, §9g) comes through this same `release_task_to_pending`, so the ordering
+above, the label-collision retry and the orphaned-record repair are one
+implementation rather than two — with a per-task cap, a refusal for published or
+still-under-verdict work, and a transcript record on top. `release` itself is
+unchanged and still refuses anything that is not in-progress.
+
 **`retire`** is documented in full in §9d, with the six tasks it was written
 for. In short: it is the only way to say that work is superseded rather than
 stuck, it records the successor id(s) in `Task.superseded_by` so the chain is
@@ -3617,6 +3625,14 @@ see the table in the contract itself, embedded in every prompt), plus:
 
 * `commit.paths` required, non-empty.
 * `revise` with `task_id: "audit"` re-runs the audit with feedback.
+* `recut` (recut-01, 2026-08-24) discards a named task's unsalvageable candidate
+  and returns it to the queue for a fresh cut from the current base. Requires
+  `task_id`; bounded at two cuts per task, refused for a published candidate and
+  for one whose verdict is still outstanding, and distinct from `stop` (which
+  parks for a human). Full rules in §9g.
+* `wanted_decision` (optional, any decision) names the verb the reviewer would
+  have used when none fits. Parsed, recorded and tallied; **structurally unable
+  to be dispatched** — see §9g.
 * Phase gate: `implement` (and `revise` of repository tasks) is denied with
   `policy_denied (phase_gate)` explaining that only the audit-review cycle is
   available. Flip `policy.implement_enabled = true` in a later phase.
@@ -6412,6 +6428,142 @@ once anything has been counted (`N consecutive stop(s) about one unchanged
 situation (parks at 3)`), so a forming livelock is visible before it has been
 paid for. No line at all is the ordinary state.
 
+### 9g. `recut` — the reviewer discards an unsalvageable candidate (recut-01, 2026-08-24)
+
+**The gap, observed 2026-08-20 on port-01.** `contract.Decision` had eight
+members — audit, plan, implement, revise, commit, push, commit_and_push, stop —
+and none of them meant *this branch is contaminated, cut it again from the base*.
+So when the reviewer reached exactly that conclusion it issued the only verb
+available:
+
+    decision: revise
+    reason:   "port-01 has reached a structural recovery dead end and another
+               ordinary executor retry would repeat the same contaminated-
+               candidate failure."
+
+It issued the verb it was simultaneously arguing against, because there was no
+other. The round before, it had spelled the remedy out in prose —
+"quarantine/supersede port-01 with a fresh successor cut from the current
+authoritative base" — and prose in a `reason` field executes nothing. An operator
+then performed that recovery **by hand twice in one day**: roadmap-01 (released,
+rebuilt from the current head, approved on review round 1 after nine consecutive
+refusals against a stale candidate) and port-01 (8 commits touching 17 files, 10
+of them outside its 7 approved paths). It is not rare either:
+`changed_paths_outside_approved` has parked nine distinct tasks, and scope-01
+through scope-04 all completed without preventing it. Detection existed; recovery
+was entirely manual.
+
+**What it does.** `recut` names a task, retires BOTH halves of its execution
+through `worktask.retire_execution` — the record to
+`.autoloop/executions/archive/<task>-recut-by-reviewer-<stamp>.json`, the worker
+repo to `quarantine/<task>-recut-by-reviewer-<stamp>`, under one label so the two
+name each other — returns the task to `pending`, and reports what it discarded.
+The next `implement` for that task is an ordinary FIRST dispatch: a fresh worker
+repo cut from the CURRENT base, with nothing carried over from the discarded
+branch. It goes through the same `release_task_to_pending` an operator's
+`python -m autoloop release` uses (§3c), so the ordering, the label-collision
+retry and the orphaned-record repair are one implementation, not two.
+
+**`recut` vs `stop`.** `stop` parks because a HUMAN must decide. `recut` is the
+reviewer deciding. `CONTRACT_INSTRUCTIONS` says exactly that, and says to use
+`stop` when unsure — a reviewer that cannot tell which applies should not be
+reaching for the destructive one.
+
+**`recut` vs `revise`.** `revise` is for work that needs changing; `recut` is for
+a branch that is beyond changing. The distinction is the reviewer's to make, and
+the cap below is what bounds getting it wrong.
+
+**The five bounds. They are not optional — this is the only destructive action
+the reviewer takes without an operator.**
+
+| Bound | How |
+|---|---|
+| **At most 2 recuts per task** | `orchestrator.MAX_TASK_RECUTS`, counted on `tasks.Task.recut_count` (durable — a recut archives the execution record, so a count kept only there would read 0 on every cut) and mirrored onto `TaskExecution.recut_count`. `_recut_count_for` reads the HIGHER of the two, so neither copy can lower it. The third cut PARKS `task_fatal` / `recut_cap` instead of cutting. |
+| **Never a published candidate** | `execution.published_sha` non-empty refuses outright (`recut_candidate_published`). Published work is never discarded by this loop; if it is wrong, that is a new task. |
+| **Never one whose verdict is outstanding** | `_recut_outstanding_verdict`: a candidate still named by a packet in `state.sent_postcommits` that this reply does not answer can still be approved by a later `push` naming that request id (`_approval_packet`), so it may already be approved. `recut_verdict_outstanding`. |
+| **Nothing is deleted** | `worktask.retire_execution` MOVES both halves. The discarded commits stay reachable inside the quarantined worker repo. |
+| **It is recorded** | A `task_recut` transcript event carrying the reviewer's own reason, the discarded candidate and base, both retirement destinations, and `recut_count`/`cap`. A task that silently restarted is never a mystery afterwards. |
+
+**Why two, and not three.** A recut is the reviewer's claim that the BRANCH is
+the problem, and a fresh cut from the current base is the complete remedy for
+that claim. One clean rebuild that still cannot produce a reviewable candidate is
+ordinary bad luck (a base that moved under it, an agent round that died); two is
+the point at which "the branch was contaminated" stops explaining the evidence,
+because the second cut shared nothing with the first except the task's
+description, scope and approved plan. What is left is the SPECIFICATION, and no
+third branch fixes a spec. Each cut costs a full executor round plus a review
+round on work that is then thrown away, so a third buys one more identical
+experiment at the price of the operator attention the cap exists to summon.
+
+**Why `blocked` is accepted where `release` refuses it.** A contaminated
+candidate is normally already parked `task_fatal` by the time a recut is
+warranted — port-01 was `blocked` on `attempt_count_ceiling` when its reviewer
+called it — so a verb that only accepted `in_progress` would refuse precisely
+when it is needed. `TaskRegistry.release` is untouched ("Narrow on purpose", two
+callers this had no business changing); the admission lives in the new
+`TaskRegistry.recut` / `recut_obstacle`, which reads the STORED status like
+`shelve` does and **never reaches an operator hold** (`hold_origin ==
+HOLD_ORIGIN_OPERATOR` is refused before the status test, so the reviewer cannot
+launder a human's quarantine by naming the task).
+
+**Every other refusal is a policy denial, not a park.** A denial re-prompts with
+the reason, is bounded by `policy.max_policy_denials`, and lets the reviewer
+choose `stop` if a human really is needed. A park would hold an autonomous
+session open for an answer nobody is there to give. The cap is the one exception,
+because a cap with an answer is not a cap.
+
+**Old replies still parse.** Adding `recut` widens `ACTIVE_DECISIONS` (derived by
+subtraction from `Decision`), so nothing that parsed before stops parsing, and
+the retired `ask_user` is still absorbed exactly as it was.
+
+#### The wanted-verb field, and how the NEXT missing verb gets found
+
+This section exists because a human read one directive's prose and inferred a
+vocabulary gap. That does not scale. The loop already proves why: `notes` —
+documented as "(optional) anything else worth recording" — parses, is
+type-checked, rides on the `Directive`, and was used in **0 of 578** directives,
+with no consumer anywhere in `orchestrator.py`, `dashboard.py`, `transcript.py`
+or `worktask.py`. An open-ended optional field earns exactly that.
+
+So the contract gained ONE narrow field instead: `wanted_decision`, the verb the
+reviewer WOULD have used when none of the available ones fits. A specific
+question has an answer shape; "anything else worth recording" does not.
+
+* **It can never be dispatched.** That is the hard bound. It is a plain `str` on
+  the `Directive`; `parse_response` never converts it to a `Decision` and
+  deliberately does not even validate it against one; `_dispatch` branches on
+  `directive.decision` alone. A reviewer writing `wanted_decision: "push"` gets
+  it COUNTED, not executed. Anything else would hand the reviewer an unbounded
+  vocabulary and let it name actions the policy engine never authorized — the
+  circular-ownership hazard `docs/SECURITY.md` finding #2 exists to close.
+* **A value naming a real decision is a signal, not an error.** It means the
+  reviewer believed the fitting verb was unavailable when it was not, i.e. these
+  instructions are unclear.
+* **It is tallied.** `.autoloop/wanted_decisions.json` (`WantedDecisionTally`) is
+  a cumulative count across sessions — its own file, not a `LoopState` field,
+  because `cli._select_and_kickoff` replaces the whole `LoopState` at every
+  session boundary and a counter there would be reset by the transition it
+  exists to count. Each occurrence also writes a `wanted_decision` transcript
+  event whose `result` key carries the rendered running total, so the dashboard's
+  recent-events feed shows `wanted: recut x7, split x3` without the dashboard
+  knowing the field exists.
+* **It enforces nothing, so it is tolerant.** An unreadable tally reads as empty
+  and is rewritten rather than parking a round — but the event says
+  `tally_reset: true`, so a lost history never looks like a first sighting.
+  Bounded both ways: one verb is truncated at
+  `MAX_WANTED_DECISION_CHARS`, and the 51st distinct verb folds into `(other)`
+  without losing a count, because the value is reviewer-authored free text.
+* **A named verb becomes real only the slow way**: a person reads the tally and
+  files a task. That is what recut-01 was, and this is what makes the next one
+  cheaper to find.
+
+`cat .autoloop/wanted_decisions.json` is the operator's read;
+`rg '"type": "wanted_decision"' .autoloop/transcript.jsonl` is the per-occurrence
+one. Surfacing the same line in `python -m autoloop status` beside `repeat stops`
+would be the natural next step and was out of this task's approved scope.
+
+---
+
 ## 10. Recovery procedures
 
 | Situation | Do |
@@ -6425,6 +6577,8 @@ paid for. No line at all is the ordinary state.
 | Parked `rate_limited` | ChatGPT is rate-limiting the ACCOUNT ("Too many requests…"), and it did not lift across the loop's whole back-off budget (§5c). **Do not restart the browser** — the limit is server-side and a restart adds another request; that reflex is what caused the incident this park exists to replace. Leave the account idle for a while (an hour is usually plenty), close the blocker (`python -m autoloop blockers`, then `answer <id> "..."`), and `run --retry`. If it recurs, raise `browser.rate_limit_backoff_seconds` so the loop waits longer before re-probing. The back-offs never spent the failure budget, so nothing else needs resetting. The park quotes the EVIDENCE it classified from — if that line says the modal was seen, this really is the account; if it says the page could not be probed, read the `browser_unattachable` row below and check `/json/list` before waiting anything out. |
 | Parked `browser_unattachable` | **The browser, not the account.** The CDP endpoint answers but lists no attachable page, so there was nothing a rate limit could even cover — the classic cause is a CLOSED WINDOW (Chrome keeps running and `/json/version` keeps answering, so every check built on it says healthy; `curl http://127.0.0.1:9222/json/list` returns `[]`). The loop already restarted the profile once and it did not help. Open the dedicated profile's window, or run `python3 -m autoloop.browser.chrome_restart` (§8a) and confirm `/json/list` lists pages; then close the blocker and `run --retry`. No budget was spent — not the failure budget, not the rate-limit back-offs (§5c). |
 | Repeated malformed replies / denials | Loop parks with the reason; talk to the conversation manually if needed, then `run --answer "..."`. |
+| Parked `recut_cap` | The reviewer asked to recut a task that has already been cut twice from the base (§9g). **This is working as intended and the answer is not "allow another cut".** Two clean rebuilds that still could not produce a reviewable candidate is evidence about the task's SPECIFICATION — the cuts shared nothing but its description, scope and approved plan. Rewrite the task (`python -m autoloop` inbox `description`/`scope` kinds), split it, or retire it (§9d). Nothing was discarded: the candidate, its worker repo and its execution record are exactly where the last cut left them. |
+| Parked `recut_retirement_failed` | A `recut` returned the task to `pending` (durable) but could not move its artefacts aside — the park names the obstacle and whichever residue survived. Move the named worker repo out of `workers/` by hand (the next dispatch refuses to create over it) and archive the named execution record if it is still live (it holds the merge window shut, §3f). Then close the blocker and continue. |
 | **Ambiguous submission** (`needs_user`, "submission … is AMBIGUOUS") | The by-content search already ran and did not prove the request present — the park text says what it found (nothing, a different chat, or that it refused to conclude), so read that line first. Open the conversation and look. If the request is there, `run --retry` (reconciles and continues). If it is genuinely absent, `run --resubmit` authorizes exactly one more send of the same id. Autoloop resolves this by itself only when it can PROVE the request is in this request's own conversation; it never decides the absent direction for you — see §5b. |
 | `send-not-ready` / `composer-not-synchronised` diagnostics | The editor never accepted the input, so **nothing was sent**: safe to `run --retry`. If it repeats, the composer selectors or the input method need attention (`browser/selectors.py`, `browser/chatgpt.py::_enter_prompt`). |
 | Crash mid-audit | `run` — the audit directive re-dispatches (`_resolve_audit_task` resumes the SAME per-run worker repo/unit id when redispatching within the same iteration; prior run's raw reports remain under `.autoloop/audit/`). |

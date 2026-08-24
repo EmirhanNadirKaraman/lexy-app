@@ -465,6 +465,7 @@ _COMPLETE_PAYLOADS = {
         "commit": {"message": "m", "paths": ["a.py"]},
         "reviewed": REVIEWED,
     },
+    "recut": {"task_id": "t1"},
     "stop": {},
 }
 
@@ -1226,8 +1227,33 @@ def test_contract_stays_within_its_budget():
     had impl-02's advisory validation channel, so the length was read off a
     real run — **3,636**, i.e. 64 characters of headroom left, and the hand sum
     (3,489 + 147) agreed with it exactly. Treat the earlier figures as the
-    estimates they say they are; treat this one as observed."""
-    assert len(CONTRACT_INSTRUCTIONS) <= 3700
+    estimates they say they are; treat this one as observed.
+
+    **The ceiling MOVED for the first time since 2026-08-15 (recut-01,
+    2026-08-24), to 4,550, and this is the accounting.** A ninth DECISION plus a
+    new top-level KEY is the "genuine new requirement" the rule above allows —
+    the reviewer could not previously say "this branch is contaminated, cut it
+    again", so it issued `revise` while arguing against one, and an operator
+    performed that recovery by hand twice in one day. A decision the reviewer
+    cannot be told about is a decision it will not use, so this text is where
+    the cost has to land.
+
+    It was paid down first, not simply added. The first cut measured **4,988**
+    on a real advisory run; compressing the three additions — rationale moved
+    into the source comments beside `_RESPONSE_FORMAT` and `Decision.RECUT`,
+    which cost nothing per turn — took a hand-summed 510 back out (the
+    `wanted_decision` key 450 -> 201, the `recut` decision entry 733 -> 504, the
+    `recut` vs `stop` trailer 153 -> 121), for roughly **4,478** and ~70
+    characters of headroom. The two numbers that are OBSERVED are 3,636 and
+    4,988; 4,478 is the difference of one hand sum from the other and should be
+    replaced with a real reading by the next executor that measures it.
+
+    What was NOT paid for out of this budget: why two recuts and not three, what
+    "unsalvageable" means, how the cap survives the retirement that charges it,
+    and the whole argument for the wanted-verb field. Those are in
+    `docs/AUTOLOOP.md` §9g and in the source comments — the reviewer needs the
+    RULE every turn and the reasoning never."""
+    assert len(CONTRACT_INSTRUCTIONS) <= 4550
 
 
 def test_preference_clause_has_its_own_tighter_budget():
