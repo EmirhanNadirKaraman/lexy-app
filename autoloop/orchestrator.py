@@ -113,6 +113,26 @@ code — no new taxonomy is invented here.
 
 Failure routing:
 
+Every transport fault below arrives as a `BrowserError` subclass — the hierarchy
+in `errors.py` is named after the first implementation, not after the subsystem
+that failed — so before any of it applies, `_route_transport_fault` asks whether
+the ACTIVE PROVIDER is browser-backed (`conversation.transport_is_browser_backed`).
+It is for the browser provider, and for that one nothing changes. For every other
+transport the fault goes to `_handle_transport_failure` instead, which runs no
+`restart_command`, never touches `browser_restart_skips` or
+`policy.max_browser_restart_skips`, writes `transport_error` rather than
+`browser_error`, and — on the ordinary failure budget running out — parks
+(`transport_failure_budget_exhausted`) with a remedy for the transport actually
+in use. On 2026-08-22 the absence of that split answered a `codex exec` fault by
+launching Chrome, spending the browser recovery budget, and parking with advice
+to restart a browser the run does not use.
+
+One additional move belongs to the non-browser side and to nothing else: while
+`awaiting`, a transport that declares `idempotent_submit` and whose own
+`reconcile` confirms the reply is gone re-enters `submitting` and RE-RUNS the
+invocation (`_replay_unrecoverable_await`, bounded by `MAX_AWAIT_REPLAYS`).
+A transport without that declaration is never re-run automatically.
+
 * LoginExpiredError            → needs_user, resume_phase preserved (--retry)
 * RateLimitedError             → classified first, then BACK OFF and re-probe,
                                  phase unchanged: an account-level THROTTLE is
@@ -250,6 +270,7 @@ from .changeset_review import ChangesetBinding
 from .config import AutoloopConfig
 from .config_writer import update_conversation_url
 from .context import build_context, render_context
+from .conversation import transport_is_browser_backed, transport_remedy
 from .contract import (
     AUDIT_TASK_ID,
     COMMIT_DECISIONS,
@@ -929,6 +950,26 @@ RESTART_SKIPPED_ALREADY_SPENT = "skipped_already_spent"
 MODAL_SIGHTED = "the throttle modal is up on a page this loop can drive"
 
 
+#: How many times ONE request may be re-invoked by
+#: `Orchestrator._replay_unrecoverable_await` because its transport can no
+#: longer produce the reply the loop is waiting for.
+#:
+#: The real need is one per PROCESS: `codex.conversation.CodexConversation`
+#: keeps its reply in an in-memory dict, so a request submitted before a restart
+#: is unrecoverable afterwards and re-running is the recovery that transport
+#: already promises. Three, so a run that is replaced a couple of times
+#: mid-request for unrelated reasons (a self-upgrade exec, an operator kill)
+#: still recovers rather than parking on the second one.
+#:
+#: A module constant rather than a `policy.PolicyConfig` field on purpose: this
+#: bounds a re-run the TRANSPORT declared safe, not an operator preference, and
+#: a knob here would invite raising it — which is how "bounded" becomes "keeps
+#: re-invoking a reviewer that never answers". Deliberately uncoupled from
+#: `max_consecutive_failures`: exhausting this budget does not end the run, it
+#: hands the fault back to that one, which is what produces the park.
+MAX_AWAIT_REPLAYS = 3
+
+
 class Orchestrator:
     #: The clock every measured stage duration is read from (prof-01,
     #: 2026-08-20). MONOTONIC, not wall clock: this measures an interval, and
@@ -1213,16 +1254,20 @@ class Orchestrator:
                 # `failed`, describing neither the cause nor the remedy.
                 self._handle_quota_exhausted(phase, exc)
             except ConversationUnusableError as exc:
-                self._handle_conversation_unusable(phase, exc)
+                self._route_transport_fault(
+                    phase, exc, self._handle_conversation_unusable
+                )
             except ResponseTimeoutError as exc:
                 # Caught BEFORE the generic BrowserError below (it is one),
                 # so a repeated, confirmed-silent response-START timeout can
                 # be routed to the rotation entry condition instead of only
                 # ever retrying on the ordinary failure budget. See
                 # `_handle_response_start_timeout`.
-                self._handle_response_start_timeout(phase, exc)
+                self._route_transport_fault(
+                    phase, exc, self._handle_response_start_timeout
+                )
             except BrowserError as exc:
-                self._handle_browser_failure(phase, exc)
+                self._route_transport_fault(phase, exc, self._handle_browser_failure)
             except GitError as exc:
                 self._handle_git_failure(phase, exc)
             except StateError as exc:
@@ -2765,12 +2810,30 @@ class Orchestrator:
         retry loop wearing the shape of a back-off.
         """
         state = self.state
-        # Before the counter moves, so a browser fault never spends a budget
-        # that exists to bound waiting on the SERVER (brw-03's rule).
-        classification, evidence = self._classify_rate_limit_state()
-        if classification == RL_BROWSER_UNATTACHABLE:
-            self._recover_unattachable_browser(phase, exc, evidence)
-            return
+        if self._transport_is_browser_backed():
+            # Before the counter moves, so a browser fault never spends a budget
+            # that exists to bound waiting on the SERVER (brw-03's rule).
+            classification, evidence = self._classify_rate_limit_state()
+            if classification == RL_BROWSER_UNATTACHABLE:
+                self._recover_unattachable_browser(phase, exc, evidence)
+                return
+        else:
+            # A run with no browser is not asked the browser question at all.
+            # `_classify_rate_limit_state` reaches its third world by dialling
+            # `browser.cdp_url`, which answers about whatever Chrome happens to
+            # be running on this host — nothing to do with the transport that
+            # raised. A zero-target answer there would restart a browser for a
+            # non-browser fault, which is exactly the confusion this class of
+            # bug is made of, and even the classification's PROSE would put
+            # browser evidence into a codex park. No codex transport raises
+            # `RateLimitedError` today (`codex/protocol_errors.py` says so
+            # explicitly); this closes the door before someone opens it.
+            classification, evidence = (
+                RL_THROTTLED,
+                f"the {self.active_provider()} transport reported a throttle; "
+                "this run drives no browser, so no page or CDP endpoint was "
+                "probed",
+            )
         # Everything that reaches here is classified as something other than
         # unattachable, so this episode's spent restart is settled and the next
         # unattachable browser is a new fault with its own recovery. That
@@ -2818,13 +2881,32 @@ class Orchestrator:
             # confirmed. Both branches keep the wait, the remedy and the word
             # "restart"; they differ in what they claim to know.
             sighted = evidence == MODAL_SIGHTED
-            if sighted:
+            if not self._transport_is_browser_backed():
+                # A THIRD branch, and it exists for the same reason the guard
+                # above the classification does: both of the branches below
+                # tell an operator to reason about a browser, and one of them
+                # tells them to curl a CDP endpoint and restart Chrome. On a run
+                # that drives no browser that is advice about someone else's
+                # program — the exact failure recov-01 undoes, arriving through
+                # the one park in this handler rather than through the restart.
+                # Unreachable today (no non-browser transport raises
+                # `RateLimitedError`), and closed anyway: leaving half a door
+                # shut is not shutting it.
+                verdict_text = (
+                    f"This is NOT a transport fault — the {self.active_provider()} "
+                    "transport reported an account-level limit, and this run "
+                    "drives no browser, so nothing local can clear it."
+                )
+                evidence_label = "What was observed"
+            elif sighted:
                 verdict_text = (
                     "This is NOT a browser fault — the composer is present the "
                     "whole time and a restart cannot help, because the limit is "
                     "server-side."
                 )
+                evidence_label = "What the browser looked like"
             else:
+                evidence_label = "What the browser looked like"
                 verdict_text = (
                     "CHECK THE BROWSER BEFORE WAITING: the throttle modal was "
                     "never actually sighted during these back-offs, so a limit "
@@ -2844,10 +2926,13 @@ class Orchestrator:
                 "while (an hour is usually more than enough), then resume with "
                 "`python -m autoloop run --retry`. If it keeps happening, raise "
                 "browser.rate_limit_backoff_seconds so the loop waits longer "
-                f"before re-probing. Last error: {exc}. What the browser looked "
+                f"before re-probing. Last error: {exc}. {evidence_label} when "
                 # The sentence that stops this park from asserting more than
-                # was measured, and the input to the branch above.
-                f"like when this was classified: {evidence}",
+                # was measured, and the input to the branch above. Its LABEL
+                # follows the transport for the same reason the verdict above
+                # does: "what the browser looked like" is a false premise on a
+                # run that has none.
+                f"this was classified: {evidence}",
                 resume_phase=phase.value,
                 kind="loop_fatal",
                 code="rate_limited",
@@ -2995,6 +3080,9 @@ class Orchestrator:
         req.send_attempted = False
         req.last_send_outcome = ""
         req.resends_used = 0
+        # Same rule, one more mark: a replay budget describes re-invocations of
+        # the OLD transport, which the new one has never performed.
+        req.replays_used = 0
         req.submitted = False
         req.conversation_url = state.conversation_url
         req.conversation_epoch = state.conversation_epoch
@@ -3138,6 +3226,45 @@ class Orchestrator:
         stop trusting.
         """
         state = self.state
+        if not self._transport_is_browser_backed():
+            # THE THIRD DOOR, and the only one of the three that is reachable
+            # on an ordinary day. `_step_submission_rejected` arrives here after
+            # two disproven sends, and the subprocess codex transport returns
+            # REJECTED on every non-zero exit — so two consecutive codex
+            # failures on one request reach this method without passing any of
+            # the fault handlers.
+            #
+            # Both ways out below are wrong for such a transport, and neither is
+            # hypothetical. With `browser.project_url` unset (the normal codex
+            # deployment) the next branch parks telling the operator to set it
+            # "to the ChatGPT project this conversation belongs to" — browser
+            # advice for a subprocess fault, which is the whole failure recov-01
+            # undoes. With it left set (an operator who moved from the browser
+            # to codex and did not clear the section) the preconditions PASS,
+            # `state.rotations` is spent, and `_rotate_conversation` then raises
+            # because this transport has no `retarget`/`current_url` — a park
+            # about a rotation that could never have happened, plus a consumed
+            # budget.
+            #
+            # Refused here instead, before either. Rotation is a browser concept
+            # end to end: it opens a chat in a ChatGPT project and moves a turn
+            # into it. A transport with no rotation surface is not being denied
+            # a recovery it had — it never had one — so nothing is lost, and
+            # `state.rotations` is deliberately NOT spent, exactly like the
+            # `rotation_unavailable` branch below.
+            provider = self.active_provider()
+            self._park_rotation(
+                req,
+                "rotation_unsupported_by_transport",
+                f"two sends of {req.request_id} were disproven in a row and the "
+                f"{provider} transport has no conversation to rotate away from — "
+                "rotation opens a replacement chat in a ChatGPT project, which "
+                "this run does not use. Nothing was rotated and no rotation "
+                "budget was spent. "
+                f"{transport_remedy(provider)} "
+                "Then resume with `python -m autoloop run --retry`.",
+            )
+            return
         project_url = self._config.browser.project_url
         if not project_url:
             self._park_rotation(
@@ -7158,6 +7285,247 @@ class Orchestrator:
         state.last_response = None
         state.phase = Phase.READY.value
         self._store.save(state)
+
+    # ---- transport-aware fault routing --------------------------------------
+
+    def _transport_is_browser_backed(self) -> bool:
+        """Would restarting the browser be a recovery for THIS run's faults?
+
+        Asked of the ACTIVE provider (`active_provider()`, so a run that has
+        failed over to the browser answers for the browser), never of the client
+        object. The client is the wrong witness twice over: the failure handlers
+        below run after `_drop_client`, and a transport whose factory raised
+        never produced an object at all — both of which read as "no client" and
+        would have to fall back to a default. See `conversation._BROWSER_BACKED`
+        for why the default is "not a browser".
+        """
+        return transport_is_browser_backed(self.active_provider())
+
+    def _route_transport_fault(self, phase: Phase, exc: BrowserError, browser_handler) -> None:
+        """Send one transport fault to the recovery its TRANSPORT has.
+
+        Every transport fault arrives here as a `BrowserError` subclass — the
+        hierarchy is named after the first implementation, not after the
+        subsystem each fault came from — so the exception type cannot answer
+        "may I restart Chrome". This is the single place that asks, and the
+        three `except` clauses in `run` keep their existing order and their
+        existing browser handlers: for the browser provider this is a
+        pass-through and nothing about restart, cooldown, rotation or the fault
+        budget changes.
+
+        For anything else `_handle_transport_failure` takes it instead. That is
+        the 2026-08-22 incident: a `ResponseTimeoutError` raised by a
+        SUBPROCESS reached `_handle_response_start_timeout` ->
+        `_handle_browser_failure`, which launched Chrome on the browser profile
+        (pid 29055, `--remote-debugging-port=9222`), spent the browser fault
+        budget on it, and parked the loop advising a browser restart. The run
+        had no browser in its design at all.
+        """
+        if self._transport_is_browser_backed():
+            browser_handler(phase, exc)
+            return
+        self._handle_transport_failure(phase, exc)
+
+    def _replay_unrecoverable_await(self, phase: Phase, exc: BrowserError) -> bool:
+        """Re-enter `submitting` when the reply this request is waiting for
+        cannot exist any more AND the transport says re-running is safe. True
+        when that happened and the caller must stop.
+
+        THE FAULT THIS UNDOES IS A PHASE THAT CANNOT BE SATISFIED.
+        `codex.conversation.CodexConversation` captures its reply in an
+        in-memory dict, because a CLI turn is synchronous — "the waiting already
+        happened ... there is nothing to poll for". A request submitted before a
+        process restart is therefore unrecoverable afterwards and
+        `await_response` correctly says so. But the PERSISTED phase says
+        `awaiting`, which assumes the reply is somewhere the process can go and
+        re-read: true for the browser, where it sits in the chat thread; false
+        for a subprocess whose stdout is gone. Left alone the loop waits, fails,
+        retries and eventually parks over a reply that can never appear.
+
+        Persisting the reply would be the wrong repair: the dict is a handoff
+        between two calls inside one round, not a durable artifact, and storing
+        it would keep a value whose only source has exited while leaving the
+        unsatisfiable phase reachable. Re-running is the recovery this transport
+        already promises.
+
+        Three gates, all required, none of them inferred:
+
+        * **`phase is AWAITING`** — the only phase in which a missing reply is
+          the fault. `SubprocessCodexRunner.run` raises the same
+          `ResponseTimeoutError` type from `submit` when the CLI outruns
+          `codex.timeout_seconds`; that one happens in `submitting`, where the
+          existing send machinery already owns the decision, and reading it as a
+          replay signal would re-invoke on top of a possibly-live process.
+        * **`idempotent_submit`** — THE licence, and only it. A transport that
+          does not declare it is not re-run automatically, because that is
+          exactly how a duplicate turn gets posted into a shared thread. Probed
+          on the client that is still held, never on one built here: a
+          `_get_client()` inside a failure handler can raise and leave `run`'s
+          `except` with no park at all, so an absent client answers "no replay".
+        * **`reconcile` confirms absence** — the transport's own authority on
+          whether a reply exists. Presence outranks everything; a reply that
+          turns out to be there is an ordinary fault, not a replay.
+
+        Charged to `MAX_AWAIT_REPLAYS` and to nothing else. A replay that
+        actually ran is a recovery that was PERFORMED, and the same rule
+        `_handle_browser_failure` already applies to a restart that ran holds
+        here: it is not evidence recovery fails. The ordinary failure budget
+        still bites, because a transport that cannot answer fails again on the
+        submit side and is charged there.
+        """
+        if phase is not Phase.AWAITING:
+            return False
+        state = self.state
+        req = state.pending_request
+        if req is None:  # pragma: no cover - defensive; awaiting always has one
+            return False
+        client = self._client
+        if client is None:
+            return False
+        provider = self.active_provider()
+        if not getattr(client, "idempotent_submit", False):
+            # Not a refusal to recover — the ordinary budget still runs. It is
+            # a refusal to RE-RUN, recorded so a transcript reader can see the
+            # capability was asked for and answered no.
+            self._log(
+                "transport_replay_declined",
+                request_id=req.request_id,
+                data={
+                    "reason_code": "not_idempotent",
+                    "provider": provider,
+                    "phase": phase.value,
+                },
+            )
+            return False
+        try:
+            reply_exists = bool(client.reconcile(req.request_id))
+        except Exception as reconcile_exc:
+            # Could not ask is not "absent". Fail closed: no replay, and the
+            # fault falls through to the ordinary budget.
+            self._log(
+                "transport_replay_declined",
+                request_id=req.request_id,
+                data={
+                    "reason_code": "reconcile_failed",
+                    "provider": provider,
+                    "error": f"{type(reconcile_exc).__name__}: {reconcile_exc}",
+                },
+            )
+            return False
+        if reply_exists:
+            return False
+        if req.replays_used >= MAX_AWAIT_REPLAYS:
+            self._log(
+                "transport_replay_declined",
+                request_id=req.request_id,
+                data={
+                    "reason_code": "replay_budget",
+                    "provider": provider,
+                    "replays_used": req.replays_used,
+                    "max_replays": MAX_AWAIT_REPLAYS,
+                },
+            )
+            return False
+        req.replays_used += 1
+        # The marks the FAILED invocation left describe an invocation that
+        # appended nothing anywhere — that is what `idempotent_submit` asserts —
+        # so they must not make `submitting` treat the re-issue as ambiguous.
+        # `resends_used` is deliberately NOT reset: it bounds same-chat resends
+        # and this is not one.
+        req.send_attempted = False
+        req.submitted = False
+        req.last_send_outcome = ""
+        req.start_timeouts = 0
+        req.start_timeout_wait_seconds = 0.0
+        state.phase = Phase.SUBMITTING.value
+        self._log(
+            "transport_replay_authorized",
+            request_id=req.request_id,
+            data={
+                "reason_code": "idempotent_submit_unrecoverable_reply",
+                "provider": provider,
+                "replays_used": req.replays_used,
+                "max_replays": MAX_AWAIT_REPLAYS,
+                "error": str(exc),
+                "kind": type(exc).__name__,
+            },
+        )
+        # AFTER the reconcile, never before: dropping a codex client discards
+        # the in-memory reply stash, which is the very thing the reconcile above
+        # reads. Dropped now because the replay IS a fresh invocation.
+        self._drop_client()
+        self._store.save(state)
+        return True
+
+    def _handle_transport_failure(self, phase: Phase, exc: BrowserError) -> None:
+        """A fault from a transport that is not a browser.
+
+        Everything browser-specific is absent by construction, not by a flag
+        checked halfway down: no `restart_command` is run, `browser_restart_skips`
+        is never touched, `policy.max_browser_restart_skips` is never consulted,
+        and no `browser_error` record is written. The event is `transport_error`
+        and it names the provider, so the transcript says which subsystem
+        actually failed.
+
+        What is KEPT is the ordinary failure budget. `consecutive_failures` is
+        the loop's generic "this keeps failing" counter — git failures spend it
+        too — and a transport that cannot answer must still end somewhere. The
+        alternative, an exemption, would let a permanently broken codex retry
+        forever, which is a worse version of the fault this replaces.
+
+        The end of that budget is a PARK, not `failed`: parking records a
+        `blockers.Blocker` carrying the exact guidance, and the guidance names a
+        fix for the transport in use. That guidance lives in
+        `conversation.transport_remedy` rather than here, because this module is
+        held provider-agnostic by test — the registry is the one place that may
+        know a provider by name.
+        """
+        state = self.state
+        provider = self.active_provider()
+        # Before `_drop_client`, because the replay decision reads the held
+        # client's own `reconcile`.
+        if self._replay_unrecoverable_await(phase, exc):
+            return
+        self._drop_client()
+        state.consecutive_failures += 1
+        self._log(
+            "transport_error",
+            data={
+                "phase": phase.value,
+                "provider": provider,
+                "error": str(exc),
+                "kind": type(exc).__name__,
+                "consecutive_failures": state.consecutive_failures,
+            },
+        )
+        verdict = self._policy.check_failure_budget(state.consecutive_failures)
+        if verdict.allowed:
+            # Phase unchanged — the loop re-enters it with a fresh client.
+            self._store.save(state)
+            return
+        # The run is over for this transport. Same accounting rule as the
+        # browser path: a candidate that was out for review when the transport
+        # gave up has to be re-produced, and that redo is a fault's cost rather
+        # than the task's. The CODE differs deliberately —
+        # `browser_session_lost` would file a subprocess fault under the browser.
+        self._note_round_fault("transport_session_lost")
+        self._to_needs_user(
+            f"the {provider} transport failed "
+            f"{state.consecutive_failures} times in a row, more than "
+            f"policy.max_consecutive_failures "
+            f"({self._policy.config.max_consecutive_failures}) allows. "
+            f"{transport_remedy(provider)} "
+            f"Then resume with `python -m autoloop run --retry`. "
+            f"Last error: {exc}",
+            resume_phase=phase.value,
+            kind="loop_fatal",
+            code="transport_failure_budget_exhausted",
+            detail=(
+                f"phase={phase.value} provider={provider} "
+                f"kind={type(exc).__name__} "
+                f"consecutive_failures={state.consecutive_failures}"
+            ),
+        )
 
     def _attempt_browser_restart(self) -> bool:
         """True when a restart actually ran and reported success.

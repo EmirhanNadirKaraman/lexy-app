@@ -467,6 +467,28 @@ time. Fixing only the count would have left the pointless re-inserts.
 
 ## 2. Test suite
 
+### An `inspect.getsource` test fails in a file you never touched
+**Symptom:** an advisory validation run reports failures in an unrelated test
+file, and the assertion shows the WRONG function's body — e.g.
+`test_task_inbox.py::test_apply_requests_is_the_single_merge_used_by_both_callers`
+failing with `assert 'apply_requests(' in '    def _rebase_execution_if_stale(…'`,
+plus a `StopIteration` from its sibling. The same tests passed on the previous
+run and pass again afterwards. Measured 2026-08-24 (recov-01).
+**Cause:** not a regression, and not flakiness in the usual sense. Those tests
+read `inspect.getsource(orchestrator.Orchestrator._drain_task_inbox)`, which
+seeks by the code object's recorded `co_firstlineno` and then reads the file
+**as it is on disk right now**. Editing `orchestrator.py` while the run is in
+flight shifts every line below the edit, so the seek lands in whichever method
+now occupies those lines. The edit does not even have to be near the test's
+subject — one added block near the top of a 8,500-line module is enough.
+**Fix:** do not edit a file while its validation run is executing. The advisory
+channel says the result describes the tree AS IT STOOD WHEN YOU ASKED; that is
+true of what it *reports on*, not of what a long-running `inspect.getsource`
+re-reads mid-run. Wait for `RESULT #n`, then edit. To tell this artifact from a
+real break, check the named subject directly: if `_drain_task_inbox` still
+contains `apply_requests(` with a three-name unpack, the assertion holds and the
+run's view of the file was stale.
+
 ### Backend suite: hundreds of `asyncpg` errors, or one unreproducible failure
 **Symptom:** `python3 -m pytest -n auto` in `lexy-app/backend` reports something
 like `1260 errors` with tracebacks bottoming out in
@@ -2962,6 +2984,65 @@ report, assert `NOT RUN` — see `autoloop/tests/test_validation_failfast.py`.
 
 ## 15. Autoloop Codex CLI transport (`codex_cli`)
 
+### `browser_restarted` / `browser_restart_cooldown_blocked` on a run that has no browser
+**Symptom:** `conversation.provider = "codex_cli"`, no browser anywhere in the
+run's design, and the transcript fills with browser events — 34 of them in 35
+minutes on 2026-08-22. Chrome is genuinely launched (pid 29055,
+`--user-data-dir=/Users/emir/.autoloop-chrome --remote-debugging-port=9222`), and
+the loop finally parks `loop_fatal` on `browser_restart_cooldown_blocked`,
+advising a manual `python3 -m autoloop.browser.chrome_restart` or a lower
+`browser.restart_cooldown_seconds`. Neither can repair a subprocess fault. Often
+the `browser_error` beside it reads `no codex reply was captured for alr-…; the
+invocation did not complete in this process`, `kind=ResponseTimeoutError`.
+**Cause:** two things, and only the second one is obvious. (1) Every transport
+fault is a `BrowserError` subclass — `errors.py` names the hierarchy after the
+first implementation — so the exception type could not say which subsystem
+failed, and `run` sent a fault raised by `CodexConversation` to
+`_handle_browser_failure`, which drops the client, runs
+`browser.restart_command` and charges the browser budgets. (2) The underlying
+fault is a PHASE THAT CANNOT BE SATISFIED: `CodexConversation` keeps its reply in
+an in-memory dict (a CLI turn is synchronous, so there is nothing to poll for),
+the persisted phase says `awaiting`, and after a restart that reply is gone for
+good — so the loop waited, failed and retried over something that could never
+appear.
+**Fix:** applied repo-side 2026-08-24 (recov-01).
+`conversation.transport_is_browser_backed(provider)` is asked first, keyed on the
+provider NAME (a `getattr(client, …)` probe fails open — the handlers run with
+the client already dropped). A non-browser fault goes to
+`_handle_transport_failure`: no restart, no `browser_restart_skips`, a
+`transport_error` record naming the provider, and — on the ordinary failure
+budget running out — a `transport_failure_budget_exhausted` park whose advice
+names `codex exec`, `codex_invocation_failed` and
+`conversation.fallback_provider`. Separately, a transport that declares
+`idempotent_submit` now re-enters `submitting` and RE-RUNS the invocation
+(`_replay_unrecoverable_await`, bounded by `MAX_AWAIT_REPLAYS`), so a restart
+mid-`awaiting` finishes the round instead of parking. If you see this symptom
+again, do NOT lower the cooldown or restart Chrome: check
+`conversation.provider`, and read the `transport_error` /
+`codex_invocation_failed` records. `docs/AUTOLOOP.md` §5d-quater has the full
+account.
+
+### `rotation_unavailable` / "set browser.project_url" on a run that has no browser
+**Symptom:** a `codex_cli` run parks `loop_fatal` after two failures on one
+request, saying the conversation cannot be used and that no
+`browser.project_url` is configured — a key that belongs to the browser
+transport and cannot help. Or, if that key IS still set from an earlier browser
+deployment: a park about a rotation that failed, plus a spent `state.rotations`.
+**Cause:** the sibling of the entry above, reached by a different road.
+`codex_cli` returns `SubmitResult.REJECTED` on every non-zero exit and on a clean
+exit with empty stdout, so two ordinary failures walk `submitting →
+submission_rejected → one resend → submission_rejected → _attempt_rotation`.
+That path reaches rotation WITHOUT passing any fault handler, so the transport
+guard on the fault routing never sees it. Rotation is a browser concept end to
+end — it opens a chat in a ChatGPT project — and this transport has no
+`retarget`/`current_url` at all.
+**Fix:** applied repo-side 2026-08-24 (recov-01). `_attempt_rotation` refuses
+first for a non-browser transport (`rotation_unsupported_by_transport`), names
+that transport's own remedy, and spends no rotation budget. If you see the old
+wording, do NOT set `browser.project_url` — read the `codex_invocation_failed`
+records for the two failures instead; the sends were disproven for a reason the
+transport already logged.
+
 ### `the Codex allowance for this ChatGPT plan is exhausted (exit 1)` — and it is not
 **Symptom:** the loop parks `loop_fatal`, code `quota_exhausted`, on an account
 that is nowhere near its limit. Checked two ways on 2026-08-22: `codex app-server`
@@ -3107,3 +3188,7 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | scope-05 | Revision round: that §9 entry's wiring check is rewritten, because production now passes `revert_authority=` from `cli._build_orchestrator`. The form is still rendered only when the round has a recorded out-of-scope path AND a usable base sha, so an absent `REVERT-OUT-OF-SCOPE:` in your prompt now means no execution record, no base sha on it, or an embedder that wired no authority — report it rather than retrying the line. |
 | 2026-08-24 | contract-01 | New §6 entry for `invalid_json: Invalid control character at:` with a deep column offset — a literal newline inside the long `notes` value, which twice parked the loop `parse_budget_exhausted`. Filed beside the `no_json_block` entry because that is where contract-parse symptoms already live, though the cause is the model's encoding rather than the browser. The half worth knowing is that the KIND changed: 13 of the 25 historical parse errors were `no_json_block`, so a `parse_error` count alone will not show you this one. |
 | 2026-08-24 | contract-01 | That entry's Fix says the recovery used twice — `run --answer` telling the reviewer to escape newlines and keep notes short — WORKS and then decays, because a conversational instruction lives in the thread and does not survive a rotation or a fresh session. `CONTRACT_INSTRUCTIONS` is re-sent every round, which is why the rule was put there instead. Do not answer a recurrence with another `--answer` alone. |
+| 2026-08-24 | recov-01 | New §15 entry, filed FIRST in that section (newest-first): browser events, a genuinely launched Chrome and a `browser_restart_cooldown_blocked` park on a `codex_cli` run. The trap worth knowing is the remedy: the park's own advice — restart the browser, lower `browser.restart_cooldown_seconds` — cannot repair a subprocess fault, so following it wastes the investigation. Check `conversation.provider` and read `transport_error` / `codex_invocation_failed` instead. |
+| 2026-08-24 | recov-01 | New §2 entry: an `inspect.getsource` test failing in a file you never touched, showing the WRONG function's body. Editing a module while its validation run is in flight shifts the lines under a seek that reads the file live, so the failure names an unrelated neighbour. Cost this round its last advisory run — two `test_task_inbox.py` tests "failed" against code that was correct. Check the named subject directly before debugging it. |
+| 2026-08-24 | recov-01 | Same §15 entry gained the reachable variant: two consecutive codex failures on ONE request used to park `rotation_unavailable` telling the operator to set `browser.project_url`. Same trap, same remedy — that key is a browser setting and cannot help. `codex_cli` returns REJECTED on every non-zero exit, so this needs no exotic condition; the park is now `rotation_unsupported_by_transport` and names the transport. |
+| 2026-08-24 | recov-01 | Same entry names the second, less obvious half: the `awaiting` phase is UNSATISFIABLE after a restart on `codex_cli`, because the reply lives in an in-memory dict. Persisting it is the wrong fix and was rejected; the transport already declares `idempotent_submit`, so the loop now re-runs the invocation. A recurrence on a transport WITHOUT that declaration is expected to keep waiting — that is not this bug. |

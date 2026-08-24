@@ -4315,6 +4315,178 @@ not a thing to leave undocumented.
 
 ---
 
+## 5d-quater. A fault is recovered by the transport's remedy, not the browser's
+
+Added 2026-08-24 (recov-01).
+
+**The problem, measured.** On 2026-08-22 a run with
+`conversation.provider = "codex_cli"` — and no browser anywhere in its design —
+logged 34 browser events in 35 minutes and ended like this:
+
+```
+17:34:22  browser_restarted        launching chrome on profile /Users/emir/.autoloop-chrome, debug port 9222
+17:34:22  browser_error            no codex reply was captured for alr-7765f8cc-0021;
+                                   the invocation did not complete in this process   kind=ResponseTimeoutError
+17:34:22  browser_restart_skipped  within cooldown
+```
+
+Chrome really started (pid 29055, `--user-data-dir=/Users/emir/.autoloop-chrome
+--remote-debugging-port=9222`). The loop then parked `loop_fatal` on
+`browser_restart_cooldown_blocked`, advising the operator to restart the browser
+by hand or lower `browser.restart_cooldown_seconds`. Neither can repair a
+subprocess fault. The run spent its recovery budget, launched a program it does
+not use, and asked for help with the wrong subsystem.
+
+**Why it happened.** Every transport fault arrives as a `BrowserError` subclass:
+`errors.py` names the hierarchy after the first implementation, so the exception
+type says nothing about which subsystem failed. `run`'s three transport clauses
+therefore sent a `ResponseTimeoutError` raised by `CodexConversation.await_response`
+to `_handle_response_start_timeout` → `_handle_browser_failure`, which drops the
+client, runs `browser.restart_command`, and charges either
+`policy.max_browser_restart_skips` or `policy.max_consecutive_failures`.
+
+**The split.** `conversation.transport_is_browser_backed(provider)` is now asked
+first, by `_route_transport_fault`, before any of that applies:
+
+* It is keyed on the PROVIDER NAME, not on an attribute of the client object.
+  A `getattr(client, …)` probe fails open in exactly this shape — the failure
+  handlers run with the client already dropped, and a transport whose FACTORY
+  raised never produced an object to ask; both read as "no client" and would
+  fall back to the historical browser behaviour.
+* It answers for the ACTIVE provider (`active_provider()`), so a run that has
+  failed over to the browser answers for the browser.
+* An unknown name is NOT browser-backed. That is the fail-closed direction, and
+  its cost is stated rather than hidden: a third-party Playwright adapter
+  registered under some other name loses auto-restart until it declares itself
+  with `register_provider(…, browser_backed=True)`. A lost recovery shows up as
+  retries and a park; the other direction is an automation killing and
+  relaunching a browser the run never used.
+
+For `browser_chatgpt` this is a pass-through and **nothing changes** — restart,
+cooldown, rotation, `browser_restart_skips` and the `browser_restart_cooldown_blocked`
+park all behave exactly as §5b/§5c describe, which the untouched
+`test_rounds_and_restart.py` and `test_transport_recovery.py` suites assert.
+
+For anything else `_handle_transport_failure` takes the fault:
+
+| | browser-backed | not browser-backed |
+|---|---|---|
+| restart command | run, on the cooldown | never run |
+| `browser_restart_skips` | charged when a restart was skipped | never touched |
+| transcript event | `browser_error` | `transport_error`, carrying `provider` |
+| `consecutive_failures` | charged (unless the restart ran and worked, or the cooldown refused it) | charged |
+| budget exhausted | `failed`, resumable via `--retry` | parks `loop_fatal` `transport_failure_budget_exhausted` |
+
+`consecutive_failures` is deliberately still charged. It is the loop's generic
+"this keeps failing" counter — git failures spend it too — and exempting a
+transport that cannot answer would let a permanently broken codex retry forever,
+which is a worse version of the fault being fixed. What the non-browser side
+gets instead is a PARK rather than a bare `failed`: a park writes a
+`blockers.Blocker` carrying guidance that names a fix for the transport actually
+in use (`conversation.transport_remedy`, with a generic branch naming
+`conversation.provider` and `conversation.fallback_provider` for a transport
+with no entry). Advice referencing a subsystem the run does not use is worse
+than no advice: it sends the investigation somewhere else, which is where the
+measured one went.
+
+That advice lives with the REGISTRY, not beside the handler that quotes it, and
+the reason is a seam worth keeping: `orchestrator.py`, `policy.py` and `state.py`
+are held provider-agnostic by test (`test_codex_app_server.py::test_the_orchestrator_
+policy_and_state_modules_stay_provider_agnostic`), while `conversation.py` already
+owns `_PROVIDERS` and may know a name. The first draft of this change put the
+table in the orchestrator and that test caught it.
+
+The account-throttle path is guarded for the same reason, in BOTH of its
+browser-shaped halves. `_classify_rate_limit_state` reaches its
+`RL_BROWSER_UNATTACHABLE` world by dialling `browser.cdp_url`, which answers
+about whatever Chrome happens to be running on the HOST — nothing to do with the
+transport that raised — so on a non-browser run that question is not asked at
+all, and the restart it leads to is unreachable. The `rate_limited` PARK is the
+other half and is easy to miss: its unsighted-modal branch tells the operator to
+`curl 127.0.0.1:9222/json/list` and says "a restart IS the remedy", which on a
+codex run is advice about someone else's program. It now has a third branch
+naming the transport, and the evidence sentence's label follows the transport
+too ("what the browser looked like" is a false premise on a run that has none).
+The browser's two branches are byte-identical. No codex transport raises
+`RateLimitedError` today (§5d-ter says so explicitly); both doors are shut
+anyway, because shutting one of two is not shutting the way in.
+
+**The unsatisfiable phase, and why the reply is not persisted.**
+`CodexConversation` keeps its reply in `self._responses`, an in-memory dict,
+because a CLI turn is synchronous — its own docstring: "the waiting already
+happened … there is nothing to poll for". A request submitted before a process
+restart is therefore unrecoverable afterwards, and `await_response` correctly
+says so. But the PERSISTED phase says `awaiting`, which assumes the reply lives
+somewhere the process can go and re-read: true for the browser, where it sits in
+the chat thread; false for a subprocess whose stdout is gone. Left alone the
+loop waits, fails, retries and eventually parks over a reply that can never
+appear.
+
+Persisting the reply is rejected deliberately rather than left as an option. The
+dict is a handoff between two calls inside one round, not a durable artifact;
+storing it would keep a value whose only source has exited AND leave the
+unsatisfiable phase reachable. Re-running is the recovery this transport already
+promises.
+
+**`idempotent_submit` IS the licence, and only it.**
+`_replay_unrecoverable_await` re-enters `submitting` and re-issues the SAME
+request id with the SAME bytes, on four gates, none of them inferred:
+
+1. the phase is `awaiting` — `SubprocessCodexRunner.run` raises the same
+   `ResponseTimeoutError` type from `submit` when the CLI outruns
+   `codex.timeout_seconds`, and that one happens in `submitting`, where the send
+   machinery already owns the decision;
+2. the held client declares `idempotent_submit` — probed on the client still in
+   hand, never on one built inside a failure handler (a `_get_client()` there can
+   raise and leave `run`'s `except` with no park at all), so an absent client
+   means no replay;
+3. the transport's own `reconcile` confirms the reply is ABSENT — presence
+   outranks everything, and a `reconcile` that RAISES is "could not ask", not
+   "absent", so it declines;
+4. `PendingRequest.replays_used` is under `orchestrator.MAX_AWAIT_REPLAYS` (3).
+
+A transport without the declaration — `codex_app_server`, and every future one
+that stays silent — is never re-run automatically: appending a second copy of a
+packet to a shared thread is exactly the harm the ambiguity park exists for. It
+keeps retrying in `awaiting` on the ordinary failure budget, as it did before.
+
+A replay charges nothing to the failure budget, on the rule
+`_handle_browser_failure` already applies to a restart that ran: a recovery that
+was PERFORMED is not evidence recovery fails. The bound is what stops that being
+open-ended — a transport that confirmed every send and answered none would
+re-invoke a reviewer forever — and past it the fault falls back to the ordinary
+budget and its park. `replays_used` lives on the request, so it survives a
+restart (a per-process counter would be refilled by the very restarts it
+bounds), and is cleared with the other per-transport marks when the reviewer
+role moves to another provider.
+
+Both halves are recorded: `transport_replay_authorized` with the provider and
+the count, `transport_replay_declined` with `not_idempotent`,
+`reconcile_failed` or `replay_budget`.
+
+**Rotation is refused for a non-browser transport, and this is the door that is
+actually reachable.** The two guards above sit in fault handlers;
+`_step_submission_rejected` reaches `_attempt_rotation` without passing any of
+them, and `codex_cli` returns `SubmitResult.REJECTED` on every non-zero exit and
+on a clean exit with empty stdout. So two ordinary consecutive codex failures on
+one request arrive at rotation. Both ways out were wrong:
+
+* with `browser.project_url` unset — the normal codex deployment — the park told
+  the operator to set it "to the ChatGPT project this conversation belongs to";
+* with it left set by an operator who moved from the browser to codex, the
+  preconditions PASSED, `state.rotations` was spent, and `_rotate_conversation`
+  then raised because the transport has no `retarget`/`current_url` — a park
+  about a rotation that could never have happened, plus a consumed budget.
+
+`_attempt_rotation` now refuses before either, parking
+`rotation_unsupported_by_transport` with the transport's own remedy and spending
+no rotation budget. Nothing is lost: rotation opens a chat in a ChatGPT project
+and moves a turn into it, so a transport with no rotation surface is not being
+denied a recovery it ever had. For the browser both pre-existing refusals
+(`rotation_unavailable`, `rotation_cap_reached`) are untouched.
+
+---
+
 ## 5d-bis. Chunked packet delivery: a big diff arrives in parts, not omitted
 
 Added 2026-08-14 (pkt-01).

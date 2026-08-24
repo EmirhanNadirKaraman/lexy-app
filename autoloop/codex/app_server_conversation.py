@@ -30,7 +30,16 @@ the thread is real, `reconcile` can ask the server what actually happened, and
 answers True only when the request is on the thread AND has an answer to hand
 back. A turn that was appended and never answered reconciles False and parks
 `submission_ambiguous` — the correct outcome, arrived at from evidence rather
-than from a declaration.
+than from a declaration. The same declaration is what keeps this transport out
+of `orchestrator._replay_unrecoverable_await`: a loop restarted while `awaiting`
+on a request this adapter cannot answer is NOT re-invoked, because re-invoking
+would append a second copy of the packet to a thread that already holds one.
+
+**Faults here are not browser faults.** `conversation.transport_is_browser_backed`
+does not list `codex_app_server`, so a failure raised by this adapter is
+recovered by `orchestrator._handle_transport_failure`: no Chrome is launched, no
+browser budget moves, and the park it can eventually reach names this
+transport's own `codex_app_server_failed` records.
 
 **No restart durability, and no sandbox preset.** `thread/resume` exists in the
 protocol and this adapter never sends it; the thread lives in memory and a new

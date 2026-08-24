@@ -48,6 +48,22 @@ implements only the protocol above stays valid:
   into a virtualized message list, so a readback does not conclude a message is
   absent when it is merely unmounted. Optional and best-effort: its failures
   are swallowed, and an adapter without it simply reads what is rendered.
+* **Idempotent submit** — `idempotent_submit` declares that a FAILED `submit`
+  appended nothing to any durable conversation, so re-issuing the same request
+  id cannot double-post. It is the ONLY licence the orchestrator has to re-run
+  an invocation on its own account (`Orchestrator._replay_unrecoverable_await`
+  and the `submitting` ambiguity branch). A transport that does not set it is
+  never re-run automatically.
+
+**Which faults are recovered by restarting a browser is a property of the
+TRANSPORT, not of the exception type** — see `transport_is_browser_backed`
+below. Every transport fault arrives as a `BrowserError` subclass (the routing
+in `orchestrator.run` is by type, and `errors.py` names the hierarchy after the
+first implementation), so the type alone cannot say whether launching Chrome is
+a recovery or a category error. On 2026-08-22 a `codex_cli` run answered a
+`ResponseTimeoutError` from a SUBPROCESS by starting Chrome on the browser
+profile, spending the browser fault budget, and parking the loop with advice to
+restart a browser it does not use.
 """
 
 from __future__ import annotations
@@ -65,8 +81,11 @@ __all__ = [
     "LLMConversation",
     "SubmitResult",
     "available_providers",
+    "browser_backed_providers",
     "create_conversation",
     "register_provider",
+    "transport_is_browser_backed",
+    "transport_remedy",
 ]
 
 
@@ -242,13 +261,120 @@ _PROVIDERS: dict[str, ConversationFactory] = {
     "codex_app_server": _codex_app_server_factory,
 }
 
+#: Providers whose faults a BROWSER RESTART can actually recover — the ones for
+#: which `orchestrator._handle_browser_failure`, `browser.restart_command`,
+#: `browser.restart_cooldown_seconds` and `policy.max_browser_restart_skips`
+#: describe anything at all. Membership is what the orchestrator asks before it
+#: launches Chrome, charges the browser fault budget, or writes a park naming
+#: the browser.
+#:
+#: **Keyed by the provider NAME, not by an attribute on the client object, and
+#: that is the load-bearing choice.** A `getattr(client, ...)` probe fails OPEN
+#: in the exact shape this exists to prevent: the failure handlers run with the
+#: client already dropped, and a transport whose FACTORY raised never produced
+#: an object to ask. Both answer "no client" and would default to the historical
+#: browser behaviour — which is starting Chrome for a subprocess fault.
+#: `active_provider()` answers with nothing held at all.
+#:
+#: **An unknown name is NOT browser-backed**, which is the fail-closed
+#: direction: a provider registered by a future adapter gets the transport-
+#: generic recovery (retry on the ordinary failure budget, park naming the
+#: provider) rather than a browser launch nobody asked for. The cost is real and
+#: is stated rather than hidden: a THIRD-PARTY Playwright adapter registered
+#: under some other name silently loses auto-restart until it declares itself
+#: with `register_provider(..., browser_backed=True)`. That is a lost recovery,
+#: which shows up as retries and a park; the other direction is an automation
+#: killing and relaunching a browser a run never used.
+_BROWSER_BACKED: set[str] = {"browser_chatgpt"}
 
-def register_provider(name: str, factory: ConversationFactory) -> None:
+
+def register_provider(
+    name: str, factory: ConversationFactory, *, browser_backed: bool = False
+) -> None:
+    """Register `name` as a selectable `conversation.provider`.
+
+    `browser_backed=True` additionally declares that this transport's faults are
+    recovered by `browser.restart_command` — see `_BROWSER_BACKED`. Default
+    False: an adapter that says nothing is treated as not-a-browser, so the
+    orchestrator never restarts Chrome on its behalf.
+    """
     _PROVIDERS[name] = factory
+    if browser_backed:
+        _BROWSER_BACKED.add(name)
+    else:
+        _BROWSER_BACKED.discard(name)
 
 
 def available_providers() -> list[str]:
     return sorted(_PROVIDERS)
+
+
+def browser_backed_providers() -> list[str]:
+    return sorted(_BROWSER_BACKED)
+
+
+def transport_is_browser_backed(provider: str) -> bool:
+    """Would restarting the browser be a recovery for this provider's faults?
+
+    False for every name this module does not positively know to drive a
+    browser, including the empty string and a name that was never registered —
+    see `_BROWSER_BACKED` for why the unknown case answers this way.
+    """
+    return provider in _BROWSER_BACKED
+
+
+#: What an operator can actually DO about a fault from each NON-browser
+#: transport, quoted into the park `orchestrator._handle_transport_failure`
+#: writes. Here rather than in the orchestrator because that module is held
+#: provider-agnostic by test (`test_codex_app_server.py::test_the_orchestrator_
+#: policy_and_state_modules_stay_provider_agnostic`), and this one is the
+#: registry: knowing a provider by name is its job.
+#:
+#: This exists because the alternative is what shipped. On 2026-08-22 a
+#: `codex_cli` run parked advising the operator to "restart the browser by hand
+#: (python3 -m autoloop.browser.chrome_restart)" or to lower
+#: `browser.restart_cooldown_seconds`. Neither can repair a subprocess fault,
+#: and advice naming a subsystem the run does not use is worse than no advice:
+#: it sends the investigation somewhere else, which is where that one went.
+_TRANSPORT_REMEDIES: dict[str, str] = {
+    "codex_cli": (
+        "Run codex.command (default `codex exec`) by hand from a shell and see "
+        "what it says; `codex login` if it refuses. This run's own "
+        "codex_invocation_failed transcript records carry the exit code and the "
+        "stderr tail for every failed invocation. If the invocations are being "
+        "killed at the deadline, raise codex.timeout_seconds. To keep going on "
+        "the other transport instead, set conversation.fallback_provider. No "
+        "browser is involved in this run: restarting one changes nothing."
+    ),
+    "codex_app_server": (
+        "Run codex.app_server_command by hand from a shell and see what it "
+        "says; `codex login` if it refuses. This run's own "
+        "codex_app_server_failed transcript records carry the protocol error "
+        "that ended each turn. If turns are being cut off at the deadline, "
+        "raise codex.timeout_seconds. To keep going on the other transport "
+        "instead, set conversation.fallback_provider. No browser is involved in "
+        "this run: restarting one changes nothing."
+    ),
+}
+
+
+def transport_remedy(provider: str) -> str:
+    """Operator-actionable advice for a fault from `provider`.
+
+    Never mentions restarting a browser, because the only caller is the
+    non-browser recovery path. A provider with no entry gets the generic
+    branch rather than silence — an unnamed transport with no advice would
+    recreate the original fault in a new place.
+    """
+    remedy = _TRANSPORT_REMEDIES.get(provider)
+    if remedy:
+        return remedy
+    return (
+        f"Check the transport named by conversation.provider ({provider!r}) "
+        "and whatever records it writes to this run's transcript. No browser is "
+        "involved in this run, so restarting one changes nothing. To keep going "
+        "on a different transport, set conversation.fallback_provider."
+    )
 
 
 def create_conversation(provider: str, config: "AutoloopConfig") -> LLMConversation:

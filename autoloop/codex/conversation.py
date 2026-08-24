@@ -26,6 +26,26 @@ a shared, persistent chat thread and means nothing here. The adapter declares
 the property rather than lying about `send_attempted`, so the orchestrator's
 reasoning stays visible at the seam instead of being smuggled through a flag.
 
+It is also what makes an `awaiting` phase RECOVERABLE here. `_responses` is
+in-memory, so a request submitted before a process restart has no reply
+afterwards and `await_response` says so — but the persisted phase still says
+`awaiting`, which assumes the reply is somewhere a process can go and re-read.
+It is not: the stdout that carried it belongs to an exited subprocess. Rather
+than persist the reply (a handoff between two calls inside one round is not a
+durable artifact, and storing it would leave the unsatisfiable phase reachable),
+`orchestrator._replay_unrecoverable_await` re-enters `submitting` and RE-RUNS
+the invocation — on this declaration, after `reconcile` confirms the reply is
+absent, and bounded by `orchestrator.MAX_AWAIT_REPLAYS`.
+
+**Faults here are not browser faults.** `conversation.transport_is_browser_backed`
+does not list `codex_cli`, so a failure raised by this adapter is recovered by
+`orchestrator._handle_transport_failure`: no Chrome is launched, no browser
+budget moves, and the park it can eventually reach points at the
+`codex_invocation_failed` records below rather than at a browser restart. On
+2026-08-22 the missing distinction did the opposite — 34 browser events, a real
+Chrome started on the loop's profile, and a `browser_restart_cooldown_blocked`
+park, all for a `ResponseTimeoutError` raised by `await_response` right here.
+
 **No rotation, by omission.** `retarget` / `current_url` are absent, so
 `_client_for_request`'s `getattr` probe skips retargeting and rotation is
 structurally unreachable. Every rotation trigger — a disproven send, a wedged

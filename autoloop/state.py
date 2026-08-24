@@ -117,6 +117,16 @@ if TYPE_CHECKING:
 # by the very session replacement it exists to observe. An old state file
 # therefore needs no backfill, and a deployment with no ledger file yet simply
 # starts counting from its next stop.
+#
+# NOT bumped for transport-aware fault recovery either
+# (`PendingRequest.replays_used`). Same reasoning as `start_timeouts` above: a
+# new field defaulting to 0, and 0 is the truth rather than a guess for a
+# request loaded from a state file written before it existed — no process had
+# ever re-invoked it, because nothing could. The direction of the default is the
+# safe one too: 0 means the request still has its whole replay budget, and the
+# budget only ever authorizes a re-run on a transport that declares
+# `idempotent_submit`, i.e. one whose failed invocation provably appended
+# nothing anywhere.
 SCHEMA_VERSION = 3
 
 
@@ -344,6 +354,18 @@ class PendingRequest:
     #: measured, not merely assumed from configuration. Reset alongside
     #: `start_timeouts`.
     start_timeout_wait_seconds: float = 0.0
+    #: How many times this request has been RE-INVOKED because its transport
+    #: could no longer produce the reply it was waiting for
+    #: (`orchestrator._replay_unrecoverable_await`). Only ever spent by a
+    #: transport that declares `idempotent_submit`, and only after that
+    #: transport's own `reconcile` has confirmed the reply is absent — so each
+    #: one is a re-run that provably cannot double-post. Bounded by
+    #: `orchestrator.MAX_AWAIT_REPLAYS`; past it the fault is charged to the
+    #: ordinary failure budget and ends in a park, rather than re-invoking a
+    #: reviewer forever. Never reset by a replay (that is the whole point of
+    #: counting them); cleared with the other per-transport marks when the
+    #: reviewer role moves to another provider.
+    replays_used: int = 0
 
 
 @dataclass
