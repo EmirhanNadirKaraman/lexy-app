@@ -6521,3 +6521,532 @@ def test_a_stale_dashboard_ends_up_serving_the_new_code(tmp_path):
             child.terminate()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 child.wait(timeout=10)
+
+
+# ---- one state directory, and the unit it is dispatching NOW (dash-20) -------
+#
+# MEASURED 2026-08-23. The page read PHASE ready, UNIT notes-04 and "55m 20s
+# since dispatch" while the loop was executing ship-01 — notes-04 having been
+# completed, published and merged an hour earlier. `collect()` resolved its
+# state directory as the literal `repo / ".autoloop"`, while everything reaching
+# it through `_tasks_file` -> `_state_dir` honoured `[paths].state_dir`. So when
+# port-01 moved state out of the checkout the page went HALF LIVE: roadmap,
+# groups and counters followed the config; phase, iteration, the unit tiles and
+# live-progress froze at the instant of the move. Restarting the dashboard three
+# times changed nothing, because a restart cannot fix a hardcoded path — which
+# is what distinguished it from staleness, and is why it went undiagnosed
+# through a browser-cache theory, a wrong-port theory and a stale-process
+# theory. A page that is partly current reads as authoritative and is worse than
+# one that is plainly stale.
+#
+# THE DECOY IS THE POINT. These tests configure an EXTERNAL `state_dir` and also
+# leave a complete, plausible state directory at `<repo>/.autoloop` in which
+# every value carries the marker `decoy`. A reader that resolves the directory
+# on its own reads that one, and the marker turns up in the payload. Asserting
+# instead that `dashboard.py`'s SOURCE holds no `repo / ".autoloop"` would be an
+# echo — the test would specify the literal it then goes and finds — and it
+# would pass silently the first time a second resolver spelled it
+# `Path(repo, ".autoloop")`, `repo.joinpath(...)` or `repo / LEGACY_NAME`.
+#
+# The three `.autoloop` literals that legitimately remain are NOT state-dir
+# resolutions and no test here should hunt them: `_config_toml` and
+# `merge_window` name the CONFIG FILE, which lives at
+# `<repo>/.autoloop/config.toml` whatever the state dir is
+# (`cli.DEFAULT_CONFIG`), and `main()` checks that directory exists before it
+# will serve at all.
+
+#: Every decoy value carries this marker, so one blanket `not in` assertion
+#: covers every reader in the payload at once instead of one named sentinel per
+#: panel. Nothing real can hold it: the checkout, the worker, the external state
+#: dir and every sha, branch, pid and timestamp below are built without it.
+DECOY = "decoy"
+
+_DECOY_TASK = "decoyunit-99"
+_DECOY_ROADMAP = "decoyqueued-77"
+_DECOY_PHASE = "decoyphase"
+_DECOY_SESSION = "decoysession"
+_DECOY_BLOCKER = "decoyblocker"
+_DECOY_EVENT = "decoyevent"
+_DECOY_AUDIT = "decoyauditrun"
+_DECOY_SHA = "decoy" * 8  # 40 chars, like a real sha and unlike any real one
+#: Six digits: longer than any pid `pgrep` can put in `health.pids`, so the
+#: iteration assertion cannot be satisfied by a coincidence.
+_DECOY_ITERATION = 424243
+
+
+def toml_path(value) -> str:
+    """A filesystem path as a TOML basic string.
+
+    `json.dumps` escapes exactly what a basic string needs. Quoting by hand is
+    how a separator or a space produces an unparseable config, which
+    `_config_toml` then swallows into `{}` — and the test would pass against the
+    in-checkout default it meant to disprove, which is the fail-open shape this
+    whole section exists to close.
+    """
+    return json.dumps(str(value))
+
+
+def configure_state_dir(repo: Path, state_dir) -> None:
+    """Point `[paths].state_dir` at `state_dir`, through the loop's own config.
+
+    Written to `<repo>/.autoloop/config.toml` because that is where the config
+    lives whatever the state dir is — the chicken-and-egg that makes THAT path
+    a literal in `_config_toml` rather than a second resolver.
+    """
+    (repo / ".autoloop").mkdir(parents=True, exist_ok=True)
+    (repo / ".autoloop" / "config.toml").write_text(
+        f"[paths]\nstate_dir = {toml_path(state_dir)}\n", encoding="utf-8"
+    )
+
+
+def write_live_lock(state_dir: Path) -> None:
+    """A lock file this very process would be judged to hold.
+
+    Written by hand rather than through `LoopLock.acquire`, which installs
+    process-wide signal handlers a test has no business leaving behind.
+    """
+    import socket
+
+    from autoloop.lock import LOCK_FILENAME
+
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    (Path(state_dir) / LOCK_FILENAME).write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "started_at": utcnow_iso(),
+            "run_id": "decoyrunid",
+            "state_dir": str(state_dir),
+        }),
+        encoding="utf-8",
+    )
+
+
+def fill_decoy_state(repo: Path) -> Path:
+    """A COMPLETE state directory at `<repo>/.autoloop` — one plausible answer
+    for every reader `collect()` has, each carrying `DECOY`.
+
+    The live lock is the sharpest of them: read from here, a stopped loop
+    reports "running", and that is a health verdict rather than a stale figure.
+    """
+    sd = repo / ".autoloop"
+    (sd / "blockers").mkdir(parents=True, exist_ok=True)
+    (sd / "executions").mkdir(parents=True, exist_ok=True)
+    (sd / "audit" / _DECOY_AUDIT / "raw").mkdir(parents=True, exist_ok=True)
+    (sd / "audit" / _DECOY_AUDIT / "raw" / "decoydomain.json").write_text("{}")
+    (sd / "state.json").write_text(json.dumps({
+        "phase": _DECOY_PHASE,
+        "iteration": _DECOY_ITERATION,
+        "session_id": _DECOY_SESSION,
+        "last_decision": _DECOY_PHASE,
+        "question": _DECOY_BLOCKER,
+        "updated_at": "2020-01-01T09:09:09+00:00",
+        # The frozen "55m 20s since dispatch" of the measured failure: a stamp
+        # years away from anything a test writes, so an elapsed number computed
+        # from it is unmistakable.
+        "current_task": {"task_id": _DECOY_TASK,
+                         "started_at": "2020-01-01T09:09:09+00:00"},
+        "task_execution": {"task_id": _DECOY_TASK,
+                           "task_branch": f"autoloop/{_DECOY_TASK}",
+                           "worktree_path": str(repo / "decoyworker"),
+                           "task_base_sha": _DECOY_SHA,
+                           "candidate_sha": _DECOY_SHA,
+                           "review_round": 9, "attempt_count": 9},
+    }), encoding="utf-8")
+    (sd / "tasks.json").write_text(json.dumps({"schema_version": 1, "tasks": [
+        roadmap_task(_DECOY_TASK, status="in_progress"),
+        roadmap_task(_DECOY_ROADMAP),
+    ]}), encoding="utf-8")
+    # Filed under the LIVE task's id as well as its own, so a reader that takes
+    # `tasks.json` from the configured directory and execution records from here
+    # is caught too — that split is precisely the half-live failure.
+    for task_id in (_DECOY_TASK, "live-01"):
+        (sd / "executions" / f"{task_id}.json").write_text(json.dumps({
+            "task_id": task_id, "task_branch": f"autoloop/{DECOY}-{task_id}",
+            "candidate_sha": _DECOY_SHA, "review_round": 9, "attempt_count": 9,
+        }), encoding="utf-8")
+    (sd / "blockers" / "blk-decoy.json").write_text(json.dumps({
+        "id": _DECOY_BLOCKER, "kind": "task_fatal", "code": _DECOY_BLOCKER,
+        "question": _DECOY_BLOCKER, "task_id": _DECOY_TASK,
+    }), encoding="utf-8")
+    (sd / "transcript.jsonl").write_text(
+        json.dumps({"ts": "2020-01-01T09:09:09+00:00", "type": _DECOY_EVENT,
+                    "data": {"decision": _DECOY_EVENT}}) + "\n",
+        encoding="utf-8",
+    )
+    # `repo_root` is deliberately not this process's package root, so the read
+    # lands on `not_this_tree` — a verdict that carries the record's `task_id`
+    # and `paths` into the payload, and authorises no replacement.
+    from autoloop.auto_merge import UpgradeStore
+
+    UpgradeStore(sd / "pending_upgrade.json").save(
+        upgrade_record(repo, task_id=_DECOY_TASK, paths=["autoloop/decoyfile.py"])
+    )
+    write_live_lock(sd)
+    return sd
+
+
+def fill_live_state(state_dir, worker, base, *, task_id="live-01",
+                    candidate="", review_round=0, started_at=None,
+                    current_task_id=None):
+    """The state a loop mid-round actually writes, in `state_dir`.
+
+    No lock, so `health` reads "stopped" — the opposite of the decoy's, which
+    is what makes liveness a discriminator and not just another string.
+    """
+    sd = Path(state_dir)
+    (sd / "executions").mkdir(parents=True, exist_ok=True)
+    named = task_id if current_task_id is None else current_task_id
+    (sd / "state.json").write_text(json.dumps({
+        "phase": "executing",
+        "iteration": 7,
+        "session_id": "liveses00000",
+        "last_decision": "implement",
+        "updated_at": "2026-08-23T11:22:33+00:00",
+        "current_task": {"task_id": named,
+                         "started_at": started_at or utcnow_iso()},
+        "task_execution": {"task_id": task_id,
+                           "task_branch": f"autoloop/{task_id}",
+                           "worktree_path": str(worker),
+                           "task_base_sha": base,
+                           "candidate_sha": candidate,
+                           "review_round": review_round, "attempt_count": 1},
+    }), encoding="utf-8")
+    (sd / "tasks.json").write_text(json.dumps({"schema_version": 1, "tasks": [
+        roadmap_task(task_id, status="in_progress"),
+    ]}), encoding="utf-8")
+    (sd / "executions" / f"{task_id}.json").write_text(json.dumps({
+        "task_id": task_id, "task_branch": f"autoloop/{task_id}",
+        "candidate_sha": candidate, "review_round": review_round,
+        "attempt_count": 1,
+    }), encoding="utf-8")
+    return sd
+
+
+#: The two payload slices that are NOT read off the state directory, excluded
+#: from the blanket assertion below because neither is what it is about — and
+#: because both are answered by the host rather than by this fixture.
+#:
+#: `agents` is `live_agents()`, which takes no repo and shells out to `ps`, so
+#: whatever is running on the machine under test lands in it. `inbox` is
+#: `_inbox_dir`, which resolves from `[paths].workers_root` — deliberately, and
+#: matching `inbox.inbox_dir_for`: the inbox lives BESIDE the workers root, not
+#: under the state dir, because that path is already required to be outside the
+#: snapshotted checkout. With no `workers_root` configured it answers
+#: `~/.autoloop/inbox`, i.e. the operator's own.
+_NOT_STATE_DIR_DERIVED = ("agents", "inbox")
+
+
+def state_derived(payload: dict) -> str:
+    """The payload as text, minus the slices that do not come from the state
+    directory at all."""
+    return json.dumps({k: v for k, v in payload.items()
+                       if k not in _NOT_STATE_DIR_DERIVED})
+
+
+def test_collect_reads_the_state_dir_the_config_names_not_the_checkout(tmp_path):
+    """The regression that was missing. Every panel — phase, iteration, session,
+    the unit tiles, live progress, liveness, roadmap, blockers, events, audit and
+    the upgrade marker — must come from the configured directory, and NOT ONE of
+    them may fall back to `<repo>/.autoloop` while its neighbours do not."""
+    repo = make_repo(tmp_path)
+    worker, base = make_worker(tmp_path)
+    (worker / "added.py").write_text("a\nb\nc\n")
+    external = tmp_path / "outside" / "state"
+    external.mkdir(parents=True)
+    configure_state_dir(repo, external)
+    fill_decoy_state(repo)
+    fill_live_state(external, worker, base)
+
+    payload = collect(repo)
+
+    assert payload["session"]["phase"] == "executing"
+    assert payload["session"]["iteration"] == 7
+    assert payload["session"]["session_id"] == "liveses00000"
+    assert payload["task"]["id"] == "live-01"
+    assert payload["task"]["worker"] == str(worker)
+    assert payload["progress"]["task_id"] == "live-01"
+    assert payload["progress"]["insertions"] == 3
+    assert [r["id"] for r in payload["roadmap"]] == ["live-01"]
+    assert payload["blockers"] == []
+    assert payload["events"] == []
+    assert payload["audit"]["run"] is None
+    assert payload["build"]["upgrade"]["state"] == "current"
+    # Liveness, not a string: the decoy holds a lock this process would be
+    # judged to own, so a reader that went there reports a stopped loop running.
+    assert payload["health"]["label"] == "stopped"
+    assert payload["health"]["lock_alive"] is False
+
+    # And the whole payload, in one assertion: no reader anywhere in it resolved
+    # the state directory for itself.
+    assert DECOY not in state_derived(payload)
+
+
+def test_a_configured_state_dir_that_does_not_exist_yet_is_still_the_answer(tmp_path):
+    """A fresh deployment before the loop's first save. Every panel reads
+    absent — which is the truth — and none of them falls back to the checkout,
+    where a complete previous-generation state directory is sitting."""
+    repo = make_repo(tmp_path)
+    external = tmp_path / "outside" / "never-created"
+    configure_state_dir(repo, external)
+    fill_decoy_state(repo)
+
+    payload = collect(repo)
+
+    assert payload["session"]["phase"] is None
+    assert payload["task"]["state"] == "idle"
+    assert payload["progress"] is None
+    assert payload["roadmap"] == []
+    assert payload["health"]["label"] == "stopped"
+    assert DECOY not in state_derived(payload)
+
+
+def test_a_relative_state_dir_resolves_against_the_checkout(tmp_path):
+    """`[paths].state_dir` may be relative — the shipped config's own value is.
+    A "fix" that only honoured an absolute path would leave every relative
+    deployment reading the checkout, i.e. exactly this bug for the operators
+    most likely to hit it."""
+    repo = make_repo(tmp_path)
+    worker, base = make_worker(tmp_path)
+    configure_state_dir(repo, "loopstate")
+    fill_decoy_state(repo)
+    fill_live_state(repo / "loopstate", worker, base)
+
+    payload = collect(repo)
+
+    assert payload["session"]["iteration"] == 7
+    assert payload["task"]["id"] == "live-01"
+    assert DECOY not in state_derived(payload)
+
+
+def test_an_unconfigured_state_dir_still_reads_the_checkout(tmp_path):
+    """The other half of the claim: with `[paths].state_dir` unset, behaviour is
+    unchanged. `make_repo` writes no config at all, so this is the shape every
+    other test in this file runs under."""
+    repo = make_repo(tmp_path)
+    fill_decoy_state(repo)
+
+    payload = collect(repo)
+
+    assert payload["session"]["phase"] == _DECOY_PHASE
+    assert payload["session"]["iteration"] == _DECOY_ITERATION
+    assert payload["task"]["id"] == _DECOY_TASK
+    assert payload["health"]["label"] == "running"
+
+
+def test_a_config_that_will_not_parse_falls_back_to_the_checkout(tmp_path):
+    """PINNED, NOT ENDORSED — and the residual hole in this claim.
+
+    `_config_toml` swallows a malformed config into `{}` so that one bad TOML
+    cannot take down the page you read when something is already wrong. The cost
+    is that `_state_dir` then answers `<repo>/.autoloop`, so on a post-port-01
+    deployment a typo in `config.toml` puts the WHOLE page back on the stale
+    in-checkout directory — silently, and looking identical to the bug this task
+    closed. Every panel moves together, so it is a plainly stale page rather
+    than a half-live one, which is why it is documented here rather than
+    changed: the unconfigured default is port-06's, and surfacing this on the
+    page is a payload field somebody has to decide on.
+    """
+    repo = make_repo(tmp_path)
+    worker, base = make_worker(tmp_path)
+    external = tmp_path / "outside" / "state"
+    external.mkdir(parents=True)
+    (repo / ".autoloop" / "config.toml").write_text(
+        f"[paths\nstate_dir = {toml_path(external)}\n", encoding="utf-8"
+    )
+    fill_decoy_state(repo)
+    fill_live_state(external, worker, base)
+
+    payload = collect(repo)
+
+    assert payload["session"]["phase"] == _DECOY_PHASE, (
+        "an unreadable config falls back to the in-checkout directory — if this "
+        "has been changed, port-06 is the task that owns the default"
+    )
+    # The saving grace, and the reason this is tolerable: the fallback is TOTAL.
+    # Every panel moves with it, so nothing on the page is current.
+    assert payload["task"]["id"] == _DECOY_TASK
+    assert payload["health"]["label"] == "running"
+
+
+# ---- the unit panel: the dispatch on screen, and nobody else's figures -------
+
+
+def test_a_dispatch_that_has_produced_nothing_is_named_rather_than_dashed():
+    """The empty state, honestly. Before dash-20 the tiles rendered
+    `t.candidate || "—"`, so "nothing is executing" and "something is executing
+    and has committed nothing" were the same two characters — and an em dash
+    beside a live agent reads as an absent feature, not as the alarming state it
+    is."""
+    from autoloop.dashboard import NO_CANDIDATE_YET, unit_panel
+
+    panel = unit_panel({"task_execution": {
+        "task_id": "dash-20", "task_branch": "autoloop/dash-20",
+        "review_round": 1, "attempt_count": 2,
+    }})
+
+    assert panel["state"] == "no_candidate"
+    assert panel["unit_label"] == "dash-20"
+    assert panel["round_label"] == "1"
+    assert panel["candidate_label"] == NO_CANDIDATE_YET
+    # Its own figures, never a placeholder standing in for them.
+    assert panel["id"] == "dash-20" and panel["candidate"] == ""
+
+
+def test_a_first_round_shows_its_real_zero_and_not_an_em_dash():
+    """`TaskExecution.review_round` starts at 0 and is incremented only once a
+    review packet is BUILT, so a unit executing its first round genuinely
+    carries 0. `t.round || "—"` would render that measured zero as unknown —
+    the same fabricate-an-absence bug, one field over."""
+    from autoloop.dashboard import UNIT_IDLE, UNIT_UNKNOWN, unit_panel
+
+    panel = unit_panel({"task_execution": {"task_id": "dash-20", "review_round": 0}})
+
+    assert panel["round"] == 0
+    assert panel["round_label"] == "0"
+    assert panel["round_label"] not in (UNIT_IDLE, UNIT_UNKNOWN)
+
+    # A record that carries no round at all is UNKNOWN, which is a different
+    # fact from "no unit in flight" and must not borrow its marker.
+    missing = unit_panel({"task_execution": {"task_id": "dash-20"}})
+    assert missing["round"] is None and missing["round_label"] == UNIT_UNKNOWN
+
+
+def test_an_idle_loop_names_no_unit_and_borrows_no_finished_figures(tmp_path):
+    """The measured failure in miniature: a published, merged execution record is
+    still on disk, and the panel must show none of it. Those records are correct
+    and other views read them — the fix is that this panel does not."""
+    from autoloop.dashboard import UNIT_IDLE
+
+    repo = make_repo(tmp_path)
+    write_registry(
+        repo,
+        [completed("notes-04")],
+        [{"task_id": "notes-04", "candidate_sha": "f" * 40,
+          "published_sha": "f" * 40, "review_round": 2}],
+    )
+    (repo / ".autoloop" / "state.json").write_text(json.dumps({
+        "phase": "ready",
+        # Still named here, an hour after it published. It must not resurrect a
+        # unit, a round, a candidate or a clock.
+        "current_task": {"task_id": "notes-04", "started_at": utcnow_iso()},
+        "task_execution": None,
+    }), encoding="utf-8")
+
+    payload = collect(repo)
+
+    assert payload["task"]["state"] == "idle"
+    assert payload["task"]["unit_label"] == UNIT_IDLE
+    assert payload["task"]["round_label"] == UNIT_IDLE
+    assert payload["task"]["candidate_label"] == UNIT_IDLE
+    assert payload["progress"] is None
+    # The finished record is still readable where it belongs — this panel simply
+    # is not one of its readers.
+    assert "f" * 12 not in json.dumps(payload["task"])
+    assert payload["merge"]["rows"], "the record still feeds the merge panel"
+
+
+def test_a_record_naming_no_unit_contributes_no_figure_at_all():
+    """A `task_execution` with no `task_id` names no unit, so a sha or a round
+    taken off it would be a figure with nobody to belong to. Not just the
+    labels: the RAW fields are empty too, because `/data.json` is a reader and
+    a candidate sitting beside `state: idle` is the same half-live reading in a
+    different pane. Reachable from a hand-edited or half-written state file,
+    which is the only kind of state file anyone edits by hand."""
+    from autoloop.dashboard import UNIT_IDLE, unit_panel
+
+    panel = unit_panel({"task_execution": {
+        "candidate_sha": "e" * 40, "review_round": 4,
+        "task_branch": "autoloop/ghost-01", "worktree_path": "/tmp/ghost",
+    }})
+
+    assert panel["state"] == "idle"
+    assert set(panel) == {"state", "id", "branch", "worker", "base", "candidate",
+                          "round", "attempts", "unit_label", "round_label",
+                          "candidate_label"}, "both shapes must carry the same keys"
+    assert panel["candidate"] == "" and panel["round"] is None
+    assert panel["candidate_label"] == panel["round_label"] == UNIT_IDLE
+    assert "ghost" not in json.dumps(panel) and "e" * 12 not in json.dumps(panel)
+
+
+def test_every_unit_state_the_backend_can_emit_is_reachable_and_spelled():
+    """`MERGE_GROUPS`' rule applied here: a state the backend can produce and the
+    template cannot spell would reach an operator as a bare word, and a state
+    nothing produces is dead vocabulary that invites a fourth."""
+    from autoloop.dashboard import UNIT_STATES, unit_panel
+
+    produced = {
+        unit_panel({})["state"],
+        unit_panel({"task_execution": {"task_id": "t"}})["state"],
+        unit_panel({"task_execution": {"task_id": "t",
+                                       "candidate_sha": "a" * 40}})["state"],
+    }
+    assert produced == set(UNIT_STATES)
+
+
+def test_the_unit_tiles_render_the_backends_words_and_never_fall_back():
+    """A payload carrying the words is not a page showing them — and the `||`
+    this removes is the bug itself, because every value it would replace is one
+    the backend measured."""
+    script = PAGE.split("<script>", 1)[1]
+    tiles = script.split('document.getElementById("tiles").innerHTML', 1)[1] \
+                  .split(".join(\"\");", 1)[0]
+
+    for field in ("t.unit_label", "t.round_label", "t.candidate_label"):
+        assert field in tiles, f"{field} never reaches the DOM"
+    for fallback in ("t.id ||", "t.candidate ||", "t.round ||"):
+        assert fallback not in tiles, (
+            f"`{fallback}` would overwrite a measured value with an em dash"
+        )
+    assert "review round" in tiles, "the round is not on the page at all"
+
+
+def test_the_unit_tile_and_the_live_progress_line_cannot_name_two_tasks(tmp_path):
+    """One source for both: `state.task_execution`. Two readings of "what is
+    running" is how the panel disagreed with itself in the first place."""
+    repo = make_repo(tmp_path)
+    worker, base = make_worker(tmp_path)
+    external = tmp_path / "outside" / "state"
+    fill_live_state(external, worker, base, task_id="ship-01")
+    configure_state_dir(repo, external)
+    fill_decoy_state(repo)
+
+    payload = collect(repo)
+
+    assert payload["task"]["id"] == payload["progress"]["task_id"] == "ship-01"
+    assert payload["task"]["worker"] == payload["progress"]["worker"] == str(worker)
+
+
+def test_a_since_dispatch_timer_never_outlives_the_execution_it_belongs_to(tmp_path):
+    """Two ways a clock could outlive its dispatch, and neither may produce a
+    number: the execution is over (published, so `task_execution` is cleared),
+    and the execution is live but `current_task` names a DIFFERENT task, whose
+    stamp would date this round from somebody else's dispatch."""
+    repo = make_repo(tmp_path)
+    worker, base = make_worker(tmp_path)
+    external = tmp_path / "outside" / "state"
+    configure_state_dir(repo, external)
+
+    # 1. Over. `current_task` still names it, with a stamp from moments ago.
+    fill_live_state(external, worker, base, task_id="ship-01")
+    state = json.loads((external / "state.json").read_text())
+    state["task_execution"] = None
+    (external / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    assert collect(repo)["progress"] is None, "a finished dispatch has no clock"
+
+    # 2. Live, but the stamp on record belongs to another task.
+    fill_live_state(external, worker, base, task_id="ship-01",
+                    current_task_id="someone-else",
+                    started_at="2020-01-01T09:09:09+00:00")
+    progress = collect(repo)["progress"]
+
+    assert progress["task_id"] == "ship-01"
+    assert progress["elapsed_seconds"] is None, "unknown, never another task's"
+    assert progress["dispatched_at"] == ""
+    # …and the lines, which come from git in the worker, still render: the clock
+    # being unknown is not a reason to blank the figures beside it.
+    assert progress["insertions"] == 0
+
+    # The page says so in words rather than printing a zero it never measured.
+    fmt = PAGE.split("function fmtDur(s){", 1)[1].split("\n}", 1)[0]
+    assert 'if (typeof s !== "number") return "unknown";' in fmt
