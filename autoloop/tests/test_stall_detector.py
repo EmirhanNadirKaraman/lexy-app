@@ -632,7 +632,7 @@ def test_a_failed_tracked_diff_never_reads_as_a_measured_zero(worker_repo):
 
 
 def test_an_unreadable_repo_is_unknown_not_zero(tmp_path):
-    """A measured zero means "the hang produced nothing"; an unreadable repo
+    """A measured zero means "the round produced nothing"; an unreadable repo
     means "we do not know". Collapsing the two would let a probe failure read
     as proof that no work was lost."""
     not_a_repo = tmp_path / "nope"

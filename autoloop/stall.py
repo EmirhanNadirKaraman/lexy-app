@@ -150,8 +150,13 @@ class PartialWork:
             return f"UNKNOWN — {reason}"
         if self.files_changed == 0:
             return (
+                # "round", not "hang": since exec-01 this same sentence is read
+                # by `implement_executor._partial_work_note` on every failed
+                # round, most of which are not hangs at all (a provider error, a
+                # crash, a failed validation). The claim — nothing changed, so
+                # nothing was lost — is identical for all of them.
                 "NONE — no file in the worker repository had changed, so this "
-                "hang produced nothing (no work was lost)"
+                "round produced nothing (no work was lost)"
             )
         body = (
             f"{self.files_changed} file(s) changed, ~{self.lines_written} line(s) "
