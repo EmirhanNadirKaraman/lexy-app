@@ -707,6 +707,25 @@ obstacle. It also means production code reading a stop reason is guarded against
 a shape only a hand-built directive can produce — worth keeping fallbacks for,
 not worth widening the contract for.
 
+### A `PAGE` prose assertion fails on text that is demonstrably on the page
+
+**Symptom:** a dashboard test asserting a sentence appears in `dashboard.PAGE`
+fails, and the message shows the sentence's own words in the haystack it says is
+missing them — `assert 'never the same as open' in ' style="font-size:13px…'`.
+Opening the page and reading it confirms the sentence is there.
+**Cause:** `PAGE` is one long hard-wrapped Python string, so a phrase that
+straddles a source line break contains a newline and several spaces of indent in
+the middle. `"never the same as\n      open"` is not `"never the same as open"`.
+The assertion is really a check on where the editor wrapped, and it passes or
+fails on an edit that changes nothing an operator can see.
+**Fix:** collapse whitespace before asserting —
+`panel = " ".join(section.split())` — so the test states what the page SAYS.
+`test_merge_window_panel.py::test_the_page_says_what_a_reason_and_a_note_each_mean`
+does this. Reflowing the HTML to put the phrase on one line "fixes" the run and
+leaves the trap armed for the next person who rewraps a paragraph.
+**The same trap does not apply to markup** — `id="mwstate"`, a tag, a CSS rule —
+because those are written on one line by construction; it is only prose.
+
 ---
 
 ## 3. Frontend build
@@ -3298,3 +3317,5 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-24 | recut-01 | `recut_verdict_outstanding` is not a bug: the recut named a task whose candidate an unanswered packet still presents, so a later `push` could approve it. Judge that packet first; do not widen the check. |
 | 2026-08-24 | recut-01 | New §2 entry: growing `CONTRACT_INSTRUCTIONS` fails `test_contract_stays_within_its_budget` AND `test_context.test_no_scheduling_advice_moved_into_the_context_block` — two failures, one ceiling. Compress first, raise both numbers second. |
 | 2026-08-24 | recut-01 | Revision round. A change-note line far longer than anything a task would write is usually TWO rows with the newline between them deleted: the seam shows a doubled pipe followed by the next row's date. Grep the four trackers for that shape before rewriting anyone's note. The 941-char failure this round was exactly that, and the first fix mis-read it as an over-long note of its own and shortened its own lines instead, leaving the real line untouched. Restore the newline; do not rewrite either half. |
+| 2026-08-24 | dash-19 | New §2 entry for the trap that cost this round an advisory validation run: a `dashboard.PAGE` prose assertion failing while the sentence is demonstrably on the page. `PAGE` is one hard-wrapped string, so a phrase straddling a source line break carries a newline and an indent in the middle of it. Collapse whitespace before asserting; reflowing the paragraph to satisfy the literal leaves the trap armed for whoever rewraps it next. Markup assertions are unaffected — a tag or an id is on one line by construction. |
+| 2026-08-24 | dash-19 | Second note, for the mistake THIS round made in these four files: a `Read` with a `limit` shows you the end of the WINDOW, not the end of the file, and three of my four notes landed mid-section behind lines the window had cut off. Nothing merged wrongly — the section is arrival-ordered, so it reads the same — but "put nothing after your own line" was broken in three trackers at once. Read past the anchor, or read with no limit, before appending. |

@@ -3618,6 +3618,102 @@ decide whether the per-branch ancestry cost is worth attacking at all.
 
 ---
 
+## 4j. The dashboard says WHY the merge window is shut (dash-19, 2026-08-24)
+
+**The gap.** `merge_report` (§4i's panel) answers which finished work is not in
+the branch, and answered nothing about the cause: measured 2026-08-21,
+`GET /api/state` carried `merge.counts = {'merged': 65, 'unmerged': 6,
+'unpublished': 3, 'unknown': 0}` and no mention of `_merge_window_blockers`
+anywhere in `dashboard.py`. So the page could say six branches had not landed
+and could not say what was stopping them.
+
+**What that cost.** The only rendered form of the answer was the startup sweep's
+line in `.autoloop/logs/loop-*.log`, which an operator grepped repeatedly over
+two days. A log line is a SNAPSHOT taken when a sweep last ran and it goes stale
+in silence; three wrong conclusions came out of that in one session — a task
+reported as holding the window forty minutes after it had published, two records
+nearly retired as holders that the live check already exempted as notes, and a
+round of `codex-01` nearly interrupted to clear a jam that did not exist.
+
+**The payload.** `collect()` carries a `merge_window` object beside `merge`:
+
+```json
+{"state": "open" | "shut" | "unknown", "reasons": [], "notes": [], "detail": ""}
+```
+
+`state` is `MERGE_WINDOW_STATES`, decided by `reasons` and only by `reasons`.
+`detail` is non-empty only for `unknown`, and says which failure produced it.
+Read it as of the payload's `served_at`, which is the whole difference between
+this and the log line — the page stamps every render with it, on every tick,
+whether or not the answer changed.
+
+**Reasons and notes are different things and are never merged.** A reason closes
+the window; a note names a record that is wrong in a way an operator should know
+about and closes nothing. Both come back from one call to
+`cli._merge_window_blockers`, and both are rendered — in separate containers,
+under separate headings, with separate icons. Collapsing them would either make
+a latent fault look like a blocker or hide it. The notes are the half nothing
+else surfaces: a record `release` should have retired with its worker, or a
+published candidate whose own record does not record the publication, which
+names in advance the `task_base_behind_head` park a later revise would hit.
+
+**It CALLS the predicate; it is the fourth caller, not a fifth
+implementation** — beside `auto_merge`, `merge_sweep` and `context` (§5f), with
+the same deferred-import idiom, since `cli` imports `orchestrator` which imports
+`dashboard`. A dashboard that derived its own version of the window could
+disagree with the loop about whether a merge is safe, which is the worst thing
+this panel could do. **Nothing here changes what closes the window** — that is
+merge-04's question; this only shows the existing answer.
+
+**Three things this had to get right, each a fail-open if it did not.**
+
+* **`unknown` is never `open`.** The check reads execution records, asks git
+  about ancestry and asks the remote about publication, and any of those can
+  fail — an unloadable config, a `tasks.json` that will not parse as a registry,
+  a git binary having a bad day. All of them land on `unknown` with a stated
+  detail. An empty reason list means "nothing is holding the window"; a check
+  that could not run has no reason list at all, and the page draws the two
+  differently, down to the heading counts (`unknown`, never `0`).
+* **The state directory is the page's, not the config file's.** `load_config`
+  honours a relative `[paths].state_dir` verbatim, so it resolves against the
+  process's cwd — which for a dashboard is wherever it was launched. The config
+  is `dataclasses.replace`d with `_state_dir(repo)` before the call, so the
+  window describes the same records the panels around it do. The unfixed version
+  reads an empty directory and reports OPEN, or reads another checkout's records
+  and is confidently wrong; `_merge_window_blockers`' own comment records that
+  failure from 2026-08-04.
+* **Every git subprocess is bounded.** `GitGateway` passes no `timeout` to
+  `subprocess.run`, which is right for a loop running one command at a time and
+  wrong for a page that sweeps every 2s and funnels every tab through one sweep.
+  The gateway is built with `runner=_bounded_git` (15s, the same bound
+  `_remote_refs` puts on the page's own `ls-remote`). A timeout raises
+  `subprocess.TimeoutExpired`, which is neither `GitError` nor `OSError` and so
+  passes through the predicate's fail-closed handlers to this panel's guard —
+  `unknown`, which is what a question that could not be asked is.
+
+**Nothing is cached, for §4i's reason plus one of its own.** Answering
+`_candidate_publication` out of the 60s-cached `_remote_refs` would be fail-OPEN:
+publication is an EXEMPTION, so a stale "published" writes a record off and
+reports the window open while it is shut. It would also need a second timestamp,
+and the window has to be readable as of `served_at`. A fresh `seen` set is passed
+per sweep — it de-duplicates two records pointing at one ref within that sweep
+and remembers nothing after it.
+
+**Read-only and lock-free, like every other observation here.** The predicate
+writes nothing, no `LoopLock` is taken, and nothing called from here takes one —
+which is what lets the panel answer while the loop is running, i.e. when the
+question is actually asked.
+
+**Where to look.** `autoloop/dashboard.py`: `merge_window`,
+`MERGE_WINDOW_STATES`, `_bounded_git`, `_one_line`, the `merge_window` key in
+`collect()`, the `#mwstate` / `#mwreasons` / `#mwnotes` section of `PAGE` and the
+`renderMergeWindow` region between its `MERGE_WINDOW_START` / `_END` markers.
+Tests: `autoloop/tests/test_merge_window_panel.py`, which drives the real
+predicate against real checkouts, pins the seam with a recorder, and runs the
+panel's own render under node.
+
+---
+
 ## 5. Response contract (v3)
 
 As v2 (task-id-based work authorization, `plan`, `reviewed` integrity stamps —
