@@ -1285,6 +1285,31 @@ def branch_for(task_id: str, record: dict) -> str:
     return str(record.get("task_branch") or "") or f"{BRANCH_PREFIX}{task_id}"
 
 
+def task_id_for_branch(branch: str) -> str:
+    """The task id `branch` belongs to by NAME, or `""` when it names none.
+
+    `BRANCH_PREFIX` plus the WHOLE remainder, and nothing else: `autoloop/dash-15`
+    is `dash-15`, `autoloop/` alone is nothing, and a branch that does not carry
+    the prefix at all (a publisher `intended_remote_ref` pointing somewhere else,
+    a hand-made branch) is nothing. No prefix match against a partial id, ever —
+    `autoloop/dash-1` must not resolve to `dash-15`, and a panel that guessed
+    would hang one task's description on another task's row.
+
+    `""` is the ONLY negative and it means "no name to look up", never "no such
+    task": the caller's job is to render the row exactly as it would have
+    rendered without a lookup. A branch outliving its task is ordinary — merge-01
+    was retired on 2026-08-24 and base-01 before it — so this resolving to an id
+    the registry has never heard of is a normal Tuesday, not an error.
+
+    Lookup only, exactly as `BRANCH_PREFIX` is documented: nothing derived from
+    this may decide whether a branch is merged, unmerged, unpublished or unknown.
+    """
+    branch = str(branch or "")
+    if not branch.startswith(BRANCH_PREFIX):
+        return ""
+    return branch[len(BRANCH_PREFIX):]
+
+
 def naming_ancestor(task_id: str, commits, ancestor) -> str:
     """The full sha of the FIRST commit whose subject names `task_id` and which
     git says is an ancestor of the base head. `""` when there is no such commit.
@@ -1317,7 +1342,7 @@ def naming_ancestor(task_id: str, commits, ancestor) -> str:
 
 
 def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
-                 refs: dict, ancestor, commits=None) -> list[dict]:
+                 refs: dict, ancestor, commits=None, descriptions=None) -> list[dict]:
     """One row per completed task: which of `MERGE_STATES` it is in, and why.
 
     Pure resolution logic — `ancestor(sha) -> "yes"/"no"/"unknown"` is injected,
@@ -1353,7 +1378,20 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
     different confidences — a published branch that is an ancestor is git's own
     answer about the exact ref the publisher wrote, while (3) is a subject-line
     match — and an operator acting on the row needs to tell them apart.
+
+    ONE DISPLAY FIELD RIDES ALONG, and it may not touch the four states above.
+
+    `descriptions` is `{task_id: text}` — the raw registry read — and the row
+    gets the WHOLE description of the task its BRANCH NAMES (`task_id_for_branch`,
+    exact prefix + whole id, never a partial match). A branch that names no task,
+    or names one the registry does not hold, gets `""`: the row still renders,
+    with its branch and its state, and simply no description. That is the normal
+    case for a branch that outlived its task, not an error, and it is why the
+    lookup goes through the branch name rather than the row's own id — the panel
+    is a report about BRANCHES, and a description hung on a row whose branch
+    belongs to something else would be a claim nobody made.
     """
+    descriptions = descriptions or {}
     out = []
     for task in completed:
         task_id = task.get("id") or ""
@@ -1383,6 +1421,11 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
             else:
                 state = "unpublished"
                 detail = f"completed, but origin has no {branch} — the work was never pushed"
+        # The branch's own task, by name and by the WHOLE id — never the row's
+        # `task_id`, which would make this panel a report about registry rows
+        # again and would hide the case the fail-soft rule exists for.
+        named_task = task_id_for_branch(branch)
+        description = str(descriptions.get(named_task) or "") if named_task else ""
         out.append({
             "id": task_id, "title": task.get("title") or "", "branch": branch,
             # The sha that DECIDED the row, which is why `named` outranks
@@ -1394,6 +1437,13 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
             # commit and the column showing another.
             "sha": (published or named or candidate)[:12],
             "state": state, "detail": detail,
+            # THE WHOLE DESCRIPTION, never a slice — the same rule the roadmap
+            # docket ships under, and for the same reason: a truncation would be
+            # indistinguishable on the page from a task that really is that
+            # short. `chars` travels with it so the row can label its disclosure
+            # without the page measuring a string the backend already has.
+            "description": description,
+            "chars": len(description),
         })
     return out
 
@@ -1476,6 +1526,11 @@ def merge_groups(rows: list[dict]) -> list[dict]:
     group claimed would be silently absent from the panel. `merge_states` only
     ever produces the four, and the page's own `MS[r.state] || MS.unknown`
     falls back the same way.
+
+    ROW ORDER INSIDE A GROUP IS THE ORDER THE ROWS ARRIVED IN, which is the
+    roadmap's `(priority, id)` order — this is a second axis on the same list,
+    not a re-sort of it, so nothing here may reorder what `merge_states`
+    produced.
     """
     grouped: dict[str, list[dict]] = {state: [] for state, _label, _collapsed in MERGE_GROUPS}
     for row in rows:
@@ -1490,7 +1545,7 @@ def merge_groups(rows: list[dict]) -> list[dict]:
 
 def merge_report(repo: Path, roadmap: list[dict], head: str,
                  remote_ok: bool, refs: list[dict], branch: str,
-                 executions: dict) -> dict:
+                 executions: dict, descriptions=None) -> dict:
     """The payload the page renders: rows, a count per state, and the same rows
     grouped by state for display.
 
@@ -1508,6 +1563,14 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
     It IS skipped when the remote was unreadable, because no row can reach the
     third source then — `merge_states` keeps it inside the readable-remote
     branch — and that skip states the same bound at the call site.
+
+    `descriptions` is `{task_id: text}` read from the SAME tolerant raw
+    `tasks.json` this panel's `roadmap` comes from, never from a `TaskRegistry`
+    (dash-15, 2026-08-24). That is deliberate: `task_groups` returns `[]` when
+    the graph will not load as a registry, and a merge panel whose descriptions
+    vanished exactly when the roadmap panel broke would fail in the one state an
+    operator most needs to read a branch's row. Passed in rather than re-read
+    here for the reason `executions` is — one read of one file per poll.
     """
     completed = [t for t in roadmap if (t.get("status") or "") == "completed"]
     rows = merge_states(
@@ -1515,6 +1578,7 @@ def merge_report(repo: Path, roadmap: list[dict], head: str,
         {r["ref"]: r.get("full") or r.get("sha") or "" for r in refs},
         lambda sha: is_ancestor(repo, sha, head),
         _cached_commit_subjects(repo) if remote_ok else None,
+        descriptions or {},
     )
     return {
         "base_branch": branch or "HEAD",
@@ -3295,6 +3359,20 @@ def collect(repo: Path) -> dict:
             "priority": t.get("priority", 100),
         })
     roadmap.sort(key=lambda r: (r.get("priority", 100), r.get("id") or ""))
+    # `{task_id: whole description}` off the SAME raw rows, for the merge panel
+    # alone (dash-15). Not folded into the `roadmap` rows above: that list is
+    # read by several panels and by `/data.json`, and descriptions are the
+    # largest thing in `tasks.json` — this keeps the bytes on the one panel that
+    # renders them. Built from the tolerant read rather than from the registry
+    # so a branch's row still carries its description when the graph will not
+    # load as a registry at all; see `merge_report`.
+    # An id-less row is dropped rather than filed under `""`: `autoloop/` with
+    # nothing after it resolves to `""` too, and the two must never meet.
+    task_descriptions = {
+        str(t.get("id") or ""): str(t.get("description") or "")
+        for t in tasks.get("tasks", [])
+        if isinstance(t, dict) and str(t.get("id") or "")
+    }
     # Read ONCE and shared: the grouped roadmap and the merge panel ask the
     # same records different questions (which commit is under review now, which
     # commit landed), and two globs of the same directory could disagree
@@ -3405,7 +3483,7 @@ def collect(repo: Path) -> dict:
         # Completed is not integrated: which finished tasks are actually in the
         # branch, decided by git ancestry rather than by their status.
         "merge": merge_report(repo, roadmap, head, remote_ok, remote_refs, branch,
-                              executions),
+                              executions, task_descriptions),
         # The registry against the code, in BOTH directions: a shipped-elsewhere
         # record whose carrying commits have stopped being ancestors, and a
         # completed task the base cannot show. Re-derived on every poll rather
@@ -3749,6 +3827,30 @@ summary:hover{color:var(--ink)}
 @media (max-width:560px){
   #roadmap details.task>summary{grid-template-columns:34px 1fr}
   #roadmap .size{grid-column:2}}
+/* ---- the merge panel's description row (dash-15) -------------------------
+   The roadmap docket's treatment one panel up, on purpose and with the same
+   --rm- tokens: a branch row and a task row are the same object read two ways,
+   so a second style for the same text would make one page look like two. The
+   description sits in its own full-width row under the branch's cells rather
+   than in a sixth cell — this is a five-column table and a `pre` of several
+   thousand characters in a table cell is a column nobody can read.
+   The `pre` declarations are the roadmap's, unchanged except for the top
+   margin that separates it from the cells above — same tokens, same
+   pre-wrap-not-a-clamp rule, same measure, so the text sets identically. */
+#merged tr.mdrow>td,#mgmergedrows tr.mdrow>td{padding:0 8px 8px 0}
+#merged details.mdesc,#mgmergedrows details.mdesc{margin:0}
+#merged details.mdesc>summary,#mgmergedrows details.mdesc>summary{
+     font-size:11.5px;color:var(--rm-muted);
+     font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+#merged details.mdesc>summary:hover,#mgmergedrows details.mdesc>summary:hover{
+     color:var(--rm-accent)}
+#merged details.mdesc>summary:focus-visible,
+#mgmergedrows details.mdesc>summary:focus-visible{
+     outline:2px solid var(--rm-accent);outline-offset:2px}
+#merged pre.desc,#mgmergedrows pre.desc{margin:7px 0 0;white-space:pre-wrap;
+     overflow-wrap:anywhere;max-width:92ch;
+     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+     line-height:1.62;color:var(--rm-ink-soft)}
 .themetog{margin-left:auto;font-size:12px;background:var(--card);color:var(--ink2);
           border:1px solid var(--line);border-radius:999px;padding:4px 11px;cursor:pointer}
 .themetog:hover{color:var(--ink)}
@@ -3883,7 +3985,10 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       match — those all read "done" for work that was only ever pushed to a side
       branch. <b>unknown</b> means git could not answer (origin unreachable, or
       the repository would not read); it is never reported as not-merged — which
-      is why that group renders with its count even at zero.</p>
+      is why that group renders with its count even at zero.
+      Open a row's <i>description</i> for the whole task text, exactly as
+      tasks.json holds it; a branch whose task the registry no longer holds
+      keeps its row and simply has none.</p>
   </section>
 
   <!-- The roadmap read as a RELATION rather than as a list. A second hand-built
@@ -4522,25 +4627,61 @@ function renderRoadmap(d){
 //
 // Everything between the markers is lifted verbatim by the tests, which run it
 // under node against a stub document to prove an opened disclosure survives a
-// refresh. Keep each marker alone on its line and keep this region free of
-// module state other than `esc` / `rows`, or those tests stop being able to
-// reach it.
+// refresh. Keep each marker alone on its line, and keep this region free of
+// anything on the page other than `esc` / `rows` and its OWN declarations — the
+// listener wiring lives in `bindMergeDescriptions` below the region for exactly
+// that reason, reached from in here only through the `MSBIND` hook, which
+// defaults to a no-op. Otherwise those tests stop being able to reach it.
 // MERGE_PANEL_START
 // Three real states plus unknown, every one of them icon + word: a colour
 // alone could not tell "not published" from "not merged", and those need
 // different actions (nothing was ever pushed vs it is pushed and stranded).
 const MS = {merged:["✓","merged"], unmerged:["▲","NOT merged"],
             unpublished:["○","not published"], unknown:["?","unknown"]};
+// Which merge rows the operator has opened a description on, by task id. The
+// rows themselves are rebuilt from the payload on every 2s poll, so the `open`
+// attribute a browser was holding is destroyed each tick — this is what puts it
+// back, and it is the same mechanism `RMOPEN` uses one panel down. Keyed by the
+// task id rather than by position: a row whose state changes moves to another
+// group, and it must keep the disclosure the operator opened on it.
+const MSOPEN = new Set();
+const msToggle = (id, open) => { if (open) MSOPEN.add(String(id)); else MSOPEN.delete(String(id)); };
+// The listener wiring, installed from outside this region because it reaches
+// the DOM the node harness does not have. Left at this no-op when the region is
+// lifted; a test pins the real assignment, since an unassigned hook would bind
+// nothing on the page while every node test still passed.
+let MSBIND = () => {};
+// The task's WHOLE description, in a full-width row under the branch's cells —
+// the roadmap docket's <details> + pre-wrapped <pre>, one panel up, so the two
+// read as one page. Rendered ONLY when there is a description: a branch whose
+// task the registry no longer holds (retired, superseded, never there) gets its
+// cells and no disclosure, never a dropped row and never a guess.
+const msDesc = r => {
+  const desc = String(r.description || "");
+  if (!desc) return "";
+  const id = String(r.id || "");
+  const chars = typeof r.chars === "number" ? r.chars : desc.length;
+  // esc() on BOTH: a description is untrusted text out of tasks.json — anyone
+  // who can write that file can write `<script>` — and it is the one field here
+  // long enough that nobody would notice it had been read as markup.
+  return `<tr class="mdrow"><td colspan="5">`
+    + `<details class="mdesc" data-id="${esc(id)}"${MSOPEN.has(id) ? " open" : ""}>`
+    + `<summary>description — ${esc(chars)} ch</summary>`
+    + `<pre class="desc">${esc(desc)}</pre></details></td></tr>`;
+};
+// The row content is exactly what it was before the grouping — same cells, same
+// icon + word, same `row-active` on an unmerged row. The description rides in
+// its own row underneath, so the cells above stay a table.
 const msRow = r => {
   const [ic, word] = MS[r.state] || MS.unknown;
   return `<tr class="${r.state === "unmerged" ? "row-active" : ""}">
     <td><code>${esc(r.id)}</code></td><td><code>${esc(r.branch)}</code></td>
     <td><code>${esc(r.sha || "—")}</code></td><td>${esc(ic)} ${esc(word)}</td>
-    <td class="muted">${esc(r.detail)}</td></tr>`;
+    <td class="muted">${esc(r.detail)}</td></tr>` + msDesc(r);
 };
-// The row content is EXACTLY what it was before the grouping — same five
-// columns, same icon + word, same `row-active` on an unmerged row. Grouping is
-// a display axis over the rows, not a new reading of them.
+// FIVE columns, which is what `msDesc`'s colspan spans: a column added here
+// without moving that number leaves the description row short and the table
+// ragged.
 const msTable = g => rows(["task","branch","sha","state","why"],
                           (g.rows || []).map(msRow).join(""));
 const msHeading = g => `<h3 class="gh">${esc((MS[g.key] || MS.unknown)[0])} `
@@ -4587,8 +4728,32 @@ function renderMerge(d){
     gMerged ? `✓ ${gMerged.label} (${gMerged.count})` : "✓ Merged";
   document.getElementById("mgmergedrows").innerHTML =
     gMerged ? msTable(gMerged) : `<p class="empty">unknown</p>`;
+  // AFTER both writes, and over BOTH of them. The merged group — the bulk of
+  // this panel and the one it is named for — renders into `mgmergedrows`, so a
+  // binder that only reached `merged` would forget the open state of exactly
+  // the rows this exists for, silently and with every other check still green.
+  MSBIND();
 }
 // MERGE_PANEL_END
+
+// The description disclosures' listeners, outside the pure region for the same
+// reason `bindDeps` is: they reach a DOM the node harness does not have. Rebound
+// on every render because these rows are fresh DOM each time, and `toggle` does
+// not bubble — a delegated listener on the container would simply never fire,
+// which is how an open row silently starts snapping shut every two seconds.
+//
+// BOTH containers. `#merged` holds the three groups that need a human;
+// `#mgmergedrows` holds the merged group, which is most of the panel.
+function bindMergeDescriptions(){
+  for (const host of ["merged", "mgmergedrows"]) {
+    const box = document.getElementById(host);
+    if (!box) continue;
+    box.querySelectorAll("details.mdesc").forEach(el => {
+      el.addEventListener("toggle", () => msToggle(el.dataset.id, el.open));
+    });
+  }
+}
+MSBIND = bindMergeDescriptions;
 
 // ---- the dependency graph ----------------------------------------------------
 //
