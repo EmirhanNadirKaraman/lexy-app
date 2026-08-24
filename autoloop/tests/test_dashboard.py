@@ -128,10 +128,26 @@ def run_git(cwd, *args):
 
 
 def make_repo(tmp_path):
+    """An observed checkout whose state dir is `<repo>/.autoloop`, said out loud.
+
+    The config line is not decoration (port-06, 2026-08-24). `_state_dir` no
+    longer falls back to `<repo>/.autoloop` when `[paths]` names nothing — an
+    unconfigured checkout is a state directory this page cannot resolve, and it
+    says so instead of guessing — so every test below that writes state into
+    `<repo>/.autoloop` now STATES that this is where it lives, in the config the
+    dashboard reads. An explicit relative value resolves against the checkout,
+    which is what keeps each of those assertions exactly as it was.
+
+    Tests that need a different shape write their own config over this one
+    (`configure_state_dir`), or delete it to exercise the unresolvable case.
+    """
     repo = tmp_path / "repo"
     (repo / ".autoloop").mkdir(parents=True)
     (repo / "docs").mkdir()
     (repo / "autoloop").mkdir()
+    (repo / ".autoloop" / "config.toml").write_text(
+        '[paths]\nstate_dir = ".autoloop"\n', encoding="utf-8"
+    )
     run_git(repo, "init", "-q", "-b", "work")
     run_git(repo, "config", "user.email", "t@e.com")
     run_git(repo, "config", "user.name", "T")
@@ -438,6 +454,39 @@ def test_a_priority_edit_will_not_create_the_registry(tmp_path, monkeypatch):
 
     assert status == 500, body
     assert not tasks_file.exists(), "a refused edit must not create the registry"
+
+
+def test_a_priority_edit_refuses_when_the_state_dir_cannot_be_resolved(
+    tmp_path, monkeypatch
+):
+    """The write half of port-06's claim, driven through the REAL store rather
+    than the patched one — `serving_with_store` replaces `_task_store`, which is
+    exactly the function that has to refuse here.
+
+    `_tasks_file` both reads and writes, and its docstring's reasoning ("the read
+    and the write must be the same file") was defeated one level up: with no
+    resolvable directory the old code wrote `<repo>/.autoloop/tasks.json`, read
+    the new number back out of it, and reported a save the loop would never see.
+    A refusal that names the reason is the only honest answer.
+    """
+    repo = make_repo(tmp_path)
+    (repo / ".autoloop" / "config.toml").unlink()
+    decoy = repo / ".autoloop" / "tasks.json"
+    decoy.write_text(
+        json.dumps({"schema_version": 1, "tasks": [a_task("dash-03", priority=3)]}),
+        encoding="utf-8",
+    )
+
+    with serving(repo, tmp_path / "outside" / "inbox", monkeypatch) as base:
+        status, body = post(base, "/api/priority", {"id": "dash-03", "priority": 1})
+
+    assert status == 500, body
+    assert "nothing was written" in body["error"]
+    assert "state directory" in body["error"]
+    assert json.loads(decoy.read_text())["tasks"][0]["priority"] == 3, (
+        "the in-checkout registry the old fallback would have written must be "
+        "untouched"
+    )
 
 
 #: A real process holding the RUN-level lock the way a live `run --continuous`
@@ -6436,10 +6485,20 @@ def test_a_stale_dashboard_ends_up_serving_the_new_code(tmp_path):
     inserted ABOVE the `__main__` guard on purpose — under `python -m`, the
     guard's body runs as part of the module and anything after it never
     executes.
+
+    The checkout carries a config naming its state dir (port-06, 2026-08-24).
+    The signal file is written to `<checkout>/.autoloop/pending_upgrade.json`
+    below, and since port-06 a dashboard does not GUESS that location for an
+    unconfigured checkout — it reports a marker it cannot locate and replaces
+    nothing. Stating it is what a real deployment does; without this line the
+    test would fail for the reason the feature is now right about.
     """
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     (checkout / ".autoloop").mkdir()
+    (checkout / ".autoloop" / "config.toml").write_text(
+        '[paths]\nstate_dir = ".autoloop"\n', encoding="utf-8"
+    )
     shutil.copytree(
         REPO_ROOT / "autoloop",
         checkout / "autoloop",
@@ -6548,12 +6607,14 @@ def test_a_stale_dashboard_ends_up_serving_the_new_code(tmp_path):
 # would pass silently the first time a second resolver spelled it
 # `Path(repo, ".autoloop")`, `repo.joinpath(...)` or `repo / LEGACY_NAME`.
 #
-# The three `.autoloop` literals that legitimately remain are NOT state-dir
-# resolutions and no test here should hunt them: `_config_toml` and
-# `merge_window` name the CONFIG FILE, which lives at
+# The `.autoloop` literals that legitimately remain are NOT state-dir
+# resolutions and no test here should hunt them: `_config_toml`,
+# `_config_problem` and `merge_window` name the CONFIG FILE, which lives at
 # `<repo>/.autoloop/config.toml` whatever the state dir is
 # (`cli.DEFAULT_CONFIG`), and `main()` checks that directory exists before it
-# will serve at all.
+# will serve at all. Since port-06 the state-dir resolution itself holds none:
+# `_state_dir` delegates to `config.resolve_state_dir`, so the literal that used
+# to sit in its fallback branch is gone rather than merely unreached.
 
 #: Every decoy value carries this marker, so one blanket `not in` assertion
 #: covers every reader in the payload at once instead of one named sentinel per
@@ -6819,34 +6880,49 @@ def test_a_relative_state_dir_resolves_against_the_checkout(tmp_path):
     assert DECOY not in state_derived(payload)
 
 
-def test_an_unconfigured_state_dir_still_reads_the_checkout(tmp_path):
-    """The other half of the claim: with `[paths].state_dir` unset, behaviour is
-    unchanged. `make_repo` writes no config at all, so this is the shape every
-    other test in this file runs under."""
+def test_an_unconfigured_state_dir_reads_the_loops_own_default(tmp_path):
+    """The other half of the claim, and the one port-06 changed.
+
+    With `[paths].state_dir` absent the page resolves what the LOOP resolves —
+    `default_state_dir(workers_root)`, beside the workers root and outside the
+    checkout. Until 2026-08-24 this branch answered `<repo>/.autoloop`, the
+    pre-port-01 location, so an unconfigured deployment had a loop writing one
+    directory and a page reading another. The decoy sitting in the checkout is
+    what that reader would have found.
+    """
+    from autoloop.config import default_state_dir
+
     repo = make_repo(tmp_path)
+    worker, base = make_worker(tmp_path)
+    workers_root = tmp_path / "outside" / "workers"
+    (repo / ".autoloop" / "config.toml").write_text(
+        f"[paths]\nworkers_root = {toml_path(workers_root)}\n", encoding="utf-8"
+    )
     fill_decoy_state(repo)
+    fill_live_state(default_state_dir(workers_root), worker, base)
 
     payload = collect(repo)
 
-    assert payload["session"]["phase"] == _DECOY_PHASE
-    assert payload["session"]["iteration"] == _DECOY_ITERATION
-    assert payload["task"]["id"] == _DECOY_TASK
-    assert payload["health"]["label"] == "running"
+    assert payload["session"]["iteration"] == 7
+    assert payload["task"]["id"] == "live-01"
+    assert payload["state_dir"]["path"] == str(default_state_dir(workers_root))
+    assert payload["state_dir"]["note"] == ""
+    assert DECOY not in state_derived(payload)
 
 
-def test_a_config_that_will_not_parse_falls_back_to_the_checkout(tmp_path):
-    """PINNED, NOT ENDORSED — and the residual hole in this claim.
+def test_a_config_that_will_not_parse_is_an_error_not_a_silent_fallback(tmp_path):
+    """The residual hole port-06 was handed, closed rather than re-documented.
 
-    `_config_toml` swallows a malformed config into `{}` so that one bad TOML
-    cannot take down the page you read when something is already wrong. The cost
-    is that `_state_dir` then answers `<repo>/.autoloop`, so on a post-port-01
-    deployment a typo in `config.toml` puts the WHOLE page back on the stale
-    in-checkout directory — silently, and looking identical to the bug this task
-    closed. Every panel moves together, so it is a plainly stale page rather
-    than a half-live one, which is why it is documented here rather than
-    changed: the unconfigured default is port-06's, and surfacing this on the
-    page is a payload field somebody has to decide on.
+    `_config_toml` still swallows a malformed config into `{}` so one bad TOML
+    cannot take down the page you read when something is already wrong — but
+    `_state_dir` no longer turns that `{}` into `<repo>/.autoloop`. A typo in
+    `config.toml` used to put the whole page silently back on the stale
+    in-checkout directory, which looked exactly like the bug dash-20 closed.
+    Now the page reads nothing, says so at the top in the backend's own words,
+    and names the file that did not parse.
     """
+    import autoloop.dashboard as dash
+
     repo = make_repo(tmp_path)
     worker, base = make_worker(tmp_path)
     external = tmp_path / "outside" / "state"
@@ -6859,14 +6935,74 @@ def test_a_config_that_will_not_parse_falls_back_to_the_checkout(tmp_path):
 
     payload = collect(repo)
 
-    assert payload["session"]["phase"] == _DECOY_PHASE, (
-        "an unreadable config falls back to the in-checkout directory — if this "
-        "has been changed, port-06 is the task that owns the default"
+    assert payload["state_dir"]["path"] == ""
+    assert payload["state_dir"]["note"].startswith(dash.STATE_DIR_UNRESOLVED)
+    assert "did not parse as TOML" in payload["state_dir"]["note"], (
+        "a typo and a never-configured checkout call for opposite actions"
     )
-    # The saving grace, and the reason this is tolerable: the fallback is TOTAL.
-    # Every panel moves with it, so nothing on the page is current.
-    assert payload["task"]["id"] == _DECOY_TASK
-    assert payload["health"]["label"] == "running"
+    # NOT the decoy, and not the live directory either: neither was read,
+    # because the page could not tell which one it was supposed to read.
+    assert payload["session"]["phase"] is None
+    assert payload["task"]["state"] == "idle"
+    assert payload["roadmap"] == []
+    assert DECOY not in state_derived(payload)
+    # And no health VERDICT off a lock nobody read — the decoy's live lock is
+    # sitting right there, and "stopped" would be just as much a fabrication.
+    assert payload["health"]["label"] == dash.STATE_DIR_UNRESOLVED_LABEL
+    assert payload["health"]["role"] == "critical"
+
+
+def test_a_checkout_with_no_config_at_all_says_so_rather_than_guessing(tmp_path):
+    """The state every fresh checkout starts in, and the one port-05 / port-04
+    would have hit first. Nothing configures a state directory, so there is no
+    answer — and the page says which file is missing instead of reading the
+    directory the loop abandoned."""
+    repo = make_repo(tmp_path)
+    (repo / ".autoloop" / "config.toml").unlink()
+    fill_decoy_state(repo)
+    # The git-tracked seed roadmap this repository really ships. `collect` falls
+    # back to it when a KNOWN state dir holds no registry yet — a claim it
+    # cannot make about a directory it could not resolve.
+    (repo / "autoloop" / "seed_tasks.json").write_text(
+        json.dumps([roadmap_task("seeded-01")]), encoding="utf-8"
+    )
+
+    payload = collect(repo)
+
+    assert payload["state_dir"]["path"] == ""
+    assert "does not exist" in payload["state_dir"]["note"]
+    assert "workers_root" in payload["state_dir"]["note"], (
+        "the note must name the key that would fix it"
+    )
+    assert payload["roadmap"] == [], (
+        "the banner says every panel is empty because nothing could be read; a "
+        "seed roadmap underneath it would make that sentence false"
+    )
+    assert DECOY not in state_derived(payload)
+
+
+def test_the_page_can_still_be_rendered_when_the_state_dir_is_unresolvable(tmp_path):
+    """The alarm must not take the page down with it. Every key `collect`
+    answers on a healthy checkout is still answered here — a payload missing one
+    of them throws in `render` and the operator gets a blank page instead of the
+    sentence explaining it, which is the failure this test exists to catch."""
+    repo = make_repo(tmp_path)
+    healthy = set(collect(repo))
+    (repo / ".autoloop" / "config.toml").unlink()
+
+    payload = collect(repo)
+
+    assert set(payload) == healthy
+    # The slices that are NOT state-derived still answer, because they were
+    # never the state dir's to answer: the checkout is still readable.
+    assert payload["git"]["branch"] == "work"
+    assert payload["build"]["running"]
+    assert payload["merge_window"]["state"] == "unknown", (
+        "the window is a question that could not be asked, never `open`"
+    )
+    assert payload["build"]["upgrade"]["state"] == "unreadable_marker", (
+        "a marker this process cannot LOCATE is one it cannot read"
+    )
 
 
 # ---- the unit panel: the dispatch on screen, and nobody else's figures -------
