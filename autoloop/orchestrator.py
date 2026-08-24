@@ -302,7 +302,12 @@ from .errors import (
 )
 from .manifest import ManifestStore
 from .executor import ExecutionOutcome, TaskExecutor
-from .health import StrandedRound, stranded_fault_rounds
+from .health import (
+    StrandedRound,
+    current_round_age_seconds,
+    round_ceiling_for,
+    stranded_fault_rounds,
+)
 from . import heartbeat
 from .git_gateway import GitGateway
 from .packet import (
@@ -5262,9 +5267,22 @@ class Orchestrator:
         **What is safe to requeue is decided by `health.stranded_fault_rounds`**
         (see it for the four conditions, including the one that keeps this from
         firing on a healthy round: the task the loop's own session names as
-        current is never swept, so a round that has just faulted keeps the
-        reviewer's redo — that is how quota-01 and dash-18 recovered on their
-        own in the incident).
+        current is exempt while its round is YOUNGER THAN THE ROUND CEILING, so
+        a round that has just faulted keeps the reviewer's redo — that is how
+        quota-01 and dash-18 recovered on their own in the incident).
+
+        **That exemption is bounded, and the bound is not decoration.**
+        `state.task_execution` is replaced only by the NEXT dispatch, so a
+        faulted task that nothing displaces stays "current" indefinitely — with
+        an unconditional exemption this sweep would skip it forever while
+        `next_ready()` also refuses it and no blocker named it, which is this
+        task's own defect rebuilt one level up. Past `health.round_ceiling_for`
+        (the agent ceiling the executor KILLS a round at, plus a grace for the
+        validation/commit/packet tail) the round provably is not executing, so
+        the task is judged like any other strand: requeued if the shape is safe,
+        blocked if it is not. Nothing here can sweep a live round — this method
+        runs from `_step_ready`, the loop is single-threaded, and a round that
+        is executing is inside `_dispatch_executor` rather than here.
 
         **The record is KEPT, and the status is moved with the bare
         `TaskRegistry.release`.** This deliberately does NOT call
@@ -5301,7 +5319,13 @@ class Orchestrator:
         if self._execution_store is None:
             return
         current = (self.state.task_execution or {}).get("task_id") or ""
-        strands = stranded_fault_rounds(self._registry, self._execution_store, current)
+        strands = stranded_fault_rounds(
+            self._registry,
+            self._execution_store,
+            current,
+            current_round_age_seconds(self.state),
+            round_ceiling_for(self._config),
+        )
         if not strands:
             return
         released: list[StrandedRound] = []
@@ -5347,11 +5371,17 @@ class Orchestrator:
                     # ceiling across an outage instead of inferring it.
                     "attempt_count": strand.attempt_count,
                     "fault_attempt_count": strand.fault_attempt_count,
+                    # Which of the two ways it stopped being scheduled: the loop
+                    # dispatched something else, or the loop still names this
+                    # task and only the round ceiling proved that claim stale.
+                    # The second arm is invisible in the state file itself —
+                    # `task_execution` still names the task after this runs —
+                    # so the transcript is the only place it can be read.
+                    "stale_current": strand.stale_current,
                     "note": (
-                        "its round was destroyed by the environment and the loop "
-                        "moved on, so nothing was scheduling it — returned to "
-                        "pending with its execution record and both attempt "
-                        "budgets untouched"
+                        "its round was destroyed by the environment and nothing "
+                        "was scheduling it — returned to pending with its "
+                        "execution record and both attempt budgets untouched"
                     ),
                 },
             )
@@ -5389,11 +5419,23 @@ class Orchestrator:
         if self._blocker_store is None:
             note = "no blocker store configured — this strand is reported here only"
         else:
+            # Said out loud because it changes what the operator is looking at:
+            # the loop's own state (and so the dashboard's in-flight panel)
+            # still names this task as the round in progress, and only the
+            # round ceiling established that the round is over. Without this
+            # line the blocker and the dashboard disagree with no explanation.
+            stale = (
+                " The loop's state still names it as the round in flight, but "
+                "that round is older than the round ceiling, so it is not "
+                "running."
+                if strand.stale_current
+                else ""
+            )
             question = (
                 f"task {strand.task_id} was left in progress by a round the "
                 f"environment destroyed ({strand.fault_code}), and it cannot be "
-                f"returned to the queue automatically: {obstacle}. Nothing will "
-                "schedule it until you decide. Read its execution record, then "
+                f"returned to the queue automatically: {obstacle}.{stale} Nothing "
+                "will schedule it until you decide. Read its execution record, then "
                 "either continue it (re-dispatch, once the fault is over) or "
                 f"`python -m autoloop release {strand.task_id}` — which retires "
                 "the worker repo and the execution record, so the task starts "
@@ -5406,7 +5448,8 @@ class Orchestrator:
                 f"review_round={strand.review_round} "
                 f"attempt_count={strand.attempt_count}/{MAX_TASK_ATTEMPTS} "
                 f"fault_attempt_count={strand.fault_attempt_count}/"
-                f"{MAX_TASK_FAULT_ATTEMPTS}"
+                f"{MAX_TASK_FAULT_ATTEMPTS} "
+                f"stale_current={'yes' if strand.stale_current else 'no'}"
             )
             # TWO try blocks, not one, and the split is deliberate: the LOOKUP
             # is a de-duplication convenience and the RECORD is the report. A
@@ -5458,6 +5501,7 @@ class Orchestrator:
                 "review_round": strand.review_round,
                 "attempt_count": strand.attempt_count,
                 "fault_attempt_count": strand.fault_attempt_count,
+                "stale_current": strand.stale_current,
                 "note": note,
             },
         )

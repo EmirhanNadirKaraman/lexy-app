@@ -5632,11 +5632,12 @@ conditions, all required:
 1. the registry's stored status is `in_progress` (`TaskRegistry.in_progress_tasks`,
    which reads the stored string — `state_of` answers BLOCKED for an in-progress
    task with an incomplete dependency, and raises on a dangling one);
-2. it is **not** the task `LoopState.task_execution` names. That is the whole of
-   the "the loop moved on" evidence, and it is what makes the sweep safe to run
-   every round — a round that has just faulted is still the current task while
-   its report travels to the reviewer, so the reviewer keeps the redo that
-   recovered quota-01 and dash-18 on their own;
+2. it is **not** the task `LoopState.task_execution` names, **or** that claim is
+   older than the round ceiling. The exemption is what makes the sweep safe to
+   run every round — a round that has just faulted is still the current task
+   while its report travels to the reviewer, so the reviewer keeps the redo that
+   recovered quota-01 and dash-18 on their own — and the bound on it is what
+   keeps the exemption from becoming a second hiding place (see below);
 3. the execution record's LAST attempt reads as a round the environment took:
    settled on the fault budget with an outcome that is not `sent_for_review`, or
    still OPEN (nothing ever stamped it — what `_reconcile_unfinished_attempts`
@@ -5676,6 +5677,38 @@ shape is empty by definition.
 and park, and until something chose the task the strand would be invisible again
 — so it gets the blocker straight away, which is the same answer the ceiling
 gives one round earlier.
+
+**The exemption for the current task is BOUNDED, and the bound is the point.**
+`LoopState.task_execution` is replaced only by the NEXT dispatch, so a faulted
+task that nothing else displaces stays "the current task" for as long as the
+session lasts — forever, when it is the only task on the roadmap. An
+unconditional exemption would therefore rebuild this section's own defect one
+level up: `next_ready()` refuses the task, the sweep skips it, no blocker names
+it. So the exemption is granted on POSITIVE evidence that the round is young —
+`health.current_round_age_seconds`, the dispatch stamp
+`state.current_task["started_at"]` matched to the task `task_execution` names
+(the same pair, under the same matching rule, that `dashboard.worker_progress`
+dates a round from) — measured against `health.round_ceiling_for`:
+`config.audit.agent_ceiling_seconds` plus an hour's grace. That ceiling is not a
+related number, it is the absolute backstop the implementation agent is KILLED
+at (`cli._build_executor` passes it to both implement-agent bindings), plus the
+tail a round still has after the kill: validation, the commit, the review
+packet. So a round older than it provably is not executing, and sweeping past
+the bound cannot sweep a live round. Nothing else changes: past the ceiling the
+task is judged by the same two answers above, and the arm that fired is recorded
+as `stale_current` in both transcript entries and in the blocker. An age that
+CANNOT be established (no stamp, a stamp for a different dispatch, an
+unparseable one) is the absence of evidence, not evidence of youth, so it grants
+no exemption either — the reachable way to get one is a dispatch that died
+between stamping `current_task` and writing `task_execution`, whose task is
+genuinely abandoned.
+
+The age is WALL-CLOCK, and machine sleep is deliberately not discounted from it
+the way §3d's silence alarm discounts it. Over-ageing here cannot cause a wrong
+action — the sweep runs only from `_step_ready`, and a round that is executing
+is inside `_dispatch_executor`, not in the sweep — so the whole cost is that a
+round which slept through the ceiling can draw one advisory `stranded` verdict,
+which mutates nothing and is re-judged when the round ends.
 
 **Detection is carried on every health verdict.** `Health.stranded_tasks` and a
 clause in `detail` are added to whatever `health.check` was going to say, and the

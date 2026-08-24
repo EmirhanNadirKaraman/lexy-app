@@ -29,8 +29,12 @@ What is pinned here, in the order the claim needs it:
     bound below exact;
   * the BOUND — an outage that faults every round ends at
     `fault_attempt_ceiling`, it does not cycle the roadmap through a dead API;
-  * the current task is never swept, so the reviewer keeps the redo that
-    recovered two of the six tasks on its own;
+  * the task whose round is genuinely in flight is never swept, so the reviewer
+    keeps the redo that recovered two of the six tasks on its own — and that
+    exemption is itself BOUNDED by the round ceiling, because
+    `state.task_execution` is replaced only by the next dispatch, so an
+    unconditional one would exclude a lone faulted task from this sweep forever
+    while `next_ready()` also refused it: the same third state, one level up;
   * both arms are written to the transcript with the task id and the fault
     code, because the twenty-one hours were bought by silence.
 
@@ -42,6 +46,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -120,6 +125,29 @@ def implement(task_id="t1") -> Directive:
     return Directive(decision=Decision.IMPLEMENT, reason="go", task_id=task_id)
 
 
+def stamp_aged(age_seconds: float) -> str:
+    """A dispatch stamp `age_seconds` old, in `state.utcnow_iso`'s own shape.
+
+    Ages are built by moving the STAMP rather than by injecting a clock: the
+    production readers (`health.current_round_age_seconds`, and
+    `dashboard._elapsed_seconds` beside it) take their `now` from the wall
+    clock in every real call, so a test that replaced it would stop exercising
+    the parse that turns a recorded string back into an age.
+    """
+    return (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat()
+
+
+def config_with_ceiling(value):
+    """The one field `health.round_ceiling_for` reads, set to `value`.
+
+    A stand-in rather than a real `AutoloopConfig`, because the shapes under
+    test are ones the dataclass refuses to hold — a missing section, a string
+    where a float belongs — and those are exactly what a hand-edited config
+    file delivers.
+    """
+    return type("Cfg", (), {"audit": type("Audit", (), {"agent_ceiling_seconds": value})()})()
+
+
 class Wiring:
     """Everything a test here reaches for, built once around a real repo."""
 
@@ -153,11 +181,41 @@ class Wiring:
         return [e for e in self.transcript() if e.get("type") == entry_type]
 
     def moved_on_to(self, task_id: str | None) -> None:
-        """The loop is now working something else — the whole of the evidence
-        that an in-progress task has been abandoned."""
+        """The loop is now working something else — one of the two ways an
+        in-progress task is shown to have been abandoned (the other is
+        `working_on(..., age_seconds=)` past the round ceiling)."""
         self.orch.state.task_execution = (
             None if task_id is None else {"task_id": task_id}
         )
+
+    def working_on(self, task_id: str, age_seconds: float = 0.0) -> None:
+        """The loop's own claim to be running a round for `task_id`, dispatched
+        `age_seconds` ago.
+
+        BOTH halves of it, because the age is only readable when they agree:
+        `_dispatch_executor` stamps `state.current_task` and
+        `_dispatch_task_postcommit` writes `state.task_execution`, and
+        `health.current_round_age_seconds` refuses a stamp that belongs to a
+        different dispatch.
+        """
+        self.orch.state.current_task = {
+            "task_id": task_id,
+            "title": f"T {task_id}",
+            "decision": "implement",
+            "started_at": stamp_aged(age_seconds),
+        }
+        self.orch.state.task_execution = {"task_id": task_id}
+
+    def persist_state(self) -> None:
+        """What the loop does at dispatch (`_dispatch_task_postcommit`), and
+        what `health.check` reads instead of the in-memory object."""
+        StateStore(self.config.state_file).save(self.orch.state)
+
+    def ceiling(self) -> float:
+        """The bound under test, read from the config rather than restated: a
+        test carrying its own copy of the number would keep passing after the
+        one the loop uses moved."""
+        return health.round_ceiling_for(self.config)
 
 
 class ScriptedExecutor:
@@ -481,17 +539,190 @@ def test_the_task_the_loop_is_working_is_never_swept(tmp_path):
     """The narrowing that keeps the reviewer's redo alive. A round that has
     just faulted is still the current task while its report travels to the
     reviewer, and that redo is how quota-01 and dash-18 recovered on their own
-    in the incident. Sweeping here would take the task out from under it."""
+    in the incident. Sweeping here would take the task out from under it.
+
+    Driven through a REAL dispatch, so the dispatch stamp the exemption is
+    granted on is the one `_dispatch_executor` actually writes rather than one
+    this test invented."""
     wiring = build(tmp_path)
 
     wiring.orch._dispatch_executor(implement("t1"))
     assert wiring.orch.state.task_execution["task_id"] == "t1"
+    assert wiring.orch.state.current_task["task_id"] == "t1"
 
     wiring.orch._reconcile_stranded_tasks()
 
     assert wiring.status("t1") == "in_progress"
     assert not wiring.open_blockers()
     assert not wiring.entries("task_strand_requeued")
+
+
+# =============================================================================
+# 3b. ...but that exemption is BOUNDED — the third state, one level up
+# =============================================================================
+#
+# `state.task_execution` is replaced only by the NEXT dispatch. A faulted task
+# that nothing else displaces therefore stays "the current task" for as long as
+# the session lasts, which is forever when it is the only task there is. An
+# unconditional exemption for the current task hands that case straight back
+# the defect this whole file is about: nothing schedules it, this sweep skips
+# it, and no blocker names it.
+
+
+def test_a_lone_stranded_task_the_state_still_names_is_requeued_past_the_ceiling(
+    tmp_path,
+):
+    """THE case the bound exists for, with nothing else in the roadmap to
+    displace it: one task, faulted, still named by the loop's own state, its
+    round older than the ceiling. It goes back in the pool and says so."""
+    wiring = build(tmp_path, tasks=("t1",))
+    record_for(wiring)
+    wiring.working_on("t1", age_seconds=wiring.ceiling() + 60)
+
+    wiring.orch._reconcile_stranded_tasks()
+
+    assert wiring.registry.next_ready().id == "t1"
+    entry = wiring.entries("task_strand_requeued")[0]["data"]
+    assert entry["task_id"] == "t1"
+    assert entry["fault_code"] == API_ERROR
+    # The one field that distinguishes this arm from "the loop moved on":
+    # `task_execution` still names t1 after the sweep, so the transcript is the
+    # only place the difference can be read.
+    assert entry["stale_current"] is True
+    assert not wiring.open_blockers()
+    assert wiring.orch.state.task_execution["task_id"] == "t1", (
+        "the sweep moves the STATUS; it does not rewrite the session's state"
+    )
+
+
+def test_a_round_still_inside_the_ceiling_is_left_alone(tmp_path):
+    """The other side of the same boundary, and the false alarm that would
+    matter: a round the loop is genuinely running has exactly the record shape
+    a strand does — an open ledger entry, no candidate, no review round."""
+    wiring = build(tmp_path, tasks=("t1",))
+    record_for(wiring, ledger=((ATTEMPT_PENDING, "dispatched"),), fault_attempt_count=0)
+    wiring.working_on("t1", age_seconds=wiring.ceiling() - 60)
+
+    wiring.orch._reconcile_stranded_tasks()
+
+    assert wiring.status("t1") == "in_progress"
+    assert wiring.registry.next_ready() is None
+    assert not wiring.open_blockers()
+    assert not wiring.entries("task_strand_requeued")
+
+
+def test_the_ceiling_is_longer_than_the_longest_round_that_can_still_be_running(
+    tmp_path,
+):
+    """WHY sweeping past the bound cannot sweep a live round, stated as a
+    number rather than as a feeling: the ceiling is the agent's own hard kill
+    (`config.audit.agent_ceiling_seconds`, which `cli._build_executor` passes to
+    both implement-agent bindings) plus a grace for the validation/commit/packet
+    tail that follows it. A round older than that has already been killed."""
+    wiring = build(tmp_path)
+
+    assert wiring.ceiling() > wiring.config.audit.agent_ceiling_seconds
+    assert wiring.ceiling() == (
+        wiring.config.audit.agent_ceiling_seconds + health.ROUND_CEILING_GRACE_SECONDS
+    )
+
+
+def test_a_misconfigured_ceiling_falls_back_to_the_shipped_one_not_to_zero():
+    """The fail-open in the OTHER direction: a ceiling of zero would retire the
+    exemption altogether and sweep every live round. `agent_ceiling_seconds` is
+    operator-configurable, so an absent, non-numeric or non-positive value
+    falls back to the shipped default instead."""
+    shipped = health.DEFAULT_ROUND_CEILING_SECONDS
+
+    assert health.round_ceiling_for(None) == shipped
+    assert health.round_ceiling_for(config_with_ceiling(None)) == shipped
+    assert health.round_ceiling_for(config_with_ceiling("not a number")) == shipped
+    assert health.round_ceiling_for(config_with_ceiling(0)) == shipped
+    assert health.round_ceiling_for(config_with_ceiling(-1)) == shipped
+    assert health.round_ceiling_for(config_with_ceiling(60)) == (
+        60 + health.ROUND_CEILING_GRACE_SECONDS
+    ), "a configured ceiling IS honoured — the fallbacks above are not the only path"
+
+
+def test_a_dispatch_stamp_for_a_different_task_is_not_an_exemption(tmp_path):
+    """No stamp for THIS round is no evidence, and no evidence is not an
+    exemption. The reachable way to get here is a dispatch that died between
+    its two writes — `_dispatch_executor` stamps `current_task` before
+    `_dispatch_task_postcommit` writes `task_execution` — which leaves the two
+    naming different tasks. The task `task_execution` names is then genuinely
+    abandoned, so reading "no stamp" as "still running" would strand exactly
+    it."""
+    wiring = build(tmp_path, tasks=("t1",))
+    record_for(wiring)
+    wiring.orch.state.current_task = {"task_id": "t2", "started_at": stamp_aged(5)}
+    wiring.orch.state.task_execution = {"task_id": "t1"}
+
+    wiring.orch._reconcile_stranded_tasks()
+
+    assert wiring.registry.next_ready().id == "t1"
+
+
+def test_a_stale_current_strand_outside_the_safe_shape_is_blocked_not_requeued(
+    tmp_path,
+):
+    """The bound widens WHICH tasks are judged, never what is safe to do with
+    one. A candidate is still a candidate whoever the state says is current."""
+    wiring = build(tmp_path, tasks=("t1",))
+    before = record_for(wiring, candidate_sha="a" * 40)
+    wiring.working_on("t1", age_seconds=wiring.ceiling() + 60)
+
+    wiring.orch._reconcile_stranded_tasks()
+
+    _assert_reported_not_touched(wiring)
+    assert wiring.executions.load("t1") == before
+    blocker = wiring.open_blockers()[0]
+    assert "still names it as the round in flight" in blocker.question
+    assert "stale_current=yes" in blocker.detail
+    assert wiring.entries("task_strand_blocked")[0]["data"]["stale_current"] is True
+
+
+def test_the_stale_current_requeue_happens_once_not_every_round(tmp_path):
+    """Idempotence, and it is not an assumption: after the release the task is
+    `pending`, so `in_progress_tasks()` — the candidate set the whole predicate
+    starts from — no longer returns it at all, even though the state still
+    names it."""
+    wiring = build(tmp_path, tasks=("t1",))
+    record_for(wiring)
+    wiring.working_on("t1", age_seconds=wiring.ceiling() + 60)
+
+    for _ in range(3):
+        wiring.orch._reconcile_stranded_tasks()
+
+    assert [t.id for t in wiring.registry.in_progress_tasks()] == []
+    assert len(wiring.entries("task_strand_requeued")) == 1
+    assert not wiring.open_blockers()
+
+
+def test_the_bound_still_holds_when_the_loop_never_moves_on(tmp_path):
+    """The dispatch loop, on the new arm. Same proof as the outage test below,
+    with the loop never dispatching anything else: every requeued round is
+    still charged to `fault_attempt_count`, which the requeue never resets, so
+    the stale-current arm walks into the same ceiling and stops there instead
+    of cycling one task through a dead API forever."""
+    wiring = build(tmp_path, tasks=("t1",))
+
+    for expected in range(1, MAX_TASK_FAULT_ATTEMPTS + 1):
+        wiring.orch.state.phase = Phase.READY.value
+        wiring.orch._dispatch_executor(implement("t1"))
+        assert wiring.executions.load("t1").fault_attempt_count == expected
+        # The loop moves on to NOTHING: its own state still names t1, and only
+        # the round ceiling says that claim is stale.
+        wiring.orch.state.current_task["started_at"] = stamp_aged(wiring.ceiling() + 60)
+        wiring.orch._reconcile_stranded_tasks()
+        if expected < MAX_TASK_FAULT_ATTEMPTS:
+            assert wiring.registry.next_ready().id == "t1"
+            assert not wiring.open_blockers(), "still inside the allowance"
+        else:
+            assert wiring.registry.next_ready() is None
+            assert [b.code for b in wiring.open_blockers()] == [STRANDED_AFTER_FAULT]
+
+    assert wiring.executions.load("t1").attempt_count == 0
+    assert wiring.executions.load("t1").fault_attempt_count == MAX_TASK_FAULT_ATTEMPTS
 
 
 def test_a_round_that_reached_the_reviewer_is_not_a_strand(tmp_path):
@@ -816,11 +1047,13 @@ def test_health_carries_the_strand_on_a_verdict_that_already_needs_attention(tmp
 
 def test_health_stays_quiet_for_the_task_the_loop_is_working(tmp_path):
     """The false-alarm surface: mid-round, a healthy task has exactly the
-    record shape a strand does — no candidate, no review round."""
+    record shape a strand does — no candidate, no review round. The dispatch
+    stamp is what tells the two apart, and the loop writes it (`current_task`)
+    in the same save as `task_execution`."""
     wiring = build(tmp_path)
     record_for(wiring)
-    wiring.orch.state.task_execution = {"task_id": "t1"}
-    StateStore(wiring.config.state_file).save(wiring.orch.state)
+    wiring.working_on("t1", age_seconds=90)
+    wiring.persist_state()
     TranscriptLogger(wiring.config.transcript_file).append("directive", data={})
 
     with LoopLock(wiring.config.state_dir):
@@ -828,6 +1061,83 @@ def test_health_stays_quiet_for_the_task_the_loop_is_working(tmp_path):
 
     assert verdict.needs_attention is False
     assert verdict.stranded_tasks == ()
+
+
+def test_health_names_the_task_whose_round_outlived_the_ceiling(tmp_path):
+    """The detection half of the bound, and the state the 2026-08-22 incident
+    would have sat in with only one task on the roadmap: the loop still claims
+    to be working it, and nothing but the round ceiling can say otherwise."""
+    wiring = build(tmp_path)
+    record_for(wiring)
+    wiring.working_on("t1", age_seconds=wiring.ceiling() + 60)
+    wiring.persist_state()
+    TranscriptLogger(wiring.config.transcript_file).append("directive", data={})
+
+    with LoopLock(wiring.config.state_dir):
+        verdict = health.check(wiring.config, agent_probe=lambda: False)
+
+    assert verdict.code == health.STUCK_STRANDED
+    assert verdict.stranded_tasks == ("t1",)
+
+
+def test_a_dispatch_stamp_a_little_in_the_future_is_skew_not_an_age():
+    """Wall clocks get adjusted. `dashboard._elapsed_seconds` reads the same
+    stamp under the same rule, and the two must agree: a couple of minutes
+    ahead reads as "just started" (so a live round keeps its exemption), and
+    anything further ahead is not a measurable age at all, so it reads unknown
+    and the caller falls back to the evidence it has."""
+    state = LoopState.new(URL)
+    state.task_execution = {"task_id": "t1"}
+
+    state.current_task = {"task_id": "t1", "started_at": stamp_aged(-30)}
+    assert health.current_round_age_seconds(state) == 0.0
+
+    state.current_task = {"task_id": "t1", "started_at": stamp_aged(-86400)}
+    assert health.current_round_age_seconds(state) is None
+
+
+def test_an_unusable_dispatch_stamp_reads_as_unknown_never_as_young():
+    """Every shape that is not a usable age, in one place: no state, no round,
+    no `current_task`, a stamp for another task, an unparseable stamp, a
+    missing one. `None` is the absence of evidence and the caller grants its
+    exemption on evidence only."""
+    assert health.current_round_age_seconds(None) is None
+
+    state = LoopState.new(URL)
+    assert health.current_round_age_seconds(state) is None, "no round in flight"
+
+    state.task_execution = {"task_id": "t1"}
+    assert health.current_round_age_seconds(state) is None, "no current_task at all"
+
+    state.current_task = {"task_id": "t2", "started_at": stamp_aged(10)}
+    assert health.current_round_age_seconds(state) is None, "another task's stamp"
+
+    state.current_task = {"task_id": "t1", "started_at": "not a timestamp"}
+    assert health.current_round_age_seconds(state) is None
+
+    state.current_task = {"task_id": "t1"}
+    assert health.current_round_age_seconds(state) is None
+
+    # ...and the one shape that IS a usable age, so the assertions above are
+    # not all passing for the same uninteresting reason.
+    state.current_task = {"task_id": "t1", "started_at": stamp_aged(300)}
+    age = health.current_round_age_seconds(state)
+    assert age is not None and 290 < age < 400
+
+
+def test_a_naive_dispatch_stamp_is_read_as_utc():
+    """`utcnow_iso()` is tz-aware, but a record written by an older build (or
+    by hand) may not be. Reading a naive stamp as local time would shift the
+    age by the machine's offset — hours, either way, on the one number the
+    exemption is granted from."""
+    state = LoopState.new(URL)
+    state.task_execution = {"task_id": "t1"}
+    naive = (datetime.now(timezone.utc) - timedelta(seconds=600)).replace(tzinfo=None)
+    state.current_task = {"task_id": "t1", "started_at": naive.isoformat()}
+
+    age = health.current_round_age_seconds(state)
+
+    assert age is not None and 590 < age < 700
 
 
 def test_health_is_quiet_when_there_is_no_roadmap_at_all(tmp_path):
