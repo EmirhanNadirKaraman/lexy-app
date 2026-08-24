@@ -98,7 +98,13 @@ from pathlib import Path
 # `os.execv` further down exists to avoid, arrived at while deciding whether to
 # execv. Everything they pull in is pure Python with no optional dependency.
 from .auto_merge import UPGRADE_PENDING, UpgradeStore, loop_code_paths
-from .errors import StateError, TaskGraphError
+# The loop's OWN state-directory rule, imported rather than re-implemented
+# (port-06). `config` pulls in nothing optional — `errors`, `policy`, `stall`,
+# `validation` and `tomllib`, all pure Python — so this costs nothing that the
+# three imports above do not already cost. `load_config` itself stays a
+# deferred import inside `merge_window`, because THAT needs `cli`.
+from .config import resolve_state_dir, workers_root_from
+from .errors import ConfigError, StateError, TaskGraphError
 from .tasks import (
     SATISFIES_DEPENDENCY,
     TaskRegistry,
@@ -286,7 +292,12 @@ def _run(args, cwd=None, timeout=8):
     return _run_checked(args, cwd=cwd, timeout=timeout) or ""
 
 
-def _json(path: Path):
+def _json(path: Path | None):
+    """A JSON file's content, `None` when it cannot be read — including when
+    there is no path at all (`_under` on an unresolvable state dir), which is
+    the same "absent" a missing or half-written file already produces."""
+    if path is None:
+        return None
     try:
         return json.loads(path.read_text())
     except (OSError, ValueError):
@@ -738,18 +749,70 @@ def _inbox_dir(repo: Path) -> Path:
     return Path.home() / ".autoloop" / "inbox"
 
 
-def _state_dir(repo: Path) -> Path:
-    """`[paths].state_dir` for this checkout, defaulted to `.autoloop`.
+def _config_problem(repo: Path) -> str:
+    """WHY `_config_toml` came back empty, in a phrase, or `""`.
 
-    A relative value is resolved against the checkout, which is where the loop
-    itself resolves it from (`config.load_config` reads it as a plain `Path` and
-    every real run has the repo root as its cwd).
+    Called only on a failure path, so the second read costs nothing on a
+    healthy page. It exists because `_config_toml` deliberately collapses
+    "there is no config", "the file is unreadable" and "the file is not TOML"
+    into `{}` — fine while every setting had a documented default, and not fine
+    now that a missing `[paths]` means the state directory cannot be resolved
+    at all. A typo in `config.toml` and a checkout that was never configured
+    call for opposite actions, and an operator told only "cannot resolve"
+    cannot tell which they have.
     """
-    configured = _config_section(repo, "paths").get("state_dir")
-    if configured and isinstance(configured, str):
-        path = Path(configured).expanduser()
-        return path if path.is_absolute() else repo / path
-    return repo / ".autoloop"
+    path = repo / ".autoloop" / "config.toml"
+    if not path.exists():
+        return f"{path} does not exist"
+    try:
+        import tomllib
+
+        tomllib.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return f"{path} could not be read ({exc})"
+    except ValueError as exc:
+        return f"{path} did not parse as TOML ({exc})"
+    return ""
+
+
+def _state_dir(repo: Path) -> Path:
+    """The state directory for this checkout — the LOOP's answer, or none.
+
+    Delegates to `config.resolve_state_dir`, the single rule `load_config`
+    itself resolves through, and holds no fallback of its own. Until port-06
+    (2026-08-24) this function ended `return repo / ".autoloop"` when
+    `[paths].state_dir` was absent — the PRE-port-01 location, inside the
+    checkout — while the loop resolved `default_state_dir(workers_root)`
+    outside it. Every reader on this page agreed with every other and all of
+    them disagreed with the loop, which is worse than a stale page: `_tasks_file`
+    below both READS and WRITES, so a priority edit would have landed in an
+    abandoned registry, been read back correctly, and never reached the loop.
+
+    **It RAISES `ConfigError` rather than guessing.** A silent fallback is what
+    produced the divergence, and the one thing a reader must never do is answer
+    confidently about a directory nobody writes. Callers surface it: `collect`
+    empties every state-derived panel and says so at the top of the page,
+    `merge_window` reports `unknown`, `upgrade_decision` reports an unreadable
+    marker, and `/api/priority` refuses to write.
+    """
+    paths = _config_section(repo, "paths")
+    try:
+        return resolve_state_dir(
+            paths.get("state_dir"), paths.get("workers_root"), base=repo
+        )
+    except ConfigError as exc:
+        problem = _config_problem(repo)
+        raise ConfigError(
+            f"the state directory for {repo} could not be resolved: {exc}"
+            + (f" ({problem})" if problem else "")
+        ) from exc
+
+
+#: The registry file's name under the state dir, spelled ONCE: `collect` reads
+#: it off its own resolved directory and `_tasks_file` builds the path the
+#: priority write uses, and a rename that moved only one of them would recreate
+#: precisely the read-here/write-there bug this section is about.
+TASKS_FILENAME = "tasks.json"
 
 
 def _tasks_file(repo: Path) -> Path:
@@ -758,9 +821,11 @@ def _tasks_file(repo: Path) -> Path:
     Resolved through the config rather than hard-coded, because the read and
     the write must be the same file: the row shows a value read back from disk,
     so a page reading one path and writing another would report a save that did
-    not happen where it was looking.
+    not happen where it was looking. Since port-06 that resolution is the LOOP's
+    own, so "the same file" now also means the same file the loop dispatches
+    from — the level at which this reasoning was previously defeated.
     """
-    return _state_dir(repo) / "tasks.json"
+    return _state_dir(repo) / TASKS_FILENAME
 
 
 def _task_store(repo: Path):
@@ -769,18 +834,78 @@ def _task_store(repo: Path):
     Built per request rather than held: the store is stateless (a path, a
     ledger path, and a mutex resolved from the path), and a long-lived one
     would keep a stale handle if the operator moved the state dir under it.
+
+    Both paths come from the loop's own resolvers, and neither has a fallback
+    of its own. `_state_dir` raises rather than guessing, so a registry this
+    process cannot locate is never written to. The LEDGER root goes through
+    `workers_root_from` for the same reason (port-06): the attestation is only
+    worth anything where the orchestrator reads it
+    (`mutation_ledger_for(config.workers_root, config.state_dir)`), and this
+    function used to guess `~/.autoloop/workers` — writing a record into the
+    operator's home directory, about a checkout it was not derived from. With
+    no usable `workers_root` there is no attestation to be had, so the ledger
+    falls back INSIDE the state dir exactly as `mutation_ledger_for` documents:
+    the write is then visible to the escape detector, which is the safe
+    direction.
     """
     from .tasks import TaskStore, mutation_ledger_for
 
-    workers_root = _config_section(repo, "paths").get("workers_root")
-    root = (
-        Path(workers_root).expanduser()
-        if workers_root and isinstance(workers_root, str)
-        else Path.home() / ".autoloop" / "workers"
-    )
+    state_dir = _state_dir(repo)
+    try:
+        root = workers_root_from(_config_section(repo, "paths").get("workers_root"))
+    except ConfigError:
+        root = None
     return TaskStore(
-        _tasks_file(repo), ledger=mutation_ledger_for(root, _state_dir(repo))
+        state_dir / TASKS_FILENAME, ledger=mutation_ledger_for(root, state_dir)
     )
+
+
+#: What the health tile says when the state directory could not be resolved.
+#: NOT "stopped": no lock was read, so there is no verdict to give, and a loop
+#: running perfectly would be reported dead.
+STATE_DIR_UNRESOLVED_LABEL = "state directory unresolved"
+
+#: The sentence the page shows when it could not resolve the state directory,
+#: with the reason appended. Pinned HERE rather than in `PAGE`, like the unit
+#: panel's words and the merge groups' labels, so the empty state is assertable
+#: in Python instead of grep-able in a JavaScript string.
+#:
+#: It has to say the second sentence as well as the first. Every panel below it
+#: renders empty, and an empty roadmap beside an empty pipeline reads as "the
+#: loop has nothing to do" — which is the fail-open this page has been bitten by
+#: twice: `unknown` reported as `open` (§4j) and a stale reader reported as a
+#: corrupt task graph (2026-08-22).
+STATE_DIR_UNRESOLVED = (
+    "⚠ The STATE DIRECTORY could not be resolved, so this page read NO "
+    "loop state at all. Every panel below is empty because nothing could be "
+    "read — not because nothing is there. "
+)
+
+
+def _under(state_dir: Path | None, name: str) -> Path | None:
+    """`state_dir / name`, or `None` when there is no state dir.
+
+    The one place `collect` is allowed to build a state path, so an
+    unresolvable directory cannot become an `AttributeError` halfway down a
+    sweep — and `_json(None)` is `None`, which is the same "absent" every other
+    unreadable file already produces.
+    """
+    return None if state_dir is None else Path(state_dir) / name
+
+
+def _state_dir_or_note(repo: Path) -> tuple[Path | None, str]:
+    """`(state_dir, "")`, or `(None, why)` — the page's own form of
+    `_state_dir`, which raises.
+
+    Kept apart from `_state_dir` on purpose: everything that WRITES, or that
+    would otherwise answer a question with a guessed directory, wants the
+    raise. `collect` is the one caller that must keep rendering, so it takes the
+    reason as text and puts it on the page.
+    """
+    try:
+        return _state_dir(repo), ""
+    except ConfigError as exc:
+        return None, _one_line(exc)
 
 
 # ---- serving the code the checkout now holds (loop-03, 2026-08-23) -----------
@@ -900,7 +1025,13 @@ def _pending_upgrade_file(repo: Path) -> Path:
 
     Two spellings of one path, pinned equal by a test — the entire claim is that
     this reads the signal the loop already writes, and a second path would read
-    nothing, forever, silently.
+    nothing, forever, silently. Since port-06 the two spellings share their
+    RESOLVER as well as their filename, so the pinned equality covers the
+    unconfigured deployment too rather than only the configured one.
+
+    Raises `ConfigError` when the state directory cannot be resolved; the one
+    caller (`upgrade_decision`) turns that into a stated verdict, because a
+    marker this process cannot locate is a fact about this process.
     """
     return _state_dir(repo) / "pending_upgrade.json"
 
@@ -975,7 +1106,23 @@ def upgrade_decision(repo: Path) -> dict:
     because a process that cannot tell whether it is current, or knows it is
     not, must never look like one that knows it is.
     """
-    path = _pending_upgrade_file(repo)
+    try:
+        path = _pending_upgrade_file(repo)
+    except ConfigError as exc:
+        # The marker cannot be LOCATED, which lands in the same place as one
+        # that cannot be parsed: this process cannot tell whether its own code
+        # is current, so it says so and authorises no replacement. Reported
+        # through the existing vocabulary rather than a new state — the words
+        # `unreadable_marker` renders are already exactly this claim, and the
+        # note carries the reason. `collect` says the wider thing at the top of
+        # the page; this branch also covers `_upgrade_at_boundary`, which runs
+        # with no payload in sight.
+        return _view(
+            "unreadable_marker",
+            f"It could not even be located — {_one_line(exc)}. Fix "
+            "[paths] in .autoloop/config.toml; nothing here is a statement "
+            "about the task graph.",
+        )
     record = UpgradeStore(path).load()
     if record is None:
         if path.exists():
@@ -1538,7 +1685,7 @@ def merge_states(completed: list[dict], executions: dict, remote_ok: bool,
     return out
 
 
-def _executions(repo: Path) -> dict:
+def _executions(state_dir: Path | None) -> dict:
     """`{task_id: record}` for every LIVE execution record.
 
     `glob("*.json")`, deliberately NOT `rglob`: `worktask.retire_execution`
@@ -1549,13 +1696,18 @@ def _executions(repo: Path) -> dict:
 
     A corrupt record is skipped, never raised — a tracker that 500s because one
     record is half-written tells the operator nothing.
+
+    Takes the RESOLVED state directory rather than the repo (port-06): it is
+    `collect`'s single resolution, passed in, so this cannot answer about a
+    different directory from the panels beside it and cannot re-resolve one the
+    caller has already found unresolvable. `None` means exactly that — no
+    records, because there is nowhere to read them from — and the page says why
+    at the top rather than here.
     """
     out: dict = {}
-    # THROUGH `_state_dir`, for the same reason `collect` was fixed on
-    # 2026-08-23: a second hardcoded path here kept the candidate, round
-    # and attempt figures reading pre-migration records while the rest of
-    # the page had followed the config.
-    directory = _state_dir(repo) / "executions"
+    if state_dir is None:
+        return out
+    directory = Path(state_dir) / "executions"
     if not directory.is_dir():
         return out
     for path in sorted(directory.glob("*.json")):
@@ -3527,17 +3679,31 @@ def collect(repo: Path) -> dict:
     # of the move. A page that is partly current reads as authoritative, and
     # three dashboard restarts changed nothing because a restart cannot fix a
     # hardcoded path.
-    sd = _state_dir(repo)
-    state = _json(sd / "state.json") or {}
+    #
+    # Resolved ONCE and threaded (port-06). `sd is None` is the honest third
+    # answer — not "the checkout", which is where this used to land silently:
+    # every state-derived slice below then reads absent and `state_dir.note`
+    # says why at the top of the page. Absent-because-unreadable and
+    # absent-because-empty must never look the same, and the whole payload
+    # moving together is what keeps the page plainly blank rather than
+    # half-live.
+    sd, sd_error = _state_dir_or_note(repo)
+    state = _json(_under(sd, "state.json")) or {}
     # `tasks.json` only exists once a registry has been saved; before that the
     # CLI seeds from the tracked file. Reading only the former showed an empty
     # roadmap while `next-task` correctly reported rt-01.
     #
-    # Through `_tasks_file`, so this is the same path `/api/priority` writes:
-    # the row's number is read back from disk after a save, and a read that
-    # went somewhere else would report the edit as lost.
-    tasks = _json(_tasks_file(repo)) or {}
-    if not tasks.get("tasks"):
+    # Off the SAME resolved directory `/api/priority` writes through
+    # (`_tasks_file` -> `_state_dir`, one filename constant): the row's number
+    # is read back from disk after a save, and a read that went somewhere else
+    # would report the edit as lost.
+    tasks = _json(_under(sd, TASKS_FILENAME)) or {}
+    # The seed fallback answers "the loop has not saved a registry YET", which
+    # is a claim about a KNOWN state directory — so it is skipped when there is
+    # none (port-06). Otherwise a page that read nothing would still show this
+    # checkout's git-tracked seed roadmap, under a banner saying every panel is
+    # empty because nothing could be read.
+    if sd is not None and not tasks.get("tasks"):
         seeded = _json(repo / "autoloop" / "seed_tasks.json")
         if isinstance(seeded, list):
             tasks = {"tasks": seeded}
@@ -3556,7 +3722,7 @@ def collect(repo: Path) -> dict:
     # live — a distinction a bare `ps -p` cannot make.
     from .lock import LoopLock
 
-    lock_info = LoopLock(sd).read()
+    lock_info = LoopLock(sd).read() if sd is not None else None
     lock_alive = lock_info is not None and LoopLock.is_live(lock_info)
     lock_pid = str(lock_info.pid) if lock_info else ""
     # Kept for display only. Never the authority: it is the check that was
@@ -3567,7 +3733,13 @@ def collect(repo: Path) -> dict:
         if p
     ]
 
-    if lock_alive:
+    if sd is None:
+        # NOT "stopped". No lock was read because no directory could be
+        # resolved, and reporting a health verdict off a read that never
+        # happened is the fail-open this whole path exists to close — a loop
+        # running perfectly would read `stopped` here.
+        health = ("critical", STATE_DIR_UNRESOLVED_LABEL)
+    elif lock_alive:
         health = ("good", "running")
     elif lock_info is not None:
         health = ("critical", "stopped — stale lock")
@@ -3575,14 +3747,17 @@ def collect(repo: Path) -> dict:
         health = ("warning", "stopped")
 
     # --- audit run: which domains have landed --------------------------
-    runs = sorted((sd / "audit").glob("*"), key=lambda p: p.stat().st_mtime, reverse=True) \
-        if (sd / "audit").is_dir() else []
+    audit_dir = _under(sd, "audit")
+    runs = sorted(audit_dir.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True) \
+        if audit_dir is not None and audit_dir.is_dir() else []
     run_dir = runs[0] if runs else None
     completed = sorted(p.stem for p in (run_dir / "raw").glob("*")) if run_dir and (run_dir / "raw").is_dir() else []
 
     # --- blockers -------------------------------------------------------
     blockers = []
-    for f in sorted((sd / "blockers").glob("blk-*.json")) if (sd / "blockers").is_dir() else []:
+    blockers_dir = _under(sd, "blockers")
+    for f in (sorted(blockers_dir.glob("blk-*.json"))
+              if blockers_dir is not None and blockers_dir.is_dir() else []):
         b = _json(f)
         if b and not b.get("resolved_at"):
             blockers.append({
@@ -3630,7 +3805,7 @@ def collect(repo: Path) -> dict:
     # same records different questions (which commit is under review now, which
     # commit landed), and two globs of the same directory could disagree
     # mid-write.
-    executions = _executions(repo)
+    executions = _executions(sd)
 
     # The grouped read of the same rows, hoisted out of the payload literal
     # because the flat list below borrows one answer from it.
@@ -3651,8 +3826,8 @@ def collect(repo: Path) -> dict:
 
     # --- recent events --------------------------------------------------
     events = []
-    tp = sd / "transcript.jsonl"
-    if tp.exists():
+    tp = _under(sd, "transcript.jsonl")
+    if tp is not None and tp.exists():
         try:
             for line in tp.read_text().splitlines()[-14:]:
                 if not line.strip():
@@ -3689,6 +3864,16 @@ def collect(repo: Path) -> dict:
     return {
         "health": {"role": health[0], "label": health[1], "pids": pids,
                    "lock_pid": lock_pid, "lock_alive": lock_alive},
+        # WHERE everything above was read from, and the sentence to show when
+        # the answer is "nowhere" (port-06). `note` is empty on a healthy page,
+        # which is what the banner keys off; `path` is stated even then, because
+        # "which directory is this page describing" is the question three
+        # separate incidents were spent guessing at.
+        "state_dir": {
+            "path": str(sd) if sd is not None else "",
+            "error": sd_error,
+            "note": (STATE_DIR_UNRESOLVED + sd_error) if sd_error else "",
+        },
         "session": {
             "phase": state.get("phase"), "iteration": state.get("iteration"),
             "session_id": (state.get("session_id") or "")[:12],
@@ -5563,14 +5748,22 @@ function render(d, force){
   const stale = document.getElementById("stale");
   const up = (d.build && d.build.upgrade) || null;
   const upline = (up && up.state !== "current") ? upgradeBanner(up) : "";
+  // A THIRD sentence shares the box since port-06: the state directory could
+  // not be resolved, so nothing below was read from anywhere at all. It goes
+  // FIRST because it outranks both — a process that cannot find the state dir
+  // holds no data, and an empty roadmap beside an empty pipeline otherwise
+  // reads as "the loop has nothing to do". The words are the backend's
+  // (`STATE_DIR_UNRESOLVED`), like the unit tiles' and the merge groups'.
+  const sdline = (d.state_dir && d.state_dir.note) || "";
   if (d.build && d.build.stale) {
     stale.style.display = "block";
-    stale.textContent = `\u26a0 This page is STALE — dashboard.py changed on disk `
+    stale.textContent = sdline
+      + `\u26a0 This page is STALE — dashboard.py changed on disk `
       + `(running ${d.build.running}, on disk ${d.build.on_disk}). `
       + `Restart the dashboard to load it.` + upline;
-  } else if (upline) {
+  } else if (sdline || upline) {
     stale.style.display = "block";
-    stale.textContent = upline;
+    stale.textContent = sdline + upline;
   } else { stale.style.display = "none"; }
 
   // ---- the dependency graph ----------------------------------------------
@@ -6179,6 +6372,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json_response(400, {"error": f"bad request: {exc}"})
         try:
             task = _task_store(self.repo).apply_priority(task_id, priority)
+        except ConfigError as exc:
+            # The registry could not be LOCATED, so nothing was written
+            # anywhere (port-06). Reported rather than applied to a guessed
+            # path: the old fallback would have written `<repo>/.autoloop/
+            # tasks.json` on a deployment whose loop dispatches from outside
+            # the checkout, and the read-back below would have confirmed the
+            # save from the same abandoned file — an edit that reads as landed
+            # and never reaches the loop.
+            return self._json_response(
+                500,
+                {"error": f"nothing was written — {exc}"},
+            )
         except TaskGraphError as exc:
             # An unknown id or a non-integer priority, in the registry's own
             # words — the same authority a queued request would have been

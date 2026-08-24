@@ -230,6 +230,55 @@ Also unmoved: **the config file itself** is still `.autoloop/config.toml`
 (`cli.DEFAULT_CONFIG`), and `config_writer` still refuses to rewrite it unless
 git is verifiably not tracking it. Only writable runtime state moved.
 
+#### 3h-bis. One resolver, so every reader agrees (port-06, 2026-08-24)
+
+The rule above had **two implementations**. `config.load_config` applied it;
+`dashboard._state_dir` applied a second copy that ended `return repo /
+".autoloop"` when the key was absent — the pre-port-01 location, inside the
+checkout. So a deployment following §3h's own documented shape (`state_dir`
+omitted) got a **loop writing one directory and a dashboard reading another**.
+
+It was not reachable here, because this deployment sets `state_dir` explicitly
+and both honoured that verbatim. It was armed for anyone who omits the key: a
+fresh checkout, or the ports that start from an unconfigured state.
+
+**Worse than a stale page.** `dashboard._tasks_file` both READS and WRITES, and
+its own docstring gives the reason it must be one path: "the row shows a value
+read back from disk, so a page reading one path and writing another would report
+a save that did not happen where it was looking." That reasoning was defeated one
+level up — both halves agreed with each other and disagreed with the loop, so a
+priority set from the page would have been written to an abandoned registry, read
+back correctly, and never reached the running loop.
+
+* **`config.resolve_state_dir` is the single rule**, called by `load_config` and
+  by `dashboard._state_dir`. Same reasoning as `tasks.unauthorized_paths`: two
+  implementations drift, and a drift here is silent by construction.
+  `config.workers_root_from` is the same move for the key the default is derived
+  from — validating it a second way would derive a different default while
+  looking like agreement.
+* **A relative value is one rule with a `base`**, not two. The loop passes none
+  (it honours the operator's literal value against its own cwd, and that cwd IS
+  the checkout — `cli` builds every gateway on `Path.cwd()` and reads the
+  relative `.autoloop/config.toml`); the dashboard passes the checkout, because
+  ITS cwd is wherever the operator launched it. Both name the same directory,
+  and `test_state_dir_location.py` executes that with `monkeypatch.chdir`
+  rather than asserting it in prose.
+* **A reader that cannot resolve it SAYS SO.** `_state_dir` raises rather than
+  guessing; `collect` empties every state-derived panel and puts
+  `dashboard.STATE_DIR_UNRESOLVED` at the top of the page with the reason (and
+  which config file is missing or unparseable); health reads `state directory
+  unresolved`, never `stopped`, because no lock was read; `merge_window` reports
+  `unknown`; `upgrade_decision` reports an unreadable marker; and
+  `/api/priority` refuses with `nothing was written`. A silent fallback is what
+  produced this.
+* **Blank and non-string values are refused** rather than read as `Path("")`,
+  which is `.` — the process's cwd, i.e. a different directory for each reader.
+  An explicit value is otherwise unchanged, including no `~` expansion: the loop
+  honours the literal, so a reader that expanded it would point where the writer
+  never writes.
+* **Nothing is migrated.** Making the readers agree is the whole change; moving
+  anybody's state remains an operator-initiated act (§3h, "No migration").
+
 ---
 
 ### 3g. Detecting a task's scope (propose, never authorize)
@@ -3754,14 +3803,14 @@ that marker to appear nowhere in the payload. A source grep for `repo /
 itself supplies, and would pass silently against a second resolver spelled
 `Path(repo, ".autoloop")` or `repo.joinpath(...)`.
 
-**The residual hole, stated rather than hidden.** `_config_toml` swallows an
-unreadable or unparseable config into `{}` so one bad TOML cannot take down the
-page you read when something is already wrong — and `_state_dir` then answers
-`<repo>/.autoloop`. On a post-port-01 deployment a typo in `config.toml`
-therefore puts the whole page back on the stale in-checkout directory. It is
-tolerable only because that fallback is TOTAL: every panel moves together, so
-the page is plainly stale rather than half-live. port-06 owns the unconfigured
-default; this is its explicitly-configured sibling and neither fixes the other.
+**The residual hole, closed by port-06 (2026-08-24).** `_config_toml` still
+swallows an unreadable or unparseable config into `{}` so one bad TOML cannot
+take down the page you read when something is already wrong — but `_state_dir`
+no longer turns that `{}` into `<repo>/.autoloop`. A typo in `config.toml` used
+to put the whole page silently back on the stale in-checkout directory, which is
+this very bug wearing a different cause. It now reads nothing at all, says so at
+the top of the page in the backend's own words, and names the file that did not
+parse; §3h-bis has the rule and the other readers it covers.
 
 **The unit panel, and the honest empty state.** `collect()["task"]` is
 `unit_panel(state)`, read off `state.task_execution` — the loop's own record of

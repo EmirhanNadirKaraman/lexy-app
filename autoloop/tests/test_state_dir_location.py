@@ -23,8 +23,16 @@ What is pinned here, and nothing wider:
 Deliberately NOT pinned, because it is deliberately not implemented: there is
 no migration. `state.json`, `tasks.json` and the lock are not read from the old
 directory — see `docs/AUTOLOOP.md` §3h.
+
+Since port-06 (2026-08-24) it also pins that the rule has ONE implementation:
+the dashboard resolves through `config.resolve_state_dir` rather than its own
+copy, so the loop and the page name the same directory under every shape of
+`[paths]`, and a reader with nothing to resolve from raises instead of guessing.
+The final section drives both readers against one config file — see
+`docs/AUTOLOOP.md` §3h-bis.
 """
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -299,6 +307,195 @@ def test_a_stray_file_at_the_new_path_does_not_silence_the_legacy_report(
     (config.state_dir / "workers").write_text("not a dir\n")
 
     assert config.workers_dir == checkout / LEGACY_STATE_DIR_NAME / "workers"
+
+
+# --- one resolver, two readers (port-06, 2026-08-24) --------------------------
+#
+# The loop was not the only thing resolving `[paths].state_dir`. `dashboard.
+# _state_dir` resolved it too, and ended `return repo / ".autoloop"` when the key
+# was absent — the PRE-port-01 location, inside the checkout — while the loop
+# resolved `default_state_dir(workers_root)` outside it. So a deployment that
+# followed the shape documented above got a loop writing one directory and a page
+# reading another.
+#
+# It is worse than a stale page because `dashboard._tasks_file` also WRITES: a
+# priority set from the page would have gone into an abandoned registry, been
+# read back correctly from that same file, and never reached the running loop.
+#
+# Both readers now call `config.resolve_state_dir`. These tests drive the two of
+# them against ONE config file and compare their answers — never against a path
+# the test spelled, which would only pin what the test itself supplied.
+
+TASK_ROW = {
+    "id": "t-1", "title": "T", "description": "d", "status": "pending",
+    "priority": 3, "depends_on": [], "approved_paths": ["docs/A.md"],
+}
+
+
+def page_state_dir(checkout):
+    """What the DASHBOARD resolves for this checkout, through its own reader."""
+    from autoloop import dashboard
+
+    return dashboard._state_dir(checkout)
+
+
+def test_with_state_dir_absent_both_readers_resolve_the_same_directory(
+    checkout, workers_root
+):
+    """The divergence itself. Absent is the state a fresh checkout, port-04 and
+    port-05 all start in, and the one this deployment does not happen to be in
+    — which is why it went unnoticed."""
+    cfg = write_config(checkout, workers_root)
+
+    assert page_state_dir(checkout) == load_config(cfg).state_dir
+    assert page_state_dir(checkout).is_absolute()
+    assert page_state_dir(checkout) != checkout / LEGACY_STATE_DIR_NAME, (
+        "the pre-port-01 location is what the page used to answer here"
+    )
+
+
+def test_an_absolute_state_dir_is_honoured_by_both(checkout, workers_root, tmp_path):
+    """The compatibility contract, from both sides: an operator who says where
+    their state lives is obeyed verbatim by the loop AND by the page."""
+    explicit = tmp_path / "elsewhere" / "loop-state"
+    cfg = write_config(checkout, workers_root, f'state_dir = "{explicit}"\n')
+
+    assert load_config(cfg).state_dir == explicit
+    assert page_state_dir(checkout) == explicit
+
+
+def test_a_relative_state_dir_resolves_against_the_checkout_for_both(
+    checkout, workers_root, monkeypatch
+):
+    """A relative value is the shape `config.example.toml` still ships, and the
+    one where "verbatim" and "the same directory" have to be reconciled rather
+    than asserted.
+
+    The loop keeps the operator's literal value and resolves it against its OWN
+    cwd; the page resolves it against the checkout. Those agree because the
+    loop's cwd IS the checkout — `cli` builds every gateway on `Path.cwd()` and
+    reads the relative `.autoloop/config.toml`. `monkeypatch.chdir` is what
+    EXECUTES that claim here instead of restating it in prose.
+    """
+    cfg = write_config(checkout, workers_root, 'state_dir = "loopstate"\n')
+    config = load_config(cfg)
+
+    assert config.state_dir == Path("loopstate"), "verbatim — port-01's contract"
+
+    monkeypatch.chdir(checkout)
+    assert config.state_dir.resolve() == page_state_dir(checkout).resolve()
+
+
+@pytest.mark.parametrize("shape", ["absent", "absolute", "relative"])
+def test_a_priority_edit_from_the_page_lands_where_the_loop_reads(
+    shape, checkout, workers_root, tmp_path, monkeypatch
+):
+    """The consequence, driven end to end: the dashboard's own write path, read
+    back through the LOOP's own path.
+
+    Reading it back through `dashboard._tasks_file` would prove only that the
+    page agrees with itself — which is exactly what the broken version did, and
+    exactly why an operator could not tell.
+    """
+    from autoloop import dashboard
+    from autoloop.tasks import TASKS_SCHEMA_VERSION, TaskStore
+
+    line = {
+        "absent": "",
+        "absolute": f'state_dir = "{tmp_path / "explicit-state"}"\n',
+        "relative": 'state_dir = "loopstate"\n',
+    }[shape]
+    cfg = write_config(checkout, workers_root, line)
+    # Before `load_config`, so the relative shape is resolved from the directory
+    # a real loop runs in rather than from wherever pytest was started.
+    monkeypatch.chdir(checkout)
+    config = load_config(cfg)
+
+    loop_registry = Path(config.tasks_file)
+    loop_registry.parent.mkdir(parents=True, exist_ok=True)
+    loop_registry.write_text(
+        json.dumps({"schema_version": TASKS_SCHEMA_VERSION, "tasks": [TASK_ROW]}),
+        encoding="utf-8",
+    )
+
+    applied = dashboard._task_store(checkout).apply_priority("t-1", 1)
+
+    assert applied.priority == 1
+    reread = TaskStore(config.tasks_file).load()
+    assert reread is not None, f"the page wrote a registry the loop cannot find ({shape})"
+    assert reread.get("t-1").priority == 1
+
+
+def test_a_state_directory_that_cannot_be_resolved_is_an_error_not_a_default(checkout):
+    """The rule that keeps this fixed: a reader with nothing to resolve FROM
+    says so. A silent fallback is what produced the divergence, and it produced
+    it invisibly — the page rendered a complete, plausible, abandoned state
+    directory."""
+    from autoloop import dashboard
+
+    cfg_dir = checkout / LEGACY_STATE_DIR_NAME
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg = cfg_dir / "config.toml"
+
+    # Names neither key: the loop refuses to load, and the page refuses to
+    # answer, for the same missing setting.
+    cfg.write_text(f'[browser]\nconversation_url = "{URL}"\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="workers_root"):
+        load_config(cfg)
+    with pytest.raises(ConfigError, match="workers_root") as page:
+        dashboard._state_dir(checkout)
+    assert "could not be resolved" in str(page.value)
+
+    # No config file at all — a checkout nobody has configured. Still an error,
+    # and it names the file rather than reading the old directory.
+    cfg.unlink()
+    with pytest.raises(ConfigError, match="does not exist"):
+        dashboard._state_dir(checkout)
+
+
+def test_a_state_dir_that_is_not_a_usable_path_is_refused_by_both(
+    checkout, workers_root
+):
+    """`Path("")` is `.` — the process's cwd, which is a guess wearing a value's
+    clothes and would differ between the two readers by construction. Blank and
+    non-string values are refused instead, by the one resolver, so neither
+    reader can invent an answer the other would not."""
+    from autoloop import dashboard
+    from autoloop.config import resolve_state_dir
+
+    for written in ('state_dir = ""\n', 'state_dir = "   "\n', "state_dir = 7\n"):
+        cfg = write_config(checkout, workers_root, written)
+        with pytest.raises(ConfigError, match="state_dir"):
+            load_config(cfg)
+        with pytest.raises(ConfigError, match="state_dir"):
+            dashboard._state_dir(checkout)
+
+    # And directly, including the shape no TOML file can produce but a caller
+    # can: no configured value AND no workers root to derive one from.
+    with pytest.raises(ConfigError, match="workers_root"):
+        resolve_state_dir(None, None)
+
+
+def test_the_resolver_is_the_only_state_dir_rule_the_dashboard_has(
+    checkout, workers_root, monkeypatch
+):
+    """The structural half of the claim: `dashboard._state_dir` DELEGATES.
+
+    Asserted by replacing the shared resolver and watching the page's answer
+    move with it — a second implementation, however faithfully it agreed today,
+    would keep answering the old way and this would fail. A source grep for
+    `repo / ".autoloop"` was rejected for the reason `test_dashboard.py` records:
+    it pins the literal the test itself supplies.
+    """
+    import autoloop.dashboard as dashboard_module
+
+    cfg = write_config(checkout, workers_root)
+    assert dashboard_module._state_dir(checkout) == load_config(cfg).state_dir
+
+    sentinel = Path("/sentinel/state/dir")
+    monkeypatch.setattr(dashboard_module, "resolve_state_dir",
+                        lambda *args, **kwargs: sentinel)
+    assert dashboard_module._state_dir(checkout) == sentinel
 
 
 def test_a_hand_built_config_without_a_legacy_dir_is_unchanged(tmp_path):

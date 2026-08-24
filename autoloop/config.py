@@ -395,6 +395,104 @@ def default_state_dir(workers_root: Path) -> Path:
     return Path(workers_root).expanduser().parent / DEFAULT_STATE_DIR_NAME
 
 
+def workers_root_from(raw) -> Path:
+    """`[paths].workers_root` as a validated absolute `Path`.
+
+    Extracted from `load_config` (port-06, 2026-08-24) so that ANY reader can
+    ask the loop's own question — "where does this deployment keep its worker
+    repositories" — and get the loop's own answer or the loop's own refusal.
+    The default state directory is derived from this value, so a second reader
+    validating it a second way would derive a different default while looking
+    like it agreed.
+
+    Raises `ConfigError` for missing, blank, non-string and relative values.
+    Every message is the one `load_config` already raised, verbatim: this is a
+    move, not a new rule.
+    """
+    # `not raw` first, exactly as `load_config` tested it before this moved:
+    # every falsy TOML value (absent, "", 0, false) is "not configured", and the
+    # `.strip()` catches the blank-looking string that is not empty.
+    if not raw or not str(raw).strip():
+        raise ConfigError(
+            "paths.workers_root is required — an ABSOLUTE path outside this "
+            "checkout where task worker repositories live (e.g. "
+            "\"~/.autoloop/workers\"). There is no default; see "
+            "config.example.toml. (Autoloop M1: a worker repo nested inside "
+            "the checkout is invisible to every git-based verification "
+            "primitive scoped to the checkout.)"
+        )
+    workers_root = Path(str(raw)).expanduser()
+    if not workers_root.is_absolute():
+        raise ConfigError(
+            f"paths.workers_root must be an absolute path, got {raw!r} "
+            "(after expanding '~') — a relative path is ambiguous across the "
+            "different working directories worker-repo subprocesses run from"
+        )
+    return workers_root
+
+
+def resolve_state_dir(configured, workers_root, *, base: Path | None = None) -> Path:
+    """THE rule that turns `[paths]` into a state directory. One function, two
+    callers: `load_config` (the loop) and `dashboard._state_dir` (the page).
+
+    Written for port-06 (2026-08-24), which is the bug it exists to make
+    unrepresentable: the dashboard used to end `return repo / ".autoloop"` when
+    the key was absent, i.e. the PRE-port-01 location, while the loop resolved
+    `default_state_dir(workers_root)` — outside the checkout. Both halves of the
+    page agreed with each other and disagreed with the loop, so a priority set
+    from the page would have been written to an abandoned registry, read back
+    correctly, and never reached the running loop. Two implementations drift;
+    this one cannot, for the same reason `tasks.unauthorized_paths` is a single
+    matcher.
+
+    * **Absent** → `default_state_dir(workers_root)`, which needs a usable
+      `workers_root` and REFUSES when there is none. That refusal is the point:
+      a reader that cannot resolve the directory must say so rather than guess,
+      because a silent guess is what produced the divergence.
+    * **Explicit** → honoured **verbatim** — port-01's compatibility contract,
+      unchanged in every respect. `~` is deliberately NOT expanded here (unlike
+      `workers_root`): the loop honours the literal value, and a reader that
+      expanded it would point somewhere the writer never writes. Blank and
+      non-string values are refused instead of being read as `Path("")`, which
+      is `.` — a guess wearing a value's clothes.
+    * **Relative** → resolved against `base` when one is given, and returned as
+      written when it is not. That is one rule, not two: `load_config` passes
+      no base because the loop honours the operator's value against its OWN
+      cwd, and the loop's cwd IS the checkout (`cli` builds every gateway on
+      `Path.cwd()` and `DEFAULT_CONFIG` is the relative `.autoloop/config.toml`);
+      the dashboard passes the checkout because ITS cwd is wherever the operator
+      launched it. Both therefore name the same directory, which is what
+      `test_state_dir_location.py` executes with `monkeypatch.chdir`.
+    """
+    if configured is None:
+        root = workers_root_from(workers_root)
+        state_dir = default_state_dir(root)
+        # The one way the derivation can collide with the path it derives from.
+        # Refused HERE, naming the remedy, rather than left to surface later as
+        # `validate_workers_root`'s "workers_root is nested beneath the state
+        # directory" — true, but baffling to an operator who never configured a
+        # state directory at all.
+        if state_dir == root:
+            raise ConfigError(
+                f"paths.workers_root ends in {DEFAULT_STATE_DIR_NAME!r} "
+                f"({root}), which collides with the default state "
+                "directory derived beside it. Set [paths].state_dir "
+                "explicitly, or point workers_root at a differently named "
+                "directory."
+            )
+        return state_dir
+    if not isinstance(configured, str) or not configured.strip():
+        raise ConfigError(
+            f"paths.state_dir must be a non-empty string path, got {configured!r} "
+            "— delete the key entirely to use the default beside "
+            "paths.workers_root, which is what an absent value means"
+        )
+    path = Path(configured)
+    if base is None or path.is_absolute():
+        return path
+    return Path(base) / path
+
+
 def legacy_state_dir_for(config_path: Path) -> Path | None:
     """The pre-port-01 in-checkout state directory for THIS deployment, or
     `None` when there is nothing to point at.
@@ -1004,55 +1102,27 @@ def load_config(path: Path) -> AutoloopConfig:
     # the publisher dir" needs that context and is checked separately by
     # `worker_env.validate_workers_root` at the two places a `WorkerRepoManager`
     # actually gets constructed for real dispatch (`cli.py`, `doctor.py`).
-    workers_root_raw = paths_data.get("workers_root")
-    if not workers_root_raw or not str(workers_root_raw).strip():
-        raise ConfigError(
-            "paths.workers_root is required — an ABSOLUTE path outside this "
-            "checkout where task worker repositories live (e.g. "
-            "\"~/.autoloop/workers\"). There is no default; see "
-            "config.example.toml. (Autoloop M1: a worker repo nested inside "
-            "the checkout is invisible to every git-based verification "
-            "primitive scoped to the checkout.)"
-        )
-    workers_root = Path(str(workers_root_raw)).expanduser()
-    if not workers_root.is_absolute():
-        raise ConfigError(
-            f"paths.workers_root must be an absolute path, got {workers_root_raw!r} "
-            "(after expanding '~') — a relative path is ambiguous across the "
-            "different working directories worker-repo subprocesses run from"
-        )
+    #
+    # Through `workers_root_from` since port-06, so the dashboard asks this
+    # question of the same code rather than of a second copy of the rule.
+    workers_root = workers_root_from(paths_data.get("workers_root"))
 
     # `state_dir` (port-01, 2026-08-23) — resolved HERE, after `workers_root`,
-    # because the default is now derived from it.
+    # because the default is derived from it, and through the SHARED resolver
+    # since port-06 (2026-08-24), because the dashboard resolves the same key
+    # and the two must be one rule rather than two agreeing copies.
     #
     # An EXPLICIT value is honoured verbatim, exactly as before: same `Path()`,
-    # same relative-resolves-against-cwd behaviour, no expansion, no refusal
-    # that did not exist yesterday. That is the whole compatibility contract —
-    # a deployment that wants its state to stay where it is says so in one
-    # line, and `config.example.toml` still ships that line. Such a config also
-    # gets `legacy_state_dir=None`: nothing moved out from under it, so there
-    # is no older location to look in.
+    # same relative-resolves-against-cwd behaviour (no `base` is passed here —
+    # the loop's cwd is the checkout), no expansion. That is the whole
+    # compatibility contract — a deployment that wants its state to stay where
+    # it is says so in one line, and `config.example.toml` still ships that
+    # line. Such a config also gets `legacy_state_dir=None`: nothing moved out
+    # from under it, so there is no older location to look in.
     #
-    # UNSET now means "beside workers_root", outside the checkout, absolute.
-    if state_dir_raw is not None:
-        state_dir = Path(state_dir_raw)
-        legacy_state_dir: Path | None = None
-    else:
-        state_dir = default_state_dir(workers_root)
-        # The one way the derivation can collide with the path it derives
-        # from. Refused HERE, naming the remedy, rather than left to surface
-        # later as `validate_workers_root`'s "workers_root is nested beneath
-        # the state directory" — true, but baffling to an operator who never
-        # configured a state directory at all.
-        if state_dir == workers_root:
-            raise ConfigError(
-                f"paths.workers_root ends in {DEFAULT_STATE_DIR_NAME!r} "
-                f"({workers_root}), which collides with the default state "
-                "directory derived beside it. Set [paths].state_dir "
-                "explicitly, or point workers_root at a differently named "
-                "directory."
-            )
-        legacy_state_dir = legacy_state_dir_for(path)
+    # UNSET means "beside workers_root", outside the checkout, absolute.
+    state_dir = resolve_state_dir(state_dir_raw, workers_root)
+    legacy_state_dir = legacy_state_dir_for(path) if state_dir_raw is None else None
 
     # `validation_env_file` (the validation-environment boundary): OPTIONAL,
     # but absolute when present. Same split as `workers_root` above — "unset"
