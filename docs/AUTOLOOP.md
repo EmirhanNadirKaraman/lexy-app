@@ -1584,6 +1584,84 @@ candidate sha from this binding alone — never from a fresh
 by the time an approval arrives) and never from the directive (a `push`
 directive cannot even carry a task_id — see `contract._forbid`).
 
+**A binding outlives the ONE request that created it (bind-02, 2026-08-24).**
+The paragraph above is the whole mechanism when the approval arrives in the
+reply to the packet. It does not always. Two things can come between the packet
+and its approval, and before this each lost the binding:
+
+*A CORRECTIVE RE-PROMPT.* When a reply cannot be acted on, the loop replaces the
+request with a correction. There are FIVE such sites, not the four an obvious
+reading finds — `_handle_parse_error`, `_handle_policy_denial`,
+`_handle_review_mismatch`, `_dispatch_plan`'s plan-rejection branch, and
+`_handle_git_failure`, whose "nothing further was done, decide how to proceed"
+is a policy denial's shape. A correction's payload carries none of the
+candidate's identifiers, so `_current_pending_postcommit` binds it to nothing,
+*correctly* — it presents nothing. But it is also not a new review: the packet
+under review has not changed and the candidate has not moved, so the correction
+now INHERITS the binding of the request it is correcting
+(`LoopState.carry_postcommit`, recorded by `_carry_postcommit_forward` before
+`last_response` is cleared, consumed and cleared by the very next
+`_step_ready`). All five are routed through the one helper rather than
+special-cased: they build the same kind of message, and a binding that survives
+one of them and not the others is a trap that only shows up on whichever path
+nobody tested. Plan rejection is a no-op by FACT, not by exemption — a `plan`
+reply answers a request that never carried a binding, which the helper decides
+by looking. The inherited binding keeps the ORIGINAL packet's `packet_sha256`,
+and `TaskExecution.presented_report_sha256` / `review_request_id` are NOT
+re-stamped: those record which report presented the candidate, and a correction
+presents no packet.
+
+*WHERE THE CARRY STOPS.* A failed executor round's `implementation_review`
+report does NOT carry, and that is the boundary rather than an omission: a round
+RAN and is reporting what happened to it, so an approval of that report is about
+a different presented state, not a re-prompt about an unchanged one. Carrying
+there would let a `push` publish the candidate from before the revision the
+reviewer asked for.
+
+*THE CONVERSATION MOVING ON.* `last_response` is only the most recent thing sent.
+A stamped approval, by contrast, NAMES the request it reviewed. `LoopState.
+sent_postcommits` is the loop's own bounded record (`MAX_SENT_POSTCOMMIT_RECORDS`,
+oldest evicted) of which request ids went out carrying which binding, written
+from the only two places a request's stamps are ever set (`_step_ready`,
+`_fall_back_to_omission`), so an entry can never describe a digest the request no
+longer has. `_approval_packet` consults it ONLY when `reviewed.request_id`
+differs from the request being answered — every ordinary round and every
+inherited-binding correction takes exactly the path it always did, so the ledger
+BACKS UP `last_response` rather than replacing it. That gate is deliberate:
+making the ledger primary would put a second source of truth in front of the
+common path, where a future site that re-stamps a request without updating the
+ledger would begin refusing legitimate approvals.
+
+*WHAT THIS DOES NOT WIDEN.* An approval that names a packet must match that
+packet's `request_id`, `head_sha` and `report_sha256` exactly —
+`verify_review`'s demand is unchanged, asked of the request the reviewer says it
+reviewed. The binding still names one candidate sha and one tree, and every
+push-time check in `_dispatch_task_push` runs against it unaltered. An approval
+that resolves NO binding is still refused, `commit`/`commit_and_push` are still
+retired, and a published task's ledger entries are dropped
+(`_forget_sent_postcommits_for_task`) so a repeat approval of an
+already-answered packet is a refusal rather than a second run of the completion
+path. Every failure to read a record — a malformed carry, a half-filled ledger
+entry — reads as ABSENT and is logged (`postcommit_carry_unusable`,
+`postcommit_carry_stale`, `postcommit_packet_record_unusable`), which refuses the
+approval; the tolerant reader is `state.postcommit_binding_from_record`, and its
+docstring says why raising here would end the process with no park and no
+blocker. A carry is additionally checked against `state.task_execution`, so it
+cannot re-present a candidate a later round has superseded.
+
+*WHY IT MATTERS.* On 2026-08-20 (prof-01) an `unexpected_field` parse error on a
+review packet produced an unbound correction; the reviewer answered it with a
+fully stamped `push`; `_dispatch` fell through to `legacy_git_path_retired`; and
+a candidate that had passed four review rounds and full validation became
+APPROVED AND UNPUBLISHABLE with no supported route back. The reviewer then
+correctly refused every subsequent packet, each refusal ended the session, and
+each new session sent another kickoff — three cycles in fifteen minutes, with
+`needs_attention` FALSE throughout (§9f bounds that repetition; this removes the
+cause). `parse_error` appears 18 times in that one transcript: every occurrence
+that lands on a postcommit round could strand an approval the same way. It is
+the same class as `AUTOLOOP_TODO` A2, one layer over — there a binding was
+dropped when the response was persisted, here across a re-prompt.
+
 **Push routing (`Orchestrator._dispatch_task_push`, `GitGateway.push_exact`).**
 There is no ambient `push()` anymore (removed 2026-07-30 — it pushed
 whatever the current branch tip happened to be, exactly the
@@ -1624,6 +1702,22 @@ inside the now-removed `_dispatch_git` (which only refused a *stale or
 unbound* response while a live candidate was on record) — the replacement is
 unconditional, so there is no longer a scenario where a legacy commit/push
 decision succeeds at all, regardless of what `state.task_execution` shows.
+
+Since bind-02 (2026-08-24) that refusal MUST NOT DEAD-END for an unbound `push`.
+The denial code and its original sentence are unchanged — they are the answer
+for `commit`/`commit_and_push`, where the commit the reviewer is asking for does
+not exist — but when an unpublished candidate IS on record
+(`_unpublished_candidate`, read from `state.task_execution`, which
+`_dispatch_task_push` clears on publication), `_legacy_git_verdict` appends the
+way forward: it names the task and the candidate sha, states that no packet in
+this session binds the approval so resending `push` will be refused identically,
+and asks for `revise` on that task so the loop produces and sends a fresh
+postcommit review packet to approve instead. That is the half the reviewer was
+missing in the 2026-08-20 incident: it was told its approval was invalid, not
+what would make one valid, and answered by refusing every packet until a human
+intervened. It widens nothing — the decision is still denied, `revise` still
+goes through `authorize_directive` and the round cap, and a task with no review
+round left parks for an operator with the accumulated diff (`_park_round_cap`).
 
 **Revision rounds.** `revise` re-enters the same worktree, keeps the ORIGINAL
 `task_base_sha`, and produces a NEW commit on top of the current candidate —

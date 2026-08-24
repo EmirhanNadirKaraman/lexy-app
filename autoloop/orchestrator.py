@@ -342,6 +342,7 @@ from .state import (
     RotationRecord,
     StateStore,
     StopRepetitionStore,
+    postcommit_binding_from_record,
     stop_repetition_file,
     utcnow_iso,
 )
@@ -450,6 +451,22 @@ PREEMPTION_RETIREMENT_REASON = "displaced-by-urgent"
 #: quota burned grows linearly, so three is the smallest count that is not
 #: plausibly a coincidence.
 MAX_REPEATED_STOPS = 3
+
+#: How many sent produce-then-review packets `LoopState.sent_postcommits` keeps
+#: (oldest evicted first). The ledger answers exactly one question — "did this
+#: loop send a postcommit packet under the request id this approval names?" —
+#: and an approval that names a packet from eight rounds ago is not an approval
+#: anyone should honour: the review round cap is two, so a live review arc is
+#: never more than a handful of requests long, and every entry past that
+#: describes work a later round has already superseded (which
+#: `_dispatch_task_push` would refuse as `push_candidate_stale` anyway).
+#:
+#: Bounded at all because this lives in the state file, which is rewritten on
+#: every step: an unbounded list would grow with the session and make every
+#: save larger for records nothing can act on. EVICTION IS FAIL-CLOSED — an
+#: approval naming an evicted packet resolves no binding and is refused, never
+#: resolved against a different packet.
+MAX_SENT_POSTCOMMIT_RECORDS = 8
 
 
 @dataclass(frozen=True)
@@ -1751,6 +1768,29 @@ class Orchestrator:
                 ),
             )
             return
+        # A corrective re-prompt carries none of the candidate's identifiers, so
+        # the bind above answers `None` for it — correctly, since the correction
+        # presents nothing. What it is NOT is a new review: the packet under
+        # review has not changed and the candidate has not moved, so the binding
+        # of the request being corrected is inherited here rather than dropped.
+        # Consumed unconditionally (the helper always clears) and used only when
+        # nothing was freshly bound: a payload that really does present a
+        # candidate binds to THAT one, with its own packet digest.
+        carried = self._consume_carried_postcommit(state)
+        if postcommit is None and carried is not None:
+            postcommit = carried
+            self._log(
+                "postcommit_carry_applied",
+                request_id=request_id,
+                data={
+                    "task_id": carried.task_id,
+                    "candidate_sha": carried.candidate_sha,
+                    # The digest of the PACKET this binding came from, not of
+                    # this request — the correction presents no packet, and
+                    # rewriting it to `ctx.report_sha256` would claim it did.
+                    "packet_sha256": carried.packet_sha256,
+                },
+            )
         state.pending_request = PendingRequest(
             request_id=request_id,
             payload=state.outbox,
@@ -1792,9 +1832,23 @@ class Orchestrator:
             ),
         )
         if postcommit is not None:
+            # Every request that leaves here carrying a binding is recorded, an
+            # inherited one included: the ledger's question is "did this loop
+            # send a request bound to that candidate under this id", and a
+            # correction that inherited a binding did.
+            self._record_sent_postcommit(
+                state, request_id, ctx.head_sha, ctx.report_sha256, postcommit
+            )
+        if postcommit is not None and postcommit is not carried:
             # Bind the exact report this candidate was reviewed under, on the
             # TaskExecution record, so a later approval answering a DIFFERENT
             # report can never authorize publishing it.
+            #
+            # Skipped for an INHERITED binding, deliberately. These two fields
+            # record which report actually PRESENTED the candidate, and a
+            # corrective re-prompt presents no packet — overwriting them with
+            # the correction's own digest would replace the record of the
+            # review with a record of the apology for a malformed reply.
             execution = self._execution_store.load(postcommit.task_id)
             if execution is not None:
                 execution.presented_report_sha256 = ctx.report_sha256
@@ -2120,6 +2174,13 @@ class Orchestrator:
         req.delivery = None
         if req.postcommit is not None:
             req.postcommit.packet_sha256 = ctx.report_sha256
+            # The ledger is the FOURTH place holding this digest, and it has to
+            # move with the other three or an approval naming this request id
+            # would be checked against the stamps of a packet that was never
+            # sent. `_record_sent_postcommit` replaces the entry in place.
+            self._record_sent_postcommit(
+                state, req.request_id, ctx.head_sha, ctx.report_sha256, req.postcommit
+            )
             execution = self._execution_store.load(req.postcommit.task_id)
             if execution is not None:
                 execution.presented_report_sha256 = ctx.report_sha256
@@ -3853,6 +3914,255 @@ class Orchestrator:
             packet_sha256=report_sha256,
         )
 
+    # ---- postcommit bindings that outlive one request -----------------------
+    #
+    # A produce-then-review packet is presented ONCE, and the approval that
+    # publishes it may not arrive in the reply to that packet. Two things can
+    # come between them, and each loses the binding a different way:
+    #
+    #   * a CORRECTIVE RE-PROMPT (parse error, policy denial, review mismatch,
+    #     plan rejection) — the loop replaces the request with a correction
+    #     whose payload carries none of the candidate's identifiers, so
+    #     `_current_pending_postcommit` binds it to nothing. That is what
+    #     happened on 2026-08-20 (prof-01): a `unexpected_field` parse error on
+    #     the review packet turned a candidate that had passed four review
+    #     rounds and full validation into APPROVED AND UNPUBLISHABLE, and the
+    #     reviewer's correct refusals then livelocked the loop for fifteen
+    #     minutes. `carry_postcommit` carries the binding across the
+    #     correction: the packet under review has not changed, so the
+    #     correction is about the same candidate.
+    #   * the CONVERSATION MOVING ON — `last_response` is only the most recent
+    #     thing sent, and an approval that names the packet's own request id is
+    #     better evidence of what was approved than "whatever was last sent".
+    #     `sent_postcommits` is the loop's record of what it presented, so that
+    #     name can be checked rather than disbelieved.
+    #
+    # Neither is an authorization. A binding says which candidate a request
+    # PRESENTED; every push-time check in `_dispatch_task_push` (the execution
+    # record still shows this candidate, it still resolves, it is still on the
+    # task's line, its tree still matches) runs against it exactly as before,
+    # and an approval that resolves no binding at all is still refused. This
+    # restores a binding that was lost; it never invents one.
+
+    @staticmethod
+    def _sent_postcommit_records(state: LoopState) -> list[dict]:
+        """`state.sent_postcommits` as a list of dicts, whatever is on disk.
+
+        The one place the field's shape is trusted, so a hand-edited or
+        half-written state file cannot raise from three different call sites.
+        A non-list reads as EMPTY and a non-dict entry is dropped — fail-closed
+        in both directions, since an entry that is not there resolves no
+        approval. `reversed(5)` and `for record in 5` both raise `TypeError`
+        deep inside `_step_ready` / `_dispatch`, where nothing catches it.
+        """
+        raw = state.sent_postcommits
+        if not isinstance(raw, list):
+            return []
+        return [record for record in raw if isinstance(record, dict)]
+
+    def _record_sent_postcommit(
+        self,
+        state: LoopState,
+        request_id: str,
+        head_sha: str,
+        report_sha256: str,
+        binding: PostcommitBinding,
+    ) -> None:
+        """Remember that `request_id` went out carrying `binding`.
+
+        Called from the only two places a request's stamps are ever written —
+        `_step_ready` (a request is born) and `_fall_back_to_omission` (an
+        unsent request is re-stamped around an omitted diff). Keeping both in
+        step is what stops a ledger entry from describing a digest the request
+        no longer has, which would refuse a legitimate approval at push time
+        with nothing on screen explaining it.
+
+        Replaces any existing entry for the same id rather than appending a
+        second one, so re-stamping updates rather than duplicating.
+        """
+        records = [
+            record
+            for record in self._sent_postcommit_records(state)
+            if record.get("request_id") != request_id
+        ]
+        records.append(
+            {
+                "request_id": request_id,
+                "head_sha": head_sha,
+                "report_sha256": report_sha256,
+                "postcommit": asdict(binding),
+            }
+        )
+        state.sent_postcommits = records[-MAX_SENT_POSTCOMMIT_RECORDS:]
+
+    def _forget_sent_postcommits_for_task(self, state: LoopState, task_id: str) -> None:
+        """Drop every ledger entry for `task_id` — called once its candidate is
+        actually published.
+
+        Not tidying. Publication does not change `execution.candidate_sha`, so
+        without this a SECOND `push` naming the same already-answered packet
+        would resolve the same binding, pass every push-time check, and re-run
+        the completion path (re-marking the task completed, re-triggering the
+        auto-merge) for work that already shipped. Forgetting the packet makes
+        that a refusal instead.
+        """
+        state.sent_postcommits = [
+            record
+            for record in self._sent_postcommit_records(state)
+            if not (
+                isinstance(record.get("postcommit"), dict)
+                and record["postcommit"].get("task_id") == task_id
+            )
+        ]
+
+    def _carry_postcommit_forward(self) -> None:
+        """Record the binding of the response being corrected, so the corrective
+        re-prompt about to be queued inherits it.
+
+        Called by all four corrective-re-prompt sites (`_handle_parse_error`,
+        `_handle_policy_denial`, `_handle_review_mismatch`, and
+        `_dispatch_plan`'s plan-rejection branch) and deliberately not
+        special-cased per site: they build the same kind of message — "that
+        reply cannot be acted on, send another one about the SAME presented
+        state" — and a binding that survives one of them and not the others is
+        a trap that only shows up on whichever path nobody tested. Plan
+        rejection self-resolves to a no-op: a `plan` reply answers a request
+        that never carried a binding, so there is nothing to carry.
+
+        MUST be called BEFORE the caller clears `state.last_response`, and only
+        on the path that actually sends a correction — a budget exhaustion
+        parks or stops instead, and leaving a carry behind for a request that
+        will never be built is how a binding attaches to something unrelated.
+        """
+        state = self.state
+        resp = state.last_response
+        binding = resp.postcommit if resp is not None else None
+        if binding is None:
+            return
+        state.carry_postcommit = asdict(binding)
+        self._log(
+            "postcommit_carry_recorded",
+            request_id=resp.request_id,
+            data={
+                "task_id": binding.task_id,
+                "candidate_sha": binding.candidate_sha,
+            },
+        )
+
+    def _consume_carried_postcommit(self, state: LoopState) -> PostcommitBinding | None:
+        """Take the carried binding, if there is a usable one, and clear it.
+
+        ALWAYS clears, whether or not the value was usable and whether or not
+        the caller ends up using it: a carry is for the NEXT request and one
+        left behind would attach to a later, unrelated one.
+
+        An unreadable record (hand-edited state file, a half-written save)
+        reads as ABSENT and says so in the transcript rather than raising —
+        `postcommit_binding_from_record` explains why the tolerant reader is
+        the right one here. Absent means the corrective re-prompt binds
+        nothing, which is exactly the behaviour that predates this mechanism.
+
+        A carry is only meaningful while the candidate it names is still this
+        session's live, unpublished candidate, so it is checked against
+        `state.task_execution` before it is honoured. In the intended path that
+        is always true — the carry is consumed by the very next request, and
+        only a publish or a further round can move `task_execution` — which is
+        exactly why the check is worth making: it costs nothing when the
+        mechanism is behaving and it is the one thing that would stop a carry
+        surviving into some future path nobody has written yet from
+        re-presenting a superseded candidate as bound.
+        """
+        raw = state.carry_postcommit
+        state.carry_postcommit = None
+        if not raw:
+            return None
+        binding = postcommit_binding_from_record(raw)
+        if binding is None:
+            self._log("postcommit_carry_unusable", data={"record": str(raw)[:200]})
+            return None
+        live = state.task_execution if isinstance(state.task_execution, dict) else {}
+        if (
+            live.get("task_id") != binding.task_id
+            or live.get("candidate_sha") != binding.candidate_sha
+        ):
+            self._log(
+                "postcommit_carry_stale",
+                data={
+                    "task_id": binding.task_id,
+                    "candidate_sha": binding.candidate_sha,
+                    "live_task_id": str(live.get("task_id") or ""),
+                    "live_candidate_sha": str(live.get("candidate_sha") or ""),
+                },
+            )
+            return None
+        return binding
+
+    def _approval_packet(
+        self, directive: Directive, resp: LastResponse | None
+    ) -> tuple[dict | None, PostcommitBinding | None]:
+        """The sent postcommit packet this approval NAMES, when it names one
+        other than the request it is answering — `(record, binding)`, or
+        `(None, None)`.
+
+        A BACKUP for the `last_response` binding, not a replacement, and the
+        gate that makes it one is `reviewed.request_id != resp.request_id`.
+        Every ordinary round (and every corrective re-prompt that inherited a
+        binding) answers the request it was asked, so those keep taking exactly
+        the path they always did — `verify_review` against the response's own
+        stamps, `_dispatch` against `resp.postcommit` — and nothing this method
+        does can change their outcome. Only the case the loop used to have no
+        answer for at all consults the ledger. That ordering is deliberate:
+        making the ledger primary would put a second source of truth in front
+        of the common path, where any future site that re-stamps a request
+        without updating the ledger would start refusing legitimate approvals.
+
+        NOT A WIDENING. The named packet's own three stamps are then what
+        `verify_review` demands, so the approval must still match the exact
+        request it claims to have reviewed; the binding it yields still names
+        one candidate sha and one tree; and every push-time check runs
+        unchanged. What it removes is only the loop's inability to recognise
+        its own packet once the conversation moved past it.
+
+        Restricted to `push`: `commit` / `commit_and_push` are retired
+        (docs/SECURITY.md S21) and must stay refused, so there is no reason to
+        resolve a binding for them. Skipped entirely when the response carries
+        an operator-changeset binding, so `_dispatch_changeset_push`'s path is
+        untouched.
+        """
+        if directive.decision is not Decision.PUSH:
+            return None, None
+        if resp is None or resp.changeset is not None:
+            return None, None
+        reviewed = directive.reviewed
+        if reviewed is None or not reviewed.request_id:
+            return None, None
+        if reviewed.request_id == resp.request_id:
+            return None, None
+        for record in reversed(self._sent_postcommit_records(self.state)):
+            if record.get("request_id") != reviewed.request_id:
+                continue
+            binding = postcommit_binding_from_record(record.get("postcommit"))
+            if binding is None:
+                self._log(
+                    "postcommit_packet_record_unusable",
+                    data={"request_id": reviewed.request_id},
+                )
+                return None, None
+            return record, binding
+        return None, None
+
+    def _push_binding(
+        self, directive: Directive, resp: LastResponse | None
+    ) -> PostcommitBinding | None:
+        """Which produce-then-review candidate this `push` publishes: the
+        packet the approval NAMES if that is a packet this loop sent, otherwise
+        the binding of the request it is answering. `None` means no
+        authoritative binding exists and the push must be refused."""
+        _record, binding = self._approval_packet(directive, resp)
+        if binding is not None:
+            return binding
+        return resp.postcommit if resp is not None else None
+
     def _resolve_or_park_ambiguous(self, req: PendingRequest, reconciled: bool) -> None:
         """Last check before parking: is the request actually THERE?
 
@@ -4205,8 +4515,15 @@ class Orchestrator:
         # the wrong branch name (denying it whenever the main checkout sits
         # on "main"/"master", the exact opposite of what protected_branches
         # is meant to gate).
-        if resp.postcommit is not None and directive.decision in PUSH_DECISIONS:
-            destination_branch = resp.postcommit.task_branch
+        #
+        # `named_packet` is the sent postcommit packet this approval NAMES when
+        # that is NOT the request it answers — the "the conversation moved on"
+        # case (see `_approval_packet`). It is `None` for every ordinary round,
+        # and where it is `None` everything below is byte-for-byte what it was.
+        named_packet, named_binding = self._approval_packet(directive, resp)
+        push_binding = named_binding if named_binding is not None else resp.postcommit
+        if push_binding is not None and directive.decision in PUSH_DECISIONS:
+            destination_branch = push_binding.task_branch
         elif resp.changeset is not None and directive.decision in PUSH_DECISIONS:
             destination_branch = resp.changeset.branch
         else:
@@ -4216,8 +4533,36 @@ class Orchestrator:
             self._handle_policy_denial(directive, verdict)
             return
         if directive.decision in REVIEWED_DECISIONS:
+            # Verified against the packet the approval NAMES when it names one
+            # this loop sent, otherwise against the request it answers — never
+            # against a mixture of the two. An approval that names an earlier
+            # packet must match THAT packet's three stamps exactly, which is
+            # the same demand `verify_review` has always made, asked of the
+            # request the reviewer says it reviewed rather than of whatever was
+            # sent most recently.
+            expected_request_id = resp.request_id
+            expected_head_sha = resp.head_sha
+            expected_report_sha256 = resp.report_sha256
+            if named_packet is not None:
+                expected_request_id = str(named_packet.get("request_id", ""))
+                expected_head_sha = str(named_packet.get("head_sha", ""))
+                expected_report_sha256 = str(named_packet.get("report_sha256", ""))
+                self._log(
+                    "approval_bound_to_named_packet",
+                    request_id=resp.request_id,
+                    data={
+                        "named_request_id": expected_request_id,
+                        "task_id": named_binding.task_id,
+                        "candidate_sha": named_binding.candidate_sha,
+                    },
+                )
             try:
-                verify_review(directive, resp.request_id, resp.head_sha, resp.report_sha256)
+                verify_review(
+                    directive,
+                    expected_request_id,
+                    expected_head_sha,
+                    expected_report_sha256,
+                )
             except ContractError as exc:
                 self._handle_review_mismatch(exc)
                 return
@@ -4259,6 +4604,14 @@ class Orchestrator:
     def _dispatch(self, directive: Directive) -> None:
         state = self.state
         decision = directive.decision
+        # Resolved ONCE, here, so the branch condition and the argument passed
+        # to `_dispatch_task_push` cannot disagree about which candidate this
+        # approval publishes. `None` for every decision that is not a `push`.
+        push_binding = (
+            self._push_binding(directive, state.last_response)
+            if decision is Decision.PUSH and state.last_response is not None
+            else None
+        )
         if decision is Decision.STOP:
             self._handle_contract_stop(directive)
         elif decision in RETIRED_DECISIONS:
@@ -4291,14 +4644,18 @@ class Orchestrator:
             # `state.PendingRequest.changeset`'s docstring); the order itself
             # carries no meaning.
             self._dispatch_changeset_push(directive, state.last_response)
-        elif decision is Decision.PUSH and state.last_response is not None and (
-            state.last_response.postcommit is not None
-        ):
+        elif decision is Decision.PUSH and push_binding is not None:
             # A push answering a produce-then-review packet publishes via
-            # `push_exact`, sourced entirely from the response's binding
-            # (never from `directive` — see `_dispatch_task_push`'s
-            # docstring).
-            self._dispatch_task_push(directive, state.last_response)
+            # `push_exact`, sourced entirely from the binding (never from
+            # `directive` — see `_dispatch_task_push`'s docstring).
+            #
+            # The binding is `resp.postcommit` for every ordinary round, and
+            # for a corrective re-prompt that inherited one. `_push_binding`
+            # additionally recognises an approval that NAMES a postcommit
+            # packet this loop sent, for the case where `last_response` has
+            # moved past it — the same identity, resolved by the id the
+            # reviewer cited rather than by recency.
+            self._dispatch_task_push(directive, state.last_response, push_binding)
         elif decision in COMMIT_DECISIONS or decision in PUSH_DECISIONS:
             # The legacy authorize-then-produce commit/push path (`commit`,
             # `commit_and_push`, and any `push` NOT bound to a produce-then-
@@ -4311,19 +4668,78 @@ class Orchestrator:
             # is refused through the SAME budget-capped corrective-reprompt
             # machinery as any other policy denial — never silently routed to
             # the executor, which does not understand a git decision.
-            self._handle_policy_denial(
-                directive,
-                Verdict.deny(
-                    "legacy_git_path_retired",
-                    "direct commit/push is no longer supported — the orchestrator "
-                    "commits automatically after implementing (or auditing) a "
-                    "task in its own worker repo; the only valid approval is "
-                    "`push` with the `reviewed` stamp answering a postcommit or "
-                    "operator-changeset review packet",
-                ),
-            )
+            self._handle_policy_denial(directive, self._legacy_git_verdict(decision))
         else:  # audit / implement / revise
             self._dispatch_executor(directive)
+
+    def _unpublished_candidate(self) -> tuple[str, str] | None:
+        """`(task_id, candidate_sha)` of the produce-then-review candidate this
+        session is holding unpublished, or `None`.
+
+        Read from `state.task_execution`, which `_dispatch_task_push` clears the
+        moment a candidate is actually published — so a value here means there
+        really is work waiting for an approval, not merely that a task once ran.
+        Display only: nothing branches on it and no push is ever sourced from it
+        (that is the whole point of `PostcommitBinding`).
+        """
+        task_exec = self.state.task_execution
+        if not isinstance(task_exec, dict):
+            return None
+        task_id = str(task_exec.get("task_id") or "")
+        candidate_sha = str(task_exec.get("candidate_sha") or "")
+        if not task_id or not candidate_sha:
+            return None
+        return task_id, candidate_sha
+
+    def _legacy_git_verdict(self, decision: Decision) -> Verdict:
+        """The refusal for a retired git decision — `commit`, `commit_and_push`,
+        or a `push` no review packet binds.
+
+        THE REFUSAL MUST NOT DEAD-END, and for an unbound `push` the generic
+        sentence does. On 2026-08-20 the reviewer answered it by correctly
+        refusing every subsequent packet ("the controller is repeatedly starting
+        fresh sessions instead of presenting the required postcommit review
+        packet"), each refusal ended the session, and each new session sent
+        another kickoff — three cycles in fifteen minutes, `needs_attention`
+        FALSE throughout, until a human discarded four rounds of approved work.
+        The reviewer had nothing else to say: it was being told its approval was
+        invalid, not what would make one valid.
+
+        So when there IS an unpublished candidate on record, the refusal names
+        it and names the one move that produces a packet an approval can bind
+        to. It does not widen anything: the decision is still denied, the
+        retired path is still unreachable, and `revise` goes through
+        `authorize_directive` and the round cap like any other — a task with no
+        review round left parks for an operator with the accumulated diff
+        (`_park_round_cap`) instead of looping, which is the outcome this text
+        is trying to reach anyway.
+
+        The original sentence is kept verbatim and appended to rather than
+        rewritten: it is the answer for `commit` / `commit_and_push`, where
+        there is nothing to re-present because the commit the reviewer is asking
+        for does not exist.
+        """
+        reason = (
+            "direct commit/push is no longer supported — the orchestrator "
+            "commits automatically after implementing (or auditing) a "
+            "task in its own worker repo; the only valid approval is "
+            "`push` with the `reviewed` stamp answering a postcommit or "
+            "operator-changeset review packet"
+        )
+        candidate = self._unpublished_candidate()
+        if decision is Decision.PUSH and candidate is not None:
+            task_id, candidate_sha = candidate
+            reason += (
+                f". An unpublished candidate for task '{task_id}' "
+                f"({candidate_sha[:12]}) IS on record here, but nothing in this "
+                "session binds your approval to a review packet that presented "
+                "it, so this loop cannot publish it and resending `push` will be "
+                "refused the same way. It has to be PRESENTED AGAIN before it "
+                f"can be approved: reply `revise` with task_id '{task_id}' and "
+                "the loop will produce and send a fresh postcommit review "
+                "packet — approve that packet's request_id"
+            )
+        return Verdict.deny("legacy_git_path_retired", reason)
 
     # ---- repeated stops -----------------------------------------------------
     #
@@ -4637,8 +5053,17 @@ class Orchestrator:
             state.policy_denials += 1
             self._log("plan_rejected", data={"code": exc.code, "error": str(exc)})
             budget = self._policy.check_denial_budget(state.policy_denials)
+            # Routed through the same helper as the other three corrective
+            # re-prompts rather than exempted, so no site is the one nobody
+            # thought about. In practice it is a no-op: a `plan` reply answers a
+            # request that never carried a postcommit binding, so there is
+            # nothing to carry — which the helper decides by looking, instead of
+            # this site asserting it. Recorded before `last_response` is cleared
+            # on the line below, and undone by the budget branch that parks.
+            self._carry_postcommit_forward()
             state.last_response = None
             if not budget.allowed:
+                state.carry_postcommit = None
                 # PARKS, where `_handle_policy_denial`'s exhaustion of the same
                 # `state.policy_denials` counter now STOPS. Deliberate, and the
                 # divergence is the interesting part: a rejected plan is a
@@ -5989,6 +6414,15 @@ class Orchestrator:
                 details=outcome.details,
                 validation=outcome.validation or "(none)",
             )
+            # NO postcommit carry here, and this is the boundary of that
+            # mechanism rather than an omission. `_carry_postcommit_forward` is
+            # for a CORRECTIVE re-prompt — a message that presents nothing new
+            # and asks again about a packet that has not changed. This is the
+            # opposite: an executor round RAN and is reporting what happened to
+            # it. Carrying a binding across it would let an approval of the
+            # report publish the candidate from BEFORE the round the reviewer
+            # asked for, which is a different presented state, not a re-prompt
+            # about the same one.
             state.last_response = None
             state.consecutive_failures = 0
             state.phase = Phase.READY.value
@@ -6952,19 +7386,31 @@ class Orchestrator:
         tip = worktree_git.head_sha()
         return worktree_git.is_descendant(tip, candidate) and worktree_git.is_descendant(tip, base)
 
-    def _dispatch_task_push(self, directive: Directive, resp: LastResponse) -> None:
+    def _dispatch_task_push(
+        self,
+        directive: Directive,
+        resp: LastResponse,
+        binding: PostcommitBinding | None = None,
+    ) -> None:
         """Publish a produce-then-review candidate via `push_exact`.
 
         `directive` is used ONLY for logging/reason text — never for identity.
         A `push` directive cannot carry a task_id at all (`contract._forbid`
-        rejects it at parse time), so `resp.postcommit` — the binding
-        captured the moment THIS packet was sent, not a fresh
-        `TaskExecutionStore` lookup — is the only source of which task and
-        which candidate sha this approval concerns. That is what makes
-        swapping the candidate underneath an approval a REFUSAL rather than a
-        silent wrong-commit publish: if `TaskExecutionStore` now disagrees
-        with the binding, or the recorded candidate no longer resolves, or
-        its tree no longer matches what was reviewed, nothing is pushed.
+        rejects it at parse time), so the BINDING — captured the moment the
+        packet was sent, not a fresh `TaskExecutionStore` lookup — is the only
+        source of which task and which candidate sha this approval concerns.
+        That is what makes swapping the candidate underneath an approval a
+        REFUSAL rather than a silent wrong-commit publish: if
+        `TaskExecutionStore` now disagrees with the binding, or the recorded
+        candidate no longer resolves, or its tree no longer matches what was
+        reviewed, nothing is pushed.
+
+        `binding` defaults to `resp.postcommit`, which is where it comes from
+        for every ordinary round. `_dispatch` passes it explicitly so an
+        approval that NAMES a postcommit packet this loop sent resolves to that
+        packet's binding instead (`_approval_packet`) — a different way of
+        FINDING the binding, never a different set of checks: everything below
+        this line reads `binding` and nothing else, exactly as it always did.
 
         No `env_snapshot` is passed to `push_exact` here — pass 2a/2b persist
         no environment snapshot across the review round-trip (only within a
@@ -7003,7 +7449,13 @@ class Orchestrator:
         call), never the main checkout's current, possibly-drifted value.
         """
         state = self.state
-        binding = resp.postcommit
+        if binding is None:
+            binding = resp.postcommit
+        if binding is None:  # pragma: no cover - `_dispatch` never routes here unbound
+            raise StateError(
+                "postcommit push dispatched with no binding — the caller must "
+                "resolve one (see `_push_binding`) or refuse the push"
+            )
         if self._publisher is not None:
             live_url = self._git.config_get(f"remote.{self._publisher.remote}.url")
             if live_url != self._publisher_url_snapshot:
@@ -7194,6 +7646,12 @@ class Orchestrator:
         # honest about there being nothing left "awaiting publication". The
         # `TaskExecutionStore` record on disk is untouched.
         state.task_execution = None
+        # And forget the packets that presented this candidate. Publication does
+        # not advance `execution.candidate_sha`, so a SECOND `push` naming the
+        # same already-answered packet would otherwise resolve the same binding,
+        # pass every check above, and re-run this completion path for work that
+        # has already shipped. Dropping the entries makes that a refusal.
+        self._forget_sent_postcommits_for_task(state, binding.task_id)
         self._mark_task_completed(binding.task_id)
         self._log(
             "task_pushed",
@@ -7496,6 +7954,14 @@ class Orchestrator:
                 detail=str(exc),
             )
             return
+        # A parse error is a FORMATTING failure, not a new review: the packet
+        # under review has not changed and the candidate has not moved, so the
+        # correction inherits the binding of the request it is correcting.
+        # Recorded before `last_response` is cleared, and only on this path —
+        # the budget-exhaustion return above parks, and a carry left behind for
+        # a request that will never be built is how a binding attaches to
+        # something unrelated.
+        self._carry_postcommit_forward()
         state.outbox = parse_error_payload(exc.code, str(exc))
         state.last_response = None
         state.phase = Phase.READY.value
@@ -7532,6 +7998,12 @@ class Orchestrator:
                 detail=f"decision={directive.decision.value} verdict_code={verdict.code}",
             )
             return
+        # Same reasoning as `_handle_parse_error`'s carry, and deliberately not
+        # a different rule: a denial asks for a different decision about the
+        # SAME presented state, and dropping the binding here would leave an
+        # approval that answers the correction unpublishable in exactly the way
+        # a parse error used to.
+        self._carry_postcommit_forward()
         state.outbox = policy_denied_payload(directive.decision.value, verdict.reason)
         state.last_response = None
         state.phase = Phase.READY.value
@@ -7560,6 +8032,12 @@ class Orchestrator:
                 detail=str(exc),
             )
             return
+        # The carry matters MOST here: this correction exists because an
+        # approval arrived with the wrong stamps, and its whole purpose is to
+        # get a correctly stamped one back. Dropping the binding would make the
+        # re-stamped approval unpublishable — the loop refusing the very reply
+        # it asked for.
+        self._carry_postcommit_forward()
         state.outbox = review_mismatch_payload(exc.code, str(exc))
         state.last_response = None
         state.phase = Phase.READY.value
@@ -8019,6 +8497,16 @@ class Orchestrator:
                 detail=str(exc),
             )
             return
+        # The FIFTH corrective re-prompt, found by walking every site that
+        # replaces `last_response` with a payload asking for another decision
+        # rather than by the list in the brief. It is the same shape as a policy
+        # denial — "nothing further was done, decide how to proceed" about a
+        # state that has not changed — so it carries the binding for the same
+        # reason. The staleness guard in `_consume_carried_postcommit` is what
+        # makes that safe here specifically: a git failure is exactly the moment
+        # the repository may have moved, and a carry whose candidate is no
+        # longer `state.task_execution`'s is discarded rather than honoured.
+        self._carry_postcommit_forward()
         state.outbox = git_error_payload(decision, str(exc))
         state.last_response = None
         state.phase = Phase.READY.value
