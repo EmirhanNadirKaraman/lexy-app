@@ -749,6 +749,67 @@ def _inbox_dir(repo: Path) -> Path:
     return Path.home() / ".autoloop" / "inbox"
 
 
+def _intake_dir(repo: Path) -> Path:
+    """Where intake DRAFTS live — a SIBLING of the inbox, never inside it.
+
+    Derived from `_inbox_dir` rather than re-deriving `workers_root`, so the
+    page and `python -m autoloop intake` cannot end up looking at two different
+    directories (`inbox.intake_dir_for` places it identically).
+
+    The sibling placement is load-bearing, not tidiness: `TaskInbox.drain`
+    globs `*.json` in the inbox directory and MOVES anything that will not
+    parse into `rejected/`, so a draft or a decline ledger written in there
+    would be eaten by the next drain.
+    """
+    return _inbox_dir(repo).parent / "intake"
+
+
+def _intake_view(path: Path, result=None) -> dict:
+    """One draft, as the page renders it. READ-ONLY, and it derives nothing.
+
+    Every field comes from `inbox.parse_draft` / `inbox.draft_blockers` — the
+    same functions the CLI reads the file with — so the page cannot disagree
+    with `python -m autoloop intake list` about whether a draft is ready. In
+    particular `ready` is NEVER computed here: it is the absence of blockers,
+    and the blockers are the inbox's answer.
+    """
+    from .inbox import draft_blockers, parse_draft
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"id": path.stem, "error": f"could not read {path}: {exc}"}
+    draft = parse_draft(text, path.stem)
+    blockers = draft_blockers(draft)
+    view = {
+        "id": path.stem,
+        "file": str(path),
+        "text": text,
+        "title": draft.title,
+        "ready": not blockers,
+        "blockers": list(blockers),
+        "questions": [
+            {"text": q.text, "answer": q.answer, "required": q.required}
+            for q in draft.questions
+        ],
+        "evidence": [{"text": e.text, "source": e.source} for e in draft.evidence],
+        "assumptions": list(draft.assumptions),
+        "tasks": [
+            {"id": t.id, "title": t.title, "approved_paths": list(t.approved_paths)}
+            for t in draft.tasks
+        ],
+    }
+    if result is not None:
+        view["pass"] = {
+            "added_questions": list(result.added_questions),
+            "added_evidence": list(result.added_evidence),
+            "evidence_note": result.evidence_note,
+            "provider_note": result.provider_note,
+            "assumptions": list(result.assumptions),
+        }
+    return view
+
+
 def _config_problem(repo: Path) -> str:
     """WHY `_config_toml` came back empty, in a phrase, or `""`.
 
@@ -4652,6 +4713,44 @@ form.newtask .actions{display:flex;align-items:center;gap:8px}
       constant, not a config value) are always allowed and need not be
       listed.</p>
   </section>
+
+  <!-- STATIC markup, like the form above and for the same reason: `render()`
+       must never rewrite a box an operator is typing in. The exchange itself
+       lives in a FILE beside the inbox, outside the checkout — this panel
+       writes and reads that file and holds no state of its own, which is why
+       an abandoned draft leaves nothing behind here either. -->
+  <section>
+    <h2>Intake — a rough idea, asked about until it is a task</h2>
+    <form class="newtask" id="intakenew" autocomplete="off">
+      <label>draft name<input name="id" required placeholder="book-reader"></label>
+      <label>the idea, in a sentence or two — not a specification
+        <textarea name="idea" rows="3" required
+          placeholder="Add a book reader page."></textarea></label>
+      <div class="actions"><button class="save" type="submit">Start draft</button>
+        <span id="iknote"></span></div>
+    </form>
+    <div class="actions" style="margin-top:9px">
+      <input id="ikid" placeholder="draft name" style="max-width:220px">
+      <button class="save" type="button" id="ikload">Load</button>
+      <button class="save" type="button" id="ikask">Ask questions</button>
+      <button class="save" type="button" id="iksave">Save edits</button>
+      <button class="save" type="button" id="iksubmit">Submit draft</button>
+    </div>
+    <label>the exchange — answer after each <code>-&gt;</code>, or on the line under it
+      <textarea id="iktext" rows="16" spellcheck="false"
+        style="width:100%;box-sizing:border-box;font-family:ui-monospace,monospace"></textarea></label>
+    <div id="ikstate" class="muted" style="font-size:12px"></div>
+    <p class="muted" style="font-size:12px;margin:9px 0 0">
+      Start draft and Save edits write a markdown file beside the inbox and
+      create no task; deleting that file abandons the idea and leaves nothing
+      behind. Ask questions asks the loop's configured conversation provider,
+      so it is refused while a round is running — a question asked mid-round is
+      what <code>ask_user</code> was retired for. Submit is the only button here
+      that queues anything, and it queues through the same inbox as the form
+      above. The <code>approved_paths</code> in the draft are SUGGESTED
+      mechanically and authorize nothing: editing them and submitting is the
+      confirmation.</p>
+  </section>
   <section><h2>Language-app tasks</h2><div id="apptasks" class="scroll"></div></section>
   <section><h2>Blockers</h2><div id="blockers"></div></section>
   <section><h2>Recent events</h2><div id="events" class="scroll"></div></section>
@@ -6077,6 +6176,91 @@ ntform.addEventListener("submit", async e => {
   finally { btn.disabled = false; LASTJSON = null; }
 });
 
+// ---- intake ------------------------------------------------------------
+// Bound ONCE, like the form above, because the markup is static.
+//
+// This panel holds NO state. Every button is a round trip to a file beside the
+// inbox, and the textarea is a view of that file's bytes — so two tabs, a
+// reload, or the CLI editing the same draft all converge, and closing the tab
+// mid-idea leaves a file and nothing else. There is no client-side draft
+// format here on purpose: `autoloop.inbox` parses and renders it, and a second
+// parser on this page would drift from the one that decides what gets filed.
+const ikn = document.getElementById("iknote");
+const iktext = document.getElementById("iktext");
+const ikstate = document.getElementById("ikstate");
+const ikid = document.getElementById("ikid");
+const ikform = document.getElementById("intakenew");
+const iknote = (ok, msg) => {
+  ikn.className = ok ? "saved" : "savefail";
+  ikn.textContent = (ok ? " ✓ " : " ✗ ") + msg;
+};
+const ikpost = async (url, payload) => {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Autoloop": "1"},
+    body: JSON.stringify(payload),
+  });
+  return [r.ok, await r.json().catch(() => ({}))];
+};
+// `ready` is never computed here — it is whatever the server said, which is
+// the absence of `inbox.draft_blockers`. A page that decided for itself when a
+// draft was finished would be a second gate, and the wrong one.
+const ikrender = v => {
+  if (v.error) { ikstate.textContent = v.error; return; }
+  iktext.value = v.text || "";
+  const bl = v.blockers || [];
+  ikstate.textContent = v.ready
+    ? `ready — ${(v.tasks||[]).length} task(s) drafted; check approved_paths, then Submit`
+    : (bl.length ? "not a draft yet — " + bl.join("  |  ") : "");
+  if (v.pass && v.pass.provider_note) ikstate.textContent += "  |  " + v.pass.provider_note;
+  if (v.pass && v.pass.evidence_note) ikstate.textContent += "  |  " + v.pass.evidence_note;
+};
+const ikload = async () => {
+  const id = String(ikid.value || "").trim();
+  if (!id) return iknote(false, "name a draft to load");
+  const r = await fetch("/api/intake?id=" + encodeURIComponent(id));
+  const body = await r.json().catch(() => ({}));
+  if (body.error) return iknote(false, body.error);
+  ikrender(body); iknote(true, "loaded " + id);
+};
+ikform.addEventListener("submit", async e => {
+  e.preventDefault();
+  const id = String(ikform.elements["id"].value || "").trim();
+  const [ok, body] = await ikpost("/api/intake",
+    {id, idea: String(ikform.elements["idea"].value || "")});
+  if (!ok) return iknote(false, body.error || "refused");
+  ikid.value = body.id; ikform.reset();
+  iknote(true, "draft " + body.id + " — no task exists yet");
+  ikload();
+});
+document.getElementById("ikload").addEventListener("click", ikload);
+document.getElementById("iksave").addEventListener("click", async () => {
+  const id = String(ikid.value || "").trim();
+  const [ok, body] = await ikpost("/api/intake/edit", {id, text: iktext.value});
+  iknote(ok, ok ? "saved " + id : (body.error || "refused"));
+  if (ok) ikload();
+});
+document.getElementById("ikask").addEventListener("click", async () => {
+  const id = String(ikid.value || "").trim();
+  ikn.className = ""; ikn.textContent = " asking… (this talks to a model)";
+  // Edits are saved FIRST: a pass re-reads the file, so asking with unsaved
+  // answers in the box would ask about the previous version and then overwrite
+  // the box with it — silently discarding what was typed.
+  const [saved, savedBody] = await ikpost("/api/intake/edit", {id, text: iktext.value});
+  if (!saved) return iknote(false, savedBody.error || "could not save before asking");
+  const [ok, body] = await ikpost("/api/intake/ask", {id});
+  if (!ok) return iknote(false, body.error || "refused");
+  ikrender(body);
+  iknote(true, `${(body.pass && body.pass.added_questions || []).length} new question(s)`);
+});
+document.getElementById("iksubmit").addEventListener("click", async () => {
+  const id = String(ikid.value || "").trim();
+  const [ok, body] = await ikpost("/api/intake/submit", {id});
+  if (!ok) return iknote(false, body.error || "refused");
+  iknote(true, "queued " + (body.queued || []).join(", "));
+  LASTJSON = null;
+});
+
 // ---- roadmap search + expand-all ---------------------------------------
 // Bound ONCE, here, because both controls are static markup — inside
 // `renderRoadmap` they would gain a duplicate listener on every 2s poll.
@@ -6203,11 +6387,20 @@ class Handler(BaseHTTPRequestHandler):
     repo = Path(".")
 
     def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
-        """The write paths. There are two, and they are deliberately unequal.
+        """The write paths, and they are deliberately unequal.
 
         `/api/task` (creation) and `/api/suggest-paths` still touch nothing the
         loop observes: a creation request goes to the inbox, which lives
         OUTSIDE the checkout, and is merged by the loop between steps.
+
+        The four `/api/intake/*` routes (intake-02, 2026-08-25) sit in the same
+        class and add no new authority: three of them write a markdown DRAFT
+        beside that inbox, equally outside the checkout, and the fourth
+        (`/api/intake/submit`) queues through the very same `TaskInbox.submit`
+        `/api/task` uses. Nothing there can widen an existing task, and nothing
+        there reaches the registry without an operator pressing submit. The one
+        genuinely different route is `/api/intake/ask`, which asks a MODEL and
+        therefore refuses while a round is running.
 
         `/api/priority` writes `.autoloop/tasks.json` IMMEDIATELY (2026-08-16).
         That is a real departure from the read-only posture this file was
@@ -6295,9 +6488,155 @@ class Handler(BaseHTTPRequestHandler):
             return self._submit_priority(body)
         if self.path.startswith("/api/suggest-paths"):
             return self._suggest_paths(body)
+        # The intake routes are matched BEFORE `/api/task`, and the longer
+        # intake routes before the bare one: every match here is `startswith`,
+        # so `/api/intake/submit` would otherwise be served by `/api/intake`.
+        if self.path.startswith("/api/intake/ask"):
+            return self._intake_ask(body)
+        if self.path.startswith("/api/intake/edit"):
+            return self._intake_edit(body)
+        if self.path.startswith("/api/intake/submit"):
+            return self._intake_submit(body)
+        if self.path.startswith("/api/intake"):
+            return self._intake_new(body)
         if self.path.startswith("/api/task"):
             return self._submit_task(body)
         return self._json_response(404, {"error": "unknown endpoint"})
+
+    # ---- intake ------------------------------------------------------------
+    #
+    # Four routes, and between them they do exactly what the CLI's `intake new`
+    # / `ask` / `submit` do — by CALLING those same functions in
+    # `autoloop.inbox`. There is no dashboard-side draft format, no
+    # dashboard-side question list and no dashboard-side submit path: the
+    # mechanism decision for this feature is that all three entry points
+    # "simply WRITE THIS FILE", and a chat UI here would have made the page a
+    # second implementation of the exchange.
+    #
+    # `/api/intake` and `/api/intake/edit` write a markdown file OUTSIDE the
+    # checkout, beside `workers_root`, exactly where the task inbox lives and
+    # for the same reason — so they are safe at any moment, including mid-round.
+    # `/api/intake/ask` is NOT: it asks a model a question, and a question
+    # asked mid-round is what `ask_user` was retired for, so it refuses while a
+    # round is live and fails closed when it cannot tell.
+
+    def _intake_error(self, exc) -> None:
+        return self._json_response(400, {"error": str(exc)})
+
+    def _intake_new(self, body: dict) -> None:
+        """Start a draft from a typed idea. Queues NOTHING and creates no task.
+
+        The same `inbox.create_draft` the CLI calls, with the same arguments,
+        so a draft started here is byte-identical to one started with
+        `python -m autoloop intake new` (pinned by
+        `test_intake.py::test_three_entry_points_produce_a_byte_identical_draft`).
+        """
+        from .inbox import IntakeError, create_draft
+
+        try:
+            path = create_draft(
+                _intake_dir(self.repo), str(body.get("id", "")), str(body.get("idea", ""))
+            )
+        except IntakeError as exc:
+            return self._intake_error(exc)
+        except OSError as exc:
+            return self._json_response(500, {"error": f"could not write the draft: {exc}"})
+        return self._json_response(
+            200,
+            {
+                "id": path.stem,
+                "file": str(path),
+                "note": "a file, not a task — nothing is queued until you submit",
+            },
+        )
+
+    def _intake_edit(self, body: dict) -> None:
+        """Save the operator's edits VERBATIM.
+
+        No normalisation on the way in. This text becomes the task description,
+        so a route that tidied it would be editing the artifact — and the whole
+        reason the exchange is a file is that there is no translation step in
+        which meaning drifts.
+        """
+        from .inbox import IntakeError, write_draft_text
+
+        try:
+            path = write_draft_text(
+                _intake_dir(self.repo), str(body.get("id", "")), body.get("text")
+            )
+        except IntakeError as exc:
+            return self._intake_error(exc)
+        except OSError as exc:
+            return self._json_response(500, {"error": f"could not save: {exc}"})
+        return self._json_response(200, {"id": path.stem, "saved": True})
+
+    def _intake_ask(self, body: dict) -> None:
+        """One interview pass. REFUSED while a round is running.
+
+        The provider comes from `[conversation] provider` — the one already
+        configured, with a credential and a failure mode the operator knows —
+        and is imported lazily here rather than at module load, because that
+        package reaches optional third-party dependencies and this page must
+        keep rendering on a machine without them.
+        """
+        from .inbox import IntakeError, draft_path, interview_step, provider_asker
+
+        try:
+            path = draft_path(_intake_dir(self.repo), str(body.get("id", "")))
+        except IntakeError as exc:
+            return self._intake_error(exc)
+        try:
+            from .config import load_config
+
+            config = load_config(self.repo / ".autoloop" / "config.toml")
+        except (ConfigError, OSError, ImportError) as exc:
+            return self._json_response(
+                500,
+                {"error": f"the loop's config could not be loaded, so no model "
+                          f"was asked: {exc}"},
+            )
+        try:
+            from .inbox import refuse_if_round_running
+
+            refuse_if_round_running(config.state_dir, "the intake interview")
+            result = interview_step(path, ask=provider_asker(config), repo=self.repo)
+        except IntakeError as exc:
+            return self._intake_error(exc)
+        except OSError as exc:
+            return self._json_response(500, {"error": f"the pass failed: {exc}"})
+        return self._json_response(200, _intake_view(path, result))
+
+    def _intake_submit(self, body: dict) -> None:
+        """File a ready draft through the SAME inbox `add-task` uses.
+
+        This is the operator's confirmation, and the only thing on this page
+        that turns a draft into a queued task. `approved_paths` are whatever is
+        in the file at this instant: suggested mechanically, edited by whoever
+        is looking at them, and authorized by this click.
+        """
+        from .inbox import (
+            InboxError,
+            IntakeError,
+            TaskInbox,
+            draft_path,
+            submit_draft,
+        )
+
+        try:
+            path = draft_path(_intake_dir(self.repo), str(body.get("id", "")))
+            filed = submit_draft(path, TaskInbox(_inbox_dir(self.repo)))
+        except (IntakeError, InboxError) as exc:
+            return self._intake_error(exc)
+        except OSError as exc:
+            return self._json_response(500, {"error": f"could not queue: {exc}"})
+        return self._json_response(
+            200,
+            {
+                "queued": [task_id for task_id, _ in filed],
+                "files": [queued.name for _, queued in filed],
+                "note": "applied by the loop on its next run",
+            },
+        )
 
     def _suggest_paths(self, body: dict) -> None:
         """Propose the paths a task probably touches. READ-ONLY.
@@ -6494,6 +6833,37 @@ class Handler(BaseHTTPRequestHandler):
             # line), so every spelling of the route is the same question and
             # sharing one sweep between them is right rather than merely cheap.
             payload = json.dumps(collect_shared(self.repo)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path.startswith("/api/intake"):
+            # READ-ONLY, and a GET so a reload is free. `?id=<slug>` renders one
+            # draft; no id lists them. Both go through `inbox`'s own parser, so
+            # this page and the CLI cannot disagree about what a draft says.
+            from urllib.parse import parse_qs, urlsplit
+
+            from .inbox import IntakeError, draft_path, list_drafts
+
+            wanted = (parse_qs(urlsplit(self.path).query).get("id") or [""])[0]
+            if not wanted:
+                payload = json.dumps(
+                    {
+                        "drafts": [
+                            _intake_view(p) for p in list_drafts(_intake_dir(self.repo))
+                        ],
+                        "dir": str(_intake_dir(self.repo)),
+                    }
+                ).encode()
+            else:
+                try:
+                    payload = json.dumps(
+                        _intake_view(draft_path(_intake_dir(self.repo), wanted))
+                    ).encode()
+                except IntakeError as exc:
+                    payload = json.dumps({"error": str(exc)}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))

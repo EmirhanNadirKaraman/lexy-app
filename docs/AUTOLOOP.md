@@ -3373,6 +3373,206 @@ A preempted session ends as `stopped` with `stop_kind = "preempted"`. Like
 mode reassesses and starts the next session — which is why nothing that reads
 `run()`'s outcome needed a new branch.
 
+## 4f-sexies. Operator intake — an idea, interviewed into a draft (intake-02, 2026-08-25)
+
+**The problem, stated plainly.** Every task description on this roadmap that is
+any good contains things a human cannot reasonably produce at a keyboard:
+measured counts, citations to exact files, verbatim quotes from earlier review
+verdicts, and a list of the ways the task can fail. Those came from an operator
+running `grep`, `git log` and the analysis scripts and pasting the answers in.
+That is the part worth automating. The judgement — what the task should achieve,
+what would count as done, what must not break — is the operator's and stays
+there.
+
+**Three questions do most of the work.**
+
+    "What would prove this worked?"        -> the provable claim
+    "What would make it fail?"             -> the constraints
+    "What is already true about this?"     -> the evidence to go and measure
+
+The system CANNOT answer the first two; only the operator knows what they
+wanted, so both are CONSTANTS in `inbox.REQUIRED_QUESTIONS` and both must be
+answered before anything is drafted. It CAN answer the third, and does — by
+reading the repository through `path_suggest` and offering what it found for
+the operator to accept or reject.
+
+### The mechanism: a file, not a chat session
+
+The exchange happens in a markdown file the operator edits. The system appends
+questions; the operator answers inline; the system re-reads, keeps what is
+answered and asks sharper ones. When the required questions are answered it
+emits a `## Draft` section, and the operator submits it through the existing
+inbox path.
+
+    # idea.md
+    Add a book reader page.
+
+    <!-- autoloop:intake v1 -->
+    ## Questions
+    ?! What would prove this worked? …          -> a reader can open a book
+    ?! What would make it fail? …               ->
+    ? Does it remember where you stopped?       ->
+
+    ## Evidence — read from this repository; delete any line that does not fit
+    - lexy-app/backend/services/book_service.py — named in the description (source: git ls-files)
+
+Why a file and not a chatbot, in the order the reasons matter:
+
+* **No session state.** Nothing to resume and nothing to lose. It makes "an
+  abandoned exchange must leave nothing behind" true by construction rather
+  than by cleanup code: an operator who starts describing an idea and walks
+  away has created one file in a directory nothing reads, and deleting it is
+  the whole of abandoning it.
+* **Asynchronous.** Three answers now and two tomorrow is normal for an
+  operator and hostile to a chat window.
+* **The artifact is the output.** What the operator edits becomes the task
+  description (`inbox.render_task_description` derives it at SUBMIT time, so an
+  edit anywhere in the file changes what is filed). There is no translation
+  step in which the meaning drifts.
+* **It is what makes ONE path possible.** The dashboard, the CLI and a
+  dropped-in `.md`/`.txt` all simply WRITE THIS FILE, through the same
+  `inbox.create_draft`. A chat UI would have made the dashboard a second
+  implementation. Pinned by
+  `test_intake.py::test_three_entry_points_produce_a_byte_identical_draft`,
+  which asserts byte equality — "they all call the helper" would prove nothing.
+
+Drafts live in `inbox.intake_dir_for(...)` — a SIBLING of the task inbox,
+beside `workers_root`, outside the checkout. A sibling and not a child, because
+`TaskInbox.drain` globs `*.json` in its own directory and moves anything it
+cannot parse into `rejected/`, which would eat the decline ledger.
+
+### Ask at authoring time, never during a round
+
+This is the whole safety of it. `ask_user` was retired (auto-11,
+`policy._RETIRED_DENIALS`) because it parked the loop on a question addressed to
+a human who, in an autonomous run, is not there to answer it — 9 parks and 15.7h
+of operator-blocked time, measured 2026-08-25. Intake is the opposite
+situation: the operator is present by definition, that is what makes it intake.
+
+So `inbox.refuse_if_round_running` gates every step that asks a question —
+`intake ask`, `intake suggest`, `intake plan`, and the dashboard's
+`/api/intake/ask` — and it FAILS CLOSED. A lock file that cannot be read, or
+one whose contents are corrupt, counts as running. That deliberately disagrees
+with `LoopLock.is_live`, which treats a corrupt lock as stale: that method
+answers "may I TAKE this lock", where the permissive answer is recoverable.
+This one answers "is it safe to ask", where it is not. It never takes
+`LoopLock` itself, for the reason `dashboard._submit_priority` already gives.
+
+Writing a draft, editing one and SUBMITTING one are deliberately NOT gated:
+they touch nothing inside the checkout and inherit `add-task`'s "safe at any
+moment, even mid-run" property.
+
+### Nothing reaches the registry without a submit
+
+`inbox.submit_draft` is the only function in the whole flow that queues
+anything, and it queues through `TaskInbox.submit` — the same gate `add-task`
+and the dashboard form use, shape-checked by the same `check_request_shape` and
+validated by the same `TaskRegistry.add_many` on merge. It shape-checks every
+spec BEFORE writing any of them, so a two-task plan whose second task is
+malformed queues neither: half a split is worse than none.
+
+`approved_paths` still comes from `path_suggest` and still requires human
+confirmation. `inbox.suggested_paths` FILLS the field with `path  # reason`
+entries, exactly as the dashboard's Detect-paths button does, and submitting is
+the confirmation. A plan reply's own `approved_paths` are discarded — a task
+that arrived carrying its own permission slip is the circularity
+`docs/SECURITY.md` #2 closes.
+
+### Where the fail-open failures would have been
+
+* **The draft-emission gate.** If "nothing left to ask" meant "the model
+  returned no questions", a provider that is down, throttled or terse would
+  declare the interview finished. `inbox.draft_blockers` therefore asks for
+  POSITIVE evidence only: both required questions PRESENT in the file and
+  ANSWERED. Deleting one blocks the draft rather than clearing it.
+* **Blank answers are two different things.** Blank on an optional
+  design-space question is a legitimate answer meaning "you decide", and the
+  system proceeds while writing down what it assumed. Blank on a required one
+  is not: assuming there fabricates the provable claim.
+* **Echo.** The prompt carries the idea, the open questions and the evidence,
+  so a model with nothing to add hands some of it back. `inbox._is_echo` drops
+  it. Without that, the interview never converges and an evidence line we
+  supplied gets promoted into a second, uncited claim. Nothing a model says
+  ever becomes `Evidence`.
+* **An empty evidence section.** `path_suggest.tracked_files` returns `[]` for
+  a git that errored, a git that is missing and a directory that is not a
+  checkout. `repo_evidence` says which of "nothing was read" and "nothing
+  matched" happened, because rendering the first as the second is a fabricated
+  negative.
+
+### Phase 1 — suggest, so the operator never faces a blank page
+
+`intake suggest` offers two or three concrete things, never a list: choosing
+between options is a far easier act than authoring. **Every suggestion cites
+its source**, and that is the constraint the phase lives or dies by — a system
+that suggests work will keep suggesting work whether or not any is needed.
+Three mechanical readers, each naming what it read and saying so even when it
+read nothing:
+
+* `audit_finding_suggestions` — a `#### domain:id — headline` line in a
+  rendered audit report whose id appears nowhere in `tasks.json`.
+* `ready_task_suggestions` — a pending task whose dependencies are all done.
+* `open_blocker_suggestions` — an unresolved blocker record the loop wrote.
+
+Declining is free and sticks: `record_decline` stores the suggestion key
+against a FINGERPRINT of its evidence, so it is re-offered only when that
+evidence changes. The fingerprint is over the finding id and its headline —
+never over anything that moves on its own, which would expire every decline
+immediately.
+
+### Phase 3 — decompose lazily, through the verb that already exists
+
+`Decision.PLAN` already carries `tasks: [TaskSpec]` and `TaskRegistry.add_many`
+already validates every path fail-closed. What was missing was an ENTRY POINT
+that submits a goal for planning, and `inbox.plan_step` is that: it asks the
+configured conversation provider for a directive and parses it with the same
+`contract.parse_response`. There is no second decomposer.
+
+**One level, and lazily.** `plan_step` refuses a draft that already holds more
+than one task. A planner producing one level is not guessing about deeper
+levels; the question is WHEN they are produced. Eager decomposition spends the
+subdivision before any evidence exists about which branches were worth taking,
+and its stopping test ("one testable claim") can always be applied once more,
+so it has no floor. Lazy has one: you stop when nothing is refusing. The
+trigger for a further split is a real number — brw-14 was refused at 416,193
+bytes against a 400,000-byte packet cap, having PASSED review — and it belongs
+to a reviewer with that task's evidence in front of it, not to this command.
+
+### Which model asks
+
+The configured conversation provider (`[conversation] provider`), through
+`inbox.provider_asker`, and not a new one: it is already configured with a
+credential and a failure mode the operator knows, a second provider is a second
+thing to break, and the interview runs outside a round so it never competes
+with the reviewer for a session.
+
+**This is the one place an LLM is appropriate in this flow**, and it is worth
+being explicit because `path_suggest` deliberately is not one ("a suggestion you
+cannot explain is one you cannot check"). Good clarifying questions cannot be
+derived mechanically. The safety comes from somewhere else: the output is a
+DRAFT the operator reads and edits, and nothing reaches the registry without
+that. Explainability is the human reading it, not the derivation. Do not let
+that reasoning leak back into `path_suggest`, whose output is a permission scope
+and must stay mechanical.
+
+### Commands
+
+```bash
+python -m autoloop intake suggest                      # 2-3 cited things to do
+python -m autoloop intake accept <key> --id reader     # or: intake decline <key>
+python -m autoloop intake new --id reader --text "…"   # or --file notes.md
+python -m autoloop intake ask --id reader              # one pass; --no-model for constants only
+python -m autoloop intake show --id reader
+python -m autoloop intake plan --id reader             # ONE level, optional
+python -m autoloop intake submit --id reader --dry-run
+python -m autoloop intake submit --id reader           # the only step that queues
+```
+
+The dashboard's Intake panel does the same four things over
+`POST /api/intake`, `/api/intake/edit`, `/api/intake/ask` and
+`/api/intake/submit`, plus `GET /api/intake?id=<slug>` — by calling the same
+functions, with no draft format of its own.
+
 ## 4g. The validation-environment boundary (test DB credentials)
 
 **The problem.** A task may declare validation that needs a database — `rt-01`

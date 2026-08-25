@@ -726,6 +726,41 @@ leaves the trap armed for the next person who rewraps a paragraph.
 **The same trap does not apply to markup** — `id="mwstate"`, a tag, a CSS rule —
 because those are written on one line by construction; it is only prose.
 
+### `SyntaxError: source code string cannot contain null bytes`, and `ruff` says the tree is clean
+
+**Symptom:** a handful of tests fail with
+`SyntaxError: source code string cannot contain null bytes`, and the tests that
+fail have nothing to do with the change — the ones seen on 2026-08-25 were
+`test_config_repo_section.py::test_a_config_edit_cannot_newly_authorize_a_behaviour_changing_file[.env]`
+and its five other parametrizations. `ruff check .` PASSES on the same tree.
+**Cause:** a NUL byte (`\0`) somewhere in a `.py` file the failing tests import
+transitively. Python's import machinery refuses the whole module; the failures
+land on whichever tests import it FIRST, which is why they look unrelated.
+Modules importing it at module scope produce collection ERRORS rather than
+FAILED lines, so a truncated failure summary can hide the real blast radius.
+Ruff does not answer this question: it parsed and passed the same file.
+**Find it with ripgrep, not with the editor.** A NUL is invisible in every
+rendering, including a `Read` of the file. `rg` names it:
+```bash
+rg -n 'def ' autoloop/inbox.py
+# autoloop/inbox.py: WARNING: stopped searching binary file after match
+#   (found "\0" byte around offset 94283)
+```
+`rg` reports it as a binary file and STOPS at the byte, so the last match it
+prints brackets the location: the NUL is between that line and the next line
+the pattern would have matched. A plain `rg -l $'\0' .` finds nothing useful,
+because binary detection suppresses the listing — search for ordinary text and
+read the warning instead.
+**Fix:** rewrite the file. An `Edit`-style exact-match replacement CANNOT remove
+it: no `old_string` you can type contains a NUL, and a replacement spanning the
+region matched (the matcher normalises it away) while leaving the byte in place
+— three attempts on 2026-08-25, each confirmed still binary afterwards. `Write`
+the whole file from its read-back content, then re-run the `rg` above and
+confirm the warning is gone before spending another validation run.
+**Cheapest prevention:** after a large generated edit to a Python file, run one
+`rg` over it. The check costs a second; the miss costs a whole validation run,
+and the failure it produces points at the wrong file.
+
 ---
 
 ## 3. Frontend build
@@ -3329,3 +3364,5 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-25 | ceil-01 | Two `task_fatal` parks are new and both are WORKING AS INTENDED. `ceiling_plan_unanswered`: the task reached its attempt ceiling, asked the reviewer to classify it, and the reply was neither a differing `decomposition` nor a `plan` — the loop deliberately does not ask twice, because the ask spends no attempt and no denial budget, so a re-ask has nothing to stop it. `ceiling_plan_unchanged`: the reviewer handed back the plan already on record, which classifies nothing. Read the request in the transcript before answering either. |
 | 2026-08-25 | ceil-01 | The wrong moves at `attempt_count_ceiling` are unchanged and now have a right one. Do NOT raise `MAX_TASK_ATTEMPTS` and do not hand-edit `attempt_count` — that ceiling is the only bound on local churn. Since ceil-01 that park means the reviewer was ALREADY asked and both remedies are spent (one extension, no split depth left), or the task is an audit unit. What is left is a specification problem: rewrite, decompose by hand, or retire. |
 | 2026-08-25 | ceil-01 | No new RUNTIME error class was hit this round, so nothing was filed above the marker. The trap worth knowing is a documentation one: a source comment crediting a task id with a mechanism is not evidence the mechanism exists. `contract.py` and `tasks.py` both said splitting a task "is `split-01`'s mechanism"; `split-01` is recorded completed but `test_shipped_elsewhere.py` lists it among the ids whose work never shipped, and no split code existed. Grep for the function before planning around it. |
+| 2026-08-25 | intake-02 | New §2 entry for the trap that cost this round its first advisory run: `SyntaxError: source code string cannot contain null bytes` on six parametrizations of a `test_config_repo_section.py` test that has nothing to do with the change, while `ruff check .` PASSES the same tree. A NUL byte in a `.py` file the failing tests import transitively — ruff parsed it and passed, so lint is no evidence here. |
+| 2026-08-25 | intake-02 | The two halves of that entry worth knowing before you debug. FINDING it: a NUL is invisible in every rendering, including a file read, so search the file for ordinary text with `rg` and read the `stopped searching binary file … found "\0" byte around offset N` warning — the last match printed brackets the location. REMOVING it: an exact-match string replacement cannot, because no `old_string` you can type contains a NUL and a span across it matches while leaving the byte; rewrite the whole file, then re-run the `rg` before spending another run. |

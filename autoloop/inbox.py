@@ -128,13 +128,23 @@ to avoid:
 The widening this is honest about: an inbox request can now change what an
 existing task is authorized to write, which `docs/SECURITY.md` S28 previously
 recorded as impossible. It is recorded there rather than left implied.
+
+**Operator intake lives at the bottom of this file** (intake-02, 2026-08-25):
+a rough idea becomes a DRAFT through a question-and-answer exchange held in a
+markdown file, and that draft reaches the registry only when the operator runs
+`submit_draft`, which calls `TaskInbox.submit` above and nothing else. It adds
+no request kind and no second submission route — see the banner comment there
+for why it is in this module and why it is a file rather than a chat session.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 #: Fields a CREATION request (`kind: "task"`, or no kind at all) may carry.
@@ -773,3 +783,1533 @@ def apply_requests(registry, specs: list[dict]) -> tuple[list[str], list[str], l
         else:
             added.append(f"{task.id} (priority {task.priority})")
     return added, applied, refused
+
+
+# ===========================================================================
+# OPERATOR INTAKE — a rough idea, turned into a DRAFT by question and answer.
+# ===========================================================================
+#
+# Everything below runs at AUTHORING TIME and produces a FILE. It never
+# dispatches, never writes the registry, and reaches the queue only through
+# `TaskInbox.submit` above — the same gate `add-task` and the dashboard form
+# already use, called by `submit_draft` and by nothing else here.
+#
+# **Why this lives in `inbox.py`.** Its entire output is an inbox creation
+# request, and the one rule this module exists to keep single is "a request is
+# shape-checked by exactly one function". Putting the draft → request
+# conversion one function away from `check_request_shape` is what stops a
+# second, drifting copy of that rule appearing behind a friendlier front door.
+#
+# **Why a file and not a chat session.** There is no session state, so nothing
+# to resume and nothing to lose: an operator who starts describing an idea and
+# walks away has created a file in a directory nothing reads, which is what
+# makes "an abandoned exchange leaves nothing behind" true by construction
+# rather than by cleanup code. It is asynchronous (three answers now, two
+# tomorrow), the artifact IS the task description so no meaning drifts in
+# translation, and it is what makes ONE path possible — the CLI, a dropped-in
+# `.md`/`.txt` and the dashboard all simply WRITE THIS FILE.
+#
+# **`ask_user` is the thing this must not become.** That verb was retired
+# (`policy._RETIRED_DENIALS`) because it parked the loop on a question
+# addressed to a human who, in an autonomous run, is not there to answer it.
+# Intake is the opposite situation — the operator is present by definition,
+# that is what makes it intake — so `refuse_if_round_running` refuses every
+# question-asking entry point while a round is live, and fails CLOSED when it
+# cannot tell. A question asked mid-round rebuilds `ask_user` under a new name.
+#
+# **The one place an LLM is appropriate here**, and it is worth being explicit
+# because `path_suggest` deliberately is not one. Good clarifying questions
+# cannot be derived mechanically. The safety comes from somewhere else instead:
+# the output is a DRAFT the operator reads and edits, and nothing reaches the
+# registry without that. Explainability is the human reading it, not the
+# derivation. Note what the model is NOT allowed to contribute: the two
+# questions only the operator can answer are CONSTANTS here, the evidence is
+# read off git by `path_suggest`, and `approved_paths` is mechanical — so a
+# provider that is down, throttled or terse degrades the interview and cannot
+# fabricate any of the three things a reviewer would later believe.
+
+#: Marks where the operator's own prose ends and the exchange begins. Every
+#: reader here splits on it, so text ABOVE it is never rewritten by a pass:
+#: the idea stays exactly as it was typed.
+INTAKE_MARKER = "<!-- autoloop:intake v1 -->"
+
+#: What a dropped-in idea file may be. Narrow on purpose — this is text an
+#: operator wrote, and accepting `.py` or `.json` would mean adopting something
+#: that is almost certainly not an idea.
+INTAKE_SUFFIXES = (".md", ".txt")
+
+#: A draft's slug, which becomes `<slug>.md` inside the intake directory. The
+#: character class is the whole containment: no separator, no `..`, no leading
+#: dot, so a slug arriving from an HTTP body cannot address a file outside the
+#: intake directory however it is spelled.
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+#: The two questions the SYSTEM CANNOT ANSWER, asked verbatim on the first
+#: pass and required before any draft is emitted. They are constants rather
+#: than model output precisely because a provider that is unavailable must not
+#: be able to make a draft look complete — see `draft_blockers`.
+REQUIRED_QUESTIONS = (
+    "What would prove this worked? Name the ONE claim a reviewer can check.",
+    "What would make it fail? Name the constraints that must not break.",
+)
+
+#: Batch size. Three to five at a time: dripping one question per pass turns an
+#: afternoon's authoring into a week's, and twenty at once is not answered at
+#: all. The required questions above count towards the same batch.
+MAX_QUESTIONS_PER_PASS = 5
+
+#: How many things phase 1 offers. Two or three, never a list — choosing
+#: between options is a far easier act than authoring, and a list of forty
+#: is authoring again with extra steps.
+MAX_WORK_SUGGESTIONS = 3
+
+_H_QUESTIONS = "## Questions"
+_H_EVIDENCE = "## Evidence"
+_H_ASSUMPTIONS = "## Assumptions"
+_H_DRAFT = "## Draft"
+
+#: A question line in the file: `?` for one you may leave blank, `?!` for one
+#: only you can answer. The answer is whatever follows the FIRST `->`.
+_QUESTION_RE = re.compile(r"^\?(!?)[ \t]*(.*)$")
+#: A question in a MODEL REPLY. Tolerates the bullet and numbering a model
+#: reaches for anyway; still requires the `?` marker, so ordinary prose in the
+#: reply is not harvested as a question.
+_REPLY_QUESTION_RE = re.compile(r"^[ \t]*(?:[-*•][ \t]*|\d+[.)][ \t]*)?\?[ \t]*(.+)$")
+_SOURCE_RE = re.compile(r"[ \t]*\(source:[ \t]*(.+?)\)[ \t]*$")
+_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+_TASK_HEAD_RE = re.compile(r"^###[ \t]+task:[ \t]*(.*)$")
+#: A finding heading in a rendered audit report:
+#: `#### db_migrations:db-01 — Author a new baseline migration …`
+_AUDIT_FINDING_RE = re.compile(
+    r"^####[ \t]+([A-Za-z0-9_]+:[A-Za-z0-9_.\-]+)[ \t]+[—–-][ \t]*(.+?)[ \t]*$"
+)
+
+
+class IntakeError(Exception):
+    """An intake action that cannot proceed, in words for the operator.
+
+    Separate from `InboxError`, which is about the SHAPE of a queued request.
+    Everything raised here is about the exchange — an unreadable draft, a draft
+    that is not ready, a round in flight, a provider that did not answer.
+    """
+
+
+# ---- the draft file: parse, render, round-trip -----------------------------
+
+
+@dataclass(frozen=True)
+class IntakeQuestion:
+    """One question and, once the operator types one, its answer.
+
+    `required` is the whole safety distinction. A blank answer to an OPTIONAL
+    question is a legitimate answer meaning "you decide" or "not yet", and the
+    system proceeds while SAYING what it assumed. A blank answer to a REQUIRED
+    one is not: the task text is explicit that only the operator knows what
+    they wanted, so assuming there would fabricate the provable claim — the
+    thing that is then quoted back in the spec and believed.
+    """
+
+    text: str
+    answer: str = ""
+    required: bool = False
+
+    @property
+    def answered(self) -> bool:
+        return bool(self.answer.strip())
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """Something the system ACTUALLY READ, with the source named.
+
+    `source` is not decoration: the constraint is "do not invent measurements",
+    and a claim an operator cannot go and check is exactly the fabricated count
+    that is worse than no count. Every producer here names a real reader
+    (`git ls-files`, a report path, `tasks.json`), and nothing a model said
+    ever becomes an `Evidence` — see `_questions_from_reply`.
+    """
+
+    text: str
+    source: str
+
+
+@dataclass(frozen=True)
+class DraftTask:
+    """One proposed task — the part of the draft that is not derived.
+
+    `approved_paths` entries may carry a trailing `  # reason`, exactly as the
+    dashboard's Detect-paths button appends one, and `submit_draft` strips it
+    again: the operator reads reasons, the registry validates paths.
+    """
+
+    id: str
+    title: str
+    priority: int = 100
+    depends_on: tuple[str, ...] = ()
+    approved_paths: tuple[str, ...] = ()
+    #: Only set for a task that came out of a `plan` pass; a single-task draft
+    #: derives its whole description from the artifact.
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class IntakeDraft:
+    slug: str
+    idea: str
+    questions: tuple[IntakeQuestion, ...] = ()
+    evidence: tuple[Evidence, ...] = ()
+    assumptions: tuple[str, ...] = ()
+    tasks: tuple[DraftTask, ...] = ()
+
+    @property
+    def title(self) -> str:
+        """The first non-blank line of the idea, as a task title."""
+        for line in self.idea.splitlines():
+            stripped = line.strip().lstrip("#").strip()
+            if stripped:
+                return stripped[:120]
+        return ""
+
+
+def _normalize(text: str) -> str:
+    """Text reduced to what two spellings of the same question share.
+
+    Used for one job only — deciding whether a question has already been
+    asked — so it is deliberately aggressive: punctuation, case and spacing
+    all vanish. A model that returns our own question back with a comma moved
+    must not add it a second time.
+    """
+    return _NORMALIZE_RE.sub(" ", text.lower()).strip()
+
+
+def _split_marker(text: str) -> tuple[str, list[str]]:
+    """`(idea, exchange_lines)`.
+
+    A file with no marker is ALL idea — that is what a `.md` an operator wrote
+    by hand looks like before the first pass touches it, and reading it as an
+    idea is the only reading that does not throw their text away.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == INTAKE_MARKER:
+            return "\n".join(lines[:i]).strip("\n"), lines[i + 1:]
+    return text.strip("\n"), []
+
+
+def parse_draft(text: str, slug: str = "") -> IntakeDraft:
+    """Read a draft file. Never raises on content — an operator edits this by
+    hand and half of them will be mid-edit.
+
+    **Written for a HAND-MANGLED file, because that is the normal one.** The
+    operator deletes the `->`, answers on the next line, reflows a long answer
+    across three, pastes something with tabs. So: an answer is whatever follows
+    the first `->` on the question's own line PLUS every following line in the
+    section that is not itself a question, a heading or a comment. Losing an
+    answer is the one failure this parser must not have — it is the operator's
+    words, and nothing else in the flow can reconstruct them.
+    """
+    idea, lines = _split_marker(text)
+    questions: list[IntakeQuestion] = []
+    evidence: list[Evidence] = []
+    assumptions: list[str] = []
+    tasks: list[DraftTask] = []
+    section = ""
+    pending_paths = False
+    description: list[str] | None = None
+
+    def flush_description() -> None:
+        nonlocal description
+        if description is not None and tasks:
+            tasks[-1] = replace(tasks[-1], description="\n".join(description).strip("\n"))
+        description = None
+
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith("## "):
+            flush_description()
+            pending_paths = False
+            section = stripped
+            continue
+        if section.startswith(_H_DRAFT) and description is not None:
+            # Inside a `description:` block: an indented line continues it, and
+            # anything at column zero ends it. Checked BEFORE the comment and
+            # blank-line skips below, so a description may contain either.
+            if not raw.strip() or raw[:1] in (" ", "\t"):
+                description.append(raw[2:] if raw.startswith("  ") else raw.lstrip())
+                continue
+            flush_description()
+        if stripped.startswith("<!--"):
+            continue
+        if section.startswith(_H_QUESTIONS):
+            match = _QUESTION_RE.match(raw)
+            if match:
+                body = match.group(2)
+                # The FIRST `->`, not the last: an ANSWER containing an arrow
+                # is far likelier than a question containing one (nothing this
+                # module writes ever does — `_questions_from_reply` rewrites a
+                # model's `->` to a real arrow for exactly this reason), and
+                # splitting on the last would eat the front of such an answer.
+                head, sep, tail = body.partition("->")
+                text_part = (head if sep else body).strip()
+                if text_part:
+                    questions.append(
+                        IntakeQuestion(
+                            text=text_part,
+                            answer=tail.strip() if sep else "",
+                            required=match.group(1) == "!",
+                        )
+                    )
+                continue
+            if stripped and questions:
+                # A continuation line: the operator answered under the question
+                # instead of after the arrow. Keep it.
+                prior = questions[-1]
+                joined = f"{prior.answer}\n{stripped}" if prior.answer else stripped
+                questions[-1] = replace(prior, answer=joined)
+            continue
+        if not stripped:
+            continue
+        if section.startswith(_H_EVIDENCE):
+            body = stripped[1:].strip() if stripped.startswith("-") else stripped
+            match = _SOURCE_RE.search(body)
+            evidence.append(
+                Evidence(
+                    text=_SOURCE_RE.sub("", body).strip() if match else body,
+                    source=match.group(1).strip() if match else "",
+                )
+            )
+            continue
+        if section.startswith(_H_ASSUMPTIONS):
+            assumptions.append(stripped[1:].strip() if stripped.startswith("-") else stripped)
+            continue
+        if section.startswith(_H_DRAFT):
+            head = _TASK_HEAD_RE.match(stripped)
+            if head:
+                pending_paths = False
+                tasks.append(DraftTask(id=head.group(1).strip(), title=""))
+                continue
+            if not tasks:
+                continue
+            if pending_paths and stripped.startswith("-"):
+                entry = stripped[1:].strip()
+                if entry:
+                    tasks[-1] = replace(
+                        tasks[-1], approved_paths=tasks[-1].approved_paths + (entry,)
+                    )
+                continue
+            key, sep, value = stripped.partition(":")
+            if not sep:
+                continue
+            key, value = key.strip().lower(), value.strip()
+            pending_paths = False
+            if key == "title":
+                tasks[-1] = replace(tasks[-1], title=value)
+            elif key == "priority":
+                try:
+                    tasks[-1] = replace(tasks[-1], priority=int(value))
+                except ValueError:
+                    # Left at whatever it was. `check_request_shape` refuses a
+                    # non-integer priority at submit in its own words; guessing
+                    # one here would hide the typo instead of reporting it.
+                    pass
+            elif key == "depends_on":
+                deps = tuple(d.strip() for d in value.split(",") if d.strip())
+                tasks[-1] = replace(tasks[-1], depends_on=deps)
+            elif key == "approved_paths":
+                pending_paths = True
+            elif key == "description":
+                description = []
+    flush_description()
+    return IntakeDraft(
+        slug=slug,
+        idea=idea,
+        questions=tuple(questions),
+        evidence=tuple(evidence),
+        assumptions=tuple(assumptions),
+        tasks=tuple(tasks),
+    )
+
+
+def _render_question(question: IntakeQuestion) -> list[str]:
+    marker = "?!" if question.required else "?"
+    answer_lines = question.answer.split("\n") if question.answer else [""]
+    out = [f"{marker} {question.text} -> {answer_lines[0]}".rstrip()]
+    out += [f"  {line}" for line in answer_lines[1:]]
+    return out
+
+
+def render_draft(draft: IntakeDraft) -> str:
+    """The file, from the parsed draft. `parse_draft(render_draft(d))` is `d`.
+
+    The idea is written back BYTE FOR BYTE. Every pass re-renders the sections
+    below the marker, so a round trip that lost an answer or reflowed one would
+    silently eat the operator's words on the next `ask` —
+    `test_intake.py::test_a_draft_round_trips_through_parse_and_render` is what
+    stops that.
+    """
+    out = [draft.idea.strip("\n"), "", INTAKE_MARKER, "", _H_QUESTIONS]
+    out += [
+        "<!-- Answer after the `->`, or on the lines under a question. -->",
+        "<!-- `?!` is yours alone: nothing is drafted until both are answered. -->",
+        "<!-- `?` may be left blank; a blank means 'you decide' and the "
+        "assumption is written down below. -->",
+    ]
+    for question in draft.questions:
+        out += _render_question(question)
+    out += ["", f"{_H_EVIDENCE} — read from this repository; delete any line that does not fit"]
+    if draft.evidence:
+        out += [
+            f"- {item.text}" + (f" (source: {item.source})" if item.source else "")
+            for item in draft.evidence
+        ]
+    else:
+        out.append("<!-- nothing yet -->")
+    if draft.assumptions:
+        out += ["", f"{_H_ASSUMPTIONS} — what a blank answer was taken to mean"]
+        out += [f"- {line}" for line in draft.assumptions]
+    if draft.tasks:
+        out += [
+            "",
+            f"{_H_DRAFT} — nothing is filed until you run "
+            "`python -m autoloop intake submit`",
+            "<!-- approved_paths were SUGGESTED mechanically (path_suggest) and "
+            "authorize nothing. -->",
+            "<!-- Editing them here and submitting is the confirmation. -->",
+        ]
+        for task in draft.tasks:
+            out += [
+                "",
+                f"### task: {task.id}",
+                f"title: {task.title}",
+                f"priority: {task.priority}",
+                f"depends_on: {', '.join(task.depends_on)}",
+                "approved_paths:",
+            ]
+            if not task.approved_paths:
+                # An empty list here is the ordinary case for an idea that
+                # names no file, and it must not read as "nothing needed":
+                # `draft_specs` refuses a task with no scope, because the
+                # registry accepts one and the orchestrator then never
+                # dispatches it. Say what to do instead of leaving a blank.
+                out.append(
+                    "<!-- nothing was detected — name a file, folder or "
+                    "function above, or type the paths here as `  - path`. "
+                    "Submitting with none is refused. -->"
+                )
+            out += [f"  - {path}" for path in task.approved_paths]
+            if task.description:
+                out.append("description:")
+                out += [f"  {line}".rstrip() for line in task.description.split("\n")]
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+# ---- where drafts live -----------------------------------------------------
+
+
+def intake_dir_for(workers_root: Path | None, state_dir: Path) -> Path:
+    """Where drafts live: a SIBLING of the inbox, never inside it.
+
+    Beside `workers_root` for the same reason `inbox_dir_for` is — outside the
+    checkout, so a draft an operator edits mid-round is invisible to the escape
+    detector and cannot park the loop.
+
+    **A sibling, and that is load-bearing.** `TaskInbox.drain` globs `*.json`
+    in its own directory and MOVES anything that will not parse into
+    `rejected/`. A decline ledger or a draft written inside that directory
+    would be eaten by the next drain, which both destroys the record and
+    reports a spurious problem line. Pinned by
+    `test_intake.py::test_a_drain_ignores_everything_intake_writes`.
+    """
+    if workers_root is not None:
+        return Path(workers_root).expanduser().parent / "intake"
+    return Path(state_dir) / "intake"
+
+
+def draft_path(intake_dir: Path, slug: str) -> Path:
+    """`<intake_dir>/<slug>.md`, or `IntakeError` for a slug that is not one.
+
+    The check is containment, not tidiness: `slug` arrives from an HTTP body on
+    the dashboard route, and `_SLUG_RE` is what stops `../../etc/whatever` or
+    an absolute path being addressed at all.
+    """
+    text = str(slug or "").strip()
+    if not _SLUG_RE.match(text):
+        raise IntakeError(
+            f"{slug!r} is not a usable draft name — lowercase letters, digits, "
+            "'.', '_' and '-' only, starting with a letter or digit"
+        )
+    return Path(intake_dir) / f"{text}.md"
+
+
+def slug_for(name: str) -> str:
+    """A filename or free phrase, reduced to a slug this module accepts.
+
+    Used by the file entry point, where the natural name for the draft is the
+    dropped file's own stem, and by nothing that decides authorization.
+    """
+    text = _NORMALIZE_RE.sub("-", str(name).lower()).strip("-")
+    return text[:64].strip("-.") or "idea"
+
+
+def list_drafts(intake_dir: Path) -> list[Path]:
+    directory = Path(intake_dir)
+    if not directory.is_dir():
+        return []
+    return sorted(p for p in directory.glob("*.md") if p.is_file())
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_draft(path: Path) -> IntakeDraft:
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise IntakeError(f"could not read the draft {path}: {exc}") from exc
+    return parse_draft(text, Path(path).stem)
+
+
+def create_draft(intake_dir: Path, slug: str, idea: str) -> Path:
+    """THE entry point every route converges on. Writes one file, nothing else.
+
+    The CLI's `intake new --text`, the CLI's `intake new --file` and the
+    dashboard's `POST /api/intake` all call exactly this, with the same
+    arguments, and therefore produce a BYTE-IDENTICAL file — which is the only
+    falsifiable reading of "three entry points, one path".
+    (`test_intake.py::test_three_entry_points_produce_a_byte_identical_draft`.)
+
+    Deliberately clock-free: a timestamp in the created file would make that
+    equality depend on three calls landing in the same second, and there is
+    nothing here a date answers that the filesystem does not.
+
+    Refuses to overwrite. A second `new` on a live draft would silently discard
+    an exchange the operator is halfway through, and nothing in the flow could
+    get it back.
+    """
+    text = str(idea or "").strip()
+    if not text:
+        raise IntakeError(
+            "nothing to work from — write a sentence or two about what you want"
+        )
+    path = draft_path(intake_dir, slug)
+    if path.exists():
+        raise IntakeError(
+            f"{path} already exists — edit it, or pick another name. Nothing was "
+            "written, so the exchange already in that file is intact."
+        )
+    _write_atomic(path, render_draft(IntakeDraft(slug=Path(path).stem, idea=text)))
+    return path
+
+
+def create_draft_from_file(intake_dir: Path, source: Path, slug: str = "") -> Path:
+    """The `.md`/`.txt` entry point. Reads the file and calls `create_draft`.
+
+    The suffix check is what makes "an idea file" mean something: a `.py` or a
+    `.json` pointed at this is almost certainly a mistake, and adopting it
+    would produce a draft whose idea is source code.
+    """
+    src = Path(source)
+    if src.suffix.lower() not in INTAKE_SUFFIXES:
+        raise IntakeError(
+            f"{src} is not an idea file — {', '.join(INTAKE_SUFFIXES)} only"
+        )
+    try:
+        text = src.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise IntakeError(f"could not read {src}: {exc}") from exc
+    return create_draft(intake_dir, slug or slug_for(src.stem), text)
+
+
+def write_draft_text(intake_dir: Path, slug: str, text: str) -> Path:
+    """Replace a draft's text with what the operator edited. Verbatim.
+
+    No normalisation, no re-render: this is their file, and a route that
+    "tidied" it on the way in would be editing an artifact that becomes the
+    task description. The draft must already exist — this edits, it never
+    creates, so a typo'd slug cannot quietly mint a second draft.
+    """
+    if not isinstance(text, str):
+        raise IntakeError("the draft body must be text")
+    path = draft_path(intake_dir, slug)
+    if not path.exists():
+        raise IntakeError(f"no draft at {path} — create it first")
+    _write_atomic(path, text if text.endswith("\n") else text + "\n")
+    return path
+
+
+# ---- the authoring-time guard: is it safe to ask a question at all? --------
+
+
+def round_is_running(state_dir: Path) -> tuple[bool, str]:
+    """`(running, why)` — and it FAILS CLOSED.
+
+    Every "is anything running" check in this codebase that guessed has guessed
+    wrong in the permissive direction, so the rule here is: proceed only when
+    there is positively no live lock. A lock file that cannot be read, or one
+    whose contents are corrupt, answers TRUE — because the alternative is an
+    intake question reaching a model while a round is mid-flight, which is
+    `ask_user` rebuilt under a new name.
+
+    Note the deliberate disagreement with `LoopLock.is_live`, which treats a
+    corrupt lock as stale: it is answering "may I take this lock", where the
+    permissive answer is recoverable. This answers "is it safe to ask", where
+    it is not.
+    """
+    from .lock import LOCK_FILENAME, LoopLock
+
+    path = Path(state_dir) / LOCK_FILENAME
+    try:
+        if not path.exists():
+            return False, ""
+        info = LoopLock(Path(state_dir)).read()
+    except OSError as exc:
+        return True, f"the loop's lock file could not be examined ({exc})"
+    if info is None:
+        return False, ""
+    if info.pid == -1:
+        return True, (
+            "the loop's lock file is corrupt, so whether a round is running "
+            "cannot be determined"
+        )
+    if LoopLock.is_live(info):
+        return True, f"the loop is running ({info.describe()})"
+    return False, ""
+
+
+def refuse_if_round_running(state_dir: Path, what: str) -> None:
+    """Raise `IntakeError` if `what` must not happen right now.
+
+    Applied to every step that asks a QUESTION or offers work — `interview_step`
+    through its callers, `gather_suggestions`, `plan_step`. Deliberately NOT
+    applied to writing a draft file or to `submit_draft`: those touch nothing
+    inside the checkout and inherit `add-task`'s "safe at any moment, even
+    mid-run" property, and taking that away would be a regression dressed as
+    caution.
+
+    It never takes `LoopLock`. That lock is held for the whole run, so waiting
+    on it would mean waiting for the loop to stop — the same reasoning
+    `dashboard._submit_priority` spells out.
+    """
+    running, why = round_is_running(state_dir)
+    if running:
+        raise IntakeError(
+            f"not now: {why}. {what} asks a question, and a question asked "
+            "mid-round is what `ask_user` was retired for. Intake is safe "
+            "precisely because the operator is present, which is an "
+            "authoring-time fact. Try again when the round ends — writing and "
+            "editing a draft, and submitting one, stay safe at any moment."
+        )
+
+
+# ---- evidence: what the system actually read -------------------------------
+
+
+def repo_evidence(repo: Path, text: str) -> tuple[tuple[Evidence, ...], str]:
+    """`(evidence, note)` — mechanical, cited, and honest about reading nothing.
+
+    Delegates to `path_suggest`, which is the module that already answers "what
+    does this text point at in this repository" without an LLM, and each line
+    carries the reason it was proposed so the operator can reject it.
+
+    **An empty list and a failed scan are DIFFERENT, and the note is how.**
+    `path_suggest.tracked_files` returns `[]` for a git that errored, a git
+    that is missing and a directory that is not a checkout, all of which mean
+    "nothing was read" — and an empty Evidence section rendered from that would
+    read as "nothing relevant exists here", which is a fabricated negative.
+    """
+    from .path_suggest import suggest, tracked_files
+
+    root = Path(repo)
+    files = tracked_files(root)
+    if not files:
+        return (), (
+            f"no evidence gathered: git listed no tracked files under {root} "
+            "(not a checkout, or git did not answer). NOTHING WAS READ — which "
+            "is not the same as nothing being relevant."
+        )
+    try:
+        found = suggest(text, root)
+    except OSError as exc:
+        return (), f"no evidence gathered: the repository scan failed ({exc})"
+    if not found:
+        return (), (
+            f"read {len(files)} tracked files; none was named or defined by the "
+            "text so far. Name a file, a folder or a function to get more."
+        )
+    return (
+        tuple(
+            Evidence(text=f"{item.path} — {item.reason}", source="git ls-files")
+            for item in found
+        ),
+        "",
+    )
+
+
+# ---- the interview ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InterviewPass:
+    """What one pass did, for the operator to read. No state lives here."""
+
+    path: Path
+    added_questions: tuple[str, ...] = ()
+    added_evidence: tuple[str, ...] = ()
+    evidence_note: str = ""
+    provider_note: str = ""
+    open_questions: tuple[str, ...] = ()
+    blockers: tuple[str, ...] = ()
+    assumptions: tuple[str, ...] = ()
+
+    @property
+    def ready(self) -> bool:
+        return not self.blockers
+
+
+def draft_blockers(draft: IntakeDraft) -> tuple[str, ...]:
+    """Why this draft may NOT be turned into a task yet. Empty means ready.
+
+    **This is the fail-open gate of the whole feature, so it is positive-only.**
+    Readiness is never inferred from the absence of something: not from "the
+    model returned no more questions" (a provider that is down returns none),
+    not from "nothing is left to ask". It requires POSITIVE evidence — both
+    `REQUIRED_QUESTIONS` present in the file AND answered by the operator.
+    Deleting a required question from the file therefore blocks the draft
+    rather than clearing it.
+    """
+    out: list[str] = []
+    if not draft.idea.strip():
+        out.append("the idea is empty — say what you want, in a sentence or two")
+    answered = {
+        _normalize(q.text): q.answered for q in draft.questions if q.required
+    }
+    for question in REQUIRED_QUESTIONS:
+        key = _normalize(question)
+        if key not in answered:
+            out.append(
+                f"the required question is not in the file: {question!r} — run "
+                "`intake ask` (it adds it), or paste it back under ## Questions "
+                "prefixed with `?!`"
+            )
+        elif not answered[key]:
+            out.append(f"unanswered, and only you can answer it: {question}")
+    return tuple(out)
+
+
+def _is_echo(candidate: str, draft: IntakeDraft, seen: set[str]) -> bool:
+    """True when a 'new' question is text we handed the model ourselves.
+
+    The prompt carries the idea, the questions already asked and the evidence,
+    so a model with nothing to add will hand some of it back. Reading that as
+    output is the ECHO failure: it produces an interview that never converges
+    (the same question re-added every pass) and, for an evidence line, promotes
+    something we already cited into a second, uncited claim.
+    """
+    key = _normalize(candidate)
+    if not key or key in seen:
+        return True
+    if key in {_normalize(line) for line in draft.idea.splitlines() if line.strip()}:
+        return True
+    return key in {_normalize(item.text) for item in draft.evidence}
+
+
+def _questions_from_reply(reply: str, draft: IntakeDraft, seen: set[str]) -> list[str]:
+    """The questions in a model reply — and never anything else from it.
+
+    A reply with no `?` line yields nothing, which is a degraded pass and NOT a
+    finished interview: `draft_blockers` is what decides readiness, and it
+    cannot be satisfied by silence.
+    """
+    out: list[str] = []
+    local = set(seen)
+    for line in str(reply or "").splitlines():
+        match = _REPLY_QUESTION_RE.match(line)
+        if not match:
+            continue
+        # `->` is the file's answer separator, so a question containing one
+        # would split wrongly on the next read. The arrow is preserved as a
+        # character the operator can still read.
+        question = match.group(1).strip().replace("->", "→")
+        if not question or _is_echo(question, draft, local):
+            continue
+        local.add(_normalize(question))
+        out.append(question)
+    return out
+
+
+def interview_prompt(draft: IntakeDraft) -> str:
+    """What the configured conversation provider is asked.
+
+    It is given the idea, the answers so far and the evidence — and told which
+    of those are already handled, because the failure mode of not saying so is
+    a reply that restates them as questions. It is asked for OPTIONS within the
+    design space, not for judgement about the product: the system is entitled
+    to opinions about the codebase, which it can read, and none about what the
+    operator wanted.
+    """
+    lines = [
+        "You are helping an operator turn a rough idea into ONE task "
+        "specification for an automated implementation loop. You are NOT "
+        "writing the task. You are asking the questions that would let them "
+        "write it.",
+        "",
+        "THE IDEA, as they wrote it:",
+        draft.idea.strip() or "(blank)",
+        "",
+    ]
+    answered = [q for q in draft.questions if q.answered]
+    if answered:
+        lines.append("ALREADY ANSWERED — do not ask these again:")
+        lines += [f"- {q.text} => {q.answer}" for q in answered]
+        lines.append("")
+    open_questions = [q for q in draft.questions if not q.answered]
+    if open_questions:
+        lines.append("ALREADY ASKED and still open — do not repeat these either:")
+        lines += [f"- {q.text}" for q in open_questions]
+        lines.append("")
+    if draft.evidence:
+        lines.append(
+            "ALREADY KNOWN about the repository (read mechanically, not by you "
+            "— do not restate any of it as a question or as a finding):"
+        )
+        lines += [f"- {item.text}" for item in draft.evidence]
+        lines.append("")
+    lines += [
+        "Ask AT MOST 5 and at least 3 NEW questions that would sharpen this "
+        "into something a reviewer could judge. Rules:",
+        "- Each one must be about the DESIGN SPACE — an option the operator "
+        "has to choose between, e.g. 'does this need to remember where you "
+        "stopped reading?'. Offer the option; do not choose it.",
+        "- 'No' must be a cheap, sensible answer to every one of them.",
+        "- Do not ask what would prove it worked, or what would make it fail: "
+        "those are already asked verbatim.",
+        "- Do not ask anything the repository could answer; that is read "
+        "mechanically.",
+        "",
+        "Reply with NOTHING but the questions, one per line, each line "
+        "starting with '?'. No preamble, no numbering, no commentary.",
+    ]
+    return "\n".join(lines)
+
+
+def _assumption_lines(draft: IntakeDraft) -> tuple[str, ...]:
+    """What a blank answer was taken to mean, said out loud.
+
+    Only OPTIONAL questions can produce one — a blank required answer blocks
+    the draft instead (`draft_blockers`). Written into the file so the operator
+    corrects it on the next pass rather than discovering it in a task.
+    """
+    return tuple(
+        f"{q.text} — left blank, so this is being treated as 'you decide': the "
+        "draft claims nothing about it."
+        for q in draft.questions
+        if not q.required and not q.answered
+    )
+
+
+def suggested_paths(repo: Path | None, text: str) -> tuple[str, ...]:
+    """`approved_paths` proposals, each as `path  # reason`.
+
+    From `path_suggest` and from nowhere else — never from the interview, never
+    from a plan reply. That module's docstring is the rule: "A suggestion is not
+    an authorization, and the distinction is the whole design." Filling the
+    field is help; submitting it is the operator's confirmation, exactly as the
+    dashboard's Detect-paths button behaves.
+
+    The trailing comment is the same convention that button uses, and
+    `_strip_path_comment` removes it again at submit: the operator reads
+    reasons, the registry validates paths.
+    """
+    if repo is None:
+        return ()
+    from .path_suggest import suggest
+
+    try:
+        found = suggest(text, Path(repo))
+    except OSError:
+        return ()
+    return tuple(f"{item.path}  # {item.reason}" for item in found)
+
+
+def _seed_task(draft: IntakeDraft, repo: Path | None) -> DraftTask:
+    """The single task a ready draft proposes, with SUGGESTED paths."""
+    return DraftTask(
+        id=draft.slug,
+        title=draft.title,
+        approved_paths=suggested_paths(repo, render_answers(draft)),
+    )
+
+
+def render_answers(draft: IntakeDraft) -> str:
+    """The idea plus every question and answer, as one block of text.
+
+    Used for the description AND as the text the path suggester reads, so the
+    scope proposed reflects everything the operator has said rather than only
+    their opening sentence.
+    """
+    out = [draft.idea.strip()]
+    for question in draft.questions:
+        out.append("")
+        out.append(question.text)
+        out.append(question.answer.strip() or "(left blank — you decide)")
+    return "\n".join(out)
+
+
+def interview_step(
+    path: Path, *, ask=None, repo: Path | None = None
+) -> InterviewPass:
+    """One pass: re-read, keep what is answered, ask sharper ones, re-render.
+
+    The pass NEVER decides the interview is over. It adds questions, adds
+    evidence, records the assumptions blanks imply and — only when
+    `draft_blockers` is empty — emits the `## Draft` section. A provider that
+    fails is reported and costs the pass its optional questions; it cannot
+    advance the draft one inch, because the two questions that gate readiness
+    are constants added here.
+
+    `ask` is injected rather than constructed so a test can drive a pass with a
+    stub, and so the CLI and the dashboard share ONE implementation with one
+    provider wiring (`provider_asker`).
+    """
+    draft = read_draft(path)
+    seen = {_normalize(q.text) for q in draft.questions}
+    added: list[IntakeQuestion] = []
+    for question in REQUIRED_QUESTIONS:
+        if _normalize(question) not in seen:
+            added.append(IntakeQuestion(question, required=True))
+            seen.add(_normalize(question))
+
+    provider_note = ""
+    room = MAX_QUESTIONS_PER_PASS - len(added)
+    if ask is None:
+        provider_note = (
+            "no conversation provider was wired for this pass, so only the "
+            "questions this module holds as constants were added"
+        )
+    elif room > 0:
+        try:
+            reply = ask(interview_prompt(draft))
+        except IntakeError as exc:
+            reply = ""
+            provider_note = (
+                f"the interview could not reach the model: {exc} — the questions "
+                "only you can answer were added anyway; run this again for "
+                "design-space options."
+            )
+        fresh = _questions_from_reply(reply, draft, seen)
+        if not fresh and not provider_note:
+            provider_note = (
+                "the model returned no usable question this pass (a reply with "
+                "no '?' line, or only echoes of what it was given). That is a "
+                "thin pass, NOT a finished interview."
+            )
+        for question in fresh[:room]:
+            added.append(IntakeQuestion(question, required=False))
+            seen.add(_normalize(question))
+
+    questions = draft.questions + tuple(added)
+    known = {item.text for item in draft.evidence}
+    evidence_note = ""
+    new_evidence: tuple[Evidence, ...] = ()
+    if repo is not None:
+        found, evidence_note = repo_evidence(
+            repo, render_answers(replace(draft, questions=questions))
+        )
+        new_evidence = tuple(item for item in found if item.text not in known)
+
+    draft = replace(
+        draft,
+        questions=questions,
+        evidence=draft.evidence + new_evidence,
+    )
+    blockers = draft_blockers(draft)
+    assumptions: tuple[str, ...] = ()
+    if not blockers:
+        # Only now, and only here, does the file gain a task. Assumptions are
+        # written at the same moment for the same reason: this is the point at
+        # which the system PROCEEDS on a blank, and that is when it owes the
+        # operator an account of what it assumed.
+        assumptions = _assumption_lines(draft)
+        merged = list(draft.assumptions)
+        merged += [line for line in assumptions if line not in draft.assumptions]
+        draft = replace(
+            draft,
+            assumptions=tuple(merged),
+            tasks=draft.tasks or (_seed_task(draft, repo),),
+        )
+    _write_atomic(Path(path), render_draft(draft))
+    return InterviewPass(
+        path=Path(path),
+        added_questions=tuple(q.text for q in added),
+        added_evidence=tuple(item.text for item in new_evidence),
+        evidence_note=evidence_note,
+        provider_note=provider_note,
+        open_questions=tuple(q.text for q in draft.questions if not q.answered),
+        blockers=blockers,
+        assumptions=assumptions,
+    )
+
+
+# ---- the provider seat -----------------------------------------------------
+
+
+def provider_asker(config):
+    """An `ask` callable backed by the CONFIGURED conversation provider.
+
+    `[conversation] provider`, not a new one, and for three reasons: it is
+    already configured with a credential and a failure mode the operator knows;
+    a second provider is a second thing to break and to keep in sync with the
+    adapters; and the interview runs at authoring time, outside a round, so it
+    never competes with the reviewer for the same session.
+
+    Every transport fault becomes an `IntakeError` carrying the transport's own
+    remedy text, because that is what the operator can act on — and because the
+    caller's whole error policy is "a failed ask is a thin pass", which needs
+    one exception type to be true.
+    """
+
+    def ask(prompt: str) -> str:
+        import uuid
+
+        from .conversation import (
+            SubmitResult,
+            create_conversation,
+            transport_remedy,
+        )
+        from .errors import AutoloopError
+
+        provider = config.conversation.provider
+        try:
+            client = create_conversation(provider, config)
+        except AutoloopError as exc:
+            raise IntakeError(f"{provider} could not be started: {exc}") from exc
+        request_id = f"intake-{uuid.uuid4().hex[:12]}"
+        try:
+            client.attach()
+            if client.submit(request_id, prompt) is SubmitResult.REJECTED:
+                raise IntakeError(
+                    f"{provider} refused the intake question. "
+                    f"{transport_remedy(provider)}"
+                )
+            return client.await_response(request_id)
+        except AutoloopError as exc:
+            raise IntakeError(
+                f"{provider} did not answer: {exc}. {transport_remedy(provider)}"
+            ) from exc
+        finally:
+            try:
+                client.close()
+            except (OSError, AutoloopError):
+                pass
+
+    return ask
+
+
+# ---- phase 3: one level of decomposition, through the existing verb --------
+
+
+@dataclass(frozen=True)
+class PlanPass:
+    path: Path
+    tasks: tuple[str, ...] = ()
+    note: str = ""
+
+
+def plan_prompt(draft: IntakeDraft) -> str:
+    """Ask for the `plan` directive the contract already defines.
+
+    No second decomposer is built here. `Decision.PLAN` already carries
+    `tasks: [TaskSpec]` and `TaskRegistry.add_many` already validates every
+    path fail-closed; what was missing was an ENTRY POINT that submits a goal
+    for planning, which is this.
+    """
+    from .contract import PROTOCOL_VERSION
+
+    return "\n".join(
+        [
+            "Split ONE goal into a small number of tasks — ONE LEVEL ONLY.",
+            "",
+            "Do not decompose further than one level. A task that turns out to "
+            "be too large is split later, by a reviewer holding that task's own "
+            "evidence, when it actually refuses to fit — not now, on a guess.",
+            "",
+            "THE GOAL:",
+            render_answers(draft),
+            "",
+            "Reply with ONE fenced json block and nothing else — the SAME "
+            "directive shape the reviewer uses, parsed by the same "
+            "`contract.parse_response`, because there is no second decomposer "
+            "here:",
+            f'{{"version": {PROTOCOL_VERSION}, "decision": "plan", '
+            '"reason": "<why this split>", "tasks": [{"id": "<slug>", '
+            '"title": "<title>", "description": "<what to build and what must '
+            'not break>", "depends_on": []}]}',
+            "",
+            "Omit approved_paths: the scope is proposed mechanically from the "
+            "repository and confirmed by a human, and anything you wrote there "
+            "would be discarded.",
+        ]
+    )
+
+
+def plan_step(path: Path, *, ask, repo: Path | None = None) -> PlanPass:
+    """Replace a ready draft's single task with the one-level split of it.
+
+    Refuses on a draft that is not ready (`draft_blockers`) and on one that
+    ALREADY holds more than one task — that would be a second level, and a
+    second level is `split-03`'s, issued by a reviewer with the failing task's
+    evidence in front of it. There is no recursive mode here to build.
+
+    `approved_paths` on every produced task is re-derived from `path_suggest`
+    and the reply's own paths are dropped, so a plan cannot arrive carrying its
+    own permission slip.
+    """
+    from .contract import ContractError, Decision, parse_response
+
+    draft = read_draft(path)
+    blockers = draft_blockers(draft)
+    if blockers:
+        raise IntakeError(
+            "this draft is not ready to be split: " + "; ".join(blockers)
+        )
+    if len(draft.tasks) > 1:
+        raise IntakeError(
+            f"this draft already holds {len(draft.tasks)} tasks — planning it "
+            "again would be a second level, which belongs to the reviewer that "
+            "sees a task actually refuse to fit, not to this command"
+        )
+    reply = ask(plan_prompt(draft))
+    try:
+        directive = parse_response(reply)
+    except ContractError as exc:
+        raise IntakeError(f"the reply was not a usable directive: {exc}") from exc
+    if directive.decision is not Decision.PLAN or not directive.tasks:
+        raise IntakeError(
+            f"expected a 'plan' directive; got {directive.decision.value!r}. "
+            "Nothing was written."
+        )
+    tasks = [
+        DraftTask(
+            id=spec.id,
+            title=spec.title,
+            depends_on=tuple(spec.depends_on),
+            # `spec.approved_paths` is DISCARDED, deliberately and silently to
+            # the model: a plan that could name its own scope would be a task
+            # arriving with its own permission slip, which is exactly the
+            # circularity `docs/SECURITY.md` #2 closes.
+            approved_paths=suggested_paths(repo, f"{spec.title}\n{spec.description}"),
+            description=spec.description,
+        )
+        for spec in directive.tasks
+    ]
+    _write_atomic(Path(path), render_draft(replace(draft, tasks=tuple(tasks))))
+    return PlanPass(
+        path=Path(path),
+        tasks=tuple(task.id for task in tasks),
+        note=directive.reason,
+    )
+
+
+# ---- submission: the ONLY thing here that queues anything ------------------
+
+
+def _strip_path_comment(entry: str) -> str:
+    return entry.split("#", 1)[0].strip()
+
+
+def render_task_description(draft: IntakeDraft, task: DraftTask) -> str:
+    """The description the queued task carries.
+
+    Derived from the artifact at SUBMIT time rather than stored, so the
+    operator editing any part of the file — an answer, an evidence line, an
+    assumption — changes what is filed. That is the point of the file being the
+    exchange: there is no translation step in which the meaning drifts.
+    """
+    out = [task.description.strip()] if task.description.strip() else []
+    out.append(render_answers(draft))
+    if draft.evidence:
+        out += ["", "Evidence read from the repository (each one is checkable):"]
+        out += [
+            f"- {item.text}" + (f" [{item.source}]" if item.source else "")
+            for item in draft.evidence
+        ]
+    if draft.assumptions:
+        out += ["", "Assumed from a blank answer:"]
+        out += [f"- {line}" for line in draft.assumptions]
+    out += [
+        "",
+        f"Authored through `python -m autoloop intake` ({draft.slug}.md). "
+        "approved_paths were proposed by path_suggest and confirmed by the "
+        "operator, who submitted this.",
+    ]
+    return "\n".join(out).strip()
+
+
+def draft_specs(draft: IntakeDraft) -> list[dict]:
+    """The inbox creation requests this draft would file. Queues NOTHING.
+
+    Separated from `submit_draft` so both the CLI and the dashboard can show an
+    operator exactly what a submit would send, and so `submit_draft` can
+    shape-check every spec BEFORE queueing any of them.
+    """
+    blockers = draft_blockers(draft)
+    if blockers:
+        raise IntakeError(
+            "this draft is not finished: "
+            + "; ".join(blockers)
+            + ". Run `intake ask` and answer the `?!` questions."
+        )
+    if not draft.tasks:
+        raise IntakeError(
+            "there is no `## Draft` section yet — run `intake ask` until it "
+            "emits one (it does that only once the `?!` questions are answered)"
+        )
+    specs: list[dict] = []
+    for task in draft.tasks:
+        paths = [p for p in (_strip_path_comment(e) for e in task.approved_paths) if p]
+        if not paths:
+            # A UI precondition, in the same terms `dashboard._submit_task`
+            # uses it: the registry accepts an empty scope and the orchestrator
+            # then refuses to dispatch the task forever, so filing one is a
+            # trap rather than a task.
+            raise IntakeError(
+                f"task {task.id!r} has no approved paths — a task with no "
+                "authorized scope can never be dispatched. Edit the "
+                "`approved_paths:` list under `### task: " + task.id + "`."
+            )
+        specs.append(
+            {
+                "kind": KIND_TASK,
+                "id": task.id,
+                "title": task.title,
+                "description": render_task_description(draft, task),
+                "priority": task.priority,
+                "depends_on": list(task.depends_on),
+                "approved_paths": paths,
+            }
+        )
+    return specs
+
+
+def submit_draft(path: Path, inbox: TaskInbox) -> list[tuple[str, Path]]:
+    """File this draft through the inbox. The ONE place intake queues anything.
+
+    Every spec is shape-checked against `check_request_shape` — the same
+    function `TaskInbox.submit` calls — BEFORE any of them is written, so a
+    two-task plan whose second task is malformed queues neither. Half a split
+    is worse than none: the operator would have to work out which half landed.
+
+    Nothing else changes. The registry still validates the graph on merge, the
+    loop still drains between steps, and the draft file is left exactly where
+    it is — it is the operator's record of what they filed.
+
+    The pre-check cannot make the WRITES atomic — the inbox is a directory of
+    files and has no transaction — so a disk failure between the first and the
+    second still leaves a partial split. That case REPORTS what landed rather
+    than raising a bare `OSError`, because the recovery ("re-submit only the
+    missing half, or delete the queued file") depends on knowing which one it
+    was, and a traceback does not say.
+    """
+    draft = read_draft(path)
+    specs = draft_specs(draft)
+    for spec in specs:
+        check_request_shape(spec)
+    filed: list[tuple[str, Path]] = []
+    for spec in specs:
+        try:
+            filed.append((str(spec["id"]), inbox.submit(spec)))
+        except OSError as exc:
+            landed = ", ".join(task_id for task_id, _ in filed) or "(nothing)"
+            raise IntakeError(
+                f"could not queue {spec['id']!r}: {exc}. Already queued and "
+                f"still in the inbox: {landed}. Nothing was rolled back — "
+                "re-submitting this draft would queue those a second time, so "
+                "delete them from the inbox first or file the rest by hand."
+            ) from exc
+    return filed
+
+
+# ---- phase 1: suggest, so the operator never faces a blank page ------------
+
+
+@dataclass(frozen=True)
+class WorkSuggestion:
+    """One concrete thing worth doing, WITH the source it came from.
+
+    **A suggestion that cannot name a file, a finding id, a measurement or a
+    task id must not be offered.** A system that suggests work will keep
+    suggesting work whether or not any is needed, so the citation is not a
+    courtesy — it is the only thing separating this from noise dressed as
+    initiative. Every producer below reads a real artifact and puts its path or
+    id in `cite`.
+    """
+
+    key: str
+    source: str
+    cite: str
+    headline: str
+    fingerprint: str
+
+    def as_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "source": self.source,
+            "cite": self.cite,
+            "headline": self.headline,
+            "fingerprint": self.fingerprint,
+        }
+
+
+def _fingerprint(*parts: str) -> str:
+    """Identity of the EVIDENCE behind a suggestion, for the decline ledger.
+
+    Over the finding id and its headline — stable text from a rendered report —
+    and deliberately NOT over anything that moves on its own (a date, a count,
+    a rendered "N open"). A fingerprint that changed by itself would expire
+    every decline immediately, which is the same as not recording them.
+    """
+    return hashlib.sha256(" ".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def audit_finding_suggestions(repo: Path, report_glob: str, registry_text: str):
+    """Findings in the rendered audit reports that the registry never mentions.
+
+    "Unactioned" is answered mechanically and narrowly: the finding's qualified
+    id does not appear anywhere in `tasks.json`. That is checkable by the
+    operator in one grep, which is the property that matters — a cleverer test
+    would be one they could not verify.
+    """
+    out: list[WorkSuggestion] = []
+    root = Path(repo)
+    try:
+        reports = sorted(root.glob(report_glob))
+    except (OSError, ValueError):
+        return out
+    for report in reports:
+        try:
+            text = report.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            cite_path = str(report.relative_to(root))
+        except ValueError:
+            cite_path = report.name
+        for line in text.splitlines():
+            match = _AUDIT_FINDING_RE.match(line)
+            if not match:
+                continue
+            qualified, headline = match.group(1), match.group(2)
+            if qualified in registry_text:
+                continue
+            out.append(
+                WorkSuggestion(
+                    key=f"audit_finding:{qualified}",
+                    source="audit_finding",
+                    cite=f"{cite_path} — finding {qualified}, unmentioned in tasks.json",
+                    headline=headline,
+                    fingerprint=_fingerprint(qualified, headline),
+                )
+            )
+    return out
+
+
+def ready_task_suggestions(tasks_data) -> list[WorkSuggestion]:
+    """Tasks already on the roadmap whose dependencies are all done.
+
+    The operator may simply not know these are waiting, and offering one costs
+    nothing: it is work already authored and already scoped.
+    """
+    rows = (tasks_data or {}).get("tasks") if isinstance(tasks_data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    done = {
+        str(r.get("id")): str(r.get("status") or "pending")
+        for r in rows
+        if isinstance(r, dict) and r.get("id")
+    }
+    out: list[WorkSuggestion] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        task_id = str(row.get("id") or "")
+        if not task_id or done.get(task_id) != "pending":
+            continue
+        deps = row.get("depends_on") or ()
+        if not isinstance(deps, (list, tuple)):
+            continue
+        if any(done.get(str(d)) not in ("completed", "shipped_elsewhere") for d in deps):
+            continue
+        title = str(row.get("title") or "")
+        out.append(
+            WorkSuggestion(
+                key=f"ready_task:{task_id}",
+                source="ready_task",
+                cite=f"tasks.json — task {task_id}, pending with every dependency done",
+                headline=title or task_id,
+                fingerprint=_fingerprint(task_id, title),
+            )
+        )
+    return out
+
+
+def open_blocker_suggestions(blockers_dir: Path) -> list[WorkSuggestion]:
+    """Defects the loop itself recorded and has not had answered.
+
+    A measured number in the loop's own records: each one is a round that
+    stopped, with an id, a code and the question it stopped on. Cited by the
+    record's own filename so the operator can open it.
+    """
+    directory = Path(blockers_dir)
+    if not directory.is_dir():
+        return []
+    out: list[WorkSuggestion] = []
+    for path in sorted(directory.glob("*.json")):
+        data = _read_json(path)
+        if not isinstance(data, dict):
+            continue
+        if data.get("resolved_at") or data.get("archived_reason"):
+            continue
+        blocker_id = str(data.get("id") or path.stem)
+        code = str(data.get("code") or "")
+        question = str(data.get("question") or "").strip().splitlines()[:1]
+        headline = (question[0] if question else code or blocker_id)[:200]
+        out.append(
+            WorkSuggestion(
+                key=f"open_blocker:{blocker_id}",
+                source="open_blocker",
+                cite=f"{path.name} — open blocker {blocker_id} ({code})",
+                headline=headline,
+                fingerprint=_fingerprint(blocker_id, code),
+            )
+        )
+    return out
+
+
+def declines_file(intake_dir: Path) -> Path:
+    """The decline ledger — a sibling of the drafts, inside the intake dir.
+
+    NOT inside the inbox directory: `TaskInbox.drain` globs `*.json` there and
+    moves anything it cannot parse into `rejected/`, which would eat this file
+    and report a problem line for it on the next drain.
+    """
+    return Path(intake_dir) / "declined.json"
+
+
+def load_declines(intake_dir: Path) -> dict:
+    data = _read_json(declines_file(intake_dir))
+    return data if isinstance(data, dict) else {}
+
+
+def record_decline(intake_dir: Path, key: str, fingerprint: str) -> Path:
+    """Remember that this was declined, AGAINST THE EVIDENCE IT CARRIED.
+
+    Declining must be free, and it must stick: re-offering the same finding
+    tomorrow teaches the operator to stop reading the offers. It stops sticking
+    only when the evidence itself changes — a re-worded finding, a task whose
+    title moved — which is the "without new evidence" half of the rule.
+    """
+    path = declines_file(intake_dir)
+    data = load_declines(intake_dir)
+    data[str(key)] = str(fingerprint)
+    _write_atomic(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+@dataclass(frozen=True)
+class SuggestionOffer:
+    suggestions: tuple[WorkSuggestion, ...] = ()
+    sources: tuple[str, ...] = ()
+    declined: int = 0
+
+
+def gather_suggestions(
+    repo: Path,
+    *,
+    report_glob: str,
+    tasks_file: Path,
+    blockers_dir: Path,
+    intake_dir: Path,
+    limit: int = MAX_WORK_SUGGESTIONS,
+) -> SuggestionOffer:
+    """Two or three concrete things to do, each citing where it came from.
+
+    Round-robin across the sources rather than taking the first three of
+    whichever one is longest: a panel showing three findings from one report is
+    a report, and the point of this is a CHOICE.
+
+    Every source reports whether it was READ, including when it found nothing —
+    an empty offer with no explanation is indistinguishable from "there is
+    nothing to do", and one of those two is a lie.
+    """
+    tasks_data = _read_json(tasks_file)
+    try:
+        registry_text = Path(tasks_file).read_text(encoding="utf-8")
+    except OSError:
+        registry_text = ""
+    findings = audit_finding_suggestions(repo, report_glob, registry_text)
+    ready = ready_task_suggestions(tasks_data)
+    blocked = open_blocker_suggestions(blockers_dir)
+    sources = [
+        f"audit reports ({report_glob}): {len(findings)} finding(s) the registry "
+        "never mentions",
+        (
+            f"{tasks_file}: {len(ready)} ready task(s)"
+            if tasks_data is not None
+            else f"{tasks_file}: NOT READ (missing or unparseable) — 0 ready tasks "
+            "reported, which is not the same as none existing"
+        ),
+        (
+            f"{blockers_dir}: {len(blocked)} open blocker record(s)"
+            if Path(blockers_dir).is_dir()
+            else f"{blockers_dir}: NOT READ (no such directory)"
+        ),
+    ]
+    declines = load_declines(intake_dir)
+    picked: list[WorkSuggestion] = []
+    skipped = 0
+    pools = [findings, ready, blocked]
+    index = 0
+    while len(picked) < limit and any(pools):
+        pool = pools[index % len(pools)]
+        index += 1
+        if not pool:
+            continue
+        item = pool.pop(0)
+        if declines.get(item.key) == item.fingerprint:
+            skipped += 1
+            continue
+        picked.append(item)
+    return SuggestionOffer(
+        suggestions=tuple(picked), sources=tuple(sources), declined=skipped
+    )
+
+
+def draft_from_suggestion(intake_dir: Path, suggestion: WorkSuggestion, slug: str = ""):
+    """Turn an ACCEPTED suggestion into a draft — through `create_draft`.
+
+    The handoff passes through a human: the system offers, the operator picks,
+    and only then does a file exist. Nothing here submits, and the citation is
+    carried into the idea text so the draft can still name where it came from
+    after the offer is gone.
+    """
+    idea = "\n".join(
+        [
+            suggestion.headline,
+            "",
+            f"Offered by `intake suggest` from {suggestion.cite}.",
+            "Rewrite this in your own words — the citation above is the "
+            "evidence, not the specification.",
+        ]
+    )
+    return create_draft(intake_dir, slug or slug_for(suggestion.key), idea)
