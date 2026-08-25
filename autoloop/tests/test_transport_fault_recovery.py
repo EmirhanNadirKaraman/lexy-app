@@ -29,10 +29,12 @@ Four properties, and the fourth is the one a rename would fail:
 3. an unrecoverable `awaiting` is replayed — but ONLY on `idempotent_submit`,
    only in `awaiting`, only after `reconcile` confirms absence, and only within
    a bound (§3);
-4. the browser provider's restart, cooldown, rotation and fault-budget
-   behaviour is unchanged, which the untouched `test_rounds_and_restart.py` and
+4. the browser provider's restart, cooldown and fault-budget behaviour is
+   unchanged, which the untouched `test_rounds_and_restart.py` and
    `test_transport_recovery.py` suites assert directly and §4 re-checks through
-   the new dispatch site.
+   the new dispatch site. (Conversation rotation was the fourth item on that
+   list until brw-15 removed it; §4's browser/codex split is now about the
+   REMEDY each park quotes, not about which recovery each transport gets.)
 
 No codex binary is involved: `CodexRunner` is a protocol and every test injects
 a fake, exactly as `test_codex_provider.py` does.
@@ -954,11 +956,14 @@ class RejectingClient(PlainClient):
 
 def test_two_disproven_codex_sends_never_park_on_browser_advice(tmp_path, restarts):
     """THE reachable door, and the one an adversarial pass found last: two
-    consecutive REJECTED sends reach `_attempt_rotation` from
-    `_step_submission_rejected` WITHOUT passing any fault handler, so none of
-    the routing guards above see it. With `browser.project_url` unset — the
+    consecutive REJECTED sends leave `_step_submission_rejected` WITHOUT passing
+    any fault handler, so none of the routing guards above see them. They used
+    to reach `_attempt_rotation`, and with `browser.project_url` unset — the
     normal codex deployment — the park told the operator to set it "to the
-    ChatGPT project this conversation belongs to"."""
+    ChatGPT project this conversation belongs to". Since brw-15 the rotation is
+    gone entirely and the park is `send_rejected_twice`; the property this test
+    was written for is unchanged and is the reason it survives — the remedy
+    names the transport actually in use."""
     client = RejectingClient()
     orch, store, config = build(
         tmp_path,
@@ -968,29 +973,30 @@ def test_two_disproven_codex_sends_never_park_on_browser_advice(tmp_path, restar
         restart_command=RESTART_COMMAND,
     )
 
-    # submit -> rejected -> reconcile+resend -> rejected -> reconcile -> rotate
+    # submit -> rejected -> reconcile+resend -> rejected -> reconcile -> park
     orch.run(max_steps=5)
 
     assert orch.state.phase == Phase.NEEDS_USER.value
-    assert park_code(config) == "rotation_unsupported_by_transport"
+    assert park_code(config) == "send_rejected_twice"
     question = orch.state.question or ""
     assert "codex_cli" in question
     assert "codex exec" in question, "the remedy acts on the transport in use"
     assert "browser.project_url" not in question
     assert "chrome_restart" not in question
-    # Nothing was rotated and no rotation budget was spent — a transport with no
-    # rotation surface is not being denied a recovery it ever had.
+    assert "conversation_url" not in question, "no browser advice for a codex run"
+    # Nothing was rotated and no rotation budget was spent.
     assert orch.state.rotations == 0
     assert rows(config, "conversation_rotated") == []
     assert restarts == []
 
 
-def test_a_stale_project_url_cannot_spend_a_rotation_on_a_codex_run(tmp_path, restarts):
+def test_a_stale_project_url_changes_nothing_on_a_codex_run(tmp_path, restarts):
     """The other half, and the worse one: an operator who moved from the browser
-    to codex and left `[browser]` populated used to PASS both preconditions,
-    spend `state.rotations`, and only then fail inside `_rotate_conversation`
-    because the transport has no `retarget`. The refusal now happens before
-    either, so a leftover config value cannot cost a budget."""
+    to codex and left `[browser]` populated used to PASS both rotation
+    preconditions, spend `state.rotations`, and only then fail inside
+    `_rotate_conversation` because the transport has no `retarget`. Nothing
+    consults `browser.project_url` on this path any more, so a leftover config
+    value cannot cost a budget or change a single word of the park."""
     client = RejectingClient()
     orch, store, config = build(
         tmp_path,
@@ -1003,15 +1009,22 @@ def test_a_stale_project_url_cannot_spend_a_rotation_on_a_codex_run(tmp_path, re
     orch.run(max_steps=5)
 
     assert orch.state.rotations == 0, "the budget must not be spent"
-    assert park_code(config) == "rotation_unsupported_by_transport"
-    assert "browser.project_url" not in (orch.state.question or "")
+    assert park_code(config) == "send_rejected_twice"
+    question = orch.state.question or ""
+    assert "browser.project_url" not in question
+    assert "g-p-leftover" not in question
+    assert "codex exec" in question
 
 
-def test_the_browser_still_rotates_and_still_parks_the_way_it_did(tmp_path, restarts):
-    """The bound: for a browser run both pre-existing refusals are untouched —
-    a missing `browser.project_url` still parks `rotation_unavailable` naming
-    that key, which `test_transport_recovery.py` pins and this re-checks past
-    the new branch."""
+def test_the_browser_parks_on_the_same_code_with_its_own_remedy(tmp_path, restarts):
+    """The bound on the two tests above: the split they assert is about the
+    REMEDY, not about the outcome. A browser run reaching the same two disproven
+    sends parks on the same `send_rejected_twice` code — it is the same fault —
+    and gets browser-shaped advice instead of codex-shaped advice.
+
+    Before brw-15 the two transports diverged at the code as well (the browser's
+    missing `browser.project_url` parked `rotation_unavailable` naming that
+    key), which is the divergence the removal collapses."""
     client = RejectingClient()
     orch, store, config = build(
         tmp_path,
@@ -1022,8 +1035,11 @@ def test_the_browser_still_rotates_and_still_parks_the_way_it_did(tmp_path, rest
 
     orch.run(max_steps=5)
 
-    assert park_code(config) == "rotation_unavailable"
-    assert "browser.project_url" in (orch.state.question or "")
+    assert park_code(config) == "send_rejected_twice"
+    question = orch.state.question or ""
+    assert "browser.conversation_url" in question, "the browser's own remedy"
+    assert "codex exec" not in question
+    assert "browser.project_url" not in question, "nothing consults it any more"
     assert orch.state.rotations == 0
 
 

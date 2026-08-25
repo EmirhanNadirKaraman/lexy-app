@@ -30,9 +30,13 @@ implements only the protocol above stays valid:
   provider can positively disprove acceptance (see `browser/observation.py`). An
   adapter that cannot returns UNCONFIRMED for the same situation, which is the
   historical behaviour: ambiguity, park for a human.
-* **Rotation** — `retarget(url)` + `current_url()` let the orchestrator move an
-  in-flight request to a replacement conversation. Without them, a wedged
-  conversation parks instead of rotating.
+* **Retargeting** — `retarget(url)` + `current_url()`. `retarget` is still used,
+  by `Orchestrator._client_for_request`, to aim the client at the conversation
+  THIS request is bound to rather than at the loop's current one; an adapter
+  without it is simply never re-aimed. Both were also the surface conversation
+  ROTATION drove, and that is gone since brw-15 (2026-08-25): a wedged
+  conversation parks, and moving the loop to a fresh chat is an operator action.
+  `current_url` now has no caller outside the browser adapter itself.
 * **Chunked delivery** — `supports_chunked_delivery` declares that this adapter
   holds ONE persistent conversation, so a review packet whose diff is too large
   for a single message may be deposited as numbered parts before the message

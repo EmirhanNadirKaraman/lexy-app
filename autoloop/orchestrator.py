@@ -56,25 +56,47 @@ Transport-recovery additions (this change):
   ONE same-chat resend of the same request id. Unknown acceptance still never
   earns a resend — the whole point of the distinction.
 * A second confirmed rejection, or a conversation that is structurally unusable,
-  may `rotate`: open one fresh chat in the configured project, prove it usable,
-  and rebind the in-flight request to it. Bounded by
-  `policy.max_conversation_rotations` (default 1 per run); no project URL
-  configured means no rotation, ever — the loop parks instead.
+  PARKS the loop (`send_rejected_twice`, `conversation_unusable`) — see
+  "Conversation rotation is gone" below for what used to happen instead.
 * Every request carries its OWN authoritative `conversation_url` and
   `conversation_epoch`. Submitting, awaiting and reconciling all follow the
   request's URL, never the loop's current one, so a late reply in an abandoned
   chat cannot authorize anything.
 * A CONFIRMED, persisted send whose assistant turn never begins generating
-  (`ResponseTimeoutError` with `stage="start"`, repeated) is a THIRD, distinct
-  rotation trigger — the "silent conversation" — layered on top of the
-  ordinary failure budget rather than routed around it. Three consecutive
-  such timeouts for the same request, an accumulated measured wait of at
-  least 3x `response_start_timeout_seconds`, and a FINAL reconciliation that
-  still finds no assistant turn started, together authorize exactly one
-  rotation (`_handle_response_start_timeout` / `_attempt_silence_rotation`).
-  A response that already started and is merely slow (`stage="complete"`)
-  never qualifies, and a reply that appears during that final reconciliation
-  cancels the attempt.
+  (`ResponseTimeoutError` with `stage="start"`) is counted per request
+  (`PendingRequest.start_timeouts` / `start_timeout_wait_seconds`) and then
+  handed to the ordinary failure budget like any other transport fault. The
+  counters are diagnostic: they used to earn a third recovery, and nothing
+  acts on them now (see below).
+
+Conversation rotation is gone (brw-15, 2026-08-25):
+
+* Until this change a wedged conversation could `rotate`: open one fresh chat in
+  `browser.project_url`, post the in-flight request into it, prove the chat
+  holds it, and rebind the loop. `_attempt_rotation`, `_attempt_silence_rotation`,
+  `_rotate_conversation`, `_park_rotation` and their helpers are removed, and
+  with them the blocker codes only they could raise — `rotation_unavailable`,
+  `rotation_cap_reached`, `rotation_failed` and
+  `rotation_unsupported_by_transport`.
+* Why: rotation is a ChatGPT-project concept end to end, and the DEFAULT
+  transport is a subprocess with no conversation to rotate away from — see
+  `conversation._BROWSER_BACKED`, which is where this module is allowed to know
+  a provider by name and this docstring is not. Two disproven sends on such a
+  transport reached the machinery without passing any fault handler, and 11 of
+  the loop's first 103 blocker records were `rotation_failed` — a recovery that
+  parked more runs than it saved. Parking is what a wedged conversation gets
+  now, and moving the loop to a fresh chat is an operator action
+  (`browser.conversation_url` + `reset`).
+* What stays: `state.rotations`, `state.last_rotation` and
+  `policy.max_conversation_rotations` are untouched in `state.py` / `policy.py`,
+  so `cli._drift_is_recorded_rotation` still recognises a config/state
+  disagreement left by a rotation an OLDER process performed. Nothing in this
+  module increments the counter any more, so on a state file written from here
+  it reads 0.
+* `autoloop/browser/` still ships `retarget`/`current_url`/
+  `find_conversation_with`. `find_conversation_with` is live — the by-content
+  presence search (`_search_for_request`) uses it; the other two are now only
+  used by the browser adapter itself.
 
 Urgent preemption (2026-08-22):
 
@@ -106,10 +128,9 @@ Urgent preemption (2026-08-22):
 Note for the merge with the blocker/quarantine work (commit 5346551, branch
 `feat/autoloop-postcommit-review`): every park site added here goes through the
 existing two-argument `_to_needs_user` and emits a stable `reason_code` in its
-transcript event (`submission_unknown`, `rotation_unavailable`,
-`rotation_cap_reached`, `rotation_failed`, `conversation_unusable`). When the two
-lines meet, classifying them is a matter of passing the kind that matches each
-code — no new taxonomy is invented here.
+transcript event (`submission_unknown`, `send_rejected_twice`,
+`conversation_unusable`). When the two lines meet, classifying them is a matter
+of passing the kind that matches each code — no new taxonomy is invented here.
 
 Failure routing:
 
@@ -157,9 +178,9 @@ A transport without that declaration is never re-run automatically.
                                  server. A limit that has already cleared
                                  resumes without a wait
                                  (`_classify_rate_limit_state`)
-* ResponseTimeoutError(start)  → ordinary budget as below, PLUS: 3rd
-                                 consecutive one for the same request may
-                                 rotate (see "silent conversation" above)
+* ResponseTimeoutError(start)  → ordinary budget as below. The per-request
+                                 timeout counters are still kept (see above);
+                                 nothing acts on them since brw-15
 * other BrowserError           → drop conversation, try a browser restart,
                                  retry same phase; failure budget exhausted →
                                  failed (resume via --retry). EXCEPT when the
@@ -268,7 +289,6 @@ from .browser.observation import SendOutcome
 from .browser.playwright_session import attachable_page_targets
 from .changeset_review import ChangesetBinding
 from .config import AutoloopConfig
-from .config_writer import update_conversation_url
 from .context import build_context, render_context
 from .conversation import transport_is_browser_backed, transport_remedy
 from .contract import (
@@ -284,7 +304,6 @@ from .contract import (
     verify_review,
 )
 from .errors import (
-    AutoloopError,
     BrowserError,
     ContractError,
     ConversationSearchInconclusive,
@@ -339,7 +358,6 @@ from .state import (
     Phase,
     PostcommitBinding,
     ProviderSwitch,
-    RotationRecord,
     StateStore,
     StopRepetitionStore,
     postcommit_binding_from_record,
@@ -1046,53 +1064,12 @@ def _preemption_stop_reason(target: Task, displaced_id: str, record: dict) -> st
 #: (`cli._clear_fault_budget_on_answer`).
 MAX_TASK_FAULT_ATTEMPTS = 5
 
-#: Appended to a request that is being re-sent into a replacement conversation.
-#: One line, because the payload it follows is already self-contained — every
-#: turn carries its own CONTEXT block and the full response contract. It says
-#: which conversation is authoritative and nothing else; replaying the
-#: abandoned chat's history by hand would be reconstructing evidence rather
-#: than continuing work.
-CONTINUATION_NOTE = (
-    "[autoloop transport note] This request continues an Autoloop session after "
-    "a conversation-transport recovery. The previous conversation is abandoned "
-    "and nothing in it is authoritative. Reply only here; this conversation is "
-    "the only one Autoloop reads."
-)
-
-
-#: A replacement chat has no address inside the project until its first turn is
-#: processed, so the rotation polls for one. Bounded: an address that never
-#: becomes a project conversation is a failed rotation, not something to wait on
-#: forever.
-#: How long to wait for the address bar to show a conversation UNDER THE
-#: PROJECT after a rotation posts — not merely an address that differs from
-#: the project page, which is what this used to wait for and is evidence of
-#: nothing (see `PLACEHOLDER_CONVERSATION_PREFIX`). Only the FAST PATH — when
-#: it expires, the chat is found by the request id it contains
-#: (`find_conversation_with`), so this being short costs a few page loads
-#: rather than the whole rotation. It used to be the only witness, and 20s
-#: against an account whose composer needs 180s failed three rotations that
-#: had actually succeeded. 30s is deliberate on that account: the content
-#: search is the backstop, so a longer wait would only delay it.
-ROTATION_URL_TIMEOUT_SECONDS = 30.0
-ROTATION_URL_POLL_SECONDS = 0.5
-
-#: The address a chat opened from a project page carries BEFORE its first
-#: message lands: `https://chatgpt.com/c/WEB:<uuid>` — note it is not under the
-#: project prefix at all, so it fails the membership check exactly like a chat
-#: in some other project would (2026-08-16, one LOOP-FATAL park). It is used
-#: ONLY to explain a refusal to the operator; nothing branches on it, because a
-#: URL shape ChatGPT owns is the wrong thing to build control flow on, and an
-#: address about to gain the project prefix must be waited through, not judged.
-PLACEHOLDER_CONVERSATION_PREFIX = "WEB:"
-
-
 def _conversation_id(url: str) -> str | None:
     """The id a `/c/<id>` URL ends with, or None for anything else.
 
     Mirrors `BrowserChatGPT._conversation_id` deliberately rather than
     importing it: URL comparison on the orchestrator's side of the seam is
-    already its own (`_url_in_project`), and the alternative is the
+    already its own (`_same_conversation`), and the alternative is the
     orchestrator reaching into one adapter's private helper to reason about
     conversations every provider has.
     """
@@ -1100,18 +1077,6 @@ def _conversation_id(url: str) -> str | None:
     if len(segs) >= 2 and segs[-2] == "c":
         return segs[-1]
     return None
-
-
-def _is_placeholder_conversation(url: str) -> bool:
-    """True for the pre-persistence address a brand-new chat carries.
-
-    Explanatory only — see `PLACEHOLDER_CONVERSATION_PREFIX`. A rotation waits
-    the same bounded wait for EVERY address that is not yet inside the project;
-    this exists so the park it eventually writes says "the placeholder was
-    still there" instead of leaving an operator to recognise the shape.
-    """
-    conversation = _conversation_id(url)
-    return bool(conversation and conversation.startswith(PLACEHOLDER_CONVERSATION_PREFIX))
 
 
 #: The four outcomes of `Orchestrator._browser_restart_outcome`. They are
@@ -1330,9 +1295,11 @@ class Orchestrator:
         #: LIVE `remote.<remote>.url` before every publish and refuses (never
         #: auto-heals) on a mismatch — see that method's docstring.
         self._publisher_url_snapshot = publisher_url_snapshot
-        #: Where the config file lives, so a completed rotation can point it at
-        #: the replacement conversation. Defaults to the conventional location
-        #: under `state_dir`; the CLI passes the path it actually loaded, since
+        #: Where the config file lives. Its one writer, the rotation's config
+        #: heal, is gone since brw-15; the path is still carried because
+        #: `cli._build_orchestrator` passes it and a future writer would need
+        #: the same value. Defaults to the conventional location under
+        #: `state_dir`; the CLI passes the path it actually loaded, since
         #: `--config` can put it anywhere. Only ever written through
         #: `config_writer`, which refuses git-tracked paths.
         self._config_path = Path(config_path) if config_path else config.state_dir / "config.toml"
@@ -1434,9 +1401,9 @@ class Orchestrator:
                 self._step(phase)
             except LoginExpiredError as exc:
                 # Deliberately caught BEFORE ConversationUnusableError: a
-                # logged-out profile is an account problem, and opening a new
-                # chat cannot fix it. Rotating here would spend the run's one
-                # rotation on a login prompt.
+                # logged-out profile is an account problem, and the conversation
+                # is not the thing at fault. Parking as `conversation_unusable`
+                # would name the wrong subsystem in the blocker.
                 self._log("login_expired", data={"error": str(exc)})
                 self._drop_client()
                 self._to_needs_user(
@@ -1465,10 +1432,9 @@ class Orchestrator:
                     phase, exc, self._handle_conversation_unusable
                 )
             except ResponseTimeoutError as exc:
-                # Caught BEFORE the generic BrowserError below (it is one),
-                # so a repeated, confirmed-silent response-START timeout can
-                # be routed to the rotation entry condition instead of only
-                # ever retrying on the ordinary failure budget. See
+                # Caught BEFORE the generic BrowserError below (it is one), so
+                # a response-START timeout can advance the per-request silence
+                # counters before it takes the ordinary failure budget. See
                 # `_handle_response_start_timeout`.
                 self._route_transport_fault(
                     phase, exc, self._handle_response_start_timeout
@@ -2298,10 +2264,9 @@ class Orchestrator:
         `BrowserError` is deliberately NOT swallowed. Its subclasses are the
         two conditions the loop routes rather than retries — a logged-out
         profile (`LoginExpiredError`, which no amount of scrolling fixes) and a
-        wedged conversation (`ConversationUnusableError`, which authorizes a
-        rotation). Eating those here would demote a routed fault into a silent
-        "the part is absent", and the loop would answer a login prompt by
-        omitting a diff.
+        wedged conversation (`ConversationUnusableError`, which parks). Eating
+        those here would demote a routed fault into a silent "the part is
+        absent", and the loop would answer a login prompt by omitting a diff.
         """
         mount = getattr(client, "mount_message_tail", None)
         if mount is not None:
@@ -2419,8 +2384,8 @@ class Orchestrator:
             # it did not persist. What that licenses depends entirely on WHY:
             #
             #  * the transport disproved acceptance -> `submission_rejected`
-            #    owns the decision (it may spend one same-chat resend, or
-            #    rotate). Routing there rather than deciding here is what makes
+            #    owns the decision (it may spend one same-chat resend, then
+            #    parks). Routing there rather than deciding here is what makes
             #    a crash mid-recovery resume from the same evidence the live
             #    run had, instead of silently downgrading to "ambiguous".
             #  * anything else -> genuinely ambiguous, park. The backend may
@@ -2603,7 +2568,8 @@ class Orchestrator:
         network every time, so a request that turns out to be there simply
         proceeds. Only confirmed absence unlocks anything, and what it unlocks
         is bounded: one same-chat resend of the same request id, then (on a
-        second confirmed rejection) at most one rotation.
+        second confirmed rejection) a park. Until brw-15 that second rejection
+        could open a replacement chat instead; see `_park_send_rejected_twice`.
         """
         state = self.state
         req = state.pending_request
@@ -2653,8 +2619,9 @@ class Orchestrator:
             return
 
         # Confirmed absent twice, in the same chat, with the transport
-        # disproving both sends. The chat itself is the suspect now.
-        self._attempt_rotation(req, reason="send_rejected_twice")
+        # disproving both sends. The chat itself is the suspect now — and since
+        # brw-15 there is no automatic move to another one, so this stops.
+        self._park_send_rejected_twice(req)
 
     def _rate_limit_delay(self, backoffs: int) -> float:
         """The wait for the `backoffs`-th consecutive throttle, doubling from
@@ -3355,14 +3322,14 @@ class Orchestrator:
     def _handle_conversation_unusable(
         self, phase: Phase, exc: ConversationUnusableError
     ) -> None:
-        """The configured conversation loaded and is broken.
+        """The configured conversation loaded and is broken. Park.
 
         Distinct from `_handle_browser_failure`: that one counts consecutive
         failures and retries the same phase with a fresh client, which for a
         wedged chat just re-runs the same failure until the budget is spent.
-        Accounting is deliberately NOT shared — a rotation attempt does not
-        also increment `consecutive_failures`, or one fault would be charged to
-        two budgets and the loop would fail earlier than either one describes.
+        Accounting is deliberately NOT shared — this park does not also
+        increment `consecutive_failures`, or one fault would be charged to two
+        budgets and the loop would fail earlier than either one describes.
         For the same reason this handler never touches the browser restart
         machinery: both shapes of the error (an attach that found no composer,
         and a submission this loop made that provably never appeared — see
@@ -3371,11 +3338,21 @@ class Orchestrator:
         spend recovery on a fault it cannot fix. The 2026-08-17 incident is
         the second shape misrouted: a missing submission surfaced as a locator
         timeout, read as a lost session, and bought ten minutes of 45-second
-        Chrome restarts against a chat only rotation could fix.
+        Chrome restarts against a chat no restart could fix.
 
-        `reason` carries the error's own code into the transcript and the
-        `RotationRecord`, so a rotation forced by a vanished submission stays
-        distinguishable from one forced by a chat that would not load.
+        Until brw-15 (2026-08-25) this was the entry point to conversation
+        rotation, which opened a replacement chat in `browser.project_url` and
+        moved the in-flight request into it. That machinery is gone, so the one
+        remaining honest answer is to stop and say which chat is wedged and why.
+        The error's own `code` is carried into the transcript and into the
+        blocker's detail, so a vanished submission stays distinguishable from a
+        chat that would not load; the blocker CODE is the fixed
+        `conversation_unusable`, because a code set that varies with the
+        transport's error strings is one `cli._RESOLUTION_PRECONDITIONS` and
+        `test_m1_hardening._emitted_blocker_codes` cannot reason about.
+
+        Reached only for a browser-backed transport (`_route_transport_fault`),
+        so the remedy may name the browser.
         """
         state = self.state
         reason = getattr(exc, "code", "") or "conversation_unusable"
@@ -3386,39 +3363,48 @@ class Orchestrator:
         self._drop_client()
         req = state.pending_request
         if req is None:
-            # Nothing in flight to rebind; treat as an ordinary browser fault
-            # so the failure budget still governs a dead conversation at rest.
+            # Nothing in flight; treat as an ordinary browser fault so the
+            # failure budget still governs a dead conversation at rest.
             self._handle_browser_failure(phase, exc)
             return
-        # `resume_phase` is not set here: every park below routes through
-        # `_park_rotation` -> `_to_needs_user`, which sets it from the live
-        # phase. Assigning it here too would just be overwritten.
-        self._attempt_rotation(req, reason=reason)
+        self._to_needs_user(
+            f"the conversation this loop is using is unusable ({reason}): {exc}. "
+            f"Request {req.request_id} is still bound to it "
+            f"({req.conversation_url or state.conversation_url or 'unknown'}), so a "
+            "plain restart resumes in the same chat. Autoloop no longer opens a "
+            "replacement chat on its own: open the conversation by hand and see "
+            "whether it works. If it does not, point browser.conversation_url at a "
+            "fresh chat and `reset` — the drift guard requires state and config to "
+            "agree — rather than resending, since a resend into a chat that already "
+            "holds this request posts it twice.",
+            resume_phase=phase.value,
+            kind="loop_fatal",
+            code="conversation_unusable",
+            detail=f"request_id={req.request_id} reason_code={reason}",
+        )
 
     def _handle_response_start_timeout(
         self, phase: Phase, exc: ResponseTimeoutError
     ) -> None:
         """A confirmed, persisted send whose assistant turn never starts —
-        the "silent conversation" fault distinct from every other rotation
-        trigger, where a send was disproven or the chat itself was broken.
-        Here the send is known good; the model simply never begins.
+        the "silent conversation" fault, where the send is known good and the
+        model simply never begins.
 
-        Every occurrence still goes through `_handle_browser_failure` FIRST,
-        exactly like `_handle_conversation_unusable` layers rotation ON TOP
-        of (never instead of) the ordinary failure budget for a wedged chat.
-        Only on the THIRD consecutive `stage="start"` timeout for the SAME
-        request — with that budget still allowing a retry — does this
-        attempt the additional proof rotation requires (see
-        `_attempt_silence_rotation`). A `stage="complete"` timeout (a
-        response that already started and is merely slow or stalled) is
-        never a candidate and is routed through unconditionally.
+        Handled by the ordinary failure budget, exactly like every other
+        transport fault, with ONE extra thing done first: the per-request
+        counters are advanced, so the state file records how long this request
+        actually waited and across how many windows. `_handle_browser_failure`
+        is what persists them — a crash here must resume with the count intact,
+        not lose it back to 0.
 
-        "No resubmission happened between these windows" holds by
-        construction, not by an extra guard here: `awaiting` has no
-        transition back to `submitting` except through a completed
-        rotation, which resets `start_timeouts` to 0 — so a nonzero count
-        can only describe consecutive timeouts in one conversation, for one
-        submission, with nothing resent in between.
+        Until brw-15 (2026-08-25) a third consecutive `stage="start"` timeout,
+        past an accumulated-wait floor and confirmed by one final
+        reconciliation, additionally authorized a conversation rotation.
+        Nothing reads the counters now; they are kept because they are the only
+        durable record of a silent conversation and because
+        `PendingRequest`/`state.py` are not this change's to edit. A
+        `stage="complete"` timeout (a response that already started and is
+        merely slow) never counted and still does not.
         """
         if phase is not Phase.AWAITING or exc.stage != "start":
             self._handle_browser_failure(phase, exc)
@@ -3436,587 +3422,59 @@ class Orchestrator:
             if exc.elapsed is not None
             else self._config.browser.response_start_timeout_seconds
         )
-        # Persists the incremented, still-ordinary-failure counters durably
-        # (via `_handle_browser_failure`'s own save) before anything below
-        # risks a further network call — a crash here must resume with the
-        # timeout count intact, not lose it back to 0.
         self._handle_browser_failure(phase, exc)
-        if state.phase != Phase.AWAITING.value or req.start_timeouts < 3:
-            # Either the ordinary budget already parked/failed the loop, or
-            # this is only the first or second such timeout — an ordinary
-            # retry, not yet a rotation candidate.
-            return
 
-        floor = 3 * self._config.browser.response_start_timeout_seconds
-        if req.start_timeout_wait_seconds < floor:
-            # Computed from the CURRENT config, not a literal 360 — and
-            # deliberately NOT an assertion. `elapsed` on each of the three
-            # timeouts was measured against whatever
-            # `response_start_timeout_seconds` was configured AT THE TIME;
-            # an operator raising that value between processes (this trigger
-            # is exactly the kind of fault a restart can land in the middle
-            # of) can leave a true, honestly-measured accumulated wait below
-            # a floor computed from the NEW value. That is insufficient
-            # evidence, not corruption — the correct response is to keep
-            # retrying ordinarily, never to crash the loop over it.
-            self._log(
-                "response_silence_wait_below_floor",
-                request_id=req.request_id,
-                data={
-                    "reason_code": "response_silence_wait_below_floor",
-                    "start_timeouts": req.start_timeouts,
-                    "accumulated_wait_seconds": req.start_timeout_wait_seconds,
-                    "floor_seconds": floor,
-                },
-            )
-            return
-        self._attempt_silence_rotation(req)
+    def _park_send_rejected_twice(self, req: PendingRequest) -> None:
+        """Two sends of one request disproven in a row, in the same chat. Stop.
 
-    # ---- conversation rotation ---------------------------------------------
+        The one caller is `_step_submission_rejected`, and getting here means
+        the transport reported BOTH sends rejected and reconciliation confirmed
+        the request is in the conversation neither time. A third identical
+        attempt is exactly the duplicate the `submission_rejected` phase exists
+        to bound, so the loop stops and says so.
 
-    def _attempt_rotation(self, req: PendingRequest, reason: str) -> None:
-        """Move the in-flight request to a fresh chat in the same project.
+        Until brw-15 (2026-08-25) this was the third and — on an ordinary day —
+        only reachable door into conversation rotation. `_step_submission_
+        rejected` arrives here without passing any fault handler, and the
+        subprocess codex transport returns REJECTED on every non-zero exit, so
+        two consecutive codex failures on one request walked straight into a
+        recovery that opens a ChatGPT chat. With `browser.project_url` unset
+        (the normal codex deployment) that parked telling the operator to set it
+        "to the ChatGPT project this conversation belongs to"; with it left set
+        by an operator who had moved off the browser, it spent
+        `state.rotations` and then failed inside the rotation because the
+        transport has no `retarget`. Neither outcome had anything to do with the
+        fault.
 
-        Parks — never proceeds — unless every precondition holds. The sequence
-        is deliberately "prove, then bind": the new chat's URL is only written
-        anywhere after the request has been reconciled against it, because the
-        address bar is exactly the kind of evidence this changeset exists to
-        stop trusting.
+        So the remedy is chosen from the transport actually in use, and nothing
+        here is browser-specific unless the run is.
         """
-        state = self.state
-        if not self._transport_is_browser_backed():
-            # THE THIRD DOOR, and the only one of the three that is reachable
-            # on an ordinary day. `_step_submission_rejected` arrives here after
-            # two disproven sends, and the subprocess codex transport returns
-            # REJECTED on every non-zero exit — so two consecutive codex
-            # failures on one request reach this method without passing any of
-            # the fault handlers.
-            #
-            # Both ways out below are wrong for such a transport, and neither is
-            # hypothetical. With `browser.project_url` unset (the normal codex
-            # deployment) the next branch parks telling the operator to set it
-            # "to the ChatGPT project this conversation belongs to" — browser
-            # advice for a subprocess fault, which is the whole failure recov-01
-            # undoes. With it left set (an operator who moved from the browser
-            # to codex and did not clear the section) the preconditions PASS,
-            # `state.rotations` is spent, and `_rotate_conversation` then raises
-            # because this transport has no `retarget`/`current_url` — a park
-            # about a rotation that could never have happened, plus a consumed
-            # budget.
-            #
-            # Refused here instead, before either. Rotation is a browser concept
-            # end to end: it opens a chat in a ChatGPT project and moves a turn
-            # into it. A transport with no rotation surface is not being denied
-            # a recovery it had — it never had one — so nothing is lost, and
-            # `state.rotations` is deliberately NOT spent, exactly like the
-            # `rotation_unavailable` branch below.
-            provider = self.active_provider()
-            self._park_rotation(
-                req,
-                "rotation_unsupported_by_transport",
-                f"two sends of {req.request_id} were disproven in a row and the "
-                f"{provider} transport has no conversation to rotate away from — "
-                "rotation opens a replacement chat in a ChatGPT project, which "
-                "this run does not use. Nothing was rotated and no rotation "
-                "budget was spent. "
-                f"{transport_remedy(provider)} "
-                "Then resume with `python -m autoloop run --retry`.",
+        provider = self.active_provider()
+        if self._transport_is_browser_backed():
+            remedy = (
+                "Open the conversation by hand and check whether it accepts a "
+                "message at all. If it does not, point browser.conversation_url "
+                "at a fresh chat and `reset` — the drift guard requires state "
+                "and config to agree — rather than resending here."
             )
-            return
-        project_url = self._config.browser.project_url
-        if not project_url:
-            self._park_rotation(
-                req,
-                "rotation_unavailable",
-                "the conversation cannot be used and no browser.project_url is "
-                "configured, so autoloop cannot open a replacement chat. `run "
-                "--retry` alone will not clear this. Set browser.project_url to "
-                "the ChatGPT project this conversation belongs to and then retry, "
-                "or move the loop to a healthy conversation by hand.",
-            )
-            return
-        verdict = self._policy.check_rotation_budget(state.rotations)
-        if not verdict.allowed:
-            self._park_rotation(
-                req,
-                "rotation_cap_reached",
-                f"this run could not reach the conversation and {verdict.reason}. "
-                "The budget is per RUN: starting a new run (`run --retry`, or "
-                "`run --continuous` again) begins with a fresh one, so if the "
-                "cause was transport — a dropped network, a browser that died "
-                "mid-navigation — fix that and start a new run. A spent rotation "
-                "is NOT evidence the chat itself is broken; open the conversation "
-                "by hand before concluding it is. Raise "
-                "policy.max_conversation_rotations only to allow more rotations "
-                "WITHIN one run, which is rarely the actual problem. If a new run "
-                "reaches the chat but no reply ever starts, check whether the "
-                "request was ever posted — the loop resumes into `awaiting` and "
-                "will wait for a response to a message that never landed.",
-            )
-            return
-
-        if req.delivery is not None:
-            # A chunked packet's parts live in the conversation being ABANDONED.
-            # A rotation carries only the verdict message, which would name part
-            # ids the replacement chat does not contain — the reviewer would be
-            # asked to decide on a patch that is not there. Re-sending the parts
-            # is not an option either: the rotation posts the verdict message
-            # itself, so they would arrive after the question. Fall back to the
-            # omission notice first — rule 2 applied to a different failure, and
-            # the reviewer is told plainly what it cannot see.
-            #
-            # Deliberately AFTER both preconditions: a rotation refused for a
-            # missing `project_url` or a spent budget sends nothing, so the old
-            # conversation still holds the whole delivery and there is nothing
-            # to give up.
-            self._fall_back_to_omission(req, reason_code="rotation_leaves_parts_behind")
-        old_url = req.conversation_url or state.conversation_url
-        # Consume the budget BEFORE the attempt, durably. A rotation SENDS a
-        # message; if the process dies between that send and the binding below,
-        # recovery must not be able to open a second chat and post again. Same
-        # pessimism as `send_attempted`, for the same reason — and it is why a
-        # failed attempt still costs a rotation.
-        state.rotations += 1
-        self._store.save(state)
-        try:
-            new_url, sent_prompt = self._rotate_conversation(req, project_url)
-        except LoginExpiredError:
-            raise
-        except RateLimitedError as exc:
-            # Caught ahead of the generic clause so the park says THROTTLE
-            # rather than "opening a replacement chat failed", which would
-            # send the operator looking at the conversation. Parked rather
-            # than backed off: the rotation budget is already spent and the
-            # attempt may have posted, so this is not a step that can simply
-            # be re-entered after a wait. Not re-raised either — this method
-            # is reached from inside `run()`'s own except clauses, where a
-            # raise would leave the try entirely and end the process.
-            self._log(
-                "rate_limited",
-                request_id=req.request_id,
-                data={"reason_code": "rate_limited", "context": "rotation",
-                      "error": str(exc)},
-            )
-            self._drop_client()
-            self._park_rotation(
-                req,
-                "rate_limited",
-                "ChatGPT rate limited this account while a replacement chat "
-                f"was being opened: {exc}. The rotation attempt is spent — it "
-                "may have posted before the throttle bit, so autoloop will not "
-                "try again on its own. Leave the account idle for a while, "
-                "check whether the replacement chat exists, then resume.",
-            )
-            return
-        except (BrowserError, AutoloopError) as exc:
-            self._log(
-                "rotation_failed",
-                request_id=req.request_id,
-                data={"reason_code": "rotation_failed", "error": str(exc)},
-            )
-            self._drop_client()
-            self._park_rotation(
-                req,
-                "rotation_failed",
-                f"the conversation is unusable and opening a replacement chat "
-                f"failed: {exc}. The rotation attempt is spent — it may have "
-                "posted before failing, so autoloop will not try again on its own. "
-                f"State still points at the RETIRED conversation ({old_url or 'unknown'}) "
-                "with this request marked submitted against it, so a plain restart "
-                "resumes there — which is the conversation that was just found "
-                "unusable. If the message above names an address, open it: when a "
-                "replacement chat exists and holds this request, move the loop to it "
-                "(point browser.conversation_url at that chat, then `reset`, since "
-                "the drift guard requires state and config to agree) rather than "
-                "resending — a resend into a chat that already has the request posts "
-                "it twice.",
-            )
-            return
-
-        # Only now is the request's prompt the one that was actually sent. Doing
-        # this before the send would leave a failed rotation holding a prompt
-        # that announces the conversation is abandoned, in the conversation that
-        # was never abandoned — which is exactly where `--resubmit` would send it.
-        req.prompt = sent_prompt
-        req.prompt_sha256 = hashlib.sha256(sent_prompt.encode("utf-8")).hexdigest()
-        record = RotationRecord(
-            old_url=old_url,
-            new_url=new_url,
-            request_id=req.request_id,
-            reason=reason,
-            epoch=state.conversation_epoch + 1,
-        )
-        state.conversation_epoch = record.epoch
-        state.conversation_url = new_url
-        state.last_rotation = asdict(record)
-        req.conversation_url = new_url
-        req.conversation_epoch = record.epoch
-        req.submitted = True
-        req.send_attempted = True
-        req.last_send_outcome = SendOutcome.ACCEPTED.value
-        # Fresh conversation, fresh silence clock: whatever `start_timeouts`
-        # counted described the RETIRED conversation, which this request no
-        # longer belongs to. Carrying it forward would let a future timeout
-        # in the new chat inherit a count it did not earn.
-        req.start_timeouts = 0
-        req.start_timeout_wait_seconds = 0.0
-        # A completed rotation is itself a successful transport action — a
-        # send AND a reconciliation both just succeeded against the new
-        # conversation — exactly the evidence `_step_awaiting`'s own success
-        # path resets this counter on. Not resetting it here would leave the
-        # replacement chat starting from whatever count the RETIRED one had
-        # accrued, which for the silent-conversation trigger specifically
-        # means a single further timeout in the brand-new chat could exceed
-        # `max_consecutive_failures` and fail the loop before the rotation
-        # cap even gets a chance to refuse a second rotation. Cannot loop:
-        # `max_conversation_rotations` bounds rotations, not this reset.
-        state.consecutive_failures = 0
-        state.phase = Phase.AWAITING.value
-        state.resume_phase = None
-        self._log(
-            "conversation_rotated",
-            request_id=req.request_id,
-            data=asdict(record) | {"rotations": state.rotations},
-        )
-        self._store.save(state)
-        self._heal_config_url(new_url)
-
-    def _attempt_silence_rotation(self, req: PendingRequest) -> None:
-        """The third consecutive response-START timeout for `req`, with the
-        ordinary failure budget still allowing another try. One thing
-        remains before rotation may fire: proof, not assumption, that the
-        conversation is STILL silent right now — a reply could have landed
-        in the gap between the third timeout and this check, or across a
-        restart.
-
-        This is the ONLY extra step the "silent conversation" trigger needs:
-        past this point it reuses `_attempt_rotation` for everything else
-        (the project_url precondition, the rotation budget,
-        `_rotate_conversation`, and the persisted `RotationRecord`) exactly
-        like `_handle_conversation_unusable` and `_step_submission_rejected`
-        do — their own disproof already came from the transport itself, so
-        neither needs this call.
-
-        `LoginExpiredError` is parked HERE, not re-raised: this method is
-        itself called from inside `run()`'s `except ResponseTimeoutError`
-        handler, so a raise here would leave the try/except entirely (a
-        sibling `except LoginExpiredError` on the SAME try never catches an
-        exception raised from within another branch of it) and crash the
-        process instead of parking. `_attempt_rotation`'s own re-raise is
-        safe only for its OTHER caller, `_step_submission_rejected`, which
-        runs inside that same try — never rotate for login expiry, but never
-        let discovering that take the whole loop down either.
-        """
-        try:
-            client = self._client_for_request(req)
-            client.attach()
-            still_silent = self._reconcile_no_response(client, req.request_id)
-        except LoginExpiredError as exc:
-            self._log("login_expired", data={"error": str(exc), "context": "silence_check"})
-            self._drop_client()
-            self._to_needs_user(
-                str(exc),
-                resume_phase=Phase.AWAITING.value,
-                kind="loop_fatal",
-                code="login_expired",
-            )
-            return
-        except (BrowserError, AutoloopError) as exc:
-            # The check itself could not complete. This is NOT evidence the
-            # conversation is silent — it is an ordinary transport hiccup on
-            # the confirmation step, so it changes nothing further: the
-            # ordinary failure budget already decided (in
-            # `_handle_response_start_timeout`) that the loop retries
-            # `awaiting` with a fresh client, and that decision is left
-            # standing.
-            self._log(
-                "response_silence_check_failed",
-                request_id=req.request_id,
-                data={"reason_code": "response_silence_check_failed", "error": str(exc)},
-            )
-            self._drop_client()
-            return
-        if not still_silent:
-            # A reply appeared between the third timeout and this reload.
-            # The conversation was never broken — just slow — so the streak
-            # is stale and must not survive to threaten a future timeout.
-            self._log(
-                "response_silence_check_cancelled",
-                request_id=req.request_id,
-                data={
-                    "reason_code": "response_started_during_reconciliation",
-                    "start_timeouts": req.start_timeouts,
-                },
-            )
-            req.start_timeouts = 0
-            req.start_timeout_wait_seconds = 0.0
-            self._store.save(self.state)
-            return
-        self._log(
-            "response_silence_confirmed",
-            request_id=req.request_id,
-            data={
-                "reason_code": "response_start_silence",
-                "start_timeouts": req.start_timeouts,
-                "start_timeout_wait_seconds": req.start_timeout_wait_seconds,
-            },
-        )
-        self._attempt_rotation(req, reason="response_start_silence")
-
-    @staticmethod
-    def _reconcile_no_response(client, request_id: str) -> bool:
-        """Probe the optional final-silence-check capability the same way
-        `_client_for_request` probes `retarget`/`current_url`: a provider
-        without it (every non-Playwright adapter today) cannot PROVE the
-        conversation silent by reconciliation — only the live polling
-        `await_response` already did — so this fails closed. No capability,
-        no rotation on this trigger.
-        """
-        check = getattr(client, "reconcile_no_response", None)
-        if check is None:
-            return False
-        return check(request_id)
-
-    def _rotate_conversation(
-        self, req: PendingRequest, project_url: str
-    ) -> tuple[str, str]:
-        """Open one new chat in the project and land `req` in it.
-
-        Returns `(new_conversation_url, prompt_actually_sent)` — both already
-        verified. Mutates nothing on `req`: a rotation that fails partway must
-        leave the request exactly as it was, still bound to the old
-        conversation, so the caller commits the new prompt only on success.
-
-        ChatGPT does not mint a chat's durable address until it has its first
-        turn, so the order is forced: retarget to the project page, submit
-        there — that submit IS the priming message, sent exactly once — and
-        only then read the address the server assigned. Every step after the
-        submit is verification.
-
-        The address it shows in the meantime is not the project page: a chat
-        opened from a project posts under a PLACEHOLDER
-        (`https://chatgpt.com/c/WEB:<uuid>`) that is not under the project
-        prefix at all. So "the address moved off the project page" was never
-        evidence the chat exists, and judging membership on it refused every
-        rotation (2026-08-16). The wait below is what primes the chat; the
-        membership rule itself is unchanged and still refuses a replacement
-        that really is outside the project.
-        """
-        client = self._get_client()
-        retarget = getattr(client, "retarget", None)
-        current_url = getattr(client, "current_url", None)
-        if retarget is None or current_url is None:
-            raise BrowserError(
-                "the configured conversation provider does not support rotation "
-                "(no retarget/current_url); rotate by hand"
-            )
-        retarget(project_url)
-        client.attach()
-
-        prompt = self._continuation_prompt(req)
-        # ONE send, never retried. This submit is issued from the PROJECT PAGE,
-        # where every send opens a NEW chat — so a second attempt would not
-        # retry anything, it would create a second conversation and orphan the
-        # first, with the request live in both. Anything short of acceptance
-        # therefore raises, and the caller parks; the rotation budget was
-        # already spent before this method was entered, for the same reason.
-        result = client.submit(req.request_id, prompt)
-        if result not in (SubmitResult.CONFIRMED, SubmitResult.ALREADY_PERSISTED):
-            raise BrowserError(
-                f"the replacement chat did not accept the request ({result.value})"
-            )
-
-        # Wait for the address to become a project conversation — the question
-        # the membership check actually asks — rather than merely to differ
-        # from the project page.
-        #
-        # The old condition stopped at the first change, and the first change
-        # is the placeholder `/c/WEB:<uuid>` a chat carries until its first
-        # message lands. That address is under no project, so the check refused
-        # it every time and the loop parked LOOP-FATAL on a rotation that had
-        # in fact worked (2026-08-16): an operator sent one short message by
-        # hand and the same address became `/g/g-p-<project>-<slug>/c/<uuid>`,
-        # which passes this check unchanged. Priming, not the rule, was
-        # missing.
-        #
-        # Bounded, and deliberately blind to the placeholder's shape: an
-        # address that is not in the project yet is waited through whatever it
-        # looks like, and an address that never gets there refuses below with
-        # the address actually observed.
-        deadline = time.monotonic() + ROTATION_URL_TIMEOUT_SECONDS
-        new_url = current_url()
-        while not self._url_in_project(new_url, project_url) and time.monotonic() < deadline:
-            time.sleep(ROTATION_URL_POLL_SECONDS)
-            new_url = current_url()
-        if not self._url_in_project(new_url, project_url):
-            # The address bar is a poor witness for a chat that was just
-            # created: ChatGPT mints `/c/<id>` some time after accepting the
-            # first message, and on a slow account that outlasts any polling
-            # window worth having. So ask the CONTENT instead — the request id
-            # is in the message and identifies the chat without the URL.
-            #
-            # This is not a nicety. Three rotations failed on the timeout while
-            # the chat existed and held the request, each leaving an orphan
-            # nobody read, and each reporting "the chat id was never assigned"
-            # about a chat that plainly had one (2026-08-03).
-            by_content = getattr(client, "find_conversation_with", None)
-            found = None
-            searched = False
-            if by_content is not None:
-                try:
-                    found = by_content(req.request_id, project_url)
-                    searched = True
-                except (BrowserError, AutoloopError):
-                    found = None
-            # `found` is NOT re-checked against `_url_in_project`, deliberately.
-            # The search reads the PROJECT'S OWN chat list, so its scoping is
-            # the membership check — and it builds candidates with `urljoin`
-            # against the project page, which yields a prefix-less
-            # `https://chatgpt.com/c/<id>` for a chat that is inside the project
-            # (same trap `_same_conversation` documents). Re-applying the
-            # address-bar rule here would refuse every by-content rescue in
-            # production while passing every test that types URLs by hand,
-            # undoing the 2026-08-03 fix. The rule this changeset defends is the
-            # one on the address bar above, which is where the refusal belongs.
-            if found:
-                self._log(
-                    "rotation_found_by_content",
-                    request_id=req.request_id,
-                    data={"url": found, "note": "address bar had not caught up"},
-                )
-                new_url = found
-            else:
-                # Name the address ACTUALLY OBSERVED. A generic "timed out"
-                # sends the next operator hunting a browser fault; the
-                # placeholder shape says plainly that the chat was never
-                # primed, and a foreign `/c/<id>` says plainly that it opened
-                # somewhere else.
-                if new_url.rstrip("/") == project_url.rstrip("/"):
-                    detail = "it is still the project page"
-                elif _is_placeholder_conversation(new_url):
-                    # Says what was SEEN and nothing more. "so the chat never
-                    # took the message" would be an absence claim nothing here
-                    # established — the 2026-08-03 failure was a chat that held
-                    # the request while its address lagged — and a park that
-                    # implies absence steers an operator to `--resubmit`.
-                    # A fragment, like the other two branches, so the clause
-                    # appended below joins it as one sentence instead of running
-                    # two together across a full stop.
-                    detail = (
-                        f"the address never became a project conversation — it was "
-                        f"still the pre-persistence placeholder {new_url!r} when the "
-                        f"wait expired (a chat opened from a project shows one until "
-                        f"its first message lands)"
-                    )
-                else:
-                    detail = f"{new_url!r} is not under {project_url!r}"
-                if searched:
-                    # Only claimable because the search RAN and came back empty.
-                    # A provider without the capability, or a search that raised,
-                    # read no history at all, and a park that says "no chat
-                    # carries this" on the strength of a read nobody performed is
-                    # manufactured evidence.
-                    detail += " and no chat in the project carries this request"
-                raise BrowserError(
-                    f"the replacement chat is not inside the configured project: {detail}"
-                )
-        retarget(new_url)
-        # The address bar said the send landed here; make the conversation say
-        # it. Until this returns True the rotation has not happened and nothing
-        # is bound to the new URL.
-        if not client.reconcile(req.request_id):
-            raise BrowserError(
-                "the replacement chat does not contain the request after "
-                "reconciliation — refusing to bind to it"
-            )
-        return new_url, prompt
-
-    @staticmethod
-    def _url_in_project(candidate: str, project_url: str) -> bool:
-        """True when `candidate` is a conversation under `project_url`.
-
-        Compares the project path prefix, so a chat that opened outside the
-        project (a stray navigation, a redirect to the plain composer) is
-        refused rather than silently adopted.
-        """
-        if not candidate:
-            return False
-        want, have = urlsplit(project_url), urlsplit(candidate)
-        if want.netloc != have.netloc:
-            return False
-        project_path = want.path.rstrip("/")
-        # ".../project" is the project landing page; conversations live at
-        # ".../c/<id>" under the same /g/<...> prefix.
-        base = project_path.rsplit("/", 1)[0] if project_path.endswith("/project") else project_path
-
-        # Compare SEGMENTS, and allow the last one to carry a slug suffix.
-        # ChatGPT writes the project landing page as `/g/g-p-<id>/project` but
-        # its conversations as `/g/g-p-<id>-<slugified-project-name>/c/<id>`,
-        # so a plain `startswith(base + "/c/")` rejects a chat that really is
-        # inside the project. On 2026-08-03 a rotation created a chat, posted
-        # the request into it, and then refused its own successful result on
-        # this check — and the SAME check rejected the conversation the loop
-        # had been using all day, which is what proves it was never
-        # discriminating good from bad.
-        #
-        # The suffix must be `-<something>`: `g-p-abc` may match `g-p-abc-x`
-        # but never `g-p-abcdef`, the segment-boundary trap that `approved_
-        # paths` prefixes hit too.
-        want_segs = [seg for seg in base.split("/") if seg]
-        have_segs = [seg for seg in have.path.split("/") if seg]
-        if len(have_segs) < len(want_segs) + 2:
-            return False
-        for index, wanted in enumerate(want_segs):
-            got = have_segs[index]
-            last = index == len(want_segs) - 1
-            if got != wanted and not (last and got.startswith(wanted + "-")):
-                return False
-        return have_segs[len(want_segs)] == "c" and bool(have_segs[len(want_segs) + 1])
-
-    def _continuation_prompt(self, req: PendingRequest) -> str:
-        """The same request, plus one line saying the transport moved.
-
-        The payload is already self-contained (`prompts.build_prompt` re-sends
-        the CONTEXT block and the full contract every turn), so the new chat is
-        contract-complete without replaying any history. The note exists so the
-        reviewer knows which conversation is authoritative — not to reconstruct
-        what the abandoned one said.
-        """
-        return req.prompt.rstrip("\n") + "\n\n" + CONTINUATION_NOTE
-
-    def _heal_config_url(self, new_url: str) -> None:
-        """Point the config file at the new conversation.
-
-        Best-effort by design: the rotation itself is already committed to
-        state, and state is what this run follows. A failure here only means
-        the NEXT session would start from the old URL, which the CLI's
-        drift guard detects and reports — a worse outcome than a healed config,
-        but far better than unwinding a rotation that already succeeded.
-        """
-        try:
-            update_conversation_url(self._config_path, new_url, Path.cwd())
-        except (AutoloopError, OSError) as exc:
-            self._log(
-                "config_heal_failed",
-                data={"reason_code": "config_heal_failed", "error": str(exc)},
-            )
-
-    def _park_rotation(self, req: PendingRequest, reason_code: str, question: str) -> None:
-        self._log(
-            "rotation_declined",
-            request_id=req.request_id,
-            data={"reason_code": reason_code, "rotations": self.state.rotations},
-        )
-        # Every rotation refusal is loop_fatal: the conversation channel itself
-        # is unusable or exhausted, which no other task can route around. The
-        # fail-closed default would already give loop_fatal — passing it
-        # explicitly, with the caller's own reason_code, is what makes the
-        # persisted blocker say WHICH refusal it was instead of "unclassified".
+        else:
+            remedy = transport_remedy(provider)
         self._to_needs_user(
-            question,
+            f"two sends of {req.request_id} were disproven in a row: the "
+            f"{provider} transport reported each one rejected and reconciliation "
+            "confirmed the request is not in the conversation either time. "
+            "Autoloop will not send it a third time on its own. "
+            f"{remedy} "
+            "Then `python -m autoloop run --retry` to reconcile once more — and "
+            "if the request is still absent with the transport repaired, `run "
+            "--resubmit`, which authorizes exactly one more send of this same "
+            "request id, so a message that did land is detected rather than "
+            "duplicated. A plain `--retry` alone re-parks here: the one same-chat "
+            "resend this phase allows is already spent.",
             resume_phase=self.state.phase,
             kind="loop_fatal",
-            code=reason_code,
+            code="send_rejected_twice",
+            detail=f"request_id={req.request_id} resends_used={req.resends_used}",
         )
 
     def _current_pending_postcommit(
@@ -4416,13 +3874,15 @@ class Orchestrator:
 
         A hit in a DIFFERENT chat parks too, and is not a contradiction: it
         proves the id exists somewhere, not that THIS send landed where the
-        loop is listening. Rotation deliberately reuses the request id in the
+        loop is listening. An operator who moved the loop by hand, or a
+        conversation rotation an older process performed (the machinery is gone
+        since brw-15, but its leftovers are not), reuses the request id in the
         replacement chat, so a hit elsewhere can be a retired copy — and
-        adopting a chat on that evidence is a rotation-grade rebinding
-        (epoch, `state.conversation_url`, the config URL) taken on a duplicate
-        id. The operator gets told which chat instead, which is the one fact
-        that was missing. Nor is such a hit evidence of ABSENCE here: the
-        search returns on its first sighting and stops walking.
+        adopting a chat on that evidence would rebind epoch,
+        `state.conversation_url` and the config URL on a duplicate id. The
+        operator gets told which chat instead, which is the one fact that was
+        missing. Nor is such a hit evidence of ABSENCE here: the search returns
+        on its first sighting and stops walking.
         """
         found, note = self._search_for_request(req)
         if found is not None and self._same_conversation(found, req.conversation_url):
@@ -4519,15 +3979,15 @@ class Orchestrator:
             #
             # `ConversationUnusableError` is caught for the opposite reason:
             # not because its normal route says too little, but because that
-            # route ACTS. It is the one browser fault that authorizes a
-            # rotation (see its docstring), and `_rotate_conversation` POSTS
-            # the request id into the replacement chat — a send, from the one
-            # phase whose entire contract is that only `--resubmit` repeats
-            # one. The search walks the project page and up to `limit` OTHER
-            # chats, so the wedged page here is usually not even this request's
-            # conversation: letting a stranger's broken chat authorize a repost
-            # of this request is exactly the duplicate `submission_ambiguous`
-            # exists to prevent. A wedged page is also no evidence about
+            # route CONDEMNS THE WRONG CHAT. The search walks the project page
+            # and up to `limit` OTHER chats, so the wedged page here is usually
+            # not even this request's conversation — and
+            # `_handle_conversation_unusable` would park loop_fatal naming the
+            # conversation this request is bound to, on evidence gathered from
+            # a stranger's. (Before brw-15 it was worse still: that route
+            # rotated, which POSTS the request id into a replacement chat — a
+            # send, from the one phase whose entire contract is that only
+            # `--resubmit` repeats one.) A wedged page is also no evidence about
             # presence, so the safe park is the honest answer either way.
             #
             # Every OTHER browser fault propagates untouched — see the
@@ -4664,10 +4124,12 @@ class Orchestrator:
         req = state.pending_request
         if req is None:
             raise StateError("phase=awaiting but no pending request")
-        # Aimed at the request's OWN conversation. After a rotation the loop's
-        # current conversation and this request's are the same, but a request
-        # that predates the rotation keeps its old binding — so a reply that
-        # arrives late in an abandoned chat is never the one that gets read.
+        # Aimed at the request's OWN conversation, never at `state.
+        # conversation_url`. The two are the same for every request this
+        # process creates; they diverge for one created before the loop was
+        # moved to another chat (an operator repointing the config, or a
+        # rotation an older process performed) — and then a reply that arrives
+        # late in the abandoned chat is never the one that gets read.
         client = self._client_for_request(req)
         # attach() navigates only when the page is absent or elsewhere — never a
         # reload here, or a streaming answer would be destroyed mid-flight.
@@ -8886,8 +8348,8 @@ class Orchestrator:
         "may I restart Chrome". This is the single place that asks, and the
         three `except` clauses in `run` keep their existing order and their
         existing browser handlers: for the browser provider this is a
-        pass-through and nothing about restart, cooldown, rotation or the fault
-        budget changes.
+        pass-through and nothing about restart, cooldown or the fault budget
+        changes.
 
         For anything else `_handle_transport_failure` takes it instead. That is
         the 2026-08-22 incident: a `ResponseTimeoutError` raised by a
@@ -10103,10 +9565,10 @@ class Orchestrator:
 
         Every phase that touches a pending request goes through here, so
         "reconcile a historical request against the URL it was sent to" is a
-        property of the code path rather than a rule each site remembers. After
-        a rotation the two differ, and using the current URL to reconcile an
-        older request would ask the wrong chat whether it holds a message it
-        never received.
+        property of the code path rather than a rule each site remembers. The
+        two differ once the loop has been moved to another chat, and using the
+        current URL to reconcile an older request would ask the wrong chat
+        whether it holds a message it never received.
         """
         self._bind_request_conversation(req)
         client = self._get_client()
@@ -10120,12 +9582,21 @@ class Orchestrator:
         """Give a request its authoritative conversation if it has none.
 
         Only reachable for requests written before this field existed, and only
-        ever correct because it cannot happen after a rotation: the binding is
-        taken on first touch, every request created since carries its own, and
-        `rotations == 0` means the loop URL *is* this request's URL. Guarded
-        rather than assumed — an unbound request surfacing after a rotation
-        would be a real inconsistency, and silently pointing it at the new chat
-        is exactly the wrong repair.
+        ever correct while the loop has never left the chat it started in: the
+        binding is taken on first touch, every request created since carries
+        its own, and `rotations == 0` means the loop URL *is* this request's
+        URL. Guarded rather than assumed — an unbound request surfacing after
+        the loop moved would be a real inconsistency, and silently pointing it
+        at the new chat is exactly the wrong repair.
+
+        `state.rotations` is the guard, and brw-15 removed the only code that
+        incremented it. The check is KEPT rather than deleted because the field
+        is not: a state file written by an older process can still carry a
+        nonzero count, and that file is exactly the one where this request's
+        binding cannot be inferred. It reads 0 for every state this code
+        writes, which makes the guard inert — not fail-open, since a request
+        with no binding in a run that never moved genuinely does belong to
+        `state.conversation_url`.
         """
         if req.conversation_url:
             return
