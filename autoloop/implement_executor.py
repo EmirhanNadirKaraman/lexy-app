@@ -89,6 +89,34 @@ git will not read means nothing is reverted and every request says so.
 `worktask.RecordedRevertAuthority` supplies the base sha and records the result
 on `TaskExecution.reverted_out_of_scope_paths`.
 
+**A round can also DELETE a file its own `approved_paths` already let it WRITE**
+(del-01, 2026-08-25) — the case the two paragraphs above deliberately do not
+reach, and the one the missing tool cost most. The prohibition never prevented
+destruction: `Edit`/`Write` over an authorized path can already reduce that file
+to nothing, so what the agent could not do was remove the ENTRY — destroy a file
+cleanly rather than leave a committed zero-byte one (roadmap-01, 2026-08-18).
+Three specs were bent around it in one night (brw-14, port-05, shrink-01,
+2026-08-24/25), and a file MOVE — write the new path, delete the old — was not
+expressible at all. `DELETE-FILE: <path>` is the third request form
+(`_DELETE_RE`, `_apply_scoped_deletes`, `tasks.deletable_paths`) and its
+authority is `Task.approved_paths`, NOT the out-of-scope record the two
+instructions above select from: two authorities for two questions, never merged.
+
+Nothing new bounds it, because the bound already existed. `tasks.deletable_paths`
+gates the request on `tasks.unauthorized_paths` — the very function that records
+an out-of-scope write — so an out-of-scope deletion is refused by exactly the
+code that would have flagged an out-of-scope write, and an in-scope deletion goes
+through `git status`/`changed_paths` and both scope comparisons like any other
+change (`GitGateway.changed_paths` is `git diff-tree -r --name-only -z`, which
+lists a DELETED path exactly as it lists a modified one). No tool is added:
+`WRITE_ALLOWED_TOOLS` is unchanged and `Bash` is still disallowed. TRACKER PATHS
+ARE REFUSED even though writing them is allowed — that grant exists so a task can
+append a change note to a ledger every task shares, and it is not a licence to
+remove one. Every deletion this executor performs is NAMED in the round summary
+(`_scoped_delete_note`), computed from what was actually unlinked and never from
+the agent's account of it, because a round that deletes a file and does not say
+which has hidden the most consequential change it can make.
+
 **The prompt asks the agent to attack its own claim** (impl-01, 2026-08-22).
 `_ADVERSARIAL_SELF_TEST` is given on every implement AND revise round: hunt the
 cases in which THIS task's own stated claim would still fail, fix only what
@@ -236,7 +264,13 @@ from .executor import ExecutionOutcome
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
 from .stall import DEFAULT_CEILING_SECONDS, PartialWork, StallPolicy, WorkerTreeProbe
-from .tasks import Task, authorized_cleanup_paths, effective_approved_paths
+from .tasks import (
+    TRACKER_PATHS,
+    Task,
+    authorized_cleanup_paths,
+    deletable_paths,
+    effective_approved_paths,
+)
 from .validation import NOT_RUN, run_validation_commands
 from .validation_env import ValidationEnv
 from .worker_env import worker_env
@@ -1434,6 +1468,33 @@ _REVERT_RE = re.compile(
 )
 
 
+#: The line shape an IN-SCOPE DELETION is requested on — `DELETE-FILE:` first on
+#: its line, optionally indented, nothing else in front of it. The same anchoring
+#: discipline as the two anchors above, including the refusal of `-`/`*`/`>`
+#: prefixes, so an agent summarising the instruction as a bullet is reporting,
+#: not requesting.
+#:
+#: **Why a THIRD anchor and not a widened second one** (del-01, 2026-08-25). The
+#: two above select from `TaskExecution.out_of_scope_paths`, a record the LOOP
+#: writes from its own path comparisons and an agent can never add to. This one
+#: selects from `Task.approved_paths`, which answers the opposite question — a
+#: path the task IS allowed to touch. Merging the two would let one request form
+#: choose between two different authorities, and the reviewer reading a request
+#: line could no longer tell which one authorized it.
+#:
+#: **Echo-safety is doubly structural here.** An agent quoting the instruction
+#: back emits the placeholder `<repository-relative path>`, and BOTH guards
+#: refuse it independently: `tasks.deletable_paths` cannot authorize it (no
+#: `approved_paths` entry can contain a `<` or a space —
+#: `tasks._validate_approved_path` allowlists `[A-Za-z0-9._-]` segments — so
+#: neither an exact entry nor a directory prefix can match it), and
+#: `_remove_recorded_file` deletes nothing because no file with that name is on
+#: disk. The second guard is the load-bearing one, because it holds whatever a
+#: hand-edited `Task` record contains: this executor never deletes a path that
+#: is not a real regular file inside the worker repo.
+_DELETE_RE = re.compile(r"^[ \t]*delete-file:[ \t]*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+
 def _cleanup_instruction(paths: tuple[str, ...], revert_enabled: bool = False) -> str:
     """The cleanup section of the agent prompt, or "" when there is nothing to
     clean up.
@@ -1510,6 +1571,72 @@ def _cleanup_instruction(paths: tuple[str, ...], revert_enabled: bool = False) -
     return text
 
 
+def _delete_instruction(
+    approved: tuple[str, ...], trackers: tuple[str, ...] = TRACKER_PATHS
+) -> str:
+    """The IN-SCOPE DELETION section of the agent prompt, or "" when the task
+    declares no approved paths at all.
+
+    Rendered on EVERY ordinary round, unlike `_cleanup_instruction` — this is a
+    capability of the task's own scope rather than an exception granted by a
+    record, so there is no "occasion to use it" to wait for. It renders nothing
+    for an unscoped task, which is the fail-closed branch and matches
+    `_scope_instruction`'s: with no approved paths `tasks.deletable_paths`
+    authorizes nothing, so describing the form would offer a capability that
+    cannot fire.
+
+    It names the trackers it refuses, LITERALLY, for the reason
+    `_cleanup_instruction` lists its paths literally: a refusal an agent has to
+    infer is a refusal it will run into instead. Those names come from
+    `tasks.TRACKER_PATHS`, reviewed source, never from anything an agent wrote.
+
+    Two sentences are load-bearing rather than decorative. One says the deletion
+    is scope-checked exactly like a write, because "you may delete inside your
+    scope" is one sentence away from "deleting is how you get out of your scope".
+    The other asks the agent to NAME every deletion in its own report — the
+    executor names them too, from what it actually unlinked
+    (`_scoped_delete_note`), and the instruction exists so the agent's account
+    and the loop's measurement can be compared rather than only one of them
+    existing.
+    """
+    if not approved:
+        return ""
+    listed = "\n".join(f"  - {_scope_entry(p)}" for p in sorted(trackers))
+    return (
+        "DELETING A FILE — you can, inside the scope above, and only there.\n"
+        "You have no Bash access and no delete tool, so this is not a command "
+        "you compose: write one line per file, at the start of a line, in the "
+        "exact form\n"
+        "  DELETE-FILE: <repository-relative path>\n"
+        "copying the path exactly — no quotes, no backticks, no leading './'. "
+        "The executor unlinks the file after you finish and before validation "
+        "runs, so the suite grades the tree that is actually committed.\n"
+        "A deletion is SCOPE-CHECKED EXACTLY LIKE A WRITE, by the same code: a "
+        "path under APPROVED SCOPE above is deleted, and a path outside it is "
+        "refused and reported as refused, precisely as an edit to it would have "
+        "been recorded as out of scope. Deleting is not a way out of your "
+        "scope. Nothing here widens it, and this authorizes ONE unlink of one "
+        "authorized file — never a directory, and never a path outside your "
+        "working directory.\n"
+        "These shared documentation trackers are REFUSED even though you may "
+        "WRITE them:\n"
+        f"{listed}\n"
+        "Every task in this repository is granted those so it can APPEND its "
+        "own change note; they are append-only ledgers, and a grant that exists "
+        "for appending is not a licence to remove one. A request naming one of "
+        "them deletes nothing and is reported as refused.\n"
+        "SAY WHICH FILES YOU DELETED, in your own report, in prose. A deletion "
+        "is the most consequential change you can make and the reviewer reads "
+        "your report before the diff. The executor also names every file it "
+        "actually removed, so this is not the record — it is your account of "
+        "it, and the two are meant to be comparable.\n"
+        "A MOVE is a write plus a deletion: write the new path, delete the old "
+        "one, and git records it as a rename. BOTH paths must be in scope, or "
+        "the half that is not will be refused and you will have made a copy "
+        "rather than a move."
+    )
+
+
 #: Introduces `tasks.Task.decomposition` in the agent's prompt.
 #:
 #: The reviewer approved this plan before any code was written, so it is the
@@ -1576,6 +1703,14 @@ def _agent_prompt(
         # to move with it (pinned by
         # `test_the_prompt_and_the_scope_gate_read_the_same_tracker_source`).
         _scope_instruction(effective_approved_paths(task.approved_paths)),
+        # Immediately after the list it is bounded by, and given the RAW
+        # `approved_paths` rather than the effective set: the trackers the
+        # effective set unions in are exactly the paths this section REFUSES,
+        # and handing them to it as "your scope" would state the opposite of
+        # what it goes on to say. `tasks.deletable_paths` makes the same split
+        # on the same two inputs, so the prompt and the gate agree by
+        # construction rather than by description.
+        _delete_instruction(task.approved_paths),
         # Last of the unconditional sections, so it displaces nothing: the
         # adversarial instruction still names the scope list "below" and still
         # sits immediately above it, and the cleanup-then-feedback adjacency
@@ -1602,7 +1737,12 @@ def _agent_prompt(
         parts.append(cleanup)
     if feedback:
         parts.append(f"Revision feedback from the previous review round: {feedback}")
-    return "\n\n".join(parts)
+    # Empties are dropped rather than joined, because one section is allowed to
+    # render nothing: `_delete_instruction` returns "" for a task with no
+    # approved paths (its fail-closed branch), and an unfiltered join would put
+    # a blank paragraph between two sections instead. Every other entry is a
+    # non-empty constant or a guarded append, so this changes nothing else.
+    return "\n\n".join(p for p in parts if p)
 
 
 def _extract_cleanup_requests(raw_text: str) -> tuple[str, ...]:
@@ -1630,6 +1770,20 @@ def _extract_revert_requests(raw_text: str) -> tuple[str, ...]:
     as ignored.
     """
     return _extract_requests(_REVERT_RE, raw_text)
+
+
+def _extract_delete_requests(raw_text: str) -> tuple[str, ...]:
+    """The paths an agent's output ASKED to have deleted from its OWN approved
+    scope, in the order written.
+
+    Identical rules to `_extract_cleanup_requests` — deduplicated, stripped, and
+    normalised no further — for identical reasons, which is why all three go
+    through `_extract_requests` rather than being written three times. A
+    near-miss is FAIL-CLOSED here too: a path that is not literally inside the
+    task's approved scope deletes nothing and the round reports the request as
+    refused.
+    """
+    return _extract_requests(_DELETE_RE, raw_text)
 
 
 def _extract_requests(pattern: "re.Pattern[str]", raw_text: str) -> tuple[str, ...]:
@@ -1676,13 +1830,23 @@ def _cleanup_note(removed: tuple[str, ...], ignored: tuple[str, ...]) -> str:
 def _remove_recorded_file(root: Path, rel: str) -> bool:
     """Unlink `rel` inside `root`. True only when a file was actually removed.
 
-    Called ONLY for a path `authorized_cleanup_paths` has already matched
-    against the loop's own record, so every check here is defence in depth
-    against a record that has been tampered with rather than a real
-    expectation. It refuses an absolute path, any `..` segment, anything whose
-    parent does not resolve inside `root`, and anything that is not a regular
-    file or a symlink — a directory is never removed, so no recursive delete
-    exists on this path at all.
+    THE ONE UNLINK, shared by every authorization that can reach a deletion, so
+    the guards below cannot drift into three versions of themselves: the
+    `REMOVE-OUT-OF-SCOPE:` cleanup (`_apply_recorded_cleanup`, gated by
+    `authorized_cleanup_paths` against the loop's own out-of-scope record), the
+    created-path branch of a revert (`_revert_recorded_file`, same gate), and
+    since del-01 the in-scope `DELETE-FILE:` request (`_apply_scoped_deletes`,
+    gated by `tasks.deletable_paths` against `Task.approved_paths`). Each caller
+    decides WHETHER a path may be deleted; this decides only whether the thing at
+    that path is safely removable, and it is called only after a gate has already
+    said yes — so every check here is defence in depth against a tampered record
+    or a hand-edited `Task` rather than a real expectation.
+
+    It refuses an absolute path, any `..` segment, anything whose parent does not
+    resolve inside `root`, and anything that is not a regular file or a symlink —
+    a directory is never removed, so no recursive delete exists on this path at
+    all. That last refusal is what makes an ECHOED request harmless whatever the
+    gate above it concluded: a path no file sits at is deleted by nobody.
 
     A symlink is unlinked as the LINK, never followed: `Path.unlink` removes
     the entry, so a recorded path that is somehow a symlink to something
@@ -1703,7 +1867,12 @@ def _remove_recorded_file(root: Path, rel: str) -> bool:
         if parent != base and base not in parent.parents:
             return False
         target.unlink()
-    except OSError:
+    except (OSError, ValueError):
+        # `ValueError` and not only `OSError`: a path holding a NUL byte raises
+        # `ValueError: embedded null byte` out of the first `is_symlink()`,
+        # before any syscall. Every caller reads False as "not removed", so
+        # catching it keeps the malformed case fail-closed instead of raising
+        # out of a round that is otherwise fine.
         return False
     return True
 
@@ -1898,6 +2067,102 @@ def _revert_note(reverts: _Reverts, recorded_ok: bool) -> str:
         parts.append(
             " The revert(s) above could NOT be written to the execution record; "
             "the files are restored in the tree but the record does not say so."
+        )
+    return "".join(parts)
+
+
+class _ScopedDeletes(NamedTuple):
+    """What one round's IN-SCOPE deletion pass actually did, split by WHY.
+
+    Six facts rather than one list, for the reason `_Reverts` gives: collapsing
+    them is how a refusal comes to read like a success. The split here also
+    decides which entries may be NAMED in the round summary and which may only
+    be COUNTED, which is a security property rather than a presentation choice —
+    that summary becomes the commit message
+    (`orchestrator._dispatch_task_postcommit` builds `title\\n\\nsummary`), so an
+    agent-chosen string of unbounded length must never reach it.
+
+      * `done` — actually unlinked. NAMED (through `_bounded_paths`): the unlink
+        succeeded, so every entry is a path that really was a regular file in the
+        worker repo, which is the same bound `changed_paths` has. This is the
+        one category the task's disclosure constraint is about.
+      * `trackers` — a shared documentation ledger, refused although a WRITE to
+        it is allowed. NAMED: membership is exact equality against
+        `tasks.TRACKER_PATHS`, reviewed source, so the text is bounded by a set
+        the repository wrote. Kept separate from `outside` because "outside your
+        approved paths" is a FALSE statement about a path the task may write, and
+        a reviewer chasing it would look in the wrong place.
+      * `deferred` — the path is in this task's recorded out-of-scope set, which
+        `REMOVE-OUT-OF-SCOPE:`/`REVERT-OUT-OF-SCOPE:` already govern. NAMED:
+        bounded by the loop's own record. Nothing is done for it here, so the two
+        authorities never act on one path in one round.
+      * `outside` — no `approved_paths` entry covers it. COUNTED, never named.
+      * `absent` — authorized, and nothing is at that path. COUNTED, never named:
+        an unwritten path is a string the agent chose and no filesystem bounds it.
+      * `failed` — authorized, something IS there, and it was not removed (a
+        directory, or a path `_remove_recorded_file`'s guards refused, or an
+        OSError). COUNTED for the same reason: `..` segments make the string
+        agent-chosen again even though a real entry exists.
+    """
+
+    done: tuple[str, ...] = ()
+    trackers: tuple[str, ...] = ()
+    deferred: tuple[str, ...] = ()
+    outside: tuple[str, ...] = ()
+    absent: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
+
+
+def _scoped_delete_note(deletes: _ScopedDeletes) -> str:
+    """The sentence the round's summary carries about in-scope deletions, or "".
+
+    THE DISCLOSURE del-01 requires, and it is computed from what this executor
+    ACTUALLY UNLINKED — never from `result.raw_text`. An agent that writes "I
+    deleted nothing" moves no entry here, and an agent that writes "I deleted
+    forty files" moves none either. The prompt separately asks the agent to name
+    its deletions in prose; that account rides to `report_details` and is exactly
+    the thing this sentence exists to be comparable with.
+
+    Naming versus counting follows `_cleanup_note`'s existing asymmetry and
+    `_ScopedDeletes` states which category is which and why.
+    """
+    parts = []
+    if deletes.done:
+        parts.append(
+            f" DELETED {len(deletes.done)} file(s) from this task's approved "
+            f"paths: {_bounded_paths(deletes.done)}."
+        )
+    if deletes.trackers:
+        parts.append(
+            f" Refused to delete {len(deletes.trackers)} shared documentation "
+            "tracker(s): "
+            + ", ".join(deletes.trackers)
+            + " — every task may APPEND a change note there, which is not a "
+            "licence to remove one; nothing was deleted for them."
+        )
+    if deletes.outside:
+        parts.append(
+            f" Refused {len(deletes.outside)} deletion request(s) for path(s) "
+            "outside this task's approved paths (nothing was deleted for them; "
+            "the requests are in the executor report below)."
+        )
+    if deletes.deferred:
+        parts.append(
+            f" Left {len(deletes.deferred)} requested path(s) to the "
+            "out-of-scope instructions, which already govern them: "
+            + ", ".join(deletes.deferred)
+            + "."
+        )
+    if deletes.absent:
+        parts.append(
+            f" {len(deletes.absent)} deletion request(s) named an authorized "
+            "path with no file at it; nothing was deleted for them."
+        )
+    if deletes.failed:
+        parts.append(
+            f" Could NOT delete {len(deletes.failed)} authorized path(s) — a "
+            "directory, or a path the unlink guards refused; nothing was "
+            "deleted for them."
         )
     return "".join(parts)
 
@@ -2314,6 +2579,84 @@ class ImplementExecutor:
             superseded=tuple(superseded),
         )
 
+    @staticmethod
+    def _apply_scoped_deletes(
+        git: GitGateway, task: Task, recorded: tuple[str, ...], raw_text: str
+    ) -> _ScopedDeletes:
+        """Delete the files this round asked for AND is authorized to delete.
+
+        The claim del-01 exists to make, in one method: a round can remove a file
+        whose path its own `approved_paths` already authorize it to WRITE, the
+        removal shows up in `changed_paths` like any other change, and a removal
+        outside those paths is refused.
+
+        **The authority is `Task.approved_paths`, and the matcher is the loop's
+        own.** `tasks.deletable_paths` runs `tasks.unauthorized_paths` over
+        `effective_approved_paths(task.approved_paths)` — the same function, on
+        the same list, that both of the loop's scope comparisons use to decide
+        whether a WRITE was in scope. So the refusal here and the record there
+        cannot drift into disagreeing about one path, and nothing is widened:
+        this reads `approved_paths` and never writes it, and it grants exactly
+        one unlink of one already-authorized file.
+
+        **A tracker path is refused although a write to it is allowed** — see
+        `tasks.deletable_paths` for why the append grant is not a delete grant.
+        It is reported as its own category rather than as "outside your scope",
+        which for a tracker would be false.
+
+        **A path in `recorded` is LEFT ALONE and reported**, so the two
+        authorities never both act on one path in one round. `recorded` is
+        `TaskExecution.out_of_scope_paths`, which `REMOVE-OUT-OF-SCOPE:` and
+        `REVERT-OUT-OF-SCOPE:` already govern; the sets are disjoint in the
+        ordinary case (a path recorded out of scope was by construction NOT in
+        `approved_paths` when it was recorded) and this branch is what keeps them
+        disjoint after an operator widens a task's scope between rounds. Without
+        it, a path named under `DELETE-FILE:` and `REVERT-OUT-OF-SCOPE:` in one
+        report would be deleted and then restored, and both notes would be wrong
+        about the end state.
+
+        **Nothing is deleted that is not a real file.** Every authorized path is
+        probed first and handed to `_remove_recorded_file`, whose guards refuse an
+        absolute path, a `..` segment, a parent outside the worker repo and a
+        directory. That is the guard that makes an echoed instruction inert
+        whatever the gate concluded, and it is why `absent` is a category rather
+        than an error.
+        """
+        requested = _extract_delete_requests(raw_text)
+        if not requested:
+            return _ScopedDeletes()
+        authorized, outside, trackers = deletable_paths(requested, task.approved_paths)
+        governed = set(recorded)
+        deferred = sorted(p for p in authorized if p in governed)
+        root = git.repo_root
+        done: list[str] = []
+        absent: list[str] = []
+        failed: list[str] = []
+        for rel in sorted(p for p in authorized if p not in governed):
+            target = root / rel
+            try:
+                present = target.is_symlink() or target.exists()
+            except (OSError, ValueError):
+                present = False
+            if not present:
+                # The end state the request asked for already holds. Reported as
+                # its own category and never as a failure — but reported, because
+                # an agent asking to delete a path that is not there is usually
+                # an agent that mistyped one that is.
+                absent.append(rel)
+            elif _remove_recorded_file(root, rel):
+                done.append(rel)
+            else:
+                failed.append(rel)
+        return _ScopedDeletes(
+            done=tuple(done),
+            trackers=tuple(sorted(trackers)),
+            deferred=tuple(deferred),
+            outside=tuple(sorted(outside)),
+            absent=tuple(absent),
+            failed=tuple(failed),
+        )
+
     def _revert_base_sha(self, task: Task) -> str:
         """The commit a revert restores from, or "" for "no revert authority".
 
@@ -2518,19 +2861,26 @@ class ImplementExecutor:
                 fault_kind=classify_agent_fault(result),
             )
 
-        # BEFORE the status read below and BEFORE validation, both on purpose.
-        # Before the status read, so the deletion is part of `changed_paths` and
-        # therefore of what gets staged and committed — a cleanup-only round
-        # that changed nothing else would otherwise fall into the "changed no
-        # files in its worker repo" refusal with the removal sitting on disk,
-        # uncommitted. Before validation, so the suite runs against the tree
-        # that is actually going to be committed rather than against one that
-        # still contains the file being removed.
+        # ALL THREE file-moving passes run HERE: after the agent, BEFORE the
+        # status read below and BEFORE validation, all on purpose. Before the
+        # status read, so what they did is part of `changed_paths` and therefore
+        # of what gets staged and committed — a round whose only work is a
+        # removal or a restore would otherwise fall into the "changed no files in
+        # its worker repo" refusal with the change sitting on disk, uncommitted.
+        # Before validation, so the suite runs against the tree that is actually
+        # going to be committed rather than against one that still contains the
+        # file being removed.
+        #
+        # FIRST, the in-scope deletion (del-01). Its order relative to the other
+        # two decides nothing, deliberately: `_apply_scoped_deletes` leaves every
+        # path in `cleanup_paths` to them and reports it, so no path is ever
+        # touched by two authorities in one round and neither existing pass had
+        # to learn about this one.
+        deletes = self._apply_scoped_deletes(git, task, cleanup_paths, result.raw_text)
+        # SECOND, the recorded out-of-scope removal (scope-04).
         removed, ignored = self._apply_recorded_cleanup(git, cleanup_paths, result.raw_text)
-        # SECOND, and inside the same window, for the same two reasons: the
-        # restored content has to be part of `changed_paths` so it is staged and
-        # committed, and validation has to grade the tree that is committed. The
-        # removal running first is what makes a path named under both
+        # THIRD, the recorded out-of-scope restore (scope-05). The removal pass
+        # above running first is what makes a path named under BOTH out-of-scope
         # instructions deterministic — see `_apply_recorded_reverts`.
         reverts = self._apply_recorded_reverts(
             git, cleanup_paths, revert_base_sha, result.raw_text, removed
@@ -2555,6 +2905,7 @@ class ImplementExecutor:
                     # execution record by this point, and a round that failed
                     # afterwards must not report itself as having done nothing
                     # to a path the record now says it repaired.
+                    + _scoped_delete_note(deletes)
                     + _revert_note(reverts, reverts_recorded)
                     + advisory.note()
                 ),
@@ -2567,6 +2918,7 @@ class ImplementExecutor:
                 summary=(
                     f"task '{task.id}': the implementation agent ran but changed "
                     "no files in its worker repo — nothing to review"
+                    + _scoped_delete_note(deletes)
                     + _revert_note(reverts, reverts_recorded)
                     + advisory.note()
                 ),
@@ -2609,6 +2961,7 @@ class ImplementExecutor:
                     # from here, so the work the agent did leaves no trace the
                     # reviewer can read except this.
                     + _partial_work_note(changed, partial)
+                    + _scoped_delete_note(deletes)
                     + _revert_note(reverts, reverts_recorded)
                     + advisory.note()
                 ),
@@ -2640,6 +2993,7 @@ class ImplementExecutor:
                     # between them were indistinguishable from four that wrote
                     # nothing, and drew the same `revise` four times.
                     + _partial_work_note(changed, partial)
+                    + _scoped_delete_note(deletes)
                     + _revert_note(reverts, reverts_recorded)
                     + advisory.note()
                 ),
@@ -2654,6 +3008,12 @@ class ImplementExecutor:
                 f"task '{task.id}' implemented: {len(changed)} file(s) changed; "
                 "validation passed."
                 + _cleanup_note(removed, ignored)
+                # NEVER omitted on the success path, which is the disclosure
+                # del-01 requires: this is the round that produces a candidate,
+                # and a deletion the reviewer is not told about is the most
+                # consequential change a round can hide. Computed from what was
+                # actually unlinked, never from `result.raw_text`.
+                + _scoped_delete_note(deletes)
                 + _revert_note(reverts, reverts_recorded)
                 + advisory.note()
             ),

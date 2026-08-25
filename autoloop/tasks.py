@@ -1116,6 +1116,58 @@ def effective_approved_paths(
     return tuple(sorted(set(approved) | set(trackers)))
 
 
+def deletable_paths(
+    requested, approved: tuple[str, ...], trackers: tuple[str, ...] = TRACKER_PATHS
+) -> tuple[set[str], set[str], set[str]]:
+    """Split `requested` into `(authorized, outside, tracker_refused)` — may a
+    round DELETE a file its own `approved_paths` already let it WRITE?
+
+    The del-01 rule (2026-08-25), and deliberately a DIFFERENT question from
+    `authorized_cleanup_paths` above. That one answers "did the loop record this
+    exact path as written OUTSIDE the task's scope", and its authority is
+    `TaskExecution.out_of_scope_paths` — a record no agent can add to. This one
+    answers "is this path INSIDE the task's scope", and its authority is
+    `Task.approved_paths`. Two authorities for two questions, kept apart on
+    purpose: merging them would let a request select from something it can
+    influence.
+
+    **The scope half is `unauthorized_paths` and nothing else.** Not a copy of
+    its rule, not a second matcher with the same intent — the function itself, on
+    `effective_approved_paths(approved, trackers)`, which is the same call the
+    prompt's APPROVED SCOPE section and both of the loop's own scope comparisons
+    make. So a deletion is refused by EXACTLY the code that records an
+    out-of-scope write, a trailing '/' means a subtree at both ends, and the two
+    can never drift into disagreeing about one path. An empty `approved` makes
+    `effective_approved_paths` return `()`, so an unscoped task can delete
+    nothing — the same fail-closed answer it already gets for writing.
+
+    **A TRACKER PATH IS REFUSED even though writing it is allowed**, and that is
+    the one place this deliberately does not follow the write rule.
+    `effective_approved_paths` grants every task write access to `TRACKER_PATHS`
+    so it can APPEND its change note; those files are append-only ledgers shared
+    by every task in the repository, and a grant that exists for appending must
+    not become a licence to remove one. The refusal is checked FIRST and reported
+    as its own category, never folded into `outside`: "outside your approved
+    paths" would be a false statement about a path the task may write, and a
+    reviewer chasing that sentence would look in the wrong place.
+
+    It refuses a tracker unconditionally — including when the task's OWN
+    `approved_paths` covers it independently (an exact `docs/TESTS.md` entry, or
+    a `docs/` prefix). Two tasks' change notes are the thing being protected, and
+    which grant happens to reach the file does not change that.
+
+    `outside` and `tracker_refused` are returned rather than dropped so the
+    caller can report what it refused, for the reason `authorized_cleanup_paths`
+    gives: a silently ignored request looks identical to a satisfied one.
+    """
+    tracker_set = set(trackers)
+    requested_set = set(requested)
+    tracker_refused = requested_set & tracker_set
+    rest = requested_set - tracker_refused
+    outside = unauthorized_paths(rest, effective_approved_paths(approved, trackers))
+    return rest - outside, outside, tracker_refused
+
+
 @dataclass(frozen=True)
 class StrandReport:
     """Who a task would leave waiting forever if it reached a terminal
