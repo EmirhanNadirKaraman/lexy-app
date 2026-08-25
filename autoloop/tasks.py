@@ -524,6 +524,44 @@ def _persisted_recut_count(raw: dict) -> int:
     return value
 
 
+def _persisted_nonneg_int(raw: dict, field: str) -> int:
+    """One of the ceil-01 budget counters off a stored row, validated, as an int.
+
+    The generalised `_persisted_recut_count`, and it exists for the same reason
+    that one does: `from_dict` bypasses `add_many`, so this is the ONLY gate a
+    stored or hand-edited row passes, and every field it covers
+    (`attempt_extensions`, `inherited_attempts`, `split_depth`) is an input to a
+    BOUND — how far the attempt ceiling may be widened, how much of the parent's
+    spend a subtask inherits, how deep splitting may recurse. Reading a value it
+    cannot trust as 0 would not merely lose information; on all three it hands
+    back allowance the loop never granted.
+
+    A MISSING key, and an explicit `null`, both default to 0: that is every
+    `tasks.json` written before these fields existed, and it is not malformed —
+    such a row genuinely has no extension, no inherited spend and no split
+    ancestry, because nothing could have given it one.
+
+    Everything else raises, including `True` (a `bool` IS an `int` in Python, so
+    `True >= 1` is a legal comparison answering the quiet wrong thing) and any
+    negative (nothing writes one, and `-1000` would postpone a cap by a thousand
+    rounds — a guard switched off by a plausible number rather than by an error).
+
+    Not folded into `_persisted_recut_count`: that one names its field in its
+    own error text and is quoted by name in `Task.recut_count`'s docstring and
+    in the recut tests, and merging them would rewrite a shipped message to buy
+    four lines.
+    """
+    value = raw.get(field, 0)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise StateCorruptError(
+            f"task file has an invalid {field} {value!r} for task "
+            f"{raw.get('id')!r} — it must be a non-negative integer"
+        )
+    return value
+
+
 def _shipped_hint(task: "Task") -> str:
     """A parenthetical naming the carrying commits, empty when none is recorded:
     ` (shipped under 4f2a9c1b3d5e, 9b1c…)`.
@@ -900,8 +938,12 @@ class Task:
     #: TEXT rather than a list of step records, deliberately. It is agent
     #: instructions in the same category as `description`, nothing schedules or
     #: dispatches per step, and a machine-actionable step list here would be a
-    #: second way to split a task — which `split-01` already does atomically
-    #: across the registry, the execution record and the worker repo.
+    #: second way to split a task. There is exactly one way, and it is a
+    #: reviewer's `plan` answering an attempt-ceiling classification request
+    #: (`orchestrator._dispatch_ceiling_split`, ceil-01): subtasks added,
+    #: parent's spend carried onto them, parent retired into them. This comment
+    #: used to credit `split-01` with that mechanism — a task recorded completed
+    #: whose work never shipped, so it named code that did not exist.
     #:
     #: Written only by `set_decomposition`, from the dispatch path, before the
     #: executor for that round starts. New field with a default, so a
@@ -988,6 +1030,51 @@ class Task:
     #: above, plus `_persisted_recut_count`, which REFUSES a stored value it
     #: cannot read rather than defaulting it to 0.
     recut_count: int = 0
+    #: How many times the reviewer has EXTENDED this task's attempt budget after
+    #: it reached the attempt ceiling (ceil-01, 2026-08-25). Written only by
+    #: `grant_attempt_extension` below.
+    #:
+    #: The budget it extends is `orchestrator.MAX_TASK_ATTEMPTS`, and the number
+    #: of extensions is itself capped (`orchestrator.MAX_CEILING_EXTENSIONS`), so
+    #: this widens the ceiling by a bounded amount and never removes it. It lives
+    #: HERE, not on the execution record, for exactly the reason `recut_count`
+    #: does: a split or a recut ARCHIVES that record, and a grant counted only
+    #: there would read 0 on the next one — a bound that switches itself off at
+    #: the moment it is doing work.
+    #:
+    #: Validated at load by `_persisted_nonneg_int`, which REFUSES a value it
+    #: cannot read rather than defaulting it to 0: reading an unreadable grant
+    #: count as "none spent yet" hands back the whole allowance silently.
+    attempt_extensions: int = 0
+    #: Attempts this task's PARENT had already spent when a reviewer decomposed
+    #: it at the attempt ceiling — carried onto every child at creation and never
+    #: rewritten afterwards.
+    #:
+    #: THE ANTI-REFUND. A split that gave each subtask a fresh
+    #: `MAX_TASK_ATTEMPTS` would make the ceiling mean nothing: a looping task
+    #: could buy an unbounded budget by being split again and again. The parent's
+    #: spend is therefore a DEBT the children inherit —
+    #: `orchestrator._attempt_cap_for` subtracts it — floored so that a child
+    #: still has usable attempts (`orchestrator.MIN_CHILD_ATTEMPTS`), because a
+    #: child born with a budget of zero simply rebuilds the park this exists to
+    #: remove.
+    inherited_attempts: int = 0
+    #: How many ceiling decompositions separate this task from a task a reviewer
+    #: planned directly: 0 for every ordinary task, parent's + 1 for a child.
+    #: `orchestrator.MAX_SPLIT_DEPTH` reads it, and is what stops a subtask
+    #: splitting again without limit.
+    split_depth: int = 0
+    #: WHEN this task asked the reviewer to classify it at the attempt ceiling,
+    #: as a UTC timestamp. `""` — the ordinary state — means "not waiting on a
+    #: classification".
+    #:
+    #: THE ASKED-ONCE RECORD, and the reason a ceiling hit cannot ping-pong. The
+    #: ceiling check spends no attempt and no denial budget, so a loop that
+    #: merely re-asked on every dispatch would re-ask forever with every
+    #: automated signal green. `orchestrator._handle_attempt_ceiling` parks
+    #: instead when this is already set: the reviewer was asked, and an answer
+    #: that did not classify the task is not grounds to ask again.
+    ceiling_plan_requested_at: str = ""
 
 
 #: The repository trackers every task may update, WITHOUT naming them in its
@@ -2063,6 +2150,11 @@ class TaskRegistry:
         there is exactly one way to be pending, so letting them keep three
         copies of this assignment would be a bug in whichever one drifted.
 
+        Since ceil-01 it also drops a pending attempt-ceiling classification
+        request, for the same reason and with the same argument against three
+        copies — see the comment on that line, which is where the reasoning
+        for each of the three verbs is written down.
+
         `by_stored_status` is the first documented difference between them —
         see `shelve`, which explains why it reads `task.status` directly and
         why `release` must keep asking `state_of`. Default False, so a future
@@ -2101,6 +2193,30 @@ class TaskRegistry:
                 "`unblock` for a quarantined task",
             )
         task.status = "pending"
+        # A pending task has no round to be at the ceiling OF, so it carries no
+        # unanswered classification request either (ceil-01). Cleared for all
+        # three verbs here, because all three end the round the request was
+        # asked about, and a marker left behind is a REFUND in the two that
+        # archive the execution record: the next dispatch starts at attempt 0,
+        # where an identical plan would park the task `ceiling_plan_unchanged`
+        # and a differing one would spend its single extension on a budget
+        # nothing had spent. `shelve` keeps the record, so clearing it there
+        # means the next dispatch ASKS AFRESH against the same candidate
+        # instead of parking `ceiling_plan_unanswered` — an operator who sets a
+        # stalled round aside has answered nothing, and the "never ask twice"
+        # bound is per round, not per task lifetime.
+        #
+        # AFTER the status move, so a refused verb leaves the marker exactly
+        # where it found it: the refusal above raises rather than returning,
+        # and a cleared-but-unpersisted marker on a task that did not move is
+        # the same stale record read the other way round.
+        #
+        # `unblock` deliberately does NOT clear it. That is the one route back
+        # to pending that ends no round — see
+        # `orchestrator._park_ceiling_plan_unanswered`, which tells an operator
+        # in as many words that answering the blocker does not re-ask the
+        # reviewer.
+        task.ceiling_plan_requested_at = ""
         return task
 
     # ---- lookup -------------------------------------------------------------
@@ -2484,6 +2600,129 @@ class TaskRegistry:
             )
         task.decomposition = decomposition
         return task
+
+    # ---- the attempt ceiling's own three writes (ceil-01) --------------------
+    #
+    # Written by the DISPATCH path, like `set_decomposition` directly above and
+    # for the same reason: they record what a reviewer decided about a task that
+    # is mid-round, at the moment the round decides it. So they follow that
+    # method's guard — terminal records refused, `in_progress` accepted — rather
+    # than `_refuse_immutable`'s, which exists for operator edits that can land
+    # at an arbitrary moment and strand a dispatch already being judged against
+    # the field. There is deliberately no operator route and no inbox kind to any
+    # of them: an operator who wants to hand a task more attempts already has
+    # one, `python -m autoloop answer` on the blocker, and a second author for a
+    # budget would make "granted" mean two different things.
+    #
+    # The CAPS these counters are read against live in `orchestrator`
+    # (`MAX_CEILING_EXTENSIONS`, `MAX_SPLIT_DEPTH`), never here — the same
+    # arrangement `recut_count`/`MAX_TASK_RECUTS` uses, and for the same reason:
+    # the registry owns the durable count, the dispatch owns the policy, and
+    # `tasks` importing `orchestrator` would be a cycle.
+
+    def request_ceiling_plan(self, task_id: str, now: str) -> Task:
+        """Record that this task has ASKED the reviewer to classify it at the
+        attempt ceiling.
+
+        Idempotent in the only sense that matters: an already-waiting task keeps
+        its ORIGINAL timestamp. The field answers "has this task already asked?",
+        and refreshing it on a second ask would erase the very fact that stops a
+        ceiling hit re-asking forever (`Task.ceiling_plan_requested_at`).
+
+        A blank timestamp is refused rather than stored: `""` is the value that
+        means "not waiting", so arriving there by writing one would silently
+        un-ask the question.
+        """
+        task = self.get(task_id)
+        self._refuse_terminal_ceiling_write(task, "attempt-ceiling plan request")
+        if not isinstance(now, str) or not now.strip():
+            raise TaskGraphError(
+                "empty_task_field",
+                f"task '{task_id}' needs a non-empty timestamp for its "
+                "attempt-ceiling plan request — an empty one means it never asked",
+            )
+        if not task.ceiling_plan_requested_at:
+            task.ceiling_plan_requested_at = now
+        return task
+
+    def grant_attempt_extension(self, task_id: str) -> Task:
+        """Extend this task's attempt budget by one grant, and clear the request
+        that asked for it — in ONE call, so the two can never disagree.
+
+        Separating them is the failure worth naming: a grant that left the
+        request standing would park the task as unanswered on its very next
+        dispatch, and a cleared request with no grant would send it straight back
+        into the ceiling it just classified. Both halves here or neither.
+
+        The CAP is the caller's (`orchestrator.MAX_CEILING_EXTENSIONS`); this
+        method counts. It refuses to grant to a task that never asked, which is
+        what keeps an ordinary mid-task `decomposition` reshape from quietly
+        buying a wider ceiling.
+        """
+        task = self.get(task_id)
+        self._refuse_terminal_ceiling_write(task, "attempt-budget extension")
+        if not task.ceiling_plan_requested_at:
+            raise TaskGraphError(
+                "ceiling_plan_not_requested",
+                f"task '{task_id}' did not ask for a classification at the "
+                "attempt ceiling, so there is no request for an extension to "
+                "answer — an ordinary plan reshape does not widen the ceiling",
+            )
+        task.attempt_extensions += 1
+        task.ceiling_plan_requested_at = ""
+        return task
+
+    def clear_ceiling_plan_request(self, task_id: str) -> Task:
+        """Drop a pending attempt-ceiling request WITHOUT granting anything.
+
+        The decomposition half's counterpart to `grant_attempt_extension`: a
+        reviewer that answers the request by splitting the task has answered it,
+        and the parent is about to be retired into its children — but a retired
+        row still carrying the marker would be picked up as the pending parent of
+        the NEXT plan (`ceiling_plan_pending` filters terminal rows for the same
+        reason, so this is the belt to that braces).
+
+        Never used to "expire" a request. There is no timeout here: the request
+        is answered, or the task parks on its next dispatch.
+        """
+        task = self.get(task_id)
+        self._refuse_terminal_ceiling_write(task, "attempt-ceiling plan request")
+        task.ceiling_plan_requested_at = ""
+        return task
+
+    def ceiling_plan_pending(self) -> list[Task]:
+        """Every LIVE task waiting on an attempt-ceiling classification.
+
+        Terminal rows are filtered out, not merely expected to be absent: a
+        retired parent whose marker survived would otherwise be offered as the
+        parent of an unrelated later `plan`, which is a split applied to the
+        wrong task.
+        """
+        return [
+            task
+            for task in self._tasks.values()
+            if task.ceiling_plan_requested_at and task.status not in _TERMINAL_STATUSES
+        ]
+
+    def _refuse_terminal_ceiling_write(self, task: Task, what: str) -> None:
+        """Terminal records take none of the three writes above.
+
+        Driven off `_TERMINAL_STATUSES` rather than a literal tuple, for the
+        reason `set_decomposition` spells out: a status added to that set must
+        not fall through and let a dispatch rewrite the budget of finished work.
+        """
+        if task.status not in _TERMINAL_STATUSES:
+            return
+        code = {
+            "completed": "task_completed",
+            "retired": "task_retired",
+        }.get(task.status, "task_shipped_elsewhere")
+        hint = _successor_hint(task) or _shipped_hint(task)
+        raise TaskGraphError(
+            code,
+            f"task '{task.id}' is {task.status}{hint} — a {what} cannot be "
+            "recorded against work that is already finished; plan a new task",
+        )
 
     def set_approved_paths(self, task_id: str, paths) -> Task:
         """Replace an existing task's authorization scope.
@@ -3100,6 +3339,28 @@ class TaskRegistry:
                     # `_persisted_recut_count` — an unreadable value raises
                     # rather than defaulting to "no cuts spent yet".
                     "recut_count": _persisted_recut_count(raw),
+                    # VALIDATED for the same reason as `recut_count` directly
+                    # above, and each one bounds something: how far the attempt
+                    # ceiling may be widened, how much of a parent's spend a
+                    # subtask inherits, and how deep splitting may recurse. See
+                    # `_persisted_nonneg_int` — an unreadable value raises
+                    # rather than loading as "nothing spent yet".
+                    "attempt_extensions": _persisted_nonneg_int(
+                        raw, "attempt_extensions"
+                    ),
+                    "inherited_attempts": _persisted_nonneg_int(
+                        raw, "inherited_attempts"
+                    ),
+                    "split_depth": _persisted_nonneg_int(raw, "split_depth"),
+                    # Coerced, not validated, exactly like `urgent_at` above and
+                    # for the same reason: a missing key is a `tasks.json`
+                    # written before ceil-01 and loads as "not waiting on a
+                    # classification", while a hand-edited `null` must become
+                    # `""` rather than `None` — every reader tests this for
+                    # truthiness and then prints it.
+                    "ceiling_plan_requested_at": str(
+                        raw.get("ceiling_plan_requested_at", "") or ""
+                    ),
                     # VALIDATED, not just tuple()-converted — this path never
                     # reaches `add_many` (see the bypass below), so it is the
                     # only gate a stored row passes. See

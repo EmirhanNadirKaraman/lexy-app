@@ -449,6 +449,16 @@ class PolicyEngine:
         mid-review when this lands, answerable on the same round from the
         denial text — a chosen cost, not an oversight.
 
+        **ONE EXCEPTION TO THAT REUSE, since ceil-01 (2026-08-25): a task
+        waiting on an attempt-ceiling classification.** Such a task asked the
+        reviewer for a fresh plan against its current candidate, and reusing the
+        stored one is exactly the reply that answers nothing — it would start
+        another round against a budget that has already run out. Refused here
+        rather than left to the orchestrator's park, because a denial re-prompts
+        with the rule and is bounded by `check_denial_budget`, while the park
+        holds an autonomous session open for a human. It costs the ordinary case
+        nothing: the field is empty on every task that is not at its ceiling.
+
         **Here, rather than in a round of its own.** The loop already asks what
         to work on and already receives `implement` before any agent runs, so
         approving the plan on that directive costs nothing: no extra request,
@@ -475,7 +485,31 @@ class PolicyEngine:
         if directive.decomposition is not None:
             return Verdict.ok()
         # `_check_task_reference` ran first, so the task exists.
-        if registry.get(directive.task_id).decomposition:
+        task = registry.get(directive.task_id)
+        if getattr(task, "ceiling_plan_requested_at", ""):
+            # THE ONE PLACE THE REUSE RULE ABOVE DOES NOT APPLY (ceil-01,
+            # 2026-08-25). A task that reached its attempt ceiling asked the
+            # reviewer for a FRESH plan against its current candidate, and "the
+            # stored plan stands" is precisely the answer that cannot be
+            # accepted here: it would start another round against the budget
+            # that just ran out, and the orchestrator would park the task as
+            # unanswered. Refused here instead, where the reviewer gets the rule
+            # back with the correction and the denial budget bounds the
+            # exchange — before `mark_in_progress` and before `_open_attempt`,
+            # so the correction costs no attempt.
+            return Verdict.deny(
+                "ceiling_plan_required",
+                f"task '{directive.task_id}' reached its attempt ceiling and "
+                f"asked you to classify it (at {task.ceiling_plan_requested_at}). "
+                f"A `{directive.decision.value}` that carries no `decomposition` "
+                "re-uses the plan that is already on record, which is the one "
+                "answer that cannot classify anything. Send it again with a "
+                "`decomposition` that DIFFERS from the stored plan — that is the "
+                "'one named remaining fix' answer and it extends the budget — or "
+                "answer with `plan` to decompose the task into subtasks, or with "
+                "`stop`. Nothing was executed and no attempt was spent.",
+            )
+        if task.decomposition:
             # Approved on an earlier directive and still on record — a revise
             # of work already under way, a re-dispatch after a crash, or a
             # second implement on the same task is not a second thing to

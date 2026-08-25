@@ -1896,17 +1896,33 @@ def test_pre_commit_failures_consume_the_attempt_budget_across_restart(tmp_path)
         assert orch.state.phase == Phase.READY.value  # each failure re-enters ready, not parked
 
     # One more restart: the ceiling refuses BEFORE the executor ever runs.
+    #
+    # Since ceil-01 (2026-08-25) the first refusal ASKS the reviewer to classify
+    # the task instead of parking for a human — the ROUTE changed, the bound did
+    # not. What this test is about is unchanged and is asserted on both
+    # dispatches: the executor never runs again, and the refusal does not bump
+    # `attempt_count`.
+    orch = fresh_orchestrator()
+    orch._dispatch_executor(implement("t1"))
+    assert orch.state.phase == Phase.READY.value  # a question, not a park
+    assert orch._executor.calls == 0  # the ceiling fired before dispatch
+    assert "ATTEMPT CEILING REACHED" in (orch.state.outbox or "")
+    assert registry.get("t1").ceiling_plan_requested_at
+    assert execution_store.load("t1").attempt_count == MAX_TASK_ATTEMPTS
+
+    # And a dispatch that does not answer that question parks, still before the
+    # executor: the loop asks once.
     orch = fresh_orchestrator()
     orch._dispatch_executor(implement("t1"))
     assert orch.state.phase == Phase.NEEDS_USER.value
     assert orch.state.park_kind == "task_fatal"
-    assert orch._executor.calls == 0  # the ceiling fired before dispatch
+    assert orch._executor.calls == 0
     execution = execution_store.load("t1")
     assert execution.attempt_count == MAX_TASK_ATTEMPTS  # not bumped by the refusal itself
 
     blocker = blocker_store.load(orch.state.park_blocker_id)
     assert blocker is not None
-    assert blocker.code == "attempt_count_ceiling"
+    assert blocker.code == "ceiling_plan_unanswered"
 
 
 # =============================================================================

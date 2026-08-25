@@ -452,6 +452,99 @@ MAX_TASK_RECUTS = 2
 #: releasing it by hand or an urgent request displacing it.
 RECUT_RETIREMENT_REASON = "recut-by-reviewer"
 
+# ---- the attempt ceiling's classification bounds (ceil-01, 2026-08-25) ------
+#
+# A task that reaches `MAX_TASK_ATTEMPTS` no longer parks for a human on the
+# ceiling alone: it asks the REVIEWER — which already holds the candidate and
+# the verdict history — to classify it, and the reply decides between a named
+# remaining fix on an extended budget and a decomposition. Measured 2026-08-24
+# over 131 resolved blockers, `attempt_count_ceiling` was the single largest
+# cause of operator-blocked time (12 parks, 32.0h, median 1.34h — the highest
+# median of the top five), because unlike the mechanical parks it needs a
+# JUDGEMENT, and the judgement waited for a person.
+#
+# NOTHING HERE RAISES `MAX_TASK_ATTEMPTS`. That constant bounds unbounded local
+# churn and a structural refusal still spends an attempt without spending a
+# review round; every number below is a bound ON TOP of it, and each one is
+# small on purpose:
+#
+#   * the extension is +2 attempts, granted at most once per task, so a task
+#     that is genuinely looping reaches a hard wall at 7 dispatches rather than
+#     never;
+#   * a decomposition may not recurse past `MAX_SPLIT_DEPTH`;
+#   * a child inherits its parent's SPEND, so a split cannot refund a budget.
+#
+# The park is not removed either — it is moved to the end of the sequence. When
+# both remedies are spent the task still parks `attempt_count_ceiling`, with the
+# same code an operator's tooling already knows.
+
+#: How many attempts one reviewer-granted extension adds to `MAX_TASK_ATTEMPTS`.
+#:
+#: TWO, and the number is an argument. The measured case this exists for is a
+#: task one attempt from done: blk-01 sat at attempt 5 of 5, round 3, zero
+#: faults, with a verdict that endorsed eight things by name and left ONE fix,
+#: remedy spelled out. One attempt would grant exactly that and nothing for the
+#: round in which the named fix turns out to need a second pass; five would be a
+#: second full budget, i.e. the refund this must not become.
+CEILING_EXTENSION_ATTEMPTS = 2
+
+#: How many times ONE task's attempt budget may be extended this way.
+#:
+#: ONE. The extension answers a specific claim — "the objections are shrinking
+#: and this is the last fix" — and a task that spends 7 attempts without landing
+#: has falsified it. A second grant would be the reviewer arguing with its own
+#: evidence, and it is exactly the unbounded-churn back door the task's own
+#: specification forbids. The ceiling is then still not a park: a task with no
+#: extension left is asked again, and the only answer left on offer is a
+#: decomposition or `stop`.
+MAX_CEILING_EXTENSIONS = 1
+
+#: How deep a ceiling decomposition may recurse. 0 is an ordinary planned task;
+#: a child carries its parent's depth + 1.
+#:
+#: ONE — children cannot be split again. The narrowest bound that satisfies "a
+#: subtask that hits its own ceiling must not be able to split again without
+#: limit", and the reversible one: raising it later is a constant, lowering it
+#: after tasks exist on disk at depth 2 is not. A child at the bound is not
+#: stranded — it still gets its own extension, and then the hard wall.
+MAX_SPLIT_DEPTH = 1
+
+#: The floor under a child's attempt budget after it inherits its parent's spend.
+#:
+#: Without a floor the arithmetic is self-defeating: a parent at 5/5 subtracts 5
+#: from `MAX_TASK_ATTEMPTS` and every child is born at its own ceiling, which
+#: rebuilds the park the split exists to remove while passing any naive
+#: "attempts were not refunded" test. TWO is the deliberate, bounded concession:
+#: one attempt to produce a candidate and one to answer the first review of it.
+#: It is still strictly less than `MAX_TASK_ATTEMPTS`, so no child ever receives
+#: a fresh budget.
+MIN_CHILD_ATTEMPTS = 2
+
+#: The fewest subtasks a decomposition may name.
+#:
+#: TWO, and it is an anti-refund rule rather than a style rule. One child would
+#: inherit the parent's spend, get the floor, and hand the SAME unit of work
+#: `MIN_CHILD_ATTEMPTS` more attempts under a new id — a rename that buys
+#: budget. A reviewer that believes the work is one unit is asking for an
+#: extension, and the refusal says so.
+MIN_CEILING_SPLIT_TASKS = 2
+
+#: The `retire_execution` label a ceiling-split parent's execution record and
+#: worker repo are filed under, so the two halves name each other on disk and a
+#: human reading either one can tell the round was decomposed rather than
+#: released, recut or displaced.
+CEILING_SPLIT_RETIREMENT_REASON = "split-at-attempt-ceiling"
+
+#: Longest any single evidence section of the ceiling classification request may
+#: be. The request deliberately carries NO range diff — `packet
+#: .RANGE_DIFF_MAX_BYTES` already refused port-01's at 414KB, and blk-01's
+#: candidate is 1,821 insertions across 11 files — so what is left (the attempt
+#: ledger, the last feedback, the stored plan, the touched-file list) is small,
+#: and this bounds the one of them that is reviewer-authored prose. Overflow is
+#: always STATED, never silent: a truncation that reads as complete coverage is
+#: the same fail-open as no evidence at all.
+CEILING_REQUEST_SECTION_MAX_CHARS = 4000
+
 #: Filename of the wanted-verb tally under `AutoloopConfig.state_dir`.
 WANTED_DECISIONS_FILENAME = "wanted_decisions.json"
 
@@ -4804,6 +4897,22 @@ class Orchestrator:
             self._park_recut_cap(directive, task, execution, spent)
             return
 
+        # A recut ARCHIVES the execution record, so the next dispatch starts
+        # from `attempt_count = 0` — the ceiling this task may have asked to be
+        # classified at no longer exists (ceil-01). Cleared here, in the same
+        # registry write the retirement persists, or the stale marker would meet
+        # the fresh cut's first `implement`: an identical plan would park it
+        # `ceiling_plan_unchanged`, and a differing one would spend its single
+        # extension on a budget nothing had spent.
+        #
+        # `registry.recut` clears it too, via the `_return_to_pending` all three
+        # return-to-pending verbs share, so this is the belt to that braces and
+        # is idempotent either way. Kept because this is the call site where the
+        # reason is legible, and because it is the reason the shared clear was
+        # written — `release` and `shelve` reach the same stale marker by the
+        # same route and had no such line.
+        if task.ceiling_plan_requested_at:
+            self._registry.clear_ceiling_plan_request(task_id)
         try:
             release = release_task_to_pending(
                 task_id,
@@ -5290,6 +5399,16 @@ class Orchestrator:
     def _dispatch_plan(self, directive: Directive) -> None:
         state = self.state
         specs = directive.tasks or ()
+        ceiling_parent = self._ceiling_split_parent(state)
+        if ceiling_parent is not None:
+            # A `plan` while a task is waiting on an attempt-ceiling
+            # classification IS that classification's decompose answer. Handled
+            # in its own method because it does two things an ordinary plan never
+            # does — carry the parent's spend onto the children, and retire the
+            # parent into them — and because every one of its refusals has to
+            # happen before either.
+            self._dispatch_ceiling_split(directive, ceiling_parent)
+            return
         try:
             self._registry.add_many(
                 [
@@ -5452,6 +5571,13 @@ class Orchestrator:
             return
         if not is_audit and directive.decision in TASK_DECISIONS:
             task = self._registry.get(directive.task_id)
+            if not self._ceiling_reply_ok(directive, task):
+                # This task asked the reviewer to classify it at its attempt
+                # ceiling and the answer was refused or parked. Checked BEFORE
+                # `set_decomposition` below, which is what keeps an ordinary
+                # mid-task plan reshape from silently widening a ceiling: the
+                # grant happens there, gated on the request, or not at all.
+                return
             if directive.decomposition is not None:
                 # The approved plan, made durable BEFORE the executor runs, in
                 # the same save as `mark_in_progress` — so a task can never be
@@ -6012,14 +6138,25 @@ class Orchestrator:
             if strand.obstacle:
                 self._report_strand_blocker(strand, strand.obstacle)
                 continue
+            # THE SAME ceiling the dispatch would apply, not a second copy of the
+            # base constant (ceil-01): a task whose budget the reviewer extended
+            # has attempts left, and blocking it here as "already spent" would
+            # park exactly the task that was just told to carry on. Falls back to
+            # `MAX_TASK_ATTEMPTS` for an id the registry does not hold, which is
+            # the reading that refuses rather than the one that admits.
+            task_cap = (
+                self._attempt_cap_for(self._registry.get(strand.task_id))
+                if self._registry.has(strand.task_id)
+                else MAX_TASK_ATTEMPTS
+            )
             if (
-                strand.attempt_count >= MAX_TASK_ATTEMPTS
+                strand.attempt_count >= task_cap
                 or strand.fault_attempt_count >= MAX_TASK_FAULT_ATTEMPTS
             ):
                 self._report_strand_blocker(
                     strand,
                     "its attempt budget is already spent "
-                    f"(attempts {strand.attempt_count}/{MAX_TASK_ATTEMPTS}, "
+                    f"(attempts {strand.attempt_count}/{task_cap}, "
                     f"faults {strand.fault_attempt_count}/{MAX_TASK_FAULT_ATTEMPTS}), "
                     "so the next dispatch would refuse it",
                 )
@@ -6499,21 +6636,21 @@ class Orchestrator:
         # round that finished — see the method's own docstring.
         self._reconcile_unfinished_attempts(execution)
 
-        if execution.attempt_count >= MAX_TASK_ATTEMPTS:
-            self._to_needs_user(
-                f"task {task.id}: {execution.attempt_count} commit attempts on "
-                f"{execution.task_branch} without reaching an approved review "
-                f"(cap {MAX_TASK_ATTEMPTS}). A structural refusal consumes an "
-                "attempt but not a review round, so this ceiling is what stops "
-                "unbounded local churn. Nothing was rolled back or pushed.",
-                kind="task_fatal",
-                code="attempt_count_ceiling",
-                task_id=task.id,
-                detail=(
-                    f"attempt_count={execution.attempt_count} cap={MAX_TASK_ATTEMPTS} "
-                    f"branch={execution.task_branch} "
-                    f"ledger={','.join(execution.attempt_ledger)}"
-                ),
+        attempt_cap = self._attempt_cap_for(task)
+        if execution.attempt_count >= attempt_cap:
+            # Since ceil-01 this is not automatically a park: the reviewer is
+            # asked to classify the task against its own candidate first, and
+            # only an exhausted or already-asked task ends here for a human. The
+            # audit is exempt — it is not a roadmap task, so there is no registry
+            # row to record a request on and nothing to decompose it into.
+            self._handle_attempt_ceiling(
+                directive,
+                task,
+                execution,
+                worktree_git,
+                state,
+                attempt_cap,
+                is_audit=is_audit,
             )
             return
         if execution.fault_attempt_count >= MAX_TASK_FAULT_ATTEMPTS:
@@ -7194,6 +7331,943 @@ class Orchestrator:
             )
 
         return exempt
+
+    # ---- the attempt ceiling: classify, then extend or decompose ------------
+    #
+    # The sequence, in the order a task meets it:
+    #
+    #   1. `_attempt_cap_for` says what this task's ceiling actually is —
+    #      `MAX_TASK_ATTEMPTS`, plus whatever a reviewer already granted, minus
+    #      whatever a parent already spent.
+    #   2. `_handle_attempt_ceiling` decides between ASKING and PARKING. It asks
+    #      once, records that it asked, and parks if it has already asked or if
+    #      no remedy is left.
+    #   3. `_ceiling_reply_ok` reads the answer that comes back on the next
+    #      `implement`/`revise`: a plan that DIFFERS buys an extension, a plan
+    #      identical to the stored one parks, and no plan at all falls through to
+    #      the park in step 2.
+    #   4. `_dispatch_ceiling_split` reads the other answer — a `plan` — and
+    #      applies it: children carrying the parent's spend, parent retired into
+    #      them, record archived and worker quarantined under one label.
+    #
+    # Nothing here refunds an attempt, and nothing here raises
+    # `MAX_TASK_ATTEMPTS`. Every route out of a ceiling is bounded by a constant
+    # declared at the top of this module, and the last route is still the park
+    # this replaced, under the same `attempt_count_ceiling` code.
+
+    @staticmethod
+    def _nonneg_int(value: object) -> int:
+        """`value` as a non-negative int, or 0.
+
+        Defensive for the same reason `_recut_count_for` is on its side of the
+        pair: `tasks._persisted_nonneg_int` refuses an unreadable stored value at
+        LOAD, but a `Task` handed in by an embedder or a test goes through no
+        such gate, and a `bool` is an `int` in Python. A budget computed from
+        `True` would be quietly wrong rather than loudly broken.
+        """
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return int(value)
+
+    def _attempt_cap_for(self, task: Task) -> int:
+        """How many attempts THIS task gets before it reaches its ceiling.
+
+        `MAX_TASK_ATTEMPTS` for every ordinary task, which is the whole of the
+        old behaviour. Two adjustments on top, and the ORDER of them is the
+        anti-refund rule:
+
+          * a child of a ceiling split first SUBTRACTS the parent's spend, and
+            the result is floored at `MIN_CHILD_ATTEMPTS` so the child is not
+            born already at its ceiling;
+          * a reviewer-granted extension is added AFTERWARDS, so it is worth
+            `CEILING_EXTENSION_ATTEMPTS` real attempts to a child too. Adding
+            before the floor would have made the grant worth nothing for exactly
+            the tasks that had least budget — a guard that reads as granted while
+            behaving as if it were not.
+
+        The consequence worth stating: a child's cap is
+        `MIN_CHILD_ATTEMPTS + CEILING_EXTENSION_ATTEMPTS` at its most generous,
+        which is strictly less than `MAX_TASK_ATTEMPTS`. No subtask ever holds a
+        full fresh budget, extended or not.
+        """
+        inherited = self._nonneg_int(getattr(task, "inherited_attempts", 0))
+        extensions = min(
+            self._nonneg_int(getattr(task, "attempt_extensions", 0)),
+            MAX_CEILING_EXTENSIONS,
+        )
+        base = MAX_TASK_ATTEMPTS - inherited
+        if inherited:
+            base = max(base, MIN_CHILD_ATTEMPTS)
+        return base + extensions * CEILING_EXTENSION_ATTEMPTS
+
+    def _ceiling_remedies(self, task: Task) -> tuple[bool, bool]:
+        """`(may_extend, may_split)` for a task standing at its ceiling.
+
+        Both are read from the DURABLE registry row, never from the execution
+        record: a split archives that record, so a bound counted there would
+        read zero on the next one.
+        """
+        extensions = self._nonneg_int(getattr(task, "attempt_extensions", 0))
+        depth = self._nonneg_int(getattr(task, "split_depth", 0))
+        return extensions < MAX_CEILING_EXTENSIONS, depth < MAX_SPLIT_DEPTH
+
+    def _handle_attempt_ceiling(
+        self,
+        directive: Directive,
+        task: Task,
+        execution: TaskExecution,
+        worktree_git: GitGateway,
+        state: LoopState,
+        cap: int,
+        *,
+        is_audit: bool,
+    ) -> None:
+        """A task has reached its attempt ceiling: ask the reviewer to classify
+        it, or park when asking is not available or is not owed.
+
+        THE ORDER IS THE SAFETY PROPERTY, so it is stated rather than implied:
+
+          * an AUDIT unit parks exactly as it always did — it is synthetic, has
+            no registry row to record a request against, and cannot be
+            decomposed into roadmap tasks;
+          * a task that has ALREADY ASKED parks. This is the ping-pong bound.
+            The ceiling check runs before `_open_attempt` and before any policy
+            denial, so it spends neither budget; a loop that merely re-asked
+            would re-ask forever with every automated signal green, which is the
+            exact shape of the stop-livelock `MAX_REPEATED_STOPS` had to bound.
+          * a task with NO REMEDY LEFT parks, under the same
+            `attempt_count_ceiling` code an operator's tooling already knows;
+          * and a failure to RECORD the request parks too. Fail-closed on
+            purpose: a loop that asked but cannot remember asking is a loop that
+            asks again.
+
+        Everything else asks, and the ask costs no attempt.
+        """
+        if is_audit or not self._registry.has(task.id):
+            self._park_attempt_ceiling(
+                task,
+                execution,
+                cap,
+                note=(
+                    "The audit is not a roadmap task: there is no registry row to "
+                    "record a classification against and nothing to decompose it "
+                    "into, so it parks here as it always has."
+                    if is_audit
+                    else "This id is not in the task registry, so no "
+                    "classification can be recorded against it."
+                ),
+            )
+            return
+        if task.ceiling_plan_requested_at:
+            self._park_ceiling_plan_unanswered(directive, task, execution, cap)
+            return
+        may_extend, may_split = self._ceiling_remedies(task)
+        if not (may_extend or may_split):
+            self._park_attempt_ceiling(
+                task,
+                execution,
+                cap,
+                note=(
+                    f"The reviewer has already classified this task: its attempt "
+                    f"budget was extended {self._nonneg_int(task.attempt_extensions)} "
+                    f"time(s) (cap {MAX_CEILING_EXTENSIONS}) and it sits at split "
+                    f"depth {self._nonneg_int(task.split_depth)} of "
+                    f"{MAX_SPLIT_DEPTH}, so neither a further extension nor a "
+                    "further decomposition is available. What is left is a "
+                    "specification problem, not a budget one."
+                ),
+            )
+            return
+        try:
+            self._registry.request_ceiling_plan(task.id, utcnow_iso())
+            self._task_store.save(self._registry)
+        except (TaskGraphError, StateError, OSError) as exc:
+            # RECORD FIRST, ask second — and if the record cannot be written,
+            # do not ask at all. The marker is the only thing that stops the
+            # next dispatch asking again, so asking without it is the ping-pong
+            # this park exists to prevent.
+            self._park_attempt_ceiling(
+                task,
+                execution,
+                cap,
+                note=(
+                    "The loop could not record an attempt-ceiling classification "
+                    f"request for this task ({exc}), so it did not ask: an "
+                    "unrecorded request would be re-asked on every dispatch."
+                ),
+            )
+            return
+        # Read BEFORE `last_response` is cleared, or the request this ceiling was
+        # reached under could never be paired with the question it produced.
+        answered = state.last_response.request_id if state.last_response else None
+        state.outbox = self._ceiling_plan_request(
+            task, execution, worktree_git, cap, may_extend, may_split
+        )
+        state.last_response = None
+        state.consecutive_failures = 0
+        state.phase = Phase.READY.value
+        self._log(
+            "attempt_ceiling_plan_requested",
+            request_id=answered,
+            data={
+                "task_id": task.id,
+                "attempt_count": execution.attempt_count,
+                "cap": cap,
+                "base_cap": MAX_TASK_ATTEMPTS,
+                "review_round": execution.review_round,
+                "may_extend": may_extend,
+                "may_split": may_split,
+                "candidate_sha": execution.candidate_sha,
+                "ledger": list(execution.attempt_ledger),
+            },
+        )
+        self._store.save(state)
+
+    def _park_attempt_ceiling(
+        self, task: Task, execution: TaskExecution, cap: int, note: str = ""
+    ) -> None:
+        """The original ceiling park, kept verbatim in substance and under the
+        same `attempt_count_ceiling` code, with one sentence added saying WHY
+        this particular ceiling hit was not handed to the reviewer.
+
+        The code is deliberately unchanged: `cli`, the blocker store and an
+        operator's own greps all key off it, and a task that genuinely churned
+        through every remedy has hit exactly the wall that code has always
+        named.
+        """
+        self.state.last_response = None
+        self._to_needs_user(
+            f"task {task.id}: {execution.attempt_count} commit attempts on "
+            f"{execution.task_branch} without reaching an approved review "
+            f"(cap {cap}). A structural refusal consumes an "
+            "attempt but not a review round, so this ceiling is what stops "
+            "unbounded local churn. Nothing was rolled back or pushed."
+            + (f"\n\n{note}" if note else ""),
+            kind="task_fatal",
+            code="attempt_count_ceiling",
+            task_id=task.id,
+            detail=(
+                f"attempt_count={execution.attempt_count} cap={cap} "
+                f"base_cap={MAX_TASK_ATTEMPTS} "
+                f"extensions={self._nonneg_int(getattr(task, 'attempt_extensions', 0))}/"
+                f"{MAX_CEILING_EXTENSIONS} "
+                f"split_depth={self._nonneg_int(getattr(task, 'split_depth', 0))}/"
+                f"{MAX_SPLIT_DEPTH} "
+                f"branch={execution.task_branch} "
+                f"ledger={','.join(execution.attempt_ledger)}"
+            ),
+        )
+
+    def _park_ceiling_plan_unanswered(
+        self,
+        directive: Directive,
+        task: Task,
+        execution: TaskExecution,
+        cap: int,
+    ) -> None:
+        """The reviewer was asked to classify this task and the reply did not.
+
+        A PARK, and the one that makes the whole mechanism bounded. Asking costs
+        no attempt and no denial budget, so "ask again" has no natural end; a
+        second ask would be the loop talking to itself while `needs_attention`
+        stayed false — measured elsewhere in this file as three refusals in
+        fifteen minutes with every signal green.
+
+        In practice `policy._check_decomposition` refuses a plan-less
+        `implement`/`revise` on a waiting task first, with a correction the
+        reviewer can act on and a denial budget bounding the correction. Reaching
+        here means either that gate was bypassed or the reviewer answered with
+        something that is neither a plan nor a decomposition — an operator has
+        the whole arc, including the request that went out.
+        """
+        self.state.last_response = None
+        self._to_needs_user(
+            f"task {task.id}: it reached its attempt ceiling "
+            f"({execution.attempt_count}/{cap}) and asked the reviewer to "
+            f"classify it at {task.ceiling_plan_requested_at}, but the reply did "
+            "not answer the question: neither a NEW decomposition for this task "
+            "(which would have extended its budget for a named remaining fix) "
+            "nor a `plan` decomposing it into subtasks. The loop does not ask "
+            "twice — a second request costs no attempt and no denial budget, so "
+            "it would repeat forever. Nothing was rolled back or pushed; the "
+            f"candidate on {execution.task_branch} is untouched.\n\n"
+            "Answering this blocker does NOT re-ask the reviewer: the task is "
+            "still at its ceiling and still marked as having asked, so the next "
+            "dispatch parks here again. While the round is still in progress, "
+            f"`python -m autoloop shelve {task.id}` clears the marker and keeps "
+            "the record, so the next dispatch asks afresh against the same "
+            "candidate and the same spent attempts — or parks "
+            "`attempt_count_ceiling` if no remedy is left. (`release` and "
+            "`recut` clear it too, but they archive the record, so the task "
+            "starts over at attempt 0.) Once continuous mode has quarantined "
+            "the task (`blocked`) those verbs refuse it and unblocking does "
+            "not clear the marker, so the route from there is to clear this "
+            "task's "
+            "`ceiling_plan_requested_at` in `tasks.json` with the loop stopped. "
+            "Otherwise rewrite, decompose or retire the task — and do "
+            "NOT raise MAX_TASK_ATTEMPTS, which is the only bound on local "
+            "churn.\n\n"
+            f"Last directive: {directive.decision.value} — {directive.reason}",
+            kind="task_fatal",
+            code="ceiling_plan_unanswered",
+            task_id=task.id,
+            detail=(
+                f"attempt_count={execution.attempt_count} cap={cap} "
+                f"requested_at={task.ceiling_plan_requested_at} "
+                f"decision={directive.decision.value} "
+                f"branch={execution.task_branch}"
+            ),
+        )
+
+    def _park_ceiling_plan_unchanged(self, directive: Directive, task: Task) -> None:
+        """The reviewer answered the classification request with the plan that is
+        already on record.
+
+        THE ECHO CASE, and it parks rather than re-prompting because the request
+        itself contains the stored plan — the reviewer is shown it so that it can
+        differ from it, which is exactly what makes handing it straight back
+        indistinguishable from not having classified at all. A planner fixed on
+        one axis re-proposes that axis; the task's own specification names this
+        as the failure to require against rather than to hope about.
+
+        Compared after `_normalise_feedback` (whitespace and case), the same
+        normalisation the repeated-feedback bound uses. Deliberately NOT fuzzy:
+        two genuinely different plans must always be allowed through, so only an
+        exact match after normalisation is refused.
+        """
+        self.state.last_response = None
+        self._to_needs_user(
+            f"task {task.id}: the reviewer answered its attempt-ceiling "
+            "classification request with the SAME plan that is already on "
+            "record, so nothing about the task has been reclassified — the "
+            "budget was not extended and no decomposition was applied. The "
+            "stored plan was included in the request precisely so the new one "
+            "could differ from it. Nothing was rolled back or pushed.\n\n"
+            "Answering this blocker does NOT re-ask the reviewer: the task is "
+            "still at its ceiling and still marked as having asked. While the "
+            f"round is still in progress, `python -m autoloop shelve {task.id}` "
+            "clears the marker and keeps the record, so the next dispatch asks "
+            "afresh against the same candidate (`release` and `recut` clear it "
+            "too, but they archive the record and the task starts over at "
+            "attempt 0). Once continuous mode has quarantined the task "
+            "(`blocked`) those verbs refuse it and unblocking does not clear "
+            "the marker, so from there "
+            "clear this task's `ceiling_plan_requested_at` in `tasks.json` with "
+            "the loop stopped — or rewrite, decompose or retire the task.\n\n"
+            f"Reviewer's reason: {directive.reason}",
+            kind="task_fatal",
+            code="ceiling_plan_unchanged",
+            task_id=task.id,
+            detail=(
+                f"requested_at={task.ceiling_plan_requested_at} "
+                f"decision={directive.decision.value}"
+            ),
+        )
+
+    def _ceiling_reply_ok(self, directive: Directive, task: Task) -> bool:
+        """Read a task-decision reply to an attempt-ceiling request. True when
+        the dispatch may continue.
+
+        Called from `_dispatch_executor` BEFORE `set_decomposition`, which is the
+        gate that matters: that method stores any plan an `implement`/`revise`
+        carries, so an extension granted beside it without this check would mean
+        every ordinary mid-task reshape silently widened the ceiling. The grant
+        happens ONLY for a task that actually asked.
+
+        Returns True unchanged for every task that is not waiting, which is all
+        of them nearly all of the time.
+        """
+        if not getattr(task, "ceiling_plan_requested_at", ""):
+            return True
+        plan = directive.decomposition
+        if plan is None:
+            # `policy._check_decomposition` refuses this first in the ordinary
+            # flow. Falling through leaves the marker set, so the ceiling check
+            # below parks the task as unanswered rather than dispatching a round
+            # against a budget nobody extended.
+            return True
+        if self._normalise_feedback(plan.render()) == self._normalise_feedback(
+            task.decomposition
+        ):
+            self._park_ceiling_plan_unchanged(directive, task)
+            return False
+        may_extend, _ = self._ceiling_remedies(task)
+        if not may_extend:
+            # Refused, not parked: the request told the reviewer that no
+            # extension was left and that a decomposition or `stop` was what
+            # remained, so there IS an answer it can act on — which is the
+            # standing rule for every refusal the reviewer can correct.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_extension_spent",
+                    f"task '{task.id}' has already had its attempt budget "
+                    f"extended {self._nonneg_int(task.attempt_extensions)} time(s) "
+                    f"(cap {MAX_CEILING_EXTENSIONS}), so a new plan for it cannot "
+                    "buy another one. A task that spends a second budget without "
+                    "landing has falsified the claim an extension makes. Answer "
+                    "the classification request with `plan` — at least "
+                    f"{MIN_CEILING_SPLIT_TASKS} subtasks, each independently "
+                    "reviewable — or with `stop`. Nothing was executed and no "
+                    "attempt was spent.",
+                ),
+            )
+            return False
+        try:
+            self._registry.grant_attempt_extension(task.id)
+        except TaskGraphError as exc:  # pragma: no cover - guarded above
+            self._handle_policy_denial(
+                directive, Verdict.deny(exc.code, f"{exc}. Nothing was executed.")
+            )
+            return False
+        self._log(
+            "attempt_ceiling_extended",
+            data={
+                "task_id": task.id,
+                "extensions": task.attempt_extensions,
+                "cap": MAX_CEILING_EXTENSIONS,
+                "granted_attempts": CEILING_EXTENSION_ATTEMPTS,
+                "attempt_cap": self._attempt_cap_for(task),
+                "reason": directive.reason,
+            },
+        )
+        return True
+
+    @staticmethod
+    def _bounded_section(text: str, limit: int = CEILING_REQUEST_SECTION_MAX_CHARS) -> str:
+        """`text`, cut to `limit` characters, SAYING SO when it cut.
+
+        A silent truncation reads exactly like complete coverage, which is the
+        fail-open this whole request is trying to avoid: the reviewer is
+        classifying on this evidence, and evidence that quietly stops early
+        invites the wrong classification with no signal that anything is
+        missing.
+        """
+        body = (text or "").strip()
+        if not body:
+            return "(none recorded)"
+        if len(body) <= limit:
+            return body
+        dropped = len(body) - limit
+        return f"{body[:limit]}\n… [{dropped} more character(s) withheld to keep this request deliverable]"
+
+    def _ceiling_plan_request(
+        self,
+        task: Task,
+        execution: TaskExecution,
+        worktree_git: GitGateway,
+        cap: int,
+        may_extend: bool,
+        may_split: bool,
+    ) -> str:
+        """What the loop asks the reviewer when a task reaches its ceiling.
+
+        Built here rather than from a `prompts.TEMPLATES` entry for the reason
+        `_recut_report` gives: it says things no template shape covers — which
+        remedies are still available for THIS task, and what each answer must
+        look like.
+
+        **NO RANGE DIFF, deliberately.** The packet cap already bites on exactly
+        the tasks that reach a ceiling: port-01's range diff was refused at 414KB
+        against `RANGE_DIFF_MAX_BYTES` of 400,000, and blk-01's candidate is
+        1,821 insertions across 11 files. What classification needs is not the
+        diff — it is whether the reviewer's own objections are SHRINKING or
+        RELOCATING, which the verdict history answers and the diff does not. So
+        this carries the attempt ledger, the last feedback, the stored plan and
+        the touched-file list, each bounded and each saying what it withheld.
+        """
+        touched: list[str] = []
+        touched_note = ""
+        if execution.candidate_sha:
+            try:
+                touched = sorted(
+                    worktree_git.commit_range_paths(
+                        execution.task_base_sha, execution.candidate_sha
+                    )
+                )
+            except GitError as exc:
+                # `GitError`, not just `GitCommandError`: an unreadable repo
+                # raises the base class, and losing the whole classification
+                # request to it would send this round back through
+                # `_handle_git_failure` with the ceiling still unclassified. A
+                # missing file list is a stated gap; a missing request is not.
+                touched_note = f"(the file list is unavailable: {exc})"
+        else:
+            touched_note = "(no candidate has been committed on this branch yet)"
+        answers = []
+        if may_extend:
+            answers.append(
+                "  A. A NAMED REMAINING FIX — the objections are shrinking and "
+                "this candidate is close. Reply `revise` (or `implement`) with "
+                f"task_id '{task.id}' AND a `decomposition` that says what is "
+                "left. The plan MUST DIFFER from the one on record below; an "
+                f"identical one parks. That grants {CEILING_EXTENSION_ATTEMPTS} "
+                f"more attempts, once per task ({MAX_CEILING_EXTENSIONS} "
+                "granted so far: "
+                f"{self._nonneg_int(task.attempt_extensions)})."
+            )
+        if may_split:
+            answers.append(
+                "  B. A DECOMPOSITION — the objections keep RELOCATING: each "
+                "round finds a deeper hole in the same property, and the task "
+                "has become the too-big task this exists to split. Reply `plan` "
+                f"with at least {MIN_CEILING_SPLIT_TASKS} subtasks, each with "
+                "its own `approved_paths` and each independently reviewable. "
+                "This task is then retired into them, its record archived and "
+                "its worker quarantined — nothing is deleted. Each subtask "
+                f"INHERITS the {execution.attempt_count} attempt(s) already "
+                "spent here, so a split never refunds a budget."
+            )
+        answers.append(
+            "  C. `stop` — a human should decide. Use this when neither of the "
+            "above is honest; it is always available."
+        )
+        unavailable = []
+        if not may_extend:
+            unavailable.append(
+                f"an extension (already granted {self._nonneg_int(task.attempt_extensions)} "
+                f"of {MAX_CEILING_EXTENSIONS})"
+            )
+        if not may_split:
+            unavailable.append(
+                f"a decomposition (this task is at split depth "
+                f"{self._nonneg_int(task.split_depth)} of {MAX_SPLIT_DEPTH})"
+            )
+        return (
+            f"ATTEMPT CEILING REACHED — task {task.id} needs a classification, "
+            "not a park.\n\n"
+            f"{task.title}\n\n"
+            f"It has spent {execution.attempt_count} of {cap} attempts "
+            f"(base cap {MAX_TASK_ATTEMPTS}"
+            + (
+                f", minus {self._nonneg_int(task.inherited_attempts)} inherited "
+                "from the parent it was split from"
+                if self._nonneg_int(task.inherited_attempts)
+                else ""
+            )
+            + (
+                f", plus {self._nonneg_int(task.attempt_extensions) * CEILING_EXTENSION_ATTEMPTS} "
+                "already granted"
+                if self._nonneg_int(task.attempt_extensions)
+                else ""
+            )
+            + f") across {execution.review_round} review round(s), with "
+            f"{execution.fault_attempt_count} round(s) charged to the separate "
+            "fault budget. An attempt is spent by a structural refusal or a "
+            "failed validation as well as by a round you judged, so this ceiling "
+            "is what bounds local churn — it is NOT being raised.\n\n"
+            f"Branch {execution.task_branch}, base "
+            f"{execution.task_base_sha[:12]}, candidate "
+            f"{execution.candidate_sha[:12] or '(none committed)'}.\n\n"
+            "--- attempt ledger (one entry per dispatch: ordinal|budget|outcome) ---\n"
+            + self._bounded_section(
+                "\n".join(execution.attempt_ledger) or "(none recorded)"
+            )
+            + "\n\n--- files this candidate touches ---\n"
+            + (touched_note or self._bounded_section("\n".join(touched)))
+            + "\n\n--- your most recent revise feedback (normalised) ---\n"
+            + self._bounded_section(execution.last_revise_feedback)
+            + "\n\n--- the plan currently on record for this task ---\n"
+            + self._bounded_section(task.decomposition)
+            + "\n\n--- what the executor last reported ---\n"
+            + self._bounded_section(execution.report_summary)
+            + "\n\nCLASSIFY IT. Read your own verdict history: objections that "
+            "are SHRINKING (one named fix left, the rest endorsed) and "
+            "objections that keep RELOCATING (every round a deeper hole in the "
+            "same property) have opposite remedies, and the counters above "
+            "cannot tell them apart. Answer with exactly one of:\n\n"
+            + "\n\n".join(answers)
+            + (
+                "\n\nNot available for this task: " + "; ".join(unavailable) + "."
+                if unavailable
+                else ""
+            )
+            + "\n\nThis is asked ONCE. A reply that is none of the above parks "
+            "the task for a human. Nothing has been executed, nothing was "
+            "rolled back, and no attempt was spent on this request."
+        )
+
+    # ---- the decomposition half: a `plan` that answers the request ----------
+
+    def _ceiling_split_parent(self, state: LoopState) -> Task | None:
+        """The task a `plan` is answering the ceiling request FOR, or None.
+
+        None is the ordinary answer — nearly every `plan` is roadmap work and
+        must keep going through `_dispatch_plan` untouched.
+
+        Attribution is deliberately conservative, because a split applied to the
+        wrong parent retires a task nobody asked to retire: the task named by
+        `state.current_task` wins (it is the dispatch that hit the ceiling), a
+        single waiting task is unambiguous, and anything else — two tasks waiting
+        from different sessions with nothing naming either — is treated as an
+        ORDINARY plan and logged. Those parents then park as unanswered on their
+        next dispatch, which is the pre-existing behaviour rather than a new
+        failure.
+        """
+        pending = self._registry.ceiling_plan_pending()
+        if not pending:
+            return None
+        current = state.current_task
+        current_id = (
+            str(current.get("task_id") or "") if isinstance(current, dict) else ""
+        )
+        for task in pending:
+            if task.id == current_id:
+                return task
+        if len(pending) == 1:
+            return pending[0]
+        self._log(
+            "ceiling_split_parent_ambiguous",
+            data={"pending": sorted(t.id for t in pending), "current": current_id},
+        )
+        return None
+
+    def _dispatch_ceiling_split(self, directive: Directive, parent: Task) -> None:
+        """Apply a `plan` that answers `parent`'s attempt-ceiling request.
+
+        EVERY refusal happens before anything moves, and the two writes that do
+        move are ordered so a crash cannot leave the registry describing a task
+        that no longer exists: the children are added and the parent retired into
+        them by `release_task_to_pending`, which persists the registry ONCE
+        (children + retirement in the same file write) before it touches the
+        execution record or the worker repo on disk.
+
+        There is no bespoke split mechanism here on purpose. `add_many` is
+        atomic, `retire(superseded_by=...)` is the registry's own supersession
+        (and re-points the parent's dependents at the successors), and
+        `release_task_to_pending` is the same record-and-worker retirement a
+        `recut` and an operator `release` already use.
+        """
+        state = self.state
+        specs = directive.tasks or ()
+        if self._execution_store is None or self._worker_repos is None:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_unavailable",
+                    "this loop has no execution store and worker-repository "
+                    "manager configured, so it cannot retire the parent's record "
+                    "and worker — and adding subtasks while leaving the parent's "
+                    "candidate live is worse than doing neither. Nothing was "
+                    "changed.",
+                ),
+            )
+            return
+        may_extend, may_split = self._ceiling_remedies(parent)
+        if not may_split:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_depth",
+                    f"task '{parent.id}' is already a subtask at split depth "
+                    f"{self._nonneg_int(parent.split_depth)} (cap "
+                    f"{MAX_SPLIT_DEPTH}), so it cannot be decomposed again — "
+                    "splitting without a bound is how one looping task becomes "
+                    "an unbounded family of them. "
+                    + (
+                        "Answer with a differing `decomposition` for it instead, "
+                        "or with `stop`."
+                        if may_extend
+                        else "Answer with `stop`."
+                    )
+                    + " Nothing was changed.",
+                ),
+            )
+            return
+        if len(specs) < MIN_CEILING_SPLIT_TASKS:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_too_small",
+                    f"a decomposition of '{parent.id}' must name at least "
+                    f"{MIN_CEILING_SPLIT_TASKS} subtasks; this plan names "
+                    f"{len(specs)}. One subtask inherits the parent's spend and "
+                    "then hands the SAME unit of work a fresh floor of attempts "
+                    "under a new id, which is a rename that buys budget. If the "
+                    "work really is one unit, that is answer A — `revise` with a "
+                    "`decomposition` that differs from the one on record. "
+                    "Nothing was changed.",
+                ),
+            )
+            return
+        named_parent = [s.id for s in specs if s.id == parent.id]
+        if named_parent:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_names_parent",
+                    f"this plan names '{parent.id}' as one of its own subtasks. "
+                    "The parent is retired into its children, so a child under "
+                    "the same id cannot be created and the split would be "
+                    "refused halfway through. Give each subtask a new id. "
+                    "Nothing was changed.",
+                ),
+            )
+            return
+        blocking = self._in_progress_dependents(parent.id)
+        if blocking:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_dependent_in_progress",
+                    f"task(s) {', '.join(blocking)} depend on '{parent.id}' and "
+                    "are in progress, so retiring it would rewrite the "
+                    "dependencies a running dispatch is being judged against. "
+                    "Let them finish first. Nothing was changed.",
+                ),
+            )
+            return
+        try:
+            execution = self._execution_store.load(parent.id)
+        except (StateError, OSError) as exc:
+            # Unreadable, NOT absent — the same fail-closed reading `recut` takes:
+            # a record this cannot parse may name a published candidate, and the
+            # spend it carries is what every child's budget is derived from.
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_record_unreadable",
+                    f"task '{parent.id}' has an execution record this loop cannot "
+                    f"read ({exc}), so neither its published state nor the "
+                    "attempts its children must inherit can be established. An "
+                    "operator has to look at it. Nothing was changed.",
+                ),
+            )
+            return
+        if execution is None:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_no_execution",
+                    f"task '{parent.id}' has no execution record, so there is no "
+                    "spend for its children to inherit and nothing to retire. "
+                    "Nothing was changed.",
+                ),
+            )
+            return
+        if execution.published_sha:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_candidate_published",
+                    f"task '{parent.id}' has ALREADY PUBLISHED candidate "
+                    f"{execution.published_sha[:12]} — published work is never "
+                    "retired by this loop. If it is wrong, that is a new task. "
+                    "Nothing was changed.",
+                ),
+            )
+            return
+
+        inherited = self._nonneg_int(execution.attempt_count)
+        child_depth = self._nonneg_int(parent.split_depth) + 1
+        children = [
+            Task(
+                id=s.id,
+                title=s.title,
+                description=s.description,
+                depends_on=s.depends_on,
+                approved_paths=s.approved_paths,
+                inherited_attempts=inherited,
+                split_depth=child_depth,
+            )
+            for s in specs
+        ]
+        try:
+            self._registry.add_many(children)
+        except TaskGraphError as exc:
+            # `add_many` is atomic, so the registry is exactly as it was and the
+            # parent is still waiting: this is a denial, not a park.
+            self._log("plan_rejected", data={"code": exc.code, "error": str(exc)})
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    exc.code,
+                    f"{exc}. The decomposition of '{parent.id}' was not applied "
+                    "and nothing was changed.",
+                ),
+            )
+            return
+        child_ids = tuple(child.id for child in children)
+        self._registry.clear_ceiling_plan_request(parent.id)
+        try:
+            release = release_task_to_pending(
+                parent.id,
+                self._registry,
+                self._execution_store,
+                self._worker_repos,
+                persist=lambda: self._task_store.save(self._registry),
+                reason=CEILING_SPLIT_RETIREMENT_REASON,
+                tolerate_retirement_failure=True,
+                move=lambda tid: self._registry.retire(
+                    tid,
+                    superseded_by=child_ids,
+                    reason=(
+                        "decomposed at the attempt ceiling into "
+                        + ", ".join(child_ids)
+                    ),
+                ),
+            )
+        except TaskGraphError as exc:
+            # The children are in the registry and the parent is not retired.
+            # Persist that — it is what is true — and park loudly rather than
+            # leaving a half-applied split only this process knows about.
+            self._task_store.save(self._registry)
+            state.last_response = None
+            self._to_needs_user(
+                f"task {parent.id}: its decomposition into "
+                f"{', '.join(child_ids)} was half-applied — the subtasks now "
+                f"exist, but the parent could not be retired into them ({exc}). "
+                "Its candidate, worker repository and execution record are all "
+                "untouched. Retire it by hand once the obstacle is cleared, or "
+                "remove the subtasks.",
+                kind="task_fatal",
+                code="ceiling_split_parent_not_retired",
+                task_id=parent.id,
+                detail=f"children={','.join(child_ids)} error={exc.code}: {exc}",
+            )
+            return
+
+        retirement = release.retirement
+        self._log(
+            "task_ceiling_split",
+            request_id=state.last_response.request_id if state.last_response else None,
+            data={
+                "task_id": parent.id,
+                "reason": directive.reason,
+                "wanted_decision": directive.wanted_decision,
+                "children": list(child_ids),
+                "inherited_attempts": inherited,
+                "child_split_depth": child_depth,
+                "child_attempt_cap": self._attempt_cap_for(children[0]),
+                "parent_attempt_count": execution.attempt_count,
+                "discarded_candidate": execution.candidate_sha,
+                "label": retirement.label if retirement is not None else "",
+                "archived_record": (
+                    str(retirement.record_path)
+                    if retirement is not None and retirement.record_path is not None
+                    else ""
+                ),
+                "quarantined_worker": (
+                    str(retirement.worker_path)
+                    if retirement is not None and retirement.worker_path is not None
+                    else ""
+                ),
+                "artifacts_retired": release.artifacts_retired,
+                "obstacle": release.obstacle,
+            },
+        )
+        # The parent's bookkeeping is gone; so must every pointer this session
+        # still holds to it — the same cleanup a recut does, and for the same
+        # reason: a later approval naming the retired packet would otherwise
+        # resolve a binding to work that no longer has a record.
+        self._forget_sent_postcommits_for_task(state, parent.id)
+        if isinstance(state.task_execution, dict) and (
+            state.task_execution.get("task_id") == parent.id
+        ):
+            state.task_execution = None
+        if isinstance(state.current_task, dict) and (
+            state.current_task.get("task_id") == parent.id
+        ):
+            state.current_task = None
+        carried = state.carry_postcommit
+        if isinstance(carried, dict) and carried.get("task_id") == parent.id:
+            state.carry_postcommit = None
+
+        if not release.artifacts_retired:
+            state.last_response = None
+            self._to_needs_user(
+                f"task {parent.id}: it was decomposed into "
+                f"{', '.join(child_ids)} and retired, but its artefacts could "
+                f"not be retired — {release.obstacle}. "
+                + (
+                    f"The worker repository is still at {release.stale_worker_path}. "
+                    if release.stale_worker_path
+                    else ""
+                )
+                + (
+                    "Its execution record is still live, so the merge window "
+                    "stays shut on it. "
+                    if release.stale_execution_record
+                    else ""
+                )
+                + "Move them aside by hand. The subtasks are in the roadmap and "
+                "can be dispatched once that is done.",
+                kind="task_fatal",
+                code="ceiling_split_retirement_failed",
+                task_id=parent.id,
+                detail=(
+                    f"children={','.join(child_ids)} "
+                    f"obstacle={release.obstacle} "
+                    f"stale_worker={release.stale_worker_path} "
+                    f"stale_record={release.stale_execution_record}"
+                ),
+            )
+            return
+
+        state.outbox = self._ceiling_split_report(
+            directive,
+            parent,
+            execution,
+            child_ids,
+            inherited,
+            # Read off a real child through the SAME helper the dispatch will
+            # judge it by, never re-derived here: a report that computed the
+            # budget a second way could tell the reviewer a number the loop does
+            # not enforce.
+            self._attempt_cap_for(children[0]),
+            release,
+        )
+        state.last_response = None
+        state.consecutive_failures = 0
+        state.phase = Phase.READY.value
+        self._store.save(state)
+
+    def _in_progress_dependents(self, task_id: str) -> list[str]:
+        """Ids of DIRECT dependents of `task_id` that are in progress.
+
+        The one obstacle `TaskRegistry.retire` refuses that this dispatch can
+        check cheaply beforehand — and it must, because by the time `retire`
+        raises, the children have already been added. Everything else `retire`
+        refuses (completed, retired, shipped-elsewhere) cannot describe a task
+        that just hit its attempt ceiling.
+        """
+        return sorted(
+            task.id
+            for task in self._registry.all_tasks()
+            if task_id in task.depends_on and task.status == "in_progress"
+        )
+
+    def _ceiling_split_report(
+        self, directive, parent, execution, child_ids, inherited, child_cap, release
+    ) -> str:
+        """What the loop tells the reviewer after a ceiling split landed.
+
+        Says the two numbers a reviewer cannot spend sensibly without: what each
+        child inherited, and what that leaves it. A report that showed only the
+        new ids would read as "you got a fresh start", which is the one thing
+        this must not imply.
+        """
+        retirement = release.retirement
+        return (
+            f"DECOMPOSITION APPLIED — task {parent.id} is retired into "
+            f"{', '.join(child_ids)}.\n\n"
+            f"Your reason: {directive.reason}\n\n"
+            f"Its candidate {execution.candidate_sha[:12] or '(none committed)'} "
+            f"on {execution.task_branch} was NOT deleted: the execution record "
+            "was archived to "
+            f"{retirement.record_path if retirement and retirement.record_path else '(no record on disk)'} "
+            "and the worker repository quarantined at "
+            f"{retirement.worker_path if retirement and retirement.worker_path else '(no worker on disk)'}"
+            f", both under the label {retirement.label if retirement else '(none)'}.\n\n"
+            f"THE BUDGET IS NOT REFUNDED. Each subtask inherits the {inherited} "
+            f"attempt(s) already spent, so each starts with {child_cap} of the "
+            f"usual {MAX_TASK_ATTEMPTS} — a decomposition is a re-scoping, not a "
+            "fresh allowance. Each may still be extended once at its own "
+            f"ceiling, and none of them may be decomposed again (split depth cap "
+            f"{MAX_SPLIT_DEPTH}).\n\n"
+            "Each subtask needs its own `decomposition` on the `implement` that "
+            "starts it, and cannot be dispatched at all without `approved_paths`."
+        )
 
     def _park_round_cap(
         self,
