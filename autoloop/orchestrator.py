@@ -240,6 +240,31 @@ section for the full table):
   change what happens next; use `_to_needs_user` wherever a human doing
   something makes the SAME session resumable.
 
+Autonomous recovery (halt-02, 2026-08-25):
+
+* A CONFIG FLAG, DEFAULT OFF (`config.AutonomyConfig`). With it off — every
+  existing deployment, every direct `AutoloopConfig(...)` — every park below
+  behaves exactly as it did, and turning it off again restores that.
+* With it on, `_to_needs_user` gives an ALLOWLISTED code two stages instead of
+  one park: re-enter the recovery path the loop already has (`--retry`'s phase
+  re-entry, or `--resubmit`'s same-id re-issue), bounded by a budget counted on
+  the durable blocker record; and, once that path is exhausted, park
+  `task_fatal` naming the task in flight so `cli._handle_parked_task` sets that
+  ONE task aside and the loop carries on. The allowlist, the per-code budgets
+  and the argument for each are `blockers.AUTONOMOUS_RECOVERIES`; the five
+  parks it may never reach are `blockers.HARD_HALT_CODES`.
+* halt-02 named SEVEN codes; the table holds SIX. The missing one is the
+  conversation-rotation failure this file's brw-15 section describes, which has
+  had no producer since that change — a code no live provider can raise is
+  removed rather than automated, so it is absent by decision.
+* Three of those six get a budget of ZERO, and that is the honest answer rather
+  than a gap: `worker_environment_drift`, `publisher_url_drift` and
+  `crash_reconciliation_ambiguous` have no in-process recovery path at all —
+  their remedies are an operator repairing the shared git environment,
+  confirming a new push destination, and clearing a commit intent by hand, none
+  of which the loop may perform for itself. An empty recovery path is exhausted
+  immediately, so the set-aside fires at once.
+
 Repeated stops (stop-01, 2026-08-23):
 
 * A reviewer's `stop` is a VERDICT, not a failure, so no budget ever counted
@@ -283,7 +308,14 @@ from .auto_merge import (
     MergeDeferralStore,
     UpgradeStore,
 )
-from .blockers import NO_TASK, STRANDED_AFTER_FAULT, BlockerStore
+from .blockers import (
+    NO_TASK,
+    RECOVER_BY_RESUBMITTING,
+    RECOVER_BY_RESUMING,
+    STRANDED_AFTER_FAULT,
+    BlockerStore,
+    autonomous_recovery,
+)
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
 from .browser.playwright_session import attachable_page_targets
@@ -389,6 +421,8 @@ from .worktask import (
     IntentStore,
     Reconciliation,
     Retirement,
+    SplitIntent,
+    SplitIntentStore,
     TaskExecution,
     TaskExecutionStore,
     accumulate_assumptions,
@@ -397,9 +431,11 @@ from .worktask import (
     format_attempt,
     preserve_execution,
     reconcile_after_crash,
+    reconcile_split_acceptance,
     refund_attempt,
     retire_execution,
     split_attempt,
+    split_intents_dir,
 )
 from .worktree import WorktreeManager
 
@@ -538,6 +574,20 @@ MIN_CEILING_SPLIT_TASKS = 2
 #: human reading either one can tell the round was decomposed rather than
 #: released, recut or displaced.
 CEILING_SPLIT_RETIREMENT_REASON = "split-at-attempt-ceiling"
+
+#: `blockers.Blocker.code` for a split acceptance the startup reconciliation
+#: could NOT settle by itself (split-04, 2026-08-25) — the marker is unreadable,
+#: it cannot be shown to describe what the registry recorded, or the parent's
+#: record and worker refused to move.
+#:
+#: Recorded WITHOUT parking, like `blockers.STRANDED_AFTER_FAULT` and for the
+#: same reason: the loop is working, on other tasks, and what is being reported
+#: is one retired parent's leftover artefacts. Both of the consequences that
+#: constant documents apply here too — it is invisible to
+#: `test_m1_hardening._emitted_blocker_codes` (which AST-walks `_to_needs_user`
+#: and `_to_fault_stop` only), so it is deliberately absent from
+#: `cli._RESOLUTION_PRECONDITIONS`, and it never changes a task's status.
+SPLIT_ACCEPTANCE_UNRECONCILED = "split_acceptance_unreconciled"
 
 #: Longest any single evidence section of the ceiling classification request may
 #: be. The request deliberately carries NO range diff — `packet
@@ -1342,6 +1392,16 @@ class Orchestrator:
         self._wanted_decisions = WantedDecisionTally(
             wanted_decisions_file(config.state_dir)
         )
+        #: In-flight split acceptances (`worktask.SplitIntentStore`). DERIVED
+        #: from `config.state_dir` for exactly the reason the two stores above
+        #: are, and here the argument is at its sharpest: this marker is the
+        #: ONLY durable evidence that a decomposition was half-applied, so a
+        #: store a construction site can forget to pass is a recovery that
+        #: silently never runs — and the state it recovers from is invisible by
+        #: construction (a retired parent nothing will dispatch again). Nothing
+        #: to pass, nothing to forget: every Orchestrator that ran `__init__`
+        #: reconciles.
+        self._split_intents = SplitIntentStore(split_intents_dir(config.state_dir))
         #: Persisted operator-facing blocker records (`blockers.py`).
         #: Optional, like every other produce-then-review collaborator:
         #: `None` (many existing tests that hand-build a minimal
@@ -1385,6 +1445,15 @@ class Orchestrator:
         #: are gone at attach time would then restart, clear, restart — the
         #: loop the bound exists to stop.
         self._rate_limit_browser_restarted = False
+        #: The `blockers.Blocker.id` an autonomous retry is currently riding on
+        #: (halt-02), or `""`. Set by `_autonomous_retry`, consumed by
+        #: `_close_recovered_blocker` on the first completed step, and dropped
+        #: without being closed by any park. IN MEMORY DELIBERATELY: it means
+        #: "this process retried and has not yet seen the retry work", which is
+        #: not a fact about the loop that should outlive the process — a
+        #: successor reads the still-open record as budget already spent, which
+        #: is the direction that retries less.
+        self._autonomous_recovered_blocker = ""
         # Autoloop M2 (`publisher.py`). Optional and independently gated from
         # the `worktrees`/`execution_store`/`intent_store` triple above: when
         # `None` (every existing caller and test), `_dispatch_task_push`
@@ -1462,6 +1531,14 @@ class Orchestrator:
 
     def run(self, max_steps: int | None = None) -> str:
         """Run until a terminal phase, a pause or abort request, or max_steps."""
+        # STARTUP, before the first step and before anything reads the state
+        # directory: a decomposition this process's predecessor half-applied
+        # leaves the registry describing a retired parent whose execution record
+        # is still live, which holds the repository-wide merge window shut and
+        # announces nothing. See `_reconcile_split_acceptance`. Costs one
+        # `is_dir()` when no split has ever been accepted, which is the ordinary
+        # case, and never raises.
+        self._reconcile_split_acceptance()
         steps = 0
         while True:
             # BOTH locations: the flag moved outside the checkout (see
@@ -1631,6 +1708,12 @@ class Orchestrator:
                 # restart it is owed. In-memory only, so no save is owed for
                 # it.
                 self._rate_limit_browser_restarted = False
+                # Same evidence, a second reader: an autonomous retry that is
+                # followed by a completed step has recovered, and its blocker
+                # record can be closed with a machine reason. Ordinary runs
+                # (and every run with autonomy off) have no marker set and
+                # this returns immediately.
+                self._close_recovered_blocker()
                 if self.state.rate_limit_backoffs:
                     self.state.rate_limit_backoffs = 0
                     self.state.rate_limit_wait_seconds = 0.0
@@ -8166,12 +8249,29 @@ class Orchestrator:
     def _dispatch_ceiling_split(self, directive: Directive, parent: Task) -> None:
         """Apply a `plan` that answers `parent`'s attempt-ceiling request.
 
-        EVERY refusal happens before anything moves, and the two writes that do
-        move are ordered so a crash cannot leave the registry describing a task
-        that no longer exists: the children are added and the parent retired into
-        them by `release_task_to_pending`, which persists the registry ONCE
-        (children + retirement in the same file write) before it touches the
-        execution record or the worker repo on disk.
+        EVERY refusal happens before anything moves, and the writes that do move
+        are ordered so the residue a crash leaves is the loudest one available:
+        the children are added and the parent retired into them by
+        `release_task_to_pending`, which persists the registry ONCE (children +
+        retirement in the same file write) before it touches the execution
+        record or the worker repo on disk.
+
+        **ORDERING IS NOT ENOUGH, AND THIS IS WHERE THE DURABLE MARKER COMES
+        IN.** Acceptance spans three stores — the registry, the execution record
+        and the worker repository — and there is no point at which all three
+        commit together. So a process that dies after the registry save and
+        before `retire_execution` leaves `tasks.json` saying the parent is
+        retired while its record and worker are still live: not stale, but
+        CONTRADICTORY, and silent, since the record holds the repository-wide
+        merge window shut (`cli._merge_window_blockers`) and the parent will
+        never be dispatched again for anything to notice.
+
+        A `SplitIntent` is therefore written durably immediately below — after
+        the last refusal, before the first mutation — and cleared only once all
+        three agree. `Orchestrator.run` reconciles against it at startup
+        (`_reconcile_split_acceptance`), which FINISHES a registry write that
+        landed and DISCARDS a marker for one that did not. The registry, never
+        the marker, decides which of those it is.
 
         There is no bespoke split mechanism here on purpose. `add_many` is
         atomic, `retire(superseded_by=...)` is the registry's own supersession
@@ -8313,11 +8413,45 @@ class Orchestrator:
             )
             for s in specs
         ]
+        child_ids = tuple(child.id for child in children)
+        # THE DURABLE MARKER, and it goes HERE — after the last refusal above
+        # (every one of which says "Nothing was changed", and would be made a
+        # liar by a marker claiming a split was in flight) and before the first
+        # mutation below. From this line until the marker is cleared, a crash at
+        # any point is reconcilable from disk; see `_reconcile_split_acceptance`
+        # and the section at the bottom of `worktask.py`.
+        #
+        # A marker that cannot be WRITTEN refuses the split outright. Continuing
+        # without it is the fail-open reading: the split would then be exactly as
+        # crash-unsafe as it was before this existed, with nothing saying so.
+        try:
+            self._split_intents.save(
+                SplitIntent(
+                    parent_id=parent.id,
+                    child_ids=child_ids,
+                    reason=CEILING_SPLIT_RETIREMENT_REASON,
+                )
+            )
+        except OSError as exc:
+            self._handle_policy_denial(
+                directive,
+                Verdict.deny(
+                    "ceiling_split_intent_unwritable",
+                    f"the durable marker recording this decomposition of "
+                    f"'{parent.id}' could not be written ({exc}), and without it a "
+                    "crash partway through would leave the registry describing a "
+                    "task whose execution record and worker repository still "
+                    "exist, with nothing able to find it afterwards. Nothing was "
+                    "changed.",
+                ),
+            )
+            return
         try:
             self._registry.add_many(children)
         except TaskGraphError as exc:
             # `add_many` is atomic, so the registry is exactly as it was and the
             # parent is still waiting: this is a denial, not a park.
+            self._clear_split_intent(parent.id)
             self._log("plan_rejected", data={"code": exc.code, "error": str(exc)})
             self._handle_policy_denial(
                 directive,
@@ -8328,7 +8462,6 @@ class Orchestrator:
                 ),
             )
             return
-        child_ids = tuple(child.id for child in children)
         self._registry.clear_ceiling_plan_request(parent.id)
         try:
             release = release_task_to_pending(
@@ -8353,6 +8486,14 @@ class Orchestrator:
             # Persist that — it is what is true — and park loudly rather than
             # leaving a half-applied split only this process knows about.
             self._task_store.save(self._registry)
+            # The marker is SPENT, and dropping it here is not optional. This
+            # state is half-applied but it is not contradictory: the parent is
+            # still live and still owns its record and its worker, which is
+            # precisely what the park below tells the operator. A marker left
+            # standing would have the next start's reconciliation read a live
+            # parent, answer UNAPPLIED and drop it anyway — so this is the same
+            # decision, taken where the fact is already known.
+            self._clear_split_intent(parent.id)
             state.last_response = None
             self._to_needs_user(
                 f"task {parent.id}: its decomposition into "
@@ -8397,6 +8538,15 @@ class Orchestrator:
                 "obstacle": release.obstacle,
             },
         )
+        if release.artifacts_retired:
+            # All three stores agree, so the marker has nothing left to say.
+            # KEPT when they do not — the branch at the bottom of this method —
+            # because that residue is exactly what the next start's
+            # reconciliation is for: the parent IS retired in the registry, so a
+            # record still sitting in `executions/*.json` is holding the
+            # repository-wide merge window shut on work nobody will ever
+            # dispatch again.
+            self._clear_split_intent(parent.id)
         # The parent's bookkeeping is gone; so must every pointer this session
         # still holds to it — the same cleanup a recut does, and for the same
         # reason: a later approval naming the retired packet would otherwise
@@ -8432,7 +8582,9 @@ class Orchestrator:
                     else ""
                 )
                 + "Move them aside by hand. The subtasks are in the roadmap and "
-                "can be dispatched once that is done.",
+                "can be dispatched once that is done. The split-acceptance "
+                "marker is deliberately KEPT, so the next start retries the "
+                "retirement by itself once the obstacle is gone.",
                 kind="task_fatal",
                 code="ceiling_split_retirement_failed",
                 task_id=parent.id,
@@ -8508,6 +8660,226 @@ class Orchestrator:
             f"{MAX_SPLIT_DEPTH}).\n\n"
             "Each subtask needs its own `decomposition` on the `implement` that "
             "starts it, and cannot be dispatched at all without `approved_paths`."
+        )
+
+    # ---- split acceptance: the startup half ---------------------------------
+
+    def _clear_split_intent(self, parent_id: str) -> None:
+        """Drop `parent_id`'s split-acceptance marker. Never raises.
+
+        The marker is bookkeeping about work that is already decided, so a
+        state directory that refuses the unlink must not take down the dispatch
+        that just succeeded — the worst case is one stale marker, and the next
+        start's reconciliation reads the REGISTRY rather than the marker, so a
+        stale one is answered correctly (UNAPPLIED or an idempotent COMPLETED)
+        and dropped then.
+        """
+        try:
+            self._split_intents.clear(parent_id)
+        except OSError as exc:  # pragma: no cover - unwritable state dir
+            self._log(
+                "split_acceptance_marker_not_cleared",
+                data={"task_id": parent_id, "error": str(exc)},
+            )
+
+    def _reconcile_split_acceptance(self) -> None:
+        """Finish, or discard, every split acceptance a crash left in flight.
+
+        THE invariant this exists for: after `_dispatch_ceiling_split` has
+        started, the task registry, the parent's execution record and the
+        parent's worker repository are either all in agreement, or a durable
+        marker names the parent and the next start settles it. There is no third
+        state, and before split-04 there was: a process that died between the
+        registry save and `retire_execution` left `tasks.json` saying the parent
+        was retired while `executions/<parent>.json` still described live
+        unpublished work — which shuts the repository-wide merge window
+        (`cli._merge_window_blockers`) for every other task, with nothing
+        reporting it and no dispatch of the retired parent ever coming to
+        notice.
+
+        **Run from `run()`, before the first step, and that is startup rather
+        than a per-round sweep.** A crash mid-split leaves the phase wherever the
+        dying round had it, so waiting for `_step_ready` would delay this behind
+        an arbitrary amount of other work — and the merge window is read by
+        other commands in the meantime. It is cheap enough to sit there: one
+        `is_dir()` when nothing is in flight, which is every start but the ones
+        that need it.
+
+        **The registry decides, never the marker** (`worktask.
+        reconcile_split_acceptance`). A marker only says a split was ATTEMPTED;
+        whether it happened is read from the parent's row, every time. So a
+        registry write that never landed discards the marker and touches no
+        artefact, one that landed finishes the artefact half idempotently, and
+        anything that cannot be shown to be either touches nothing and reports.
+
+        Nothing here raises. This runs before the loop's own error handling is
+        in play, and a recovery that took the process down would be worse than
+        the state it recovers from.
+        """
+        try:
+            pending = self._split_intents.pending()
+        except OSError as exc:  # pragma: no cover - unreadable state dir
+            self._log("split_acceptance_scan_failed", data={"error": str(exc)})
+            return
+        for parent_id in pending:
+            try:
+                intent = self._split_intents.load(parent_id)
+            except (StateError, OSError) as exc:
+                # Reported, never skipped, and the marker is KEPT. A corrupt
+                # marker read as absent is the alarm switching itself off: the
+                # contradictory state it points at would stay, with the last
+                # thing that knew about it now discarded.
+                self._report_split_blocker(
+                    parent_id,
+                    "its split-acceptance marker is on disk but unreadable "
+                    f"({exc}), so what was half-applied cannot be established",
+                )
+                continue
+            if intent is None:  # pragma: no cover - removed between the two calls
+                continue
+            try:
+                result = reconcile_split_acceptance(
+                    intent, self._registry, self._execution_store, self._worker_repos
+                )
+            except (StateError, GitError, TaskGraphError, OSError) as exc:
+                # `reconcile_split_acceptance` catches the retirement's own
+                # failures and reports them as FAILED; this covers a registry or
+                # store that misbehaves in some way it does not model. Same
+                # ending either way — keep the marker, name the task.
+                self._report_split_blocker(
+                    parent_id,
+                    f"its split acceptance could not be reconciled ({exc})",
+                )
+                continue
+            if not result.intent_is_spent:
+                self._report_split_blocker(parent_id, result.detail)
+                continue
+            self._clear_split_intent(parent_id)
+            retirement = result.retirement
+            self._log(
+                "split_acceptance_reconciled",
+                data={
+                    "task_id": parent_id,
+                    "outcome": result.outcome.value,
+                    "children": list(intent.child_ids),
+                    "detail": result.detail,
+                    "label": retirement.label if retirement is not None else "",
+                    "archived_record": (
+                        str(retirement.record_path)
+                        if retirement is not None
+                        and retirement.record_path is not None
+                        else ""
+                    ),
+                    "quarantined_worker": (
+                        str(retirement.worker_path)
+                        if retirement is not None
+                        and retirement.worker_path is not None
+                        else ""
+                    ),
+                },
+            )
+
+    def _report_split_blocker(self, parent_id: str, obstacle: str) -> None:
+        """File (or retain) an OPEN blocker naming a split acceptance this
+        start could not settle, and say so in the transcript.
+
+        The other half of the invariant, and the same shape
+        `_report_strand_blocker` uses for the same reason: what is being
+        reported is INVISIBLE otherwise. A retired parent is never dispatched,
+        so nothing else will ever look at it again — and if its execution record
+        survived, the cost is a merge window that stays shut for every other
+        task in the repository.
+
+        **Retains the BLOCKER rather than re-recording it, and logs anyway.** An
+        open blocker for the same `(task_id, code)` is left exactly as it is
+        (`BlockerStore.record` bumps `recurrences`, which means "this condition
+        re-parked", not "a start looked at it again") — but the transcript entry
+        is written every start regardless. See the comment at that call for why
+        the early return `_report_strand_blocker` uses would be a fail-open
+        here: the parent is retired, and a retired task's open blockers are
+        resolved automatically.
+
+        **Never changes the task's status, and never parks the loop.** The task
+        is already retired; the loop is working, on other tasks. Reporting is
+        the whole action.
+
+        Best-effort on the store, loud in the transcript — a blocker directory
+        that cannot be read or written must not take down a start, so the
+        transcript entry is written either way and carries what went wrong.
+        """
+        blocker_id = ""
+        note = ""
+        if self._blocker_store is None:
+            note = "no blocker store configured — this is reported here only"
+        else:
+            question = (
+                f"task {parent_id} was decomposed at its attempt ceiling and the "
+                f"acceptance could not be finished automatically: {obstacle}. Its "
+                "subtasks are in the roadmap and can be dispatched. What is left "
+                f"is the parent's own leftovers — look for "
+                f"{self._execution_store.path_for(parent_id) if self._execution_store is not None else 'its execution record'} "
+                "and its worker repository. A surviving execution record holds the "
+                "merge window shut for EVERY task, so it is the half worth moving "
+                "first. Answering this blocker records your decision; it does NOT "
+                "move anything."
+            )
+            detail = (
+                f"obstacle={obstacle} "
+                f"marker={self._split_intents.path_for(parent_id)}"
+            )
+            # TWO try blocks, not one, and the split is deliberate: the LOOKUP is
+            # a de-duplication convenience and the RECORD is the report. A
+            # blocker directory this cannot read must not therefore go
+            # unreported — a duplicate blocker is a nuisance, a missing one is
+            # the invisibility this whole sweep exists to end.
+            try:
+                existing = next(
+                    (
+                        blocker
+                        for blocker in self._blocker_store.open_blockers()
+                        if blocker.task_id == parent_id
+                        and blocker.code == SPLIT_ACCEPTANCE_UNRECONCILED
+                    ),
+                    None,
+                )
+            except (StateError, OSError) as exc:
+                existing = None
+                note = f"the open blockers could not be read ({exc}) — recording anyway"
+            if existing is not None:
+                blocker_id = existing.id
+                note = "an open blocker for this already exists"
+            else:
+                try:
+                    blocker_id = self._blocker_store.record(
+                        task_id=parent_id,
+                        kind="task_fatal",
+                        code=SPLIT_ACCEPTANCE_UNRECONCILED,
+                        question=question,
+                        detail=detail,
+                        phase=self.state.phase,
+                        now=utcnow_iso(),
+                        session_id=self.state.session_id or "",
+                    ).id
+                except (StateError, OSError) as exc:
+                    note = f"the blocker could not be recorded ({exc})"
+        # WRITTEN EVERY START, deliberately unlike `_report_strand_blocker`,
+        # which returns early once its blocker is open. Two reasons that one
+        # does not transfer. This runs once per process START, not once per
+        # round, so the recurrence-noise argument does not apply. And the
+        # blocker here may not survive: `cli._reconcile_retired_blockers`
+        # resolves open blockers naming a RETIRED task, and the parent is
+        # retired in every shape that reaches this method — so a report living
+        # only in the blocker store could be closed out from under the
+        # condition it describes, leaving the marker in place with nothing
+        # saying so. The transcript is the durable half nothing else closes.
+        self._log(
+            "split_acceptance_unreconciled",
+            data={
+                "task_id": parent_id,
+                "obstacle": obstacle,
+                "blocker_id": blocker_id,
+                "note": note,
+            },
         )
 
     def _park_round_cap(
@@ -10134,26 +10506,40 @@ class Orchestrator:
         `task_id` is descriptive metadata on the record either way; only
         `cli.py`'s continuous-mode handling treats it as actionable, and
         only for `kind="task_fatal"`.
+
+        **Autonomous mode (halt-02, 2026-08-25) intercepts here, and ONLY
+        here.** With `config.autonomy.enabled` — default False — a `code` that
+        `blockers.autonomous_recovery` recognises does not necessarily park:
+        the blocker record is written exactly as it always is, and then the
+        recovery path that already exists is re-entered, bounded by a budget
+        counted on that durable record. When the budget is spent the loop still
+        parks, but `task_fatal` naming the task in flight, so the existing
+        quarantine in `cli._handle_parked_task` sets that one task aside and
+        the loop keeps working. Every step of that is fail-closed: no store, no
+        resolvable task, an unrecognised code, a hard halt, a `resume_phase`
+        that is missing or terminal, or a resubmit with no request all fall
+        through to the ordinary park below, unchanged.
         """
         state = self.state
         originating_phase = state.phase
-        state.question = question
-        state.resume_phase = resume_phase
-        state.phase = Phase.NEEDS_USER.value
-        state.stop_kind = ""
-        state.park_kind = kind
-        state.park_task_id = task_id
-        state.park_blocker_id = None
-        self._log(
-            "needs_user",
-            data={
-                "question": question,
-                "resume_phase": resume_phase,
-                "kind": kind,
-                "code": code,
-                "task_id": task_id,
-            },
-        )
+        # Resolved BEFORE the record is written, because it decides the record's
+        # own `kind` and `task_id` — and `BlockerStore.record` upserts on
+        # (task, code, phase) without ever rewriting either field, so a record
+        # first written `loop_fatal`/`(loop)` could not be promoted later. One
+        # identity for the whole episode, decided once.
+        plan = self._autonomy_plan(code)
+        if plan is not None:
+            set_aside = self._autonomous_set_aside_task(task_id)
+            if set_aside is None:
+                # There is no task to set aside, so the second half of
+                # autonomous recovery cannot happen — and the first half must
+                # not either. Retrying toward a park that would still stop the
+                # loop just spends rounds to arrive at the same halt.
+                plan = None
+            else:
+                kind = "task_fatal"
+                task_id = set_aside
+        blocker = None
         if self._blocker_store is not None:
             blocker_task_id = task_id or NO_TASK
             # Idempotent: re-parking on the same (task, code, phase) updates
@@ -10171,8 +10557,193 @@ class Orchestrator:
                 # abandoned by a session that has since been reset.
                 session_id=state.session_id or "",
             )
-            state.park_blocker_id = blocker.id
+            if plan is not None and self._autonomous_retry(
+                plan, blocker, code=code, resume_phase=resume_phase
+            ):
+                return
+        # From here down the loop parks, exactly as it did before autonomous
+        # mode existed. The marker is dropped rather than acted on: a park
+        # means the retry did NOT recover, so its record must stay open.
+        self._autonomous_recovered_blocker = ""
+        state.question = question
+        state.resume_phase = resume_phase
+        state.phase = Phase.NEEDS_USER.value
+        state.stop_kind = ""
+        state.park_kind = kind
+        state.park_task_id = task_id
+        state.park_blocker_id = blocker.id if blocker is not None else None
+        self._log(
+            "needs_user",
+            data={
+                "question": question,
+                "resume_phase": resume_phase,
+                "kind": kind,
+                "code": code,
+                "task_id": task_id,
+            },
+        )
         self._store.save(state)
+
+    # ---- autonomous recovery (halt-02, 2026-08-25) --------------------------
+
+    def _autonomy_plan(self, code: str):
+        """`blockers.AutonomousRecovery` for `code`, or `None` for "park
+        exactly as this loop parks today".
+
+        Four fail-closed gates, in the order they can be answered cheapest
+        first. The `is not True` on the flag is deliberate rather than a
+        `not ...`: `load_config` refuses a non-boolean, but an `AutoloopConfig`
+        built directly (every construction in the test suite) is not validated
+        by anything, and a truthy string must not read as consent to act
+        without an operator.
+
+        A configured `BlockerStore` is REQUIRED, and not merely because the
+        retry budget is counted on it. Setting a task aside deletes the session
+        file (`cli._handle_parked_task`) on the strength of the blocker record
+        holding the question durably; with no store there is no such record,
+        and the question would be destroyed rather than filed.
+        """
+        autonomy = getattr(self._config, "autonomy", None)
+        if autonomy is None or getattr(autonomy, "enabled", False) is not True:
+            return None
+        if self._blocker_store is None:
+            return None
+        return autonomous_recovery(code)
+
+    def _autonomous_set_aside_task(self, task_id: str | None) -> str | None:
+        """WHICH task autonomous mode would set aside for a fault raised here,
+        or `None` when there is no task to set aside.
+
+        The park site's own `task_id` wins — it is the only one that knows a
+        fault belongs to a task other than the one currently executing (a push
+        approval's `binding.task_id`, say). Otherwise the task in flight, read
+        off `state.task_execution`, which is the serialised record of whichever
+        task is running the produce-then-review path.
+
+        `None` — a fault raised while no task is in flight, e.g. a login expiry
+        during a plan request — is a real answer and not a failure: there is
+        nothing to quarantine, so the loop parks as it always did rather than
+        inventing a victim.
+        """
+        if task_id:
+            return task_id
+        execution = self.state.task_execution
+        if isinstance(execution, dict):
+            candidate = execution.get("task_id")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        return None
+
+    def _autonomous_retry(self, plan, blocker, *, code: str, resume_phase: str | None) -> bool:
+        """Re-enter `plan`'s recovery path. True when the loop moved and the
+        caller must return without parking; False when it could not, and the
+        caller parks (as a set-aside, since a plan exists) instead.
+
+        The budget is `min(the code's own allowance, config.autonomy.
+        max_recovery_attempts)` — the config value can only ever restrain the
+        table — and is metered on `BlockerStore.open_recurrences`, i.e. across
+        every OPEN record for this (task, code) rather than the one record just
+        written. A fault that moves one phase along therefore continues
+        spending the same allowance instead of being handed a fresh one.
+
+        `RECOVER_UNAVAILABLE` returns False by construction, which is the whole
+        point of that value: the recovery path for those codes is empty, so it
+        is exhausted on the first occurrence and the set-aside fires at once.
+        """
+        state = self.state
+        budget = min(plan.max_attempts, self._config.autonomy.max_recovery_attempts)
+        # `record` has already counted THIS occurrence, so the retries already
+        # spent are one fewer than the total. `max(0, ...)` guards a record
+        # written with a nonsense count rather than trusting arithmetic on it.
+        spent = max(0, self._blocker_store.open_recurrences(blocker.task_id, code) - 1)
+        if spent >= budget:
+            return False
+        if plan.action == RECOVER_BY_RESUMING:
+            target = self._resumable_phase(resume_phase)
+            if target is None:
+                return False
+            state.phase = target.value
+        elif plan.action == RECOVER_BY_RESUBMITTING:
+            # The same request id on purpose, exactly like `cli.
+            # _authorize_resubmit`: if the earlier attempt did land,
+            # reconciliation detects it and nothing is duplicated.
+            if state.pending_request is None:
+                return False
+            state.pending_request.send_attempted = False
+            state.phase = Phase.SUBMITTING.value
+        else:
+            return False
+        state.question = None
+        state.resume_phase = None
+        state.stop_kind = ""
+        state.park_kind = None
+        state.park_task_id = None
+        state.park_blocker_id = None
+        # Consumed by the first COMPLETED step (`run`'s else branch), which is
+        # the only honest evidence the fault is behind the loop. Held in memory
+        # only: a process that dies before that step leaves the record open,
+        # and the next one reads its recurrences as budget already spent —
+        # fewer retries, never more.
+        self._autonomous_recovered_blocker = blocker.id
+        self._log(
+            "autonomous_recovery",
+            data={
+                "code": code,
+                "action": plan.action,
+                "blocker_id": blocker.id,
+                "task_id": blocker.task_id,
+                "attempt": spent + 1,
+                "budget": budget,
+                "phase": state.phase,
+            },
+        )
+        self._store.save(state)
+        return True
+
+    @staticmethod
+    def _resumable_phase(raw: str | None) -> "Phase | None":
+        """`raw` as a phase the loop can actually step, or `None`.
+
+        A park with no `resume_phase` has said it is not resumable, and a
+        terminal one would re-enter the park it just left; both mean "there is
+        no recovery path here", which is the same answer as an unparseable
+        value. Refusing all three in one place is why the retry cannot fall
+        into a phase nobody chose.
+        """
+        try:
+            phase = Phase(raw)
+        except ValueError:
+            return None
+        return None if phase in TERMINAL_PHASES else phase
+
+    def _close_recovered_blocker(self) -> None:
+        """A step COMPLETED after an autonomous retry: close that blocker.
+
+        Called from `run`'s else branch, beside the rate-limit reset, and for
+        the same reason it is — a completed step is the only free, honest
+        evidence that the condition the loop retried through has cleared.
+
+        Never raises. A store that cannot be written leaves the record open,
+        which spends the next occurrence's budget rather than granting it, so
+        the failure mode of this method is fewer retries.
+        """
+        blocker_id = getattr(self, "_autonomous_recovered_blocker", "")
+        if not blocker_id:
+            return
+        self._autonomous_recovered_blocker = ""
+        if self._blocker_store is None:  # pragma: no cover - never set without one
+            return
+        try:
+            self._blocker_store.close_recovered(
+                blocker_id,
+                "autonomous recovery: a step completed after the retry, so the "
+                "fault this recorded is behind the loop",
+            )
+        except (StateError, OSError) as exc:
+            self._log(
+                "autonomous_recovery_close_failed",
+                data={"blocker_id": blocker_id, "error": f"{type(exc).__name__}: {exc}"},
+            )
 
     def _to_fault_stop(
         self,

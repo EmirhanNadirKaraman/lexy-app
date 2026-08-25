@@ -8,7 +8,7 @@ tools look for `AGENTS.md` by convention; it is a pointer, not a second guide.
 
 ## Why a pointer and not a copy
 
-There was briefly a real copy here: 357 lines, the same length as `CLAUDE.md`,
+There was briefly a real copy here: 357 lines, then the same length as `CLAUDE.md`,
 278 of them identical to it, produced by find-replacing "Claude" with "Codex".
 Two problems made it worse than useless.
 

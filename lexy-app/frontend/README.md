@@ -1,73 +1,59 @@
-# React + TypeScript + Vite
+# Lexy frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The React SPA for the Lexy language-learning app. The repository guide is
+[`CLAUDE.md`](../../CLAUDE.md) at the repo root; the file-level index is
+[`docs/SUMMARY.md`](../../docs/SUMMARY.md). This file covers only what is
+specific to running and testing this package.
 
-Currently, two official plugins are available:
+> This README replaced the unmodified `npm create vite` template text on
+> 2026-08-25. That template described a scaffold, not this app.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Stack
 
-## React Compiler
+Versions below are from `package.json` as of 2026-08-25.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- **React 19.2** + **react-router-dom 7.13**
+- **Vite 8** with `@vitejs/plugin-react` 6 (Oxc). The React Compiler is not enabled.
+- **TypeScript 5.9**, `"strict": true` in both `tsconfig.app.json` and `tsconfig.node.json`
+- **Vitest 4** + jsdom for tests
+- **No state library** — `useOutletContext`, custom hooks in `src/hooks/`, and
+  `localStorage` for the auth token
+- **No CSS framework** — inline `React.CSSProperties`, themed through the
+  CSS-variable system in `src/index.css` driven by `[data-theme]` on `<html>`
 
-## Expanding the ESLint configuration
+## Commands
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev        # Vite dev server on :5173
+npm run build      # tsc -b && vite build
+npm run lint       # eslint .
+npm run test       # vitest run
+npm run preview    # serve the production build locally
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+`npm run dev` proxies `/api` to `http://localhost:8000` (`vite.config.ts`), so
+the backend must be running separately — see `CLAUDE.md` §11. In the Docker
+build there is no proxy and no :5173: the backend serves the built `dist/` as
+static files, and the whole app is on :8000.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Two things that will cost you time
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+**`tsc --noEmit` passing does not mean `npm run build` passes.** The build runs
+`tsc -b`, which uses the project references and stricter settings. Always run
+the real `npm run build`. This is logged in
+[`docs/COMMON_ERRORS.md`](../../docs/COMMON_ERRORS.md) — read it before
+debugging a build failure from scratch.
+
+**`npm run lint` is not currently clean.** Measured 2026-08-25: **22 errors and
+8 warnings**, all pre-existing, mostly `react-refresh/only-export-components`
+from files that export both a component and a helper. Lint is not part of the
+validation gate for this package (that is `npm run build` plus `npx vitest
+run`), so treat a finding here as pre-existing unless your change introduced it.
+
+## Tests
+
+`npx vitest run` — **322 tests across 44 files** as of 2026-08-25. Setup file is
+`src/test/setup.ts`. Per-file coverage notes live in
+[`docs/TESTS.md`](../../docs/TESTS.md); update that file whenever you add,
+remove, or rename a test.

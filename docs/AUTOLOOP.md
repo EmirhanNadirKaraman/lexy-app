@@ -6836,6 +6836,122 @@ environment's. Both stay `in_progress` until the reviewer or an operator moves
 them. An unreadable execution record is the one "cannot tell" case, and it fails
 closed: it is reported as a blocker and never requeued.
 
+### 9c-quater. Autonomous recovery: exhaust the recovery path, then step aside (halt-02, 2026-08-25)
+
+**A CONFIG FLAG, DEFAULT OFF.** `[autonomy] enabled = false` in
+`autoloop/config.example.toml`; `config.AutonomyConfig`. With it off — every
+config file written before this existed, and every `AutoloopConfig(...)` built
+directly — every park in §9c behaves exactly as it did, including the
+classification each park site chose for itself. Turning it off again restores
+that in full; nothing here is one-way.
+
+**The problem it answers.** Measured 2026-08-24 over 131 resolved blocker
+records: 411.8h parked, and over the 70.3h window where every round is timed,
+21.5h — 30.6%, in five gaps out of 103 — was the loop waiting for an operator. A
+transport or environment fault is the worst of those waits, because there is
+nothing to *decide*: the loop already knows the remedy and simply will not move
+without a human saying so.
+
+**Two stages, in order.** With the flag on, a park whose `code` is in
+`blockers.AUTONOMOUS_RECOVERIES`:
+
+1. **re-enters the recovery path that already exists** — `run --retry`'s
+   re-entry of the park's own `resume_phase`, or `run --resubmit`'s re-issue of
+   the same request id — bounded by a budget, and
+2. **when that path is exhausted, sets the ONE task in flight aside**: the park
+   still happens, but classified `task_fatal` naming that task, which is the
+   existing quarantine `cli._handle_parked_task` already knows how to work past.
+   The loop keeps going on the rest of the roadmap instead of stopping.
+
+Stage 2 is the point; stage 1 is only worth doing where a recovery path
+genuinely exists. Nothing about §9c's machinery changed: the interception is at
+`orchestrator._to_needs_user` and nowhere else, and `cli.py`, `state.py`,
+`policy.py` and `tasks.py` are untouched by it.
+
+**The table, and why three budgets are zero.**
+
+| code | action | retries | why |
+|---|---|---|---|
+| `login_expired` | re-enter `resume_phase` | 2 | The park already carries the phase it was raised in, and `run()` drops the client before parking, so re-entry builds a fresh client — the manual remedy minus the wait. |
+| `git_unavailable_in_ready` | re-enter `resume_phase` | 2 | Raised while BUILDING a request: the outbox is intact and nothing was sent. Re-running the context build answers a git that was merely busy. |
+| `submission_ambiguous` | re-issue the same request id | 1 | The one automation that TRADES a risk rather than removing one — a possible duplicate beats a stopped loop, and one re-issue is the whole trade: a second buys no new evidence and doubles the duplicate. The risk is smaller than "a duplicate": `_step_submitting` reconciles BEFORE it sends, so a message that did land is detected and the loop goes to `awaiting` having sent nothing. |
+| `worker_environment_drift` | — | 0 | No `resume_phase`, and the round's `last_response` is cleared before the park, so there is no phase to step again. The remedy is an operator repairing the shared git environment. |
+| `publisher_url_drift` | — | 0 | SECURITY-SHAPED. The only recovery is `reprovision-publisher --confirm` — an operator confirming a NEW push destination is correct. A loop that could take it could redirect its own publication. Nothing is published on this path, ever. |
+| `crash_reconciliation_ambiguous` | — | 0 | `reconcile_after_crash` is deterministic over an intent the park deliberately does not clear, so a re-run returns AMBIGUOUS by construction. Already `task_fatal` at its own site. |
+
+A budget of 0 is not a gap: an empty recovery path is exhausted on the first
+occurrence, so the set-aside fires at once — which is the half that was missing.
+
+**Seven codes were named; six are in the table.** halt-02's claim names six that
+must "retry through the recovery path that already exists" plus
+`submission_ambiguous`, which must RE-ISSUE — seven in all. One of the six, the
+conversation-rotation failure, is gone rather than automated: brw-15 (§5c's
+rotation removal) deleted the only machinery that could raise it, so there is no
+live provider behind it — and a code nothing can raise must be removed rather
+than automated, because automating one reads as coverage while covering a path
+nothing reaches. It is deliberately absent from the table, and
+`test_autonomous_recovery.py` asserts both that absence and that every code that
+IS in the table is one `orchestrator.py` can actually emit.
+
+**The five hard halts are unreachable from any of it.**
+`blockers.HARD_HALT_CODES` — `checkout_escape_detected`,
+`worker_isolation_violation`, `primary_checkout_dirty`,
+`approved_path_symlink_traversal`, `prompt_integrity_mismatch` — mean an agent
+wrote outside its worker repository, or the checkout is not what the loop
+believes it to be. Continuing past one corrupts the tree every later task builds
+on, so stepping aside from it is exactly the wrong answer. Two locks enforce
+that: the table is an ALLOWLIST, and `blockers.autonomous_recovery` refuses a
+hard halt outright before consulting it. A test asserts the two sets are
+disjoint, so adding a hard halt to the table is a failing test rather than a
+silent automation.
+
+**Every gate fails closed.** No `BlockerStore`, no resolvable task, an
+unrecognised or empty code, a hard halt, a `resume_phase` that is missing or
+terminal, a re-issue with no request in flight, a `[autonomy]` section that is
+malformed, or an `enabled` that is not literally `True` — each falls through to
+the ordinary park, unchanged. The store requirement is not only about the
+budget: setting a task aside deletes the session file on the strength of the
+blocker record holding the question durably, so with no store the question would
+be destroyed rather than filed. A CORRUPT record raises, as everywhere else in
+that module, rather than reading as "nothing open" — which would be a full,
+unspent budget derived from evidence nobody could read.
+
+**The budget is durable, per-episode, and cannot be refreshed by a phase
+change.** It is metered on `BlockerStore.open_recurrences(task, code)` — the sum
+of recurrences across every OPEN record for that pair — not on the single record
+`record()` upserts, because that one keys on `(task, code, phase)` and a fault
+that migrates one phase along would otherwise buy a second full allowance.
+`autonomy.max_recovery_attempts` is a CEILING on the table's own numbers, never a
+floor: at 0 the set-aside stays and no retry happens; above a code's own number
+it changes nothing.
+
+**A record is closed only by evidence.** A retry that is followed by a COMPLETED
+step is the only free, honest evidence the fault is behind the loop — the same
+evidence the rate-limit reset already uses — and that closes the record through
+`BlockerStore.close_recovered`, with a machine reason in `archived_reason` and
+`answer` left `None`, so a machine close can never forge the operator
+confirmation `cli._RESOLUTION_PRECONDITIONS` demands. A park drops the marker
+without closing anything. A process that dies mid-retry, or a store that cannot
+be written, leaves the record OPEN, which the next occurrence reads as budget
+already spent — fewer retries, never more.
+
+**What an operator sees.** A blocker record is written for every one of these
+faults exactly as before, so `python -m autoloop blockers` lists it while the
+loop is still retrying, `health` and the monitor go red on it, and `answer`
+resolves it. Nothing becomes invisible; what changes is that the loop no longer
+stands still next to it. The transcript carries `autonomous_recovery` (code,
+action, attempt, budget, phase) for each retry.
+
+**One documented decision this overrides, stated rather than implied.**
+`worker_environment_drift`'s park site argues for `loop_fatal` because the drift
+affects every task, not just the one that surfaced it — so quarantining one task
+leaves the condition in place for the next. Under autonomous mode each task is
+instead set aside in turn; with a genuinely loop-wide drift that walks the
+backlog blocking each task, until `run --continuous` finds nothing ready and
+exits 0 printing the open blockers (the exhaustion path in §9c). That is bounded
+and visible, but it is more churn than the single stop it replaces, and it is
+the trade the flag turns on.
+
 ### 9d. Retired: superseded work is not blocked work
 
 `blocked` used to carry a THIRD meaning, and it was the one that made the

@@ -24,14 +24,20 @@
 
 ## `match_learning_words` unit behavior
 
-- Returns `item_id`, `item_type='word'`, and `word` for each match
-- Matches on lowercased surface form OR lemma
-- Excludes words with `status='known'`
+- Returns `item_id`, `item_type ∈ {'word','phrase'}`, and `word` for each match,
+  deduplicated across both paths
+- WORDS path matches on lowercased surface form OR lemma
+- PHRASES path delegates to `matcher_service.match_sentence_with_ids` (spaCy),
+  so an inflected phrase matches its canonical
+- Excludes items with `status='known'`
+- Scoped to the session's language, not a hardcoded `'de'`
 - Returns an empty list for an empty or non-alphabetic text input
+
+*(Updated 2026-08-25 — this section described the word-only version.)*
 
 ## Non-goals (what the feature should NOT do)
 
-- Must NOT match phrase items (only `item_type='word'`)
-- Must NOT advance active track for `mixed`-language messages
+- Must still exclude items with `status='known'` from both the word and phrase paths
+- Must NOT advance the active track for any turn whose `language_detected` differs from the session language (`'mixed'` and `'en'` alike)
 - Must NOT fire `free_chat_matched` (that event is defined but currently unreachable — tests should confirm it is NOT fired by the chat router)
 - Must NOT fail the chat response if a progression or analytics call raises

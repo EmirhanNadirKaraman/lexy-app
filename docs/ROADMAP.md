@@ -65,9 +65,15 @@ round-trips), the **LLM provider seam** (the three ad-hoc
 and an **OpenAI-compatible provider** so the backend can target a
 self-hosted model server. Anthropic remains the default throughout.
 
-Verified on **2026-07-29** (current): backend **1151 passed / 2 skipped**,
-frontend **322 passed across 44 files**, root pipeline **221 passed**,
-`ruff check .` clean, alembic head **037**.
+Verified on **2026-07-29**: backend **1151 passed / 2 skipped**, frontend
+**322 passed across 44 files**, root pipeline **221 passed**, `ruff check .`
+clean, alembic head **037**.
+
+**Re-measured 2026-08-25:** backend **1,320 collected** (the 1151 above was the
+bare-`pytest` figure, which silently drops `test_document_package.py` — use
+`python3 -m pytest`), frontend **322 across 44 files** (unchanged), root
+`tests/` **368 collected**, `autoloop/tests` **3,672**, `ruff check .` still
+clean, alembic head still **037**.
 
 > Historical baselines quoted elsewhere in this file (847/274 as of
 > 2026-07-27, and 745 backend / 671 root / 238 frontend before that) are

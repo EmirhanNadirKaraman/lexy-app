@@ -17,7 +17,8 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 | Layer | Path | Status |
 |---|---|---|
 | **App backend** (production) | `lexy-app/backend/` | FastAPI + asyncpg + Postgres. This is what serves the frontend. |
-| **Pipeline modules (root)** | `pipeline.py`, `eligibility.py`, `exposure_counter.py`, `user_knowledge.py`, `learning_units.py`, `onboarding.py`, `subtitle_*.py`, `utterance_*.py`, `word_knowledge.py`, `validate_tier_lemmas.py` | Standalone in-memory utilities. NOT mounted on FastAPI. Used by `subtitle-scraper/` and ad-hoc data prep. |
+| **Pipeline modules (root)** | `pipeline.py`, `pipeline_diagnostics.py`, `eligibility.py`, `exposure_counter.py`, `exposure_service.py`, `user_knowledge.py`, `learning_units.py`, `onboarding.py`, `subtitle_*.py`, `utterance_*.py`, `word_knowledge.py`, `validate_tier_lemmas.py` | Standalone in-memory utilities. NOT mounted on FastAPI. Used by `subtitle-scraper/` and ad-hoc data prep. |
+
 **Implication:** the root pipeline modules are the **only** pipeline tree. Change them directly; there is no second copy to keep in sync.
 
 > **Historical (resolved 2026-07-27):** a third layer, `src/app/`, used to hold a
@@ -33,13 +34,19 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 
 ## 3. Stack
 
+> **Why the numbering skips 4 and 7.** "Directory map" (§4) and "API surface"
+> (§7) were deleted on 2026-07-29 for having drifted — they are reconstructible
+> from the repo and better covered by `docs/SUMMARY.md`. The numbers were left
+> in place on purpose so that cross-references to §8b / §10 / §12 / §14, here
+> and in other docs, keep pointing at the same sections. Don't renumber.
+
 ### Backend (`lexy-app/backend/`)
 - **FastAPI** + **asyncpg** (async Postgres driver, pool-based)
-- **Alembic** migrations (25+ files in `alembic/versions/`)
+- **Alembic** migrations (37 files in `lexy-app/backend/migrations/versions/`, head `037`). **Not `alembic/versions/`** — that directory does not exist here; `alembic.ini` points at `migrations/`.
 - **JWT auth** (HS256, secret in `SECRET_KEY` env)
 - **LLM** → `services/llm_provider.py` is the only place a client is constructed. Two backends, selected by `LLM_PROVIDER`: `anthropic` (default, `claude-haiku-4-5-20251001`) and `openai_compatible` (any `/chat/completions` server — Ollama `/v1`, llama.cpp, vLLM, LM Studio). One call shape everywhere: non-streaming, JSON Schema in, structured dict out. **No host is assumed** — `LLM_BASE_URL` is built for a GPU box over Tailscale, not localhost. See §11 for the env vars.
 - **LLM cache**: SHA256(prompt_key + model + params) → `llm_cache` table, with TTL. Curated human glosses live in the same table under the sentinel model `curated:words_4000_old`, which `translate_item_gloss` checks before the model-specific key so they survive an `LLM_MODEL` switch.
-- **spaCy** (`de_core_news_md` etc.) for tokenisation/lemmatisation.
+- **spaCy** for tokenisation/lemmatisation, via `services/nlp_service.py`, which maps language code → model and loads the **`_sm`** sizes (`de_core_news_sm`, `es_core_news_sm`, …; 11 languages mapped). The Dockerfile downloads `de_core_news_sm`. The larger `de_core_news_md` is used by the **root pipeline modules only** (`pipeline.py`, `utterance_unit_extractor.py`, `validate_tier_lemmas.py`) — don't assume one size across both trees.
 
 ### Frontend (`lexy-app/frontend/`)
 - **React 19** + **React Router 7** + **Vite 8** + **TypeScript** (strict)
@@ -49,9 +56,9 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 - Dev proxy: `/api → http://localhost:8000`
 
 ### Data pipelines
-- **`subtitle-scraper/`** — yt-dlp + spaCy + Postgres. Pulls transcripts for ~916 YouTube channels.
+- **`subtitle-scraper/`** — yt-dlp + spaCy + Postgres. Pulls transcripts for the channels marked `active` in the `channel` table (runtime is DB-only). Both the in-repo bootstrap seed `seed_data/channels.json` and the live `channel` table hold **190** entries, all `active` (counted 2026-08-25). A candidate list of 1,000 German channels sits unused at `subtitle-scraper/top-1000-most-subscribed-youtube-channels-in-germany.csv`.
 - **`pdf_text_extraction/`** — Docling + TATR + custom masking. **NOT used for book ingestion, and currently non-importable**: it imports `pipeline.stages.pdf_text_extraction.*`, a layout that doesn't exist in this repo (`ModuleNotFoundError: No module named 'pipeline.stages'`). The shipping book path is `book_service` (PyMuPDF embedded text → sparse-text heuristic → pytesseract OCR fallback), which imports none of this. Verified 2026-07-27.
-- **`masking/`** — alternative/older PDF pipeline (`latest_ingest.py`, table reconstruction). Partially functional: run from inside the folder, `mask_tables.py` and `visualize_docling_full.py` import fine, but `latest_ingest.py` / `simple_pdf_processor.py` need a `parsers` package that exists nowhere in this repo — so the **text-stitching** half (`ContextAwareStitcher`) is the missing piece. `book_service` does no cross-block stitching, so that is the one real gap here.
+- **`masking/`** — alternative/older PDF pipeline (`latest_ingest.py`, table reconstruction). Partially functional: run from inside the folder, `mask_tables.py` and `visualize_docling_full.py` import fine, but `latest_ingest.py` fails at import with `ModuleNotFoundError: No module named 'parsers'`. `simple_pdf_processor.py` **imports fine** — it catches the same missing `parsers` package and logs `text_processing not available - text won't be stitched`, then runs without stitching. Either way the **text-stitching** half (`ContextAwareStitcher`) is the missing piece. Verified 2026-08-25. `book_service` does no cross-block stitching, so that is the one real gap here.
 - **`postprocessing/`** — bulk extraction of phrases from already-scraped text into `word_occurrences`.
 - **`ilp/`** — PuLP-based book-selection optimiser (find minimum book set covering a target vocab list). Standalone CLI, still unwired. Its *technique* now also lives in `playlist_service.ilp_cover` as the opt-in `algorithm="ilp"` playlist mode — re-implemented for the request path, not imported, since the CLI reads word-list files and its own DB config.
 
@@ -64,8 +71,8 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 
 ### Notable migrations
 - **001** — users / user_word_knowledge / srs_cards baseline
-- **005** — phrase_table (with `phrase_type` enum)
-- **007** — grammar_rule_table (linked via `applicable_phrase_types`, `applicable_lemmas`)
+- **005** — phrase_table (`phrase_type` is a plain `TEXT` column defaulting to `'verb_pattern'`, not a Postgres enum and not CHECK-constrained — the value set is enforced in application code only)
+- **007** — grammar_rule_table (linked via `applicable_phrase_types`; `applicable_lemmas` is added later, by **011**)
 - **008** — books (documents/pages/blocks)
 - **009** — reading_selections
 - **013–022** — channel surrogate-key refactor (3-phase: youtube_channel_id string → internal SERIAL id)
@@ -89,13 +96,22 @@ Primary user goal: see a word in real context, mark/learn it, see it again at th
 | `reading_service`, `reading_llm_service`, `reading_stats_service` | interactive reading (word status overlays, selections, translate, explain, coverage) |
 | `chat_service`, `guided_chat_service` | session lifecycle; guided picks target item via `recommendation_service` or caller |
 | `recommendation_service`, `prioritization_service`, `insights_service` | recommendations (sentences/videos/items) + insight cards (frequent_unknowns, recent_mistakes) |
-| `matcher_service` | calls into `subtitle-scraper/phrase_finder.py` via a fragile `os.chdir` + sys.path hack (see §10) |
+| `matcher_service` | calls into `subtitle-scraper/phrase_finder.py` via a `sys.path.insert` + deferred import (the `os.chdir` hack was removed 2026-05-20 — see §10). The sibling import carries `# noqa: E402`; do not hoist it. |
 | `nlp_service` | spaCy wrapper |
 | `playlist_service` | playlist generation from target words |
 | `reminder_service` | learning-reminder summary |
 | `settings_service` | reads/writes `users.settings` JSONB (channel prefs etc. live here) |
 | `usage_events_service` | records `word_usage_events` (analytics, fire-and-forget) |
 | `search_service` | full-text search over videos/subtitles |
+| `catalog_resolver` | shared surface-text → (`word_table` \| `phrase_table`) resolution. One rule, two callers (`word_list_service`, `reading_service`). |
+| `text_norm` | Unicode-safe case-insensitive matching. Exists because the DB runs under the **C locale**, so Postgres `lower()` does not fold non-ASCII. Pairs with the generated `word_norm` columns (migration 036). |
+| `word_list_service` | user vocabulary lists — upload, see what you already know, export |
+| `content_request_service` | owns every statement against `content_request`, the queue the scraper consumes |
+| `notification_service` | read side of the `notification` table (write side is `subtitle-scraper/pipeline.py::_notify_user`) |
+| `book_import_service` | document-package import (roadmap **A2**): `verify → validate → dry-run → persist`, no DB mutation before every gate passes. Helpers in `services/document_package/`. |
+| `lemma_correction_service` | user flags for bad spaCy lemmas (#39 slice 3A). **Signal only** — never writes `lemma_override`. |
+| `word_seed_service`, `gloss_seed_service`, `system_list_seed_service` | startup/one-shot seeding: catalog words from `data/final_result.txt`, curated glosses into the permanent LLM cache, and the built-in system word lists (migration 037). |
+| `srs_backfill_service`, `srs_cleanup_service` | one-shot repair jobs: create missing active cards for existing `learning` items (Hole 11/16), and delete `srs_cards` orphaned by a removed `user_word_knowledge` row (Hole 10). |
 
 ---
 
@@ -108,7 +124,7 @@ The thing to internalise — every other service depends on it.
 - **Auto-promotion** happens inside `progression_service` on every recorded event (transcript click, status change, SRS review correct/incorrect, guided chat target_counted, free chat language_detected use).
   - The free-chat branch is the one to be careful with: `language_detected == session_language` is the *only* gate between passive-only and active credit (`routers/chat.py:204`), and active credit feeds one-way auto-promotion to `known`. Widening that gate over-grants unrecoverably — see Hole 19 / **N5** in `docs/ROADMAP.md` before touching it.
 - **SM-2** scheduling lives in `progression_service._update_srs(conn, ..., direction, action)`.
-- **Transactions:** `apply_progression` wraps the upsert + promotion + SRS update in a single `async with conn.transaction():` (line 178). Don't add a competing outer transaction.
+- **Transactions:** `apply_progression` wraps the upsert + promotion + SRS update in a single `async with conn.transaction():` (`services/progression_service.py:259`). Don't add a competing outer transaction.
 - **Events are deferred / fire-and-forget** for non-critical analytics (`usage_events_service.record_event` via `asyncio.create_task`).
 
 If you change progression rules, check `tests/test_progression.py` + `test_free_chat_progression.py` + `test_reading_progression.py`.
@@ -123,7 +139,7 @@ Read this before assuming anything about how an event flows through `progression
 
 **`passive_review_correct` bumps `passive_level` (since 2026-05-18).** A successful passive review now adds 1 to passive_level — matches `transcript_clicked`'s weight. Historical: before this date `passive_delta=0`, so reviews didn't grow the "Understood" dots.
 
-**`status_marked_unknown` resets the SRS schedule (since 2026-05-18).** Clicking "Unknown" sets `passive_srs="incorrect"` and `active_srs="incorrect"` — both run the SM-2 incorrect branch on cards that exist (interval=1 day, ease-0.15, reps=0). Levels are intentionally left alone (no fabrication, mirrors `status_marked_known`'s choice). Crucially, `action="incorrect"` with a missing card is a **no-op** (see `_update_srs` line ~333) — manual unknown never *creates* a new active card. Historical: before this date the rule was an empty delta and the SRS card kept its long interval.
+**`status_marked_unknown` resets the SRS schedule (since 2026-05-18).** Clicking "Unknown" sets `passive_srs="incorrect"` and `active_srs="incorrect"` — both run the SM-2 incorrect branch on cards that exist (interval=1 day, ease-0.15, reps=0). Levels are intentionally left alone (no fabrication, mirrors `status_marked_known`'s choice). Crucially, `action="incorrect"` with a missing card is a **no-op** (`_update_srs` is defined at `services/progression_service.py:498`; the no-op branch is at ~580) — manual unknown never *creates* a new active card. Historical: before this date the rule was an empty delta and the SRS card kept its long interval.
 
 **`status_marked_known` does NOT touch active levels or the active SRS card.** Manual "Known" is user confidence, not production evidence — `active_delta=0`, `active_srs=None`. The status field is written to `known` inside `apply_progression`'s own transaction, from the `status_override="known"` the router passes (`routers/words.py:153`) — see the atomicity rule below. The rule only advances the passive SRS card. Active mastery is reserved for real production events (`guided_counted`, `free_chat_used_correctly`, `active_review_correct`). Historical note: before 2026-05-18 this rule wrote `active_delta=1, active_srs="correct"` — inflating active mastery on a confidence click. Fixed; if you see a user with active_level > 0 and no production events in `word_usage_events`, that's pre-fix data.
 
@@ -160,7 +176,7 @@ Read this before assuming anything about how an event flows through `progression
 - **Channels live in the `channel` table only** (since 2026-05-20, #7). `subtitle-scraper/seed_data/channels.json` is the bootstrap seed for fresh deployments; `seed_channels.py` upserts it into the DB (idempotent). Runtime (`pipeline.py:load_channels`) is DB-only — no file fallback. Old flat files at the scraper root (`channels.json`, `merged_channels.json`, `subscribed_channels.txt`) and `merge_channels.py` are gone.
 - **Channel preferences** moved to `user_channel_preference (user_id, youtube_channel_id, preference_kind)` since T1.4 / migration 027 (2026-05-20). Display-name cache `channel_names` still lives in JSONB (it's a lookup table, not a preference). Frontend API shape unchanged — `get_preferences` joins on read.
 - **`apply_progression` IS transactional** and now writes status too (resolved 2026-05-19). The router calls `apply_progression(..., status_override=body.status)` once — status + level deltas + SRS card moves all happen inside one transaction. `word_service.upsert_word_status` is gone; `progression_service` is the single writer to `user_word_knowledge`.
-- **LLM rate limiting** (since 2026-05-19, #12). `services/rate_limiter.py` — in-memory sliding window, 30 req/min + 400 req/hour per user. Wired via `core/deps.rate_limit_llm` into all 10 LLM-backed routes. `GET /srs/due` exempt (cached glosses). 429 → `detail="rate_limit_minute"` or `"rate_limit_hour"` with `Retry-After`. **Multi-worker deploy needs Redis backend** — limiter is in-process today.
+- **LLM rate limiting** (since 2026-05-19, #12). `services/rate_limiter.py` — in-memory sliding window, 30 req/min + 400 req/hour per user. Wired via `core/deps.rate_limit_llm` into all **11** LLM-backed routes (`books` 2, `chat` 3, `insights` 3, `reading` 2, `srs` 1; counted 2026-08-25). `GET /srs/due` exempt (cached glosses). 429 → `detail="rate_limit_minute"` or `"rate_limit_hour"` with `Retry-After`. **Multi-worker deploy needs Redis backend** — limiter is in-process today.
 - **CORS env-driven** (since 2026-05-19). `CORS_ORIGINS` env var, comma-separated, falls back to `http://localhost:5173` when unset. Documented in `.env.example`. See `_parse_cors_origins` in `main.py`.
 - **Theme** is a CSS-variable system driven by `[data-theme="light|dark"]` on `<html>` (#20a/#20b). Since T1.3 (2026-05-20) the user pref is a tristate `theme_mode = system | light | dark` (default "system" for new users). `useResolvedTheme(mode)` resolves "system" via `prefers-color-scheme: dark` and updates live when the OS switches. `dark_mode` boolean remains on the wire for legacy clients (mirrored from theme_mode on every write).
 - **Mobile** mostly desktop-only. Memory says polish is blocked until end-to-end loop works.
@@ -233,21 +249,22 @@ Two things to know before "fixing" what it reports:
     `ignore = ["E501"]`) and ruff itself is pinned to `0.14.1` in
     `lexy-app/backend/requirements.txt`. Don't rely on ruff's built-in defaults
     — they're narrower (E4/E7/E9 + F) and shift between releases. **E501
-    (line-too-long) is off deliberately**: enabling it reports 405 pre-existing
-    violations, i.e. a repo-wide reflow, not a lint fix. Import sorting (`I`) is
+    (line-too-long) is off deliberately**: enabling it reports 530 pre-existing
+    violations (measured 2026-08-25; `ruff.toml`'s own comment still says the
+    older 405), i.e. a repo-wide reflow, not a lint fix. Import sorting (`I`) is
     off for the same reason plus the E402 trap above.
 
 ### Backend tests
 ```bash
 cd lexy-app/backend
 python3 -m pytest                   # serial
-python3 -m pytest -n auto           # parallel via pytest-xdist — ~60s for 1258 tests
+python3 -m pytest -n auto           # parallel via pytest-xdist
 ```
 **Use `python3 -m pytest`, not the bare `pytest` entrypoint.** `python -m`
 puts the cwd on `sys.path`, which `tests/test_document_package.py` (A2) needs
 for its bare `from services import …` imports; the `pytest` console script
-does not, and the file then fails collection (1151 instead of 1258 — see
-`docs/COMMON_ERRORS.md` §2).
+does not, and the file then fails collection (**1196 collected + 1 collection
+error** instead of **1320** — counted 2026-08-25; see `docs/COMMON_ERRORS.md` §2).
 `pytest-randomly` is blocked via `addopts = -p no:randomly` in both ini files.
 That is deliberate and load-bearing — see `docs/TESTS.md` for the spaCy/thinc
 seed conflict it works around. Don't remove it.
@@ -268,7 +285,9 @@ pytest tests/                       # just the root pipeline modules
 pytest autoloop/tests               # just the autoloop loop harness
 ```
 Root `pytest.ini` sets `testpaths = tests autoloop/tests`, so a bare `pytest`
-at the repo root runs **both** trees. Expect minutes, not seconds — the
+at the repo root runs **both** trees: **4,040 tests collected** — 368 from
+`tests/`, 3,672 from `autoloop/tests` (counted 2026-08-25).
+Expect minutes, not seconds — the
 autoloop suite shells out to real `git` and spawns real subprocesses. It is
 still hermetic (no database, no network, no real `claude` CLI) and derives
 every state dir, worker root and lock path from `tmp_path`, so running it
@@ -387,8 +406,9 @@ not boot. Two things to know before switching:
 
 **Fast self-check greps** (run from repo root; each should come back clean or expected):
 ```bash
-# Non-parameterized SQL outside migrations. Expected hits: search_service.py:62,103,216
-# (these interpolate only a loop index + a constant threshold — already verified safe).
+# Non-parameterized SQL outside migrations. Expected hits: search_service.py:164,205,322
+# (each interpolates only the loop index `{i + 1}` and the module constant
+# SIMILARITY_THRESHOLD — no request value reaches the string. Verified 2026-08-25.)
 # Any OTHER hit, or any hit that interpolates a request value, is a real bug:
 rg -n 'f"(SELECT|INSERT|UPDATE|DELETE)' lexy-app/backend --glob '!**/migrations/**'
 # Shell / eval / exec sinks (review every hit):
