@@ -212,11 +212,19 @@ class Decomposition:
     answers to one question.
 
     **Prose, never a schedule.** Nothing dispatches per step, and nothing here
-    splits a task into several: that is `split-01`'s mechanism, which applies a
-    split atomically across the registry, the execution record and the worker
-    repo. These steps are instructions for the implementing agent, in the same
-    category as `tasks.Task.description`, and keeping them prose is what stops
-    this becoming the second split mechanism the design forbids.
+    splits a task into several. These steps are instructions for the
+    implementing agent, in the same category as `tasks.Task.description`, and
+    keeping them prose is what stops this becoming a second split mechanism.
+
+    The FIRST one — the only one — is `plan`, answering a task's attempt-ceiling
+    classification request (ceil-01, 2026-08-25): `orchestrator.
+    _dispatch_ceiling_split` adds the subtasks, carries the parent's spent
+    attempts onto them, and retires the parent into them across the registry,
+    the execution record and the worker repo. That is where a task becomes
+    several. (An earlier revision of this paragraph credited `split-01` with
+    that mechanism; `split-01` is recorded completed but never shipped one —
+    `autoloop/tests/test_shipped_elsewhere.py` lists it among the tasks whose
+    work is not in the base — so the sentence named code that does not exist.)
 
     **Optional here, required by `policy.authorize_directive` — for `revise`
     too.** The same layering `TaskSpec.approved_paths` already uses: requiring

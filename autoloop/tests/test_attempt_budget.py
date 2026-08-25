@@ -1016,9 +1016,17 @@ def test_a_task_whose_process_dies_every_round_still_terminates(tmp_path):
 
 
 def test_the_task_budget_still_terminates_a_task_that_fails_its_own_work(tmp_path):
-    """Unchanged behaviour, restated against the ledger: five completed
-    failures still reach `attempt_count_ceiling`, and the record now says all
-    five were the task's own."""
+    """Five completed failures still END the task, and the record still says all
+    five were the task's own.
+
+    The ROUTE changed with ceil-01 (2026-08-25) and the BOUND did not. The sixth
+    dispatch no longer parks straight away: it asks the reviewer to classify the
+    task against its own candidate, which is where the measured 32 operator-blocked
+    hours went. What this test is about is unchanged and is asserted throughout —
+    the ledger is five task-budget failures, no further round is ever dispatched
+    against the exhausted budget, `attempt_count` is never bumped by a refusal,
+    and the task ends parked rather than churning on.
+    """
     orch, execution_store, blocker_store, task, _config = build(
         tmp_path,
         lambda wr, rr: ScriptedExecutor(
@@ -1031,12 +1039,21 @@ def test_the_task_budget_still_terminates_a_task_that_fails_its_own_work(tmp_pat
         orch._dispatch_executor(implement(task.id))
         assert execution_store.load(task.id).attempt_count == expected
 
+    # Sixth: the ceiling asks instead of parking, and spends nothing.
+    orch.state.phase = Phase.READY.value
+    orch._dispatch_executor(implement(task.id))
+    assert orch.state.phase == Phase.READY.value
+    assert "ATTEMPT CEILING REACHED" in (orch.state.outbox or "")
+    assert execution_store.load(task.id).attempt_count == MAX_TASK_ATTEMPTS
+
+    # Seventh, with the question unanswered: the loop asks once and then parks.
     orch.state.phase = Phase.READY.value
     orch._dispatch_executor(implement(task.id))
 
     assert orch.state.phase == Phase.NEEDS_USER.value
-    assert blocker_store.load(orch.state.park_blocker_id).code == "attempt_count_ceiling"
+    assert blocker_store.load(orch.state.park_blocker_id).code == "ceiling_plan_unanswered"
     execution = execution_store.load(task.id)
+    assert execution.attempt_count == MAX_TASK_ATTEMPTS
     assert execution.fault_attempt_count == 0
     assert ledger(execution) == [(ATTEMPT_TASK, "executor_reported_failure")] * 5
 
