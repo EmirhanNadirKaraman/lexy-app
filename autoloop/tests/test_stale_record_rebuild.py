@@ -1266,12 +1266,25 @@ def test_a_probe_that_cannot_run_at_all_never_archives_the_record(
     process, in the one place a second failure has nowhere to go.
 
     Reached by the `push_candidate_stale` road (the approval names a different
-    sha), and that is forced rather than chosen: `_dispatch_task_push` catches
-    only `GitCommandError` around its own `read_commit`, so an `OSError` on the
-    UNRESOLVABLE road escapes that site before any recovery is consulted. Noted
-    here because it is a real gap at `orchestrator.py`'s push site rather than in
-    the handler under test, and widening this change to it is not this round's
-    job. The recovery reads the same record through the same probe either way."""
+    sha), and that is FORCED rather than chosen. On the unresolvable road
+    `_dispatch_task_push` reaches git twice before it can classify anything, and
+    neither reach survives a repository that is not there: `_candidate_is_on_
+    task_line` calls `is_descendant` unguarded (`orchestrator.py:9277`), which is
+    the EARLIEST escape, and one line later `read_commit` is wrapped in `except
+    GitCommandError` only, which an `OSError` also passes through. So that road
+    cannot be driven with a dead repository at all — the exception leaves the
+    site before any recovery is consulted.
+
+    Named here rather than fixed, deliberately, and the distinction matters to
+    what this file claims. Both escapes are FAIL-LOUD and PRE-DATE this change:
+    the loop dies instead of raising `push_candidate_unresolvable`, so no rebuild
+    runs, nothing is archived and no record is destroyed on evidence nobody
+    gathered. They therefore weaken the six-code claim in NO direction — a code
+    that is never raised triggers no rebuild — which is why closing them is a
+    change to the publish-authorization path rather than to this handler, and is
+    reported instead of taken. The recovery under test reads the same record
+    through the same probe whichever road reaches it, which is what lets this
+    test exercise the `OSError` arm of `_commit_presence` honestly."""
     wiring = PostcommitWiring(tmp_path)
     wiring.orch.state.outbox = "the packet that was already queued"
     scripted_worker_gateway(
