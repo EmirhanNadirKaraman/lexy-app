@@ -3118,6 +3118,28 @@ reachable test lives under this command's paths"). To run everything anyway,
 call `validation.run_validation_commands(..., fail_fast=False)`; there is no
 config key, and `docs/AUTOLOOP.md` §4h says why.
 
+### A validation command reports `TIMEOUT` and names no failing test
+**Symptom:** the summary reads
+`ruff check .: PASS; python3 -m pytest -n 4 autoloop/tests -q …: TIMEOUT;
+python3 -m pytest -n 4 tests/ -q …: NOT RUN; STOPPED at the first failing
+command: …`. Nothing identifies a broken test, because nothing broke — the
+command never finished. Hit 2026-08-25 (halt-02, advisory run 1 of 3).
+**Cause:** `validation.run_validation_commands` gives each command a
+`timeout: float = 1800` (30 minutes) and turns `subprocess.TimeoutExpired` into
+`f"{command}: TIMEOUT"` — a FAILURE, exactly like a nonzero exit, so fail-fast
+then marks every later command `NOT RUN`. The autoloop suite is ~3,672 tests
+that shell out to real `git` and spawn real subprocesses, so under concurrent
+load (several worker repos validating at once) it can genuinely exceed 30
+minutes without anything being wrong with the tree.
+**Fix:** do not read `TIMEOUT` as "a test failed" and do not start bisecting for
+one. Two things separate the benign case from a real hang. (1) A hang has a
+subject: a test that loops forever holds one xdist worker, so re-running the
+suite reproduces it at the same place. (2) A load timeout does not: the same
+tree passes on a later run. Before spending an advisory run on the difference,
+put an explicit bound on any test of yours that drives an unbounded loop —
+`Orchestrator.run(max_steps=N)` rather than `run()` — so a genuine hang fails
+its own test in seconds instead of taking the whole command down with it.
+
 ### A test asserts a validation summary and now fails on a later command
 **Symptom:** a test feeding a MULTI-command list to a runner that returns a
 nonzero code asserts `<later command>: PASS` and gets `NOT RUN`.
@@ -3369,3 +3391,5 @@ rather than landing outside the ledger unnoticed.
 | 2026-08-25 | split-04 | No new entry: §2's `inspect.getsource` one (recov-01, 2026-08-24) already describes exactly what happened here, down to the same two `test_task_inbox.py` tests. Second occurrence, same cause — `orchestrator.py` edited while advisory run 3 was in flight — and it cost this round its last run too. Read that entry rather than debugging the named tests; both were correct throughout. |
 | 2026-08-25 | split-04 | One fact that entry did not have, added here rather than by rewording it: the blast radius is not limited to `_drain_task_inbox`. `test_m1_hardening.py::test_push_refused_protected_is_actually_emitted_for_a_protected_branch_refusal` reads `inspect.getsource(Orchestrator._dispatch_task_push)` and failed in the same run, so ANY `getsource` subject in the edited module is exposed, including ones ABOVE the edit. |
 | 2026-08-25 | split-04 | And the mistake THIS round repeated, dash-19's own note two dozen lines up: my first append anchored on a line a windowed `Read` had shown as last, so both lines landed mid-ledger and had to be moved. Read past the anchor before appending — the window's end is not the file's end. |
+| 2026-08-25 | halt-02 | New §14 entry: a validation command reporting `TIMEOUT` and naming no failing test. `run_validation_commands` gives each command 1800s and turns `subprocess.TimeoutExpired` into a FAILURE, so fail-fast then marks the rest `NOT RUN` — the summary looks like a test broke when nothing did. Filed in §14 with the other fail-fast reporting shapes rather than in §2, because the symptom is the summary, not a test. |
+| 2026-08-25 | halt-02 | The half worth knowing before spending a run on it: a real hang reproduces at the same place because it holds one xdist worker, while a load timeout does not. Cheapest insurance is bounding your own tests — `Orchestrator.run(max_steps=N)` rather than `run()` — so a genuine loop fails its own test in seconds instead of taking the whole command down and telling you nothing about which test it was. |

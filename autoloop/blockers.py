@@ -31,6 +31,14 @@ blocker as "not there" when it actually failed to decode would let the
 operator believe a problem was resolved (or never existed) when it did not —
 exactly backwards for a record whose entire purpose is not losing track of
 open questions.
+
+Autonomous recovery (halt-02, 2026-08-25) lives here too — `HARD_HALT_CODES`,
+`AUTONOMOUS_RECOVERIES` and `autonomous_recovery`. It is a TABLE, in this
+module rather than in `orchestrator.py`, for two reasons. The table is data
+about blocker codes and this is the blocker-code module; and the orchestrator's
+source is read as evidence by `test_transport_recovery.py`'s retired-code walk,
+so a table of code strings there would be indistinguishable from an emitter.
+`orchestrator._to_needs_user` is the only caller.
 """
 
 from __future__ import annotations
@@ -74,6 +82,193 @@ NO_TASK = "(loop)"
 #:     task's status. The question text says so and names `release` as the
 #:     command that moves the task.
 STRANDED_AFTER_FAULT = "stranded_after_environment_fault"
+
+
+# ---- autonomous recovery (halt-02, 2026-08-25) ------------------------------
+#
+# Measured 2026-08-24 over 131 resolved blocker records: 411.8h of the loop's
+# life was spent parked, and 30.6% of the window where every round is timed was
+# the loop waiting for an operator. A transport or environment fault is the
+# worst of those waits, because there is nothing to DECIDE — the loop already
+# knows the remedy, it simply refuses to move without a human saying so.
+#
+# Autonomous mode (`config.AutonomyConfig`, default OFF) changes that for the
+# codes named below and for NOTHING else. Two stages, in order:
+#
+#   1. RETRY the recovery path that already exists, bounded, durably counted;
+#   2. when that path is exhausted, SET THE TASK ASIDE — park `task_fatal`
+#      naming the task in flight, which is the existing quarantine
+#      `cli._handle_parked_task` already knows how to work past — so the loop
+#      keeps going on the rest of the roadmap instead of stopping.
+#
+# Stage 2 is the point. Stage 1 is only worth doing where a recovery path
+# genuinely exists, which is why `max_attempts` is 0 for three of the SIX
+# entries and the reason is written into each entry rather than left implied.
+#
+# Six entries, not seven: halt-02 named seven codes, and one of them — the
+# conversation-rotation failure brw-15 retired — has no producer left in
+# `orchestrator.py`. A code no live provider can raise is REMOVED rather than
+# automated, so it is absent here by decision, and
+# `test_autonomous_recovery.py` asserts both that absence and that every code
+# that IS here is one the orchestrator can actually emit.
+
+
+#: The parks autonomous mode must NEVER touch, whatever else is configured.
+#:
+#: Each one means an agent wrote outside its worker repository, or the checkout
+#: is not what the loop believes it to be. Continuing past any of them corrupts
+#: the tree every later task builds on, so "retry and step aside" is exactly the
+#: wrong answer: stepping aside from a compromised checkout leaves the
+#: compromise in place and starts the next task on top of it.
+#:
+#: An ALLOWLIST is what actually enforces this (`AUTONOMOUS_RECOVERIES` below);
+#: this frozenset is the second, redundant lock — `autonomous_recovery` refuses
+#: a member outright, and a test asserts the two sets are disjoint, so adding a
+#: hard halt to the table is a failing test rather than a silent automation.
+HARD_HALT_CODES = frozenset({
+    "checkout_escape_detected",
+    "worker_isolation_violation",
+    "primary_checkout_dirty",
+    "approved_path_symlink_traversal",
+    "prompt_integrity_mismatch",
+})
+
+#: Re-enter the phase the park itself declares resumable (`resume_phase`) —
+#: precisely what `run --retry` does, and the loop's own statement that this
+#: session can continue by stepping that phase again.
+RECOVER_BY_RESUMING = "resume_phase"
+
+#: Re-issue the SAME request id (`run --resubmit`): clear the request's
+#: `send_attempted` mark and re-enter `submitting`. The one action that
+#: knowingly risks a duplicate, and it is authorized for exactly one code.
+RECOVER_BY_RESUBMITTING = "resubmit"
+
+#: No in-process recovery exists, so the recovery path is exhausted the moment
+#: the fault is raised and stage 2 fires immediately. NOT a synonym for "do
+#: nothing": setting the task aside and continuing is the whole remedy for
+#: these, and it is the half that was missing.
+RECOVER_UNAVAILABLE = "none"
+
+
+@dataclass(frozen=True)
+class AutonomousRecovery:
+    """What autonomous mode does about one blocker code, and why.
+
+    `max_attempts` counts RETRIES, not occurrences: at 2, the first and second
+    occurrence of the condition each re-enter the recovery path and the third
+    sets the task aside. At 0 the first occurrence sets it aside.
+    """
+
+    code: str
+    action: str
+    max_attempts: int
+    why: str
+
+
+AUTONOMOUS_RECOVERIES: dict[str, AutonomousRecovery] = {
+    entry.code: entry
+    for entry in (
+        AutonomousRecovery(
+            code="login_expired",
+            action=RECOVER_BY_RESUMING,
+            max_attempts=2,
+            why=(
+                "The park already carries the phase it was raised in as "
+                "`resume_phase`, and `run()` drops the client before parking — "
+                "so re-entering that phase builds a fresh client and re-reads "
+                "the session, which is the entire manual remedy minus the wait "
+                "for a human. Nothing is sent by the re-entry that was not "
+                "about to be sent anyway."
+            ),
+        ),
+        AutonomousRecovery(
+            code="git_unavailable_in_ready",
+            action=RECOVER_BY_RESUMING,
+            max_attempts=2,
+            why=(
+                "Raised while BUILDING a request, before one exists: the outbox "
+                "is intact and nothing has been sent, which is why the park is "
+                "retryable in the first place. Re-entering `ready` re-runs the "
+                "context build against a git that may simply have been busy "
+                "(an index lock, a concurrent fetch)."
+            ),
+        ),
+        AutonomousRecovery(
+            code="submission_ambiguous",
+            action=RECOVER_BY_RESUBMITTING,
+            max_attempts=1,
+            why=(
+                "The one code whose automation TRADES a risk rather than "
+                "removing one: acceptance is unknown, so re-issuing may post a "
+                "duplicate. Autonomous mode takes that trade deliberately — a "
+                "possible duplicate request beats a stopped loop — and takes it "
+                "ONCE, because the second identical resend buys no new evidence "
+                "and doubles the duplicate. Still reachable: "
+                "`codex.app_server_conversation` declines `idempotent_submit` "
+                "and reconciles an appended-but-unanswered turn to False."
+            ),
+        ),
+        AutonomousRecovery(
+            code="worker_environment_drift",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "The park declares no `resume_phase` and the round's own "
+                "`last_response` is cleared before it, so there is no phase to "
+                "step again. The existing remedy is an operator repairing the "
+                "shared git environment (a hook, `core.hooksPath`, a url "
+                "rewrite) — the loop must not undo any of those on its own. So "
+                "the recovery path is empty and the task is set aside at once. "
+                "NOTE the classification this overrides: the park site argues "
+                "loop_fatal because the drift affects every task, and under "
+                "autonomous mode each task is instead set aside in turn."
+            ),
+        ),
+        AutonomousRecovery(
+            code="publisher_url_drift",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "SECURITY-SHAPED, and the reason `max_attempts` is 0 rather "
+                "than small. The only recovery is `reprovision-publisher "
+                "--confirm`, an operator's confirmation that a NEW push "
+                "destination is correct; a loop that could take it would be a "
+                "loop that can redirect its own publication. Re-running the "
+                "snapshot-vs-live comparison in the same process is not a "
+                "recovery either, it is the identical read seconds later. "
+                "Nothing is published, ever, on this path."
+            ),
+        ),
+        AutonomousRecovery(
+            code="crash_reconciliation_ambiguous",
+            action=RECOVER_UNAVAILABLE,
+            max_attempts=0,
+            why=(
+                "`reconcile_after_crash` is deterministic over an intent the "
+                "park deliberately does NOT clear, so a re-run returns "
+                "AMBIGUOUS again by construction — a retry here is theatre that "
+                "costs a reviewer round. Already `task_fatal` at its park site, "
+                "so autonomous mode changes nothing about it except to state "
+                "that plainly and to hold it to the same table as the rest."
+            ),
+        ),
+    )
+}
+
+
+def autonomous_recovery(code: str) -> AutonomousRecovery | None:
+    """What autonomous mode does about `code`, or `None` for "park exactly as
+    the loop parks today".
+
+    `None` is the answer for every code that is not in the table, for a hard
+    halt, and for an empty/unknown one — the fail-closed direction, and the
+    reason this is a function rather than a bare dict lookup at the call site:
+    the hard-halt refusal cannot be forgotten by a caller that only remembers
+    the dict.
+    """
+    if code in HARD_HALT_CODES:
+        return None
+    return AUTONOMOUS_RECOVERIES.get(code)
 
 
 @dataclass
@@ -274,8 +469,37 @@ class BlockerStore:
         the record should say so. `reason` is required and non-empty so an
         archival can never be a silent delete.
         """
+        return self._close_without_answer(blocker_id, reason, "archive_stale")
+
+    def close_recovered(self, blocker_id: str, reason: str) -> "Blocker":
+        """Close a blocker whose fault AUTONOMOUS MODE ACTUALLY RECOVERED FROM
+        — the loop retried, a step then completed, and the condition is gone.
+
+        A sibling of `archive_stale` rather than a call to it, because the two
+        record different facts and an operator reading `archived_reason` has to
+        be able to tell them apart: one says the question was abandoned with a
+        session, this one says the loop answered it by succeeding. Both refuse
+        to write `answer`, for the same reason — that field means an operator
+        responded, and forging it would fake exactly the confirmation
+        `cli._RESOLUTION_PRECONDITIONS` exists to demand.
+
+        Closing is what makes the retry budget PER EPISODE. The budget is read
+        off `Blocker.recurrences` for the open record of this
+        (task, code, phase), so a record left open after a recovered fault
+        would hand the next, unrelated occurrence a budget that was already
+        spent — a login expiry today silently costing next week's its retries.
+        A close that never happens (the process dies mid-retry, the store
+        cannot be written) leaves the budget spent, which is the safe
+        direction: the loop retries less, never more.
+        """
+        return self._close_without_answer(blocker_id, reason, "close_recovered")
+
+    def _close_without_answer(self, blocker_id: str, reason: str, caller: str) -> "Blocker":
+        """Shared body of `archive_stale` / `close_recovered`: resolve a
+        blocker with a machine reason and no operator answer. `reason` is
+        required and non-empty so neither can ever be a silent delete."""
         if not reason.strip():
-            raise StateError("archive_stale requires a non-empty machine reason")
+            raise StateError(f"{caller} requires a non-empty machine reason")
         blocker = self.load(blocker_id)
         if blocker is None:
             raise StateError(f"no blocker with id '{blocker_id}'")
@@ -299,6 +523,31 @@ class BlockerStore:
 
     def open_blockers(self) -> list[Blocker]:
         return [b for b in self.all_blockers() if b.resolved_at is None]
+
+    def open_recurrences(self, task_id: str, code: str) -> int:
+        """How many times this (task, code) has been recorded across every OPEN
+        record, whatever phase each was raised in. 0 when none is open.
+
+        THE retry budget's meter for `orchestrator._to_needs_user`, and
+        deliberately blind to phase where `find_open` is not. `record` keys on
+        (task, code, phase) because that is the right identity for an operator
+        question — the same fault in `submitting` and in
+        `submission_unconfirmed` genuinely reads differently. It is the wrong
+        identity for a BUDGET: a fault that migrates one phase along would
+        arrive at a fresh record and buy itself a second full allowance, which
+        is exactly the unbounded retry the budget exists to prevent. Summing is
+        the conservative direction — it can only ever spend the allowance
+        faster.
+
+        Reads through `open_blockers`, so a corrupt record RAISES here rather
+        than reading as "nothing open", which would be the fail-open answer: it
+        would hand the caller a budget of zero-spent and license a retry on
+        evidence that could not be read.
+        """
+        return sum(
+            b.recurrences for b in self.open_blockers()
+            if (b.task_id, b.code) == (task_id, code)
+        )
 
     def open_blockers_by_severity(self) -> list[Blocker]:
         """Every OPEN blocker, most urgent first (`primary_sort_key`).
