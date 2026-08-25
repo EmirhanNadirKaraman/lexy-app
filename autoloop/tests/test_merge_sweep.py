@@ -415,7 +415,11 @@ def test_a_branch_already_an_ancestor_of_head_is_skipped_silently(tmp_path):
     assert result.is_clear is True, "this IS the provably-clear case"
     assert result.merged == [] and result.pending == []
     assert b.head() == merged_head, "nothing may move for a branch already in the base"
-    assert b.sweep_entries() == [], "silently means silently"
+    assert [e["type"] for e in b.sweep_entries()] == [merge_sweep.SWEEP_IDLE_EVENT], (
+        "per-BRANCH silence is unchanged; one terminal entry per invocation is "
+        "what lets a reader tell a clear sweep from a sweep that never ran "
+        "(sweep-01)"
+    )
     assert b.entries("auto_merge_merged") == [], "the merger was never called"
 
 
@@ -532,7 +536,8 @@ def test_a_retired_record_whose_work_IS_in_the_base_stays_silent(tmp_path):
     such task would otherwise be permanently unresolved. The archived copy
     answers the question authoritatively — `published_sha == candidate_sha` is
     the remote's own confirmation, and the candidate is an ancestor of HEAD —
-    so this one is provably clear and says nothing at all."""
+    so this one is provably clear and says nothing about the task at all (only
+    the invocation's own terminal entry, naming nothing unresolved)."""
     b = build(tmp_path)
     candidate = b.publish("retired-01", {"a.py": "one\n"})
     run_git(b.repo, "merge", "--no-ff", "--no-edit", "-m", "merged earlier", candidate)
@@ -545,7 +550,11 @@ def test_a_retired_record_whose_work_IS_in_the_base_stays_silent(tmp_path):
     assert result.is_clear is True, "provably integrated is provably clear"
     assert result.unresolved == []
     assert b.head() == merged_head
-    assert b.sweep_entries() == [], "silently means silently"
+    assert [e["type"] for e in b.sweep_entries()] == [merge_sweep.SWEEP_IDLE_EVENT], (
+        "per-BRANCH silence is unchanged; one terminal entry per invocation is "
+        "what lets a reader tell a clear sweep from a sweep that never ran "
+        "(sweep-01)"
+    )
 
 
 def test_a_LEGACY_archive_with_no_published_sha_is_judged_on_ancestry_alone(tmp_path):
@@ -572,7 +581,7 @@ def test_a_LEGACY_archive_with_no_published_sha_is_judged_on_ancestry_alone(tmp_
         "whether or not the record predates the field that says the remote agreed"
     )
     assert result.unresolved == []
-    assert b.sweep_entries() == []
+    assert [e["type"] for e in b.sweep_entries()] == [merge_sweep.SWEEP_IDLE_EVENT]
 
 
 def test_a_retired_record_whose_work_is_NOT_in_the_base_is_unresolved(tmp_path):
@@ -661,7 +670,11 @@ def test_the_NEWEST_retirement_being_in_the_base_clears_a_task_with_older_ones(t
     assert result.is_clear is True, "the newest publication is provably integrated"
     assert result.unresolved == []
     assert b.head() == merged_head
-    assert b.sweep_entries() == [], "silently means silently"
+    assert [e["type"] for e in b.sweep_entries()] == [merge_sweep.SWEEP_IDLE_EVENT], (
+        "per-BRANCH silence is unchanged; one terminal entry per invocation is "
+        "what lets a reader tell a clear sweep from a sweep that never ran "
+        "(sweep-01)"
+    )
 
 
 def test_archived_copies_that_cannot_be_PUT_IN_ORDER_are_unresolved(tmp_path):

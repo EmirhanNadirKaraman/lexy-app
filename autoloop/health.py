@@ -42,6 +42,25 @@ Signals, and why these rather than the obvious ones:
   a task to sit unscheduled and unreported forever, which is the failure
   being reported, not a way to report it.
 
+* **A merge backlog that cannot drain is a fault nothing was reading.** The
+  sweep (`merge_sweep.py`) refuses to merge past a completed task it cannot
+  judge, which is right and is not changed here — but it made that refusal
+  once an hour into a log line and nothing ever read it: `audit-0001` held the
+  sweep for 225.8 hours across 108 consecutive sweeps to 2026-08-25, with five
+  approved tasks queued behind it, and `health --json` mentioned merges zero
+  times. Two of those five rotted into unmergeable candidates while they
+  waited, because mainline moved under them. `held_merge_sweep` reads the
+  sweep's own terminal entries back and reports what is unresolved, what is
+  queued behind it and how long — carried on EVERY verdict (`Health.
+  held_merge_sweep`) for the same reason `stranded_tasks` is. **AGE is the
+  signal, not presence**: a sweep held for one invocation is a phase boundary
+  and clears itself, so the field is populated whenever a hold is visible but
+  only escalates past `DEFAULT_HELD_SWEEP_HOURS` — the alternative is a field
+  that goes red on every ordinary hold and gets ignored exactly like the log
+  line did. Deliberately NOT the same question as a shut merge window: a window
+  closed because a phase is executing clears in minutes and is not reported
+  here at all.
+
 * **Silence is awake time, not wall-clock.** A laptop that sleeps for hours
   is indistinguishable from a hung loop if silence is measured on the wall
   clock — observed 2026-08-05: "no activity for 224 minutes" over a machine
@@ -81,6 +100,11 @@ from pathlib import Path
 from .blockers import BlockerStore
 from .errors import StateError, TaskGraphError
 from .lock import LoopLock, boot_time_epoch
+from .merge_sweep import (
+    SWEEP_CLEARED_EVENTS,
+    SWEEP_HELD_EVENT,
+    SWEEP_IDLE_EVENT,
+)
 from .stall import DEFAULT_CEILING_SECONDS
 from .state import Phase, StateStore
 from .tasks import TaskStore
@@ -102,6 +126,28 @@ from .worktask import (
 #: threshold would only make a genuinely hung loop slower to surface.
 DEFAULT_SILENCE_MINUTES = 45.0
 
+#: How long the merge sweep may be held by work it cannot judge before that is
+#: an outage rather than a phase boundary.
+#:
+#: Held for ONE sweep is ordinary and self-clearing: the sweep re-derives its
+#: work-list from git every invocation, so a ref that was force-moved during a
+#: release, or a remote that did not answer this minute, is gone by the next
+#: run an hour later. Held for six is nobody looking — and the measured case is
+#: two orders past it (225.8 hours, 108 consecutive sweeps, five approved tasks
+#: queued behind one unjudgeable record). Generous on purpose, exactly like
+#: `DEFAULT_SILENCE_MINUTES`: this field is only worth having if it stays quiet
+#: while the loop is fine, and an operator who wants it tighter has
+#: `health --held-sweep-hours`.
+DEFAULT_HELD_SWEEP_HOURS = 6.0
+
+#: Cheap pre-filter for the transcript scan below. Every entry this reader cares
+#: about starts `merge_sweep_`, so a line without it cannot be one — a substring
+#: test over the raw line instead of a JSON parse of it, which is what keeps a
+#: whole-file scan affordable on a transcript with tens of thousands of records.
+#: A payload that happens to contain the string costs one wasted `json.loads`
+#: and is then dropped by the type check; nothing is decided on the prefix.
+_SWEEP_PREFIX = "merge_sweep_"
+
 #: Verdict codes. `needs_attention` is what a scheduler acts on.
 OK_RUNNING = "running"
 OK_PAUSED = "paused"
@@ -117,6 +163,11 @@ STUCK_NOT_RUNNING = "not_running"
 #: needs attention; when something does, that verdict keeps its own code and
 #: carries the strand in `Health.stranded_tasks` and its detail instead.
 STUCK_STRANDED = "stranded"
+#: The merge sweep has been held by work it cannot judge for longer than the
+#: threshold — see `held_merge_sweep`. Same rule as `STUCK_STRANDED`: returned
+#: only when nothing else needs attention, and otherwise carried on whatever
+#: verdict did, in `Health.held_merge_sweep` and in the detail.
+STUCK_MERGE_BACKLOG = "merge_backlog_held"
 
 
 @dataclass(frozen=True)
@@ -137,6 +188,16 @@ class Health:
     #: has a default, so a caller reading `asdict` gains a key and loses
     #: nothing.
     stranded_tasks: tuple[str, ...] = ()
+    #: The merge sweep, held by work it could not judge, or `None` when the
+    #: sweep's own transcript entries say it is not held. Carried on EVERY
+    #: verdict for the same reason `stranded_tasks` is — a nine-day hold
+    #: co-occurs happily with an open blocker or a loop that is not running,
+    #: and both of those return long before any late check could fire. Present
+    #: BELOW the escalation threshold too: the number is the argument, so an
+    #: operator reading the JSON sees a young hold growing rather than only a
+    #: red light after six hours. `asdict` renders it as a nested object and
+    #: `None` as `null`, so a reader gains a key and loses nothing.
+    held_merge_sweep: HeldSweep | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -562,6 +623,277 @@ def _with_strands(config, verdict: Health) -> Health:
     )
 
 
+@dataclass(frozen=True)
+class HeldSweep:
+    """The merge sweep, held by work it could not judge — AS OF the last sweep
+    that said so.
+
+    Every field is read back from `merge_sweep`'s own terminal transcript
+    entries and from nothing else. That is deliberate and is the only honest
+    source: the sweep keeps no state on disk (it re-derives its work-list from
+    git ancestry every run), and re-deriving the answer here would be a second
+    implementation of the enumeration — network round-trips from a monitor, and
+    a rule that would eventually disagree with the one that actually refuses to
+    merge. So this reports what the sweep DECIDED, which is what an operator
+    needs to act on anyway.
+
+    Because the lists come from the newest such entry, they describe the last
+    sweep's view: `last_seen` says when that was, and `first_seen` when the
+    current unbroken run of held sweeps began. `held_hours` is measured from
+    `first_seen` to now — not from `last_seen` — so a sweep that has stopped
+    running cannot make a nine-day hold look like an hour-old one.
+
+    `note` non-empty means the scan could not be completed (an unreadable
+    transcript, a first entry with no readable timestamp). It escalates on its
+    own: "could not look" is not "not held", the same rule `_strand_survey`
+    applies to the task registry.
+    """
+
+    #: Completed tasks the sweep could not judge, newest sweep's list.
+    unresolved: tuple[str, ...] = ()
+    #: Branches confirmed outstanding and left untouched because of them. Empty
+    #: is a real answer, not an absence: an unjudgeable task with nothing queued
+    #: behind it still stops every sweep from being clear.
+    pending: tuple[str, ...] = ()
+    #: ISO stamps bounding the current unbroken run of held sweeps.
+    first_seen: str = ""
+    last_seen: str = ""
+    #: How many sweeps in that run said so. 108 is what the measured case looked
+    #: like; 1 is a phase boundary.
+    sweeps: int = 0
+    #: `now - first_seen`, in hours, or `None` when the stamp cannot be read.
+    #: `None` is NOT young — it escalates through `note`.
+    held_hours: float | None = None
+    note: str = ""
+
+    def describe(self) -> str:
+        """One line naming every unresolved task and every queued one.
+
+        Every id, not a sample — the failure being reported is work nobody can
+        see, and a truncated list rebuilds it one row down (`_describe_strands`
+        makes the same choice for the same reason).
+        """
+        if not self.sweeps:
+            return self.note or "the merge sweep could not be checked"
+        age = (
+            "for an unmeasurable time"
+            if self.held_hours is None
+            else f"for {self.held_hours:.1f}h"
+        )
+        queue = ", ".join(self.pending) if self.pending else "nothing"
+        # Names first, stamps last, deliberately: `autoloop_health_notify.sh`
+        # puts `detail[:120]` in the notification, and "a backlog exists" is not
+        # actionable while "audit-0001 is unresolved, 5 queued" is.
+        line = (
+            f"the merge sweep is held {age} across {self.sweeps} sweep(s): "
+            f"unresolved {', '.join(self.unresolved) or '(the entry named none)'}; "
+            f"queued behind it: {queue}; first held at "
+            f"{self.first_seen or 'an entry with no stamp'}, last said so at "
+            f"{self.last_seen or 'an entry with no stamp'}"
+        )
+        return f"{line}; {self.note}" if self.note else line
+
+
+def _sweep_ids(value) -> tuple[str, ...]:
+    """The task ids in a transcript entry's list field, refusing everything
+    else. A hand-edited or truncated entry yields `()` rather than raising into
+    a monitor, and `()` never clears a hold on its own — only the entry TYPE
+    does that."""
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
+
+
+def held_merge_sweep(path: Path, now: datetime | None = None) -> HeldSweep | None:
+    """Is the merge sweep held by work it cannot judge? `None` when the sweep's
+    own entries say it is not, or when it has never written any.
+
+    **The newest terminal entry answers, and the vocabulary is total.** Since
+    sweep-01 every invocation of `BacklogSweeper.sweep` that reaches an outcome
+    writes exactly one of: `merge_sweep_held`, `merge_sweep_nothing_to_do` (with
+    the tasks it could not judge, possibly none), `merge_sweep_completed`,
+    `merge_sweep_deferred`, `merge_sweep_stopped`. So walking the file forward
+    and letting each of those set or clear the state leaves the newest one
+    holding the answer. That totality is the point: before the idle entry
+    existed, a clear sweep wrote NOTHING, so a hold that had been fixed left
+    exactly the same evidence as one still in force and this function would have
+    had to choose which way to be wrong forever.
+
+    `merge_sweep_error` is in neither set — see `merge_sweep.SWEEP_CLEARED_
+    EVENTS`. A crashed sweep proves nothing about a hold, and leaving the hold
+    reported is the closed direction.
+
+    **The whole file, not the tail.** `last_transcript_event` reads the last
+    64KB because it only needs the newest stamp; this needs the FIRST entry of a
+    run that measured 9.4 days and 108 sweeps, behind which a busy loop writes
+    thousands of unrelated records. The cost is bounded by `_SWEEP_PREFIX`: a
+    substring test per line, and a JSON parse only for the handful that pass it.
+
+    A ROTATED transcript therefore under-states the age of a hold that began in
+    the rotated-away part — the hold is still reported, and its measured age
+    starts again from the oldest entry this file still carries. That is the
+    quiet direction (an escalation is delayed, never invented), and it repairs
+    itself: the sweep appends another held entry every invocation, so the run
+    grows back past the threshold within hours.
+
+    **Never raises.** A missing file is "nothing has ever been written" and
+    answers `None`; a file that will not open, or stops being readable partway,
+    answers a `HeldSweep` carrying `note`, which the caller escalates. Malformed
+    lines are skipped one at a time exactly as `transcript.read_records` skips
+    them — the live loop appends to this file, so the last line can be a partial
+    write, and one torn line must not throw away the history in front of it.
+    """
+    if not path.exists():
+        # Not the same as unreadable: a state directory the loop has never
+        # written to has no sweep history to have an opinion about, and every
+        # caller with no roadmap at all goes down this branch.
+        return None
+    try:
+        handle = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return HeldSweep(note=f"the transcript could not be read ({exc})")
+
+    started = False
+    first_ts = last_ts = ""
+    sweeps = 0
+    latest: dict = {}
+    truncated = ""
+    try:
+        with handle:
+            for line in handle:
+                if _SWEEP_PREFIX not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                entry_type = record.get("type")
+                data = record.get("data")
+                data = data if isinstance(data, dict) else {}
+                held = entry_type == SWEEP_HELD_EVENT or (
+                    entry_type == SWEEP_IDLE_EVENT
+                    and bool(_sweep_ids(data.get("unresolved")))
+                )
+                if held:
+                    stamp = record.get("ts")
+                    stamp = stamp if isinstance(stamp, str) else ""
+                    if not started:
+                        started, first_ts = True, stamp
+                    last_ts = stamp
+                    sweeps += 1
+                    latest = data
+                elif entry_type in SWEEP_CLEARED_EVENTS or entry_type == SWEEP_IDLE_EVENT:
+                    # A terminal entry that got past the hold check, or an idle
+                    # one naming nothing unjudgeable. Either way this invocation
+                    # enumerated cleanly, so the run above it is over.
+                    started, first_ts, last_ts, sweeps, latest = False, "", "", 0, {}
+    except OSError as exc:      # pragma: no cover - a mid-read I/O failure
+        truncated = f"the transcript stopped being readable partway through ({exc})"
+
+    if not sweeps:
+        return HeldSweep(note=truncated) if truncated else None
+    moment = _parse_stamp(first_ts)
+    note = truncated
+    held_hours = None
+    if moment is None:
+        # An entry with no readable `ts`. Unknown age, and unknown is not young:
+        # the note escalates, because a hold whose duration cannot be measured
+        # is precisely the one this field must not quietly wave through.
+        note = "; ".join(
+            part
+            for part in (
+                truncated,
+                "the oldest held sweep carries no readable timestamp, so how "
+                "long it has been held cannot be measured",
+            )
+            if part
+        )
+    else:
+        elapsed = (now or datetime.now(timezone.utc)).timestamp() - moment.timestamp()
+        # A stamp in the future is a clock adjustment, not a negative age. Zero
+        # is the quiet reading of it and the next check re-judges in minutes —
+        # the same direction `current_round_age_seconds` takes on skew.
+        held_hours = max(0.0, elapsed) / 3600.0
+    return HeldSweep(
+        unresolved=_sweep_ids(latest.get("unresolved")),
+        pending=_sweep_ids(latest.get("pending")),
+        first_seen=first_ts,
+        last_seen=last_ts,
+        sweeps=sweeps,
+        held_hours=held_hours,
+        note=note,
+    )
+
+
+def _parse_stamp(value: str) -> datetime | None:
+    """A transcript `ts` as an aware datetime, or None. Naive stamps read as
+    UTC — `state.utcnow_iso` only writes aware ones, and guessing the local zone
+    for a foreign line would make the age depend on where health happens to
+    run. Same rule `last_transcript_event` applies to the same field."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _with_held_sweep(
+    config, verdict: Health, now: datetime | None, held_sweep_hours: float
+) -> Health:
+    """`verdict`, plus the merge sweep's own account of why it is not merging.
+
+    Applied to EVERY verdict, and `replace`d onto it rather than rebuilt, so
+    nothing an earlier step decided is dropped: a held sweep co-occurs with an
+    open blocker, a stale lock, a stranded task and a loop that is not running,
+    and every one of those returns from `_judge` before any late check could
+    run. That is the whole lesson of strand-01, applied to the next silent
+    failure.
+
+    **Below the threshold it is data, not an alarm.** The field is carried
+    whenever a hold is visible — the duration is the argument this exists to
+    make — but `needs_attention` and the summary are left alone until it has
+    lasted longer than `held_sweep_hours`. A field that went red on every
+    one-sweep hold would be ignored exactly like the log line it replaces.
+    """
+    finding = held_merge_sweep(config.transcript_file, now)
+    if finding is None:
+        return verdict
+    verdict = replace(verdict, held_merge_sweep=finding)
+    aged = finding.held_hours is not None and finding.held_hours > held_sweep_hours
+    if not (aged or finding.note):
+        return verdict
+    described = finding.describe()
+    if verdict.needs_attention:
+        return replace(
+            verdict,
+            detail=f"{verdict.detail}; {described}" if verdict.detail else described,
+        )
+    if not finding.sweeps:
+        summary = "autoloop cannot verify whether the merge sweep is held"
+    else:
+        age = (
+            "for an unknown time"
+            if finding.held_hours is None
+            else f"{finding.held_hours:.0f}h"
+        )
+        summary = (
+            f"autoloop's merge backlog has been held {age} — "
+            f"{len(finding.unresolved)} unjudgeable task(s), "
+            f"{len(finding.pending)} branch(es) waiting behind them"
+        )
+    return replace(
+        verdict,
+        code=STUCK_MERGE_BACKLOG,
+        needs_attention=True,
+        summary=summary,
+        detail=f"{verdict.detail}; {described}" if verdict.detail else described,
+    )
+
+
 def _agent_running(pattern: str = "claude -p") -> bool:
     """Is a subagent alive? Suppresses the silence alarm.
 
@@ -791,19 +1123,34 @@ def check(
     agent_probe=_agent_running,
     work_probe=_work_running,
     sleep_probe=machine_sleep_in_window,
+    held_sweep_hours: float = DEFAULT_HELD_SWEEP_HOURS,
 ) -> Health:
-    """Judge the loop, then the queue behind it. Read-only, and safe to run
-    mid-round.
+    """Judge the loop, then the queue behind it, then the work it has finished
+    that is not landing. Read-only, and safe to run mid-round.
 
-    Two steps rather than one, and the split is the point. `_judge` answers "is
-    this loop working", which is what every signal in this module's docstring
-    is about, and it returns EARLY from a dozen places. `_with_strands` then
-    asks the question that is true independently of all of them — "is a task
-    off the board with nothing scheduling it" — and applies the answer to
-    whatever verdict came back, so it cannot be shadowed by one.
+    Three steps rather than one, and the split is the point. `_judge` answers
+    "is this loop working", which is what every signal in this module's
+    docstring is about, and it returns EARLY from a dozen places. `_with_strands`
+    then asks the question that is true independently of all of them — "is a
+    task off the board with nothing scheduling it" — and `_with_held_sweep` asks
+    the one that is true independently of BOTH: "is finished, approved work
+    sitting unmerged because the sweep cannot judge something". Each applies its
+    answer to whatever verdict came back, so neither can be shadowed by one.
+
+    Order matters only for which CODE survives when several fire at once, and
+    it runs least-specific last: a strand keeps its code over a held sweep,
+    because a task nothing will schedule needs a human sooner than a backlog
+    that has already waited days. Both are carried in their own field and in the
+    detail either way.
     """
-    return _with_strands(
-        config, _judge(config, now, silence_minutes, agent_probe, work_probe, sleep_probe)
+    return _with_held_sweep(
+        config,
+        _with_strands(
+            config,
+            _judge(config, now, silence_minutes, agent_probe, work_probe, sleep_probe),
+        ),
+        now,
+        held_sweep_hours,
     )
 
 

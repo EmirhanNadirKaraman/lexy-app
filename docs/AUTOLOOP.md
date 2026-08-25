@@ -700,6 +700,17 @@ re-enumerates what is left next time.
 | A completed task it could not judge (ref gone, remote unreachable, record unreadable/absent/candidate-less, archive unorderable or superseded) | named, not merged, run does NOT count as clear (exit 1), and the whole sweep is held | `merge_sweep_unresolved` |
 | A ref that changed DURING the sweep | that branch and the rest are left alone; the sweep stops | `merge_sweep_publication_changed` |
 | Backlog cleared | — | `merge_sweep_completed` |
+| Nothing outstanding to merge (including when something could not be judged and nothing was queued behind it) | one terminal entry per invocation, naming any unjudgeable task; per-branch silence unchanged | `merge_sweep_nothing_to_do` |
+
+That last entry is the only thing sweep-01 (2026-08-25) added to this module,
+and it is a log line: no enumeration, order, gate or merge decision changes. It
+exists because the sequence of sweeps has to be DECIDABLE from the transcript,
+which is the sweep's only record. A clear invocation used to write nothing, so
+"still held" and "held, then fixed, and clear ever since" left identical
+evidence — and in a healthy loop `auto_merge` integrates each completion as it
+lands, so the startup sweep can be clean and silent for weeks. Any reader had to
+choose between reporting a hold forever and never reporting one. `health
+--json` is that reader (§3d).
 
 ---
 
@@ -1003,6 +1014,7 @@ Uninstall: `launchctl bootout gui/$(id -u)/com.autoloop.health && rm ~/Library/L
 ```bash
 python -m autoloop health              # exit 0 = fine, 1 = needs you
 python -m autoloop health --json       # machine-readable verdict
+python -m autoloop health --held-sweep-hours 2   # tighter merge-backlog alarm
 ```
 
 Read-only and lock-free, so a scheduler may run it at any moment including
@@ -1021,11 +1033,54 @@ Three signals, each chosen against a mistake that was actually made here:
   subagents for fifteen-plus minutes writing nothing. That is the likeliest
   false alarm, so a live agent counts as proof of work.
 
+Two conditions are carried on EVERY verdict rather than being codes of their
+own, because both co-occur happily with a stale lock, an open blocker or a loop
+that is not running — all of which return first, so a late check would stay
+silent exactly when it mattered. Each becomes the code only when nothing else
+needs attention.
+
+* **`stranded_tasks`** — a task `in_progress` with nothing scheduling it
+  (§9c-ter).
+* **`held_merge_sweep`** — the merge sweep is refusing to merge past work it
+  cannot judge (§3f-ter), reported since sweep-01 (2026-08-25). The refusal is
+  right and is unchanged; what changed is that it now reaches an operator. It
+  had been logged hourly and read by nobody: `audit-0001` held the sweep for
+  **225.8 hours across 108 consecutive sweeps** to 2026-08-25 with five
+  approved tasks queued behind it, and `health --json` mentioned merges zero
+  times. Approval is not landing — split-01 was approved, waited, and became
+  unmergeable (8 conflicting files against a mainline 86 commits ahead); its
+  recut split-02 was approved clean on 2026-08-24 and had five by the next
+  morning, purely from sitting in the queue.
+  * The field names the unresolved task(s), the branches queued behind them,
+    when the run of held sweeps started, when the sweep last said so, and how
+    many sweeps have said it: `{"unresolved": ["audit-0001"], "pending":
+    [...], "first_seen": ..., "last_seen": ..., "sweeps": 108, "held_hours":
+    225.8, "note": ""}`, or `null` when the sweep's own entries say it is not
+    held.
+  * **AGE is the signal, not presence.** A hold that lasts one sweep is a phase
+    boundary — a ref force-moved during a release, a remote that did not answer
+    this minute — and the next invocation re-derives everything from git, so it
+    clears itself. Below `--held-sweep-hours` (default 6) the field is
+    populated and `needs_attention` is untouched; past it the verdict escalates
+    (`merge_backlog_held`). A field that went red on every ordinary hold would
+    be ignored exactly like the log line it replaces.
+  * Read back from the sweep's own terminal transcript entries and from nothing
+    else — re-deriving the answer would be a second enumeration, from a
+    monitor, over the network, eventually disagreeing with the one that
+    actually refuses to merge. `note` non-empty means the scan could not be
+    completed (unreadable transcript, an entry with no readable timestamp) and
+    escalates on its own: "could not look" is not "not held".
+  * **Not the same question as a shut merge window** (§3f). A window closed
+    because a phase is executing is normal and clears in minutes; it is not
+    reported here at all.
+
 `scripts/autoloop_health_notify.sh` wraps it for launchd/cron. It `cd`s to the
 repo first — `state_dir` is relative, and launchd inherits `/` — and notifies
 only on a CHANGE of verdict, so a loop blocked since breakfast does not
 produce forty identical alerts. A check that itself fails still notifies:
-a monitor that goes quiet when it breaks is the worst kind.
+a monitor that goes quiet when it breaks is the worst kind. It needs no change
+for the above: `merge_backlog_held` is a new verdict CODE, so the digest picks
+it up through the same path `stranded` already reaches it by.
 
 ---
 

@@ -4465,7 +4465,11 @@ def _cmd_health(args: argparse.Namespace) -> int:
     has to test it, and `--json` carries the reason for anything richer.
     """
     config = load_config(args.config)
-    verdict = health.check(config, silence_minutes=args.silence_minutes)
+    verdict = health.check(
+        config,
+        silence_minutes=args.silence_minutes,
+        held_sweep_hours=args.held_sweep_hours,
+    )
     if args.json:
         print(verdict.to_json())
     else:
@@ -5644,6 +5648,17 @@ def build_parser() -> argparse.ArgumentParser:
             "how long a live loop may write nothing before it counts as stuck "
             f"(default {health.DEFAULT_SILENCE_MINUTES:.0f}; an audit fan-out is "
             "legitimately quiet for 15+ minutes)"
+        ),
+    )
+    healthp.add_argument(
+        "--held-sweep-hours",
+        type=float,
+        default=health.DEFAULT_HELD_SWEEP_HOURS,
+        help=(
+            "how long the merge sweep may be held by work it cannot judge "
+            f"before that needs attention (default "
+            f"{health.DEFAULT_HELD_SWEEP_HOURS:.0f}; one held sweep is a phase "
+            "boundary and clears itself, a hundred is an outage)"
         ),
     )
     healthp.set_defaults(func=_cmd_health)
