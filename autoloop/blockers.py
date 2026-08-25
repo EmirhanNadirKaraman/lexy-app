@@ -39,6 +39,20 @@ about blocker codes and this is the blocker-code module; and the orchestrator's
 source is read as evidence by `test_transport_recovery.py`'s retired-code walk,
 so a table of code strings there would be indistinguishable from an emitter.
 `orchestrator._to_needs_user` is the only caller.
+
+halt-03 (2026-08-25) adds the SECOND half of that table,
+`STALE_RECORD_RECOVERIES`: six codes whose fault is not a transport fault at
+all but a RECORD the loop is still holding that no longer describes anything —
+a base pinned behind the branch head, an approval binding naming a candidate
+that moved, a packet that can never bind the review it is standing in front of,
+a session pointer at an audit nobody minted. Their remedy is one action,
+`RECOVER_BY_REBUILDING_AT_HEAD`: archive the stale record, rebuild at the
+current head, re-dispatch. That is
+exactly what an operator does by hand today, which is why the median park on
+`task_base_behind_head` was 0.54h across 15 parks — seeing it IS deciding it.
+The two dicts are merged into `AUTONOMOUS_RECOVERIES`, which stays the ONE
+table `autonomous_recovery` reads, so the hard-halt refusal cannot be bypassed
+by looking a code up in the newer half directly.
 """
 
 from __future__ import annotations
@@ -149,6 +163,89 @@ RECOVER_BY_RESUBMITTING = "resubmit"
 #: these, and it is the half that was missing.
 RECOVER_UNAVAILABLE = "none"
 
+#: ARCHIVE the stale record this park is holding, rebuild at the CURRENT head,
+#: and re-dispatch (halt-03, 2026-08-25). The one action every entry in
+#: `STALE_RECORD_RECOVERIES` takes, and the reason that dict needs no second
+#: verb: the six codes differ only in WHICH record is stale, which is what
+#: `AutonomousRecovery.stale_record` names.
+#:
+#: Distinct from `RECOVER_BY_RESUMING` in the thing that makes it safe to
+#: automate. A resume is a HOPE that a transient fault has passed, so it is
+#: bounded by a retry budget and nothing else; a rebuild REMOVES the record
+#: that caused the fault, so the identical fault cannot recur off the same
+#: record. Every rebuild archives rather than deletes — the execution record
+#: goes to `executions/archive/` and its worker to `quarantine/` through
+#: `worktask.retire_execution`, and a session pointer is written into the
+#: transcript before it is cleared — so "no operator step" never means "no
+#: record of what was discarded".
+RECOVER_BY_REBUILDING_AT_HEAD = "rebuild_at_head"
+
+
+# ---- WHICH record a rebuild archives ----------------------------------------
+#
+# One value per shape, never a catch-all, because the shapes are not
+# interchangeable and treating them as one is how a rebuild destroys work.
+# `task_base_behind_head`'s record holds a reviewed candidate and has to go
+# through recut-01's five refusals before anything moves;
+# `push_candidate_stale`'s record is an APPROVAL BINDING and archiving the
+# execution beneath it would discard a live candidate over a stale pointer.
+# `orchestrator._autonomous_rebuild` dispatches on these and REFUSES an
+# unrecognised one, so a future entry that forgets to name its record parks
+# exactly as the loop parks today rather than falling into someone else's
+# handler.
+
+#: `TaskExecution` on disk: its `task_base_sha` is behind the branch head and
+#: the reviewed candidate could not be carried past it. Archived through
+#: `release_task_to_pending(move=registry.recut)` — recut-01's path, with
+#: recut-01's refusals and recut-01's durable `MAX_TASK_RECUTS` bound.
+STALE_EXECUTION_RECORD = "execution_record"
+
+#: A postcommit / changeset APPROVAL BINDING naming a candidate that is no
+#: longer this task's current one, or that no longer resolves at all. The
+#: binding is dropped and the REVIEW IT WAS STANDING IN FRONT OF IS REBUILT:
+#: `orchestrator._rebuild_task_review_at_head` re-presents the candidate the
+#: execution record actually holds as a fresh, verified-bindable
+#: `postcommit_review` packet, so the very next round can be approved and
+#: published. Dropping the binding alone — which the first cut of halt-03 did —
+#: leaves the next request carrying none of the identifiers an approval binds
+#: by, and a candidate nothing can publish is a park performed rather than
+#: avoided.
+#:
+#: The execution record underneath is still not archived in the ordinary case,
+#: for the reason the `push_candidate_stale` entry gives. The ONE exception is
+#: the shape where nothing can be rebuilt at all AND git said so — the worker
+#: repository the record names answers that its object database does not hold
+#: the record's OWN candidate — and there the rebuild routes to
+#: `STALE_EXECUTION_RECORD`'s path, recut-01's refusals and cap included, rather
+#: than emitting an unbound request. Every weaker reading of "does not resolve"
+#: parks: a probe that could not answer, a record naming no candidate, and a
+#: record naming no worker repository to ask in are each an unanswered question,
+#: not an absent object.
+STALE_PUSH_BINDING = "push_binding"
+
+#: The PACKET standing between an operator-queued changeset review
+#: (`LoopState.changeset`) and the reviewer: `LoopState.outbox` does not carry
+#: the four identifiers an approval binds by, so no round spent on it could ever
+#: publish. The queue entry is KEPT and the packet is rebuilt around it
+#: (`orchestrator._rebuild_changeset_packet_at_head`) — dropping the entry
+#: instead would send the unbindable payload as an ordinary unbound request and
+#: leave the operator's candidate unpublishable for the rest of the session,
+#: which is discarding the review rather than rebuilding it.
+STALE_QUEUED_REVIEW = "queued_review"
+
+#: `LoopState.current_task` pointing at an audit pseudo-task with no audit unit
+#: on record, so the `revise` answering it names nothing. Dropped; the next
+#: `audit` mints a fresh unit at the current head.
+STALE_AUDIT_POINTER = "audit_pointer"
+
+#: The loop's own half-finished ROUND (`last_response` / `pending_request`)
+#: after a `StateError` proved the session's bookkeeping inconsistent. Dropped
+#: so the next `ready` step rebuilds the round from the current head. The only
+#: rebuild that names no durable record, and therefore the only one whose
+#: blocker is NOT closed by the rebuild itself — see `orchestrator.
+#: _discard_inconsistent_round`.
+STALE_SESSION_ROUND = "session_round"
+
 
 @dataclass(frozen=True)
 class AutonomousRecovery:
@@ -156,16 +253,27 @@ class AutonomousRecovery:
 
     `max_attempts` counts RETRIES, not occurrences: at 2, the first and second
     occurrence of the condition each re-enter the recovery path and the third
-    sets the task aside. At 0 the first occurrence sets it aside.
+    sets the task aside. At 0 the first occurrence sets it aside. A REBUILD is
+    counted the same way, and at 1: rebuilding the same record twice inside one
+    open episode means the first rebuild did not take, and a second identical
+    attempt buys no new evidence.
+
+    `stale_record` is required for `RECOVER_BY_REBUILDING_AT_HEAD` and empty for
+    every other action. Empty is the fail-closed value: `orchestrator.
+    _autonomous_rebuild` refuses a record kind it does not recognise, so an
+    entry that names none rebuilds nothing and the loop parks as it does today.
     """
 
     code: str
     action: str
     max_attempts: int
     why: str
+    stale_record: str = ""
 
 
-AUTONOMOUS_RECOVERIES: dict[str, AutonomousRecovery] = {
+#: halt-02's half: a TRANSPORT or ENVIRONMENT fault, answered by re-entering the
+#: recovery path that already exists and then stepping the task aside.
+TRANSPORT_RECOVERIES: dict[str, AutonomousRecovery] = {
     entry.code: entry
     for entry in (
         AutonomousRecovery(
@@ -253,6 +361,166 @@ AUTONOMOUS_RECOVERIES: dict[str, AutonomousRecovery] = {
             ),
         ),
     )
+}
+
+
+# ---- halt-03's half: a STALE RECORD, rebuilt at the current head -------------
+#
+# MEASURED 2026-08-24 over 131 resolved blocker records: `task_base_behind_head`
+# is the second largest cause of parked time — 15 parks, 18.5h, median 0.54h.
+# The median is the tell. A park that is cleared as fast as it is seen is not a
+# decision anybody makes; the operator reads the blocker, archives the execution
+# record the question NAMES, and the loop cuts the task again at the current
+# head. Every code below has that shape: the loop already knows which record is
+# stale, already names the remedy in its own park text, and simply refuses to
+# perform it.
+#
+# All six are `max_attempts=1`. The budget is not the interesting bound here —
+# a rebuild removes the record that caused the fault, so the identical fault
+# cannot recur off the same record — and where a durable bound IS needed it is
+# the one that already exists: `STALE_EXECUTION_RECORD` goes through
+# `registry.recut`, so it is capped per task by `orchestrator.MAX_TASK_RECUTS`
+# across episodes, not merely within one.
+STALE_RECORD_RECOVERIES: dict[str, AutonomousRecovery] = {
+    entry.code: entry
+    for entry in (
+        AutonomousRecovery(
+            code="task_base_behind_head",
+            action=RECOVER_BY_REBUILDING_AT_HEAD,
+            max_attempts=1,
+            stale_record=STALE_EXECUTION_RECORD,
+            why=(
+                "The park's OWN text already names the remedy — 'archive "
+                ".autoloop/executions/<task>.json to start fresh at the current "
+                "head' — and recut-01 already implements exactly that, "
+                "refusals included. So this rebuilds through "
+                "`release_task_to_pending(move=registry.recut)` rather than "
+                "archiving anything itself: a published candidate is refused, a "
+                "candidate with a verdict still in flight is refused, an "
+                "unreadable record is refused, and the cut is charged to "
+                "`recut_count` so `MAX_TASK_RECUTS` caps it per task. A second "
+                "archival mechanism would have had to re-earn all four."
+            ),
+        ),
+        AutonomousRecovery(
+            code="push_candidate_stale",
+            action=RECOVER_BY_REBUILDING_AT_HEAD,
+            max_attempts=1,
+            stale_record=STALE_PUSH_BINDING,
+            why=(
+                "The park says it in its own words: 'a later round advanced it, "
+                "or the execution record is gone'. The stale thing is the "
+                "APPROVAL BINDING, and the execution record underneath it "
+                "usually holds a live candidate a reviewer is about to approve — "
+                "so this drops the binding and the ledger entries that could "
+                "re-resolve it, and archives nothing. The remedy the park asks "
+                "for, 're-review the current state before approving again', is "
+                "then PERFORMED rather than requested: the record's current "
+                "candidate is re-rendered as a `postcommit_review` packet, "
+                "verified to carry the four identifiers `_current_pending_"
+                "postcommit` binds on, and dispatched — so the next round is a "
+                "real review whose approval publishes. Dropping the binding and "
+                "queueing a sentence, as the first cut did, left that candidate "
+                "unpublishable for the session."
+            ),
+        ),
+        AutonomousRecovery(
+            code="push_candidate_unresolvable",
+            action=RECOVER_BY_REBUILDING_AT_HEAD,
+            max_attempts=1,
+            stale_record=STALE_PUSH_BINDING,
+            why=(
+                "The same stale record as `push_candidate_stale`, reached by the "
+                "other road: the approved sha does not resolve at all. TWO park "
+                "sites emit it — the task push, which names a task, and the "
+                "changeset push, which names none — so the rebuild has to handle "
+                "a binding with no task behind it, and does. On the TASK arm the "
+                "record's own candidate is usually that same unresolvable "
+                "commit, so there is nothing to re-present and the rebuild routes "
+                "to the archive-and-recut path rather than emitting an unbound "
+                "request. On the CHANGESET arm the queue entry decides, and only "
+                "on GIT'S OWN answer about it: a candidate the repository "
+                "reports it holds means only the packet was stale, so the packet "
+                "is rebuilt around it; one the repository reports it does not "
+                "hold is dropped, after its whole record is written to the "
+                "transcript. A question that went unanswered — no gateway, a "
+                "probe that died, a repository that is not there — is neither, "
+                "and parks with the operator's review untouched, because that "
+                "record exists nowhere else afterwards. Nothing is pushed on "
+                "this path, ever."
+            ),
+        ),
+        AutonomousRecovery(
+            code="state_inconsistent",
+            action=RECOVER_BY_REBUILDING_AT_HEAD,
+            max_attempts=1,
+            stale_record=STALE_SESSION_ROUND,
+            why=(
+                "The one entry whose stale record is the loop's OWN round rather "
+                "than anything on disk, and the one that has to be bounded by a "
+                "budget rather than by removal — the underlying inconsistency "
+                "can outlive the round that tripped over it, so its blocker is "
+                "deliberately left OPEN by the rebuild and closed only by a step "
+                "that afterwards COMPLETES. A second occurrence with no "
+                "completed step in between therefore finds the allowance spent "
+                "and parks. It also refuses to fire at all for the corrupt "
+                "subclass: `StateCorruptError` reaches this same handler, and "
+                "rebuilding a round on top of a store that cannot be READ is the "
+                "fail-open this whole design is built to avoid, so the park site "
+                "passes `recoverable=False` for it."
+            ),
+        ),
+        AutonomousRecovery(
+            code="audit_revise_no_record",
+            action=RECOVER_BY_REBUILDING_AT_HEAD,
+            max_attempts=1,
+            stale_record=STALE_AUDIT_POINTER,
+            why=(
+                "A `revise` of the audit pseudo-task while `state.current_task` "
+                "holds no audit unit id: the directive names a record that was "
+                "never minted, and the park's own remedy is 'Run `audit` first'. "
+                "An audit unit is synthetic and per-iteration, so there is "
+                "nothing to salvage and nothing to return to a queue — dropping "
+                "the pointer and telling the reviewer to run `audit` IS the "
+                "rebuild, and the fresh unit is cut at the current head by "
+                "construction."
+            ),
+        ),
+        AutonomousRecovery(
+            code="changeset_binding_missing",
+            action=RECOVER_BY_REBUILDING_AT_HEAD,
+            max_attempts=1,
+            stale_record=STALE_QUEUED_REVIEW,
+            why=(
+                "A queued changeset review whose PACKET cannot carry the four "
+                "identifiers an approval binds by. It is raised BEFORE anything "
+                "is sent and refuses every round for as long as the payload "
+                "stands, so this is the one code here that halts the loop "
+                "indefinitely rather than costing it a round. The stale record "
+                "is the packet, never the queue entry: `build_changeset_packet` "
+                "always stamps the four identifiers and `review-changeset` sets "
+                "no `outbox_diff`, so the queued packet always binds and this "
+                "fault can only be raised once something ELSE has taken the "
+                "outbox (a corrective re-prompt, a plan request, a later task "
+                "review packet). So the entry is kept and the packet is rebuilt "
+                "around it, which is the park's own remedy — 're-queue with "
+                "`review-changeset`' — performed rather than requested. Dropping "
+                "the entry, as the first cut of this did, sent the unbindable "
+                "payload unbound and left the operator's candidate "
+                "unpublishable: a review discarded, not rebuilt."
+            ),
+        ),
+    )
+}
+
+
+#: THE table `autonomous_recovery` reads — halt-02's transport half and halt-03's
+#: stale-record half, merged. One lookup, one hard-halt refusal: a caller that
+#: consulted `STALE_RECORD_RECOVERIES` directly would bypass the refusal in
+#: `autonomous_recovery`, which is why nothing does.
+AUTONOMOUS_RECOVERIES: dict[str, AutonomousRecovery] = {
+    **TRANSPORT_RECOVERIES,
+    **STALE_RECORD_RECOVERIES,
 }
 
 
