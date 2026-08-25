@@ -35,13 +35,10 @@ python -m spacy download de_core_news_sm
 
 ### 2. Configure Environment Variables
 
-Copy `.env.example` to `.env` and update with your PostgreSQL credentials:
-
-```bash
-cp .env.example .env
-```
-
-Then edit `.env`:
+**There is no `.env` or `.env.example` in this folder, and this script does not
+want one.** `db_config.py` loads the **repo-root** `.env`
+(`Path(__file__).parent.parent / '.env'`), the same file the backend reads. Use
+the root `.env.example` for the variable names:
 
 ```env
 DB_NAME=german_vocabulary
@@ -51,7 +48,11 @@ DB_HOST=localhost
 DB_PORT=5432
 ```
 
-**Note**: The `.env` file is in `.gitignore` and won't be committed to git.
+Those are also `db_config.py`'s built-in defaults, so an unset variable falls
+back rather than failing. The root `.env` is gitignored.
+
+*(Corrected 2026-08-25: this section used to say `cp .env.example .env` from
+inside `postprocessing/`. No such file has ever existed here.)*
 
 ### 3. Create Database
 
@@ -152,7 +153,14 @@ ORDER BY frequency DESC;
 
 ## Notes
 
-- Only processes files starting with '01' (configurable in script.py line 243)
+- Reads **every** `.txt` file in `files/text/` — `FOLDER_PATH = Path('files/text')`
+  (`script.py:268`) and `FOLDER_PATH.glob('*.txt')` (`script.py:292`). *(Corrected
+  2026-08-25: this line used to claim it only processed files starting with `01`,
+  configurable at line 243. Neither is true — there is no `01` filter in the
+  script, and line 243 is inside `main()`'s argument parsing.)*
+- **Run it from the repo root.** `FOLDER_PATH` and `OUTPUT_FOLDER` are relative
+  paths, so `python postprocessing/script.py` works and running it from inside
+  `postprocessing/` does not.
 - Filters to **exact dictionary matches only** - words not in your dictionary are excluded
 - Database connection is optional - script continues if connection fails
 - All results are sorted by frequency in descending order

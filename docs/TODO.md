@@ -176,7 +176,7 @@ UPDATE user_word_knowledge uwk SET
 - `channel_finder.py` no longer writes `subscribed_channels.txt`; discovered IDs print to stdout for piping into the content-requests endpoint or seed file.
 - Old flat files removed: `channels.json`, `merged_channels.json`, `subscribed_channels.txt`.
 - Pipeline docstring scrubbed of flat-file references.
-- Tests: `tests/pipeline/test_channel_loading.py` covers (a) `load_channels` returns DB rows, (b) no `open()` of legacy filenames anywhere in `subtitle-scraper/`.
+- Tests: `tests/test_scraper_channels.py` covers (a) `load_channels` returns DB rows, (b) no `open()` of legacy filenames anywhere in `subtitle-scraper/`. *(Path corrected 2026-08-25 — this said `tests/pipeline/test_channel_loading.py`; `tests/pipeline/` was removed with the `src/app/` deletion and no file of that name exists.)*
 - Deploy note: on a fresh DB, run `python subtitle-scraper/seed_channels.py` after migrations to populate `channel` (idempotent — safe to re-run after schema changes too).
 
 ### 8. ✅ books.py LLM repair exception specificity — RESOLVED 2026-05-19

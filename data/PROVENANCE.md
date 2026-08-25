@@ -184,9 +184,13 @@ on the SRS due-card path; 4,095 human-quality glosses already exist here.
 **Example sentences (column 4) can later preload example generation**, if the
 cache path supports it. Lower priority than the gloss seeding.
 
-**System lists need a schema change first.** `word_lists.user_id` is `NOT NULL`
-with `ON DELETE CASCADE`, so every list is user-owned; there is no
-system/default/shared list concept yet.
+**System lists needed a schema change first — it shipped.** That change was
+migration **037** (2026-07-28): `word_lists.user_id` is now **nullable**, paired
+with `is_system BOOLEAN NOT NULL DEFAULT false` and a CHECK constraint
+(`word_lists_owner_ck`) that makes an owned "system" list and an ownerless
+private list unrepresentable. `system_list_seed_service` seeds the built-ins.
+See `docs/SCHEMA.md` §"Word lists: ownership". *(Corrected 2026-08-25 — the
+paragraph below this line described the pre-037 shape as current.)*
 
 **Do not use `word_table.frequency` as a general-German frequency rank.**
 Migration 032 defines it as "number of sentences the word appears in" — i.e.

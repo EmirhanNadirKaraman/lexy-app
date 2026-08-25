@@ -1,10 +1,31 @@
 # Schema overview
 
-A lightweight map of the Postgres tables in this project. Source of truth is
-the `lexy-app/backend/migrations/versions/` directory; this document is a
-plain-text companion. Update it when a migration changes the shape of a group.
+A lightweight map of the Postgres tables in this project. For everything
+Alembic owns, source of truth is the `lexy-app/backend/migrations/versions/`
+directory; this document is a plain-text companion. Update it when a migration
+changes the shape of a group.
 
-**Current as of alembic head `037` (2026-07-29.)** This is a current-state
+> **Alembic does not own the whole database.** Migration `001` is
+> *initial_user_tables* — it starts at the user/auth layer, on top of a content
+> schema that already existed. Of the 41 tables live today (plus
+> `alembic_version`), **18 are created by no migration in this repo, and by no
+> file in this repo** — searched repo-wide for `CREATE TABLE [IF NOT EXISTS] <name>`
+> across `*.py`/`*.sql`, 2026-08-25: `word_table`, `phrase_blueprint`,
+> `language_table`, `video`, `sentence`, `word_to_sentence`,
+> `sentence_to_phrase`, `sentence_to_grammar_rule`, `grammar_rule`,
+> `video_category`, `user_video_category`, `video_blacklist`, `word_strength`,
+> `leaderboard`, `most_frequent_words`, `user_grammar`, `user_learned_language`,
+> `user_stat_table`. They predate Alembic and were created by hand or by the
+> scraper. A nineteenth, `word_occurrences`, is also outside Alembic but **is**
+> created in-repo — by `postprocessing/script.py`, on its own run, not on any
+> app startup path. Practical consequence: **`alembic upgrade head` against an empty
+> database does not reproduce this schema** — `006` runs
+> `ALTER TABLE video ADD COLUMN ...` and no migration ever creates `video`.
+> (`channel` is not an example: migration `015` does create it.)
+> Verified 2026-08-25.
+
+**Current as of alembic head `037`** (confirmed against the live database
+2026-08-25: `alembic_version.version_num = '037'`, 42 tables in `public`). This is a current-state
 map, not a migration log — the table at the bottom lists only high-impact
 migrations, and only where the *why* is worth keeping.
 
@@ -33,7 +54,7 @@ Adjust the user/secrets handling per your own threat model.
 ### Vocabulary / catalog (shared, user-agnostic)
 | Table | Purpose |
 |---|---|
-| `word_table` | (word_id PK, language, word, lemma, pos, frequency, **word_norm**) — the unit of learning for type='word'. `frequency` (migration 032) backs the autocomplete ranking; refreshed by the scraper, not written per-request. `word_norm` (migration 036) is a **generated STORED** ICU-normalized copy of `word` — see §Unicode lookups. **`pos` is part of `UNIQUE (word, language, pos)`** and every row currently holds `pos = ''`; writing a real POS forks rows rather than enriching them, which is why the catalog backfill deliberately seeds `pos = ''`. |
+| `word_table` | (word_id PK, language, word, lemma, pos, frequency, **word_norm**) — the unit of learning for type='word'. `frequency` (migration 032) backs the autocomplete ranking; refreshed by the scraper, not written per-request. `word_norm` (migration 036) is a **generated STORED** ICU-normalized copy of `word` — see §Unicode lookups. **`pos` is part of `UNIQUE (word, language, pos)`** and 38,936 of 38,942 rows hold `pos = ''` (measured 2026-08-25 — six rows now carry a real POS); writing a real POS forks rows rather than enriching them, which is why the catalog backfill deliberately seeds `pos = ''`. |
 | `phrase_table` | (phrase_id PK, language, canonical, surface_form, phrase_type) — multi-token learning units. Resolution matches `canonical`, **never** `surface_form` (773 German rows differ). |
 | `phrase_blueprint` | (blueprint_id PK, blueprint, lookup_key, **lookup_key_norm**) — the phrase-suggestion source behind `/api/suggest`. German-only; it has **no `language` column**, so callers scope it themselves. `lookup_key_norm` (migration 036) is the generated STORED normalized form. |
 | `grammar_rule_table` | (rule_id PK, title, short_explanation, applicable_phrase_types, applicable_lemmas) — passive-only direction. |

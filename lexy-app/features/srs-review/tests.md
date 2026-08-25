@@ -3,7 +3,7 @@
 ## Happy path
 
 - `GET /srs/due?language=de` returns cards whose `due_date <= NOW` and whose item has `status != 'known'` for the requesting user
-- Each returned card includes: `card_id`, `item_id`, `item_type`, `direction`, `due_date`, `display_text`, `passive_level`, `active_level`, `repetitions`
+- Each returned card includes: `card_id`, `item_id`, `item_type`, `direction`, `due_date`, `display_text`, `passive_level`, `active_level`, `repetitions`, and — since #0a-1 — `prompt_text` and `answer_text` (added to this line 2026-08-25; the `SRSReviewCard` schema requires both, so a card missing them fails validation)
 - `display_text` is the surface word for words, surface form for phrases, and title for grammar rules
 - `POST /srs/review/{card_id}` with `{"correct": true}` on a passive card fires `passive_review_correct`:
   - SM-2 advances: `new_interval = old_interval * ease_factor`, ease increases by 0.05, repetitions +1

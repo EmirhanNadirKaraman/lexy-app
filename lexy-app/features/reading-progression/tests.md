@@ -22,7 +22,10 @@
 - Review `mastered`:
   - `reading_selections.status` = `'mastered'`
   - `reading_selections.next_review_at` = NULL
-  - NO progression event is fired
+  - `status_marked_known` IS fired on the matched catalog item, with
+    `status_override='known'`, so `user_word_knowledge.status` flips to `known`
+    (Hole 24 / #5, 2026-05-20). Passive SRS card advances; the active card is
+    NOT created or touched.
   - The selection does not appear in future due-selections queries
 
 ## Reading interval schedule
@@ -42,6 +45,6 @@
 ## Non-goals (what the feature should NOT do)
 
 - Must NOT fire active SRS events from reading (reading is passive-track only)
-- Must NOT fire any progression event for `mastered` outcome
+- Must NOT fire an **active**-track event or create an active SRS card for the `mastered` outcome (it does fire `status_marked_known` — see above; corrected 2026-08-25)
 - Must NOT surface reading selections as cards in `GET /srs/due` (separate review queue)
 - Must NOT fire `status_marked_learning` again on re-save of the same canonical (upsert semantics in progression service handle idempotency at the knowledge row level)
