@@ -525,11 +525,11 @@ def test_an_unreadable_record_is_no_record(tmp_path):
 
 def test_an_orchestrator_that_cannot_act_on_the_boundary_is_not_offered_it(tmp_path):
     """The record lives under `state_dir`, so every orchestrator sharing that
-    directory can see it — including `smoke-browser`'s, which builds its own,
-    starts at `ready` with no pending request (the boundary shape exactly) and
-    reports PASS only for a clean contract stop. Offered the boundary, an
-    unrelated pending upgrade would fail a diagnostic command while diagnosing
-    nothing. `cli._build_orchestrator` is the one construction that opts in."""
+    directory can see it — tests, embedders, and (until brw-16, 2026-08-25,
+    retired the command) `smoke-browser`'s own, which started at `ready` with
+    no pending request: the boundary shape exactly. Offered the boundary, an
+    unrelated pending upgrade would end a round that had nothing to do with it.
+    `cli._build_orchestrator` is the one construction that opts in."""
     orch, config = orchestrator_at(tmp_path, Phase.READY, upgrades=False)
     UpgradeStore(config.pending_upgrade_file).save(pending_record())
 

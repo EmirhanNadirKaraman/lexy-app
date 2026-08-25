@@ -1,10 +1,19 @@
 """Abstract LLM-conversation interface + provider registry.
 
 The orchestrator talks to "one persistent reviewer conversation" through this
-interface only. `BrowserChatGPT` (Playwright over CDP against chatgpt.com) is
-the first implementation; a future Claude.ai or Gemini adapter needs only a
-class satisfying LLMConversation plus a `register_provider` call — no
-orchestrator, policy, or state changes.
+interface only. A new adapter — a Claude.ai reviewer, a Gemini one, a second
+CLI — needs only a class satisfying LLMConversation plus a `register_provider`
+call: no orchestrator, policy, or state changes.
+
+**No browser-backed provider is registered here** (brw-16, 2026-08-25).
+`conversation.provider` has named `codex_cli` since 2026-08-21, and driving a
+browser was the source of 21 of this loop's first 103 blocker records — 20%,
+none of them about review quality. The registry, the protocol and the
+`browser_backed=True` declaration below are all UNCHANGED and still work: an
+adapter that drives a browser can register itself and get every recovery the
+orchestrator has for one (`_BROWSER_BACKED`). What is gone is the one
+registration, not the mechanism. `autoloop/browser/` is still on disk and its
+`SubmitResult` is still the shared vocabulary imported below.
 
 Contract every implementation must honor:
 
@@ -125,34 +134,6 @@ class LLMConversation(Protocol):
 ConversationFactory = Callable[["AutoloopConfig"], LLMConversation]
 
 
-def _browser_chatgpt_factory(config: "AutoloopConfig") -> LLMConversation:
-    # Lazy imports: playwright only exists in live deployments.
-    from .browser.chatgpt import BrowserChatGPT
-    from .browser.playwright_session import PlaywrightSession
-
-    # Pass the conversation so the session binds to THAT tab rather than
-    # whatever ChatGPT page is open first — the profile collects strays
-    # (a chat a failed rotation left behind), and adopting one attaches
-    # the loop to the wrong conversation.
-    session = PlaywrightSession.connect(
-        config.browser.cdp_url, conversation_url=config.browser.conversation_url
-    )
-    return BrowserChatGPT(
-        session,
-        config.browser.conversation_url,
-        response_timeout=config.browser.response_timeout_seconds,
-        response_start_timeout=config.browser.response_start_timeout_seconds,
-        submit_timeout=config.browser.submit_timeout_seconds,
-        composer_timeout=config.browser.composer_timeout_seconds,
-        input_sync_timeout=config.browser.input_sync_timeout_seconds,
-        send_ready_timeout=config.browser.send_ready_timeout_seconds,
-        reconcile_timeout=config.browser.reconcile_timeout_seconds,
-        poll_interval=config.browser.poll_interval_seconds,
-        stability_seconds=config.browser.stability_seconds,
-        diagnostics_dir=config.diagnostics_dir,
-    )
-
-
 def _transcript_log(config: "AutoloopConfig") -> Callable[[str, dict], None]:
     """The failure logger every PRODUCTION codex adapter is built with.
 
@@ -256,11 +237,14 @@ def _codex_app_server_factory(config: "AutoloopConfig") -> LLMConversation:
 
 
 _PROVIDERS: dict[str, ConversationFactory] = {
-    "browser_chatgpt": _browser_chatgpt_factory,
     # Two codex transports, both selectable, neither replacing the other. The
     # subprocess one is unchanged and stays the default codex seat;
     # `codex_app_server` is the one that can chunk, because it has a thread.
-    # `conversation.fallback_provider` may still name any of the three.
+    # `conversation.fallback_provider` may name either of them.
+    #
+    # There is deliberately no browser entry (brw-16). Adding one back is a
+    # `register_provider(name, factory, browser_backed=True)` call and nothing
+    # else — see the module docstring.
     "codex_cli": _codex_cli_factory,
     "codex_app_server": _codex_app_server_factory,
 }
@@ -289,7 +273,13 @@ _PROVIDERS: dict[str, ConversationFactory] = {
 #: with `register_provider(..., browser_backed=True)`. That is a lost recovery,
 #: which shows up as retries and a park; the other direction is an automation
 #: killing and relaunching a browser a run never used.
-_BROWSER_BACKED: set[str] = {"browser_chatgpt"}
+#:
+#: EMPTY since brw-16 (2026-08-25), because no shipped provider drives a
+#: browser any more. The set is populated, exactly as it always was, by
+#: `register_provider(..., browser_backed=True)` — so the orchestrator's
+#: restart/cooldown/unattachable recovery is dormant rather than deleted, and an
+#: adapter that declares itself gets all of it back with no change here.
+_BROWSER_BACKED: set[str] = set()
 
 
 def register_provider(

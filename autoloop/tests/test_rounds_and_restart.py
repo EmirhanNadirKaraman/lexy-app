@@ -19,9 +19,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from autoloop import conversation as conversation_module
 from autoloop.blockers import BlockerStore
-from autoloop.config import BrowserConfig
+from autoloop.config import BrowserConfig, ConversationConfig
 from autoloop.contract import Decision, Directive
+from autoloop.conversation import register_provider
 from autoloop.errors import RateLimitedError, SessionLostError
 from autoloop.orchestrator import Orchestrator
 from autoloop.policy import PolicyConfig
@@ -29,6 +31,18 @@ from autoloop.state import Phase
 from autoloop.worktask import TaskExecution
 
 from test_orchestrator import build
+
+#: A browser-backed transport that exists only for this module.
+#:
+#: No SHIPPED provider drives a browser since brw-16 (2026-08-25), but the
+#: recovery machinery these tests are about — restart, cooldown, the
+#: unattachable-browser park — is untouched and is reachable by any adapter that
+#: declares itself with `register_provider(..., browser_backed=True)`. So these
+#: tests register one rather than asserting about a transport that no longer
+#: exists: the behaviour under test is the orchestrator's, and this is the seam
+#: it is reached through. Registering a REAL name would also be a lie in the
+#: other direction — `create_conversation` could not build it.
+BROWSER_PROVIDER = "fake_browser_for_restart_tests"
 
 
 def _orch():
@@ -168,9 +182,36 @@ def test_a_restart_command_that_cannot_run_never_escapes(monkeypatch):
 # record. Both guards are wanted; their interaction was the defect.
 
 
+@pytest.fixture(autouse=True)
+def _browser_backed_provider():
+    """Register `BROWSER_PROVIDER` for the duration of one test, and leave the
+    registry exactly as it was found.
+
+    Autouse rather than requested per test: every orchestrator this module
+    builds is meant to be a browser run, and a test that silently got a
+    non-browser one would still pass several of the assertions below for the
+    wrong reason.
+    """
+    register_provider(BROWSER_PROVIDER, lambda config: None, browser_backed=True)
+    try:
+        yield
+    finally:
+        conversation_module._PROVIDERS.pop(BROWSER_PROVIDER, None)
+        conversation_module._BROWSER_BACKED.discard(BROWSER_PROVIDER)
+
+
 def _browser_orch(tmp_path, policy=None, state=None, **browser_kw):
     """A real Orchestrator (state store, policy engine, transcript) whose
-    browser config carries the restart settings under test.
+    browser config carries the restart settings under test, and whose
+    `conversation.provider` is a registered BROWSER-BACKED one.
+
+    That last part is load-bearing since brw-16 (2026-08-25). `_handle_
+    rate_limited` asks `_transport_is_browser_backed()` before it classifies
+    anything, and the answer is a property of the provider NAME
+    (`conversation._BROWSER_BACKED`), which no shipped provider is in any more.
+    Without this the whole rate-limit section below would take the
+    "this run drives no browser" branch and pass or fail for reasons that have
+    nothing to do with what each test says it pins.
 
     `state` stands in for a SECOND process over the same state directory: pass
     the state a previous orchestrator left on disk and this one resumes from
@@ -180,7 +221,20 @@ def _browser_orch(tmp_path, policy=None, state=None, **browser_kw):
     orch._config = dataclasses.replace(
         orch._config,
         browser=dataclasses.replace(orch._config.browser, **browser_kw),
+        conversation=ConversationConfig(provider=BROWSER_PROVIDER),
     )
+    # THE probe that dials a socket, stubbed on the instance — the job the
+    # autouse `_no_live_cdp_probe` conftest fixture used to do for the whole
+    # suite before brw-16 removed it. It lives here now because this is one of
+    # the two modules that can still reach `_classify_rate_limit_state`, and a
+    # conftest doing it made every test file under `autoloop/tests/` depend on
+    # `autoloop.orchestrator` (see `conftest.py`).
+    #
+    # None means UNMEASURABLE, the value that leaves the classifier behaving
+    # exactly as it did before the probe existed. Tests about the
+    # classification set their own afterwards; an instance attribute assigned
+    # later simply replaces this one.
+    orch._attachable_page_targets = lambda: None
     return orch
 
 
@@ -798,7 +852,7 @@ def test_a_park_that_never_SAW_the_modal_says_so_and_sends_the_operator_to_the_b
     )
     orch._blocker_store = blockers
     orch.state.phase = Phase.AWAITING.value
-    orch._client = None  # nothing held; the endpoint is unmeasurable (conftest)
+    orch._client = None  # nothing held; the endpoint is unmeasurable (_browser_orch)
     _sleeps(orch)
 
     for _ in range(2):

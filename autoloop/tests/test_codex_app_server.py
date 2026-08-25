@@ -1050,9 +1050,9 @@ def test_a_thread_start_with_no_readable_id_is_a_named_error():
 
 
 def test_both_codex_providers_are_selectable_and_the_old_one_is_unchanged(tmp_path):
-    assert {"browser_chatgpt", "codex_cli", "codex_app_server"} <= set(
-        available_providers()
-    )
+    # `browser_chatgpt` was in this set until brw-16 (2026-08-25) unregistered
+    # it. Nothing about either codex seat changed with it.
+    assert {"codex_cli", "codex_app_server"} <= set(available_providers())
     config = AutoloopConfig(
         browser=BrowserConfig(conversation_url="https://chatgpt.com/c/x"),
         policy=PolicyConfig(),
@@ -1071,10 +1071,14 @@ def test_both_codex_providers_are_selectable_and_the_old_one_is_unchanged(tmp_pa
 
 
 def test_either_codex_transport_can_be_named_as_the_fallback(tmp_path):
-    """`fallback_provider` must still be able to name any seat. Only the two
-    codex transports are CONSTRUCTED here — building `browser_chatgpt` imports
-    playwright, which this hermetic suite does not have — so the browser seat
-    is checked for registration, which is what the failover path resolves."""
+    """`fallback_provider` must still be able to name any registered seat.
+
+    Both remaining seats are CONSTRUCTED here, which is stronger than the
+    registration-only check the browser seat used to get (building it imported
+    playwright, which this hermetic suite does not have). Since brw-16 there is
+    no third seat to check either way — and note that both of these draw on ONE
+    allowance, so this pairing proves the mechanism, not that it buys anything.
+    """
     config = AutoloopConfig(
         browser=BrowserConfig(conversation_url="https://chatgpt.com/c/x"),
         policy=PolicyConfig(),
@@ -1083,7 +1087,6 @@ def test_either_codex_transport_can_be_named_as_the_fallback(tmp_path):
             provider="codex_app_server", fallback_provider="codex_cli"
         ),
     )
-    assert "browser_chatgpt" in available_providers()
     for pairing in (
         (config.conversation.provider, config.conversation.fallback_provider),
         ("codex_cli", "codex_app_server"),

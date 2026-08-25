@@ -445,8 +445,11 @@ def test_fault_stop_records_a_loop_fatal_blocker_without_parking(tmp_path):
 def test_contract_stop_is_classified_and_is_not_a_fault(tmp_path):
     """The other half of the discriminator. Without this, `stop_kind` could
     default its way to correctness in the fault test above while every real
-    `stop` stayed unclassified — and an unclassified stop is the one that
-    `cli._cmd_smoke_browser` must NOT report as PASS."""
+    `stop` stayed unclassified — and every reader of that field gates on the
+    POSITIVE value it wants, so an unclassified stop must never pass for a
+    reviewer's clean `stop`. (`cli._cmd_smoke_browser` was one such reader
+    until brw-16, 2026-08-25, retired it; `cli._cmd_run`'s exit-code gate is
+    the live one.)"""
     orch, config, store, task_store, registry = minimal_orchestrator(tmp_path)
 
     orch._dispatch(Directive(decision=Decision.STOP, reason="all done"))

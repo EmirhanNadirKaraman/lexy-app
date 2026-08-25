@@ -21,7 +21,29 @@ from .validation import TEST_SELECTION_MODES, TEST_SELECTION_REACHABLE
 
 @dataclass(frozen=True)
 class BrowserConfig:
-    conversation_url: str
+    """Settings for a browser-backed conversation transport.
+
+    **Nothing shipped reads these to choose a transport any more** (brw-16,
+    2026-08-25): no browser provider is registered, so `[browser]` is an
+    OPTIONAL section that configures a capability the loop does not currently
+    have. It is kept — accepted, defaulted, never required — for two reasons:
+
+    * An operator upgrading mid-flight must not have to edit a config file
+      before the loop will start. A `[browser]` section that is still populated
+      loads exactly as it always did and is simply not consulted.
+    * `register_provider(..., browser_backed=True)` still works, so an adapter
+      that does drive a browser has somewhere to read its endpoint and its
+      timeouts from without reintroducing a config section.
+
+    `conversation_url` therefore DEFAULTS to `""` rather than being required.
+    That is the whole of the configuration half of brw-16's claim: a config with
+    no `[browser]` section at all constructs this dataclass and loads.
+    """
+
+    #: The one persistent chat a browser adapter would drive. Empty is normal
+    #: now — `state.LoopState.new("")` is a valid session, and nothing on the
+    #: codex transports reads it.
+    conversation_url: str = ""
     cdp_url: str = "http://127.0.0.1:9222"
     #: Deliver an oversized review diff as an UPLOADED FILE instead of chunking
     #: it into messages. OFF by default: it changes what the reviewer receives,
@@ -88,14 +110,24 @@ class BrowserConfig:
 
 @dataclass(frozen=True)
 class ConversationConfig:
-    provider: str = "browser_chatgpt"
+    #: Which registered adapter holds the reviewer role. The default is the
+    #: transport the loop actually runs on, and since brw-16 (2026-08-25) it has
+    #: to be: the browser provider it used to name is no longer registered, so a
+    #: config with no `[conversation]` section would otherwise load cleanly and
+    #: then fail at `create_conversation` on the first step.
+    provider: str = "codex_cli"
     #: Where to go when `provider` reports its allowance exhausted. Empty
-    #: disables failover — the loop parks instead. The pairing that motivates
-    #: this is codex_cli -> browser_chatgpt: Codex draws on the ChatGPT plan's
-    #: AGENTIC allowance (shared with ChatGPT Work and ChatGPT for Excel),
-    #: while ordinary ChatGPT conversations draw on a separate quota, so the
-    #: browser really does still work once Codex is spent. Two transports AND
-    #: two budgets — which is the only reason automatic failover buys anything.
+    #: disables failover — the loop parks instead, which is the DEFAULT and, as
+    #: of brw-16, the only shipped pairing that is not two seats on one budget.
+    #:
+    #: Historical: the pairing this existed for was codex_cli -> browser_chatgpt.
+    #: Codex draws on the ChatGPT plan's AGENTIC allowance (shared with ChatGPT
+    #: Work and ChatGPT for Excel) while ordinary ChatGPT conversations draw on a
+    #: separate quota, so the browser really did still work once Codex was spent
+    #: — two transports AND two budgets. With no browser provider registered
+    #: that pairing is gone; naming it here is handled explicitly rather than
+    #: ignored (`_migrate_retired_browser_provider`), never left to fail at the
+    #: moment of handover.
     fallback_provider: str = ""
 
 
@@ -601,6 +633,12 @@ class AutoloopConfig:
     def audit_dir(self) -> Path:
         return self.state_dir / "audit"
 
+    #: CALLER-LESS since brw-16 (2026-08-25). `cli._cmd_smoke_browser` was its
+    #: only reader, and that command is retired — it reads no config at all now.
+    #: Kept rather than deleted for two reasons: an operator's `.autoloop/smoke/`
+    #: still exists on disk and this is what names it, and if the loop ever wants
+    #: a one-round-trip smoke of `conversation.provider` (a new command, with its
+    #: own review — deliberately NOT this one renamed) this is where it lives.
     @property
     def smoke_dir(self) -> Path:
         return self.state_dir / "smoke"
@@ -941,6 +979,85 @@ def _migrate_retired_tracker_paths(repo_data: dict) -> tuple[str, ...]:
     )
 
 
+#: The conversation provider retired on 2026-08-25 (brw-16). No factory is
+#: registered under this name any more; see `conversation._PROVIDERS`.
+RETIRED_BROWSER_PROVIDER = "browser_chatgpt"
+
+
+def _migrate_retired_browser_provider(conversation_data: dict) -> tuple[str, ...]:
+    """Handle a `[conversation]` section that still names the browser provider.
+
+    Same treatment, and the same reasoning, as `RETIRED_AGENT_TIMEOUT_KEY` and
+    `repo.tracker_paths`: handled EXPLICITLY, never silently, and never by
+    refusing a config that used to work. The live `.autoloop/config.toml` is not
+    in this repository, so a hard refusal here would make `status`, `doctor`,
+    `blockers` and the recovery commands fail on an unmigrated deployment the
+    moment this landed — taking away the tooling an operator would use to fix
+    it. It shipped naming `fallback_provider = "browser_chatgpt"`, so this is
+    the expected state of every deployment on the day brw-16 merges, not an
+    edge case.
+
+    The two keys are treated DIFFERENTLY, because only one of them has a
+    meaningful neutral value:
+
+    * **`fallback_provider` is NEUTRALISED to `""`** — the documented value for
+      "no failover; park instead", a path the orchestrator already implements
+      and parks cleanly on (`quota_exhausted`). Left as written it would name an
+      unregistered transport, and the loop would discover that only at the
+      moment of handover: `_handle_quota_exhausted` does not consult the
+      registry, so it would switch, record the switch, and then die in
+      `create_conversation`. Failing over to nothing beats failing over to a
+      `ConfigError`.
+    * **`provider` is NOT rewritten.** Every value of it selects a transport, so
+      there is no neutral one, and guessing would run reviews on a transport the
+      operator did not choose. The notice says what to set; the config still
+      loads, and `doctor`'s provider-registration check (#12) and
+      `create_conversation` both name it precisely.
+    """
+    notices: list[str] = []
+    if conversation_data.get("provider") == RETIRED_BROWSER_PROVIDER:
+        notices.append(
+            "\n".join(
+                [
+                    f"autoloop: NOTICE — conversation.provider = "
+                    f"'{RETIRED_BROWSER_PROVIDER}' was RETIRED on 2026-08-25. No "
+                    "browser-backed provider is registered any more: 21 of this "
+                    "loop's first 103 blocker records were artifacts of driving a "
+                    "browser rather than anything about review quality.",
+                    "  NOT rewritten: every provider value selects a transport, so "
+                    "there is no neutral one to migrate to and guessing would run "
+                    "your reviews somewhere you did not choose. Your config still "
+                    "LOADS; the run will refuse at transport construction, naming "
+                    "the registered providers.",
+                    '  Set conversation.provider = "codex_cli" (or '
+                    '"codex_app_server") to start the loop.',
+                ]
+            )
+        )
+    if conversation_data.get("fallback_provider") == RETIRED_BROWSER_PROVIDER:
+        conversation_data["fallback_provider"] = ""
+        notices.append(
+            "\n".join(
+                [
+                    f"autoloop: NOTICE — conversation.fallback_provider = "
+                    f"'{RETIRED_BROWSER_PROVIDER}' names a provider RETIRED on "
+                    "2026-08-25 and has been read as \"\" (failover disabled) for "
+                    "this run.",
+                    "  Why not left as written: nothing validates a fallback name "
+                    "until the handover happens, so an exhausted allowance would "
+                    "switch the reviewer role to an unregistered transport and "
+                    "then fail constructing it. Disabled, the same exhaustion "
+                    "parks on quota_exhausted with a readable question.",
+                    "  Silence this by deleting the key, or point it at the other "
+                    "codex seat — but note that both codex transports draw on ONE "
+                    "allowance, so that pairing is two seats on one budget and "
+                    "buys nothing when the budget is what ran out.",
+                ]
+            )
+        )
+    return tuple(notices)
+
+
 def _repo_relative(section_key: str, value: str, *, allow_globs: bool) -> str:
     """Raise `ConfigError` unless `value` is a plain repository-relative path.
 
@@ -1045,7 +1162,7 @@ def load_config(path: Path) -> AutoloopConfig:
     if not path.exists():
         raise ConfigError(
             f"config file not found: {path}. Copy autoloop/config.example.toml "
-            "there and fill in browser.conversation_url."
+            "there and fill in paths.workers_root."
         )
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -1056,14 +1173,13 @@ def load_config(path: Path) -> AutoloopConfig:
     if unknown_sections:
         raise ConfigError(f"unknown config sections: {sorted(unknown_sections)}")
 
+    # `[browser]` is OPTIONAL and unused since brw-16 (2026-08-25) — see
+    # `BrowserConfig`. Absent means every default; present means every key is
+    # still validated exactly as before and simply not consulted, because an
+    # unused section must be ignored rather than rejected.
     browser_data = data.get("browser", {})
     browser_fields = {f.name for f in dataclasses.fields(BrowserConfig)}
     _check_keys("browser", browser_data, browser_fields)
-    if not browser_data.get("conversation_url"):
-        raise ConfigError(
-            "browser.conversation_url is required — the URL of the one persistent "
-            "ChatGPT conversation the loop uses (https://chatgpt.com/c/...)"
-        )
     if "restart_command" in browser_data:
         cmd = browser_data["restart_command"]
         if not isinstance(cmd, list) or not all(isinstance(c, str) for c in cmd):
@@ -1144,7 +1260,16 @@ def load_config(path: Path) -> AutoloopConfig:
 
     conversation_data = data.get("conversation", {})
     conversation_fields = {f.name for f in dataclasses.fields(ConversationConfig)}
+    # Key check FIRST, on the raw value, exactly as before: a malformed section
+    # (`conversation = "x"`) still gets this loader's own "unknown keys in
+    # [conversation]" rather than whatever `dict()` would raise about it.
     _check_keys("conversation", conversation_data, conversation_fields)
+    # Copied only now, because the migration below REWRITES a key and must not
+    # mutate the parsed document. These are real keys carrying a retired VALUE,
+    # not unknown keys, so this belongs after the check and before the dataclass
+    # — a neutralised fallback can never reach `ConversationConfig`.
+    conversation_data = dict(conversation_data)
+    conversation_notices = _migrate_retired_browser_provider(conversation_data)
     conversation = ConversationConfig(**conversation_data)
 
     codex_data = dict(data.get("codex", {}))
@@ -1239,5 +1364,5 @@ def load_config(path: Path) -> AutoloopConfig:
         executor=executor,
         audit=audit,
         repo=repo,
-        migration_notices=migration_notices + repo_notices,
+        migration_notices=migration_notices + conversation_notices + repo_notices,
     )

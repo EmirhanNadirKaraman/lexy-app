@@ -1,80 +1,33 @@
 # Autoloop configuration template.
 # Copy to .autoloop/config.toml (the default path `python -m autoloop` reads)
-# and fill in browser.conversation_url. Unknown keys are rejected, not ignored.
+# and fill in paths.workers_root. Unknown keys are rejected, not ignored.
 
-[browser]
-# The ONE persistent ChatGPT conversation the loop uses. Open the dedicated
-# profile, create a chat, copy its URL.
-conversation_url = "https://chatgpt.com/c/REPLACE-ME"
-# The ChatGPT project that conversation belongs to. Required ONLY for
-# conversation rotation: when a chat becomes unusable, or two sends in a row are
-# positively disproven, the loop opens ONE replacement chat here and rebinds the
-# in-flight request to it. Leave empty to disable rotation entirely (the loop
-# then parks for you instead). Set explicitly rather than derived from
-# conversation_url — a guessed project URL opens chats somewhere you did not
-# choose.
-project_url = ""
-# Chrome DevTools endpoint of the dedicated profile (see docs/AUTOLOOP.md for
-# the launch command).
-cdp_url = "http://127.0.0.1:9222"
-# Every wait is bounded separately so a stuck channel fails fast with a
-# specific diagnosis instead of hanging on one giant timeout.
-composer_timeout_seconds = 30.0     # composer element ready
-input_sync_timeout_seconds = 30.0   # editor really holds the whole request
-send_ready_timeout_seconds = 30.0   # Send control enabled
-submit_timeout_seconds = 60.0       # evidence the server accepted the turn
-response_start_timeout_seconds = 120.0  # assistant begins answering
-response_timeout_seconds = 900.0    # a started answer settles
-reconcile_timeout_seconds = 30.0    # persisted-history check after a reload
-poll_interval_seconds = 2.0
-# The answer must be unchanged this long (and generation stopped) to count.
-stability_seconds = 3.0
-# How the loop restarts Chrome after a session loss. Empty (or absent) disables
-# auto-restart — the loop then parks and asks you to relaunch the profile.
+# NO [browser] SECTION. As of brw-16 (2026-08-25) no browser-backed conversation
+# provider is registered, so there is nothing for one to configure and this
+# template no longer ships it. Two things follow, and both are deliberate:
 #
-# Declared, never inferred: the loop knows a cdp_url, not which Chrome owns it,
-# and an automation that pattern-matched process lists would eventually kill
-# someone's everyday browser. The shipped module matches `--user-data-dir`
-# EXACTLY (never the binary name), stops EVERY instance on that profile, waits
-# for the debug port to actually free, and only reports success once the
-# endpoint answers with a browser websocket URL — see
-# autoloop/browser/chrome_restart.py. It replaced a shell helper that stopped
-# one pid and relaunched into a survivor still holding the port, reporting
-# success every time (docs/COMMON_ERRORS.md).
-#
-# Two things to know: `-m` resolves `autoloop` from the WORKING DIRECTORY (run
-# the loop from the checkout — the relative script path this replaced had the
-# same requirement), and the profile/port default to ~/.autoloop-chrome and
-# 9222, overridable with --profile / --port or AUTOLOOP_CHROME_PROFILE /
-# AUTOLOOP_CHROME_PORT.
-restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]
-# Minimum seconds between restart attempts — without it a genuinely dead
-# transport becomes a restart loop. Failures whose restart THIS refused are
-# charged to policy.max_browser_restart_skips, never to the failure budget.
-restart_cooldown_seconds = 120.0
-# ChatGPT throttles the ACCOUNT when it sees too many requests, with a
-# full-screen "Too many requests … please wait a few minutes" modal. That is not
-# a browser fault and a restart cannot clear it — the limit is server-side, so a
-# fresh browser meets the same wall while adding another request. The loop waits
-# instead: this is the first wait, doubling on each consecutive occurrence up to
-# the ceiling below, dismissing the modal and re-probing after each one. The wait
-# is persisted as a deadline, so killing and restarting the loop mid-wait serves
-# the rest of it rather than skipping it.
-#
-# Raise this if you keep hitting the limit; the modal asks for "a few minutes"
-# and the schedule below is built around that.
-rate_limit_backoff_seconds = 60.0
-# Ceiling on ONE such wait. Kept under the heartbeat monitor's 45-minute
-# staleness threshold (scripts/check_heartbeat.py): the loop heartbeats BETWEEN
-# steps, so a sleep inside one is a gap in the record.
-rate_limit_backoff_max_seconds = 600.0
+#   * A config that STILL HAS a [browser] section keeps loading, unchanged and
+#     unread. Every key is still accepted and still validated; none of them is
+#     required, including conversation_url. Upgrading a running deployment does
+#     not mean editing a file first — delete the section when convenient, or
+#     never.
+#   * If you register a browser-backed adapter of your own
+#     (`conversation.register_provider(name, factory, browser_backed=True)`),
+#     the section and every timeout, restart and rate-limit setting in it come
+#     back exactly as they were — see autoloop/config.py's BrowserConfig for the
+#     full list of keys and their defaults. Nothing about the recovery machinery
+#     was removed; only the one registration was.
 
 [policy]
 max_iterations = 20
 max_consecutive_failures = 3
-# How many times ONE run may abandon a wedged conversation for a fresh chat in
-# browser.project_url. A second rotation in one run usually means the fault is
-# not the chat, so the default stops and asks instead of fanning out chats.
+# INERT since brw-15 (2026-08-25) removed conversation rotation, and doubly so
+# since brw-16 removed the [browser] section this sentence names: nothing spends
+# this budget any more and a wedged conversation simply parks. The key is still
+# accepted, and `state.rotations` / `doctor`'s rotation line still read it, so it
+# is left here rather than becoming an unknown-key refusal on an existing config.
+# It used to bound how many times ONE run could abandon a wedged conversation for
+# a fresh chat in browser.project_url.
 max_conversation_rotations = 1
 # How many times ONE run may hand the reviewer role to
 # conversation.fallback_provider after an exhausted allowance. One is enough:
@@ -193,23 +146,37 @@ rate_limit_error_codes = []
 [conversation]
 # Which LLMConversation adapter holds the reviewer role (see
 # autoloop/conversation.py). Built in: "codex_cli" (Codex CLI, one process per
-# turn — no DOM, so none of the browser transport's ambiguity machinery is even
-# reachable) and "browser_chatgpt" (Playwright over CDP). Further adapters
-# register here without orchestrator changes.
+# turn) and "codex_app_server" (one `codex app-server` process holding one
+# thread, so it can deposit an oversized diff as numbered parts). Neither drives
+# a browser, so none of the DOM transport's ambiguity machinery is reachable at
+# all. Further adapters register here without orchestrator changes.
+#
+# "browser_chatgpt" was RETIRED on 2026-08-25 and is not registered. A config
+# still naming it here LOADS and prints a notice saying so; the run then refuses
+# at transport construction rather than reviewing on a transport you did not
+# choose. Change it to one of the two above.
 provider = "codex_cli"
 # Where the reviewer role goes when `provider` reports its allowance exhausted.
-# Empty disables failover and the loop parks instead.
+# Empty disables failover and the loop parks instead, which is the default and
+# is currently the honest setting.
 #
-# This pairing is worth the complexity for one specific reason: Codex draws on
+# Failover only buys something when the two transports draw on DIFFERENT
+# budgets. That used to be true of codex_cli -> browser_chatgpt: Codex spends
 # your ChatGPT plan's AGENTIC allowance (shared with ChatGPT Work and ChatGPT
-# for Excel), while ordinary ChatGPT conversations draw on a SEPARATE quota. So
-# the browser genuinely still works after Codex is spent — two transports and
-# two budgets, not two doors onto the same one.
+# for Excel) while ordinary ChatGPT conversations spend a separate quota. With
+# the browser seat gone, the only remaining pairing is the two codex transports,
+# which share ONE allowance — so naming one as the other's fallback fails over
+# to the same wall.
 #
-# The handover is bounded (policy.max_provider_switches), only happens with no
-# captured reply in flight, and is recorded on the request and the response, so
-# a `reviewed` stamp always says which reviewer produced it.
-fallback_provider = "browser_chatgpt"
+# A config still naming "browser_chatgpt" here is read as "" for the run, with a
+# notice: nothing validates a fallback name until the handover actually happens,
+# so leaving it would switch the reviewer role to an unregistered transport and
+# only then fail to build it.
+#
+# When it is set, the handover is bounded (policy.max_provider_switches), only
+# happens with no captured reply in flight, and is recorded on the request and
+# the response, so a `reviewed` stamp always says which reviewer produced it.
+fallback_provider = ""
 
 [executor]
 # "audit" = the real Phase-3 audit executor (read-only claude-CLI subagents,

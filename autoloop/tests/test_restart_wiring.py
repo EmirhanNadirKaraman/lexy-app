@@ -7,7 +7,11 @@ that lives in a TOML template and in the operator's own `.autoloop/config.toml`,
 which is not in this repository at all. So this file pins the two ends of the
 transition:
 
-* the shipped template names the module, and that module exists and runs;
+* the shipped template no longer names ANY restart command — since brw-16
+  (2026-08-25) it ships no `[browser]` section at all, because no browser-backed
+  provider is registered and nothing in a run restarts a browser. The module it
+  used to name still exists and still runs, for the operator who invokes it by
+  hand and for any adapter that registers itself `browser_backed=True`;
 * a live config still naming the script keeps LOADING, unchanged, because the
   loader deliberately does not refuse it — refusing would break `status`,
   `doctor`, `run` and the recovery commands on every deployment that had not yet
@@ -22,6 +26,7 @@ and `no_machine_access` makes that structural rather than a promise.
 import importlib.util
 import os
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -90,11 +95,39 @@ def _write_config(tmp_path: Path, restart_command: str) -> Path:
 # --- the template an operator copies -----------------------------------------
 
 
-def test_the_shipped_template_restarts_via_the_module():
-    """Parsed by the real loader rather than bare `tomllib`, so the assertion
-    covers the template as something copyable — every other rule in
-    `load_config` applies to it too."""
+def test_the_shipped_template_names_no_restart_command_at_all():
+    """It named `RESTART_COMMAND_REPLACEMENT` until brw-16 (2026-08-25).
+
+    That pin has no subject any more: no browser-backed provider is registered,
+    so nothing in a run reaches `_handle_browser_failure` and no configured
+    command would ever be executed. Shipping one anyway would advertise a
+    control that does nothing, which is the failure this whole file is about
+    wearing the other hat.
+
+    Still run through the real loader, because the property that matters is that
+    the template is COPYABLE — every other rule in `load_config` applies to it
+    too — and since the section is gone, that now also demonstrates the
+    configuration half of brw-16's claim against the shipped file itself. The
+    bare `tomllib` read below answers a different question: what the DOCUMENT
+    declares, as opposed to what the loader defaulted.
+    """
     config = load_config(EXAMPLE_CONFIG)
+    # Asked of the PARSED document, not of the text: the template explains the
+    # removal in a comment that names the section, so a substring search finds
+    # the prose and fails on a template that is correct. (It did, on the first
+    # cut of this test.)
+    document = tomllib.loads(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    assert "browser" not in document, "the template ships no [browser] table"
+    assert config.browser.restart_command == (), "the dataclass default"
+    assert config.browser.conversation_url == "", "and nothing is required of it"
+
+
+def test_a_config_that_still_names_the_module_is_honoured_verbatim(tmp_path):
+    """The other side of the same removal, and the reason the loader keeps every
+    `[browser]` key: an operator who registers a browser-backed adapter, or who
+    has simply not tidied their config yet, must get exactly what they wrote."""
+    cfg = _write_config(tmp_path, str(list(RESTART_COMMAND_REPLACEMENT)).replace("'", '"'))
+    config = load_config(cfg)
     assert config.browser.restart_command == RESTART_COMMAND_REPLACEMENT
     assert config.browser.restart_command[1:] == ("-m", "autoloop.browser.chrome_restart")
 

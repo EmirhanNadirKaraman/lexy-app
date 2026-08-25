@@ -41,7 +41,7 @@ from autoloop.browser.observation import (
     scrub_path,
 )
 from autoloop.cli import _authorize_resubmit
-from autoloop.config import AutoloopConfig, BrowserConfig
+from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
 from autoloop.config_writer import (
     assert_untracked,
     replace_conversation_url,
@@ -269,6 +269,39 @@ def _outcome_for(result):
     return SendOutcome.UNKNOWN
 
 
+#: A browser-backed transport registered for this module (and for
+#: `test_conversation_retirement.py`, which imports both this name and the
+#: fixture below).
+#:
+#: Every orchestrator here used to inherit `browser_chatgpt` from
+#: `ConversationConfig()`'s default and so took the browser arm of
+#: `_route_transport_fault`. Since brw-16 (2026-08-25) no shipped provider is
+#: browser-backed, and without an explicit one these tests would silently route
+#: through `_handle_transport_failure` — logging `transport_error`, never
+#: `browser_error` — which is a different claim from the one each of them makes.
+BROWSER_PROVIDER = "fake_browser_for_transport_recovery_tests"
+
+
+@pytest.fixture(autouse=True)
+def _browser_backed_provider():
+    """Register `BROWSER_PROVIDER` for one test and leave the registry as found.
+
+    Imported by name into `test_conversation_retirement.py`, which uses `build`
+    below; an autouse fixture applies to the module it is visible in, so the
+    import is what carries it there.
+    """
+    from autoloop import conversation as conversation_module
+
+    conversation_module.register_provider(
+        BROWSER_PROVIDER, lambda config: None, browser_backed=True
+    )
+    try:
+        yield
+    finally:
+        conversation_module._PROVIDERS.pop(BROWSER_PROVIDER, None)
+        conversation_module._BROWSER_BACKED.discard(BROWSER_PROVIDER)
+
+
 def build(
     tmp_path,
     client,
@@ -285,6 +318,7 @@ def build(
         browser=BrowserConfig(conversation_url=CONV_URL, project_url=project_url),
         policy=policy or PolicyConfig(),
         state_dir=tmp_path / ".al",
+        conversation=ConversationConfig(provider=BROWSER_PROVIDER),
     )
     store = StateStore(config.state_file)
     if state is None:
