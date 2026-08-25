@@ -2150,6 +2150,11 @@ class TaskRegistry:
         there is exactly one way to be pending, so letting them keep three
         copies of this assignment would be a bug in whichever one drifted.
 
+        Since ceil-01 it also drops a pending attempt-ceiling classification
+        request, for the same reason and with the same argument against three
+        copies — see the comment on that line, which is where the reasoning
+        for each of the three verbs is written down.
+
         `by_stored_status` is the first documented difference between them —
         see `shelve`, which explains why it reads `task.status` directly and
         why `release` must keep asking `state_of`. Default False, so a future
@@ -2188,6 +2193,30 @@ class TaskRegistry:
                 "`unblock` for a quarantined task",
             )
         task.status = "pending"
+        # A pending task has no round to be at the ceiling OF, so it carries no
+        # unanswered classification request either (ceil-01). Cleared for all
+        # three verbs here, because all three end the round the request was
+        # asked about, and a marker left behind is a REFUND in the two that
+        # archive the execution record: the next dispatch starts at attempt 0,
+        # where an identical plan would park the task `ceiling_plan_unchanged`
+        # and a differing one would spend its single extension on a budget
+        # nothing had spent. `shelve` keeps the record, so clearing it there
+        # means the next dispatch ASKS AFRESH against the same candidate
+        # instead of parking `ceiling_plan_unanswered` — an operator who sets a
+        # stalled round aside has answered nothing, and the "never ask twice"
+        # bound is per round, not per task lifetime.
+        #
+        # AFTER the status move, so a refused verb leaves the marker exactly
+        # where it found it: the refusal above raises rather than returning,
+        # and a cleared-but-unpersisted marker on a task that did not move is
+        # the same stale record read the other way round.
+        #
+        # `unblock` deliberately does NOT clear it. That is the one route back
+        # to pending that ends no round — see
+        # `orchestrator._park_ceiling_plan_unanswered`, which tells an operator
+        # in as many words that answering the blocker does not re-ask the
+        # reviewer.
+        task.ceiling_plan_requested_at = ""
         return task
 
     # ---- lookup -------------------------------------------------------------

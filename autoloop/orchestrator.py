@@ -4904,6 +4904,13 @@ class Orchestrator:
         # the fresh cut's first `implement`: an identical plan would park it
         # `ceiling_plan_unchanged`, and a differing one would spend its single
         # extension on a budget nothing had spent.
+        #
+        # `registry.recut` clears it too, via the `_return_to_pending` all three
+        # return-to-pending verbs share, so this is the belt to that braces and
+        # is idempotent either way. Kept because this is the call site where the
+        # reason is legible, and because it is the reason the shared clear was
+        # written — `release` and `shelve` reach the same stale marker by the
+        # same route and had no such line.
         if task.ceiling_plan_requested_at:
             self._registry.clear_ceiling_plan_request(task_id)
         try:
@@ -7586,9 +7593,18 @@ class Orchestrator:
             f"candidate on {execution.task_branch} is untouched.\n\n"
             "Answering this blocker does NOT re-ask the reviewer: the task is "
             "still at its ceiling and still marked as having asked, so the next "
-            "dispatch parks here again. To have it asked afresh, clear this "
-            "task's `ceiling_plan_requested_at` in `tasks.json` with the loop "
-            "stopped. Otherwise rewrite, decompose or retire the task — and do "
+            "dispatch parks here again. While the round is still in progress, "
+            f"`python -m autoloop shelve {task.id}` clears the marker and keeps "
+            "the record, so the next dispatch asks afresh against the same "
+            "candidate and the same spent attempts — or parks "
+            "`attempt_count_ceiling` if no remedy is left. (`release` and "
+            "`recut` clear it too, but they archive the record, so the task "
+            "starts over at attempt 0.) Once continuous mode has quarantined "
+            "the task (`blocked`) those verbs refuse it and unblocking does "
+            "not clear the marker, so the route from there is to clear this "
+            "task's "
+            "`ceiling_plan_requested_at` in `tasks.json` with the loop stopped. "
+            "Otherwise rewrite, decompose or retire the task — and do "
             "NOT raise MAX_TASK_ATTEMPTS, which is the only bound on local "
             "churn.\n\n"
             f"Last directive: {directive.decision.value} — {directive.reason}",
@@ -7628,10 +7644,16 @@ class Orchestrator:
             "stored plan was included in the request precisely so the new one "
             "could differ from it. Nothing was rolled back or pushed.\n\n"
             "Answering this blocker does NOT re-ask the reviewer: the task is "
-            "still at its ceiling and still marked as having asked. Clear this "
-            "task's `ceiling_plan_requested_at` in `tasks.json` with the loop "
-            "stopped to have it asked again, or rewrite, decompose or retire "
-            "the task.\n\n"
+            "still at its ceiling and still marked as having asked. While the "
+            f"round is still in progress, `python -m autoloop shelve {task.id}` "
+            "clears the marker and keeps the record, so the next dispatch asks "
+            "afresh against the same candidate (`release` and `recut` clear it "
+            "too, but they archive the record and the task starts over at "
+            "attempt 0). Once continuous mode has quarantined the task "
+            "(`blocked`) those verbs refuse it and unblocking does not clear "
+            "the marker, so from there "
+            "clear this task's `ceiling_plan_requested_at` in `tasks.json` with "
+            "the loop stopped — or rewrite, decompose or retire the task.\n\n"
             f"Reviewer's reason: {directive.reason}",
             kind="task_fatal",
             code="ceiling_plan_unchanged",

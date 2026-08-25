@@ -55,13 +55,19 @@ from autoloop.orchestrator import (
     MIN_CEILING_SPLIT_TASKS,
     MIN_CHILD_ATTEMPTS,
     Orchestrator,
+    release_task_to_pending,
 )
 from autoloop.policy import PolicyConfig, PolicyEngine
 from autoloop.state import LoopState, Phase, StateStore
 from autoloop.tasks import Task, TaskRegistry, TaskStore
 from autoloop.transcript import TranscriptLogger
 from autoloop.worker_env import WorkerRepoManager
-from autoloop.worktask import IntentStore, TaskExecution, TaskExecutionStore
+from autoloop.worktask import (
+    IntentStore,
+    TaskExecution,
+    TaskExecutionStore,
+    preserve_execution,
+)
 
 URL = "https://chatgpt.com/c/test-conversation"
 
@@ -1348,6 +1354,186 @@ def test_a_recut_clears_a_pending_ceiling_request(tmp_path):
     reloaded = TaskStore(wiring.config.tasks_file).load().get("t1")
     assert reloaded.ceiling_plan_requested_at == ""
     assert wiring.orch._attempt_cap_for(task) == MAX_TASK_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# an operator ending the round ends the pending request with it
+# ---------------------------------------------------------------------------
+#
+# The ask leaves the task `in_progress` with the loop parked on the reply, which
+# is exactly the shape `release` and `shelve` exist for. Both return the task to
+# the queue, so both end the round the classification request was asked ABOUT —
+# and a marker that outlived the round would meet the next ordinary directive:
+# `policy._check_decomposition` would demand a classification nobody asked for,
+# and the plan that answered it would spend the task's single extension on a
+# budget that was never at its ceiling. Cleared in `tasks._return_to_pending`,
+# once, for all three verbs that share it.
+
+
+def operator_release(wiring, task_id="t1"):
+    """`python -m autoloop release`, through the one function `cli._cmd_release`
+    calls: the status move, the archived record and the quarantined worker."""
+    return release_task_to_pending(
+        task_id,
+        wiring.registry,
+        wiring.execution_store,
+        wiring.worker_repos,
+        persist=lambda: wiring.task_store.save(wiring.registry),
+    )
+
+
+def operator_shelve(wiring, task_id="t1"):
+    """`python -m autoloop shelve`: the same status move, with the round and
+    both of its budgets deliberately left exactly where they are."""
+    task = wiring.registry.shelve(task_id)
+    preserved = preserve_execution(task_id, wiring.execution_store, wiring.worker_repos)
+    wiring.task_store.save(wiring.registry)
+    return task, preserved
+
+
+def authorize(wiring, response_text):
+    """The policy verdict `_step_executing` reaches BEFORE anything is spent —
+    the gate that refuses a plan-less directive on a task still waiting to be
+    classified."""
+    return wiring.orch._policy.authorize_directive(
+        parse_response(response_text), "main", wiring.registry
+    )
+
+
+def test_an_operator_release_clears_a_pending_ceiling_request(tmp_path):
+    """`release` ARCHIVES the execution record, so the next dispatch starts from
+    attempt 0 and the ceiling this task asked about no longer exists — the same
+    reasoning `recut` already carried, reached by the operator's own verb."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+    assert wiring.registry.get("t1").ceiling_plan_requested_at
+
+    operator_release(wiring)
+
+    task = wiring.registry.get("t1")
+    assert task.status == "pending"
+    assert task.ceiling_plan_requested_at == ""
+    reloaded = TaskStore(wiring.config.tasks_file).load().get("t1")
+    assert reloaded.ceiling_plan_requested_at == ""
+    assert wiring.execution_store.load("t1") is None
+
+
+def test_after_a_release_the_next_ordinary_directive_needs_no_classification(tmp_path):
+    """The denial is real while the request stands and gone once the round it
+    was asked about has been released. Without the clear, every subsequent
+    directive for this task would be refused `ceiling_plan_required` until a
+    human edited `tasks.json`."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+    # Plan-LESS, which is the only shape the gate reads: a directive carrying a
+    # plan is authorized by the branch above it, answered or not.
+    waiting = authorize(wiring, revise_block("t1"))
+    assert not waiting.allowed and waiting.code == "ceiling_plan_required"
+
+    operator_release(wiring)
+
+    assert authorize(wiring, revise_block("t1")).allowed
+    assert authorize(wiring, implement_block("t1")).allowed
+
+
+def test_after_a_release_a_differing_plan_does_not_buy_an_extension(tmp_path):
+    """The half a plan-less directive cannot prove: `_ceiling_reply_ok` returns
+    early on a directive carrying no plan, so only one that DOES carry a plan
+    shows the grant is gone. This is the exact directive that would have bought
+    an extension one dispatch earlier."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+    operator_release(wiring)
+    calls_before = len(wiring.executor.calls)
+
+    dispatch(wiring, implement_block("t1", decomposition=NAMED_FIX_PLAN))
+
+    task = wiring.registry.get("t1")
+    assert task.attempt_extensions == 0
+    assert task.ceiling_plan_requested_at == ""
+    assert wiring.orch._attempt_cap_for(task) == MAX_TASK_ATTEMPTS
+    # The round really ran on the ordinary budget rather than parking: a fresh
+    # record, charged its first attempt, with no extension behind it.
+    assert len(wiring.executor.calls) == calls_before + 1
+    assert wiring.execution_store.load("t1").attempt_count == 1
+    assert wiring.orch.state.phase != Phase.NEEDS_USER.value
+    assert not [code for code in denial_codes(wiring) if code.startswith("ceiling")]
+
+
+def test_an_operator_shelve_clears_the_request_without_refunding_anything(tmp_path):
+    """`shelve` KEEPS the round, so the task is still at its ceiling afterwards.
+    Clearing the marker there buys no budget — it only means the next dispatch
+    asks afresh against the same candidate instead of parking
+    `ceiling_plan_unanswered` on a question the operator interrupted."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+
+    task, preserved = operator_shelve(wiring)
+
+    assert task.status == "pending"
+    assert task.ceiling_plan_requested_at == ""
+    reloaded = TaskStore(wiring.config.tasks_file).load().get("t1")
+    assert reloaded.ceiling_plan_requested_at == ""
+    # Nothing was refunded: the record, the candidate and the spent attempts
+    # are all exactly where the ceiling found them.
+    assert preserved.attempt_count == MAX_TASK_ATTEMPTS
+    assert wiring.execution_store.load("t1").attempt_count == MAX_TASK_ATTEMPTS
+    assert task.attempt_extensions == 0
+    assert wiring.orch._attempt_cap_for(task) == MAX_TASK_ATTEMPTS
+
+
+def test_after_a_shelve_the_ceiling_asks_again_rather_than_granting(tmp_path):
+    """The shelved round resumes AT its ceiling, so the next directive — even
+    one carrying a materially different plan — buys nothing: the dispatch runs
+    the ceiling check again and asks. One ask per round is the bound; the
+    operator's interruption is what starts a new one."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+    operator_shelve(wiring)
+    calls_before = len(wiring.executor.calls)
+
+    dispatch(wiring, revise_block("t1", feedback="one fix left", decomposition=NAMED_FIX_PLAN))
+
+    task = wiring.registry.get("t1")
+    assert task.attempt_extensions == 0
+    assert wiring.orch._attempt_cap_for(task) == MAX_TASK_ATTEMPTS
+    assert wiring.execution_store.load("t1").attempt_count == MAX_TASK_ATTEMPTS
+    assert len(wiring.executor.calls) == calls_before  # no round was dispatched
+    # Asked afresh rather than parked for a human on the ceiling alone.
+    assert "ATTEMPT CEILING REACHED" in (wiring.orch.state.outbox or "")
+    assert wiring.orch.state.phase == Phase.READY.value
+    assert task.ceiling_plan_requested_at
+
+
+def test_unblocking_a_ceiling_park_deliberately_leaves_the_request_standing(tmp_path):
+    """The counter-pin, and the reason the clear lives in `_return_to_pending`
+    rather than on every route to `pending`. `unblock` ends no round — it
+    answers a quarantine — and `_park_ceiling_plan_unanswered` tells the
+    operator in as many words that answering it does not re-ask the reviewer.
+    Clearing here would make that sentence a lie."""
+    wiring = first_round(tmp_path)
+    ask_at_ceiling(wiring)
+    wiring.registry.block("t1", "attempt_count_ceiling")
+
+    wiring.registry.unblock("t1")
+
+    task = wiring.registry.get("t1")
+    assert task.status == "pending"
+    assert task.ceiling_plan_requested_at
+
+
+def test_a_refused_return_to_pending_leaves_the_request_where_it_found_it():
+    """The clear sits AFTER the status move, and that move RAISES rather than
+    returning: a verb that refused ended no round, so the question the reviewer
+    has not answered is still on record. Clearing before the refusal would
+    un-ask it on a task nothing moved."""
+    registry = TaskRegistry([Task(id="t1", title="T", description="d")])
+    registry.request_ceiling_plan("t1", "2026-08-25T01:00:00+00:00")
+    for verb in (registry.release, registry.shelve, registry.recut):
+        with pytest.raises(TaskGraphError) as exc:
+            verb("t1")
+        assert exc.value.code == "task_not_in_progress"
+    assert registry.get("t1").ceiling_plan_requested_at == "2026-08-25T01:00:00+00:00"
 
 
 def test_the_transition_is_in_the_transcript(tmp_path):
