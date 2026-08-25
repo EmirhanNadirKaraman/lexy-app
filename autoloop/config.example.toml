@@ -382,6 +382,26 @@ test_selection = "reachable"
 # `reprovision-publisher --confirm` — an operator confirming that a new push
 # destination is correct — so it is set aside without a retry and nothing is
 # pushed.
+#
+# THE SECOND HALF (halt-03, 2026-08-25): STALE RECORDS, rebuilt at the current
+# head. Six more codes — task_base_behind_head, push_candidate_stale,
+# push_candidate_unresolvable, state_inconsistent, audit_revise_no_record and
+# changeset_binding_missing — whose fault is not a transport fault at all but a
+# record the loop is still holding that no longer describes anything. Each of
+# them ARCHIVES that record, REBUILDS at the current head and RE-DISPATCHES,
+# which is exactly what an operator does by hand today: measured 2026-08-24,
+# task_base_behind_head was the second largest cause of parked time (15 parks,
+# 18.5h) at a MEDIAN of 0.54h — cleared as fast as it was seen.
+#
+# NOTHING IS DELETED. An execution record is archived to executions/archive/ and
+# its worker repository quarantined, both under one label, through the same
+# `release_task_to_pending` path the reviewer's `recut` uses — with the same
+# refusals (a published candidate, a candidate whose verdict is still in flight,
+# a record that cannot be read, an operator hold) and the same per-task cap. A
+# session pointer that has no on-disk form is written to the transcript before
+# it is cleared, so an operator's queued `review-changeset` can never evaporate
+# with nothing saying so. Any refusal falls through to the park the loop has
+# today, with the question it always had, and says so in the transcript.
 enabled = false
 
 # A CEILING on the per-code retry budgets in blockers.AUTONOMOUS_RECOVERIES,

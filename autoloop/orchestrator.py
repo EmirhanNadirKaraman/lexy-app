@@ -310,8 +310,14 @@ from .auto_merge import (
 )
 from .blockers import (
     NO_TASK,
+    RECOVER_BY_REBUILDING_AT_HEAD,
     RECOVER_BY_RESUBMITTING,
     RECOVER_BY_RESUMING,
+    STALE_AUDIT_POINTER,
+    STALE_EXECUTION_RECORD,
+    STALE_PUSH_BINDING,
+    STALE_QUEUED_REVIEW,
+    STALE_SESSION_ROUND,
     STRANDED_AFTER_FAULT,
     BlockerStore,
     autonomous_recovery,
@@ -348,6 +354,7 @@ from .errors import (
     QuotaExhaustedError,
     RateLimitedError,
     ResponseTimeoutError,
+    StateCorruptError,
     StateError,
     TaskGraphError,
 )
@@ -487,6 +494,15 @@ MAX_TASK_RECUTS = 2
 #: a glance that the REVIEWER discarded the round, rather than an operator
 #: releasing it by hand or an urgent request displacing it.
 RECUT_RETIREMENT_REASON = "recut-by-reviewer"
+
+#: The same label for the cut autonomous mode makes for itself (halt-03,
+#: 2026-08-25). A DIFFERENT string from `RECUT_RETIREMENT_REASON` on purpose:
+#: both file their two halves through `retire_execution`, and an operator
+#: reading `quarantine/` has to be able to tell a round the REVIEWER discarded
+#: from one the LOOP rebuilt because its base had been left behind. The cut is
+#: charged to the same `recut_count`, so the two share a cap even though they
+#: do not share a label.
+AUTONOMOUS_REBUILD_RETIREMENT_REASON = "rebuilt-at-head-autonomously"
 
 # ---- the attempt ceiling's classification bounds (ceil-01, 2026-08-25) ------
 #
@@ -1625,12 +1641,24 @@ class Orchestrator:
                 # park and no heartbeat — indistinguishable from being killed,
                 # and invisible to the monitor whose whole job is noticing
                 # (2026-08-03, twice). Park instead, with a durable record.
-                self._log("state_error", data={"error": str(exc)})
+                #
+                # `corrupt` is the halt-03 gate, and it is the reason this
+                # handler stayed ONE clause rather than being split into two
+                # codes: `StateCorruptError` means a store could not be READ,
+                # and autonomous mode's rebuild for `state_inconsistent`
+                # discards the round and re-dispatches — which on top of an
+                # unreadable store is the fail-open the whole design refuses.
+                # A second code would have changed what an operator sees for a
+                # corruption today; `recoverable=False` changes nothing except
+                # that this occurrence is not automated.
+                corrupt = isinstance(exc, StateCorruptError)
+                self._log("state_error", data={"error": str(exc), "corrupt": corrupt})
                 self._to_needs_user(
                     str(exc),
                     resume_phase=phase.value,
                     kind="loop_fatal",
                     code="state_inconsistent",
+                    recoverable=not corrupt,
                 )
             else:
                 # A step that COMPLETED is the only honest evidence that
@@ -10250,6 +10278,7 @@ class Orchestrator:
         code: str = "unclassified",
         task_id: str | None = None,
         detail: str = "",
+        recoverable: bool = True,
     ) -> None:
         """Park the loop on `needs_user`, classified `kind` (see the module
         docstring's "Blocker classification" section). `kind` and `code`
@@ -10278,6 +10307,28 @@ class Orchestrator:
         resolvable task, an unrecognised code, a hard halt, a `resume_phase`
         that is missing or terminal, or a resubmit with no request all fall
         through to the ordinary park below, unchanged.
+
+        **halt-03 (2026-08-25) adds the second family of recoveries here, and
+        nowhere else.** A `RECOVER_BY_REBUILDING_AT_HEAD` plan archives the
+        stale record this park is holding, rebuilds at the current head and
+        re-dispatches (`_autonomous_rebuild`). Same interception point, same
+        budget, same fail-closed fall-through — a rebuild that cannot be
+        performed returns False and the loop parks with the question it always
+        had, under the classification the SITE chose.
+
+        The set-aside stage is applied only to plans `_autonomy_requires_a_task`
+        answers True for. A rebuild of a session-scoped record needs no victim
+        to quarantine, so consulting the in-flight fallback for one would both
+        act on the wrong record and, on refusal, park a task that had nothing to
+        do with the fault — see the comment at the gate below.
+
+        `recoverable=False` is a park SITE saying that THIS occurrence must not
+        be automated even though its code is in the table. One caller today:
+        the `StateError` handler in `run`, which also catches the corrupt
+        subclass — rebuilding a round on top of a store that cannot be read is
+        precisely the fail-open every other gate here exists to refuse. It is a
+        per-occurrence veto and can only ever narrow: there is no value of it
+        that automates a code the table does not.
         """
         state = self.state
         originating_phase = state.phase
@@ -10286,8 +10337,8 @@ class Orchestrator:
         # (task, code, phase) without ever rewriting either field, so a record
         # first written `loop_fatal`/`(loop)` could not be promoted later. One
         # identity for the whole episode, decided once.
-        plan = self._autonomy_plan(code)
-        if plan is not None:
+        plan = self._autonomy_plan(code) if recoverable else None
+        if plan is not None and self._autonomy_requires_a_task(plan):
             set_aside = self._autonomous_set_aside_task(task_id)
             if set_aside is None:
                 # There is no task to set aside, so the second half of
@@ -10298,6 +10349,24 @@ class Orchestrator:
             else:
                 kind = "task_fatal"
                 task_id = set_aside
+        # A plan that does NOT require a task is deliberately left with the
+        # site's OWN `kind` and `task_id`, and the in-flight fallback is not
+        # consulted for it at all (halt-03). Both halves of that matter, and
+        # both were wrong in an earlier cut of this change:
+        #
+        #   * `_dispatch_changeset_push` raises `push_candidate_unresolvable`
+        #     naming no task, while `state.task_execution` routinely names an
+        #     unrelated task whose candidate is still unpublished. Falling back
+        #     to it made the rebuild take the TASK branch — forgetting an
+        #     innocent task's approval binding while leaving the queued
+        #     changeset, the record that actually went stale, in place. Wrong
+        #     twice over: it damaged approvable work and did not fix the fault.
+        #   * A refused rebuild would then have parked `task_fatal` and
+        #     quarantined that same innocent task, for a fault belonging to an
+        #     operator's changeset or to the loop's own bookkeeping.
+        #
+        # So these codes park exactly as they park today when the rebuild
+        # cannot be performed, and the blocker names whatever the site named.
         blocker = None
         if self._blocker_store is not None:
             blocker_task_id = task_id or NO_TASK
@@ -10393,6 +10462,44 @@ class Orchestrator:
                 return candidate
         return None
 
+    @staticmethod
+    def _autonomy_requires_a_task(plan) -> bool:
+        """Does `plan` need a task to act on at all? (halt-03)
+
+        TRUE for everything halt-02 automates, and the reason is the one its
+        gate already gives: those plans RETRY and then set the task aside, so
+        with no task the second stage cannot happen and the first is spent
+        walking toward a park that would still stop the loop.
+
+        A REBUILD is the case that gate was never written for. Three of the six
+        codes halt-03 names carry no task and never could — `state_inconsistent`
+        is the loop's own bookkeeping, `changeset_binding_missing` and the
+        changeset arm of `push_candidate_unresolvable` are an operator's
+        changeset, which has no roadmap task by construction — and their remedy
+        needs none: the stale record is a session pointer, and clearing it
+        rebuilds the round whether or not a task is in flight. Gating those on
+        having a victim to quarantine would leave exactly the three loop-halting
+        codes unautomated while the tests passed, because a test seeds
+        `state.task_execution` and the real park sites do not.
+
+        FALSE is therefore returned for one narrow shape and stated positively,
+        never as "not an execution record": a rebuild whose stale record is
+        `STALE_EXECUTION_RECORD` genuinely needs the task whose record it is,
+        and so does any future action nobody has reasoned about here.
+
+        A False answer also means the caller consults NO in-flight fallback and
+        re-classifies NOTHING — see the comment beside its one call site for the
+        two ways an earlier cut got that wrong.
+        """
+        if plan.action != RECOVER_BY_REBUILDING_AT_HEAD:
+            return True
+        return plan.stale_record not in (
+            STALE_PUSH_BINDING,
+            STALE_QUEUED_REVIEW,
+            STALE_AUDIT_POINTER,
+            STALE_SESSION_ROUND,
+        )
+
     def _autonomous_retry(self, plan, blocker, *, code: str, resume_phase: str | None) -> bool:
         """Re-enter `plan`'s recovery path. True when the loop moved and the
         caller must return without parking; False when it could not, and the
@@ -10408,6 +10515,14 @@ class Orchestrator:
         `RECOVER_UNAVAILABLE` returns False by construction, which is the whole
         point of that value: the recovery path for those codes is empty, so it
         is exhausted on the first occurrence and the set-aside fires at once.
+
+        `RECOVER_BY_REBUILDING_AT_HEAD` (halt-03) is metered by the SAME budget
+        on the same meter, and delegates the work to `_autonomous_rebuild`,
+        which returns False for every case in which the stale record cannot be
+        archived safely. It is the only action that sets `state.phase` itself
+        — a rebuild re-dispatches at `ready` rather than re-entering the phase
+        the fault was raised in, because the round the fault belonged to is the
+        thing being discarded.
         """
         state = self.state
         budget = min(plan.max_attempts, self._config.autonomy.max_recovery_attempts)
@@ -10430,6 +10545,9 @@ class Orchestrator:
                 return False
             state.pending_request.send_attempted = False
             state.phase = Phase.SUBMITTING.value
+        elif plan.action == RECOVER_BY_REBUILDING_AT_HEAD:
+            if not self._autonomous_rebuild(plan, blocker, code=code):
+                return False
         else:
             return False
         state.question = None
@@ -10458,6 +10576,466 @@ class Orchestrator:
         )
         self._store.save(state)
         return True
+
+    # ---- stale-record rebuild (halt-03, 2026-08-25) -------------------------
+    #
+    # THE claim this implements: under autonomous mode `task_base_behind_head`,
+    # `push_candidate_stale`, `push_candidate_unresolvable`,
+    # `state_inconsistent`, `audit_revise_no_record` and
+    # `changeset_binding_missing` each ARCHIVE the stale record, REBUILD at the
+    # current head and RE-DISPATCH, with no operator step.
+    #
+    # Two existing mechanisms carry it, and nothing third is built:
+    #
+    #   * recut-01's `release_task_to_pending(move=registry.recut)` archives an
+    #     execution record and returns the task to the queue, so its next
+    #     dispatch is cut fresh from the current head — with recut-01's five
+    #     refusals and its durable `MAX_TASK_RECUTS` cap;
+    #   * strand-01's shape for everything else: the loop keeps working, the
+    #     record of what happened is durable, and a case that cannot be handled
+    #     safely is REPORTED rather than skipped.
+    #
+    # Every handler below returns False rather than raising, and False means
+    # "the loop parks exactly as it does today, with the question it always
+    # had". That is the direction every unknown falls in: an unrecognised
+    # record kind, a missing store, a registry that refuses the move, an
+    # unreadable record, a published candidate, a verdict still in flight, a
+    # spent recut cap, a retirement that left residue on disk.
+
+    def _autonomous_rebuild(self, plan, blocker, *, code: str) -> bool:
+        """Archive `plan`'s stale record, rebuild at the current head and leave
+        the loop ready to re-dispatch. True when it moved; False to park.
+
+        A pure dispatcher on `plan.stale_record`, with NO fallback branch: a
+        record kind nobody wrote a handler for rebuilds nothing. That is the
+        difference between a table that grows safely and one where adding an
+        entry silently routes a new code into the nearest existing handler.
+
+        `blocker.task_id` is the identity `_to_needs_user` already settled for
+        this whole episode, and `NO_TASK` there means "no task", never a task
+        called `(loop)` — `tasks._ID_RE` forbids parentheses, so the two can
+        never be confused.
+        """
+        task_id = "" if blocker.task_id == NO_TASK else blocker.task_id
+        record = plan.stale_record
+        if record == STALE_EXECUTION_RECORD:
+            return self._rebuild_execution_record_at_head(task_id, code=code)
+        if record == STALE_PUSH_BINDING:
+            return self._discard_stale_push_binding(task_id, code=code)
+        if record == STALE_QUEUED_REVIEW:
+            return self._discard_unbindable_changeset(code=code)
+        if record == STALE_AUDIT_POINTER:
+            return self._discard_audit_pointer(code=code)
+        if record == STALE_SESSION_ROUND:
+            return self._discard_inconsistent_round(code=code)
+        self._log(
+            "autonomous_rebuild_refused",
+            data={"code": code, "stale_record": record, "reason": "unknown_record_kind"},
+        )
+        return False
+
+    def _rebuild_execution_record_at_head(self, task_id: str, *, code: str) -> bool:
+        """`task_base_behind_head`: archive the execution record whose base is
+        behind the head, and return the task to the queue so its next dispatch
+        is cut fresh at the current head.
+
+        **Every refusal recut-01 makes, made here, in its order.** They are not
+        re-derived — `_recut_count_for` and `_recut_outstanding_verdict` are the
+        same helpers `_dispatch_recut` calls, and the archival is the same
+        `release_task_to_pending(move=self._registry.recut)` call — because each
+        of them was bought by an incident. The published-candidate refusal is
+        budget-01's (a record archived 54 seconds before the reviewer returned
+        PUSH for that exact candidate); the outstanding-verdict refusal is the
+        same shape with a packet still in flight; the unreadable-record refusal
+        is the fail-closed reading of a record that might name either.
+
+        The CAP is what makes an automatic archival bounded across episodes
+        rather than only within one. `registry.recut` charges
+        `tasks.Task.recut_count`, which survives the archival that a count on
+        the execution record would not, so a task whose base keeps landing
+        behind the head is rebuilt at most `MAX_TASK_RECUTS` times and then
+        parks for a human — the same cap, the same park, whether the reviewer
+        or the loop asked for the cut.
+        """
+        state = self.state
+        if not task_id:
+            return self._refuse_rebuild(code, "the park named no task")
+        if self._execution_store is None or self._worker_repos is None:
+            # BOTH halves, exactly as `_dispatch_recut` demands them: without a
+            # worker manager `retire_execution` archives the record, reports
+            # success and leaves the contaminated worktree where the next
+            # dispatch looks for it.
+            return self._refuse_rebuild(
+                code, "this loop has no execution store and worker-repository manager"
+            )
+        if not self._registry.has(task_id):
+            return self._refuse_rebuild(code, f"task '{task_id}' is not in the registry")
+        try:
+            obstacle = self._registry.recut_obstacle(task_id)
+        except TaskGraphError as exc:
+            # `has` already ran, so this is the hand-edited / racing-registry
+            # case rather than a typo. Caught anyway: a park handler is the one
+            # place a second failure has nowhere to go, and an exception out of
+            # here replaces a recoverable park with a crashed process.
+            return self._refuse_rebuild(code, f"the registry refused ({exc.code})")
+        if obstacle is not None:
+            # Includes the operator hold, which is the one this must never
+            # launder: a task a human said "not now" about is not a task the
+            # loop may cut again on its own.
+            return self._refuse_rebuild(code, f"the registry refused ({obstacle.code})")
+        try:
+            execution = self._execution_store.load(task_id)
+        except (StateError, OSError) as exc:
+            # UNREADABLE, not absent. A record this cannot parse may name a
+            # published candidate or one under review, and archiving it unread
+            # would destroy the only evidence of which.
+            return self._refuse_rebuild(
+                code, f"its execution record cannot be read ({type(exc).__name__})"
+            )
+        if execution is None:
+            return self._refuse_rebuild(code, "it has no execution record to archive")
+        if execution.published_sha:
+            return self._refuse_rebuild(
+                code, f"its candidate {execution.published_sha[:12]} is already published"
+            )
+        outstanding = self._recut_outstanding_verdict(
+            state, task_id, execution.candidate_sha
+        )
+        if outstanding:
+            return self._refuse_rebuild(
+                code, f"a verdict on it is still outstanding under '{outstanding}'"
+            )
+        task = self._registry.get(task_id)
+        spent = self._recut_count_for(task, execution)
+        if spent >= MAX_TASK_RECUTS:
+            return self._refuse_rebuild(
+                code, f"it has already been cut {spent} time(s) (cap {MAX_TASK_RECUTS})"
+            )
+        # Same clear, same reason as `_dispatch_recut`: the archival resets
+        # `attempt_count`, so a ceiling classification the old record asked for
+        # would meet the fresh cut having been granted against a budget nothing
+        # had spent (ceil-01).
+        if task.ceiling_plan_requested_at:
+            self._registry.clear_ceiling_plan_request(task_id)
+        discarded_candidate = execution.candidate_sha
+        discarded_base = execution.task_base_sha
+        try:
+            release = release_task_to_pending(
+                task_id,
+                self._registry,
+                self._execution_store,
+                self._worker_repos,
+                persist=lambda: self._task_store.save(self._registry),
+                reason=AUTONOMOUS_REBUILD_RETIREMENT_REASON,
+                # Nobody is watching this: raising here would take the process
+                # down inside a park handler, which is the one place a second
+                # failure has nowhere to go.
+                tolerate_retirement_failure=True,
+                move=self._registry.recut,
+            )
+        except (TaskGraphError, StateError, GitError, OSError) as exc:
+            return self._refuse_rebuild(
+                code, f"the archival failed ({type(exc).__name__}: {exc})"
+            )
+        retirement = release.retirement
+        if not release.artifacts_retired:
+            # The STATUS move is already durable, so the task IS pending with
+            # residue on disk — the next dispatch would refuse to create over
+            # that worker, and a surviving record holds the merge window shut.
+            # Re-dispatching into that is worse than parking, so this parks, and
+            # the residue is named here because the park's own question cannot
+            # be rewritten from inside `_to_needs_user`.
+            return self._refuse_rebuild(
+                code,
+                f"its artefacts could not be retired ({release.obstacle}) — "
+                f"stale_worker={release.stale_worker_path or '(none)'} "
+                f"stale_record={release.stale_execution_record} "
+                f"residue_resumable={release.residue_resumable}",
+            )
+        # The record is gone; so must every pointer this session still holds to
+        # it, or a later approval naming the discarded packet would resolve a
+        # binding to work that no longer has a record. Identical to the tail of
+        # `_dispatch_recut`, and for the identical reason.
+        self._forget_sent_postcommits_for_task(state, task_id)
+        if isinstance(state.task_execution, dict) and (
+            state.task_execution.get("task_id") == task_id
+        ):
+            state.task_execution = None
+        if isinstance(state.current_task, dict) and (
+            state.current_task.get("task_id") == task_id
+        ):
+            state.current_task = None
+        carried = state.carry_postcommit
+        if isinstance(carried, dict) and carried.get("task_id") == task_id:
+            state.carry_postcommit = None
+        self._log(
+            "autonomous_rebuild",
+            data={
+                "code": code,
+                "task_id": task_id,
+                "stale_record": STALE_EXECUTION_RECORD,
+                "discarded_candidate": discarded_candidate,
+                "discarded_base": discarded_base,
+                "recut_count": release.task.recut_count,
+                "cap": MAX_TASK_RECUTS,
+                "label": retirement.label if retirement is not None else "",
+                "archived_record": (
+                    str(retirement.record_path)
+                    if retirement is not None and retirement.record_path is not None
+                    else ""
+                ),
+                "quarantined_worker": (
+                    str(retirement.worker_path)
+                    if retirement is not None and retirement.worker_path is not None
+                    else ""
+                ),
+            },
+        )
+        state.last_response = None
+        state.outbox = (
+            f"REBUILT AT HEAD — task {task_id} is back in the queue.\n\n"
+            f"Its recorded base {discarded_base[:12] or '(none)'} had fallen "
+            "behind the branch head and the reviewed candidate "
+            f"{discarded_candidate[:12] or '(none committed)'} could not be "
+            "carried past it, so the loop archived the execution record and "
+            "returned the task to the queue rather than waiting for an "
+            "operator to do the same by hand.\n"
+            "Nothing was deleted: the record was archived to "
+            f"{retirement.record_path if retirement and retirement.record_path else '(no record on disk)'} "
+            "and the worker repository quarantined at "
+            f"{retirement.worker_path if retirement and retirement.worker_path else '(no worker on disk)'}"
+            f", both under the label {retirement.label if retirement else '(none)'}.\n\n"
+            f"This was cut {release.task.recut_count} of {MAX_TASK_RECUTS}; "
+            "after that the task parks for a human instead of being cut again. "
+            "Its next `implement` starts from the CURRENT head with an empty "
+            "tree."
+        )
+        state.phase = Phase.READY.value
+        return True
+
+    def _discard_stale_push_binding(self, task_id: str, *, code: str) -> bool:
+        """`push_candidate_stale` / `push_candidate_unresolvable`: drop the
+        approval binding that names a candidate which has moved or no longer
+        resolves, and re-dispatch so the current state can be re-reviewed.
+
+        **The execution record is NOT touched, and that is the whole design.**
+        The park's own words for the task arm are "a later round advanced it" —
+        so the record underneath may hold a live candidate a reviewer is about
+        to approve, and archiving it would be the budget-01 shape with the loop
+        in the operator's seat. What is stale is the POINTER: `resp.postcommit`
+        (dropped with `state.last_response`), the `sent_postcommits` ledger
+        entries that could re-resolve it, and a `carry_postcommit` naming the
+        same task.
+
+        The changeset arm names no task at all. There the binding lives on the
+        queued review, so that is what goes — with its identifiers written to
+        the transcript first, because an operator queued it.
+
+        Returns False when there was nothing to drop and no task to attribute
+        the drop to: re-dispatching without having changed anything is theatre
+        that costs a round and arrives at the same park.
+        """
+        state = self.state
+        forgotten = [
+            str(record.get("request_id") or "")
+            for record in self._sent_postcommit_records(state)
+            if isinstance(record.get("postcommit"), dict)
+            and record["postcommit"].get("task_id") == task_id
+        ] if task_id else []
+        discarded_changeset = None
+        if task_id:
+            self._forget_sent_postcommits_for_task(state, task_id)
+            carried = state.carry_postcommit
+            if isinstance(carried, dict) and carried.get("task_id") == task_id:
+                state.carry_postcommit = None
+        else:
+            queued = state.changeset
+            if not queued:
+                return self._refuse_rebuild(
+                    code, "there is no task and no queued changeset to drop"
+                )
+            discarded_changeset = dict(queued) if isinstance(queued, dict) else str(queued)
+            state.changeset = None
+        self._log(
+            "autonomous_rebuild",
+            data={
+                "code": code,
+                "task_id": task_id or NO_TASK,
+                "stale_record": STALE_PUSH_BINDING,
+                "forgotten_packets": forgotten,
+                # The WHOLE queued record, not a summary: this transcript line is
+                # the only surviving copy of an operator's changeset once the
+                # state file is rewritten below.
+                "discarded_changeset": discarded_changeset,
+            },
+        )
+        state.last_response = None
+        subject = f"task {task_id}" if task_id else "the queued changeset review"
+        state.outbox = (
+            f"STALE APPROVAL BINDING DISCARDED — {subject}.\n\n"
+            "The reviewed candidate an approval named is no longer this task's "
+            "current candidate, or no longer resolves at all, so the loop "
+            "dropped the binding rather than waiting for an operator to. "
+            "Nothing was pushed and no execution record was archived: the "
+            "candidate on disk, if there is one, is untouched.\n\n"
+            "Re-review the current state before approving again."
+        )
+        state.phase = Phase.READY.value
+        return True
+
+    def _discard_unbindable_changeset(self, *, code: str) -> bool:
+        """`changeset_binding_missing`: drop the queued changeset review whose
+        packet cannot carry the four identifiers an approval binds by.
+
+        The one code here that halts the loop INDEFINITELY rather than costing
+        it a round: it is raised inside `_step_ready` before anything is sent,
+        so for as long as the queue entry stands every future round refuses at
+        the same line. Dropping it is exactly what an operator does.
+
+        **`state.outbox` is deliberately left alone**, unlike every other
+        rebuild. This park happens after `_step_ready` has already checked the
+        outbox is present, and that payload is the operator's — replacing it
+        with a report would discard the packet in order to explain that the
+        packet could not be sent.
+
+        The identifiers go to the transcript BEFORE the clear. An operator's
+        explicit `review-changeset` must not evaporate with nothing saying so;
+        the blocker record carries the candidate and the missing fields, and
+        this carries the whole queued record.
+        """
+        state = self.state
+        queued = state.changeset
+        if not queued:
+            # Nothing queued means nothing stale — and this code cannot be
+            # raised without one, so reaching here at all is a state nobody
+            # wrote. Park.
+            return self._refuse_rebuild(code, "no changeset is queued")
+        self._log(
+            "autonomous_rebuild",
+            data={
+                "code": code,
+                "task_id": NO_TASK,
+                "stale_record": STALE_QUEUED_REVIEW,
+                "discarded_changeset": (
+                    dict(queued) if isinstance(queued, dict) else str(queued)
+                ),
+            },
+        )
+        state.changeset = None
+        state.phase = Phase.READY.value
+        return True
+
+    def _discard_audit_pointer(self, *, code: str) -> bool:
+        """`audit_revise_no_record`: drop the session pointer that a `revise` of
+        the audit pseudo-task is answering, so the next `audit` mints a fresh
+        unit at the current head.
+
+        An audit unit is synthetic and per-iteration — there is no queue to
+        return it to and nothing on disk to archive — so the stale record here
+        is `state.current_task` itself, which the park has already established
+        carries no audit unit id. Dropping it and telling the reviewer to run
+        `audit` IS the park's own remedy, performed rather than requested.
+        """
+        state = self.state
+        stale = state.current_task if isinstance(state.current_task, dict) else None
+        self._log(
+            "autonomous_rebuild",
+            data={
+                "code": code,
+                "task_id": NO_TASK,
+                "stale_record": STALE_AUDIT_POINTER,
+                "discarded_pointer": stale,
+            },
+        )
+        state.current_task = None
+        state.last_response = None
+        state.outbox = (
+            "AUDIT POINTER DISCARDED — that `revise` named an audit this "
+            "session has no record of, so there was nothing to revise and "
+            "nothing was executed.\n\n"
+            "The loop cleared the stale pointer rather than parking for an "
+            "operator. Send `audit` to cut a fresh audit at the current head, "
+            "or pick up the roadmap with any other decision."
+        )
+        state.phase = Phase.READY.value
+        return True
+
+    def _discard_inconsistent_round(self, *, code: str) -> bool:
+        """`state_inconsistent`: drop the half-finished round a `StateError`
+        proved inconsistent, and rebuild the next one from the current head.
+
+        **The only rebuild whose stale record is not durable, and the only one
+        that therefore leaves its blocker OPEN to be bounded by the budget.**
+        Every other handler here removes a record, so the identical fault cannot
+        recur off it; this one removes the loop's own round, and the
+        inconsistency underneath can outlive it. Its record is closed only by a
+        step that afterwards COMPLETES (`_close_recovered_blocker`), so a second
+        occurrence with no completed step in between finds the allowance spent
+        and parks. That is the bound, and it is why `max_attempts` is 1.
+
+        **It never fires for `StateCorruptError`.** That subclass reaches the
+        same handler in `run`, and rebuilding a round on top of a store that
+        cannot be READ is the fail-open this design exists to refuse — so the
+        park site passes `recoverable=False` for it and the loop parks with the
+        corruption named, exactly as it does today.
+
+        `pending_request` goes too, and it is the one genuinely lossy step here:
+        a request that was sent may have a reply nobody will read. That is the
+        smaller loss. The binding that made the round publishable lives in
+        `sent_postcommits`, which is kept, so a later approval naming that
+        packet still resolves; and leaving the request in place would change
+        nothing anyway, since `_step_ready` overwrites it on the very next step.
+        Recorded before it is dropped.
+        """
+        state = self.state
+        self._log(
+            "autonomous_rebuild",
+            data={
+                "code": code,
+                "task_id": (
+                    state.task_execution.get("task_id")
+                    if isinstance(state.task_execution, dict)
+                    else NO_TASK
+                ),
+                "stale_record": STALE_SESSION_ROUND,
+                "discarded_response": (
+                    state.last_response.request_id if state.last_response else ""
+                ),
+                "discarded_request": (
+                    state.pending_request.request_id if state.pending_request else ""
+                ),
+                "discarded_outbox_chars": len(state.outbox or ""),
+            },
+        )
+        state.last_response = None
+        state.pending_request = None
+        state.outbox = (
+            "ROUND REBUILT — the loop's own bookkeeping for the last round was "
+            "inconsistent, so that round was discarded and this one is built "
+            "fresh from the current head.\n\n"
+            "Nothing on disk was archived: execution records, worker "
+            "repositories and every committed candidate are exactly where they "
+            "were. If a request was in flight, its reply will not be read — "
+            "re-state any verdict you were about to give."
+        )
+        state.phase = Phase.READY.value
+        return True
+
+    def _refuse_rebuild(self, code: str, reason: str) -> bool:
+        """Say in the transcript why a rebuild did not happen, and return False
+        so the caller parks with the question it always had.
+
+        Always LOUD, never a bare `return False`. The park an operator then sees
+        carries the original code's own text — `_to_needs_user` cannot rewrite
+        it from inside itself — so this line is the only place that says the
+        loop tried and what stopped it. Silence here would look identical to
+        autonomy being switched off.
+        """
+        self._log(
+            "autonomous_rebuild_refused",
+            data={"code": code, "reason": reason},
+        )
+        return False
 
     @staticmethod
     def _resumable_phase(raw: str | None) -> "Phase | None":

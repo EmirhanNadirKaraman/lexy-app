@@ -6823,6 +6823,118 @@ exits 0 printing the open blockers (the exhaustion path in §9c). That is bounde
 and visible, but it is more churn than the single stop it replaces, and it is
 the trade the flag turns on.
 
+### 9c-quinquies. Stale state is rebuilt at the current head, not handed to an operator (halt-03, 2026-08-25)
+
+**The same flag, the same interception point, a second family of codes.**
+`[autonomy] enabled = false` still governs everything below, still defaults off,
+and `orchestrator._to_needs_user` is still the only place any of it happens.
+§9c-quater automates a fault in the *transport*; this automates a fault in a
+*record*.
+
+**The problem it answers.** Measured 2026-08-24 over 131 resolved blocker
+records, `task_base_behind_head` is the second largest cause of parked time — 15
+parks, 18.5h, **median 0.54h**. The median is the tell. A park cleared as fast as
+it is seen is not a decision anybody is making: the operator reads the blocker,
+archives the execution record the question already names, and the loop cuts the
+task again at the current head. Seeing it *is* deciding it, which is the
+signature of work a machine should be doing.
+
+**One action, six records.** Every entry in `blockers.STALE_RECORD_RECOVERIES`
+has `action = RECOVER_BY_REBUILDING_AT_HEAD` and `max_attempts = 1`; they differ
+only in `stale_record`, which is what `orchestrator._autonomous_rebuild`
+dispatches on.
+
+| code | stale record | what the rebuild does |
+|---|---|---|
+| `task_base_behind_head` | the `TaskExecution` on disk | Archives it and requeues the task through recut-01's `release_task_to_pending(move=registry.recut)`, so the next dispatch is cut fresh at the current head. |
+| `push_candidate_stale` | the approval binding | Drops `last_response`, this task's `sent_postcommits` entries and a `carry_postcommit` naming it. The execution record is NOT touched. |
+| `push_candidate_unresolvable` | the approval binding | Same. Its second producer — the changeset push — names no task, and there the queued changeset goes instead. |
+| `state_inconsistent` | the loop's own half-finished round | Drops `last_response` and `pending_request` and rebuilds the round at `ready`. |
+| `audit_revise_no_record` | `state.current_task` | Drops the pointer and asks the reviewer for a fresh `audit`, which mints a unit at the current head by construction. |
+| `changeset_binding_missing` | `state.changeset` | Drops the queue entry that can never bind. The outbox is left alone — it is the operator's packet. |
+
+**Nothing new archives anything.** The one destructive step goes through the
+path recut-01 already built, so it inherits recut-01's five refusals rather than
+re-earning them: a published candidate is refused (budget-01's record was
+archived 54 seconds before the reviewer returned PUSH for that exact candidate);
+so is a candidate whose verdict is still outstanding, an unreadable record, an
+operator hold, a task the registry will not move, and a loop with no execution
+store *and* worker manager. A retirement that leaves residue on disk parks
+rather than re-dispatching over it. `retire_execution` MOVES both halves —
+`executions/archive/` and `quarantine/` — under one label, and the loop's label
+(`rebuilt-at-head-autonomously`) differs from the reviewer's
+(`recut-by-reviewer`) so an operator can tell which of them cut the round.
+
+**The bound across episodes is `recut_count`, not the retry budget.** A rebuild
+removes the record that caused the fault, so the identical fault cannot recur
+off it — which is exactly why the per-episode budget is not the interesting
+bound here. Where a durable one is needed it already exists: `registry.recut`
+charges `tasks.Task.recut_count`, which survives the archival that a count on
+the execution record would not, so a task whose base keeps landing behind the
+head is rebuilt at most `MAX_TASK_RECUTS` times and then parks for a human — the
+same cap and the same park whether the reviewer or the loop asked for the cut.
+
+**One consequence stated rather than left to be discovered: the archival
+REFILLS the attempt budget.** `release_task_to_pending` archives the execution
+record, so the next dispatch mints a fresh one with `attempt_count = 0` — which
+is exactly what strand-01 refuses to do for a requeued fault round ("hand the
+task an allowance it did not earn"). recut-01 accepts it because a *reviewer*
+chose the cut and a clean cut genuinely deserves clean attempts; here the *loop*
+chooses it, so a task whose base keeps landing behind the head can spend up to
+`MAX_TASK_RECUTS + 1` full `MAX_TASK_ATTEMPTS` budgets before anything parks for
+a human. That is bounded and visible — every cut is logged with its
+`recut_count` and its cap — but it is more churn than the single park it
+replaces, and it is part of the trade the flag turns on. The narrower
+alternative (archive the record but carry the counters onto the fresh one) was
+NOT taken: it would mean a second archival path that differs from recut-01's,
+which is the third mechanism this task was told not to build.
+
+**`state_inconsistent` is the exception, twice over.** It is the only stale
+record with no durable form, so the inconsistency underneath can outlive the
+round it tripped over: its blocker is therefore left OPEN by the rebuild and
+closed only by a step that afterwards COMPLETES, and a second occurrence with no
+completed step in between finds the allowance spent and parks. And it never
+fires for `StateCorruptError`, which subclasses `StateError` and reaches the same
+handler in `run`: rebuilding a round on top of a store that cannot be READ is
+the fail-open the whole design refuses, so that site passes `recoverable=False`
+— a per-occurrence veto that can only ever narrow, never automate a code the
+table does not hold.
+
+**The gate halt-02 left closed, narrowed rather than removed.** §9c-quater
+refused to act with no task to set aside, and correctly: a *retry-then-set-aside*
+plan with no task spends rounds walking toward a park that would still stop the
+loop. Three codes here carry no task and never could — `state_inconsistent` is
+the loop's own bookkeeping, and `changeset_binding_missing` plus the changeset
+arm of `push_candidate_unresolvable` belong to an operator's changeset, which has
+no roadmap task by construction — and their remedy needs none.
+`_autonomy_requires_a_task` therefore answers False for exactly those record
+kinds and True for everything else, including every halt-02 action. Left as it
+was, the three loop-halting codes would have stayed unautomated while a test
+suite that seeds `state.task_execution` passed.
+
+**`changeset_binding_missing` is the one that halts the loop indefinitely.** It
+is raised inside `_step_ready` before anything is sent, so for as long as the
+queue entry stands every future round refuses at the same line. The other five
+cost a round. Dropping the entry is what an operator does — and because there is
+no on-disk form to archive, the WHOLE queued record goes to the transcript
+first, so an explicit `review-changeset` can never evaporate with nothing saying
+so.
+
+**Every refusal is loud.** `_to_needs_user` cannot rewrite the park's own
+question from inside itself, so a rebuild that refuses lands on the park the loop
+has today with the text it always had — and `autonomous_rebuild_refused` in the
+transcript is the only thing that says the loop tried and what stopped it.
+Silence there would be indistinguishable from autonomy being switched off.
+Successful rebuilds carry `autonomous_rebuild` (code, task, stale record, and
+what was discarded, including the archive and quarantine paths).
+
+**The five hard halts are unchanged and still unreachable.** They are refused by
+`blockers.autonomous_recovery` before the table is consulted at all, so growing
+the table cannot reach them; `test_stale_record_rebuild.py` re-asserts the
+disjointness against the MERGED table. Pinned there, and by the two AST checks
+that read the `task_base_behind_head` and `state_inconsistent` park sites to
+confirm they still pass the arguments the tests replay.
+
 ### 9d. Retired: superseded work is not blocked work
 
 `blocked` used to carry a THIRD meaning, and it was the one that made the

@@ -35,6 +35,7 @@ from autoloop.blockers import (
     RECOVER_BY_RESUBMITTING,
     RECOVER_BY_RESUMING,
     RECOVER_UNAVAILABLE,
+    TRANSPORT_RECOVERIES,
     BlockerStore,
     autonomous_recovery,
 )
@@ -178,10 +179,19 @@ def emitted_blocker_codes() -> set[str]:
 
 def test_the_table_covers_every_specified_code_that_a_provider_can_still_raise():
     """SIX of the seven codes halt-02 names are automated. The seventh is the
-    rotation failure, which no live provider can raise — see the test below."""
-    assert set(AUTONOMOUS_RECOVERIES) == set(SPECIFIED_CODES) - {RETIRED_ROTATION_CODE}
-    assert len(AUTONOMOUS_RECOVERIES) == 6
-    for code, entry in AUTONOMOUS_RECOVERIES.items():
+    rotation failure, which no live provider can raise — see the test below.
+
+    Asserted over `TRANSPORT_RECOVERIES`, halt-02's own half of the table,
+    rather than over the merged `AUTONOMOUS_RECOVERIES`: halt-03 added a second
+    half for STALE RECORDS (`test_stale_record_rebuild.py` owns that claim), and
+    a set-equality over the merge would fail on every later addition while
+    saying nothing about the codes this test is actually about."""
+    assert set(TRANSPORT_RECOVERIES) == set(SPECIFIED_CODES) - {RETIRED_ROTATION_CODE}
+    assert len(TRANSPORT_RECOVERIES) == 6
+    assert set(TRANSPORT_RECOVERIES) <= set(AUTONOMOUS_RECOVERIES), (
+        "halt-02's half must still be reachable through the one lookup"
+    )
+    for code, entry in TRANSPORT_RECOVERIES.items():
         assert entry.code == code, "the table is keyed by its own code"
         assert entry.action in (
             RECOVER_BY_RESUMING, RECOVER_BY_RESUBMITTING, RECOVER_UNAVAILABLE
