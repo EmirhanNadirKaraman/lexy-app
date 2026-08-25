@@ -350,6 +350,7 @@ from .prompts import (
     review_mismatch_payload,
 )
 from .state import (
+    EXECUTION_ABORTED,
     TERMINAL_PHASES,
     ChunkedDelivery,
     LastResponse,
@@ -360,6 +361,7 @@ from .state import (
     ProviderSwitch,
     StateStore,
     StopRepetitionStore,
+    abort_requested,
     postcommit_binding_from_record,
     stop_repetition_file,
     utcnow_iso,
@@ -393,7 +395,9 @@ from .worktask import (
     attempt_outcome,
     compose_reason,
     format_attempt,
+    preserve_execution,
     reconcile_after_crash,
+    refund_attempt,
     retire_execution,
     split_attempt,
 )
@@ -682,6 +686,25 @@ class WantedDecisionTally:
 #: and leaves the record for the next run. Resuming after either is the
 #: ordinary "state is non-terminal, keep going" path, with no special case.
 SELF_UPGRADE = "self_upgrade"
+
+#: `run()`'s outcome when an operator's `abort` stopped the loop. NOT a phase,
+#: for the same reason `SELF_UPGRADE` is not: it says why the loop RETURNED, and
+#: the phase it returned FROM is the thing a resume needs. Distinct from
+#: `"paused"` so a caller can tell the two verbs apart in a log — they end the
+#: process the same way (exit 0, nothing parked, nothing to answer) and every
+#: caller handles them identically today.
+ABORTED = "aborted"
+
+#: `LoopState.stop_kind` for a session whose in-flight round an operator killed
+#: with `abort` (`_abort_round`). Its own value rather than `"contract"`,
+#: `PREEMPTION_STOP_KIND` or `cli.SHELVE_STOP_KIND`, for the reason
+#: `LoopState.stop_kind` states in full: every reader gates on the POSITIVE
+#: value it wants, so reusing one would make some gate answer yes about
+#: something that did not happen — `"contract"` would claim a reviewer answered,
+#: `"preempted"` would print a displacement, `"shelved"` would name a command
+#: nobody ran. Unrecognised-by-everything is the correct reading, and the abort
+#: FLAG (not this field) is what stops the next continuous iteration.
+ABORT_STOP_KIND = "aborted"
 
 #: `LoopState.stop_kind` for a session an operator's urgent request ended.
 #:
@@ -1438,7 +1461,7 @@ class Orchestrator:
     # ---- main loop ----------------------------------------------------------
 
     def run(self, max_steps: int | None = None) -> str:
-        """Run until a terminal phase, a pause request, or max_steps."""
+        """Run until a terminal phase, a pause or abort request, or max_steps."""
         steps = 0
         while True:
             # BOTH locations: the flag moved outside the checkout (see
@@ -1466,6 +1489,38 @@ class Orchestrator:
             phase = Phase(self.state.phase)
             if phase in TERMINAL_PHASES:
                 return phase.value
+            # BETWEEN steps, the abort flag means exactly what the pause flag
+            # means and does exactly as much: stop, here, having killed nothing.
+            # Nothing is in flight AT this point by construction — the previous
+            # step returned — so the phase is left alone and the session resumes
+            # from it with its packet and its directive intact. That is what
+            # makes this safe in `submitting` and `awaiting`, where a review
+            # packet is outstanding: the loop stops between steps exactly as
+            # `pause` already could, and no step is killed.
+            #
+            # THE KILL is a different mechanism at a different moment. It happens
+            # INSIDE `_step_executing`, in the process group the executor
+            # spawned, and is acted on by `_dispatch_task_postcommit` ->
+            # `_abort_round`. So the in-flight agent dies within seconds while a
+            # reviewer's outstanding packet is never touched.
+            #
+            # AFTER the terminal check, so a parked loop reports what it is
+            # parked on rather than an abort nobody can act on, and BEFORE the
+            # self-upgrade and preemption boundaries below: replacing the process
+            # or starting somebody else's task is not what an operator who asked
+            # the loop to stop is asking for.
+            if abort_requested(self._config):
+                self._log("abort_observed", data={"phase": phase.value})
+                heartbeat.publish(
+                    self._config,
+                    self.state,
+                    heartbeat.PAUSED,
+                    detail=(
+                        "abort requested by the operator — the loop stopped "
+                        "between steps; `resume` clears the flag"
+                    ),
+                )
+                return ABORTED
             # After the terminal check, so a parked loop reports what it is
             # parked on rather than a restart nobody can act on, and before the
             # step budget, so `--max-steps` cannot hide the boundary.
@@ -5757,17 +5812,27 @@ class Orchestrator:
     def _open_attempt(self, execution: TaskExecution) -> None:
         """Charge one dispatch and record it as OPEN.
 
-        First of the four operations over `TaskExecution.attempt_ledger`, and
+        First of the five operations over `TaskExecution.attempt_ledger`, and
         the order they run in is the whole design:
 
           `_reconcile_unfinished_attempts`  at dispatch, BEFORE the ceilings
           `_open_attempt`                   at dispatch, just before the executor
           `_finalise_attempt`               on EVERY exit of the dispatched round
           `_note_round_fault`               at a session-ending fault handler
+          `worktask.refund_attempt`         at an operator abort (`_abort_round`)
 
         The invariant they maintain: at most one entry is ever OPEN, it is
         always the last one, and it exists only between this method and the
         round's exit. Everything else here follows from that.
+
+        The fifth is the only one that REMOVES an entry rather than adding or
+        re-stamping one, and it is deliberately narrow: an operator's `abort` is
+        not the task failing, so the dispatch it killed is un-charged outright
+        (see `worktask.refund_attempt`, which also explains why settling it as a
+        fault or leaving it open would both be wrong). It is bounded by the
+        operator's own hand rather than by a counter — every abort refunds — and
+        that is the intended reading: a loop nobody is stopping cannot reach it,
+        and a loop somebody is stopping repeatedly is being stopped on purpose.
 
         Charged BEFORE the executor runs and persisted immediately — the M1
         finding #3 property this must not lose. A crash, a restart or a
@@ -6044,6 +6109,162 @@ class Orchestrator:
             )
         except Exception:
             return
+
+    # ---- operator abort ------------------------------------------------------
+
+    def _abort_round(
+        self,
+        execution: TaskExecution,
+        task: Task,
+        state: LoopState,
+        outcome: ExecutionOutcome,
+        *,
+        is_audit: bool,
+    ) -> None:
+        """End the round an operator killed: refund it, return its task to the
+        queue with its work intact, and record what was discarded.
+
+        Reached from ONE place — `_dispatch_task_postcommit`, immediately after
+        the executor returns and before anything is committed — so every claim
+        below is about a round that produced no candidate.
+
+        WHAT IT COSTS AND WHAT IT DOES NOT:
+
+        * **Nothing is charged.** `worktask.refund_attempt` removes the OPEN
+          ledger entry `_open_attempt` wrote and decrements exactly the counter
+          it charged. Leaving the entry open would NOT be equivalent: the next
+          dispatch's `_reconcile_unfinished_attempts` settles an open entry as
+          `ATTEMPT_FAULT, "interrupted_mid_round"`, so an abort that merely
+          walked away would become a fault charge one round later and,
+          eventually, a `fault_attempt_ceiling` park blaming the environment for
+          the operator's own button. No `consecutive_failures`, no
+          `_note_round_fault`, and no ceiling advanced either — an operator
+          stopping the loop is not the task failing.
+        * **The task goes back to the QUEUE, not into quarantine.**
+          `TaskRegistry.shelve` — `in_progress -> pending`, the same status move
+          `release` makes and deliberately NOT `release`'s artefacts: the
+          execution record and the worker repository are left exactly where they
+          are, so the next dispatch's three-fact reuse probe resumes THIS round
+          with its uncommitted work rather than starting over.
+          `worktask.preserve_execution` runs that same probe now, so the record
+          below states whether the resume will actually happen instead of
+          assuming it.
+        * **Mainline is untouched, structurally.** The commit is the next section
+          of `_dispatch_task_postcommit` and this returns before it; the primary
+          checkout is never written by a round at all (a write there is
+          `escape_detector`'s business, and it is checked before this). Nothing
+          here runs a git command against the main repository.
+        * **What was discarded is REPORTED, and measured rather than asserted.**
+          `outcome.summary` for an aborted round is
+          `implement_executor._aborted_outcome`, which reuses the very
+          `_partial_work` / `_partial_work_note` pair every other uncommitted
+          round reports through — files changed, lines written, which paths —
+          read from the worker repo's own `git status` / `git diff HEAD` and
+          never from anything the agent said about itself. This carries that
+          sentence into `state.aborted_round`, the `round_aborted` transcript
+          entry and `stop_reason`; it does not write a second one.
+
+        THE AUDIT is exempt from the status move alone: it holds no row in the
+        registry to return, so there is nothing to shelve. Everything else —
+        refund, preservation, record, the session ending — applies to it
+        unchanged.
+
+        Best-effort in its two outward-facing steps (the registry write and the
+        preservation probe) for the reason `_preempt_for_urgent` gives about its
+        own: the round is ending either way, and taking the process down at the
+        moment an operator is waiting for it to stop would be the worse ending.
+        Whatever failed is named in the record rather than raised.
+        """
+        refunded = refund_attempt(execution)
+        if refunded:
+            self._execution_store.save(execution)
+            self._log(
+                "attempt_refunded",
+                data={
+                    "task_id": task.id,
+                    "opened_as": refunded,
+                    "attempt_count": execution.attempt_count,
+                    "fault_attempt_count": execution.fault_attempt_count,
+                    "pending_fault_code": execution.pending_fault_code,
+                },
+            )
+
+        returned = False
+        obstacle = ""
+        if not is_audit and self._task_store is not None:
+            try:
+                self._registry.shelve(task.id)
+                # Persisted immediately: continuous mode re-reads `tasks.json`
+                # at the top of its next iteration, so an unsaved status move
+                # would simply not exist there.
+                self._task_store.save(self._registry)
+                returned = True
+            except (TaskGraphError, StateError, OSError) as exc:
+                obstacle = str(exc)
+                self._log(
+                    "abort_release_failed",
+                    data={"task_id": task.id, "error": str(exc)},
+                )
+
+        try:
+            preserved = preserve_execution(
+                task.id, self._execution_store, self._worker_repos
+            )
+        except Exception as exc:  # pragma: no cover - the probe never raises today
+            preserved = None
+            obstacle = obstacle or str(exc)
+
+        # The executor's own account of the round. For an aborted outcome it IS
+        # the partial-work sentence (measured from git); for the residual case
+        # where only the flag said so — an executor with no abort file wired, or
+        # a flag that landed between the two reads — it is the ordinary round
+        # summary and carries no measurement, which the flag beside it states so
+        # a reader never mistakes the second for the first.
+        measured = outcome.status == EXECUTION_ABORTED
+        record = {
+            "task_id": task.id,
+            "is_audit": is_audit,
+            "aborted_at_phase": Phase.EXECUTING.value,
+            "returned_to_pending": returned,
+            "attempt_refunded": refunded,
+            "attempt_count": execution.attempt_count,
+            "fault_attempt_count": execution.fault_attempt_count,
+            "obstacle": obstacle,
+            "discarded_work": outcome.summary,
+            "partial_work_measured": measured,
+            "worker_path": str(getattr(preserved, "worker_path", "") or ""),
+            "execution_record": str(getattr(preserved, "record_path", "") or ""),
+            "resumable": bool(getattr(preserved, "resumable", False)),
+            "preservation_obstacle": getattr(preserved, "obstacle", "") or "",
+            "candidate_sha": getattr(preserved, "candidate_sha", "") or "",
+            "review_round": getattr(preserved, "review_round", 0) or 0,
+            "at": utcnow_iso(),
+        }
+        state.aborted_round = record
+        state.current_task = None
+        state.task_execution = None
+        # The directive that dispatched this round dies with it — the same thing
+        # `_preempt_for_urgent` does to `last_response`, and for the same reason:
+        # keeping it would re-dispatch the killed round on resume, which is the
+        # one thing an operator who typed `abort` did not ask for. A `revise`
+        # verdict is not lost with it: `execution.last_revise_feedback` was
+        # written at dispatch and the next round still compares against it.
+        state.last_response = None
+        # The queued packet is about the task that just went back to the queue.
+        state.outbox = None
+        state.outbox_diff = None
+        state.outbox_attachment = None
+        state.phase = Phase.STOPPED.value
+        state.stop_kind = ABORT_STOP_KIND
+        state.stop_reason = (
+            f"the operator aborted the round in flight on {task.id}: the "
+            "implementation agent and its whole process group were killed, "
+            "nothing was committed, no attempt or fault was charged"
+            + (" and the task is back in the queue" if returned else "")
+            + f". {outcome.summary}"
+        )
+        self._store.save(state)
+        self._log("round_aborted", data=record)
 
     # ---- strand reconciliation (strand-01) -----------------------------------
 
@@ -6790,6 +7011,26 @@ class Orchestrator:
                 "validation": outcome.validation,
             }),
         )
+        if abort_requested(self._config) or outcome.status == EXECUTION_ABORTED:
+            # AN OPERATOR STOPPED THIS ROUND. Checked here — after the escape
+            # branch above, which returns first because an escape is a security
+            # park and must never be laundered into a clean operator stop, and
+            # BEFORE every branch below, because each of those charges a budget
+            # and/or builds a packet about a round that was not allowed to
+            # finish.
+            #
+            # EITHER signal is enough, and they are independent: the flag is the
+            # operator's own artefact, `EXECUTION_ABORTED` is the executor's
+            # report of having read it and killed the agent. A flag cleared in
+            # the microsecond between the two reads therefore still ends the
+            # round as an abort rather than as a charged failure — the
+            # fail-closed direction for "no attempt spent".
+            #
+            # NOTHING IS COMMITTED FROM HERE, which is what makes the mainline
+            # guarantee structural rather than argued: the commit is the next
+            # section of this method, and this returns before it.
+            self._abort_round(execution, task, state, outcome, is_audit=is_audit)
+            return
         if outcome.status != "ok":
             # THE measured case (exec-01, brw-11): the executor came back
             # having produced nothing because the agent provider threw a

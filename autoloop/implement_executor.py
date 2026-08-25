@@ -248,11 +248,14 @@ before.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Callable, NamedTuple, Sequence
 
@@ -263,7 +266,15 @@ from .errors import GitError
 from .executor import ExecutionOutcome
 from .git_gateway import GitGateway
 from .policy import PolicyEngine
-from .stall import DEFAULT_CEILING_SECONDS, PartialWork, StallPolicy, WorkerTreeProbe
+from .stall import (
+    DEFAULT_CEILING_SECONDS,
+    PartialWork,
+    ProcessGroupHandle,
+    StallPolicy,
+    WorkerTreeProbe,
+    spawn_supervised,
+)
+from .state import EXECUTION_ABORTED
 from .tasks import (
     TRACKER_PATHS,
     Task,
@@ -291,6 +302,319 @@ IMPLEMENT_DISALLOWED_TOOLS: tuple[str, ...] = (
 )
 
 
+# ---- operator abort: killing the step in flight ------------------------------
+#
+# WHY THIS LIVES HERE. `pause` stops the loop at the TOP OF THE NEXT STEP, and a
+# step is an agent call bounded by SILENCE rather than by elapsed time — so the
+# wait is however long the current agent takes, and the loop is EASIEST to
+# interrupt when idle and HARDEST when busy. Measured across one night of
+# pause-and-edit jobs (2026-08-25): mean 39 minutes to land a pause, worst 60,
+# one job abandoned without ever getting a boundary. `abort` is the second verb,
+# for an operator who is present and waiting, and what it does is kill the
+# PROCESS GROUP of whatever this module spawned.
+#
+# THE GROUP, NOT THE PROCESS, and in BOTH places this module spawns one:
+#
+#   * the write-capable agent, which spawns children of its own — that is the
+#     whole reason `stall.ProcessGroupHandle` exists;
+#   * the VALIDATION subprocess, which since impl-02 (2026-08-24) can be live
+#     when an abort lands: the agent runs the suite mid-round through
+#     `AdvisoryRendezvous`, and `pytest -n 4` is four worker processes. Those run
+#     in the LOOP's process group, not the agent's, so killing only the agent
+#     would leave four workers running against a worker repository nobody owns —
+#     and `AdvisoryRendezvous.stop()`, which the round's `finally` always
+#     reaches, would then wait up to `ADVISORY_STOP_JOIN_SECONDS` (11 minutes)
+#     for that thread to finish, rebuilding the 39-minute wait under a new name.
+#
+# NEITHER PATH MODIFIES `stall.py`. The agent path INJECTS a spawn
+# (`ClaudeCliRunner(spawn=...)`, already a seam) that wraps
+# `stall.ProcessGroupHandle` with a flag check, so the kill happens inside
+# `stall.supervise`'s existing poll loop and nothing about stall detection
+# changes: `supervise` sees a returncode and reports `COMPLETED`, exactly as it
+# does for an agent that exits on its own.
+
+#: How often a spawned process is checked for "has the operator aborted".
+#: Deliberately far finer than `stall.DEFAULT_POLL_SECONDS` for the validation
+#: runner (which does its own waiting) and irrelevant for the agent (whose
+#: cadence is `supervise`'s own poll). It bounds how long an abort waits, so it
+#: is small; each tick is one `Path.exists()`.
+ABORT_POLL_SECONDS = 0.25
+
+#: SIGTERM -> (grace) -> SIGKILL, same shape and the same reasoning as
+#: `stall.DEFAULT_TERMINATE_GRACE_SECONDS`: long enough for a CLI to flush what
+#: it has already written, short enough that the kill is not itself a wait. An
+#: operator pressing abort is waiting on this number.
+ABORT_TERMINATE_GRACE_SECONDS = 5.0
+
+#: Poll step inside a grace period.
+_ABORT_GRACE_POLL_SECONDS = 0.25
+
+#: The returncode reported for a command the abort killed or never started.
+#: Negative like a signal exit, and distinct from any real one, so a reader can
+#: tell "we killed this" from "it exited 137 by itself".
+ABORT_RETURNCODE = -99
+
+#: What a validation command that never launched says. Read by a human in
+#: `state.last_validation`; it must not be mistakable for a pass.
+_ABORT_NOT_STARTED = (
+    "NOT STARTED — the round was aborted by the operator before this command ran"
+)
+
+
+def abort_flag_set(abort_file: Path | None) -> bool:
+    """Has an operator asked for the step in flight to be killed?
+
+    Takes the resolved PATH rather than a config: WHERE the flag lives is
+    `state.abort_flag_file`'s single decision (outside the checkout, beside
+    `PAUSE`, for the escape-detector reason recorded there), and this module is
+    handed the answer by `cli._build_executor` rather than deriving a second one.
+    `None` — every direct `execute()` call in the tests, and any embedder that
+    does not wire it — means no abort capability at all, which is the same
+    fail-closed default `cleanup_paths_for` and `revert_authority` take.
+
+    Fail-open on an unreadable path, identically to `state.abort_requested` and
+    `cli.pause_requested`: `Path.exists()` answers False rather than raising, so
+    the loop keeps doing what it was already doing. Named rather than hidden —
+    see `state.abort_requested` for why the other direction would be worse.
+    """
+    return abort_file is not None and Path(abort_file).exists()
+
+
+def _kill_group(handle, *, grace_seconds: float, sleep=time.sleep) -> int:
+    """SIGTERM the process GROUP, wait out a bounded grace, then SIGKILL it.
+
+    `handle` is a `stall.ProcessGroupHandle` (or anything with the same three
+    methods): its `terminate`/`kill` are `os.killpg` calls, so a signal reaches
+    every descendant the spawned process left behind — which is the entire point
+    of this function and the one thing a plain `Popen.kill()` does not do.
+
+    Bounded by ITERATIONS rather than by a clock comparison, the same rule
+    `stall._stop` follows and for the same reason: a kill routine that can itself
+    hang is not a kill routine.
+
+    Always returns a non-`None` int. A caller that got `None` back would have to
+    decide what an unreaped process means, and in `AbortableProcessHandle.poll`
+    the answer would be "loop and re-signal it forever". After a SIGKILL to the
+    group the process IS dead — `SIGKILL` cannot be caught, blocked or ignored —
+    so `ABORT_RETURNCODE` reports that rather than pretending not to know.
+    """
+    steps = max(1, int(grace_seconds / _ABORT_GRACE_POLL_SECONDS))
+    for signal_action in (handle.terminate, handle.kill):
+        try:
+            signal_action()
+        except Exception:
+            # Already reaped, or a handle that refuses the signal. Either way the
+            # remaining work (observe, report) still has to happen.
+            pass
+        for _ in range(steps):
+            try:
+                returncode = handle.poll()
+            except Exception:
+                returncode = None
+            if returncode is not None:
+                return returncode
+            sleep(_ABORT_GRACE_POLL_SECONDS)
+    return ABORT_RETURNCODE
+
+
+class AbortableProcessHandle:
+    """A `stall.ProcessHandle` that also dies when the operator says so.
+
+    Wraps the handle a real spawn produced and adds ONE behaviour: every `poll()`
+    that would answer "still running" first asks whether the abort flag is set,
+    and if it is, kills the whole process group and answers with the code that
+    produced. `stall.supervise` calls `poll()` at the top of every one of its own
+    iterations, so the kill lands within one `stall.StallPolicy.poll_seconds`
+    (5s by default) plus the grace period — seconds, which is the claim.
+
+    **It reports the kill through the ORDINARY channel.** `supervise` sees a
+    returncode and returns `COMPLETED`; it does not learn that this was a kill,
+    and must not — a `stall.StallReport` says "nothing changed for N seconds, so
+    this agent was wedged", which would be a false statement about a healthy
+    agent an operator stopped. What the round was aborted is established by the
+    flag itself, read again by `_run_implementation` and once more by
+    `orchestrator._dispatch_task_postcommit`.
+
+    **`aborted` is a positive record, not an inference.** It says THIS handle
+    killed THIS process because of the flag, which is different from "the flag is
+    set now" — the latter is also true for an agent that finished normally one
+    tick earlier.
+    """
+
+    def __init__(
+        self,
+        handle,
+        abort_file: Path | None,
+        *,
+        grace_seconds: float = ABORT_TERMINATE_GRACE_SECONDS,
+        sleep=time.sleep,
+    ):
+        self._handle = handle
+        self._abort_file = abort_file
+        self._grace_seconds = grace_seconds
+        self._sleep = sleep
+        self.aborted = False
+
+    def poll(self) -> int | None:
+        returncode = self._handle.poll()
+        if returncode is not None:
+            # FIRST, and the order is the same one `stall.supervise` documents: a
+            # process that finished on its own is never posthumously "killed".
+            return returncode
+        if self.aborted or not abort_flag_set(self._abort_file):
+            return None
+        self.aborted = True
+        return _kill_group(
+            self._handle, grace_seconds=self._grace_seconds, sleep=self._sleep
+        )
+
+    def terminate(self) -> None:
+        self._handle.terminate()
+
+    def kill(self) -> None:
+        self._handle.kill()
+
+
+def abort_aware_spawn(abort_file: Path | None, spawn=None, *, sleep=time.sleep):
+    """`stall.spawn_supervised`, wrapped so the operator can kill what it spawns.
+
+    Returns a spawn callable with the signature `ClaudeCliRunner` expects, so it
+    goes in through the `spawn=` seam that already exists for tests rather than
+    through any change to `stall.py`. With no `abort_file` it returns the
+    underlying spawn UNCHANGED — one fewer object in the ordinary path, and the
+    honest representation of "no abort capability is wired here".
+    """
+    inner = spawn or spawn_supervised
+    if abort_file is None:
+        return inner
+
+    def _spawn(argv, *, cwd, env, stdout, stderr):
+        return AbortableProcessHandle(
+            inner(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr),
+            abort_file,
+            sleep=sleep,
+        )
+
+    return _spawn
+
+
+def killable_run(
+    argv,
+    *,
+    cwd=None,
+    capture_output: bool = True,
+    text: bool = False,
+    timeout: float | None = None,
+    env=None,
+    abort_file: Path | None = None,
+    poll_seconds: float = ABORT_POLL_SECONDS,
+    grace_seconds: float = ABORT_TERMINATE_GRACE_SECONDS,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> subprocess.CompletedProcess:
+    """`subprocess.run`, for a command whose whole PROCESS GROUP must be killable.
+
+    A drop-in for the `command_runner` seam `validation.run_validation_commands`
+    calls (`runner(argv, cwd=, capture_output=, text=, timeout=, env=)`), with
+    the same contract on the way out: a `CompletedProcess` carrying
+    `returncode`/`stdout`/`stderr`, `subprocess.TimeoutExpired` on a timeout, and
+    `FileNotFoundError` straight out of `Popen` for a binary that is not there.
+
+    THREE differences from `subprocess.run`, each deliberate:
+
+    * `start_new_session=True`, so the command and everything it spawns share a
+      process group of their own. `pytest -n 4` is five processes; `subprocess
+      .run`'s own timeout path kills only the one it started, leaving four
+      workers writing into a worker repository nobody owns. Every kill here is
+      `os.killpg` through `stall.ProcessGroupHandle`.
+    * it watches `abort_file` while it waits, and kills the group when the flag
+      appears. That is what stops an abort from having to wait out a suite.
+    * output goes to temporary FILES rather than pipes. A pipe nobody drains
+      fills its OS buffer and blocks the child forever, and this function cannot
+      drain one while it is polling — the same reason `stall.spawn_supervised`
+      uses files. `capture_output` is accepted for signature compatibility and
+      ignored: output is always captured, which is a superset of what any caller
+      asks for.
+
+    The temporary files live in the system temp directory, NEVER under `cwd`:
+    `cwd` is the worker repository, and a file created there mid-round is work
+    the round would be judged on.
+    """
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(
+            list(argv),
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            stdout=out,
+            stderr=err,
+            start_new_session=True,
+        )
+        handle = ProcessGroupHandle(proc)
+        deadline = clock() + timeout if timeout is not None else None
+        timed_out = False
+        while True:
+            returncode = proc.poll()
+            if returncode is not None:
+                break
+            if abort_flag_set(abort_file):
+                returncode = _kill_group(
+                    handle, grace_seconds=grace_seconds, sleep=sleep
+                )
+                break
+            if deadline is not None and clock() >= deadline:
+                returncode = _kill_group(
+                    handle, grace_seconds=grace_seconds, sleep=sleep
+                )
+                timed_out = True
+                break
+            sleep(poll_seconds)
+        out.seek(0)
+        err.seek(0)
+        stdout_bytes, stderr_bytes = out.read(), err.read()
+    stdout = stdout_bytes.decode("utf-8", "replace") if text else stdout_bytes
+    stderr = stderr_bytes.decode("utf-8", "replace") if text else stderr_bytes
+    if timed_out:
+        # Raised AFTER the group is dead, so the caller's `except
+        # TimeoutExpired` branch never runs while workers are still writing —
+        # which is what `subprocess.run` leaves behind today.
+        raise subprocess.TimeoutExpired(list(argv), timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(list(argv), returncode, stdout, stderr)
+
+
+def abort_aware_command_runner(command_runner, abort_file: Path | None):
+    """The `command_runner` a round validates with, made abortable.
+
+    Two layers, and the outer one is what makes a LIST of commands abortable
+    rather than just the one that happens to be running: `run_validation_commands`
+    executes its list in order, so a flag that appears during command 2 of 5 must
+    stop 3, 4 and 5 from launching at all. The check before each command is that
+    stop, and its `ABORT_RETURNCODE` reads as a failure — never as a pass — so a
+    validation summary can never say green about commands nobody ran.
+
+    The inner layer is `killable_run`, used only when no explicit runner was
+    injected: an injected one is a test double or an embedder's own callable, and
+    replacing it would change what the caller asked for. Such a runner still gets
+    the before-each-command check, so an abort still stops the list; what it does
+    not get is a group kill, because nothing here knows what it spawned.
+
+    With no `abort_file` this returns exactly what it was given (or
+    `subprocess.run`), so every unwired construction — every direct `execute()`
+    test, every embedder — behaves byte for byte as it did before.
+    """
+    if abort_file is None:
+        return command_runner or subprocess.run
+    inner = command_runner or functools.partial(killable_run, abort_file=abort_file)
+
+    def _run(argv, **kwargs):
+        if abort_flag_set(abort_file):
+            return subprocess.CompletedProcess(
+                list(argv), ABORT_RETURNCODE, "", _ABORT_NOT_STARTED
+            )
+        return inner(argv, **kwargs)
+
+    return _run
+
+
 def implement_agent_runner(
     root: Path,
     command: tuple[str, ...] = ("claude",),
@@ -301,6 +625,7 @@ def implement_agent_runner(
     spawn=None,
     clock=None,
     sleep=None,
+    abort_file: Path | None = None,
 ) -> ClaudeCliRunner:
     """The ONE place a write-capable `ClaudeCliRunner` is constructed.
 
@@ -325,6 +650,16 @@ def implement_agent_runner(
     and is why `timeout_seconds` now defaults to the absolute ceiling instead
     of the retired 900s: an unsupervised write-capable run should still not be
     cut off at a duration real tasks routinely exceed.
+
+    **`abort_file` is what turns the operator kill switch on**, and it composes
+    with `spawn` rather than competing with it: the wrapper goes AROUND whatever
+    spawn was passed (`abort_aware_spawn`), so a test that injects a fake spawn
+    still gets one, wrapped. It only reaches the SUPERVISED path — without a
+    `policy` there is no probe, `ClaudeCliRunner` falls back to
+    `subprocess.run(..., timeout=)` and there is no handle to kill at all. That
+    is the honest bound and it matches production, where `cli._build_executor`
+    passes both to the per-task factory and neither to the standalone binding
+    (which is never reached).
     """
     probe = None
     if policy is not None:
@@ -343,7 +678,7 @@ def implement_agent_runner(
         disallowed_tools=IMPLEMENT_DISALLOWED_TOOLS,
         progress_probe=probe,
         stall_policy=stall_policy,
-        spawn=spawn,
+        spawn=abort_aware_spawn(abort_file, spawn),
         **kwargs,
     )
 
@@ -2315,6 +2650,7 @@ class ImplementExecutor:
         cleanup_paths_for: Callable[[str], tuple[str, ...]] | None = None,
         revert_authority=None,
         advisory_max_calls: int = ADVISORY_VALIDATION_MAX_CALLS,
+        abort_file: Path | None = None,
     ):
         """`git` / `agent_runner` are the STANDALONE bindings — used verbatim
         whenever `worker_repo_root_for` is not supplied (every direct
@@ -2342,7 +2678,21 @@ class ImplementExecutor:
         self._git = git
         self._agent_runner = agent_runner
         self._validation_commands = validation_commands
-        self._command_runner = command_runner or subprocess.run
+        # The operator kill switch, or None for "no abort capability" — the same
+        # fail-closed default `cleanup_paths_for` and `revert_authority` take,
+        # and the reason every direct `execute()` test is unaffected by this.
+        # `cli._build_executor` binds it to `state.abort_flag_file(config)`, the
+        # single decision about where that flag lives.
+        self._abort_file = abort_file
+        # WRAPPED, not merely stored, and it is the only line that makes an abort
+        # survive a live validation run: BOTH the round's authoritative run and
+        # the agent's mid-round advisory runs (`_advisory_for`) go through this
+        # one attribute, so one wrap covers both. Without it an abort landing
+        # during `pytest -n 4` would leave four workers writing into a worker
+        # repository nobody owns, and the round's own `finally` would then wait
+        # up to `ADVISORY_STOP_JOIN_SECONDS` for that thread — see
+        # `abort_aware_command_runner`.
+        self._command_runner = abort_aware_command_runner(command_runner, abort_file)
         self._worker_repo_root_for = worker_repo_root_for
         self._policy = policy
         self._agent_runner_factory = agent_runner_factory
@@ -2765,6 +3115,44 @@ class ImplementExecutor:
             max_calls=self._advisory_max_calls,
         )
 
+    def _aborted_outcome(
+        self, task: Task, git: GitGateway, *, raw_text: str = "", note: str = ""
+    ) -> ExecutionOutcome:
+        """What a round killed by `abort` reports.
+
+        REUSES `_partial_work` / `_partial_work_note` rather than inventing a
+        second sentence, because the question a reviewer (and the operator) asks
+        after an abort is exactly the one those already answer: an uncommitted
+        round produced nothing a packet can show, so the only evidence of what it
+        did is the worker repository's own git state. Same measurement, same
+        wording, same provenance — read from `git status` / `git diff HEAD`,
+        never from anything the agent said about itself.
+
+        `status` is `EXECUTION_ABORTED`, not `"error"`: the orchestrator treats
+        it as the second, independent signal that this round was aborted, so a
+        flag cleared between here and there still ends the round as an abort.
+        `fault_kind` is deliberately EMPTY — an abort is neither the task's
+        failure nor the environment's, and naming a fault here would spend the
+        fault budget this is required not to spend.
+        """
+        changed, partial = self._partial_work(git)
+        summary = (
+            f"task '{task.id}': the round was ABORTED by the operator — the "
+            "implementation agent and every process it spawned were killed, "
+            "nothing was committed, and the task goes back to the queue with "
+            "this work intact."
+            + _partial_work_note(changed, partial)
+            + " Validation did not run."
+            + note
+        )
+        return ExecutionOutcome(
+            status=EXECUTION_ABORTED,
+            summary=summary,
+            details=raw_text,
+            validation="not run (aborted)",
+            changed_paths=changed,
+        )
+
     def _run_implementation(
         self,
         directive: Directive,
@@ -2772,6 +3160,15 @@ class ImplementExecutor:
         git: GitGateway,
         agent_runner: AgentRunner,
     ) -> ExecutionOutcome:
+        if abort_flag_set(self._abort_file):
+            # BEFORE anything is spawned. The orchestrator's own check at the top
+            # of each step normally catches this first, so reaching here means
+            # the flag landed in the window between that check and this call —
+            # narrow, but the answer for it is the cheap one: run no agent at
+            # all. The round is still refunded and still returned to the queue,
+            # because the orchestrator decides that from the flag, not from
+            # whether an agent happened to start.
+            return self._aborted_outcome(task, git)
         feedback = directive.feedback if directive.decision is Decision.REVISE else None
         # Bound BEFORE the agent runs, because the agent is who it exists for:
         # the brief has to name the channel and the watcher has to be up before
@@ -2813,6 +3210,21 @@ class ImplementExecutor:
             # record. `stop()` sweeps even when `start()` never ran, which is
             # also what clears residue left by a round that was killed.
             rendezvous.stop()
+        if abort_flag_set(self._abort_file):
+            # BEFORE `result.ok`, because the killed agent's own failure is a
+            # CONSEQUENCE of the abort and reporting it as the cause would tell a
+            # reviewer that a healthy agent had wedged. Before the cleanup,
+            # delete and revert passes too, and before the authoritative
+            # validation run: those are work this round is no longer doing, and
+            # starting a suite after the operator asked the loop to stop is the
+            # wait this whole verb exists to remove.
+            #
+            # The rendezvous has already been swept by the `finally` above, so
+            # the tree `_partial_work` measures below carries no trace of the
+            # channel — the same guarantee every other reader of it gets.
+            return self._aborted_outcome(
+                task, git, raw_text=result.raw_text, note=advisory.note()
+            )
         if not result.ok:
             # A failed agent still leaves whatever it had already written in
             # the worker repo, and a reviewer cannot act on "the agent failed"

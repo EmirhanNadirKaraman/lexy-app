@@ -63,7 +63,7 @@ Code: `autoloop/`. Runtime state: `.autoloop/` (gitignored).
 | Audit executor | `audit/` | The read-only production executor (§7): `findings` (agent contract), `agents` (claude-CLI runner, tool set now a constructor param — see §7b), `reconcile`, `taskgen`, `markdown` (MD-only gate), `report`, `executor`. Dispatched as a task-shaped unit of work (`Orchestrator._resolve_audit_task`), so it runs through §4b like any other task. |
 | Implement executor | `implement_executor.py` | The write-capable production executor (§7b): `ImplementExecutor` runs ONE `Edit`/`Write`-capable subagent (`implement_agent_runner`, built on the SAME `audit.agents.ClaudeCliRunner` the audit uses, configured with a different tool set) against a task's own worker repo, derives `changed_paths` from the worker repo's real `git status`, then re-runs validation. `cli._build_executor`'s `_DispatchingExecutor` routes `implement`/`revise`-of-a-real-task here; `audit`/`revise("audit")` still go to `AuditExecutor`. |
 | State / transcript | `state.py`, `transcript.py` | Atomic crash-safe state; append-only JSONL audit log. |
-| CLI | `cli.py` | `run [--continuous] status tasks next-task blockers answer retire release doctor pause resume unlock reset reprovision-publisher` (§8/§9). `smoke-browser` is still registered but RETIRED (brw-16, 2026-08-25): it prints why and exits 2, running nothing — §6. |
+| CLI | `cli.py` | `run [--continuous] status tasks next-task blockers answer retire release doctor pause abort resume unlock reset reprovision-publisher` (§8/§9). `abort` is the stop-NOW verb beside `pause`'s stop-at-a-boundary — §4f-septies. `smoke-browser` is still registered but RETIRED (brw-16, 2026-08-25): it prints why and exits 2, running nothing — §6. |
 
 ---
 
@@ -104,7 +104,10 @@ is `cli._build_executor`'s `_DispatchingExecutor`, which holds both
 
 `run`, `resume` and `reset` hold `.autoloop/LOCK` (atomic
 `O_CREAT|O_EXCL`; records pid, hostname, start time, run id, state dir).
-`status` / `tasks` / `doctor` / `pause` stay available while locked.
+`status` / `tasks` / `doctor` / `pause` / `abort` stay available while locked —
+`abort` for the same reason `pause` is, and it is the whole point of it: it
+writes one flag file outside the checkout and touches no state, no registry and
+no worker, so it is usable against the live loop it exists to stop (§4f-septies).
 `smoke-browser` held it too until brw-16 (2026-08-25) retired the command; it
 now takes no lock at all, which is asserted rather than assumed — a retired
 command that still locked would block a live run in order to print a sentence.
@@ -1340,6 +1343,7 @@ What each way of stopping costs:
 | How it stops | Lock | State | In-flight work |
 |---|---|---|---|
 | `pause` | released | consistent | none — finishes the current phase first |
+| `abort` | released | consistent | the agent in flight and its whole process group are killed; the work stays uncommitted in the worker repo, the task goes back to the queue, and no attempt or fault is charged (§4f-septies) |
 | Ctrl-C / SIGTERM / SIGHUP | released | consistent | the current step |
 | SIGKILL / power cut | left behind, `unlock` clears it | consistent | the current step |
 
@@ -3644,6 +3648,131 @@ that appears to do nothing. The handlers are lifted out of the page between the
 `INTAKE_PANEL` markers and run under node by `test_intake.py`, which asserts
 the call sequence and the first call's payload by equality — a grep cannot tell
 the two orders apart.
+
+## 4f-septies. `abort` — stopping the step in flight (abort-01, 2026-08-25)
+
+    python -m autoloop pause     # stop at the next BOUNDARY  (unattended jobs)
+    python -m autoloop abort     # stop NOW, killing the step  (you are waiting)
+    python -m autoloop resume    # clears EITHER flag
+
+**The measurement.** `pause` writes a flag that `Orchestrator.run` reads at the
+TOP OF EACH STEP, and a step is an agent call bounded by SILENCE rather than by
+elapsed time (`stall.DEFAULT_CEILING_SECONDS` is the 4-hour backstop). So the
+wait is however long the current agent takes, and the loop is EASIEST to
+interrupt when idle and HARDEST when busy — exactly inverted from when an
+operator needs to intervene. Across every pause-and-edit job run in one night,
+2026-08-25:
+
+| job | waited |
+|---|---|
+| recut-dash21 | 20.0 min |
+| cap-workers | 18.3 min |
+| strip-validation | 36.5 min |
+| restore-split02 | 39.1 min |
+| retire-browser | 39.8 min |
+| clear-sweep | 47.3 min |
+| answer-release01 | 52.8 min |
+| reorg-run | 60.0 min — ABORTED, the work never ran |
+
+5.2 hours of operator time, mean 39 minutes, one outright failure: a file
+reorganisation waited an hour for a safe boundary, never got one, and correctly
+abandoned rather than acting on a stale read.
+
+**What `abort` adds is one verb, not a change to `pause`.** Stopping at a
+boundary is still the right default and is still what an unattended job should
+use. Everything below is the second verb.
+
+**THE FLAG.** `state.abort_flag_file(config)` — `ABORT`, beside `PAUSE`, in the
+directory next to `workers_root`. OUTSIDE the checkout, which is not a
+preference: `escape_detector` snapshots the checkout around every write-capable
+agent call, and this flag is written at exactly that moment by definition, so a
+flag inside would be reported as an escape and park the loop `loop_fatal` every
+time (the trap `pause_file` hit first). Writing it takes no lock and touches no
+state, no registry and no worker, so `abort` is usable against a live loop —
+which is the only moment it means anything.
+
+**TWO PLACES IT IS READ, and they do different things.**
+
+* **Between steps** (`Orchestrator.run`, after the terminal-phase check): the
+  loop returns `ABORTED` having killed nothing, exactly as `pause` does. The
+  phase, the pending request and the reviewer's outstanding packet all survive
+  for the resume. This is what satisfies **never abort in `submitting` or
+  `awaiting`** — no step of that kind is ever killed. It sits after the terminal
+  check so a parked loop still reports its park, and before the self-upgrade and
+  preemption boundaries, because replacing the process or starting somebody
+  else's task is not what an operator asking the loop to stop is asking for.
+* **Inside the executing step**, in the process groups the executor spawned.
+  This is the kill.
+
+**THE KILL IS OF A PROCESS GROUP, in BOTH groups a round has.** Nothing in
+`stall.py` changed; the agent path goes in through `ClaudeCliRunner(spawn=...)`,
+a seam that already existed:
+
+* the AGENT — `implement_executor.AbortableProcessHandle` wraps the handle
+  `stall.spawn_supervised` produced and checks the flag on every `poll()`, which
+  `stall.supervise` calls once per its own 5s poll. On the flag it SIGTERMs the
+  group, waits a bounded grace, then SIGKILLs it, and answers with a returncode
+  — so `supervise` reports `COMPLETED` and never manufactures a `StallReport`
+  saying a healthy agent had wedged.
+* the VALIDATION SUBPROCESS — since impl-02 the agent runs the suite mid-round
+  through `AdvisoryRendezvous`, in the LOOP's process group rather than the
+  agent's. `pytest -n 4` is five processes; killing only the agent would leave
+  four writing into a worker repo nobody owns, and the round's own `finally`
+  would then wait up to `ADVISORY_STOP_JOIN_SECONDS` (11 min) for that thread —
+  the 39-minute wait rebuilt under a new name.
+  `implement_executor.abort_aware_command_runner` wraps the ONE
+  `_command_runner` both the advisory and the authoritative runs go through: it
+  refuses to launch a command once the flag is set (as a FAILURE, never as a
+  pass), and `killable_run` spawns with `start_new_session=True` so the group
+  can be signalled as a whole.
+
+**WHAT THE ROUND COSTS: nothing.** `Orchestrator._abort_round` runs as soon as
+the executor returns and BEFORE the commit:
+
+* `worktask.refund_attempt` REMOVES the open ledger entry `_open_attempt` wrote
+  and decrements exactly the counter it charged, restoring `pending_fault_code`
+  for a redo. Settling it as a fault would be wrong and leaving it OPEN would be
+  worse: `_reconcile_unfinished_attempts` settles an open entry as
+  `ATTEMPT_FAULT, "interrupted_mid_round"` at the next dispatch, so an abort
+  that merely walked away would become a fault charge one round later and,
+  eventually, a `fault_attempt_ceiling` park blaming the environment for the
+  operator's own button.
+* `TaskRegistry.shelve` returns the task `in_progress → pending` and leaves BOTH
+  artefacts alone, so the next dispatch's three-fact reuse probe resumes that
+  round with its uncommitted work. `worktask.preserve_execution` runs the same
+  probe now, so the record states whether the resume will really happen.
+* MAINLINE IS UNTOUCHED, structurally: the commit is the next section of
+  `_dispatch_task_postcommit` and the abort returns before it. Asserted, not
+  argued — `test_operator_abort.py` captures the primary checkout's HEAD and its
+  porcelain status before and after.
+* WHAT WAS DISCARDED IS REPORTED, and measured: `implement_executor.
+  _aborted_outcome` reuses the same `_partial_work` / `_partial_work_note` pair
+  every other uncommitted round reports through (files, lines, which paths, read
+  from the worker repo's own `git status` / `git diff HEAD`, never from the
+  agent's account of itself). It reaches `state.aborted_round`, the
+  `round_aborted` transcript entry, `stop_reason` and the operator's terminal.
+
+**TWO INDEPENDENT SIGNALS, either sufficient.** The flag is the operator's own
+artefact; `state.EXECUTION_ABORTED` is the executor's report of having read it
+and killed the agent. A flag cleared between the two reads still ends the round
+as an abort rather than as a charged failure — the fail-closed direction for
+"no attempt spent".
+
+**WHERE THE KILL STOPS, stated rather than implied.** It bounds the agent call
+and the executor's own validation, which is nearly all of a round's wall clock.
+A round that has already COMMITTED a candidate finishes — post-commit validation
+and packet build — and the abort is honoured at the next boundary. That is the
+same rule that makes "mainline is untouched" structural, and it means no
+produced candidate is ever thrown away. A read-only AUDIT agent gets no kill at
+all: it changes no files, so there is nothing to preserve and nothing to
+destroy, and the flag stops the loop at the top of the next step instead.
+
+**The session ends `stopped` with `stop_kind = "aborted"`**, its own value
+because every reader of that field gates on the POSITIVE one it wants.
+Continuous mode does NOT carry on — unlike a preemption — because
+`cli._run_continuous` checks the flag at the top of each iteration; without that
+the abort would stop one round and the next iteration would pick the same task
+straight back up. `resume` (and `start`) clear both flags together.
 
 ## 4g. The validation-environment boundary (test DB credentials)
 
