@@ -1,6 +1,13 @@
 """smoke-browser command through the real CLI with a fake registered
 conversation provider: full contract path (request id, stamp, parser,
-transcript), clean terminal state, executor never invoked."""
+transcript), clean terminal state, executor never invoked.
+
+The NAME is historical. Since brw-16 (2026-08-25) no browser-backed provider is
+registered, so this command no longer defaults to one: it smokes whatever
+`conversation.provider` names, and refuses up front — before the loop lock —
+when the provider it was asked for is not registered. A command that silently
+could not work was the outcome that change had to avoid.
+"""
 
 import json
 import re
@@ -60,17 +67,20 @@ def write_config(tmp_path, provider):
     return config
 
 
-def run_smoke(tmp_path, conversation):
+def run_smoke(tmp_path, conversation, *, explicit_provider=True):
     provider = "fake_smoke_provider"
     register_provider(provider, lambda config: conversation)
     try:
         config = write_config(tmp_path, provider)
-        # `--provider` is explicit since 2026-08-01: smoke-browser defaults to
-        # the browser rather than to `conversation.provider`, so the fake has
-        # to be named here rather than only in the config.
-        return cli.main(
-            ["smoke-browser", "--config", str(config), "--provider", provider]
-        )
+        # `--provider` is still passed explicitly by most tests here, because
+        # naming the seat under test is what this command is for. Since brw-16
+        # it is no longer REQUIRED: omitting it reads `conversation.provider`,
+        # which is the same fake in this config — see the pair of tests at the
+        # end of this file.
+        argv = ["smoke-browser", "--config", str(config)]
+        if explicit_provider:
+            argv += ["--provider", provider]
+        return cli.main(argv)
     finally:
         conversation_module._PROVIDERS.pop(provider, None)
 
@@ -275,6 +285,87 @@ def test_smoke_cannot_construct_an_audit_executor_or_agent_runner(tmp_path, monk
     monkeypatch.setattr(cli, "AuditExecutor", boom)
     monkeypatch.setattr(cli, "ClaudeCliRunner", boom)
     assert run_smoke(tmp_path, FakeSmokeConversation(STOP_REPLY)) == 0
+
+
+# ---- no browser default (brw-16) --------------------------------------------
+
+
+def test_omitting_the_provider_smokes_the_configured_transport(tmp_path):
+    """The replacement default. It used to be `browser_chatgpt` REGARDLESS of
+    `conversation.provider`, on the reasoning that the browser was the fallback
+    and so the seat most worth proving before it was needed. That provider is
+    not registered any more, so the old default would make every bare
+    `smoke-browser` fail on a name nothing can build."""
+    conversation = FakeSmokeConversation(STOP_REPLY)
+    assert run_smoke(tmp_path, conversation, explicit_provider=False) == 0
+    assert len(conversation.submitted) == 1
+
+
+def test_an_unregistered_provider_is_refused_before_anything_is_touched(tmp_path, capsys):
+    """"Make it say so", checked in the way that matters: the refusal names the
+    provider AND what is registered, and it happens before the loop lock is
+    taken and before the previous smoke state is archived — a command that
+    cannot build a client has nothing to smoke, and locking to discover that
+    would block a real run for no reason."""
+    config = write_config(tmp_path, "browser_chatgpt")
+    smoke_state = tmp_path / ".al" / "smoke" / "state.json"
+    smoke_state.parent.mkdir(parents=True)
+    smoke_state.write_text('{"session_id": "previous"}', encoding="utf-8")
+
+    assert cli.main(["smoke-browser", "--config", str(config)]) == 2
+
+    out = capsys.readouterr().out
+    assert "FAIL" in out
+    assert "browser_chatgpt" in out, "the provider it could not build"
+    assert "codex_cli" in out, "and what IS registered"
+    assert json.loads(smoke_state.read_text())["session_id"] == "previous", (
+        "nothing was archived, so no lock was taken and no state was disturbed"
+    )
+    assert not list(smoke_state.parent.glob("state.json.bak-*"))
+
+
+def test_the_refusal_happens_before_the_loop_lock_is_taken(tmp_path, capsys):
+    """"Before the lock" asserted directly rather than inferred.
+
+    A lock owned by another HOST is live by definition (`LoopLock.is_live` fails
+    closed for a pid it cannot verify), so `LoopLock(...)` would raise
+    `LockHeldError` here and `cli.main` would print `error: another autoloop
+    process holds …`. Seeing the refusal instead is what proves the check runs
+    first — and it matters: an unbuildable provider has nothing to smoke, so
+    blocking a real run to discover that would be a cost for no answer.
+    """
+    config = write_config(tmp_path, "browser_chatgpt")
+    lock = tmp_path / ".al" / "LOCK"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "hostname": "some-other-machine",
+                "started_at": "2026-08-25T00:00:00+00:00",
+                "run_id": "r",
+                "state_dir": str(tmp_path / ".al"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert cli.main(["smoke-browser", "--config", str(config)]) == 2
+
+    out = capsys.readouterr().out
+    assert "smoke-browser: FAIL" in out
+    assert "not registered" in out
+    assert "another autoloop process holds" not in out
+
+
+def test_an_explicit_unregistered_provider_is_refused_too(tmp_path, capsys):
+    """The other door into the same check: `--provider` names it directly."""
+    config = write_config(tmp_path, "fake_smoke_provider")  # not registered here
+    code = cli.main(
+        ["smoke-browser", "--config", str(config), "--provider", "no_such_provider"]
+    )
+    assert code == 2
+    assert "no_such_provider" in capsys.readouterr().out
 
 
 def test_each_smoke_run_uses_a_fresh_request_id(tmp_path):

@@ -6,13 +6,23 @@ import socket
 
 import pytest
 
-from autoloop.config import AutoloopConfig, BrowserConfig
+from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
 from autoloop.doctor import DoctorProbes, exit_code, run_doctor
 from autoloop.errors import LoginExpiredError
 from autoloop.lock import LoopLock
 from autoloop.policy import PolicyConfig
 
 URL = "https://chatgpt.com/c/valid-id-123"
+#: `doctor.py` still keys three checks — `conversation_url`,
+#: `conversation_active`/`conversation_rotations`, and `project_url` — on this
+#: LITERAL provider name, and so does the `primary_live` skip when CDP or
+#: playwright is unavailable. brw-16 (2026-08-25) unregistered that provider, so
+#: those branches are unreachable on a real deployment and the default
+#: `ConversationConfig()` no longer selects them. `doctor.py` was outside brw-16's
+#: approved paths and is unchanged, so the branches still exist and are still
+#: worth covering — the tests below name the retired provider explicitly to
+#: reach them, rather than being deleted. Removing those checks is a follow-up.
+BROWSER_PROVIDER_CHECKS = "browser_chatgpt"
 
 
 class FakeConversation:
@@ -46,16 +56,20 @@ class FakeConversation:
         self.closed = True
 
 
-def make_config(tmp_path, **policy) -> AutoloopConfig:
+def make_config(tmp_path, provider=None, **policy) -> AutoloopConfig:
     # `tmp_path` doubles as `repo_root` in every `run_doctor(...)` call in
     # this file, so `workers_root` must be a SIBLING of it (never a child) —
     # matching the pattern `test_full_healthy_run` already uses for the
     # `origin` bare repo below.
+    conversation = (
+        ConversationConfig(provider=provider) if provider else ConversationConfig()
+    )
     return AutoloopConfig(
         browser=BrowserConfig(conversation_url=URL),
         policy=PolicyConfig(**policy),
         state_dir=tmp_path / ".al",
         workers_root=tmp_path.parent / f"{tmp_path.name}-workers_root",
+        conversation=conversation,
     )
 
 
@@ -105,10 +119,14 @@ def test_all_green(tmp_path):
     conversation = FakeConversation()
     results = run_doctor(make_config(tmp_path), tmp_path, probes(conversation))
     named = by_name(results)
+    # `conversation_url` is deliberately NOT in this list any more: `doctor.py`
+    # adds it only for the retired `browser_chatgpt` provider, which the default
+    # config no longer selects (brw-16). Its own coverage moved to `url_check`
+    # below, which names that provider explicitly.
     for check in (
         "config", "state_dir", "lock", "workers_root", "worker_isolation", "hooks_dirs",
         "publisher", "publisher_url_drift", "cdp", "playwright", "provider",
-        "conversation_url", "primary_live",
+        "primary_live",
     ):
         assert named[check].status == "ok", (check, named[check].detail)
     assert exit_code(results) == 0
@@ -132,7 +150,13 @@ def test_git_identity_and_protected_branch_warning(tmp_path):
 
 
 def test_cdp_unreachable_fails_and_skips_live(tmp_path):
-    results = run_doctor(make_config(tmp_path), tmp_path, probes(cdp_ok=False))
+    # The skip is keyed on the retired provider NAME, so this config names it —
+    # see `BROWSER_PROVIDER_CHECKS`. With any other provider a silent CDP
+    # endpoint says nothing about the seat and the probe is simply attempted.
+    results = run_doctor(
+        make_config(tmp_path, provider=BROWSER_PROVIDER_CHECKS), tmp_path,
+        probes(cdp_ok=False),
+    )
     named = by_name(results)
     assert named["cdp"].status == "fail"
     # Renamed 2026-08-01: the single `browser_live` check became per-seat
@@ -178,10 +202,15 @@ def test_stale_lock_reported_as_failure(tmp_path):
 
 
 def url_check(tmp_path, url):
+    # Names the retired provider deliberately: `doctor.py`'s URL-shape check is
+    # keyed on that literal, so the default config would produce no
+    # `conversation_url` result at all and this helper would KeyError rather
+    # than assert anything. See `BROWSER_PROVIDER_CHECKS`.
     config = AutoloopConfig(
         browser=BrowserConfig(conversation_url=url),
         policy=PolicyConfig(),
         state_dir=tmp_path / ".al",
+        conversation=ConversationConfig(provider=BROWSER_PROVIDER_CHECKS),
     )
     return by_name(run_doctor(config, tmp_path, probes(FakeConversation())))[
         "conversation_url"

@@ -21,8 +21,10 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
 
-from autoloop.config import AutoloopConfig, BrowserConfig
+from autoloop.config import AutoloopConfig, BrowserConfig, ConversationConfig
+from autoloop.conversation import register_provider
 from autoloop.browser.chatgpt import SubmitResult
 from autoloop.contract import Decision, Directive
 from autoloop.errors import (
@@ -56,6 +58,31 @@ from autoloop.worker_env import WorkerRepoManager
 from autoloop.worktask import IntentStore, TaskExecution, TaskExecutionStore
 
 URL = "https://chatgpt.com/c/test-conversation"
+#: The transport both builders below select, and the reason it is a fake.
+#:
+#: Every orchestrator in this module used to inherit `browser_chatgpt` from
+#: `ConversationConfig()`'s default, so the transport-fault tests here took the
+#: BROWSER arm of `_route_transport_fault`: a `SessionLostError` spent
+#: `consecutive_failures` and the budget ended in `failed`. brw-16 (2026-08-25)
+#: unregistered that provider, and a non-browser transport takes
+#: `_handle_transport_failure` instead, which parks `needs_user`. Naming a
+#: registered browser-backed adapter keeps every test in this file pinning what
+#: it says it pins, rather than silently re-pointing several of them at a
+#: different handler. `provider=` lets a caller ask for the production default.
+BROWSER_PROVIDER = "fake_browser_for_orchestrator_tests"
+
+
+@pytest.fixture(autouse=True)
+def _browser_backed_provider():
+    """Register `BROWSER_PROVIDER` for one test; leave the registry as found."""
+    from autoloop import conversation as conversation_module
+
+    register_provider(BROWSER_PROVIDER, lambda config: None, browser_backed=True)
+    try:
+        yield
+    finally:
+        conversation_module._PROVIDERS.pop(BROWSER_PROVIDER, None)
+        conversation_module._BROWSER_BACKED.discard(BROWSER_PROVIDER)
 
 
 def run_git(cwd, *args):
@@ -398,6 +425,7 @@ def build(
     executor=None,
     branch="feature/x",
     execution_store=None,
+    provider=BROWSER_PROVIDER,
 ):
     repo_root = tmp_path / "repo"
     repo_root.mkdir(exist_ok=True)
@@ -409,6 +437,7 @@ def build(
         browser=BrowserConfig(conversation_url=URL),
         policy=policy or PolicyConfig(),
         state_dir=tmp_path / ".al",
+        conversation=ConversationConfig(provider=provider),
     )
     store = StateStore(config.state_file)
     if state is None:
@@ -500,6 +529,7 @@ def build_postcommit(
     tasks=(),
     executor_files=None,
     executor_status="ok",
+    provider=BROWSER_PROVIDER,
 ):
     """Real-git-backed Orchestrator construction for the smaller set of tests
     that dispatch `audit`/`implement`/`revise` end to end. `build()`'s
@@ -527,6 +557,7 @@ def build_postcommit(
         browser=BrowserConfig(conversation_url=URL),
         policy=policy_config,
         state_dir=tmp_path / ".al",
+        conversation=ConversationConfig(provider=provider),
     )
     store = StateStore(config.state_file)
     if state is None:

@@ -1271,8 +1271,9 @@ is seconds. Child agents are deliberately left to exit on their own.
 
 This lives on `LoopLock` (installed by `acquire`, restored by `release`),
 not at one call site, so it covers every holder listed above rather than
-whichever ones a wrapper was remembered on — `smoke-browser` drives a real
-browser and `review-changeset` waits on a reviewer, both long enough to be
+whichever ones a wrapper was remembered on — `smoke-browser` waits on a live
+round-trip through the configured transport (it drove a real browser until
+brw-16) and `review-changeset` waits on a reviewer, both long enough to be
 running when a machine goes down.
 
 What each way of stopping costs:
@@ -4625,9 +4626,18 @@ than carrying a guessed flag that would look like a control without being one;
 
 **`doctor` probes both seats.** `primary_live` and `fallback_live` are separate
 checks. An unverified fallback is not a fallback: checking only the configured
-primary means the browser profile's login is first tested at the moment the
-allowance runs out. `smoke-browser` is pinned to `browser_chatgpt` for the same
-reason — exercising that transport is its whole purpose.
+primary means the second seat's health is first tested at the moment the
+allowance runs out.
+
+> **Since brw-16 (2026-08-25) there is no browser seat to be the fallback.**
+> `browser_chatgpt` is no longer registered (§5g), so the pairing this section
+> describes — two transports on two budgets — has no second budget in it, and
+> `config.example.toml` ships `fallback_provider = ""`. A config still naming the
+> retired provider there is read as `""` for the run, with a notice. The failover
+> MACHINERY is untouched and is what a future second-budget adapter arrives
+> through. `smoke-browser` was pinned to `browser_chatgpt` for the reason above
+> and is now pinned to nothing: it smokes `conversation.provider`, and refuses
+> with a message naming the registry when asked for a provider that is not in it.
 
 ---
 
@@ -5233,12 +5243,99 @@ that passes neither renders exactly the block it rendered before.
 
 ---
 
+## 5g. No browser transport: what was disconnected, and what was not
+
+brw-16, 2026-08-25. **No `register_provider` call installs a browser-backed
+conversation provider, and loading a configuration succeeds with no `[browser]`
+section present.** The second half of a recut that brw-15 began (it removed
+conversation rotation); together they take the browser out of the loop's
+runtime.
+
+**Why.** `conversation.provider` has named `codex_cli` since 2026-08-21, and the
+configuration still refused to load without a browser `conversation_url` — a
+live ChatGPT thread URL sat in `config.toml` purely to satisfy a validator for a
+transport nothing selected. Measured over the first 103 blocker records: 21 of
+them (20%) were artifacts of driving a browser rather than anything about review
+quality — `rotation_failed` 11, `submission_ambiguous` 6,
+`browser_restart_cooldown_blocked` 3, `rate_limited` 1.
+
+**What changed, exactly four things.**
+
+| | Before | After |
+|---|---|---|
+| `conversation._PROVIDERS` | `browser_chatgpt`, `codex_cli`, `codex_app_server` | `codex_cli`, `codex_app_server` |
+| `conversation._BROWSER_BACKED` | `{"browser_chatgpt"}` | `set()` — populated only by `register_provider(..., browser_backed=True)` |
+| `[browser]` in the config | required (`conversation_url` refused when empty) | optional, defaulted, validated, unread |
+| `smoke-browser --provider` | defaulted to `browser_chatgpt` | defaults to `conversation.provider`; an unregistered name is refused before the lock |
+
+**What did NOT change, and this is the part to preserve.** `LLMConversation`,
+`register_provider` and the `browser_backed=True` declaration are untouched: an
+adapter that drives a browser can register itself and gets every recovery the
+orchestrator has for one — `_handle_browser_failure`, `browser.restart_command`,
+`restart_cooldown_seconds`, `policy.max_browser_restart_skips`, and the
+zero-attachable-page recovery in §4's fault-routing table. That machinery is DORMANT, not
+deleted, and `autoloop/tests/test_transport_fault_recovery.py` still exercises
+all of it by registering a browser-backed adapter of its own. The same seam is
+how conv-05's Claude reviewer arrives.
+
+**Compatibility, three rules.**
+
+* A config that still HAS a `[browser]` section loads unchanged. Every key is
+  still accepted and still VALIDATED — an unknown key or a malformed
+  `restart_command` is refused exactly as before, because "ignored" must not
+  become "unvalidated" — and none is consulted.
+* `conversation.provider = "browser_chatgpt"` still LOADS and prints a notice
+  naming what to set instead. It is NOT rewritten: every provider value selects
+  a transport, so there is no neutral one to migrate to, and guessing would run
+  reviews somewhere the operator did not choose. `doctor`'s provider-registration
+  check and `create_conversation` both name it precisely.
+* `conversation.fallback_provider = "browser_chatgpt"` IS neutralised to `""`
+  for the run, with a notice. Nothing validates a fallback name until the
+  handover happens — `_handle_quota_exhausted` does not consult the registry — so
+  left as written an exhausted allowance would switch the reviewer role to an
+  unregistered transport and only then fail to construct it. `""` is the
+  documented "no failover, park instead", a path that already works.
+
+**And it unblocked test selection, which is worth more than the transport
+removal.** `autoloop/tests/conftest.py` had one autouse fixture,
+`_no_live_cdp_probe`, whose only job was stubbing
+`Orchestrator._attachable_page_targets` so a hermetic suite would not dial a real
+Chrome on 127.0.0.1:9222. To do that it imported `autoloop.orchestrator`, and
+pytest applies a conftest to its whole directory tree — so EVERY test under
+`autoloop/tests` depended on `orchestrator`, which imports most of the package.
+That single edge is why `validation.select_validation_commands` selected the
+entire tree for a change to almost any module: measured 2026-08-25, a change to
+`autoloop/dashboard.py` selected 92 test files. The selector was not wrong. The
+fixture is gone; the conftest imports nothing from `autoloop` at all, and
+`test_browser_provider_removed.py` pins that it stays that way. The two modules
+that can still reach the probe stub it on the orchestrator instance they built.
+
+**Residue left deliberately in place.** `autoloop/browser/` is untouched on disk
+(it was not in brw-16's approved paths, and nothing imports it at runtime except
+the `SubmitResult` enum `conversation.py` re-exports).
+`Orchestrator._attachable_page_targets`, the `RL_BROWSER_UNATTACHABLE` recovery
+and `orchestrator.py`'s browser-shaped park prose are also untouched — all of
+them serve the browser_backed seam above, all of them are unreachable while
+`_BROWSER_BACKED` is empty, and `orchestrator.py` was outside brw-16's scope.
+Removing files is an operator action.
+
+---
+
 ## 6. Preflight: `doctor` and the live smoke test
 
 ```bash
 python -m autoloop doctor         # never submits anything
 python -m autoloop smoke-browser  # submits exactly ONE harmless request
 ```
+
+The second command's NAME is historical. Since brw-16 (2026-08-25) it no longer
+defaults to a browser provider — there is none registered — and instead smokes
+whatever `conversation.provider` names, or the `--provider` you pass. Asked for a
+provider that is not registered, it refuses before taking the loop lock and
+before archiving the previous smoke state, printing the name it could not build
+and the names it could. It was NOT renamed: the command, its flags and its
+PASS/FAIL contract are otherwise unchanged, and renaming it would break every
+runbook and shell history that types it.
 
 `doctor` checks: config validity, state-dir writability, lock state, git
 identity, branch policy (warns when pushes would be denied), **worker
@@ -5655,13 +5752,25 @@ Read — including the red-fix-green loop, the cap, and the assertion that
 ## 8. Setup
 
 ```bash
-pip install -r autoloop/requirements.txt   # playwright (runtime only)
-# one-time dedicated profile:
+pip install -r autoloop/requirements.txt
+codex login                                # the reviewer signs in with your ChatGPT plan
+mkdir -p .autoloop && cp autoloop/config.example.toml .autoloop/config.toml
+# edit .autoloop/config.toml: paths.workers_root, review [policy]/[audit]
+```
+
+**No browser, and no Chrome profile, since brw-16 (2026-08-25).** No
+browser-backed conversation provider is registered (§5g), so there is nothing to
+launch, nothing to log in to, and no `browser.conversation_url` to fill in — the
+`[browser]` section is optional, unread, and left out of the template. An
+existing `.autoloop/config.toml` that still has one keeps loading exactly as it
+did; delete the section when convenient. The old procedure was:
+
+```bash
+# HISTORICAL — needed only if you register a browser-backed adapter of your own.
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
     --user-data-dir="$HOME/.autoloop-chrome" --remote-debugging-port=9222
-# log in to chatgpt.com in that window, create a conversation, copy its URL
-mkdir -p .autoloop && cp autoloop/config.example.toml .autoloop/config.toml
-# edit .autoloop/config.toml: browser.conversation_url, review [policy]/[audit]
+# log in to chatgpt.com in that window, create a conversation, copy its URL into
+# [browser].conversation_url
 ```
 
 The test suite needs none of this. The audit and implement executors
@@ -5674,8 +5783,13 @@ additionally need the `claude` CLI on PATH (it is, in this environment).
 restart_command = ["python3", "-m", "autoloop.browser.chrome_restart"]
 ```
 
-That is what the template ships since **2026-08-16**, and it is the only
-restart path: `scripts/restart_autoloop_chrome.sh` is retired. The module
+The template shipped that from **2026-08-16** until **brw-16 (2026-08-25)**,
+which removed the whole `[browser]` section from it — no provider is
+browser-backed, so nothing in a run executes a restart command and shipping one
+would advertise a control that never fires. Everything below still applies to a
+config that names it (yours is honoured verbatim, key by key) and to the module
+run by hand; it is still the only restart path, and
+`scripts/restart_autoloop_chrome.sh` is still retired. The module
 (`autoloop/browser/chrome_restart.py`) stops **every** Chrome carrying
 `--user-data-dir=<profile>`, polls until nothing holds the debug port, launches,
 and reports success only once `/json/version` answers with a browser websocket
@@ -6857,9 +6971,13 @@ would be the natural next step and was out of this task's approved scope.
   change, but a long-lived deployment will still accumulate one remote
   branch per approved audit round over time; branch cleanup on the remote is
   an operator task today, not something autoloop does for you.
-* `doctor`'s live check and `smoke-browser` require the real dedicated
-  browser; hermetic tests mock them, so "implemented" ≠ "live verified" until
+* `doctor`'s live check and `smoke-browser` reach the real configured
+  transport (the dedicated browser until brw-16, 2026-08-25; `codex` since);
+  hermetic tests mock them, so "implemented" ≠ "live verified" until
   smoke-browser has actually passed on your machine.
+* `doctor` still runs its `cdp` and `playwright` checks unconditionally, so
+  both report FAIL on a host with no Chrome — expected on a codex-only
+  deployment, and pre-existing rather than introduced by brw-16.
 * One loop per state dir (enforced); multiple state dirs are possible but
   share nothing.
 * An ambiguous submission needs a human to look at the conversation. That is

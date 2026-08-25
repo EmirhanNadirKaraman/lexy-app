@@ -8,7 +8,10 @@
     python -m autoloop answer <blocker-id> "<text>"
     python -m autoloop retire <task-id> [--superseded-by ID ...] [--reason TEXT]
                                         [--rewrite-dependents]
-    python -m autoloop smoke-browser [--config PATH]
+    python -m autoloop smoke-browser [--config PATH] [--provider NAME]
+                            (one round-trip through conversation.provider; the
+                             name is historical — no browser provider is
+                             registered since brw-16, 2026-08-25)
     python -m autoloop pause | resume | unlock | reset --yes [--tasks]
     python -m autoloop merge-window [--wait] | merge-backlog
     python -m autoloop shipped-report [--repo PATH] [--base REV]  (read-only)
@@ -64,7 +67,7 @@ from .blockers import NO_TASK, Blocker, BlockerStore, by_severity
 from .changeset_review import build_changeset_binding, build_changeset_packet
 from .config import AutoloopConfig, load_config as _read_config_file
 from .contract import AUDIT_TASK_ID, Decision, Directive
-from .conversation import create_conversation
+from .conversation import available_providers, create_conversation
 from . import health, heartbeat
 from .doctor import DoctorProbes, _default_probe_cdp, exit_code, run_doctor
 from .errors import (
@@ -188,7 +191,16 @@ def load_config(path: Path) -> AutoloopConfig:
 def _load_state(config: AutoloopConfig) -> tuple[StateStore, LoopState | None]:
     store = StateStore(config.state_file)
     state = store.load()
-    if state is not None and state.conversation_url != config.browser.conversation_url:
+    # An UNSET `browser.conversation_url` is not drift, it is the absence of a
+    # configured conversation — the normal shape of a config since brw-16
+    # (2026-08-25) removed the browser provider and made `[browser]` optional.
+    # Without this an operator who deletes the now-unused section mid-session
+    # could not start the loop again without a `reset`, which is exactly the
+    # tidy-up this refusal has no business blocking: nothing aims a registered
+    # transport at `state.conversation_url`. A config that DOES declare a URL is
+    # still held to it, unchanged.
+    configured_url = config.browser.conversation_url
+    if state is not None and configured_url and state.conversation_url != configured_url:
         if not _drift_is_recorded_rotation(state, config):
             raise ConfigError(
                 "browser.conversation_url in the config differs from the one this "
@@ -2736,7 +2748,27 @@ class _SmokeNeverExecutor:
 
 def _cmd_smoke_browser(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    smoke_provider = getattr(args, "provider", None) or "browser_chatgpt"
+    # NO BROWSER DEFAULT since brw-16 (2026-08-25). This command used to default
+    # to `browser_chatgpt` regardless of `conversation.provider`, on the reasoning
+    # that the browser was the fallback and therefore the seat most worth proving
+    # before it was needed. That provider is no longer registered, so the old
+    # default would make every bare `smoke-browser` fail on a name nothing can
+    # build — a command silently unable to work, which is the outcome this had to
+    # avoid. It now smokes the transport the loop actually uses, and `--provider`
+    # still names any registered one explicitly.
+    smoke_provider = getattr(args, "provider", None) or config.conversation.provider
+    if smoke_provider not in available_providers():
+        # Refused HERE, before the lock and before any state is archived: a run
+        # that cannot build a client has nothing to smoke, and taking the loop
+        # lock to discover that would block a real run for no reason.
+        print(
+            f"smoke-browser: FAIL — conversation provider {smoke_provider!r} is not "
+            f"registered. Available: {', '.join(available_providers()) or '(none)'}. "
+            "No browser-backed provider ships any more (brw-16, 2026-08-25); this "
+            "command smokes whatever conversation.provider names, or the "
+            "--provider you pass."
+        )
+        return 2
     with LoopLock(config.state_dir):
         store = StateStore(config.smoke_dir / "state.json")
         store.archive()  # every smoke run starts fresh
@@ -2776,11 +2808,9 @@ def _cmd_smoke_browser(args: argparse.Namespace) -> int:
             git=GitGateway(Path.cwd(), policy),
             executor=_SmokeNeverExecutor(),
             transcript=TranscriptLogger(config.transcript_file),
-            # `--provider`, which defaults to the browser rather than to
-            # `conversation.provider` — see the parser. Smoke-testing the
-            # browser is this command's purpose, and since Codex became the
-            # primary reviewer the configured provider is no longer the one
-            # that needs proving.
+            # `--provider`, or `conversation.provider` when none was given.
+            # Checked against the registry above, so this cannot be a name
+            # nothing can build.
             client_factory=lambda: create_conversation(smoke_provider, smoke_config),
             registry=TaskRegistry(),
             task_store=TaskStore(config.smoke_dir / "tasks.json"),
@@ -5452,7 +5482,8 @@ def build_parser() -> argparse.ArgumentParser:
         (
             "smoke-browser",
             _cmd_smoke_browser,
-            "submit ONE harmless smoke request through the live browser",
+            "submit ONE harmless smoke request through the configured transport "
+            "(no browser provider is registered; --provider names another)",
         ),
         ("unlock", _cmd_unlock, "remove a verifiably-stale lock (refuses live locks)"),
         ("pause", _cmd_pause, "ask a running loop to stop after its current phase"),
@@ -5468,16 +5499,18 @@ def build_parser() -> argparse.ArgumentParser:
                 help="profile an archived transcript instead of the configured one",
             )
         if name == "smoke-browser":
-            # Defaults to the browser REGARDLESS of `conversation.provider`.
-            # Since Codex became the primary reviewer, reading the configured
-            # provider here would silently stop exercising the transport this
-            # command exists for — and the browser is the fallback, so it is
-            # precisely the one that must be proven before it is needed.
-            # Explicit rather than hard-coded, so any provider can be smoked.
+            # No default of its own since brw-16 (2026-08-25): it used to name
+            # the browser provider regardless of `conversation.provider`, and
+            # that provider is no longer registered. Empty means "whatever
+            # conversation.provider names", which is the transport a real run
+            # would use; any registered provider can still be smoked by name.
             p.add_argument(
                 "--provider",
-                default="browser_chatgpt",
-                help="conversation provider to smoke (default: browser_chatgpt)",
+                default="",
+                help=(
+                    "conversation provider to smoke (default: whatever "
+                    "conversation.provider names)"
+                ),
             )
         p.set_defaults(func=func)
 

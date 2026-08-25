@@ -71,6 +71,14 @@ from test_transport_recovery import (  # noqa: E402 - see conftest sys.path
     transcript_entries,
 )
 
+# The orchestrators `build` returns select a browser-backed provider that only
+# exists while this fixture has registered it (brw-16, 2026-08-25: no shipped
+# provider is browser-backed). An autouse fixture applies to the module it is
+# visible in, so importing the NAME is what carries it here — without it every
+# test below would route through `_handle_transport_failure` and the
+# `browser_error`/`browser_restarted` assertions would pass vacuously.
+from test_transport_recovery import _browser_backed_provider  # noqa: E402,F401
+
 
 def _filler(count, marker="earlier"):
     """`count` complete user/assistant exchanges — none carrying the request."""
@@ -565,6 +573,18 @@ def test_a_dead_session_in_awaiting_still_takes_the_restart_path(tmp_path):
     state.phase = Phase.AWAITING.value
     state.pending_request = pending(submitted=True, send_attempted=True)
     orch, store, config = build(tmp_path, client, state=state)
+    # THE discriminator for this whole module, and the reason it is here rather
+    # than in a docstring: since brw-16 (2026-08-25) the provider `build` names
+    # is browser-backed only while `test_transport_recovery._browser_backed_
+    # provider` is registered, and that autouse fixture reaches this file by
+    # IMPORT. Almost every assertion below is a negative — no `browser_error`,
+    # no `browser_restarted`, `browser_restart_skips == 0` — and every one of
+    # them passes vacuously if the import stopped carrying the fixture and these
+    # runs routed through `_handle_transport_failure` instead. This is the one
+    # question whose answer differs between the two worlds.
+    assert orch._transport_is_browser_backed(), (
+        "the imported autouse fixture is not registering the provider `build` names"
+    )
 
     orch.run(max_steps=1)
 

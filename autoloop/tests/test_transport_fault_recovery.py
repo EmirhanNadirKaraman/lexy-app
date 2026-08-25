@@ -74,6 +74,17 @@ CONV_URL = "https://chatgpt.com/c/x"
 #: nothing about routing. Every test here that claims Chrome stayed shut
 #: configures this.
 RESTART_COMMAND = ("python3", "-m", "autoloop.browser.chrome_restart")
+#: A browser-backed transport registered for this module only.
+#:
+#: Since brw-16 (2026-08-25) no SHIPPED provider is browser-backed, so §4's
+#: "the browser provider is untouched" tests would otherwise be asserting about
+#: a transport that does not exist. What they are really about — that a
+#: browser-backed transport still gets the restart, the cooldown park and the
+#: unattachable recovery, and that a NON-browser one gets none of it — is
+#: unchanged, and this is the seam a browser adapter arrives through now:
+#: `register_provider(..., browser_backed=True)`. Using the retired name here
+#: would test nothing, since `transport_is_browser_backed` no longer knows it.
+BROWSER_PROVIDER = "fake_browser_for_fault_tests"
 
 
 def stop_block(reason="all done"):
@@ -197,7 +208,27 @@ def build(
         task_store=TaskStore(config.tasks_file),
         manifest_store=ManifestStore(config.manifests_dir),
     )
+    # The one probe in this file's reach that dials a real socket. Stubbed on
+    # the instance to UNMEASURABLE — the job the autouse `_no_live_cdp_probe`
+    # conftest fixture did for the whole suite until brw-16 removed it (see
+    # `conftest.py` for why it could not stay there). Tests that describe a
+    # particular browser assign their own afterwards.
+    orch._attachable_page_targets = lambda: None
     return orch, store, config
+
+
+@pytest.fixture(autouse=True)
+def _browser_backed_provider():
+    """Register `BROWSER_PROVIDER` for one test, then leave the registry as
+    found — including for the tests below that assert on its exact contents."""
+    from autoloop import conversation as conversation_module
+
+    register_provider(BROWSER_PROVIDER, lambda config: None, browser_backed=True)
+    try:
+        yield
+    finally:
+        conversation_module._PROVIDERS.pop(BROWSER_PROVIDER, None)
+        _BROWSER_BACKED.discard(BROWSER_PROVIDER)
 
 
 def pending(rid=RID, prompt=PROMPT, **overrides):
@@ -258,11 +289,15 @@ def restarts(monkeypatch):
 # ---- 0. the discriminator is a property of the PROVIDER, not of an object ----
 
 
-def test_only_the_browser_provider_is_browser_backed():
-    assert transport_is_browser_backed("browser_chatgpt")
+def test_only_a_provider_that_declared_itself_is_browser_backed():
+    """No SHIPPED provider is (brw-16). The discriminator still works, and the
+    only member is the one this module registers — `test_conversation.py` pins
+    the empty registry with nothing registered at all."""
+    assert transport_is_browser_backed(BROWSER_PROVIDER)
     assert not transport_is_browser_backed("codex_cli")
     assert not transport_is_browser_backed("codex_app_server")
-    assert browser_backed_providers() == ["browser_chatgpt"]
+    assert not transport_is_browser_backed("browser_chatgpt"), "retired, not special"
+    assert browser_backed_providers() == [BROWSER_PROVIDER]
 
 
 def test_an_unknown_or_empty_provider_is_not_browser_backed():
@@ -288,7 +323,7 @@ def test_an_adapter_can_declare_itself_browser_backed():
     finally:
         conversation_module._PROVIDERS.pop(name, None)
         _BROWSER_BACKED.discard(name)
-    assert browser_backed_providers() == ["browser_chatgpt"]
+    assert browser_backed_providers() == [BROWSER_PROVIDER]
 
 
 def test_the_remedies_live_with_the_registry_not_in_the_orchestrator():
@@ -303,7 +338,7 @@ def test_the_remedies_live_with_the_registry_not_in_the_orchestrator():
     source = (
         Path(__file__).resolve().parents[1] / "orchestrator.py"
     ).read_text(encoding="utf-8")
-    for name in ("codex_cli", "codex_app_server", "browser_chatgpt"):
+    for name in ("codex_cli", "codex_app_server", "browser_chatgpt", BROWSER_PROVIDER):
         assert name not in source
     # And the advice really is reachable for each of them.
     from autoloop.conversation import transport_remedy
@@ -319,11 +354,11 @@ def test_the_orchestrator_asks_the_ACTIVE_provider(tmp_path):
     already decides everywhere else."""
     orch, _, _ = build(tmp_path / "a", SilentIdempotentClient(), provider="codex_cli")
     assert orch._transport_is_browser_backed() is False
-    orch.state.active_provider = "browser_chatgpt"
+    orch.state.active_provider = BROWSER_PROVIDER
     assert orch._transport_is_browser_backed() is True
 
     other, _, _ = build(
-        tmp_path / "b", SilentIdempotentClient(), provider="browser_chatgpt"
+        tmp_path / "b", SilentIdempotentClient(), provider=BROWSER_PROVIDER
     )
     assert other._transport_is_browser_backed() is True
     other.state.active_provider = "codex_cli"
@@ -768,7 +803,7 @@ def test_a_provider_handover_gives_the_new_transport_a_fresh_replay_budget(tmp_p
 
             raise QuotaExhaustedError("allowance spent")
 
-    clients = {"codex_cli": QuotaClient(), "browser_chatgpt": PlainClient()}
+    clients = {"codex_cli": QuotaClient(), BROWSER_PROVIDER: PlainClient()}
     repo_root = tmp_path / "repo"
     repo_root.mkdir(exist_ok=True)
     git = FakeGit(repo_root)
@@ -777,7 +812,7 @@ def test_a_provider_handover_gives_the_new_transport_a_fresh_replay_budget(tmp_p
         policy=PolicyConfig(),
         state_dir=tmp_path / ".al",
         conversation=ConversationConfig(
-            provider="codex_cli", fallback_provider="browser_chatgpt"
+            provider="codex_cli", fallback_provider=BROWSER_PROVIDER
         ),
     )
     store = StateStore(config.state_file)
@@ -801,7 +836,7 @@ def test_a_provider_handover_gives_the_new_transport_a_fresh_replay_budget(tmp_p
 
     orch.run(max_steps=1)
 
-    assert orch.state.active_provider == "browser_chatgpt"
+    assert orch.state.active_provider == BROWSER_PROVIDER
     assert orch.state.pending_request.replays_used == 0
 
 
@@ -827,7 +862,7 @@ def test_the_browser_provider_still_restarts_through_the_new_dispatch(tmp_path, 
     orch, store, config = build(
         tmp_path,
         DeadBrowser(),
-        provider="browser_chatgpt",
+        provider=BROWSER_PROVIDER,
         state=state_in(Phase.SUBMITTING),
         restart_command=RESTART_COMMAND,
         restart_cooldown_seconds=0.0,
@@ -855,7 +890,7 @@ def test_the_browser_provider_still_parks_on_the_cooldown(tmp_path, restarts):
     orch, store, config = build(
         tmp_path,
         DeadBrowser(),
-        provider="browser_chatgpt",
+        provider=BROWSER_PROVIDER,
         state=state_in(Phase.SUBMITTING),
         policy=PolicyConfig(max_browser_restart_skips=1),
         restart_command=RESTART_COMMAND,
@@ -875,7 +910,7 @@ def test_a_browser_rate_limit_still_reaches_the_unattachable_recovery(tmp_path, 
     orch, store, config = build(
         tmp_path,
         PlainClient(),
-        provider="browser_chatgpt",
+        provider=BROWSER_PROVIDER,
         state=state_in(Phase.AWAITING, pending_request=pending(submitted=True)),
         restart_command=RESTART_COMMAND,
         restart_cooldown_seconds=0.0,
@@ -1029,7 +1064,7 @@ def test_the_browser_parks_on_the_same_code_with_its_own_remedy(tmp_path, restar
     orch, store, config = build(
         tmp_path,
         client,
-        provider="browser_chatgpt",
+        provider=BROWSER_PROVIDER,
         state=state_in(Phase.SUBMITTING),
     )
 
@@ -1050,7 +1085,7 @@ def test_the_browser_rate_limit_park_keeps_its_exact_wording(tmp_path, restarts)
     orch, store, config = build(
         tmp_path,
         PlainClient(),
-        provider="browser_chatgpt",
+        provider=BROWSER_PROVIDER,
         state=state_in(Phase.AWAITING, pending_request=pending(submitted=True)),
         policy=PolicyConfig(max_rate_limit_backoffs=1),
     )

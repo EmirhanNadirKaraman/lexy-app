@@ -70,6 +70,16 @@ from test_orchestrator import FakeExecutor, FakeGit, block  # noqa: E402 - see c
 
 RID = "alr-codex-0001"
 PROMPT = f"[autoloop request {RID} | iteration 1]\n\nbody"
+#: The OTHER transport in the failover tests below, as a label only.
+#:
+#: These tests inject a `provider_factory`, so the orchestrator never resolves
+#: this name through `conversation._PROVIDERS` and what it is called changes
+#: nothing they assert. It was spelled `browser_chatgpt` until brw-16
+#: (2026-08-25) unregistered that provider; kept as a fake name rather than
+#: pointed at `codex_app_server`, because these tests are about the handover
+#: MECHANISM and naming a real second codex seat would suggest a pairing that
+#: buys something — both codex transports draw on one allowance.
+FALLBACK_PROVIDER = "fake_fallback_provider"
 
 
 def stop_block(reason="all done"):
@@ -1088,7 +1098,7 @@ class ScriptedClient:
         self.closed = True
 
 
-def build(tmp_path, clients, *, fallback="browser_chatgpt", state=None, policy=None):
+def build(tmp_path, clients, *, fallback=FALLBACK_PROVIDER, state=None, policy=None):
     repo_root = tmp_path / "repo"
     repo_root.mkdir(exist_ok=True)
     git = FakeGit(repo_root)
@@ -1163,23 +1173,23 @@ def submitting_state(prompt=PROMPT, **overrides):
 def test_exhausted_primary_hands_over_to_the_fallback(tmp_path):
     clients = {
         "codex_cli": ScriptedClient("codex", quota_on_submit=True, idempotent=True),
-        "browser_chatgpt": ScriptedClient("browser"),
+        FALLBACK_PROVIDER: ScriptedClient("browser"),
     }
     orch, store, config = build(tmp_path, clients, state=submitting_state())
 
     orch.run(max_steps=1)  # codex raises; the role moves
 
-    assert orch.state.active_provider == "browser_chatgpt"
+    assert orch.state.active_provider == FALLBACK_PROVIDER
     assert orch.state.provider_switches == 1
     assert orch.state.phase == Phase.SUBMITTING.value
     switched = entries(config, "provider_switched")
     assert switched and switched[0]["data"]["from_provider"] == "codex_cli"
-    assert switched[0]["data"]["to_provider"] == "browser_chatgpt"
+    assert switched[0]["data"]["to_provider"] == FALLBACK_PROVIDER
     assert switched[0]["data"]["reason"] == "quota_exhausted"
 
     orch.run(max_steps=1)  # re-issued on the browser
-    assert clients["browser_chatgpt"].submitted == [RID]
-    assert orch.state.pending_request.provider == "browser_chatgpt"
+    assert clients[FALLBACK_PROVIDER].submitted == [RID]
+    assert orch.state.pending_request.provider == FALLBACK_PROVIDER
 
 
 def test_the_handover_clears_only_per_transport_marks(tmp_path):
@@ -1195,7 +1205,7 @@ def test_the_handover_clears_only_per_transport_marks(tmp_path):
     state.pending_request.last_send_outcome = "rejected"
     clients = {
         "codex_cli": ScriptedClient("codex", quota_on_submit=True),
-        "browser_chatgpt": ScriptedClient("browser"),
+        FALLBACK_PROVIDER: ScriptedClient("browser"),
     }
     orch, store, config = build(tmp_path, clients, state=state)
 
@@ -1215,14 +1225,14 @@ def test_the_handover_clears_only_per_transport_marks(tmp_path):
 def test_the_response_records_which_reviewer_produced_it(tmp_path):
     clients = {
         "codex_cli": ScriptedClient("codex", quota_on_submit=True),
-        "browser_chatgpt": ScriptedClient("browser", responses=[stop_block("browser answered")]),
+        FALLBACK_PROVIDER: ScriptedClient("browser", responses=[stop_block("browser answered")]),
     }
     orch, store, config = build(tmp_path, clients, state=submitting_state())
 
     orch.run(max_steps=3)  # switch -> submit -> await
 
     assert orch.state.last_response is not None
-    assert orch.state.last_response.provider == "browser_chatgpt"
+    assert orch.state.last_response.provider == FALLBACK_PROVIDER
 
 
 def test_without_a_fallback_the_loop_parks(tmp_path):
@@ -1385,7 +1395,7 @@ def test_a_fallback_equal_to_the_primary_parks(tmp_path):
 def test_the_switch_budget_is_enforced(tmp_path):
     clients = {
         "codex_cli": ScriptedClient("codex", quota_on_submit=True),
-        "browser_chatgpt": ScriptedClient("browser", quota_on_submit=True),
+        FALLBACK_PROVIDER: ScriptedClient("browser", quota_on_submit=True),
     }
     orch, store, config = build(
         tmp_path, clients, state=submitting_state(provider_switches=1)
@@ -1410,7 +1420,7 @@ def test_a_captured_reply_blocks_the_handover(tmp_path):
     )
     clients = {
         "codex_cli": ScriptedClient("codex", quota_on_submit=True),
-        "browser_chatgpt": ScriptedClient("browser"),
+        FALLBACK_PROVIDER: ScriptedClient("browser"),
     }
     orch, store, config = build(tmp_path, clients, state=state)
 
@@ -1426,18 +1436,18 @@ def test_state_beats_config_after_a_switch(tmp_path):
     spend the same allowance again."""
     clients = {
         "codex_cli": ScriptedClient("codex", quota_on_submit=True),
-        "browser_chatgpt": ScriptedClient("browser"),
+        FALLBACK_PROVIDER: ScriptedClient("browser"),
     }
     orch, store, config = build(tmp_path, clients, state=submitting_state())
     orch.run(max_steps=1)
 
     reloaded = StateStore(config.state_file).load()
-    assert reloaded.active_provider == "browser_chatgpt"
+    assert reloaded.active_provider == FALLBACK_PROVIDER
 
     second = tmp_path / "second"
     second.mkdir()
     orch2, _, _ = build(second, clients, state=reloaded)
-    assert orch2.active_provider() == "browser_chatgpt"
+    assert orch2.active_provider() == FALLBACK_PROVIDER
 
 
 def test_switch_budget_is_checkable_without_an_orchestrator():
