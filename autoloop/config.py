@@ -386,6 +386,35 @@ class AuditConfig:
     test_selection: str = TEST_SELECTION_REACHABLE
 
 
+@dataclass(frozen=True)
+class AutonomyConfig:
+    """`[autonomy]` — how the loop behaves when a transport or environment
+    fault would otherwise park it for a human (halt-02, 2026-08-25).
+
+    OFF BY DEFAULT, and the default is the compatibility contract: with this
+    section absent — which is every existing config file, since the template is
+    copied once and never re-read — every park behaves exactly as it did
+    before, including the classification each park site chose for itself. The
+    flag is a single boolean and turning it back off restores that, so nothing
+    here forecloses the current behaviour.
+
+    What `enabled` switches on is described by `blockers.AUTONOMOUS_RECOVERIES`,
+    which is an ALLOWLIST of six codes and cannot reach
+    `blockers.HARD_HALT_CODES` at all.
+    """
+
+    #: The flag. False means "park exactly as today" at every site.
+    enabled: bool = False
+    #: A CEILING on the per-code retry budgets in `blockers.AUTONOMOUS_
+    #: RECOVERIES`, never a floor: the effective budget is `min(the code's
+    #: own max_attempts, this)`. So lowering it to 0 keeps the set-aside
+    #: behaviour while performing no retries at all, and raising it above a
+    #: code's own number changes nothing — a config value can restrain the
+    #: table, never widen it. Two by default, matching the largest number the
+    #: table actually asks for.
+    max_recovery_attempts: int = 2
+
+
 #: What the unconfigured `[paths].state_dir` is called, as a SIBLING of
 #: `workers_root` (port-01, 2026-08-23). Everything writable the loop keeps
 #: between steps — `state.json`, `tasks.json`, the lock, the transcript, the
@@ -602,6 +631,10 @@ class AutoloopConfig:
     codex: CodexConfig = CodexConfig()
     executor: ExecutorConfig = ExecutorConfig()
     audit: AuditConfig = AuditConfig()
+    #: `[autonomy]` — default OFF, so every `AutoloopConfig(...)` built
+    #: directly (the whole test suite, and `doctor`) gets exactly the
+    #: pre-halt-02 parking behaviour without naming the field.
+    autonomy: AutonomyConfig = AutonomyConfig()
     #: What the TARGET repository declares about itself. Defaulted, and last
     #: but one for the same reason `migration_notices` is last: every direct
     #: `AutoloopConfig(...)` construction across the test suite predates it,
@@ -821,7 +854,10 @@ class AutoloopConfig:
         return self.state_dir / "continuous_fingerprint.json"
 
 
-_SECTIONS = {"browser", "policy", "paths", "conversation", "codex", "executor", "audit", "repo"}
+_SECTIONS = {
+    "browser", "policy", "paths", "conversation", "codex", "executor", "audit",
+    "repo", "autonomy",
+}
 
 
 def _check_keys(section: str, data: dict, allowed: set[str]) -> None:
@@ -1350,6 +1386,30 @@ def load_config(path: Path) -> AutoloopConfig:
             "detector never runs, while still reading as configured"
         )
 
+    autonomy_data = dict(data.get("autonomy", {}))
+    _check_keys("autonomy", autonomy_data, {f.name for f in dataclasses.fields(AutonomyConfig)})
+    # Types are checked HERE rather than left to fail at the first fault. A
+    # `enabled = "true"` (a string, which TOML happily carries) is truthy, so an
+    # unchecked value would switch autonomous mode ON for an operator who typed
+    # it wrong — the one direction this flag must never fail in. `bool` is
+    # checked before `int` for `max_recovery_attempts` because `True` IS an int
+    # in Python and would otherwise read as a budget of 1.
+    if "enabled" in autonomy_data and not isinstance(autonomy_data["enabled"], bool):
+        raise ConfigError(
+            "autonomy.enabled must be a boolean (true/false), got "
+            f"{autonomy_data['enabled']!r} — a non-boolean is refused rather "
+            "than coerced, because the truthy reading would turn autonomous "
+            "recovery on by accident"
+        )
+    if "max_recovery_attempts" in autonomy_data:
+        attempts = autonomy_data["max_recovery_attempts"]
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+            raise ConfigError(
+                "autonomy.max_recovery_attempts must be a non-negative integer, "
+                f"got {attempts!r}"
+            )
+    autonomy = AutonomyConfig(**autonomy_data)
+
     repo, repo_notices = _load_repo_section(data)
 
     return AutoloopConfig(
@@ -1363,6 +1423,7 @@ def load_config(path: Path) -> AutoloopConfig:
         codex=codex,
         executor=executor,
         audit=audit,
+        autonomy=autonomy,
         repo=repo,
         migration_notices=migration_notices + conversation_notices + repo_notices,
     )

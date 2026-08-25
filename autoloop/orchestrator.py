@@ -240,6 +240,31 @@ section for the full table):
   change what happens next; use `_to_needs_user` wherever a human doing
   something makes the SAME session resumable.
 
+Autonomous recovery (halt-02, 2026-08-25):
+
+* A CONFIG FLAG, DEFAULT OFF (`config.AutonomyConfig`). With it off — every
+  existing deployment, every direct `AutoloopConfig(...)` — every park below
+  behaves exactly as it did, and turning it off again restores that.
+* With it on, `_to_needs_user` gives an ALLOWLISTED code two stages instead of
+  one park: re-enter the recovery path the loop already has (`--retry`'s phase
+  re-entry, or `--resubmit`'s same-id re-issue), bounded by a budget counted on
+  the durable blocker record; and, once that path is exhausted, park
+  `task_fatal` naming the task in flight so `cli._handle_parked_task` sets that
+  ONE task aside and the loop carries on. The allowlist, the per-code budgets
+  and the argument for each are `blockers.AUTONOMOUS_RECOVERIES`; the five
+  parks it may never reach are `blockers.HARD_HALT_CODES`.
+* halt-02 named SEVEN codes; the table holds SIX. The missing one is the
+  conversation-rotation failure this file's brw-15 section describes, which has
+  had no producer since that change — a code no live provider can raise is
+  removed rather than automated, so it is absent by decision.
+* Three of those six get a budget of ZERO, and that is the honest answer rather
+  than a gap: `worker_environment_drift`, `publisher_url_drift` and
+  `crash_reconciliation_ambiguous` have no in-process recovery path at all —
+  their remedies are an operator repairing the shared git environment,
+  confirming a new push destination, and clearing a commit intent by hand, none
+  of which the loop may perform for itself. An empty recovery path is exhausted
+  immediately, so the set-aside fires at once.
+
 Repeated stops (stop-01, 2026-08-23):
 
 * A reviewer's `stop` is a VERDICT, not a failure, so no budget ever counted
@@ -283,7 +308,14 @@ from .auto_merge import (
     MergeDeferralStore,
     UpgradeStore,
 )
-from .blockers import NO_TASK, STRANDED_AFTER_FAULT, BlockerStore
+from .blockers import (
+    NO_TASK,
+    RECOVER_BY_RESUBMITTING,
+    RECOVER_BY_RESUMING,
+    STRANDED_AFTER_FAULT,
+    BlockerStore,
+    autonomous_recovery,
+)
 from .browser.chatgpt import SubmitResult
 from .browser.observation import SendOutcome
 from .browser.playwright_session import attachable_page_targets
@@ -1390,6 +1422,15 @@ class Orchestrator:
         #: are gone at attach time would then restart, clear, restart — the
         #: loop the bound exists to stop.
         self._rate_limit_browser_restarted = False
+        #: The `blockers.Blocker.id` an autonomous retry is currently riding on
+        #: (halt-02), or `""`. Set by `_autonomous_retry`, consumed by
+        #: `_close_recovered_blocker` on the first completed step, and dropped
+        #: without being closed by any park. IN MEMORY DELIBERATELY: it means
+        #: "this process retried and has not yet seen the retry work", which is
+        #: not a fact about the loop that should outlive the process — a
+        #: successor reads the still-open record as budget already spent, which
+        #: is the direction that retries less.
+        self._autonomous_recovered_blocker = ""
         # Autoloop M2 (`publisher.py`). Optional and independently gated from
         # the `worktrees`/`execution_store`/`intent_store` triple above: when
         # `None` (every existing caller and test), `_dispatch_task_push`
@@ -1612,6 +1653,12 @@ class Orchestrator:
                 # restart it is owed. In-memory only, so no save is owed for
                 # it.
                 self._rate_limit_browser_restarted = False
+                # Same evidence, a second reader: an autonomous retry that is
+                # followed by a completed step has recovered, and its blocker
+                # record can be closed with a machine reason. Ordinary runs
+                # (and every run with autonomy off) have no marker set and
+                # this returns immediately.
+                self._close_recovered_blocker()
                 if self.state.rate_limit_backoffs:
                     self.state.rate_limit_backoffs = 0
                     self.state.rate_limit_wait_seconds = 0.0
@@ -10218,26 +10265,40 @@ class Orchestrator:
         `task_id` is descriptive metadata on the record either way; only
         `cli.py`'s continuous-mode handling treats it as actionable, and
         only for `kind="task_fatal"`.
+
+        **Autonomous mode (halt-02, 2026-08-25) intercepts here, and ONLY
+        here.** With `config.autonomy.enabled` — default False — a `code` that
+        `blockers.autonomous_recovery` recognises does not necessarily park:
+        the blocker record is written exactly as it always is, and then the
+        recovery path that already exists is re-entered, bounded by a budget
+        counted on that durable record. When the budget is spent the loop still
+        parks, but `task_fatal` naming the task in flight, so the existing
+        quarantine in `cli._handle_parked_task` sets that one task aside and
+        the loop keeps working. Every step of that is fail-closed: no store, no
+        resolvable task, an unrecognised code, a hard halt, a `resume_phase`
+        that is missing or terminal, or a resubmit with no request all fall
+        through to the ordinary park below, unchanged.
         """
         state = self.state
         originating_phase = state.phase
-        state.question = question
-        state.resume_phase = resume_phase
-        state.phase = Phase.NEEDS_USER.value
-        state.stop_kind = ""
-        state.park_kind = kind
-        state.park_task_id = task_id
-        state.park_blocker_id = None
-        self._log(
-            "needs_user",
-            data={
-                "question": question,
-                "resume_phase": resume_phase,
-                "kind": kind,
-                "code": code,
-                "task_id": task_id,
-            },
-        )
+        # Resolved BEFORE the record is written, because it decides the record's
+        # own `kind` and `task_id` — and `BlockerStore.record` upserts on
+        # (task, code, phase) without ever rewriting either field, so a record
+        # first written `loop_fatal`/`(loop)` could not be promoted later. One
+        # identity for the whole episode, decided once.
+        plan = self._autonomy_plan(code)
+        if plan is not None:
+            set_aside = self._autonomous_set_aside_task(task_id)
+            if set_aside is None:
+                # There is no task to set aside, so the second half of
+                # autonomous recovery cannot happen — and the first half must
+                # not either. Retrying toward a park that would still stop the
+                # loop just spends rounds to arrive at the same halt.
+                plan = None
+            else:
+                kind = "task_fatal"
+                task_id = set_aside
+        blocker = None
         if self._blocker_store is not None:
             blocker_task_id = task_id or NO_TASK
             # Idempotent: re-parking on the same (task, code, phase) updates
@@ -10255,8 +10316,193 @@ class Orchestrator:
                 # abandoned by a session that has since been reset.
                 session_id=state.session_id or "",
             )
-            state.park_blocker_id = blocker.id
+            if plan is not None and self._autonomous_retry(
+                plan, blocker, code=code, resume_phase=resume_phase
+            ):
+                return
+        # From here down the loop parks, exactly as it did before autonomous
+        # mode existed. The marker is dropped rather than acted on: a park
+        # means the retry did NOT recover, so its record must stay open.
+        self._autonomous_recovered_blocker = ""
+        state.question = question
+        state.resume_phase = resume_phase
+        state.phase = Phase.NEEDS_USER.value
+        state.stop_kind = ""
+        state.park_kind = kind
+        state.park_task_id = task_id
+        state.park_blocker_id = blocker.id if blocker is not None else None
+        self._log(
+            "needs_user",
+            data={
+                "question": question,
+                "resume_phase": resume_phase,
+                "kind": kind,
+                "code": code,
+                "task_id": task_id,
+            },
+        )
         self._store.save(state)
+
+    # ---- autonomous recovery (halt-02, 2026-08-25) --------------------------
+
+    def _autonomy_plan(self, code: str):
+        """`blockers.AutonomousRecovery` for `code`, or `None` for "park
+        exactly as this loop parks today".
+
+        Four fail-closed gates, in the order they can be answered cheapest
+        first. The `is not True` on the flag is deliberate rather than a
+        `not ...`: `load_config` refuses a non-boolean, but an `AutoloopConfig`
+        built directly (every construction in the test suite) is not validated
+        by anything, and a truthy string must not read as consent to act
+        without an operator.
+
+        A configured `BlockerStore` is REQUIRED, and not merely because the
+        retry budget is counted on it. Setting a task aside deletes the session
+        file (`cli._handle_parked_task`) on the strength of the blocker record
+        holding the question durably; with no store there is no such record,
+        and the question would be destroyed rather than filed.
+        """
+        autonomy = getattr(self._config, "autonomy", None)
+        if autonomy is None or getattr(autonomy, "enabled", False) is not True:
+            return None
+        if self._blocker_store is None:
+            return None
+        return autonomous_recovery(code)
+
+    def _autonomous_set_aside_task(self, task_id: str | None) -> str | None:
+        """WHICH task autonomous mode would set aside for a fault raised here,
+        or `None` when there is no task to set aside.
+
+        The park site's own `task_id` wins — it is the only one that knows a
+        fault belongs to a task other than the one currently executing (a push
+        approval's `binding.task_id`, say). Otherwise the task in flight, read
+        off `state.task_execution`, which is the serialised record of whichever
+        task is running the produce-then-review path.
+
+        `None` — a fault raised while no task is in flight, e.g. a login expiry
+        during a plan request — is a real answer and not a failure: there is
+        nothing to quarantine, so the loop parks as it always did rather than
+        inventing a victim.
+        """
+        if task_id:
+            return task_id
+        execution = self.state.task_execution
+        if isinstance(execution, dict):
+            candidate = execution.get("task_id")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        return None
+
+    def _autonomous_retry(self, plan, blocker, *, code: str, resume_phase: str | None) -> bool:
+        """Re-enter `plan`'s recovery path. True when the loop moved and the
+        caller must return without parking; False when it could not, and the
+        caller parks (as a set-aside, since a plan exists) instead.
+
+        The budget is `min(the code's own allowance, config.autonomy.
+        max_recovery_attempts)` — the config value can only ever restrain the
+        table — and is metered on `BlockerStore.open_recurrences`, i.e. across
+        every OPEN record for this (task, code) rather than the one record just
+        written. A fault that moves one phase along therefore continues
+        spending the same allowance instead of being handed a fresh one.
+
+        `RECOVER_UNAVAILABLE` returns False by construction, which is the whole
+        point of that value: the recovery path for those codes is empty, so it
+        is exhausted on the first occurrence and the set-aside fires at once.
+        """
+        state = self.state
+        budget = min(plan.max_attempts, self._config.autonomy.max_recovery_attempts)
+        # `record` has already counted THIS occurrence, so the retries already
+        # spent are one fewer than the total. `max(0, ...)` guards a record
+        # written with a nonsense count rather than trusting arithmetic on it.
+        spent = max(0, self._blocker_store.open_recurrences(blocker.task_id, code) - 1)
+        if spent >= budget:
+            return False
+        if plan.action == RECOVER_BY_RESUMING:
+            target = self._resumable_phase(resume_phase)
+            if target is None:
+                return False
+            state.phase = target.value
+        elif plan.action == RECOVER_BY_RESUBMITTING:
+            # The same request id on purpose, exactly like `cli.
+            # _authorize_resubmit`: if the earlier attempt did land,
+            # reconciliation detects it and nothing is duplicated.
+            if state.pending_request is None:
+                return False
+            state.pending_request.send_attempted = False
+            state.phase = Phase.SUBMITTING.value
+        else:
+            return False
+        state.question = None
+        state.resume_phase = None
+        state.stop_kind = ""
+        state.park_kind = None
+        state.park_task_id = None
+        state.park_blocker_id = None
+        # Consumed by the first COMPLETED step (`run`'s else branch), which is
+        # the only honest evidence the fault is behind the loop. Held in memory
+        # only: a process that dies before that step leaves the record open,
+        # and the next one reads its recurrences as budget already spent —
+        # fewer retries, never more.
+        self._autonomous_recovered_blocker = blocker.id
+        self._log(
+            "autonomous_recovery",
+            data={
+                "code": code,
+                "action": plan.action,
+                "blocker_id": blocker.id,
+                "task_id": blocker.task_id,
+                "attempt": spent + 1,
+                "budget": budget,
+                "phase": state.phase,
+            },
+        )
+        self._store.save(state)
+        return True
+
+    @staticmethod
+    def _resumable_phase(raw: str | None) -> "Phase | None":
+        """`raw` as a phase the loop can actually step, or `None`.
+
+        A park with no `resume_phase` has said it is not resumable, and a
+        terminal one would re-enter the park it just left; both mean "there is
+        no recovery path here", which is the same answer as an unparseable
+        value. Refusing all three in one place is why the retry cannot fall
+        into a phase nobody chose.
+        """
+        try:
+            phase = Phase(raw)
+        except ValueError:
+            return None
+        return None if phase in TERMINAL_PHASES else phase
+
+    def _close_recovered_blocker(self) -> None:
+        """A step COMPLETED after an autonomous retry: close that blocker.
+
+        Called from `run`'s else branch, beside the rate-limit reset, and for
+        the same reason it is — a completed step is the only free, honest
+        evidence that the condition the loop retried through has cleared.
+
+        Never raises. A store that cannot be written leaves the record open,
+        which spends the next occurrence's budget rather than granting it, so
+        the failure mode of this method is fewer retries.
+        """
+        blocker_id = getattr(self, "_autonomous_recovered_blocker", "")
+        if not blocker_id:
+            return
+        self._autonomous_recovered_blocker = ""
+        if self._blocker_store is None:  # pragma: no cover - never set without one
+            return
+        try:
+            self._blocker_store.close_recovered(
+                blocker_id,
+                "autonomous recovery: a step completed after the retry, so the "
+                "fault this recorded is behind the loop",
+            )
+        except (StateError, OSError) as exc:
+            self._log(
+                "autonomous_recovery_close_failed",
+                data={"blocker_id": blocker_id, "error": f"{type(exc).__name__}: {exc}"},
+            )
 
     def _to_fault_stop(
         self,

@@ -345,6 +345,52 @@ validation_commands = [
 # for one; there is no directive field that grants it.
 test_selection = "reachable"
 
+[autonomy]
+# What the loop does when a TRANSPORT or ENVIRONMENT fault would otherwise park
+# it for a human (halt-02, 2026-08-25). The whole section is optional and the
+# default below is OFF, so omitting it — which every config file written before
+# this existed does — behaves exactly as the loop always has: each such fault
+# parks, and the classification each park site chose for itself stands.
+#
+# Measured 2026-08-24 over 131 resolved blocker records: 411.8h parked, and over
+# the 70.3h window where every round is timed, 21.5h (30.6%) was the loop waiting
+# for an operator, in five gaps out of 103. A transport or environment fault is
+# the worst of those waits because there is nothing to decide — the loop already
+# knows the remedy and simply will not move without being told.
+#
+# With `enabled = true`, a fault whose code is in autoloop/blockers.py's
+# AUTONOMOUS_RECOVERIES gets two stages instead of a park: it re-enters the
+# recovery path that already exists (a `--retry` phase re-entry, or a
+# `--resubmit` re-issue of the same request id), bounded and durably counted;
+# and when that path is exhausted the ONE task in flight is set aside — the same
+# quarantine `run --continuous` already works past — so the loop keeps going on
+# the rest of the roadmap. A blocker record is written either way, so nothing
+# becomes invisible: `python -m autoloop blockers` still lists it, and a record
+# whose fault the loop recovered from is closed with a machine reason rather
+# than a forged operator answer.
+#
+# WHAT IT CANNOT REACH, whatever this is set to: checkout_escape_detected,
+# worker_isolation_violation, primary_checkout_dirty,
+# approved_path_symlink_traversal and prompt_integrity_mismatch. Those mean an
+# agent wrote outside its worker repository or the checkout is not what the loop
+# believes it to be, and continuing past one corrupts the tree every later task
+# builds on. They are an explicit refusal in `blockers.autonomous_recovery`, not
+# an omission from a list.
+#
+# It also never publishes and never re-provisions anything. `publisher_url_drift`
+# is in the table with a budget of ZERO precisely because its only recovery is
+# `reprovision-publisher --confirm` — an operator confirming that a new push
+# destination is correct — so it is set aside without a retry and nothing is
+# pushed.
+enabled = false
+
+# A CEILING on the per-code retry budgets in blockers.AUTONOMOUS_RECOVERIES,
+# never a floor: the effective budget is min(the code's own allowance, this).
+# Set it to 0 to keep the set-aside behaviour with no retries at all; raising it
+# above a code's own number changes nothing, because config may restrain the
+# table and never widen it.
+max_recovery_attempts = 2
+
 [repo]
 # What the loop cannot infer about the repository it is pointed at. Every value
 # below defaults to the constant that used to be hardcoded for this repository,
