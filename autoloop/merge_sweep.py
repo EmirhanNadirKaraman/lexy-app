@@ -291,6 +291,21 @@ the stale-record drift that `MergeDeferralStore` needs `attempts` and
 `last_seen_at` to survive. A branch this module merges IS recorded, in the
 transcript, by `AutoMerger`'s own `auto_merge_pushed` entry.
 
+Which makes the TRANSCRIPT the only history of what this module has decided,
+and since sweep-01 (2026-08-25) that history is read back:
+`health.held_merge_sweep` turns the terminal entries into "held by X, with Y
+queued behind it, for Z hours", so a hold reaches an operator through
+`health --json` instead of being logged hourly and read by nobody — measured,
+on this repository: `audit-0001` held the sweep for 225.8 hours across 108
+consecutive sweeps while five approved tasks waited, and `health` mentioned
+merges zero times. For that to be decidable EVERY invocation has to write
+exactly one terminal entry, which is why `SWEEP_IDLE_EVENT` exists: a clear
+sweep used to write nothing, so "still held" and "held, then fixed" left the
+same evidence and a reader could only ever fail one way or the other. Per-branch
+silence is unchanged. Nothing in what this module MERGES depends on any of it —
+the refusal to sweep past work it cannot judge is exactly as it was, and making
+that refusal visible is the whole change.
+
 ## Failure discipline
 
 Identical to `auto_merge.py`'s, and for the same reason: this runs at startup,
@@ -332,6 +347,49 @@ FAILED = "failed"                # the sweep itself could not run
 #: reached `AutoMerger.attempt`, so claiming one of its outcomes would say the
 #: merge machinery decided something it never saw.
 UNCONFIRMED = "publication_unconfirmed"
+
+#: The transcript entry each TERMINAL outcome writes. Named constants rather
+#: than literals at the emit sites because these are read BACK:
+#: `health.held_merge_sweep` reconstructs "is this backlog held, by what, with
+#: what queued behind it, and for how long" from nothing but these entries, and
+#: a slug renamed at one end only would leave that reader watching for an event
+#: nobody writes — silently, which is this module's own failure mode one layer
+#: up. The literal strings are pinned by a test for the same reason: the 110
+#: entries already in the transcript on 2026-08-25 carry these exact names, and
+#: a rename both ends agreed on would still stop the history being readable.
+SWEEP_HELD_EVENT = "merge_sweep_held"
+SWEEP_COMPLETED_EVENT = "merge_sweep_completed"
+SWEEP_DEFERRED_EVENT = "merge_sweep_deferred"
+SWEEP_STOPPED_EVENT = "merge_sweep_stopped"
+
+#: What an invocation with nothing to merge writes — the one entry that makes
+#: the SEQUENCE of sweeps decidable (sweep-01, 2026-08-25). Until it existed a
+#: clear sweep wrote nothing at all, so "still held" and "held, then fixed and
+#: clear ever since" left identical evidence, and any reader of the entries
+#: above had to keep reporting a hold that might have ended weeks ago. It
+#: carries `unresolved` because a nothing-to-do invocation can still be
+#: unjudgeable: `_backlog` records unresolved tasks and then finds no candidate
+#: to queue behind them, which is a backlog that cannot drain with an empty
+#: queue — not a clear one, as `is_clear` has always said.
+#:
+#: This is a LOG line and nothing else. It changes no enumeration, no order, no
+#: gate and no merge; a sweep that writes it merged nothing before it and will
+#: merge nothing because of it.
+SWEEP_IDLE_EVENT = "merge_sweep_nothing_to_do"
+
+#: Terminal entries that PROVE the enumeration found nothing it could not judge.
+#: All three are written PAST the hold check, which returns before them — so any
+#: one of them, seen after a run of held sweeps, ends that run. `merge_sweep_
+#: error` is deliberately in neither set: it is also written per-branch from
+#: `_attempt` (followed by `merge_sweep_stopped`), so treating it as terminal
+#: would misread a composite run, and a crashed enumeration proves nothing about
+#: a hold either way. Ignoring it keeps the hold reported, which is the closed
+#: direction.
+SWEEP_CLEARED_EVENTS = (
+    SWEEP_COMPLETED_EVENT,
+    SWEEP_DEFERRED_EVENT,
+    SWEEP_STOPPED_EVENT,
+)
 
 #: The only two per-branch outcomes the sweep continues past. Everything else
 #: — conflict, failed verification, deferral, a publication that stopped being
@@ -518,6 +576,22 @@ class BacklogSweeper:
                 base_after=start.head,
             )
         if not candidates:
+            # ONE terminal entry, so a reader of this transcript can tell a
+            # sweep that found nothing from a sweep that never ran. Per-BRANCH
+            # silence is untouched and stays deliberate (a branch already in the
+            # base is the ordinary case for every task the loop has completed);
+            # this is one line per INVOCATION, and it is what lets
+            # `health.held_merge_sweep` stop reporting a hold that has ended.
+            # `unresolved` rides along because this path is reached with it
+            # non-empty — an unjudgeable task with no branch queued behind it —
+            # and that is a held backlog with an empty queue, not a clear run.
+            self._log(
+                SWEEP_IDLE_EVENT,
+                data={
+                    "unresolved": [task_id for task_id, _why in result.unresolved],
+                    "pending": [],
+                },
+            )
             return result
 
         result.pending = [c.task_id for c in candidates]
@@ -544,7 +618,7 @@ class BacklogSweeper:
         if result.unresolved:
             result.outcome = HELD
             self._log(
-                "merge_sweep_held",
+                SWEEP_HELD_EVENT,
                 data={
                     "unresolved": [task_id for task_id, _why in result.unresolved],
                     "pending": list(result.pending),
@@ -572,7 +646,7 @@ class BacklogSweeper:
             result.outcome = DEFERRED
             result.reasons = list(reasons)
             self._log(
-                "merge_sweep_deferred",
+                SWEEP_DEFERRED_EVENT,
                 data={"reasons": list(reasons), "pending": list(result.pending)},
             )
             return result
@@ -599,7 +673,7 @@ class BacklogSweeper:
                 result.base_after = after_attempt.head
                 result.unreconciled = _unreconciled(before_attempt, after_attempt)
                 self._log(
-                    "merge_sweep_stopped",
+                    SWEEP_STOPPED_EVENT,
                     data={
                         "task_id": candidate.task_id,
                         "outcome": outcome,
@@ -622,7 +696,7 @@ class BacklogSweeper:
         # not questioned.
         result.base_after = _probe(self._git).head
         self._log(
-            "merge_sweep_completed",
+            SWEEP_COMPLETED_EVENT,
             data={
                 "merged": list(result.merged),
                 "base_sha_before": result.base_before,
